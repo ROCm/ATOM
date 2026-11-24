@@ -311,61 +311,63 @@ def test_pcp_merge_setting_is_saved_before_worker_environment_changes(monkeypatc
 def test_real_plugin_launcher_binds_after_group_creation_or_reuse(
     monkeypatch, framework, reuse
 ):
-    from unittest.mock import Mock
+    from aiter_stub import atom_under_stubs
 
-    from atom.plugin.register import init_aiter_dist
+    with atom_under_stubs() as load:
+        init_aiter_dist = load("atom.plugin.register").init_aiter_dist
+        from unittest.mock import Mock
 
-    sglang = framework == "sglang"
-    config = _config(
-        tp=2,
-        dp=1 if sglang else 2,
-        prefill_context_parallel_size=2 if sglang else 1,
-        enable_expert_parallel=not sglang and not reuse,
-        moe_ep_flatten_tp_across_dp=not sglang and not reuse,
-        plugin_config=PluginConfig(
-            is_plugin_mode=True,
-            is_sglang=sglang,
-            is_vllm=not sglang,
-            rank=3 if sglang else 1,
-            sglang_aiter_rank_id=3,
-            sglang_dist_init_addr="127.0.0.1:29500",
-        ),
-    )
-    config.parallel_config.data_parallel_rank = 0 if sglang else 1
-    config.parallel_config.data_parallel_master_ip = "127.0.0.1"
-    config.parallel_config.data_parallel_master_port = 29500
-    topology = get_parallel_mapping(config)
-    get_moe_execution_plan(config)
-    _install_runtime_groups(monkeypatch, topology, 3, omit_singleton_pcp=not sglang)
-    initialize = Mock()
-    sys.modules["aiter"].init_dist_env = initialize
-    utilities = ModuleType("aiter.dist.utils")
-    utilities.get_distributed_init_method = lambda ip, port: f"tcp://{ip}:{port}"
-    monkeypatch.setitem(sys.modules, "aiter.dist.utils", utilities)
-    reuse_module = ModuleType("atom.plugin.vllm.tp_group_reuse")
-    reuse_module.init_aiter_dist_from_vllm = Mock(return_value=reuse)
-    monkeypatch.setitem(sys.modules, reuse_module.__name__, reuse_module)
-
-    from atom.distributed import worker_binding
-
-    bind = Mock(wraps=worker_binding.bind_worker_parallel_mapping)
-    monkeypatch.setattr(worker_binding, "bind_worker_parallel_mapping", bind)
-
-    init_aiter_dist(config)
-
-    bind.assert_called_once_with(config, global_rank=3)
-    assert config.worker_moe_execution_plan is not None
-    if reuse:
-        initialize.assert_not_called()
-        reuse_module.init_aiter_dist_from_vllm.assert_called_once_with(2)
-    else:
-        initialize.assert_called_once()
-        assert (
-            initialize.call_args.kwargs["tensor_model_parallel_size"]
-            == topology.tp_size
+        sglang = framework == "sglang"
+        config = _config(
+            tp=2,
+            dp=1 if sglang else 2,
+            prefill_context_parallel_size=2 if sglang else 1,
+            enable_expert_parallel=not sglang and not reuse,
+            moe_ep_flatten_tp_across_dp=not sglang and not reuse,
+            plugin_config=PluginConfig(
+                is_plugin_mode=True,
+                is_sglang=sglang,
+                is_vllm=not sglang,
+                rank=3 if sglang else 1,
+                sglang_aiter_rank_id=3,
+                sglang_dist_init_addr="127.0.0.1:29500",
+            ),
         )
-        assert initialize.call_args.kwargs["data_parallel_size"] == topology.dp_size
-        assert (
-            initialize.call_args.kwargs["prefill_context_model_parallel_size"]
-            == topology.pcp_size
-        )
+        config.parallel_config.data_parallel_rank = 0 if sglang else 1
+        config.parallel_config.data_parallel_master_ip = "127.0.0.1"
+        config.parallel_config.data_parallel_master_port = 29500
+        topology = get_parallel_mapping(config)
+        get_moe_execution_plan(config)
+        _install_runtime_groups(monkeypatch, topology, 3, omit_singleton_pcp=not sglang)
+        initialize = Mock()
+        sys.modules["aiter"].init_dist_env = initialize
+        utilities = ModuleType("aiter.dist.utils")
+        utilities.get_distributed_init_method = lambda ip, port: f"tcp://{ip}:{port}"
+        monkeypatch.setitem(sys.modules, "aiter.dist.utils", utilities)
+        reuse_module = ModuleType("atom.plugin.vllm.tp_group_reuse")
+        reuse_module.init_aiter_dist_from_vllm = Mock(return_value=reuse)
+        monkeypatch.setitem(sys.modules, reuse_module.__name__, reuse_module)
+
+        from atom.distributed import worker_binding
+
+        bind = Mock(wraps=worker_binding.bind_worker_parallel_mapping)
+        monkeypatch.setattr(worker_binding, "bind_worker_parallel_mapping", bind)
+
+        init_aiter_dist(config)
+
+        bind.assert_called_once_with(config, global_rank=3)
+        assert config.worker_moe_execution_plan is not None
+        if reuse:
+            initialize.assert_not_called()
+            reuse_module.init_aiter_dist_from_vllm.assert_called_once_with(2)
+        else:
+            initialize.assert_called_once()
+            assert (
+                initialize.call_args.kwargs["tensor_model_parallel_size"]
+                == topology.tp_size
+            )
+            assert initialize.call_args.kwargs["data_parallel_size"] == topology.dp_size
+            assert (
+                initialize.call_args.kwargs["prefill_context_model_parallel_size"]
+                == topology.pcp_size
+            )

@@ -224,43 +224,47 @@ def test_rlhf_isolated_worker_plan_is_saved_before_binding(
 @pytest.mark.parametrize("rank", [2, 3])
 @pytest.mark.parametrize("reuse", [True, False])
 def test_vllm_pp_binds_the_second_pipeline_stage(monkeypatch, rank, reuse):
-    import sys
-    from types import ModuleType
+    from aiter_stub import atom_under_stubs
 
-    from test_parallel_mapping import _install_runtime_groups
+    with atom_under_stubs() as load:
+        init_aiter_dist = load("atom.plugin.register").init_aiter_dist
+        import sys
+        from types import ModuleType
 
-    from atom.plugin.register import init_aiter_dist
+        from test_parallel_mapping import _install_runtime_groups
 
-    config = atom_config_double(
-        tensor_parallel_size=2,
-        pipeline_parallel_size=2,
-        plugin_config=PluginConfig(is_plugin_mode=True, is_vllm=True, rank=rank),
-    )
-    topology = get_parallel_mapping(config)
-    _install_runtime_groups(monkeypatch, topology, rank, omit_singleton_pcp=True)
-    reuse_module = ModuleType("atom.plugin.vllm.tp_group_reuse")
-    reuse_module.init_aiter_dist_from_vllm = Mock(return_value=reuse)
-    monkeypatch.setitem(sys.modules, reuse_module.__name__, reuse_module)
-    sys.modules["aiter"].init_dist_env = Mock()
-    utilities = ModuleType("aiter.dist.utils")
-    utilities.get_distributed_init_method = lambda ip, port: f"tcp://{ip}:{port}"
-    monkeypatch.setitem(sys.modules, utilities.__name__, utilities)
-    pp = ModuleType("atom.distributed.pp_comm")
-    pp.init_pp_aware_dist_env = Mock()
-    monkeypatch.setitem(sys.modules, pp.__name__, pp)
-
-    from atom.distributed import worker_binding
-
-    bind = Mock(wraps=worker_binding.bind_worker_parallel_mapping)
-    monkeypatch.setattr(worker_binding, "bind_worker_parallel_mapping", bind)
-    init_aiter_dist(config)
-    bind.assert_called_once_with(config, global_rank=rank)
-    assert config.worker_moe_execution_plan.mapping.tp_rank == rank % 2
-    if reuse:
-        pp.init_pp_aware_dist_env.assert_not_called()
-    else:
-        assert (
-            pp.init_pp_aware_dist_env.call_args.kwargs["pipeline_model_parallel_size"]
-            == 2
+        config = atom_config_double(
+            tensor_parallel_size=2,
+            pipeline_parallel_size=2,
+            plugin_config=PluginConfig(is_plugin_mode=True, is_vllm=True, rank=rank),
         )
-        assert pp.init_pp_aware_dist_env.call_args.kwargs["global_rank"] == rank
+        topology = get_parallel_mapping(config)
+        _install_runtime_groups(monkeypatch, topology, rank, omit_singleton_pcp=True)
+        reuse_module = ModuleType("atom.plugin.vllm.tp_group_reuse")
+        reuse_module.init_aiter_dist_from_vllm = Mock(return_value=reuse)
+        monkeypatch.setitem(sys.modules, reuse_module.__name__, reuse_module)
+        sys.modules["aiter"].init_dist_env = Mock()
+        utilities = ModuleType("aiter.dist.utils")
+        utilities.get_distributed_init_method = lambda ip, port: f"tcp://{ip}:{port}"
+        monkeypatch.setitem(sys.modules, utilities.__name__, utilities)
+        pp = ModuleType("atom.distributed.pp_comm")
+        pp.init_pp_aware_dist_env = Mock()
+        monkeypatch.setitem(sys.modules, pp.__name__, pp)
+
+        from atom.distributed import worker_binding
+
+        bind = Mock(wraps=worker_binding.bind_worker_parallel_mapping)
+        monkeypatch.setattr(worker_binding, "bind_worker_parallel_mapping", bind)
+        init_aiter_dist(config)
+        bind.assert_called_once_with(config, global_rank=rank)
+        assert config.worker_moe_execution_plan.mapping.tp_rank == rank % 2
+        if reuse:
+            pp.init_pp_aware_dist_env.assert_not_called()
+        else:
+            assert (
+                pp.init_pp_aware_dist_env.call_args.kwargs[
+                    "pipeline_model_parallel_size"
+                ]
+                == 2
+            )
+            assert pp.init_pp_aware_dist_env.call_args.kwargs["global_rank"] == rank

@@ -2,13 +2,17 @@ mod a_chat_template {
     use serde_json::json;
 
     use crate::protocols::{
-        chat::{ChatMessage, MessageContent},
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{ContentPart, ImageUrl},
     };
     use crate::routers::prepare::chat_template::{
-        process_content_format, process_tool_call_arguments, ProcessedMessages,
+        process_chat_messages, process_content_format, process_tool_call_arguments,
+        ProcessedMessages,
     };
-    use crate::tokenizer::chat_template::ChatTemplateContentFormat;
+    use crate::routers::test_mocks::tokenizer::hf_tokenizer_path;
+    use crate::tokenizer::{
+        chat_template::ChatTemplateContentFormat, traits::Tokenizer, HuggingFaceTokenizer,
+    };
 
     fn user_parts(parts: Vec<ContentPart>) -> ChatMessage {
         ChatMessage::User {
@@ -177,6 +181,53 @@ mod a_chat_template {
     fn test_processed_messages_has_no_multimodal_field() {
         let ty = std::any::type_name::<ProcessedMessages>();
         assert!(ty.ends_with("ProcessedMessages"));
+    }
+
+    /// The engine renders with transformers, so routed tokens only match its KV
+    /// cache when this render is byte-identical. This toy template covers two of
+    /// the renders 1.4.2 changed: `tojson` is `json.dumps`, which leaves `<>&'`
+    /// unescaped, unlike Jinja's, and history tool-call arguments are a dict. The
+    /// expected text is transformers 5.16.1's `_compile_jinja_template(TEMPLATE)
+    /// .render(messages=..., tools=..., add_generation_prompt=True)` for this request.
+    #[test]
+    fn test_tojson_and_tool_call_arguments_render_as_in_transformers() {
+        const TEMPLATE: &str = r#"{% for tool in tools %}
+{{ tool.function | tojson }}
+{% endfor %}
+{% for m in messages %}
+    {% if m.role == 'system' %}{% continue %}{% endif %}
+{{ m.role }}:{% for k, v in (m.tool_calls[0].function.arguments if m.tool_calls else {}).items() %} {{ k }}={{ v }}{% endfor %};
+{% endfor %}"#;
+        let mut tokenizer = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
+        tokenizer.set_chat_template(TEMPLATE.to_string()).unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "c0",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\": \"a.txt\", \"limit\": 5}"}
+                }]}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "read",
+                "description": "Read a file's <head> & tail.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+            }}]
+        }))
+        .unwrap();
+
+        let rendered = process_chat_messages(&request, &tokenizer).unwrap().text;
+
+        assert_eq!(
+            rendered,
+            concat!(
+                r#"{"name": "read", "description": "Read a file's <head> & tail.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}"#,
+                "\nuser:;\nassistant: path=a.txt limit=5;\n",
+            )
+        );
     }
 }
 
@@ -1010,6 +1061,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -1057,6 +1109,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         assert_eq!(ctx.headers.as_ref().unwrap().get("x-trace").unwrap(), "abc");
     }
@@ -1079,6 +1132,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         assert!(ctx.processed_messages.is_none());
     }
@@ -1139,7 +1193,9 @@ mod h_prepare_chat_generate {
     use crate::protocols::generate::GenerateRequest;
     use crate::routers::prepare::generation_payload::GenerationPayload;
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
-    use crate::routers::prepare::{lookup_tokenizer, prepare_chat, prepare_generate};
+    use crate::routers::prepare::{
+        lookup_tokenizer, prepare_chat, prepare_chat_with, prepare_generate,
+    };
     use crate::routers::test_mocks;
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
@@ -1191,6 +1247,39 @@ mod h_prepare_chat_generate {
             pm.text
         );
         assert_eq!(payload.text, pm.text);
+    }
+
+    #[test]
+    fn test_only_a_router_that_asks_reads_the_prompts_opener() {
+        // The test template renders `user: <content>`, so this prompt ends
+        // on `<think>`.
+        let opened = || {
+            Arc::new(ChatCompletionRequest {
+                model: "m".to_string(),
+                messages: vec![ChatMessage::User {
+                    content: MessageContent::Text("hi <think>".to_string()),
+                    name: None,
+                }],
+                ..Default::default()
+            })
+        };
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
+        let (_, grpc) = prepare_chat(opened(), None, Some("m".into()), components.as_ref())
+            .expect("HF tokenizer must succeed");
+        assert_eq!(
+            grpc.prompt_opener, None,
+            "gRPC routing keeps its parsers' start"
+        );
+        let (_, bridge) = prepare_chat_with(
+            opened(),
+            None,
+            Some("m".into()),
+            components.as_ref(),
+            None,
+            true,
+        )
+        .expect("HF tokenizer must succeed");
+        assert_eq!(bridge.prompt_opener.as_deref(), Some("<think>"));
     }
 
     #[test]

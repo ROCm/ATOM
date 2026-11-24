@@ -121,7 +121,7 @@ def test_forward_uses_plan_for_dp_collectives(
     monkeypatch.setattr(
         moe, "get_tp_group", lambda: SimpleNamespace(all_reduce=tp_reduce)
     )
-    monkeypatch.setattr(moe, "tbo_on_comm", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(moe, "tbo_on_comm", lambda fn, *args, hold=True: fn(*args))
     gather_rows = Mock(
         side_effect=lambda rows, *_: (tuple(t.repeat(2, 1) for t in rows), 3, [3, 3])
     )
@@ -295,6 +295,11 @@ def test_shared_expert_gate_uses_supplied_plan(
 def test_compiled_forward_preserves_dp_collectives_and_outer_tp_reduce(
     monkeypatch, atom_modules, dp_attention
 ):
+    import triton.language as tl
+
+    # Dynamo tests captured Python objects against constexpr's type. This
+    # fixture replaces Triton kernels, so its annotation stub must be a type.
+    monkeypatch.setattr(tl, "constexpr", int)
     moe = atom_modules.moe
     mapping = MoEParallelMapping.make(
         tp_size=1,
@@ -327,7 +332,7 @@ def test_compiled_forward_preserves_dp_collectives_and_outer_tp_reduce(
             all_reduce=lambda rows, **kwargs: rows + 3,
         ),
     )
-    monkeypatch.setattr(moe, "tbo_on_comm", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(moe, "tbo_on_comm", lambda fn, *args, hold=True: fn(*args))
     monkeypatch.setattr(
         moe,
         "dp_gather_routed_rows",

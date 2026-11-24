@@ -28,10 +28,7 @@ class PleHostTable:
 
     Each checkpoint shard is copied into page-locked memory as it arrives, so
     the table is never whole anywhere and never in HBM; `shard_bases` gives the
-    device the address of each shard's first global row. Always copied: the
-    shards share safetensors files with other weights, and registering part of
-    a file mapping in place makes host-to-device copies from the rest of it
-    fail.
+    device the address of each shard's first global row.
 
     One shard that cannot be page-locked moves the table to `device`, as the
     data of `weight`, so it is released and resumed with the parameters.
@@ -89,7 +86,7 @@ class PleHostTable:
 
     def _take_rows(self, shard: int, row_start: int, rows: torch.Tensor) -> None:
         if not self._in_hbm:
-            pinned = host_memory.pin_rows([rows.contiguous()], copy=True)
+            pinned = host_memory.pin_rows([rows.contiguous()])
             with self._lock:
                 if pinned is not None and not self._in_hbm:
                     self._rows[shard] = (row_start, pinned[0])

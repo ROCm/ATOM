@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """V4.1 DSpark math and checkpoint layout; context storage is caller-owned."""
 
 import logging
 from copy import copy
-from types import SimpleNamespace
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
@@ -43,19 +44,27 @@ from atom.models.deepseek_v4_dspark import (
     DSparkMarkovHead,
     _DSparkInner,
 )
-from atom.models.dspark_draft import DSparkDraftModel
+from atom.models.dspark_draft import DSparkDraftModel, VocabShard
 from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.utils import envs
 
 from .attention import Attention
-from .config import build_attention_topology
-from .layers import native_quant_config
+from .config import FP4PTPC_RECIPE, build_attention_topology
+from .layers import (
+    converted_linear_spec,
+    native_quant_config,
+    routed_experts_are_ptpc,
+)
 from .model import Block, DeepseekV41ForCausalLM
 
 logger = logging.getLogger("atom")
 
 
 class DraftAttention(Attention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._wkv_shard = None  # built by `wkv_shard` on first use
+
     def context_keys(self, kv_normed, positions, rope, *, packed=False):
         """The context row alone, for a caller with no query to rotate with it.
 
@@ -70,18 +79,20 @@ class DraftAttention(Attention):
     @property
     def wkv_shard(self):
         """`wqkv_a` narrowed to the KV rows, for the fused context-KV GEMM."""
-        view = self.__dict__.get("_wkv_shard")
-        if view is None:
-            view = self._wkv_shard = self.wqkv_a.shard_view(1)
-        return view
+        if self._wkv_shard is None:
+            # A view of `wqkv_a`, not a submodule: kept out of `_modules`.
+            object.__setattr__(self, "_wkv_shard", self.wqkv_a.shard_view(1))
+        return self._wkv_shard
 
     def project_context(self, hidden, positions, rope, *, packed=False):
-        """Target keys alone; the query half is computed and dropped.
-
-        As V4's draft does, and only on the unfused path -- when the stages
-        fuse, `write_context_kv` reads `wkv_shard` and no query is projected.
+        """Target keys alone, only on the unfused path -- when the stages
+        fuse, `write_context_kv` reads `wkv_shard`. A BF16 `wqkv_a` projects
+        only the KV rows; an FP8 one computes the query half and drops it.
         """
-        _, kv_pre = self.project_qkv(hidden)
+        if self.wqkv_a.runs_bf16:
+            kv_pre = self.wkv_shard(hidden)
+        else:
+            _, kv_pre = self.project_qkv(hidden)
         return self.context_keys(self.kv_norm(kv_pre), positions, rope, packed=packed)
 
     def forward(self, hidden, hidden_scale, context_kv, step, rope, *, hidden_fp8=None):
@@ -226,10 +237,25 @@ class DeepseekV41DSpark(DSparkDraftModel):
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
+        # An FP4PTPC checkpoint converts only the backbone's linears; the
+        # draft's stay native.
+        draft.fp4ptpc = False
+        # Same rules as the backbone.
         self.moe_quant_config = make_v4_quant_config(
-            draft, online_quant_config=getattr(config, "online_quant_config", None)
+            draft,
+            online_quant_config=getattr(config, "online_quant_config", None),
+            shared_expert_spec=converted_linear_spec(draft),
+            online_routed_experts=True,
         )
+        # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
+        self.quant_config = self.moe_quant_config
         topology = build_attention_topology(args)[args.num_hidden_layers :]
+        if args.fp4ptpc and not all(
+            routed_experts_are_ptpc(self.moe_quant_config, f"mtp.{i}.ffn.experts")
+            for i in range(len(topology))
+        ):
+            # The draft's FP4 experts run only converted, as the backbone's.
+            raise ValueError(f"mtp: {FP4PTPC_RECIPE}")
         # The backbone's, handed down: the two models never run at once, so a
         # stream of its own would buy nothing. Absent when built offline,
         # which is also where nothing is fast enough to care.
@@ -255,23 +281,6 @@ class DeepseekV41DSpark(DSparkDraftModel):
             args.qk_rope_head_dim, capacity + self.block_size, base=args.rope_theta
         )
         self.embed = self.head = None
-        # Stage 0's main_norm, as a fused RMSNorm + MXFP8 quant. Outside the
-        # module tree so the loader looks for no new weight; it holds
-        # main_norm's own weight tensor, so loads and weight syncs reach it.
-        self._build_main_norm_quant()
-
-    def _build_main_norm_quant(self):
-        main = self.mtp[0].main_norm
-        norm = RMSNorm(
-            main.dim,
-            main.eps,
-            fused_quant=True,
-            quant_config=native_quant_config(),
-        )
-        norm.weight = main.weight
-        # A plain object, not a child module: assigning the RMSNorm itself
-        # would register it and make the loader look for a second weight.
-        self._main_norm_quant_holder = SimpleNamespace(norm=norm)
 
     @property
     def model(self):
@@ -323,37 +332,21 @@ class DeepseekV41DSpark(DSparkDraftModel):
         """`main_norm(main_proj(concat(taps)))` as `[1, N, hidden]`."""
         return self.mtp[0].main_norm(self._project_taps(taps))
 
-    def project_context_quant(self, taps):
-        """`project_context`, emitted as the fused KV GEMM's quantized input.
-
-        Returns E4M3 values and their row-major group-32 UE8M0 scales, the
-        `(x, x_scale)` pair `native_quant_linear` would otherwise make itself
-        with `quantize_fp8`, from one RMSNorm + MXFP8 launch.
-
-        Not bit-identical to `project_context` followed by that quantize: the
-        fused kernel quantizes the fp32 normalized value, where the chain
-        rounds it to bf16 first and quantizes the rounded value, so an element
-        near an E4M3 code boundary can land on the other code. It also has no
-        `ATOM_USE_MODEL_SENSITIVE_RMSNORM` rounding mode, so `write_context_kv`
-        keeps the chain when that is set.
-        """
-        return self._main_norm_quant()(self._project_taps(taps))
-
     def _project_taps(self, taps):
         """`main_proj(concat(taps))` as `[1, N, hidden]`, before the norm.
 
-        `main_proj` quantizes its input with `quantize_fp8`; the taps are
-        quantized where they lie instead, to the same fp8 rows and scales,
+        An FP8 `main_proj` quantizes its input with `quantize_fp8`; the taps
+        are quantized where they lie instead, to the same fp8 rows and scales,
         minus the concatenated copy. `quantize_fp8_taps` joins them itself for
         a shape its kernel does not take, and passes a single joined block
-        (a PP relay) through as it is.
+        (a PP relay) through as it is. A BF16 `main_proj` (no group32 FP8
+        GEMM) takes the joined taps unquantized.
         """
+        main_proj = self.mtp[0].main_proj
+        if main_proj.runs_bf16:
+            return main_proj(self.concat_taps(taps).unsqueeze(0))
         x, x_scale = quantize_fp8_taps(taps)
-        return self.mtp[0].main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
-
-    def _main_norm_quant(self):
-        """The fused norm built in ``__init__``."""
-        return self._main_norm_quant_holder.norm
+        return main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
 
     @property
     def context_layers(self):
@@ -393,20 +386,15 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 )
                 cache.write_window(attention.spec.layer_id, keys, step)
             return
-        weight, weight_scale, group_rows, width, preshuffled = fused
-        if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
-            hidden, hidden_scale = self.project_context(taps), None
-        else:
-            # The norm emits the GEMM's quantized input, so the GEMM does not
-            # run its own quantize_fp8 on the bf16 norm output.
-            hidden, hidden_scale = self.project_context_quant(taps)
+        weight, weight_scale, group_rows, width = fused
+        # main_norm lands in bf16 and the GEMM quantizes that, as the original
+        # model rounds.
         kv = native_quant_linear(
-            hidden,
+            self.project_context(taps),
             weight,
             weight_scale,
             weight_group_rows=group_rows,
-            weight_preshuffled=preshuffled,
-            x_scale=hidden_scale,
+            weight_preshuffled=weight.is_shuffled,
         ).unflatten(-1, (len(layers), width))
         tail = self._draft_kv_tail_fusion()
         if tail is None:
@@ -429,8 +417,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
             )
         else:
             # Same stage-major result, one kernel: the cat is not fused but
-            # deleted, each program writing its row straight to its stage slot.
+            # deleted, each program writing its row straight to its stage slot,
+            # or, when the stages' fp8 windows share a ring, to its window.
             norm_weight, eps = tail
+            window = cache.window_target([a.spec.layer_id for a in layers], step)
             keys = fused_draft_kv_tail(
                 kv,
                 norm_weight,
@@ -439,7 +429,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 self.rope.sin_cache,
                 eps,
                 packed=cache.window_fp8,
+                window=window,
+                step=step,
             )
+            if window is not None:
+                return
         for i, attention in enumerate(layers):
             cache.write_window(
                 attention.spec.layer_id,
@@ -503,15 +497,25 @@ class DeepseekV41DSpark(DSparkDraftModel):
             for s in shards
         }
         (group_rows, _, width, preshuffled), *others = layouts
-        if others or group_rows is None or any(s.bias is not None for s in shards):
+        # BF16 shards have no FP8 weights to fuse: per-stage path.
+        bf16 = any(s.runs_bf16 for s in shards)
+        if (
+            others
+            or group_rows is None
+            or bf16
+            or any(s.bias is not None for s in shards)
+        ):
             fused = None
         else:
+            weight = torch.cat([s.weight for s in shards])
+            # the concatenation is a new tensor in the stages' layout: it
+            # carries their layout flag, as every loaded weight does
+            weight.is_shuffled = preshuffled
             fused = (
-                torch.cat([s.weight for s in shards]),
+                weight,
                 torch.cat([s.weight_scale for s in shards]),
                 group_rows,
                 width,
-                preshuffled,
             )
         self._context_kv_fused = fused
         return fused
@@ -715,11 +719,50 @@ class DeepseekV41DSpark(DSparkDraftModel):
     _head_and_sample = _DSparkInner.head_and_sample
     forward_head = _DSparkInner.forward_head
 
-    def head_and_sample(self, out, anchor_ids, num_draft):
+    # `head_and_sample` draws the block through the bound `draft_sampling`, so
+    # `DSparkProposer` may arm lossless sampling here; its drafts are verified
+    # as one block.
+    supports_lossless_draft = True
+    lossless_block_verify = True
+
+    @property
+    def markov_head(self):
+        """The last stage's Markov head, the one the block is sampled with."""
+        return self.mtp[-1].markov_head
+
+    def head_and_sample(self, out, anchor_ids, num_draft, *, greedy=False):
         # `num_draft` is the shared surface's; the width rides `out[1]`.
+        if self.draft_sampling is not None and not greedy:
+            return self._head_and_sample_q(*out, anchor_ids)
         if self._sharded_markov_sample():
             return self._head_and_sample_sharded(*out, anchor_ids)
         return self._head_and_sample(*out, anchor_ids)
+
+    def _head_and_sample_q(self, normed, hc_hidden, anchor_ids):
+        """The lossless block: each x_k drawn from, and its q published to,
+        the bound `draft_sampling` (`DSparkMarkovHead.sample_block`). Where the
+        greedy block keeps the LM head sharded (`_sharded_markov_sample`), so
+        does this one: the ranks exchange tile partials, histograms and their
+        share of the stored entries rather than the logits, and store and
+        draw what the whole vocab would (`dspark_markov_sample_tp`)."""
+        B, T, _ = hc_hidden.shape
+        head, markov = self.head, self.mtp[-1].markov_head
+        shard = None
+        if self._sharded_markov_sample():
+            base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B,T,V/tp]
+            shard = VocabShard(
+                head.vocab_start_idx, get_tp_group(), envs.ATOM_USE_CUSTOM_ALL_GATHER
+            )
+        else:
+            base_logits = head.get_logits(normed).view(B, T, -1)  # [B, T, V]
+        out_ids = markov.sample_block(
+            base_logits, anchor_ids, self.draft_sampling, shard
+        )
+        # The confidence head reads W1[x_{k-1}], which the greedy op hands over
+        # and the sampled one does not.
+        prev_ids = torch.cat([anchor_ids[:, None], out_ids[:, :-1]], dim=1)
+        confidence = self.mtp[-1].confidence_head(hc_hidden, markov.markov_w1(prev_ids))
+        return out_ids, confidence
 
     def _sharded_markov_sample(self) -> bool:
         """Whether the block is sampled off this rank's vocab shard.

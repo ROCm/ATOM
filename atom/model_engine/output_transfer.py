@@ -48,8 +48,10 @@ class D2HQueue:
 
     def send(
         self, source: torch.Tensor, *, ready: torch.cuda.Event | None = None
-    ) -> None:
-        """Enqueue a copy after ready, or after the caller's current stream."""
+    ) -> torch.cuda.Event:
+        """Enqueue a copy after ready, or after the caller's current stream;
+        -> its ``copy_done``, valid until the copy is received: what a writer
+        of ``source`` waits on where the source is a fixed address."""
         if source.numel() > self.capacity:
             raise ValueError(
                 f"D2H shape {tuple(source.shape)} exceeds capacity {self.capacity}"
@@ -68,6 +70,7 @@ class D2HQueue:
             slot.copy_done.record(self.stream)
         slot.source = source
         self._pending.append(slot)
+        return slot.copy_done
 
     def receive(self):
         """Wait for the oldest transfer and return an independently owned output."""
