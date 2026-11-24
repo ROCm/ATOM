@@ -13,10 +13,13 @@ This module provides:
   from all workers.
 """
 
+import faulthandler
 import logging
 import multiprocessing
+import os
 import pickle
 import queue
+import signal
 import threading
 import time
 import weakref
@@ -59,6 +62,13 @@ from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
 from atom.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger("atom")
+
+
+# A worker writes every thread's Python stack to its stderr (the server log) on
+# this signal. The manager sends it once to each rank that leaves a KV
+# aggregation unanswered past its timeout: a rank stuck there has stopped the
+# whole pipeline, and the stack is the one thing the log cannot reconstruct.
+STACK_DUMP_SIGNAL = signal.SIGUSR1
 
 
 @dataclass
@@ -126,6 +136,9 @@ class AsyncIOProc:
         from atom.utils import enable_orphan_reaping
 
         enable_orphan_reaping()
+        # Before any RPC can stall: the manager may send this from then on, and
+        # the default action of SIGUSR1 would end the process.
+        faulthandler.register(STACK_DUMP_SIGNAL, all_threads=True)
 
         # Named once, before anything logs: `ps`, the GC lines here and the
         # freeze line the runner emits over RPC all have to be the same string,
@@ -988,12 +1001,14 @@ class AsyncIOProcManager:
             waited = time.monotonic() - pending.started_at
             if timeout > 0 and waited >= timeout and not pending.wait_warning_logged:
                 logger.error(
-                    "%s: KV aggregation still waiting for workers %s after %.1fs",
+                    "%s: KV aggregation still waiting for workers %s after %.1fs; "
+                    "their thread stacks follow",
                     self.label,
-                    missing,
+                    self._worker_names(missing),
                     waited,
                 )
                 pending.wait_warning_logged = True
+                self._dump_worker_stacks(missing)
             return None
 
         kv_output = self.kv_output_aggregator.aggregate(
@@ -1008,6 +1023,37 @@ class AsyncIOProcManager:
         self._start_kv_aggregation(func_name, args)
         logger.debug(f"Aggregated KV output: {kv_output}")
         return kv_output
+
+    def _worker_names(self, ranks: list[int]) -> list[str]:
+        """`ranks` with their pids: under PP every stage's manager has a rank 0,
+        and the pid is what ties a rank to the stack dump that follows."""
+        procs = getattr(self, "procs", [])
+        return [
+            f"{r} (pid {procs[r].pid})" if r < len(procs) else str(r) for r in ranks
+        ]
+
+    def _dump_worker_stacks(self, ranks: list[int]) -> None:
+        """Have each of `ranks` write its thread stacks to the server log.
+
+        Read-only for the worker: faulthandler prints from the signal handler
+        and the interrupted thread carries on. Best effort, so a rank that has
+        just exited only costs this line.
+        """
+        procs = getattr(self, "procs", [])
+        for rank in ranks:
+            pid = procs[rank].pid if rank < len(procs) else None
+            if pid is None:
+                continue
+            try:
+                os.kill(pid, STACK_DUMP_SIGNAL)
+            except OSError as exc:
+                logger.warning(
+                    "%s: no stack dump from worker %d (pid %d): %s",
+                    self.label,
+                    rank,
+                    pid,
+                    exc,
+                )
 
     def monitor_procs(self):
         self_ref = weakref.ref(self)

@@ -14,6 +14,7 @@ with stubbed_aiter():
         KVConnectorOutput,
         SaveOperationId,
     )
+    from atom.model_engine import async_proc
     from atom.model_engine.async_proc import AsyncIOProcManager
 
 
@@ -230,3 +231,62 @@ def test_completed_aggregation_arms_the_next_batch_before_returning():
     assert manager._pending_kv_aggregation is not None
     assert manager._pending_kv_aggregation is not first_pending
     assert manager._pending_kv_aggregation.worker_outputs == [None, None]
+
+
+def test_stalled_aggregation_dumps_missing_workers_stacks_once(monkeypatch):
+    manager = _manager(world_size=2)
+    manager.procs = [Mock(pid=101), Mock(pid=202)]
+    manager.procs[0].name = "ATOM::TP0"
+    manager.procs[1].name = "ATOM::TP1"
+    clock = [100.0]
+    monkeypatch.setattr(async_proc.time, "monotonic", lambda: clock[0])
+    kill = Mock()
+    monkeypatch.setattr(async_proc.os, "kill", kill)
+
+    assert manager.call_func_with_aggregation(_POLL) is None
+    manager.kv_outputs_queues[1].put(KVConnectorOutput())
+    clock[0] += 9.9
+    assert manager.call_func_with_aggregation(_POLL) is None
+    kill.assert_not_called()
+
+    clock[0] += 0.1
+    assert manager.call_func_with_aggregation(_POLL) is None
+    kill.assert_called_once_with(101, async_proc.STACK_DUMP_SIGNAL)
+
+    clock[0] += 20.0
+    assert manager.call_func_with_aggregation(_POLL) is None
+    kill.assert_called_once()
+
+
+def test_stack_dump_of_a_vanished_worker_is_only_logged(monkeypatch):
+    manager = _manager(world_size=1)
+    manager.procs = [Mock(pid=101)]
+    monkeypatch.setattr(
+        async_proc.os, "kill", Mock(side_effect=ProcessLookupError("gone"))
+    )
+    manager._dump_worker_stacks([0])
+
+
+def test_stack_dump_signal_prints_stacks_and_keeps_the_process():
+    import subprocess
+    import sys
+    import textwrap
+
+    # The worker's registration, then the manager's signal, in one process.
+    script = textwrap.dedent(f"""
+        import faulthandler, os, signal
+        faulthandler.register(signal.Signals({int(async_proc.STACK_DUMP_SIGNAL)}),
+                              all_threads=True)
+        os.kill(os.getpid(), signal.Signals({int(async_proc.STACK_DUMP_SIGNAL)}))
+        print("alive")
+        """)
+    done = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert done.returncode == 0
+    assert done.stdout.strip() == "alive"
+    assert "most recent call first" in done.stderr
