@@ -577,6 +577,54 @@ class TestM31IndexShard:
         )
         assert moved == len(src) * (full - index) + 2 * index
 
+    @pytest.mark.parametrize("rank", range(TP))
+    def test_what_decode_reads_is_what_a_replicated_push_lands(self, stack, rank):
+        """Per D rank, the bytes its decode reads after a sharded push -- every
+        K/V and draft byte, and the index rows of the blocks it scores
+        (`b % TP == rank`) -- are the bytes a replicated pair lands there."""
+        (_p, tt_rp, pool_rp, rep), (_d, tt_rd, pool_rd) = self.pair(
+            stack, p_rank=None, d_rank=None
+        )
+        (_p, tt_sp, pool_sp, shd), (_d, tt_sd, pool_sd) = self.pair(
+            stack, p_rank=rank, d_rank=rank
+        )
+        shd.tp_rank = rank
+        generator = torch.Generator().manual_seed(rank)
+        pool_rp.copy_(torch.randint(0, 256, pool_rp.shape, generator=generator))
+        # The sharded producer holds the same KV: its index unit u is block
+        # u * TP + rank of the replicated one.
+        for page_r, page_s in zip(tt_rp.pages, tt_sp.pages):
+            world = page_s.region.shard_world
+            assert page_s.region.semantic_role == page_r.region.semantic_role
+            page_s.view.copy_(page_r.view[rank::world] if world > 1 else page_r.view)
+        src, dst = [4, 1, 6, 3, 5], [8, 9, 2, 11, 1]
+        for producer, (pool_p, pool_d) in (
+            (rep, (pool_rp, pool_rd)),
+            (shd, (pool_sp, pool_sd)),
+        ):
+            producer._write_pages(
+                {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
+            )
+            apply_batch(producer.posted, pool_p, pool_d)
+        for page_r, page_s in zip(tt_rd.pages, tt_sd.pages):
+            world = page_s.region.shard_world
+            for d in dst:
+                if d % world == rank % world:
+                    assert torch.equal(page_s.view[d // world], page_r.view[d])
+        # Over the TP ranks, a block's index moves once instead of TP times.
+        full = sum(r.unit_bytes for r in tt_rp.block_regions)
+        index = sum(
+            r.unit_bytes
+            for r in tt_rp.block_regions
+            if self.index_region(r.semantic_role)
+        )
+        [(*_r, rep_sizes)] = rep.posted
+        [(*_s, shd_sizes)] = shd.posted
+        assert sum(rep_sizes) == len(src) * full
+        assert sum(shd_sizes) == len(src) * (full - index) + index * sum(
+            s % TP == rank for s in src
+        )
+
     def test_a_pair_that_changes_lanes_is_refused(self, stack):
         (_p, _tt, _pool, producer), _d = self.pair(stack)
         with pytest.raises(ValueError, match="change their shard"):

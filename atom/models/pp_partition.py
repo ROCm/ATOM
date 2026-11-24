@@ -239,6 +239,11 @@ def minimax_m3_stage_kv_costs(config: Any) -> tuple[list[int], int] | None:
         "fp4": index_dim // 2 + index_dim // 16,
         "fp8": index_dim,
     }.get(index_dtype, 2 * index_dim)
+    dcp_config = getattr(config, "dcp_config", None)
+    if getattr(dcp_config, "index_shard", False):
+        # A rank keeps the index of 1/TP of the blocks (`minimax_m3/index_shard.py`),
+        # in HBM and, chunk by chunk, in the CPU tier: per token on average.
+        index_bytes = -(-index_bytes // tp)
     sparse_kv = (
         kv_bytes(head_dim, "fp4")
         if envs.ATOM_M3_SPARSE_KV_NVFP4

@@ -147,7 +147,6 @@ class M3OffloadConnector(PrehashedSaveWorkerMixin, DenseOffloadConnector):
                 self.block_size,
                 chunk_size=int(cfg.chunk_size),
                 virtual_block_size=self.virtual_block_size,
-                chunk_bytes=self._codec.chunk_bytes if sharded else None,
                 source_safe_callback=(
                     self._source_group_safe
                     if getattr(self, "_early_release", False)

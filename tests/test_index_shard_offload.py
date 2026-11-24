@@ -135,44 +135,137 @@ def cpu_copies(monkeypatch):
     return pools
 
 
+def _rows(pool, block, rank):
+    """The bytes chunk-major staging holds for ``block``'s own index rows."""
+    if block % P != rank:
+        return torch.empty(0, dtype=torch.uint8)
+    unit = block // P
+    return torch.cat(
+        [t[unit * u : (unit + 1) * u] for t, u in zip(pool.sharded, SHARD_UNITS)]
+    )
+
+
+def _whole(pool, block):
+    return torch.cat(
+        [t[block * u : (block + 1) * u] for t, u in zip(pool.whole, WHOLE_UNITS)]
+    )
+
+
+def _connector(codec, chunk_blocks):
+    from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
+
+    return BlockGPUConnector(codec, block_size=1, chunk_size=chunk_blocks)
+
+
+def _store(connector, codec, objs, starts, ends, block_ids):
+    """`batched_from_gpu`'s staged pipeline, group by group, on CPU: pack every
+    chunk of a group into one staging buffer, then slice it into the objects."""
+    groups = connector._ranges_to_block_ids(starts, ends, block_ids=block_ids)
+    chunks = connector._iter_transfer_chunks(objs, groups, starts, ends)
+    for group in connector._iter_transfer_groups(chunks):
+        buf = torch.zeros(group.nbytes, dtype=torch.uint8)
+        codec.gpu_to_chunk_major_device_buffer(buf, connector._group_block_ids(group))
+        connector._slice_to_memory_objs(group, buf)
+
+
+def _load(connector, codec, objs, starts, ends, block_ids):
+    groups = connector._ranges_to_block_ids(starts, ends, block_ids=block_ids)
+    chunks = connector._iter_transfer_chunks(objs, groups, starts, ends)
+    for group in connector._iter_transfer_groups(chunks):
+        buf = torch.zeros(group.nbytes, dtype=torch.uint8)
+        connector._memory_objs_to_slice(group, buf)
+        codec.chunk_major_device_buffer_to_gpu(buf, connector._group_block_ids(group))
+
+
+# Logical blocks 0..5; block ids in the lanes of their positions, on both ends.
+SRC_TABLE = [4, 9, 6, 11, 8, 13]
+DST_TABLE = [12, 1, 2, 7, 0, 5]
+
+
+@pytest.mark.parametrize("batched", [True, False])
+@pytest.mark.parametrize("chunk_blocks", [1, 2])
 @pytest.mark.parametrize("rank", range(P))
-def test_a_ranks_chunks_round_trip_its_own_index_rows(cpu_copies, rank):
+def test_a_ranks_chunks_are_exactly_its_bytes_and_round_trip(
+    cpu_copies, monkeypatch, rank, chunk_blocks, batched
+):
+    from atom.kv_transfer.offload import _block_gpu_connector
+
+    monkeypatch.setattr(_block_gpu_connector, "_BATCHED_HOST_COPY", batched)
     source, dest = Pool(rank, seed=rank), Pool(rank, seed=None)
     cpu_copies += [source, dest]
-    codec = source.codec
     whole, shard = sum(WHOLE_UNITS), sum(SHARD_UNITS)
-    assert (codec.bytes_per_block, codec.sharded_bytes_per_block) == (whole, shard)
-    # Logical blocks 0..4 as 2-block chunks; block ids in the lanes of their
-    # positions, on both ends.
-    src_chunks = [[4, 9], [6, 11], [8]]
-    dst_chunks = [[12, 1], [2, 7], [0]]
-    sizes = [codec.chunk_bytes(len(c)) for c in src_chunks]
-    assert sizes == [2 * whole + shard] * 2 + [whole + shard]
-    buf = torch.zeros(sum(sizes), dtype=torch.uint8)
-    codec.gpu_to_chunk_major_device_buffer(buf, src_chunks)
+    assert (source.codec.bytes_per_block, source.codec.sharded_bytes_per_block) == (
+        whole,
+        shard,
+    )
+    save = _connector(source.codec, chunk_blocks)
+    # The staging chunk is the most a chunk can hold; a chunk's object is exact.
+    assert save.gpu_staging_chunk_bytes == chunk_blocks * whole + shard
+    n = len(SRC_TABLE) // chunk_blocks
+    starts = [i * chunk_blocks for i in range(n)]
+    ends = [s + chunk_blocks for s in starts]
+    shapes = save.chunk_shapes(starts, ends, block_ids=SRC_TABLE)
+    expected = [
+        torch.cat(
+            [_whole(source, b) for b in SRC_TABLE[s:e]]
+            + [_rows(source, b, rank) for b in SRC_TABLE[s:e]]
+        )
+        for s, e in zip(starts, ends)
+    ]
+    assert [int(shape[0]) for shape in shapes] == [t.numel() for t in expected]
+    objs = [
+        SimpleNamespace(tensor=torch.zeros(shape, dtype=torch.uint8))
+        for shape in shapes
+    ]
+    _store(save, source.codec, objs, starts, ends, SRC_TABLE)
+    for obj, want in zip(objs, expected):
+        assert torch.equal(obj.tensor, want)
 
-    # The bytes of chunk 0 are its blocks' whole regions, then its own rows.
-    first = buf[: sizes[0]]
-    own = [b for b in src_chunks[0] if b % P == rank]
-    rows = [t[b // P * u : (b // P + 1) * u]
-            for b in own for t, u in zip(source.sharded, SHARD_UNITS)]  # fmt: skip
-    rows = torch.cat(rows) if rows else torch.empty(0, dtype=torch.uint8)
-    assert torch.equal(first[2 * whole : 2 * whole + rows.numel()], rows)
-
-    dest.codec.chunk_major_device_buffer_to_gpu(buf, dst_chunks)
-    for src_ids, dst_ids in zip(src_chunks, dst_chunks):
-        for s, d in zip(src_ids, dst_ids):
-            for ts, td, u in zip(source.whole, dest.whole, WHOLE_UNITS):
-                assert torch.equal(td[d * u : (d + 1) * u], ts[s * u : (s + 1) * u])
-            for ts, td, u in zip(source.sharded, dest.sharded, SHARD_UNITS):
-                landed = td[d // P * u : (d // P + 1) * u]
-                if s % P == rank:
-                    assert torch.equal(landed, ts[s // P * u : (s // P + 1) * u])
+    load = _connector(dest.codec, chunk_blocks)
+    _load(load, dest.codec, objs, starts, ends, DST_TABLE)
+    for s, d in zip(SRC_TABLE, DST_TABLE):
+        assert torch.equal(_whole(dest, d), _whole(source, s))
+        assert torch.equal(_rows(dest, d, rank), _rows(source, s, rank))
     # Nothing but the rank's own units was written.
-    owned_dst = {d // P for c in dst_chunks for d in c if d % P == rank}
+    owned_dst = {d // P for d in DST_TABLE if d % P == rank}
     for td, u in zip(dest.sharded, SHARD_UNITS):
         for unit in set(range(BLOCKS // P)) - owned_dst:
             assert not td[unit * u : (unit + 1) * u].any()
+
+
+def test_a_token_path_object_of_the_most_bytes_loads_the_same(cpu_copies):
+    """LMCache's own store sizes a chunk by tokens (`get_shapes`): the object
+    is the most a chunk holds and its bytes past the chunk's are never read."""
+    rank = 1
+    source, dest = Pool(rank, seed=7), Pool(rank, seed=None)
+    cpu_copies += [source, dest]
+    save, load = _connector(source.codec, 1), _connector(dest.codec, 1)
+    starts, ends = list(range(6)), list(range(1, 7))
+    big = [
+        SimpleNamespace(
+            tensor=torch.full((save.gpu_staging_chunk_bytes,), 0xAB, dtype=torch.uint8)
+        )
+        for _ in starts
+    ]
+    _store(save, source.codec, big, starts, ends, SRC_TABLE)
+    _load(load, dest.codec, big, starts, ends, DST_TABLE)
+    for s, d in zip(SRC_TABLE, DST_TABLE):
+        assert torch.equal(_whole(dest, d), _whole(source, s))
+        assert torch.equal(_rows(dest, d, rank), _rows(source, s, rank))
+
+
+def test_an_object_smaller_than_its_chunk_is_refused(cpu_copies):
+    """An object stored for a chunk that owns no index rows cannot load into
+    one that does (both ends broke the lane rule): refused, not half-read."""
+    rank = 0
+    pool = Pool(rank, seed=None)
+    cpu_copies.append(pool)
+    connector = _connector(pool.codec, 1)
+    small = SimpleNamespace(
+        tensor=torch.zeros(pool.codec.bytes_per_block, dtype=torch.uint8)
+    )
+    with pytest.raises(ValueError, match="too small"):
+        _load(connector, pool.codec, [small], [0], [1], [4])
 
 
 def test_a_codec_needs_one_shard_and_whole_regions():
@@ -249,3 +342,128 @@ def test_the_m3_worker_registers_a_ranks_chunks(monkeypatch):
     assert captured["gpu_connector"].gpu_staging_chunk_bytes == (
         2 * whole_bytes + shard_bytes
     )
+
+
+def test_the_prepared_path_reads_the_index_rows_past_the_whole_bytes(
+    cpu_copies, monkeypatch
+):
+    """One block-id upload per transfer, as the replicated codec: each part's
+    prepared group copies what `gpu_to_chunk_major_device_buffer` does."""
+
+    def prepare(codec, groups, *, device, stream):
+        return SimpleNamespace(
+            groups=[list(g) for g in groups],
+            upload_count=int(any(groups)),
+            codec=codec,
+        )
+
+    def prepared(gather):
+        def run(codec, buf, owner, index, *, stream=None):
+            plan = codec.page_plan(owner.groups[index])
+            (codec.gather(plan, buf) if gather else codec.scatter(buf, plan))
+
+        return run
+
+    monkeypatch.setattr(DSV4PageSlotCodec, "prepare_block_id_groups", prepare)
+    monkeypatch.setattr(
+        DSV4PageSlotCodec, "gpu_to_chunk_major_device_buffer_prepared", prepared(True)
+    )
+    monkeypatch.setattr(
+        DSV4PageSlotCodec, "chunk_major_device_buffer_to_gpu_prepared", prepared(False)
+    )
+    rank = 3
+    source, dest = Pool(rank, seed=3), Pool(rank, seed=None)
+    cpu_copies += [source, dest]
+    groups = [[[b] for b in SRC_TABLE[:3]], [[b] for b in SRC_TABLE[3:]]]
+    owner = source.codec.prepare_block_id_groups(groups, device="cpu", stream=None)
+    assert owner.group_count == 2 and owner.upload_count == 2
+    for index, group in enumerate(groups):
+        sizes, _ = source.codec.staging_layout(group)
+        want = torch.zeros(sum(sizes), dtype=torch.uint8)
+        got = torch.zeros(sum(sizes), dtype=torch.uint8)
+        source.codec.gpu_to_chunk_major_device_buffer(want, group)
+        source.codec.gpu_to_chunk_major_device_buffer_prepared(got, owner, index)
+        assert torch.equal(got, want)
+        dst_group = [[d] for d in DST_TABLE[3 * index : 3 * index + 3]]
+        dst_owner = dest.codec.prepare_block_id_groups(
+            [dst_group], device="cpu", stream=None
+        )
+        dest.codec.chunk_major_device_buffer_to_gpu_prepared(got, dst_owner, 0)
+    for s, d in zip(SRC_TABLE, DST_TABLE):
+        assert torch.equal(_whole(dest, d), _whole(source, s))
+        assert torch.equal(_rows(dest, d, rank), _rows(source, s, rank))
+
+
+@pytest.mark.parametrize("rank", range(P))
+def test_a_prehashed_save_allocates_each_chunk_its_own_bytes(cpu_copies, rank):
+    """The lazy policy's demotions (1-block chunks) are prehashed saves: each
+    chunk is allocated its exact bytes, so 3 of 4 carry no index."""
+    from test_offload_prehashed_save import CHUNK, _engine, _worker
+
+    from atom.kv_transfer.disaggregation.types import SaveOperationId
+    from atom.kv_transfer.offload.metadata import (
+        LMCacheReqMeta,
+        PrehashedSave,
+        SaveSpec,
+    )
+
+    pool = Pool(rank, seed=None)
+    cpu_copies.append(pool)
+    engine = _engine()
+    from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
+
+    # One block a chunk, as the lazy policy runs.
+    connector = BlockGPUConnector(pool.codec, block_size=CHUNK, chunk_size=CHUNK)
+    asked = []
+    engine.gpu_connector.chunk_shapes = connector.chunk_shapes
+    allocate = engine.storage_manager.allocate
+
+    def sized(shapes, dtypes, busy_loop=True, fmt=None):
+        asked.append(int(shapes[0][0]))
+        return allocate(shapes, dtypes, busy_loop, fmt)
+
+    engine.storage_manager.allocate = sized
+    worker = _worker(engine)
+    blocks = SRC_TABLE[:4]  # lanes 0, 1, 2, 3
+    req = LMCacheReqMeta(
+        req_id=1,
+        token_ids=[],
+        block_ids=blocks,
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=SaveOperationId(1, 0),
+        prehashed_save=PrehashedSave(start=0, hashes=(11, 12, 13, 14)),
+    )
+    worker._do_save_req(req)
+    whole, shard = pool.codec.bytes_per_block, pool.codec.sharded_bytes_per_block
+    assert asked == [whole + shard * (b % P == rank) for b in blocks]
+
+
+def test_m31_tp4_bytes_per_token_and_the_tier_horizon(monkeypatch):
+    """M3.1 TP4 per rank and token: 14,280 B replicated; 11,040 B on average
+    with the index sharded (HBM, and the CPU tier with exact chunk objects);
+    the tier index (`lmcache_tier_horizon_tokens`) counts the latter."""
+    from test_lmcache_offload_connector import _m31_pp4_config
+
+    from atom import config as config_mod
+    from atom.models.pp_partition import minimax_m3_stage_kv_costs
+
+    monkeypatch.setenv("ATOM_M3_SPARSE_KV_NVFP4", "1")
+    monkeypatch.setattr(config_mod, "_is_minimax_m3_config", lambda hf: True)
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _kvc=None: SimpleNamespace(max_local_cpu_size=430.0),
+    )
+    config = _m31_pp4_config(0)
+    config.tensor_parallel_size, config.pipeline_parallel_size = 4, 1
+    tokens = {}
+    for shard in (False, True):
+        config.dcp_config = DCPConfig(indexer_dcp_only=shard, index_shard=shard)
+        layers, draft = minimax_m3_stage_kv_costs(config)
+        tokens[shard] = sum(layers) + draft
+    assert tokens == {False: 14_280, True: 11_040}
+    # Exact chunk objects: a 1-block chunk of an owned block holds the whole
+    # index, others none; on average 1/4 of it, as the HBM pool's price.
+    whole, index = 1_274_880, 552_960
+    assert (whole + index / P) / 128 == 11_040
+    assert offcfg.lmcache_tier_horizon_tokens(config) == int(430 * 2**30 / 11_040)

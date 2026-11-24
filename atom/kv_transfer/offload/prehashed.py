@@ -610,6 +610,19 @@ class PrehashedSaveWorkerMixin:
         storage_manager = engine.storage_manager
         shapes = engine.metadata.get_shapes(chunk)
         dtypes = engine.metadata.get_dtypes()
+        # A codec that sizes chunks by their blocks (a sharded index cache:
+        # `hybrid/m3/codec.py`) gets each chunk's exact bytes, not the most a
+        # chunk of this many tokens can hold.
+        chunk_shapes = getattr(engine.gpu_connector, "chunk_shapes", None)
+        exact = (
+            chunk_shapes(
+                [start + i * chunk for i in range(len(hashes))],
+                [start + (i + 1) * chunk for i in range(len(hashes))],
+                block_ids=req.block_ids,
+            )
+            if callable(chunk_shapes)
+            else None
+        )
         busy_loop = engine.config.get_extra_config_value("force_store_wait", False)
         keys, memory_objs, starts, ends = [], [], [], []
         refused = False
@@ -618,7 +631,10 @@ class PrehashedSaveWorkerMixin:
             if must_store_all and storage_manager.contains(key) is not None:
                 continue
             memory_obj = storage_manager.allocate(
-                shapes, dtypes, busy_loop=busy_loop, fmt=engine.fmt
+                shapes if exact is None else [exact[index]],
+                dtypes,
+                busy_loop=busy_loop,
+                fmt=engine.fmt,
             )
             if memory_obj is None:
                 refused = True
