@@ -59,7 +59,6 @@ def runtime(monkeypatch):
             context=None,
             ubatch_slices=None,
             in_hipgraph=False,
-            draft_graph_warmup=False,
         ),
         tbo=False,
         capturing=False,
@@ -473,9 +472,9 @@ def test_capture_warmup_hints_like_the_capture(runtime):
 
 
 def test_draft_graph_warmup_hints_like_its_capture(runtime):
-    # A captured draft pass warms eagerly with in_hipgraph False, then records:
-    # its warmup must take the route the recording takes.
-    runtime.forward_context.draft_graph_warmup = True
+    # A captured draft pass warms and records under in_hipgraph: its warmup
+    # must take the route the recording takes.
+    runtime.forward_context.in_hipgraph = True
     runtime.run(_context(SMALL_M_MTPR, is_draft=True))
     runtime.run(_context(SMALL_M_MTPR + 1, is_draft=True))
     runtime.capturing = True

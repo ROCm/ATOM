@@ -420,11 +420,14 @@ class Drafter(abc.ABC):
                 # running counts are the same number.
                 running_tokens = bs * self.draft_tokens_per_seq
                 runner.running_tokens_per_dp_rank.fill(running_tokens)
+                # A captured pass warms and records inside this context, as the
+                # target's capture loop does under in_hipgraph.
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
                     running_tokens_per_dp_rank=runner.running_tokens_per_dp_rank,
+                    in_hipgraph=pass_.will_capture,
                 )
                 self._publish_draft_shape(
                     get_forward_context(),
@@ -433,7 +436,6 @@ class Drafter(abc.ABC):
                     running_tokens_are_unified=True,
                     scheduled_tokens_gpu=runner.forward_vars["batch_info"].gpu[2:3],
                 )
-                get_forward_context().draft_graph_warmup = pass_.will_capture
                 pass_.warmup(bs)
                 if end_trace is not None:
                     step = pass_.name.rsplit(".", 1)[-1].lstrip("_")

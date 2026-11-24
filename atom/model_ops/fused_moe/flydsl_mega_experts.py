@@ -190,9 +190,9 @@ def _max_tokens_hint(mega, fc, *, pcp_merge: bool) -> int | None:
     None (the staged route) when no such count is known: plugin bridges, TBO
     ubatches and missing metadata. A graph capture takes the small-input route
     when the rows fit it and the staged route otherwise; the large-input route
-    is never captured. The eager warmup forward before a capture -- the capture
-    loop's (``fc.in_hipgraph``) and a draft pass's (``fc.draft_graph_warmup``)
-    -- takes the same route as the capture that follows it, so the kernels the
+    is never captured. The eager warmup forward before a capture (the target's
+    capture loop and a captured draft pass both run it under ``fc.in_hipgraph``)
+    takes the same route as the capture that follows it, so the kernels the
     capture launches are compiled and their workspaces allocated before the
     capture starts.
 
@@ -217,11 +217,7 @@ def _max_tokens_hint(mega, fc, *, pcp_merge: bool) -> int | None:
     if rows <= 0:
         return None
     rows = _pcp_merged_rows(rows, pcp_merge)
-    in_capture = (
-        fc.in_hipgraph
-        or fc.draft_graph_warmup
-        or torch.cuda.is_current_stream_capturing()
-    )
+    in_capture = fc.in_hipgraph or torch.cuda.is_current_stream_capturing()
     if in_capture and rows > mega.small_m_mtpr:
         return None
     return rows
