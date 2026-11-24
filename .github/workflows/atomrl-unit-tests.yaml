@@ -288,11 +288,9 @@ jobs:
 
   dapo-gpu:
     name: AtomRL DAPO GPU examples
-    needs: [changes, lumen-gpu]
+    needs: changes
     if: >-
-      always()
-      && needs.changes.outputs.run_atomrl_gpu == 'true'
-      && (needs.lumen-gpu.result == 'success' || needs.lumen-gpu.result == 'skipped')
+      needs.changes.outputs.run_atomrl_gpu == 'true'
       && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
     uses: ./.github/workflows/atomrl-dapo-gpu-shard.yaml
     secrets: inherit
