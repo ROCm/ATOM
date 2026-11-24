@@ -327,7 +327,7 @@ async fn process_choice(
 const ONE_SHOT_MAX_BYTES: usize = 65536;
 
 /// Fed last to the piece-by-piece parse: no reasoning delimiter starts with it.
-const RELEASE: &str = "\0";
+pub(super) const RELEASE: &str = "\0";
 
 /// A whole reply (`text`, decoded as `pieces`) split into content and reasoning, the
 /// prompt's `opener` read first; one over the one-shot limit is parsed piece by piece.
