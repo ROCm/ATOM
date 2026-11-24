@@ -56,18 +56,19 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 from aiter import QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import get_tensor_model_parallel_world_size, get_tp_group
 from aiter.rotary_embedding import get_rope
+from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.config import QuantizationConfig
 from atom.kv_transfer.disaggregation import kv_config_has_producer
+from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
     fused_allreduce_gemma_rms_norm_mxfp8_quant,
 )
-from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.embed_head import VocabParallelEmbedding, masked_embedding
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -1160,26 +1161,64 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             return hidden, torch.zeros_like(hidden)
         return embed(ids), None
 
+    def _sharded_markov_sample(self) -> bool:
+        """``ATOM_DSPARK_SHARDED_MARKOV``: sample the block off this rank's
+        vocab shard of the LM head. The whole-vocab path all-gathers the
+        ``[B * T, V]`` logits for a sampler that only wants each position's
+        argmax; here the ranks exchange ``(max, id)`` per position (T gathers of
+        ``[B, 2]``), as the DeepSeek-V4.1 DSpark draft does. Same ids."""
+        head, markov = self.lm_head, self.markov_head
+        return (
+            envs.ATOM_DSPARK_SHARDED_MARKOV
+            and head.tp_size > 1
+            and head.bias is None
+            and markov.fused_sample
+            and markov.markov_w1.weight.dtype in (torch.bfloat16, torch.float16)
+            and markov.markov_w2.weight.dtype is markov.markov_w1.weight.dtype
+        )
+
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]
-        base_logits = self.lm_head(hidden).view(bs, num_draft, -1)
         out_ids = anchor_ids.new_empty(bs, num_draft + 1)
         out_ids[:, 0] = anchor_ids
-        markov_stack = None
-        if self.markov_head.fused_sample:
-            # One request: all K steps in one launch, bit-identical to the
-            # two-stage fused path below (dspark_markov_chain.py); None where
-            # its guard does not hold.
-            from atom.model_ops.dspark_markov_chain import markov_chain_bs1
+        if self._sharded_markov_sample():
+            # Imported here, as sample_next does: the op imports Triton.
+            from atom.model_ops.dspark_markov_sample import dspark_markov_argmax_tp
 
-            embeds = markov_chain_bs1(
-                base_logits,
-                out_ids,
-                self.markov_head.markov_w1.weight,
-                self.markov_head.markov_w2.weight,
-            )
-            if embeds is not None:
-                markov_stack = embeds.unsqueeze(0)
+            head, markov = self.lm_head, self.markov_head
+            # [B, T, V / tp]: this rank's vocab shard, ids vocab_start_idx ..
+            base_logits = tgemm.mm(hidden, head.weight).view(bs, num_draft, -1)
+            w1 = markov.markov_w1.weight
+            markov_stack = w1.new_empty(bs, num_draft, w1.shape[1])
+            for k in range(num_draft):
+                dspark_markov_argmax_tp(
+                    base_logits[:, k],
+                    out_ids[:, k],
+                    w1,
+                    markov.markov_w2.weight,
+                    out_ids[:, k + 1],
+                    head.vocab_start_idx,
+                    get_tp_group(),
+                    use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
+                    embed_out=markov_stack[:, k],
+                )
+        else:
+            base_logits = self.lm_head(hidden).view(bs, num_draft, -1)
+            markov_stack = None
+            if self.markov_head.fused_sample:
+                # One request: all K steps in one launch, bit-identical to the
+                # two-stage fused path below (dspark_markov_chain.py); None where
+                # its guard does not hold.
+                from atom.model_ops.dspark_markov_chain import markov_chain_bs1
+
+                embeds = markov_chain_bs1(
+                    base_logits,
+                    out_ids,
+                    self.markov_head.markov_w1.weight,
+                    self.markov_head.markov_w2.weight,
+                )
+                if embeds is not None:
+                    markov_stack = embeds.unsqueeze(0)
         if markov_stack is None:
             markov_embeds = []
             for k in range(num_draft):

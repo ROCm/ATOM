@@ -809,6 +809,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layer's `qkv_proj` (a row view of the same weight), not the query that the
     # context write drops. Default off for A/B.
     "ATOM_DSPARK_CTX_KV_ONLY": lambda: _flag_env("ATOM_DSPARK_CTX_KV_ONLY"),
+    # MiniMax-M3.1 DSpark draft: sample the block off each rank's vocab shard of
+    # the LM head, exchanging (max, id) per position instead of all-gathering the
+    # [B * T, V] logits. Same ids. Default off for A/B.
+    "ATOM_DSPARK_SHARDED_MARKOV": lambda: _flag_env("ATOM_DSPARK_SHARDED_MARKOV"),
     "ATOM_SAMPLER_SPLIT_V_MAX_ROWS": lambda: int(
         os.getenv("ATOM_SAMPLER_SPLIT_V_MAX_ROWS", "256")
     ),
