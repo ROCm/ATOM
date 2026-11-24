@@ -75,6 +75,9 @@ UNSERVED_FIELDS = {
 # n above 1 is served unstreamed and without P/D, where atomesh's placement sends it.
 N_STREAMED = "a streamed n above 1 is not served over gRPC; send it unstreamed"
 N_TRANSFERRED = "n above 1 with kv_transfer_params (P/D) is not served over gRPC"
+STRUCTURED_STOPS = (
+    "Structured output does not support ignore_eos or custom stop strings"
+)
 SESSION_N = "n above 1 is not served over the Session; Generate serves it unstreamed"
 # Submissions a Session admits at once; past it, they wait in order for one to end.
 SESSION_ADMISSIONS = 64
@@ -510,6 +513,10 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         channel = given.required_channel
         if channel is not None and channel != api.required_tool_channel:
             raise ValueError("required_channel is not this server's tool-call channel")
+        # A grammar takes no custom stop, as Generate and the chat route refuse one.
+        grammar = given.json_schema or given.structured_tool_format
+        if grammar and (given.ignore_eos or request.stop_token_sequences):
+            raise ValueError(STRUCTURED_STOPS)
         kv_transfer_params = request.kv_transfer_params
         api._validate_chunked_receive(kv_transfer_params)
         params = api._build_sampling_params(

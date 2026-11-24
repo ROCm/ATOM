@@ -58,8 +58,9 @@ pub struct AppContext {
     /// Registry ids of the tokenizers loaded with a worker's inline chat template
     /// (an ATOM worker's GetModelInfo), with that template.
     pub tokenizer_inline_templates: Arc<RwLock<HashMap<String, String>>>,
-    /// Registry ids of the tokenizers a registration loaded with a template file.
-    pub tokenizer_template_files: Arc<RwLock<HashSet<String>>>,
+    /// Registry ids of the tokenizers a registration loaded with a template file, with
+    /// that file's path.
+    pub tokenizer_template_files: Arc<RwLock<HashMap<String, String>>>,
     /// Per tokenizer name, held while a registration loads or replaces its tokenizer.
     pub tokenizer_reconciling: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per tokenizer name, the entry a registration is replacing, from its removal

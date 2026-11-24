@@ -433,6 +433,28 @@ def test_the_session_serves_greedy_n_above_1_as_one_and_refuses_sampled(serve):
     assert len(engine.preprocessed) == 1
 
 
+@pytest.mark.parametrize(
+    "structured",
+    [{"json_schema": '{"type": "object"}'}, {"structured_tool_format": "dsml"}],
+)
+@pytest.mark.parametrize(
+    "custom", [{"stops": [[7]]}, {"ignore_eos": True}], ids=["stops", "ignore_eos"]
+)
+def test_a_structured_session_request_with_custom_stops_is_refused(
+    serve, structured, custom
+):
+    """As Generate and PrepareStructuredOutput refuse them, with the chat route's 400."""
+    engine = FakeEngine()
+    servicer = serve(engine)
+    session = servicer.sessions.open()
+    request = _submit(ignore_eos=custom.get("ignore_eos", False), **structured)
+    request.stop_token_sequences = custom.get("stops", [])
+    with pytest.raises(ValueError, match="ignore_eos or custom stop strings") as error:
+        asyncio.run(servicer._submit(session, request))
+    assert grpc_server._rejected(1, error.value).code == v1.RejectedRequest.INVALID
+    assert engine.preprocessed == [] and engine.grammars == []
+
+
 def test_the_session_refuses_stop_strings_without_their_ids(serve):
     engine = FakeEngine()
     servicer = serve(engine)
