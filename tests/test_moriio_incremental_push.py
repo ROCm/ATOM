@@ -475,3 +475,21 @@ def test_a_read_still_moves_every_block(stack, caplog):
     with caplog.at_level("WARNING", logger="atom"):
         assert not reject("r", meta, skips_computed=True)
     assert caplog.text == ""
+
+
+def test_block_sums_cover_a_sharded_region_for_the_blocks_it_holds(stack):
+    """`_block_sums` per block: a region sharded 2 ways (rank 1) holds the odd
+    blocks at units ``b // 2``; a byte there changes that block's sum only."""
+    conn = object.__new__(stack.conn.MoRIIOConnector)
+    whole = torch.randint(0, 256, (6, 8), dtype=torch.uint8)
+    odd = torch.randint(0, 256, (3, 4), dtype=torch.uint8)
+    conn._page_views = [whole, odd]
+    conn._page_regions = [(0, 8, "whole", 0, 1), (0, 4, "odd", 1, 2)]
+    blocks = [0, 1, 2, 3, 4, 5]
+    before = conn._block_sums(blocks)
+    odd[1, 2] ^= 1  # block 3
+    after = conn._block_sums(blocks)
+    assert [b for b, (x, y) in enumerate(zip(before, after)) if x != y] == [3]
+    whole[2, 0] ^= 1
+    again = conn._block_sums(blocks)
+    assert [b for b, (x, y) in enumerate(zip(after, again)) if x != y] == [2]

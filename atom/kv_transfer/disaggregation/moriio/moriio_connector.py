@@ -2148,23 +2148,27 @@ class MoRIIOConnector(KVConnectorBase):
 
     def _block_sums(self, block_ids: list[int]) -> list[int]:
         """One digest per block over all its PAGE regions (`_byte_digests`
-        per block, each region weighted apart so two never cancel)."""
+        per block, each region weighted apart so two never cancel; a sharded
+        region counts for the blocks it holds)."""
         import torch
 
         device = self._page_views[0].device
         ids = torch.as_tensor(block_ids, dtype=torch.int64, device=device)
         total = torch.zeros(len(block_ids), dtype=torch.int64, device=device)
-        weights = None
-        for i, view in enumerate(self._page_views):
-            rows = view.index_select(0, ids).reshape(len(block_ids), -1)
-            rows = rows.view(torch.uint8).to(torch.int64)
-            if weights is None or weights.numel() < rows.shape[1]:
+        for (rank, world), regions in self._page_shard_groups().items():
+            held = (ids % world == rank).nonzero().flatten()
+            if not held.numel():
+                continue
+            units = ids.index_select(0, held) // world
+            for i in regions:
+                rows = self._page_views[i].index_select(0, units)
+                rows = rows.reshape(len(units), -1).view(torch.uint8).to(torch.int64)
                 weights = (
                     torch.arange(rows.shape[1], dtype=torch.int64, device=device)
                     % 65521
                     + 1
                 )
-            total += (rows * weights[: rows.shape[1]]).sum(1) * (2 * i + 1)
+                total.index_add_(0, held, (rows * weights).sum(1) * (2 * i + 1))
         return [int(v) for v in total.tolist()]
 
     def _verify_held_landed(self, req_id: ReqId) -> None:
