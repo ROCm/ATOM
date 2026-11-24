@@ -1355,7 +1355,7 @@ models:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 512
 
-      # Dispatch-only: push runs `nightly` and the schedule only MoRI IO
+      # Dispatch-only: push runs `smoke` and the schedule only MoRI IO
       # accuracy, so nothing here reaches the published dashboard. The stop_profile export stalls both engines,
       # which makes this cell's aiperf numbers incomparable with its C72 twin.
       profile:

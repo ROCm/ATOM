@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import enum
 import fnmatch
@@ -30,6 +31,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
 )
 from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
+from atom.mono import polling_env
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -2231,22 +2233,29 @@ def _hf_architecture_factor(hf_config) -> tuple:
     return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
-def _check_mono_poll_sleep_units() -> None:
-    """Reject a bad ATOM_MONO_POLL_SLEEP_UNITS (importing ``atom.mono.polling``
-    raises) before the workers, which read the same environment, spawn; warn
-    once when it is below the default."""
-    from atom.mono import polling
-
-    if polling.POLL_SLEEP_UNITS < polling.DEFAULT:
+def _resolve_mono_poll_sleep_units(kv_copies: bool) -> None:
+    """The Mono mailbox retry spacing of this deployment, fixed before this
+    process or the workers it spawns import ``atom.mono.polling`` (which reads
+    it once; only the variable's vocabulary, ``polling_env``, is imported
+    here): ``COPY_SAFE`` where a KV transfer or offload connector copies beside
+    the Mono kernels (``kv_copies``) and ATOM_MONO_POLL_SLEEP_UNITS is unset,
+    else as set or ``DEFAULT``. A bad value is rejected; one below
+    ``COPY_SAFE`` beside such copies is warned about once."""
+    units = polling_env.units(os.environ.get(polling_env.ENV))
+    if not kv_copies:
+        return
+    if not os.environ.get(polling_env.ENV, "").strip():
+        os.environ[polling_env.ENV] = str(polling_env.COPY_SAFE)
+        return
+    if units < polling_env.COPY_SAFE:
         logger.warning(
-            "%s=%d: Mono mailbox polls back off less than the default %d. "
-            "Values below %d hung beside concurrent KV copies (offload or P/D "
-            "connectors) in the reproducer (ROCm/ATOM#3369); use it only on a "
-            "deployment without them.",
-            polling.ENV,
-            polling.POLL_SLEEP_UNITS,
-            polling.DEFAULT,
-            polling.DEFAULT,
+            "%s=%d beside a KV transfer or offload connector: Mono mailbox "
+            "polls back off less than %d, and values below %d hung beside "
+            "concurrent KV copies in the reproducer (ROCm/ATOM#3369).",
+            polling_env.ENV,
+            units,
+            polling_env.COPY_SAFE,
+            polling_env.COPY_SAFE,
         )
 
 
@@ -2811,7 +2820,6 @@ class Config:
             raise ValueError("sequence_parallel_size must be at least 1")
         if envs.ATOM_DSV41_A8W4_ATTN not in ("auto", "off"):
             raise ValueError("ATOM_DSV41_A8W4_ATTN must be auto or off")
-        _check_mono_poll_sleep_units()
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2984,6 +2992,9 @@ class Config:
             # Refuse a composite the engine cannot run now, not when a worker
             # builds it after the weights are loaded.
             validate_multi_config(self.kv_transfer_config)
+        # after the CLI's JSON string ("{}" when unset) is parsed: the string
+        # itself is truthy
+        _resolve_mono_poll_sleep_units(bool(self.kv_transfer_config))
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
@@ -3347,15 +3358,11 @@ class Config:
                 own_pool=draft_owns_kv_pool(self),
                 requested=spec.kv_cache_dtype,
             )
-            from atom.models.minimax_m3.config import (
-                DRAFT_DTYPE_CONNECTORS,
-                draft_dtype_moves,
-            )
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+            from atom.models.minimax_m3.config import draft_dtype_moves
 
-            # A MiniMax-M3 DSpark draft beside an NVFP4 KV moves with its pages:
-            # they follow the target's as bytes of their own, and the PAGE
-            # namespace hashes the draft KV dtype, so a store written with
-            # another draft dtype is never read back.
+            # An M3 DSpark draft beside an NVFP4 KV moves as bytes of its own: Mooncake
+            # P/D's pair_units refuses other draft units; the PAGE namespace hashes its dtype.
             if (
                 spec.draft_kv_dtype != self.kv_cache_dtype
                 and self.kv_transfer_config
@@ -3373,7 +3380,7 @@ class Config:
                 )
                 exception = (
                     ", except a MiniMax-M3 DSpark draft beside an NVFP4 KV under "
-                    + ", ".join(sorted(DRAFT_DTYPE_CONNECTORS))
+                    + ", ".join(KVConnectorFactory.own_dtype_draft_connectors())
                     if is_m3
                     else ""
                 )
