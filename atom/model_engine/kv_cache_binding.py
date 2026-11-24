@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Bind target and draft modules consistently for serving and scratch profiling."""
+"""Yield target and draft KV views for allocation and imported-pool callers."""
 
 import logging
 from contextlib import nullcontext
@@ -8,6 +8,11 @@ logger = logging.getLogger(__name__)
 
 
 def kv_cache_bindings(runner, module_context=nullcontext):
+    """Yield modules and KV views for callers to key by ``module.layer_num``.
+
+    Try an independent draft's builder first. Builders return None for unknown
+    modules; fall back to the target builder only if it was not already tried.
+    """
     models = [("target", runner.model, runner.attn_metadata_builder)]
     if runner.config.speculative_config and hasattr(runner, "drafter"):
         models.append(

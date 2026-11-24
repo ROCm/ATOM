@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import torch
 import torch.nn.functional as F
@@ -13,7 +14,7 @@ from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.distributed.ulysses_sp import sp_gather_rows, sp_is_enabled
-from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
+from atom.model_ops.lm_head_argmax import lm_head_argmax_pack, lm_head_draw_pack
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
@@ -236,6 +237,10 @@ def empty_token_ids(hidden: torch.Tensor) -> torch.Tensor:
 
 
 class ParallelLMHead(VocabParallelEmbedding):
+    # the model's logits are this head of its final rows, so a decode verify
+    # may take its argmax ids instead (``verify_head``); a head whose logits
+    # are not (more than this projection) says False
+    logits_are_head = True
 
     def __init__(
         self,
@@ -272,18 +277,7 @@ class ParallelLMHead(VocabParallelEmbedding):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
             if sp_is_enabled() and not self.num_embeddings % get_pcp_group().world_size:
                 return self._sp_sharded_logits(x)
-        logits = tgemm.mm(x, self.weight, self.bias)
-        if self.tp_size > 1:
-            use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
-            logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)
-            # all_logits = (
-            #     [torch.empty_like(logits) for _ in range(self.tp_size)]
-            #     if self.tp_rank == 0
-            #     else None
-            # )
-            # dist.gather(logits, all_logits, 0)
-            # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
-        return logits
+        return self.gather_logits(self.local_logits(x))
 
     def compute_argmax_token(
         self, x: torch.Tensor, *, out: torch.Tensor
@@ -330,7 +324,23 @@ class ParallelLMHead(VocabParallelEmbedding):
             and self._can_use_dp_sharded_argmax(get_forward_context().context)
         ):
             return out.copy_(self._dp_sharded_logits(x, "argmax"))
-        logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
+        return self.argmax_of_logits(self.local_logits(x), out=out)
+
+    def local_logits(self, x: torch.Tensor, out: torch.Tensor | None = None):
+        """``x``'s logits over this rank's vocab shard [N, vocab/tp] (into
+        ``out`` where given)."""
+        return tgemm.mm(x, self.weight, self.bias, out=out)
+
+    def argmax_of_logits(self, logits: torch.Tensor, *, out: torch.Tensor, draw=None):
+        """``compute_argmax_token`` from this rank's logits [N, vocab/tp] (its
+        vocab shard's, the TP path's) -> ``out``; ``draw``
+        (``verify_ids.HeadDraw``): its drawing rows' draws instead, the same on
+        every rank."""
+        if draw is not None:
+            packed = lm_head_draw_pack(
+                logits, self.vocab_start_idx, draw, self.num_embeddings
+            )
+            return out.copy_(self._best_of_ranks(packed))
         if self.tp_size <= 1:
             # `output_idx=out` rather than a returned tensor: a draft pass is
             # recorded, and a capture bakes the address the answer lands at.
@@ -341,6 +351,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.
         packed = lm_head_argmax_pack(logits, self.vocab_start_idx)
+        return out.copy_(self._best_of_ranks(packed))
+
+    def _best_of_ranks(self, packed: torch.Tensor) -> torch.Tensor:
+        """The ids [N] (fp32) of the ranks' packed bests [N, 2] (value, id)."""
+        if self.tp_size <= 1:
+            return packed[:, 1]
         # Custom, like the logits path above: `graph_capture()` arms only that
         # one, and a draft pass records this. The RCCL path is what made the
         # head un-capturable on HIP at TP > 1.
@@ -348,8 +364,15 @@ class ParallelLMHead(VocabParallelEmbedding):
         gathered = get_tp_group().all_gather(packed, dim=0, use_custom=use_custom)
         gathered = gathered.view(self.tp_size, -1, 2)
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
-        token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
-        return out.copy_(token)
+        return gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)
+
+    def gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """The full logits from this rank's [N, vocab/tp] (``forward``'s TP
+        path: one all-gather)."""
+        if self.tp_size <= 1:
+            return logits
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        return tensor_model_parallel_all_gather(logits, use_custom=use_custom)
 
     def _vocab_shard_logits(
         self, x: torch.Tensor, rank: int, world: int

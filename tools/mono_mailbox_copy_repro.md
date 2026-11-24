@@ -67,8 +67,10 @@ then emits complete and must also exit normally. Completion is still only
 a sampled liveness result; a rare hang remains possible and the hardware root
 cause and Store/Mono residency/ordering restrictions are not solved by backoff.
 
-Before lowering the default `POLL_SLEEP_UNITS` (16; try a candidate with
-`ATOM_MONO_POLL_SLEEP_UNITS`), 128-round runs are not enough:
+The default `POLL_SLEEP_UNITS` is `polling_env.DEFAULT` (4) where nothing copies
+KV beside the Mono kernels; with a KV transfer or offload connector `Config`
+sets `polling_env.COPY_SAFE` (16). Before lowering `COPY_SAFE` (try a candidate
+with `ATOM_MONO_POLL_SLEEP_UNITS`), 128-round runs are not enough:
 8 passed 44/44 such runs but hung once in four 1024-round runs, while 16 passed
 12/12 1024-round runs. Use `--mode side --repeats 1024` with `timeout` of at
 least 300s, on several GPUs, at least 12 runs for the candidate and for 16 in the

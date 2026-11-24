@@ -825,5 +825,28 @@ class TestStatsDistinct:
         assert d._stat_fire_fill == 1
 
 
+@pytest.mark.parametrize("exchange_costs", [False, True])
+def test_host_writes_and_collective_share_storage_across_ticks(exchange_costs):
+    d = make_delayer(exchange_prefill_costs=exchange_costs)
+    d.cpu_group = object()  # The collective below supplies a sibling rank.
+    snapshots = []
+
+    def reduce(tensor, op=None, group=None):
+        assert tensor is d._reduce_buf
+        snapshots.append(tensor.tolist())
+        tensor[1] += 100
+        if exchange_costs:
+            tensor[_FIXED_SLOTS] += 7
+
+    for pending, cost in [(41, 3_500_000_000), (2, 9)]:
+        call(d, pending_tokens=pending, prefill_cost=cost, reduce=reduce)
+        assert snapshots[-1][1] == pending
+        assert int(d._reduce_np[1]) == pending + 100
+        if exchange_costs:
+            assert snapshots[-1][_FIXED_SLOTS] == cost
+            assert d.rank_prefill_costs == [float(cost + 7)]
+    assert [row[0] for row in snapshots] == [1, 1]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

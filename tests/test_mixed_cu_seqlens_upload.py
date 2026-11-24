@@ -48,19 +48,41 @@ def test_prepare_model_publishes_decode_local_query_spans(monkeypatch, spec):
     runner.tbo_decode_graphs = False
     calls = []
 
-    def assemble(batch, width, group, *, defer_spec_status):
+    def assemble(batch, width, group):
         # Token assembly is the first consumer of the real query publication.
         group.publish()
         calls.append("tokens")
         cu = runner.forward_vars["cu_seqlens_q"].gpu[:4].tolist()
         assert cu == ([0, 2, 3, 5] if spec else [0, 1, 2, 3])
-        return object()
+        return object(), model_runner.TokenLocations(
+            np.array([2, 3, 4]), np.array([1, 2, 0]), np.array([0, 1])
+        )
 
     def inputs(batch, input_ids, *, forward_mode, spec_decode_indices):
         assert forward_mode is mode
         calls.append("attention")
+        # The carried decode rows must use the previous verify's rejections
+        # before attention derives their positions, despite is_prefill=True.
+        decode_ctx = np.asarray(batch.context_lens[2:])
+        np.testing.assert_array_equal(
+            processor.verify_ctx_lens(decode_ctx, processor.num_rejected[2:]),
+            decode_ctx - np.array([0, 1, 1]) * spec,
+        )
 
-    runner.tokenID_processor = SimpleNamespace(prepare_input_ids=assemble)
+    processor = model_runner.tokenIDProcessor.__new__(model_runner.tokenIDProcessor)
+    processor.runner = runner
+    processor.batch_info = SimpleNamespace(np=np.zeros(3, dtype=np.int32))
+    processor.draft_tokens_per_seq = spec
+    processor.prev_batch = SimpleNamespace(total_seqs_num=3)
+    processor.is_deferred_out = True
+    processor.spec_status_owed = False
+    processor._stage_input_ids = assemble
+    processor.recv_spec_status = lambda: (
+        np.array([1, 0, 1], dtype=np.int32) * spec,
+        np.zeros(3, dtype=np.int32),
+    )
+    runner.h2d_groups["input_ids"] = runner.h2d_groups["token_inputs"]
+    runner.tokenID_processor = processor
     runner.prepare_inputs = inputs
     runner.h2d_owner.begin()
     model_runner.ModelRunner.prepare_model(runner, batch)

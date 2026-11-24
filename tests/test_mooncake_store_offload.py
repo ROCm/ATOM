@@ -32,6 +32,7 @@ import pytest
 import torch
 from conftest import MockConfig, with_min_load
 
+from atom.config import KVCacheTensor
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
@@ -375,6 +376,29 @@ class _FakeAiterDtypes:
     @property
     def d_dtypes(self):
         return {"fp8": _AITER_FP8[self._state.gfx], "bf16": torch.bfloat16}
+
+
+# Saves whose expected result is the serial path's own: the pipeline packs the
+# next window while a put is in flight, a GPU copy failure there drains and
+# claims after a fence, and it needs one save thread. Their pipelined
+# counterparts are in test_kv_store_save_pipeline.py.
+_SERIAL_SAVE_ONLY = {
+    "test_put_failure_is_quiescent_and_reports_every_chunk",
+    "test_gpu_copy_failure_claims_nothing",
+    "test_the_kv_budget_holds_back_a_staging_buffer_per_copy_thread",
+}
+
+
+@pytest.fixture(autouse=True, params=["serial", "pipelined"])
+def save_mode(request, monkeypatch):
+    """Every test once per save path (``ATOM_STORE_SAVE_BATCH_CHUNKS`` 0 / 64)."""
+    if request.param == "serial":
+        monkeypatch.delenv("ATOM_STORE_SAVE_BATCH_CHUNKS", raising=False)
+    elif request.node.originalname in _SERIAL_SAVE_ONLY:
+        pytest.skip("the serial save's contract")
+    else:
+        monkeypatch.setenv("ATOM_STORE_SAVE_BATCH_CHUNKS", "64")
+    return request.param
 
 
 @pytest.fixture(autouse=True)
@@ -2802,7 +2826,9 @@ def test_a_chunk_the_lookup_has_no_answer_for_is_put(cluster, make_worker):
     assert _store(request.save_operation) in worker.get_finished().connector_completions
 
 
-def test_a_failed_put_after_held_chunks_reports_each_chunk_once(cluster, make_worker):
+def test_a_failed_put_after_held_chunks_reports_each_chunk_once(
+    cluster, make_worker, save_mode
+):
     worker, gpu = make_worker(save_slots=8)
     request = _save_req(37, 48)
     hashes = request.chunk_hashes
@@ -2811,9 +2837,13 @@ def test_a_failed_put_after_held_chunks_reports_each_chunk_once(cluster, make_wo
         objects[_key(hashes, index)] = b"held" * (CHUNK_BYTES // 4)
     worker._client._store.put_codes[_key(hashes, 3)] = store_client.NO_AVAILABLE_HANDLE
     reported = _counting_source_safe(worker, gpu)
+    store = cluster.store_of(MASTER)
+    asked_before = sum(1 for call in store.calls if call[0] == "exists")
     worker._do_save_req(request)
-    # Chunks 4-5 held, 2-3 read and put (3 refused), 0-1 never read: each
-    # source-safe once, so every PP stage reports the same set.
+    asked = sum(1 for call in store.calls if call[0] == "exists") - asked_before
+    # Chunks 4-5 held, 2-3 read and put (3 refused), 0-1 not put (and on the
+    # serial path never read): each source-safe once, so every PP stage
+    # reports the same set.
     assert sorted(reported) == list(range(6))
     operation = request.save_operation
     assert worker.get_finished().connector_completions == {
@@ -2821,7 +2851,15 @@ def test_a_failed_put_after_held_chunks_reports_each_chunk_once(cluster, make_wo
         _quiescent(operation),
         *(_safe(operation, index) for index in range(6)),
     }
-    assert worker._save_counts == {"lookups": 2, "put_chunks": 2, "held_chunks": 2}
+    # The lookahead queues the lowest window's lookup before the refused put
+    # returns, so the store gets that lookup; the save counts that window only
+    # if it gets there before it sees the failure.
+    if save_mode == "serial":
+        assert asked == 2 and worker._save_counts["lookups"] == 2
+    else:
+        assert asked == 3 and worker._save_counts["lookups"] in (2, 3)
+    assert worker._save_counts["put_chunks"] == 2
+    assert worker._save_counts["held_chunks"] == 2
     assert worker._pool.quarantined("save") == 0
 
 
@@ -3879,7 +3917,8 @@ def test_factory_builds_both_halves(cluster):
 def _kv_caches(num_blocks=8):
     # MLA-like: token-major rows, one plane per layer.
     return {
-        f"layer_{i}": SimpleNamespace(
+        f"layer_{i}": KVCacheTensor(
+            layer_num=i,
             k_cache=torch.zeros((num_blocks * BLOCK, 1, 8), dtype=torch.uint8),
             index_cache=None,
         )
@@ -4573,10 +4612,12 @@ def test_scattered_slots_fall_back_to_the_staging_copy(cluster, make_in_place_wo
     assert _store(request.save_operation) in worker.get_finished().connector_completions
 
 
-def test_in_place_pack_failure_claims_nothing(cluster, make_in_place_worker):
+def test_in_place_pack_failure_claims_nothing(cluster, make_in_place_worker, save_mode):
     worker, _gpu, codec, _stream = make_in_place_worker()
     codec.fail = True
     request = _save_req(44, 16)
+    if save_mode == "pipelined":
+        pytest.skip("the pipelined save drains instead: see the next test")
     with pytest.raises(RuntimeError, match="pack failed"):
         worker._do_save_req(request)
     completions = worker.get_finished().connector_completions
@@ -4585,6 +4626,36 @@ def test_in_place_pack_failure_claims_nothing(cluster, make_in_place_worker):
         for completion in completions
     )
     assert worker._pool.quarantined("save") == 0  # the fence held: released
+
+
+@pytest.mark.parametrize("fence_fails", [False, True])
+def test_a_pipelined_in_place_pack_failure_claims_after_a_fence(
+    cluster, make_in_place_worker, save_mode, monkeypatch, fence_fails
+):
+    if save_mode == "serial":
+        pytest.skip("the serial save raises: see the test above")
+    worker, _gpu, codec, _stream = make_in_place_worker()
+    codec.fail = True
+
+    def fence(device):
+        if fence_fails:
+            raise RuntimeError("fence failed")
+
+    monkeypatch.setattr(store_worker_mod, "_synchronize", fence)
+    request = _save_req(46, 16)
+    operation = request.save_operation
+    worker._do_save_req(request)  # drained, not raised
+    completions = worker.get_finished().connector_completions
+    assert _store(operation, False) in completions
+    if fence_fails:  # nothing proves the source idle: no claim at all
+        assert not any(
+            completion.channel
+            in (DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, DENSE_PAGE_SOURCE_SAFE_CHANNEL)
+            for completion in completions
+        )
+    else:  # the fence held: quiescent, and both unread chunks safe
+        assert _quiescent(operation) in completions
+        assert {_safe(operation, index) for index in range(2)} <= completions
 
 
 def test_in_place_save_failure_reports_each_chunk_once(cluster, make_in_place_worker):
@@ -4916,7 +4987,13 @@ def test_scheduler_binds_the_cancelling_abort_only_for_such_a_connector(
     import atom.utils.forward_context as fc
 
     connector = (
-        None if flag is None else SimpleNamespace(cancels_undispatched_loads=flag)
+        None
+        if flag is None
+        else SimpleNamespace(
+            cancels_undispatched_loads=flag,
+            # Keeps ATOM's own pool, as `KVConnectorSchedulerBase` does.
+            make_block_pool=lambda *args, **kwargs: None,
+        )
     )
     monkeypatch.setattr(fc, "get_kvconnector", lambda role, config: connector)
     engine = Scheduler(MockConfig(num_kvcache_blocks=8, max_model_len=64))

@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Phase 2: Mixed Domain Training (v2, aligned with lightseekorg/kimi-k2.5-eagle3) — MI350
+#
+# Dataset: mixed corpus (~181K samples) — llava_instruct, smoltalk_cn,
+#          continual_tool_kimi, kimi_2000x, creative_writing, dcagent, etc.
+# Steps: 67,826 (3 epochs × 180870/8, continuing from Phase 1 v2 checkpoint)
+# Teacher: moonshotai/Kimi-K2.5 BF16, compressed-tensors INT4 (vLLM native, TP=4, GPUs 4-7)
+# Draft: Eagle3 v2, 1-layer Transformer, loaded from Phase 1 v2 (FSDP2, float16, GPUs 0-3)
+# Transfer: Mooncake TCP
+# Hardware: 8x AMD MI350
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/Kimi-K2.5-BF16
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 20000
+  train_global_batch_size: 8
+  train_micro_batch_size: 2
+  learning_rate: 5e-5
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.015
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    position_decay: 0.8
+    num_target_layers: 1
+    spec_length: 4
+  teacher:
+    model_name: /dev/shm/Kimi-K2.5-BF16
+    inference_backend: vllm
+    tensor_parallel_size: 4
+    gpu_ids: [4, 5, 6, 7]
+    quantization: ""
+  draft:
+    from_scratch: false
+    num_layers: 1
+    num_heads: 64
+    head_dim: 128
+    ffn_dim: 12288
+    rms_norm_eps: 1e-6
+    rope_theta: 1000000.0
+    max_window_layers: 36
+    dtype: bfloat16
+    resume_from: /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase1
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+quantization:
+  training:
+    fp8: null
+    lumen_norm: true
+    lumen_linear: true
+    hf_attn_patch: true
+  rollout_correction:
+    enabled: false
+
+dataset:
+  chat_template: kimi-k25
+  last_turn_loss_only: false
+  num_preprocess_workers: 16
+  cache_dir: /dev/shm/atomrl_cache
+
+reward:
+  type: function
+  function: math_reward
+  dataset: /dev/shm/kimi-mtp-dataset-phase2/train.jsonl
+
+checkpointing:
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase2
+  save_steps: 5000
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 67826
+seed: 42

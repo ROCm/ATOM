@@ -179,6 +179,8 @@ def test_prepare_model_builds_and_passes_mixed_verify_metadata(monkeypatch):
         step_needs_eager=lambda b: True,
         prepare_query_metadata=lambda *a: {},
         consumes_device_verdict=lambda *a: False,
+        settles_spec_status=lambda *a: False,
+        take_spec_status=lambda processor: None,
         build=lambda **kw: (metadata, torch.arange(16)),
         prepare_model_inputs=lambda *a: None,
     )
@@ -304,6 +306,7 @@ def test_prefill_confidence_cannot_change_decode_budget_or_request_mapping(
     monkeypatch.setattr(mr, "get_forward_context", lambda: fc)
     monkeypatch.setattr(proposer, "get_forward_context", lambda: fc)
     monkeypatch.setattr(mr, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
     drafter = DSparkProposer.__new__(DSparkProposer)
     drafter._verify_scheduler = verify
     drafter.mtp_k = draft_width
@@ -340,7 +343,8 @@ def test_prefill_confidence_cannot_change_decode_budget_or_request_mapping(
         _commit_target_step=lambda *a: torch.arange(scheduled_bs),
         attn_metadata_builder=SimpleNamespace(publish_draft_state=published.append),
         tokenID_processor=SimpleNamespace(
-            prepare_draft_ids=lambda batch, drafts: drafts
+            prepare_draft_ids=lambda batch, drafts: drafts,
+            await_draft_ids_copy=lambda stream: None,
         ),
     )
     result = mr.ModelRunner.propose_draft_token_ids(

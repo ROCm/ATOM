@@ -679,8 +679,7 @@ class PrefillDelayer:
                     0 if prefillable else int(1000 * self._arrival_rate(now))
                 ),
             )
-            for offset, value in enumerate(gate):
-                self._reduce_buf[self._gate_at + offset] = value
+            self._reduce_np[self._gate_at : self._gate_at + len(gate)] = gate
         if self.admit_policy == "adaptive":
             if not self._cost_gate:
                 now_a = self._clock()
@@ -692,7 +691,7 @@ class PrefillDelayer:
             )
             t0_us, a_us = self._adapt_local_fits()
             at = self._adapt_at
-            buf = self._reduce_buf
+            buf = self._reduce_np
             buf[at] = int(w_eff) if prefillable else 0
             fitted = t0_us > 0 and a_us > 0
             buf[at + 1] = int(t0_us) if fitted else 0

@@ -188,7 +188,9 @@ def test_lm_head_selects_prefill_ends_and_all_decode_tokens(monkeypatch, decode_
         lambda: SimpleNamespace(context=context, attn_metadata=metadata),
     )
     monkeypatch.setattr(
-        embed_head, "tgemm", SimpleNamespace(mm=lambda x, w, b: x @ w.T)
+        embed_head,
+        "tgemm",
+        SimpleNamespace(mm=lambda x, w, b, *, out=None: torch.mm(x, w.T, out=out)),
     )
     head = SimpleNamespace(
         weight=torch.eye(2),
@@ -196,6 +198,8 @@ def test_lm_head_selects_prefill_ends_and_all_decode_tokens(monkeypatch, decode_
         tp_size=1,
         _can_use_dp_sharded_head=lambda _: False,
     )
+    head.local_logits = embed_head.ParallelLMHead.local_logits.__get__(head)
+    head.gather_logits = embed_head.ParallelLMHead.gather_logits.__get__(head)
     hidden = torch.arange((9 + 2 * decode_width) * 2).float().reshape(-1, 2)
     actual = embed_head.ParallelLMHead.forward(head, hidden)
     expected = torch.cat((hidden[[4, 8]], hidden[9:]))
