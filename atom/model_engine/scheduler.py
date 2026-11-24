@@ -4520,6 +4520,66 @@ class Scheduler:
             logger.debug("[EARLY-LOAD] parked %d tier load(s)", parked)
         return parked
 
+    def prestart_tier_loads(self) -> list[Sequence]:
+        """Load/forward overlap (`ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`): run this
+        tick's early tier load ahead of `schedule()`. Returns the requests it
+        parked; the engine ships their loads and may wait a bounded time for
+        them to land, so the `schedule()` that follows admits them into this
+        step's forward rather than the next one.
+
+        Exactly the early load `_schedule` runs (same lookup prefetch, same
+        `_early_load_tier_prefixes`, same KV-pressure bounds), only earlier:
+        local to this rank, no collective, nothing scheduled for prefill. The
+        state loads it queued are published now so a joint load can complete
+        without waiting for the batch's publish.
+        """
+        if (
+            not self.waiting
+            or self.kv_connector is None
+            or not self._connector_flag("is_offload")
+            or not getattr(self.kv_connector, "supports_early_load", False)
+        ):
+            return []
+        prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
+        if prefetch is not None:
+            prefetch(itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH))
+        entries = self._early_load.entries
+        before = set(entries)
+        if not self._early_load_tier_prefixes():
+            return []
+        started = [
+            seq
+            for seq_id, (seq, _) in entries.items()
+            if seq_id not in before
+            and seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        if started:
+            self._publish_state_loads()
+        return started
+
+    def prestart_wait_worthwhile(self, started: list[Sequence]) -> bool:
+        """Whether waiting for `started` can put one of them on this tick's
+        batch: a request slot is free and the prefill ahead of the first of
+        them in `waiting` (partial prefills, then admittable waiters with the
+        router's cached-prefix estimate) leaves token budget. Best effort, like
+        the delayer's fill signal; a wrong guess costs at most the bounded wait
+        or one step of latency, never correctness."""
+        if not started or len(self.running) >= self.max_num_seqs:
+            return False
+        budget = self.max_num_batched_tokens
+        ahead = self._partial_prefill_remaining_tokens()
+        if ahead >= budget:
+            return False
+        targets = {id(seq) for seq in started}
+        for seq in self.waiting:
+            if id(seq) in targets:
+                return True
+            if self._is_admittable_prefill(seq):
+                ahead += self.pending_prefill_tokens(seq, estimate=True)
+                if ahead >= budget:
+                    return False
+        return False
+
     def _early_load_admit(
         self,
         seq: Sequence,

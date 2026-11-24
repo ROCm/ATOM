@@ -1448,6 +1448,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
+    # Load/forward overlap (off at 0). Each engine step first starts the early
+    # tier loads that are ready to go, then waits up to this many ms for them to
+    # land before it schedules, so a restored request prefills in this step's
+    # forward instead of the next one (`EngineCore._prestart_tier_loads`).
+    "ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS": lambda: _finite_float_env(
+        "ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS", 0.0, allow_zero=True
+    ),
     # Minimum external-tier hit worth loading, in tokens. None when unset: each
     # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(

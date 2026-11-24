@@ -85,6 +85,59 @@ def yield_gil() -> None:
 # never exiting.
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
+# Load/forward overlap (`ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`): pace of the
+# worker polls inside the bounded wait for loads started ahead of schedule().
+PRESTART_LOAD_POLL_S = 0.0005
+
+
+class PrestartLoadStats:
+    """Counters of the load/forward overlap, logged once a minute per rank."""
+
+    LOG_INTERVAL_S = 60.0
+
+    def __init__(self) -> None:
+        self._last_log = time.monotonic()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.steps = 0  # steps that started at least one load ahead of schedule()
+        self.loads = 0  # loads started ahead of schedule()
+        self.skipped = 0  # steps that did not wait: no budget/slot for them
+        self.waits = 0  # steps that waited
+        self.landed = 0  # waited-for loads that landed (done or failed) in time
+        self.timed_out = 0  # waited-for loads still in flight at the deadline
+        self.wait_s = 0.0
+        self.max_wait_s = 0.0
+
+    def note_wait(self, landed: int, timed_out: int, waited_s: float) -> None:
+        self.waits += 1
+        self.landed += landed
+        self.timed_out += timed_out
+        self.wait_s += waited_s
+        self.max_wait_s = max(self.max_wait_s, waited_s)
+
+    def maybe_log(self, label: str) -> None:
+        now = time.monotonic()
+        if now - self._last_log < self.LOG_INTERVAL_S:
+            return
+        if self.steps:
+            logger.info(
+                "%s: [LOAD-OVERLAP] last %.0fs: steps=%d loads=%d skipped=%d "
+                "waits=%d landed=%d timed_out=%d avg_wait=%.1fms max_wait=%.1fms",
+                label,
+                now - self._last_log,
+                self.steps,
+                self.loads,
+                self.skipped,
+                self.waits,
+                self.landed,
+                self.timed_out,
+                1e3 * self.wait_s / self.waits if self.waits else 0.0,
+                1e3 * self.max_wait_s,
+            )
+        self._last_log = now
+        self._reset()
+
 
 def flush_dp_reuse(scheduler, output_queue) -> None:
     """Queue the scheduler's `share_cache` reuse reports (`Scheduler.
@@ -283,6 +336,12 @@ class EngineCore:
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
+        self._prestart_load_wait_s = (
+            envs.ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS / 1000.0
+            if self.kv_transfer_enabled
+            else 0.0
+        )
+        self._prestart_stats = PrestartLoadStats()
         if self.kv_transfer_enabled:
             # Physical: one output per launched worker, else this waits forever.
             self.kv_aggregator = KVOutputAggregator(world_size=config.tp_world_size)
@@ -642,6 +701,8 @@ class EngineCore:
         # waiting. Arrivals during this step remain latched until the next step.
         if self.kv_transfer_enabled:
             self._kv_progress_event.clear()
+        if getattr(self, "_prestart_load_wait_s", 0.0) > 0.0:
+            self._prestart_tier_loads()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -708,6 +769,55 @@ class EngineCore:
         if not self.input_queue.empty() or not self.utility_queue.empty():
             return
         self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
+
+    def _prestart_tier_loads(self) -> None:
+        """Load/forward overlap, ahead of `schedule()` (opt-in,
+        `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`).
+
+        Without it a waiting request with a tier hit parks inside `schedule()`,
+        its load leaves with that step's batch and lands within milliseconds,
+        but the completion is read only after the step's forward returns: the
+        request prefills one whole forward later. Here the early tier load runs
+        first (`Scheduler.prestart_tier_loads`), its loads are shipped at once,
+        and when this step's prefill budget still has room for them the engine
+        polls the workers for up to the configured wait. A load that lands in
+        time is resolved by `schedule()` like any finished load
+        (`_prioritize_ready_remote_kv_requests`) and Phase 2 admits it in arrival
+        order into this step's batch; one that does not land simply rides the
+        forward, as before.
+
+        Rank-local: no collective runs here and the step count is unchanged, so
+        DP lockstep holds; peers only reach the forward collective later by at
+        most the bounded wait. Failure and abort need nothing new: a failed load
+        reports through the same poll and `schedule()` falls back to prefill; an
+        abort that lands meanwhile is handled on the next loop pass.
+        """
+        scheduler = self.scheduler
+        prestart = getattr(scheduler, "prestart_tier_loads", None)
+        if prestart is None:
+            return
+        stats = self._prestart_stats
+        started = prestart()
+        if started:
+            meta = scheduler.kv_connector.build_connector_meta()
+            if connector_metadata_has_work(meta):
+                self.runner_mgr.call_func("process_kvconnector_output", meta)
+            stats.steps += 1
+            stats.loads += len(started)
+            if scheduler.prestart_wait_worthwhile(started):
+                t0 = time.monotonic()
+                deadline = t0 + self._prestart_load_wait_s
+                while True:
+                    self._poll_kv_transfer_progress()
+                    pending = sum(1 for seq in started if scheduler._still_loading(seq))
+                    now = time.monotonic()
+                    if not pending or now >= deadline:
+                        break
+                    time.sleep(min(PRESTART_LOAD_POLL_S, deadline - now))
+                stats.note_wait(len(started) - pending, pending, now - t0)
+            else:
+                stats.skipped += 1
+        stats.maybe_log(self.label)
 
     def _postprocess(self, seqs, fwd_out, batch):
         if self._report_backlog:
