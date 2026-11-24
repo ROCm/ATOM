@@ -323,8 +323,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
     }
 }
 
-/// Whether the worker that submitted `config` is gone, or advertises another template
-/// than `inline_template` now: a removed worker's retry must not replace its successor's.
+/// Whether the worker that submitted `config` is gone, or now has another template than
+/// the job's: a removed worker's retry must not replace its successor's.
 fn superseded(
     app_context: &AppContext,
     config: &TokenizerConfigRequest,
@@ -336,7 +336,14 @@ fn superseded(
     let Some(worker) = app_context.worker_registry.get_by_url(url) else {
         return true;
     };
-    inline_template.is_some_and(|t| worker.metadata().labels.get("chat_template") != Some(t))
+    match inline_template {
+        Some(template) => worker.metadata().labels.get("chat_template") != Some(template),
+        // Its file, as the worker's registration chose it: its own, else the router's.
+        None => {
+            let router_file = app_context.router_config.chat_template.as_deref();
+            worker.chat_template().or(router_file) != config.chat_template_path.as_deref()
+        }
+    }
 }
 
 /// Record `id` in `chats_without_template`, and warn, when llm-tokenizer renders
@@ -904,6 +911,69 @@ mod tests {
         assert_eq!(rendered(), "new: hi");
         context.worker_registry.remove_by_url("grpc://atom:1");
         LoadTokenizerStep.execute(&mut job(old)).await.unwrap();
+        assert_eq!(rendered(), "new: hi");
+    }
+
+    /// A file-backed job a removed worker submitted, retried after its successor at the
+    /// same URL loaded another file, replaces nothing.
+    #[tokio::test]
+    async fn test_a_removed_worker_s_retried_file_job_leaves_its_successor_s_file() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType, Worker};
+
+        let context = app_context();
+        let dir = tempfile::TempDir::new().unwrap();
+        let [old, new] = ["old", "new"].map(|name| {
+            let file = dir.path().join(format!("{name}.jinja"));
+            std::fs::write(&file, format!("{name}: {{{{ messages[0].content }}}}")).unwrap();
+            file.to_str().unwrap().to_string()
+        });
+        let worker = |file: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new("grpc://atom:1")
+                    .runtime_type(RuntimeType::Atom)
+                    .model_id("m")
+                    .chat_template(file)
+                    .build(),
+            )
+        };
+        let job = |file: &str| {
+            let config = TokenizerConfigRequest {
+                id: TokenizerRegistry::generate_id(),
+                name: "m".to_string(),
+                source: hf_tokenizer_path().to_string(),
+                chat_template_path: Some(file.to_string()),
+                inline_chat_template: None,
+                worker_url: Some("grpc://atom:1".to_string()),
+                cache_config: None,
+                fail_on_duplicate: false,
+            };
+            WorkflowContext::new(
+                WorkflowInstanceId::new(),
+                create_tokenizer_workflow_data(config, context.clone()),
+            )
+        };
+        let rendered = || {
+            let tokenizer = context.tokenizer_registry.get("m").unwrap();
+            let hi = json!({"role": "user", "content": "hi"});
+            tokenizer
+                .apply_chat_template(&[hi], ChatTemplateParams::default())
+                .unwrap()
+        };
+        context.worker_registry.register(worker(&old));
+        let mut removed_workers_job = job(&old);
+        LoadTokenizerStep
+            .execute(&mut removed_workers_job)
+            .await
+            .unwrap();
+        context.worker_registry.remove_by_url("grpc://atom:1");
+        context.worker_registry.register(worker(&new));
+        LoadTokenizerStep.execute(&mut job(&new)).await.unwrap();
+        assert_eq!(rendered(), "new: hi");
+
+        LoadTokenizerStep
+            .execute(&mut removed_workers_job)
+            .await
+            .unwrap(); // its retry
         assert_eq!(rendered(), "new: hi");
     }
 
