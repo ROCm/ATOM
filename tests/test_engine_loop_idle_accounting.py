@@ -47,6 +47,7 @@ def _extract(class_name: str, method: str):
         "tracing": SimpleNamespace(shutdown=lambda: None),
         "time": SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None),
         "HELD_POLL_S": 0.0,
+        "yield_gil": lambda: None,
     }
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module([func], []), str(ENGINE_CORE), "exec"), scope
@@ -69,6 +70,8 @@ class _Engine:
     - `OFFLOAD`  RL rollout parked the weights; both loops skip the pass.
     """
 
+    _report_backlog = False
+
     def __init__(self, schedule, interval_steps=INTERVAL_STEPS):
         self._schedule = list(schedule)
         self._pass = -1
@@ -86,6 +89,7 @@ class _Engine:
             prefill_delayer=None,
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
+            close_kv_connector=lambda: None,
         )
         self.utility_queue = None
         self.utility_handler = SimpleNamespace(

@@ -28,7 +28,9 @@ _RESOURCE_KEYS = {
 }
 _OPTIONAL = ("vgpr_spill", "sgpr_spill")
 _SYMBOL_KEY = b".symbol"
-_BIN = re.compile(r'bin\s*=\s*"')
+# the opening quote of the gpu.object's ELF string: after ``bin =``, or after
+# its kernel metadata where FlyDSL records it, bare
+_BIN = re.compile(r'"(?=\\7FELF)')
 _MANGLED = re.compile(r"_ZN((?:\d+\w+?)+)E")
 
 
@@ -57,14 +59,12 @@ def compile_kernels(kernels) -> list:
 
 def trace(launcher, abi) -> Record:
     """``launcher``'s hand-offs, traced compile-only (no launch, no GPU needed
-    with ``ARCH`` set). A build served from FlyDSL's disk cache is not traced,
-    so the caller disables the cache (``FLYDSL_RUNTIME_ENABLE_CACHE=0``)."""
+    with ``ARCH`` set). FlyDSL traces a build before it looks it up, so a
+    build in its disk cache is traced too."""
     with recording() as rec:
         compile_kernels([(launcher, abi)])
     if not rec.stages:
-        raise RuntimeError(
-            "nothing traced: a cached build? set FLYDSL_RUNTIME_ENABLE_CACHE=0"
-        )
+        raise RuntimeError("nothing traced")
     return rec
 
 
@@ -109,8 +109,8 @@ def launcher_resources(launcher) -> list[dict]:
 
 
 def _code_object(module_text: str) -> bytes:
-    """The ``gpu.binary``'s ELF: the ``bin = "..."`` string, MLIR-escaped (\\XX a
-    byte, \\\\ and \\" themselves)."""
+    """The ``gpu.binary``'s ELF: its object's string, MLIR-escaped (\\XX a byte,
+    \\\\ and \\" themselves)."""
     m = _BIN.search(module_text)
     if m is None:
         raise RuntimeError("no gpu.binary object in the compiled module")

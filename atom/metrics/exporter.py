@@ -19,6 +19,8 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
+from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
+
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
 
@@ -122,6 +124,16 @@ class _AtomMetricsCollector:
                 "Fraction of KV-cache blocks currently allocated.",
                 snapshot.get("kv_cache_usage_ratio", 0),
             ),
+            (
+                "atom:requests_deferred_free",
+                "Finished or aborted requests held whole until every connector releases them: a P/D decode pull, a whole-request offload save, or a load still writing into their blocks. Early-release offload leases are excluded.",
+                snapshot.get("requests_deferred_free", 0),
+            ),
+            (
+                "atom:kv_cache_blocks_deferred_free",
+                "Physical KV blocks of finished or aborted requests held whole until every connector releases them: a P/D decode pull, a whole-request offload save, or a load still writing into their blocks. Early-release offload leases are excluded. Shared prefix blocks are counted once.",
+                snapshot.get("kv_blocks_deferred_free", 0),
+            ),
         )
         for name, documentation, value in gauges:
             metric = GaugeMetricFamily(name, documentation)
@@ -155,6 +167,11 @@ class _AtomMetricsCollector:
             yield metric
 
         dp_router = snapshot.get("dp_router", {})
+        for key, documentation in ShareCacheRouter.DECISIONS.items():
+            name = "atom:dp_" + key.removesuffix("_total")
+            metric = CounterMetricFamily(name, documentation)
+            metric.add_metric([], float(dp_router.get(key, 0)))
+            yield metric
         for name, documentation, value in (
             (
                 "atom:dp_affinity_new",
@@ -226,6 +243,46 @@ class _AtomMetricsCollector:
             )
             moved_tokens.add_metric([], float(dp_router["prefix_moved_tokens"]))
             yield moved_tokens
+
+        index = dp_router.get("prefix_index")
+        if index is not None:
+            # Prefix-index budget path (`prefix_spread`): shows whether eviction
+            # ever ran and how much history it shed.
+            events = CounterMetricFamily(
+                "atom:dp_prefix_index_events",
+                "Prefix-spread index budget events: tail_trim (an old history "
+                "shortened from its tail), leaf_evict (an old history dropped "
+                "whole), over_budget (budget checks that found the index over "
+                "budget), blocked (still over budget after eviction ran out of "
+                "evictable history: only still-prefilling edges and their "
+                "ancestors were left).",
+                labels=["event"],
+            )
+            for label, key in (
+                ("tail_trim", "tail_trim_total"),
+                ("leaf_evict", "leaf_evict_total"),
+                ("over_budget", "over_budget_total"),
+                ("blocked", "trim_blocked_total"),
+            ):
+                events.add_metric([label], float(index[key]))
+            yield events
+            shed = CounterMetricFamily(
+                "atom:dp_prefix_index_evicted_tokens",
+                "Prompt tokens of prefix history shed by the index budget, by "
+                "kind: tail_trim (cut from a leaf's tail) or leaf_evict (a whole "
+                "leaf).",
+                labels=["kind"],
+            )
+            shed.add_metric(["tail_trim"], float(index["tail_trim_tokens_total"]))
+            shed.add_metric(["leaf_evict"], float(index["leaf_evict_tokens_total"]))
+            yield shed
+            indexed = GaugeMetricFamily(
+                "atom:dp_prefix_index_tokens",
+                "Prompt tokens currently held by the prefix-spread index "
+                "(unique edges, not per-rank holders).",
+            )
+            indexed.add_metric([], float(index["indexed_tokens"]))
+            yield indexed
 
         metric = CounterMetricFamily(
             "atom:dp_requests_routed",
@@ -458,6 +515,35 @@ class _AtomMetricsCollector:
                             values[queue_state],
                         )
             yield metric
+
+        pending = GaugeMetricFamily(
+            "atom:pd_admission_pending_requests",
+            "PD requests holding admission credits through their first scheduled forward.",
+            labels=["dp_rank", "engine_role", "state"],
+        )
+        pending_bytes = GaugeMetricFamily(
+            "atom:pd_admission_pending_kv_bytes",
+            "Physical receive-target bytes held by pending PD requests per D rank.",
+            labels=["dp_rank", "engine_role"],
+        )
+        deferred = CounterMetricFamily(
+            "atom:pd_admission_deferred",
+            "PD requests deferred by a credit limit, counted once per admission wait and limit.",
+            labels=["dp_rank", "engine_role", "reason"],
+        )
+        for rank in ranks:
+            if "pd_admission" not in rank:
+                continue
+            labels = [str(rank["dp_rank"]), rank["engine_role"]]
+            admission = rank["pd_admission"]
+            for request_state, count in admission["pending"].items():
+                pending.add_metric([*labels, request_state], count)
+            pending_bytes.add_metric(labels, admission["pending_kv_bytes"])
+            for reason, count in admission["deferred"].items():
+                deferred.add_metric([*labels, reason], count)
+        yield pending
+        yield pending_bytes
+        yield deferred
 
         cache = snapshot.get("cache", {})
         if describe or "offload_tokens" in cache:

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """``ATOM_DSV41_MONO_HI`` (``mono/hi_gate.py``): "auto" (the default) serves exactly the supported deployment and
 leaves every other on ATOM's mono path, with one info line; "1" refuses loudly; "0" is off. The decision reads the
 configuration, the environment and the device properties only: no hi module is imported.
 
 The configuration is ATOM's own ``Config`` of the served command line (serve_v41.sh's arguments, the InferenceX
-recipe at TP4), built the way ``LLMEngine`` builds it, so the gate sees every value ATOM settles on (its overrides
-included: V4.1's 128-token KV page whatever ``--block-size`` asks); each refusal case changes one of those fields.
+recipe at TP4, and the same at TP2 and TP8), built the way ``LLMEngine`` builds it, so the gate sees every value ATOM
+settles on (its overrides included: V4.1's 128-token KV page whatever ``--block-size`` asks); each refusal case changes
+one of those fields.
 
 What only the loaded model shows is refused at install (``hi_dispatch.install_hi``): every rank's check agreed over
 the TP group before anything is built, so one rank refusing turns the hi path off on every rank.
@@ -27,6 +29,14 @@ from atom.models.deepseek_v41.mono import hi_gate
 from atom.utils import envs
 
 FIXTURES = Path(__file__).parent / "models" / "deepseek_v41" / "fixtures"
+# a runner's staging buffers as ATOM's mono install reads them
+_STAGED = {
+    "outputs": None,
+    "temperatures": SimpleNamespace(gpu=None),
+    "top_ps": SimpleNamespace(gpu=None),
+}
+# a metadata builder whose runner stages them
+BUILDER = SimpleNamespace(model_runner=SimpleNamespace(forward_vars=_STAGED))
 # serve_v41.sh's ATOM arguments (the InferenceX dsv41flash recipe at TP4) but the model path and the server's own
 CAPTURE = "[" + ",".join(map(str, [*range(1, 33), 48, 64, 128])) + "]"
 SERVED_ARGS = (
@@ -34,6 +44,14 @@ SERVED_ARGS = (
     "--gpu-memory-utilization 0.9 --max-num-seqs 128 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 "
     "--enable_prefix_caching --block-size 16 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL "
     f"--cudagraph-capture-sizes {CAPTURE} --method dspark --num-speculative-tokens 5"
+)
+# the same recipe at TP2 (the InferenceX dsv41flash TP2 point)
+SERVED_ARGS_TP2 = SERVED_ARGS.replace(
+    "--tensor-parallel-size 4", "--tensor-parallel-size 2"
+)
+# ... and at TP8 (one MI355X node)
+SERVED_ARGS_TP8 = SERVED_ARGS.replace(
+    "--tensor-parallel-size 4", "--tensor-parallel-size 8"
 )
 
 
@@ -60,6 +78,16 @@ def served():
     return _atom_config()
 
 
+@pytest.fixture(scope="module")
+def served_tp2():
+    return _atom_config(SERVED_ARGS_TP2)
+
+
+@pytest.fixture(scope="module")
+def served_tp8():
+    return _atom_config(SERVED_ARGS_TP8)
+
+
 @pytest.fixture(autouse=True)
 def fresh_log_once(monkeypatch):
     """Each test sees its own lines: ``log_once`` logs a line once a process."""
@@ -79,8 +107,10 @@ def _config(served, **over):
     return cfg
 
 
-def _drafter():
-    return SimpleNamespace(model=SimpleNamespace(block_backbone=None))
+def _drafter(lossless=None):
+    return SimpleNamespace(
+        model=SimpleNamespace(block_backbone=None), lossless=lossless
+    )
 
 
 def _builder(uva=True, overlap=True, engram=True):
@@ -115,16 +145,52 @@ def test_auto_serves_the_served_command_line(mi355x, served, caplog):
     assert not [m for m in set(sys.modules) - before if ".mono.hi" in m]
 
 
-def test_the_gate_reads_the_values_atom_settled_on(served):
-    """Every configuration field the gate reads, as ATOM's ``Config`` holds it for the served command line: the value
-    the hook and ATOM's cache use (``--block-size 16`` becomes V4.1's 128-token page).
+def test_auto_serves_the_served_command_line_at_tp2(mi355x, served_tp2, caplog):
+    """The same recipe at ``--tensor-parallel-size 2``: served (32 heads, 1152-wide expert slices and 64,640 vocab rows
+    a rank: the package's TP2 programs), nothing of the hi path imported to decide it.
     """
+    assert served_tp2.tensor_parallel_size == 2 and 2 in hi_gate.SERVED_TPS
+    before = set(sys.modules)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert hi_gate.decide(served_tp2, _drafter(), _builder(), 0) is True
+    assert not caplog.records
+    assert not [m for m in set(sys.modules) - before if ".mono.hi" in m]
+
+
+def test_auto_serves_the_served_command_line_at_tp8(mi355x, served_tp8, caplog):
+    """The same recipe at ``--tensor-parallel-size 8``: served (8 heads, 288-wide expert slices and 16,160 vocab rows a
+    rank: the package's TP8 programs), nothing of the hi path imported to decide it.
+    """
+    assert served_tp8.tensor_parallel_size == 8 and 8 in hi_gate.SERVED_TPS
+    before = set(sys.modules)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert hi_gate.decide(served_tp8, _drafter(), _builder(), 0) is True
+    assert not caplog.records
+    assert not [m for m in set(sys.modules) - before if ".mono.hi" in m]
+
+
+@pytest.mark.parametrize("tp", [1, 3, 16])
+def test_only_the_served_tp_sizes_are_served(mi355x, served, tp):
+    """TP2, TP4 and TP8 (``SERVED_TPS``); any other size keeps ATOM's path."""
+    assert hi_gate.SERVED_TPS == (2, 4, 8)
+    cfg = _config(served, tensor_parallel_size=tp)
+    assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == (
+        f"TP{tp} (the hi path serves TP2 / TP4 / TP8)"
+    )
+
+
+@pytest.mark.parametrize("tp", [2, 4, 8])
+def test_the_gate_reads_the_values_atom_settled_on(served, served_tp2, served_tp8, tp):
+    """Every configuration field the gate reads, as ATOM's ``Config`` holds it for the served command line: the value
+    the hook and ATOM's cache use (``--block-size 16`` becomes V4.1's 128-token page), at every served TP size.
+    """
+    served = {2: served_tp2, 4: served, 8: served_tp8}[tp]
     assert served.kv_cache_block_size == hi_gate.BLOCK_SIZE == 128
     assert (
         served.tensor_parallel_size,
         served.kv_cache_dtype,
         served.index_cache_dtype,
-    ) == (4, "bf16", "fp4")
+    ) == (tp, "bf16", "fp4")
     assert {
         k: getattr(served.hf_config, k) for k in hi_gate.GEOMETRY
     } == hi_gate.GEOMETRY
@@ -147,8 +213,7 @@ def test_any_block_size_flag_takes_atoms_v41_page(mi355x, block):
 
 UNSUPPORTED = {
     "TP1": ({"tensor_parallel_size": 1}, {}, "TP1"),
-    "TP2": ({"tensor_parallel_size": 2}, {}, "TP2"),
-    "TP8": ({"tensor_parallel_size": 8}, {}, "TP8"),
+    "TP16": ({"tensor_parallel_size": 16}, {}, "TP16"),
     "DP attention": ({}, {"dp_ranks": 2}, "DP attention"),
     "fp8 KV": ({"kv_cache_dtype": "fp8"}, {}, "kv_cache_dtype fp8"),
     "fp8 index cache": ({"index_cache_dtype": "fp8"}, {}, "index-cache-dtype fp8"),
@@ -200,13 +265,17 @@ UNSUPPORTED = {
 }
 
 
+@pytest.mark.parametrize("tp", [2, 4, 8])
 @pytest.mark.parametrize("case", sorted(UNSUPPORTED))
-def test_auto_leaves_any_other_deployment_on_atoms_path(mi355x, served, caplog, case):
+def test_auto_leaves_any_other_deployment_on_atoms_path(
+    mi355x, served, served_tp2, served_tp8, caplog, case, tp
+):
     over, args, why = UNSUPPORTED[case]
+    base = {2: served_tp2, 4: served, 8: served_tp8}[tp]
     call = {"drafter": _drafter(), "builder": _builder(), "dp_ranks": 0, **args}
     with caplog.at_level(logging.INFO, logger="atom"):
         assert not hi_gate.decide(
-            _config(served, **over), call["drafter"], call["builder"], call["dp_ranks"]
+            _config(base, **over), call["drafter"], call["builder"], call["dp_ranks"]
         )
     lines = [r.getMessage() for r in caplog.records]
     assert (
@@ -236,11 +305,26 @@ def test_auto_without_flydsl(mi355x, served, monkeypatch):
     assert "FlyDSL" in hi_gate.refusal(served, _drafter(), _builder(), 0)
 
 
+def test_lossless_sampling_keeps_atoms_path(mi355x, served):
+    """The hi block draft is greedy and publishes no q, so a step it served
+    would leave the q slots lossless sampling claimed holding another draft's
+    q: an armed lossless drafter keeps the deployment on ATOM's path."""
+    assert hi_gate.refusal(served, _drafter(), _builder(), 0) == ""
+    why = hi_gate.refusal(served, _drafter(lossless=object()), _builder(), 0)
+    assert "lossless speculative sampling" in why
+    assert not hi_gate.decide(served, _drafter(lossless=object()), _builder(), 0)
+
+
+@pytest.mark.parametrize("tp", [2, 4, 8])
 @pytest.mark.parametrize("layout", hi_gate.INDEX_LAYOUTS)
-def test_both_gfx950_fp4_index_layouts_are_served(mi355x, served, layout):
+def test_both_gfx950_fp4_index_layouts_are_served(
+    mi355x, served, served_tp2, served_tp8, layout, tp
+):
     """ATOM's FP4 index plane in either gfx950 layout (``ATOM_V4_UNIFIED_MQA``: opus -> mfma, flydsl ->
-    preshuffle): the hi programs address both."""
-    cfg = _config(served, index_cache_layout=layout)
+    preshuffle): the hi programs address both, at every served TP size."""
+    cfg = _config(
+        {2: served_tp2, 4: served, 8: served_tp8}[tp], index_cache_layout=layout
+    )
     assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
 
 
@@ -253,12 +337,14 @@ def test_off(mi355x, served, monkeypatch, caplog):
     ]
 
 
-def test_forced(mi355x, served, monkeypatch):
+def test_forced(mi355x, served, served_tp2, served_tp8, monkeypatch):
     monkeypatch.setenv("ATOM_DSV41_MONO_HI", "1")
     assert hi_gate.decide(served, _drafter(), _builder(), 0)
-    with pytest.raises(RuntimeError, match="TP8"):
+    assert hi_gate.decide(served_tp2, _drafter(), _builder(), 0)
+    assert hi_gate.decide(served_tp8, _drafter(), _builder(), 0)
+    with pytest.raises(RuntimeError, match="TP16"):
         hi_gate.decide(
-            _config(served, tensor_parallel_size=8), _drafter(), _builder(), 0
+            _config(served, tensor_parallel_size=16), _drafter(), _builder(), 0
         )
 
 
@@ -300,8 +386,8 @@ def test_triton_moe_keeps_atoms_path(mi355x, served, monkeypatch):
 
 @pytest.fixture
 def dispatch_module(monkeypatch):
-    """``mono.dispatch`` with ATOM's own mono runners (FlyDSL kernels) stood in for: loaded fresh, dropped after."""
-    import importlib
+    """``mono.dispatch`` (AITER stood in for where it cannot run: its verify head reaches ``pcp_utils``) with ATOM's
+    own mono runners (FlyDSL kernels) stood in for: loaded fresh, dropped after."""
     import types
 
     from aiter_stub import _drop
@@ -317,7 +403,8 @@ def dispatch_module(monkeypatch):
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
     _drop(name)
     try:
-        yield importlib.import_module(name)
+        with atom_without_aiter() as load:
+            yield load(name)
     finally:
         _drop(name)
         if saved is not None:
@@ -350,10 +437,14 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
     if mode == "1":
         with pytest.raises(MonoUnsupported, match="FlyDSL layout"):
-            dispatch.install_mono_decode("model", served, None, metadata_builder=None)
+            dispatch.install_mono_decode(
+                "model", served, None, metadata_builder=BUILDER
+            )
         return
     with caplog.at_level(logging.INFO, logger="atom"):
-        got = dispatch.install_mono_decode("model", served, None, metadata_builder=None)
+        got = dispatch.install_mono_decode(
+            "model", served, None, metadata_builder=BUILDER
+        )
     assert got == "atom mono"
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: routed experts not in the gfx950 FlyDSL layout"
@@ -446,7 +537,9 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
     drafter = SimpleNamespace(model=draft)
     builder = SimpleNamespace(
         engram=SimpleNamespace(mapping=None, host=None),
-        model_runner=None,
+        # ATOM's mono path takes the forward's output buffer and the step's
+        # staged temperatures from it
+        model_runner=SimpleNamespace(forward_vars=_STAGED),
         use_decode_round=lambda rnd: log.append("use round"),
     )
     cfg = SimpleNamespace(max_model_len=4096, index_cache_dtype="fp4")
@@ -506,6 +599,37 @@ def test_one_rank_refusing_at_install_refuses_on_every_rank_before_anything_is_b
     assert args[2].model is draft
 
 
+def test_at_tp2_the_other_ranks_refusal_refuses_here(hi_dispatch_module, monkeypatch):
+    """A TP2 group (this process rank 1 of 2): the check runs at TP2, the one other rank's refusal is agreed and
+    raised here before anything is built, so both ranks fall back."""
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    monkeypatch.setattr(hi_dispatch_module, "_tp", lambda: ("tp cpu group", 2, 1))
+    log, args, draft = _install_world(
+        hi_dispatch_module, monkeypatch, others=("MonoUnsupported: shard",)
+    )
+    with pytest.raises(MonoUnsupported) as raised:
+        hi_dispatch_module.install_hi(*args)
+    assert str(raised.value) == "refused at install: rank 0: MonoUnsupported: shard"
+    assert log == [("check", 2, 1), ("agree", None, "tp cpu group")]
+    assert args[2].model is draft
+
+
+def test_at_tp8_one_other_ranks_refusal_refuses_here(hi_dispatch_module, monkeypatch):
+    """A TP8 group (this process rank 1 of 8): the check runs at TP8, rank 6's refusal is agreed and raised here
+    before anything is built, so every rank falls back."""
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    monkeypatch.setattr(hi_dispatch_module, "_tp", lambda: ("tp cpu group", 8, 1))
+    others = (None,) * 5 + ("MonoUnsupported: shard", None)  # ranks 0, 2 .. 7
+    log, args, draft = _install_world(hi_dispatch_module, monkeypatch, others=others)
+    with pytest.raises(MonoUnsupported) as raised:
+        hi_dispatch_module.install_hi(*args)
+    assert str(raised.value) == "refused at install: rank 6: MonoUnsupported: shard"
+    assert log == [("check", 8, 1), ("agree", None, "tp cpu group")]
+    assert args[2].model is draft
+
+
 def test_every_rank_passing_builds_after_the_agreement(hi_dispatch_module, monkeypatch):
     """Every rank's check passed: the build follows the agreement; the decode round goes to V4.1's metadata builder
     (``use_decode_round``) last, before the model is wrapped."""
@@ -528,17 +652,20 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    decoder = SimpleNamespace(write_context="atom mono context write")
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: decoder)
     monkeypatch.setattr(
-        dispatch, "MonoDraftModel", lambda m, dp: ("atom mono draft", m)
+        dispatch, "MonoDraftModel", lambda m, dp: SimpleNamespace(model=m)
     )
     model, cfg, drafter, builder, _ = args
     with caplog.at_level(logging.INFO, logger="atom"):
         got = dispatch.install_mono_decode(
             model, cfg, drafter, metadata_builder=builder
         )
-    assert got == "atom mono"
-    assert drafter.model == ("atom mono draft", draft)
+    assert got is decoder
+    # the draft wrapped, its context written on the target's mono launch
+    assert drafter.model.model is draft
+    assert drafter.model.context_writer == decoder.write_context
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: refused at install: rank 0: MonoUnsupported: shard"
     ]

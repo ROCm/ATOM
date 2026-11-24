@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import with_min_load
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -31,6 +32,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_STORE_CHANNEL,
     ChunkedOffloadSchedulerBase,
 )
+from atom.kv_transfer.offload.lookup_client import as_lookup_client
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -48,6 +50,7 @@ from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
 from atom.kv_transfer.offload.mp.token_shipping import token_list
+from atom.model_engine.sequence import SequenceStatus
 from tests.lmcache_mp_support import bare_mp_scheduler as _bare_mp_scheduler
 from tests.lmcache_mp_support import close_workers, cpu_step_events  # noqa: F401
 from tests.lmcache_mp_support import settle as _settle
@@ -81,30 +84,33 @@ def _config(
         head_dim=128,
         kv_lora_rank=kv_lora_rank,
     )
-    return SimpleNamespace(
-        hf_config=hf_config,
-        model="test/model",
-        model_tag="test/model",
-        kv_cache_block_size=4,
-        kv_cache_dtype="fp8",
-        index_cache_dtype="fp8",
-        tensor_parallel_size=tp,
-        pipeline_parallel_size=pp,
-        decode_context_parallel_size=dcp,
-        prefill_context_parallel_size=pcp,
-        enable_dp_attention=enable_dp_attention,
-        enable_expert_parallel=enable_expert_parallel,
-        speculative_config=None,
-        parallel_config=SimpleNamespace(
-            data_parallel_size=dp,
-            data_parallel_size_local=dp if dp_local is None else dp_local,
-            data_parallel_rank=dp_rank,
-        ),
-        kv_transfer_config={
-            "kv_connector": "lmcache_mp",
-            "kv_role": role,
-            "kv_connector_extra_config": extra or {},
-        },
+    return with_min_load(
+        SimpleNamespace(
+            hf_config=hf_config,
+            model="test/model",
+            model_tag="test/model",
+            kv_cache_block_size=4,
+            kv_cache_dtype="fp8",
+            index_cache_dtype="fp8",
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
+            decode_context_parallel_size=dcp,
+            dcp_config=SimpleNamespace(interleave_size=1),
+            prefill_context_parallel_size=pcp,
+            enable_dp_attention=enable_dp_attention,
+            enable_expert_parallel=enable_expert_parallel,
+            speculative_config=None,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=dp,
+                data_parallel_size_local=dp if dp_local is None else dp_local,
+                data_parallel_rank=dp_rank,
+            ),
+            kv_transfer_config={
+                "kv_connector": "lmcache_mp",
+                "kv_role": role,
+                "kv_connector_extra_config": extra or {},
+            },
+        )
     )
 
 
@@ -113,6 +119,12 @@ def _config(
     [
         ({"pp": 2}, "does not support PP"),
         ({"dcp": 2}, "does not support DCP"),
+        ({"tp": 8, "dcp": 8}, "does not support DCP"),
+        ({"tp": 8, "dcp": 4, "model_type": "glm_moe_dsa"}, "does not support DCP"),
+        (
+            {"tp": 8, "dcp": 8, "dp": 2, "model_type": "glm_moe_dsa"},
+            "does not support DCP",
+        ),
         ({"pcp": 2}, "does not support PCP"),
         ({"dp": 2, "dp_local": 1}, "only within one host"),
         ({"tp": 1.5}, "tensor_parallel_size must be an integer"),
@@ -128,6 +140,41 @@ def test_mp_config_accepts_arbitrary_model_type():
         2,
         1,
     )
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["glm", "k3"])
+def test_dcp8_keeps_shards_and_uses_global_block_boundaries(monkeypatch, nested):
+    config = _config(model_type="glm_moe_dsa", tp=8, dcp=8, kv_lora_rank=512)
+    config.kv_cache_block_size = 64
+    config.dcp_config = SimpleNamespace(interleave_size=1)
+    if nested:
+        config.hf_config = SimpleNamespace(
+            model_type="kimi_k31",
+            text_config=SimpleNamespace(model_type="kimi_linear", kv_lora_rank=512),
+        )
+    assert deployment._validate_mp_config(config) == (8, 1)
+    adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPParallelConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
+    strategies = [deployment._parallel_strategy(config, rank) for rank in range(8)]
+    assert {s.world_size for s in strategies} == {8}
+    assert {s.worker_id for s in strategies} == set(range(8))
+
+    worker = mp_worker.LMCacheMPConnector(config)
+    assert worker.block_size == 512
+    req = LMCacheReqMeta(req_id=1, token_ids=list(range(1536)), block_ids=[7, 3, 9])
+    assert worker._block_slice(req, 0, 1536) == [7, 3, 9]
+    assert worker._block_slice(req, 512, 1024) == [3]
+    with pytest.raises(ValueError, match="align"):
+        worker._block_slice(req, 64, 512)
+
+    extra = config.kv_transfer_config["kv_connector_extra_config"]
+    extra["lmcache.mp.tp_rank_collapse"] = True
+    with pytest.raises(ValueError, match="discard DCP shards"):
+        deployment._tp_replication_factor(config)
+    config.dcp_config.interleave_size = 3
+    with pytest.raises(ValueError, match="divisible by DCP interleave"):
+        deployment._validate_mp_config(config)
 
 
 @pytest.mark.parametrize(
@@ -183,11 +230,13 @@ def test_mp_config_rejects_engine_driven_transfer(monkeypatch):
         ({}, " AuTo ", "auto"),
     ],
 )
+@pytest.mark.parametrize("dcp", [1, 8])
 def test_worker_adapter_normalizes_transfer_mode(
     monkeypatch,
     extra,
     environment_mode,
     expected,
+    dcp,
 ):
     class AtomMPParallelConfig:
         def __init__(self, **kwargs):
@@ -206,9 +255,12 @@ def test_worker_adapter_normalizes_transfer_mode(
         deployment, "_model_namespace", lambda _config, **_kwargs: "test"
     )
 
-    adapter = deployment._make_worker_adapter(_config(extra=extra), rank=1)
+    adapter = deployment._make_worker_adapter(
+        _config(extra=extra, model_type="glm_moe_dsa", tp=8, dcp=dcp), rank=1
+    )
 
     assert adapter.transfer_mode == expected
+    assert adapter.block_size == 4 * dcp
 
 
 def test_parallel_strategy_keeps_every_tp_rank(monkeypatch):
@@ -282,16 +334,15 @@ def test_parallel_strategy_collapses_fully_replicated_mla(monkeypatch):
 
 
 def test_auto_rank_collapse_is_off_for_a_draft_with_its_own_pool(monkeypatch):
-    """A DSpark draft whose backend owns a KV pool appends per-rank PAGE
-    regions, so a replicated MLA target no longer collapses."""
+    """A DSpark draft whose attention family is in `DRAFT_POOL_FAMILIES` appends
+    per-rank PAGE regions, so a replicated MLA target no longer collapses."""
     from atom.utils import selector
 
     owns_pool = {"value": True}
-    monkeypatch.setattr(selector, "attn_family", lambda _hf: "draft-family")
     monkeypatch.setattr(
         selector,
-        "get_attn_backend",
-        lambda _family: SimpleNamespace(DRAFT_OWNS_KV_POOL=owns_pool["value"]),
+        "attn_family",
+        lambda _hf: selector.Family.MHA if owns_pool["value"] else selector.Family.MLA,
     )
     config = _config(tp=8, kv_lora_rank=512)
     assert deployment._tp_replication_factor(config) == 8
@@ -352,16 +403,18 @@ def test_tp_rank_collapse_can_be_disabled_and_rejects_bad_values():
 
 
 @pytest.mark.parametrize(
-    ("kv_lora_rank", "expected_readers"),
-    [(None, 1), (512, 8)],
+    ("kv_lora_rank", "dcp", "expected_readers"),
+    [(None, 1, 1), (512, 1, 8), (512, 8, 1)],
 )
 def test_scheduler_reserves_locks_for_every_collapsed_tp_reader(
     monkeypatch,
     kv_lora_rank,
+    dcp,
     expected_readers,
 ):
     @dataclass(frozen=True)
     class Key:
+        request_id: str = "req"
         num_kv_readers: int = 1
 
     class AtomMPParallelConfig:
@@ -384,11 +437,124 @@ def test_scheduler_reserves_locks_for_every_collapsed_tp_reader(
     )
 
     adapter = mp_scheduler._make_scheduler_adapter(
-        _config(tp=8, kv_lora_rank=kv_lora_rank)
+        _config(model_type="glm_moe_dsa", tp=8, dcp=dcp, kv_lora_rank=kv_lora_rank)
     )
     key = adapter._create_key([], 0, 0, "req", None)
 
     assert key.num_kv_readers == expected_readers
+    assert adapter.block_size == 4 * dcp
+
+
+@dataclass(frozen=True)
+class _SaltKey:
+    request_id: str
+    num_kv_readers: int = 1
+    cache_salt: str = ""
+
+
+def _install_salt_adapters(monkeypatch, scheduler_base=None):
+    """LMCache's ATOM adapters as far as keys go: one per call, unsalted.
+    `scheduler_base` replaces the scheduler adapter's."""
+
+    class AtomMPParallelConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class AtomMPSchedulerAdapter(_LookupAdapter):
+        def __init__(self, **_kwargs):
+            super().__init__([8, 8])
+            self.keys = []
+
+        def _create_key(self, token_ids, start, end, request_id, worker_id):
+            return _SaltKey(request_id)
+
+        def maybe_submit_lookup_request(self, request_id, token_ids):
+            super().maybe_submit_lookup_request(request_id, token_ids)
+            self.keys.append(
+                self._create_key(
+                    token_ids,
+                    start=0,
+                    end=len(token_ids),
+                    request_id=request_id,
+                    worker_id=None,
+                )
+            )
+
+    class AtomMPWorkerAdapter:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def _create_key(self, request_id, spec):
+            return _SaltKey(request_id)
+
+    adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPTransferSpec = _FakeLoadStoreOp
+    adapter_module.AtomMPParallelConfig = AtomMPParallelConfig
+    adapter_module.AtomMPSchedulerAdapter = scheduler_base or AtomMPSchedulerAdapter
+    adapter_module.AtomMPWorkerAdapter = AtomMPWorkerAdapter
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
+
+
+@pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
+def test_mp_keys_carry_the_prompts_salt(monkeypatch, cache_seed, salt):
+    """Image placeholder ids are the same for every picture, so each MP key of
+    a seeded prompt carries its `cache_seed`; a text prompt's carries none."""
+    monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
+    _install_salt_adapters(monkeypatch)
+    adapter = mp_scheduler._make_scheduler_adapter(_config())
+    client = mp_lookup._MPLookupClient(
+        adapter, config=_config(), timeout=10.0, poll_interval=0.01
+    )
+    sched = _bare_mp_scheduler()
+    ChunkedOffloadSchedulerBase.__init__(
+        sched, _config(), chunk_size=8, lookup_client=client
+    )
+    seq = SimpleNamespace(
+        id=7,
+        num_prompt_tokens=16,
+        num_tokens=16,
+        num_cached_tokens=0,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        cache_seed=cache_seed,
+        offload_loaded=False,
+        offload_load_failed=False,
+        status=SequenceStatus.WAITING,
+    )
+
+    sched.get_num_new_matched_tokens(seq)
+    assert [key.cache_salt for key in adapter.keys] == [salt]
+    adapter.end_session(mp_lookup._mp_session_id(_config(), "7"))
+    assert adapter.cache_salts == {}
+
+    sent = []
+    sched._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            driving=True,
+            offer=lambda _sid, _tokens, **kwargs: sent.append(kwargs),
+            submit=lambda _tokens, _sid, **kwargs: sent.append(kwargs) or True,
+            pump=lambda: None,
+            pending_ids=set,
+            supports_async=lambda: True,
+            discard=lambda _sid: None,
+        )
+    )
+    sched.offer_lookups([seq])
+    fresh = SimpleNamespace(**{**vars(seq), "id": 8})
+    sched.prefetch_lookups([fresh])
+    assert sched.detach_lookup(fresh, 0)
+    expected = {"request_configs": {"lmcache.tag.cache_salt": salt}} if salt else {}
+    assert sent == [expected] * 3
+
+    worker_adapter = deployment._make_worker_adapter(_config(), rank=0)
+    spec = deployment.transfer_spec(
+        token_ids=list(range(8)), block_ids=[[1]], start=0, end=8, cache_salt=salt
+    )
+    assert isinstance(spec, _FakeLoadStoreOp)
+    assert worker_adapter._create_key("load:7", spec).cache_salt == salt
 
 
 def test_server_url_normalization_and_single_server_limit():
@@ -427,6 +593,21 @@ def test_model_namespace_reuses_generic_page_namespace(monkeypatch):
         "model::atom-page-v2-layout::lmcache-mp-v3"
     )
     assert calls == [(config, cfg, 4)]
+
+
+def test_dcp_mp_namespace_separates_interleave_and_dcp1(monkeypatch):
+    monkeypatch.setattr(deployment.offcfg, "build_lmcache_config", lambda _: object())
+    monkeypatch.setattr(
+        deployment.offcfg, "build_page_namespace", lambda *_: "same-page-namespace"
+    )
+    config = _config(model_type="glm_moe_dsa", tp=8, dcp=8)
+    namespaces = []
+    for interleave in (1, 2, 4):
+        config.dcp_config = SimpleNamespace(interleave_size=interleave)
+        namespaces.append(deployment._model_namespace(config))
+    config.decode_context_parallel_size = 1
+    namespaces.append(deployment._model_namespace(config))
+    assert len(set(namespaces)) == 4
 
 
 def test_dp_replicas_share_model_namespace_but_not_request_sessions(monkeypatch):
@@ -1315,11 +1496,13 @@ def test_worker_uses_transfer_boundary_and_exact_completion(
             transfer_end_tokens=8,
         ),
         load_operation=operation,
+        cache_salt="11",
     )
 
     worker._submit_load(request, _step_event(worker))
     assert adapter.loads[0][0] == "atom-offload-dp0:5"
     submitted = adapter.loads[0][1]
+    assert submitted.cache_salt == "11"
     assert submitted.start == 0
     assert submitted.end == 8
     assert submitted.block_ids == [[10, 11]]
@@ -1725,11 +1908,13 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
         block_ids=[30, 31, 32, 33],
         save_spec=SaveSpec(skip_leading_tokens=8),
         save_operation=operation,
+        cache_salt="11",
     )
 
     worker._submit_save(request, _step_event(worker))
     assert adapter.saves[0][0] == "atom-offload-dp0:8"
     submitted = adapter.saves[0][1]
+    assert submitted.cache_salt == "11"
     assert submitted.start == 8
     assert submitted.end == 16
     assert submitted.block_ids == [[32, 33]]
@@ -2158,11 +2343,13 @@ def test_registers_multiple_layouts_as_views_of_one_engine_group(
 
 
 @pytest.mark.parametrize(("rank", "is_writer"), [(0, True), (3, False)])
+@pytest.mark.parametrize("dcp", [1, 8])
 def test_registration_collapses_only_backend_declared_tp_replicas(
     fake_lmcache_modules,
     monkeypatch,
     rank,
     is_writer,
+    dcp,
 ):
     aiter = types.ModuleType("aiter")
     aiter.__path__ = []
@@ -2180,15 +2367,18 @@ def test_registration_collapses_only_backend_declared_tp_replicas(
         "_make_worker_adapter",
         lambda _config, _rank: adapter,
     )
-    worker = mp_worker.LMCacheMPConnector(_config(tp=8, kv_lora_rank=512))
+    config = _config(model_type="glm_moe_dsa", tp=8, dcp=dcp, kv_lora_rank=512)
+    adapter.lmcache_tokens_per_chunk = 4 * dcp * 2
+    worker = mp_worker.LMCacheMPConnector(config)
     worker.register_kv_caches(
         {},
-        transfer_tensors=_transfer_tensors(tp_replication_factor=8),
+        transfer_tensors=_transfer_tensors(tp_replication_factor=8 if dcp == 1 else 1),
         num_blocks=2,
     )
 
-    assert worker._is_kv_writer is is_writer
+    assert worker._is_kv_writer is (is_writer or dcp > 1)
     assert adapter.registered is not None
+    assert all(group.tokens_per_block == 4 * dcp for group in adapter.groups)
 
 
 def test_registration_rejects_rank_collapse_without_backend_declaration(
@@ -2417,7 +2607,9 @@ def test_the_session_end_drops_the_workers_copy(monkeypatch):
     sched = _bare_mp_scheduler()
     seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
     sched._token_shipper.ship(seq, 32)
-    sched._lookup_client = SimpleNamespace()
+    from atom.kv_transfer.offload.lookup_client import LookupClient
+
+    sched._lookup_client = LookupClient()
     sched._save_tracker, sched._save_inflight = {}, {}
     sched._mp_adapter = SimpleNamespace(end_session=lambda rid: None)
     sched._config = SimpleNamespace()
@@ -2466,10 +2658,11 @@ def test_drops_reach_the_workers_without_a_transfer():
         (2, 1, True, True),
     ],
 )
+@pytest.mark.parametrize("policy", ["prefix_spread", "share_cache"])
 def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(
-    monkeypatch, dp, tp, enable_dp_attention, requires_match
+    monkeypatch, dp, tp, enable_dp_attention, requires_match, policy
 ):
-    """Only `prefix_spread` reads the configured chunk (to predict loads), so
+    """Shared-prefix routing reads the configured chunk to predict loads, so
     only an active prefix router is refused when the server runs on another
     one. Ordinary DP=1 and other strategies use the server's chunk as before;
     DP-attention's TP ranks are routable engines too."""
@@ -2478,7 +2671,7 @@ def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(
     config = _config(dp=dp, tp=tp, enable_dp_attention=enable_dp_attention)
     config.dp_load_balance = "least_requests"
     deployment.require_chunk_matches_server(server_512, config)
-    config.dp_load_balance = "prefix_spread"
+    config.dp_load_balance = policy
     if requires_match:
         with pytest.raises(ValueError, match="configured chunk to match the server"):
             deployment.require_chunk_matches_server(server_512, config)

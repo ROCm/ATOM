@@ -23,6 +23,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     EntryMajorArena,
     LayerMajorArena,
+    SplitEntryMajorArena,
     carve,
     checkpoint_ranges_for,
     entry_bytes_for,
@@ -159,6 +160,17 @@ class TestViewsAndEntriesAgree:
         assert arena.field_offset(last.name) + last.bytes_per_entry <= arena.entry_bytes
 
 
+def _assert_live_refilled(view, dead, fill):
+    """The first `dead` entries still hold the NaN a write left; the live
+    tail is back at the field's fill."""
+    assert torch.isnan(view[:, :dead]).all()
+    live = view[:, dead:]
+    if fill == 0.0:
+        assert torch.equal(live, torch.zeros_like(live))
+    else:
+        assert torch.isneginf(live).all()
+
+
 class TestInitialFill:
 
     def test_kv_zero_score_neg_inf(self):
@@ -179,6 +191,35 @@ class TestInitialFill:
         arena.view("a").fill_(1.0)
         for i in range(arena.entries):
             assert (arena.entry(i)[12:] == 0).all()
+
+    def test_refill_live_undoes_a_write(self):
+        """A CUDA graph capture's warmup runs on real slots before any request
+        owns them, and may leave NaN there; the live slots go out as if fresh.
+        The entries below the live tail belong to whatever shares the buffer
+        and keep what they hold."""
+        arena = EntryMajorArena(V4_LIKE, 5, device="cpu", live_entries=2)
+        dead = arena.entries - arena.live_entries
+        for field in V4_LIKE:
+            arena.view(field.name).fill_(float("nan"))
+        arena.refill_live()
+        for field in V4_LIKE:
+            _assert_live_refilled(arena.view(field.name), dead, field.fill)
+
+    def test_split_arena_refills_the_live_tail_of_every_plane(self):
+        """The runner's state arena is a split one, so a refill has to reach
+        each plane, and stop at each plane's live tail."""
+        planes = [
+            EntryMajorArena(V4_LIKE[:4], 5, device="cpu", live_entries=2),
+            EntryMajorArena(V4_LIKE[4:], 5, device="cpu", live_entries=2),
+        ]
+        arena = SplitEntryMajorArena(planes)
+        for field in V4_LIKE:
+            arena.view(field.name).fill_(float("nan"))
+        arena.refill_live()
+        for plane in planes:
+            dead = plane.entries - plane.live_entries
+            for field in plane.fields:
+                _assert_live_refilled(arena.view(field.name), dead, field.fill)
 
 
 def test_carving_more_than_the_buffer_holds_is_refused():
@@ -217,6 +258,34 @@ class TestALayerMajorArenaCannotFillSomeoneElsesBuffer:
 
         with pytest.raises(ValueError, match="non-zero fill"):
             LayerMajorArena(fields, 3, device="cpu", buf=buf)
+
+
+def test_a_layer_major_arena_publishes_one_region_per_field_layer():
+    """Qwen3.8's QSA arena publishes its regions as `MhaKvPool` does: one per
+    (field, layer), in field order, each one layer's run of `entries`."""
+    fields = [
+        EntryField("k", 2, (4, 2, 8), torch.bfloat16),  # 128 B a layer
+        EntryField("index_compressed", 2, (1, 1, 4), torch.bfloat16),  # 8 B
+    ]
+    arena = LayerMajorArena(fields, entries=5, device="cpu")
+    base = arena.buf.data_ptr()
+    # k's entry is 256 B, so index_compressed starts at 256 * 5 entries.
+    expected = [(base, 128), (base + 640, 128), (base + 1280, 8), (base + 1320, 8)]
+    regions = arena.region_tensors()
+    assert [role for role, _ in regions] == [
+        "k.layer_0",
+        "k.layer_1",
+        "index_compressed.layer_0",
+        "index_compressed.layer_1",
+    ]
+    assert [
+        (tensor.data_ptr(), tensor.stride(0) * tensor.element_size())
+        for _, tensor in regions
+    ] == expected
+    assert [tuple(tensor.shape) for _, tensor in regions] == [(5, 4, 2, 8)] * 2 + [
+        (5, 1, 1, 4)
+    ] * 2
+    assert arena.region_layout() == expected
 
 
 class TestMixedDtypes:

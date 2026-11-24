@@ -20,19 +20,14 @@ if TYPE_CHECKING:
     from atom.config import Config
 
 
-def _owned(value: Any, staged: tuple[torch.Tensor, ...] = ()) -> Any:
-    """A copy the graph pool cannot re-issue.
-
-    Outputs that alias declared staged inputs already live outside the graph
-    pool and can be handed back directly. Clone every other tensor because the
-    pool may re-issue its storage on a later replay.
-    """
+def _owned(value: Any, clones: Any) -> Any:
+    """``value`` with every tensor ``clones`` marks (``ReqGraph.allocated``:
+    in the graph pool) cloned out of it; the rest -- a staged input, a buffer
+    the model owns -- handed back as they are, as the eager pass hands them."""
     if isinstance(value, torch.Tensor):
-        if any(value.data_ptr() == tensor.data_ptr() for tensor in staged):
-            return value
-        return value.clone()
+        return value.clone() if clones else value
     if isinstance(value, tuple):
-        return tuple(_owned(v, staged) for v in value)
+        return tuple(_owned(v, c) for v, c in zip(value, clones, strict=True))
     return value
 
 
@@ -153,7 +148,11 @@ class DraftGraph:
     def stage(
         self, running_bs: int, srcs: "Mapping[str, torch.Tensor]"
     ) -> dict[str, torch.Tensor]:
-        """Copy every input, ``running_bs`` rows each, into its fixed buffer."""
+        """Copy every input into its fixed buffer, widening to ``running_bs``.
+
+        How many rows are real comes from the sources, never from the caller: a
+        count that cannot disagree with the tensor it describes.
+        """
         undeclared = sorted(srcs.keys() - self._buffers.keys())
         assert not undeclared, (
             f"{self.name} has no staged inputs {undeclared}; "
@@ -169,10 +168,11 @@ class DraftGraph:
         }
 
     def buffer(self, role: str, bs: int) -> torch.Tensor:
-        """Return the fixed-storage view a producer may fill in place.
+        """Return the fixed-storage view a producer may fill for the real rows.
 
-        The caller must not mutate this view between a :meth:`stage` of it and
-        the pass consuming it.
+        A following :meth:`stage` still owns padding ``bs`` to ``running_bs``.
+        The caller must not mutate this view between that stage and the pass
+        consuming it.
         """
         assert role in self._buffers, (
             f"{self.name} has no staged input {role!r}; "
@@ -186,8 +186,11 @@ class DraftGraph:
         return buf.narrow(d, 0, bs)
 
     def _stage_one(self, role: str, running_bs: int, src: torch.Tensor | None):
-        """Copy ``src``, ``running_bs`` rows along ``batch_dim``, into this
-        input's fixed buffer.
+        """Copy ``src`` into fixed storage and repeat its last row to ``running_bs``.
+
+        Every input repeats the same last index along ``batch_dim``, so a pad
+        row is a coherent copy of the last real one. Zero-filled tails faulted
+        all ranks at the first padded decode step in the validated graph path.
 
         ``src=None`` hands back the view unwritten: warmup wants a well-formed
         batch, not a particular one.
@@ -205,14 +208,26 @@ class DraftGraph:
             f"but this pass stages {self.inputs[role].shape} per sequence with "
             f"the batch at axis {d}"
         )
-        assert src.shape == out.shape, (
+        scheduled_bs = src.shape[d]
+        assert scheduled_bs <= running_bs and (scheduled_bs > 0 or running_bs == 0), (
+            f"draft input '{role}' of {self.name} arrived with {scheduled_bs} "
+            f"rows for a running batch of {running_bs}; a pass widens one or "
+            f"more real rows by repeating the last, so it needs "
+            f"0 < rows <= running_bs (or both zero)"
+        )
+        dst = out.narrow(d, 0, scheduled_bs)
+        assert src.shape == dst.shape, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
-            f"but its fixed storage expects {tuple(out.shape)}"
+            f"but its fixed storage expects {tuple(dst.shape)}"
         )
         # A producer may have written straight into this exact fixed-storage
         # view. Do not turn that into a self-copy launch.
-        if src.data_ptr() != out.data_ptr() or src.stride() != out.stride():
-            out.copy_(src)
+        if src.data_ptr() != dst.data_ptr() or src.stride() != dst.stride():
+            dst.copy_(src)
+        if running_bs > scheduled_bs:
+            out.narrow(d, scheduled_bs, running_bs - scheduled_bs).copy_(
+                src.narrow(d, scheduled_bs - 1, 1)
+            )
         return out
 
     def is_captured(self, running_bs: int) -> bool:
@@ -265,15 +280,17 @@ class DraftGraph:
         What leaves here is a VALUE. A replay hands back the tensors the
         capture allocated, and the pool re-issues those addresses to sizes
         captured later -- a reference does not hold them the way the eager
-        allocator's does. Only ``capture_epilogue`` can put a survivor in
-        there; the eager path allocates normally and needs no copy.
+        allocator's does: those it clones, as the recording found them
+        (``ReqGraph.allocated``); an output in a buffer the model owns is handed back as
+        the eager pass hands it. Only ``capture_epilogue`` can put a survivor
+        in there; the eager path allocates normally and needs no copy.
         """
         if running_bs not in self._graph:
             out = self._to_capture(running_bs, **staged)
         else:
             out = self._graph.replay(key=running_bs)
             if self.capture_epilogue:
-                out = _owned(out, tuple(staged.values()))
+                out = _owned(out, self._graph.allocated(running_bs, out))
         return (
             out
             if self.capture_epilogue
@@ -301,6 +318,9 @@ class DraftGraph:
         self._forward_and_epilogue(running_bs, **staged)
         if not self.will_capture:
             return
-        self._graph.record(
+        out = self._graph.record(
             lambda: self._to_capture(running_bs, **staged), key=running_bs
         )
+        if self.capture_epilogue:
+            # which outputs a replay copies, worked out here, not mid-serving
+            self._graph.allocated(running_bs, out)

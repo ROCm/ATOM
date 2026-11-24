@@ -46,21 +46,20 @@ def _env(**values):
 
 
 def compile_traced(launcher, program: Program):
-    """Compile ``launcher`` (no launch, no disk cache so the body is traced) and hold its recorded hand-offs to the
-    program's regions (``atom.mono.plan.check``). Raises ContractError."""
+    """Compile ``launcher`` (no launch) and hold its recorded hand-offs to the program's regions
+    (``atom.mono.plan.check``). Raises ContractError.
+
+    FlyDSL's disk cache as the process sets it (on by default): FlyDSL traces a build before it looks it up (its key
+    is the traced module), so a cached build is still traced, recorded and checked, only not compiled again.
+    """
     arch = program.target.mcpu
     with (
         recording() as rec,
-        _env(
-            COMPILE_ONLY=1,
-            FLYDSL_RUNTIME_ENABLE_CACHE=0,
-            ARCH=arch,
-            FLYDSL_GPU_ARCH=arch,
-        ),
+        _env(COMPILE_ONLY=1, ARCH=arch, FLYDSL_GPU_ARCH=arch),
     ):
         launcher(0, 0, 0, 0, 0)
     if not rec.stages:
-        raise RuntimeError("nothing traced (a cached build?)")
+        raise RuntimeError("nothing traced")
     check(
         rec,
         [RegionDecl(r.name, r.space, r.writers, r.exchange) for r in program.regions],

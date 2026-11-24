@@ -192,14 +192,20 @@ class QueryRows:
     ptr_rows: torch.Tensor
 
     def take(self, *tensors):
-        """``tensors`` ([1, rows, ...]) at the queries, in one launch."""
-        return _gather_rows(self.rows, *tensors, dim=1)
+        """``tensors`` ([1, rows, ...]) at the queries, in one launch; a None
+        (a BF16 Q's scale) stays None."""
+        taken = iter(
+            _gather_rows(self.rows, *(t for t in tensors if t is not None), dim=1)
+        )
+        return tuple(None if t is None else next(taken) for t in tensors)
 
-    def indices(self, cache, spec):
+    def indices(self, cache, spec, *, a8w4=False):
         """`cache.attention_indices` for the queries alone: built afresh, never
         the index group its step's other layers already built over every row."""
         prefix, pptr, extend, eptr = cache.attention_indices(
-            spec, replace(self.index, group_indices={})
+            spec,
+            replace(self.index, group_indices={}, a8w4_indptrs={}, window_rows=None),
+            a8w4=a8w4,
         )
         return prefix, pptr[self.ptr_rows], extend, eptr[self.ptr_rows]
 

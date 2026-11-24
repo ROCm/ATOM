@@ -58,7 +58,10 @@ def test_native_byte_accounting():
     assert sum(f.bytes_per_entry for f in geo.page_fields) == 32 * 720
     # 2.5 index rows per token -- three ratio-2 owners and one ratio-1.
     assert geo.paged_bytes == 32 * (720 + 2.5 * 132)
-    assert geo.state_fields[0].bytes_per_entry == 40 * 128 * 528
+    assert (
+        sum(f.bytes_per_entry for f in geo.state_fields if f.name.startswith("window"))
+        == 40 * 128 * 528
+    )
     assert geo.page_bytes < bf16.page_bytes / 2
     assert geo.state_bytes < bf16.state_bytes * 0.52
     assert geo.layout_id != bf16.layout_id
@@ -102,7 +105,8 @@ def test_native_main_window_rows_restore_exact_qat(magnitude):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("batch", [1, 4, 8])
-def test_packed_decode_reuses_v4_with_ragged_rows(batch):
+@pytest.mark.parametrize("planar", [False, True])
+def test_packed_decode_reuses_v4_with_ragged_rows(batch, planar):
     from atom.model_ops.attentions.deepseek_v41.packed_attention import packed_decode
     from atom.model_ops.attentions.deepseek_v41.packed_rows import gather_prefix_rows
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
@@ -146,7 +150,19 @@ def test_packed_decode_reuses_v4_with_ragged_rows(batch):
         (indices >> 1) // 288,
     ).to(torch.int32)
     expected = sparse_attn_v4_paged_decode(q, bf16, bf16_indices, ptr, sink, 512**-0.5)
-    actual = packed_decode(q, pool.view(-1, 1), indices, ptr, sink, 512**-0.5)
+    if planar:
+        indices = torch.where(
+            (indices & 1) != 0,
+            (((indices >> 1) - main_bytes.numel()) // 528) * 2 + 1,
+            ((indices >> 1) // 288) * 2,
+        )
+        pool = (
+            tuple(v.view(torch.uint8) for v in main_values),
+            tuple(v.view(torch.uint8) for v in quantize_fp8(window)),
+        )
+    else:
+        pool = pool.view(-1, 1)
+    actual = packed_decode(q, pool, indices, ptr, sink, 512**-0.5)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     # Capacity padding contains invalid addresses; the gather must use indptr.
     scratch = torch.empty((indices.numel(), 512), device="cuda", dtype=torch.bfloat16)
@@ -202,12 +218,10 @@ def _plan_rows(rows, ratio):
 
 @pytest.mark.parametrize("kv_dtype", ["fp4", "fp8"])
 @pytest.mark.parametrize("ratio", [1, 2])
-def test_compressed_rows_land_packed_under_graph_replay(kv_dtype, ratio):
-    """`compress` writes a quantized pool's main rows in the kernel itself:
-    each the BF16 pool's row for the same inputs, quantized by the pool's rule
-    (`quantize_fp4` group16 / `quantize_fp8`) and packed, byte for byte; every
-    other byte of the backing as it was. Captured with sentinel rows only, then
-    replayed with live ones at the same plan address."""
+def test_compressed_rows_land_in_native_planes_under_graph_replay(kv_dtype, ratio):
+    """Compression writes the BF16 reference quantized into each native plane,
+    byte for byte, leaving every other byte untouched. Capture sentinel rows,
+    then replay live boundaries at the same plan address."""
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 
     owners = ((0, 2), (1, 1), (2, 2))
@@ -219,7 +233,9 @@ def test_compressed_rows_land_packed_under_graph_replay(kv_dtype, ratio):
     )
     owner = 1 if ratio == 1 else 0
     per_page = cache.geometry.rows_per_page(ratio)
-    pages = cache.pages.view(f"main_{owner}")[0]
+    pages = tuple(
+        plane.view(cache.num_pages, per_page, -1) for plane in cache.main_view(owner)
+    )
     compressor, values, scores, rope, step = _compress_inputs(ratio, [(-1, -1)] * 4)
     plan = step.plans[ratio].compress_plan_gpu
 
@@ -238,32 +254,35 @@ def test_compressed_rows_land_packed_under_graph_replay(kv_dtype, ratio):
         plan.copy_(_plan_rows(rows, ratio))
         run(reference)
         ref_pages = reference.pages.view(f"main_{owner}")[0]
-        cache.page_bytes.fill_(97)
-        before = cache.backing.clone()
-        expected = cache.page_bytes.clone()
+        source = cache.main_sources[owner]
+        source.fill_(97)
+        before = [allocation.clone() for allocation in cache.allocations]
+        expected = source.clone()
         for batch, row in rows:
             if batch < 0:
                 continue
             page = int(step.block_tables[batch, row // per_page])
             latent = ref_pages[page, row % per_page][None]
-            packed = pack_rows(
-                *(
-                    quantize_fp4(latent, group_size=16, scale_dtype=torch.float8_e4m3fn)
-                    if kv_dtype == "fp4"
-                    else quantize_fp8(latent)
+            native = (
+                quantize_fp4(latent, group_size=16, scale_dtype=torch.float8_e4m3fn)
+                if kv_dtype == "fp4"
+                else quantize_fp8(latent)
+            )
+            for plane, value in zip(pages, native):
+                offset = (
+                    plane.storage_offset()
+                    + page * plane.stride(0)
+                    + (row % per_page) * plane.stride(1)
                 )
-            )[0]
-            offset = pages.storage_offset() + (row % per_page) * pages.stride(1)
-            expected[page, offset : offset + packed.numel()] = packed
+                expected[offset : offset + value.numel()] = value.view(
+                    torch.uint8
+                ).flatten()
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(cache.page_bytes, expected, rtol=0, atol=0)
-        torch.testing.assert_close(
-            cache.backing[cache.page_bytes.numel() :],
-            before[cache.page_bytes.numel() :],
-            rtol=0,
-            atol=0,
-        )
+        torch.testing.assert_close(source, expected, rtol=0, atol=0)
+        for allocation, saved in zip(cache.allocations, before):
+            if allocation.data_ptr() != source.data_ptr():
+                torch.testing.assert_close(allocation, saved, rtol=0, atol=0)
 
 
 def test_packed_window_keeps_rows_below_cached_until():
@@ -294,15 +313,14 @@ def test_packed_window_keeps_rows_below_cached_until():
             cached_until=None if cached is None else np.asarray(cached, np.int32),
         )
         cache.write_window(1, rows, step)
-        caches.append(cache.backing.clone())
+        caches.append(cache.window_sources[1].clone())
     torch.cuda.synchronize()
     whole, kept = caches
-    window = geo.window(1, 8)
-    row_bytes = 512 + 512 // 32
     expected = whole.clone()
-    for pos in range(32, 48):
-        start = window.ring_start + 0 * window.slot_rows + (pos % 128) * row_bytes
-        expected[start : start + row_bytes] = 0
+    for plane in cache.ring_view(1):
+        for pos in range(32, 48):
+            start = plane.storage_offset() + (pos % 128) * plane.stride(0)
+            expected[start : start + plane.shape[-1]] = 0
     assert not torch.equal(whole, expected)
     torch.testing.assert_close(kept, expected, rtol=0, atol=0)
 
@@ -326,12 +344,12 @@ def test_ring_update_in_the_compress_launch_matches_its_own_launch(ratio, monkey
     caches = [PagedAttentionCache(geo, 6, 2, "cuda") for _ in range(2)]
     owner = 1 if ratio == 1 else 0
     torch.manual_seed(7)
-    caches[0].page_bytes.copy_(
-        torch.randint(0, 255, caches[0].page_bytes.shape, dtype=torch.uint8)
-    )
+    for source in caches[0].main_sources.values():
+        source.copy_(torch.randint(0, 255, source.shape, dtype=torch.uint8))
     for state in caches[0].compress_state(owner):
         state.copy_(torch.randn_like(state))
-    caches[1].backing.copy_(caches[0].backing)
+    for target, source in zip(caches[1].allocations, caches[0].allocations):
+        target.copy_(source)
     compressor, values, scores, rope, _ = _compress_inputs(ratio, [(-1, -1)] * 4)
     # Two requests, two rows each, at positions (5, 6) and (9, 10)
     rows = [(0, 5), (0, 6), (1, 9), (1, 10)]
@@ -369,4 +387,5 @@ def test_ring_update_in_the_compress_launch_matches_its_own_launch(ratio, monkey
     monkeypatch.setattr(compressor_module, "update_compressor_states", separate_launch)
     caches[0].compress(owner, compressor, values, scores, step(2), rope)
     torch.cuda.synchronize()
-    torch.testing.assert_close(caches[0].backing, caches[1].backing, rtol=0, atol=0)
+    for actual, expected in zip(caches[0].allocations, caches[1].allocations):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

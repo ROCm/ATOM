@@ -23,6 +23,7 @@ def _config():
         kv_cache_block_size=256,
         tensor_parallel_size=4,
         decode_context_parallel_size=2,
+        dcp_config=SimpleNamespace(interleave_size=1),
         speculative_config=SimpleNamespace(
             method="mtp",
             num_speculative_tokens=3,
@@ -41,6 +42,16 @@ def _config():
             indexer_dtype="fp8",
         ),
     )
+
+
+def _gdn_config(model_type):
+    """`_config()` turned into a GDN hybrid: neither the compressed attention
+    the hybrid branch claims nor the latent rank `attn_family` reads as MLA."""
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.kv_lora_rank = None
+    config.hf_config.model_type = model_type
+    return config
 
 
 def _lmcache_config():
@@ -142,6 +153,13 @@ def test_page_namespace_changes_for_meaningful_geometry(mutate):
     assert offcfg.build_page_namespace(config, cfg, 4) != original
 
 
+def test_page_namespace_tells_mxfp4_kv_pages_from_fp8_ones():
+    plain = offcfg.build_page_namespace(_config(), _lmcache_config(), 4)
+    config = _config()
+    config.kv_cache_dtype = "fp4"
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) != plain
+
+
 def test_page_namespace_changes_when_code_layout_version_changes():
     current = offcfg.build_page_namespace(_config(), _lmcache_config(), 4)
     future = offcfg.build_page_namespace(
@@ -180,13 +198,32 @@ def test_unknown_explicit_offload_layout_is_rejected(override):
 )
 def test_gdn_linear_model_offload_uses_the_page_image_tier(model_type):
     # The PAGE-image tier already packs `page_unit_views`. Falling through to
-    # `dense` would restore KV over a stale slot. Clear `compress_ratios` so
-    # the hybrid branch does not claim the model first.
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = model_type
+    # `dense` would restore KV over a stale slot.
+    config = _gdn_config(model_type)
 
     assert offcfg.select_offload_layout(config) == "qwen"
+
+
+def _qwen38_config(*, image_input: bool):
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "qwen4_exp"
+    config.hf_config.text_config = SimpleNamespace(
+        model_type="qwen4_exp_text", num_attention_heads=32
+    )
+    config.multimodal_config = SimpleNamespace() if image_input else None
+    return config
+
+
+def test_qwen38_offload_uses_the_qwen_tier():
+    # Text config, not the wrapper name: `get_hf_text_config` peels it.
+    # `dense` must still be refused, or QSA KV comes back over a stale slot.
+    config = _qwen38_config(image_input=False)
+
+    assert offcfg.select_offload_layout(config) == "qwen"
+    config.kv_transfer_config = {"offload_layout": "dense"}
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.select_offload_layout(config)
 
 
 def test_qwen_offload_classes_inherit_the_k3_tier():
@@ -213,15 +250,61 @@ def test_gdn_page_namespace_names_ordinary_mha_pages(model_type):
     # lmcache_mp hashes the PAGE bytes through select_offload_layout. The
     # family name is ``qwen``, which is not a page-mode key, so the pages stay
     # the dense MHA mode. An illegal offload_layout override fails here too.
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = model_type
+    config = _gdn_config(model_type)
 
     namespace = offcfg.build_page_namespace(config, _lmcache_config(), 4)
     assert namespace.startswith("org/model::atom-page-v")
     config.kv_transfer_config = {"offload_layout": "dense"}
     with pytest.raises(ValueError, match="owns no tier"):
         offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+
+def test_qwen38_page_namespace_separates_image_input():
+    """With image input Qwen3.8 caches `rope_positions` too, so one checkpoint
+    stores two byte layouts; a shared tier must not read one as the other."""
+    text_only = offcfg.build_page_namespace(
+        _qwen38_config(image_input=False), _lmcache_config(), 1
+    )
+    images = offcfg.build_page_namespace(
+        _qwen38_config(image_input=True), _lmcache_config(), 1
+    )
+    assert text_only != images
+    assert text_only == offcfg.build_page_namespace(
+        _qwen38_config(image_input=False), _lmcache_config(), 1
+    )
+
+
+def test_qwen38_page_namespace_separates_the_draft_cache_format(monkeypatch):
+    """BF16 draft rows under FP8 target rows add `*_draft` PAGE fields; a
+    restart that flips the draft format must not read the other block size."""
+    config = _qwen38_config(image_input=False)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "1")
+    bf16_draft = offcfg.build_page_namespace(config, _lmcache_config(), 1)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "0")
+    target_draft = offcfg.build_page_namespace(config, _lmcache_config(), 1)
+    assert bf16_draft != target_draft
+
+
+@pytest.mark.parametrize("model_type", [None, "qwen3_5_moe_text"])
+def test_draft_cache_format_leaves_other_page_namespaces_unchanged(
+    monkeypatch, model_type
+):
+    config = _config() if model_type is None else _gdn_config(model_type)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "1")
+    before = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "0")
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == before
+
+
+@pytest.mark.parametrize("model_type", [None, "qwen3_5_moe_text"])
+def test_image_input_leaves_other_page_namespaces_unchanged(model_type):
+    # Their segment set does not depend on it: keying it would only split a
+    # tier that text-only and image servers can share, and orphan what is
+    # already stored.
+    config = _config() if model_type is None else _gdn_config(model_type)
+    before = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    config.multimodal_config = SimpleNamespace()
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == before
 
 
 @pytest.mark.parametrize(
@@ -231,9 +314,7 @@ def test_gdn_page_namespace_names_ordinary_mha_pages(model_type):
 def test_gdn_state_tier_is_not_downgraded_to_dense(model_type):
     # An explicit `dense` override must not strip the state tier. Otherwise a
     # KV prefix is restored over a stale slot.
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = model_type
+    config = _gdn_config(model_type)
     config.kv_transfer_config = {"offload_layout": "dense"}
 
     with pytest.raises(ValueError, match="owns no tier"):
@@ -259,9 +340,7 @@ def test_offload_layout_override_cannot_downgrade_kimi_k3_to_dense():
 def test_offload_layout_override_cannot_swap_the_two_state_tiers(model_type, override):
     # `qwen` and `kimi_k3` both own a state tier, but each for its own family's
     # state: neither restores the other's, so the swap is refused too.
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = model_type
+    config = _gdn_config(model_type)
     config.kv_transfer_config = {"offload_layout": override}
 
     with pytest.raises(ValueError, match="owns no tier"):
@@ -493,6 +572,20 @@ def test_lmcache_metadata_rejects_duplicate_lookup_scope(monkeypatch):
         offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
 
 
+@pytest.mark.parametrize("kv_dtype", ["fp4", "nvfp4"])
+def test_lmcache_metadata_reports_fp4_pages_as_uint8(monkeypatch, kv_dtype):
+    import torch
+
+    _install_metadata_modules(monkeypatch)  # its d_dtypes has no FP4 entry
+    config = _config()
+    config.kv_cache_dtype = kv_dtype
+    config.index_cache_dtype = kv_dtype
+
+    metadata = offcfg.build_lmcache_metadata(config, _lmcache_config(), 4, 0)
+
+    assert metadata.kv_dtype is torch.uint8
+
+
 def test_lmcache_metadata_accepts_tuple_lookup_scope(monkeypatch):
     metadata_type = _install_metadata_modules(monkeypatch)
     cfg = _lmcache_config()
@@ -549,9 +642,7 @@ def test_only_v41_runs_on_its_layout(model_type, compress_ratios):
 @pytest.mark.parametrize("override", ["dsv41", "kimi_k3"])
 def test_a_state_owning_model_keeps_its_own_layout(override):
     """Another state-owning layout has no tier for this model's state either."""
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = "qwen3_next"
+    config = _gdn_config("qwen3_next")
     config.kv_transfer_config = {"offload_layout": override}
     with pytest.raises(ValueError, match="owns no tier"):
         offcfg.select_offload_layout(config)
@@ -559,15 +650,17 @@ def test_a_state_owning_model_keeps_its_own_layout(override):
     assert offcfg.select_offload_layout(config) == "qwen"
 
 
-def test_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
-    """V4.1 resolved to `hybrid` before it had a layout of its own, and keeps
-    the namespace native ATOM's tiers were filled under. Its window and
-    candidate-block fields move no namespace here, V4.1's or another model's:
-    only the vLLM plugin, which never had such tiers, hashes them."""
+def test_bf16_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
+    """BF16 PAGE bytes retain their historical layout and namespace.
+
+    Window and candidate-block fields do not change this PAGE format.
+    Quantized V4.1 has a separate namespace for its source planes.
+    """
     assert offcfg.PAGE_LAYOUT_VERSION == 3
 
     def namespace(model_type, **fields):
         config = _config()
+        config.kv_cache_dtype = "bf16"
         config.hf_config.model_type = model_type
         for name, value in fields.items():
             setattr(config.hf_config, name, value)
@@ -580,3 +673,38 @@ def test_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
     )
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "hybrid")
     assert v41 == namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)
+
+
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
+def test_v41_persistent_keys_include_the_page_format(monkeypatch, kv_dtype):
+    from atom.kv_transfer.offload.kv_store import keys as store_keys
+    from atom.kv_transfer.offload.mooncake_store import keys
+    from atom.kv_transfer.offload.mp import deployment
+
+    config = _config()
+    config.kv_cache_dtype = kv_dtype
+    config.hf_config.model_type = "deepseek_v41_text"
+    cfg = _lmcache_config()
+    world_size = offcfg.lmcache_replica_world_size(config)
+    # Old interleaved V4.1 pages used the hybrid PAGE namespace.
+    with monkeypatch.context() as legacy:
+        legacy.setattr(offcfg, "select_offload_layout", lambda _: "hybrid")
+        legacy_page = offcfg.build_page_namespace(config, cfg, world_size)
+    monkeypatch.setattr(offcfg, "build_lmcache_config", lambda _: cfg)
+    monkeypatch.setattr(store_keys, "kv_storage_formats", lambda _: {"gfx": "gfx950"})
+
+    def namespaces():
+        page = offcfg.build_page_namespace(config, cfg, world_size)
+        config.kv_transfer_config = {"kv_connector": "lmcache_mp"}
+        mp = deployment._model_namespace(config)
+        config.kv_transfer_config = {"kv_connector": "mooncake_store"}
+        store = keys.store_namespace(config, cfg.chunk_size)
+        return {"page": page, "lmcache_mp": mp, "mooncake_store": store}
+
+    current = namespaces()
+    with monkeypatch.context() as legacy:
+        legacy.setattr(offcfg, "build_page_namespace", lambda *_: legacy_page)
+        previous = namespaces()
+    # PAGE-only replay has no checkpoint identity to separate versions.
+    for name in current:
+        assert (current[name] == previous[name]) is (kv_dtype == "bf16"), name

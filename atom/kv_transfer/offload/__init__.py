@@ -50,9 +50,15 @@ def register_backends(factory) -> None:
         aliases=("LMCacheOffloadConnector", "LMCacheConnectorV1"),
         requires_pd_staging=False,
         offload=True,
+        reads_page_images=True,
         # The dense codec ignores the region map; every other layout reads it.
         # Which one applies comes from the model, so the registration says so.
         reads_block_regions=offload_layout_reads_block_regions,
+        # NVFP4 pages are self-contained (data and e4m3 scales inline, the global K/V
+        # scale 1.0), so they move as opaque per-block bytes.
+        moves_nvfp4_pages=True,
+        # The PAGE namespace hashes the draft KV dtype: another dtype never reads back.
+        moves_own_dtype_draft=True,
     )
 
     factory.register(
@@ -64,6 +70,7 @@ def register_backends(factory) -> None:
         aliases=("LMCacheMPConnector",),
         requires_pd_staging=False,
         offload=True,
+        reads_page_images=True,
         # One LMCache server for every DP rank.
         shared_tier=True,
         chunk_tokens="atom.kv_transfer.offload.config:lmcache_chunk_tokens",
@@ -80,13 +87,19 @@ def register_backends(factory) -> None:
         scheduler_class="MooncakeStoreOffloadScheduler",
         requires_pd_staging=False,
         offload=True,
+        min_load_tokens=512,
         # One Mooncake Store for every DP rank.
         shared_tier=True,
         chunk_tokens="atom.kv_transfer.offload.mooncake_store.config:store_chunk_tokens",
+        lowers_hbm_hit_to_chunk=True,
         # Same predicate as lmcache_offload: dense ignores the region map, and
         # M3 and V4.1 PAGE layouts read it. Other layouts are refused at
         # startup; see `check_engine_compatibility`.
         reads_block_regions=offload_layout_reads_block_regions,
         # Dense and PAGE codecs preserve all planes, including FP4 index scales.
         copies_whole_block_regions=True,
+        # PAGE units move whole, under a namespace that hashes both cache dtypes.
+        moves_nvfp4_pages=True,
+        # Its namespace builds on the PAGE namespace, which hashes the draft KV dtype.
+        moves_own_dtype_draft=True,
     )

@@ -29,7 +29,7 @@ import torch
 from atom.config import get_current_atom_config
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-from atom.utils.forward_context import plugin_graph_is_piecewise
+from atom.utils.forward_context import get_forward_context, plugin_graph_is_piecewise
 
 # ---------------------------------------------------------------------------
 # Dual-stream MoE dispatch (V2 / V3.2 / V4 / K3)
@@ -37,11 +37,24 @@ from atom.utils.forward_context import plugin_graph_is_piecewise
 #
 # Caller contract (the MoE module looked up by `layer_name`):
 #   - `_use_dual_stream: bool`
+#   - `_dual_stream_token_threshold: int` -- the largest row count that forks
+#     (`envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`)
+#   - `_dual_stream_decode_token_threshold: int` -- the same on decode steps
+#     (equal to the above unless the model sets its own decode default)
 #   - `single_stream_moe_forward(hidden_states) -> Tensor`
 #   - `dual_stream_moe_forward(hidden_states) -> Tensor`
 #
-# Per-token gating: decode benefits from dual-stream, prefill doesn't —
-# threshold from `envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`.
+# Per-call row gating: a call with more rows than its step's bound
+# (`_dual_stream_row_bound`) stays single-stream.
+
+
+def _dual_stream_row_bound(self) -> int:
+    """The row bound for this call: the decode bound on a decode step, the
+    generic one on a prefill step or where no step context is set."""
+    context = get_forward_context().context
+    if context is not None and not context.is_prefill:
+        return self._dual_stream_decode_token_threshold
+    return self._dual_stream_token_threshold
 
 
 def _dual_stream_is_active(self, num_tokens: int) -> bool:
@@ -57,7 +70,7 @@ def _dual_stream_is_active(self, num_tokens: int) -> bool:
     # plugin frontend's own PIECEWISE graphs are left single-stream.
     return (
         self._use_dual_stream
-        and 0 < num_tokens <= envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        and 0 < num_tokens <= _dual_stream_row_bound(self)
         and not tbo_active()
         and not plugin_graph_is_piecewise()
     )
@@ -100,6 +113,8 @@ direct_register_custom_op(
 #
 # Caller contract (the MoE module looked up by `layer_name`):
 #   - `_use_dual_stream: bool`
+#   - `_dual_stream_token_threshold: int`,
+#     `_dual_stream_decode_token_threshold: int` (as above)
 #   - `single_stream_split_moe_forward(hidden_states) -> (Tensor, Tensor)`
 #   - `dual_stream_split_moe_forward(hidden_states) -> (Tensor, Tensor)`
 #
@@ -223,8 +238,8 @@ def tbo_all_reduce(x: torch.Tensor) -> torch.Tensor:
     if not tbo_active():
         return tensor_model_parallel_all_reduce(x)
 
-    # Default "inline": correct Plan-A baseline (no overlap, never hangs). Only
-    # move the AR onto the comm stream when explicitly opted into "overlap".
+    # "inline": the plain all-reduce on the compute stream (no overlap).
+    # "overlap" (default): on the comm stream, overlapping the partner ubatch.
     if envs.ATOM_TBO_TP_AR_MODE != "overlap":
         return tensor_model_parallel_all_reduce(x)
 
@@ -232,27 +247,20 @@ def tbo_all_reduce(x: torch.Tensor) -> torch.Tensor:
         tbo_current_ubatch_id,
         tbo_get_comm_stream,
         tbo_get_ubatch_tp_comm,
-        tbo_switch_to_compute_sync,
-        tbo_yield_and_switch_from_compute_to_comm,
+        tbo_on_comm,
     )
 
-    ubatch_id = tbo_current_ubatch_id()
-
-    ub_comm = tbo_get_ubatch_tp_comm(ubatch_id)
+    ub_comm = tbo_get_ubatch_tp_comm(tbo_current_ubatch_id())
     if ub_comm is None:
         # world_size == 1: nothing to reduce.
         return x
 
-    # Hand the CPU baton to the partner ubatch and move onto the comm stream,
-    # so this AR overlaps the partner's compute.
-    tbo_yield_and_switch_from_compute_to_comm()
-    comm_stream = tbo_get_comm_stream()
-    # out-of-place all_reduce on this ubatch's dedicated communicator, launched
-    # on the comm stream (current stream after the switch above).
-    x = ub_comm.all_reduce(x, stream=comm_stream)
-
-    tbo_switch_to_compute_sync()
-    return x
+    # Out-of-place all_reduce on this ubatch's dedicated communicator, on the
+    # comm stream, overlapping the partner ubatch's compute. Not held: see
+    # `tbo_on_comm`.
+    return tbo_on_comm(
+        lambda: ub_comm.all_reduce(x, stream=tbo_get_comm_stream()), hold=False
+    )
 
 
 def _tbo_all_reduce_fake(x: torch.Tensor) -> torch.Tensor:

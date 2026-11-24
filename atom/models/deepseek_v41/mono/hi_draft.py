@@ -125,9 +125,14 @@ class HiDraft:
         drafter on first use), or None without a drafter."""
         aux = self.aux
         if aux is None and self.cx_drafter is not None:
+            from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
             from atom.mono.runtime.aux_taps import bind_aux_taps
 
-            aux = self.aux = bind_aux_taps(self.cx_drafter, self.h_in0.shape[-1])
+            aux = self.aux = bind_aux_taps(
+                self.cx_drafter,
+                self.h_in0.shape[-1],
+                DeepseekV41DSpark._target_layer_input,
+            )
         if aux is None or len(aux.buffers) != self.D.TAPS:
             return None
         return list(aux.buffers)

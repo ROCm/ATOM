@@ -517,7 +517,7 @@ class K3MonoDecodeRunner:
             # K2 updates ``prefix`` in place: on a block-write layer it restarts
             # it at the all-reduced o_proj output, which K1 has already banked
             out = (prefix, self._k2(build, plan, core, prefix, blocks), None)
-        self._write_aux(plan.layer_id, out)
+        self._write_aux(plan.layer_id, out, blocks)
         return out
 
     def _pre_o_core(self, plan, positions, prefix, blocks, add, add2):
@@ -555,7 +555,7 @@ class K3MonoDecodeRunner:
         )
         return layer, normed, prefix, before, write_idx
 
-    def _write_aux(self, layer_id: int, out: tuple) -> None:
+    def _write_aux(self, layer_id: int, out: tuple, blocks) -> None:
         """This layer's aux hidden state, for a DSpark drafter tapping it.
 
         The drafter hooks ``layers[layer_id]`` (``Drafter.arm_aux_capture``),
@@ -565,17 +565,17 @@ class K3MonoDecodeRunner:
         production step left in the buffer: every DSpark deployment would
         draft from stale features.
 
-        The reconstruction is the layer's own ``aux_hidden_state``, called on
-        this step's return rather than reimplemented, so the two cannot drift
-        apart -- which is exactly what that method's docstring asks of a caller.
-        ``out`` is ``(prefix, add, add2)``; the layer's own return carries the
-        block residual in a fourth slot that the reconstruction ignores, and
-        mono keeps that in ``blocks``.
+        So this runs the drafter's own extract, the function its hook would
+        have run, on this step's return rather than reimplementing it, so the
+        two cannot drift apart. ``out`` is ``(prefix, add, add2)``; the layer's
+        own return carries the block bank in a fourth slot, and mono keeps that
+        in ``blocks`` -- a fixed-size slot stack, not the forward's grown
+        ``cat``, so only the slots banked so far hold this step's data.
         """
         if layer_id not in self.aux.layer_ids:
             return
-        layer = self.inner.layers[layer_id]
-        self.aux.write(layer_id, layer.aux_hidden_state((*out, None)))
+        tap = self.aux.extract((*out, blocks), self.inner.layers[layer_id])
+        self.aux.write(layer_id, tap)
 
     def _fallback(self, plan, positions, prefix, blocks, add, add2):
         """``KimiDecoderLayer.forward`` with ``maybe_close_block``'s ``cat``

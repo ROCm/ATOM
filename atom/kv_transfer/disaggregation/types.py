@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -243,10 +244,37 @@ class KVTransferRegion:
     # makes equal-sized planes distinguishable across code versions.
     semantic_role: str | None = None
 
+    @staticmethod
+    def unit_offset(
+        index: int, total_bytes: int, unit_bytes: int, reverse_indexed: bool
+    ) -> int:
+        if reverse_indexed:
+            return total_bytes - (index + 1) * unit_bytes
+        return index * unit_bytes
+
+    @staticmethod
+    def chunk_sizes(total_bytes: int, unit_bytes: int, max_bytes: int) -> list[int]:
+        """Split a region into MR chunks, each <= ``max_bytes`` and, apart from
+        the last, a whole number of units, so no unit crosses an MR boundary.
+
+        A unit larger than ``max_bytes`` cannot be aligned and is left to
+        straddle.
+        """
+        sizes: list[int] = []
+        offset = 0
+        while offset < total_bytes:
+            remaining = total_bytes - offset
+            chunk = min(max_bytes, remaining)
+            if chunk < remaining and chunk >= unit_bytes > 0:
+                chunk -= chunk % unit_bytes
+            sizes.append(chunk)
+            offset += chunk
+        return sizes
+
     def unit_addr(self, index: int) -> int:
-        if self.reverse_indexed:
-            return self.base_addr + self.total_bytes - (index + 1) * self.unit_bytes
-        return self.base_addr + index * self.unit_bytes
+        return self.base_addr + self.unit_offset(
+            index, self.total_bytes, self.unit_bytes, self.reverse_indexed
+        )
 
 
 @dataclass(frozen=True)
@@ -322,9 +350,9 @@ class PageRegion:
 
     region: KVTransferRegion
     view: Any = None
-    # `(runs, heads)`: the unit is `runs` equal runs, each holding this rank's
-    # `heads` KV heads one after another. None: not per head (replicated).
-    head_major_runs: tuple[int, int] | None = None
+    # `(heads, widths)`: one run per width, each this rank's `heads` KV heads of
+    # `width` B one after another. None: not per head (replicated).
+    head_major_runs: tuple[int, tuple[int, ...]] | None = None
     unit_spec: PageUnitSpec | None = None
 
 
@@ -409,6 +437,21 @@ class KVTransferTensors:
     # those are ordinary PAGE KV, never part of the state image. None means
     # every region. Appended for positional compatibility.
     paged_state_region_count: int | None = None
+    # `slot_regions`' twin of `block_region_consumer_indices`: where each
+    # region sits in a whole-model peer's slot region list, for a layout the
+    # connector's group-major inference (layer l of group g at
+    # g * (peer regions / groups) + `start_layer` + l) cannot place: a PP stage
+    # of a hybrid, whose slot regions count recurrent layers only.
+    slot_region_consumer_indices: list[int] | None = None
+    # Per slot region, the byte runs one unit splits into, each sharded
+    # contiguously over TP ranks: a peer at k times this side's TP holds the
+    # q-th k-th of every run, concatenated in run order. None for a region
+    # that cannot be split; a region in `slot_region_tp_replicated` ignores
+    # its segments and moves whole.
+    slot_region_tp_segments: list[tuple[int, ...] | None] | None = None
+    # Per slot region, whether every TP rank holds the same unit (ReplaySSM's
+    # cursor), so a peer at any TP size takes it whole instead of a shard.
+    slot_region_tp_replicated: list[bool] | None = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is
@@ -429,6 +472,15 @@ class KVTransferTensors:
         the producer published addresses only.
         """
         return tuple(page.view for page in self.pages if page.view is not None)
+
+    def without_slots(self) -> KVTransferTensors:
+        """A copy without the live request SLOTs a composite P/D connector
+        publishes, for an offload tier that rebuilds state by replay; the shared
+        descriptor stays intact for the other connector."""
+        pages = copy(self)
+        pages.num_slots = 0
+        pages.slot_regions = []
+        return pages
 
     def merge_pages(self, other: KVTransferTensors) -> None:
         """Append another contributor's PAGE units (a draft's own pool).

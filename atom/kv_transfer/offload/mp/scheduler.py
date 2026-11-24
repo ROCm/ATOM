@@ -17,7 +17,10 @@ from atom.kv_transfer.disaggregation.types import (
     req_id_of,
 )
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload._offload_common import validated_kv_role
+from atom.kv_transfer.offload._offload_common import (
+    tier_lookup_kwargs,
+    validated_kv_role,
+)
 from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
@@ -146,7 +149,11 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         for seq in seqs:
             if self._lookup_len(seq) <= 0:
                 continue
-            client.offer(str(seq.id), functools.partial(self._offered_tokens, seq))
+            client.offer(
+                str(seq.id),
+                functools.partial(self._offered_tokens, seq),
+                **tier_lookup_kwargs(seq),
+            )
 
     def _offered_tokens(self, seq: Any) -> list[int] | None:
         """The prompt to look up, or None once `seq` stopped waiting for one.
@@ -211,7 +218,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         load_spec = self._load_specs.get(sid)
         if load_spec is None:
             return matched
-        if self.block_size == 1:
+        if self.virtual_block_size == 1:
             # Allocating prompt-1 one-token blocks cannot provide a destination
             # for the complete final LMCache chunk. Recompute instead.
             self._clear_pending_load(sid)
@@ -259,8 +266,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                     int(end),
                 )
         # Also catches retirements that bypass _finish_retired_request, such as
-        # a late save with nothing left to store.
-        self._end_finished_sessions()
+        # a late save with nothing left to store. The shared builder above has
+        # already advanced the lookups this step.
+        self._end_finished_sessions(reconcile=False)
         stats = getattr(self._lookup_client, "driver_stats", None)
         if stats:
             for key, value in stats.items():
@@ -404,7 +412,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         """
         return self.__dict__.setdefault("_sessions_to_end", {})
 
-    def _end_finished_sessions(self) -> None:
+    def _end_finished_sessions(self, *, reconcile: bool = True) -> None:
         """End each finished request's session once no save or lookup remains.
 
         A detached lookup (`detach_lookup`) can outlive its request. If
@@ -417,18 +425,18 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         # Pumped on every pass: a detached lookup must be released even while
         # its request is still transferring and the waiting queue, which
         # drives `prefetch_lookups`, is empty.
+        # Terminal-only calls still need the shared reconciliation to free
+        # detached lookup locks; the metadata build has already done it.
+        if reconcile:
+            self._reconcile_lookups_each_step()
         client = self._lookup_client
-        pump = getattr(client, "pump", None)
-        if callable(pump):
-            pump()
-        self.reconcile_detached_lookups()
         pending = self._pending_session_ends()
-        in_flight = getattr(client, "is_pending", None)
+
         for sid, seq in list(pending.items()):
             entry = self._save_tracker.get(sid)
             if (entry is not None and entry[0] is seq) or sid in self._save_inflight:
                 continue
-            if callable(in_flight) and in_flight(sid):
+            if client is not None and client.is_pending(sid):
                 continue
             del pending[sid]
             # No save can follow now: the workers' copy of its tokens goes.

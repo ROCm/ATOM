@@ -68,9 +68,10 @@ def _prefetch(prefetch, rows: int | None, race: bool | str = False) -> int:
 
 
 # x's K slices at least (ArgmaxHead kparts; 0: the fewest that fit the LDS), by rows: KPARTS_ROWS[r] from r rows on.
-# The batch band's widths (compile only at TP4): at 28-30 rows the 2 slices that fit the LDS land ~75 VGPRs of
-# x beside the prefetch (14-15 spilled to memory at any prefetch); 4 slices build at 30 rows (B5, prefetch 16, greedy
-# and sampling); from 36 rows (3 16-row chunks) 10 slices with 8 units of prefetch build at 36-48 (B6-8), 16 do not
+# The batch band's widths (measured compile-only at TP4; not TP-keyed, so TP2 / TP8 bands take them too): at 28-30
+# rows the 2 slices that fit the LDS land ~75 VGPRs of x beside the prefetch (14-15 spilled to memory at any
+# prefetch); 4 slices build at 30 rows (B5, prefetch 16, greedy and sampling); from 36 rows (3 16-row chunks) 10
+# slices with 8 units of prefetch build at 36-48 (B6-8), 16 do not
 KPARTS_ROWS: dict[int, int] = {25: 4, 31: 10}
 
 
@@ -220,8 +221,8 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, **knobs)
         ]
     )
     wide = (
-        sc.tp > KEY_TP
-    )  # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: up to 12)
+        sc.tp != KEY_TP
+    )  # at a tp other than the entries': SGPR spills into VGPR lanes allowed (TP8: up to 12; TP2 band 6: 2)
     # a sharded fold (the rank columns of R): SGPR spills into VGPR lanes allowed (B = 4: 1, 5 with sampling)
     spill = residual_layout(sc.tp, rows=sc.rows) == "sharded" or wide
     return Program(name, sc, stages, host_regions=chain_regions(sc), peer_first=chain_peer_first(sc.tp, rows=sc.rows),

@@ -38,6 +38,11 @@ pub struct RouteDecision {
     pub branch: &'static str,
     /// Prefix match ratio of the best candidate, for policies that estimate one.
     pub match_ratio: Option<f64>,
+    /// Expected prefix cache hit ratio on the selected worker, reconciled with the
+    /// cached tokens its response reports. `cache_aware`'s tree branches set it only
+    /// when the selected worker is the best candidate, its KV event branches always;
+    /// other policies leave it None.
+    pub estimated_hit_ratio: Option<f64>,
 }
 
 impl RouteDecision {
@@ -45,6 +50,7 @@ impl RouteDecision {
         Self {
             branch,
             match_ratio: None,
+            estimated_hit_ratio: None,
         }
     }
 }
@@ -109,6 +115,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     }
 
     fn needs_tokens(&self) -> bool {
+        false
+    }
+
+    /// The policy routes better with the request's tokens but routes without them too, so
+    /// the router tokenizes the request only when it can.
+    fn wants_tokens(&self) -> bool {
         false
     }
 
@@ -188,6 +200,8 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    /// The request has media, so its tokens cannot match the KV event index.
+    pub carries_media: bool,
 }
 
 #[cfg(test)]

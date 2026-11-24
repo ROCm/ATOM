@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
@@ -26,7 +27,10 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
-from atom.model_ops.attentions.pool_layout.paged_state_copy import DescriptorStaging
+from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+    DescriptorStaging,
+    launch_copy_descriptor,
+)
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
 from atom.model_ops.attentions.sparse_mla_head_groups import PERSISTENT_WORK_BUFFERS
@@ -63,12 +67,6 @@ PAD_SLOT_ID = -1
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
-    #: Whether a *draft* of this flavor caches into a pool of its own. False
-    #: means its rows are the target's -- an MLA draft's latent is the target's
-    #: latent -- and `make_kv_pool` below is never asked. A property of the
-    #: flavor, so a class answer and not a call.
-    DRAFT_OWNS_KV_POOL: ClassVar[bool] = False
-
     @staticmethod
     @abstractmethod
     def get_name() -> str:
@@ -91,14 +89,22 @@ class AttentionBackend(ABC):
         target_block_size: int,
         layers: int,
         kv_dtype,
+        blocks_per_entry: int = 1,
+        flash_layout: bool = False,
     ):
         """A pool of `layers` rows at this config's geometry.
 
-        Asked of a *draft* model's backend, and only where `DRAFT_OWNS_KV_POOL`
-        — the target's layers are its builder's own business. Both counts are
-        told rather than read: `layers` only the walk knows, and the block only
-        the target builder, whose it is and not this backend's for the reason
-        in `DraftKvBuilder.kv_pool`.
+        Asked of a *draft* model's backend, and only for a family in
+        `selector.DRAFT_POOL_FAMILIES` — the target's layers are its builder's
+        own business. Both counts are told rather than read: `layers` only the
+        walk knows, and the block only the target builder, whose it is and not
+        this backend's for the reason in `DraftKvBuilder.kv_pool`.
+
+        `blocks_per_entry` and `flash_layout` are what a draft's
+        `DraftKvPoolSpec.pool_kwargs` adds: an entry spanning that many
+        `target_block_size` blocks, stored in the FLASH order. The defaults are
+        the generic pool, one block per entry in the SHUFFLE order, which is
+        all a draft without a `kv_pool_spec` is built with.
         """
         raise NotImplementedError
 
@@ -193,6 +199,22 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         before it, alike on every TP rank."""
         return False
 
+    def settles_spec_status(self, batch: ScheduledBatch, max_seqlen_q: int) -> bool:
+        """True when this builder stages the step before the previous verify's
+        host-side status and restages what the status moves once it is taken
+        (`take_spec_status`): the wait then overlaps the staging and the rest
+        of the step's preparation. Asked once a step, before its input ids;
+        ignored when the step `consumes_device_verdict`."""
+        return False
+
+    def take_spec_status(self, processor) -> None:
+        """Take the previous verify's host-side status, owed by this step
+        (`tokenIDProcessor.take_deferred_spec_status`): where the runner ends
+        the step's preparation, before the target's launch, so everything
+        before it overlaps the wait. A builder that `settles_spec_status`
+        finishes the step there (its heads, and what reads them)."""
+        processor.take_deferred_spec_status()
+
     def close(self):
         """Release backend-owned host workers and mapped resources."""
         self.release_kv_pools()
@@ -264,6 +286,17 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         for buf in targets:
             buf.np[:] = PAD_SLOT_ID
             buf.copy_to_gpu()
+
+    def reset_cache_after_capture(self) -> None:
+        """Undo what the capture wrote into the cache, before any request runs.
+
+        `blank_cache_write_targets` keeps writes made through the slot mapping
+        off the cache. A backend whose capture writes through real slots or a
+        placeholder block (there is no null slot or block to point it at)
+        leaves that behind, and the next request given the slot or block
+        inherits it. Such a backend overrides this; the default has nothing to
+        undo.
+        """
 
     # ------------------------------------------------------------------ #
     # Cache sizing — one byte currency for every cache class.             #
@@ -440,14 +473,27 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return staging
 
     def warmup_per_req_cache(self) -> None:
-        """Pay whatever the first checkpoint copy would pay, before serving.
+        """Warm checkpoint planning, staging and copying without changing bytes.
 
-        Called once by ModelRunner after `allocate_per_req_cache`'s pools are
-        installed, which is the earliest a backend can reach its own addresses.
-        Nothing else warms this path: `execute_paged_state_copies` runs only
-        from `build()`, so a backend that compiles a kernel or fills a cache
-        there does it inside a live request's batch. A no-op by default.
+        ModelRunner calls this after installing the per-request pools. Each
+        planned span copies onto itself, preserving both pages and initialized
+        state even when eager startup has no later capture reset.
         """
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            return
+        plan = self._checkpoint_copy_plan()
+        if not plan.num_spans:
+            return
+        staging = self._checkpoint_staging()
+        rows = staging.rows(0)[: plan.num_spans]
+        destinations = np.zeros(
+            (1, len(self._page_unit_stream_sizes(spec.units_per_checkpoint))),
+            dtype=np.int64,
+        )
+        plan.write_descriptor(rows, self._checkpoint_slot_bases()[:1], destinations)
+        rows[:, 1] = rows[:, 0]
+        launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
 
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.

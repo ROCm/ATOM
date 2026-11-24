@@ -114,6 +114,152 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
         assert_eq!(result.unwrap_err().code, "token_routing_unsupported");
     }
 }
+
+#[tokio::test]
+async fn chats_rendered_without_their_template_are_not_tokenized() {
+    let config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::PrefixHash {
+            prefix_token_count: 4,
+            load_factor: 1.25,
+        },
+        ..Default::default()
+    };
+    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, _pool.handle())
+        .await
+        .unwrap();
+    let id = TokenizerRegistry::generate_id();
+    app.tokenizer_registry
+        .load(&id, "m", "hf-test", || async {
+            Ok(crate::routers::test_mocks::tokenizer::hf_tokenizer())
+        })
+        .await
+        .unwrap();
+    for marked in [false, true] {
+        if marked {
+            app.chats_without_template.write().insert(id.clone());
+        }
+        let parsed = ParsedInference::parse(
+            "/v1/chat/completions",
+            br#"{"model":"m","messages":[{"role":"user","content":"test"}]}"#,
+        )
+        .unwrap();
+        let routing = IngressRouting::new(&app);
+        let result = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        if marked {
+            assert_eq!(result.unwrap_err().code, "token_routing_unsupported");
+        } else {
+            assert!(result.unwrap().1.is_some());
+        }
+    }
+}
+
+fn prefix_hash() -> crate::config::PolicyConfig {
+    crate::config::PolicyConfig::PrefixHash {
+        prefix_token_count: 4,
+        load_factor: 1.25,
+    }
+}
+
+/// A byte-level tokenizer twice: as HuggingFace loads it, and encoding with fastokens.
+fn huggingface_and_fastokens(
+    chat_template: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<dyn crate::tokenizer::traits::Tokenizer>,
+    Arc<dyn crate::tokenizer::traits::Tokenizer>,
+) {
+    use crate::routers::test_mocks::tokenizer::{byte_level_tokenizer_dir, BYTE_LEVEL_MERGES};
+    let config = json!({"chat_template": chat_template});
+    let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, false, config);
+    let path = dir.path().join("tokenizer.json");
+    let hf = crate::tokenizer::factory::create_tokenizer(path.to_str().unwrap()).unwrap();
+    let fast = crate::routers::prepare::fast_tokenizer::FastTokenizer::new(hf.clone(), &path, 0);
+    (dir, hf, Arc::new(fast.unwrap()))
+}
+
+/// Models fastokens encodes tokenize up to a limit of their own, and render their
+/// chats with the HuggingFace template.
+#[tokio::test]
+async fn fastokens_models_tokenize_up_to_their_own_limit() {
+    let mut config = crate::config::RouterConfig {
+        policy: prefix_hash(),
+        ..Default::default()
+    };
+    config.prepare_pool.max_tokenize_bytes = Some(16);
+    config.fastokens.max_tokenize_bytes = Some(1024);
+    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, _pool.handle())
+        .await
+        .unwrap();
+    let template =
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}";
+    let (_dir, hf, fast) = huggingface_and_fastokens(template);
+    for (model, tokenizer) in [("hf", hf.clone()), ("fast", fast)] {
+        app.tokenizer_registry
+            .load(&TokenizerRegistry::generate_id(), model, model, || async {
+                Ok(tokenizer)
+            })
+            .await
+            .unwrap();
+    }
+    let long = "the weather ".repeat(100);
+    for prompt in ["the weather in 2026 is fine", &long] {
+        for (route, body, text) in [
+            (
+                "/v1/completions",
+                json!({"prompt": prompt}),
+                prompt.to_string(),
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"messages": [{"role": "user", "content": prompt}]}),
+                format!("<|im_start|>user\n{prompt}<|im_end|>\n"),
+            ),
+        ] {
+            for model in ["hf", "fast"] {
+                let mut body = body.clone();
+                body["model"] = json!(model);
+                let parsed =
+                    ParsedInference::parse(route, &serde_json::to_vec(&body).unwrap()).unwrap();
+                let routing = IngressRouting::new(&app);
+                let result = app
+                    .prepare_pool
+                    .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                        routing.prepare(&parsed, ctx)
+                    })
+                    .await
+                    .unwrap()
+                    .wait()
+                    .await
+                    .unwrap();
+                if model == "hf" || prompt.len() > 1024 {
+                    assert_eq!(
+                        result.unwrap_err().code,
+                        "tokenizer_input_too_large",
+                        "{route} {model}"
+                    );
+                } else {
+                    let tokens = result.unwrap().1.unwrap();
+                    assert_eq!(
+                        tokens,
+                        hf.encode(&text, false).unwrap().token_ids(),
+                        "{route}"
+                    );
+                }
+            }
+        }
+    }
+}
 fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -261,6 +407,130 @@ async fn lightweight_http_routing_needs_no_second_pool_submission() {
             assert_eq!(candidates[0].model_id(), "m");
         }
     }
+}
+
+/// The PD router's and ext-proc's planners select decode first under ATOM's idx2idx only.
+#[tokio::test]
+async fn idx2idx_planners_select_prefill_on_the_decode_rank() {
+    use crate::config::{AtomPdRankMappingPolicy, BackendType};
+    use crate::core::{
+        placement::{test_support::make_descriptor, PdPlanner, PlacementPlan},
+        DPAwareWorkerBuilder,
+    };
+    use crate::routers::http_pd_router::PDRouter;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let kv_transfer_info = Router::new().route(
+        "/kv_transfer_info",
+        get(|| async { axum::Json(json!({"tp_size": 1, "kv_role": "kv_producer"})) }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, kv_transfer_info).await });
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let descriptor = make_descriptor(Some("m"), None, None, None);
+    for (backend, decode_first) in [(BackendType::Atom, true), (BackendType::Sglang, false)] {
+        let config = crate::config::RouterConfig {
+            backend,
+            atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::Idx2Idx,
+            ..Default::default()
+        };
+        let app = Arc::new(
+            AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
+        let prefill = WorkerType::Prefill {
+            bootstrap_port: None,
+        };
+        let workers: Vec<Arc<dyn Worker>> = [
+            (base.as_str(), 0, prefill.clone()),
+            (base.as_str(), 1, prefill),
+            ("http://d", 1, WorkerType::Decode),
+        ]
+        .into_iter()
+        .map(|(url, rank, kind)| {
+            let builder = DPAwareWorkerBuilder::new_with_type(url, rank, 2, kind);
+            Arc::new(builder.model_id("m").build()) as Arc<dyn Worker>
+        })
+        .collect();
+        for worker in &workers {
+            app.worker_registry.register(worker.clone());
+        }
+        app.policy_registry
+            .set_prefill_policy(Arc::new(crate::policies::RoundRobinPolicy::new()));
+        let policies = Arc::new(PolicyRegistryAdapter::new(app.policy_registry.clone()));
+        let ingress = IngressRouting::new(&app).planner(workers, policies);
+        let router = PDRouter::new(&app).await.unwrap();
+
+        for planner in [&ingress as &dyn PdPlanner, router.planner.as_ref()] {
+            let mut ranks = HashSet::new();
+            for _ in 0..4 {
+                match planner.plan(&descriptor).await.unwrap() {
+                    PlacementPlan::Pair { prefill, .. } => ranks.insert(prefill.dp_rank()),
+                    other => panic!("expected Pair, got {other:?}"),
+                };
+            }
+            assert_eq!(
+                ranks == HashSet::from([Some(1)]),
+                decode_first,
+                "{backend:?}"
+            );
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn regular_cached_tokens_are_reconciled_against_the_estimate() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let usage = r#"{"usage":{"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+    let engine = Router::new().fallback(move || async move {
+        ([(http::header::CONTENT_TYPE, "application/json")], usage)
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
+    let policy = crate::config::PolicyConfig::CacheAware {
+        cache_threshold: 0.5,
+        balance_abs_threshold: 64,
+        balance_rel_threshold: 1.5,
+        eviction_interval_secs: 60,
+        max_tree_size: 1 << 20,
+    };
+    let (_pool, app, router) = preparation_test_router(false, policy).await;
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(&url).model_id("m").build());
+    app.worker_registry.register(worker.clone());
+    app.policy_registry.on_worker_added("m", None);
+    app.policy_registry.init_cache_aware_policy("m", &[worker]);
+    for _ in 0..2 {
+        let request = InferenceEnvelope::parse(
+            "/v1/completions".parse().unwrap(),
+            json_headers(),
+            Bytes::from_static(br#"{"model":"m","prompt":"test"}"#),
+            &app,
+        )
+        .await
+        .unwrap();
+        let response = router.route_inference(request, &app).await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+    }
+
+    // The first request matches none of its text on the only worker; the second, all of it.
+    let rendered = handle.render();
+    for line in [
+        r#"mesh_route_cache_tokens_total{pool="regular",kind="prompt"} 200"#,
+        r#"mesh_route_cache_tokens_total{pool="regular",kind="cached"} 80"#,
+        r#"mesh_route_cache_estimate_tokens_total{pool="regular",kind="estimated"} 100"#,
+        r#"mesh_route_cache_estimate_tokens_total{pool="regular",kind="actual"} 80"#,
+    ] {
+        assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+    }
+    server.abort();
 }
 
 #[tokio::test]
@@ -782,6 +1052,7 @@ async fn tokenize_endpoint_limits_the_total_prompt_bytes() {
     let pool = PreparePoolRuntime::new(default_pool()).unwrap();
     let mut config = crate::config::RouterConfig::default();
     config.prepare_pool.max_tokenize_bytes = Some(11);
+    config.fastokens.max_tokenize_bytes = Some(20);
     let context = Arc::new(
         AppContext::from_config(config, 5, pool.handle())
             .await
@@ -794,16 +1065,38 @@ async fn tokenize_endpoint_limits_the_total_prompt_bytes() {
         .load("limited", "m", "mock", || async { Ok(tokenizer) })
         .await
         .unwrap();
-    for (prompt, status) in [
-        (json!("hello world"), http::StatusCode::OK),
-        (json!(["hello", "world!"]), http::StatusCode::OK),
-        (json!("hello world!"), http::StatusCode::PAYLOAD_TOO_LARGE),
+    let (_dir, _, fast) = huggingface_and_fastokens("");
+    context
+        .tokenizer_registry
+        .load("fast", "fast", "fast", || async { Ok(fast) })
+        .await
+        .unwrap();
+    for (model, prompt, status) in [
+        ("m", json!("hello world"), http::StatusCode::OK),
+        ("m", json!(["hello", "world!"]), http::StatusCode::OK),
         (
+            "m",
+            json!("hello world!"),
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "m",
             json!(["hello", "world!!"]),
             http::StatusCode::PAYLOAD_TOO_LARGE,
         ),
+        // Models fastokens encodes have a limit of their own.
+        (
+            "fast",
+            json!(["hello world", "again!!!!"]),
+            http::StatusCode::OK,
+        ),
+        (
+            "fast",
+            json!("hello world, again!!!"),
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+        ),
     ] {
-        let request = json_request("/v1/tokenize", json!({"model": "m", "prompt": prompt}));
+        let request = json_request("/v1/tokenize", json!({"model": model, "prompt": prompt}));
         let response = crate::routers::comm::tokenize::tokenize(&context, request).await;
         assert_eq!(response.status(), status, "{prompt}");
         if status == http::StatusCode::PAYLOAD_TOO_LARGE {
@@ -821,11 +1114,15 @@ fn json_request(path: &str, body: serde_json::Value) -> Request {
         .unwrap()
 }
 
-async fn error_type(response: Response) -> serde_json::Value {
+async fn body_json(response: Response) -> serde_json::Value {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["type"].clone()
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn error_type(response: Response) -> serde_json::Value {
+    body_json(response).await["error"]["type"].clone()
 }
 
 #[tokio::test]
@@ -1040,6 +1337,188 @@ async fn token_routing_is_prepared_in_the_parse_job_or_needs_the_pool_again() {
     let (_, (metadata, tokens)) = request.prepare_routing(&closed, &routing).await.unwrap();
     assert_eq!(metadata.text, "hello world");
     assert!(tokens.is_some_and(|tokens| !tokens.is_empty()));
+}
+
+/// With `--kv-events`, `cache_aware` wants tokens, and a request whose model the router
+/// cannot tokenize is still prepared, by its text, its model warned about once. Messages,
+/// which have no token-routing template, are not tokenized or warned about.
+#[tokio::test]
+async fn wanted_tokens_fall_back_to_the_text() {
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+        },
+        kv_events: true,
+        ..Default::default()
+    };
+    let app = AppContext::from_config(config, 5, pool.handle())
+        .await
+        .unwrap();
+    let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+        Arc::new(crate::tokenizer::MockTokenizer::new());
+    app.tokenizer_registry
+        .load("mock-id", "m", "mock", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    let chat = json!({"model": "untokenized", "messages": [{"role": "user", "content": "hi"}]});
+    let messages = json!({"model": "messages", "messages": [{"role": "user", "content": "hi"}]});
+    for (path, body, model, tokenized, warned) in [
+        (
+            "/generate",
+            json!({"model": "m", "text": "hello world"}),
+            "m",
+            true,
+            false,
+        ),
+        ("/v1/chat/completions", chat, "untokenized", false, true),
+        ("/v1/messages", messages, "messages", false, false),
+    ] {
+        let parsed = ParsedInference::parse(path, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let text = parsed.metadata_with_text(true).text;
+        let routing = IngressRouting::new(&app);
+        let (metadata, tokens) = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.text, text);
+        assert_eq!(tokens.is_some(), tokenized, "{model}");
+        assert_eq!(UNTOKENIZED_MODELS.contains(model), warned, "{model}");
+    }
+}
+
+/// A P/D pair's policies share the request's tokens. With `--kv-events`, they carry the
+/// special tokens, as ATOM stores the blocks `cache_aware` matches, even with `prefix_hash`
+/// the other, which needs them.
+#[tokio::test]
+async fn tokens_cache_aware_wants_carry_the_special_tokens_in_any_pair() {
+    use crate::policies::{CacheAwarePolicy, LoadBalancingPolicy, PrefixHashPolicy};
+    let prefix_hash =
+        || -> Arc<dyn LoadBalancingPolicy> { Arc::new(PrefixHashPolicy::new(Default::default())) };
+    let cache_aware = || -> Arc<dyn LoadBalancingPolicy> { Arc::new(CacheAwarePolicy::new()) };
+    // A tokenizer that, as Llama's, puts `<s>`, id 0, before the words.
+    let dir = tempfile::tempdir().unwrap();
+    let special = |id: u32, content: &str| {
+        json!({"id": id, "content": content, "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": true})
+    };
+    let tokenizer = json!({"version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [special(0, "<s>"), special(1, "<unk>")], "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "unk_token": "<unk>",
+            "vocab": {"<s>": 0, "<unk>": 1, "a": 2, "b": 3}}});
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, tokenizer.to_string()).unwrap();
+    let config = json!({"add_bos_token": true, "bos_token": "<s>"});
+    std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+    for (kv_events, prefill, decode, want) in [
+        (true, prefix_hash(), cache_aware(), &[0, 2, 3][..]),
+        (true, cache_aware(), prefix_hash(), &[0, 2, 3]),
+        (false, prefix_hash(), cache_aware(), &[2, 3]),
+    ] {
+        let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+        let config = crate::config::RouterConfig {
+            mode: crate::config::RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            kv_events,
+            ..Default::default()
+        };
+        let app = AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap();
+        app.policy_registry.set_prefill_policy(prefill);
+        app.policy_registry.set_decode_policy(decode);
+        let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> = Arc::new(
+            crate::tokenizer::HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap(),
+        );
+        // Preparation workers encode with copies they load from the source.
+        app.tokenizer_registry
+            .load("bos-id", "m", path.to_str().unwrap(), || async {
+                Ok(tokenizer)
+            })
+            .await
+            .unwrap();
+        // With media, `prefix_hash` keeps the tokens, and `cache_aware` leaves it to the tree.
+        for (body, media) in [
+            (json!({"model": "m", "text": "a b"}), false),
+            (
+                json!({"model": "m", "text": "a b", "image_data": "x.png"}),
+                true,
+            ),
+        ] {
+            let parsed = ParsedInference::parse("/generate", body.to_string().as_bytes()).unwrap();
+            let routing = IngressRouting::new(&app);
+            let (metadata, tokens) = app
+                .prepare_pool
+                .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                    routing.prepare(&parsed, ctx)
+                })
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(tokens.as_deref(), Some(want), "kv_events: {kv_events}");
+            assert_eq!(metadata.carries_media, media);
+        }
+    }
+}
+
+/// The template and encode stages `--kv-events` adds to a chat request `cache_aware`
+/// places, with the tokenizer.json at `MESH_BENCH_TOKENIZER`.
+#[test]
+#[ignore = "bench: cargo test --release --lib wanted_tokens_cost -- --ignored --nocapture"]
+fn wanted_tokens_cost() {
+    use crate::{
+        protocols::chat::ChatCompletionRequest,
+        routers::prepare::chat_template::process_chat_messages,
+        tokenizer::{traits::Encoder, HuggingFaceTokenizer},
+    };
+    let path = std::env::var("MESH_BENCH_TOKENIZER").expect("MESH_BENCH_TOKENIZER");
+    let tokenizer = HuggingFaceTokenizer::from_file(&path).unwrap();
+    let text = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).repeat(64);
+    let percentiles = |samples: &mut Vec<Duration>| {
+        samples.sort();
+        let at = |p: usize| samples[(samples.len() - 1) * p / 100];
+        format!("p50 {:.2?} p99 {:.2?}", at(50), at(99))
+    };
+    for chars in [4_000, 32_000, 128_000] {
+        let content: String = text.chars().take(chars).collect();
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({"model": "m",
+            "messages": [{"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": content}]}))
+        .unwrap();
+        let (mut template, mut encode, mut tokens) = (Vec::new(), Vec::new(), 0);
+        for _ in 0..100 {
+            let started = Instant::now();
+            let prompt = process_chat_messages(&chat, &tokenizer).unwrap().text;
+            template.push(started.elapsed());
+            let started = Instant::now();
+            tokens = tokenizer.encode(&prompt, true).unwrap().token_ids().len();
+            encode.push(started.elapsed());
+        }
+        println!(
+            "{tokens} tokens: template {}, encode {}",
+            percentiles(&mut template),
+            percentiles(&mut encode)
+        );
+    }
 }
 
 #[test]
