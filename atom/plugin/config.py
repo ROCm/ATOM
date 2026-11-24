@@ -388,8 +388,9 @@ def _vllm_kv_transfer_config(config: Any) -> dict:
     # defaults alone (`kv_load_failure_policy`, an empty extra-config) made
     # this return a truthy dict -- which every reader takes as "a transport is
     # configured". That is what this docstring has always promised not to do,
-    # and the readers are not all V4.1's: `qwen4_exp_attn` refuses outright on
-    # a truthy value, and `EngineCore` sets `kv_transfer_enabled` from one.
+    # and the readers are not all V4.1's: `qwen4_exp_attn` checks a truthy value
+    # against its offload rules (and refuses it under RapidServe), and
+    # `EngineCore` sets `kv_transfer_enabled` from one.
     if not translated.get("kv_connector"):
         return {}
     return translated
