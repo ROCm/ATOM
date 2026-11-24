@@ -4853,6 +4853,29 @@ mod h_atom_native_tool_calls {
         assert_eq!(unary, (String::new(), Value::Null));
     }
 
+    /// A qwen_xml call outside a `<tool_call>` wrapper is a call, whole or cut off, as
+    /// ATOM's HTTP parser reads one; a bare name prose follows is not.
+    #[tokio::test]
+    async fn a_bare_qwen_function_call_is_a_call() {
+        let expected = ("get_weather".to_string(), json!({"city": "Paris"}));
+        for reply in [
+            "<function=get_weather><parameter=city>Paris</parameter></function>",
+            "Checking.\n<function=get_weather>\n<parameter=city>Paris",
+        ] {
+            assert_eq!(
+                cut_off_call(reply).await,
+                [expected.clone(), expected.clone()]
+            );
+        }
+        let prose = "Write <function=get_weather> and then its parameters.";
+        let none = (String::new(), Value::Null);
+        assert_eq!(cut_off_call(prose).await, [none.clone(), none]);
+        // Nor does a name quoted before a call take that call's parameters.
+        let quoted = "Use <function=search> here. \
+                      <tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>";
+        assert_eq!(cut_off_call(quoted).await, [expected.clone(), expected]);
+    }
+
     /// A MiniMax-M3 call cut off inside a parameter keeps its value, as ATOM's HTTP
     /// parser does at end of input.
     #[tokio::test]
