@@ -63,8 +63,37 @@ def _physical_index(gpu_id: int) -> int:
     )
     if not visible:
         return gpu_id
-    vis = [int(x) for x in visible.split(",") if x.strip() != ""]
+    vis = [_mask_entry_index(x) for x in visible.split(",") if x.strip() != ""]
     return vis[gpu_id] if gpu_id < len(vis) else gpu_id
+
+
+def _mask_entry_index(entry: str) -> int:
+    """Physical index of one *_VISIBLE_DEVICES entry: a number, or a
+    ``GPU-<unique id>`` name (what a job scheduler hands a container), looked up
+    among the DRM cards in PCI-BDF order -- the order `_query_node_sysfs`
+    indexes them in. Raises ValueError for a name no card carries."""
+    entry = entry.strip()
+    try:
+        return int(entry)
+    except ValueError:
+        pass
+    unique_id = entry.lower().removeprefix("gpu-")
+    cards: list[tuple[str, str]] = []
+    for dev in glob.glob("/sys/class/drm/card*/device"):
+        path = os.path.join(dev, "unique_id")
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            cards.append(
+                (os.path.basename(os.path.realpath(dev)), f.read().strip().lower())
+            )
+    cards.sort()
+    for index, (_, card_id) in enumerate(cards):
+        if card_id == unique_id:
+            return index
+    raise ValueError(
+        f"no GPU with unique id {unique_id!r} for the visible-device entry {entry!r}"
+    )
 
 
 def _query_node_amdsmi(gpu_id: int) -> int | None:
