@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from types import SimpleNamespace
 from typing import ClassVar, NamedTuple
 
 import aiter
@@ -1262,5 +1263,53 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # A capture runs a full synthetic batch: nothing is padded.
             scheduled_tokens=scheduled_tokens,
             running_tokens=scheduled_tokens,
+        )
+        return attn_metadata, context
+
+    @property
+    def supports_token_graph(self) -> bool:
+        """MiniMax-M3 prefill replays token graphs (`ATOM_M3_PREFILL_TOKEN_GRAPH`).
+
+        Every launch outside the attention op is sized by the token count, and
+        the whole sparse path (KV / index insert, scoring, selection, sparse
+        attention) runs inside `unified_attention_with_output_base`, the eager
+        region, on the live step's metadata. Padding rows are position 0 with
+        no KV slot (`_pad_tokens`), and the sparse prefill zeroes the output
+        rows its metadata does not cover (`_metadata_rows`)."""
+        return self._has_sparse_attention and envs.ATOM_M3_PREFILL_TOKEN_GRAPH
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A prefill of ``tokens`` rows for recording that token-graph bucket:
+        one request from position 0 with no KV slot, so neither the warmup nor
+        the recording pass writes the cache. The regions run for real on it;
+        the segments only need its shape."""
+        if not 0 < tokens <= self.max_num_batched_tokens:
+            raise ValueError("token-graph bucket exceeds the token buffer")
+        lengths = np.asarray([tokens], dtype=np.int32)
+        # No block table: every slot is -1 (`_write_prefill_slots`) and the
+        # staged table row is zero-filled, i.e. every page reads block 0.
+        batch = SimpleNamespace(
+            is_dummy_run=False,
+            req_ids=[0],
+            num_scheduled_tokens=lengths,
+            context_lens=lengths,
+            num_cached_tokens=[0],
+            block_tables=[],
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            total_tokens_num=tokens,
+            total_tokens_num_prefill=tokens,
+            mrope_positions_by_req={},
+        )
+        self.publish_query_metadata(lengths, 1, tokens)
+        attn_metadata, positions = self.prepare_prefill(batch, 1, tokens)
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=False,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
         )
         return attn_metadata, context
