@@ -1981,7 +1981,9 @@ class MoRIIOConnector(KVConnectorBase):
         rows = []
         for ids in (body, tail):
             for view, cut in zip(self._page_views, plan.cuts):
-                blocks = view.index_select(0, ids).reshape(ids.numel(), -1)
+                # flatten, not reshape(n, -1): an incremental push of only the last block
+                # leaves the body empty, and reshape(0, -1) is ambiguous.
+                blocks = view.index_select(0, ids).flatten(1)
                 rows.append(
                     torch.cat([blocks[:, a : a + n] for a, _, n in cut.tolist()], 1)
                 )
