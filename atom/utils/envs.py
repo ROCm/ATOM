@@ -629,6 +629,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_CP_SCORE_FLYDSL": lambda: (
         os.getenv("ATOM_M3_CP_SCORE_FLYDSL", "0") == "1"
     ),
+    # MiniMax-M3 indexer CP decode: select each shard's top-k with the
+    # group-max prefilter in one warp (indexer_candidate_exchange._tile_winners)
+    # instead of a full bitonic top-k over the tile in 8 warps. Same keys, bit
+    # for bit; opt-in until measured.
+    "ATOM_M3_CP_SELECT_LEAN": lambda: (os.getenv("ATOM_M3_CP_SELECT_LEAN", "0") == "1"),
     # MiniMax-M3: store the sparse (indexed) layers' K/V as NVFP4 (e2m1 + E4M3 per
     # 16) in their own pool; dense layers, the draft and --kv_cache_dtype are
     # unchanged.

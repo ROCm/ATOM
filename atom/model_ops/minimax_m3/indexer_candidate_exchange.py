@@ -25,9 +25,15 @@ from atom.model_ops.minimax_m3.index_topk import (
     _pack_score_key,
     _require_packable,
 )
+from atom.utils import envs
 
 # Live blocks one _local_topk tile selects from; longer rows stream more tiles.
 LOCAL_TOPK_TILE = 512
+# The lean shard selection (ATOM_M3_CP_SELECT_LEAN, `_tile_winners`): groups of a
+# tile, keys a group keeps, and the warps of the exchange program.
+LEAN_GROUPS = tl.constexpr(32)
+LEAN_KEEP = tl.constexpr(4)  # `_tile_winners` extracts exactly 4
+LEAN_NUM_WARPS = 1
 
 
 def _scan_width(local, topk):
@@ -64,6 +70,52 @@ def _force(score, block, valid, local_start, INIT_BLOCKS: tl.constexpr):
 
 
 @triton.jit
+def _tile_winners(
+    key, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_T: tl.constexpr, LEAN: tl.constexpr
+):
+    """``tl.topk(key, BLOCK_SIZE_T)``; with LEAN, through a prefilter that is exact.
+
+    Group g of the tile holds its slots g, g + 32, ... (LEAN_GROUPS strided
+    groups, so neighbouring blocks land in different groups). The BLOCK_SIZE_T-th
+    largest group max ``thr`` is at most the BLOCK_SIZE_T-th largest key: that
+    many distinct keys (one a group) reach it. So every winner is >= thr, and
+    when no group holds more than LEAN_KEEP keys >= thr, each group's top
+    LEAN_KEEP hold all winners and the top-k of those LEAN_KEEP * 32 candidates
+    is the tile's, bit for bit (keys are unique but for the empty 0, which
+    pads both alike). Otherwise (about 1% of rows on random scores) the full
+    top-k. Extracting a group's maxima stays in a thread's registers; only the
+    32-wide threshold and the 128-wide final top-k cross lanes.
+    """
+    if (
+        LEAN
+        and BLOCK_SIZE_K >= 2 * LEAN_KEEP * LEAN_GROUPS
+        and BLOCK_SIZE_T <= LEAN_GROUPS
+    ):
+        groups = tl.reshape(key, [BLOCK_SIZE_K // LEAN_GROUPS, LEAN_GROUPS])
+        thr = tl.min(tl.topk(tl.max(groups, 0), BLOCK_SIZE_T), 0)
+        crowded = tl.max(tl.sum(((groups >= thr) & (groups != 0)).to(tl.int32), 0), 0)
+        if crowded <= LEAN_KEEP:
+            m0 = tl.max(groups, 0)
+            groups = tl.where(groups == m0[None, :], 0, groups)
+            m1 = tl.max(groups, 0)
+            groups = tl.where(groups == m1[None, :], 0, groups)
+            m2 = tl.max(groups, 0)
+            groups = tl.where(groups == m2[None, :], 0, groups)
+            m3 = tl.max(groups, 0)
+            cand = tl.cat(
+                tl.cat(m0, m1, can_reorder=True),
+                tl.cat(m2, m3, can_reorder=True),
+                can_reorder=True,
+            )
+            winners = tl.topk(cand, BLOCK_SIZE_T)
+        else:
+            winners = tl.topk(key, BLOCK_SIZE_T)
+    else:
+        winners = tl.topk(key, BLOCK_SIZE_T)
+    return winners
+
+
+@triton.jit
 def _shard_winners(
     Scores,
     Lengths,
@@ -79,6 +131,7 @@ def _shard_winners(
     LOCAL_KEEP: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    LEAN: tl.constexpr,
 ):
     """This shard's top-BLOCK_SIZE_T packed keys for one (head, query row)."""
     request = row // QUERY_LEN
@@ -103,7 +156,9 @@ def _shard_winners(
     valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
     score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
     score = _force(score, block, valid, local_start, INIT_BLOCKS)
-    winners = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
+    winners = _tile_winners(
+        _pack_score_key(score, block + 1, valid), BLOCK_SIZE_K, BLOCK_SIZE_T, LEAN
+    )
     for start in tl.range(BLOCK_SIZE_K, live_end, BLOCK_SIZE_K):
         off = start + tl.arange(0, BLOCK_SIZE_K)
         local_valid = off < live_end
@@ -111,7 +166,9 @@ def _shard_winners(
         valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
         score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
         score = _force(score, block, valid, local_start, INIT_BLOCKS)
-        tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
+        tile = _tile_winners(
+            _pack_score_key(score, block + 1, valid), BLOCK_SIZE_K, BLOCK_SIZE_T, LEAN
+        )
         winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
     return winners
 
@@ -132,6 +189,7 @@ def _local_topk(
     LOCAL_KEEP: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    LEAN: tl.constexpr,
 ):
     """Pack this shard's [heads, tokens, local] scores down to its own top-k keys.
 
@@ -162,6 +220,7 @@ def _local_topk(
         LOCAL_KEEP,
         BLOCK_SIZE_K,
         BLOCK_SIZE_T,
+        LEAN,
     )
     off_t = tl.arange(0, BLOCK_SIZE_T)
     tl.store(
@@ -308,6 +367,7 @@ def local_candidate_keys(
     global_blocks,
     init_blocks=0,
     local_blocks=0,
+    lean=None,
 ):
     """Reduce [heads,tokens,local] scores to [heads,tokens,topk] packed keys.
 
@@ -315,8 +375,10 @@ def local_candidate_keys(
 
     The forced-block counts must match the ones the merge is given: a forced
     block has to be pinned on the rank that owns it or it never reaches the
-    merge to be pinned there.
+    merge to be pinned there. ``lean``: as in `select_exchanged_candidates`.
     """
+    if lean is None:
+        lean = envs.ATOM_M3_CP_SELECT_LEAN
     if scores.ndim != 3 or scores.dtype != torch.float32:
         raise ValueError("scores must be FP32 [heads,tokens,local_blocks]")
     heads, tokens, local = scores.shape
@@ -357,7 +419,8 @@ def local_candidate_keys(
             LOCAL_KEEP=local_blocks,
             BLOCK_SIZE_K=width,
             BLOCK_SIZE_T=triton.next_power_of_2(topk),
-            num_warps=DECODE_TOPK_NUM_WARPS,
+            LEAN=lean,
+            num_warps=LEAN_NUM_WARPS if lean else DECODE_TOPK_NUM_WARPS,
         )
     return keys
 
@@ -486,6 +549,7 @@ def _select_exchange_merge(
     SBT_STRIDE: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
     MAX_POLLS: tl.constexpr,
+    LEAN: tl.constexpr,
 ):
     """_local_topk, the exchange and _merge_topk in one launch.
 
@@ -518,6 +582,7 @@ def _select_exchange_merge(
         LOCAL_KEEP,
         BLOCK_SIZE_K,
         BLOCK_SIZE_T,
+        LEAN,
     )
     tl.debug_barrier()  # every wave has read the old call
     tl.store(counter, call)
@@ -629,6 +694,7 @@ def select_exchanged_candidates(
     local_blocks,
     mailbox,
     pages_per_block=PAGES_PER_SPARSE_BLOCK,
+    lean=None,
 ):
     """``local_candidate_keys``, the exchange and ``merge_candidate_keys`` in one
     launch, through ``mailbox`` (an ``indexer_cp.CandidateMailbox`` that
@@ -636,8 +702,11 @@ def select_exchanged_candidates(
     same ``pages_per_block``), bit for bit.
 
     Every rank of the group must make the same calls in the same order, as for
-    any collective.
+    any collective. ``lean`` (default ATOM_M3_CP_SELECT_LEAN): the shard top-k
+    through `_tile_winners`' prefilter in one warp; the same bits.
     """
+    if lean is None:
+        lean = envs.ATOM_M3_CP_SELECT_LEAN
     heads, tokens, local = scores.shape
     if heads != world_size or not mailbox.fits(tokens, topk):
         raise ValueError(
@@ -683,7 +752,8 @@ def select_exchanged_candidates(
         "SBT_STRIDE": output[0].stride(0),
         "PAGES_PER_BLOCK": pages_per_block,
         "MAX_POLLS": mailbox.MAX_POLLS,
-        "num_warps": DECODE_TOPK_NUM_WARPS,
+        "LEAN": lean,
+        "num_warps": LEAN_NUM_WARPS if lean else DECODE_TOPK_NUM_WARPS,
     }
     if not torch.cuda.is_current_stream_capturing():
         _prewarm_exchange(args, kw, triton.cdiv(global_blocks, world_size))
