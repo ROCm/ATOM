@@ -9,13 +9,17 @@ use uuid::Uuid;
 
 use crate::{
     app_context::AppContext,
-    core::worker::RuntimeType,
+    core::{
+        placement::{types::RenderedTemplate, PlacementError},
+        steps::tokenizer_registration::loaded_template,
+        worker::RuntimeType,
+    },
     protocols::{
         chat::ChatCompletionRequest,
         common::{InputIds, StringOrArray},
         generate::GenerateRequest,
     },
-    routers::comm::error,
+    routers::comm::{error, placement_response::placement_err_to_response},
     tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
 };
 
@@ -87,14 +91,17 @@ pub fn prepare_chat_with(
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
-    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
+    // The tokenizer and what it was loaded with, read once: a model's last worker
+    // leaving drops it.
+    let entry = components.tokenizer_registry.get_by_name(model_id_str);
+    let tokenizer = match &entry {
+        Some(entry) => entry.tokenizer.clone(),
+        None => lookup_tokenizer(model_id_str, &components.tokenizer_registry)?,
+    };
     let workers = components.worker_registry.get_by_model(model_id_str);
     // What its tokenizer was loaded with: a template file is a template, as
     // --chat-template is; a built-in encoder renders without one.
-    let id = components
-        .tokenizer_registry
-        .get_by_name(model_id_str)
-        .map(|e| e.id);
+    let id = entry.map(|e| e.id);
     let templated = components.router_config.chat_template.is_some()
         || id
             .as_ref()
@@ -127,6 +134,7 @@ pub fn prepare_chat_with(
         .transpose()
         .map_err(|e| error::internal_error("invalid_reasoning_toggle", e))?;
 
+    let rendered_here = rendered.is_none();
     let (processed, token_ids, prompt_opener) = match rendered {
         Some(rendered) => (
             ProcessedMessages {
@@ -180,6 +188,16 @@ pub fn prepare_chat_with(
         tool_constraints,
     );
     (payload.dp_session_id, payload.dp_parent_session_id) = dp_session_ids(headers.as_ref());
+    if let (true, Some(id)) = (rendered_here, &id) {
+        let fingerprint = loaded_template(components, id).ok_or_else(|| {
+            let err = PlacementError::ChatTemplateChanged;
+            placement_err_to_response(err, Some(model_id_str))
+        })?;
+        payload.chat_template = Some(RenderedTemplate {
+            fingerprint,
+            router_file: components.router_config.chat_template.clone(),
+        });
+    }
 
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -339,6 +357,7 @@ pub(crate) fn build_chat_payload(
         log_metrics: false,
         dp_session_id: None,
         dp_parent_session_id: None,
+        chat_template: None,
     }
 }
 
@@ -392,6 +411,7 @@ pub(crate) fn build_generate_payload(
         log_metrics: req.log_metrics,
         dp_session_id: None,
         dp_parent_session_id: None,
+        chat_template: None,
     }
 }
 

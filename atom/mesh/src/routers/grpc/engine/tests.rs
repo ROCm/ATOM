@@ -55,6 +55,7 @@ mod a_payload_to_proto {
             log_metrics: false,
             dp_session_id: None,
             dp_parent_session_id: None,
+            chat_template: None,
         }
     }
 
@@ -821,6 +822,7 @@ mod e_engine_dispatch {
             log_metrics: false,
             dp_session_id: None,
             dp_parent_session_id: None,
+            chat_template: None,
         }
     }
 

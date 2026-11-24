@@ -416,6 +416,7 @@ fn scenario_a_payload() -> GenerationPayload {
         log_metrics: false,
         dp_session_id: None,
         dp_parent_session_id: None,
+        chat_template: None,
     }
 }
 
@@ -505,6 +506,7 @@ fn scenario_b_payload() -> GenerationPayload {
         log_metrics: true,
         dp_session_id: None,
         dp_parent_session_id: None,
+        chat_template: None,
     }
 }
 
@@ -588,6 +590,7 @@ fn scenario_c_payload() -> GenerationPayload {
         log_metrics: false,
         dp_session_id: None,
         dp_parent_session_id: None,
+        chat_template: None,
     }
 }
 
@@ -683,6 +686,7 @@ fn scenario_d_payload() -> GenerationPayload {
         log_metrics: false,
         dp_session_id: None,
         dp_parent_session_id: None,
+        chat_template: None,
     }
 }
 
@@ -806,6 +810,7 @@ fn scenario_b_prime_payload() -> GenerationPayload {
         log_metrics: true,
         dp_session_id: None,
         dp_parent_session_id: None,
+        chat_template: None,
     }
 }
 

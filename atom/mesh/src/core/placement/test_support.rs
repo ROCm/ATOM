@@ -411,6 +411,7 @@ pub fn make_descriptor<'a>(
         headers,
         stream: false,
         carries_media: false,
+        chat_template: None,
     }
 }
 

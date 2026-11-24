@@ -951,6 +951,7 @@ mod e_generation_payload {
             log_metrics: false,
             dp_session_id: None,
             dp_parent_session_id: None,
+            chat_template: None,
         }
     }
 
