@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.model_engine.dp_sync_gate import DPSyncGate
 from atom.model_engine.engine_stats import EngineStats
 
 ENGINE_CORE = Path(__file__).resolve().parents[1] / "atom/model_engine/engine_core.py"
@@ -42,7 +43,10 @@ def _extract(class_name: str, method: str):
         if isinstance(node, ast.FunctionDef) and node.name == method
     )
     scope: dict = {
-        "envs": SimpleNamespace(ATOM_METRICS_UPDATE_INTERVAL_S=1e9),
+        "envs": SimpleNamespace(
+            ATOM_METRICS_UPDATE_INTERVAL_S=1e9, ATOM_DP_SYNC_INTERVAL=1
+        ),
+        "DPSyncGate": DPSyncGate,
         "logger": SimpleNamespace(info=lambda *a, **k: None, exception=lambda *a: None),
         "tracing": SimpleNamespace(shutdown=lambda: None),
         "time": SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None),
@@ -133,6 +137,10 @@ class _Engine:
             False,
             self._state is OFFLOAD,
         )
+
+    def _validate_dp_sync_interval(self, interval):
+        # This single-engine harness has no peer interval to disagree with.
+        return interval
 
     def _process_engine_step(self):
         if self._state is not WORK:
