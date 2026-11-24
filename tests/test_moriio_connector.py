@@ -657,6 +657,15 @@ class WritePathTest(unittest.TestCase):
         conn._done_sending_lock = threading.Lock()
         conn._write_ids = {}
         conn._finished_writes = collections.deque()
+        # The prefill of the transfer push_request asks for has finished.
+        prefilled = types.SimpleNamespace(query=lambda: True)
+        conn._kv_ready_events = {9: prefilled}
+        conn._kv_ready_batches = collections.deque()
+        conn._kv_ready_expired = {}
+        conn._kv_ready_lock = threading.Lock()
+        conn._gated_writes = collections.deque()
+        conn._verify_page_dst = {}
+        conn._write_page_digests = {}
         conn._state_tensors = {}
         conn._num_state_slots = 0
         conn._built_state_sessions = {}
