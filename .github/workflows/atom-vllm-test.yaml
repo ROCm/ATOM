@@ -53,6 +53,8 @@ jobs:
             atom/plugin/**
             .github/workflows/atom-vllm-test.yaml
             .github/scripts/plugin_ci/**
+            .github/scripts/atom_oot_test.sh
+            .github/scripts/check_mtp_acceptance.sh
             .github/benchmark/oot_models_accuracy.json
             docker/atom_release.dockerfile
             docker/vllm_release.dockerfile

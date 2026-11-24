@@ -54,6 +54,8 @@ jobs:
             atom/plugin/**
             .github/workflows/atom-sglang-test.yaml
             .github/scripts/plugin_ci/**
+            .github/scripts/atom_sglang_test.sh
+            .github/workflows/docker-release.yaml
             .github/benchmark/sglang_models_accuracy.json
             docker/atom_release.dockerfile
             docker/sglang_release.dockerfile
