@@ -65,6 +65,26 @@ class StageMissingLayer(nn.Module):
         return f"stage_name={self.stage_name!r}"
 
 
+# Stage sizes a `Config` resolved (`ATOM_PP_LAYER_PARTITION`), by (layers,
+# stages). Installed where the config is built and wherever a copy of it is
+# unpickled, so every process that asks `get_pp_indices` -- scheduler, workers,
+# the P/D connectors in them -- gets the same split.
+_installed_pp_partitions: dict[tuple[int, int], tuple[int, ...]] = {}
+
+
+def install_pp_layer_partition(num_hidden_layers: int, partition) -> None:
+    """Make `get_pp_indices` split a ``num_hidden_layers``-layer model
+    ``len(partition)`` ways as ``partition`` in this process, unless
+    ``VLLM_PP_LAYER_PARTITION`` is set."""
+    partition = tuple(int(n) for n in partition)
+    if sum(partition) != num_hidden_layers or min(partition) < 1:
+        raise ValueError(
+            f"PP partition {list(partition)} does not split {num_hidden_layers} "
+            "layers into non-empty stages"
+        )
+    _installed_pp_partitions[(num_hidden_layers, len(partition))] = partition
+
+
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int
 ) -> tuple[int, int]:
@@ -91,6 +111,8 @@ def get_pp_indices(
             raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
         if sum(partitions) != num_hidden_layers:
             raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
+    elif (num_hidden_layers, pp_size) in _installed_pp_partitions:
+        partitions = list(_installed_pp_partitions[(num_hidden_layers, pp_size)])
     else:
         layers_per_partition = num_hidden_layers // pp_size
         partitions = [layers_per_partition for _ in range(pp_size)]
