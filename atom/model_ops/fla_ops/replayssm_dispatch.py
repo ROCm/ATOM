@@ -26,6 +26,22 @@ def _get_aiter_replayssm():
     )
 
 
+@lru_cache(maxsize=1)
+def _aiter_ckpt_dtypes():
+    """Checkpoint dtypes the installed AITER ReplaySSM takes.
+
+    An AITER that does not publish ``CKPT_DTYPES`` takes FP32 only, so a 16-bit
+    state pool (``ATOM_GDN_SSM_DTYPE=fp16`` / ``bf16``) stays on the native
+    kernel there instead of reaching an AITER that would reject it after
+    routing.
+    """
+    try:
+        from aiter.ops.triton.attention.kda_replayssm import CKPT_DTYPES
+    except (ImportError, AttributeError):
+        return (torch.float32,)
+    return tuple(CKPT_DTYPES)
+
+
 def _supported(
     q,
     k,
@@ -73,7 +89,9 @@ def _supported(
     floating = (torch.bfloat16, torch.float16, torch.float32)
     if any(x.dtype not in floating for x in (q, k, v, a, b, buf_k, buf_u)):
         return False
-    if any(x.dtype != torch.float32 for x in (A_log, dt_bias, ckpt, buf_g)):
+    if any(x.dtype != torch.float32 for x in (A_log, dt_bias, buf_g)):
+        return False
+    if ckpt.dtype not in _aiter_ckpt_dtypes():
         return False
     if ckpt.ndim != 4 or ckpt.shape[1:] != (HV, V, K):
         return False
