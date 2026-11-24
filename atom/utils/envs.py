@@ -625,6 +625,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_M3_SP_SHARED_LOCAL_SIDE", "0"
     )
     == "1",
+    # Under SP prefill, the norm + quant chains of the hand-offs run as aiter's one-launch
+    # `norm_mx` (add + Gemma RMSNorm -> MXFP8 [+ bf16 + MXFP4]) where this aiter has it;
+    # the bytes equal the norm + quant kernels. 0 keeps those kernels.
+    "ATOM_M3_SP_NORM_MX": lambda: os.getenv("ATOM_M3_SP_NORM_MX", "1") == "1",
     "ATOM_M3_SP_MOE_CHECK": lambda: os.getenv("ATOM_M3_SP_MOE_CHECK", "0") == "1",
     # Smallest decode batch (requests) that takes the indexer-CP arm; a smaller
     # one scores on the TP path. Unset: 16 for an FP4/NVFP4 index cache (the CP
