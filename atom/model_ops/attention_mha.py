@@ -23,6 +23,7 @@ from atom.model_ops.base_attention import (
     run_pa_decode,
     run_pa_fwd_asm,
 )
+from atom.model_ops.minimax_m3 import tt_prefill
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -1400,6 +1401,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             and num_kv_heads == 1
             and not pa_decode_gluon_supports_arch()
         )
+        # whether the TP1 FP8 prefill may take aiter's token-tiled kernel
+        self._tt_prefill = tt_prefill.layer_eligible(
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            topk=topk,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: torch.Tensor | None = None
@@ -1863,6 +1872,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     self.scale,
                     v.dtype,
                     out=output[:rows],
+                )
+            elif self._tt_prefill and tt_prefill.step_takes(prefill_md, rows):
+                tt_prefill.run(
+                    q[:rows],
+                    k_cache,
+                    v_cache,
+                    k_scale,
+                    v_scale,
+                    topk_idx,
+                    block_tables,
+                    prefill_md,
+                    self.scale,
+                    output[:rows],
                 )
             else:
                 minimax_m3_sparse_attn_prefill_asm(
