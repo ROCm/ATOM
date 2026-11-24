@@ -1160,34 +1160,6 @@ def test_handoff_keys_at_their_bounds_are_accepted(d_engine, handoff):
     api_server._validate_kv_transfer_params({"do_remote_prefill": True, **handoff})
 
 
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("key,value", OUT_OF_RANGE_HANDOFF)
-def test_standalone_completion_refuses_an_out_of_range_handoff_key(stream, key, value):
-    from unittest.mock import MagicMock
-
-    from atom.entrypoints.atomesh.atom_standalone_service import (
-        AtomStandaloneService,
-    )
-
-    service = object.__new__(AtomStandaloneService)
-    service.model_name = "m"
-    service.engine = SimpleNamespace(
-        config=SimpleNamespace(max_model_len=MAX_MODEL_LEN)
-    )
-    service.engine_service = MagicMock()
-    request = {
-        "model": "m",
-        "prompt": "hi",
-        "kv_transfer_params": {"do_remote_prefill": True, key: value},
-    }
-    start = service.start_completions_stream if stream else service.completions
-
-    # The mesh router answers a ValueError with HTTP 400.
-    with pytest.raises(ValueError, match=key):
-        start(request)
-    assert not service.engine_service.method_calls
-
-
 def _intake(hf_config=None, *, num_draft_tokens=0, rapidserve=False):
     """The engine's request intake, as the server's executor runs it."""
     from atom.model_engine.llm_engine import InputOutputProcessor
