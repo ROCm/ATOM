@@ -890,6 +890,11 @@ class ModelRunner:
     # See `__init__`; a class default too, for runners built without it.
     early_output_sink = None
 
+    # Bytes of the paged KV pool a connector allocated outside the torch
+    # allocator (`KVConnectorFactory.allocate_kv_pool`), which the allocation
+    # cross-check in `allocate_kv_cache` cannot see.
+    _kv_pool_outside_torch_bytes: int = 0
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.structured_output = None
@@ -2410,7 +2415,19 @@ class ModelRunner:
                 )
         offsets, total = plan_regions(sizes)
         if buf is None:
-            buf = torch.zeros(total, dtype=torch.uint8, device=self.device)
+            # A connector whose peer maps this rank's KV pool allocates it in
+            # exportable memory, outside the torch allocator.
+            shared = (
+                KVConnectorFactory.allocate_kv_pool(self.config, total, self.device)
+                if self.config.kv_transfer_config
+                else None
+            )
+            self._kv_pool_outside_torch_bytes = 0 if shared is None else total
+            buf = (
+                shared
+                if shared is not None
+                else torch.zeros(total, dtype=torch.uint8, device=self.device)
+            )
         elif buf.numel() < total:
             raise ValueError(
                 f"the imported paged pool holds {buf.numel()} B but this side's "
@@ -2556,7 +2573,7 @@ class ModelRunner:
         # check must mirror that — otherwise it spuriously fires for any
         # backend that declares a per-request state pool (V4, GDN).
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        actual_kv_bytes = post_alloc - pre_alloc
+        actual_kv_bytes = post_alloc - pre_alloc + self._kv_pool_outside_torch_bytes
         # Each sub-pool contributes `entry_bytes × entries`. The counts come
         # straight from the sizing plan — which already absorbed the pipeline-
         # parallel reconciliation — so this mirrors the budget by construction
