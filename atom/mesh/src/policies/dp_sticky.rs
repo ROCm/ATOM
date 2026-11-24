@@ -6,7 +6,7 @@
 //! the fewest live sessions (load breaks ties). Requests without a session ID
 //! use minimum-load balancing. A stale mapping is replaced when its worker is
 //! no longer healthy, the session has been idle for too long, or a request of
-//! the session failed on it with a server error or got no response.
+//! the session failed with a server error or got no response.
 
 use std::sync::Arc;
 
@@ -260,11 +260,6 @@ mod tests {
         selected
     }
 
-    /// The session's current binding: the one its last placed request carries.
-    fn binding(policy: &SessionAffinityPolicy, session: &str) -> Option<u64> {
-        policy.binding(session)
-    }
-
     fn worker_changes(rendered: &str) -> Vec<&str> {
         let mut changes: Vec<_> = rendered
             .lines()
@@ -358,7 +353,7 @@ mod tests {
         };
 
         assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
-        let placed = binding(&policy, "session-1");
+        let placed = policy.binding("session-1");
         policy.on_dispatch_failed(Some(&headers), &workers[0], placed);
         // The retry avoids worker 0, where it failed.
         let (retry, decision) = policy.select_with_decision(&workers, &info).await;
@@ -386,7 +381,7 @@ mod tests {
         };
 
         // Worker 1 holds fewer sessions, but s2 failed there.
-        policy.on_dispatch_failed(Some(&s2), &workers[1], binding(&policy, "s2"));
+        policy.on_dispatch_failed(Some(&s2), &workers[1], policy.binding("s2"));
         let (retry, decision) = policy.select_with_decision(&workers, &info).await;
         assert_eq!((retry, decision.branch), (Some(0), "rebind"));
 
@@ -394,7 +389,7 @@ mod tests {
         let only = &workers[1..];
         assert_eq!(route(&policy, only, "regular", "s4").await, 0);
         let s4 = headers("s4");
-        policy.on_dispatch_failed(Some(&s4), &only[0], binding(&policy, "s4"));
+        policy.on_dispatch_failed(Some(&s4), &only[0], policy.binding("s4"));
         let info = SelectWorkerInfo {
             headers: Some(&s4),
             ..Default::default()
@@ -418,14 +413,14 @@ mod tests {
         let s = headers("s");
 
         // a fails, then b: the next retry goes to c, not back to a.
-        policy.on_dispatch_failed(Some(&s), &workers[0], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&s), &workers[0], policy.binding("s"));
         assert_eq!(route(&policy, &workers, "regular", "s").await, 1);
-        policy.on_dispatch_failed(Some(&s), &workers[1], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&s), &workers[1], policy.binding("s"));
         assert_eq!(route(&policy, &workers, "regular", "s").await, 2);
 
         // A hit on c clears the set: a failure on c then avoids c alone.
         assert_eq!(route(&policy, &workers, "regular", "s").await, 2);
-        policy.on_dispatch_failed(Some(&s), &workers[2], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&s), &workers[2], policy.binding("s"));
         assert_eq!(route(&policy, &workers, "regular", "s").await, 0);
     }
 
@@ -440,7 +435,7 @@ mod tests {
         };
 
         assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
-        let old = binding(&policy, "session-1");
+        let old = policy.binding("session-1");
         workers[0].set_healthy(false);
         let (_, rebind) = policy.select_with_decision(&workers, &info).await;
         assert_eq!(rebind.branch, "rebind");
@@ -485,13 +480,13 @@ mod tests {
         }
         let s = headers("s");
         assert_eq!(route(&policy, &workers, "regular", "s").await, 0);
-        policy.on_dispatch_failed(Some(&s), &workers[0], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&s), &workers[0], policy.binding("s"));
         assert_eq!(route(&policy, &workers, "regular", "s").await, 1);
 
         // A hit on b clears a from the set: a failure on b goes back to a,
         // the lighter of a and c.
         assert_eq!(route(&policy, &workers, "regular", "s").await, 1);
-        policy.on_dispatch_failed(Some(&s), &workers[1], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&s), &workers[1], policy.binding("s"));
         assert_eq!(route(&policy, &workers, "regular", "s").await, 0);
     }
 
@@ -507,7 +502,7 @@ mod tests {
         assert_eq!(route(&policy, &workers, "regular", "s").await, 0);
         // Worker 1 holds another session, so the tie would go back to worker 0.
         assert_eq!(route(&policy, &workers, "regular", "other").await, 1);
-        policy.on_dispatch_failed(Some(&headers), &workers[0], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&headers), &workers[0], policy.binding("s"));
 
         workers.iter().for_each(|worker| worker.set_healthy(false));
         assert_eq!(policy.select_worker(&workers, &info).await, None);
@@ -536,7 +531,7 @@ mod tests {
         // Meanwhile another request of the session fails on worker 0, and the
         // next one is placed on worker 1 and sent there.
         assert_eq!(route(&policy, &workers, "decode", "session-1").await, 0);
-        policy.on_dispatch_failed(Some(&headers), &workers[0], binding(&policy, "session-1"));
+        policy.on_dispatch_failed(Some(&headers), &workers[0], policy.binding("session-1"));
         assert_eq!(route(&policy, &workers, "decode", "session-1").await, 1);
         // The first request's decode is now sent to worker 0 and fails.
         policy.on_dispatch("decode", Some(&headers), &workers[0], stale.binding);
