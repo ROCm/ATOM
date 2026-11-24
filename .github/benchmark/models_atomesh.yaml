@@ -2683,5 +2683,8 @@ models:
             prefill_policy: agentic
             decode_policy: least_load
             kv_events: true
-            kv_storage_weight: 1.0
+            # A token loaded from the Store counts most of what a device hit
+            # does, not all: the prefills share the one Store, so at 1.0 each
+            # scores its hits alike and agentic places by load alone.
+            kv_storage_weight: 0.87
             extra_args: "--request-timeout-secs 1800 --prepare-timeout-ms 15000"
