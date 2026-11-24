@@ -234,14 +234,15 @@ class ConnectorSourceTest(unittest.TestCase):
         for name in ("get_finished", "_handshake_listener", "_finish_write"):
             self.assertIn("with self._done_sending_lock:", self.segment(name), name)
 
-    def test_unimplemented_transfer_subsets_are_not_ignored(self):
+    def test_transfer_subsets_are_skipped_or_refused(self):
         body = self.segment("_rejects_transfer_subset")
-        self.assertIn("num_computed_blocks", body)
         self.assertIn("src_block_skip_factor", body)
         for path in ("_issue_read_for_req", "_request_write"):
             caller = self.segment(path)
             self.assertIn("self._rejects_transfer_subset(", caller, path)
             self.assertIn("_fail_before_transfer", caller, path)
+            # The consumer's local prefix is skipped on both ends of the pairing.
+            self.assertIn("self._kept_prefix_blocks(meta)", caller, path)
 
     def test_a_rejected_request_does_not_take_down_the_rank(self):
         body = self.segment("_issue_read_for_req")
@@ -354,6 +355,7 @@ class ConnectorBehaviourTest(unittest.TestCase):
         conn._verify_before = {}
         conn._state_tensors = {}
         conn._verify_state_before = {}
+        conn._verify_kept = {}
         conn._write_state_digests = {}
         conn._write_reports_lock = threading.Lock()
         return conn, names
@@ -666,6 +668,7 @@ class WritePathTest(unittest.TestCase):
         conn._num_state_slots = 0
         conn._built_state_sessions = {}
         conn._verify_state_before = {}
+        conn._verify_kept = {}
         conn._write_state_digests = {}
 
         conn.sent = []
@@ -878,6 +881,43 @@ class WritePathTest(unittest.TestCase):
         )
         self.assertAlmostEqual(request["deadline"], time.time() + 600, delta=60)
         self.assertEqual(conn._awaiting_write["d1"][0], request["deadline"])
+
+    def test_a_push_skips_the_prefix_the_consumer_holds(self):
+        conn = self.make(producer=False)
+        meta = self.recv_meta([4, 5, 6], [10, 11, 12])
+        meta.num_computed_blocks = 1
+        conn._request_write("d1", meta)
+        ((frames, _host, _port),) = conn.sent
+        request = self.msgpack.loads(frames[1])
+        self.assertEqual(request["dst_block_ids"], [5, 6])
+        self.assertEqual(request["src_block_ids"], [11, 12])
+
+    def test_a_read_skips_the_prefix_the_consumer_holds(self):
+        conn = self.make(producer=False)
+        conn.transfer_mode = "read"
+        reads = []
+        conn._read_blocks = lambda **kwargs: reads.append(kwargs)
+        meta = self.recv_meta([4, 5, 6], [10, 11, 12])
+        meta.num_computed_blocks = 2
+        meta.remote_engine_id = "engine"
+        conn._issue_read_for_req("d1", meta)
+        ((call,),) = [reads]
+        self.assertEqual(call["local_block_ids"], [6])
+        self.assertEqual(call["remote_block_ids"], [12])
+        self.assertEqual(call["kept_block_ids"], [4, 5])
+
+    def test_verify_reports_a_receive_that_wrote_into_the_kept_prefix(self):
+        conn = self.make(producer=False)
+        conn._note_kept_prefix("d1", [1], is_mla=True)
+        with self.assertLogs("atom", "INFO") as logs:
+            conn._verify_kept_landed("d1")
+        self.assertIn("reused prefix rows unchanged", logs.output[-1])
+
+        conn._note_kept_prefix("d2", [1], is_mla=True)
+        conn.kv_caches["layer_0"].k_cache[2] = 7
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._verify_kept_landed("d2")
+        self.assertIn("the receive wrote into blocks it kept", logs.output[0])
 
     def test_the_consumer_refuses_a_short_source_without_asking(self):
         conn = self.make(producer=False)
@@ -1639,6 +1679,7 @@ class SchedulerSlotTest(unittest.TestCase):
         sched.dp_rank = 0
         sched._reqs_need_recv = {}
         sched._awaiting_send = set()
+        sched.hash_block_size = 4
         sched.request_id_to_transfer_id = {}
         sched.transfer_id_to_request_id = {}
         return sched
@@ -1653,9 +1694,36 @@ class SchedulerSlotTest(unittest.TestCase):
             "kv_transfer_params": {},
             "output_tokens": [42],
             "spec_token_ids": None,
+            "num_cached_tokens": 0,
         }
         fields.update(attrs)
         return types.SimpleNamespace(**fields)
+
+    def test_the_lookup_answers_until_the_receive_is_queued(self):
+        sched = self.make(producer=False)
+        seq = self.seq(
+            kv_transfer_params={"do_remote_prefill": True, "transfer_id": 7},
+            prompt_token_ids=[1, 2, 3],
+            state_slot=-1,
+        )
+        # Held back after the first yes (a full running set), asked again.
+        self.assertEqual(sched.get_num_new_matched_tokens(seq), (3, True))
+        self.assertEqual(sched.get_num_new_matched_tokens(seq), (3, True))
+        sched.update_state_after_alloc(seq)
+        self.assertEqual(sched.get_num_new_matched_tokens(seq), (0, False))
+
+    def test_the_consumer_records_the_prefix_it_holds(self):
+        sched = self.make(producer=False)
+        seq = self.seq(
+            kv_transfer_params={"do_remote_prefill": True, "transfer_id": 7},
+            block_table=[1, 2, 3],
+            num_cached_tokens=8,
+            state_slot=3,
+        )
+        sched.update_state_after_alloc(seq)
+        self.assertEqual(seq.kv_transfer_params["num_computed_blocks"], 2)
+        self.assertTrue(sched.receives_suffix_and_state)
+        self.assertFalse(self.make(producer=True).receives_suffix_and_state)
 
     def test_the_producer_publishes_its_state_slot(self):
         sched = self.make(producer=True)

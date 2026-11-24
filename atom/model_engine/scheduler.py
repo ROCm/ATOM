@@ -899,6 +899,9 @@ class Scheduler:
             # Only such a connector changes the abort path; any other keeps
             # the class's `_finish_rejected_waiting` as is.
             self._finish_rejected_waiting = self._finish_rejected_waiting_cancelling
+        self.block_manager.remote_state_reuses_local_prefix = bool(
+            getattr(self.kv_connector, "receives_suffix_and_state", False)
+        )
         # What a P/D receive's first decode takes past its prompt: T0 and the
         # `mtp_k` verify slots its handoff appends, then the reach past them
         # that `can_append` checks before the step runs, as decode does below.

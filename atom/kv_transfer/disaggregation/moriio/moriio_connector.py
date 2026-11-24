@@ -238,6 +238,8 @@ class MoRIIOConnector(KVConnectorBase):
         self._verify_before: dict[ReqId, dict[str, int]] = {}
         self._verify_rows: dict[ReqId, Any] = {}
         self._verify_state_before: dict[ReqId, tuple[int, dict[str, int]]] = {}
+        # Reused local prefix blocks, digested before the receive.
+        self._verify_kept: dict[ReqId, tuple[Any, dict[str, int]]] = {}
         self._write_state_digests: dict[ReqId, dict[str, int]] = {}
         self._logged_layout = False
 
@@ -726,12 +728,14 @@ class MoRIIOConnector(KVConnectorBase):
         if self._rejects_transfer_subset(req_id, meta):
             self._fail_before_transfer(req_id, meta)
             return
+        kept = self._kept_prefix_blocks(meta)
         try:
             self._read_blocks(
                 request_id=req_id,
                 dst_engine_id=meta.remote_engine_id,
-                local_block_ids=meta.local_block_ids,
-                remote_block_ids=meta.remote_block_ids,
+                local_block_ids=list(meta.local_block_ids)[kept:],
+                remote_block_ids=list(meta.remote_block_ids or [])[kept:],
+                kept_block_ids=list(meta.local_block_ids)[:kept],
                 remote_host=meta.remote_host,
                 remote_handshake_port=meta.remote_handshake_port,
                 remote_dp_rank=meta.remote_dp_rank,
@@ -776,6 +780,17 @@ class MoRIIOConnector(KVConnectorBase):
             )
 
     @staticmethod
+    def _kept_prefix_blocks(meta: ReqMeta) -> int:
+        """Leading blocks the consumer already holds; they are not moved."""
+        return max(0, int(getattr(meta, "num_computed_blocks", 0) or 0))
+
+    def _note_kept_prefix(self, req_id: ReqId, kept_ids: list[int], is_mla: bool):
+        """Under verify, digest the reused prefix so a write into it is caught."""
+        if kept_ids:
+            rows = self._verify_rows_for(kept_ids, is_mla)
+            self._verify_kept[req_id] = (rows, self._verify_digest(rows))
+
+    @staticmethod
     def _rejects_transfer_subset(req_id: ReqId, meta: ReqMeta) -> bool:
         """Whether the request asks for a subset neither direction implements.
 
@@ -783,13 +798,6 @@ class MoRIIOConnector(KVConnectorBase):
         skip already-computed blocks is safe to over-serve; a source stride is
         not, because the pairing would put blocks in the wrong place.
         """
-        if getattr(meta, "num_computed_blocks", 0):
-            logger.warning(
-                "req %s asks to skip %d already-computed blocks, which this "
-                "connector does not implement; transferring all blocks",
-                req_id,
-                meta.num_computed_blocks,
-            )
         if getattr(meta, "src_block_skip_factor", 1) != 1:
             logger.error(
                 "req %s: src_block_skip_factor=%s is not implemented by the "
@@ -810,8 +818,10 @@ class MoRIIOConnector(KVConnectorBase):
         if self._rejects_transfer_subset(req_id, meta):
             self._fail_before_transfer(req_id, meta)
             return
-        dst = [int(b) for b in meta.local_block_ids]
-        src = [int(b) for b in (meta.remote_block_ids or [])]
+        kept = self._kept_prefix_blocks(meta)
+        kept_ids = [int(b) for b in meta.local_block_ids[:kept]]
+        dst = [int(b) for b in meta.local_block_ids[kept:]]
+        src = [int(b) for b in (meta.remote_block_ids or [])[kept:]]
         try:
             self._source_covers(f"req {req_id}", dst, src)
         except ValueError as error:
@@ -856,6 +866,7 @@ class MoRIIOConnector(KVConnectorBase):
             rows = self._verify_rows_for(dst, is_mla)
             self._verify_rows[req_id] = rows
             self._verify_before[req_id] = self._verify_digest(rows)
+            self._note_kept_prefix(req_id, kept_ids, is_mla)
             if self._state_tensors:
                 self._verify_state_before[req_id] = (
                     dst_slot,
@@ -891,6 +902,7 @@ class MoRIIOConnector(KVConnectorBase):
             logger.exception("req %s: could not ask the producer to push KV", req_id)
             self._verify_rows.pop(req_id, None)
             self._verify_before.pop(req_id, None)
+            self._verify_kept.pop(req_id, None)
             self._verify_state_before.pop(req_id, None)
             self._fail_before_transfer(req_id, meta)
             return
@@ -1187,9 +1199,36 @@ class MoRIIOConnector(KVConnectorBase):
             )
         else:
             logger.info(
-                "[moriio-verify] req %s: all %d layers changed",
+                "[moriio-verify] req %s: all %d layers changed (%d rows received)",
                 req_id,
                 len(before),
+                rows.numel(),
+            )
+        self._verify_kept_landed(req_id)
+
+    def _verify_kept_landed(self, req_id: ReqId) -> None:
+        """Report a reused prefix block the receive wrote into."""
+        kept = self._verify_kept.pop(req_id, None)
+        if kept is None:
+            return
+        rows, before = kept
+        after = self._verify_digest(rows)
+        changed = [name for name, value in before.items() if after[name] != value]
+        if changed:
+            logger.error(
+                "[moriio-verify] req %s: %d of %d layers changed in the %d reused "
+                "prefix rows (first %s) -- the receive wrote into blocks it kept",
+                req_id,
+                len(changed),
+                len(before),
+                rows.numel(),
+                changed[0],
+            )
+        else:
+            logger.info(
+                "[moriio-verify] req %s: %d reused prefix rows unchanged",
+                req_id,
+                rows.numel(),
             )
 
     def _state_digest(self, slot: int) -> dict[str, int]:
@@ -1261,6 +1300,7 @@ class MoRIIOConnector(KVConnectorBase):
         remote_handshake_port: int,
         remote_dp_rank: int = 0,
         remote_tp_size: int = 0,
+        kept_block_ids: list[int] | None = None,
     ) -> None:
         """Issue RDMA reads for all layers of a single request.
 
@@ -1318,6 +1358,7 @@ class MoRIIOConnector(KVConnectorBase):
             rows = self._verify_rows_for(local_block_ids, is_mla)
             self._verify_rows[request_id] = rows
             self._verify_before[request_id] = self._verify_digest(rows)
+            self._note_kept_prefix(request_id, kept_block_ids or [], is_mla)
 
         for layer_idx, layer_name in enumerate(layer_names):
             k_sessions, v_sessions = sessions[layer_idx]
@@ -2124,6 +2165,7 @@ class MoRIIOConnector(KVConnectorBase):
             for req_id in failed_recving:
                 self._verify_rows.pop(req_id, None)
                 self._verify_before.pop(req_id, None)
+                self._verify_kept.pop(req_id, None)
                 self._verify_state_before.pop(req_id, None)
                 with self._write_reports_lock:
                     self._write_state_digests.pop(req_id, None)
@@ -2176,6 +2218,10 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_size = config.parallel_config.data_parallel_size
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.host_ip = get_ip()
+        # Tokens one block-table entry covers, the unit of the reused prefix.
+        self.hash_block_size = (
+            config.kv_cache_block_size * config.decode_context_parallel_size
+        )
 
         # Pending receive requests: req_id -> (Sequence, block_table, state slot)
         self._reqs_need_recv: dict[ReqId, tuple[Any, list[int], int]] = {}
@@ -2188,6 +2234,12 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+
+    @property
+    def receives_suffix_and_state(self) -> bool:
+        """A consumer receives only the blocks past its local prefix hit, and
+        the per-request state whole (`num_computed_blocks`)."""
+        return not self.is_producer
 
     def get_num_new_matched_tokens(self, seq: Sequence) -> tuple[int, bool]:
         """Check if this sequence needs remote KV prefill.
@@ -2254,6 +2306,10 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
                 seq,
                 list(seq.block_table),
                 getattr(seq, "state_slot", -1),
+            )
+            # The prefix this consumer already holds is not received again.
+            params["num_computed_blocks"] = (
+                seq.num_cached_tokens // self.hash_block_size
             )
             params["do_remote_prefill"] = False
             logger.debug(

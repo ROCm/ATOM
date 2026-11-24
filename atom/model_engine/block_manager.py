@@ -462,6 +462,9 @@ class BlockManager:
         # Kept plural because GDN's recurrent state is a second member the
         # moment it stops forking (see the state-cache protocol).
         self.state_caches: tuple[StateCache, ...] = (self._state_checkpoint_cache,)
+        # Set by the scheduler when its P/D connector receives only the blocks
+        # past the local hit and the per-request state whole (`_state_from_peer`).
+        self.remote_state_reuses_local_prefix = False
 
         # Class names already warned about in `state_checkpoint_fates`. See
         # there for why the warning latches.
@@ -1289,10 +1292,15 @@ class BlockManager:
         # so a boundary is only resumable where somebody checkpointed the state.
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
-        resumable = self._gated_hit(seq, compressed_hit, block_hashes)
-        # A checkpoint far below the compressed hit loses to a bounded replay,
-        # which keeps the whole hit and rebuilds the state at its end.
-        num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
+        if self._state_from_peer(seq):
+            # Nothing resumes from the prefix: the producer pushes the state.
+            resumable = num_cached_blocks = compressed_hit
+            seq.replays_hit = seq.replay_kv_load = False
+        else:
+            resumable = self._gated_hit(seq, compressed_hit, block_hashes)
+            # A checkpoint far below the compressed hit loses to a bounded
+            # replay, which keeps the whole hit and rebuilds the state at its end.
+            num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -1647,9 +1655,20 @@ class BlockManager:
         construction), else the HBM hit's last block. A replay rebuilds the
         state instead of restoring it, so it resumes from none.
         """
+        if self._state_from_peer(seq):
+            return -1
         if joint_hash != -1:
             return joint_hash
         return -1 if self.tier_resume_replays(seq) else hit_hash
+
+    def _state_from_peer(self, seq: Sequence) -> bool:
+        """A P/D receive whose per-request state the producer pushes whole, so
+        its local prefix needs no checkpoint and resumes no state."""
+        return (
+            self.remote_state_reuses_local_prefix
+            and seq.has_per_req_cache
+            and bool((seq.kv_transfer_params or {}).get("do_remote_prefill"))
+        )
 
     def lower_hit_to_chunk(
         self,
