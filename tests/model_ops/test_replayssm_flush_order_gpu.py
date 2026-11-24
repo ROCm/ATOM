@@ -13,6 +13,7 @@ if not torch.cuda.is_available():
     pytest.skip("needs a GPU", allow_module_level=True)
 
 from atom.model_ops.fla_ops.replayssm import (
+    replayssm_flush_wait,
     replayssm_gated_delta_rule,
     replayssm_sigmoid_gating_delta_rule,
 )
@@ -48,6 +49,8 @@ def make_step(op, lens, window, cursors):
         "q": torch.randn(1, T, H, D, **bf16),
         "k": torch.randn(1, T, H, D, **bf16),
         "v": torch.randn(1, T, HV, D, **bf16),
+        "flush_arrivals": torch.zeros(n_slots, HV, dtype=torch.int32, device=DEV),
+        "flush_wait": replayssm_flush_wait(),
         "write_pos": write_pos,
         "slot_idx": torch.tensor(slots, dtype=torch.int32, device=DEV),
         "cu_seqlens": torch.tensor([0] + lens, device=DEV).cumsum(0).int(),
@@ -94,7 +97,7 @@ def test_flush_replays_old_records_before_overwrite(op, scene, graph):
             t.copy_(state[name])
         return fn(**{**args, **over}, **work)
 
-    step()  # Compile and allocate the persistent arrival counters before capture.
+    step()  # Compile before capture; the pool already owns its arrival counters.
     repeat_step = step
     if graph:
         torch.cuda.synchronize()
@@ -113,6 +116,7 @@ def test_flush_replays_old_records_before_overwrite(op, scene, graph):
         for name, t in got.items():
             differs[name] += (t != first[name]).any()
     assert {n: int(c) for n, c in differs.items()} == dict.fromkeys(first, 0)
+    assert not args["flush_arrivals"].any()
 
     # At h = 0 the step appends at row 0 without flushing: the k / g it stores.
     step(write_pos=torch.zeros_like(args["write_pos"]))
