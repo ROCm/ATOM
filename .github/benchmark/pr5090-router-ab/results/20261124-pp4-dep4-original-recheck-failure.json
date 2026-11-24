@@ -49,5 +49,15 @@
   },
   "archive_sha256": "e4ea9d86a72ff80d5970c628247eb510a2fa78724b2e606bcf93f7d02d09d343",
   "conclusion": "Original-order C40 reproduced PP3 Mooncake synchronous-write timeouts. It was stopped after diagnosis, shortly after profiling began, and provides no valid performance window. C80 also failed on a different node and PCI device; root cause remains unresolved.",
-  "final_matching_container_ids": []
+  "final_matching_container_ids": [],
+  "first_failed_request_trace": {
+    "source_trace_id": "00ca01c4aaeccee751ae6285beb54dea262f",
+    "turn_index": 25,
+    "source_outer_idx": 28,
+    "source_inner_idx": null,
+    "source_kind": "weka_main",
+    "agent_depth": 0,
+    "first_failed_decode_dp_rank": 1
+  },
+  "peer_labels": "Anonymized connection labels, not DP rank numbers"
 }

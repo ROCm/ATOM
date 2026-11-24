@@ -87,5 +87,15 @@
   "next_investigation": "Compare the independent original-order C40 control; inspect descriptor construction and native Mooncake per-task completion versus batch counters/progress. No timeout increase or worker fix is claimed.",
   "archive_sha256": "dc708711352464d9af78457cba871ce1856c70230f702667611d4360fdd4356c",
   "prefill_log_sha256": "750d429e42ce73024dc1919b8ae5b24d7f5ac06c5a10cbfc258df65adaea4cfe",
-  "monitor_sha256": "fcaada25faf5b81362df440610fbcca502d56d9dde06d9cffeb686297af5010a"
+  "monitor_sha256": "fcaada25faf5b81362df440610fbcca502d56d9dde06d9cffeb686297af5010a",
+  "first_failed_request_trace": {
+    "source_trace_id": "212e46e294bd09113e425ebc8a430cc528a6",
+    "turn_index": 0,
+    "source_outer_idx": 65,
+    "source_inner_idx": 2,
+    "source_kind": "weka_subagent",
+    "agent_depth": 1,
+    "first_failed_decode_dp_rank": 3
+  },
+  "peer_labels": "Anonymized connection labels, not DP rank numbers"
 }
