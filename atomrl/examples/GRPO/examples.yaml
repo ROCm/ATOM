@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# GRPO examples: training and rollout on separate nodes, weights over RDMA.
+# Alias 8 is example 8 of docs/07-disaggregated-rdma.md.
+
+images:
+  # docker/Dockerfile.dsv4, target trainer; built from the ATOM repository root.
+  dsv4-trainer:
+    ref: dsv4-flash:trainer
+    atomrl_mount: /workspace/ATOM/atomrl
+    env: {RL_ROOT: /workspace}
+    build: docker build -f atomrl/examples/GRPO/docker/Dockerfile.dsv4 --target trainer -t dsv4-flash:trainer .
+
+defaults:
+  image: release
+  command: bash {examples}/GRPO/run_grpo.sh
+  nodes: 2
+  needs: [rdma]
+  prepare: python3 {examples}/DAPO/tools/prepare_data.py --data-root {data_root} --models Qwen3-30B-A3B
+  requires:
+    - models/Qwen3-30B-A3B
+    - data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
+    - data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet
+  env:
+    MODE: longrun
+    CONFIG_OVERRIDE: "{config}"
+    MODEL_PATH: "{data_root}/models/Qwen3-30B-A3B"
+    # Same tokenizer as Qwen3-8B-Base, so the DAPO filtered set applies.
+    TRAIN_FILE: "{data_root}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+    VAL_FILE: "{data_root}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+    CKPT_DIR: "{data_root}/ckpts/atomrl-examples/{id}"
+    RESUME_OVERRIDE: "false"
+    WEIGHT_SYNC_BACKEND: rdma
+    WANDB_MODE: disabled
+    # run_grpo.sh defaults to INFO with INIT,NET: 5.6 million lines (730 MB) in 5 steps.
+    NCCL_DEBUG: WARN
+  smoke:
+    steps: 5
+    timeout_min: 120
+    stall_min: 40
+  full:
+    steps: 1000
+    timeout_min: 20160
+    stall_min: 60
+
+examples:
+  - id: grpo-qwen3moe-vllm-2node
+    aliases: ["8"]
+    title: "Qwen3-30B-A3B GRPO, Megatron TP4/EP8 on one node, vLLM BF16 TP2x4 on the other, RDMA sync"
+    tier: t2
+    status: validated
+    smoke:
+      config: configs/grpo_qwen3_30b_a3b_vllm_ep8_longrun.yaml
+      overrides: &ex8
+        - cluster.num_nodes=2
+        - cluster.ray_address=auto
+        - controller.ray.actor.process_on_nodes=[8]
+        - controller.ray.rollout.process_on_nodes=[8]
+        - controller.ray.actor.topology_tags.node_ip={hosts[0].ip}
+        - controller.ray.rollout.topology_tags.node_ip={hosts[1].ip}
+        - weight_sync.backend=rdma
+        - weight_sync.rdma.require_rdma=true
+        - weight_sync.rdma.interface={rdma.interface}
+        - weight_sync.rdma.hca={rdma.hca}
+        - weight_sync.rdma.gid_index={rdma.gid_index}
+        - val_steps=0
+        - checkpointing.save_steps=100000
+        - logger.wandb_enabled=false
+      checks:
+        # Four runs on 2x 8x MI355X (2026-11-17): 0.000818, 0.000820, 0.000815, 0.000819.
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.00082, band: 3}
+          - {name: entropy, info: true}
+    full:
+      config: configs/grpo_qwen3_30b_a3b_vllm_ep8_longrun.yaml
+      overrides: *ex8
+
+  - id: grpo-qwen3moe-atom-2node
+    title: "Qwen3-30B-A3B GRPO, Megatron TP4/EP8 on one node, ATOM BF16 TP2x4 on the other, RDMA sync"
+    tier: t2
+    status: validated
+    needs: [rdma, atom_rdma]
+    env:
+      BACKEND: atom
+      ATOM_FORCE_ATTN_TRITON: "1"
+    smoke:
+      # The vLLM two-node config with the rollout on ATOM. No R3 (ATOM is
+      # fail-closed on it), so k3_kl runs about twice the vLLM example's.
+      config: configs/grpo_qwen3_30b_a3b_atom_ep8_2node_longrun.yaml
+      overrides: *ex8
+      checks:
+        # One run on 2x 8x MI355X with ROCm/ATOM#3058 (2026-11-17): 0.00168.
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.0017, band: 3}
+          - {name: entropy, info: true}
+    full:
+      config: configs/grpo_qwen3_30b_a3b_atom_ep8_2node_longrun.yaml
+      overrides: *ex8
+
+  - id: grpo-dsv4-flash-3node
+    title: "DeepSeek-V4-Flash GRPO, Megatron TP4/PP4/EP4 on two nodes, vLLM FP8 TP8 on a third"
+    tier: long
+    status: unvalidated
+    image: dsv4-trainer
+    nodes: 3
+    command: bash {examples}/GRPO/run_grpo_dsv4.sh
+    prepare: null
+    requires:
+      - models/DeepSeek-V4-Flash-BF16
+      - data/dsv4-flash/dapo-math-17k/dapo-math-17k.jsonl
+      - data/dsv4-flash/aime-2024/aime-2024.jsonl
+    notes: >-
+      Topology from the config: trainer workers on the first two hosts, the
+      rollout on the third. The long-run config reads ACTOR_NODE_IPS and
+      ROLLOUT_NODE_IPS; pass them with --env.
+    env:
+      MODE: smoke
+      MODEL_PATH: "{data_root}/models/DeepSeek-V4-Flash-BF16"
+      TRAIN_FILE: "{data_root}/data/dsv4-flash/dapo-math-17k/dapo-math-17k.jsonl"
+      VAL_FILE: "{data_root}/data/dsv4-flash/aime-2024/aime-2024.jsonl"
+    smoke:
+      config: configs/grpo_dsv4_flash_vllm_smoke.yaml
+      steps: 3
+      overrides:
+        - weight_sync.rdma.interface={rdma.interface}
+        - weight_sync.rdma.hca={rdma.hca}
+        - weight_sync.rdma.gid_index={rdma.gid_index}
+        - logger.wandb_enabled=false
+      checks:
+        marker: "step="
+        metrics: []
+    full:
+      config: configs/grpo_dsv4_flash_vllm_longrun.yaml
+      steps: 200

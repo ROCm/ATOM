@@ -1,0 +1,226 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Megatron-Native twin of dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml.
+#
+# Same verl FP8-E2E BF16 reference recipe, same 1000-step schedule, same data,
+# same rollout engine. The point of this file is to isolate the training
+# backend, so every hyper-parameter that defines the optimization problem is
+# copied verbatim from the FSDP2 config:
+#   prompt/response 2048/20480, train_prompt_bsz 128 x n 16 = 2048 sequences,
+#   gen_prompt_bsz 384, one update per rollout, grpo, token-mean,
+#   clip 0.2/0.28/10, lr 1e-6 with NO warmup, wd 0.1, clip_grad 1.0,
+#   entropy_coeff 0, overlong_buffer 512/1.0, filter_groups acc/10,
+#   token-level TIS at C=2.0, temperature/top_p/top_k 1.0/1.0/-1, val every 10.
+#
+# Topology matches FSDP2's data-parallel width so the gradient is an average
+# over the same partition of the same global batch:
+#   TP=1, PP=1, CP=1, EP=8  ->  DP = 8/(1*1*1) = 8
+#
+# MEMORY: this configuration died at step 14 with
+# HSA_STATUS_ERROR_OUT_OF_RESOURCES inside the actor backward. Actor peak was
+# 157-177 GB reserved (135 GB allocated) against a 288 GB card that also holds a
+# resident vLLM, and ROCm has no expandable_segments to reclaim the ~42 GB
+# allocator gap. The transient is dominated by the update path materialising the
+# packed logits [T, 151936] with grad; since _build_bins gives any row longer
+# than the budget its own bin and every step carried a ~20.7k-token sequence,
+# lowering max_tokens_per_gpu cannot cap it. See the context_parallel_size note
+# for why the parallelism knobs do not help either.
+#
+# Router precision: the FSDP2 run gets BF16 routers from
+# ATOMRL_FP32_MOE_ROUTER=0, which patches the FSDP backend and the vLLM worker
+# ext but never reaches the Megatron engine -- that reads `moe_router_dtype`.
+# `null` means "no upcast", i.e. the BF16 router that verl uses and that the
+# FSDP2 baseline runs. Keep ATOMRL_FP32_MOE_ROUTER=0 in the environment anyway,
+# since that is what puts the *rollout* router in BF16 on both runs.
+# NOTE fp32 routers are the more stable choice; BF16 is the comparable one.
+#
+# ONE deviation from the FSDP2 config, and it does not touch the optimization
+# problem: `gpu_memory_utilization` is 0.30 rather than 0.40. Megatron-Native
+# holds ~68% more resident memory per actor than FSDP2 (measured on the 4k
+# smoke: 72.0 vs 42.8 GB allocated, 137 vs 114 GB peak reserved), and the
+# already-validated Megatron MoE long run peaked at ~147 GB/card with vLLM at
+# 0.30. At 0.40 vLLM would take ~101 GB of the 252 GiB card and leave no margin
+# above that peak. Full activation recomputation is on for the same reason.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B-Base"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 22528      # verl max_prompt 2048 + max_response 20480
+  max_response_length: 20480
+  train_global_batch_size: 2048         # verl train_prompt_bsz 128 x n 16
+  gen_batch_size: 384                   # verl gen_prompt_bsz = 128 * 3
+  train_micro_batch_size: 1             # verl ppo_micro_batch_size_per_gpu 1
+  max_token_len_per_gpu: 22528          # verl actor_ppo_max_token_len
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0                    # verl lr_warmup_steps_ratio 0.0 -> no warmup
+  weight_decay: 0.1
+  max_grad_norm: 1.0                    # verl clip_grad
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16               # COMPUTE dtype; master weights stay fp32
+    megatron_cfg:
+      use_distributed_optimizer: true
+      # ---- Expert Parallel: 128 experts sharded across all 8 GPUs ----
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      # CP=2 was tried and made things WORSE -- it died on the first update after
+      # resume with "Available Free mem : 0 MB", where CP=1 had survived 13 steps.
+      # CP does shard the logits (each rank keeps only its own chunk), but the
+      # saving is cancelled out: DP drops 8 -> 4, so the distributed optimizer's
+      # fp32 master + Adam state per rank doubles (~8.5 -> ~17 GB), and the CP
+      # path adds a torch.cat copy of the local logits that the CP=1 path gets as
+      # a view. Net effect was roughly break-even on the transient and strictly
+      # worse on the resident baseline. Same argument rules out TP and PP as
+      # memory fixes: anything that shrinks DP pays for it in optimizer state.
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      sequence_parallel: false
+      moe_grouped_gemm: true
+      moe_permute_fusion: true          # fused MoE permute: fewer scratch buffers
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
+      moe_aux_loss_coeff: 0.0           # RL loss unchanged, same as FSDP2
+      # fp32, NOT null. Setting this to null to match the FSDP2 baseline's BF16
+      # router was a mistake: FSDP2 and vLLM run the same PyTorch router op on the
+      # same layout, so BF16 rounding lands them on the same top-8 experts, but
+      # Megatron routes through its own TopKRouter feeding grouped-GEMM experts.
+      # In BF16 the two implementations pick different experts for near-tie tokens,
+      # and a flipped expert changes that token's log-prob a lot. Measured: with
+      # this at null, rollout_corr/kl was flat at 6.5e-4 through step 77 and then
+      # grew ~16%/step to 2.4e-2 by step 110 while the FSDP2 run held 6.6e-4 at the
+      # same steps; the earlier Megatron run with fp32 here stayed at 7e-4 until
+      # step ~185. This is what config.py means by "bf16 top-k flips experts ->
+      # large train/rollout log-prob mismatch". Costs comparability with the FSDP2
+      # baseline on one axis, which is the right trade against a broken run.
+      moe_router_dtype: fp32
+      # Full activation recomputation: bounds the activation peak for resp=20480
+      # on a 30B policy. Same setting the validated Megatron MoE long run uses.
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: true
+      # 8192, not 22528. This does NOT lower the worst-case bin -- the single
+      # ~20.7k-token sequence each step still gets a bin to itself -- but it stops
+      # every *packed* bin from also reaching 22.5k tokens. Instead of ~7 peak-sized
+      # allocate/free cycles per step there is one, which is what matters when the
+      # failure mode is allocator fragmentation (135 GB allocated vs 177 GB
+      # reserved) on a runtime with no expandable_segments.
+      max_tokens_per_gpu: 8192
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      # 0.25 is close to the floor: each colocated replica holds the whole 30.5B
+      # policy in BF16 (~61 GB), so 0.25 x 288 GB leaves only ~11 GB of KV cache.
+      # Going lower starves the rollout entirely. This frees ~14 GB per card for
+      # the actor at the cost of roughly half the generation concurrency.
+      gpu_memory_utilization: 0.25
+      max_model_len: 22528
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 32768
+      max_num_seqs: 256
+      quantization: ""                  # BF16 baseline
+      calculate_log_probs: true         # verl rollout.calculate_log_probs
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    rollout_replay: false               # verl's recipe has no router replay
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16                 # verl n_resp_per_prompt
+    kl_coeff: 0.0                       # verl use_kl_loss=False, kl_coef=0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 20480
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token                   # verl rollout_is=token
+    rollout_is_threshold: 2.0           # verl C=2
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+# verl trainer.test_freq=10 on AIME-2024.
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 10
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  # Separate from the FSDP2 directory on purpose: the two backends use different
+  # checkpoint formats and must never share a path. A Megatron dist-checkpoint of
+  # this policy is ~400GB, and CheckpointCallback frees the previous one before
+  # writing the next, so the steady-state footprint is one copy.
+  checkpoint_dir: "${oc.env:SCRATCH_ROOT}/ckpts/atomrl-dapo/verlref-moe-a3b-bf16-megatron-ep8"
+  save_steps: 5
+  save_total_limit: 1
+  resume: true
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: ATOMRL-MOE
+    name: verlref-moe-a3b-bf16-megatron-ep8-B128-R20K-TIS
+
+num_training_steps: 1000
+seed: 10086

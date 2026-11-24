@@ -158,6 +158,10 @@ class TransferSlotPool:
         self._cond = threading.Condition()
         self._closed = False
 
+    def holding(self) -> threading.Condition:
+        """The pool's lock, re-entrant: no slot is acquired while it is held."""
+        return self._cond
+
     # -- geometry ----------------------------------------------------------
     def capacity(self, region: str) -> int:
         """Slots the region was built with."""

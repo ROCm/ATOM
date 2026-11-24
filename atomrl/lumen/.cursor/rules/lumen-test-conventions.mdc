@@ -1,0 +1,99 @@
+---
+description: Test writing conventions for the Lumen project to prevent common test bugs
+globs: Lumen/tests/**/*.py,tests/**/*.py
+alwaysApply: false
+---
+
+# Lumen Test Conventions
+
+## FP8 / GPU tests MUST run on CUDA
+
+FP8 ops (`torch.float8_e4m3fn`, `torch.float8_e4m3fnuz`) require CUDA. Tests using FP8 activation store, FP8 quantization, or any Lumen FP8 path must create tensors on CUDA and move modules to CUDA:
+
+```python
+# BAD — FP8 autograd breaks on CPU
+mlp = LumenGatedMLP(64, 128, fp8_activation_store=True)
+x = torch.randn(2, 16, 64, requires_grad=True)
+
+# GOOD
+mlp = LumenGatedMLP(64, 128, fp8_activation_store=True).cuda()
+x = torch.randn(2, 16, 64, device="cuda", requires_grad=True)
+```
+
+## Leaf tensor rule for gradient SNR tests
+
+When comparing gradients between a Lumen op and a reference (`F.linear`, `attention_ref`), the reference weight tensor MUST be a leaf. Multiplying after `requires_grad=True` creates a non-leaf tensor whose `.grad` is always `None`:
+
+```python
+# BAD — w is non-leaf (has grad_fn=MulBackward), w.grad stays None
+w = torch.randn(128, 64, requires_grad=True) * 0.02
+
+# GOOD — multiply first, then enable grad tracking
+w = (torch.randn(128, 64) * 0.02).requires_grad_(True)
+```
+
+## Forward signature: always pass ALL positional args
+
+Megatron-compatible modules (`LumenDotProductAttention`, `LumenDotProductAttentionMLA`) require `attention_mask` as a positional argument. Always pass it, even in benchmarks:
+
+```python
+# BAD
+attn(q, k, v)
+
+# GOOD
+attn(q, k, v, attention_mask=None)
+```
+
+## FP8 backend auto-mapping
+
+`LumenAttention` defaults to `backend_type="aiter_csrc"`. When `quant_type` is set (FP8 mode), the module auto-maps `aiter_csrc → aiter_triton` because `attention_fp8_quant` only accepts `aiter_triton`, `aiter_triton_fp8`, `aiter_csrc_fp8`, `aiter_asm_fp8`. Tests that want FP8 attention need not set `backend_type` explicitly; the mapping is automatic.
+
+## Tensor dimensions must match parallel partitioning
+
+`LumenRowParallelLinear(in_features, out_features, tp_size=N)` with `input_is_parallel=True` expects input of size `in_features / tp_size`:
+
+```python
+# BAD — input_size_per_partition = 64 / 2 = 32, but input has 64
+m = LumenRowParallelLinear(64, 128, tp_size=2)
+x = torch.randn(4, 64)
+
+# GOOD
+x = torch.randn(4, 32)
+```
+
+## MXFP8 quant_block_size must divide head_dim
+
+Triton MXFP8 kernel requires `padded_head_dim % quant_block_size == 0`. When parametrizing `quant_block_size`, use a head_dim divisible by all values:
+
+```python
+# BAD — head_dim=64 not divisible by 128 or 256
+@pytest.mark.parametrize("quant_block_size", [64, 128, 256])
+def test_block_sizes(self, quant_block_size):
+    q = torch.randn(1, 128, 4, 64, ...)  # head_dim=64
+
+# GOOD — head_dim=256 divisible by all block sizes
+    q = torch.randn(1, 128, 4, 256, ...)  # head_dim=256
+```
+
+## Read-only properties on mock objects
+
+`SdmaTpComm.npes` and `SdmaTpComm.my_pe` are read-only `@property` attributes. Set values via the underlying `_ctx` mock, not by assignment:
+
+```python
+# BAD — raises AttributeError
+comm.npes = 2
+comm.my_pe = 0
+
+# GOOD — values come from the mock context
+mock_ctx.get.return_value = SimpleNamespace(my_pe=0, npes=2)
+```
+
+## Assert gradients before computing SNR
+
+Always verify gradients are non-None before passing to `compute_snr`:
+
+```python
+assert dinput is not None, "backward did not populate input grad"
+assert dweight is not None, "backward did not populate weight grad"
+dinput_snr = compute_snr(ref_grad, dinput)
+```

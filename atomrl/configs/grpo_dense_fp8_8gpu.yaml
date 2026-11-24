@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
+policy:
+  model_name: meta-llama/Llama-3.1-8B-Instruct
+  training_backend: fsdp2
+  generation_backend: atom
+  max_total_sequence_length: 4096
+  train_global_batch_size: 128
+  train_micro_batch_size: 8
+
+algorithm:
+  name: grpo
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: fp8
+    use_deep_gemm: true
+  training:
+    fp8: hybrid
+    fp8_recipe: blockwise
+    fp8_weight_cache: true
+  rollout_correction:
+    enabled: true
+    method: tis
+    clip: 1.5
+
+moe:
+  r3:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+  dataset: nvidia/OpenMathInstruct-2
+
+checkpointing:
+  checkpoint_dir: results/grpo_dense_fp8_8gpu
+  save_steps: 50
+
+logger:
+  wandb_enabled: true
+  wandb:
+    project: atomrl
+    name: grpo-llama8b-fp8-8gpu
+
+num_training_steps: 500
+seed: 42

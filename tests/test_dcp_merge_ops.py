@@ -1093,9 +1093,19 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
     forward_vars["sparse_kv_last_page_lens"] = SimpleNamespace(
         gpu=torch.ones(4, dtype=torch.int32)
     )
-    builder._sparse_prefill_work_plan = MethodType(
-        aiter_mla.AiterMLAMetadataBuilder._sparse_prefill_work_plan, builder
-    )
+    builder._dcp_sparse_prefill_mode = "q"
+    builder.sparse_prefill_num_heads = 64
+    builder._sparse_prefill_work_view_cache = {}
+    for name in (
+        "_sparse_prefill_work_plan",
+        "_sparse_prefill_work_views",
+        "_sparse_prefill_work_widths",
+    ):
+        setattr(
+            builder,
+            name,
+            MethodType(getattr(aiter_mla.AiterMLAMetadataBuilder, name), builder),
+        )
     md = SimpleNamespace(
         cu_seqlen_ks=torch.zeros(4, dtype=torch.int32),
         cu_seqlen_ke=torch.arange(4, dtype=torch.int32),
@@ -1343,6 +1353,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         kv_cache_dtype=cache_dtype,
         index_cache_dtype="fp8",
         attn_prefill_chunk_size=0,
+        speculative_config=None,
         enable_tbo=False,
         enable_tbo_decode=False,
         compilation_config=SimpleNamespace(static_forward_context={}),

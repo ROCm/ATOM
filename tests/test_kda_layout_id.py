@@ -46,6 +46,7 @@ def builder(
     interval=-1,
     block_size=4,
     dcp=1,
+    kv_transfer_config=None,
 ):
     """`kpool` is the model's (GLM-5.3 pools indexer keys); `kpool_tail` says
     whether this PP stage holds indexer layers, and with them the tail plane."""
@@ -57,6 +58,7 @@ def builder(
         state_checkpoint_interval_tokens=interval,
         kv_cache_block_size=block_size,
         decode_context_parallel_size=dcp,
+        kv_transfer_config=kv_transfer_config,
     )
     if kpool_tail is None:
         kpool_tail = kpool > 1

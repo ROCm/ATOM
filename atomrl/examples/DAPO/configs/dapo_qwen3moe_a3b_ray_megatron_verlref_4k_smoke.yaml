@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Megatron-Native twin of dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml.
+#
+# Purpose: isolate the training backend. Every field that defines the
+# optimization problem, the rollout engine and the data is byte-identical to the
+# FSDP2 verlref smoke; the only differences are
+# `policy.training_backend` and the `megatron_cfg` block that describes how the
+# same 8 GPUs are carved up.
+#
+# Topology is chosen so the data-parallel width matches FSDP2 DP8:
+#   TP=1, PP=1, CP=1, EP=8  ->  DP = 8/(1*1*1) = 8
+# so each rank still sees 128/8 = 16 sequences per step and the gradient is the
+# average over the same partition of the same global batch.
+#
+# Router precision: the FSDP2 run gets BF16 routers from
+# ATOMRL_FP32_MOE_ROUTER=0, which only patches the FSDP backend and the vLLM
+# worker ext -- the Megatron engine reads `moe_router_dtype` instead. `null`
+# means "no upcast", i.e. the BF16 router that matches verl and the FSDP2 run.
+# Keep ATOMRL_FP32_MOE_ROUTER=0 in the environment anyway: it is what puts the
+# *rollout* router in BF16, and that half is shared between the two runs.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B-Base"
+  training_backend: megatron_native
+  generation_backend: vllm
+  max_total_sequence_length: 6144       # verl's 2048 prompt + 4096 response
+  max_response_length: 4096
+  train_global_batch_size: 128          # 8 prompts x 16 generations
+  gen_batch_size: 24                    # 8 * 3, verl's train:gen ratio
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 6144
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      sequence_parallel: false
+      moe_grouped_gemm: true
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
+      moe_aux_loss_coeff: 0.0
+      moe_router_dtype: null
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: true
+      max_tokens_per_gpu: 6144
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.30
+      max_model_len: 6144
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8192
+      max_num_seqs: 256
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+moe:
+  r3:
+    rollout_replay: false
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 4096
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 1000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086

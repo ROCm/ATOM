@@ -23,27 +23,6 @@ from atom.model_ops.utils import atom_parameter
 logger = logging.getLogger("atom")
 
 
-def pin_rows(sources):
-    """Copy with ATOM's exact-size HIP allocator; never register a file mapping.
-
-    Main's public pin_rows lacks F's explicit copy override. Reuse its allocator,
-    leases and chunked copy without changing Engram's allocation policy.
-    """
-    allocator = host_memory._host_allocator()
-    if allocator is None:
-        return None
-    leases = []
-    try:
-        out = host_memory._copy(allocator, sources, leases)
-    except Exception:
-        logger.warning("Mono PLE: host shard copy failed", exc_info=True)
-        out = None
-    if out is None:
-        for lease in leases:
-            lease.release()
-    return out
-
-
 class MonoPleHostTable:
     """One rank's rows `[vocab_start, vocab_end)` of a table loaded shard by shard.
 
@@ -51,17 +30,6 @@ class MonoPleHostTable:
     (`host_memory.pin_rows`), so the table is never whole anywhere and never
     in HBM. `shard_bases` then gives, per shard, the address of its first
     global row for the device to read over UVA.
-
-    Always copied, whatever `ATOM_ENGRAM_UVA_COPY` says: the shards share
-    safetensors files with other weights, and registering part of a file
-    mapping in place makes ordinary host-to-device copies from the rest of
-    that mapping fail (`hipErrorInvalidValue`, or a GPU memory fault). The
-    registered pages would also be private copies (the mapping is
-    `MAP_PRIVATE`), so registering would not share them across processes.
-    And the kernel reads a shard from one base address, while in-place
-    registrations of adjacent, unaligned shards share their boundary pages
-    (`host_memory._PageRuns`): a shard then spans device ranges that are
-    mapped apart.
 
     One shard that cannot be page-locked moves the table to `device` -- the
     rows already pinned are copied over -- and the addresses point there
@@ -113,7 +81,7 @@ class MonoPleHostTable:
             )
         hbm = self._hbm
         if hbm is None:
-            pinned = pin_rows([rows.contiguous()])
+            pinned = host_memory.pin_rows([rows.contiguous()])
             with self._lock:
                 if pinned is not None and self._hbm is None:
                     self._rows[shard] = (row_start, pinned[0])
@@ -170,8 +138,8 @@ class MonoPleHostTable:
                 address += (first - self.vocab_start) * row_bytes
             else:
                 row_start, pinned = self._rows[shard]
-                # (not always the host address: memory registered in place is
-                # mapped at another device address, and a kernel handed the
+                # (not always the host address: HIP may map page-locked host
+                # memory at another device address, and a kernel handed the
                 # host one faults; the host address where there is no HIP
                 # runtime to ask)
                 address = device_address(pinned.data_ptr(), identity_without_hip=True)

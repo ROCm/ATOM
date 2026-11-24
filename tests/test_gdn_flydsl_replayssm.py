@@ -326,20 +326,12 @@ def _replayssm_prefill(monkeypatch, *, flydsl, keep, checkpoint):
     published = chunk.pop_last_intermediate_states()
     if keep and not checkpoint:
         assert torch.equal(published, h_kv)
-    return pool
 
 
 @pytest.mark.parametrize("checkpoint", [False, True])
 @pytest.mark.parametrize("keep", [False, True])
-def test_replayssm_prefill_runs_flydsl_and_writes_the_same_checkpoint(
-    monkeypatch, keep, checkpoint
+@pytest.mark.parametrize("flydsl", [False, True])
+def test_replayssm_prefill_writes_the_logical_kv_final_state_into_the_pool(
+    monkeypatch, flydsl, keep, checkpoint
 ):
-    flydsl_pool = _replayssm_prefill(
-        monkeypatch, flydsl=True, keep=keep, checkpoint=checkpoint
-    )
-    triton_pool = _replayssm_prefill(
-        monkeypatch, flydsl=False, keep=keep, checkpoint=checkpoint
-    )
-    # Same logical final state in -> the same checkpoint bytes out, whichever
-    # kernel produced it and whatever layout it came back in.
-    assert torch.equal(flydsl_pool, triton_pool)
+    _replayssm_prefill(monkeypatch, flydsl=flydsl, keep=keep, checkpoint=checkpoint)

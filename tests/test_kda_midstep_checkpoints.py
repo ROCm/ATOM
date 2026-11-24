@@ -191,6 +191,15 @@ def test_the_state_pool_lends_scratch_only_where_it_is_borrowed(k3_modules):
     assert extra(interval=4) == extra(interval=5) == K3.MIDSTEP_SCRATCH_SLOTS
     assert extra(interval=-1, dcp=2) == K3.MIDSTEP_SCRATCH_SLOTS
 
+    transfer = {"kv_connector": "moriio", "state_transfer_slots": 8}
+    assert extra(replayssm=True, interval=32, kv_transfer_config=transfer) == (
+        8 + K3.MIDSTEP_SCRATCH_SLOTS + DECODE_SNAPSHOT_SCRATCH_SLOTS
+    )
+    assert extra(replayssm=True, interval=3, kv_transfer_config=transfer) == 8
+    assert extra(replayssm=True, interval=-1, kv_transfer_config=transfer) == (
+        8 + K3.MIDSTEP_SCRATCH_SLOTS
+    )
+
 
 @pytest.mark.parametrize(
     "interval, expected", [(-1, -1), (0, 0), (511, 0), (512, 512), (513, 512)]

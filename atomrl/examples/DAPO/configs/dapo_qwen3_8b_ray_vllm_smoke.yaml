@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# verl-aligned online rollout SMOKE: Ray driver + colocated vLLM replicas.
+#
+# Exercises the full verl-aligned stack inside AtomRL's Ray controller path:
+#   - training on 8 Ray actors with cross-actor torch.distributed rendezvous +
+#     FSDP2 sharding + grad sync (verl RayWorkerGroup style)
+#   - 8 colocated vLLM AsyncLLM rollout replicas (TP=1, one per training GPU)
+#   - ZMQ CUDA-IPC bucketed weight sync (BucketedWeightSender/Receiver)
+#   - cumem / ROCm KV-only sleep-wake between rollout and training
+#   - DAPO dynamic sampling (filter_groups) + token-level TIS
+#
+# Small batch / short horizon so it finishes fast on 8 GPUs. Launch via
+# run_smoke_ray_vllm.sh (overrides model/data paths).
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B-Base"
+  training_backend: fsdp2
+  generation_backend: vllm
+  max_total_sequence_length: 2048
+  max_response_length: 512
+  train_global_batch_size: 128         # 8 prompts x 16 generations (/8 actors = 16 rows each)
+  gen_batch_size: 24                   # over-sample prompts/round for filter_groups
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 2048
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16
+    fsdp_cfg:
+      # 256GB MI300X: keep params/optimizer resident (offload has an FSDP2
+      # CPU-offload validation edge case under the Ray path; not needed at 8B).
+      param_offload: false
+      optimizer_offload: false
+  generation:
+    vllm_cfg:
+      transport: ray_http              # verl-aligned Ray actor rollout
+      ray_http_start_server: false     # RPC generate path (HTTP optional)
+      gpu_memory_utilization: 0.30
+      max_model_len: 2048
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 4096
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true        # TIS rollout correction
+      # NOTE: vLLM cumem sleep is broken on this ROCm box (frees no memory +
+      # corrupts weights) and the old KV-only patch is incompatible with vLLM
+      # 0.23. With 256GB MI300X the engine (gpu_mem_util=0.30 => ~76GB) stays
+      # resident alongside FSDP training, so sleep is disabled.
+      enable_sleep_mode: false
+      sleep_level: 2
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 512
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 256
+      penalty_factor: 1.0
+      log: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/atomrl-dapo/ray-vllm-smoke"
+  save_steps: 1000
+  save_total_limit: 1
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 3
+seed: 10086
