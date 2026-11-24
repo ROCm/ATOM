@@ -187,12 +187,14 @@ def sync_dp_metadata(
         ]
     if dspark_on:
         fields.append(max_seqlen_q)
-    local = torch.tensor(fields, dtype=torch.int32)
+    # On the host whatever the default device: the runner calls this under
+    # CUDA, and Gloo and `.numpy()` both need CPU tensors.
+    local = torch.tensor(fields, dtype=torch.int32, device="cpu")
 
     # A group of one is its own row, with nothing to exchange.
     gathered = local[None]
     if dp_size > 1:
-        gathered = torch.empty((dp_size, len(fields)), dtype=torch.int32)
+        gathered = torch.empty((dp_size, len(fields)), dtype=torch.int32, device="cpu")
         torch.distributed.all_gather(list(gathered.unbind(0)), local, group=dp_group)
     sync = np.ascontiguousarray(gathered.numpy().T)  # [n_fields, dp_size]
 

@@ -266,3 +266,33 @@ def test_every_reduction_comes_back_as_a_plain_value_in_dp_order(monkeypatch):
     assert type(r.max_seqlen_q_across_dp) is int and r.max_seqlen_q_across_dp == 2
     assert type(r.max_final_requests_across_dp) is int
     assert r.max_final_requests_across_dp == 4
+
+
+def test_the_row_stays_on_the_host_under_a_default_device(monkeypatch):
+    """The model runner calls this under a CUDA default device, so the row and
+    the gather buffer must name the CPU themselves: Gloo and `.numpy()` take
+    host tensors only. `meta` stands in for CUDA on a CPU host."""
+    devices = []
+
+    def fake_all_gather(out_list, local, group=None):
+        devices.extend(t.device.type for t in (local, *out_list))
+        for out in out_list:
+            out.copy_(local)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    with torch.device("meta"):
+        pair = sync_dp_metadata(
+            dp_group=_FakeGroup([None]),
+            dp_size=2,
+            running_tokens_per_dp_rank=np.zeros(2, dtype=np.int32),
+            **_base(),
+        )
+        alone = sync_dp_metadata(
+            dp_group=None,
+            dp_size=1,
+            running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
+            **_base(),
+        )
+    assert set(devices) == {"cpu"}
+    assert pair.scheduled_tokens_per_dp_rank.tolist() == [10, 10]
+    assert alone.scheduled_tokens_per_dp_rank.tolist() == [10]
