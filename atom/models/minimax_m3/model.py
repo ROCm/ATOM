@@ -364,6 +364,9 @@ class MiniMaxM3MoE(nn.Module):
             )
             if self.fhmoe is not None:
                 self.fhmoe.bind(self.shared_experts)
+        self.shared_full = sp_prefill.make_shared_full(
+            self.shared_experts, config, quant_config, f"{prefix}.shared_experts"
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
