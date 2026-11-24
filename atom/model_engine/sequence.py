@@ -537,6 +537,9 @@ class Sequence:
 
         # statistics fields
         self.arrive_time = 0.0
+        # When a prefill chunk of this request was last scheduled, for an
+        # admission order other than arrival (`Scheduler._admit_rank`).
+        self.prefill_served_time = 0.0
         self.first_token_time = 0.0
         self.leave_time = 0.0
         self.leave_reason = ""

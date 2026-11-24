@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -37,6 +38,7 @@ MODES = ("any", "eager", "capture")
 ON_DECLINE = ("native", "error")
 SHADOW = ("error", "shadow", "nested")
 MONO_MODES = ("auto", "off")
+PREFILL_ADMIT_ORDERS = ("fifo", "short_new", "srpt")
 _SLOT_RE = re.compile(r"^[A-Za-z0-9_*]+(\.[A-Za-z0-9_*]+)*$")
 
 
@@ -59,6 +61,23 @@ def _strict_int(value: Any, where: str, *, min_value: int | None = None) -> int:
         raise RecipeRefused("recipe-schema", f"{where} must be an int")
     if min_value is not None and value < min_value:
         raise RecipeRefused("recipe-schema", f"{where} must be >= {min_value}")
+    return value
+
+
+def _strict_number(value: Any, where: str, *, min_value: float | None = None) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise RecipeRefused("recipe-schema", f"{where} must be a number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise RecipeRefused("recipe-schema", f"{where} must be finite")
+    if min_value is not None and value < min_value:
+        raise RecipeRefused("recipe-schema", f"{where} must be >= {min_value}")
+    return value
+
+
+def _one_of(value: Any, where: str, choices: tuple[str, ...]) -> str:
+    if not isinstance(value, str) or value not in choices:
+        raise RecipeRefused("recipe-schema", f"{where} must be one of {choices}")
     return value
 
 
@@ -113,10 +132,17 @@ class EngineOptions:
     prefill_cost_ceil: bool = False
     prefill_decode_interval_busy: int = 0
     prefill_decode_interval_busy_seqs: int = 48
+    # Load-dependent decode interval (0 = off): see `PrefillDelayer`.
+    prefill_decode_interval_slope: float = 0.0
+    prefill_decode_interval_slope_from: int = 0
     prefill_long_cap_busy: int = 0
     prefill_long_cap_busy_seqs: int = 48
     dp_session_prefix_owner_tokens: int = 0
     dp_session_prefix_owner_max_extra_reqs: int = 8
+    # The order a rank admits the prefill work it holds: see
+    # `Scheduler._order_waiting_prefills`.
+    prefill_admit_order: str = "fifo"
+    prefill_admit_max_age_ms: int = 3000
 
     @classmethod
     def from_mapping(cls, raw: Any) -> EngineOptions:
@@ -129,7 +155,7 @@ class EngineOptions:
         if unknown:
             raise RecipeRefused("recipe-schema", f"unknown engine option(s): {unknown}")
         defaults = cls()
-        return cls(
+        options = cls(
             prefill_short_first_rows=_strict_int(
                 raw.get("prefill_short_first_rows", defaults.prefill_short_first_rows),
                 "engine.prefill_short_first_rows",
@@ -171,6 +197,22 @@ class EngineOptions:
                 "engine.prefill_decode_interval_busy_seqs",
                 min_value=1,
             ),
+            prefill_decode_interval_slope=_strict_number(
+                raw.get(
+                    "prefill_decode_interval_slope",
+                    defaults.prefill_decode_interval_slope,
+                ),
+                "engine.prefill_decode_interval_slope",
+                min_value=0,
+            ),
+            prefill_decode_interval_slope_from=_strict_int(
+                raw.get(
+                    "prefill_decode_interval_slope_from",
+                    defaults.prefill_decode_interval_slope_from,
+                ),
+                "engine.prefill_decode_interval_slope_from",
+                min_value=0,
+            ),
             prefill_long_cap_busy=_strict_int(
                 raw.get("prefill_long_cap_busy", defaults.prefill_long_cap_busy),
                 "engine.prefill_long_cap_busy",
@@ -199,7 +241,33 @@ class EngineOptions:
                 "engine.dp_session_prefix_owner_max_extra_reqs",
                 min_value=0,
             ),
+            prefill_admit_order=_one_of(
+                raw.get("prefill_admit_order", defaults.prefill_admit_order),
+                "engine.prefill_admit_order",
+                PREFILL_ADMIT_ORDERS,
+            ),
+            prefill_admit_max_age_ms=_strict_int(
+                raw.get("prefill_admit_max_age_ms", defaults.prefill_admit_max_age_ms),
+                "engine.prefill_admit_max_age_ms",
+                min_value=0,
+            ),
         )
+        if options.prefill_decode_interval_slope > 0 and (
+            options.prefill_decode_interval_busy < 1
+        ):
+            raise RecipeRefused(
+                "recipe-schema",
+                "engine.prefill_decode_interval_slope needs "
+                "engine.prefill_decode_interval_busy, its ceiling",
+            )
+        if options.prefill_short_first_rows and options.prefill_admit_order != "fifo":
+            raise RecipeRefused(
+                "recipe-schema",
+                "engine.prefill_short_first_rows and engine.prefill_admit_order "
+                f"{options.prefill_admit_order!r} both reorder prefill admission: "
+                "set one",
+            )
+        return options
 
     def dump(self) -> dict[str, Any]:
         return asdict(self)

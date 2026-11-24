@@ -151,6 +151,13 @@ def test_v2_options_parse_and_key_the_plan():
     [
         {"engine": {"prefill_short_first_rows": -1}},
         {"engine": {"no_such_knob": 1}},
+        {"engine": {"prefill_decode_interval_slope": -1}},
+        {"engine": {"prefill_decode_interval_slope": "2"}},
+        {"engine": {"prefill_decode_interval_slope": 2}},
+        {"engine": {"prefill_decode_interval_slope_from": 1.5}},
+        {"engine": {"prefill_admit_order": "shortest"}},
+        {"engine": {"prefill_admit_max_age_ms": -1}},
+        {"engine": {"prefill_short_first_rows": 96, "prefill_admit_order": "srpt"}},
         {"model_options": {"fused_attn": "yes"}},
         {"model_options": {"mono_mode": "sometimes"}},
         {"dspark_options": {"lean_head": 1}},
@@ -160,6 +167,25 @@ def test_v2_options_parse_and_key_the_plan():
 def test_v2_refuses_a_bad_option(fields):
     with pytest.raises(recipes.RecipeRefused):
         _plan(**fields)
+
+
+def test_the_scheduler_options_of_a_load_dependent_interval_and_an_admit_order():
+    plan = _plan(
+        engine={
+            "prefill_short_first_rows": 96,
+            "prefill_decode_interval_busy": 110,
+            "prefill_decode_interval_slope": 2,
+            "prefill_decode_interval_slope_from": 30,
+            "prefill_admit_order": "fifo",
+        }
+    )
+    assert plan.engine.prefill_decode_interval_slope == 2.0
+    assert plan.engine.prefill_decode_interval_slope_from == 30
+    assert plan.engine.prefill_admit_order == "fifo"
+    assert plan.engine.prefill_admit_max_age_ms == 3000
+    assert recipes.EngineOptions().prefill_decode_interval_slope == 0
+    srpt = _plan(engine={"prefill_admit_order": "srpt", "prefill_admit_max_age_ms": 0})
+    assert srpt.engine.prefill_admit_order == "srpt" and srpt.plan_id != plan.plan_id
 
 
 def test_v1_keeps_its_schema_and_refuses_modules():
@@ -245,6 +271,9 @@ def test_no_new_environment_variable_carries_a_recipe_option():
         "ATOM_PREFILL_COST_CEIL",
         "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS",
         "ATOM_MOE_EXPERT_PLACEMENT",
+        "ATOM_PREFILL_DECODE_INTERVAL_SLOPE",
+        "ATOM_PREFILL_ADMIT_ORDER",
+        "ATOM_PREFILL_ADMIT_MAX_AGE_MS",
     ):
         assert name not in envs, name
 

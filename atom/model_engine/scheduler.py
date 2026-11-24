@@ -67,7 +67,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.observability import tracing
-from atom.plugin_recipe import engine_options_for
+from atom.plugin_recipe import PREFILL_ADMIT_ORDERS, engine_options_for
 from atom.sampling_params import RequiredChannel
 from atom.structured_output import StructuredRequest, is_structured
 from atom.utils import envs, get_hf_text_config
@@ -79,6 +79,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger("atom")
 
 _DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
+# How many waiting prompts an engine.prefill_admit_order other than "fifo"
+# looks at on a prefill step (each costs a memoised prefix probe).
+_ADMIT_ORDER_LOOKAHEAD = 32
+
+
+def check_prefill_admission_switches(engine) -> None:
+    """Refuse engine.prefill_short_first_rows together with an
+    engine.prefill_admit_order other than "fifo" (`engine`: the recipe's
+    engine options).
+
+    Two rules for the same decision, the order a rank admits its own prefill
+    work. Short-first is a two-tier order with rows of every step held for the
+    long prompts in progress and a skip count that promotes a passed-over
+    request; engine.prefill_admit_order sorts by the tokens left with an age
+    bound. No combination is defined.
+
+    Raised by `Scheduler.__init__`, and by `EngineCore.__init__` before
+    anything else, so a server started with both stops before the model loads.
+    """
+    order = engine.prefill_admit_order
+    if engine.prefill_short_first_rows and order != "fifo":
+        raise ValueError(
+            "engine.prefill_short_first_rows and engine.prefill_admit_order="
+            f"{order} both reorder prefill admission: set one, "
+            "not both (drop engine.prefill_short_first_rows or leave "
+            "engine.prefill_admit_order at fifo)"
+        )
 
 
 def defers_output(config, family=None) -> bool:
@@ -693,6 +720,8 @@ class Scheduler:
     # engine.prefill_short_first_rows (`_short_first_order`); off for a scheduler
     # assembled without `__init__`.
     _short_first_rows = 0
+    # engine.prefill_admit_order; arrival order for such a scheduler too.
+    _admit_order = "fifo"
 
     def __init__(
         self,
@@ -740,6 +769,20 @@ class Scheduler:
                 "engine.prefill_long_cap_busy_seqs positive; got "
                 f"{self._busy_long_prefill_cap}, {self._busy_long_prefill_seqs}"
             )
+        # Admission order among this rank's own prefill work; see
+        # `_order_waiting_prefills` / `_order_partial_prefills`.
+        self._admit_order = engine.prefill_admit_order
+        self._admit_max_age_s = engine.prefill_admit_max_age_ms / 1000.0
+        if self._admit_order not in PREFILL_ADMIT_ORDERS or self._admit_max_age_s < 0:
+            raise ValueError(
+                f"engine.prefill_admit_order must be one of {PREFILL_ADMIT_ORDERS} "
+                "and engine.prefill_admit_max_age_ms non-negative; got "
+                f"{self._admit_order!r}, {engine.prefill_admit_max_age_ms}"
+            )
+        self._admit_clock = time.time
+        # A step left room for new prompts that then were not admitted: the
+        # next prefill step holds none back.
+        self._admit_hold_missed = False
         # Short requests first (0 = arrival order); see `_short_first_order`.
         self._short_first_rows = engine.prefill_short_first_rows
         self._short_first_long_rows = engine.prefill_short_first_long_rows
@@ -759,6 +802,7 @@ class Scheduler:
                 f"got {self._short_first_rows}, {self._short_first_max_skips}, "
                 f"{self._short_first_long_rows}"
             )
+        check_prefill_admission_switches(engine)
         self.max_model_len = config.max_model_len
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
@@ -1480,6 +1524,7 @@ class Scheduler:
         batched_tokens: int,
         *,
         cap_from: int | None = None,
+        held: tuple[int, float] | None = None,
     ) -> int:
         """The next chunk of a running prefill that resumes at `resume` and
         starts at `start`, or 0. A chunk ending at or below `resume` only
@@ -1487,20 +1532,140 @@ class Scheduler:
         same way again, forever: it waits for a step with room instead.
         `cap_from`: where the long-prefill cap counts from, `resume` unless the
         forward continues a bounded replay, whose rows below its `until` ride
-        on top as its first forward's did."""
+        on top as its first forward's did. `held`: batch tokens and cost this
+        step keeps for new prompts admitted ahead of the chunk
+        (`_order_partial_prefills`); it is sized as if they were on the batch."""
         cap_from = resume if cap_from is None else cap_from
         remaining = seq.num_tokens - start
         long_cap = self._long_prefill_cap()
         if 0 < long_cap < seq.num_tokens - cap_from:
             remaining = long_cap + cap_from - start
+        if held is None:
+            room = self._prefill_room(batched_tokens, start)
+        else:
+            batched_tokens += held[0]
+            spent = self._tick_cost
+            self._tick_cost = spent + held[1]
+            room = self._prefill_room(batched_tokens, start)
+            self._tick_cost = spent
         chunk = self._chunked_prefill_size(
             remaining,
-            self._prefill_room(batched_tokens, start),
+            room,
             batched_tokens,
             history_len=start,
             kind=ChunkKind.NEXT,
         )
         return chunk if start + chunk > resume else 0
+
+    def _admit_order_active(self) -> bool:
+        """Whether a prefill step admits in an order other than arrival
+        (engine.prefill_admit_order): never with a KV connector or P/D
+        admission, whose waiting queue holds parked and resumed requests in an
+        order of their own."""
+        return (
+            self._admit_order != "fifo"
+            and self.kv_connector is None
+            and self.pd_admission is None
+        )
+
+    def _admit_rank(self, seq: Sequence, remaining: int, now: float) -> tuple:
+        """Where `seq`, with `remaining` tokens left to prefill, stands in the
+        admission order (smaller first). A prompt that has gone
+        `_admit_max_age_s` without a chunk -- since it arrived, or since its
+        last one -- is ahead of every younger one, so none starves: first the
+        ones mid-prefill, which then get a chunk at least that often whatever
+        else is queued, then the new ones, each group oldest first. The
+        others go by the tokens they have left."""
+        since = max(seq.arrive_time, seq.prefill_served_time)
+        if now - since >= self._admit_max_age_s:
+            return (0 if seq.is_partial_prefill else 1, since)
+        return (2, remaining)
+
+    def _order_waiting_prefills(self, now: float) -> list[tuple]:
+        """Put the new prompts at the front of `waiting` in admission order
+        (`_admit_rank`, ties in queue order) and return them in it, each as
+        ``(rank, seq, cached_blocks, resume)``.
+
+        Only prompts a prefill could admit are moved, and only among the
+        places they hold: an aborted or remote-loading entry stays where it
+        is, and so does everything past the lookahead. The size is what the
+        prefix cache leaves to prefill now, from the probe the cost estimate
+        makes every tick (`can_allocate_memoized`): nothing is recorded, and
+        admission still takes whatever hit it finds when it runs."""
+        slots: list[int] = []
+        found: list[tuple] = []
+        hash_block_size = self.block_manager.hash_block_size
+        for i, seq in enumerate(self.waiting):
+            if len(slots) >= _ADMIT_ORDER_LOOKAHEAD:
+                break
+            if (
+                seq.status != SequenceStatus.WAITING
+                or self._unschedulable_reason(seq) is not None
+            ):
+                continue
+            cached = self.block_manager.can_allocate_memoized(seq)
+            resume = max(cached, 0) * hash_block_size
+            rank = self._admit_rank(seq, seq.num_tokens - resume, now)
+            slots.append(i)
+            found.append((rank, seq, cached, resume))
+        found.sort(key=lambda entry: entry[0])
+        for slot, entry in zip(slots, found):
+            if self.waiting[slot] is not entry[1]:
+                self.waiting[slot] = entry[1]
+        return found
+
+    def _order_partial_prefills(
+        self, fresh: list[tuple], now: float
+    ) -> tuple[list[Sequence], dict[int, tuple[int, float]], set[int]]:
+        """engine.prefill_admit_order "srpt": the prompts mid-prefill in admission
+        order, what each leaves for the new prompts ahead of it, and those
+        prompts' ids.
+
+        Phase 1 still runs before Phase 2, so a new prompt cannot be put on
+        the batch ahead of a running one. Instead a running prompt is sized as
+        if the chunks of the new prompts ranked ahead of it (`fresh`, from
+        `_order_waiting_prefills`) were already on the batch: their tokens
+        and their cost against the step's target. Held only for prompts
+        Phase 2 can take this step -- a slot in `running`, blocks to
+        allocate, not an atomic prompt, within the batch budget and the cost
+        target -- and not at all on the step after one whose hold went unused
+        (`_admit_hold_missed`), so a prompt Phase 2 keeps refusing cannot stop
+        the ones behind it."""
+        partials = [
+            (self._admit_rank(seq, seq.num_tokens - seq.num_cached_tokens, now), seq)
+            for seq in self.running
+            if seq.is_partial_prefill
+        ]
+        partials.sort(key=lambda entry: entry[0])
+        ahead: list[tuple] = []
+        if not self._admit_hold_missed:
+            slots = self.max_num_seqs - len(self.running)
+            room, spent = self.max_num_batched_tokens, 0.0
+            for rank, seq, cached, resume in fresh:
+                if len(ahead) >= slots or cached < 0:
+                    break
+                if self._requires_atomic_prefill(seq):
+                    break
+                start = self.block_manager.replay_start(seq, resume, hit=True)
+                tokens = self._new_prefill_tokens(seq, start, resume)
+                cost = self._chunk_cost(start, tokens)
+                if tokens > room or spent + cost > self._tick_cost_limit:
+                    break
+                room -= tokens
+                spent += cost
+                ahead.append((rank, tokens, cost, seq.id))
+        held: dict[int, tuple[int, float]] = {}
+        held_ids: set[int] = set()
+        tokens, cost, taken = 0, 0.0, 0
+        for rank, seq in partials:
+            while taken < len(ahead) and ahead[taken][0] < rank:
+                tokens += ahead[taken][1]
+                cost += ahead[taken][2]
+                held_ids.add(ahead[taken][3])
+                taken += 1
+            if tokens:
+                held[seq.id] = (tokens, cost)
+        return [seq for _, seq in partials], held, held_ids
 
     def _resume_partial_prefills(
         self,
@@ -1509,10 +1674,12 @@ class Scheduler:
         num_scheduled_tokens: list[int],
         num_seqs_prefill: int,
         num_batched_tokens: int,
+        admit_held: dict[int, tuple[int, float]] | None = None,
     ) -> tuple[int, int]:
         """Phase 1 of `_schedule`: the next chunk of every partial prefill in
         `seqs` (`running`, or a part of it in this tick's order), until one
-        gets no room."""
+        gets no room. `admit_held`: what a prompt leaves for the new prompts
+        ahead of it under engine.prefill_admit_order "srpt"."""
         for seq in seqs:
             if num_seqs_prefill >= self.max_num_seqs:
                 break
@@ -1528,6 +1695,7 @@ class Scheduler:
                 resume,
                 num_batched_tokens,
                 cap_from=max(resume, seq.replay_until),
+                held=admit_held.get(seq.id) if admit_held else None,
             )
             if chunk:
                 self._resume_prefill(seq, start, hit=False)
@@ -2602,12 +2770,26 @@ class Scheduler:
         # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
-        #
+        # An admission order other than arrival (engine.prefill_admit_order)
+        # reorders this rank's own queues before the two phases read them.
+        admit_now = 0.0
+        admit_ordered = delayer_allows and self._admit_order_active()
+        partial_order = None
+        admit_held: dict[int, tuple[int, float]] = {}
+        admit_held_ids: set[int] = set()
+        if admit_ordered:
+            admit_now = self._admit_clock()
+            fresh = self._order_waiting_prefills(admit_now)
+            if self._admit_order == "srpt":
+                partial_order, admit_held, admit_held_ids = (
+                    self._order_partial_prefills(fresh, admit_now)
+                )
         # With engine.prefill_short_first_rows the long prompts in progress resume
         # after Phase 2 has admitted the short requests (`_short_first_order`):
         # `late_partials`, due when Phase 2 reaches `late_before` or ends. Until
         # then `held` tokens of the budget count as batched, which keeps them
-        # free for those prompts.
+        # free for those prompts. Never together with an admission order above
+        # (`__init__` refuses the pair).
         late_partials: list[Sequence] = []
         late_before = None
         held = 0
@@ -2627,11 +2809,12 @@ class Scheduler:
             )
         elif delayer_allows and self._partial_prefill_count > 0:
             num_seqs_prefill, num_batched_tokens = self._resume_partial_prefills(
-                self.running,
+                self.running if partial_order is None else partial_order,
                 scheduled_seqs,
                 num_scheduled_tokens,
                 num_seqs_prefill,
                 num_batched_tokens,
+                admit_held,
             )
 
         # ---- Phase 2: new requests from waiting ----
@@ -3110,6 +3293,11 @@ class Scheduler:
             # leaves the next sizing drawing the same arm.
             self._commit_calibration_arm()
             self._inflight_prefix_wait.pop(seq.id, None)
+
+        if admit_ordered:
+            for seq in scheduled_seqs.values():
+                seq.prefill_served_time = admit_now
+            self._admit_hold_missed = not admit_held_ids <= scheduled_seqs.keys()
 
         if late_partials:
             # Phase 2 ended on its short requests.

@@ -694,6 +694,251 @@ class TestPrefillDecodeInterval:
         assert d._stat_hold_decode_interval == 1
 
 
+def _slope_delayer(**kw):
+    """A delayer whose first decision past the decode interval fires (on KV
+    pressure, with `_protected_passes`' arguments), so the passes it holds
+    after an executed prefill are the interval it armed."""
+    d = make_delayer(ttft_max_ticks=1, stall_ticks=1, kv_high_watermark=0.1, **kw)
+    skip_first(d)
+    return d
+
+
+def _protected_passes(d, g):
+    """Decode passes `d` protects after an executed prefill that leaves `g`
+    (>= 1: with none there is no pass to protect) sequences decoding."""
+    held = d._stat_hold_decode_interval
+    d.notify_prefill_executed()
+    n = 0
+    while not call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0, running_decode_batch=g):
+        n += 1
+        assert n < 1000
+    assert d._stat_hold_decode_interval - held == n
+    return n
+
+
+class TestDecodeIntervalSlope:
+    """decode_interval_slope: the armed interval rises with the group's decode
+    count, min(busy, base + floor(slope * max(0, g - slope_from)))."""
+
+    @pytest.mark.parametrize(
+        "tiers",
+        [
+            {"prefill_decode_interval": 3},
+            {
+                "prefill_decode_interval": 3,
+                "busy_decode_interval": 9,
+                "busy_decode_seqs": 48,
+            },
+            {
+                "prefill_decode_interval": 0,
+                "busy_decode_interval": 5,
+                "busy_decode_seqs": 20,
+            },
+            # a busy value below the normal one is accepted without the slope
+            {
+                "prefill_decode_interval": 6,
+                "busy_decode_interval": 2,
+                "busy_decode_seqs": 30,
+            },
+        ],
+    )
+    def test_slope_zero_arms_the_interval_of_the_two_tiers(self, tiers):
+        base = tiers["prefill_decode_interval"]
+        busy = tiers.get("busy_decode_interval", 0)
+        seqs = tiers.get("busy_decode_seqs", 48)
+        before = _slope_delayer(**tiers)
+        off = _slope_delayer(
+            decode_interval_slope=0.0, decode_interval_slope_from=17, **tiers
+        )
+        for g in range(1, 131):
+            want = busy if busy > 0 and g >= seqs else base
+            assert _protected_passes(before, g) == want, g
+            assert _protected_passes(off, g) == want, g
+
+    def test_slope_zero_with_no_sequence_decoding(self):
+        kw = {"prefill_decode_interval": 3, "busy_decode_interval": 9}
+        before = make_delayer(**kw)
+        off = make_delayer(decode_interval_slope=0.0, **kw)
+        for d in (before, off):
+            skip_first(d)
+            d.notify_prefill_executed()
+            # armed with the normal interval; this decision is its first pass
+            assert call(d, pending_tokens=1000, running_decode_batch=0) is True
+        assert before._decode_interval_remaining == 2
+        assert off._decode_interval_remaining == 2
+
+    def test_armed_interval_rises_from_the_knee_to_the_ceiling(self):
+        d = _slope_delayer(
+            prefill_decode_interval=4,
+            busy_decode_interval=12,
+            # the busy tier's trigger would arm 12 at every count if it were read
+            busy_decode_seqs=1,
+            decode_interval_slope=0.25,
+            decode_interval_slope_from=32,
+        )
+        assert _protected_passes(d, 1) == 4
+        assert _protected_passes(d, 31) == 4  # from - 1
+        assert _protected_passes(d, 32) == 4  # from
+        assert _protected_passes(d, 35) == 4  # floor(0.75)
+        assert _protected_passes(d, 36) == 5
+        assert _protected_passes(d, 42) == 6  # from + 10: floor(2.5)
+        assert _protected_passes(d, 63) == 11  # floor(7.75)
+        assert _protected_passes(d, 64) == 12  # reaches the ceiling
+        assert _protected_passes(d, 65) == 12
+        assert _protected_passes(d, 10**12) == 12
+        # and back down with the load
+        assert _protected_passes(d, 40) == 6
+
+    def test_slope_above_one_and_zero_base(self):
+        d = _slope_delayer(
+            prefill_decode_interval=0,
+            busy_decode_interval=7,
+            decode_interval_slope=2.0,
+        )
+        assert [_protected_passes(d, g) for g in (1, 2, 3, 4, 500)] == [2, 4, 6, 7, 7]
+
+    def test_interval_is_a_bounded_integer_at_any_count(self):
+        d = make_delayer(
+            prefill_decode_interval=2,
+            busy_decode_interval=40,
+            decode_interval_slope=1e300,
+            decode_interval_slope_from=8,
+        )
+        assert d._sloped_decode_interval(0) == 2
+        assert d._sloped_decode_interval(8) == 2
+        for g in (9, 2**40, 2**63 - 1):
+            armed = d._sloped_decode_interval(g)
+            assert armed == 40 and type(armed) is int
+        d = make_delayer(
+            prefill_decode_interval=2,
+            busy_decode_interval=40,
+            decode_interval_slope=0.5,
+        )
+        last = 0
+        for g in range(200):
+            armed = d._sloped_decode_interval(g)
+            assert type(armed) is int
+            assert armed == min(40, 2 + g // 2)
+            assert armed >= last
+            last = armed
+
+    @pytest.mark.parametrize(
+        "local,peer",
+        [(0, 5), (10, 21), (16, 16), (1, 40), (30, 34), (64, 0), (200, 300)],
+    )
+    def test_ranks_fed_the_same_reduced_count_arm_the_same_interval(self, local, peer):
+        kw = {
+            "dp_size": 2,
+            "prefill_decode_interval": 2,
+            "busy_decode_interval": 10,
+            "decode_interval_slope": 0.25,
+            "decode_interval_slope_from": 32,
+            "ttft_max_ticks": 1,
+            "stall_ticks": 1,
+            "kv_high_watermark": 0.1,
+        }
+        want = min(10, 2 + max(0, local + peer - 32) // 4)
+        ran, idle = make_delayer(**kw), make_delayer(**kw)
+        skip_first(ran)
+        skip_first(idle)
+        # Only one rank ran the prefill, and each holds a different share of
+        # the group's decodes: the reduced values are all the ranks agree on.
+        ran.notify_prefill_executed()
+        for tick in range(want + 1):
+            a = call(
+                ran,
+                pending_tokens=MAX_BATCHED,
+                kv_usage=1.0,
+                running_decode_batch=local,
+                reduce=_add_rank({0: 1, 1: MAX_BATCHED, 2: peer, 3: 1}),
+            )
+            b = call(
+                idle,
+                pending_tokens=MAX_BATCHED,
+                kv_usage=1.0,
+                running_decode_batch=peer,
+                reduce=_add_rank(
+                    {0: 1, 1: MAX_BATCHED, 2: local, 3: 1, 7: 1 if tick == 0 else 0}
+                ),
+            )
+            assert a is b is (tick == want), tick
+            assert ran._decode_interval_remaining == want - tick - (tick < want)
+            assert idle._decode_interval_remaining == ran._decode_interval_remaining
+        assert ran._stat_hold_decode_interval == want
+        assert idle._stat_hold_decode_interval == want
+
+    def test_fire_without_executed_prefill_does_not_arm_interval(self):
+        d = _slope_delayer(
+            prefill_decode_interval=3,
+            busy_decode_interval=9,
+            decode_interval_slope=0.5,
+        )
+        loaded = {"pending_tokens": MAX_BATCHED, "kv_usage": 1.0}
+        for _ in range(3):
+            # Admission that yields no prefill batch reports no execution.
+            assert call(d, running_decode_batch=100, **loaded) is True
+            assert d._decode_interval_remaining == 0
+        assert d._stat_hold_decode_interval == 0
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {"decode_interval_slope": -0.1},
+            {"decode_interval_slope": float("nan")},
+            {"decode_interval_slope": float("inf")},
+            {"decode_interval_slope_from": -1},
+            {"decode_interval_slope": 0.5, "decode_interval_slope_from": -1},
+        ],
+    )
+    def test_out_of_range_values_rejected(self, kw):
+        with pytest.raises(ValueError, match="decode_interval_slope"):
+            make_delayer(prefill_decode_interval=2, busy_decode_interval=8, **kw)
+
+    @pytest.mark.parametrize("base,busy", [(8, 4), (3, 0), (0, 0)])
+    def test_slope_without_a_ceiling_at_or_above_the_base_rejected(self, base, busy):
+        with pytest.raises(ValueError, match="ceiling"):
+            make_delayer(
+                prefill_decode_interval=base,
+                busy_decode_interval=busy,
+                decode_interval_slope=0.5,
+            )
+        # the same tiers are accepted while the slope is off
+        make_delayer(prefill_decode_interval=base, busy_decode_interval=busy)
+
+    def test_ceiling_equal_to_the_base_is_a_flat_interval(self):
+        d = _slope_delayer(
+            prefill_decode_interval=5,
+            busy_decode_interval=5,
+            decode_interval_slope=3.0,
+        )
+        assert [_protected_passes(d, g) for g in (1, 50)] == [5, 5]
+
+    def test_adaptive_policy_ignores_the_slope(self):
+        d = make_delayer(
+            admit_policy="adaptive",
+            prefill_decode_interval=4,
+            busy_decode_interval=12,
+            decode_interval_slope=0.5,
+        )
+        assert d.decode_interval_slope == 0
+        assert d.prefill_decode_interval == 0 and d.busy_decode_interval == 0
+
+    def test_startup_log_names_the_ceiling_and_the_ignored_trigger(self):
+        kw = {"prefill_decode_interval": 4, "busy_decode_interval": 12}
+        with mock.patch("atom.model_engine.prefill_delayer.logger") as log:
+            make_delayer(
+                decode_interval_slope=0.25, decode_interval_slope_from=32, **kw
+            )
+            on = log.info.call_args[0][0]
+            make_delayer(**kw)
+            off = log.info.call_args[0][0]
+        assert "decode_interval_slope=0.25 decode_interval_slope_from=32" in on
+        assert "ceiling(busy_decode_interval)=12" in on
+        assert "(busy_decode_seqs=48 ignored)" in on
+        assert "slope" not in off
+        assert off.endswith("busy_decode_interval=12 busy_decode_seqs=48")
+
+
 class TestStatsDistinct:
     def test_fill_and_stall_counted_separately(self):
         d = make_delayer(stall_ticks=2, ttft_max_ticks=1000)

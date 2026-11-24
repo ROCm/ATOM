@@ -304,6 +304,8 @@ class PrefillDelayer:
         "busy_decode_interval",
         "busy_decode_seqs",
         "cpu_group",
+        "decode_interval_slope",
+        "decode_interval_slope_from",
         "dp_size",
         "group_running_decode",
         "kv_high_watermark",
@@ -338,6 +340,8 @@ class PrefillDelayer:
         busy_decode_interval: int = 0,
         busy_decode_seqs: int = 48,
         cost_ceil: bool = False,
+        decode_interval_slope: float = 0.0,
+        decode_interval_slope_from: int = 0,
     ):
         if dp_size > 1 and cpu_group is None:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
@@ -409,6 +413,38 @@ class PrefillDelayer:
             0 if admit_policy == "adaptive" else busy_decode_interval
         )
         self.busy_decode_seqs = busy_decode_seqs
+        # Load-dependent form of the same interval (slope 0 = off): the interval
+        # grows with the group's decode count instead of stepping once,
+        #   min(busy_decode_interval,
+        #       prefill_decode_interval
+        #       + floor(slope * max(0, g_running_dec - slope_from)))
+        # so `busy_decode_interval` is its ceiling and `busy_decode_seqs` is
+        # not read. A pure function of the reduced count and of values every
+        # rank is started with, so the countdown stays in lockstep.
+        if (
+            not math.isfinite(decode_interval_slope)
+            or decode_interval_slope < 0
+            or decode_interval_slope_from < 0
+        ):
+            raise ValueError(
+                "decode_interval_slope must be finite and non-negative and "
+                "decode_interval_slope_from non-negative; got "
+                f"{decode_interval_slope}, {decode_interval_slope_from}"
+            )
+        self.decode_interval_slope = (
+            0.0 if admit_policy == "adaptive" else float(decode_interval_slope)
+        )
+        self.decode_interval_slope_from = decode_interval_slope_from
+        if self.decode_interval_slope > 0 and (
+            self.busy_decode_interval < 1
+            or self.busy_decode_interval < self.prefill_decode_interval
+        ):
+            raise ValueError(
+                "decode_interval_slope needs busy_decode_interval (its ceiling) "
+                "positive and at least prefill_decode_interval; got "
+                f"busy_decode_interval={self.busy_decode_interval}, "
+                f"prefill_decode_interval={self.prefill_decode_interval}"
+            )
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
         #   slot 0 = prefillable        (SUM → n_prefillable)
@@ -539,10 +575,17 @@ class PrefillDelayer:
             f"cost_gate={self._cost_gate} "
             f"admit_policy={admit_policy!r}"
             + (
-                f" busy_decode_interval={self.busy_decode_interval} "
-                f"busy_decode_seqs={self.busy_decode_seqs}"
-                if self.busy_decode_interval
-                else ""
+                f" decode_interval_slope={self.decode_interval_slope} "
+                f"decode_interval_slope_from={self.decode_interval_slope_from} "
+                f"ceiling(busy_decode_interval)={self.busy_decode_interval} "
+                f"(busy_decode_seqs={self.busy_decode_seqs} ignored)"
+                if self.decode_interval_slope > 0
+                else (
+                    f" busy_decode_interval={self.busy_decode_interval} "
+                    f"busy_decode_seqs={self.busy_decode_seqs}"
+                    if self.busy_decode_interval
+                    else ""
+                )
             )
         )
 
@@ -783,10 +826,14 @@ class PrefillDelayer:
         # decode/empty batch, which must not start a decode-protection window.
         if prefill_ran_n > 0:
             self._decode_interval_remaining = (
-                self.busy_decode_interval
-                if self.busy_decode_interval > 0
-                and g_running_dec >= self.busy_decode_seqs
-                else self.prefill_decode_interval
+                self._sloped_decode_interval(g_running_dec)
+                if self.decode_interval_slope > 0
+                else (
+                    self.busy_decode_interval
+                    if self.busy_decode_interval > 0
+                    and g_running_dec >= self.busy_decode_seqs
+                    else self.prefill_decode_interval
+                )
             )
 
         # First call fires unconditionally (one-time warmup seed).
@@ -1040,6 +1087,19 @@ class PrefillDelayer:
     def _adapt_hold(self, g_pending: int) -> bool:
         self._stat_adapt_hold_ticks += 1
         return self._hold(g_pending)
+
+    def _sloped_decode_interval(self, g_running_dec: int) -> int:
+        """The interval to arm with `g_running_dec` sequences decoding in the
+        group, under `decode_interval_slope` (see __init__)."""
+        base = self.prefill_decode_interval
+        cap = self.busy_decode_interval
+        extra = self.decode_interval_slope * max(
+            0, g_running_dec - self.decode_interval_slope_from
+        )
+        # compared before the floor: the product may be too large to convert
+        if extra >= cap - base:
+            return cap
+        return base + math.floor(extra)
 
     def notify_prefill_executed(self, tokens: int = 0) -> None:
         """Report a completed local prefill forward.

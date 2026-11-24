@@ -27,7 +27,12 @@ from atom.model_engine.engine_utility import (
 )
 from atom.model_engine.prefill_backlog import prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
-from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
+from atom.model_engine.scheduler import (
+    DecodeScheduler,
+    PrefillScheduler,
+    Scheduler,
+    check_prefill_admission_switches,
+)
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -97,6 +102,11 @@ class EngineCore:
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
+        # Two recipe options the scheduler refuses together: stop here, not
+        # after the model has loaded.
+        from atom.plugin_recipe import engine_options_for
+
+        check_prefill_admission_switches(engine_options_for(config))
         # Requests taken from the input queue, and the last (ingested, prefill
         # left) pair reported to the CoreManager (`_report_prefill_backlog`).
         self._ingested_seqs = 0
@@ -328,6 +338,8 @@ class EngineCore:
                 busy_decode_interval=engine.prefill_decode_interval_busy,
                 busy_decode_seqs=engine.prefill_decode_interval_busy_seqs,
                 cost_ceil=engine.prefill_cost_ceil,
+                decode_interval_slope=engine.prefill_decode_interval_slope,
+                decode_interval_slope_from=engine.prefill_decode_interval_slope_from,
             )
         )
 

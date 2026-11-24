@@ -83,8 +83,10 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 | `engine.prefill_short_first_rows` / `_long_rows` / `_max_skips` | `ATOM_PREFILL_SHORT_FIRST_*` (#3644) |
 | `engine.prefill_cost_ceil` | `ATOM_PREFILL_COST_CEIL` (#3644) |
 | `engine.prefill_decode_interval_busy` / `_seqs` | `ATOM_PREFILL_DECODE_INTERVAL_BUSY*` (#3644) |
+| `engine.prefill_decode_interval_slope` / `_slope_from` | `ATOM_PREFILL_DECODE_INTERVAL_SLOPE` / `_SLOPE_FROM` |
 | `engine.prefill_long_cap_busy` / `_seqs` | `ATOM_PREFILL_LONG_CAP_BUSY*` (#3644) |
 | `engine.dp_session_prefix_owner_tokens` / `_max_extra_reqs` | `ATOM_DP_SESSION_PREFIX_OWNER_*` (#3644) |
+| `engine.prefill_admit_order` / `prefill_admit_max_age_ms` | `ATOM_PREFILL_ADMIT_ORDER` / `ATOM_PREFILL_ADMIT_MAX_AGE_MS` |
 | `model_options.ffn_mhc_fuse_quant` | `ATOM_DSV41_FFN_SEAM_QUANT` (#3645) |
 | `model_options.shared_act_quant` | `ATOM_DSV41_SHARED_ACT_QUANT` (#3645) |
 | `model_options.fused_attn` / `fused_attn_min_rows` | `ATOM_DSV41_FUSED_ATTN*` (#3645) |
@@ -96,6 +98,15 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 | `dspark_options.two_buffer_attn` | `ATOM_V41_DRAFT_ATTN_NO_CAT` (#3645) |
 | `dspark_options.lean_head` | `ATOM_DSPARK_LEAN_HEAD` (#3645) |
 | `dspark_options.verify_argmax_once` | `ATOM_SPEC_VERIFY_ARGMAX_ONCE` (#3645) |
+
+- `engine.prefill_decode_interval_slope` (a number, 0 = off) with `_slope_from`: after an
+  executed prefill that leaves `g` sequences decoding in the DP group, the decode interval is
+  `min(prefill_decode_interval_busy, ATOM_PREFILL_DECODE_INTERVAL + floor(slope * max(0, g - slope_from)))`.
+  `prefill_decode_interval_busy` is then the ceiling (required) and `_busy_seqs` is not read.
+- `engine.prefill_admit_order`: `"fifo"` (default: prompts mid-prefill, then new prompts as they
+  arrived), `"short_new"` (new prompts with the fewest tokens left first) or `"srpt"` (fewest
+  left first across both). A prompt that has gone `prefill_admit_max_age_ms` without a chunk
+  goes ahead of every younger one. Refused together with `prefill_short_first_rows`.
 
 None of these are environment variables in this branch. The host keeps its own:
 `ATOM_PLUGIN_HOST` (kill switch), `ATOM_PLUGIN_HOST_STRICT`, `ATOM_PLUGIN_HOTPLUG`,
