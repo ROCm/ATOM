@@ -15,6 +15,12 @@ pub enum EngineError {
     DecodeIncomplete,
     ConnectionAcquireFailed(String),
     RequestBuildFailed(String),
+    /// The engine refused the request, with the status that says whose
+    /// fault it is.
+    Rejected {
+        status: http::StatusCode,
+        reason: String,
+    },
 }
 
 impl fmt::Display for EngineError {
@@ -27,6 +33,7 @@ impl fmt::Display for EngineError {
             Self::DecodeIncomplete => f.write_str("decode stream closed without Complete"),
             Self::ConnectionAcquireFailed(r) => write!(f, "connection acquire failed: {}", r),
             Self::RequestBuildFailed(r) => write!(f, "request build failed: {}", r),
+            Self::Rejected { reason, .. } => write!(f, "rejected: {}", reason),
         }
     }
 }
