@@ -507,6 +507,30 @@ t "the notice quotes the first three ❌ lines" \
 t "and the output the notice dropped is kept on stderr" \
   "$(grep -c -e 'check_prompts: 14 checks' -e '❌ four' "$_flow_err")" "2"
 rm -f "$_flow_err"
+# preflight.sh carries a hand-copy of that fallback, and an owner runs preflight when
+# paged -- the one moment the reason has to be there. It had no coverage at all, so the
+# empty reason this change removes could come back in the copy while run_one's original
+# stayed pinned by the cases above. Same treatment: extracted between its own markers and
+# run, never reimplemented here.
+_pf_gate() {  # <python body for a stand-in check_prompts> -> what preflight would print
+  d=$(mktemp -d); printf '%s\n' "$1" > "$d/check_prompts.py"
+  blk=$(sed -n '/# >>> preflight-prompt-gate/,/# <<< preflight-prompt-gate/p' "$S/preflight.sh")
+  # preflight.sh is `set -uo pipefail` -- NOT -e, unlike run_one. The difference is the
+  # whole point of extracting rather than copying: pipefail is what makes the no-match
+  # grep fail, and the absence of -e is what keeps the script alive to use the fallback.
+  S="$d" ok=0 bad=0 bash -c "set -uo pipefail
+$blk" 2>/dev/null
+  rm -rf "$d"
+}
+t "preflight says something when check_prompts prints nothing" \
+  "$(_pf_gate 'raise SystemExit(7)' | grep -c 'no output; run it by hand')" "1"
+t "and preflight names the check that actually refused" \
+  "$(_pf_gate 'print("\u274c ATOM_RUN_BUDGET=9300s does not fit the review job'"'"'s 9000s cap")
+raise SystemExit(1)' | awk '/ATOM_RUN_BUDGET=9300s/{n++} tolower($0)~/drift/{d++} END{print n+0 ":" d+0}')" "1:0"
+# The harness above hand-copies preflight's shell options, as the two run_one harnesses do
+# for run_one's. Pin it to the real line for the same reason.
+t "the preflight harness runs under preflight's own shell options" \
+  "$(grep -c '^set -uo pipefail$' "$S/preflight.sh")$(grep -c 'bash -c "set -uo pipefail$' "$S/selftest.sh")" "11"
 t "a drifted prompt is reported as drift" \
   "$(_flow_msg '
 import pathlib,sys

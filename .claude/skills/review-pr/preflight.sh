@@ -19,6 +19,7 @@ done
 echo "[check_prompts]"
 # Drift is two of check_prompts' checks; naming them all "drift" sends the reader to
 # regenerate files that were never the problem. Print what it said.
+# >>> preflight-prompt-gate (selftest extracts and runs this block verbatim)
 if _cp="$(python3 "$S/check_prompts.py" 2>&1)"; then echo "  ✅ check_prompts.py passes (prompts verbatim, guards wired)"; ok=$((ok+1));
 else
   # Same fallback as run_one.sh's prompt-gate. A refusal with no output at all, or with
@@ -30,6 +31,7 @@ else
   printf '%s\n' "${_why:-no output; run it by hand}" | sed 's/^/     /'
   bad=$((bad+1))
 fi
+# <<< preflight-prompt-gate
 
 echo "[tooling guards]"
 st=$(bash "$S/selftest.sh" 2>&1); st_rc=$?
