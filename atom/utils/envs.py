@@ -785,6 +785,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3.1 DSpark draft: its MLP's SwiGLU-OAI fused with the MXFP8 quant
     # of down_proj's input, as ATOM_MINIMAX_M3_SWIGLU_MXFP8 does for the target.
     "ATOM_DSPARK_SWIGLU_MXFP8": lambda: _flag_env("ATOM_DSPARK_SWIGLU_MXFP8"),
+    # MiniMax-M3.1 DSpark draft context rows (`project_context`): each TP rank
+    # computes 1/TP of the BF16 `fc` output columns (column-parallel instead of
+    # replicated) and all-gathers them before `hidden_norm`. Read at
+    # construction: it decides how `fc` is built and loaded. Default off for A/B.
+    "ATOM_DSPARK_FC_TP": lambda: _flag_env("ATOM_DSPARK_FC_TP"),
+    # MiniMax-M3.1 DSpark draft context rows: project only the K/V rows of each
+    # layer's `qkv_proj` (a row view of the same weight), not the query that the
+    # context write drops. Default off for A/B.
+    "ATOM_DSPARK_CTX_KV_ONLY": lambda: _flag_env("ATOM_DSPARK_CTX_KV_ONLY"),
     "ATOM_SAMPLER_SPLIT_V_MAX_ROWS": lambda: int(
         os.getenv("ATOM_SAMPLER_SPLIT_V_MAX_ROWS", "256")
     ),

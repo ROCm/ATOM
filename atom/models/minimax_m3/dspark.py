@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from aiter import QuantType, dtypes
+from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
 from torch import nn
@@ -68,7 +69,12 @@ from atom.model_ops.layernorm import (
 )
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.embed_head import VocabParallelEmbedding, masked_embedding
-from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
+from atom.model_ops.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
     PAGES_PER_SPARSE_BLOCK,
@@ -318,6 +324,22 @@ class M3DSparkAttention(nn.Module):
         self.kv = KVCacheBinding(layer_num)
         # 0: every block row attends the whole context (see `_window_rows`).
         self.sliding_window = int(getattr(config, "sliding_window", 0) or 0)
+        # ATOM_DSPARK_CTX_KV_ONLY, read once: the context write runs every step.
+        self.context_kv_only = envs.ATOM_DSPARK_CTX_KV_ONLY
+
+    def _context_kv_proj(self):
+        """``qkv_proj`` narrowed to its K/V rows: a row view of the same weight
+        and scales, built on first use (after the weights are loaded and laid
+        out) and again if the weight's storage is ever rebound."""
+        weight_ptr = self.qkv_proj.weight.data_ptr()
+        cached = self.__dict__.get("_kv_rows")
+        if cached is None or cached[0] != weight_ptr:
+            # Kept out of the module tree: the view is not a parameter owner.
+            cached = self.__dict__["_kv_rows"] = (
+                weight_ptr,
+                self.qkv_proj.make_row_view(self.q_size, 2 * self.kv_size),
+            )
+        return cached[1]
 
     def _bound_cache(self):
         """This layer's KV cache in the layout every access of it uses.
@@ -363,14 +385,19 @@ class M3DSparkAttention(nn.Module):
     ) -> None:
         """K/V rows for the target context: k_norm + RoPE on K, V as is.
 
-        The q third of the fused projection is computed and dropped; the kernel
-        writes K/V only when told it has zero query heads.
+        Only the K/V rows of the fused projection are computed under
+        ATOM_DSPARK_CTX_KV_ONLY; otherwise the q third is computed and dropped.
+        Either way the kernel writes K/V only when told it has zero query heads.
         """
         cache = self._bound_cache()
         if cache is None:
             return
-        qkv = linear_out(self.qkv_proj(ctx_hidden))
-        _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.context_kv_only:
+            kv = linear_out(self._context_kv_proj()(ctx_hidden))
+            k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
+        else:
+            qkv = linear_out(self.qkv_proj(ctx_hidden))
+            _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         self._norm_rope_write(k, k, v, 0, positions, slot_mapping, cache)
 
     def write_context_kv_rows(self, k, v, positions, slot_mapping) -> None:
@@ -670,11 +697,20 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         self.vocab_size = int(config.vocab_size)
 
         # The checkpoint keeps this projection BF16 (an ignored layer). The aux
-        # hidden states arrive replicated; under ATOM_DSPARK_FUSED_AR each rank
-        # reduces its quarter of K and the context norm all-reduces the partial
-        # sums (`project_context`), so a rank reads a quarter of the weight.
+        # hidden states arrive replicated. Replicated by default; under
+        # ATOM_DSPARK_FUSED_AR each rank reduces its quarter of K and the context
+        # norm all-reduces the partial sums (`project_context`), so a rank reads
+        # a quarter of the weight; otherwise, under ATOM_DSPARK_FC_TP, each rank
+        # computes 1/TP of the output columns and `project_context` all-gathers
+        # them.
         self._fc_partial = _draft_fused_ar()
-        fc_kind = RowParallelLinear if self._fc_partial else ReplicatedLinear
+        self.fc_column_parallel = envs.ATOM_DSPARK_FC_TP and not self._fc_partial
+        if self._fc_partial:
+            fc_kind = RowParallelLinear
+        elif self.fc_column_parallel:
+            fc_kind = ColumnParallelLinear
+        else:
+            fc_kind = ReplicatedLinear
         self.fc = fc_kind(
             self.hidden_size * len(self.target_layer_ids),
             self.hidden_size,
@@ -749,16 +785,25 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         the last one through the target's final norm instead (the NeMo recipe's
         post-norm feature) dropped GSM8K acceptance from 51% to 39%.
         """
-        if not self._fc_partial:
-            return self.hidden_norm(linear_out(self.fc(aux_concat)))
-        k, r = self.fc.input_size, self.fc.tp_rank
-        part = linear_out(self.fc(aux_concat[:, r * k : (r + 1) * k].contiguous()))
-        if _draft_fuse_rows(part.shape[0]):
-            hidden, _ = fused_allreduce_gemma_rms_norm(
-                part, torch.zeros_like(part), self.hidden_norm
+        if self._fc_partial:
+            k, r = self.fc.input_size, self.fc.tp_rank
+            part = linear_out(
+                self.fc(aux_concat[:, r * k : (r + 1) * k].contiguous())
             )
-            return hidden
-        return self.hidden_norm(tensor_model_parallel_all_reduce(part))
+            if _draft_fuse_rows(part.shape[0]):
+                hidden, _ = fused_allreduce_gemma_rms_norm(
+                    part, torch.zeros_like(part), self.hidden_norm
+                )
+                return hidden
+            return self.hidden_norm(tensor_model_parallel_all_reduce(part))
+        ctx = linear_out(self.fc(aux_concat))
+        if self.fc_column_parallel:
+            # This rank's output columns -> the whole row, in rank order (the
+            # loader gives rank r rows r * hidden / TP on of the weight). RCCL:
+            # a prefill chunk's rows exceed the custom all-gather's buffer, and
+            # this runs eagerly after the target forward, never under capture.
+            ctx = tensor_model_parallel_all_gather(ctx, use_custom=False, dim=-1)
+        return self.hidden_norm(ctx)
 
     @property
     def context_layers(self):
