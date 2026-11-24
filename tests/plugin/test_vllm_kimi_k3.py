@@ -545,8 +545,11 @@ def test_dense_mla_decode_keeps_supported_persistent_gathered_head_width():
 
         import torch
 
+        from atom.config import set_current_atom_config
         from atom.model_ops.attention_mla import MLAAttention
         from atom.plugin.vllm.attention import layer_mla
+
+        set_current_atom_config(SimpleNamespace(speculative_config=None))
 
         seen = {}
 
@@ -566,6 +569,7 @@ def test_dense_mla_decode_keeps_supported_persistent_gathered_head_width():
             dcp_world_size=8,
             kv_cache_dtype="fp8",
             is_sparse_mla=False,
+            causal_decode=True,
             dcp_persistent_supported=True,
             scale=1.0,
             _q_scale=None,
@@ -801,8 +805,11 @@ def test_dcp_multi_token_decode_selects_the_round_robin_kernel():
 
         import torch
 
+        from atom.config import set_current_atom_config
         from atom.model_ops.attention_mla import MLAAttention
         from atom.plugin.vllm.attention import layer_mla
+
+        set_current_atom_config(SimpleNamespace(speculative_config=None))
 
         seen = {}
 
@@ -825,6 +832,7 @@ def test_dcp_multi_token_decode_selects_the_round_robin_kernel():
                 dcp_rank=3,
                 kv_cache_dtype="fp8",
                 is_sparse_mla=False,
+                causal_decode=True,
                 dcp_persistent_supported=True,
                 scale=1.0,
                 _q_scale=None,

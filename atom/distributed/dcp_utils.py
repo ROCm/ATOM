@@ -57,12 +57,17 @@ def get_dcp_rank() -> int:
 def mla_dcp_decode_call(
     dcp_world_size: int, max_seqlen_q: int = 1, causal: bool = True
 ) -> dict:
-    """How a DCP decode calls ``mla_decode_fwd``, as aiter's shape queries take
-    it. Mirrors ``MLAAttention._forward_decode``: only a causal decode of more
-    than one row masks on global positions, through the round-robin
-    (``g_kv_indptr``) kernel; every other decode runs as if DCP were off."""
+    """How a persistent DCP decode calls ``mla_decode_fwd``, as aiter's shape
+    queries take it; both ``dcp_persistent_supported`` and the multi-token width
+    query (``get_mla_decode_num_heads``) ask with it. Mirrors
+    ``MLAAttention._forward_decode``: only a causal decode of more than one row
+    masks on global positions, through the round-robin (``g_kv_indptr``) kernel;
+    every other decode, the DSpark draft's non-causal block among them, runs as
+    if DCP were off."""
     round_robin = dcp_world_size > 1 and max_seqlen_q > 1 and causal
     return {
+        "persistent": True,
+        "page_size": max(envs.ATOM_MLA_PAGE_SIZE, 1),
         "return_lse": True,
         "causal": causal,
         "cp_world_size": dcp_world_size if round_robin else 1,
@@ -70,34 +75,55 @@ def mla_dcp_decode_call(
     }
 
 
+def mla_kv_dtype(kv_cache_dtype: str):
+    """The dtype aiter's MLA decode queries take for Q and KV under
+    ``kv_cache_dtype`` (fp8 KV -> aiter's fp8, anything else -> bf16)."""
+    import torch
+    from aiter import dtypes
+
+    return dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
+
+
+def mla_dcp_decode_shape_support(
+    num_heads: int,
+    kv_cache_dtype: str,
+    dcp_world_size: int,
+    max_seqlen_q: int = 1,
+    causal: bool = True,
+):
+    """aiter's ``get_mla_decode_shape_support`` for the persistent DCP decode
+    ``mla_dcp_decode_call`` describes, at ``num_heads`` gathered query heads."""
+    from aiter.ops.attention import get_mla_decode_shape_support
+
+    dtype = mla_kv_dtype(kv_cache_dtype)
+    return get_mla_decode_shape_support(
+        num_heads,
+        max_seqlen_q,
+        dtype,
+        dtype,
+        **mla_dcp_decode_call(dcp_world_size, max_seqlen_q, causal),
+    )
+
+
 def dcp_persistent_supported(
     num_heads: int, kv_cache_dtype: str, dcp_world_size: int
 ) -> bool:
-    """Whether DCP decode can run in *persistent* mode at ``num_heads`` gathered
-    query heads.
+    """Whether a one-row DCP decode can run in *persistent* mode at
+    ``num_heads`` gathered query heads.
 
     Asks aiter whether mla_decode_fwd has a persistent decode that returns the
     lse DCP's merge needs, for this call: gfx950's ASM kernels, and gfx1250's
     PS1 ones when AITER_MLA_DECODE_PS1_FLYDSL=1 selects them. gfx942 has none
-    and falls back to the triton stage2 reduce. Cache the result once per
-    ``__init__``; it is not for the forward pass.
+    and falls back to the triton stage2 reduce. A decode of more than one row
+    takes the width aiter's get_mla_decode_num_heads names instead
+    (``_persistent_width`` in ``atom.model_ops.attention_mla``). Cache the
+    result once per ``__init__``; it is not for the forward pass.
     """
-    import torch
-    from aiter import dtypes
-    from aiter.ops.attention import MlaBackend, get_mla_decode_shape_support
+    from aiter.ops.attention import MlaBackend
 
-    dtype = dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
-    support = get_mla_decode_shape_support(
-        num_heads,
-        1,
-        dtype,
-        dtype,
-        persistent=True,
-        page_size=max(envs.ATOM_MLA_PAGE_SIZE, 1),
-        **mla_dcp_decode_call(dcp_world_size),
-    )
+    support = mla_dcp_decode_shape_support(num_heads, kv_cache_dtype, dcp_world_size)
     # aiter has no table for the FlyDSL PS1 route and answers None there; a
-    # None from any other route is a failed query, not a yes.
+    # None from any other route (opus among them) is not a yes.
     return bool(support.supported) or (
         support.supported is None and support.backend is MlaBackend.FLYDSL_PS1
     )
