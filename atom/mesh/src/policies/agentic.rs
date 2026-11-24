@@ -257,23 +257,30 @@ impl LoadBalancingPolicy for AgenticPolicy {
             .zip(provider)
             .map(|(tokens, provider)| provider.match_workers(tokens, workers))
             .filter(|hits| healthy.iter().any(|&idx| hits[idx].is_some()));
-        let index_hits = match (index_hits, matchable.zip(provider)) {
+        // With a store, `held` is what each worker's engine reports cached once it has
+        // loaded from it. The hits count a load at the store's weight, which ranks the
+        // workers; the one selected is estimated and charged by what it will hold.
+        let (index_hits, held) = match (index_hits, matchable.zip(provider)) {
             (Some(device), Some((tokens, provider))) if provider.store_weight() > 0.0 => {
                 let weight = provider.store_weight();
                 let cached = provider.cached_tokens(tokens, workers, &device).await;
                 let prompt = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-                let credited = device.iter().zip(&cached).map(|(&device, &cached)| {
-                    let device = device?;
-                    // A store that does not answer (its lookup timed out, or its
-                    // breaker is open) is taken to hold the prompt: one that serves
-                    // holds most of it, and counting none would charge the worker
-                    // the whole prompt until its prefill ends.
-                    let loaded = cached.unwrap_or(prompt).saturating_sub(device);
-                    Some(device + (weight * f64::from(loaded)).round() as u32)
+                // A store that does not answer (its lookup timed out, or its breaker
+                // is open) is taken to hold the prompt: one that serves holds most of
+                // it, and counting none would charge the worker the whole prompt
+                // until its prefill ends.
+                let held: Vec<_> = device
+                    .iter()
+                    .zip(&cached)
+                    .map(|(&device, &cached)| Some(cached.unwrap_or(prompt).max(device?)))
+                    .collect();
+                let credited = device.iter().zip(&held).map(|(&device, &held)| {
+                    let (device, held) = (device?, held?);
+                    Some(device + (weight * f64::from(held - device)).round() as u32)
                 });
-                Some(credited.collect::<Vec<_>>())
+                (Some(credited.collect::<Vec<_>>()), Some(held))
             }
-            (hits, _) => hits,
+            (hits, _) => (hits, None),
         };
         let tree = text.map(|_| self.tree(workers[healthy[0]].as_ref()));
         let (source, hits) = match (index_hits, text.zip(tree.as_deref())) {
@@ -314,13 +321,19 @@ impl LoadBalancingPolicy for AgenticPolicy {
             .max()
             .unwrap_or(0);
         let reused = prompt_tokens - selection.uncached_tokens;
+        // The selected worker computes what neither its device holds nor its engine
+        // loads, and its queue is charged that alone: a load waits on the store while
+        // the GPU serves others. The engine's share_cache balancer charges the same.
+        let cached = held
+            .and_then(|held| held[selection.worker_index])
+            .map_or(reused, |held| (held as usize).min(prompt_tokens));
         let ratio =
             |tokens: usize| (prompt_tokens > 0).then(|| tokens as f64 / prompt_tokens as f64);
         let selected_known = hits[selection.worker_index].is_some();
         let (branch, estimated_hit_ratio) = match source {
-            Hits::Index if longest == 0 => ("miss", ratio(0).filter(|_| selected_known)),
-            Hits::Index if reused == longest => ("hit", ratio(reused)),
-            Hits::Index => ("relocate", ratio(reused).filter(|_| selected_known)),
+            Hits::Index if longest == 0 => ("miss", ratio(cached).filter(|_| selected_known)),
+            Hits::Index if reused == longest => ("hit", ratio(cached)),
+            Hits::Index => ("relocate", ratio(cached).filter(|_| selected_known)),
             Hits::Text if longest == 0 => ("text_miss", None),
             Hits::Text if reused == longest => ("text_hit", ratio(reused)),
             Hits::Text => ("text_relocate", None),
@@ -332,7 +345,7 @@ impl LoadBalancingPolicy for AgenticPolicy {
                 .then(|| ratio(longest))
                 .flatten(),
             estimated_hit_ratio,
-            prefill_tokens: Some(selection.uncached_tokens),
+            prefill_tokens: Some(prompt_tokens - cached),
             reservation_id: None,
         };
         (Some(selection.worker_index), decision)
@@ -571,11 +584,14 @@ mod tests {
             tokens: Some(&tokens),
             ..Default::default()
         };
-        // a's device holds 40 of the 100 tokens; b's none, but its store 90.
+        // a's device holds 40 of the 100 tokens; b's none, but its store 90. The weight
+        // says which of them leads; b, once chosen, is estimated to report the 90 it
+        // loads and charged the 10 it computes, whatever the weight.
         for (weight, b_cached, want) in [
             (0.0, Some(90), (Some(0), "hit", Some(0.4), Some(60))),
+            (0.3, Some(90), (Some(0), "hit", Some(0.4), Some(60))),
+            (0.5, Some(90), (Some(1), "hit", Some(0.9), Some(10))),
             (1.0, Some(90), (Some(1), "hit", Some(0.9), Some(10))),
-            (0.5, Some(90), (Some(1), "hit", Some(0.45), Some(55))),
         ] {
             let policy = agentic(512, None);
             policy.set_kv_events(Arc::new(Stored(
@@ -599,17 +615,17 @@ mod tests {
             ..Default::default()
         };
         // a's device holds 40 of the 100 tokens, b's none, and the store both read
-        // does not answer: a keeps its lead, and is charged the 60 it would load at
-        // half, not all 60.
+        // does not answer: a keeps its lead, and is charged none of the 60 it is
+        // taken to load.
         let policy = agentic(512, None);
         policy.set_kv_events(Arc::new(Stored(vec![(40, None), (0, None)], 0.5)));
-        let hit = (Some(0), "hit", Some(0.7), Some(30));
+        let hit = (Some(0), "hit", Some(1.0), Some(0));
         assert_eq!(decide(&policy, &workers, &info).await, hit);
-        // With nothing on a device, the workers tie and each is charged half.
+        // With nothing on a device, the workers tie and neither is charged.
         let policy = agentic(512, None);
         policy.set_kv_events(Arc::new(Stored(vec![(0, None), (0, None)], 0.5)));
         let (_, branch, ratio, charge) = decide(&policy, &workers, &info).await;
-        assert_eq!((branch, ratio, charge), ("hit", Some(0.5), Some(50)));
+        assert_eq!((branch, ratio, charge), ("hit", Some(1.0), Some(0)));
     }
 
     #[tokio::test]
