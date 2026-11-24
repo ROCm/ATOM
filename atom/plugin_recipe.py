@@ -39,6 +39,7 @@ ON_DECLINE = ("native", "error")
 SHADOW = ("error", "shadow", "nested")
 MONO_MODES = ("auto", "off")
 PREFILL_ADMIT_ORDERS = ("fifo", "short_new", "srpt")
+SEG_FUSE_ITEMS = (1, 7)
 _SLOT_RE = re.compile(r"^[A-Za-z0-9_*]+(\.[A-Za-z0-9_*]+)*$")
 
 
@@ -102,6 +103,17 @@ def _row_counts(value: Any, where: str) -> str | tuple[int, ...] | None:
             "recipe-schema", f"{where} must be a path or a list of positive ints"
         )
     return tuple(value)
+
+
+def _items(value: Any, where: str, known: tuple) -> tuple:
+    """A list of item names or numbers out of ``known``, in ``known``'s order."""
+    if not isinstance(value, (list, tuple)) or any(
+        isinstance(x, bool) or x not in known for x in value
+    ):
+        raise RecipeRefused(
+            "recipe-schema", f"{where} must be a list of items out of {known}"
+        )
+    return tuple(x for x in known if x in value)
 
 
 _WIDTHS_RE = re.compile(r"^\d+(-\d+)?([ ,]+\d+(-\d+)?)*$")
@@ -354,6 +366,11 @@ class ModelOptions:
     expert_placement: str | tuple[tuple[str, tuple[int, ...]], ...] | None = None
     block_transition: bool = False
     mono_mode: str = "auto"
+    # Launch fusions of the non-MoE decode segment, by item number
+    # (`atom.models.deepseek_v41_plugin.seg_fuse`): 1, the FFN mHC writes the
+    # shared expert's MXFP8 input pair; 7, the shared expert's SiLU-mul and
+    # w2's input quant as AITER's one launch.
+    seg_fuse: tuple[int, ...] = ()
 
     @classmethod
     def from_mapping(cls, raw: Any) -> ModelOptions:
@@ -374,7 +391,7 @@ class ModelOptions:
                 "recipe-schema",
                 f"model_options.mono_mode must be one of {MONO_MODES}",
             )
-        return cls(
+        options = cls(
             target_model_cls=_opt_str(
                 raw.get("target_model_cls", defaults.target_model_cls),
                 "model_options.target_model_cls",
@@ -414,7 +431,20 @@ class ModelOptions:
                 "model_options.block_transition",
             ),
             mono_mode=mono_mode,
+            seg_fuse=_items(
+                raw.get("seg_fuse", defaults.seg_fuse),
+                "model_options.seg_fuse",
+                SEG_FUSE_ITEMS,
+            ),
         )
+        for item, other in ((1, "ffn_mhc_fuse_quant"), (7, "shared_act_quant")):
+            if item in options.seg_fuse and getattr(options, other):
+                raise RecipeRefused(
+                    "recipe-schema",
+                    f"model_options.seg_fuse item {item} and model_options.{other} "
+                    "replace the same launch: set one",
+                )
+        return options
 
     def placement_spec(self) -> str | dict[str, list[int]] | None:
         if self.expert_placement is None or isinstance(self.expert_placement, str):

@@ -38,6 +38,7 @@ from atom.models.deepseek_v41.layers import (
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
+from . import seg_fuse
 from .attention import Attention
 from .moe import MoE
 
@@ -79,6 +80,9 @@ class Block(nn.Module):
             layer=self.layer_name,
             fake=torch.empty_like,
         )
+        # model_options.seg_fuse: None / untouched unless an item is on.
+        self._ffn_quant = seg_fuse.bind_ffn_quant(self)
+        seg_fuse.install_act(self.ffn)
         # Weights only: each norm runs inside its seam (`pre_delayed`).
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -108,7 +112,9 @@ class Block(nn.Module):
         self.hc_fuse_quant = False
         # The same for the FFN seam (model_options.ffn_mhc_fuse_quant): its one reader
         # of the pair is the shared expert's gate_up_proj, which otherwise runs
-        # `quantize_fp8` on the BF16 rows -- one launch a layer.
+        # `quantize_fp8` on the BF16 rows -- one launch a layer. Also what
+        # model_options.seg_fuse item 1 turns on, with its own way of handing
+        # the pair to the shared expert (`_ffn_quant`).
         self.hc_ffn_fuse_quant = False
         self.engram = None
         if spec.layer_id in config.engram_layer_ids:
@@ -161,6 +167,14 @@ class Block(nn.Module):
                     else "unfused (needs the HIP mHC seam and a standalone "
                     "group-32 MXFP8 shared expert on the single-stream path)"
                 ),
+            )
+        if self._ffn_quant is not None:
+            # model_options.seg_fuse item 1: the same seam output, read by the
+            # shared expert through `_ffn_quant`.
+            self.hc_ffn_fuse_quant = (
+                self.hc_ffn_fn_packed is not None
+                and fuse_quant_supported()
+                and seg_fuse.ffn_reads_pair(self)
             )
 
     def attention_forward(self, normed, cache, step, rope):
@@ -258,7 +272,11 @@ class Block(nn.Module):
             # `v41.block.ffn` still sees one BF16 tensor; the pair waits on the
             # module for whichever `single_stream_moe_forward` the call reaches.
             hidden, hidden_fp8, hidden_scale = normed
-            if self._ffn == self.ffn.__call__:
+            if self._ffn_quant is not None:
+                # model_options.seg_fuse item 1: the shared expert holds the
+                # pair for the call, whichever dispatch reaches it.
+                output = self._ffn_quant(hidden, hidden_fp8, hidden_scale)
+            elif self._ffn == self.ffn.__call__:
                 output = self.ffn(hidden, (hidden_fp8, hidden_scale))
             else:
                 output = self._ffn_pair(hidden, hidden_fp8, hidden_scale)

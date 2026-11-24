@@ -168,6 +168,10 @@ def test_v2_options_parse_and_key_the_plan():
         {"engine": {"prefill_short_first_rows": 96, "prefill_admit_order": "srpt"}},
         {"model_options": {"fused_attn": "yes"}},
         {"model_options": {"mono_mode": "sometimes"}},
+        {"model_options": {"seg_fuse": [8]}},
+        {"model_options": {"seg_fuse": "1,7"}},
+        {"model_options": {"seg_fuse": [1], "ffn_mhc_fuse_quant": True}},
+        {"model_options": {"seg_fuse": [7], "shared_act_quant": True}},
         {"dspark_options": {"lean_head": 1}},
         {"dspark_options": {"dp_sharded_head": "on"}},
         {"dspark_options": {"dp_sharded_head_max_rows": 0}},
@@ -247,6 +251,19 @@ def test_the_start_up_options_parse_and_key_the_plan():
     )
     assert by_path.engine.prefill_warmup_ladder == "ladder.txt"
     assert by_path.plan_id != plan.plan_id
+
+
+def test_the_model_option_seg_fuse_keys_the_plan():
+    assert recipes.ModelOptions().seg_fuse == ()
+    plan = _plan(model_options={"seg_fuse": [7, 1]})
+    assert plan.model_options.seg_fuse == (1, 7)
+    assert plan.dump()["model_options"]["seg_fuse"] == (1, 7)
+    assert plan.plan_id != _plan(model_options={"seg_fuse": [1]}).plan_id
+    copy = pickle.loads(pickle.dumps(plan))
+    assert copy == plan and copy.dump() == plan.dump()
+    host.configure(plan, kill_switch=False)
+    assert host.model_options().seg_fuse == (1, 7)
+    host._reset_for_testing()
 
 
 def test_the_host_options_reach_code_without_a_config():
@@ -345,6 +362,7 @@ def test_no_new_environment_variable_carries_a_recipe_option():
         "ATOM_PREFILL_DECODE_INTERVAL_SLOPE",
         "ATOM_PREFILL_ADMIT_ORDER",
         "ATOM_PREFILL_ADMIT_MAX_AGE_MS",
+        "ATOM_DSV41_SEG_FUSE",
         "ATOM_DP_DSPARK_SHARDED_HEAD",
         "ATOM_SAMPLER_SKIP_GREEDY_PICK",
         "ATOM_SPEC_SKIP_UNUSED_TARGET_DRAW",

@@ -98,6 +98,7 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 | `model_options.maxima_grid` | `ATOM_DSV41_MAXIMA_GRID` (#3645) |
 | `model_options.expert_placement` (path or `{layer: perm}`) | `ATOM_MOE_EXPERT_PLACEMENT` (#3645) |
 | `model_options.block_transition` | `ATOM_V41_TRANSITION_AB` (#3529, still read) |
+| `model_options.seg_fuse` (items `1`, `7`) | `ATOM_DSV41_SEG_FUSE` |
 | `model_options.mono_mode: "off"` | skipping the mono installer |
 | `dspark_options.fused_prologue` | `ATOM_DSPARK_FUSED_PROLOGUE` (#3639) |
 | `dspark_options.two_buffer_attn` | `ATOM_V41_DRAFT_ATTN_NO_CAT` (#3645) |
@@ -116,6 +117,16 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   left first across both). A prompt that has gone `prefill_admit_max_age_ms` without a chunk
   goes ahead of every younger one. Refused together with `prefill_short_first_rows`.
 
+- `model_options.seg_fuse`: a list of items, each two back-to-back launches of the non-MoE
+  decode segment as one with the same bytes out. `1`: the FFN seam's Mega-MHC also writes the
+  MXFP8 pair of its normed output and the shared expert's `gate_up_proj` reads it; under an
+  owner of `v41.block.ffn` the pair is held on the shared expert for the length of the call and
+  used only for the very rows it was written with, so it is read whether the owner calls
+  `single_stream_moe_forward` or the shared expert itself. `7`: the shared expert's
+  `silu_and_mul` and the `quantize_fp8` in front of `w2` become AITER's `silu_mul_mxfp8`
+  (gfx950). Item 1 asks for the Mega-MHC launch `ffn_mhc_fuse_quant` asks for and item 7
+  replaces the launches `shared_act_quant` replaces, by another kernel: a recipe that sets an
+  item and that option is refused.
 - `dspark_options.dp_sharded_head`: under pure DP attention (TP 1) the draft block's rows and
   anchors are all-gathered over the DP group, each rank projects every row onto its own
   `V / dp` slice of the replicated LM head, and each position's id is picked from the

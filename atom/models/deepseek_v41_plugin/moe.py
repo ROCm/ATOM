@@ -166,3 +166,10 @@ class MoE(V4MoE):
                 scales.reshape(rows.shape[0], -1),
             )
         return super().forward(rows, hidden_quant).view_as(hidden)
+
+    def forward_quant(self, hidden, hidden_fp8, hidden_scale):
+        """`forward(hidden)` given ``hidden``'s group-32 MXFP8 pair, which the
+        shared expert's first GEMM reads where it runs on this stream
+        (`model_options.seg_fuse` item 1); the other dispatches ignore the
+        pair."""
+        return self.forward(hidden, (hidden_fp8, hidden_scale))

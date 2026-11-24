@@ -10,6 +10,10 @@ the plugin model only:
   the one-launch act + quant (`model_options.ffn_mhc_fuse_quant` /
   `shared_act_quant`, ROCm/ATOM#3645). The fused act + quant is the seam's
   *native*, so a planned `v41.moe.shared_act` owner still serves first;
+- `model_options.seg_fuse` (`.seg_fuse`): the shared expert reading the FFN
+  mHC's MXFP8 pair it was handed for one call (`seg_fuse_input`), whichever
+  dispatch reaches it, and AITER's one-launch SiLU-mul + MXFP8 quant
+  (`seg_fuse_act`);
 - a static expert placement (`model_options.expert_placement`) applied to the
   routed experts and the router rows alike;
 - MegaMoE (`--moe-backend mega`) kept single-stream: its fused kernels hold
@@ -60,10 +64,19 @@ class PluginExpert(_v4.Expert):
             self._gate_up_act,
             capability=self._expert_capability,
         )
+        # `model_options.seg_fuse` (`.seg_fuse`), both None unless that sets
+        # them. `seg_fuse_input`: `(x, x_fp8, x_scale)`, the MXFP8 pair of the
+        # FFN input its producer already wrote, held only while that FFN call
+        # runs. `seg_fuse_act`: the one-launch SiLU-mul + MXFP8 quant that
+        # stands in for `silu_and_mul` and w2's own quant.
+        self.seg_fuse_input = None
+        self.seg_fuse_act = None
 
     def forward(self, x, weights=None, x_quant=None):
         # ``x_quant``: `quantize_fp8(x)`'s bytes from the FFN mHC; a group-32
         # gate_up_proj reads them instead of quantizing the rows again.
+        if x_quant is None and getattr(self, "seg_fuse_input", None) is not None:
+            x_quant = self._seg_fuse_pair(x)
         if x_quant is not None and self.gate_up_proj.native_a8_group_rows is not None:
             combined = self.gate_up_proj(x_quant[0], x_scale=x_quant[1])
             return self.act_down(combined, weights)
@@ -78,6 +91,24 @@ class PluginExpert(_v4.Expert):
             )
             return self.w2(act, x_scale=act_scale)
         return self.act_down(self.gate_up_proj(x), weights)
+
+    def _seg_fuse_pair(self, x):
+        """The held pair if it is ``x``'s: same memory, same rows; it is given
+        out once. Anything else reads None and `gate_up_proj` quantizes ``x``
+        as before."""
+        hidden, x_fp8, x_scale = self.seg_fuse_input
+        if (
+            x.dim() != 2
+            or x.dtype != hidden.dtype
+            or x.numel() != hidden.numel()
+            or x.data_ptr() != hidden.data_ptr()
+        ):
+            return None
+        rows, width = x.shape
+        if x_fp8.numel() != rows * width or x_scale.numel() != rows * (width // 32):
+            return None
+        self.seg_fuse_input = None
+        return x_fp8.reshape(rows, width), x_scale.reshape(rows, width // 32)
 
     def _gate_up_act(self, x, weights, w13_w, w13_ws):
         """`v41.moe.shared_expert`'s native: gate_up, then the act seam."""
@@ -136,6 +167,10 @@ class PluginExpert(_v4.Expert):
             )
             if native_mx:
                 x_scale = x_scale.view(torch.float8_e8m0fnu)
+            return x_fp8, x_scale
+        seg_fuse_act = getattr(self, "seg_fuse_act", None)
+        if seg_fuse_act is not None and weights is None:
+            x_fp8, x_scale = seg_fuse_act(combined, float(self.swiglu_limit))
             return x_fp8, x_scale
         out = torch.empty(
             (combined.shape[0], combined.shape[-1] // 2),
