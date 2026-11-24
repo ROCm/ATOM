@@ -1690,6 +1690,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_PP_SPLIT_BY_KV_BYTES": lambda: _flag_env(
         "ATOM_OFFLOAD_PP_SPLIT_BY_KV_BYTES"
     ),
+    # save_policy lazy: once HBM holds a chunk loaded from the CPU tier, the
+    # tier evicts its copy first and HBM demotes the block again before it
+    # evicts it, so a chunk both tiers hold costs the tier no room
+    # (lazy_save.py). Off by default.
+    "ATOM_OFFLOAD_LAZY_EXCLUSIVE": lambda: _flag_env("ATOM_OFFLOAD_LAZY_EXCLUSIVE"),
     # lmcache_mp sends tier lookups for the head of the waiting queue ahead of
     # admission; this is how many waiting requests per scheduling pass.
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(

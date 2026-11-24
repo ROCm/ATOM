@@ -385,6 +385,30 @@ def test_a_save_that_must_store_all_skips_chunks_the_tier_holds():
     assert _store_reports(worker) == {("a", True), ("b", True)}
 
 
+@pytest.mark.parametrize("exclusive", ["0", "1"])
+def test_a_lazy_exclusive_demotion_makes_the_chunks_the_tier_kept_recent(
+    monkeypatch, exclusive
+):
+    """HBM is evicting its copy of a chunk the tier kept (cold since HBM loaded
+    it): skipped as before, and, with exclusive tiers, counted as hit."""
+    monkeypatch.setenv("ATOM_OFFLOAD_LAZY_EXCLUSIVE", exclusive)
+    from atom.kv_transfer.offload import prehashed
+
+    engine = _engine()
+    worker = _worker(engine)
+    worker._early_release = True
+    calls = []
+    monkeypatch.setattr(
+        worker, "_tier_backends_do", lambda hashes, op: calls.append((hashes, op))
+    )
+    worker._do_save_req(_store_all("a", (11,)))
+    worker._do_save_req(_store_all("b", (11, 12)))
+    keys, _objs = engine.storage_manager.put[-1]
+    assert [k.chunk_hash for k in keys] == [12]
+    assert calls == ([([11], prehashed._make_recent)] if exclusive == "1" else [])
+    assert _store_reports(worker) == {("a", True), ("b", True)}
+
+
 @pytest.mark.parametrize("state", ["unhealthy", "frozen", "passive"])
 def test_an_engine_that_stores_nothing_fails_a_save_that_must_store_all(state):
     engine = _engine()

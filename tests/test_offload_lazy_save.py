@@ -2020,13 +2020,46 @@ def test_the_pin_a_waiting_request_holds_is_counted_until_its_load(lmcache):
 
 
 # ------------------------------------------------ a trace replayed end to end
-def _replay(lmcache, *, write_back, pd):
+class _LRUChunks:
+    """A tier's chunk set of `cap` chunks: a store or a lookup hit makes a
+    chunk the most recent, and a store past `cap` evicts the least recent."""
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.chunks = {}
+
+    def __contains__(self, chunk_hash):
+        if chunk_hash not in self.chunks:
+            return False
+        self.chunks[chunk_hash] = self.chunks.pop(chunk_hash)
+        return True
+
+    def __len__(self):
+        return len(self.chunks)
+
+    def update(self, hashes):
+        for chunk_hash in hashes:
+            self.chunks.pop(chunk_hash, None)
+            self.chunks[chunk_hash] = None
+            while len(self.chunks) > self.cap:
+                del self.chunks[next(iter(self.chunks))]
+
+    def cool(self, chunk_hash):
+        """First in line for eviction (the worker's `_make_coldest`)."""
+        if chunk_hash in self.chunks:
+            del self.chunks[chunk_hash]
+            self.chunks = {chunk_hash: None, **self.chunks}
+
+
+def _replay(lmcache, *, write_back, pd, tier_cap=None):
     """Multi-turn conversations through the real scheduler, P/D or alone, with
     the lazy tier: each turn re-sends the conversation so far plus new tokens,
     the worker reports a demotion two steps after it is dispatched and a load
-    one step after, and the tier never evicts. Returns, over the follow-up
-    turns, the blocks of the previous turn neither HBM nor the tier served, and
-    the pool."""
+    one step after, and puts the chunks a build names cold first in line. The
+    tier never evicts, or holds `tier_cap` chunks, least recently stored or hit
+    first (a demotion of a chunk it holds makes it recent, as the worker does).
+    Returns, over the follow-up turns, the blocks of the previous turn neither
+    HBM nor the tier served, and the pool."""
     shell = LMCacheOffloadConnectorScheduler(_config(step=4 * BLOCK))
     producer = _Producer()
     connector = _multi(producer, shell) if pd else shell
@@ -2037,6 +2070,8 @@ def _replay(lmcache, *, write_back, pd):
     if not write_back:
         pool.set_write_back(None)  # as before the fix
     tier = lmcache.tier
+    if tier_cap is not None:
+        tier.stored = _LRUChunks(tier_cap)
     # (conversation, blocks) in arrival order: five conversations, round robin,
     # each turn a few blocks longer, so turns of 6..22 blocks arrive while the
     # pool (48) holds about two conversations.
@@ -2106,6 +2141,9 @@ def _replay(lmcache, *, write_back, pd):
             ):
                 sends.append((tick + 2, seq.id))
             for sub in getattr(meta, "metas", None) or ([meta] if meta else []):
+                for chunk_hash in getattr(sub, "tier_cold_chunks", ()):
+                    if isinstance(tier.stored, _LRUChunks):
+                        tier.stored.cool(chunk_hash)
                 for req in getattr(sub, "requests", ()):
                     if req.prehashed_save is not None:
                         reports.append((tick + 2, req))
@@ -2266,3 +2304,132 @@ def test_eager_without_prehashed_saves_probes_nothing(lmcache, monkeypatch):
     seq = _seq(3)
     assert isinstance(shell._impl, M3OffloadScheduler)
     assert shell._impl._tier_index is None and shell.tier_probe(seq, 0) == 0
+
+
+# ------------------------------------------------- exclusive tiers (opt-in)
+def _loaded(sched, pool, seq, start, end):
+    """`seq` held as a prefill leaves it, with chunks [start, end) filled by a
+    tier load that reported."""
+    blocks = _hold(pool, seq)
+    operation = LoadOperationId(seq.id, 0)
+    sched._active_load_operations[str(seq.id)] = (seq, operation)
+    seq.offload_load_start_tokens = start * BLOCK
+    seq.offload_loaded_tokens = end * BLOCK
+    assert sched.load_finished(operation)
+    return blocks
+
+
+def test_exclusive_cools_what_a_load_filled_from_the_tier_once(lmcache, monkeypatch):
+    monkeypatch.setenv("ATOM_OFFLOAD_LAZY_EXCLUSIVE", "1")
+    sched, pool, _ = _lazy(lmcache, 12)
+    seq = _seq(4)
+    blocks = _loaded(sched, pool, seq, 1, 3)
+    chain = _chain(seq)
+    _finish(sched, pool, seq)
+    # HBM holds chunks 1 and 2 now: dirty, so HBM demotes them again before
+    # it evicts them, and the tier's copies go first in line with the next build.
+    assert _saved(sched, blocks) == [False] * 4
+    assert [sched._is_dirty(b) for b in blocks] == [True] * 4
+    assert sched.has_pending_work()
+    meta = sched.build_connector_meta()
+    assert meta.tier_cold_chunks == chain[1:3] and meta.has_work()
+    assert sched._perf_counters["lazy_tier_cooled"] == 2
+    # Once: a request finishing on the same blocks again (it hit HBM) adds none.
+    again = _seq(4)
+    assert _hold(pool, again) == blocks
+    _finish(sched, pool, again)
+    assert sched.build_connector_meta().tier_cold_chunks == []
+    assert not sched.has_pending_work()
+
+
+def test_exclusive_leaves_a_duplicate_blocks_tier_copy_in_place(lmcache, monkeypatch):
+    monkeypatch.setenv("ATOM_OFFLOAD_LAZY_EXCLUSIVE", "1")
+    sched, pool, _ = _lazy(lmcache, 12)
+    seq = _seq(2)
+    blocks = _loaded(sched, pool, seq, 0, 2)
+    # The load filled blocks[1], but the index names another copy of its
+    # content: the tier's copy keeps its place.
+    canonical = pool.pop()
+    pool.allocate(canonical)
+    original = pool.block(blocks[1])
+    pool.block(canonical).update(original.hash, original.token_ids)
+    pool._hash_to_block_id[original.hash] = canonical
+    _finish(sched, pool, seq)
+    assert sched.build_connector_meta().tier_cold_chunks == _chain(seq)[:1]
+    assert _saved(sched, blocks) == [False, False]
+
+
+@pytest.mark.parametrize("exclusive", ["0", "1"])
+def test_exclusive_doubles_the_demotions_in_flight(lmcache, monkeypatch, exclusive):
+    # Every block a load brought back is dirty too: twice the slots.
+    monkeypatch.setenv("ATOM_OFFLOAD_LAZY_EXCLUSIVE", exclusive)
+    # 1000 blocks make a window of 20, past the four vacant ones.
+    sched, *_ = _cold(lmcache, 40, vacant=RESERVE, blocks=1000)
+    slots = lazy_save._MAX_DEMOTIONS_IN_FLIGHT * (2 if exclusive == "1" else 1)
+    assert len(sched.build_connector_meta().requests) == slots
+    assert len(sched._demotions) == slots
+
+
+def test_without_exclusive_a_load_ships_no_cold_chunks(lmcache):
+    sched, pool, _ = _lazy(lmcache, 12)
+    seq = _seq(3)
+    blocks = _loaded(sched, pool, seq, 0, 3)
+    _finish(sched, pool, seq)
+    assert _saved(sched, blocks) == [True] * 3
+    assert sched.build_connector_meta().tier_cold_chunks == []
+
+
+def _cpu_backend(policy):
+    """LMCache's real `LocalCPUBackend` under `policy`, its memory objects
+    stood in for."""
+    pytest.importorskip("lmcache")
+    from lmcache.v1.config import LMCacheEngineConfig
+    from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+
+    from atom.kv_transfer.offload.cache_policy import register_slru_policy
+
+    register_slru_policy()
+    cfg = LMCacheEngineConfig.from_defaults(
+        chunk_size=BLOCK,
+        local_cpu=True,
+        max_local_cpu_size=0.001,
+        cache_policy=policy,
+    )
+    return LocalCPUBackend(cfg, metadata=None, memory_allocator=object())
+
+
+@pytest.mark.parametrize("policy", ["ATOM_SLRU", "LRU"])
+def test_the_worker_cools_named_chunks_before_the_steps_saves(monkeypatch, policy):
+    from test_offload_prehashed_save import _tdb as real_token_database
+
+    backend = _cpu_backend(policy)
+    tdb = real_token_database()
+    engine = SimpleNamespace(
+        token_database=tdb,
+        storage_manager=SimpleNamespace(storage_backends={"LocalCPUBackend": backend}),
+    )
+    k0, k1, k2, k3 = keys = [tdb._make_key_by_hash(h) for h in (10, 11, 12, 13)]
+    for key in keys:
+        backend.hot_cache[key] = SimpleNamespace(can_evict=True)
+        backend.cache_policy.update_on_put(key)
+    backend.cache_policy.update_on_hit(k0, backend.hot_cache)  # most recent
+    worker = M3OffloadConnector.__new__(M3OffloadConnector)
+    worker._engine = engine
+    order = []
+
+    def saves(_self, _meta):
+        candidates = backend.cache_policy.get_evict_candidates(backend.hot_cache, 10)
+        order.append(candidates)
+
+    monkeypatch.setattr(DenseOffloadConnector, "start_load_kv", saves)
+    meta = LMCacheOffloadMetadata()
+    meta.tier_cold_chunks = [10, 12, 99]  # 99: not in the tier
+    worker.start_load_kv(meta)
+    # Before the step's saves: 12, then 10, ahead of the rest; nothing dropped.
+    assert order == [[k2, k0, k1, k3]]
+    assert len(backend.hot_cache) == 4
+    # A demotion finding 10 still held makes it recent again.
+    from atom.kv_transfer.offload import prehashed
+
+    worker._tier_backends_do([10], prehashed._make_recent)
+    assert backend.cache_policy.get_evict_candidates(backend.hot_cache, 10)[-1] == k0

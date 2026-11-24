@@ -40,6 +40,13 @@ class SLRUCachePolicy(LRUCachePolicy):
         self._probationary[key] = None
         self._probationary.move_to_end(key)
 
+    def make_coldest(self, key: Any) -> None:
+        """Put a chunk first in line for eviction, whichever queue held it: a
+        lazy exclusive tier's copy of a chunk HBM holds again."""
+        self._protected.pop(key, None)
+        self._probationary[key] = None
+        self._probationary.move_to_end(key, last=False)
+
     def update_on_force_evict(self, key: Any) -> None:
         """Forget a chunk explicitly removed by the storage backend."""
         self._probationary.pop(key, None)

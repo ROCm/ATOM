@@ -6,8 +6,9 @@
 The eager save policy stores every prompt chunk a prefill computes, so the CPU
 tier holds a superset of the GPU prefix cache. The lazy policy stores a block
 only when the GPU prefix cache is about to evict it, so the tier holds what
-the GPU evicted (a block loaded back from it stays in both) and the two
-together hold more prefixes. No request stores its own prompt:
+the GPU evicted (a block loaded back from it stays in both, unless the tiers
+are exclusive) and the two together hold more prefixes. No request stores its
+own prompt:
 
 * Keys. When a request finishes or is preempted, each of its published prompt
   blocks is keyed by pool block id with its GPU block hash, its LMCache chunk
@@ -27,6 +28,16 @@ together hold more prefixes. No request stores its own prompt:
   the blocks it passed over are the first a demotion takes
   (`BlockPool.held_blocks`). A block is lost unsaved only when the pool holds
   nothing clean to evict instead (`lazy_evicted_unsaved`).
+* Exclusive tiers (`ATOM_OFFLOAD_LAZY_EXCLUSIVE`, off by default). A block a
+  load filled is keyed unsaved instead of saved, and its chunk hash rides the
+  next metadata (`tier_cold_chunks`); the worker puts the tier's copy first in
+  its eviction order before that step's stores. HBM demotes the block again
+  before it evicts it: a store of a chunk the tier kept is skipped and makes
+  it recent, one it dropped is stored again. A returning conversation's
+  prefix then takes room in one tier, not both: otherwise the tier spends
+  most of its protected half on copies of what HBM holds (M3.1 C192 trace).
+  Demotions double (about 1.8x the blocks on that trace), and so do the
+  demotion slots: every block a load brought back is dirty.
 * Lookup. The tier holds what HBM evicted rather than the prefix HBM still
   has, so a lookup asks only past the HBM hit, which the scheduler probes first
   (`needs_hbm_probe_before_lookup`).
@@ -88,6 +99,7 @@ from atom.kv_transfer.offload.prehashed import (
     PrehashedSaveSchedulerMixin,
     PrehashedSaveWorkerMixin,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -165,7 +177,8 @@ class LazySaveSchedulerMixin:
         # Demotions in flight: operation -> (pinned block ids, dispatch time).
         self._demotions: dict[SaveOperationId, tuple[list[int], float]] = {}
         # A demotion's size: the blocks one step's tokens fill, the most
-        # unsaved content a step adds (a load's blocks are the tier's already).
+        # unsaved content a step adds (a load's blocks are the tier's already,
+        # unless the tiers are exclusive).
         self._demotion_blocks = -(-int(self._config.max_num_batched_tokens) // chunk)
         # The free list as the last look left it, and how far the window may
         # slide from there unseen, or None for any change (`_look_due`); None
@@ -182,6 +195,17 @@ class LazySaveSchedulerMixin:
         # The PP head's observer of demotions that will never report
         # (`bind_save_abandoned`); None without PP.
         self._report_abandoned = None
+        # ATOM_OFFLOAD_LAZY_EXCLUSIVE: a chunk HBM loaded from the tier goes
+        # first in the tier's eviction order and its block is keyed unsaved, so
+        # a chunk both tiers hold costs the tier no room. The chunk hashes to
+        # send with the next build.
+        self._exclusive = bool(envs.ATOM_OFFLOAD_LAZY_EXCLUSIVE)
+        self._tier_cold: list[int] = []
+        # Exclusive tiers demote every block a load brought back too (about
+        # 1.8x the blocks on the M3.1 C192 trace): twice the slots. With four,
+        # a 1/8-scale replay of that trace lost 3.4x the blocks it lost dirty
+        # with eight.
+        self._max_demotions = _MAX_DEMOTIONS_IN_FLIGHT * (2 if self._exclusive else 1)
 
     def bind_save_abandoned(self, report) -> None:
         """Take the PP head's observer of abandoned saves, called with the
@@ -236,8 +260,10 @@ class LazySaveSchedulerMixin:
         self._looked_at = None
         first, end = loaded[1:] if loaded is not None and loaded[0] is seq else (0, 0)
         chain = self._prefix_chunk_hashes(seq, n)
-        blocks = self._block_manager.kv.blocks
+        pool = self._block_manager.kv
+        blocks, indexed = pool.blocks, pool.index_get
         keys = self._block_keys
+        exclusive = self._exclusive
         for i, block_id in enumerate(seq.block_table[:n]):
             h = blocks[block_id].hash
             old = keys.get(block_id)
@@ -245,7 +271,16 @@ class LazySaveSchedulerMixin:
                 saved = False
             else:
                 saved = old[2]
-            keys[block_id] = (h, chain[i], saved or first <= i < end)
+            if first <= i < end:
+                if not exclusive:
+                    saved = True
+                elif h != -1 and indexed(h) == block_id:
+                    # HBM holds the chunk now: the tier's copy is the first it
+                    # evicts, and this block is demoted again before HBM
+                    # evicts it (a store the worker skips if the copy stayed).
+                    saved = False
+                    self._tier_cold.append(chain[i])
+            keys[block_id] = (h, chain[i], saved)
 
     def request_finished(self, seq) -> None:
         self._key_blocks(seq)
@@ -289,6 +324,12 @@ class LazySaveSchedulerMixin:
     # -- demotion ------------------------------------------------------------
     def build_connector_meta(self):
         meta = super().build_connector_meta()
+        if self._tier_cold:
+            # The worker reorders these before this build's demotions, so a
+            # demotion of the same chunk leaves it recent.
+            meta.tier_cold_chunks = self._tier_cold
+            self._perf_bump("lazy_tier_cooled", len(self._tier_cold))
+            self._tier_cold = []
         self._demote(meta)
         return meta
 
@@ -336,7 +377,7 @@ class LazySaveSchedulerMixin:
         # Every slot taken leaves no budget. Not looking then also keeps the
         # last look's accounting, so a slot that comes back is used at once.
         if (
-            len(self._demotions) >= _MAX_DEMOTIONS_IN_FLIGHT
+            len(self._demotions) >= self._max_demotions
             or not self._look_due(pool)
             or time.monotonic() < self._backoff_until
         ):
@@ -350,7 +391,7 @@ class LazySaveSchedulerMixin:
         # A pinned block is off the free list: leave two demotions' worth
         # there, or the next allocation preempts a request instead.
         budget = min(
-            (_MAX_DEMOTIONS_IN_FLIGHT - len(self._demotions)) * size,
+            (self._max_demotions - len(self._demotions)) * size,
             pool.num_free - 2 * size,
         )
         keys, blocks, indexed = self._block_keys, pool.blocks, pool.index_get
@@ -501,6 +542,7 @@ class LazySaveSchedulerMixin:
         # may bring the next step's first evictions within the window.
         return (
             bool(self._demotions)
+            or bool(self._tier_cold)
             or self._look_due(self._block_manager.kv)
             or super().has_pending_work()
         )
