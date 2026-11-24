@@ -10,7 +10,9 @@ use crate::{
     app_context::AppContext,
     core::{
         circuit_breaker::CircuitBreakerConfig,
-        steps::workflow_data::LocalWorkerWorkflowData,
+        steps::{
+            tokenizer_registration::admit_model_template, workflow_data::LocalWorkerWorkflowData,
+        },
         worker::{HealthConfig, RuntimeType, WorkerType},
         BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
     },
@@ -96,6 +98,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
 
         // Get runtime type (for gRPC workers)
         let runtime_type = determine_runtime_type(connection_mode, &context.data, config);
+        let atom = runtime_type == RuntimeType::Atom;
 
         // Build circuit breaker config
         let circuit_breaker_config = build_circuit_breaker_config(app_context);
@@ -140,6 +143,27 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
                 &final_labels,
             )
         };
+
+        if atom {
+            let file = (config.chat_template.as_deref())
+                .or(app_context.router_config.chat_template.as_deref());
+            let inline = file
+                .is_none()
+                .then(|| final_labels.get("chat_template"))
+                .flatten();
+            let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+            admit_model_template(
+                app_context,
+                &model_id,
+                &urls,
+                file,
+                inline.map(String::as_str),
+            )
+            .map_err(|e| WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: format!("Refused {}: {e}", config.url),
+            })?;
+        }
 
         // Update workflow data
         context.data.actual_workers = Some(workers);

@@ -529,9 +529,9 @@ mod b2_chat_aggregator_branches {
         if let TokenChunk::Complete { meta, .. } = &mut complete {
             meta.cached_tokens = cached;
             meta.timing = timed.map(|(ttft_s, tpot_s, latency_s)| SeqTiming {
-                ttft_s,
-                tpot_s,
-                latency_s,
+                ttft: ttft_s,
+                tpot: tpot_s,
+                latency: latency_s,
             });
         }
         complete
@@ -1282,9 +1282,9 @@ mod c2_chat_streaming_branches {
         let mut meta = meta_plain();
         meta.cached_tokens = 2;
         meta.timing = timed.then_some(SeqTiming {
-            ttft_s: 0.1,
-            tpot_s: 0.01,
-            latency_s: 1.0,
+            ttft: 0.1,
+            tpot: 0.01,
+            latency: 1.0,
         });
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1],
@@ -1333,9 +1333,9 @@ mod c2_chat_streaming_branches {
         let mut meta = meta_plain();
         meta.cached_tokens = 2;
         meta.timing = Some(SeqTiming {
-            ttft_s: 0.1,
-            tpot_s: 0.01,
-            latency_s: 1.0,
+            ttft: 0.1,
+            tpot: 0.01,
+            latency: 1.0,
         });
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1],
@@ -3534,6 +3534,54 @@ mod e1_generate_streaming_body_content {
     }
 
     #[tokio::test]
+    async fn test_generate_streaming_decodes_a_character_split_across_steps() {
+        use std::sync::Arc;
+
+        use crate::routers::{
+            prepare::stop_decoder_builder::create_stop_decoder,
+            test_mocks::tokenizer::byte_level_tokenizer_dir,
+        };
+        use crate::tokenizer::{huggingface::HuggingFaceTokenizer, traits::Tokenizer};
+
+        let dir = byte_level_tokenizer_dir(&[], false, serde_json::json!({}));
+        let path = dir.path().join("tokenizer.json");
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap());
+        let mut ctx = generate_ctx();
+        ctx.stop_decoder = create_stop_decoder(&tokenizer, None, None, true, false);
+        ctx.tokenizer = tokenizer;
+        // "你" is three bytes, one token each in a byte-level vocabulary; the
+        // engine hands over the first in one step and the rest in the next.
+        let ids: Vec<u32> = "你".bytes().map(u32::from).collect();
+        let partial = |token_ids: &[u32]| {
+            Ok(TokenChunk::Partial {
+                token_ids: token_ids.to_vec(),
+                logprobs: None,
+            })
+        };
+        let stream = synthetic_single_stream(vec![
+            partial(&ids[..1]),
+            partial(&ids[1..]),
+            Ok(TokenChunk::Complete {
+                token_ids: ids.clone(),
+                finish_reason: FinishReason::Stop,
+                matched_stop: None,
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 3,
+                    total_tokens: 4,
+                },
+                logprobs: None,
+                input_logprobs: None,
+                meta: meta(),
+            }),
+        ]);
+        let s = body_of(generate_streaming::process(stream, ctx, "regular")).await;
+        assert!(s.contains("\"text\":\"你\""), "{s}");
+        assert!(!s.contains('\u{FFFD}'), "{s}");
+    }
+
+    #[tokio::test]
     async fn test_generate_streaming_partial_accumulates_text() {
         let stream = synthetic_single_stream(vec![
             Ok(TokenChunk::Partial {
@@ -4479,6 +4527,40 @@ mod g_complete_suffix {
         assert_eq!(last["text"], unary[0]["text"]);
         assert!(last["text"].as_str().unwrap().ends_with('.'), "{last}");
     }
+
+    /// A streamed chat replays a long Complete 256 ids at a time, each piece copied
+    /// alone rather than cut from a copy of the whole remaining suffix.
+    #[test]
+    fn a_replayed_piece_copies_only_its_own_ids() {
+        use crate::routers::token_handle::token_chunk::{TokenLogprob, TokenLogprobs};
+        let ids: Vec<u32> = (0..65_536).collect();
+        let item = TokenLogprob {
+            token_id: 0,
+            logprob: -1.0,
+            decoded_text: None,
+            top: Vec::new(),
+        };
+        let complete = TokenChunk::Complete {
+            token_ids: ids.clone(),
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage::default(),
+            logprobs: Some(TokenLogprobs {
+                items: vec![item; ids.len()],
+            }),
+            input_logprobs: None,
+            meta: WorkerMeta::default(),
+        };
+        let piece = chat_streaming::unstreamed(&complete, 1024, 256).unwrap();
+        assert_eq!((piece[0], piece.len(), piece.capacity()), (1024, 256, 256));
+        let logprobs = chat_streaming::unstreamed_logprobs(&complete, 1024, 256).unwrap();
+        assert_eq!(
+            (logprobs.items.len(), logprobs.items.capacity()),
+            (256, 256)
+        );
+        let whole = chat_streaming::unstreamed(&complete, 1024, usize::MAX).unwrap();
+        assert_eq!(whole.len(), 65_536 - 1024); // /generate's whole suffix
+    }
 }
 
 mod h_atom_native_tool_calls {
@@ -4651,6 +4733,11 @@ mod h_atom_native_tool_calls {
     /// A qwen_xml reply cut off by max_tokens inside a call: (name, arguments) of the call
     /// read unary, then streamed.
     async fn cut_off_call(reply: &str) -> [(String, Value); 2] {
+        cut_off_call_reasoned(reply, None).await
+    }
+
+    /// `cut_off_call`, its reasoning separated by the `reasoning` parser.
+    async fn cut_off_call_reasoned(reply: &str, reasoning: Option<&str>) -> [(String, Value); 2] {
         let tool = json!({"type": "function", "function": {"name": "get_weather", "parameters": {
             "type": "object", "properties": {"city": {"type": "string"}},
         }}});
@@ -4669,6 +4756,10 @@ mod h_atom_native_tool_calls {
             let mut ctx = ctx(stream, json!("auto"));
             ctx.original = ProtocolRequest::Chat(Arc::new(req));
             ctx.configured_tool_parser = Some("qwen_xml".to_string());
+            if let Some(parser) = reasoning {
+                ctx.reasoning_parser_factory = Some(test_mocks::reasoning_parser_factory());
+                ctx.configured_reasoning_parser = Some(parser.to_string());
+            }
             let mut chunks: Vec<TokenChunk> = Vec::new();
             if stream {
                 chunks.extend(ids.chunks(3).map(|ids| TokenChunk::Partial {
@@ -4729,6 +4820,16 @@ mod h_atom_native_tool_calls {
         let prose = "You write <function=get_weather> and then its parameters";
         let none = (String::new(), Value::Null);
         assert_eq!(cut_off_call(prose).await, [none.clone(), none]);
+    }
+
+    /// A last "<" the reasoning parser holds until the Complete releases it still reaches
+    /// the call it ends, streamed as unary.
+    #[tokio::test]
+    async fn a_cut_off_call_keeps_a_last_character_the_reasoning_parser_held() {
+        let reply = "<tool_call><function=get_weather><parameter=city>Paris<";
+        let expected = ("get_weather".to_string(), json!({"city": "Paris<"}));
+        let read = cut_off_call_reasoned(reply, Some("qwen3")).await;
+        assert_eq!(read, [expected.clone(), expected]);
     }
 }
 

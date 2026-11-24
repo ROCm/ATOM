@@ -104,7 +104,7 @@ async fn run_generate_stream(
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(engine_error_to_string)?;
         // A Complete's ids past the partials' (SGLang's and vLLM's carries them all).
-        let rest = unstreamed(&chunk, consumed);
+        let rest = unstreamed(&chunk, consumed, usize::MAX);
         match chunk {
             TokenChunk::Partial {
                 token_ids,

@@ -1638,9 +1638,9 @@ mod h_completion_adapter {
     async fn an_atom_completion_reports_its_timing_once_per_request() {
         let timed = |ttft_s, latency_s| {
             Some(SeqTiming {
-                ttft_s,
-                tpot_s: 0.01,
-                latency_s,
+                ttft: ttft_s,
+                tpot: 0.01,
+                latency: latency_s,
             })
         };
         let usage = completion_usage(vec![sibling(timed(0.1, 1.0))]).await;

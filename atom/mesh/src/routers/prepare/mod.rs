@@ -18,7 +18,7 @@ use crate::{
         generate::GenerateRequest,
     },
     routers::comm::error,
-    tokenizer::{registry::TokenizerEntry, traits::Tokenizer},
+    tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
 };
 
 pub(crate) mod chat_template;
@@ -35,8 +35,8 @@ pub(crate) mod tool_constraints;
 mod tests;
 
 use chat_template::{
-    atom_chat_render_gap, atom_template_not_loaded, default_template_kwargs,
-    merged_template_kwargs, process_chat_messages_with_kwargs, LoadedTemplate,
+    atom_chat_render_gap, default_template_kwargs, merged_template_kwargs,
+    process_chat_messages_with_kwargs, ProcessedMessages,
 };
 use generation_payload::{
     GenerationPayload, LogprobConfig, SamplingParams, StopConfig, StructuredOutput,
@@ -61,40 +61,27 @@ fn staged<T>(stage: &'static str, work: impl FnOnce() -> T) -> T {
     done
 }
 
-/// The model's tokenizer entry; while a registration swaps it, the one being replaced.
-fn tokenizer_entry(model_id: &str, components: &AppContext) -> Option<TokenizerEntry> {
-    let registry = &components.tokenizer_registry;
-    let registered = || {
-        registry
-            .get_by_name(model_id)
-            .or_else(|| registry.get_by_id(model_id))
-    };
-    // Missed between a swap's removal and insert: the replaced entry, or, once it
-    // is forgotten, the replacement.
-    let replaced = || {
-        components
-            .tokenizers_replaced
-            .get(model_id)
-            .map(|e| e.clone())
-    };
-    registered().or_else(replaced).or_else(registered)
-}
-
-fn tokenizer_not_found(model_id: &str) -> Response {
-    error!(model = %model_id, "Tokenizer not found for model");
-    error::internal_error(
-        "tokenizer_not_found",
-        format!("Tokenizer not found for model: {}", model_id),
-    )
-}
-
 pub fn lookup_tokenizer(
     model_id: &str,
-    components: &AppContext,
+    registry: &TokenizerRegistry,
 ) -> Result<Arc<dyn Tokenizer>, Response> {
-    tokenizer_entry(model_id, components)
-        .map(|entry| entry.tokenizer)
-        .ok_or_else(|| tokenizer_not_found(model_id))
+    registry.get(model_id).ok_or_else(|| {
+        error!(model = %model_id, "Tokenizer not found for model");
+        error::internal_error(
+            "tokenizer_not_found",
+            format!("Tokenizer not found for model: {}", model_id),
+        )
+    })
+}
+
+/// A chat prompt rendered outside the router, for a model whose template the
+/// router cannot render (ATOM's Python message encoders).
+#[derive(Debug, Clone)]
+pub struct RenderedChat {
+    pub text: String,
+    pub token_ids: Vec<u32>,
+    /// The channel opener the prompt ends on (`ResponseContext::prompt_opener`).
+    pub prompt_opener: Option<String>,
 }
 
 pub fn prepare_chat(
@@ -103,12 +90,36 @@ pub fn prepare_chat(
     model_id: Option<String>,
     components: &AppContext,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
-    prepare_chat_declaring(req, None, None, headers, model_id, components)
+    prepare_chat_with(req, headers, model_id, components, None, false)
 }
 
-/// `prepare_chat`, with the tools its messages declare read from its raw body
+/// `prepare_chat`, taking the prompt as `rendered` when it is given, and,
+/// with `reads_prompt_opener`, naming the opener a prompt it renders ends on
+/// (`ResponseContext::prompt_opener`; a rendered prompt names its own).
+pub fn prepare_chat_with(
+    req: Arc<ChatCompletionRequest>,
+    headers: Option<HeaderMap>,
+    model_id: Option<String>,
+    components: &AppContext,
+    rendered: Option<RenderedChat>,
+    reads_prompt_opener: bool,
+) -> Result<(GenerationPayload, ResponseContext), Response> {
+    prepare_chat_declaring(
+        req,
+        None,
+        None,
+        headers,
+        model_id,
+        components,
+        rendered,
+        reads_prompt_opener,
+    )
+}
+
+/// `prepare_chat_with`, with the tools its messages declare read from its raw body
 /// (`MessageTools::read`), without them the typed request's, and its `thinking`
 /// control (`read_thinking`), which the typed request has no field for.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_chat_declaring(
     req: Arc<ChatCompletionRequest>,
     message_tools: Option<MessageTools>,
@@ -116,33 +127,34 @@ pub fn prepare_chat_declaring(
     headers: Option<HeaderMap>,
     model_id: Option<String>,
     components: &AppContext,
+    rendered: Option<RenderedChat>,
+    reads_prompt_opener: bool,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
+    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
     let workers = components.worker_registry.get_by_model(model_id_str);
-    let configured_template = components.router_config.chat_template.is_some();
-    // The entry, its mark and its worker template read under one lock, which a swap
-    // takes to forget the replaced entry's.
-    let (entry, built_in_encoder, loaded_template) = {
-        let marked = components.chats_without_template.read();
-        let entry = tokenizer_entry(model_id_str, components);
-        let built_in = entry
+    // What its tokenizer was loaded with: a template file is a template, as
+    // --chat-template is; a built-in encoder renders without one.
+    let id = components
+        .tokenizer_registry
+        .get_by_name(model_id_str)
+        .map(|e| e.id);
+    let templated = components.router_config.chat_template.is_some()
+        || id
             .as_ref()
-            .is_some_and(|entry| marked.contains(&entry.id));
-        let templates = components.tokenizer_inline_templates.read();
-        let files = components.tokenizer_template_files.read();
-        let loaded = entry.as_ref().map(|e| match templates.get(&e.id) {
-            Some(template) => LoadedTemplate::Worker(template.clone()),
-            None if files.contains_key(&e.id) => LoadedTemplate::File,
-            None => LoadedTemplate::Own,
-        });
-        (entry, built_in, loaded)
-    };
-    // A template file the tokenizer was loaded with is a template, as --chat-template is.
-    let templated = configured_template || loaded_template == Some(LoadedTemplate::File);
-    if let Some(gap) = atom_chat_render_gap(&workers, templated, built_in_encoder) {
+            .is_some_and(|id| components.tokenizer_template_files.read().contains_key(id));
+    let built_in_encoder = id
+        .as_ref()
+        .is_some_and(|id| components.chats_without_template.read().contains(id));
+    // A prompt rendered outside the router needs no template.
+    if let Some(gap) = rendered
+        .is_none()
+        .then(|| atom_chat_render_gap(&workers, templated, built_in_encoder))
+        .flatten()
+    {
         return Err(error::not_implemented(
             "chat_template_unavailable",
             format!(
@@ -151,19 +163,6 @@ pub fn prepare_chat_declaring(
             ),
         ));
     }
-    if let Some(worker) = atom_template_not_loaded(&workers, configured_template, loaded_template) {
-        return Err(error::service_unavailable(
-            "chat_template_loading",
-            format!(
-                "The tokenizer of model {model_id_str} is not yet loaded with the chat \
-                 template of its ATOM worker {}; retry later.",
-                worker.url()
-            ),
-        ));
-    }
-    let tokenizer = entry
-        .map(|entry| entry.tokenizer)
-        .ok_or_else(|| tokenizer_not_found(model_id_str))?;
     let default_kwargs = default_template_kwargs(&workers)
         .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
@@ -174,7 +173,7 @@ pub fn prepare_chat_declaring(
     // Only ATOM reads the tools a message declares.
     let message_tools = atom
         .then(|| message_tools.unwrap_or_else(|| MessageTools::of(&req)))
-        .filter(|declared| !declared.is_empty() || declared.1.is_some());
+        .filter(|declared| !declared.is_empty() || declared.1.is_some() || declared.2.is_some());
 
     let template_kwargs = if atom {
         let toggle = reasoning_toggle(&workers)
@@ -189,19 +188,30 @@ pub fn prepare_chat_declaring(
     } else {
         merged_template_kwargs(&body_ref, default_kwargs.as_ref())
     };
-    let processed = staged("template", || {
-        process_chat_messages_with_kwargs(
-            &body_ref,
-            &*tokenizer,
-            &template_kwargs,
-            message_tools.as_ref(),
-        )
-    })
-    .map_err(|e| error::bad_request("process_messages_failed", e))?;
-
-    let encoding = staged("encode", || tokenizer.encode(&processed.text, false))
-        .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
-    let token_ids = encoding.token_ids().to_vec();
+    let (processed, token_ids, rendered_opener) = match rendered {
+        Some(rendered) => (
+            ProcessedMessages {
+                text: rendered.text,
+                stop_sequences: body_ref.stop.clone(),
+            },
+            rendered.token_ids,
+            Some(rendered.prompt_opener),
+        ),
+        None => {
+            let processed = staged("template", || {
+                process_chat_messages_with_kwargs(
+                    &body_ref,
+                    &*tokenizer,
+                    &template_kwargs,
+                    message_tools.as_ref(),
+                )
+            })
+            .map_err(|e| error::bad_request("process_messages_failed", e))?;
+            let encoding = staged("encode", || tokenizer.encode(&processed.text, false))
+                .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
+            (processed, encoding.token_ids().to_vec(), None)
+        }
+    };
 
     let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
         generate_tool_constraints(tools, &req.tool_choice, &req.model)
@@ -210,12 +220,18 @@ pub fn prepare_chat_declaring(
         None
     };
 
-    let prompt_opener = if atom {
-        let markers = reasoning_open_markers(&workers)
-            .map_err(|e| error::internal_error("invalid_structured_output", e))?;
-        response_context::prompt_opener(&processed.text, &markers)
-    } else {
-        None
+    let prompt_opener = match rendered_opener {
+        Some(opener) => opener,
+        None if atom => {
+            let markers = reasoning_open_markers(&workers)
+                .map_err(|e| error::internal_error("invalid_structured_output", e))?;
+            response_context::prompt_opener(&processed.text, &markers)
+        }
+        None if reads_prompt_opener => {
+            let think = [response_context::THINK_OPEN.to_string()];
+            response_context::prompt_opener(&processed.text, &think)
+        }
+        None => None,
     };
     let structured_output = atom
         .then(|| {
@@ -296,7 +312,7 @@ pub fn prepare_generate(
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
-    let tokenizer = lookup_tokenizer(model_id_str, components)?;
+    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
 
     let (original_text, token_ids) = resolve_generate_input(&req, &tokenizer)
         .map_err(|e| error::bad_request("resolve_input_failed", e))?;
@@ -566,9 +582,14 @@ fn structured_output(
         Some(sent) => Some(to_json(sent)?),
         None => req.tools.as_ref().map(to_json).transpose()?,
     };
+    // A namespaced named choice goes as sent too, so ATOM names it as it names the tool.
+    let tool_choice_json = match message_tools.and_then(|declared| declared.2.as_deref()) {
+        Some(sent) => Some(to_json(sent)?),
+        None => req.tool_choice.as_ref().map(to_json).transpose()?,
+    };
     Ok(StructuredOutput {
         tools_json,
-        tool_choice_json: req.tool_choice.as_ref().map(to_json).transpose()?,
+        tool_choice_json,
         response_format_json: req.response_format.as_ref().map(to_json).transpose()?,
         message_tools_json: message_tools
             .filter(|declared| !declared.is_empty())

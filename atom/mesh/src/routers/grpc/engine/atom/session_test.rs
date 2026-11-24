@@ -403,9 +403,9 @@ async fn a_completion_reports_its_ttft_tpot_and_latency_from_its_times() {
     }
 
     let timing = SeqTiming {
-        ttft_s: 0.25,
-        tpot_s: 0.5,
-        latency_s: 1.25,
+        ttft: 0.25,
+        tpot: 0.5,
+        latency: 1.25,
     };
     let streamed = chunks(streamed.unwrap()).await;
     assert!(

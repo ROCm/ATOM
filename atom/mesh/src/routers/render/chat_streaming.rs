@@ -173,14 +173,10 @@ async fn run_chat_stream(
             },
         };
         // A Complete's ids past the partials' are streamed first, as one more partial.
-        let chunk = match unstreamed(&chunk, consumed) {
-            Some(mut rest) => {
-                // In pieces, so no delta outgrows the reasoning and tool parsers' buffers.
-                rest.truncate(SUFFIX_PIECE);
-                let logprobs = unstreamed_logprobs(&chunk, consumed).map(|mut logprobs| {
-                    logprobs.items.truncate(rest.len());
-                    logprobs
-                });
+        // In pieces, so no delta outgrows the reasoning and tool parsers' buffers.
+        let chunk = match unstreamed(&chunk, consumed, SUFFIX_PIECE) {
+            Some(rest) => {
+                let logprobs = unstreamed_logprobs(&chunk, consumed, rest.len());
                 held = Some(chunk);
                 TokenChunk::Partial {
                     token_ids: rest,
@@ -344,7 +340,50 @@ async fn run_chat_stream(
                         text = released.normal_text.trim_end_matches(RELEASE).to_string();
                     }
                 }
-                if !text.is_empty() {
+                let tool_choice_enabled =
+                    !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
+                // Read as a partial's text is: it may end a tool call.
+                if !text.is_empty()
+                    && tool_choice_enabled
+                    && tools.is_some()
+                    && (tool_parser_available || used_json_schema)
+                {
+                    let tool_chunks = if is_specific_function {
+                        process_specific_function_stream(
+                            &text,
+                            &mut has_tool_call,
+                            tool_choice,
+                            request_id,
+                            model,
+                            created,
+                            system_fingerprint.as_deref(),
+                            history_tool_calls_count,
+                        )
+                    } else {
+                        if ctx.reads_as_atom {
+                            tool_text.push_str(&text);
+                        }
+                        process_tool_calls_stream(
+                            &text,
+                            &mut tool_parser,
+                            &mut has_tool_call,
+                            tools.as_ref().unwrap(),
+                            ctx.tool_parser_factory.as_ref(),
+                            ctx.configured_tool_parser.as_deref(),
+                            request_id,
+                            model,
+                            created,
+                            system_fingerprint.as_deref(),
+                            history_tool_calls_count,
+                            used_json_schema,
+                        )
+                        .await
+                    };
+                    for c in tool_chunks {
+                        format_sse_chunk_into(&mut sse_buffer, &c, null_usage);
+                        send_bytes(tx, &sse_buffer, "flushed tool call chunk")?;
+                    }
+                } else if !text.is_empty() {
                     let chunk = ChatCompletionStreamResponse::builder(request_id, model)
                         .created(created)
                         .add_choice_content(INDEX, "assistant", text)
@@ -484,27 +523,37 @@ async fn run_chat_stream(
 /// The most ids of a Complete's unstreamed suffix sent as one delta.
 const SUFFIX_PIECE: usize = 256;
 
-/// The ids of a Complete past the `consumed` its partials streamed: SGLang's and vLLM's
-/// carry every output id, ATOM's streamed one none.
-pub(super) fn unstreamed(chunk: &TokenChunk, consumed: usize) -> Option<Vec<u32>> {
+/// The first `limit` ids of a Complete past the `consumed` its partials streamed:
+/// SGLang's and vLLM's carry every output id, ATOM's streamed one none.
+pub(super) fn unstreamed(chunk: &TokenChunk, consumed: usize, limit: usize) -> Option<Vec<u32>> {
     match chunk {
         TokenChunk::Complete { token_ids, .. } => token_ids
             .get(consumed..)
             .filter(|rest| !rest.is_empty())
-            .map(<[u32]>::to_vec),
+            .map(|rest| rest[..rest.len().min(limit)].to_vec()),
         TokenChunk::Partial { .. } => None,
     }
 }
 
 /// The logprobs of those ids, where the Complete's cover every id it carries.
-fn unstreamed_logprobs(chunk: &TokenChunk, consumed: usize) -> Option<TokenLogprobs> {
+pub(super) fn unstreamed_logprobs(
+    chunk: &TokenChunk,
+    consumed: usize,
+    limit: usize,
+) -> Option<TokenLogprobs> {
     match chunk {
         TokenChunk::Complete {
             token_ids,
             logprobs: Some(logprobs),
             ..
         } if logprobs.items.len() == token_ids.len() => Some(TokenLogprobs {
-            items: logprobs.items.get(consumed..)?.to_vec(),
+            items: logprobs
+                .items
+                .get(consumed..)?
+                .iter()
+                .take(limit)
+                .cloned()
+                .collect(),
         }),
         _ => None,
     }
