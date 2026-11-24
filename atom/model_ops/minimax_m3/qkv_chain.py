@@ -3,7 +3,8 @@
 # Copyright (c) 2026 ATOM Project Contributors
 """MiniMax-M3.1 decode QKV front chain (``ATOM_M3_QKV_CHAIN=1``, default off).
 
-In pure-decode steps of ``MIN_ROWS``..``MAX_ROWS`` rows (TP4, NVFP4 K/V and index caches) a sparse attention layer's
+In pure-decode steps of ``MIN_ROWS``..``max_rows()`` rows (17-64: one aiter launch; 65-128 with an aiter that has the split
+chain: split-3 GEMM + reduce-insert, two launches) (TP4, NVFP4 K/V and index caches) a sparse attention layer's
 ``qkv_proj`` runs only the MXFP8 activation quantizer (codes in the decode GEMM's (16, 16) tile layout, AITER-shuffled
 E8M0 scales), and the attention op's ``rope_cache`` runs aiter's one-launch ``qkv_chain_cooperative_insert`` (QKV MXFP8
 GEMM + q / k / index RMSNorm + partial RoPE + NVFP4 K / V / index-K insert) on the parked codes. Both decisions are taken
@@ -24,7 +25,11 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.utils import envs
 
 N, K = 2560, 6144
-MIN_ROWS, MAX_ROWS = 17, 64
+MIN_ROWS = 17
+COOP_MAX_ROWS = 64  # the one-launch chain
+SPLIT_MAX_ROWS = (
+    128  # the split-3 GEMM + reduce-insert chain (aiter ``qkv_chain_insert``)
+)
 
 _PENDING = None  # (rows, codes, scales, weight, chain_scale) of the last qkv_front that took the chain
 
@@ -46,6 +51,32 @@ def available() -> bool:
         )
     except ImportError:
         return False
+
+
+@functools.cache
+def split_available() -> bool:
+    """aiter's chain entry also serves 65-128 rows (``qkv_chain_insert`` / ``code_rows``)."""
+    if not available():
+        return False
+    try:
+        from aiter.ops.flydsl.kernels import qkv_chain as _c
+
+        return hasattr(_c, "qkv_chain_insert") and hasattr(_c, "code_rows")
+    except ImportError:
+        return False
+
+
+def max_rows() -> int:
+    return SPLIT_MAX_ROWS if split_available() else COOP_MAX_ROWS
+
+
+def code_rows(m: int) -> int:
+    """Rows of (16, 16)-layout codes the chain reads at ``m`` rows (the quantizer's block)."""
+    if split_available():
+        from aiter.ops.flydsl.kernels.qkv_chain import code_rows as _code_rows
+
+        return _code_rows(m)
+    return 16 * ((m + 15) // 16)
 
 
 def layer_ok(
@@ -71,7 +102,7 @@ def layer_ok(
 
 def take(m: int) -> bool:
     """Run time: this forward's qkv linear + insert take the chain."""
-    if not (MIN_ROWS <= m <= MAX_ROWS):
+    if not (MIN_ROWS <= m <= max_rows()):
         return False
     from atom.utils.forward_context import get_forward_context
 
@@ -114,7 +145,7 @@ def qkv_front(
             mxfp8_quantize_shuffled,
         )
 
-        codes, scales = mxfp8_quantize_shuffled(x2, 16 * ((m + 15) // 16))
+        codes, scales = mxfp8_quantize_shuffled(x2, code_rows(m))
         _PENDING = (m, codes, scales, weight, chain_scale)
         return torch.empty((*x.shape[:-1], N), dtype=torch.bfloat16, device=x.device)
     _PENDING = None
@@ -161,10 +192,15 @@ def run_chain(
     num_index_heads,
     eps,
 ):
-    from aiter.ops.flydsl.kernels.qkv_chain import qkv_chain_cooperative_insert
+    from aiter.ops.flydsl.kernels import qkv_chain as _chain
 
     m, codes, scales, weight, chain_scale = pend
-    qkv_chain_cooperative_insert(
+    entry = (
+        _chain.qkv_chain_insert
+        if split_available()
+        else _chain.qkv_chain_cooperative_insert
+    )
+    entry(
         codes.view(torch.float8_e4m3fn),
         scales,
         weight,
@@ -194,24 +230,31 @@ def run_chain(
 def warm(weight: torch.Tensor, chain_scale: torch.Tensor) -> None:
     """Eager calls at load (QKV linear prepare): compile the chain's row tiers and create its counter pool outside graph
     capture (a first call inside capture raises). Every slot -1: no page is written."""
+    from aiter.ops.flydsl.kernels import qkv_chain as _chain
     from aiter.ops.flydsl.kernels.mxfp8_quant_shuffled import mxfp8_quantize_shuffled
-    from aiter.ops.flydsl.kernels.qkv_chain import qkv_chain_cooperative_insert
 
+    entry = (
+        _chain.qkv_chain_insert
+        if split_available()
+        else _chain.qkv_chain_cooperative_insert
+    )
     dev = weight.device
     nw = torch.zeros(128, dtype=torch.bfloat16, device=dev)
     cs = torch.zeros((128, 64), dtype=torch.bfloat16, device=dev)
     kv = torch.zeros((1, 2, 128, 72), dtype=torch.uint8, device=dev)
     idx = torch.zeros((1, 128, 72), dtype=torch.uint8, device=dev)
     one = torch.ones(1, dtype=torch.float32, device=dev)
-    for m in (MIN_ROWS, 33, 49):
+    # one row per tier: the one-launch chain (17-64) and, with the split chain, its three 65-128 row configs
+    # (80 / 96 / 128 rows of codes), which compile separately
+    for m in (MIN_ROWS, 33, 49) + ((65, 81, 97) if split_available() else ()):
         codes, scales = mxfp8_quantize_shuffled(
-            torch.zeros((m, K), dtype=torch.bfloat16, device=dev), 16 * ((m + 15) // 16)
+            torch.zeros((m, K), dtype=torch.bfloat16, device=dev), code_rows(m)
         )
         pos = torch.zeros(m, dtype=torch.int64, device=dev)
         skip = torch.full((m,), -1, dtype=torch.int64, device=dev)
         q = torch.empty((m, 2048), dtype=torch.bfloat16, device=dev)
         iq = torch.empty((m, 128), dtype=torch.float8_e4m3fn, device=dev)
-        qkv_chain_cooperative_insert(
+        entry(
             codes.view(torch.float8_e4m3fn),
             scales,
             weight,

@@ -38,8 +38,32 @@ def _ctx(monkeypatch, **kw):
     ],
 )
 def test_take_row_window(monkeypatch, rows, want):
+    monkeypatch.setattr(qkv_chain, "split_available", lambda: False)
     _ctx(monkeypatch)
     assert qkv_chain.take(rows) is want
+
+
+@pytest.mark.parametrize(
+    "rows, want",
+    [
+        (16, False),
+        (17, True),
+        (64, True),
+        (65, True),
+        (96, True),
+        (128, True),
+        (129, False),
+    ],
+)
+def test_take_row_window_with_split_chain(monkeypatch, rows, want):
+    monkeypatch.setattr(qkv_chain, "split_available", lambda: True)
+    _ctx(monkeypatch)
+    assert qkv_chain.take(rows) is want
+
+
+def test_code_rows_without_split_chain(monkeypatch):
+    monkeypatch.setattr(qkv_chain, "split_available", lambda: False)
+    assert [qkv_chain.code_rows(m) for m in (17, 32, 33, 64)] == [32, 32, 48, 64]
 
 
 @pytest.mark.parametrize("flags", [{"is_prefill": True}, {"is_dummy_run": True}])
