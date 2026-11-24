@@ -45,8 +45,8 @@ def kup_qpe_fusion_reason(
 ) -> str | None:
     """None means eligible; otherwise return the specific decline reason.
 
-    The caller's existing prestored-q_out gate owns the flag/TDM, prefill/DCP
-    and slot-count checks. Keep use_qrep and the kernel shape/dtype contracts.
+    The caller owns the flag/TDM, prefill/DCP and slot-count checks. Keep
+    use_qrep and the kernel shape/dtype contracts.
     """
     if use_qrep:
         return "query replication"

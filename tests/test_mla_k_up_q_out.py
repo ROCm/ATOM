@@ -49,6 +49,31 @@ def projection(monkeypatch):
         }
     ]
     assert {n.name for n in methods} == method_names
+    init = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    )
+    static_gate = next(
+        n
+        for n in init.body
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "_absorb_bf16_fuse_qout"
+            for t in n.targets
+        )
+    )
+    configure = ast.FunctionDef(
+        name="_configure_feature",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg="self")],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+        body=[static_gate],
+        decorator_list=[],
+    )
+    methods.append(configure)
     for method in methods:
         method.decorator_list = []
     namespace = {
@@ -60,10 +85,20 @@ def projection(monkeypatch):
         "_MLA_Q_OUT_PADDED_DIM": 16,
     }
     exec(  # noqa: S102 - checked-in production bodies, following the V-up CPU test
-        compile(ast.Module(body=helpers + methods, type_ignores=[]), str(path), "exec"),
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=helpers + methods, type_ignores=[])
+            ),
+            str(path),
+            "exec",
+        ),
         namespace,
     )
-    layer = type("Projection", (), {name: namespace[name] for name in method_names})()
+    layer = type(
+        "Projection",
+        (),
+        {name: namespace[name] for name in method_names | {"_configure_feature"}},
+    )()
     layer.num_heads, layer.num_kv_heads = 3, 1
     layer.qk_nope_head_dim, layer.qk_rope_head_dim, layer.kv_lora_rank = 4, 2, 8
     layer.qk_head_dim = 6
@@ -77,6 +112,7 @@ def projection(monkeypatch):
     layer._q_nope_prestored_supported = True
     # This fixture exercises the parent prestored path with #3498's opt-in off.
     layer._kup_qpe_enabled = False
+    layer._configure_feature()
     layer.use_seg_mla = layer._fused_q_head_pad = False
     layer.dcp_world_size, layer.padded_num_heads = 1, 4
     layer.is_sparse_mla = False
@@ -129,6 +165,26 @@ def test_bf16_k_up_writes_strided_q_nope_slice_without_touching_rope(projection,
     assert torch.equal(rope, x.reshape(tokens, 3, 6)[..., 4:])
 
 
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_default_bf16_k_up_allocates_contiguous_output(projection, noncontiguous):
+    layer, _, seen = projection
+    tokens = 5
+    x = (torch.arange(tokens * 36) % 7).reshape(tokens, 36).to(torch.bfloat16)
+    x = x[:, ::2] if noncontiguous else x[:, :18].contiguous()
+    result, rope = layer._q_proj_and_k_up_proj(x)
+    assert result.shape == (tokens, 3, 8)
+    assert result.is_contiguous() and result.dtype == torch.bfloat16
+    assert result.stride() == (24, 8, 1)
+    assert seen["YQ"].shape == (3, tokens, 8)
+    assert seen["YQ"].stride() == (8, 24, 1)
+    assert seen["YQ"].data_ptr() == result.data_ptr()
+    expected = torch.einsum(
+        "tnp,nlp->tnl", x.reshape(tokens, 3, 6)[..., :4].float(), layer.W_K.float()
+    )
+    assert torch.equal(result, expected.to(torch.bfloat16))
+    assert torch.equal(rope, x.reshape(tokens, 3, 6)[..., 4:])
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -157,17 +213,23 @@ def test_forward_selects_prestored_only_for_supported_decode(
     if case == "unsupported":
         # aiter's q_nope_prestored_supported() said no (gfx942/950).
         layer._q_nope_prestored_supported = False
-    layer.kv_shuffled = case not in ("unshuffled", "seg", "head_pad", "dcp")
+    layer.kv_shuffled = case not in ("unshuffled", "seg", "head_pad", "dcp", "prefill")
     layer.use_seg_mla = case == "seg"
     layer._fused_q_head_pad = case == "head_pad"
     layer.dcp_world_size = 2 if case == "dcp" else 1
     if case == "scaled_weight":
         layer.W_K_scale = torch.ones(3)
     namespace["is_rocm_aiter_fp4bmm_enabled"] = lambda: case == "fp4"
+    layer._configure_feature()
+    # Production initialization reads the flag once; forward must not query it.
+    namespace["_mla_absorb_bf16_fuse_qout_enabled"] = lambda: pytest.fail(
+        "flag read during forward"
+    )
 
     # Observe the real dispatch independently from projection arithmetic.
     def project(x, **kwargs):
-        out = kwargs["q_nope_out"]
+        out = kwargs.get("q_nope_out")
+        seen["projection_kwargs"] = kwargs
         seen["destination"] = out
         if out is None:
             out = torch.ones(tokens, 3, 8, dtype=torch.bfloat16)
@@ -212,7 +274,8 @@ def test_forward_selects_prestored_only_for_supported_decode(
         assert seen["rope_kwargs"]["q_nope_prestored"] is True
     else:
         assert seen["destination"] is None
-        assert "q_nope_prestored" not in seen.get("rope_kwargs", {})
+        assert seen.get("rope_kwargs", {}).get("q_nope_prestored") is not True
+        assert "q_nope_out" not in seen["projection_kwargs"]
 
 
 @pytest.mark.parametrize("eligible", [True, False])
@@ -281,6 +344,8 @@ def test_registered_absorb_flags_defaults_and_overrides(projection, monkeypatch)
     monkeypatch.delenv("ATOM_MLA_ABSORB_BF16")
     monkeypatch.delenv("ATOM_MLA_ABSORB_BF16_FUSE_QOUT")
     assert namespace["_mla_absorb_bf16_enabled"]() is False
+    assert namespace["_mla_absorb_bf16_fuse_qout_enabled"]() is False
+    monkeypatch.setenv("ATOM_MLA_ABSORB_BF16_FUSE_QOUT", "1")
     assert namespace["_mla_absorb_bf16_fuse_qout_enabled"]() is True
     monkeypatch.setenv("ATOM_MLA_ABSORB_BF16", "1")
     monkeypatch.setenv("ATOM_MLA_ABSORB_BF16_FUSE_QOUT", "0")

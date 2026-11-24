@@ -506,8 +506,8 @@ def _mla_absorb_bf16_enabled() -> bool:
 
 def _mla_absorb_bf16_fuse_qout_enabled() -> bool:
     """With BF16 absorb, have the K-up GEMM write q_nope straight into the fused
-    rope kernel's q_out (skipping a BF16 round trip of the K-up result). Default
-    on; ATOM_MLA_ABSORB_BF16_FUSE_QOUT=0 restores the separate q_nope buffer."""
+    rope kernel's q_out (skipping a BF16 round trip of the K-up result). Opt in
+    with ATOM_MLA_ABSORB_BF16_FUSE_QOUT=1 pending isolated GPU validation."""
     return envs.ATOM_MLA_ABSORB_BF16_FUSE_QOUT
 
 
@@ -771,6 +771,12 @@ class MLAAttention(nn.Module):
         self.kv_shuffled = bool(envs.ATOM_MLA_KV_SHUFFLED)
         # aiter owns which archs take q_nope already written into q_out.
         self._q_nope_prestored_supported = q_nope_prestored_supported()
+        self._absorb_bf16_fuse_qout = (
+            self.kv_shuffled
+            and self._q_nope_prestored_supported
+            and _mla_absorb_bf16_fuse_qout_enabled()
+            and not is_rocm_aiter_fp4bmm_enabled()
+        )
         self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         # Resolved on the first gather, when the weights and cache exist; see
         # `_kv_b_proj_gather`. None = not asked yet.
@@ -1368,8 +1374,9 @@ class MLAAttention(nn.Module):
             absorb_bf16 = _mla_absorb_bf16_enabled()
             if absorb_bf16:
                 # BF16 absorb: keep the up-proj matrices in BF16 and skip the
-                # per-batched-tensor FP8 quant; the bmm sites run torch.bmm. A
-                # None scale is the BF16 marker the bmm paths branch on.
+                # per-batched-tensor FP8 quant; the bmm sites run AITER's Triton
+                # batched_gemm_bf16. A None scale is the BF16 marker the bmm
+                # paths branch on.
                 self.W_K, self.W_K_scale = W_K.contiguous(), None
                 self.W_V, self.W_V_scale = W_V.contiguous(), None
             else:
@@ -1769,7 +1776,7 @@ class MLAAttention(nn.Module):
             # BF16 absorb via Triton batched GEMM (gfx1250-safe; torch.bmm's
             # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
             # X @ W^T with W (B,N,K): q_nope (N,B,P) @ W_K (N,L,P)^T -> (N,B,L),
-            # then -> (B,N,L) to match the fp8/fp4 output layout.
+            # stored through YQ's transposed strides in the (B,N,L) destination.
             if q_nope_out is None:
                 ql_nope = torch.empty(
                     q_nope.shape[1],
@@ -3356,19 +3363,11 @@ class MLAAttention(nn.Module):
             # can be BF16 or FP8, and the latter rounds through BF16 in Gluon.
             q_out_prestored = None
             if (
-                q.shape[0] >= 64
-                and kv_cache.numel() > 0
+                self._absorb_bf16_fuse_qout
                 and self.W_K_scale is None
-                and self.kv_shuffled
-                and self._q_nope_prestored_supported
-                and not context.is_prefill
-                and self.num_kv_heads == 1
+                and q.shape[0] >= 64
+                and kv_cache.numel() > 0
                 and attn_metadata.slot_mapping.numel() == q.shape[0]
-                and not is_rocm_aiter_fp4bmm_enabled()
-                and not self.use_seg_mla
-                and not self._fused_q_head_pad
-                and self.dcp_world_size <= 1
-                and _mla_absorb_bf16_fuse_qout_enabled()
             ):
                 q_out_prestored = torch.empty(
                     (
@@ -3380,18 +3379,29 @@ class MLAAttention(nn.Module):
                     device=q.device,
                 )
                 if self._kup_qpe_enabled:
-                    kv_view = self._shuffled_kv_view(kv_cache)
-                    reason = kup_qpe_fusion_reason(
-                        use_qrep=use_qrep,
-                        q_out=q_out_prestored,
-                        w_k=self.W_K,
-                        cos_cache=self.rotary_emb.cos_cache,
-                        sin_cache=self.rotary_emb.sin_cache,
-                        positions=positions,
-                        rope_dim=self.qk_rope_head_dim,
-                        kv_cache=kv_view,
-                        k_scale=self._k_scale,
-                    )
+                    if context.is_prefill:
+                        reason = "prefill"
+                    elif self.dcp_world_size != 1:
+                        reason = "DCP must be 1"
+                    elif self.num_kv_heads != 1:
+                        reason = "multiple KV heads"
+                    elif self.use_seg_mla:
+                        reason = "segmented KV cache"
+                    elif self._fused_q_head_pad:
+                        reason = "head padding"
+                    else:
+                        kv_view = self._shuffled_kv_view(kv_cache)
+                        reason = kup_qpe_fusion_reason(
+                            use_qrep=use_qrep,
+                            q_out=q_out_prestored,
+                            w_k=self.W_K,
+                            cos_cache=self.rotary_emb.cos_cache,
+                            sin_cache=self.rotary_emb.sin_cache,
+                            positions=positions,
+                            rope_dim=self.qk_rope_head_dim,
+                            kv_cache=kv_view,
+                            k_scale=self._k_scale,
+                        )
                     self._log_kup_qpe(reason or "eligible", q.shape[0])
                     if reason is None:
                         self._q_proj_k_up_rope_and_cache(
@@ -3404,24 +3414,24 @@ class MLAAttention(nn.Module):
                             attn_metadata.slot_mapping,
                             q_out_prestored,
                         )
-                        # The parent gate requires pure decode, DCP=1 and no
-                        # head padding. This is the normal decode tail.
+                        # The fusion guards above require pure decode, DCP=1
+                        # and no head padding. This is the normal decode tail.
                         return self._forward_decode(
                             q_out_prestored,
                             kv_cache,
                             attn_metadata,
                             q_prepadded=self._fused_q_head_pad,
                         )
-            q_nope, q_rope = self._q_proj_and_k_up_proj(
-                q,
-                x_scale=q_scale,
-                group=use_qrep,
-                q_nope_out=(
-                    None
-                    if q_out_prestored is None
-                    else q_out_prestored[..., : self.kv_lora_rank]
-                ),
-            )
+                q_nope, q_rope = self._q_proj_and_k_up_proj(
+                    q,
+                    x_scale=q_scale,
+                    group=use_qrep,
+                    q_nope_out=q_out_prestored[..., : self.kv_lora_rank],
+                )
+            else:
+                q_nope, q_rope = self._q_proj_and_k_up_proj(
+                    q, x_scale=q_scale, group=use_qrep
+                )
 
             # ---- Prefill Context Parallel --------------------------------
             # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But
@@ -3515,11 +3525,7 @@ class MLAAttention(nn.Module):
                         apply_scale=True,
                         q_out=q_out,
                         shuffled_kv_cache=True,
-                        **(
-                            {"q_nope_prestored": True}
-                            if q_out_prestored is not None
-                            else {}
-                        ),
+                        q_nope_prestored=q_out_prestored is not None,
                     )
                 elif self.use_seg_mla and self.dcp_world_size <= 1:
                     kv_cache_seg = self._seg_kv_cache_view(kv_cache)

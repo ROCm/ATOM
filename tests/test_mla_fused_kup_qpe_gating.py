@@ -314,6 +314,56 @@ def test_fallback_reasons_distinguish_failures():
     )
 
 
+@pytest.mark.parametrize("cause", ["prefill", "dcp", "kv_heads", "seg", "padding"])
+def test_fusion_guards_after_parent_static_gate(cause):
+    path = Path(__file__).parents[1] / "atom/model_ops/attention_mla.py"
+    branch = next(
+        n
+        for n in ast.walk(ast.parse(path.read_text()))
+        if isinstance(n, ast.If)
+        and isinstance(n.test, ast.Attribute)
+        and n.test.attr == "_kup_qpe_enabled"
+    )
+    driver = ast.FunctionDef(
+        name="driver",
+        decorator_list=[],
+        body=[branch],
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg="self")],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[driver], type_ignores=[]))
+    reasons = []
+    fake = SimpleNamespace(
+        _kup_qpe_enabled=True,
+        dcp_world_size=2 if cause == "dcp" else 1,
+        num_kv_heads=2 if cause == "kv_heads" else 1,
+        use_seg_mla=cause == "seg",
+        _fused_q_head_pad=cause == "padding",
+        _log_kup_qpe=lambda reason, count: reasons.append(reason),
+    )
+    namespace = {
+        "context": SimpleNamespace(is_prefill=cause == "prefill"),
+        "q": torch.empty(64, 1),
+    }
+    exec(  # noqa: S102 - trusted production fusion guards
+        compile(module, str(path), "exec"), namespace
+    )
+    assert namespace["driver"](fake) is None
+    expected = {
+        "prefill": "prefill",
+        "dcp": "DCP must be 1",
+        "kv_heads": "multiple KV heads",
+        "seg": "segmented KV cache",
+        "padding": "head padding",
+    }
+    assert reasons == [expected[cause]]
+
+
 def test_diagnostics_log_each_reason_once():
     rows = []
     layer_type = SimpleNamespace(_kup_qpe_logged=set())
