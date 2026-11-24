@@ -525,10 +525,15 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+        # Set by the scheduler; a producer reads V off its draft-row marks.
+        self._block_manager: Any = None
 
     @property
     def supports_pd_admission(self) -> bool:
         return not self.is_producer
+
+    def bind_block_manager(self, block_manager: Any) -> None:
+        self._block_manager = block_manager
 
     def _receive_prefix(
         self, seq, num_cached_blocks: int, geometry: tuple[int, int] | None
@@ -803,6 +808,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                         seq, "prefix_cache_hit_tokens", 0
                     ),
                 }
+                if draft_rows_from := self._block_manager.draft_rows_from(seq):
+                    params["prefill_handoff"]["draft_rows_from"] = draft_rows_from
             # Cancellation must drain active reads before dropping the claim.
             if aborted or str(seq.id) in self._awaiting_send:
                 self._reqs_need_save[seq.id] = (
@@ -875,6 +882,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "remote_slot_index": final_state_slot,
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
+        if self.is_producer and (
+            draft_rows_from := self._block_manager.draft_rows_from(seq)
+        ):
+            # The decode marks its blocks below V (`register_received_prefix`).
+            seq.kv_transfer_params_output["draft_rows_from"] = draft_rows_from
         logger.debug(
             "[PD-STATE-SLOT] producer-finished transfer_id=%s final_src_slot=%d",
             seq.id,
@@ -968,6 +980,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                         "prefix_cache_hit_tokens": handoff.prefix_cache_hit_tokens,
                     }
                 )
+                if handoff.draft_rows_from is not None:
+                    # Before `finished_recving`: `register_received_prefix` reads it.
+                    seq.kv_transfer_params["draft_rows_from"] = handoff.draft_rows_from
         output.received_handoffs.clear()
         for req_id in output.failed_recving:
             self._chunked_receiving.pop(req_id, None)

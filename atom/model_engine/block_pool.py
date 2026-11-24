@@ -531,7 +531,7 @@ class BlockPool:
     def _adopt(self, destination: int, source: int) -> None:
         """Give `source`'s identity to `destination`, leaving source empty.
 
-        Ref count, hash and tokens all move: a relocation is invisible to the
+        Ref count, hash, tokens and the draft-rows mark all move: a relocation is invisible to the
         sequences holding the block except for the id itself, which the caller
         rewrites. The bytes are the caller's to move too — this is the
         bookkeeping half, and the two have to happen in the same pass.
@@ -546,6 +546,8 @@ class BlockPool:
             self._reused.discard(source)
             self._reused.add(destination)
         dst.ref_count, dst.hash, dst.token_ids = src.ref_count, src.hash, src.token_ids
+        dst.draft_rows_missing = src.draft_rows_missing
+        src.draft_rows_missing = False
         if src.hash != -1 and self._hash_to_block_id.get(src.hash) == source:
             self._hash_to_block_id[src.hash] = destination
             self.index_version += 1

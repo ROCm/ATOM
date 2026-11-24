@@ -2861,7 +2861,8 @@ class Scheduler:
                 continue
             if not allocated:
                 # A state-less joint boundary could not be privatised without
-                # risking a shared decoding sequence's blocks (finding #2).
+                # risking a shared decoding sequence's blocks (finding #2), or a
+                # hit hash moved to a block missing draft rows since the probe.
                 # Return the seq to waiting for a clean recompute once the pool
                 # has room, and stop admitting this pass.
                 self.waiting.appendleft(seq)
@@ -3401,6 +3402,7 @@ class Scheduler:
                 seq.offload_loaded = False
                 seq.offload_loaded_tokens = seq.num_cached_tokens
                 seq.offload_load_start_tokens = None
+                seq.offload_draft_start_tokens = None
                 if seq.offload_joint.load_hash != -1:
                     # The hit's own state is a tier load. Stay parked for it;
                     # this failure was the joint, not that load.
@@ -3427,6 +3429,7 @@ class Scheduler:
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
+        seq.offload_draft_start_tokens = None
         seq.offload_load_failed = True
         if self._connector_flag("is_offload") and not seq.block_table:
             # A failed disown dropped the whole table: no resume runs for it
@@ -3588,6 +3591,7 @@ class Scheduler:
             seq.num_cached_tokens,
             seq.num_tokens,
         )
+        draft_start = seq.offload_draft_start_tokens
         if loaded > seq.num_cached_tokens:
             promoted = 0
             if load_start is not None and load_start < loaded:
@@ -3595,9 +3599,11 @@ class Scheduler:
                     seq,
                     start_token=load_start,
                     end_token=loaded,
+                    draft_start=draft_start,
                 )
                 logger.info(
-                    "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d gpu_indexed_tokens=%d",
+                    "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d gpu_indexed_tokens=%d"
+                    + ("" if draft_start is None else f" draft_from={draft_start}"),
                     seq.id,
                     load_start,
                     loaded,
@@ -3609,6 +3615,7 @@ class Scheduler:
             # prefix-cache hit inherited from an upstream prefill node.
             seq.prefix_cache_hit_tokens = max(seq.prefix_cache_hit_tokens, loaded)
         seq.offload_load_start_tokens = None
+        seq.offload_draft_start_tokens = None
         seq.offload_loaded = True
         # A state load moves no KV, so the block above does nothing for it --
         # `num_cached_tokens` is already the boundary the state covers, and all
@@ -6538,8 +6545,9 @@ class DecodeScheduler(Scheduler):
                     logger.warning("Cannot allocate prefill")
                     break
                 if not self.block_manager.allocate(seq):
-                    # Disown could not be backed (finding #2); leave the seq at
-                    # the front of waiting to retry once the pool has room.
+                    # Disown could not be backed (finding #2), or a hit hash moved
+                    # to a block missing draft rows; leave the seq at the front of
+                    # waiting to retry once the pool has room.
                     self.block_manager.deallocate(seq)
                     break
                 # The prefill process drafts into this allocation too.

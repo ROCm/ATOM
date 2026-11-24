@@ -489,9 +489,19 @@ prefill hashes each prompt block at most once on the scheduler thread, and none
 when the shipped chain is adopted (`publish_loaded_prefix`,
 `register_received_prefix` and `acquire_offload_prefix` still hash the blocks
 they handle). The evaluation applies the SWA and state
-gates, the bounded replay, the checkpoint demand/end, the count of hit blocks
-already in use, and the fit. `allocate` claims the block ids the seq's last
-walk found, unless the index changed under them.
+gates, the bounded replay, the draft-row gate, the checkpoint demand/end, the
+count of hit blocks already in use, and the fit. `allocate` claims the block ids
+the seq's last walk found, unless the index changed under them.
+
+The draft-row gate serves a sliding-window DSpark draft whose KV rides the
+target's blocks (`spec_decode/draft_window_geometry.py`). A tier load that wrote
+no draft rows below some token, and a P/D receive below the producer's
+`draft_rows_from` (V, the end of its highest such block, sent with the handoff),
+mark those blocks `Block.draft_rows_missing`. Once any block is marked, a hit is
+cut at the first marked block inside the prompt's draft read window; marks below
+the window are kept. `allocate` refuses (the caller requeues) when a hit hash
+has since moved to a marked block in the window. An unmarked copy that a load,
+a receive or a forward publishes takes a marked block's index entry.
 
 The probes that run every tick (the delayer's head check and probe, the DP
 chunk-cost estimate) call `can_allocate_memoized`. It reuses a seq's walk until

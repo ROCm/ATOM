@@ -359,7 +359,9 @@ def test_decode_reserve_counts_the_draft_lookahead_once(
         chunked=chunked,
         num_kvcache_blocks=num_kvcache_blocks,
         speculative_config=SimpleNamespace(
-            num_speculative_tokens=3, use_dspark=lambda: True
+            num_speculative_tokens=3,
+            use_dspark=lambda: True,
+            draft_model_hf_config=SimpleNamespace(architectures=["DSparkDraft"]),
         ),
         options={"enabled": True, "num_reserved_decode_tokens": 8},
     )
@@ -400,7 +402,14 @@ def test_decode_reserve_counts_the_draft_lookahead_once(
     "speculative_config, first_decode_tokens",
     [
         # T0 and 3 verify slots, then a 4-token reach for either drafter.
-        (SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: True), 8),
+        (
+            SimpleNamespace(
+                num_speculative_tokens=3,
+                use_dspark=lambda: True,
+                draft_model_hf_config=SimpleNamespace(architectures=["DSparkDraft"]),
+            ),
+            8,
+        ),
         (SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False), 8),
         # T0, then a 1-token reach.
         (None, 2),
@@ -623,7 +632,9 @@ def test_speculative_first_decode_uses_existing_lookahead(build, chunked):
     sched, request = build(
         chunked=chunked,
         speculative_config=SimpleNamespace(
-            num_speculative_tokens=3, use_dspark=lambda: True
+            num_speculative_tokens=3,
+            use_dspark=lambda: True,
+            draft_model_hf_config=SimpleNamespace(architectures=["DSparkDraft"]),
         ),
     )
     a, b = request(), request()

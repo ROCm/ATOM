@@ -71,6 +71,8 @@ def _mooncake(is_producer=True):
         dcp_size=1,
         hash_block_size=16,
         pp_size=1,
+        # No block lacks draft rows: no V.
+        _block_manager=SimpleNamespace(draft_rows_from=lambda seq: 0),
     )
 
 

@@ -614,7 +614,7 @@ def scheduler_connector(
 ):
     monkeypatch.setattr(mc, "get_ip", lambda: "127.0.0.1")
     monkeypatch.setattr(mc, "get_open_port", lambda: 6400)
-    return mc.MooncakeConnectorScheduler(
+    connector = mc.MooncakeConnectorScheduler(
         SimpleNamespace(
             kv_transfer_config={
                 "kv_role": "kv_producer" if is_producer else "kv_consumer",
@@ -628,6 +628,9 @@ def scheduler_connector(
             decode_context_parallel_size=dcp_size,
         )
     )
+    # The scheduler binds its block manager; none of these marks a block.
+    connector.bind_block_manager(SimpleNamespace(draft_rows_from=lambda seq: 0))
+    return connector
 
 
 @pytest.mark.parametrize("pp_size", [1, 3])
@@ -648,7 +651,9 @@ def test_real_scheduler_pins_from_first_chunk_through_final_handoff(
             pipeline_parallel_size=pp_size,
             speculative_config=(
                 SimpleNamespace(
-                    num_speculative_tokens=draft_tokens, use_dspark=lambda: False
+                    method="mtp",
+                    num_speculative_tokens=draft_tokens,
+                    use_dspark=lambda: False,
                 )
                 if draft_tokens
                 else None
@@ -2542,3 +2547,90 @@ def test_a_withdrawn_producer_admission_dispatches_no_source_blocks(
     assert set(meta.reqs_to_save) == {first.id}
     assert str(withdrawn.id) not in producer._awaiting_send
     assert not withdrawn.block_table
+
+
+# ── V: where the producer's blocks a tier load left without draft rows end ──
+
+
+def _marked_producer(monkeypatch, seq_factory, params):
+    """A finished producer prompt whose tier load left blocks 0-1 without draft rows."""
+    from conftest import MockConfig
+
+    from atom.model_engine.block_manager import BlockManager
+
+    sched = scheduler_connector(monkeypatch, True)
+    manager = BlockManager(MockConfig(num_kvcache_blocks=16, kv_cache_block_size=4))
+    sched.bind_block_manager(manager)
+    seq = seq_factory(list(range(24)), kv_transfer_params=params)
+    manager.allocate(seq)
+    manager.mark_draft_rows_missing(seq, 0, 8)
+    seq.append_token(42)
+    seq.prefill_completed = True
+    return sched, manager, seq
+
+
+@pytest.mark.parametrize("chunked", [True, False])
+def test_the_producer_hands_the_decode_v(monkeypatch, seq_factory, chunked):
+    params = {"do_remote_decode": True, "transfer_id": "v", "chunked_transfer": chunked}
+    sched, manager, seq = _marked_producer(monkeypatch, seq_factory, dict(params))
+    other = seq_factory(list(range(100, 124)), kv_transfer_params=dict(params))
+    manager.allocate(other)
+    other.append_token(42)
+    other.prefill_completed = True
+    for finished in (seq, other):
+        sched.request_finished(finished)
+    if chunked:
+        sent = [s.kv_transfer_params["prefill_handoff"] for s in (seq, other)]
+    else:
+        sent = [s.kv_transfer_params_output for s in (seq, other)]
+    assert sent[0]["draft_rows_from"] == 8
+    # Every draft row written: no V.
+    assert "draft_rows_from" not in sent[1]
+
+
+def test_the_handoff_carries_a_positive_v():
+    wire = {"first_token_id": 42}
+    assert PrefillHandoff.from_wire(1, wire).draft_rows_from is None
+    assert (
+        PrefillHandoff.from_wire(1, {**wire, "draft_rows_from": 8}).draft_rows_from == 8
+    )
+    for bad in (0, -1, "8", 8.0):
+        with pytest.raises(ValueError, match="draft rows boundary"):
+            PrefillHandoff.from_wire(1, {**wire, "draft_rows_from": bad})
+
+
+def test_the_decode_marks_below_v_before_registering_the_receive(
+    monkeypatch, seq_factory
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+    from atom.spec_decode.draft_window_geometry import DraftReadWindow
+
+    sched = Scheduler(MockConfig(num_kvcache_blocks=16, enable_prefix_caching=True))
+    bm = sched.block_manager
+    bm.draft_read_window = DraftReadWindow(window=8, read_page=2)
+    connector = sched.kv_connector = scheduler_connector(monkeypatch, False)
+    seq = seq_factory(
+        list(range(24)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_prefill": True,
+            "transfer_id": "v",
+        },
+    )
+    bm.allocate(seq)
+    connector.update_state_after_alloc(seq)
+    handoff = PrefillHandoff.from_wire(
+        seq.id, {"first_token_id": 42, "draft_rows_from": 8}
+    )
+    sched._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={seq.id}, received_handoffs={seq.id: handoff}
+        )
+    )
+    assert sched._update_waiting_for_remote_kv(seq)
+    marks = [bm.kv.block(block).draft_rows_missing for block in seq.block_table]
+    assert marks == [True, True, False, False, False, False]
+    # A shorter prompt on the decode whose draft reads block 1 stops there.
+    assert bm.can_allocate(seq_factory(list(range(10)) + [90, 91])) == 1

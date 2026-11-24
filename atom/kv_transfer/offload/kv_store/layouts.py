@@ -6,13 +6,16 @@
 One row is the codec id folded into the store namespace and the builder the
 worker calls. The scheduler and the worker both read it, so a new layout is
 one entry rather than a branch in each caller. A backend moves the subset its
-:class:`StoreLayouts` names. Codec modules are imported here; Triton stays lazy
-inside the DSV4 codec.
+:class:`StoreLayouts` names. Under a draft window, a layout's row is its split
+(:data:`DRAFT_WINDOW_LAYOUTS`): target objects without the draft's PAGE regions,
+which :func:`build_draft_codec` packs into objects of their own. Codec modules
+are imported here; Triton stays lazy inside the DSV4 codec.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from copy import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +30,10 @@ DENSE_CODEC_ID = "dense-opaque-block-v1"
 # V4.1 stores PAGE regions only; request state is rebuilt by replay, so its
 # objects must not share a namespace with dense or M3 bytes.
 REPLAY_PAGE_CODEC_ID = "v41-replay-page-v1"
+# M3 under a draft window: a namespace of its own, so no key names unsplit bytes.
+DRAFT_WINDOW_M3_CODEC_ID = "m3-page-regions-draft-window-v1"
+# The `PageUnitSpec.namespace` of a draft's own PAGE regions.
+DRAFT_PAGE_NAMESPACE = "draft"
 
 CodecBuilder = Callable[[Any, Any, int | None, bool], Any]
 
@@ -49,6 +56,10 @@ def _m3_codec_id() -> str:
 
 def _replay_codec_id() -> str:
     return REPLAY_PAGE_CODEC_ID
+
+
+def _draft_window_m3_codec_id() -> str:
+    return DRAFT_WINDOW_M3_CODEC_ID
 
 
 def _build_dense(
@@ -88,10 +99,47 @@ def _build_replay_pages(
     return pure_page_codec(transfer_tensors.without_slots(), num_blocks)
 
 
+def split_draft_pages(transfer_tensors: Any) -> tuple[Any, Any | None]:
+    """Copies of `transfer_tensors` with the target's PAGE regions and with the
+    draft's, each in publication order; the draft's is None when it has none."""
+    pages = list(transfer_tensors.pages)
+    is_draft = [
+        getattr(page.unit_spec, "namespace", None) == DRAFT_PAGE_NAMESPACE
+        for page in pages
+    ]
+    if not any(is_draft):
+        return transfer_tensors, None
+    target, draft = copy(transfer_tensors), copy(transfer_tensors)
+    target.pages = [page for page, own in zip(pages, is_draft) if not own]
+    draft.pages = [page for page, own in zip(pages, is_draft) if own]
+    return target, draft
+
+
+def _build_m3_target(
+    kv_caches: Any,
+    transfer_tensors: Any,
+    num_blocks: int | None,
+    permit_per_request_state: bool,
+) -> Any:
+    target = split_draft_pages(transfer_tensors)[0]
+    return _build_m3(kv_caches, target, num_blocks, permit_per_request_state)
+
+
+def build_draft_codec(transfer_tensors: Any, num_blocks: int | None) -> Any | None:
+    """The codec of a draft window's draft objects; None for a rank whose
+    transfer tensors hold no draft regions."""
+    draft = split_draft_pages(transfer_tensors)[1]
+    return None if draft is None else pure_page_codec(draft, num_blocks)
+
+
 STORE_LAYOUTS: dict[str, StoreLayout] = {
     "dense": StoreLayout(_dense_codec_id, _build_dense),
     "m3": StoreLayout(_m3_codec_id, _build_m3),
     "dsv41": StoreLayout(_replay_codec_id, _build_replay_pages),
+}
+# The layouts a draft window splits, by their target objects.
+DRAFT_WINDOW_LAYOUTS: dict[str, StoreLayout] = {
+    "m3": StoreLayout(_draft_window_m3_codec_id, _build_m3_target),
 }
 
 
@@ -107,15 +155,24 @@ class StoreLayouts:
         # model resolves to ...".
         self._refusal = refusal
 
-    def require(self, name: str) -> StoreLayout:
-        """The row for `name`, or the refusal the startup check reports."""
+    def require(self, name: str, *, draft_window: bool = False) -> StoreLayout:
+        """The row for `name` (its split under a draft window), or the refusal
+        the startup check reports."""
         if name not in self.names:
             raise ValueError(f"{self._refusal}; this model resolves to {name!r}")
-        return STORE_LAYOUTS[name]
+        if not draft_window:
+            return STORE_LAYOUTS[name]
+        if name not in DRAFT_WINDOW_LAYOUTS:
+            raise ValueError(
+                f"a draft window splits the {', '.join(DRAFT_WINDOW_LAYOUTS)} "
+                f"layout only; this model resolves to {name!r}"
+            )
+        return DRAFT_WINDOW_LAYOUTS[name]
 
-    def codec_id(self, config: Any) -> str:
+    def codec_id(self, config: Any, *, draft_window: bool = False) -> str:
         """The codec version folded into this server's store namespace."""
-        return self.require(offcfg.select_offload_layout(config)).codec_id()
+        name = offcfg.select_offload_layout(config)
+        return self.require(name, draft_window=draft_window).codec_id()
 
     def build_codec(
         self,
@@ -125,9 +182,11 @@ class StoreLayouts:
         num_blocks: int | None,
         *,
         permit_per_request_state: bool,
+        draft_window: bool = False,
     ) -> Any:
         """Build the codec for the layout `config` resolves to."""
-        layout = self.require(offcfg.select_offload_layout(config))
+        name = offcfg.select_offload_layout(config)
+        layout = self.require(name, draft_window=draft_window)
         return layout.build(
             kv_caches,
             transfer_tensors,
@@ -138,8 +197,13 @@ class StoreLayouts:
 
 __all__ = [
     "DENSE_CODEC_ID",
+    "DRAFT_PAGE_NAMESPACE",
+    "DRAFT_WINDOW_LAYOUTS",
+    "DRAFT_WINDOW_M3_CODEC_ID",
     "REPLAY_PAGE_CODEC_ID",
     "STORE_LAYOUTS",
     "StoreLayout",
     "StoreLayouts",
+    "build_draft_codec",
+    "split_draft_pages",
 ]

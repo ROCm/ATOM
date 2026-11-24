@@ -51,6 +51,9 @@ def test_decode_handoff_builds_full_mtp_window(seq_factory):
     class SpecConfig:
         num_speculative_tokens = 3
 
+        class draft_model_hf_config:
+            architectures = ("DSparkDraft",)
+
         @staticmethod
         def use_dspark():
             return True

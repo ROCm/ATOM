@@ -191,6 +191,9 @@ class TestUndeferredSpecPlaceholders:
                 speculative_config=SimpleNamespace(
                     num_speculative_tokens=self.mtp_k,
                     use_dspark=lambda: True,
+                    draft_model_hf_config=SimpleNamespace(
+                        architectures=["DSparkDraft"]
+                    ),
                 ),
                 num_kvcache_blocks=64,
             )

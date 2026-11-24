@@ -200,6 +200,7 @@ def test_producer_advertises_remote_pp_size():
     sched.handshake_port = 40000
     sched.base_handshake_port = 6301
     sched.is_producer = True
+    sched._block_manager = SimpleNamespace(draft_rows_from=lambda seq: 0)
 
     seq = SimpleNamespace(
         output_tokens=[7],
@@ -248,6 +249,7 @@ def test_producer_publishes_only_the_prompt_blocks(
     sched.handshake_port = 40000
     sched.base_handshake_port = 6301
     sched.is_producer = True
+    sched._block_manager = SimpleNamespace(draft_rows_from=lambda seq: 0)
     sched._awaiting_send = set()
     sched._reqs_need_save = {}
 
@@ -289,6 +291,7 @@ def test_finished_block_ids_are_lists_of_their_own(is_producer):
     sched.handshake_port = 40000
     sched.base_handshake_port = 6301
     sched.is_producer = is_producer
+    sched._block_manager = SimpleNamespace(draft_rows_from=lambda seq: 0)
     sched._awaiting_send = set()
     sched._reqs_need_save = {}
     sched.request_id_to_transfer_id = {}
