@@ -1510,24 +1510,31 @@ class MoRIIOConnector(KVConnectorBase):
         ]
 
     def _log_transfer_stats(
-        self,
-        transfer_id: int,
-        ok: bool,
-        stats: tuple[float, int, int, int],
-        waited_s: float,
+        self, transfer_id: int, ok: bool, request: dict[str, Any]
     ) -> None:
-        """ATOM_MORIIO_TRANSFER_STATS: one line per fabric push."""
-        posted, nbytes, blocks, segments = stats
+        """ATOM_MORIIO_TRANSFER_STATS: one line per fabric push.
+
+        Three spans, all on this rank's monotonic clock: ``queue_ms`` from the
+        WRITE_REQ's arrival on the listener to the step that took it up,
+        ``wait_ms`` from there to posting the batch (the handshake and the
+        prefill's KV-ready event), ``write_ms`` from posting to the step that
+        saw it settle. Pushes are served from ``get_finished``, once per engine
+        step, so the first and the last include up to a step each.
+        """
+        posted, nbytes, blocks, segments = request["_page_stats"]
+        accepted = request.get("_accepted_at", posted)
+        received = request.get("_received_at", accepted)
         write_ms = (time.monotonic() - posted) * 1e3
         logger.info(
             "MoRIIO transfer stats: transfer=%s protocol=fabric-write ok=%s "
-            "blocks=%d bytes=%d wait_ms=%.3f write_ms=%.3f GB_per_s=%.1f "
-            "segments=%d tp=%d",
+            "blocks=%d bytes=%d queue_ms=%.3f wait_ms=%.3f write_ms=%.3f "
+            "GB_per_s=%.1f segments=%d tp=%d",
             transfer_id,
             ok,
             blocks,
             nbytes,
-            waited_s * 1e3,
+            (accepted - received) * 1e3,
+            (posted - accepted) * 1e3,
             write_ms,
             nbytes / max(write_ms, 1e-6) / 1e6,
             segments,
@@ -2201,14 +2208,8 @@ class MoRIIOConnector(KVConnectorBase):
         """Release the source blocks and tell the consumer how the push went."""
         transfer_id = int(request["transfer_id"])
         self._sending_writes.pop(transfer_id, None)
-        stats = request.get("_page_stats")
-        if self._transfer_stats and stats is not None:
-            self._log_transfer_stats(
-                transfer_id,
-                ok,
-                stats,
-                stats[0] - request.get("_accepted_at", stats[0]),
-            )
+        if self._transfer_stats and "_page_stats" in request:
+            self._log_transfer_stats(transfer_id, ok, request)
         # A second ask for this transfer is refused by `_write_ids` from here
         # on, so its ready entry has no reader left; one arriving after
         # `_forget_finished_writes` must not find its source ready either.
@@ -2356,7 +2357,11 @@ class MoRIIOConnector(KVConnectorBase):
                 elif msg == MoRIIOConstants.WRITE_REQ:
                     # Only queued; the worker thread owns the RDMA engine.
                     try:
-                        self._write_requests.put(msgpack.loads(parts[2]))
+                        request = msgpack.loads(parts[2])
+                        if isinstance(request, dict):
+                            # For ATOM_MORIIO_TRANSFER_STATS' queue_ms.
+                            request["_received_at"] = time.monotonic()
+                        self._write_requests.put(request)
                     except Exception:
                         logger.exception("Dropping undecodable WRITE_REQ")
 
