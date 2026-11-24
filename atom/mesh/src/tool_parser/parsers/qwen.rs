@@ -595,16 +595,42 @@ mod coder {
         /// As `QwenXmlParser._is_truncated_call` reads an open `<function=NAME>` at end
         /// of input: a call when what follows the declared name is a parameter or the
         /// function's close, whole or cut off; then its open tags are closed.
-        fn end_of_input_closers(&self, _tools: &[Tool]) -> Option<String> {
-            if !(self.in_tool_call && self.current_tool_name_sent) {
+        fn end_of_input_closers(&self, tools: &[Tool]) -> Option<String> {
+            if !self.in_tool_call {
                 return None;
             }
-            let rest = self.buffer.trim_start();
+            let rest = match self.current_tool_name_sent {
+                true => self.buffer.trim_start(),
+                // A bare call is held at its declared name until what follows the name arrives.
+                false => {
+                    let declared = self.xml_function_pattern.captures(&self.buffer)?;
+                    let tool_indices = helpers::get_tool_indices(tools);
+                    if !(self.bare_call && tool_indices.contains_key(declared[1].trim())) {
+                        return None;
+                    }
+                    self.buffer[declared.get(0)?.end()..].trim_start()
+                }
+            };
+            let followers = ["<parameter=", "</function>"];
             let continues = |token: &str| rest.starts_with(token) || token.starts_with(rest);
-            if !["<parameter=", "</function>"].into_iter().any(continues) {
+            if !followers.into_iter().any(continues) {
                 return None;
             }
             let mut closers = String::new();
+            // Outside a value, a tag cut off where a parameter or the close starts is
+            // completed, so a bare call rereads whole (an empty name is no parameter).
+            if rest.rfind("<parameter=") <= rest.rfind("</parameter>") {
+                let cut = |tag: &'static str| {
+                    helpers::ends_with_partial_token(rest, tag).map(|arrived| &tag[arrived..])
+                };
+                if let Some(completion) = followers.into_iter().find_map(cut) {
+                    closers.push_str(completion);
+                    if completion.ends_with('=') {
+                        closers.push('>');
+                    }
+                }
+            }
+            let rest = format!("{rest}{closers}");
             if rest.rfind("<parameter=") > rest.rfind("</parameter>") {
                 closers.push_str("</parameter>");
             }

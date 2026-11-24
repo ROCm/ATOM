@@ -4876,6 +4876,28 @@ mod h_atom_native_tool_calls {
         assert_eq!(cut_off_call(quoted).await, [expected.clone(), expected]);
     }
 
+    /// A bare qwen_xml call cut off at its declared name, or inside the tag after it, is
+    /// kept, as ATOM's HTTP parser keeps it at end of input; a cut-off name is not.
+    #[tokio::test]
+    async fn a_bare_qwen_call_cut_off_after_its_name_is_kept() {
+        let expected = ("get_weather".to_string(), json!({}));
+        for reply in ["<function=get_weather>", "<function=get_weather><para"] {
+            let read = cut_off_call(reply).await;
+            assert_eq!(read, [expected.clone(), expected.clone()], "{reply}");
+        }
+        let reply = "<function=get_weather><parameter=city>Paris</parameter><para";
+        let paris = ("get_weather".to_string(), json!({"city": "Paris"}));
+        assert_eq!(cut_off_call(reply).await, [paris.clone(), paris]);
+        let none = (String::new(), Value::Null);
+        for reply in [
+            "<function=get_wea",
+            "<function=search>",
+            "<function=get_weather> so",
+        ] {
+            assert_eq!(cut_off_call(reply).await, [none.clone(), none.clone()]);
+        }
+    }
+
     /// A qwen_xml reply read unary, then streamed, from an ATOM worker or not: (content,
     /// names of the calls) of each.
     async fn read_qwen_xml(reply: &str, reads_as_atom: bool) -> [(String, String); 2] {
