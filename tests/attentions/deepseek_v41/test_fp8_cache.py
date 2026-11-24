@@ -96,3 +96,80 @@ def test_v41_attention_matches_its_dequantized_reference(heads, planar):
     actual = sparse_attn_v41_paged_2src(*args)
     expected = sparse_attn_v41_paged_2src_reference(*args)
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("heads", [8, 16, 32, 64])
+@pytest.mark.parametrize("path", ["entry", "in_kernel", "unique", "per_entry", "ring"])
+def test_v41_bf16_query_attention_matches_its_dequantized_reference(
+    monkeypatch, heads, path
+):
+    """The BF16-query attention over MXFP8 planes (the path gfx942 takes)
+    against V4's reference on the dequantized rows: the in-register split
+    kernel, the prefill gather with its rows decoded once, the per-entry
+    gather past the scratch bound, a decode-sized ring gathered by row, and
+    the BF16 entry that picks between them. Eight heads is one TP8 rank of
+    the 64-head Flash model."""
+    from atom.model_ops.attentions.deepseek_v41 import fp8_attention
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src_reference
+
+    torch.manual_seed(42)
+    device, dim, tokens = "cuda", 512, 7
+
+    def rows(n):
+        values = quantize_fp8(torch.randn(n, dim, device=device).bfloat16())
+        return tuple(v.contiguous() for v in values)
+
+    # A source no larger than its selection is decoded whole (prefill); a
+    # larger one is a ring, gathered like the CSA pool (decode).
+    extend_rows = 4096 if path == "ring" else tokens + 128
+    pool, extend = rows(4096), rows(extend_rows)
+    prefix_counts = [0, 1, 37, 512, 300, 64, 129]
+    extend_counts = [128, 5, 0, 1, 128, 77, 33]
+    prefix = torch.cat(
+        [torch.randperm(4096, device=device)[:n] for n in prefix_counts]
+    ).int()
+    second = torch.cat(
+        [torch.randperm(extend_rows, device=device)[:n] for n in extend_counts]
+    ).int()
+
+    def indptr(counts):
+        return torch.tensor([0, *counts], device=device).cumsum(0).int()
+
+    if path == "per_entry":
+        # Fewer scratch rows than the step references: no unique decode,
+        # query ranges tiled to the bound.
+        monkeypatch.setattr(fp8_attention, "_SCRATCH_ROWS", 256)
+    query = torch.randn(tokens, heads, dim, device=device).bfloat16()
+    sink = torch.randn(heads, device=device)
+    args = (
+        query,
+        pool,
+        prefix,
+        indptr(prefix_counts),
+        extend,
+        second,
+        indptr(extend_counts),
+        sink,
+        dim**-0.5,
+    )
+    if path == "entry":
+        attend = fp8_attention.sparse_attn_v41_paged_2src_bf16
+    elif path == "in_kernel":
+        attend = fp8_attention.sparse_attn_v41_paged_2src_fp8kv
+    else:
+        attend = fp8_attention.sparse_attn_v41_paged_2src_gather
+    actual = attend(*args)
+    expected = sparse_attn_v4_paged_2src_reference(
+        query.float(),
+        fp8_attention.dequantize_rows(*fp8_attention._split(pool, dim)),
+        prefix,
+        indptr(prefix_counts),
+        fp8_attention.dequantize_rows(*fp8_attention._split(extend, dim)),
+        second,
+        indptr(extend_counts),
+        sink,
+        dim**-0.5,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
