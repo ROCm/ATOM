@@ -2617,15 +2617,17 @@ class MooncakeConnector(KVConnectorBase):
     # -----------------------------------------------------------------
 
     def _execute_transfer(self, request_data: dict) -> None:
-        """Compute offsets and perform RDMA write for a single request."""
+        """Compute offsets and perform RDMA write for a single request.
+
+        However it ends, the request then counts as served
+        (``_write_request_served``).
+        """
         try:
             req_id = request_data["request_id"]
             transfer_id = request_data.get("transfer_id", req_id)
             consumer_host = request_data["consumer_host"]
             consumer_rpc_port = request_data["consumer_rpc_port"]
             dst_block_ids = request_data["dst_block_ids"]
-            consumer_tp_size = request_data.get("consumer_tp_size", self.tp_size)
-            consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
             consumer_dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
             has_slot_data = request_data.get("has_slot_regions", False)
 
@@ -2802,42 +2804,6 @@ class MooncakeConnector(KVConnectorBase):
 
             # Notify consumer — all data (blocks + slot state) is written.
             self._notify_transfer_result(request_data, success=True)
-
-            # Track refcount for multi-consumer TP fan-out.
-            all_done = False
-            with self._transfer_refcount_lock:
-                if transfer_id not in self._transfer_refcount:
-                    self._transfer_refcount[transfer_id] = consumers_per_rank
-                self._transfer_refcount[transfer_id] -= 1
-                if self._transfer_refcount[transfer_id] <= 0:
-                    self._transfer_refcount.pop(transfer_id)
-                    all_done = True
-
-            if all_done:
-                if self.pp_size > 1:
-                    if self.pp_rank != 0:
-                        # Stage 0 drops its entry on release, which only it
-                        # receives; nothing here reads this one again.
-                        self._drop_completed_prefill(transfer_id)
-                    # PP-prefill: this stage's write is done, but stage-0 must not
-                    # reuse the shared page until ALL stages finish. Freeing is
-                    # deferred to _record_release (driven by consumer releases).
-                    logger.debug(
-                        "[PRODUCER] stage pp_rank=%d served %d consumers for "
-                        "transfer_id=%s; awaiting release",
-                        self.pp_rank,
-                        consumers_per_rank,
-                        transfer_id,
-                    )
-                else:
-                    with self._completion_lock:
-                        self.done_sending.add(transfer_id)
-                    self._drop_completed_prefill(transfer_id)
-                    logger.debug(
-                        "[PRODUCER] All %d consumers served for transfer_id=%s",
-                        consumers_per_rank,
-                        transfer_id,
-                    )
         except Exception:
             logger.exception(
                 "[PRODUCER] transfer FAILED for req %s (transfer_id=%s); "
@@ -2851,6 +2817,57 @@ class MooncakeConnector(KVConnectorBase):
                 logger.exception(
                     "[PRODUCER] failed to notify consumer of transfer failure"
                 )
+        finally:
+            self._write_request_served(request_data)
+
+    def _write_request_served(self, request_data: dict) -> None:
+        """Count one consumer rank's write request as served, written or failed.
+
+        When the last consumer rank this rank serves (TP fan-out) is counted,
+        the source pages may be reused: under PP-prefill once the consumer
+        releases them (_record_release), otherwise now. A failed write frees
+        them too, as the consumer does not ask again. A write Mooncake gave up
+        on may still read them after their reuse, but it lands only in the
+        consumer's pages, which the consumer holds until no such write can
+        land (``_complete_recv``).
+        """
+        transfer_id = request_data.get("transfer_id", request_data.get("request_id"))
+        if transfer_id is None:
+            return
+        consumers_per_rank = max(
+            1, request_data.get("consumer_tp_size", self.tp_size) // self.tp_size
+        )
+        with self._transfer_refcount_lock:
+            left = self._transfer_refcount.get(transfer_id, consumers_per_rank) - 1
+            if left > 0:
+                self._transfer_refcount[transfer_id] = left
+                return
+            self._transfer_refcount.pop(transfer_id, None)
+
+        if self.pp_size > 1:
+            if self.pp_rank != 0:
+                # Stage 0 drops its entry on release, which only it
+                # receives; nothing here reads this one again.
+                self._drop_completed_prefill(transfer_id)
+            # PP-prefill: this stage's write is done, but stage-0 must not
+            # reuse the shared page until ALL stages finish. Freeing is
+            # deferred to _record_release (driven by consumer releases).
+            logger.debug(
+                "[PRODUCER] stage pp_rank=%d served %d consumers for "
+                "transfer_id=%s; awaiting release",
+                self.pp_rank,
+                consumers_per_rank,
+                transfer_id,
+            )
+            return
+        with self._completion_lock:
+            self.done_sending.add(transfer_id)
+        self._drop_completed_prefill(transfer_id)
+        logger.debug(
+            "[PRODUCER] All %d consumers served for transfer_id=%s",
+            consumers_per_rank,
+            transfer_id,
+        )
 
     def _acquire_chunked_reader(
         self, state: ChunkedPrefill, request_data: dict
