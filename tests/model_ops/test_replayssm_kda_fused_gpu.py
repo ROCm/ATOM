@@ -20,6 +20,7 @@ if not torch.cuda.is_available():
     pytest.skip("needs a GPU", allow_module_level=True)
 
 from atom.model_ops.fla_ops.replayssm import (
+    replayssm_flush_wait,
     replayssm_kda_fused_update,
     replayssm_sigmoid_gating_delta_rule,
 )
@@ -58,6 +59,8 @@ def make_inputs(lens, write_pos, seed=0):
     pos[SLOT_IDX[: len(lens)]] = torch.tensor(write_pos, device=DEV)
     return {
         "fused": fused,
+        "flush_arrivals": torch.zeros(SLOTS, HV, device=DEV, dtype=torch.int32),
+        "flush_wait": replayssm_flush_wait(),
         "fb_w": torch.randint(-8, 9, (LP, D), **bf16) / 64,
         "conv_w": (torch.randn(3 * LP, 4, device=DEV) * 0.5).to(torch.bfloat16),
         "A_log": torch.randn(HV, device=DEV),
@@ -167,6 +170,8 @@ def run_unfused(inp, a):
         use_qk_l2norm_in_kernel=True,
         lower_bound=LB,
         fork_slots=a["fork_slots"],
+        flush_arrivals=inp["flush_arrivals"],
+        flush_wait=inp["flush_wait"],
         **s,
     )
     return out.view(T, HV, D), {"conv": conv, **s}

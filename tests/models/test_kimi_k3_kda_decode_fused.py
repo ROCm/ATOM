@@ -102,6 +102,8 @@ def layer_case(modules, monkeypatch, verify=False, glm=False, hd=128):
         replay_buf_k=torch.zeros(8, 2, 16, hd, dtype=torch.bfloat16),
         replay_buf_u=torch.zeros(8, 2, 16, hd, dtype=torch.bfloat16),
         replay_buf_g=torch.zeros(8, 2, 16, hd),
+        replay_flush_arrivals=torch.zeros(8, 2, dtype=torch.int32),
+        replay_flush_wait="s_waitcnt vmcnt(0)",
     )
     ctx = NS(attn_metadata=NS(kda_metadata=meta), kv_cache_data={"layer_0": cache})
     monkeypatch.setattr(kimi, "get_forward_context", lambda: ctx)
@@ -158,6 +160,28 @@ def layer_case(modules, monkeypatch, verify=False, glm=False, hd=128):
         read=read,
         conv=conv,
     )
+
+
+def test_conv_weight_rank_is_rejected_before_kernel_launch(modules, monkeypatch):
+    c = layer_case(modules, monkeypatch)
+    c.attn.conv_weight = c.attn.conv_weight.unsqueeze(1)
+    assert c.attn.conv_weight.shape == (768, 1, 4)
+    with pytest.raises(AssertionError, match="conv weight must be two-dimensional"):
+        c.attn._forward_impl(c.hidden)
+    assert not c.calls.fused and not c.calls.conv and not c.calls.split
+    assert not c.calls.forks
+
+
+@pytest.mark.parametrize("verify", [False, True], ids=["decode", "verify"])
+def test_fallback_passes_pool_owned_flush_resources(modules, monkeypatch, verify):
+    c = layer_case(modules, monkeypatch, verify=verify)
+    monkeypatch.setenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", "0")
+    for _ in range(2):
+        c.attn._forward_impl(c.hidden)
+    assert len(c.calls.split) == 2 and not c.calls.fused
+    for call in c.calls.split:
+        assert call["flush_arrivals"] is c.cache.replay_flush_arrivals
+        assert call["flush_wait"] == c.cache.replay_flush_wait
 
 
 @pytest.mark.parametrize("verify", [False, True], ids=["decode", "verify"])

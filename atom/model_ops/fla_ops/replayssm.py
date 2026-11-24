@@ -50,8 +50,8 @@ __all__ = [
     "replayssm_commit",
     "replayssm_flush_wait",
     "replayssm_gated_delta_rule",
-    "replayssm_materialize",
     "replayssm_kda_fused_update",
+    "replayssm_materialize",
     "replayssm_sigmoid_gating_delta_rule",
 ]
 
@@ -2327,6 +2327,7 @@ def replayssm_kda_fused_update(
     cap = buf_k.shape[2]
     assert K == V, "KDA heads are square"
     assert mixed_qkv.shape[-1] == 3 * HV * K and f_b_weight.shape == (HV * K, F)
+    assert conv_weight.dim() == 2, "the fused conv weight must be two-dimensional"
     assert conv_weight.shape[-1] == 4, "the fused conv is width 4"
     assert mixed_qkv.dtype == conv_state.dtype == f_b_weight.dtype == torch.bfloat16
     assert f_a.dtype == torch.bfloat16, "f_b projection consumes bf16 activations"
