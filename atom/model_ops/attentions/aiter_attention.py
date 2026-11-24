@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import logging
 from typing import ClassVar, NamedTuple
 
@@ -17,7 +18,12 @@ from atom.config import (
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
-from atom.model_ops.minimax_m3.index_shard import index_shard_world
+from atom.model_ops.minimax_m3.index_shard import (
+    index_shard_world,
+    owned_index_slots,
+    page_view,
+    plan_index_gather,
+)
 from atom.model_ops.minimax_m3.sparse_attn import (
     make_sparse_decode_metadata,
     make_sparse_prefill_metadata,
@@ -336,6 +342,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_head_k * self.max_bs * max_qlen,
                 **i32_kwargs,
             )
+            if index_shard_world(config) > 1:
+                # A sharded index cache's step slots (`_own_index_slots`):
+                # persistent for the same reason.
+                self.model_runner.forward_vars[
+                    "sparse_attention_index_slot_mapping"
+                ] = torch.empty(
+                    config.max_num_batched_tokens,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -493,14 +509,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # multiply it out.
         entry_tokens = self.block_size * self.block_ratio
         extra_fields = self._index_cache_fields(entry_tokens)
-        # A rank keeps 1/P of a sharded index cache (`index_shard`): the blocks
-        # its CP rank scores.
-        world = index_shard_world(runner.config)
-        extra_shard = (0, 1)
-        if world > 1:
-            from atom.distributed.indexer_cp import get_indexer_cp_rank
-
-            extra_shard = (get_indexer_cp_rank(), world)
         pools = {}
         for geometry, count in self.row_counts().items():
             if not isinstance(geometry, KvGeometry):
@@ -519,10 +527,38 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
                 extra_fields=extra_fields,
                 kv_format=geometry.kv_format,
-                extra_shard=extra_shard if extra_fields else (0, 1),
+                # A rank keeps 1/P of a sharded index cache.
+                extra_shard=self.index_shard if extra_fields else (0, 1),
             )
             extra_fields = ()
         return pools
+
+    @functools.cached_property
+    def index_shard(self) -> tuple[int, int]:
+        """``(rank, P)``: this rank keeps the MiniMax-M3 index cache of the
+        blocks ``b % P == rank``, the ones its indexer-CP rank scores
+        (`minimax_m3/index_shard.py`); ``(0, 1)`` when it is replicated."""
+        world = index_shard_world(self.model_runner.config)
+        if world == 1:
+            return (0, 1)
+        from atom.distributed.indexer_cp import get_indexer_cp_rank
+
+        return (get_indexer_cp_rank(), world)
+
+    def _own_index_slots(self, sparse_md, persistent: bool = True) -> None:
+        """Under a sharded index cache, the step's index slots: this rank's
+        rows at its local slots, -1 for the rest (`owned_index_slots`); into
+        the decode graphs' persistent buffer unless not ``persistent`` (a
+        prefill, never captured)."""
+        rank, world = self.index_shard
+        if world == 1:
+            return
+        out = None
+        if persistent:
+            out = self.model_runner.forward_vars["sparse_attention_index_slot_mapping"]
+        sparse_md.index_slot_mapping = owned_index_slots(
+            sparse_md.slot_mapping, rank, world, out=out
+        )
 
     def _index_cache_spec(self) -> _IndexCacheSpec | None:
         """MiniMax-M3's indexer key cache, or None where there is none.
@@ -712,6 +748,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 module.impl.index_cache = pool.field_view(
                     "index", row, spec.dtype, (-1, self.block_size, spec.dim)
                 )
+            # The planes by block id, as the CP decode scorers read them: this
+            # rank's share of a sharded cache (`page_view`), else themselves.
+            rank, world = pool.extra_shard
+            module.impl.index_shard = pool.extra_shard
+            module.impl.index_cache_by_page = page_view(
+                module.impl.index_cache, rank, world
+            )
+            module.impl.index_scale_by_page = (
+                None
+                if module.impl.index_scale is None
+                else page_view(module.impl.index_scale, rank, world)
+            )
             module.impl.max_model_len = runner.config.max_model_len
             module.impl.index_topk_cache_state = getattr(
                 runner, "_sparse_attention_topk_cache_state", None
@@ -1030,7 +1078,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
             # Sliced like the block tables above -- `num_prefills` counts
             # requests, and these two are padded past it.
-            attn_metadata.sparse_attention_metadata = make_sparse_prefill_metadata(
+            sparse_md = make_sparse_prefill_metadata(
                 cu_seqlens_q=attn_metadata.cu_seqlens_q[: bs + 1],
                 seq_lens=attn_metadata.context_lens[:bs],
                 block_table=sparse_block_tables,
@@ -1041,6 +1089,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_prefill_tokens=batch.scheduled_tokens,
                 num_idx_heads=self._num_idx_heads,
             )
+            attn_metadata.sparse_attention_metadata = sparse_md
+            rank, world = self.index_shard
+            if world > 1:
+                self._own_index_slots(sparse_md, persistent=False)
+                # The scorer reads every block of its requests: gather them
+                # from their owners (a warmup's dummy step skips attention).
+                if not batch.is_dummy_run:
+                    sparse_md.prefill.index_gather = plan_index_gather(
+                        batch.block_tables,
+                        batch.context_lens,
+                        rank,
+                        world,
+                        sparse_md.slot_mapping.device,
+                    )
 
     def _refuse_ragged_on_rectangular_layers(
         self, lengths: np.ndarray, max_seqlen_q: int
@@ -1190,6 +1252,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
+            self._own_index_slots(attn_metadata.sparse_attention_metadata)
 
     def finish_ubatch(
         self,
@@ -1314,6 +1377,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
+            self._own_index_slots(attn_metadata.sparse_attention_metadata)
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)
         # Decode replays a captured graph, so the op must see a plan HERE

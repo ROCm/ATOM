@@ -24,6 +24,8 @@ _POOL_VIEW_ATTRS = (
     "v_scale",
     "index_cache",
     "index_scale",
+    "index_cache_by_page",
+    "index_scale_by_page",
 )
 
 
