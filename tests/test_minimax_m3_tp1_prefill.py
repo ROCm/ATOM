@@ -124,22 +124,63 @@ def test_linear_supported_takes_native_mxfp8_1x32_only(monkeypatch, attrs, ok):
 def test_fake_impls_give_the_real_shapes():
     m, h = 300, 6144
     x = torch.empty(m, h, dtype=torch.bfloat16, device="meta")
-    res_out, xq, xs = T._norm_mxfp8_fake(x, x, x, None, 1e-6)
+    res_out, xq, xs = T._norm_mxfp8_fake(x, x, x, None, 1e-6, 9856)
     assert res_out.shape == (m, h) and xq.dtype == _FP8
-    assert xs.shape == (m, h // 32) and xs.dtype == torch.uint8
-    outs = T._norm_moe_input_fake(x, x, None, 1e-6)
+    assert xs.shape == (512, h // 32) and xs.dtype == torch.uint8
+    outs = T._norm_moe_input_fake(x, x, None, 1e-6, 6144)
     assert [(tuple(t.shape), t.dtype) for t in outs] == [
         ((m, h), torch.bfloat16),
         ((m, h), torch.bfloat16),
         ((m, h), _FP8),
-        ((m, h // 32), torch.uint8),
+        ((512, h // 32), torch.uint8),
     ]
     assert T._materialize_fake(x, x).shape == (m, h)
     w = torch.empty(9856, h, dtype=_FP8, device="meta")
-    assert T._linear_q_fake(xq, xs, w, None).shape == (m, 9856)
-    assert T._linear_bf16_fake(x, w, None).shape == (m, 9856)
+    assert T._linear_q_fake(xq, xs, w, None, None).shape == (m, 9856)
+    assert T._linear_bf16_fake(x, w, None, None).shape == (m, 9856)
     assert T._mlp_fake(xq, xs, "x").shape == (m, h)
     assert [t.shape for t in T._moe_ffn_fake(x, xq, xs, None, "x")] == [(m, h)] * 2
+
+
+def _w4_index(rows: int, k: int) -> torch.Tensor:
+    """Byte position of scale (row, group) in shuffle_scale_w4, from the 8-wave
+    GEMM reader's formula (aiter ScalePreshuffledS2R)."""
+    r = torch.arange(rows).view(-1, 1)
+    g = torch.arange(k // 32).view(1, -1)
+    rb, rr, kb, gg = r // 32, r % 32, g // 8, g % 8
+    return (
+        (rb * (k // 256) + kb) * 256
+        + ((gg % 4) * 16 + rr % 16) * 4
+        + (gg // 4) * 2
+        + rr // 16
+    )
+
+
+@pytest.mark.parametrize("rows,k", [(1, 3072), (37, 6144), (256, 8192), (1000, 12288)])
+def test_shuffle_scale_w4_follows_the_reader_formula(rows, k):
+    scale = torch.randint(0, 255, (rows, k // 32), dtype=torch.uint8)
+    w4 = T.shuffle_scale_w4(scale.view(torch.float8_e8m0fnu)).view(torch.uint8)
+    assert w4.numel() == T.scale_rows(rows) * k // 32
+    assert torch.equal(w4[_w4_index(rows, k).view(-1)], scale.view(-1))
+    # rows past `rows` (up to the 256 padding) read the neutral exponent 127
+    pad = torch.ones(w4.numel(), dtype=torch.bool)
+    pad[_w4_index(rows, k).view(-1)] = False
+    assert bool((w4[pad] == 127).all())
+
+
+@pytest.mark.parametrize("m,want", [(1, 256), (256, 256), (257, 512), (8192, 8192)])
+def test_scale_rows_pad_to_256(m, want):
+    assert T.scale_rows(m) == want
+
+
+def test_psc_layout_needs_an_unsplit_8wave_row_1024_rows_and_k_256(monkeypatch):
+    rows = {(8192, 9856, 6144): (1, 4), (1000, 9856, 6144): (2, 8)}
+    monkeypatch.setattr(T, "_psc_row", lambda m, n, k: rows.get((m, n, k)))
+    assert T.psc_layout(8192, 9856, 6144)
+    assert not T.psc_layout(8192, 6144, 6144)  # no unsplit 8-wave row
+    assert not T.psc_layout(1000, 9856, 6144)  # below 1024 rows
+    rows[(8192, 9856, 6000)] = (1, 4)
+    assert not T.psc_layout(8192, 9856, 6000)  # K not a multiple of 256
 
 
 @pytest.fixture(scope="module")
@@ -169,10 +210,10 @@ def _fake_ops(monkeypatch, seen):
 
         monkeypatch.setattr(T, name, op)
 
-    rec("linear_bf16", lambda x, w, ws: x.new_full((x.shape[0], w.shape[0]), 1.0))
-    rec("linear_q", lambda xq, xs, w, ws: xq.new_full((xq.shape[0], w.shape[0]), 1.0))
-    rec("norm_mxfp8", lambda x, s, res, w, eps: (res + 1, res, res))
-    rec("norm_moe_input", lambda x, res, w, eps: (x, res + 2, x, x))
+    rec("linear_bf16", lambda x, w, *_: x.new_full((x.shape[0], w.shape[0]), 1.0))
+    rec("linear_q", lambda xq, xs, w, *_: xq.new_full((xq.shape[0], w.shape[0]), 1.0))
+    rec("norm_mxfp8", lambda x, s, res, w, eps, n: (res + 1, res, res))
+    rec("norm_moe_input", lambda x, res, w, eps, n: (x, res + 2, x, x))
     rec("moe_ffn", lambda x, q8, s8, logits, name: (x + 3, x + 4))
     rec("mlp", lambda q8, s8, name: q8 + 5)
     rec("materialize", lambda r, s: r * 2 + s)
@@ -182,7 +223,8 @@ def _moe_layer(defer: bool):
     """A MoE layer of hidden 8 and 4 q columns, as `_forward_tp1` reads it."""
 
     def linear(n, k):
-        return SimpleNamespace(weight=SimpleNamespace(shape=(n, k)), weight_scale=None)
+        weight = SimpleNamespace(shape=(n, k))
+        return SimpleNamespace(weight=weight, weight_scale=None, weight_scale_w4=None)
 
     norm = SimpleNamespace(weight=None, variance_epsilon=1e-6)
     return SimpleNamespace(
@@ -195,7 +237,10 @@ def _moe_layer(defer: bool):
         input_layernorm=norm,
         post_attention_layernorm=norm,
         is_moe_layer=True,
-        block_sparse_moe=SimpleNamespace(gate=lambda x: x),
+        block_sparse_moe=SimpleNamespace(
+            gate=lambda x: x,
+            shared_experts=SimpleNamespace(gate_up_proj=linear(16, 8)),
+        ),
         tp1_defer=defer,
         tp1_ffn_name="model.layers.1.tp1_ffn",
     )
@@ -285,8 +330,21 @@ def _generic_norm(h, residual):
     return norm, norm(h, residual)
 
 
+def _row_scales(xs, m, k, n_out) -> torch.Tensor:
+    """Rows < m of e8m0 bytes in the layout `psc_layout` names for an [m, k]
+    input of an n_out-row weight, row-major (the 256-row padding is unset)."""
+    if not T.psc_layout(m, n_out, k):
+        return xs[:m]
+    return xs.view(-1)[_w4_index(m, k).to(xs.device)]
+
+
+def _scales_equal(xs, ref, m, n_out) -> bool:
+    """``xs`` as `_row_scales` reads it == `quantize_fp8`'s row-major ``ref``."""
+    return _bytes_equal(_row_scales(xs, m, ref.shape[1] * 32, n_out), ref)
+
+
 @gpu
-@pytest.mark.parametrize("m", _MS)
+@pytest.mark.parametrize("m", _MS + (8191, 16384))
 def test_norms_equal_add_rmsnorm_then_quantize_fp8(dev, m):
     from atom.model_ops.blockscale import quantize_fp8
 
@@ -296,25 +354,32 @@ def test_norms_equal_add_rmsnorm_then_quantize_fp8(dev, m):
         hin = x if shared is None else x * 2 + shared
         norm, (normed, res_out) = _generic_norm(hin, res)
         q, qs = quantize_fp8(normed)
-        got = T.norm_mxfp8(x, shared, res, norm.weight, norm.variance_epsilon)
-        assert _bytes_equal(got[0], res_out)
-        assert _bytes_equal(got[1], q) and _bytes_equal(got[2], qs)
-    got = T.norm_moe_input(x, res, norm.weight, norm.variance_epsilon)
+        for n_out in (9856, 24576):  # qkv, a dense gate_up
+            got = T.norm_mxfp8(x, shared, res, norm.weight, 1e-6, n_out)
+            assert _bytes_equal(got[0], res_out) and _bytes_equal(got[1], q)
+            assert _scales_equal(got[2], qs, m, n_out)
+    normed, res_out, q8, s8 = T.norm_moe_input(x, res, norm.weight, 1e-6, 6144)
     norm_ref, res_ref = norm(x, res)
     q, qs = quantize_fp8(norm_ref)
-    for a, b in zip(got, (norm_ref, res_ref, q, qs)):
-        assert _bytes_equal(a, b)
+    assert _bytes_equal(normed, norm_ref) and _bytes_equal(res_out, res_ref)
+    assert _bytes_equal(q8, q) and _scales_equal(s8, qs, m, 6144)
     assert _bytes_equal(T.materialize(x, s), x * 2 + s)
 
 
 def _mxfp8_weight(n, k, seed, dev):
+    """A preshuffled MXFP8 1x32 weight as LinearBase holds it: (weight, the
+    GEMM's weight scale, its shuffle_scale_w4 copy)."""
     from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
 
     g = torch.Generator(device=dev).manual_seed(seed)
     w = (torch.randn(n, k, device=dev, generator=g) * 0.5).to(_FP8)
     codes = torch.randint(118, 125, (n, k // 32), device=dev, generator=g)
     ws = codes.to(torch.uint8).view(torch.float8_e8m0fnu)
-    return shuffle_weight(w, layout=(16, 16)), shuffle_mxfp8_bpreshuffle_scale(ws)
+    return (
+        shuffle_weight(w, layout=(16, 16)),
+        shuffle_mxfp8_bpreshuffle_scale(ws),
+        T.shuffle_scale_w4(ws),
+    )
 
 
 # qkv, o_proj, shared gate_up, shared down, dense gate_up, dense down
@@ -324,22 +389,24 @@ _LINEARS = [(9856, 6144), (6144, 8192), (6144, 6144), (6144, 3072), (24576, 6144
 @gpu
 @pytest.mark.parametrize("n,k", _LINEARS + [(6144, 12288)])
 def test_linears_equal_native_quant_linear(dev, n, k):
-    from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
+    """Row-major scales and, where aiter's row is the 8-wave kernel, preshuffled
+    ones (ragged M included): the generic linear's bytes."""
+    from atom.model_ops.blockscale import native_quant_linear
 
-    w, ws = _mxfp8_weight(n, k, n + k, dev)
-    for m in (1000, 3001, 8192):
+    w, ws, ws_w4 = _mxfp8_weight(n, k, n + k, dev)
+    for m in (1000, 1024, 3001, 8191, 8192, 16384):
         x = _acts(m, k, m, dev)
         want = native_quant_linear(
             x, w, ws, weight_group_rows=1, weight_preshuffled=True
         )
-        assert _bytes_equal(T.linear_bf16(x, w, ws), want)
-        xq, xs = quantize_fp8(x)
-        assert _bytes_equal(T.linear_q(xq, xs.view(torch.uint8), w, ws), want)
+        assert _bytes_equal(T.linear_bf16(x, w, ws, ws_w4), want), m
+        xq, xs = T.quant_mxfp8(x, n)
+        assert _bytes_equal(T.linear_q(xq, xs, w, ws, ws_w4), want), m
 
 
 @gpu
 @pytest.mark.parametrize("inter", [3072, 12288])
-@pytest.mark.parametrize("m", (37, 1000, 8192))
+@pytest.mark.parametrize("m", (37, 1000, 3001, 8192))
 def test_mlp_equals_the_generic_mlp(dev, inter, m):
     from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
     from atom.model_ops.swiglu_oai import swiglu_oai_split
@@ -347,8 +414,10 @@ def test_mlp_equals_the_generic_mlp(dev, inter, m):
     h = 6144
 
     def lin(n, k, seed):
-        weight, weight_scale = _mxfp8_weight(n, k, seed, dev)
-        return SimpleNamespace(weight=weight, weight_scale=weight_scale)
+        weight, weight_scale, weight_scale_w4 = _mxfp8_weight(n, k, seed, dev)
+        return SimpleNamespace(
+            weight=weight, weight_scale=weight_scale, weight_scale_w4=weight_scale_w4
+        )
 
     gu, dn = lin(2 * inter, h, inter), lin(h, inter, inter + 1)
     mlp = SimpleNamespace(
@@ -371,8 +440,16 @@ def test_mlp_equals_the_generic_mlp(dev, inter, m):
 
     act = swiglu_oai_split(linear(x, gu), alpha=1.702, beta=1.0, limit=7.0)
     want = linear(act, dn)
-    q8, s8 = quantize_fp8(x)
-    assert _bytes_equal(T.mlp_forward(mlp, q8, s8.view(torch.uint8)), want)
+    q8, s8 = T.quant_mxfp8(x, 2 * inter)
+    assert _bytes_equal(T.mlp_forward(mlp, q8, s8), want)
+    if m >= 1024:  # the SwiGLU's w4 scales, as the down GEMM reads them
+        from atom.model_ops.minimax_m3.tp1_swiglu import swiglu_oai_mxfp8_w4
+
+        y, s = swiglu_oai_mxfp8_w4(linear(x, gu), 1.702, 1.0, 7.0)
+        q, qs = quantize_fp8(act)
+        assert _bytes_equal(y, q)
+        rows = _w4_index(m, inter).view(-1).to(dev)
+        assert _bytes_equal(s.view(-1)[rows], qs.view(torch.uint8).view(-1))
 
 
 @gpu
@@ -381,16 +458,17 @@ def test_the_ops_compile_to_the_eager_bytes(dev):
     the eager bytes."""
     h = 6144
     norm, _ = _generic_norm(_acts(8, h, 0, dev), _acts(8, h, 1, dev))
-    w, ws = _mxfp8_weight(9856, h, 7, dev)
+    w, ws, ws_w4 = _mxfp8_weight(9856, h, 7, dev)
 
     def chain(x, shared, res):
-        res, xq, xs = T.norm_mxfp8(x, shared, res, norm.weight, 1e-6)
-        y = T.linear_q(xq, xs, w, ws)[:, :h]
-        normed, res, q8, s8 = T.norm_moe_input(y, res, norm.weight, 1e-6)
+        res, xq, xs = T.norm_mxfp8(x, shared, res, norm.weight, 1e-6, 9856)
+        y = T.linear_q(xq, xs, w, ws, ws_w4)[:, :h]
+        normed, res, q8, s8 = T.norm_moe_input(y, res, norm.weight, 1e-6, 6144)
         return T.materialize(normed, res), q8, s8
 
     compiled = torch.compile(chain, dynamic=True, fullgraph=True)
-    for m in (1000, 3001):
+    for m in (1000, 3001, 8192):
         args = [_acts(m, h, seed, dev) for seed in (4, 5, 6)]
-        for a, b in zip(compiled(*args), chain(*args)):
-            assert _bytes_equal(a, b)
+        (out_c, q_c, s_c), (out_e, q_e, s_e) = compiled(*args), chain(*args)
+        assert _bytes_equal(out_c, out_e) and _bytes_equal(q_c, q_e)
+        assert _bytes_equal(*(_row_scales(s, m, h, 6144) for s in (s_c, s_e)))
