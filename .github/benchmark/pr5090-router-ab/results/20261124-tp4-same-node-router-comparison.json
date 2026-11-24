@@ -1,0 +1,631 @@
+{
+  "purpose": "M3.1 TP4/TP4 1P1D c40 same-node router comparison, complete 3600-second send windows",
+  "comparison": {
+    "same_node": true,
+    "rows": [
+      {
+        "metric": "output_token_throughput",
+        "stat": "avg",
+        "unit": "tokens/sec",
+        "atomesh": 1821.693582973492,
+        "baseline": 1815.603222024392,
+        "atomesh_relative_change_pct": 0.3354455904913678
+      },
+      {
+        "metric": "request_throughput",
+        "stat": "avg",
+        "unit": "requests/sec",
+        "atomesh": 1.648678549755819,
+        "baseline": 1.6408871629132855,
+        "atomesh_relative_change_pct": 0.4748277041000337
+      },
+      {
+        "metric": "time_to_first_token",
+        "stat": "p50",
+        "unit": "ms",
+        "atomesh": 1269.3694695,
+        "baseline": 1377.3110335,
+        "atomesh_relative_change_pct": -7.83712330581573
+      },
+      {
+        "metric": "time_to_first_token",
+        "stat": "p95",
+        "unit": "ms",
+        "atomesh": 11971.33339,
+        "baseline": 12165.5209875,
+        "atomesh_relative_change_pct": -1.596212753235371
+      },
+      {
+        "metric": "time_to_first_token",
+        "stat": "p99",
+        "unit": "ms",
+        "atomesh": 15519.387543350007,
+        "baseline": 15935.147617999995,
+        "atomesh_relative_change_pct": -2.609075765199409
+      },
+      {
+        "metric": "inter_token_latency",
+        "stat": "p50",
+        "unit": "ms",
+        "atomesh": 2.274419902775933,
+        "baseline": 2.244299100287795,
+        "atomesh_relative_change_pct": 1.3421028633962218
+      },
+      {
+        "metric": "inter_token_latency",
+        "stat": "p95",
+        "unit": "ms",
+        "atomesh": 3.3157003883948075,
+        "baseline": 3.3009061385653897,
+        "atomesh_relative_change_pct": 0.44818753422197766
+      },
+      {
+        "metric": "inter_token_latency",
+        "stat": "p99",
+        "unit": "ms",
+        "atomesh": 3.8895516141048607,
+        "baseline": 3.8899104150406587,
+        "atomesh_relative_change_pct": -0.00922388686409592
+      }
+    ],
+    "limits": [
+      "Single c40 point; no accuracy or power evaluation",
+      "One run per router on the same node; run-order effects and variance remain"
+    ]
+  },
+  "worker_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "model": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+  "model_snapshot": "1442d09d4926cb286fa2dc6646c83c4af2b3898c",
+  "same_worker_contract_and_client_packages": true,
+  "actual_recipe_worker_fields_match": true,
+  "client_freeze_sha256": "2bee811bfb6d839342339ced99ae2662ab74b3ebaf7f99d0fca2449e7a0a2a0f",
+  "formal_sa_submission": false,
+  "arms": {
+    "atomesh": {
+      "router_runtime": {
+        "commit": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+        "profile": "release",
+        "source_dirty": "false",
+        "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+        "binary_sha256": "8449c2c9bac35b9d4af57d0ecb6060bed6157404c254db2c2dd92a8525d5200e",
+        "lockfile_sha256": "86354f5a25283aa2535ea97b2b6a937a7cc5860f6934d378ab91cd2d13db19b7",
+        "image_id": "sha256:3a6338c35f32a85ffb6024796cb2b3902cad287611ae7f4add84311c35283247",
+        "base_image": "rocm/atom-dev:nightly_202611110332@sha256:19712185deac1eca8db5f21bc25ff2f9a3f44758bfd7cec8cc1c7889fbea097d",
+        "runtime_verified": true
+      },
+      "srt_runtime": {
+        "source_sha": "df706bc365e00bea74e5babe87b4049f624341ea",
+        "installed_hashes": {
+          "core/docker.py": "ab4d438a37299e01735596862fc434ed432f3337ce412bf25e6f8f2254fda0ee",
+          "core/launcher.py": "d8023788365855558dc7226057e31dca514e3969171caad672ff9bbc9364146d",
+          "core/runtime.py": "89f1d051a53a89f1fb6d5ff2671a705af335f0487b57741accdd0baf2df74c02",
+          "core/schema.py": "ff91c29d5d607ddd6367f452bfe8a1f6f00b664f62ff96838673aeb7b38f9f1c",
+          "backends/vllm.py": "3b5802019e4e55a36456661e57aae876670f53e27ff45c0c0bfd20a37a4bfbad",
+          "frontends/atomesh.py": "a313fd62b933b487703baa6857f3fc4b5e7939ed9a0b98d51d8f53009bb9df53",
+          "frontends/vllm_router.py": "2d4d1f13864decb890485de33a694b5a8ca934b9c4485dfd7efadd7d125a11c9"
+        },
+        "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]"
+      },
+      "control_phase_times_utc": {
+        "started": "21:12:00.431",
+        "sending complete": "22:12:00.431",
+        "complete": "22:12:06.955"
+      },
+      "send_duration_s": 3600.0,
+      "window": {
+        "start_ns": 1795468320431033296,
+        "end_ns": 1795471926955786639
+      },
+      "observation_duration_s": 3606.524753343,
+      "denominator_source": "server_metrics_export.json summary.phase_time_ranges.profiling",
+      "raw_record_counts": {
+        "warmup:error": 444,
+        "profiling:valid": 5946,
+        "profiling:cancelled": 0,
+        "profiling:error": 1
+      },
+      "output_tokens": 6569983,
+      "metrics": {
+        "time_to_first_token": {
+          "unit": "ms",
+          "avg": 3243.3830802440293,
+          "p1": 90.87755055,
+          "p5": 119.222759,
+          "p10": 148.0142845,
+          "p25": 257.346858,
+          "p50": 1269.3694695,
+          "p75": 5035.145651,
+          "p90": 9549.5812505,
+          "p95": 11971.33339,
+          "p99": 15519.387543350007,
+          "min": 47.937101999999996,
+          "max": 20558.381776,
+          "std": 3957.6469788684394,
+          "count": 5946,
+          "sum": 19285155.795130998
+        },
+        "inter_token_latency": {
+          "unit": "ms",
+          "avg": 2.2613360984978628,
+          "p1": 0.0,
+          "p5": 1.2355826071428573,
+          "p10": 1.4739993963268563,
+          "p25": 1.8171434412394747,
+          "p50": 2.274419902775933,
+          "p75": 2.7152136289218243,
+          "p90": 3.0679784334363984,
+          "p95": 3.3157003883948075,
+          "p99": 3.8895516141048607,
+          "min": 0.0,
+          "max": 8.609303243243243,
+          "std": 0.6882710350827932,
+          "count": 5946,
+          "sum": 13445.904441668292
+        },
+        "request_latency": {
+          "unit": "ms",
+          "avg": 5642.5915884707365,
+          "p1": 241.84340594999998,
+          "p5": 428.49019325,
+          "p10": 634.150411,
+          "p25": 1420.5457589999999,
+          "p50": 3841.418893,
+          "p75": 8150.80435175,
+          "p90": 13454.616214,
+          "p95": 16189.36255025,
+          "p99": 23196.602562750002,
+          "min": 111.109584,
+          "max": 139427.367861,
+          "std": 6124.288145273475,
+          "count": 5946,
+          "sum": 33550849.585047
+        },
+        "output_token_throughput": {
+          "unit": "tokens/sec",
+          "avg": 1821.693582973492
+        },
+        "input_token_throughput": {
+          "unit": "tokens/sec",
+          "avg": 283024.25847870583
+        },
+        "request_throughput": {
+          "unit": "requests/sec",
+          "avg": 1.648678549755819
+        },
+        "context_overflow_count": {
+          "unit": "requests",
+          "avg": 0.0
+        },
+        "adj_time_to_first_token": {
+          "unit": "ms",
+          "p1": 90.725145,
+          "p5": 119.21973299999999,
+          "p10": 148.10875099999998,
+          "p25": 257.269345,
+          "p50": 1269.897151,
+          "p75": 5035.856828,
+          "p90": 9551.423469,
+          "p95": 11974.565315,
+          "p99": 15554.746618,
+          "min": 47.937101999999996,
+          "count": 5947
+        },
+        "adj_inter_token_latency": {
+          "unit": "ms",
+          "p1": 0.0,
+          "p5": 1.2348761428571429,
+          "p10": 1.4741621003460206,
+          "p25": 1.81707823204023,
+          "p50": 2.2745374935217906,
+          "p75": 2.715605069230769,
+          "p90": 3.068865312185297,
+          "p95": 3.3169153049853373,
+          "p99": 3.901043477578475,
+          "min": 0.0,
+          "count": 5947
+        },
+        "adj_request_latency": {
+          "unit": "ms",
+          "p1": 241.542432,
+          "p5": 428.43249,
+          "p10": 634.151758,
+          "p25": 1420.348371,
+          "p50": 3842.248795,
+          "p75": 8152.958793,
+          "p90": 13469.069387,
+          "p95": 16204.19307,
+          "p99": 23359.424355,
+          "min": 111.109584,
+          "count": 5947
+        }
+      },
+      "output_tps_per_allocated_gpu": 227.7116978716865,
+      "client_invalid_response_rate_pct": 0.016815200941651252,
+      "errors": [
+        {
+          "request_id": "e08cbcec-a47e-42ad-aa6e-3d71f2a56f59",
+          "source_trace_id": "002001296e8a8c38ad9d7cc436d691afc602",
+          "turn_index": 121,
+          "source_outer_idx": 126,
+          "input_tokens": 381745,
+          "error": {
+            "type": "InvalidInferenceResultError",
+            "message": "InvalidInferenceResultError('Invalid inference result: No responses with actual content were received from the server (only usage/metadata, null/empty data, or [DONE] markers)')",
+            "cause_chain": [
+              "InvalidInferenceResultError"
+            ]
+          }
+        }
+      ],
+      "error_summary": [
+        {
+          "error_details": {
+            "type": "InvalidInferenceResultError",
+            "message": "InvalidInferenceResultError('Invalid inference result: No responses with actual content were received from the server (only usage/metadata, null/empty data, or [DONE] markers)')",
+            "cause_chain": [
+              "InvalidInferenceResultError"
+            ]
+          },
+          "count": 1
+        }
+      ],
+      "duration_coverage": [
+        {
+          "phase_name": "profiling",
+          "expected_duration_seconds": 3600.0,
+          "required_ratio": 0.95,
+          "ttft_ratio": 1.0,
+          "inter_token_latency_ratio": 1.0
+        }
+      ],
+      "dataset": {
+        "source_type": "public_dataset",
+        "loader": "semianalysis_cc_traces_weka_062126",
+        "hf_dataset_name": "semianalysisai/cc-traces-weka-062126",
+        "hf_split": "train",
+        "num_dataset_entries": 393
+      },
+      "mooncake": {
+        "reported_transferred_bytes": 1762212986880.0,
+        "failed_transfers": 0.0,
+        "failed_receives": 0.0,
+        "expired_requests": 0.0
+      },
+      "decode_queue": {
+        "running": {
+          "avg": 4.04369918699187,
+          "min": 0.0,
+          "max": 5.0,
+          "std": 1.3993811505794107,
+          "p1": 0.0,
+          "p5": 1.0,
+          "p10": 2.0,
+          "p25": 3.0,
+          "p50": 5.0,
+          "p75": 5.0,
+          "p90": 5.0,
+          "p95": 5.0,
+          "p99": 5.0
+        },
+        "waiting": {
+          "avg": 5.1343311160384335,
+          "min": 0.0,
+          "max": 27.0,
+          "std": 6.474555080502668,
+          "p1": 0.0,
+          "p5": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 2.0,
+          "p75": 9.0,
+          "p90": 16.0,
+          "p95": 19.0,
+          "p99": 23.0
+        }
+      },
+      "natural_speculation": {
+        "accepted_tokens": 5087041.0,
+        "draft_tokens": 10479056.0,
+        "draft_calls": 1497008.0,
+        "token_acceptance_rate": 0.4854484029859178,
+        "accepted_per_position": {
+          "0": 1250413.0,
+          "1": 1008624.0,
+          "2": 808202.0,
+          "3": 653088.0,
+          "4": 539425.0,
+          "5": 449297.0,
+          "6": 377992.0
+        }
+      },
+      "exit_codes": {
+        "pool-workload.rc": 0,
+        "pool-exit.rc": 0,
+        "gpool-release.rc": 0
+      },
+      "artifact_sha256": {
+        "profile_export_aiperf.json": "6f2c61b189ce98f5a2452d5dd73c727ee47d08c876ca98c6531b7a2de2cb6df3",
+        "server_metrics_export.json": "22d21beec6da0a516a0df2548417a732814e3334307eb748bdb4d5b52d26cc99",
+        "profile_export.jsonl": "e5a452590d2621d3f4a0da903048a3e75d5c1ccea1a8236805c34e79f2c829d8"
+      },
+      "lease": "Lcb2ddc",
+      "node": "pit2-p03-g42",
+      "harness_sha": "cf463b9e7e804dae190b5fa2d2d1c907222fbdbb"
+    },
+    "vllm-router": {
+      "router_runtime": {
+        "kind": "baseline",
+        "base_image": "vllm/vllm-router:v0.1.16@sha256:4c9c87a7a911fd7628cf38a4c2ab65107a797778d95fa2a4d63e19f91b732e7c",
+        "image_id": "sha256:4c9c87a7a911fd7628cf38a4c2ab65107a797778d95fa2a4d63e19f91b732e7c",
+        "repo_digests": [
+          "vllm/vllm-router@sha256:4c9c87a7a911fd7628cf38a4c2ab65107a797778d95fa2a4d63e19f91b732e7c"
+        ],
+        "version": "0.1.16",
+        "binary_sha256": "7c3aa02a1a36da7b1a37f80826989c4917718f28f4a8c498f5de1eee80703e78",
+        "binary_path": "/usr/local/bin/vllm-router",
+        "runtime_verified": true
+      },
+      "srt_runtime": {
+        "source_sha": "df706bc365e00bea74e5babe87b4049f624341ea",
+        "installed_hashes": {
+          "core/docker.py": "ab4d438a37299e01735596862fc434ed432f3337ce412bf25e6f8f2254fda0ee",
+          "core/launcher.py": "d8023788365855558dc7226057e31dca514e3969171caad672ff9bbc9364146d",
+          "core/runtime.py": "89f1d051a53a89f1fb6d5ff2671a705af335f0487b57741accdd0baf2df74c02",
+          "core/schema.py": "ff91c29d5d607ddd6367f452bfe8a1f6f00b664f62ff96838673aeb7b38f9f1c",
+          "backends/vllm.py": "3b5802019e4e55a36456661e57aae876670f53e27ff45c0c0bfd20a37a4bfbad",
+          "frontends/atomesh.py": "a313fd62b933b487703baa6857f3fc4b5e7939ed9a0b98d51d8f53009bb9df53",
+          "frontends/vllm_router.py": "2d4d1f13864decb890485de33a694b5a8ca934b9c4485dfd7efadd7d125a11c9"
+        },
+        "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]"
+      },
+      "control_phase_times_utc": {
+        "started": "18:36:48.328",
+        "sending complete": "19:36:48.329",
+        "complete": "19:37:05.884"
+      },
+      "send_duration_s": 3600.001,
+      "window": {
+        "start_ns": 1795459008328919858,
+        "end_ns": 1795462625884187620
+      },
+      "observation_duration_s": 3617.555267762,
+      "denominator_source": "server_metrics_export.json summary.phase_time_ranges.profiling",
+      "raw_record_counts": {
+        "warmup:error": 444,
+        "profiling:valid": 5936,
+        "profiling:cancelled": 0,
+        "profiling:error": 1
+      },
+      "output_tokens": 6568045,
+      "metrics": {
+        "time_to_first_token": {
+          "unit": "ms",
+          "avg": 3454.9053127713946,
+          "p1": 122.3002887,
+          "p5": 160.91231525,
+          "p10": 206.26736499999998,
+          "p25": 375.13746449999996,
+          "p50": 1377.3110335,
+          "p75": 5598.83174825,
+          "p90": 9747.408675499999,
+          "p95": 12165.5209875,
+          "p99": 15935.147617999995,
+          "min": 51.54015,
+          "max": 20100.053235,
+          "std": 4079.8750894198715,
+          "count": 5936,
+          "sum": 20508317.936611
+        },
+        "inter_token_latency": {
+          "unit": "ms",
+          "avg": 2.2400878052980935,
+          "p1": 0.0,
+          "p5": 1.224769282041052,
+          "p10": 1.443506977822291,
+          "p25": 1.7938099984756097,
+          "p50": 2.244299100287795,
+          "p75": 2.707471494867724,
+          "p90": 3.05468033719031,
+          "p95": 3.3009061385653897,
+          "p99": 3.8899104150406587,
+          "min": 0.0,
+          "max": 8.41824373076923,
+          "std": 0.696519279037196,
+          "count": 5936,
+          "sum": 13297.161212249484
+        },
+        "request_latency": {
+          "unit": "ms",
+          "avg": 5838.657192042116,
+          "p1": 305.29226625,
+          "p5": 512.33713425,
+          "p10": 721.787257,
+          "p25": 1478.051266,
+          "p50": 3990.3466565,
+          "p75": 8632.22781825,
+          "p90": 13427.226631,
+          "p95": 16444.9622145,
+          "p99": 23585.175353099996,
+          "min": 107.983029,
+          "max": 126982.544604,
+          "std": 6211.978080232226,
+          "count": 5936,
+          "sum": 34658269.091961995
+        },
+        "output_token_throughput": {
+          "unit": "tokens/sec",
+          "avg": 1815.603222024392
+        },
+        "input_token_throughput": {
+          "unit": "tokens/sec",
+          "avg": 281822.0291160106
+        },
+        "request_throughput": {
+          "unit": "requests/sec",
+          "avg": 1.6408871629132855
+        },
+        "context_overflow_count": {
+          "unit": "requests",
+          "avg": 0.0
+        },
+        "adj_time_to_first_token": {
+          "unit": "ms",
+          "p1": 121.940446,
+          "p5": 160.922138,
+          "p10": 206.29426999999998,
+          "p25": 375.155449,
+          "p50": 1378.1299589999999,
+          "p75": 5600.45897,
+          "p90": 9747.984650999999,
+          "p95": 12169.397523,
+          "p99": 15962.909846999999,
+          "min": 51.54015,
+          "count": 5937
+        },
+        "adj_inter_token_latency": {
+          "unit": "ms",
+          "p1": 0.0,
+          "p5": 1.225426504842615,
+          "p10": 1.4443873186582807,
+          "p25": 1.7938905833333332,
+          "p50": 2.244317578304848,
+          "p75": 2.7084129432624113,
+          "p90": 3.0549400345821325,
+          "p95": 3.3017034292615595,
+          "p99": 3.899078631493506,
+          "min": 0.0,
+          "count": 5937
+        },
+        "adj_request_latency": {
+          "unit": "ms",
+          "p1": 305.07631799999996,
+          "p5": 512.391262,
+          "p10": 722.01554,
+          "p25": 1478.8461459999999,
+          "p50": 3990.410484,
+          "p75": 8632.779573,
+          "p90": 13429.651061999999,
+          "p95": 16447.116719999998,
+          "p99": 23601.372357,
+          "min": 107.983029,
+          "count": 5937
+        }
+      },
+      "output_tps_per_allocated_gpu": 226.950402753049,
+      "client_invalid_response_rate_pct": 0.01684352366515075,
+      "errors": [
+        {
+          "request_id": "d3419050-27db-415e-ac9c-60dbf1198510",
+          "source_trace_id": "002001296e8a8c38ad9d7cc436d691afc602",
+          "turn_index": 121,
+          "source_outer_idx": 126,
+          "input_tokens": 381744,
+          "error": {
+            "type": "InvalidInferenceResultError",
+            "message": "InvalidInferenceResultError('Invalid inference result: No responses with actual content were received from the server (only usage/metadata, null/empty data, or [DONE] markers)')",
+            "cause_chain": [
+              "InvalidInferenceResultError"
+            ]
+          }
+        }
+      ],
+      "error_summary": [
+        {
+          "error_details": {
+            "type": "InvalidInferenceResultError",
+            "message": "InvalidInferenceResultError('Invalid inference result: No responses with actual content were received from the server (only usage/metadata, null/empty data, or [DONE] markers)')",
+            "cause_chain": [
+              "InvalidInferenceResultError"
+            ]
+          },
+          "count": 1
+        }
+      ],
+      "duration_coverage": [
+        {
+          "phase_name": "profiling",
+          "expected_duration_seconds": 3600.0,
+          "required_ratio": 0.95,
+          "ttft_ratio": 1.0,
+          "inter_token_latency_ratio": 1.0
+        }
+      ],
+      "dataset": {
+        "source_type": "public_dataset",
+        "loader": "semianalysis_cc_traces_weka_062126",
+        "hf_dataset_name": "semianalysisai/cc-traces-weka-062126",
+        "hf_split": "train",
+        "num_dataset_entries": 393
+      },
+      "mooncake": {
+        "reported_transferred_bytes": 1773491978240.0,
+        "failed_transfers": 0.0,
+        "failed_receives": 0.0,
+        "expired_requests": 0.0
+      },
+      "decode_queue": {
+        "running": {
+          "avg": 4.00469786293294,
+          "min": 0.0,
+          "max": 5.0,
+          "std": 1.4270777609791274,
+          "p1": 0.0,
+          "p5": 1.0,
+          "p10": 2.0,
+          "p25": 3.0,
+          "p50": 5.0,
+          "p75": 5.0,
+          "p90": 5.0,
+          "p95": 5.0,
+          "p99": 5.0
+        },
+        "waiting": {
+          "avg": 5.049834193072955,
+          "min": 0.0,
+          "max": 36.0,
+          "std": 6.954733150324314,
+          "p1": 0.0,
+          "p5": 0.0,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p50": 1.0,
+          "p75": 8.0,
+          "p90": 17.0,
+          "p95": 20.0,
+          "p99": 24.0
+        }
+      },
+      "natural_speculation": {
+        "accepted_tokens": 5094518.0,
+        "draft_tokens": 10413823.0,
+        "draft_calls": 1487689.0,
+        "token_acceptance_rate": 0.48920727767314653,
+        "accepted_per_position": {
+          "0": 1246995.0,
+          "1": 1006558.0,
+          "2": 811866.0,
+          "3": 658787.0,
+          "4": 537585.0,
+          "5": 451068.0,
+          "6": 381659.0
+        }
+      },
+      "exit_codes": {
+        "pool-workload.rc": 0,
+        "pool-exit.rc": 0,
+        "gpool-release.rc": 0
+      },
+      "artifact_sha256": {
+        "profile_export_aiperf.json": "27429d68544389a9730e23a0b80703848f2ab0239720d0bef4f36187e0109a1b",
+        "server_metrics_export.json": "ee6886853e46baf4a4b458fde2a7413436c7659bc2d1480e7ffd9adeb54d8771",
+        "profile_export.jsonl": "cdd55af0ca2b4d752e6539f33f3b96a4654063fae2131d633df1de0cdf8c67df"
+      },
+      "lease": "Ld48419",
+      "node": "pit2-p03-g42",
+      "harness_sha": "112a93b2884e25e250b986f48c1ebb2fd171e5cd"
+    }
+  },
+  "cleanup": "Both runs exited successfully and released their leases normally. Release was initially refused for delayed VRAM drain, then succeeded without force. Final task-container queries are empty and no leases are held.",
+  "access_outage": "The jump-host access outage interrupted monitoring. Original g42 run continued, completed its full window and exported results; completion and cleanup were verified after access restoration.",
+  "error_followup": "Each arm had one empty-content response at trace 002001296e8a8c38ad9d7cc436d691afc602 turn 121, source_outer_idx 126. Input counts 381745 vs 381744; cause remains unisolated."
+}
