@@ -33,7 +33,7 @@ mod tests;
 
 use chat_template::{
     atom_chat_render_gap, atom_template_not_loaded, default_template_kwargs,
-    process_chat_messages_with_defaults, LoadedTemplate,
+    process_chat_messages_with_defaults, AtomChat, LoadedTemplate,
 };
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
@@ -183,11 +183,18 @@ pub(crate) fn prepare_chat_rendered(
     let body_ref = filter_chat_request_by_tool_choice(&req);
     let atom = workers
         .iter()
-        .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom);
+        .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom)
+        .then(|| AtomChat::of(&workers))
+        .transpose()
+        .map_err(|e| error::internal_error("invalid_reasoning_toggle", e))?;
 
-    let processed =
-        process_chat_messages_with_defaults(&body_ref, &*tokenizer, default_kwargs.as_ref(), atom)
-            .map_err(|e| error::bad_request("process_messages_failed", e))?;
+    let processed = process_chat_messages_with_defaults(
+        &body_ref,
+        &*tokenizer,
+        default_kwargs.as_ref(),
+        atom.as_ref(),
+    )
+    .map_err(|e| error::bad_request("process_messages_failed", e))?;
 
     let encoding = tokenizer
         .encode(&processed.text, false)

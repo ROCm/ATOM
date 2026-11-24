@@ -570,6 +570,34 @@ async fn a_vllm_worker_is_still_detected_as_vllm() {
     assert_eq!(labels.get("max_context_length").unwrap(), "2048");
 }
 
+/// A reasoning effort of "none" switches the model's reasoning toggle off over its
+/// default, as ATOM's HTTP chat does (`resolve_reasoning_controls`).
+#[tokio::test]
+async fn a_reasoning_effort_of_none_switches_the_default_on_toggle_off_as_on_http() {
+    let template = "thinking={{ enable_thinking }}: {{ messages[0].content }}";
+    let info = GetModelInfoResponse {
+        reasoning_toggle_json: r#"["enable_thinking", false, true]"#.into(),
+        ..model_info("atom-toggle", template, r#"{"enable_thinking": true}"#)
+    };
+    let url = serve_atom(info, 1).await;
+    let ctx = context();
+    register(&ctx, json!({ "url": url })).await.unwrap();
+    assert_eq!(
+        render(&ctx, "atom-toggle", Value::Null).await,
+        "thinking=True: hi"
+    );
+
+    let body = json!({
+        "model": "atom-toggle",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+    let model = Some("atom-toggle".into());
+    let (_, resp) = prepare_chat(Arc::new(request), None, model, &ctx).unwrap();
+    assert_eq!(resp.original_text.as_deref(), Some("thinking=False: hi"));
+}
+
 /// A vLLM worker's HealthCheck answer does not decide its registration, as before
 /// ATOM workers were served: only an ATOM worker's must say healthy.
 #[tokio::test]

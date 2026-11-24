@@ -138,7 +138,31 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
-    process_chat_messages_with_defaults(request, tokenizer, None, false)
+    process_chat_messages_with_defaults(request, tokenizer, None, None)
+}
+
+/// The label with an ATOM worker's reasoning toggle, `[name, off value, on value]`:
+/// GetModelInfo's `reasoning_toggle_json`.
+const REASONING_TOGGLE_LABEL: &str = "reasoning_toggle_json";
+
+/// What an ATOM model's chat renders its reasoning controls with: its toggle, if any.
+pub(crate) struct AtomChat {
+    pub toggle: Option<(String, Value, Value)>,
+}
+
+impl AtomChat {
+    /// The model's, from the first of its `workers` with the toggle label.
+    pub(crate) fn of(workers: &[Arc<dyn Worker>]) -> Result<Self, String> {
+        let toggle = workers
+            .iter()
+            .find_map(|worker| worker.metadata().labels.get(REASONING_TOGGLE_LABEL))
+            .map(|json| {
+                serde_json::from_str(json)
+                    .map_err(|e| format!("Invalid {REASONING_TOGGLE_LABEL} label {json}: {e}"))
+            })
+            .transpose()?;
+        Ok(Self { toggle })
+    }
 }
 
 /// The efforts ATOM's chat templates read (`VALID_TEMPLATE_EFFORTS` in
@@ -146,13 +170,14 @@ pub fn process_chat_messages(
 const ATOM_TEMPLATE_EFFORTS: [&str; 3] = ["low", "high", "max"];
 
 /// As `process_chat_messages`, with the request's template kwargs over `default_kwargs`;
-/// for an ATOM model (`atom`), its reasoning effort then over both as `thinking_effort`,
-/// as ATOM's HTTP chat applies it (`apply_reasoning_controls`).
+/// for an ATOM model (`atom`), its reasoning effort then over both as ATOM's HTTP chat
+/// applies it (`apply_reasoning_controls`): "none" switches the toggle off, an effort
+/// its templates read becomes `thinking_effort`.
 pub fn process_chat_messages_with_defaults(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     default_kwargs: Option<&HashMap<String, Value>>,
-    atom: bool,
+    atom: Option<&AtomChat>,
 ) -> Result<ProcessedMessages, String> {
     let any = tokenizer.as_any();
     let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
@@ -188,7 +213,7 @@ pub fn process_chat_messages_with_defaults(
 
     let mut combined_template_kwargs = default_kwargs.cloned().unwrap_or_default();
 
-    if let (false, Some(reasoning_effort)) = (atom, &request.reasoning_effort) {
+    if let (None, Some(reasoning_effort)) = (atom, &request.reasoning_effort) {
         combined_template_kwargs.insert(
             "reasoning_effort".to_string(),
             Value::String(reasoning_effort.clone()),
@@ -201,9 +226,14 @@ pub fn process_chat_messages_with_defaults(
         }
     }
     let effort = request.reasoning_effort.as_deref();
-    if let Some(effort) = effort.filter(|e| atom && ATOM_TEMPLATE_EFFORTS.contains(e)) {
-        let effort = Value::String(effort.to_string());
-        combined_template_kwargs.insert("thinking_effort".to_string(), effort);
+    if let (Some(atom), Some(effort)) = (atom, effort) {
+        if let (Some((name, off, _)), "none") = (&atom.toggle, effort) {
+            combined_template_kwargs.insert(name.clone(), off.clone());
+        }
+        if ATOM_TEMPLATE_EFFORTS.contains(&effort) {
+            let effort = Value::String(effort.to_string());
+            combined_template_kwargs.insert("thinking_effort".to_string(), effort);
+        }
     }
 
     let final_template_kwargs = if combined_template_kwargs.is_empty() {
