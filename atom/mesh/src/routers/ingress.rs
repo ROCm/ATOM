@@ -648,6 +648,7 @@ pub struct IngressRouting {
     chats_without_template: Arc<RwLock<HashSet<String>>>,
     pd: bool,
     tokenize_limits: TokenizeLimits,
+    prefill_on_decode_rank: bool,
 }
 
 impl IngressRouting {
@@ -659,6 +660,7 @@ impl IngressRouting {
             chats_without_template: app.chats_without_template.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             tokenize_limits: app.tokenize_limits,
+            prefill_on_decode_rank: app.router_config.prefill_on_decode_rank(),
         }
     }
 
@@ -795,6 +797,7 @@ impl IngressRouting {
             )),
             policies,
         )
+        .with_prefill_on_decode_rank(self.prefill_on_decode_rank)
     }
 
     pub(crate) fn candidates(

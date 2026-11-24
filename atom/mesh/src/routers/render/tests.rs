@@ -529,9 +529,9 @@ mod b2_chat_aggregator_branches {
         if let TokenChunk::Complete { meta, .. } = &mut complete {
             meta.cached_tokens = cached;
             meta.timing = timed.map(|(ttft_s, tpot_s, latency_s)| SeqTiming {
-                ttft_s,
-                tpot_s,
-                latency_s,
+                ttft: ttft_s,
+                tpot: tpot_s,
+                latency: latency_s,
             });
         }
         complete
@@ -1282,9 +1282,9 @@ mod c2_chat_streaming_branches {
         let mut meta = meta_plain();
         meta.cached_tokens = 2;
         meta.timing = timed.then_some(SeqTiming {
-            ttft_s: 0.1,
-            tpot_s: 0.01,
-            latency_s: 1.0,
+            ttft: 0.1,
+            tpot: 0.01,
+            latency: 1.0,
         });
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1],
@@ -1333,9 +1333,9 @@ mod c2_chat_streaming_branches {
         let mut meta = meta_plain();
         meta.cached_tokens = 2;
         meta.timing = Some(SeqTiming {
-            ttft_s: 0.1,
-            tpot_s: 0.01,
-            latency_s: 1.0,
+            ttft: 0.1,
+            tpot: 0.01,
+            latency: 1.0,
         });
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1],
@@ -3531,6 +3531,54 @@ mod e1_generate_streaming_body_content {
     async fn body_of(resp: axum::response::Response) -> String {
         let body = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
         String::from_utf8_lossy(&body).to_string()
+    }
+
+    #[tokio::test]
+    async fn test_generate_streaming_decodes_a_character_split_across_steps() {
+        use std::sync::Arc;
+
+        use crate::routers::{
+            prepare::stop_decoder_builder::create_stop_decoder,
+            test_mocks::tokenizer::byte_level_tokenizer_dir,
+        };
+        use crate::tokenizer::{huggingface::HuggingFaceTokenizer, traits::Tokenizer};
+
+        let dir = byte_level_tokenizer_dir(&[], false, serde_json::json!({}));
+        let path = dir.path().join("tokenizer.json");
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap());
+        let mut ctx = generate_ctx();
+        ctx.stop_decoder = create_stop_decoder(&tokenizer, None, None, true, false);
+        ctx.tokenizer = tokenizer;
+        // "你" is three bytes, one token each in a byte-level vocabulary; the
+        // engine hands over the first in one step and the rest in the next.
+        let ids: Vec<u32> = "你".bytes().map(u32::from).collect();
+        let partial = |token_ids: &[u32]| {
+            Ok(TokenChunk::Partial {
+                token_ids: token_ids.to_vec(),
+                logprobs: None,
+            })
+        };
+        let stream = synthetic_single_stream(vec![
+            partial(&ids[..1]),
+            partial(&ids[1..]),
+            Ok(TokenChunk::Complete {
+                token_ids: ids.clone(),
+                finish_reason: FinishReason::Stop,
+                matched_stop: None,
+                usage: Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 3,
+                    total_tokens: 4,
+                },
+                logprobs: None,
+                input_logprobs: None,
+                meta: meta(),
+            }),
+        ]);
+        let s = body_of(generate_streaming::process(stream, ctx, "regular")).await;
+        assert!(s.contains("\"text\":\"你\""), "{s}");
+        assert!(!s.contains('\u{FFFD}'), "{s}");
     }
 
     #[tokio::test]

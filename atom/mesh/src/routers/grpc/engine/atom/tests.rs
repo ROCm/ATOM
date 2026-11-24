@@ -16,6 +16,7 @@ use tonic::transport::{server::TcpIncoming, Server};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::request::generate_request;
+use super::AtomClient;
 use crate::atom_engine::grpc::{
     atom_engine_server::{AtomEngine, AtomEngineServer},
     generate_response, AbortRequest, AbortResponse, Frames, GenerateComplete, GenerateError,
@@ -51,6 +52,7 @@ struct FakeAtom {
     stall_server_info: bool,
     /// GetServerInfo calls, each answered after 100 ms.
     server_info_reads: std::sync::atomic::AtomicUsize,
+    chat_template: Option<String>,
 }
 
 impl FakeAtom {
@@ -98,6 +100,7 @@ impl AtomEngine for FakeAtom {
             max_context_length: 4096,
             eos_token_ids: vec![2, 7],
             usage_on_finish: true,
+            chat_template: self.chat_template.clone(),
             ..Default::default()
         }))
     }
@@ -403,9 +406,9 @@ async fn a_stream_becomes_token_chunks_in_order() {
     );
     assert_eq!((counts, meta.cached_tokens), ((3, 3, 6), 2));
     let timing = SeqTiming {
-        ttft_s: 0.25,
-        tpot_s: 0.125,
-        latency_s: 0.5,
+        ttft: 0.25,
+        tpot: 0.125,
+        latency: 0.5,
     };
     assert_eq!(meta.timing, Some(timing));
 
@@ -421,6 +424,26 @@ async fn a_stream_becomes_token_chunks_in_order() {
         ),
         "{cut:?}"
     );
+}
+
+#[tokio::test]
+async fn a_reply_past_4_mib_reaches_the_router() {
+    let ids = vec![1 << 22; 1 << 20]; // 4-byte varints: 4 MiB and more
+    let fake = Arc::new(FakeAtom {
+        scripts: Mutex::new(vec![vec![complete(&ids, "max_tokens")]].into()),
+        chat_template: Some("x".repeat(5 << 20)),
+        ..Default::default()
+    });
+    let url = serve(fake).await;
+
+    let whole = collect(&single(atom_worker(&url)), false).await;
+    assert!(
+        matches!(&whole[..], [Ok(TokenChunk::Complete { token_ids, .. })] if *token_ids == ids),
+        "the 4 MiB Complete failed its call"
+    );
+    let client = AtomClient::connect(&url).await.unwrap();
+    let info = client.get_model_info().await.unwrap();
+    assert_eq!(info.chat_template.map(|t| t.len()), Some(5 << 20));
 }
 
 /// `complete`, answering sibling `index`.

@@ -53,16 +53,30 @@ class _ExtendMode:
 
 
 class _MambaPool:
+    """One mamba layer; per-layer views are taken from the pool's state
+    tensors, as SGLang's `MambaPool.State.at_layer_idx` does."""
+
     def __init__(self, temporal):
-        self.mamba_map = {0: None}
-        self._cache = SimpleNamespace(conv=[torch.zeros(2, 4)], temporal=temporal)
+        self.mamba_map = {0: 0}
+        self.mamba_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(
+                conv=[torch.zeros(1, 2, 4)], temporal=temporal[None]
+            )
+        )
 
     @staticmethod
     def get_mamba_indices(req_pool_indices):
         return req_pool_indices
 
+    def mamba2_layer_index(self, layer_id):
+        return self.mamba_map[layer_id]
+
     def mamba2_layer_cache(self, layer_id):
-        return self._cache
+        state = self.mamba_pool.mamba_cache
+        index = self.mamba2_layer_index(layer_id)
+        return SimpleNamespace(
+            conv=[state.conv[0][index]], temporal=state.temporal[index]
+        )
 
 
 def _qwen4_impl(monkeypatch):
@@ -106,7 +120,8 @@ def test_ring_keeps_the_raw_checkpoint_and_runs_flydsl_prefill(monkeypatch, repl
     state = caches["layer_0"].v_cache
     if replayssm:
         # The tensor `_verify_replayssm` replays, untransposed.
-        assert state is temporal and state.is_contiguous()
+        assert state.data_ptr() == temporal.data_ptr()
+        assert state.shape == temporal.shape and state.is_contiguous()
     else:
         assert state.data_ptr() == temporal.data_ptr()
         assert state.stride()[-2:] == (1, 128)

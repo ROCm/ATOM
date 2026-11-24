@@ -124,7 +124,6 @@ impl AtomOutput {
 }
 
 impl Pipeline {
-    #[cfg(test)]
     pub(crate) fn with_injected(
         planner: Arc<dyn PdPlanner>,
         engine: Arc<dyn Dispatcher>,
@@ -232,20 +231,35 @@ impl Pipeline {
         model_id: Option<String>,
         components: Arc<AppContext>,
     ) -> Response {
-        self.execute_chat_declaring(req, None, None, headers, model_id, components)
+        self.execute_chat_with(req, headers, model_id, components, None)
             .await
     }
 
-    /// `execute_chat`, with the tools its messages declare and its `thinking` control
-    /// read from its raw body.
-    pub async fn execute_chat_declaring(
+    /// `execute_chat`, with the prompt `rendered` outside the router when it
+    /// is given (`prepare::prepare_chat_with`).
+    pub async fn execute_chat_with(
         &self,
         req: Arc<ChatCompletionRequest>,
-        message_tools: Option<MessageTools>,
-        thinking: Option<serde_json::Value>,
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<AppContext>,
+        rendered: Option<prepare::RenderedChat>,
+    ) -> Response {
+        let declared = (None, None);
+        self.execute_chat_declaring(req, declared, headers, model_id, components, rendered)
+            .await
+    }
+
+    /// `execute_chat_with`, with the tools its messages declare and its `thinking`
+    /// control read from its raw body.
+    pub async fn execute_chat_declaring(
+        &self,
+        req: Arc<ChatCompletionRequest>,
+        (message_tools, thinking): (Option<MessageTools>, Option<serde_json::Value>),
+        headers: Option<HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<AppContext>,
+        rendered: Option<prepare::RenderedChat>,
     ) -> Response {
         let start = Instant::now();
         let model = req.model.clone();
@@ -266,6 +280,8 @@ impl Pipeline {
             headers,
             model_id,
             &components,
+            rendered,
+            self.atom_output.is_some(),
         ) {
             Ok(t) => t,
             Err(e) => return self.record_chat_err(&model, start, e),

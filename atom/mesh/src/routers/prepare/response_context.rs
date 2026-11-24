@@ -55,6 +55,9 @@ pub struct ResponseContext {
     pub usage_on_finish: bool,
 }
 
+/// The opener a `<think>` template's generation prompt can end on.
+pub const THINK_OPEN: &str = "<think>";
+
 /// ATOM's `prompt_starts_in_reasoning`: the marker among `markers` (GetModelInfo's
 /// `reasoning_open_markers`) that the prompt, trailing whitespace aside, ends with.
 pub fn prompt_opener(prompt: &str, markers: &[String]) -> Option<String> {

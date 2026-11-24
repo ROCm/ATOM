@@ -15,7 +15,7 @@ use crate::protocols::{
     responses::ResponsesRequest,
 };
 
-pub mod atom_standalone;
+pub mod atom_bridge;
 pub mod comm;
 pub mod factory;
 pub mod grpc;

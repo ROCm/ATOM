@@ -59,9 +59,9 @@ impl AtomUsage {
                     })
                 }
                 Some(u) => {
-                    u.timing.ttft_s = u.timing.ttft_s.max(timing.ttft_s);
-                    u.timing.tpot_s = u.timing.tpot_s.max(timing.tpot_s);
-                    u.timing.latency_s = u.timing.latency_s.max(timing.latency_s);
+                    u.timing.ttft = u.timing.ttft.max(timing.ttft);
+                    u.timing.tpot = u.timing.tpot.max(timing.tpot);
+                    u.timing.latency = u.timing.latency.max(timing.latency);
                     u.choices += 1;
                 }
             }
@@ -86,7 +86,7 @@ impl AtomUsage {
         let (Some(timing), Some(info)) = (meta.timing, meta_info.as_object_mut()) else {
             return;
         };
-        let values = [timing.ttft_s, timing.tpot_s, timing.latency_s];
+        let values = [timing.ttft, timing.tpot, timing.latency];
         for (key, value) in TIMING_KEYS.into_iter().zip(values) {
             info.insert(key.into(), json!(value));
         }
@@ -102,9 +102,9 @@ impl AtomUsage {
                 Some(WorkerMeta {
                     cached_tokens: field("cached_tokens").unwrap_or(0.0) as u32,
                     timing: Some(SeqTiming {
-                        ttft_s: ttft_s?,
-                        tpot_s: tpot_s?,
-                        latency_s: latency_s?,
+                        ttft: ttft_s?,
+                        tpot: tpot_s?,
+                        latency: latency_s?,
                     }),
                     ..Default::default()
                 })
@@ -136,9 +136,9 @@ impl AtomUsage {
             );
         }
         if fields.timing {
-            usage.insert("ttft_s".into(), json!(round4(self.timing.ttft_s)));
-            usage.insert("tpot_s".into(), json!(round4(self.timing.tpot_s)));
-            usage.insert("latency_s".into(), json!(round4(self.timing.latency_s)));
+            usage.insert("ttft_s".into(), json!(round4(self.timing.ttft)));
+            usage.insert("tpot_s".into(), json!(round4(self.timing.tpot)));
+            usage.insert("latency_s".into(), json!(round4(self.timing.latency)));
             if self.choices > 1 {
                 usage.insert("num_choices".into(), json!(self.choices));
             }

@@ -55,8 +55,8 @@ async fn do_grpc_health_check(
         .await
         .map_err(|_| "gRPC health check timeout".to_string())?
         .map_err(|e| format!("gRPC health check failed: {}", e))?;
-    // As an HTTP worker's /health must answer 2xx.
-    if !health.healthy {
+    // An ATOM worker's must say healthy, as an HTTP worker's /health must answer 2xx.
+    if runtime_type == "atom" && !health.healthy {
         return Err(format!("gRPC health check: unhealthy: {}", health.message));
     }
 

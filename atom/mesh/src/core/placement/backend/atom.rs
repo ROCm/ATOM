@@ -1,10 +1,13 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+use dashmap::DashSet;
 
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::super::planner::{idx2idx, Idx2Idx};
 use super::super::types::AdapterError;
 use super::{BackendAdapter, PairCtx};
 use crate::config::types::AtomPdRankMappingPolicy;
@@ -237,32 +240,30 @@ fn map_atom_prefill_idx2idx(
     prefill: Arc<dyn Worker>,
     decode: &Arc<dyn Worker>,
 ) -> Arc<dyn Worker> {
-    let (Some(prefill_dp_size), Some(decode_dp_rank)) = (prefill.dp_size(), decode.dp_rank())
-    else {
-        debug!(
-            "ATOM PD rank mapping policy=idx2idx skipped: prefill={} prefill_dp_size={:?} decode={} decode_dp_rank={:?}",
-            prefill.url(),
-            prefill.dp_size(),
-            decode.url(),
-            decode.dp_rank()
-        );
-        return prefill;
+    let decode_dp_rank = match idx2idx(prefill.as_ref(), decode.as_ref()) {
+        Idx2Idx::Move(rank) => rank,
+        Idx2Idx::Keep => {
+            debug!(
+                "ATOM PD rank mapping policy=idx2idx keeps prefill={} decode={}",
+                prefill.url(),
+                decode.url()
+            );
+            return prefill;
+        }
+        Idx2Idx::OutOfRange { rank, size } => {
+            // A deployment fault rather than a request's: warn once per prefill.
+            static WARNED: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+            if WARNED.insert(prefill.base_url().to_string()) {
+                warn!(
+                    "ATOM PD rank mapping policy=idx2idx: decode rank {} is outside prefill {} dp_size {}, so its ranks are not mapped; check the prefill and decode DP sizes",
+                    rank,
+                    prefill.base_url(),
+                    size
+                );
+            }
+            return prefill;
+        }
     };
-
-    if decode_dp_rank >= prefill_dp_size {
-        warn!(
-            "ATOM PD rank mapping policy=idx2idx skipped: decode rank {} is outside prefill dp_size {} (prefill={}, decode={})",
-            decode_dp_rank,
-            prefill_dp_size,
-            prefill.url(),
-            decode.url()
-        );
-        return prefill;
-    }
-
-    if prefill.dp_rank() == Some(decode_dp_rank) {
-        return prefill;
-    }
 
     let mapped_url = format!("{}@{}", prefill.base_url(), decode_dp_rank);
     match worker_registry.get_by_url(&mapped_url) {
