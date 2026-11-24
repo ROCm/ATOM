@@ -510,15 +510,20 @@ def test_nvfp4_attention_fp8_output_is_bf16_then_quant(phase, rows, pad, monkeyp
 
 
 @gfx1250_only
-@pytest.mark.parametrize("phase", ["decode", "prefill"])
+@pytest.mark.parametrize("hkv", [1, 4], ids=["hkv1", "hkv4"])
+@pytest.mark.parametrize("phase", ["decode", "prefill", "prefill-reuse"])
 @pytest.mark.parametrize("rows, pad", [(8, 0), (64, 0), (37, 11), (512, 0), (2048, 3)])
-def test_nvfp4_attention_mxfp8_output_is_bf16_then_quantize_fp8(phase, rows, pad):
+def test_nvfp4_attention_mxfp8_output_is_bf16_then_quantize_fp8(
+    phase, rows, pad, hkv, monkeypatch
+):
     """o_proj's MXFP8 input from the attention (ATOM_MINIMAX_M3_PA_MXFP8_OUT)
     equals the split path it replaces bit for bit: the BF16-only attention, then
     o_proj's own ``quantize_fp8``. The MXFP8 output keeps the BF16 call's split
     (aiter writes it in every output mode), so the oracle is the BF16-only call
     itself, not a re-split one. A padded bucket's extra rows are FP8 zeros with
-    E8M0 1.0 scales."""
+    E8M0 1.0 scales. ``hkv`` 4: PP4 x TP1's 64 query heads over 4 KV heads a GPU,
+    the (row, kv head) sequences writing the row-major ``[rows, 64 * D]``
+    activation. ``prefill-reuse``: with ATOM_M3_SPARSE_PREFILL_REUSE."""
     from aiter import dtypes
 
     from atom.model_ops.blockscale import quantize_fp8
@@ -530,32 +535,42 @@ def test_nvfp4_attention_mxfp8_output_is_bf16_then_quantize_fp8(phase, rows, pad
     )
 
     torch.manual_seed(11)
-    blocks, topk, maxb = 4096, 16, 48
-    stage = torch.randn(blocks, 2, PAGE, 1, D, device=DEV).to(torch.bfloat16)
-    kp = torch.zeros(blocks, 1, PAGE, D // 2, dtype=torch.uint8, device=DEV)
-    ks = torch.zeros(blocks, 1, PAGE, D // 16, dtype=torch.uint8, device=DEV)
+    reuse = phase == "prefill-reuse"
+    monkeypatch.setenv("ATOM_M3_SPARSE_PREFILL_REUSE_MIN_ROWS", "1")
+    # The image's aiter pads the reuse kernel's MXFP8 bucket for one kv head
+    # only, so with more the MXFP8 prefill runs the paged decode (sparse_attn_nvfp4):
+    # its oracle is that kernel's BF16 output.
+    monkeypatch.setenv("ATOM_M3_SPARSE_PREFILL_REUSE", str(int(reuse and hkv == 1)))
+    blocks, topk, maxb, heads = 4096 // hkv, 16, 48, 16 * hkv
+    stage = torch.randn(blocks, 2, PAGE, hkv, D, device=DEV).to(torch.bfloat16)
+    kp = torch.zeros(blocks, hkv, PAGE, D // 2, dtype=torch.uint8, device=DEV)
+    ks = torch.zeros(blocks, hkv, PAGE, D // 16, dtype=torch.uint8, device=DEV)
     vp, vs = torch.zeros_like(kp), torch.zeros_like(ks)
     kv_nvfp4_store(stage, torch.arange(blocks * PAGE, device=DEV), kp, ks, vp, vs)
     seq = torch.randint(PAGE, maxb * PAGE, (rows,), dtype=torch.int32, device=DEV)
     bt = torch.randint(0, blocks, (rows, maxb), dtype=torch.int32, device=DEV)
     row_req, row_seq = decode_rows(seq, rows, 1)
     n = (row_seq + PAGE - 1) // PAGE
-    idx = (torch.rand(1, rows, topk, device=DEV) * (n[None, :, None] - 1)).int()
-    idx[0, :, topk - 1] = n - 1
-    q = torch.randn(rows, 16, D, device=DEV).to(torch.bfloat16)
+    # Each kv head its own selection.
+    idx = (torch.rand(hkv, rows, topk, device=DEV) * (n[None, :, None] - 1)).int()
+    idx[:, :, topk - 1] = n - 1
+    q = torch.randn(rows, heads, D, device=DEV).to(torch.bfloat16)
     q[:, ::5] *= 16  # heads of very different output magnitude
     table = nvfp4_page_table(idx, bt, row_req, row_seq)
     args = (q, kp, ks, vp, vs, idx, bt, row_req, row_seq, D**-0.5)
-    bf16_only = nvfp4_sparse_attention(*args, page_table=table)
+    direct = phase != "decode"
+    bf16_only = nvfp4_sparse_attention(*args, page_table=table, quantized_direct=direct)
     ref_q, ref_s = quantize_fp8(bf16_only.view(rows, -1))
+    monkeypatch.setenv("ATOM_M3_SPARSE_PREFILL_REUSE", str(int(reuse)))
 
-    fp8 = torch.full((rows + pad, 16 * D), 0x7F, dtype=torch.uint8, device=DEV)
+    fp8 = torch.full((rows + pad, heads * D), 0x7F, dtype=torch.uint8, device=DEV)
     fp8 = fp8.view(dtypes.fp8)
-    scales = torch.full((rows + pad, 16 * D // 32), 0xFF, dtype=torch.uint8, device=DEV)
-    scales = scales.view(torch.float8_e8m0fnu)
+    scales = torch.full(
+        (rows + pad, heads * D // 32), 0xFF, dtype=torch.uint8, device=DEV
+    ).view(torch.float8_e8m0fnu)
     nvfp4_sparse_attention(
         *args, page_table=table, quantized_output=fp8, output_scale=scales,
-        quantized_direct=phase == "prefill",
+        quantized_direct=direct,
     )  # fmt: skip
     torch.cuda.synchronize()
     assert torch.equal(fp8[:rows].view(torch.uint8), ref_q.view(torch.uint8))
