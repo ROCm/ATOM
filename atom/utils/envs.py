@@ -1111,6 +1111,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp32 split-K partials summed in a fixed order (deterministic, bf16-rounding-different from
     # hipBLASLt), one extra fc weight copy per rank. Default off.
     "ATOM_DSPARK_FC_RING": lambda: os.getenv("ATOM_DSPARK_FC_RING", "0").lower() == "1",
+    # LM head shard GEMM at 1..128 rows (decode / draft / verify steps) on aiter's
+    # gfx950 small-M BF16 ring GEMM (aiter.ops.flydsl.gemm_a16w16_ring) instead of
+    # tgemm: deterministic fp32-accumulated logits (hipBLASLt-different summation order), one
+    # extra shard copy per rank, taken once at load (not refreshed by an online
+    # weight sync). Default off.
+    "ATOM_LM_HEAD_RING": lambda: os.getenv("ATOM_LM_HEAD_RING", "0").lower() == "1",
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
