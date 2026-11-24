@@ -26,7 +26,8 @@ config to the MHA backend, which owns a pool laid out like the target's and
 binds it onto each layer's ``KVCacheBinding``. Both writes -- context rows and the
 block's own rows -- go through ``triton_fused_norm_rope_cache`` with an explicit
 slot mapping, the kernel the target's dense layers use for the same norm, RoPE
-and per-token fp8 cache format.
+and per-token fp8 cache format. A TP1 rank writes every layer's context rows in one
+stacked K/V GEMM and one launch of the same math instead (``dspark_ctx_kv``).
 
 The block attention is ``B * T`` independent q_len=1 paged decode rows --
 non-causal by construction -- over each request's ``[context | block]``,
@@ -51,6 +52,7 @@ Checkpoint layout (``<draft>/dspark``, MXFP8 [1, 32] linears, BF16 rest):
 The draft ships no embedding or LM head; both are the target's.
 """
 
+import logging
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -63,6 +65,11 @@ from atom.config import QuantizationConfig
 from atom.kv_transfer.disaggregation import kv_config_has_producer
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
+from atom.model_ops.minimax_m3.dspark_ctx_kv import (
+    CtxKvWriter,
+    ctx_kv_gemm,
+    stack_kv_rows,
+)
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
     PAGES_PER_SPARSE_BLOCK,
@@ -83,6 +90,8 @@ from atom.models.dspark_draft import (
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
 from atom.utils.forward_context import get_forward_context
+
+logger = logging.getLogger("atom")
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -457,6 +466,63 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         # first call.
         self.max_num_seqs = atom_config.max_num_seqs
         self._bt16 = None
+        # (layer 0's k cache address, what `_build_fused_ctx_kv` built for it)
+        self._ctx_kv = None
+
+    def write_context_rows(self, ctx_hidden, positions, slot_mapping) -> None:
+        """Every layer's context K/V in one GEMM over the stacked K/V weight rows and
+        one cache write, the q columns never computed; else layer by layer."""
+        cache = self.layers[0].self_attn._bound_cache()
+        fused = self._fused_ctx_kv(cache)
+        if fused is not None:
+            weight, scale, qkv_rows, writer = fused
+            kv = ctx_kv_gemm(ctx_hidden, weight, scale, qkv_rows)
+            if kv is not None:
+                writer(kv, positions, slot_mapping, cache)
+                return
+        super().write_context_rows(ctx_hidden, positions, slot_mapping)
+
+    def _fused_ctx_kv(self, cache):
+        """`_build_fused_ctx_kv`'s result for the pool ``cache`` is in, built once per
+        pool address."""
+        if cache is None:
+            return None
+        key = cache[0].data_ptr()
+        if self._ctx_kv is None or self._ctx_kv[0] != key:
+            self._ctx_kv = (key, self._build_fused_ctx_kv())
+        return self._ctx_kv[1]
+
+    def _build_fused_ctx_kv(self):
+        """(stacked K/V weight, its scale, qkv rows, writer), or None where the layers
+        do not take it: measured at TP1 on native MXFP8 weights and an fp8 cache."""
+        attns = [layer.self_attn for layer in self.layers]
+        first = attns[0]
+        if get_tensor_model_parallel_world_size() != 1 or first.kv_cache_dtype != "fp8":
+            return None
+        for attn in attns:
+            weight = attn.qkv_proj.weight
+            if (
+                attn.qkv_proj.native_a8_group_rows != 1
+                or weight.dtype != torch.float8_e4m3fn
+                or not getattr(weight, "is_shuffled", False)
+            ):
+                return None
+        try:
+            writer = CtxKvWriter(
+                [a._bound_cache() for a in attns],
+                [a.k_norm.weight for a in attns],
+                first.rotary_emb,
+                first.k_norm.variance_epsilon,
+            )
+        except ValueError as exc:
+            logger.warning(f"DSpark context K/V written layer by layer: {exc}")
+            return None
+        weight, scale = stack_kv_rows(
+            [a.qkv_proj.weight.data for a in attns],
+            [a.qkv_proj.weight_scale.data for a in attns],
+            slice(first.q_size, first.q_size + 2 * first.kv_size),
+        )
+        return weight, scale, first.qkv_proj.weight.shape[0], writer
 
     # ---- drafting entry points (called by the proposer) --------------------
 
