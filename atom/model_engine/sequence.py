@@ -451,6 +451,10 @@ class Sequence:
         # move together through admission and load. Grouped so a joint reset
         # cannot forget a field; see `OffloadJointRecord`.
         self.offload_joint = OffloadJointRecord()
+        # The HBM prefix hit, in tokens, as admission probed it before the tier
+        # lookup: where a lookup starts for a tier that holds what HBM evicted
+        # (`needs_hbm_probe_before_lookup`).
+        self.offload_hbm_probe_tokens = 0
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

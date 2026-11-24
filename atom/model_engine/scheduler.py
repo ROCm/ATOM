@@ -2304,14 +2304,27 @@ class Scheduler:
             hbm_probe = None
             probed_tier_kv = (0, 0)
             lookup_detachable = False
-            if (
+            detach = (
                 not remote_ready_for_decode
                 and not offload_resume
                 and self._lookup_detach_enabled(seq)
+            )
+            # A tier that holds what HBM evicted is asked only past the HBM hit
+            # (`needs_hbm_probe_before_lookup`), so that is probed first too.
+            if detach or (
+                not remote_ready_for_decode
+                and not offload_resume
+                and self._connector_flag("needs_hbm_probe_before_lookup")
             ):
                 hbm_probe = self._probe_hbm_prefix(seq)
+                seq.offload_hbm_probe_tokens = (
+                    max(0, hbm_probe.num_cached_blocks)
+                    * self.block_manager.hash_block_size
+                )
                 probed_tier_kv = self._tier_hit(seq)
-                lookup_detachable = self._can_detach_tier_lookup(seq, hbm_probe)
+                lookup_detachable = detach and self._can_detach_tier_lookup(
+                    seq, hbm_probe
+                )
             if (
                 not remote_ready_for_decode
                 and not offload_resume
