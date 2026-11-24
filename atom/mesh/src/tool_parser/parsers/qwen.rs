@@ -345,32 +345,37 @@ mod coder {
                 return Ok((text.to_string(), vec![]));
             }
 
-            let start = match self.bare_calls {
-                // Text ends where the first call does (a wrapped one at its wrapper); a
-                // `<function=` or `<tool_call>` prose quotes does not end it.
-                true => self.extractor.find(text).map(|first| first.start()),
-                false => text.find(self.tool_call_start_token),
-            };
-            let Some(start) = start else {
-                return Ok((text.to_string(), vec![]));
-            };
-            let normal_text = text[..start].to_string();
-            let mut parsed = Vec::new();
+            let tool_indices = helpers::get_tool_indices(tools);
+            let (mut first, mut parsed) = (None, Vec::new());
             for captures in self.extractor.captures_iter(text) {
-                if let Some(content) = captures.get(1).or_else(|| captures.get(2)) {
-                    match self.parse_xml_format(content.as_str().trim(), tools) {
-                        Ok(Some(tool)) => parsed.push(tool),
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!("Failed to parse XML tool call: {:?}", error);
-                        }
+                let Some(content) = captures.get(1).or_else(|| captures.get(2)) else {
+                    continue;
+                };
+                match self.parse_xml_format(content.as_str().trim(), tools) {
+                    // A bare call names a declared tool, as when streamed; else it is text.
+                    Ok(Some(tool))
+                        if captures.get(1).is_some()
+                            || tool_indices.contains_key(&tool.function.name) =>
+                    {
+                        first.get_or_insert(captures.get(0).unwrap().start());
+                        parsed.push(tool);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!("Failed to parse XML tool call: {:?}", error);
                     }
                 }
             }
-            if parsed.is_empty() {
-                return Ok((text.to_string(), vec![]));
+            let start = match self.bare_calls {
+                // Text ends where the first call does (a wrapped one at its wrapper); a
+                // `<function=` or `<tool_call>` prose quotes does not end it.
+                true => first,
+                false => text.find(self.tool_call_start_token),
+            };
+            match (start, parsed.is_empty()) {
+                (Some(start), false) => Ok((text[..start].to_string(), parsed)),
+                _ => Ok((text.to_string(), vec![])),
             }
-            Ok((normal_text, parsed))
         }
 
         /// Where the first call in `text` starts, and whether it is a bare `<function=...>`.
@@ -827,6 +832,24 @@ mod coder {
             let mut text: String = read.iter().map(|result| &*result.normal_text).collect();
             text.push_str(&parser.end_of_input_text());
             (text, calls)
+        }
+
+        /// A bare call naming no declared tool is text, unary as streamed.
+        #[tokio::test]
+        async fn a_bare_call_naming_no_declared_tool_is_text() {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function", "function": {"name": "get_weather", "parameters": {}},
+            }))
+            .unwrap();
+            let reply = "The format is <function=YOUR FUNCTION NAME></function>.";
+            let mut parser = QwenCoderParser::new();
+            parser.read_as_atom();
+            let unary = parser.parse_complete_with_tools(reply, &[tool]).await;
+            let (text, calls) = unary.unwrap();
+            assert_eq!((text.as_str(), calls.len()), (reply, 0));
+            for size in 1..=9 {
+                assert_eq!(stream(reply, size).await, (reply.to_string(), 0));
+            }
         }
 
         /// Text a parser holds at end of input as a call's possible start, and that never

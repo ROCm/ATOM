@@ -4989,6 +4989,14 @@ mod h_atom_native_tool_calls {
         }
     }
 
+    /// A bare qwen_xml call naming no declared tool is text, unary as streamed.
+    #[tokio::test]
+    async fn a_bare_qwen_call_naming_no_declared_tool_is_text() {
+        let reply = "The format is <function=YOUR FUNCTION NAME></function>.";
+        let text = (reply.to_string(), String::new());
+        assert_eq!(read_qwen_xml(reply, true).await, [text.clone(), text]);
+    }
+
     /// A MiniMax-M3 call cut off inside a parameter keeps its value, as ATOM's HTTP
     /// parser does at end of input.
     #[tokio::test]
