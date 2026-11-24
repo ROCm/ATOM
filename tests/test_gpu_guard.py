@@ -41,6 +41,24 @@ def test_scan_maps_visible_gpus(kfd):
     assert gpu_guard.scan(gpus) == {10: {2: 200 << 30}, 13: {3: 2 << 20}}
 
 
+def test_visible_gpus_follow_rocr_uuids(kfd, monkeypatch):
+    # unique ids per GPU node (node 0 is the CPU): ROCR_VISIBLE_DEVICES=GPU-<hex>
+    uids = [0xA1, 0xB2, 0xC3, 0xD4]
+    for i, uid in enumerate(uids, start=1):
+        (kfd / "topology" / "nodes" / str(i) / "properties").write_text(
+            f"cpu_cores_count 0\nunique_id {uid}\n"
+        )
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES")
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "GPU-d4,GPU-00000000000000C3")
+    assert gpu_guard.visible_gpus() == [3, 2]
+    # HIP indices count within what ROCr leaves visible
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1")
+    assert gpu_guard.visible_gpus() == [2]
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0,1")
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES")
+    assert gpu_guard.visible_gpus() == [0, 1]
+
+
 def test_guard_reports_newcomer_until_it_leaves(kfd):
     _proc(kfd, 10, {333: 200 << 30})
     _proc(kfd, 11, {444: 200 << 30})

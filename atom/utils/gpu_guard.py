@@ -51,14 +51,70 @@ def kfd_gpu_ids() -> list[int]:
     return [i for i in ids if i]
 
 
+def _kfd_unique_ids() -> list[int]:
+    """Each GPU's ``unique_id`` (``ROCR_VISIBLE_DEVICES=GPU-<hex>``), in
+    ``kfd_gpu_ids`` order; 0 where a node does not report one."""
+    nodes = f"{KFD}/topology/nodes"
+    try:
+        names = sorted(os.listdir(nodes), key=int)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for n in names:
+        if not _read_int(f"{nodes}/{n}/gpu_id"):
+            continue
+        uid = 0
+        try:
+            with open(f"{nodes}/{n}/properties") as f:
+                for line in f:
+                    key, _, value = line.partition(" ")
+                    if key == "unique_id":
+                        uid = int(value.strip() or 0)
+        except (OSError, ValueError):
+            pass
+        out.append(uid)
+    return out
+
+
+def _rocr_visible() -> list[int] | None:
+    """Physical indices ROCR_VISIBLE_DEVICES leaves visible (indices or
+    ``GPU-<unique id hex>``), in its order; None when it is unset."""
+    raw = os.environ.get("ROCR_VISIBLE_DEVICES", "").strip()
+    if not raw:
+        return None
+    uids = None
+    out = []
+    for tok in (t.strip() for t in raw.split(",")):
+        if tok.isdigit():
+            out.append(int(tok))
+        elif tok[:4].upper() == "GPU-":
+            if uids is None:
+                uids = _kfd_unique_ids()
+            try:
+                want = int(tok[4:], 16)
+            except ValueError:
+                continue
+            if want in uids:
+                out.append(uids.index(want))
+    return out
+
+
 def visible_gpus() -> list[int]:
-    """Physical indices of this process's GPUs (HIP_VISIBLE_DEVICES, else
-    CUDA_VISIBLE_DEVICES, else every GPU)."""
+    """Physical indices of this process's GPUs: ROCR_VISIBLE_DEVICES (else every
+    GPU), narrowed by HIP_VISIBLE_DEVICES, else CUDA_VISIBLE_DEVICES, which
+    index into what ROCr leaves visible."""
+    base = _rocr_visible()
+    if base is None:
+        base = list(range(len(kfd_gpu_ids())))
     for var in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
         raw = os.environ.get(var, "").strip()
         if raw:
-            return [int(x) for x in raw.split(",") if x.strip().isdigit()]
-    return list(range(len(kfd_gpu_ids())))
+            return [
+                base[int(x)]
+                for x in raw.split(",")
+                if x.strip().isdigit() and int(x) < len(base)
+            ]
+    return base
 
 
 def scan(gpus: dict[int, int], min_vram: int = _MIN_VRAM) -> dict[int, dict[int, int]]:
