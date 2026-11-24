@@ -536,13 +536,19 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         )
         if prompt is None:
             raise ValueError("prompt_token_ids is required")
+        buffer = self.steps.callback(session.put, session.flush)
+
+        def stream_callback(output: RequestOutput) -> None:
+            # Timed as the engine delivers it, as Generate times its outputs.
+            buffer((output, time.time()))
+
         preprocessing = asyncio.get_running_loop().run_in_executor(
             None,
             partial(
                 api.engine.io_processor.preprocess,
                 prompt,
                 params,
-                stream_callback=self.steps.callback(session.put, session.flush),
+                stream_callback=stream_callback,
                 kv_transfer_params=api._engine_kv_transfer_params(kv_transfer_params),
                 data_parallel_rank=request.data_parallel_rank,
                 dp_session_id=request.dp_session_id,
