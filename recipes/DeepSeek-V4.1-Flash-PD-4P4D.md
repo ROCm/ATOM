@@ -7,11 +7,26 @@ Both run TP4 with DP attention and EP4 (DEP4). The workload uses FP8 KV, an
 FP4 index plane, DSpark with five speculative tokens, prefix caching, and a
 Mooncake Store as the P-side KV offload tier.
 
-Compared with the earlier 4P4D configuration, this one cuts mean TTFT from
-3.74 s to 1.07-1.24 s (-67 to -71%). ITL improves from 6.91 to 6.37 ms, and
-output throughput rises from 6,644 to about 7,390 tok/s (+11%). The commands
-change only configuration. They do not need code patches beyond two upstream
-PRs that are still open (see [Dependencies](#dependencies)).
+Compared with the earlier 4P4D configuration, the base of this recipe (E14a)
+cuts mean TTFT from 3.74 s to 1.07-1.24 s (-67 to -71%). ITL improves from
+6.91 to 6.37 ms, and output throughput rises from 6,644 to about 7,390 tok/s
+(+11%).
+
+The best configuration adds five opt-in settings on top of E14a:
+
+- MegaMoE on D (`--moe-backend mega`).
+- `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20` on P.
+- `ATOM_PD_EARLY_HANDOFF=1` on P.
+- `ATOM_DP_IDLE_WHEN_BLOCKED=1` on P.
+- Denser decode cudagraph capture sizes on D.
+
+With these on the slower host, mean TTFT is 0.916 s (P50 0.522 s), down from
+1.198 s for E14a on that host. Outside the arrival burst the mean is 0.563 s.
+ITL and throughput stay flat. See [Best configuration](#best-configuration)
+and [Results](#results).
+
+The commands change only configuration, but several of the settings depend on
+upstream PRs that are still open (see [Dependencies](#dependencies)).
 
 The comparison with a single 8-GPU DEP8 instance is mixed. A fair version of
 that single instance also uses MegaMoE with 16K chunks and a warm JIT cache,
@@ -28,6 +43,11 @@ output throughput per GPU. See [Results](#results).
 | 3 | P | `--long-prefill-token-threshold 8192` | A long prompt takes at most 8K tokens per step and no longer blocks short prompts behind it. Time from P receiving a request to its first forward fell to 0.42-0.59 s, and P90 TTFT fell from 3.2 to 1.5 s. |
 | 4 | P, D | `ATOM_ENABLE_PREFILL_DELAYER=0` | Combined with item 2 at 16K, TTFT fell from 3.74 to 2.84 s. |
 | 5 | Store | Mooncake Store on the same host as P/D (optional) | About -2%, within noise. A remote Store works the same way. |
+| 6 | D | `--moe-backend mega` (E19 = E14a + items 6 and 7) | ITL fell from 6.37 to 5.88 ms on Host A, and throughput rose to 7,572 tok/s. |
+| 7 | P | `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20` (needs ATOM #3772) | The first forward waits up to 20 ms for a Store load already in flight, instead of recomputing the prefix. |
+| 8 | P | `ATOM_PD_EARLY_HANDOFF=1` (needs ATOM #3773) | P answers the router as soon as it has dispatched the request, so D allocates and pulls KV while P computes. Time from P finish to first token fell from 0.309 to 0.136 s. **Use only with a single P instance** (see [Caveats](#caveats)). |
+| 9 | P | `ATOM_DP_IDLE_WHEN_BLOCKED=1` (needs the T1 PR) | A DP rank whose only work is waiting on a Store lookup or load, or on a KV send, no longer forces the group into dummy forwards. Outside the arrival burst, P queueing fell from about 0.22 s to 0.083 s. Ignored while the prefill delayer is on. |
+| 10 | D | `--cudagraph-capture-sizes '[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]'` | D runs batch 15-20 per rank at C256. The old 16→24 step padded those batches. In a same-host A/B, a step at batch 17 was 2.67 ms faster and at batch 19 2.49 ms faster. Batches 16 and 24 changed by ±0.15 ms. Startup time and cudagraph memory (1.53 GB) were unchanged. |
 
 Several other changes were tried and are **not** part of this recipe. Each
 gave no gain or traded one metric for another:
@@ -76,6 +96,21 @@ Base image: `rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0`.
 
    The copy keeps the image's prebuilt `.so` modules. Bind-mount `<WORK>/aiter-P`
    at `/app/aiter-test` in the P container. D keeps the image's aiter.
+
+**Best configuration only.** Items 7-9 are opt-in environment variables
+added by open ATOM PRs:
+
+3. **ATOM [#3772](https://github.com/ROCm/ATOM/pull/3772)**:
+   `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`.
+4. **ATOM [#3773](https://github.com/ROCm/ATOM/pull/3773)**:
+   `ATOM_PD_EARLY_HANDOFF`. It applies only when P uses single-node DP and
+   the router uses the legacy relay.
+5. **The T1 PR**: `ATOM_DP_IDLE_WHEN_BLOCKED`, which includes the
+   `BLOCKED_IDLE_SLEEP_S` GIL yield.
+
+With a variable unset, or its PR missing, that item falls back to the E14a
+behaviour. **D with MegaMoE (item 6)** needs the same #3187 tree and aiter as
+P.
 
 When P starts, its log should contain a line like:
 `MegaMoEV2 mtpr=16384 experts=384 topk=6: staged route (compact), small-input capacities (256, 512), large-input route`.
@@ -257,6 +292,36 @@ the generated text with synthetic output, so a non-empty response does not
 show that the content is correct. Before using mega on D, restart P and D
 without `--spec-decode-acceptance-length` and run GSM8K through the router.
 
+### Best configuration
+
+This is E14a above plus items 6-10 of the table. Every addition is a flag or
+environment variable. Items 7-9 need the open PRs listed under
+[Dependencies](#dependencies).
+
+**P**: add three environment variables to the P command in section 2. Keep
+`ATOM_ENABLE_PREFILL_DELAYER=0`: `ATOM_DP_IDLE_WHEN_BLOCKED` is ignored while
+the delayer is on.
+
+```bash
+  -e ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20 \
+  -e ATOM_PD_EARLY_HANDOFF=1 \
+  -e ATOM_DP_IDLE_WHEN_BLOCKED=1 \
+```
+
+**D**: mount the same #3187 source tree and aiter as P, and change two flags
+in the D command above.
+
+```bash
+  --moe-backend mega \
+  --cudagraph-capture-sizes '[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]' \
+```
+
+`ATOM_PD_EARLY_HANDOFF` is for **one P instance only**. P answers the router
+once it has dispatched the request, so the router's in-flight count for P
+stays near zero. With several P instances, atomesh's least-loaded choice
+between them then no longer sees each P's queue depth. Leave it unset when
+more than one P serves a router.
+
 ## 4. Router and encoding ingress
 
 ```bash
@@ -347,17 +412,43 @@ is in seconds and ITL is the mean in ms. Throughput is aiperf output tok/s.
 | Earlier 4P4D (standard MoE, chunk 32K, delayer on) | 8 | 3.742 | 2.941 | 6.151 | 18.80 | 6.91 | 6,644 | 830 |
 | Single DEP8, standard MoE | 8 | 1.875 | 1.347 | 3.021 | 10.68 | 7.81 | 7,067 | 883 |
 | Single DEP8, mega, chunk 16K | 8 | 1.268 | 0.927 | 1.963 | **8.03** | **5.97** | **7,618** | **952** |
-| **This recipe, run 1** | 8 | **1.072** | 0.818 | 1.476 | **7.44** | 6.37 | 7,393 | 924 |
-| **This recipe, run 2** | 8 | 1.243 | **0.812** | 1.478 | 11.87 | 6.36 | 7,342 | 918 |
-| This recipe + persistent D JIT cache | 8 | 1.199 | 0.815 | **1.419** | 14.23 | 6.26 | 7,385 | 923 |
+| **E14a (items 1-5), run 1** | 8 | 1.072 | 0.818 | 1.476 | **7.44** | 6.37 | 7,393 | 924 |
+| **E14a (items 1-5), run 2** | 8 | 1.243 | 0.812 | 1.478 | 11.87 | 6.36 | 7,342 | 918 |
+| E14a + persistent D JIT cache | 8 | 1.199 | 0.815 | 1.419 | 14.23 | 6.26 | 7,385 | 923 |
+| **E19 = E14a + D mega (6) + prestart wait (7)** | 8 | **1.037** | **0.653** | **1.370** | 12.35 | **5.88** | 7,572 | 947 |
 
 **Host B** (a slower host; same-host pair, both with a warm cache):
 
 | Config | GPUs | TTFT mean | P50 | P90 | P99 | ITL | tok/s | tok/s/GPU |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Single DEP8, mega, chunk 16K | 8 | 1.454 | 1.103 | 2.318 | **7.61** | **7.32** | **7,106** | **888** |
-| **This recipe** | 8 | **1.198** | **0.874** | **1.575** | 8.87 | 8.28 | 6,816 | 852 |
-| This recipe + mega on D (accuracy not validated) | 8 | 1.244 | 0.899 | 1.585 | 9.78 | 7.91 | 6,896 | 862 |
+| **E14a (items 1-5)** | 8 | 1.198 | 0.874 | 1.575 | 8.87 | 8.28 | 6,816 | 852 |
+| E14a + mega on D | 8 | 1.244 | 0.899 | 1.585 | 9.78 | 7.91 | 6,896 | 862 |
+| **Full stack = E19 + early handoff (8) + idle when blocked (9)** | 8 | **0.916** | **0.522** | **1.118** | 12.02 | 8.01 | 6,941 | 868 |
+
+The full-stack and E19 runs used the earlier decode capture sizes; item 10 was
+measured separately (see the table at the top). The Host A and Host B rows
+cannot be compared with each other.
+
+**Outside the arrival burst.** These are the same runs with the requests that
+arrived 280-420 s into the window removed. That window holds the burst
+described below.
+
+| Config (host) | TTFT mean | P50 | P90 | P99 |
+|---|---:|---:|---:|---:|
+| E14a (Host A, a separate run) | 0.828 | 0.782 | 1.265 | 2.04 |
+| E19 (Host A) | 0.704 | 0.617 | 1.094 | 1.99 |
+| E14a + early handoff only (Host A) | 0.695 | 0.652 | 1.075 | 1.81 |
+| **Full stack (Host B)** | **0.563** | **0.496** | **0.877** | **1.72** |
+
+In the full stack, each setting has a measurable effect:
+
+- **Early handoff (8):** time from P finish to first token was 0.18 s on
+  Host B. In a same-host A/B on Host A it fell from 0.309 s to 0.136 s.
+- **Idle when blocked (9):** P queueing outside the burst fell from about
+  0.22 s to 0.083 s.
+- ITL and throughput matched Host B's own baselines: 8.01 ms against
+  7.91-8.28 ms.
 
 The same campaign also measured a single 4-GPU DEP4 instance (standard MoE)
 at C256 as a reference. It reached 2.277 / 1.476 / 3.448 / 22.94 s TTFT,
@@ -388,7 +479,22 @@ What the tables show:
 ## Caveats
 
 - ATOM #3187 and aiter #7788 are open. Pin the commits listed above;
-  newer heads have not been measured with this recipe.
+  newer heads have not been measured with this recipe. The best
+  configuration also depends on ATOM #3772, #3773 and the T1 PR, which are
+  open too. Each of them is off by default.
+- **P99 TTFT is bound by the arrival burst.** P99 is 12.0-12.4 s with or
+  without items 6-9, because the burst about 300 s into the window queues
+  every request behind a 4-GPU P. Items 6-10 improve the mean, P50, P90 and
+  the non-burst tail, but not this.
+- **Early handoff (8) is for a single P instance.** With several P instances
+  behind one router, the router stops seeing P load; see
+  [Best configuration](#best-configuration). Under a burst, D also reserves
+  pages for requests still queued on P. In the A/B, D's mean waiting
+  requests rose from 1.1 to 7.5, with no preemption and no errors.
+- **The full stack was measured once, on Host B only.** A same-host E19 run
+  on Host B was not made, so the gain of items 8 and 9 over E19 is a
+  cross-host estimate.
+- **MegaMoE on D (6) is not accuracy-validated.** See the note in section 3.
 - Every throughput run used `--spec-decode-acceptance-length 3.51`. This fixes
   the acceptance length so the workload is comparable, but it is not real
   acceptance. For production, remove the flag on both P and D, then report
