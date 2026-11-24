@@ -62,6 +62,7 @@ from atom.kv_transfer.disaggregation import (
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_cache_binding import kv_cache_bindings
 from atom.model_engine.model_setup import (
     build_model,
     construct_drafter,
@@ -102,6 +103,12 @@ from atom.model_engine.token_logprobs import (
     pack_token_logprobs,
     unpack_token_logprobs,
 )
+from atom.model_loader.weight_cache.client import (
+    daemon_load_extra,
+    load_drafter_from_cache,
+    load_from_cache,
+)
+from atom.model_loader.weight_utils import params_on_meta
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     InsufficientPoolBudget,
@@ -1102,12 +1109,17 @@ class ModelRunner:
     def _build_and_load_model(
         self, config: Config, model_class: type, device: torch.device
     ) -> torch.nn.Module:
-        """Construct the model and load its weights from disk: the loader
-        ``get_model`` calls.
+        """Construct the model and load its weights (from disk, or a weight
+        cache daemon's under ATOM_PRELOAD): the loader ``get_model`` calls.
 
         Override point: subclasses (e.g. the rapidserve decode process) may
         construct on the meta device and import weights via IPC instead.
         """
+        if envs.ATOM_PRELOAD == "server":
+            # A weight cache daemon's weights, if it can give them.
+            model = load_from_cache(config, model_class, device, rank=self.rank)
+            if model is not None:
+                return model
         model = build_model(config, model_class, device)
         load_start = time.perf_counter()
         loaded = load_weights(model, config)
@@ -1123,6 +1135,12 @@ class ModelRunner:
     def _build_and_load_drafter(self) -> Drafter:
         """Construct the drafter and load its weights, sharing with the loaded
         model what the draft does not hold itself."""
+        if envs.ATOM_PRELOAD == "server":
+            drafter = load_drafter_from_cache(
+                self.config, self.device, self, self.model, rank=self.rank
+            )
+            if drafter is not None:
+                return drafter
         drafter = construct_drafter(self.config, self.device, self)
         logger.info("Loading drafter model...")
         load_start = time.perf_counter()
@@ -1987,6 +2005,9 @@ class ModelRunner:
         # RCCL/NCCL buffers etc. held outside the allocator: device-used minus
         # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
         non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
+        # A weight cache daemon's weights count here, as a disk load's would;
+        # what it holds beside them is left out (the headroom holds it).
+        non_torch = max(non_torch - daemon_load_extra(), 0)
 
         cudagraph_overhead = self._estimate_cudagraph_overhead()
         safety_margin = int(total * 0.02)
@@ -2364,38 +2385,12 @@ class ModelRunner:
         # models with only one type of attention, but not support multi-type of attention models.
         # We need to support it by kv_cache_group in the future.
 
-        # Prepare list of models to bind KV cache
-        models_to_bind = [("target", self.model)]
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            models_to_bind.append(("draft", self.drafter.model))
-
-        # Keyed by each module's own global layer_num, which is what it looks
-        # up at forward time (`kv_cache_data[f"layer_{self.layer_num}"]`). The
-        # walk's ordinal used to be passed down and stood in for this, for a
-        # pool row and for an index-map key; under PP it is none of the three.
-        kv_cache_data = {}
-        for model_name, model in models_to_bind:
-            logger.info("Binding KV cache for the %s model", model_name)
-            for module in model.modules():
-                # A draft that owns an independent KV pool binds through its
-                # sibling builder first; for unrecognized modules it returns
-                # None and we fall through to the target builder.
-                kv_cache_tensor = None
-                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
-                    kv_cache_tensor = self.draft_kv_builder.build_kv_cache_tensor(
-                        module
-                    )
-                # Per-attention-type binding is owned by the attention
-                # metadata builder; ModelRunner only walks modules and
-                # collects the resulting KVCacheTensor entries. The builder
-                # returns None for modules it does not recognize (so a
-                # sibling module like nn.LayerNorm is silently skipped).
-                if kv_cache_tensor is None:
-                    kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
-                        module
-                    )
-                if kv_cache_tensor is not None:
-                    kv_cache_data[f"layer_{module.layer_num}"] = kv_cache_tensor
+        # Use each module's global layer number, including on PP stages.
+        kv_cache_data = {
+            f"layer_{module.layer_num}": tensor
+            for module, tensor in kv_cache_bindings(self)
+            if tensor is not None
+        }
 
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
         if transfer_tensors is not None:
@@ -4843,33 +4838,6 @@ class RapidServeModelRunner(ModelRunner):
             config.disagg_kvcache_ipc_addr.encode()
         ).hexdigest()[:12]
 
-    @staticmethod
-    @contextmanager
-    def _init_weight_params_on_meta():
-        """Construct a model with all `nn.Parameter`s on the meta device (no
-        persistent GPU weight allocation), leaving the default device unchanged
-        so init code that explicitly targets CUDA (e.g. aiter RoPE) and buffers
-        work normally. Each parameter is briefly created on the real device then
-        replaced with a meta tensor, so the transient peak is one parameter, not
-        the whole model. Used by decode in disagg, which fills params from
-        prefill via IPC.
-        """
-        orig_register = torch.nn.Module.register_parameter
-
-        def register_parameter(self, name, param):
-            orig_register(self, name, param)
-            p = self._parameters.get(name)
-            if p is not None:
-                self._parameters[name] = torch.nn.Parameter(
-                    p.detach().to("meta"), requires_grad=p.requires_grad
-                )
-
-        torch.nn.Module.register_parameter = register_parameter
-        try:
-            yield
-        finally:
-            torch.nn.Module.register_parameter = orig_register
-
     # ------------------------------------------------------------------
     # Base ModelRunner override points
     # ------------------------------------------------------------------
@@ -4882,7 +4850,7 @@ class RapidServeModelRunner(ModelRunner):
         # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);
         # import_model_weight_ipc_handles() materializes params from prefill,
         # and RoPE caches are recomputed locally.
-        with self._init_weight_params_on_meta():
+        with params_on_meta():
             return build_model(config, model_class, device)
 
     def _maybe_warmup(self):
@@ -5153,26 +5121,11 @@ class RapidServeModelRunner(ModelRunner):
             )
         self._back_paged_pools(num_kvcache_blocks, buf=self.kv_cache)
 
-        models_to_bind = [("target", self.model)]
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            models_to_bind.append(("draft", self.drafter.model))
-
-        kv_cache_data = {}
-        for model_name, model in models_to_bind:
-            for module in model.modules():
-                # Same dispatch as the allocating path's loop: a draft with a
-                # pool of its own binds through its own builder, and its pool
-                # is now a region of the same imported buffer.
-                bound = None
-                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
-                    bound = self.draft_kv_builder.build_kv_cache_tensor(module)
-                if bound is None:
-                    bound = self.attn_metadata_builder.build_kv_cache_tensor(module)
-                if bound is not None:
-                    # The same key the allocating path uses. Keyed by the walk's
-                    # ordinal here until now, which agreed with it only while
-                    # the first bound module was layer 0.
-                    kv_cache_data[f"layer_{module.layer_num}"] = bound
+        kv_cache_data = {
+            f"layer_{module.layer_num}": tensor
+            for module, tensor in kv_cache_bindings(self)
+            if tensor is not None
+        }
 
         from atom.utils.forward_context import set_kv_cache_data
 
