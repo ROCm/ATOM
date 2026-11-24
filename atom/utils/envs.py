@@ -186,6 +186,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of their own as they arrive, and report each push as it lands, instead
     # of from the engine step's get_finished. Off by default.
     "ATOM_MORIIO_WRITE_THREAD": lambda: _flag_env("ATOM_MORIIO_WRITE_THREAD", "0"),
+    # MoRIIO P/D write mode, decode side: ask the prefill to push only the
+    # blocks past this decode's own prefix-cache hit on the prompt, not the
+    # whole prompt (a model without per-request state). Off by default.
+    "ATOM_MORIIO_INCREMENTAL_PUSH": lambda: _flag_env(
+        "ATOM_MORIIO_INCREMENTAL_PUSH", "0"
+    ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(

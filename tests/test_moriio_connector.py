@@ -74,6 +74,7 @@ class RemotePrefillLookupTest(unittest.TestCase):
             dcp_size=1,
             hash_block_size=4,
             _same_page_geometry=lambda params: True,
+            _local_prefix_blocks=lambda seq: 0,
         )
         seq = types.SimpleNamespace(
             id=7,

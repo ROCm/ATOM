@@ -1328,14 +1328,17 @@ class MoRIIOConnector(KVConnectorBase):
             )
 
     @staticmethod
-    def _rejects_transfer_subset(req_id: ReqId, meta: ReqMeta) -> bool:
-        """Whether the request asks for a subset neither direction implements.
+    def _rejects_transfer_subset(
+        req_id: ReqId, meta: ReqMeta, skips_computed: bool = False
+    ) -> bool:
+        """Whether the request asks for a subset this direction does not implement.
 
-        Both paths move every advertised block, paired one to one. A request to
-        skip already-computed blocks is safe to over-serve; a source stride is
+        Both paths pair blocks one to one. Write mode skips the blocks this
+        decode already holds (``skips_computed``, `_request_write`); a read
+        moves every block, which is safe to over-serve. A source stride is
         not, because the pairing would put blocks in the wrong place.
         """
-        if getattr(meta, "num_computed_blocks", 0):
+        if getattr(meta, "num_computed_blocks", 0) and not skips_computed:
             logger.warning(
                 "req %s asks to skip %d already-computed blocks, which this "
                 "connector does not implement; transferring all blocks",
@@ -1427,7 +1430,7 @@ class MoRIIOConnector(KVConnectorBase):
         the prefill and holds the source blocks until it reports back, so all
         that is left is to tell it where to write.
         """
-        if self._rejects_transfer_subset(req_id, meta):
+        if self._rejects_transfer_subset(req_id, meta, skips_computed=True):
             self._fail_before_transfer(req_id, meta)
             return
         dst = [int(b) for b in meta.local_block_ids]
@@ -1438,6 +1441,13 @@ class MoRIIOConnector(KVConnectorBase):
             logger.error("%s", error)
             self._fail_before_transfer(req_id, meta)
             return
+        # ATOM_MORIIO_INCREMENTAL_PUSH: the leading blocks are this decode's
+        # own prefix-cache hit (`MoRIIOConnectorScheduler._local_prefix_blocks`),
+        # shared blocks the push must not write; the producer pushes the rest,
+        # still paired by position. At least the last block is pushed (a hit
+        # never covers it), so every push and its report stay as they were.
+        skip = max(0, min(int(meta.num_computed_blocks or 0), len(dst) - 1))
+        src, dst = src[skip : len(dst)], dst[skip:]
         src_slot = int(getattr(meta, "remote_slot_index", -1))
         dst_slot = int(getattr(meta, "local_slot_index", -1))
         remote_tp_size = int(meta.tp_size or 0) or self.tp_size
@@ -1506,7 +1516,9 @@ class MoRIIOConnector(KVConnectorBase):
             "decode_tp_size": self.tp_size,
             "decode_tp_rank": self.tp_rank,
             "dst_block_ids": dst,
-            "src_block_ids": src[: len(dst)],
+            "src_block_ids": src,
+            # Leading blocks left out of both lists; for the producer's stats.
+            "skipped_blocks": skip,
             "deadline": deadline,
             "src_slot_index": src_slot,
             "dst_slot_index": dst_slot,
@@ -1986,10 +1998,11 @@ class MoRIIOConnector(KVConnectorBase):
         WRITE_REQ's arrival on the listener to the step that took it up,
         ``wait_ms`` from there to posting the batch (the handshake and the
         prefill's KV-ready event), ``write_ms`` from posting to the step that
-        saw it settle. Pushes are served from ``get_finished``, once per engine
-        step, so the first and the last include up to a step each; with
-        ATOM_MORIIO_WRITE_THREAD, by a thread that polls every
-        ``_PUSH_POLL_S``.
+        saw it settle. ``skipped``: the decode's own prefix-cache blocks left
+        out of the push (ATOM_MORIIO_INCREMENTAL_PUSH). Pushes are served from
+        ``get_finished``, once per engine step, so the first and the last
+        include up to a step each; with ATOM_MORIIO_WRITE_THREAD, by a thread
+        that polls every ``_PUSH_POLL_S``.
         """
         posted, nbytes, blocks, segments = request["_page_stats"]
         accepted = request.get("_accepted_at", posted)
@@ -1997,11 +2010,12 @@ class MoRIIOConnector(KVConnectorBase):
         write_ms = (time.monotonic() - posted) * 1e3
         logger.info(
             "MoRIIO transfer stats: transfer=%s protocol=fabric-write ok=%s "
-            "blocks=%d bytes=%d queue_ms=%.3f wait_ms=%.3f write_ms=%.3f "
-            "GB_per_s=%.1f segments=%d tp=%d",
+            "blocks=%d skipped=%d bytes=%d queue_ms=%.3f wait_ms=%.3f "
+            "write_ms=%.3f GB_per_s=%.1f segments=%d tp=%d",
             transfer_id,
             ok,
             blocks,
+            int(request.get("skipped_blocks") or 0),
             nbytes,
             (accepted - received) * 1e3,
             (posted - accepted) * 1e3,
@@ -2684,6 +2698,7 @@ class MoRIIOConnector(KVConnectorBase):
             float(request.get("deadline") or 0.0)
             int(request.get("src_slot_index", -1))
             int(request.get("dst_slot_index", -1))
+            int(request.get("skipped_blocks") or 0)
             valid = (
                 "decode_req_id" in request
                 and isinstance(request["decode_host"], str)
@@ -3347,6 +3362,11 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         self.pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
         self.dp_size = config.parallel_config.data_parallel_size
         self.dp_rank = config.parallel_config.data_parallel_rank
+        # Tokens per block-table entry: `seq.num_cached_tokens` counts global
+        # tokens, and under DCP an entry spans dcp_size physical blocks.
+        self.hash_block_size = (
+            config.kv_cache_block_size * config.decode_context_parallel_size
+        )
         self.host_ip = get_ip()
         # A producer's pushes are served from the workers' `get_finished`, so
         # a downstream PP stage polls it at the idle cadence rather than every
@@ -3436,11 +3456,28 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
                 getattr(seq, "state_slot", -1),
             )
             params["do_remote_prefill"] = False
+            params["num_computed_blocks"] = self._local_prefix_blocks(seq)
             logger.debug(
-                "Queued req %s for remote KV loading (%d blocks)",
+                "Queued req %s for remote KV loading (%d blocks, %d held here)",
                 seq.id,
                 len(seq.block_table),
+                params["num_computed_blocks"],
             )
+
+    def _local_prefix_blocks(self, seq: Sequence) -> int:
+        """ATOM_MORIIO_INCREMENTAL_PUSH: the leading block-table entries whose
+        KV this decode already holds -- its own prefix-cache hit, which
+        `allocate` just shared into the table -- so the producer need not push
+        them (`MoRIIOConnector._request_write`). As Mooncake's
+        `num_computed_blocks`.
+
+        0 with the flag off, and for a model with per-request state: the
+        producer's state covers the whole prompt and a block-only delta does
+        not carry it.
+        """
+        if not envs.ATOM_MORIIO_INCREMENTAL_PUSH or seq.has_per_req_cache:
+            return 0
+        return int(seq.num_cached_tokens) // self.hash_block_size
 
     def request_finished(self, seq: Sequence) -> None:
         """Populate KV transfer output metadata when a request completes.
