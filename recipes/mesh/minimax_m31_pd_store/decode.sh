@@ -6,13 +6,18 @@
 #   MODE=tp4   -tp 4 with indexer CP (ATOM_M3_INDEXER_CP=1): today's decode
 #   FORCE_AL=4.04 benchmark runs, empty for real acceptance
 #   D_SEQS per DP rank under dep4/mega (default 64), D_MEM (0.9)
+#   D_PENDING_KV_FRACTION (0.15), D_RESERVED_DECODE_TOKENS (512): decode admission
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 MODE=${MODE:-dep4}
 rm -rf /root/.cache/atom/*
 export HIP_VISIBLE_DEVICES=4,5,6,7
 export ATOM_DP_MASTER_PORT=29700 ATOM_DP_BASE_PORT=29800
-KV='{"kv_connector":"mooncake","kv_role":"kv_consumer","handshake_port":6301,"protocol":"rdma","ib_device":"rdma4,rdma5,rdma6,rdma7","pd_admission":{"enabled":true,"max_pending_kv_fraction":0.15,"num_reserved_decode_tokens":512}}'
+# Decode admission (recipes/pd_disaggregation_guide.md): pending-receive KV budget per D rank
+# and the decode growth kept free for every admitted request (>= 2 x (k + 1) = 16 for k=7).
+D_PENDING_KV_FRACTION=${D_PENDING_KV_FRACTION:-0.15}
+D_RESERVED_DECODE_TOKENS=${D_RESERVED_DECODE_TOKENS:-512}
+KV="{\"kv_connector\":\"mooncake\",\"kv_role\":\"kv_consumer\",\"handshake_port\":6301,\"protocol\":\"rdma\",\"ib_device\":\"rdma4,rdma5,rdma6,rdma7\",\"pd_admission\":{\"enabled\":true,\"max_pending_kv_fraction\":${D_PENDING_KV_FRACTION},\"num_reserved_decode_tokens\":${D_RESERVED_DECODE_TOKENS}}}"
 # Per DP rank under DP attention: requests, CUDA-graph batch sizes and MNBT.
 # Under DP + a drafter the decode token graphs stop at ATOM_TOKEN_GRAPH_DP_MAX_TOKENS
 # (512 rows = 64 requests x 8 verify rows), so 64 requests per rank is the graph ceiling.

@@ -81,10 +81,26 @@ All scripts are in [`minimax_m31_pd_store/`](minimax_m31_pd_store/).
    - `wait_ready.sh <port> <log>` for each server (prefill 8010, decode 8020).
    - `gsm8k.sh <label> 32 200` for a 200-question GSM8K through the router (20-shot chat, real acceptance).
    - `store.sh status` for Store capacity, keys and evictions.
+   - `curl -s http://$NODE_IP:8020/metrics | grep atom:pd_admission` for decode admission: pending receives, pending KV bytes and deferrals.
 
 ## Benchmark point
 
 Run 1P1D with AgentX traces at **C140** (the concurrency of the whole 1P1D), with `FORCE_AL=4.04` on both roles. Earlier 1P1D + Store runs on experiment branches peaked at C140, and C160 was 4% lower. Report the decode running batch and KV usage next to tok/s: at C140 a TP4 decode runs about 40-50 requests at a time.
+
+## KV transfer and decode admission
+
+The prefill producer sends its KV over Mooncake RDMA with chunked transfer (`"enable_chunked_transfer": true`): each PP stage publishes its own pages, and the decode waits for every stage. `"chunked_admission_timeout_s": 1500` keeps the prefill from dropping requests that wait a long time for admission at the decode under high concurrency.
+
+The decode consumer turns on `pd_admission` (main, ROCm/ATOM#3147, #3165, #3173; [guide](../pd_disaggregation_guide.md#decode-admission)). Mooncake reserves the decode's destination blocks before the prefill writes them, so without admission a backlog of pending receives can hold most of the decode KV pool while few requests decode.
+
+| Setting (`decode.sh` env) | Default | What it does |
+| --- | --- | --- |
+| `max_pending_kv_fraction` (`D_PENDING_KV_FRACTION`) | 0.15 | Defers a new receive while pending receives would exceed this fraction of each D rank's KV pool. |
+| `num_reserved_decode_tokens` (`D_RESERVED_DECODE_TOKENS`) | 512 | Defers a new receive unless every admitted request can still grow by this many tokens (capped by what it may still generate). It must be at least 2 x (k + 1) = 16 with DSpark k=7. It defers only and never preempts. |
+
+- Under DEP4 every DP rank has its own scheduler, so both limits apply per rank.
+- The decode needs PP=1, DCP=1, PCP=1, SP=1 and a single paged KV pool; all variants here qualify.
+- Watch `atom:pd_admission_deferred`, `atom:pd_admission_pending_kv_bytes` and `atom:pd_admission_pending_requests` on the decode's `/metrics`. Many deferrals while the decode runs a small batch mean the budget is too tight; preemptions or a full KV pool mean the reserve is too small.
 
 ## Settings and why
 
@@ -99,7 +115,7 @@ Run 1P1D with AgentX traces at **C140** (the concurrency of the whole 1P1D), wit
   - The page-cache dropper only touches the model directory.
 - Decode consumer:
   - `ib_device` rdma4-7.
-  - `pd_admission` with `max_pending_kv_fraction` 0.15.
+  - Decode admission: see the next section.
   - TP4: `--max-num-seqs 256`, MNBT 16384, CUDA graphs up to 256.
   - DEP4: 64 requests per DP rank, because under DP plus a drafter the decode token graphs stop at `ATOM_TOKEN_GRAPH_DP_MAX_TOKENS` (512 rows = 64 requests x 8 verify rows). MNBT 4096, `MORI_SHMEM_HEAP_SIZE=8G`.
   - `MODE=mega` uses MNBT 512 so MegaMoE's combine wire stays bf16.
