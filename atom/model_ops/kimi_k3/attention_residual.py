@@ -124,7 +124,9 @@ if _HAS_TRITON:
         # prefix so downstream layers reuse it. DO_ADD2 folds a SECOND addend the
         # same way, so an MoE layer can hand over its routed and shared expert
         # outputs unsummed and skip an entire [T, H] elementwise kernel.
-        t = tl.program_id(0)
+        # 64-bit: block_residual's token stride is blocks x H (~57K at H=7168),
+        # so t * stride_br_t passes 2**31 within a long prefill batch.
+        t = tl.program_id(0).to(tl.int64)
         o_d = tl.arange(0, BD)
         m_d = o_d < H
         sw = tl.load(sw_ptr + o_d, mask=m_d, other=0.0).to(tl.float32)
