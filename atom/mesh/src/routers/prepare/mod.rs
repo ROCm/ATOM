@@ -41,7 +41,7 @@ use stop_decoder_builder::create_stop_decoder;
 use tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constraints};
 
 /// The model's tokenizer entry; while a registration swaps it, the one being replaced.
-fn tokenizer_entry(model_id: &str, components: &AppContext) -> Option<TokenizerEntry> {
+pub(crate) fn tokenizer_entry(model_id: &str, components: &AppContext) -> Option<TokenizerEntry> {
     let registry = &components.tokenizer_registry;
     let registered = || {
         registry
