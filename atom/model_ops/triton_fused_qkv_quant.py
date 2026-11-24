@@ -68,12 +68,14 @@ def _partial_amax(
     Rows=None,
     MASK_ROWS: tl.constexpr = False,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # 64-bit offsets: a TP1 or PP stage's prefill Q/K/V over a long cached context
+    # passes 2**31 elements (K alone is context x 128 heads x 192).
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     acc = tl.full((BLOCK,), 0, tl.float32)
     for step in range(tl.cdiv(N, PARTS * BLOCK)):
         x = _load_tensor(
             X,
-            offsets + step * PARTS * BLOCK,
+            offsets + step.to(tl.int64) * (PARTS * BLOCK),
             N,
             SHAPE,
             STRIDE,
@@ -168,7 +170,7 @@ def _quant_tensor(
     Rows=None,
     MASK_ROWS: tl.constexpr = False,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     x = _load_tensor(
         X,
         offsets,
