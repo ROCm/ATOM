@@ -78,6 +78,7 @@ def stack():
             fabric=load("atom.kv_transfer.disaggregation.moriio.fabric"),
             common=load("atom.kv_transfer.disaggregation.moriio.moriio_common"),
             types=load("atom.kv_transfer.disaggregation.types"),
+            multi=load("atom.kv_transfer.disaggregation.multi.multi_connector"),
             index_fp4=load("atom.model_ops.minimax_m3.index_fp4"),
             sub_pool=load("atom.model_ops.attentions.pool_layout.sub_pool_spec"),
         )
@@ -94,6 +95,15 @@ def kv_config(role: str, **extra) -> dict:
     }
     cfg.update(extra)
     return cfg
+
+
+# The prefill's --kv-transfer-config with the LMCache CPU tier, as the GPU plan
+# (pd1123/README-fabric.md) passes it: no spaces, server.sh splits EXTRA_ARGS.
+P_MULTI = (
+    '{"kv_connector":"multi","connectors":[{"kv_connector":"moriio",'
+    '"kv_role":"kv_producer","moriio_backend":"fabric","moriio_mode":"write",'
+    '"handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}'
+)
 
 
 class _SparseAttention(nn.Module):
@@ -125,8 +135,9 @@ class _DraftKVBinding(nn.Module):
         self.layer_num = layer_num
 
 
-def m31_runner(stack, blocks: int, role: str):
-    """A ModelRunner with M3.1's builders and pool backed for ``blocks`` blocks.
+def m31_runner(stack, blocks: int, role: str, kv: dict | None = None):
+    """A ModelRunner with M3.1's builders and pool backed for ``blocks`` blocks,
+    under ``kv`` (default: the plan's fabric config for ``role``).
 
     Returns the runner, its transfer tensors and the pool tensor.
     """
@@ -141,7 +152,7 @@ def m31_runner(stack, blocks: int, role: str):
     )
     runner = object.__new__(mr.ModelRunner)
     runner.config = types.SimpleNamespace(
-        kv_transfer_config=kv_config(role),
+        kv_transfer_config=kv if kv is not None else kv_config(role),
         kv_cache_dtype="fp8",
         index_cache_dtype="fp4",
         hf_config=hf,
@@ -730,6 +741,245 @@ class TestConfigPath:
         never = lambda kind, cfg: pytest.fail("built a backend")
         with pytest.raises(ValueError, match="moriio_mode=write"):
             self.connector(stack, kv_config("kv_consumer", moriio_mode="read"), never)
+
+
+# ---------------------------------------------------------------------------
+# MoRIIO fabric next to the LMCache CPU tier on the prefill (`multi`)
+# ---------------------------------------------------------------------------
+
+
+class _OffloadWorker:
+    """What MultiConnector calls on the lmcache_offload worker sub."""
+
+    is_producer = False
+    _state_tier = None
+
+    def __init__(self, output_cls):
+        self.output_cls = output_cls
+        self.registered = None
+        self.ready: list = []
+
+    def register_kv_caches(self, kv_caches, transfer_tensors=None, num_blocks=None):
+        self.registered = (kv_caches, transfer_tensors, num_blocks)
+
+    def start_load_kv(self, metadata):
+        pass
+
+    def publish_prefill_chunks(self, batch):
+        pass
+
+    def record_kv_cache_ready(self, req_ids):
+        self.ready.append(list(req_ids))
+
+    def get_finished(self):
+        return self.output_cls(finished_saving={"save-9"})
+
+
+class _OffloadScheduler:
+    """The lmcache_offload scheduler sub: a prefix hit and a save per request."""
+
+    is_producer = False
+    is_offload = True
+
+    def __init__(self):
+        self.saving: set = set()
+
+    def get_num_new_matched_tokens(self, seq):
+        return 256, True
+
+    def cancel_pending_load(self, seq):
+        pass
+
+    def request_finished(self, seq):
+        self.saving.add(seq.id)
+
+    def should_defer_free(self, seq):
+        return seq.id in self.saving
+
+    def waits_for_transfer_report(self, seq):
+        return False
+
+    def admission_ready(self, seq):
+        return True
+
+    def send_finished(self, req_id):
+        pass
+
+
+class TestMultiWithLMCache:
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.delenv("ATOM_MORIIO_MODE", raising=False)
+        with mock.patch("torch.cuda.current_device", lambda: 0):
+            yield
+
+    def test_the_prefills_json_selects_fabric_for_the_moriio_leg(self, stack):
+        kv = json.loads(P_MULTI)
+        assert stack.types.kv_config_has_producer(kv)
+        config = types.SimpleNamespace(kv_transfer_config=kv)
+        leaves = stack.factory.KVConnectorFactory.leaf_connectors(config)
+        assert [name for name, _ in leaves] == ["moriio", "lmcache_offload"]
+        assert stack.conn.MoRIIOConnector._fabric_backend_from(leaves[0][1])
+
+    def test_the_runner_takes_the_fabric_pool_under_multi(self, stack):
+        for kv in (
+            json.loads(P_MULTI),
+            # The offload leg first: it allocates nothing, the walk goes on.
+            dict(
+                json.loads(P_MULTI),
+                connectors=json.loads(P_MULTI)["connectors"][::-1],
+            ),
+        ):
+            runner, tt, pool = m31_runner(stack, 6, "kv_producer", kv=kv)
+            assert runner._kv_pool_outside_torch_bytes == pool.numel()
+            base, end = pool.data_ptr(), pool.data_ptr() + pool.numel()
+            assert all(
+                base <= r.base_addr and r.base_addr + r.total_bytes <= end
+                for r in tt.block_regions
+            )
+
+    def test_the_composite_registers_records_and_pushes_through_moriio(
+        self, stack, write_path
+    ):
+        # Each end registers against the pool its own process allocated last
+        # (`fabric._pool_range`), so the decode registers before the prefill
+        # allocates.
+        _d, tt_d, pool_d = m31_runner(stack, 10, "kv_consumer")
+        d_meta = fabric_connector(stack, producer=False)._register_pages(
+            {}, tt_d, tt_d.num_blocks
+        )
+        _p, tt_p, pool_p = m31_runner(stack, 8, "kv_producer", kv=json.loads(P_MULTI))
+        producer = write_path.make(producer=True)
+        producer.use_fabric = True
+        producer.tp_size = TP
+        producer.kv_cache_block_size = BLOCK
+        producer._kv_ready_events = {}
+        producer.engine_id = "10.0.0.1:6301"
+        producer.side_channel_port = 6301
+        advertised = []
+        producer._handshake_listener = lambda meta, *_rest: advertised.append(meta)
+        status = write_path.FakeStatus()
+        posted = []
+
+        def write(sizes, l_offs, r_offs, session):
+            posted.append((session, list(l_offs), list(r_offs), list(sizes)))
+            return status
+
+        wrapper = producer.moriio_wrapper
+        wrapper.register_local_buffer = lambda ptr, size, dev: packed_desc(ptr, size)
+        wrapper.get_unpack_memory_metadata = lambda packed: ("desc", packed)
+        wrapper.build_session = lambda local, remote: ("session", local[1], remote[1])
+        wrapper.write_remote_data_status = write
+        offload = _OffloadWorker(stack.types.KVConnectorOutput)
+        multi = object.__new__(stack.multi.MultiConnector)
+        multi._connectors = [producer, offload]
+        multi.is_producer = True
+        multi._state_tier = None
+
+        multi.register_kv_caches({}, tt_p, tt_p.num_blocks)
+        producer._handshake_listener_thread.join(timeout=5)
+        assert len(producer._page_regions) == 380
+        assert len(advertised[0].page_regions) == 380  # what the decode is sent
+        assert offload.registered[1] is tt_p
+        event_patch, stream_patch = cuda_events()
+        with event_patch, stream_patch:
+            multi.record_kv_cache_ready([9])
+        assert offload.ready == [[9]] and 9 in producer._kv_ready_events
+
+        engine = "10.0.0.2:7400_dp0"  # push_request's decode end
+        wire = msgspec.msgpack.Encoder().encode(d_meta)
+        producer.remote_moriio_metadata[engine] = msgspec.msgpack.Decoder(
+            stack.common.MoRIIOAgentMetadata
+        ).decode(wire)
+        producer._remote_agents[engine] = {"agent"}
+        src, dst = [2, 3, 4], [7, 8, 9]
+        producer._write_requests.put(
+            write_path.push_request(
+                decode_tp_size=TP, src_block_ids=src, dst_block_ids=dst
+            )
+        )
+        out = multi.get_finished()  # the prefill's forward is still running
+        assert posted == [] and not out.finished_sending
+        producer._kv_ready_events[9].done = True
+        out = multi.get_finished()
+        assert len(posted) == 1 and not out.finished_sending
+        assert out.finished_saving == {"save-9"}  # the offload leg, merged
+        status.state = "ok"
+        out = multi.get_finished()
+        assert out.finished_sending == {9}
+
+        generator = torch.Generator().manual_seed(1)
+        pool_p.copy_(torch.randint(0, 256, pool_p.shape, generator=generator))
+        before = pool_d.clone()
+        written = apply_batch(posted, pool_p, pool_d)
+        assert int(written.max()) == 1
+        for page_p, page_d in zip(tt_p.pages, tt_d.pages, strict=True):
+            assert torch.equal(page_d.view[dst], page_p.view[src])
+        untouched = written == 0
+        assert torch.equal(pool_d[untouched], before[untouched])
+
+    def scheduler(self, stack):
+        sched = object.__new__(stack.conn.MoRIIOConnectorScheduler)
+        sched.is_producer = True
+        sched.engine_id = "None"
+        sched.host_ip = "10.0.0.1"
+        sched.handshake_port = 5555
+        sched.base_handshake_port = 6301
+        sched.tp_size = TP
+        sched.dp_rank = 0
+        sched._awaiting_send = set()
+        sched._reqs_need_recv = {}
+        sched._reqs_need_save = {}
+        sched.request_id_to_transfer_id = {}
+        sched.transfer_id_to_request_id = {}
+        offload = _OffloadScheduler()
+        multi = object.__new__(stack.multi.MultiConnectorScheduler)
+        multi._connectors = [sched, offload]
+        multi.is_producer = True
+        multi.is_offload = True
+        multi._load_winner = {}
+        return multi, offload
+
+    def prefill(self, leave_reason: str = "max_tokens"):
+        import numpy as np
+
+        return types.SimpleNamespace(
+            id=9,
+            leave_reason=leave_reason,
+            output_tokens=[42],
+            spec_token_ids=np.array([], dtype=np.int32),
+            block_table=[1, 2],
+            state_slot=-1,
+            prompt_token_ids=list(range(200)),
+            kv_transfer_params={"do_remote_decode": True},
+            prefix_cache_hit_tokens=0,
+        )
+
+    def test_the_source_is_held_until_the_push_and_the_save_are_done(self, stack):
+        multi, offload = self.scheduler(stack)
+        seq = self.prefill()
+        # On the prefill MoRIIO answers no lookup; the CPU tier's hit wins.
+        assert multi.get_num_new_matched_tokens(seq) == (256, True)
+        assert multi.admission_ready(seq)
+        multi.request_finished(seq)
+        handoff = seq.kv_transfer_params_output
+        assert handoff["do_remote_prefill"] and handoff["transfer_id"] == 9
+        assert handoff["remote_block_ids"] == [1, 2] and handoff["tp_size"] == TP
+        # The deferred T0 and the (empty: a producer never drafts) drafts.
+        assert handoff["first_token_id"] == 42 and handoff["draft_token_ids"] == []
+        assert multi.should_defer_free(seq)
+        multi.send_finished(9)  # the push landed; the save has not
+        assert multi.should_defer_free(seq)
+        offload.saving.discard(9)
+        assert not multi.should_defer_free(seq)
+
+    def test_an_aborted_prefill_hands_nothing_off_and_claims_nothing(self, stack):
+        multi, offload = self.scheduler(stack)
+        seq = self.prefill("aborted")
+        multi.request_finished(seq)
+        assert seq.kv_transfer_params_output is None
+        offload.saving.discard(9)
+        assert not multi.should_defer_free(seq)
 
 
 # ---------------------------------------------------------------------------
