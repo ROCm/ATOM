@@ -900,6 +900,10 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+        if self._connector_flag("cancels_undispatched_loads"):
+            # Only such a connector changes the abort path; any other keeps
+            # the class's `_finish_rejected_waiting` as is.
+            self._finish_rejected_waiting = self._finish_rejected_waiting_cancelling
         # What a P/D receive's first decode takes past its prompt: T0 and the
         # `mtp_k` verify slots its handoff appends, then the reach past them
         # that `can_append` checks before the step runs, as decode does below.
@@ -1618,7 +1622,7 @@ class Scheduler:
         BlockManager bookkeeping; cheap (no traversal of seq tables).
         """
         bm = self.block_manager
-        total = bm.kv.num_blocks
+        total = bm.kv.num_usable_blocks
         if total <= 0:
             return 0.0
         return bm.kv.num_used / total
@@ -2191,7 +2195,7 @@ class Scheduler:
                 f"{self.max_num_batched_tokens}. {remedy}"
             )
         bm = self.block_manager
-        total_blocks = bm.kv.num_blocks
+        total_blocks = bm.kv.num_usable_blocks
         # `num_pool_blocks`, not `seq.num_blocks`: the latter counts global
         # blocks, while the pool is sized and drawn per-rank. Under dcp>1 the
         # two differ by `dcp_world_size`.
@@ -3390,6 +3394,22 @@ class Scheduler:
             return
         seq._awaiting_aborted_load_cleanup = True
 
+    def _finish_rejected_waiting_cancelling(
+        self, seq: Sequence, reason: str = "aborted"
+    ) -> None:
+        """`_finish_rejected_waiting` behind a connector that cancels undispatched loads.
+
+        Parking counts a reservation before metadata reaches workers. A load
+        still pending (a renewal not yet finished) is cancelled now and the
+        request leaves as one with no load; a load workers own keeps its
+        blocks until its exact terminal report.
+        """
+        if getattr(
+            seq, "_counted_as_inflight_load", False
+        ) and self.kv_connector.cancel_undispatched_load(seq):
+            self._uncount_inflight_load(seq)
+        type(self)._finish_rejected_waiting(self, seq, reason)
+
     def abort_request(self, req_id: int) -> bool:
         """Reclaim waiting cancellations on the event, independent of admission."""
         for seq in self.waiting:
@@ -4086,8 +4106,9 @@ class Scheduler:
     ) -> bool | None:
         """Admission's allocation (Phase 2 and early load): commit the probe,
         allocate keeping `num_cached_blocks` of HBM hit, and the draft round's
-        lookahead. None, with nothing committed, when the state offload holds
-        the admission for a verdict on the image it would load
+        lookahead. A fresh allocation also resets the restore fields an earlier
+        tier load left on `seq`. None, with nothing committed, when the state
+        offload holds the admission for a verdict on the image it would load
         (`record_allocation(defer_unverified=True)`); retry a pass later. False,
         with the seq deallocated, when `allocate` refused."""
         if not self.block_manager.record_allocation(
@@ -4097,6 +4118,20 @@ class Scheduler:
         if not self.block_manager.allocate(seq, num_cached_blocks):
             self.block_manager.deallocate(seq)
             return False
+        # A fresh allocation starts from nothing restored. An earlier tier load
+        # (restore, then preempt; or a failed load that re-parked) leaves these
+        # behind: a stale `offload_loaded_tokens` makes the wake mark rows the
+        # new load never filled as cached, and a stale `offload_loaded` (set by
+        # the wake) / `offload_load_failed` (set by the failure path) makes an
+        # abort free the blocks the new load is still writing into. Reset before
+        # the connector is told of the allocation, which may set the token
+        # fields again. Only a connector's load sets them (planned by the
+        # connector, woken or failed by the scheduler), so no connector means
+        # nothing to reset.
+        if self.kv_connector is not None:
+            seq.offload_loaded = seq.offload_load_failed = False
+            seq.offload_loaded_tokens = 0
+            seq.offload_load_start_tokens = None
         self._allocate_prefill_draft_lookahead(seq)
         return True
 
@@ -4179,8 +4214,8 @@ class Scheduler:
         """Refuse a batch whose draft round would write past a row's blocks.
 
         A position past the last allocated block reads block id 0 from the
-        zeroed block-table tail, and the KV write lands in physical block 0 --
-        silently, in whatever request or state checkpoint owns it. Every path
+        zeroed block-table tail, overwriting reserved padding or unrelated
+        live KV at physical block 0. Every path
         that schedules a forward has to have allocated through
         `len(seq) + draft_lookahead` (`may_append(..., lookahead=)`); this is
         where one that did not fails loudly. Remote-prefill rows are skipped:
@@ -4466,7 +4501,7 @@ class Scheduler:
             or not self.kv_connector.supports_early_load
         ):
             return 0
-        total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
+        total_blocks = int(bm.kv.num_usable_blocks) if bm is not None else 0
         state.maybe_log(total_blocks)
         state.tick += 1
         if state.entries:
@@ -5804,7 +5839,7 @@ class Scheduler:
         if self._connector_flag("is_offload"):
             for i, queued in enumerate(self.waiting):
                 if queued.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                    continue  # in flight, even if an earlier load left its flags
+                    continue  # in flight
                 if not self._is_offload_prefill_resume(queued):
                     break
                 pos = i + 1

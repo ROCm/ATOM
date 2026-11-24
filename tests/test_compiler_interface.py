@@ -114,3 +114,18 @@ def test_lowering_exception_message_keeps_the_operator_text():
     exc = _operator_issue()
     err = exc.LoweringException(ValueError("bad"), "op", [_CountingArg()], {})
     assert str(err) == "ValueError: bad\n  target: op\n  args[0]: IR"
+
+
+def test_traced_file_hash_skips_pseudo_paths(tmp_path):
+    # Dynamo records the stdlib's frozen modules ("<frozen genericpath>" when a
+    # traced function calls os.path.exists) and exec()'d code ("<string>")
+    # among the traced files; none of them can be opened.
+    from atom.utils.backends import _hash_traced_files
+
+    real = tmp_path / "model.py"
+    real.write_text("x = 1\n")
+    pseudo = ["<string>", "<frozen os>", "<frozen genericpath>", "<frozen posixpath>"]
+    with_pseudo = _hash_traced_files(sorted([str(real), *pseudo]))
+    assert with_pseudo == _hash_traced_files(sorted([str(real), *pseudo]))
+    real.write_text("x = 2\n")
+    assert with_pseudo != _hash_traced_files(sorted([str(real), *pseudo]))
