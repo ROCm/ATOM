@@ -264,7 +264,13 @@ class ConnectorSourceTest(unittest.TestCase):
         self.assertNotIn("os.environ", self.source)
         defined = (ROOT / "atom/utils/envs.py").read_text()
         documented = (ROOT / "docs/environment_variables.md").read_text()
-        for suffix in ("MODE", "HANDSHAKE_TIMEOUT_S", "WRITE_TIMEOUT_S", "VERIFY"):
+        for suffix in (
+            "MODE",
+            "HANDSHAKE_TIMEOUT_S",
+            "WRITE_TIMEOUT_S",
+            "SEND_TIMEOUT_S",
+            "VERIFY",
+        ):
             name = f"ATOM_MORIIO_{suffix}"
             self.assertIn(f"envs.{name}", self.source)
             self.assertIn(f'"{name}"', defined)
@@ -602,6 +608,7 @@ class WritePathTest(unittest.TestCase):
         import collections
         import queue
         import threading
+        import time
         import types
 
         conn = object.__new__(self.connector)
@@ -657,6 +664,10 @@ class WritePathTest(unittest.TestCase):
         conn._done_sending_lock = threading.Lock()
         conn._write_ids = {}
         conn._finished_writes = collections.deque()
+        conn._send_timeout_s = 480.0
+        conn._clock = time.monotonic
+        conn._send_expiry = {}
+        conn._reported_untimed = {}
         conn._state_tensors = {}
         conn._num_state_slots = 0
         conn._built_state_sessions = {}
@@ -1530,6 +1541,8 @@ class SchedulerSlotTest(unittest.TestCase):
 
     def make(self, *, producer: bool):
         """A scheduler holding only what `request_finished` and the recv path read."""
+        import time
+
         sched = object.__new__(self.scheduler)
         sched.is_producer = producer
         sched.engine_id = "10.0.0.1:7300"
@@ -1540,6 +1553,9 @@ class SchedulerSlotTest(unittest.TestCase):
         sched.dp_rank = 0
         sched._reqs_need_recv = {}
         sched._awaiting_send = set()
+        sched._send_timeout_s = 480.0
+        sched._clock = time.monotonic
+        sched._reqs_need_send = {}
         sched.request_id_to_transfer_id = {}
         sched.transfer_id_to_request_id = {}
         return sched
@@ -1588,6 +1604,143 @@ class SchedulerSlotTest(unittest.TestCase):
         meta = sched.build_connector_meta().reqs_to_recv[7]
         self.assertEqual((meta.local_slot_index, meta.remote_slot_index), (4, 6))
         self.assertEqual(meta.local_block_ids, [1, 2, 3])
+
+
+class SendTimeoutTest(unittest.TestCase):
+    """A producer frees a finished request's blocks once no consumer has
+    reported moving them ATOM_MORIIO_SEND_TIMEOUT_S (480 s here) after it
+    finished, on an injected clock. Scheduler and worker are both real; only
+    the RDMA and ZMQ edges are stubbed, as in `WritePathTest`."""
+
+    make_worker = WritePathTest.make
+    push_request = WritePathTest.push_request
+    make_scheduler = SchedulerSlotTest.make
+    seq = staticmethod(SchedulerSlotTest.seq)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.connector = import_connector()
+        cls.scheduler = import_connector("MoRIIOConnectorScheduler")
+        if cls.connector is None or cls.scheduler is None:
+            raise unittest.SkipTest("moriio_connector needs aiter, torch and a GPU")
+        import msgpack
+        import torch
+
+        from atom.kv_transfer.disaggregation.moriio.moriio_common import (
+            MoRIIOConstants,
+        )
+
+        cls.msgpack = msgpack
+        cls.torch = torch
+        cls.constants = MoRIIOConstants
+
+    def setUp(self):
+        self.now = 1000.0
+        self.sched = self.make_scheduler(producer=True)
+        self.sched._clock = lambda: self.now
+        self.worker = self.make_worker(producer=True)
+        self.worker._clock = lambda: self.now
+
+    def finish(self, seq_id=7):
+        """A prefill that finished at `now`, its metadata delivered."""
+        seq = self.seq(id=seq_id, leave_reason="stop_sequence")
+        self.sched.request_finished(seq)
+        self.worker.start_load_kv(self.sched.build_connector_meta())
+        return seq
+
+    def step(self, at):
+        """One worker step at `at`; its sends retire the scheduler's claims."""
+        self.now = at
+        sent = self.worker.get_finished().finished_sending
+        for transfer_id in sent:
+            self.sched.send_finished(transfer_id)
+        return sent
+
+    def test_a_request_never_read_is_released_after_the_timeout(self):
+        seq = self.finish()
+        self.assertEqual(self.step(1479.9), set())
+        self.assertTrue(self.sched.should_defer_free(seq))
+        with self.assertLogs("atom", "WARNING") as logs:
+            self.assertEqual(self.step(1480.0), {7})
+        self.assertIn("ATOM_MORIIO_SEND_TIMEOUT_S", logs.output[0])
+        self.assertFalse(self.sched.should_defer_free(seq))
+        self.assertEqual(self.step(5000.0), set())
+
+    def test_a_done_notify_releases_at_once_and_stops_the_timer(self):
+        seq = self.finish()
+        # What the handshake listener does on POP_DONE_RECV.
+        self.worker.done_sending.add(7)
+        self.assertEqual(self.step(1000.5), {7})
+        self.assertFalse(self.sched.should_defer_free(seq))
+        self.assertEqual(self.worker._send_expiry, {})
+        self.assertEqual(self.step(1480.0), set())
+        self.assertEqual(self.step(5000.0), set())
+
+    def test_a_notify_that_beats_the_metadata_starts_no_timer(self):
+        self.sched.request_finished(self.seq(id=7, leave_reason="stop_sequence"))
+        meta = self.sched.build_connector_meta()
+        self.worker.done_sending.add(7)
+        self.assertEqual(self.step(1000.5), {7})
+        self.worker.start_load_kv(meta)
+        self.assertEqual(self.worker._send_expiry, {})
+        self.assertEqual(self.step(1480.0), set())
+
+    def test_no_timer_runs_for_a_request_that_has_not_finished(self):
+        seq = self.seq(id=7)
+        self.sched.update_state_after_alloc(seq)
+        self.worker.start_load_kv(self.sched.build_connector_meta())
+        self.assertEqual(self.step(1e6), set())
+        self.assertEqual(self.worker._send_expiry, {})
+        # Nor for one aborted mid-prefill: it advertised no blocks.
+        seq.leave_reason = "aborted"
+        self.sched.request_finished(seq)
+        self.assertEqual(self.sched.build_connector_meta().reqs_to_send, {})
+
+    def test_a_timer_releases_only_its_own_request(self):
+        self.finish(seq_id=7)
+        self.now = 1200.0
+        later = self.finish(seq_id=8)
+        self.assertEqual(self.step(1480.0), {7})
+        self.assertTrue(self.sched.should_defer_free(later))
+        self.assertEqual(self.step(1680.0), {8})
+
+    def test_a_push_still_running_outlives_its_timer(self):
+        seq = self.finish(seq_id=9)
+        statuses = [FakeStatus()]
+        self.worker._write_target_ready = lambda request: True
+        self.worker._write_blocks = lambda request, engine_id: statuses
+        self.worker._write_requests.put(self.push_request())
+        self.assertEqual(self.step(1001.0), set())
+        self.assertEqual(self.step(1540.0), set())
+        self.assertTrue(self.sched.should_defer_free(seq))
+        statuses[0].state = "ok"
+        self.assertEqual(self.step(1541.0), {9})
+        self.assertEqual(self.step(5000.0), set())
+
+    def test_a_push_asked_for_after_the_release_is_refused(self):
+        self.finish(seq_id=9)
+        with self.assertLogs("atom", "WARNING"):
+            self.assertEqual(self.step(1480.0), {9})
+        pushed = []
+        self.worker._write_target_ready = lambda request: True
+        self.worker._write_blocks = lambda request, engine_id: pushed.append(
+            request
+        ) or [FakeStatus("ok")]
+        self.worker._write_requests.put(self.push_request())
+        with self.assertLogs("atom", "ERROR"):
+            self.step(1481.0)
+        self.assertEqual(pushed, [])
+        ((frames, _host, _port),) = self.worker.sent
+        self.assertEqual(frames[0], self.constants.WRITE_DONE)
+        self.assertEqual(self.msgpack.loads(frames[1])["ok"], False)
+
+    def test_zero_keeps_the_claim_until_a_report(self):
+        self.sched._send_timeout_s = 0.0
+        self.worker._send_timeout_s = 0.0
+        seq = self.finish()
+        self.assertEqual(self.sched.build_connector_meta().reqs_to_send, {})
+        self.assertEqual(self.step(1e9), set())
+        self.assertTrue(self.sched.should_defer_free(seq))
 
 
 class WrapperMessagingTest(unittest.TestCase):
