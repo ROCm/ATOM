@@ -173,7 +173,10 @@ def test_fc_tp_matches_replicated(mods, rank, monkeypatch, tp, dtype, rows):
         assert torch.equal(got, expected), f"rank {r}: differs from replicated"
 
 
-def _attention(mods, weights):
+def _attention(mods, weights, kv_transfer_config=None):
+    """The draft attention as `Config` builds it: ``kv_transfer_config`` is
+    always there (``{}`` without P/D), and a P/D producer (a TP1 PP stage)
+    may hold more KV heads than ranks."""
     hf = SimpleNamespace(
         hidden_size=HIDDEN,
         num_attention_heads=HEADS,
@@ -184,9 +187,10 @@ def _attention(mods, weights):
         rope_theta=10000.0,
         rotary_dim=HEAD_DIM // 2,
     )
-    att = mods.m3.M3DSparkAttention(
-        SimpleNamespace(kv_cache_dtype="fp8"), hf, None, layer_num=0
+    atom_config = SimpleNamespace(
+        kv_cache_dtype="fp8", kv_transfer_config=kv_transfer_config or {}
     )
+    att = mods.m3.M3DSparkAttention(atom_config, hf, None, layer_num=0)
     for shard, w in weights.items():
         att.qkv_proj.weight_loader(att.qkv_proj.weight, w, shard)
     att.kv.k_cache = torch.zeros(1)  # bound: the context write runs
@@ -205,8 +209,11 @@ def _record_context_write(mods, monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("tp", [4, 8])
+@pytest.mark.parametrize("tp", [1, 4, 8])
 def test_ctx_kv_only_writes_the_same_kv(mods, rank, monkeypatch, tp):
+    """TP 4 / 8: a decode, or a TP prefill. TP 1: the last stage of a PP x TP1
+    prefill, a P/D producer holding every KV head (the decode's TP4 ranks each
+    get theirs through the push)."""
     torch.manual_seed(tp)
     weights = {
         "q": torch.randn(HEADS * HEAD_DIM, HIDDEN).bfloat16(),
@@ -217,13 +224,14 @@ def test_ctx_kv_only_writes_the_same_kv(mods, rank, monkeypatch, tp):
     positions = torch.arange(9)
     slots = torch.arange(100, 109)
     calls = _record_context_write(mods, monkeypatch)
+    pd = {"kv_role": "kv_producer"} if tp == 1 else None
 
     for r in range(tp):
         rank(r, tp)
         written = []
         for flag in ("0", "1"):
             monkeypatch.setenv("ATOM_DSPARK_CTX_KV_ONLY", flag)
-            att = _attention(mods, weights)
+            att = _attention(mods, weights, kv_transfer_config=pd)
             assert att.context_kv_only == (flag == "1")
             calls.clear()
             att.write_context_kv(ctx, positions, slots)
@@ -233,9 +241,10 @@ def test_ctx_kv_only_writes_the_same_kv(mods, rank, monkeypatch, tp):
             written.append((call["k"], call["v"]))
         (k0, v0), (k1, v1) = written
         assert torch.equal(k0, k1) and torch.equal(v0, v1), f"rank {r}"
-        # And it is this rank's KV head, not a query head.
+        # And it is this rank's KV heads, not a query head.
+        heads = max(1, KV_HEADS // tp)
         head = r * KV_HEADS // tp
-        rows = slice(head * HEAD_DIM, (head + 1) * HEAD_DIM)
+        rows = slice(head * HEAD_DIM, (head + heads) * HEAD_DIM)
         assert torch.equal(k1, F.linear(ctx, weights["k"][rows]))
         assert torch.equal(v1, F.linear(ctx, weights["v"][rows]))
 
@@ -302,3 +311,19 @@ def test_ctx_kv_only_view_follows_a_rebound_weight(mods, rank, monkeypatch):
     second = att._context_kv_proj()
     assert second is not first
     assert torch.equal(second.weight, att.qkv_proj.weight.data[att.q_size :])
+
+
+def test_a_tp1_drafter_off_pd_is_still_refused(mods, rank, monkeypatch):
+    """Only a P/D producer (the PP x TP1 prefill's last stage) may hold more
+    KV heads than ranks: it never runs the per-row block decode."""
+    monkeypatch.setenv("ATOM_DSPARK_CTX_KV_ONLY", "1")
+    rank(0, 1)
+    weights = {
+        "q": torch.randn(HEADS * HEAD_DIM, HIDDEN).bfloat16(),
+        "k": torch.randn(KV_HEADS * HEAD_DIM, HIDDEN).bfloat16(),
+        "v": torch.randn(KV_HEADS * HEAD_DIM, HIDDEN).bfloat16(),
+    }
+    with pytest.raises(ValueError, match="TP >= 4"):
+        _attention(mods, weights)
+    with pytest.raises(ValueError, match="TP >= 4"):
+        _attention(mods, weights, kv_transfer_config={"kv_role": "kv_consumer"})
