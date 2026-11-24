@@ -99,12 +99,13 @@ def _rope_gptj(
     x, pos, cos_ptr, sin_ptr, stride_cos_t, ROWS: tl.constexpr, ROPE: tl.constexpr
 ):
     """Interleaved RoPE of BF16 ``x [ROWS, ROPE]`` at ``pos [ROWS]`` with the
-    model's BF16 cos/sin cache (front half, GPT-J pairs), bit-identical to
-    AITER's `_rope_kernel_cached_thd_2c_gqa_onehead_fwd` on gfx1250. That
-    kernel lowers ``x * cos + rot * sin`` to ``v_pk_mul_bf16`` then
-    ``v_pk_fma_bf16``: ``bf16(x * cos + bf16(rot * sin))``, one rounding of
-    the sum. Here the BF16 products are exact in FP32, and TwoSum recovers
-    what the FP32 add drops, so the final rounding to BF16 is the same."""
+    model's BF16 cos/sin cache (front half, GPT-J pairs), rounded as AITER's
+    `_rope_kernel_cached_thd_2c_gqa_onehead_fwd` is on gfx1250 when it lowers
+    ``x * cos + rot * sin`` to ``v_pk_mul_bf16`` then ``v_pk_fma_bf16``:
+    ``bf16(x * cos + bf16(rot * sin))``, one rounding of the sum. Here the
+    BF16 products are exact in FP32, and TwoSum recovers what the FP32 add
+    drops, so the final rounding to BF16 is the same. A Triton build that
+    lowers AITER's kernel otherwise lands some elements one BF16 ulp apart."""
     d = tl.arange(0, ROPE)
     cs = pos[:, None] * stride_cos_t + (d // 2)[None, :]
     cos = tl.load(cos_ptr + cs).to(tl.float32)
