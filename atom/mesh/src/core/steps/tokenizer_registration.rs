@@ -193,10 +193,15 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 .read()
                 .get(loaded)
                 .cloned();
-            let from_file = app_context.tokenizer_template_files.read().contains(loaded);
+            let file = app_context
+                .tokenizer_template_files
+                .read()
+                .get(loaded)
+                .cloned();
             let replaced = match (&inline_template, &chat_template) {
-                (Some(template), _) => !from_file && recorded.as_ref() != Some(template),
-                (None, Some(_)) => recorded.is_some(),
+                (Some(template), _) => file.is_none() && recorded.as_ref() != Some(template),
+                // A file wins over the tokenizer's own template and a worker's alike.
+                (None, Some(path)) => file.as_ref() != Some(path),
                 (None, None) => false,
             };
             if replaced {
@@ -231,9 +236,9 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             let templates = &app_context.tokenizer_inline_templates;
             templates.write().insert(loaded.clone(), template);
         }
-        if let (Ok(LoadOutcome::Loaded { id: loaded }), Some(_)) = (&result, &chat_template) {
+        if let (Ok(LoadOutcome::Loaded { id: loaded }), Some(path)) = (&result, &chat_template) {
             let files = &app_context.tokenizer_template_files;
-            files.write().insert(loaded.clone());
+            files.write().insert(loaded.clone(), path.clone());
         }
 
         match result {
@@ -526,6 +531,50 @@ mod tests {
         assert_eq!(rendered(), "second: hi");
     }
 
+    /// A template file replaces a tokenizer loaded with its own template, and another
+    /// file replaces the first; the same file again leaves it in place.
+    #[tokio::test]
+    async fn test_a_template_file_replaces_the_tokenizer_s_own_template() {
+        let context = app_context();
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = ["first", "second"].map(|name| {
+            let file = dir.path().join(format!("{name}.jinja"));
+            std::fs::write(&file, format!("{name}: {{{{ messages[0].content }}}}")).unwrap();
+            file.to_str().unwrap().to_string()
+        });
+        let register = |path: Option<&str>| {
+            let config = TokenizerConfigRequest {
+                id: TokenizerRegistry::generate_id(),
+                name: "m".to_string(),
+                source: hf_tokenizer_path().to_string(),
+                chat_template_path: path.map(str::to_string),
+                inline_chat_template: None,
+                cache_config: None,
+                fail_on_duplicate: false,
+            };
+            let data = create_tokenizer_workflow_data(config, context.clone());
+            async move {
+                let mut workflow = WorkflowContext::new(WorkflowInstanceId::new(), data);
+                LoadTokenizerStep.execute(&mut workflow).await
+            }
+        };
+        let loaded = || context.tokenizer_registry.get_by_name("m").unwrap();
+        let rendered = || {
+            let hi = json!({"role": "user", "content": "hi"});
+            (loaded().tokenizer)
+                .apply_chat_template(&[hi], ChatTemplateParams::default())
+                .unwrap()
+        };
+        register(None).await.unwrap();
+        register(Some(&paths[0])).await.unwrap();
+        assert_eq!(rendered(), "first: hi");
+        let first = loaded().id;
+        register(Some(&paths[0])).await.unwrap();
+        assert_eq!(loaded().id, first);
+        register(Some(&paths[1])).await.unwrap();
+        assert_eq!(rendered(), "second: hi");
+    }
+
     /// A registration naming a template file replaces a tokenizer loaded with a
     /// worker's inline template, once: the file's tokenizer then stays.
     #[tokio::test]
@@ -571,7 +620,7 @@ mod tests {
         assert!(context
             .tokenizer_template_files
             .read()
-            .contains(&file_loaded));
+            .contains_key(&file_loaded));
         assert!(context.tokenizers_replaced.is_empty());
     }
 
