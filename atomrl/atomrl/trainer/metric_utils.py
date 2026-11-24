@@ -1,4 +1,11 @@
-# Copyright 2025 The AtomRL Authors.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+#
+# Modified by Advanced Micro Devices, Inc.
+# Source: https://github.com/verl-project/verl/blob/8357f1e0a7ce4c06dc970c2c637d49b33815f5cc/verl/trainer/ppo/metric_utils.py
+
 # Derived from verl (verl-project/verl):
 #   verl/trainer/ppo/metric_utils.py L89-310 (compute_data_metrics, compute_timing_metrics,
 #                                              compute_throughput_metrics)

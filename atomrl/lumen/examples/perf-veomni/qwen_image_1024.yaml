@@ -1,3 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+#
+# Modified by Advanced Micro Devices, Inc.
+# Source: https://github.com/ByteDance-Seed/VeOmni/blob/573848a00fcd7329c2411346c6f4a983e9f67e3f/configs/dit/qwen_image_sft.yaml
+
 # 1024x1024, matching VeOmni's official configs/dit/qwen_image_sft.yaml. This is
 # the example's default; qwen_image_smoke.yaml is the same thing at 256 with
 # max_sequence_length 64, reachable with RES=256.

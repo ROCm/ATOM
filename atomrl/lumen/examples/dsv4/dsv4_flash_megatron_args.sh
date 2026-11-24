@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 RadixArk, Inc.
+# Copyright 2025 Zhipu AI
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+#
+# Modified by Advanced Micro Devices, Inc.
+# Source: https://github.com/radixark/miles/blob/9437366e0aa3a25294720f70d18b081067595f85/scripts/models/deepseek-v4-flash.sh
+
 # DSV4 Flash full model (43 layers) Megatron args — sourced by run_dsv4_flash_pretrain_inner.sh.
 #
 # Ported from miles/scripts/models/deepseek-v4-flash.sh with Lumen spec module.

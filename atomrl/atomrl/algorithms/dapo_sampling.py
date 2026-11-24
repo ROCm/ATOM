@@ -1,6 +1,11 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
+#
+# Modified by Advanced Micro Devices, Inc.
+# Source: https://github.com/verl-project/verl/blob/8357f1e0a7ce4c06dc970c2c637d49b33815f5cc/verl/workers/reward_manager/dapo.py
+# Source: https://github.com/verl-project/verl/blob/246cac4ca6b0e3ce1009bc48aaa798689e0600af/recipe/dapo/dapo_ray_trainer.py
 
 """Pure, testable DAPO helpers ported faithfully from verl.
 

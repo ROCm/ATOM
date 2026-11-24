@@ -326,6 +326,7 @@ FROM ${DSV4_BOOTSTRAP_IMAGE} AS dsv4-bootstrap
 FROM ${DSV4_BASE_IMAGE} AS dsv4-trainer
 
 ARG IMAGE_ROLE=dsv4-trainer
+ARG DSV4_BOOTSTRAP_IMAGE
 
 COPY --from=sources /sources /workspace
 
@@ -336,8 +337,23 @@ COPY --from=sources /sources /workspace
 # - native libs (mooncake)
 COPY --from=dsv4-bootstrap /opt/dsv4-bootstrap/Megatron-LM /workspace/Megatron-LM
 COPY --from=dsv4-bootstrap /opt/dsv4-runtime/tilelang /opt/tilelang
-COPY --from=dsv4-bootstrap /opt/dsv4-bootstrap/site-packages/tile_kernels /opt/dsv4-site/tile_kernels
+RUN --mount=type=bind,from=dsv4-bootstrap,source=/opt/dsv4-bootstrap/site-packages,target=/dsv4-site-src \
+    set -eux; \
+    mkdir -p /opt/dsv4-site; \
+    cp -a /dsv4-site-src/tile_kernels /opt/dsv4-site/; \
+    for metadata in /dsv4-site-src/tile_kernels*.dist-info; do \
+      [ ! -e "${metadata}" ] || cp -a "${metadata}" /opt/dsv4-site/; \
+    done
 COPY --from=dsv4-bootstrap /opt/dsv4-bootstrap/native-libs /opt/dsv4-native-libs
+RUN printf '%s\n' \
+      "bootstrap_image=${DSV4_BOOTSTRAP_IMAGE}" \
+      "copied=/opt/dsv4-bootstrap/Megatron-LM" \
+      "copied=/opt/dsv4-runtime/tilelang" \
+      "copied=/opt/dsv4-bootstrap/site-packages/tile_kernels" \
+      "copied=/opt/dsv4-bootstrap/native-libs" \
+      > /workspace/THIRD_PARTY_IMAGE_SOURCES && \
+    find /opt/dsv4-site -maxdepth 1 -name '*.dist-info' -printf 'metadata=%f\n' \
+      >> /workspace/THIRD_PARTY_IMAGE_SOURCES
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -439,7 +455,7 @@ RUN pip install --no-cache-dir \
     LUMEN_BUILD_EXTENSIONS=1 pip install --no-cache-dir --no-build-isolation --no-deps \
       -e /workspace/ATOM
 
-ENV PYTHONPATH="/workspace/ATOM/atomrl:${PYTHONPATH:-}" \
+ENV PYTHONPATH="/workspace/ATOM/atomrl" \
     PYTHONUNBUFFERED=1 \
     TOKENIZERS_PARALLELISM=false \
     HIP_FORCE_DEV_KERNARG=1 \

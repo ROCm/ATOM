@@ -1,9 +1,11 @@
-# Copyright 2025 The AtomRL Authors.
-# Derived from verl (verl-project/verl). See atomrl/algorithms/rollout_correction.py
-# for full attribution and docs/rollout_corr.md for references.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """Backward-compatible re-exports.
 
-Primary implementation moved to atomrl.algorithms.rollout_correction.
+Re-exports the Apache-2.0-derived implementation in
+``atomrl.algorithms.rollout_correction`` without copying its implementation.
 """
 
 from atomrl.algorithms.rollout_correction import (  # noqa: F401

@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2023 DeepSeek
-# Copyright 2026 Advanced Micro Devices, Inc.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 #
 # Adapted from DeepSeek-V4-Pro under its MIT license:
-# https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/LICENSE
+# https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/b5968e9190ef611bbf34a7229255be88a0e937c1/LICENSE
 
 """Block-wise FP8 activation quantization for DeepSeek-V4.
 
-Ported from deepseek-ai/DeepSeek-V4-Pro/inference/kernel.py to keep bit-exact
-parity with the upstream inference kernel. Keep this file in sync when
-DeepSeek updates the reference implementation.
+Ported from DeepSeek-V4-Pro's inference kernel and adapted for Lumen's output
+dtype contract. Keep this file semantically aligned with the pinned upstream
+implementation when updating it.
 
-Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/inference/kernel.py
+Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/b5968e9190ef611bbf34a7229255be88a0e937c1/inference/kernel.py
 """
 
 import tilelang
