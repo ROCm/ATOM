@@ -354,8 +354,9 @@ def test_fp8_prefill_rows_stay_direct(monkeypatch):
 
 
 class _MxAttention(_QuantAttention):
-    def __init__(self, kv_format: str = "nvfp4"):
+    def __init__(self, kv_format: str = "nvfp4", num_kv_heads: int = 1):
         super().__init__()
+        self.num_kv_heads = num_kv_heads
         # Before the KV cache is bound -- when torch.compile traces the forward
         # in the warmup run -- `kv_nvfp4` is still False.
         self.impl = SimpleNamespace(kv_format=kv_format, kv_nvfp4=False)
@@ -406,10 +407,12 @@ def test_mxfp8_out_keeps_the_bf16_path_otherwise():
     assert layer.o_proj.calls[0][1] is None
 
 
-def _mx_conditions(monkeypatch, *, flag=True, kv_format="nvfp4", native_a8=1):
+def _mx_conditions(
+    monkeypatch, *, flag=True, kv_format="nvfp4", native_a8=1, kv_heads=1
+):
     monkeypatch.setattr(m3_model.envs, "ATOM_MINIMAX_M3_PA_MXFP8_OUT", flag)
     monkeypatch.setattr(m3_model, "nvfp4_reads_page_table", lambda: True)
-    attn = _MxAttention(kv_format)
+    attn = _MxAttention(kv_format, kv_heads)
     o_proj = SimpleNamespace(native_a8_group_rows=native_a8)
     return m3_model._sparse_pa_mxfp8_conditions(attn, o_proj)
 
@@ -423,8 +426,8 @@ def test_mxfp8_out_follows_the_declared_kv_format_not_the_binding(monkeypatch):
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"flag": False}, {"kv_format": ""}, {"native_a8": None}],
-    ids=["flag-off", "fp8-kv", "o_proj-not-native-a8"],
+    [{"flag": False}, {"kv_format": ""}, {"native_a8": None}, {"kv_heads": 4}],
+    ids=["flag-off", "fp8-kv", "o_proj-not-native-a8", "four-kv-heads"],
 )
 def test_mxfp8_out_conditions_refuse(monkeypatch, kwargs):
     assert not all(_mx_conditions(monkeypatch, **kwargs).values())
