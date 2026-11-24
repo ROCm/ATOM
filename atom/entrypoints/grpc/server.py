@@ -440,7 +440,10 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                 for item in items:
                     if isinstance(item, frames.Rejection):  # the codec's INVALID
                         refused.append(item)
-                    elif item.seq_id in session.admitting:
+                    elif (
+                        item.seq_id in session.admitting
+                        or item.seq_id in session.requests
+                    ):
                         in_flight = ValueError(
                             f"seq_id {item.seq_id} is already in flight"
                         )

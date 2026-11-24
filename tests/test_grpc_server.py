@@ -858,6 +858,40 @@ def test_a_finished_request_whose_send_then_fails_leaves_its_reused_seq_id_alone
     assert rejected == [], rejected  # A ended with its Completion, nothing after
 
 
+def test_a_duplicate_of_a_running_seq_id_is_refused_without_delaying_its_abort(
+    serve, monkeypatch
+):
+    monkeypatch.setattr(grpc_server, "SESSION_ADMISSIONS", 1)
+    engine = FakeEngine([([5], None)])
+    servicer = serve(engine)
+    sent = asyncio.Event()
+
+    async def client():
+        yield pb.Frames(frames=_submit_batch((3, "a", [1])))
+        await _until(lambda: engine.running)  # A runs
+        engine.release.clear()  # B holds the cap in preprocess
+        yield pb.Frames(frames=_submit_batch((4, "b", [2])))
+        await _until(lambda: len(engine.preprocessed) == 2)
+        yield pb.Frames(frames=_submit_batch((3, "a again", [3])))  # A's, in flight
+        abort = v1.Envelope(protocol_version=frames.PROTOCOL_VERSION)
+        abort.abort.seq_ids.append(3)
+        yield pb.Frames(frames=[abort.SerializeToString()])
+        await sent.wait()
+
+    async def abort_a_after_its_duplicate():
+        call = servicer.Session(client(), SimpleNamespace())
+        await anext(call)  # Ready
+        await _until(lambda: engine.aborted)
+        aborted_while_b_preprocessed = not engine.release.is_set()
+        engine.release.set()
+        sent.set()
+        await call.aclose()
+        return aborted_while_b_preprocessed
+
+    assert asyncio.run(abort_a_after_its_duplicate())
+    assert len(engine.preprocessed) == 2  # the duplicate never reached preprocess
+
+
 def test_an_abort_is_applied_while_admissions_are_at_their_cap(serve, monkeypatch):
     monkeypatch.setattr(grpc_server, "SESSION_ADMISSIONS", 2)
     engine = FakeEngine([([5], None)])
