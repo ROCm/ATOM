@@ -3978,6 +3978,54 @@ mod e2_generate_streaming_branches {
     }
 }
 
+/// Streaming metrics count the output a Complete carries past the partials too.
+mod e4_generate_streaming_output_tokens {
+    use axum::body::to_bytes;
+
+    use super::test_support::generate_ctx;
+    use crate::routers::render::generate_streaming;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+
+    #[tokio::test]
+    async fn test_output_tokens_are_the_complete_s_count() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let partial = |id| {
+            Ok(TokenChunk::Partial {
+                token_ids: vec![id],
+                logprobs: None,
+            })
+        };
+        let complete = Ok(TokenChunk::Complete {
+            token_ids: vec![1, 2, 3],
+            finish_reason: FinishReason::Stop,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 3,
+                total_tokens: 4,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta::default(),
+        });
+        let stream = synthetic_single_stream(vec![partial(1), partial(2), complete]);
+        let resp = generate_streaming::process(stream, generate_ctx(), "regular");
+        to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let rendered = handle.render();
+        let output = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("mesh_router_tokens_total{")
+                    && line.contains("token_type=\"output\"")
+            })
+            .and_then(|line| line.rsplit_once(' ')?.1.parse::<f64>().ok());
+        assert_eq!(output, Some(3.0), "{rendered}");
+    }
+}
+
 mod e3_generate_streaming_across_chunks {
     use std::sync::Arc;
 
