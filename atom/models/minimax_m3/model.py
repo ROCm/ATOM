@@ -207,9 +207,6 @@ def _sparse_pa_mxfp8_conditions(attn: nn.Module, o_proj: nn.Module) -> dict:
         "NVFP4 K/V (declared)": getattr(attn.impl, "kv_format", "") == "nvfp4",
         "native group-32 o_proj": getattr(o_proj, "native_a8_group_rows", None)
         is not None,
-        # The epilogue's (row, kv head) sequences write one kv head's slice of a
-        # row; the attention takes one local kv head (sparse_attn_nvfp4).
-        "one local KV head": getattr(attn, "num_kv_heads", None) == 1,
     }
 
 

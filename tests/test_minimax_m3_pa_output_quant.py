@@ -424,10 +424,15 @@ def test_mxfp8_out_follows_the_declared_kv_format_not_the_binding(monkeypatch):
     assert all(_mx_conditions(monkeypatch).values())
 
 
+def test_mxfp8_out_takes_several_local_kv_heads(monkeypatch):
+    """PP4 x TP1: four KV heads a GPU (sparse_attn_nvfp4 splits the output)."""
+    assert all(_mx_conditions(monkeypatch, kv_heads=4).values())
+
+
 @pytest.mark.parametrize(
     "kwargs",
-    [{"flag": False}, {"kv_format": ""}, {"native_a8": None}, {"kv_heads": 4}],
-    ids=["flag-off", "fp8-kv", "o_proj-not-native-a8", "four-kv-heads"],
+    [{"flag": False}, {"kv_format": ""}, {"native_a8": None}],
+    ids=["flag-off", "fp8-kv", "o_proj-not-native-a8"],
 )
 def test_mxfp8_out_conditions_refuse(monkeypatch, kwargs):
     assert not all(_mx_conditions(monkeypatch, **kwargs).values())
