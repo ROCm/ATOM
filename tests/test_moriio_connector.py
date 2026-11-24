@@ -954,6 +954,74 @@ class WritePathTest(unittest.TestCase):
         # Back to rank 1 of the consumer, the rank that asked.
         self.assertEqual((host, port), ("10.0.0.2", 7401))
 
+    def test_the_smallest_ready_push_is_posted_first(self):
+        conn = self.make(producer=True)
+        conn._kv_ready_events = dict.fromkeys((9, 10, 11, 12), conn._kv_ready_events[9])
+        conn._write_target_ready = lambda request: True
+        posted = []
+
+        def write(request, engine_id):
+            posted.append(request["transfer_id"])
+            return [FakeStatus()]
+
+        conn._write_blocks = write
+        for tid, blocks in ((9, 50), (10, 2), (11, 9)):
+            conn._write_requests.put(
+                self.push_request(
+                    transfer_id=tid,
+                    dst_block_ids=list(range(blocks)),
+                    src_block_ids=list(range(blocks)),
+                )
+            )
+        conn._service_write_requests()
+        # Posting time grows with the push: a large one first would hold back
+        # every smaller push queued behind it.
+        self.assertEqual(posted, [10, 11, 9])
+        self.assertEqual(conn._pending_writes, [])
+
+    def test_a_landed_push_is_reported_before_the_next_post(self):
+        conn = self.make(producer=True)
+        conn._kv_ready_events = dict.fromkeys((9, 10, 11, 12), conn._kv_ready_events[9])
+        conn._write_target_ready = lambda request: True
+        reported_before = []
+
+        def write(request, engine_id):
+            reported_before.append(len(conn.sent))
+            return [FakeStatus("ok")]
+
+        conn._write_blocks = write
+        for tid in (9, 10):
+            conn._write_requests.put(self.push_request(transfer_id=tid))
+        conn._service_write_requests()
+        # The first push landed while the pass went on; its consumer is told
+        # before the second is posted, not after the whole pass.
+        self.assertEqual(reported_before, [0, 1])
+        self.assertEqual(len(conn.sent), 2)
+
+    def test_a_push_asked_for_during_a_post_joins_the_next_pick(self):
+        conn = self.make(producer=True)
+        conn._kv_ready_events = dict.fromkeys((9, 10, 11, 12), conn._kv_ready_events[9])
+        conn._write_target_ready = lambda request: True
+        posted = []
+
+        def write(request, engine_id):
+            posted.append(request["transfer_id"])
+            if request["transfer_id"] == 10:
+                conn._write_requests.put(self.push_request(transfer_id=12))
+            return [FakeStatus()]
+
+        conn._write_blocks = write
+        for tid, blocks in ((9, 50), (10, 1)):
+            conn._write_requests.put(
+                self.push_request(
+                    transfer_id=tid,
+                    dst_block_ids=list(range(blocks)),
+                    src_block_ids=list(range(blocks)),
+                )
+            )
+        conn._service_write_requests()
+        self.assertEqual(posted, [10, 12, 9])
+
     def test_a_failed_push_still_frees_the_source(self):
         conn = self.make(producer=True)
         conn._remote_agents = {"10.0.0.2:7400_dp0": {"agent"}}
