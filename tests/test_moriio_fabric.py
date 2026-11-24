@@ -213,5 +213,97 @@ class ConnectorWiringTest(unittest.TestCase):
         self.assertIn("our own PAGE descriptor", body)
 
 
+class StatePoolTest(unittest.TestCase):
+    """Per-request state comes from a fabric MemPool made once per process."""
+
+    def tearDown(self):
+        fabric._state_pool = None
+
+    def test_one_pool_serves_every_allocation(self):
+        import sys
+        import types
+        from unittest import mock
+
+        made = []
+        mori_io = types.ModuleType("mori.io")
+        mori_io.make_fabric_mem_pool = lambda: made.append(object()) or made[-1]
+        mori = types.ModuleType("mori")
+        mori.io = mori_io
+        with (
+            mock.patch.dict(sys.modules, {"mori": mori, "mori.io": mori_io}),
+            mock.patch.object(torch.cuda, "use_mem_pool", side_effect=lambda p: p),
+        ):
+            first = fabric.fabric_state_pool()
+            second = fabric.fabric_state_pool()
+        self.assertEqual(len(made), 1)
+        self.assertIs(first, made[0])
+        self.assertIs(second, made[0])
+
+
+class StateWiringTest(unittest.TestCase):
+    """A KDA model's per-request state moves over the fabric with its pages."""
+
+    setUpClass = classmethod(ConnectorWiringTest.setUpClass.__func__)
+    segment = ConnectorWiringTest.segment
+
+    def test_state_registers_beside_the_pool_and_reaches_the_peer(self):
+        body = self.segment("_register_pages")
+        self.assertNotIn("also keeps per-request state", body)
+        self.assertIn("self._register_state(layer_name, kv_cache)", body)
+        # The same checks as the RDMA registration: ReplaySSM records only
+        # with their cursor, and the producer's transfer slots on top.
+        self.assertIn("self._check_replay_cursor()", body)
+        self.assertIn("self._first_transfer_slot = self._num_state_slots - ", body)
+        self.assertIn("state_descs=", body)
+        self.assertIn("num_state_slots=self._num_state_slots", body)
+
+    def test_only_rdma_limits_a_state_registration(self):
+        body = self.segment("_register_state_tensor")
+        self.assertIn(
+            "if not self.use_fabric and num_slots * slot_bytes > MAX_RDMA_CHUNK_BYTES",
+            body,
+        )
+        self.assertIn("if self.use_fabric and not desc_fabric_info(desc)[0]:", body)
+
+    def test_the_state_slot_rides_with_the_page_batch(self):
+        body = self.segment("_write_blocks")
+        fabric_branch = body[body.index("if self.use_fabric:") :]
+        fabric_branch = fabric_branch[: fabric_branch.index("return statuses")]
+        # Checked before any page is written, posted after the pages.
+        self.assertLess(
+            fabric_branch.index("self._state_writes(request, engine_id)"),
+            fabric_branch.index("self._write_pages("),
+        )
+        self.assertIn(
+            "for session, size, local_offset, remote_offset in state_writes",
+            fabric_branch,
+        )
+
+    def test_the_state_pool_hook_reaches_the_model_runner(self):
+        runner = (ROOT / "atom/model_engine/model_runner.py").read_text()
+        hook = runner.index("KVConnectorFactory.per_request_state_pool(self.config)")
+        self.assertLess(hook, runner.index("allocate_per_req_cache(", hook))
+        self.assertIn("return fabric_state_pool()", self.source)
+
+
+class KeptPrefixWiringTest(unittest.TestCase):
+    """A receive that keeps the consumer's local prefix (ROCm/ATOM#3572) is
+    verified over the fabric as over RDMA: the kept PAGE blocks must not change."""
+
+    setUpClass = classmethod(ConnectorWiringTest.setUpClass.__func__)
+    segment = ConnectorWiringTest.segment
+
+    def test_the_kept_prefix_is_digested_before_the_ask_and_checked_after(self):
+        ask = self.segment("_request_write")
+        fabric_branch = ask[ask.index("if self._verify_kv and self.use_fabric:") :]
+        self.assertIn(
+            "self._note_kept_pages(req_id, kept_ids)",
+            fabric_branch[: fabric_branch.index("elif self._verify_kv:")],
+        )
+        finished = self.segment("get_finished")
+        self.assertIn("self._verify_page_kept_landed(req_id)", finished)
+        self.assertIn("self._verify_page_kept.pop(req_id, None)", finished)
+
+
 if __name__ == "__main__":
     unittest.main()

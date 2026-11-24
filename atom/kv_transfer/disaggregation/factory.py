@@ -518,6 +518,23 @@ class KVConnectorFactory:
         return None
 
     @classmethod
+    def per_request_state_pool(cls, config: Any) -> Any:
+        """The per-request state allocation context of the first connector with one.
+
+        None leaves the attention backend to allocate the state as usual
+        (`KVConnectorBase.per_request_state_pool`).
+        """
+
+        for name, leaf_config in cls.leaf_connectors(config) or ():
+            entry = cls._registry[name]
+            mod = importlib.import_module(entry["worker_module"])
+            klass = getattr(mod, entry["worker_class"])
+            context = klass.per_request_state_pool(leaf_config)
+            if context is not None:
+                return context
+        return None
+
+    @classmethod
     def create_connector(
         cls, config: Any, role: str = "worker"
     ) -> KVConnectorBase | KVConnectorSchedulerBase:

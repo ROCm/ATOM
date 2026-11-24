@@ -33,6 +33,15 @@ def builder(kv_transfer_config):
         (
             {
                 "kv_connector": "moriio",
+                "kv_role": "kv_producer",
+                "moriio_backend": "fabric",
+                "state_transfer_slots": 8,
+            },
+            8,
+        ),
+        (
+            {
+                "kv_connector": "moriio",
                 "kv_role": "kv_consumer",
                 "state_transfer_slots": 8,
             },

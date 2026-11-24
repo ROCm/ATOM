@@ -830,7 +830,7 @@ class WritePathTest(unittest.TestCase):
         )
         return caches
 
-    def register(self, conn, kv_caches):
+    def register(self, conn, kv_caches, transfer_tensors=None):
         """Run `register_kv_caches` with the listener stubbed; return its metadata."""
         conn.kv_cache_shape = None
         conn.blocks_per_chunk = None
@@ -840,7 +840,7 @@ class WritePathTest(unittest.TestCase):
         advertised = []
         conn._handshake_listener = lambda metadata, *_rest: advertised.append(metadata)
         conn._start_write_service = lambda: None
-        conn.register_kv_caches(kv_caches)
+        conn.register_kv_caches(kv_caches, transfer_tensors)
         conn._handshake_listener_thread.join(timeout=5)
         return advertised[0]
 
@@ -950,6 +950,31 @@ class WritePathTest(unittest.TestCase):
         with self.assertLogs("atom", "ERROR") as logs:
             conn._verify_kept_landed("d2")
         self.assertIn("the receive wrote into blocks it kept", logs.output[0])
+
+    def test_a_producer_over_two_hosts_is_reached_on_its_ranks_host(self):
+        import types
+
+        # A TP8 producer over two hosts (4 ranks each) reports only its first
+        # host; rank 5 asks, and later notifies, rank 5 on the second.
+        conn = self.make(producer=False)
+        conn.tp_rank = 5
+        conn._remote_tp_hosts = {"10.0.0.1": ["10.0.0.1", "10.0.0.9"]}
+        conn.request_id_to_transfer_id = {"d1": 77}
+        meta = self.recv_meta([4, 5], [10, 11, 12])
+        conn._request_write("d1", meta)
+        ((_frames, host, port),) = conn.sent
+        self.assertEqual((host, port), ("10.0.0.9", 7306))
+        conn._notify_producer("d1", meta)
+        self.assertEqual(conn.notified, [(77, "10.0.0.9", 7306)])
+        # Rank 3 is on the first host; a producer the map does not name keeps
+        # its remote_host; hosts that do not split the TP group are refused.
+        conn.tp_rank = 3
+        self.assertEqual(conn._producer_host(meta), "10.0.0.1")
+        other = types.SimpleNamespace(remote_host="10.0.0.3", tp_size=8)
+        self.assertEqual(conn._producer_host(other), "10.0.0.3")
+        conn._remote_tp_hosts = {"10.0.0.1": ["a", "b", "c"]}
+        with self.assertRaises(ValueError):
+            conn._producer_host(meta)
 
     def test_the_consumer_refuses_a_short_source_without_asking(self):
         conn = self.make(producer=False)
@@ -1176,6 +1201,79 @@ class WritePathTest(unittest.TestCase):
         conn._page_batch([2, 3, 7], [4, 5, 4], remote, into_remote=False)
         with self.assertRaisesRegex(ValueError, r"local blocks \[2\] appear more"):
             conn._page_batch([2, 3, 2], [4, 5, 6], remote, into_remote=False)
+
+    def fabric(self, conn, *, blocks: int = 8):
+        """`conn` over the fabric: two PAGE regions, the peer's at other offsets."""
+        conn.use_fabric = True
+        conn._page_regions = [(0, 16, "k"), (1000, 4, "k_scale")]
+        conn._page_views = [
+            self.torch.zeros((blocks, 1, 16), dtype=self.torch.uint8),
+            self.torch.zeros((blocks, 1, 4), dtype=self.torch.uint8),
+        ]
+        conn._verify_page_dst = {}
+        conn._verify_page_kept = {}
+        conn._write_page_digests = {}
+        conn._get_or_build_page_session = lambda engine_id: (
+            "S-page",
+            [(64, 16), (5000, 4)],
+        )
+        return conn
+
+    def test_a_fabric_push_moves_the_suffix_and_a_staged_transfer_slot(self):
+        # The consumer names only the blocks past its kept prefix (#3572).
+        consumer = self.fabric(self.make(producer=False))
+        meta = self.recv_meta([4, 5, 6], [10, 11, 12])
+        meta.num_computed_blocks = 2
+        consumer._request_write("d1", meta)
+        ((frames, _host, _port),) = consumer.sent
+        asked = self.msgpack.loads(frames[1])
+        self.assertEqual((asked["dst_block_ids"], asked["src_block_ids"]), ([6], [12]))
+
+        # The producer pushes those pages, and the state from transfer slot 5
+        # only once the copy into it landed (#3571).
+        conn = self.fabric(self.make_stateful(self.make(producer=True), slots=6))
+        conn._first_transfer_slot = 4
+        request = self.pending_push(conn, 5)
+        request["dst_block_ids"], request["src_block_ids"] = [6], [12]
+        conn._service_write_requests()
+        self.assertEqual((conn.writes, len(conn._pending_writes)), ([], 1))
+        conn._staged_sources[9] = (5, FakeEvent(done=True))
+        conn._service_write_requests()
+        self.assertEqual(
+            conn.writes,
+            [
+                (
+                    "S-page",
+                    [12 * 16, 1000 + 12 * 4],
+                    [64 + 6 * 16, 5000 + 6 * 4],
+                    [16, 4],
+                ),
+                ("S-k", [5 * 24], [5 * 24], [24]),
+                ("S-v", [5 * 128], [5 * 128], [128]),
+            ],
+        )
+
+    def test_fabric_verify_reports_a_push_into_the_kept_prefix(self):
+        conn = self.fabric(self.make(producer=False))
+        conn._verify_kv = True
+        meta = self.recv_meta([4, 5, 6], [10, 11, 12])
+        meta.num_computed_blocks = 2
+        conn._request_write("d1", meta)
+        self.assertEqual(conn._verify_page_dst["d1"], [6])
+        self.assertEqual(conn._verify_page_kept["d1"][0], [4, 5])
+        # The push lands in block 6 and leaves the kept blocks alone.
+        conn._page_views[0][6] = 9
+        with self.assertLogs("atom", "INFO") as logs:
+            conn._verify_page_kept_landed("d1")
+        self.assertIn("2 reused prefix blocks unchanged", logs.output[-1])
+
+        conn._request_write("d2", meta)
+        conn._page_views[1][5] = 7
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._verify_page_kept_landed("d2")
+        self.assertIn("the receive wrote into blocks it kept", logs.output[0])
+        self.assertIn("roles ['k_scale']", logs.output[0])
+        self.assertEqual(conn._verify_page_kept, {})
 
     def test_a_changed_source_reports_the_forwards_after_the_kv_ready_event(self):
         conn = self.make(producer=True)
@@ -1706,6 +1804,58 @@ class WritePathTest(unittest.TestCase):
             caches[name].replay_write_pos = None
         with self.assertRaises(ValueError) as caught:
             self.register(conn, caches)
+        self.assertIn("replay_write_pos", str(caught.exception))
+
+    def fabric_registration(self, conn):
+        """Make `conn` register over the fabric: one PAGE region, and buffers
+        whose packed descriptors carry a fabric handle."""
+        types = self.types
+        conn.use_fabric = True
+        conn._verify_kv = False
+
+        def register_local_buffer(ptr, size, device):
+            fields = [b"key", 1, 0, b"bus", ptr, size, 1, b"", 0, 0, b"\x01" * 64]
+            return self.msgpack.packb(fields + [16, b"ppod", 0, size, {}])
+
+        conn.moriio_wrapper.register_local_buffer = register_local_buffer
+        region = types.SimpleNamespace(
+            base_addr=0x10000,
+            total_bytes=8 * 16,
+            unit_bytes=16,
+            semantic_role="mla.kv",
+            reverse_indexed=False,
+        )
+        view = types.SimpleNamespace(device=types.SimpleNamespace(index=0))
+        return types.SimpleNamespace(
+            pages=[types.SimpleNamespace(region=region, view=view)],
+            swa_block_regions=[],
+            num_blocks=8,
+        )
+
+    def test_the_fabric_registers_the_state_rdma_does(self):
+        # ReplaySSM records and cursor included, and the same transfer slots.
+        config = self.types.SimpleNamespace(state_transfer_slots=2)
+        rdma = self.make(producer=True)
+        rdma._config = config
+        rdma_meta = self.register(rdma, self.replay_caches())
+
+        conn = self.make(producer=True)
+        conn._config = config
+        tensors = self.fabric_registration(conn)
+        meta = self.register(conn, self.replay_caches(), tensors)
+        self.assertEqual(list(conn._state_tensors), list(rdma._state_tensors))
+        self.assertEqual(meta.state_slot_bytes, rdma_meta.state_slot_bytes)
+        self.assertEqual(set(meta.state_descs), set(rdma_meta.state_descs))
+        self.assertEqual((meta.num_state_slots, conn._first_transfer_slot), (6, 4))
+        self.assertEqual(rdma._first_transfer_slot, 4)
+
+        caches = self.replay_caches()
+        for name in ("layer_0", "layer_3"):
+            caches[name].replay_write_pos = None
+        conn = self.make(producer=True)
+        tensors = self.fabric_registration(conn)
+        with self.assertRaises(ValueError) as caught:
+            self.register(conn, caches, tensors)
         self.assertIn("replay_write_pos", str(caught.exception))
 
     def test_the_cursor_is_pushed_and_digested_with_the_slot(self):

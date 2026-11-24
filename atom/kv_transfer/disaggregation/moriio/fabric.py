@@ -90,6 +90,26 @@ def allocate_fabric_pool(nbytes: int, device: Any) -> torch.Tensor:
     return tensor
 
 
+# The MemPool per-request state comes from, kept for the process's lifetime.
+_state_pool: Any = None
+
+
+def fabric_state_pool() -> Any:
+    """A context under which torch allocates from fabric-exportable memory.
+
+    The attention backend allocates per-request state (a KDA layer's conv and
+    SSM state) with plain torch calls, not from the paged pool, so it cannot use
+    `allocate_fabric_pool`; its allocations are routed to a mori fabric MemPool
+    instead, and the peer imports each state tensor by its own fabric handle.
+    """
+    global _state_pool
+    if _state_pool is None:
+        from mori.io import make_fabric_mem_pool
+
+        _state_pool = make_fabric_mem_pool()
+    return torch.cuda.use_mem_pool(_state_pool)
+
+
 def pool_span(regions: list[tuple[int, int]]) -> tuple[int, int]:
     """``(base, nbytes)`` to register for ``regions`` ((base, nbytes) each).
 
