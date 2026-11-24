@@ -15,9 +15,12 @@ use tonic::{
     transport::{server::Router, server::TcpIncoming, Server},
     Request, Response, Status, Streaming,
 };
-use wfaas::WorkflowId;
+use wfaas::{StepExecutor, WorkflowContext, WorkflowId, WorkflowInstanceId};
 
-use super::{create_local_worker_workflow_data, get_dp_info};
+use super::{
+    create_local_worker_workflow_data, get_dp_info, CreateLocalWorkerStep,
+    DetectConnectionModeStep, DiscoverDPInfoStep, DiscoverMetadataStep, RegisterWorkersStep,
+};
 use crate::{
     app_context::AppContext,
     atom_engine::grpc::{
@@ -515,6 +518,42 @@ async fn a_worker_with_another_template_is_refused_while_the_tokenizer_loads() {
     assert!(ctx.worker_registry.get_by_url(&second).is_none());
     drop(held);
     assert_eq!(render(&ctx, "atom-loading", Value::Null).await, "first: hi");
+}
+
+/// Of two registrations with different templates that both pass worker creation
+/// before either registers, exactly one is admitted.
+#[tokio::test]
+async fn of_two_concurrent_registrations_with_different_templates_one_is_admitted() {
+    let ctx = context();
+    let mut created = Vec::new();
+    for template in ["first", "second"] {
+        let template = format!("{template}: {{{{ messages[0].content }}}}");
+        let url = serve_atom(model_info("atom-race", &template, "{}"), 1).await;
+        let config = serde_json::from_value(json!({ "url": url })).unwrap();
+        let data = create_local_worker_workflow_data(config, ctx.clone());
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        DetectConnectionModeStep
+            .execute(&mut context)
+            .await
+            .unwrap();
+        DiscoverMetadataStep.execute(&mut context).await.unwrap();
+        DiscoverDPInfoStep.execute(&mut context).await.unwrap();
+        CreateLocalWorkerStep.execute(&mut context).await.unwrap();
+        created.push(context);
+    }
+    let mut registered = Vec::new();
+    for context in &mut created {
+        registered.push(
+            RegisterWorkersStep
+                .execute(context)
+                .await
+                .map_err(|e| e.to_string()),
+        );
+    }
+    assert!(registered[0].is_ok(), "{:?}", registered[0]);
+    let refused = registered[1].as_ref().unwrap_err();
+    assert!(refused.contains("redeploying"), "{refused}");
+    assert_eq!(ctx.worker_registry.get_by_model("atom-race").len(), 1);
 }
 
 /// A model's tokenizer loaded with a template file keeps it: a worker that only

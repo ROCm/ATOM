@@ -5,11 +5,17 @@ use std::{collections::HashSet, sync::Arc};
 use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{
-    StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
 use crate::{
-    core::steps::workflow_data::WorkerRegistrationData, observability::metrics::MeshMetrics,
+    core::{
+        steps::{
+            tokenizer_registration::admit_model_template, workflow_data::WorkerRegistrationData,
+        },
+        worker::RuntimeType,
+    },
+    observability::metrics::MeshMetrics,
 };
 
 /// Unified step to register workers in the registry.
@@ -33,6 +39,24 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             .get_actual_workers()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
+        // Admission and registration in one step: of two registrations with different
+        // templates, the second sees the first's workers.
+        let admitting = app_context.template_admission.lock();
+        let atom = workers
+            .iter()
+            .find(|w| w.metadata().runtime_type == RuntimeType::Atom);
+        if let Some(atom) = atom {
+            let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+            let advertised = atom.metadata().labels.get("chat_template");
+            let (model, file) = (atom.model_id(), atom.chat_template());
+            let advertised = advertised.map(String::as_str);
+            let admitted = admit_model_template(&app_context, model, &urls, file, advertised);
+            admitted.map_err(|e| WorkflowError::StepFailed {
+                step_id: StepId::new("register_workers"),
+                message: format!("Refused {}: {e}", atom.url()),
+            })?;
+        }
+
         let mut worker_ids = Vec::with_capacity(workers.len());
 
         for worker in workers.iter() {
@@ -45,6 +69,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             );
             worker_ids.push(worker_id);
         }
+        drop(admitting);
 
         // Collect unique worker configurations to avoid redundant metric updates
         let unique_configs: HashSet<_> = workers
