@@ -365,6 +365,9 @@ class PageUnitCheckpointStore:
         # Whether an image's first restore refreshes its LRU place, or only a
         # later one does (ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE).
         self._refresh_first_restore = envs.ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE
+        # Or sends it to the cold end, to be spent first
+        # (ATOM_STATE_CHECKPOINT_DEMOTE_FIRST_RESTORE).
+        self._demote_first_restore = envs.ATOM_STATE_CHECKPOINT_DEMOTE_FIRST_RESTORE
         self._inflight_stores: list[int] = []
         self._queued_restores: list[tuple[int, CheckpointRestoreOp]] = []
         self._inflight_restores: list[int] = []
@@ -574,6 +577,10 @@ class PageUnitCheckpointStore:
         # again is shared, and kept warm.
         if self._refresh_first_restore or record.restores > 1:
             self._lru.move_to_end(checkpoint_id)
+        elif self._demote_first_restore:
+            # Even where it was filed it outlives the live anchors filed before
+            # it; superseded, it is the first thing the store should spend.
+            self._lru.move_to_end(checkpoint_id, last=False)
         op = CheckpointRestoreOp(
             dst_slot=dst_slot,
             unit_ids=record.unit_ids,

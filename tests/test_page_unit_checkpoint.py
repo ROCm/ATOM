@@ -1063,3 +1063,28 @@ def test_an_image_read_once_ages_from_where_it_was_filed(monkeypatch):
     ready(store, 606)
     assert store.lookup(404) == -1
     assert store.lookup(202) >= 0
+
+
+def test_an_image_read_once_is_spent_first_when_demoted(monkeypatch):
+    """ATOM_STATE_CHECKPOINT_DEMOTE_FIRST_RESTORE=1: a session's anchor, once
+    read by its next turn, is spent before every image not yet read, those
+    filed before it included, so live anchors outlast superseded ones; an image
+    read a second time is shared and refreshed as before."""
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE", "0")
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMOTE_FIRST_RESTORE", "1")
+    _, store = make_store(num_units=9)
+    ready(store, 101)
+    ready(store, 202)
+    ready(store, 303)
+    _read(store, 303)
+    # The newest image, read once, goes before the older ones nobody has read.
+    ready(store, 404)
+    assert store.lookup(303) == -1
+    assert store.lookup(101) >= 0 and store.lookup(202) >= 0
+
+    _read(store, 202)
+    _read(store, 202)
+    # Demoted by its first read, refreshed by its second: 101 is spent next.
+    ready(store, 505)
+    assert store.lookup(101) == -1
+    assert store.lookup(202) >= 0 and store.lookup(404) >= 0
