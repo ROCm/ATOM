@@ -150,7 +150,7 @@ class _Ops:
         self.calls = []
         self.router = SimpleNamespace(route_quant_small=self._route)
         self.gemms = SimpleNamespace(
-            get_plan=lambda n: n, decode_expert_gemms=self._gemms
+            get_plan=lambda n, **kw: n, decode_expert_gemms=self._gemms
         )
         self._routed = routed
 
@@ -179,6 +179,7 @@ def _dispatch_layer(name, routed):
     ops = _Ops(routed)
     layer.ops = ops.tuple()
     layer.ready = True
+    layer.plan_kw = {}
     for n in (
         "gate",
         "gate_lines",
@@ -217,3 +218,12 @@ def test_uncovered_router_input_falls_back():
     ops = _dispatch_layer("d3", None)
     out = dm.decode_moe_forward(torch.zeros(16, dm.H, dtype=torch.bfloat16), "d3")
     assert ops.calls == ["route"] and bool((out == 7).all())
+
+
+def test_split_layout_probe():
+    assert dm.split_layout_supported(
+        SimpleNamespace(get_plan=lambda n, asm=True, w13_split=False: n)
+    )
+    assert not dm.split_layout_supported(
+        SimpleNamespace(get_plan=lambda n, asm=True: n)
+    )

@@ -17,8 +17,8 @@ per layer and step runs:
 The ops are ``aiter.ops.flydsl.kernels.mega_moe_tp.{decode_router_chain, decode_expert_gemms}`` and
 ``aiter.ops.flydsl.kernels.moe_slots_shared_reduce``. The kernels read the weights in their own layouts: routed w2
 values and scales and the shared expert's values are the bytes ATOM already holds (aiter's (16, 16) preshuffle);
-the routed w13 values are ATOM's with the gate / up 16-row blocks interleaved and the routed w13 and the shared
-scales are re-laid copies (built once after weight loading, before graph capture).
+the routed w13 values are read in place when this aiter's ``get_plan`` takes ``w13_split`` (else a copy with the
+gate / up 16-row blocks interleaved is kept) and the routed w13 and the shared scales are re-laid copies (built once after weight loading, before graph capture).
 """
 
 import logging
@@ -69,6 +69,17 @@ def load_ops():
         router_line_layout,
         moe_slots_shared_reduce,
     )
+
+
+def split_layout_supported(gemms) -> bool:
+    """Whether this aiter's ``get_plan`` takes ``w13_split`` (the GEMM1 tile reads the routed w13 in the
+    preshuffled [E, 2, I/16, block] layout, so no re-laid copy of it is needed)."""
+    import inspect
+
+    try:
+        return "w13_split" in inspect.signature(gemms.get_plan).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _u8(t: torch.Tensor) -> torch.Tensor:
@@ -154,7 +165,15 @@ class DecodeMoe(nn.Module):
         self.gate = gate.contiguous()
         self.gate_lines = router_line_layout(self.gate)
         self.bias = moe.e_score_correction_bias.data
-        self.w13 = routed_w13_layout(_u8(ex.w13_weight))
+        # an aiter whose GEMM1 tile reads the preshuffled [E, 2, I/16, block] layout in place needs no second w13
+        self.plan_kw = (
+            {"w13_split": True} if split_layout_supported(self.ops[1]) else {}
+        )
+        self.w13 = (
+            _u8(ex.w13_weight)
+            if self.plan_kw
+            else routed_w13_layout(_u8(ex.w13_weight))
+        )
         self.s13 = routed_w13_scale_layout(
             _u8(ex.w13_weight_scale).view(E, 2 * I, H // 32)
         )
@@ -166,16 +185,20 @@ class DecodeMoe(nn.Module):
         self.ss13, self.ss2 = shared_scale_layouts(
             _u8(gu.weight_scale), _u8(dn.weight_scale)
         )
-        self.ready = True
         global _logged_extra
         if not _logged_extra:
             _logged_extra = True
-            extra = self.w13.numel() + self.s13.numel()
+            extra = self.s13.numel() + (0 if self.plan_kw else self.w13.numel())
             logger.info(
-                "ATOM_M3_DECODE_MOE: holds a second, re-laid copy of each MoE layer's routed w13 + scales "
-                "(%.0f MiB per layer and rank, besides the default path's weights)",
+                "ATOM_M3_DECODE_MOE: %s; holds %.0f MiB per MoE layer and rank besides the default path's weights",
+                (
+                    "routed w13 read in place (aiter w13_split)"
+                    if self.plan_kw
+                    else "this aiter cannot read w13 in place: a second re-laid w13 copy is kept"
+                ),
                 extra / 2**20,
             )
+        self.ready = True
 
     def _unsupported(self, moe) -> str | None:
         ex, sh = moe.experts, moe.shared_experts
@@ -244,7 +267,7 @@ def decode_moe_forward(hidden_states: torch.Tensor, layer_name: str) -> torch.Te
     if routed is None:  # a row layout the router kernels do not cover
         return dm._moe[0].default_forward(hidden_states)
     (xq, xs), (q8, s8), weights, ids = routed
-    plan = gemms.get_plan(rows)
+    plan = gemms.get_plan(rows, **dm.plan_kw)
     slots, shared = gemms.decode_expert_gemms(
         plan,
         xq.view(-1),
