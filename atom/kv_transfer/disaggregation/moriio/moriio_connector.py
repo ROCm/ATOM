@@ -2729,7 +2729,28 @@ class MoRIIOConnector(KVConnectorBase):
         calling while finished prefills hold deferred blocks, so a request is
         served even when no batch is running; with ATOM_MORIIO_WRITE_THREAD,
         on the push thread only (`_push_loop`).
+
+        Posting a push costs time in proportion to its segments (a 5K-block
+        push from a TP1 stage to a TP4 consumer is ~1M of them, ~0.2 s per
+        consumer rank), and every push behind it waits. So the smallest ready
+        push goes first, WRITE_REQs that arrived meanwhile join before each
+        pick, and pushes that have landed are reported between posts.
         """
+        self._accept_write_requests()
+        self._forget_finished_writes()
+        while True:
+            ready = self._ready_writes()
+            if not ready:
+                break
+            entry = min(ready, key=lambda e: len(e[0]["dst_block_ids"]))
+            self._pending_writes = [e for e in self._pending_writes if e is not entry]
+            self._post_write(entry[0])
+            self._settle_writes()
+            self._accept_write_requests()
+        self._settle_writes()
+
+    def _accept_write_requests(self) -> None:
+        """Move the WRITE_REQs the listener queued into `_pending_writes`."""
         while True:
             try:
                 request = self._write_requests.get_nowait()
@@ -2737,9 +2758,13 @@ class MoRIIOConnector(KVConnectorBase):
                 break
             if self._is_valid_write_request(request):
                 self._accept_write_request(request)
-        self._forget_finished_writes()
 
-        waiting: list[tuple[dict[str, Any], float]] = []
+    def _ready_writes(self) -> list[tuple[dict[str, Any], float]]:
+        """The pending pushes that can be posted now. Fails the ones past their
+        deadline or timeout, or whose consumer cannot be reached; the rest stay
+        pending."""
+        pending: list[tuple[dict[str, Any], float]] = []
+        ready: list[tuple[dict[str, Any], float]] = []
         now = time.time()
         for request, queued_at in self._pending_writes:
             deadline = request.get("deadline")
@@ -2751,8 +2776,8 @@ class MoRIIOConnector(KVConnectorBase):
                 )
                 self._finish_write(request, ok=False)
                 continue
-            ready = self._write_target_ready(request)
-            if ready is None:
+            target = self._write_target_ready(request)
+            if target is None:
                 if time.monotonic() - queued_at > self._handshake_timeout_s:
                     logger.error(
                         "transfer %s: no handshake with the consumer after %.0fs",
@@ -2761,9 +2786,9 @@ class MoRIIOConnector(KVConnectorBase):
                     )
                     self._finish_write(request, ok=False)
                 else:
-                    waiting.append((request, queued_at))
+                    pending.append((request, queued_at))
                 continue
-            if not ready:
+            if not target:
                 self._finish_write(request, ok=False)
                 continue
             if not self._source_ready(int(request["transfer_id"])):
@@ -2776,21 +2801,30 @@ class MoRIIOConnector(KVConnectorBase):
                     )
                     self._finish_write(request, ok=False)
                 else:
-                    waiting.append((request, queued_at))
+                    pending.append((request, queued_at))
                 continue
-            try:
-                statuses = self._write_blocks(request, self._write_engine_id(request))
-            except Exception:
-                logger.exception(
-                    "transfer %s: could not push KV to the consumer",
-                    request["transfer_id"],
-                )
-                self._forget_peer(self._write_engine_id(request))
-                self._finish_write(request, ok=False)
-                continue
-            self._sending_writes[self._push_key(request)] = (statuses, request)
-        self._pending_writes = waiting
+            entry = (request, queued_at)
+            pending.append(entry)
+            ready.append(entry)
+        self._pending_writes = pending
+        return ready
 
+    def _post_write(self, request: dict[str, Any]) -> None:
+        """Post one push; a push that cannot be posted fails alone."""
+        try:
+            statuses = self._write_blocks(request, self._write_engine_id(request))
+        except Exception:
+            logger.exception(
+                "transfer %s: could not push KV to the consumer",
+                request["transfer_id"],
+            )
+            self._forget_peer(self._write_engine_id(request))
+            self._finish_write(request, ok=False)
+            return
+        self._sending_writes[self._push_key(request)] = (statuses, request)
+
+    def _settle_writes(self) -> None:
+        """Report every posted push whose writes have all settled."""
         for (transfer_id, *_), (statuses, request) in list(
             self._sending_writes.items()
         ):
