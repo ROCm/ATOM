@@ -344,11 +344,9 @@ mod coder {
             }
 
             let start = match self.bare_calls {
-                // Text ends at the first call or wrapper; a `<function=` prose quotes does not end it.
-                true => self.extractor.find(text).map(|first| {
-                    let wrapper = text.find(self.tool_call_start_token);
-                    wrapper.map_or(first.start(), |w| w.min(first.start()))
-                }),
+                // Text ends where the first call does (a wrapped one at its wrapper); a
+                // `<function=` or `<tool_call>` prose quotes does not end it.
+                true => self.extractor.find(text).map(|first| first.start()),
                 false => text.find(self.tool_call_start_token),
             };
             let Some(start) = start else {
@@ -726,6 +724,26 @@ mod coder {
             }
             assert_eq!(streamed, reply);
             assert!(!parser.has_tool_markers(reply));
+        }
+
+        /// A bare call's reply keeps its prose up to the call, a `<tool_call>` it quotes too.
+        #[tokio::test]
+        async fn a_quoted_wrapper_before_a_bare_call_stays_text() {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function", "function": {"name": "get_weather", "parameters": {}},
+            }))
+            .unwrap();
+            let prose = "Use <tool_call> as the wrapper. ";
+            let reply = format!(
+                "{prose}<function=get_weather><parameter=city>Paris</parameter></function>"
+            );
+            let mut parser = QwenCoderParser::new();
+            parser.read_as_atom();
+            let (text, calls) = parser
+                .parse_complete_with_tools(&reply, &[tool])
+                .await
+                .unwrap();
+            assert_eq!((text.as_str(), calls.len()), (prose, 1));
         }
 
         #[test]
