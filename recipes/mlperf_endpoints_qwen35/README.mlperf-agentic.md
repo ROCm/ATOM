@@ -1,7 +1,42 @@
-# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-21 points
+# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-23 points
 
 How to reproduce the numbers below: the exact code, the settings, the run, and how each number is computed.
 They are 10-minute measurement points, not official results (see [What these numbers are](#what-these-numbers-are)).
+
+## 2026-11-23: one-shot split reduce sized by the launch, 3D decode XCD rotation, 896 token-split programs at c256-c512
+
+`agentic_20261123.env` on top of the 11-01 to 11-21 env files. Code: `alizaidy/gfx1250-qwen-support` (ATOM 104232865,
+aiter 601e663db, which include the upstream GDN kernel changes) plus the aiter one-shot split reduce shape rule
+(`AITER_GFX12_SPLIT_REDUCE_ONESHOT_AUTO`) with its ATOM fold hook, and the aiter 3D decode XCD rotation
+(`AITER_UA3D_XCD_ROTATE`). Same image, topology, client and metric as before; every configuration warmed up first.
+The baseline column is the 2026-11-21 recipe on this code, so the gains below are these changes only.
+
+Per-point settings are the 11-21 ones plus `AITER_GFX12_SPLIT_REDUCE_ONESHOT_AUTO=1` everywhere and, at c256-c512 only,
+`AITER_UA3D_XCD_ROTATE=1 AITER_GFX12_TOKEN_SPLIT_PROGRAMS=896` (after the point's fp4pt split extras).
+
+| point | baseline (11-21 recipe) | + AUTO | + AUTO + rotation | + AUTO + rotation + 896 programs (recipe) | accuracy (recipe) |
+|---|---:|---:|---:|---:|---|
+| c64 | 1144.6 (0.5614) | **1163.2** (+1.6%) | | | 0.5619 |
+| c256 | | 585.4 (0.5585) | | **598.4** (+2.2%) | 0.5623 |
+| c384 | | 439.0 (0.5629) | 440.0 (0.5597) | **450.4** (+2.6%) | 0.5616 |
+| c512 | | 344.3 (0.5631) | | **350.5** (+1.8%) | 0.5623 |
+
+Official-length run of the recipe at c384 (`run_official_host.sh <container> 384`): **e2e 438.2, 59,038 tok/s, accuracy
+0.5617** (coding 0.5309, workflow 0.7041), 356,549 / 356,549 requests, 0 failed, 37.9 minutes.
+
+Notes:
+- AUTO: the one-shot reduce used one fixed (CHUNK, SPEC, warps) = 16,8,2. A pass now covers ~4x the expected live
+  segments of a sequence (token-split programs / (KV heads x sequences)) while every program's LDS stays resident, with
+  speculative boxes only when the live segments fill them. Kernels unchanged; bitwise (only the TDM pass size,
+  speculation and warps change). Reduce us a call, 16,8,2 -> AUTO: 1x4 6.3 -> 3.1, 8x4 6.6 -> 3.9, 32x4 5.4 -> 4.8,
+  120x4 13.6 -> 12.8. c1024 was not served-measured (kernel ~-10 us a step).
+- XCD rotation: workgroups go to the 8 XCDs by dispatch id mod 8 and the 3D grid is (sequence, head, segment) with the
+  sequence fastest, so with a multiple of 8 sequences all segments of a sequence ran on one XCD (128 resident programs);
+  long contexts overflowed it into a second round (+40-50% call time; 32x4 lognormal contexts 167.7 -> 118.6 us with the
+  rotation). Bitwise. On its own it only removes those cliffs (c384 440.0 vs 439.0); it is what makes larger splits pay.
+- 896 programs (was 512) is numerical (summation order only): -55 us a decode step at 24 sequences, -125 at 32, -170 at 40.
+  Without the rotation 768 / 896 programs overflow an XCD often.
+- The c256 baseline's 0.5585 has no numerical change against the 11-21 recipe (10-minute accuracy moves +-0.004).
 
 ## 2026-11-21: the 11-20 settings at every point, LPT prefill order, c256-c512 decode configs, optional c64 decode flags
 
