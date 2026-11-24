@@ -431,7 +431,7 @@ def test_session_token_times_are_taken_as_the_engine_delivers_them(serve, monkey
     session = servicer.sessions.open()
 
     async def submitted():
-        await servicer._submit(session, _submit())
+        await servicer._submit(session, _submit(), 0.0)
         for _ in range(5):  # the steps' deliveries, run on this loop
             await asyncio.sleep(0)
 
@@ -441,12 +441,54 @@ def test_session_token_times_are_taken_as_the_engine_delivers_them(serve, monkey
     assert (done.first_token_time, done.leave_time) == (1.0, 2.0)
 
 
+def test_a_session_request_arrives_when_read_not_when_admitted(serve, monkeypatch):
+    clock = SimpleNamespace(now=1.0)
+    monkeypatch.setattr(grpc_server, "time", SimpleNamespace(time=lambda: clock.now))
+    monkeypatch.setattr(grpc_server, "SESSION_ADMISSIONS", 1)  # B waits for A
+    engine = FakeEngine([([5], "eos")])
+    engine.release.clear()  # A holds the cap in preprocess
+    preprocess = engine.io_processor.preprocess
+
+    def preprocessed(*args, **kwargs):  # the engine's clock: 5 s, once released
+        seq = preprocess(*args, **kwargs)
+        seq.arrive_time = clock.now
+        return seq
+
+    engine.io_processor.preprocess = preprocessed
+    servicer = serve(engine)
+    ended = asyncio.Event()
+
+    async def client():
+        yield pb.Frames(frames=_submit_batch((3, "a", [1]), (4, "b", [2])))
+        await ended.wait()
+
+    async def admitted_late():
+        call = servicer.Session(client(), SimpleNamespace())
+        await anext(call)  # Ready
+        await _until(lambda: engine.preprocessed)
+        clock.now = 5.0
+        engine.release.set()
+        done = []
+        while len(done) < 2:
+            body = _envelope((await asyncio.wait_for(anext(call), 5)).frames)
+            done += body.completions.items
+        ended.set()
+        await call.aclose()
+        return done
+
+    done = asyncio.run(admitted_late())
+    assert sorted((c.seq_id, c.arrive_time, c.leave_time) for c in done) == [
+        (3, 1.0, 5.0),
+        (4, 1.0, 5.0),
+    ]
+
+
 def test_the_session_refuses_logprobs_it_would_not_serve(serve):
     engine = FakeEngine()
     servicer = serve(engine)
     session = servicer.sessions.open()
     with pytest.raises(ValueError, match="logprobs"):
-        asyncio.run(servicer._submit(session, _submit(logprobs=True)))
+        asyncio.run(servicer._submit(session, _submit(logprobs=True), 0.0))
     assert engine.preprocessed == []
 
 
@@ -455,10 +497,10 @@ def test_the_session_serves_greedy_n_above_1_as_one_and_refuses_sampled(serve):
     servicer = serve(engine)
     session = servicer.sessions.open()
     with pytest.raises(ValueError, match="n above 1"):
-        asyncio.run(servicer._submit(session, _submit(n=2, temperature=1.0)))
+        asyncio.run(servicer._submit(session, _submit(n=2, temperature=1.0), 0.0))
     assert engine.preprocessed == []
     # Greedy siblings would all be the same reply: one is served, as Generate does.
-    asyncio.run(servicer._submit(session, _submit(n=2, temperature=0.0)))
+    asyncio.run(servicer._submit(session, _submit(n=2, temperature=0.0), 0.0))
     assert len(engine.preprocessed) == 1
 
 
@@ -479,7 +521,7 @@ def test_a_structured_session_request_with_custom_stops_is_refused(
     request = _submit(ignore_eos=custom.get("ignore_eos", False), **structured)
     request.stop_token_sequences = custom.get("stops", [])
     with pytest.raises(ValueError, match="ignore_eos or custom stop strings") as error:
-        asyncio.run(servicer._submit(session, request))
+        asyncio.run(servicer._submit(session, request, 0.0))
     assert grpc_server._rejected(1, error.value).code == v1.RejectedRequest.INVALID
     assert engine.preprocessed == [] and engine.grammars == []
 
@@ -489,7 +531,7 @@ def test_the_session_refuses_stop_strings_without_their_ids(serve):
     servicer = serve(engine)
     session = servicer.sessions.open()
     with pytest.raises(ValueError, match="stop_token_sequences"):
-        asyncio.run(servicer._submit(session, _submit(stop_strings=["END"])))
+        asyncio.run(servicer._submit(session, _submit(stop_strings=["END"]), 0.0))
     assert grpc_server._rejected(1, ValueError("x")).code == v1.RejectedRequest.INVALID
     assert engine.preprocessed == []
 
@@ -504,9 +546,9 @@ def test_the_session_holds_a_required_call_only_to_the_server_s_channel(
     session = servicer.sessions.open()
     forged = RequiredChannel((1,), (3,), 1, (-1,))
     with pytest.raises(ValueError, match="required_channel"):
-        asyncio.run(servicer._submit(session, _submit(required_channel=forged)))
+        asyncio.run(servicer._submit(session, _submit(required_channel=forged), 0.0))
     assert engine.preprocessed == []
-    asyncio.run(servicer._submit(session, _submit(required_channel=own)))
+    asyncio.run(servicer._submit(session, _submit(required_channel=own), 0.0))
     assert len(engine.preprocessed) == 1
 
 
@@ -515,7 +557,7 @@ def test_a_session_grammar_failure_is_rejected_as_internal(serve):
     session = serve(engine).sessions.open()
     seq = SimpleNamespace(id=session.seq_id(1), num_prompt_tokens=2, arrive_time=0.0)
     engine.io_processor.requests[seq.id] = seq
-    session.add(1, seq, "r")
+    session.add(1, seq, "r", 0.0)
     session.put((RequestOutput(seq.id, [], True, "structured_output_error"), 0.0))
     session.flush()
     rejected = _envelope(session.outbox.get_nowait()).rejected.items
@@ -530,7 +572,7 @@ def test_a_session_ended_during_preprocess_leaves_no_seq(serve):
     session = servicer.sessions.open()
 
     async def end_while_preprocessing():
-        submit = asyncio.create_task(servicer._submit(session, _submit()))
+        submit = asyncio.create_task(servicer._submit(session, _submit(), 0.0))
         await _until(lambda: engine.preprocessed)
         submit.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -550,7 +592,7 @@ def test_a_session_ended_during_preprocess_keeps_its_window_until_the_seq_drops(
     window = session.window
 
     async def end_while_preprocessing():
-        submit = asyncio.create_task(servicer._submit(session, _submit()))
+        submit = asyncio.create_task(servicer._submit(session, _submit(), 0.0))
         await _until(lambda: engine.preprocessed)
         submit.cancel()  # as the Session RPC ends: its reader cancelled, then close
         with pytest.raises(asyncio.CancelledError):
@@ -586,7 +628,7 @@ def test_a_submission_cancelled_once_it_reached_the_engine_holds_its_window(
 
     async def cancel_then_resubmit():
         request = _submit(json_schema='{"type": "object"}')
-        submit = asyncio.create_task(servicer._submit(session, request))
+        submit = asyncio.create_task(servicer._submit(session, request, 0.0))
         await asyncio.to_thread(entered.wait, 10)
         submit.cancel()  # as the Session RPC ends: its reader cancelled, then close
         session.close()
@@ -617,7 +659,7 @@ def test_engine_ids_are_not_reused_by_a_client_seq_id_or_a_windows_next_session(
 
     async def submit_seq_id_1_twice(session):
         for _ in range(2):
-            await servicer._submit(session, _submit())
+            await servicer._submit(session, _submit(), 0.0)
             await _until(lambda: not session.requests)
         session.close()
 
@@ -655,7 +697,7 @@ def test_a_client_that_stops_reading_fails_its_session_past_the_outbox_bound(
         call = servicer.Session(client(), context)
         assert _envelope(list((await anext(call)).frames)).WhichOneof("body") == "ready"
         session = opened[0]
-        await servicer._submit(session, _submit())
+        await servicer._submit(session, _submit(), 0.0)
         await _until(lambda: session.outbox.qsize() == 1)
         seq = engine.running[next(iter(session.client_ids))]
         for _ in range(2):  # the engine's next steps, which the client does not read
@@ -1060,7 +1102,7 @@ def test_a_session_submission_that_fails_after_a_send_aborts_its_seq(serve):
 
     engine.core_mgr.add_request = decode_then_fail
     with pytest.raises(RuntimeError, match="prefill send"):
-        asyncio.run(servicer._submit(session, _submit()))
+        asyncio.run(servicer._submit(session, _submit(), 0.0))
     assert engine.running == {} and engine.aborted
     assert session.requests == {} and engine.io_processor.requests == {}
 
@@ -1070,7 +1112,7 @@ def test_a_session_admits_a_prompt_only_in_kv_transfer_params(serve):
     servicer = serve(engine)
     kv = {"prompt_token_ids": [4, 5], "do_remote_prefill": False}
     submit = replace(_submit(prompt=()), kv_transfer_params=kv)
-    asyncio.run(servicer._submit(servicer.sessions.open(), submit))
+    asyncio.run(servicer._submit(servicer.sessions.open(), submit, 0.0))
     prompt, _, kwargs = engine.preprocessed[0]
     assert prompt == [4, 5]
     assert kwargs["kv_transfer_params"] == {"do_remote_prefill": False}
@@ -1080,7 +1122,7 @@ def test_a_session_request_without_a_prompt_is_refused(serve):
     engine = FakeEngine()
     servicer = serve(engine)
     with pytest.raises(ValueError, match="prompt_token_ids is required"):
-        asyncio.run(servicer._submit(servicer.sessions.open(), _submit(prompt=())))
+        asyncio.run(servicer._submit(servicer.sessions.open(), _submit(prompt=()), 0.0))
     assert engine.preprocessed == []
 
 

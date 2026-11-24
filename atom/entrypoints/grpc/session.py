@@ -29,6 +29,7 @@ STRUCTURED_FAILED = "Structured decoding failed for this request"  # HTTP chat's
 class _Request:
     seq: object  # its Sequence, under the engine's id for it
     external_request_id: str | None
+    arrive_time: float  # when the Session read it, before admission and preprocess
     first_token_time: float = 0.0
 
 
@@ -76,8 +77,10 @@ class Session:
             raise ValueError(f"seq_id {client_id} is already in flight")
         return next(self.engine_ids)
 
-    def add(self, client_id: int, seq, external_request_id: str | None) -> None:
-        self.requests[client_id] = _Request(seq, external_request_id)
+    def add(
+        self, client_id: int, seq, external_request_id: str | None, arrive_time: float
+    ) -> None:
+        self.requests[client_id] = _Request(seq, external_request_id, arrive_time)
         self.client_ids[seq.id] = client_id
 
     def _pop(self, client_id: int) -> _Request:
@@ -207,7 +210,7 @@ def _completion(client_id, request, output, delivered: float) -> frames.Completi
         leave_reason=output.finish_reason or "",
         num_prompt_tokens=seq.num_prompt_tokens,
         num_cached_tokens=seq.num_prompt_tokens if request.first_token_time else 0,
-        arrive_time=seq.arrive_time,
+        arrive_time=request.arrive_time,
         first_token_time=request.first_token_time,
         leave_time=delivered,
         kv_transfer_params_output=output.kv_transfer_params_output,
