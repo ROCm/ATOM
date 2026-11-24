@@ -862,9 +862,10 @@ def test_defaults():
     # is the way a default flip silently turns a comparison into a no-op.
     assert cfg.enable_query_replication is True
     assert cfg.enable_project_before_merge is True
-    # a2a: measured faster than ag_rs on the decode shapes here. Pinned because
-    # it also decides what an A/B control arm gets when it passes nothing.
-    assert cfg.comm_backend == "a2a"
+    # auto: Config resolves it to the mailbox where validated, else a2a. Pinned
+    # because it also decides what an A/B control arm gets when it passes
+    # nothing: a control arm must now pass "a2a" explicitly.
+    assert cfg.comm_backend == "auto"
 
 
 def test_from_dict_parses_both_keys():
@@ -890,7 +891,7 @@ def test_from_dict_empty_and_none_give_defaults():
             cfg.enable_query_replication,
             cfg.enable_project_before_merge,
             cfg.comm_backend,
-        ) == (1, True, True, "a2a")
+        ) == (1, True, True, "auto")
 
 
 def test_from_dict_coerces_types():
@@ -1094,9 +1095,19 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
     forward_vars["sparse_kv_last_page_lens"] = SimpleNamespace(
         gpu=torch.ones(4, dtype=torch.int32)
     )
-    builder._sparse_prefill_work_plan = MethodType(
-        aiter_mla.AiterMLAMetadataBuilder._sparse_prefill_work_plan, builder
-    )
+    builder._dcp_sparse_prefill_mode = "q"
+    builder.sparse_prefill_num_heads = 64
+    builder._sparse_prefill_work_view_cache = {}
+    for name in (
+        "_sparse_prefill_work_plan",
+        "_sparse_prefill_work_views",
+        "_sparse_prefill_work_widths",
+    ):
+        setattr(
+            builder,
+            name,
+            MethodType(getattr(aiter_mla.AiterMLAMetadataBuilder, name), builder),
+        )
     md = SimpleNamespace(
         cu_seqlen_ks=torch.zeros(4, dtype=torch.int32),
         cu_seqlen_ke=torch.arange(4, dtype=torch.int32),

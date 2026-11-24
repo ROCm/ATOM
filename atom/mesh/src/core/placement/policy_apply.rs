@@ -56,4 +56,5 @@ fn record_decision(
         decision.branch,
         decision.match_ratio,
     );
+    route_trace::record_estimate(pool, selected, decision.estimated_hit_ratio);
 }

@@ -15,7 +15,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 
-from atom.config import get_current_atom_config
+from atom.config import get_current_atom_config, kv_cache_torch_dtype
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     MLAAttention,
@@ -45,7 +45,7 @@ def get_aiter_kv_cache_dtype(config) -> torch.dtype:
         kv_cache_dtype = "bf16"
     elif kv_cache_dtype == "float16":
         kv_cache_dtype = "fp16"
-    return dtypes.d_dtypes[kv_cache_dtype]
+    return kv_cache_torch_dtype(kv_cache_dtype)
 
 
 @dataclass

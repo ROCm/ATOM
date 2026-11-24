@@ -75,8 +75,9 @@ A request flows through the system in ten steps:
 
 7. **`ModelRunner.forward()`** — executes the three-phase forward pass:
    - `prepare_model()` — assembles input IDs (handling deferred output from previous steps), builds attention metadata, and gathers sampling temperatures.
-   - `run_model()` — runs the model forward. Prefill and large batches run eagerly; decode batches replay captured CUDA graphs. Returns logits and hidden states.
-   - `postprocess()` — samples tokens (or runs rejection sampling for speculative decoding), prepares deferred output via `tokenIDProcessor`, and optionally proposes draft tokens through `EagleProposer`.
+   - `run_model()` — runs the model forward. Prefill and large batches run eagerly; decode batches replay captured CUDA graphs. Returns the hidden states.
+   - `run_lm_head()` — the LM head on the forward's stream: a verify head's ids where they stand for the step, else the logits (`compute_logits()`).
+   - `postprocess()` — samples tokens from the head's output (or runs rejection sampling for speculative decoding), prepares deferred output via `tokenIDProcessor`, and optionally proposes draft tokens through `EagleProposer`.
 
 8. **`Scheduler.postprocess()`** — appends sampled tokens to each `Sequence`, records `first_token_time`, checks stop conditions (EOS, stop token IDs, stop token sequences, `max_tokens`), and moves finished sequences out of the running queue. The `BlockManager` deallocates blocks for finished sequences.
 
@@ -112,29 +113,39 @@ ATOM uses a module-level global `ForwardContext` to pass metadata through CUDA g
 
 This pattern enables stateless dispatch: attention backends and model operators call `get_forward_context()` to access metadata without requiring it as a function parameter, which is critical for CUDA graph compatibility.
 
-## Model hooks (head output, deferred status, decode round)
+## Model hooks (verify head, deferred status, decode round)
 
 Two switches of `ModelRunner` let a model take over part of a step; neither
 is specific to one model, and a model that uses neither runs exactly as before.
 
-- **The in-graph head output.** A model may give its own head output,
-  `compute_head(hidden_states)`, resolved once at install (`ModelRunner.compute_head`):
-  the forward's logits, or a speculative verify's output token ids
-  `[requests, num_spec_steps + 1]` and verdict `[3, requests]` (accepted,
-  rejected, anchor row: the rejection sampler's layout), computed inside its
-  forward; None leaves the head to the logits. `ModelRunner._head_output` takes
-  it after an eager forward and records it at the tail of a decode graph's
-  capture, as `logits_in_graph` records the logits at TP 1, so a replay returns
-  it. `ModelRunner._step_head` keeps a verify's ids and verdict only where they
-  stand for the step (`_head_ids_serve`: nothing reads the logits but each
-  row's pick -- no logprobs, structured output or required channel, exact or
-  forced acceptance -- every request verifies the full draft span, and the rows
-  are all greedy or all sampled from temperature and top-p alone), else it
-  computes the logits; `postprocess` then branches once, on whether the head
-  output carries ids. As on every other step, the output ids are broadcast over
-  TP and each request's next id (the next forward's ids, the drafter's anchor)
-  is gathered from the broadcast ids. ATOM's own greedy argmax and rejection
-  verdict could move into the graph the same way.
+- **The verify head.** `ModelRunner.run_model` returns the forward's hidden
+  states; a decode graph records the forward alone, and the head runs after it,
+  eagerly, on the forward's stream (`ModelRunner.run_lm_head`, whose `LmHeadOutput`
+  `postprocess` takes; under RapidServe inside the CU-masked decode stream).
+  A verify head (`atom/model_ops/verify_head.py`
+  `VerifyHead`, bound once at install by `ModelRunner._bind_verify_head`: the
+  model's own `verify_head`, else for a drafted model whose logits are its
+  `ParallelLMHead` the shared mono LM head launch, `atom/mono/lm_head`, in
+  front of ATOM's Triton `ArgmaxVerifyHead` on the steps it does not serve)
+  picks each row's id itself and
+  verifies the drafts on them: `sample_token_ids(hidden_states)` gives a
+  speculative verify's output token ids `[requests, num_spec_steps + 1]` and
+  spec status `[3, requests]` (accepted, rejected, anchor row: the rejection
+  sampler's layout; `verify_ids.VerifyOutput`), or None where it serves no
+  such step. `run_lm_head` asks it only where its ids stand for the step
+  (`VerifyHead.samples_step`: nothing reads the logits but each row's pick --
+  no logprobs, structured output or required channel, exact or forced
+  acceptance -- every request verifies the full draft span, and the rows are
+  all greedy or all sampled the ways the head draws, `samples` /
+  `draws_top_p(rows)`: the mono LM head draws a row within its top-p in the
+  launch, `atom/mono/lm_head/top_p*.py`) and
+  no lossless drafter verifies a sampled step by the probability ratio;
+  otherwise, or where it gives None, the logits (`ModelRunner.compute_logits`,
+  which an RLHF rollout masks past the true vocabulary, binding no verify head),
+  the sampler and the rejection sampler run as before. As on every other step,
+  the output ids are broadcast over TP unless the head's agree
+  (`VerifyHead.ids_agree`), and each request's next id (the next forward's
+  ids, the drafter's anchor) is gathered from the broadcast ids.
 - **The deferrable status wait.** An attention builder may say a step consumes
   the previous verify's verdict on the device rather than its host-side status
   (`AttentionMetadataBuilder.consumes_device_verdict`, asked once a step in
@@ -161,8 +172,8 @@ and the model's forward all read it, so they agree on every step.
 DeepSeek-V4.1's high-interactivity monokernels (`atom/models/deepseek_v41/mono/hi_*.py`,
 `round/`, the FlyDSL runtime in `hi/`; `ATOM_DSV41_MONO_HI`, on by default where
 `hi_gate` says they serve: MI355X at TP2, TP4 or TP8) use all three: `hi_dispatch` wraps the model
-(`HiDecodeModel`, whose `compute_head` is the in-graph verify head and
-post-verify, `round/post_verify.py`), and `round.HiRound` is its decode round
+(`HiDecodeModel`, whose verify head, `HiVerifyHead`, takes the in-graph head and
+post-verify's outputs, `round/post_verify.py`), and `round.HiRound` is its decode round
 (the device round, `round/device_round.py`, consumes the device verdict).
 
 ## Multi-process architecture
@@ -253,21 +264,54 @@ RPC targets must not perform cross-DP collectives: each EngineCore dequeues
 control work independently, so another DP engine may already be waiting in the
 busy loop's state all-reduce.
 
-Direct, SHM and IPC weight updates are fenced sessions. The first bucket stops
-serving; CoreManager clears the fence only after every DP engine completes the
-final bucket. Built-in senders abort from ``finally`` if iteration stops early,
-and asynchronous weight-update utility sends are rejected because they have no
-owner to finish or abort them. ``AsyncLLMEngine.get_weight_sync_status()``
-reports a fence, an in-progress session and its last failure.
+Direct, SHM, IPC and RDMA (``AsyncLLMEngine.receive_weights_rdma``) weight
+updates are fenced sessions. The first bucket stops serving; CoreManager clears
+the fence only after every DP engine completes the final bucket. Built-in
+senders abort from ``finally`` if iteration stops early, and asynchronous
+weight-update utility sends are rejected because they have no owner to finish
+or abort them. ``AsyncLLMEngine.get_weight_sync_status()`` reports a fence, an
+in-progress session, its last failure, and whether the weights are whole.
 
 Every update carries the id of the sync it belongs to: one per
 ``weight_sync_session()`` until that sync finishes, and one per update sent
 outside a session. A session whose update failed sends nothing more, and an
 engine refuses the remaining updates and the finish of a failed or aborted
 sync, so the rest of a failed sync cannot commit as a new one. Recovering takes
-a new, complete sync. Weights may be resumed while fenced, since after
+a new sync that rewrites every parameter: once a sync has failed or been
+abandoned between buckets, the runners refuse to complete one that leaves any
+parameter as it was. Weights may be resumed while fenced, since after
 ``sleep(level=2)`` only a resume gives released parameters storage again; the
 fence keeps serving off until that complete sync commits.
+
+What syncs the runners can take is asked once, at engine startup, when
+``Config.weight_sync_runner`` says they answer ``get_worker_capabilities``
+(``AsyncLLMEngine`` sets it); a runner that cannot answer fails startup. Each
+engine reports the answer in its READY, and CoreManager refuses a reload that
+any engine's runners cannot take before any engine runs it -- under PP, one
+stage's runners alone may be the ones that cannot. Such a sync -- a model a
+reload cannot rewrite in place, such as MLA, prefill context parallelism,
+expert-parallel or redundant-expert MoE, or weights in a format a
+full-precision write cannot produce -- writes nothing and fences nothing. The
+engine and the runners refuse it too, before writing. A sync whose updates
+every rank refused before writing, or that never reached a rank, leaves the
+fence and the prefix cache as they were when the sync began. Weights a sleep
+discards are not whole either: the engine stays fenced until a sync that
+rewrites every parameter.
+
+An RDMA stream is decided by the runners. Each waits for every broadcast for
+at most its weight group's ``timeout_s``, and the group is built to abort its
+communicator on a timeout rather than end the process. So a trainer that dies
+mid-stream fails the stream on every rank once that timeout has passed since
+the last frame each rank received, and the group has been torn down. The group
+then has to be joined again, and the engine stays fenced until a sync rewrites
+every parameter. A caller that stops waiting before the engine answers does
+not learn whether the stream was written, and the engine stays fenced the same
+way. A stream's version is used up only once FINISH commits it, so a sync the
+engine failed can be retried at the same version. The engine keeps each group's
+committed version, and forgets it when the runners join that group anew or
+leave it; so ``collective_rpc`` takes ``group_name`` only as a keyword for
+``init_rdma_weight_group`` and ``destroy_rdma_weight_group``, and refuses
+either call otherwise.
 
 ## Sequence lifecycle
 

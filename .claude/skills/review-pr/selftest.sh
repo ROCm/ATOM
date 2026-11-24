@@ -438,6 +438,88 @@ t "a card that softens BEYOND ONE PASS is refused" \
   "$(_cov_gate "$_BIG" 'Coverage: 47 files / 16647 added lines')" "SOFTENED-COVERAGE"
 t "a card carrying the measured coverage passes" \
   "$(_cov_gate "$_SMALL" 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
+# The label alone, with nothing after the colon, is not a verdict.
+t "a coverage label with nothing after it is refused" \
+  "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
+
+# `[diff-too-large]` (GitHub refusing a diff over 20000 lines) writes no coverage line,
+# so the card has to supply one and it has to say BEYOND ONE PASS.
+_cov_raw() {  # <full rules.txt, or MISSING> <card coverage line or -> problem kind or ok
+  python3 -c '
+import sys, tempfile, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+d = tempfile.mkdtemp()
+if sys.argv[2] != "MISSING":
+    pathlib.Path(d, "rules.txt").write_text(sys.argv[2] + "\n")
+card = "## T\n\nReview: OK\n" + ("" if sys.argv[3] == "-" else sys.argv[3] + "\n")
+p = triage._check_coverage_line(card, d)
+print(p[0][0] if p else "ok")' "$S" "$1" "$2"
+}
+# An unreadable or ruleless rules.txt is NOT this gate's job: the ledger gate (Step 1b,
+# SKILL.md:380) runs first and exits non-zero on both, so the review never reaches the
+# card gate. Asserted here rather than assumed -- deleting a check is only safe while the
+# check that replaces it is the one being measured.
+_ledger_rc() {  # <rules.txt content, or MISSING> -> exit code of the ledger gate
+  d=$(mktemp -d)
+  [ "$1" = MISSING ] || printf '%s\n' "$1" > "$d/rules.txt"
+  : > "$d/verdicts.txt"
+  python3 "$S/triage.py" ledger "$d/rules.txt" "$d/verdicts.txt" >/dev/null 2>&1
+  rc=$?
+  rm -rf "$d"
+  echo $rc
+}
+t "a missing rules.txt is refused by the ledger gate, before this one" \
+  "$(_ledger_rc MISSING)" "1"
+t "a rules.txt that is not Step 1 output is refused by the ledger gate" \
+  "$(_ledger_rc 'some other file entirely')" "1"
+t "and the card gate stays out of it" \
+  "$(_cov_raw MISSING -)" "ok"
+t "a diff GitHub refused to serve still owes the reader a coverage line" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' -)" "MISSING-COVERAGE"
+t "a diff GitHub refused to serve passes once the card says it is partial" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' 'Coverage: BEYOND ONE PASS -- GitHub refused the diff')" "ok"
+# ...but only if it says the right thing: a present coverage line is not enough, it has
+# to carry the verdict.
+t "a diff GitHub refused to serve may not be called ordinary" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' 'Coverage: 3 files / 20 added lines -- within one review pass')" \
+  "SOFTENED-COVERAGE"
+# And it may not claim a measurement that does not exist: with `[diff-too-large]` the
+# rule is policy, so the message must not open "Step 1 measured this diff".
+_cov_why() {  # <full rules.txt> <card coverage line> -> the problem's reason text
+  python3 -c '
+import sys, tempfile, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+d = tempfile.mkdtemp()
+pathlib.Path(d, "rules.txt").write_text(sys.argv[2] + "\n")
+p = triage._check_coverage_line("## T\n\nReview: OK\n" + sys.argv[3] + "\n", d)
+print(p[0][2] if p else "ok")' "$S" "$1" "$2"
+}
+t "a refused diff is not described as measured" \
+  "$(_cov_why '    [diff-too-large        ] A1 A2' 'Coverage: 3 files -- within one review pass' \
+     | grep -c 'Step 1 measured')" "0"
+t "a measured BEYOND ONE PASS diff still says so" \
+  "$(_cov_why "$_BIG" 'Coverage: 47 files / 16647 added lines' | grep -c 'Step 1 measured')" "1"
+# Same for the MISSING branch, which the SOFTENED fix did not cover: a refused diff has
+# no measurement there either, and nothing was checking its wording.
+t "a refused diff with no coverage line is not described as measured" \
+  "$(_cov_why '    [diff-too-large        ] A1 A2' 'Review: OK' | grep -c 'measured')" "0"
+t "MISSING names what it could not find" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' - >/dev/null; \
+     python3 -c '
+import sys, tempfile, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+d = tempfile.mkdtemp()
+pathlib.Path(d, "rules.txt").write_text("    [diff-too-large        ] A1 A2\n")
+print(len(triage._check_coverage_line("## T\n\nReview: OK\n", d)[0][1]) > 0)' "$S")" "True"
+# A real measurement outranks the policy: `[diff-too-large]` alongside a coverage line
+# must compare against the line, not fall back to the refusal rule.
+t "a measured line outranks the diff-too-large policy" \
+  "$(_cov_raw '  coverage: 5 files / 49 added lines -- within one review pass
+    [diff-too-large        ] A1 A2' 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
+t "an underivable diff has nothing to compare and stays silent" \
+  "$(_cov_raw '    [underivable           ] A1 A2' -)" "ok"
+t "a failed derivation has nothing to compare and stays silent" \
+  "$(_cov_raw '    [derivation-failed     ] A1 A2' -)" "ok"
 
 # The pollution case needs REAL skill prose, not a one-line stand-in: a synthetic hunk
 # trips no family and the test passes with the filter removed -- it did, until this was
@@ -504,6 +586,27 @@ _budget_pair() {  # <agent> <budget> -> rc of run_one's precondition
   ( ATOM_AGENT_TIMEOUT=$1 ATOM_RUN_BUDGET=$2 \
     timeout 20 bash "$S/run_one.sh" 0 x/y >/dev/null 2>&1; echo $? )
 }
+# The old gate here forbade any other workflow from using the review runner's label, to
+# prop up a box_busy() that counted only its own runs. That ban cost every review in a repo
+# the day one landed (aiter#8255). What has to hold instead is that watchdog watches the
+# label the job actually runs on -- checked on its own, because a watchdog whose behaviour
+# tests also fail would hide whether this gate still bites.
+_label_gate() {  # <RUNNER_LABEL to plant> -> does check_prompts refuse?
+  r=$(mktemp -d); d="$r/.claude/skills/review-pr"
+  mkdir -p "$d" "$r/.github/workflows"; cp -r "$S"/. "$d/" 2>/dev/null
+  cp "$S/../../../.github/workflows/"*.y*ml "$r/.github/workflows/" 2>/dev/null
+  python3 -c '
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1], "watchdog.py")
+p.write_text(re.sub(r"^RUNNER_LABEL = .[^\"]+.$", "RUNNER_LABEL = \"%s\"" % sys.argv[2],
+                    p.read_text(), count=1, flags=re.M))' "$d" "$1"
+  out=$(python3 "$d/check_prompts.py" 2>&1 | grep -c "is not the review job.s label")
+  rm -rf "$r"
+  printf '%s\n' "$out"
+}
+t "a watchdog watching the wrong label is refused" "$(_label_gate wrong-box)" "1"
+t "and the right one is not" "$(_label_gate atom-bot)" "0"
+
 t "a per-agent timeout that starves the refuter is refused" "$(_budget_pair 5400 7200)" "2"
 
 # A cross-family refuter must be reachable by doing what the comment says. The hook has

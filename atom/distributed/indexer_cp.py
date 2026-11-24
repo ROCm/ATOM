@@ -21,12 +21,19 @@ TP > num_kv_heads means a strided subgroup per head-set and a collective
 This module is ATOM-native only -- the vLLM/SGLang bridges keep the TP path.
 """
 
+import ctypes
+import logging
+
 import torch
 import torch.distributed as dist
 
 from atom.config import get_current_atom_config
+from atom.distributed.group_agreement import group_agree
+from atom.mono.runtime.hip_ipc import check_hip_error, load_runtime
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 
 def indexer_cp_enabled() -> bool:
@@ -88,6 +95,132 @@ def get_indexer_cp_world_size() -> int:
 # BYTES and not the tokens/topk factorization -- which is why the threshold is
 # expressed in bytes rather than as a token count.
 _ALLGATHER_MAX_PAYLOAD_BYTES = 512 * 1024
+_MAILBOX_ARCHES = ("gfx950", "gfx1250")
+
+
+def _mailbox_runtime():
+    """The aiter IPC API used only while opening a mailbox.
+
+    ``_should_use_vmm`` is private to aiter. ``CandidateMailbox`` imports these
+    outside its fallback, so a renamed symbol fails setup instead of silently
+    taking the collective path.
+
+    Needs aiter with ROCm/aiter#6974, which adds every name used here
+    (``IPCBufferPool.open_peer_buffers`` included). ``CandidateMailbox`` uses
+    ``create(raw_cached=True)`` and requires ROCm 7.14 or later (aiter's
+    gfx1250 hipIpc floor, applied on every arch); older ROCm or VMM setups take
+    the collective fallback.
+    """
+    from aiter.dist.device_communicators.custom_all_reduce import (
+        IPCBufferPool,
+        _should_use_vmm,
+    )
+
+    return IPCBufferPool, _should_use_vmm
+
+
+class CandidateMailbox:
+    """Where ``select_exchanged_candidates`` sends each head's candidates: a
+    mailbox of 2 banks x ``world`` senders x ``max_rows`` rows x ``MAX_TOPK``
+    keys on every rank, mapped by every peer (hipIpc), and this rank's call
+    counters.
+
+    Cached memory, as aiter's gluon all-reduce inboxes: polling uncached memory
+    is slower.
+
+    Setup failures are agreed before any rank can return a usable mailbox.
+    Failures before ``open_peer_buffers`` keep every rank out of the handle
+    exchange; failures that return or raise from it are agreed afterward. A
+    process that dies inside the exchange before publishing its handle can
+    still leave peers in the TCPStore read until the store itself times out.
+    """
+
+    MAX_TOPK = 64
+    BANKS = 2
+
+    def __init__(self, cpu_group, world: int, max_rows: int, device):
+        self.world = world
+        self.max_rows = max_rows
+        nbytes = self.BANKS * world * max_rows * self.MAX_TOPK * 8
+        failure, self._pool = None, None
+        IPCBufferPool, _should_use_vmm = _mailbox_runtime()
+        try:
+            if _should_use_vmm(True):
+                raise RuntimeError("hipIpc of cached memory needs ROCm 7.14 or later")
+            # All device allocations precede the first agreement. A rank-local
+            # OOM therefore makes every rank skip the peer-handle exchange and
+            # take the collective fallback.
+            self.peers = torch.empty(world, dtype=torch.int64, device=device)
+            self.send_calls = torch.zeros(
+                world * max_rows, dtype=torch.int32, device=device
+            )
+            self.recv_calls = torch.zeros(max_rows, dtype=torch.int32, device=device)
+            self._pool = IPCBufferPool(device, cpu_group)
+            mailbox = self._pool.create("indexer_cp_mailbox", nbytes, raw_cached=True)
+            err = load_runtime().hipMemset(
+                ctypes.c_void_p(mailbox.data_ptr), 0, ctypes.c_size_t(nbytes)
+            )
+            check_hip_error(err, operation="hipMemset")
+            torch.cuda.synchronize(device)
+        except Exception as error:  # noqa: BLE001 - agree every rank-local failure
+            failure = error
+        if group_agree(failure is None, cpu_group):
+            try:
+                peers = self._pool.open_peer_buffers("indexer_cp_mailbox")
+                self.peers.copy_(torch.tensor(peers, dtype=torch.int64, device="cpu"))
+                torch.cuda.synchronize(device)
+            except Exception as error:  # noqa: BLE001 - agree every mapping failure
+                failure = error
+            if not group_agree(failure is None, cpu_group):
+                failure = failure or RuntimeError("a peer failed to map the mailbox")
+        else:
+            failure = failure or RuntimeError("a peer failed to allocate the mailbox")
+        if failure is not None:
+            if self._pool is not None:
+                self._pool.close_peer_buffers()
+                self._pool.close()
+            raise RuntimeError(f"candidate mailbox: {failure}") from failure
+
+    def fits(self, heads: int, tokens: int, topk: int) -> bool:
+        return (
+            heads == self.world
+            and tokens <= self.max_rows
+            and 1 <= topk <= self.MAX_TOPK
+        )
+
+
+_mailbox: CandidateMailbox | None = None
+
+
+def candidate_mailbox() -> CandidateMailbox | None:
+    """The one-launch exchange's mailbox, or None when decode keeps the
+    collective (unsupported architecture, no graphs, or mapping failure)."""
+    return _mailbox
+
+
+def _open_candidate_mailbox(device, max_rows: int) -> None:
+    global _mailbox
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    # The mailbox needs cross-GPU `.wt`/`.cv` to lower to sc0 sc1, as on
+    # _MAILBOX_ARCHES. Other architectures keep the collective exchange.
+    if _mailbox is not None or get_gfx_runtime() not in _MAILBOX_ARCHES:
+        return
+    group = get_indexer_cp_group()
+    try:
+        _mailbox = CandidateMailbox(
+            group.cpu_group,
+            group.world_size,
+            max_rows,
+            device,
+        )
+    except RuntimeError as error:
+        # CandidateMailbox agrees recoverable setup failures before raising.
+        logger.warning(
+            "indexer CP keeps the collective candidate exchange: %s",
+            error,
+            exc_info=True,
+        )
 
 
 def exchange_candidates(keys: torch.Tensor) -> torch.Tensor:
@@ -187,7 +320,7 @@ def _exchange_via_all_gather(keys: torch.Tensor, group) -> torch.Tensor:
     ]
 
 
-def warmup_exchange(device) -> None:
+def warmup_exchange(device, max_mailbox_rows: int) -> None:
     """Run one eager all-to-all so capture never sees NCCL's lazy setup.
 
     NCCL establishes peer connections on a group's first collective. Doing that
@@ -212,6 +345,11 @@ def warmup_exchange(device) -> None:
     instead of raising here. That predicate is monotonic in payload size, so
     clearing it for the probe implies clearing it for the larger production
     payload -- the warmup cannot pass for a transport production then skips.
+
+    It then opens the one-launch exchange's mailbox, a collective that capture
+    must not see either. ``max_mailbox_rows`` is the runner's
+    ``max_num_seqs * (mtp_k + 1)``, with the drafter's resolved ``mtp_k`` (0
+    without one) rather than the possibly unset speculative config field.
     """
     if not indexer_cp_enabled():
         return
@@ -223,3 +361,4 @@ def warmup_exchange(device) -> None:
     if _can_all_gather(probe, group):
         _exchange_via_all_gather(probe, group)
     torch.cuda.synchronize()
+    _open_candidate_mailbox(device, max_mailbox_rows)
