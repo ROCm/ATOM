@@ -71,11 +71,15 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
             }
         }
 
+        // Under the admission lock: a worker admitted with the loaded tokenizer is
+        // registered before the check or admitted after the drop, never in between.
+        let admitting = app_context.template_admission.lock();
         for model in &atom_models {
             if app_context.worker_registry.get_by_model(model).is_empty() {
                 drop_tokenizer(app_context, model);
             }
         }
+        drop(admitting);
 
         // Log if some workers were already removed (e.g., by another process)
         if removed_count != worker_urls.len() {
