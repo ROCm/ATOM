@@ -209,7 +209,7 @@ def _flydsl_attention(
     q, k_payload, k_scale, v_payload, v_scale, table, ctx, sm_scale,
     plan_step_owner, plan_cache_owner,
     quantized_output=None, output_scale=None, quantized_direct=True,
-    rows_per_request=0,
+    rows_per_request=0, output=None,
 ):  # fmt: skip
     """aiter's FlyDSL paged decode over the NVFP4 cache, one length-1 sequence a
     (row, kv head), planned and scratch-cached like the FP8 sparse path's.
@@ -231,6 +231,7 @@ def _flydsl_attention(
     from atom.model_ops.base_attention import (
         _flydsl_plan_scratch,
         _flydsl_prepare_explicit_plan,
+        flydsl_row_chunks,
     )
     from atom.model_ops.minimax_m3.sparse_attn import _cluster_resident_rows
 
@@ -238,7 +239,8 @@ def _flydsl_attention(
     pages, num_kv_heads = k_payload.shape[:2]
     group = num_q_heads // num_kv_heads
     seqs = rows * num_kv_heads
-    output = torch.empty_like(q)
+    if output is None:  # else a chunk's rows of the caller's output
+        output = torch.empty_like(q)
     quant_args = {}
     mxfp8 = quantized_output is not None and output_scale.dtype != torch.float32
     if quantized_output is not None:
@@ -313,6 +315,22 @@ def _flydsl_attention(
                 **_prefill_reuse_impl(),
             )
             return output
+    chunks = flydsl_row_chunks(rows, num_kv_heads)
+    if len(chunks) > 1:
+        # Past one plan's sequences (PP x TP1 prefill keeps every KV head),
+        # whole-token chunks, one plan each. Equal chunks share a plan key, so
+        # none keeps the step's plan: it would hold another chunk's lengths.
+        for start, end in chunks:
+            tail = None if end == rows else end  # a padded bucket's rows
+            seq_slice = slice(start * num_kv_heads, end * num_kv_heads)
+            _flydsl_attention(
+                q[start:end], k_payload, k_scale, v_payload, v_scale,
+                table[seq_slice], ctx[seq_slice], sm_scale, None, plan_cache_owner,
+                None if quantized_output is None else quantized_output[start:tail],
+                None if output_scale is None else output_scale[start:tail],
+                quantized_direct, rows_per_request, output[start:end],
+            )  # fmt: skip
+        return output
     # The FP8 sparse path's split: a bounded top-k window per row.
     partitions = get_recommended_splits(seqs, 1)
     workgroup_budget = None
