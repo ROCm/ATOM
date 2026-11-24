@@ -200,9 +200,10 @@ pub fn prepare_chat_with(
             let err = PlacementError::ChatTemplateChanged;
             placement_err_to_response(err, Some(model_id_str))
         })?;
+        let loaded_file = components.tokenizer_template_files.read().get(&id).cloned();
         payload.chat_template = Some(RenderedTemplate {
             fingerprint,
-            router_file: components.router_config.chat_template.clone(),
+            fallback_file: loaded_file.or_else(|| components.router_config.chat_template.clone()),
         });
     }
 
