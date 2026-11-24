@@ -83,9 +83,9 @@ class TestLayerEligible:
     [
         (8192, 8192, 8192, True),
         (1536, 1536, 32768, True),
+        (8192, 8192, 65_536, True),
         (1535, 1535, 8192, False),  # too few rows: most CUs idle
-        (8192, 8192, 32769, False),  # past the context bound
-        (8192, 8192, 524_288, False),
+        (8192, 8192, 65_537, False),  # past the context bound
         (8192, 8192, 599_040, False),  # also past the kernel's 524,288-token bitmap
         (8192, 8000, 8192, False),  # pad rows past the scheduled tokens
     ],
@@ -238,7 +238,12 @@ def _err(o, ref):
 @gpu
 @pytest.mark.parametrize(
     "qlens,prefixes",
-    [([1000], [3000]), ([300, 7, 650], [0, 4000, 1500]), ([1, 13, 2500], [0, 9, 700])],
+    [
+        ([1000], [3000]),
+        ([300, 7, 650], [0, 4000, 1500]),
+        ([1, 13, 2500], [0, 9, 700]),
+        ([1536], [62_000]),  # past the old 32K bound
+    ],
 )
 @pytest.mark.parametrize("seed", [0, 1])
 def test_token_tiled_error_is_not_worse_than_asm(qlens, prefixes, seed):

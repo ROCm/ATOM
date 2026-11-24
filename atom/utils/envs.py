@@ -654,7 +654,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
     # MiniMax-M3 FP8 sparse prefill at TP1 on gfx950: aiter's token-tiled kernel on
-    # steps of >= 1536 tokens and context <= 32K (`tt_prefill`); 0 keeps ASM.
+    # steps of >= 1536 tokens and context <= 64K (`tt_prefill`); 0 keeps ASM.
     "ATOM_M3_TT_PREFILL": lambda: _flag_env("ATOM_M3_TT_PREFILL", "1"),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
