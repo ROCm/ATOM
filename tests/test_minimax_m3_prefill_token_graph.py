@@ -7,7 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
+pytest.importorskip("aiter")
+
+from atom.model_ops.attentions.aiter_attention import (  # noqa: E402
+    AiterAttentionMetadataBuilder,
+)
 
 _supports = AiterAttentionMetadataBuilder.supports_token_graph.fget
 _capture = AiterAttentionMetadataBuilder.build_for_token_graph_capture
