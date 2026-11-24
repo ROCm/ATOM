@@ -97,17 +97,23 @@ def test_step_gate(rows, scheduled, max_seq_len, want):
     assert tt.step_takes(md, rows) is want
 
 
+cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+@cuda
 def test_tile_map_covers_every_row_once_without_straddling(monkeypatch):
     monkeypatch.setattr(tt, "_ops", lambda: types.SimpleNamespace(TT_TQ=12))
     qlens, prefixes = [25, 1, 12, 0, 40], [100, 7, 0, 3, 5000]
-    cu = torch.tensor([0, *torch.tensor(qlens).cumsum(0).tolist()], dtype=torch.int32)
+    i32 = {"dtype": torch.int32, "device": "cuda"}
+    cu = torch.tensor([0, *torch.tensor(qlens).cumsum(0).tolist()], **i32)
     md = types.SimpleNamespace(
-        cu_seqlens_q=cu, context_lens=torch.tensor(prefixes, dtype=torch.int32)
+        cu_seqlens_q=cu, context_lens=torch.tensor(prefixes, **i32)
     )
     total_q = sum(qlens)
     req, kv_lens, t0, n, ntiles = tt._tile_map(md, total_q)
     assert ntiles == -(-total_q // 12) + len(qlens)
     assert t0.shape == n.shape == (ntiles,)
+    req = req.cpu()
     seen = torch.zeros(total_q, dtype=torch.int32)
     for start, length in zip(t0.tolist(), n.tolist()):
         assert 0 <= length <= 12
@@ -120,6 +126,50 @@ def test_tile_map_covers_every_row_once_without_straddling(monkeypatch):
     assert kv_lens.tolist() == want_kv
     # built once a step: every later layer reads it back
     assert tt._tile_map(md, total_q)[2] is t0
+
+
+def _tile_map_torch(cu, prefix, total_q, tq):
+    """The tile map in torch ops: searchsorted rows and a cumsum of request tiles."""
+    nreq = prefix.shape[0]
+    rows = torch.arange(total_q, dtype=cu.dtype, device=cu.device)
+    req = torch.searchsorted(cu[1:], rows, right=True).clamp_(max=nreq - 1)
+    kv_lens = prefix[req] + (rows - cu[req]) + 1
+    lens = (cu[1 : nreq + 1] - cu[:nreq]).to(torch.int64)
+    tiles = (lens + tq - 1) // tq
+    ends = torch.cumsum(tiles, 0)
+    ntiles = (total_q + tq - 1) // tq + nreq
+    k = torch.arange(ntiles, device=cu.device, dtype=torch.int64)
+    b = torch.searchsorted(ends, k, right=True)
+    live = b < nreq
+    b = b.clamp(max=nreq - 1)
+    local = k - (ends[b] - tiles[b])
+    t0 = torch.where(live, cu[b].to(torch.int64) + local * tq, 0)
+    n = torch.where(live, torch.clamp(lens[b] - local * tq, 0, tq), 0)
+    return [x.to(torch.int32) for x in (req, kv_lens, t0, n)], ntiles
+
+
+@cuda
+@pytest.mark.parametrize("nreq", [1, 2, 7, 64, 65, 130, 513])
+@pytest.mark.parametrize("max_prefix", [32768, 524_288])
+def test_tile_map_kernel_matches_torch(monkeypatch, nreq, max_prefix):
+    """One launch for the whole map, the torch ops' bytes: ragged, empty and tile-multiple
+    requests, batches past one 64-request pass of the kernel, prefixes up to 512K."""
+    monkeypatch.setattr(tt, "_ops", lambda: types.SimpleNamespace(TT_TQ=12))
+    g = torch.Generator().manual_seed(nreq)
+    lens = torch.randint(0, 3000, (nreq,), generator=g)
+    lens[:: max(1, nreq // 3)] = 12
+    lens[1::5] = 0
+    lens[0] = max(int(lens[0]), 1)
+    i32 = {"dtype": torch.int32, "device": "cuda"}
+    cu = torch.tensor([0, *lens.cumsum(0).tolist()], **i32)
+    prefix = torch.randint(0, max_prefix, (nreq,), generator=g).to(**i32)
+    total_q = int(lens.sum())
+    md = types.SimpleNamespace(cu_seqlens_q=cu, context_lens=prefix)
+    got = tt._tile_map(md, total_q)
+    want, ntiles = _tile_map_torch(cu, prefix, total_q, 12)
+    assert got[4] == ntiles
+    for a, b in zip(got[:4], want):
+        assert a.dtype == b.dtype and torch.equal(a, b)
 
 
 # ---------------------------------------------------------------------------
