@@ -283,7 +283,7 @@ impl SessionAffinityPolicy {
             WorkerIdentity::from_worker(&workers[worker_index]),
             now,
             reassigned,
-        );
+        )
     }
 
     /// Places `key` with the inner policy, away from the workers it failed on
@@ -406,9 +406,9 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
         let Some(key) = self.binding_key(headers) else {
             return;
         };
-        if let Some(reason) = self
-            .table
-            .record_dispatch(key, WorkerIdentity::from_worker(worker), binding)
+        if let Some(reason) =
+            self.table
+                .record_dispatch(key, WorkerIdentity::from_worker(worker), binding)
         {
             MeshMetrics::record_session_worker_change(pool, reason);
         }
