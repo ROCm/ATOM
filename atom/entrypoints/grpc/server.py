@@ -446,10 +446,10 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
                         )
                         refused.append(_rejected(item.seq_id, in_flight))
                     elif len(admissions) < SESSION_ADMISSIONS:
-                        session.admitting.add(item.seq_id)  # an Abort waits for it
+                        session.admitting[item.seq_id] = item  # an Abort waits for it
                         admit(item)
                     elif len(waiting) < SESSION_WAITING:
-                        session.admitting.add(item.seq_id)
+                        session.admitting[item.seq_id] = item
                         waiting.append(item)
                     else:
                         busy = v1.RejectedRequest.OVERLOADED
@@ -462,7 +462,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         finally:
             try:  # a cancelled reader's admissions settle as a cancelled submission does
                 for item in waiting:  # never started: nothing of it to settle
-                    session.admitting.discard(item.seq_id)
+                    session.admitting.pop(item.seq_id, None)
                     session.aborted_while_admitting.discard(item.seq_id)
                 waiting.clear()
                 for admission in admissions:
@@ -480,9 +480,12 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         except Exception as error:  # noqa: BLE001 - refused as Generate is
             session.reject([_rejected(client_id, error)])
         finally:
-            session.admitting.discard(client_id)
-            aborted = client_id in session.aborted_while_admitting
-            session.aborted_while_admitting.discard(client_id)
+            # Unless it ended first and the client has sent its seq_id again.
+            aborted = False
+            if session.admitting.get(client_id) is request:
+                del session.admitting[client_id]
+                aborted = client_id in session.aborted_while_admitting
+                session.aborted_while_admitting.discard(client_id)
         if aborted:
             session.abort([client_id])
 
