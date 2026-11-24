@@ -200,6 +200,7 @@ class EngineCore:
             config.pool_entries = block_info.get("pool_entries", {})
             config.pool_entry_bytes = block_info.get("pool_entry_bytes", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
+            config.state_transfer_slots = block_info.get("state_transfer_slots", 0)
             self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True

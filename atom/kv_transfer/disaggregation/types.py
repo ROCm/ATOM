@@ -672,6 +672,7 @@ class ConnectorMetadata:
         "reqs_in_batch",
         "reqs_not_processed",
         "chunked_admissions",
+        "state_stages",
     )
 
     def __init__(self) -> None:
@@ -684,6 +685,9 @@ class ConnectorMetadata:
         # Register P logical requests before allocating source blocks. Workers
         # report D readiness through the existing TP/PP completion channel.
         self.chunked_admissions: dict[ReqId, TransferId] = {}
+        # Producer: transfer id -> (live slot, transfer slot) state copies the
+        # runner makes before the next forward, which may reuse the live slot.
+        self.state_stages: dict[TransferId, tuple[int, int]] = {}
 
     def has_work(self) -> bool:
         """Whether the worker has anything to do with this snapshot."""

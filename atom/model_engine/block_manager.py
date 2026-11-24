@@ -317,6 +317,33 @@ class BlockManager:
         # from "no slots were ever created" (permanent).
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        # A P/D producer's transfer slots: the top of the state pool, never
+        # admitted into, where a finished request's state waits for its push.
+        self.num_state_transfer_slots = (
+            int(getattr(config, "state_transfer_slots", 0) or 0)
+            if self.num_state_slots
+            else 0
+        )
+        if self.num_state_transfer_slots:
+            if self.num_state_slots - self.num_state_transfer_slots < (
+                self.state_slots_per_req
+            ):
+                raise ValueError(
+                    f"{self.num_state_transfer_slots} state transfer slots leave "
+                    f"{self.num_state_slots - self.num_state_transfer_slots} of "
+                    f"{self.num_state_slots} state slots for live requests"
+                )
+            self.num_state_slots -= self.num_state_transfer_slots
+        self._free_transfer_slots: deque[int] = deque(
+            range(
+                self.num_state_slots,
+                self.num_state_slots + self.num_state_transfer_slots,
+            )
+        )
+        # Finished requests moved to a transfer slot, and those that kept
+        # their live slot because every transfer slot was taken.
+        self.transfer_slot_moves = 0
+        self.transfer_slots_full = 0
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -3326,6 +3353,7 @@ class BlockManager:
         return (
             self.kv.eviction_stats()
             | self.state.occupancy()
+            | self.transfer_slot_occupancy()
             | self.state_checkpoint_fates()
         )
 
@@ -3798,9 +3826,9 @@ class BlockManager:
                 # (in flight): the entry is already gone and the orphan-slot path
                 # above holds the slot until `settle_state_load`.
                 self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
-                self.state.release_many(seq.state_slots[1:])
+                self._release_state_slots(seq.state_slots[1:])
             else:
-                self.state.release_many(seq.state_slots)
+                self._release_state_slots(seq.state_slots)
             # No next forward will read a pending fork source after deallocation.
             self.state.drop_reader(seq.state_fork_src)
             seq.state_slots = []
@@ -3808,6 +3836,51 @@ class BlockManager:
 
         seq.offload_joint.load_hash = -1
         seq.offload_joint.reset_joint()
+
+    def _release_state_slots(self, slots) -> None:
+        """Hand back live slots to the pool, transfer slots to their own list."""
+        for slot in slots or ():
+            if slot >= self.num_state_slots:
+                self._free_transfer_slots.append(slot)
+            elif slot >= 0:
+                self.state.release(slot)
+
+    def move_state_to_transfer_slot(self, seq: Sequence) -> tuple[int, int] | None:
+        """Re-home a finished P/D request's state in a transfer slot.
+
+        Returns ``(src, dst)``: the caller must copy slot ``src`` into ``dst``
+        before the next forward, which may reuse ``src``. None when there is no
+        free transfer slot or the committed slot cannot move yet.
+        """
+        if not self.num_state_transfer_slots or not (
+            seq.has_per_req_cache and seq.state_slots
+        ):
+            return None
+        src = seq.state_slot
+        if src < 0 or src >= self.num_state_slots:
+            return None
+        if seq.offload_joint.load_hash != -1 or seq.state_fork_src >= 0:
+            # A state load still writes the committed slot, or a pending fork
+            # means the state is still in its source, not in `src`.
+            return None
+        if not self._free_transfer_slots:
+            self.transfer_slots_full += 1
+            return None
+        dst = self._free_transfer_slots.popleft()
+        self.state.release_many(seq.state_slots)
+        seq.state_slots = [dst]
+        self.transfer_slot_moves += 1
+        return src, dst
+
+    def transfer_slot_occupancy(self) -> dict[str, int]:
+        """Transfer slots in use and in total, and the moves made or missed."""
+        total = self.num_state_transfer_slots
+        return {
+            "transfer_slots_total": total,
+            "transfer_slots_used": total - len(self._free_transfer_slots),
+            "transfer_slot_moves": self.transfer_slot_moves,
+            "transfer_slots_full": self.transfer_slots_full,
+        }
 
     def can_append(
         self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0

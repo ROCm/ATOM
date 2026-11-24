@@ -576,6 +576,20 @@ class FakeStatus:
         return self.state
 
 
+class FakeEvent:
+    """Stands in for torch.cuda.Event; ``done`` is flipped by the test."""
+
+    def __init__(self, done: bool = False):
+        self.done = done
+        self.recorded = False
+
+    def record(self):
+        self.recorded = True
+
+    def query(self):
+        return self.done
+
+
 class WritePathTest(unittest.TestCase):
     """Serial WRITE mode, both ends, with the RDMA and ZMQ edges stubbed."""
 
@@ -670,6 +684,9 @@ class WritePathTest(unittest.TestCase):
         conn._verify_state_before = {}
         conn._verify_kept = {}
         conn._write_state_digests = {}
+        conn._first_transfer_slot = 0
+        conn._staged_sources = {}
+        conn._config = None
 
         conn.sent = []
         conn.writes = []
@@ -1548,6 +1565,94 @@ class WritePathTest(unittest.TestCase):
         self.assertIn(("S-k", [48], [120], [24]), conn.writes)
         self.assertIn(("S-v", [256], [640], [128]), conn.writes)
 
+    def pending_push(self, conn, src_slot: int, *, queued_at: float | None = None):
+        """Queue a push from `src_slot` whose consumer is already handshaken."""
+        import time
+
+        conn._get_or_build_sessions = lambda engine_id: (self.block_sessions(), None)
+        request = self.push_request(
+            src_slot_index=src_slot, dst_slot_index=5, deadline=time.time() + 60
+        )
+        engine_id = conn._write_engine_id(request)
+        conn._remote_agents[engine_id] = set()
+        conn.remote_moriio_metadata[engine_id] = conn.remote_moriio_metadata["engine"]
+        conn._write_ids[9] = None
+        queued = time.monotonic() if queued_at is None else queued_at
+        conn._pending_writes = [(request, queued)]
+        return request
+
+    def test_a_live_slot_is_pushed_without_staging(self):
+        conn = self.make_stateful(self.make(producer=True), slots=6)
+        conn._first_transfer_slot = 4
+        self.pending_push(conn, 2)
+        conn._service_write_requests()
+        self.assertIn(9, conn._sending_writes)
+
+    def test_a_transfer_slot_is_pushed_only_once_its_copy_landed(self):
+        conn = self.make_stateful(self.make(producer=True), slots=6)
+        conn._first_transfer_slot = 4
+        self.pending_push(conn, 5)
+        conn._service_write_requests()
+        # The runner has not copied the state there yet.
+        self.assertEqual((conn.writes, len(conn._pending_writes)), ([], 1))
+
+        landed = FakeEvent(done=False)
+        conn._staged_sources[9] = (5, landed)
+        conn._service_write_requests()
+        self.assertEqual((conn.writes, len(conn._pending_writes)), ([], 1))
+
+        landed.done = True
+        conn._service_write_requests()
+        self.assertEqual(conn._pending_writes, [])
+        self.assertIn(9, conn._sending_writes)
+        self.assertIn(("S-v", [640], [640], [128]), conn.writes)
+
+    def test_a_push_from_a_slot_it_was_not_staged_into_fails(self):
+        conn = self.make_stateful(self.make(producer=True), slots=6)
+        conn._first_transfer_slot = 4
+        self.pending_push(conn, 5)
+        conn._staged_sources[9] = (4, FakeEvent(done=True))
+        with self.assertLogs("atom", "ERROR"):
+            conn._service_write_requests()
+        self.assertEqual(conn.writes, [])
+        self.assertEqual(conn.done_sending, {9})
+        ((frames, _host, _port),) = conn.sent
+        self.assertFalse(self.msgpack.loads(frames[1])["ok"])
+
+    def test_a_copy_that_never_arrives_fails_after_the_handshake_timeout(self):
+        import time
+
+        conn = self.make_stateful(self.make(producer=True), slots=6)
+        conn._first_transfer_slot = 4
+        self.pending_push(conn, 5, queued_at=time.monotonic() - 301)
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._service_write_requests()
+        self.assertIn("never reached transfer slot 5", logs.output[0])
+        self.assertEqual(conn.done_sending, {9})
+
+    def test_a_finished_or_released_transfer_forgets_its_copy(self):
+        conn = self.make_stateful(self.make(producer=True), slots=6)
+        conn._staged_sources = {9: (4, FakeEvent()), 10: (5, FakeEvent())}
+        conn._finish_write(self.push_request(), ok=True)
+        self.assertNotIn(9, conn._staged_sources)
+        # A consumer that failed before asking releases the source by notify.
+        conn.done_sending.add(10)
+        conn.get_finished()
+        self.assertEqual(conn._staged_sources, {})
+
+    def test_one_event_marks_every_copy_of_a_step(self):
+        conn = self.make(producer=True)
+        meta = self.types.SimpleNamespace(state_stages={9: (1, 4), 10: (2, 5)})
+        with mock.patch.object(self.torch.cuda, "Event", FakeEvent):
+            conn.start_load_kv(meta)
+        (slot9, event9), (slot10, event10) = (
+            conn._staged_sources[9],
+            conn._staged_sources[10],
+        )
+        self.assertEqual((slot9, slot10), (4, 5))
+        self.assertIs(event9, event10)
+        self.assertTrue(event9.recorded)
+
     def test_the_producer_refuses_a_push_that_names_no_slot(self):
         conn = self.make_stateful(self.make(producer=True))
         sessions = self.block_sessions()
@@ -1680,6 +1785,7 @@ class SchedulerSlotTest(unittest.TestCase):
         sched._reqs_need_recv = {}
         sched._awaiting_send = set()
         sched.hash_block_size = 4
+        sched._state_stages = {}
         sched.request_id_to_transfer_id = {}
         sched.transfer_id_to_request_id = {}
         return sched
@@ -1724,6 +1830,22 @@ class SchedulerSlotTest(unittest.TestCase):
         self.assertEqual(seq.kv_transfer_params["num_computed_blocks"], 2)
         self.assertTrue(sched.receives_suffix_and_state)
         self.assertFalse(self.make(producer=True).receives_suffix_and_state)
+
+    def test_a_staged_copy_rides_the_next_metadata_once(self):
+        sched = self.make(producer=True)
+        sched.stage_state_for_send(self.seq(), 1, 4)
+        self.assertEqual(sched.build_connector_meta().state_stages, {7: (1, 4)})
+        self.assertEqual(sched.build_connector_meta().state_stages, {})
+
+    def test_a_send_released_before_its_copy_drops_the_copy(self):
+        sched = self.make(producer=True)
+        sched.stage_state_for_send(self.seq(), 1, 4)
+        sched.send_finished("7")
+        self.assertEqual(sched.build_connector_meta().state_stages, {})
+
+    def test_only_a_producer_stages_state(self):
+        with self.assertRaises(RuntimeError):
+            self.make(producer=False).stage_state_for_send(self.seq(), 1, 4)
 
     def test_the_producer_publishes_its_state_slot(self):
         sched = self.make(producer=True)

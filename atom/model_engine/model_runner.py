@@ -2101,6 +2101,15 @@ class ModelRunner:
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
+        # Read by BlockManager (shipped below) and by a producer's connector.
+        transfer_slots = getattr(
+            self.attn_metadata_builder, "state_transfer_slots", None
+        )
+        config.state_transfer_slots = (
+            int(transfer_slots())
+            if callable(transfer_slots) and plan.entries.get(STATE_SLOT_CLASS)
+            else 0
+        )
         # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
         uses_paged_state = transfer.copies
@@ -2244,6 +2253,7 @@ class ModelRunner:
             "pool_entries": dict(plan.entries),
             "pool_entry_bytes": dict(plan.entry_bytes),
             "pool_entries_per_req": dict(plan.entries_per_req),
+            "state_transfer_slots": config.state_transfer_slots,
             "state_runtime": state_runtime.to_wire(),
         }
 
@@ -3898,6 +3908,11 @@ class ModelRunner:
     def process_kvconnector_output(self, connector_meta_output):
         """Dispatch KV connector metadata to initiate async KV loading."""
         if connector_meta_output is not None:
+            stages = getattr(connector_meta_output, "state_stages", None)
+            if stages:
+                # Ahead of the next forward on this stream, which may reuse
+                # the live slots these copies read.
+                self.attn_metadata_builder.relocate_state_slots(list(stages.values()))
             connector = get_kvconnector()
             if connector is not None:
                 connector.start_load_kv(connector_meta_output)

@@ -158,6 +158,7 @@ def test_decode_images_get_spare_slots_only_where_they_are_built(
         num_state_layers=lambda: 2,
         _replayssm_bytes_per_slot=lambda: 0,
         slots_per_req=lambda: 1,
+        state_transfer_slots=lambda: 0,
     )
     spec = _builder_cls().state_spec(builder)
     assert spec.extra_entries == (DECODE_SNAPSHOT_SCRATCH_SLOTS if spare else 0)

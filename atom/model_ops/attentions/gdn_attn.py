@@ -742,8 +742,23 @@ class GDNStateMixin(PoolRowsMixin):
             STATE_SLOT_CLASS,
             self.num_state_layers() * per_layer + self._replayssm_bytes_per_slot(),
             entries_per_req=self.slots_per_req(),
-            extra_entries=DECODE_SNAPSHOT_SCRATCH_SLOTS if scratch else 0,
+            extra_entries=(DECODE_SNAPSHOT_SCRATCH_SLOTS if scratch else 0)
+            + self.state_transfer_slots(),
         )
+
+    def state_transfer_slots(self) -> int:
+        """Slots past the live ones where a MoRIIO producer parks a finished
+        request's state until its push (kv-transfer `state_transfer_slots`)."""
+        from atom.kv_transfer.disaggregation.factory import resolve_pd_backend
+
+        cfg = self.model_runner.config.kv_transfer_config or {}
+        if (
+            cfg.get("kv_connector", "moriio") != "moriio"
+            or resolve_pd_backend(cfg) != "moriio"
+            or cfg.get("kv_role", "kv_producer") != "kv_producer"
+        ):
+            return 0
+        return max(0, int(cfg.get("state_transfer_slots", 0) or 0))
 
     def slots_per_req(self) -> int:
         """Baseline GDN reserves one extra state slot per speculative token so

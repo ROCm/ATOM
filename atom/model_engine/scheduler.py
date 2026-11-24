@@ -35,6 +35,7 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
+from atom.kv_transfer.disaggregation.types import produced_no_handoff
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -1894,6 +1895,19 @@ class Scheduler:
         callback = getattr(self.kv_connector, "abandon_save", None)
         if callable(callback):
             callback(str(seq.id))
+
+    def _stage_state_for_send(self, seq: Sequence) -> None:
+        """Move a finished P/D request's state to a transfer slot, if one is free.
+
+        Its live slots go back to admission now; the connector copies the state
+        before the next forward and pushes it from the transfer slot.
+        """
+        stage = getattr(self.kv_connector, "stage_state_for_send", None)
+        if not callable(stage) or produced_no_handoff(seq):
+            return
+        moved = self.block_manager.move_state_to_transfer_slot(seq)
+        if moved is not None:
+            stage(seq, *moved)
 
     def _connector_send_finished(self, req_id) -> None:
         """Drop the connector's send claim on a request's source blocks.
@@ -5485,6 +5499,8 @@ class Scheduler:
         # without sampled output and requests without a stream queue.
         seq.leave_reason = reason
         if self.kv_connector is not None:
+            # Before `request_finished`, which advertises the slot to the peer.
+            self._stage_state_for_send(seq)
             callback = getattr(self.kv_connector, "request_finished", None)
             if callable(callback):
                 callback(seq)
