@@ -1471,6 +1471,13 @@ validate_mooncake_store_settings() {
     fi
   done < <(env)
   mooncake_store_requested || return 0
+  if [[ "${AGGREGATED:-0}" == "1" && "$(mooncake_setting MOONCAKE_STORE_AGG 0)" != "1" ]]; then
+    # start_prefill starts the Store, and an aggregated cell has no prefill:
+    # its server would run without the offload the case asked for, unless the
+    # case opts in (MOONCAKE_STORE_AGG=1) and start_aggregated starts it.
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE needs a P/D prefill; an aggregated cell starts none (set MOONCAKE_STORE_AGG=1 to start it with the aggregated server)" >&2
+    exit 2
+  fi
   (
     apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
     check_mooncake_store_settings

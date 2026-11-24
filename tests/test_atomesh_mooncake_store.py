@@ -1275,6 +1275,27 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
             "validate_mooncake_store_settings\n", MOONCAKE_STORE="0", AGGREGATED="1"
         )
 
+    def test_an_aggregated_cell_may_opt_in_to_the_store(self):
+        # start_aggregated starts the Store when the case asks for it.
+        self.run_shell(
+            "validate_mooncake_store_settings\n",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE="1",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_AGG="1",
+            AGGREGATED="1",
+        )
+
+    def test_several_prefill_workers_on_a_node_may_share_its_store_on_request(self):
+        for script, env in (
+            ("", {"ATOMESH_PD_WORKER_LAYOUT": "prefill_single_node", "xP": "2"}),
+            ("prefill_nodes=(0 0)\n", {"ATOMESH_PD_WORKER_LAYOUT": "packed_nodes", "xP": "2"}),
+        ):
+            with self.subTest(env=env, script=script):
+                self.run_shell(
+                    script + "validate_mooncake_store_settings\n",
+                    MOONCAKE_STORE_SHARED_PREFILL="1",
+                    **env,
+                )
+
     def test_the_p_d_connector_alone_passes(self):
         for config in (
             P_D_PRODUCER,

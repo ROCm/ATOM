@@ -2743,6 +2743,7 @@ models:
               MOONCAKE_STORE: "1"
               MOONCAKE_STORE_OWNERS: "1:256:rdma7"
               MOONCAKE_STORE_RDMA_DEVICES: "rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma6"
+              MOONCAKE_STORE_AGG: "1"
               MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4.1-Flash"
             decode:
               HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
