@@ -18,24 +18,24 @@ from test_prefill_short_first import _Delayer, _prompt, _sched, _shorts, _step
 from atom.model_engine.prefill_delayer import _FIXED_SLOTS, PrefillDelayer
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus, SequenceType
-from atom.plugin_recipe import EngineOptions
+from atom.utils import envs
 
 KNOBS = {
-    "prefill_short_first_rows": 0,
-    "prefill_short_first_long_rows": 4096,
-    "prefill_short_first_max_skips": 32,
-    "prefill_cost_ceil": False,
-    "prefill_decode_interval_busy": 0,
-    "prefill_decode_interval_busy_seqs": 48,
-    "prefill_long_cap_busy": 0,
-    "prefill_long_cap_busy_seqs": 48,
+    "ATOM_PREFILL_SHORT_FIRST_ROWS": 0,
+    "ATOM_PREFILL_SHORT_FIRST_LONG_ROWS": 4096,
+    "ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS": 32,
+    "ATOM_PREFILL_COST_CEIL": False,
+    "ATOM_PREFILL_DECODE_INTERVAL_BUSY": 0,
+    "ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS": 48,
+    "ATOM_PREFILL_LONG_CAP_BUSY": 0,
+    "ATOM_PREFILL_LONG_CAP_BUSY_SEQS": 48,
 }
 
 
 def test_all_admission_defaults(monkeypatch):
-    defaults = EngineOptions()
     for key, value in KNOBS.items():
-        assert getattr(defaults, key) == value
+        monkeypatch.delenv(key, raising=False)
+        assert getattr(envs, key) == value
     sched = Scheduler(MockConfig())
     assert sched._short_first_rows == sched._busy_long_prefill_cap == 0
     d = PrefillDelayer(dp_size=1, cpu_group=None, max_num_batched_tokens=16)
@@ -176,6 +176,7 @@ class _Group:
 
 @pytest.mark.parametrize("ceil", [False, True])
 def test_dp_cost_ceil_rounds_per_rank_and_preserves_target_room(monkeypatch, ceil):
+    monkeypatch.setenv("ATOM_PREFILL_COST_CEIL", str(int(ceil)))
     costs = [40.5, 40.5, 0.0]
     rounded = [math.ceil(x) if ceil else int(x) for x in costs]
     observed = []
@@ -194,7 +195,6 @@ def test_dp_cost_ceil_rounds_per_rank_and_preserves_target_room(monkeypatch, cei
             cpu_group=_Group(rank),
             max_num_batched_tokens=16,
             exchange_prefill_costs=True,
-            cost_ceil=ceil,
         )
         d.should_allow_prefill(
             prefillable=rank < 2,
@@ -282,12 +282,8 @@ def test_busy_ignored_by_adaptive_policy():
 def test_busy_long_cap_and_replay_semantics(
     monkeypatch, seq_factory, base_cap, busy_cap, load, expected
 ):
-    sched = _sched(
-        monkeypatch,
-        rows=0,
-        engine={"prefill_long_cap_busy": busy_cap},
-        long_prefill_token_threshold=base_cap,
-    )
+    monkeypatch.setenv("ATOM_PREFILL_LONG_CAP_BUSY", str(busy_cap))
+    sched = _sched(monkeypatch, rows=0, long_prefill_token_threshold=base_cap)
     assert sched._long_prefill_cap() == base_cap  # no delayer: no busy signal
     sched.prefill_delayer = SimpleNamespace(group_running_decode=load)
     assert sched._long_prefill_cap() == expected

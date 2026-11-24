@@ -24,19 +24,6 @@ from atom.model_engine.collective_rpc import (
     RpcPayload,
     checked_timeout,
 )
-from atom.model_engine.plugin_hotplug import (
-    BEGIN_ROUND_CMD,
-    END_ROUND_CMD,
-    HOTPLUG_CMD,
-    RELOAD_UNSUPPORTED_REASON,
-    HotplugPayloadError,
-    PluginRefusal,
-    hotplug_enabled,
-    release_plugin_round,
-    round_in_progress_reply,
-    take_plugin_round,
-    topology_refusal,
-)
 from atom.model_engine.sequence import BlockTable, SequenceStatus
 from atom.utils import envs
 
@@ -122,10 +109,6 @@ _CAPABILITY_TIMEOUT_S = 30.0
 # and leaves the engine fenced. A rank that dies is noticed at once. This only
 # keeps the deadline finite.
 WEIGHT_STREAM_TIMEOUT_S = 24 * 3600.0
-# A hot-plug installs a plan and captures a handful of decode graphs: seconds
-# on a healthy runner, so a caller's own deadline is preferred and this is the
-# fallback when the manager did not send one.
-_HOTPLUG_HANDLER_TIMEOUT_S = 300.0
 
 
 def _remaining_timeout(args: dict, default: float) -> float:
@@ -231,9 +214,6 @@ class EngineUtilityHandler:
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
         PAUSE_GENERATION_CMD: "_handle_pause_generation",
         RESUME_GENERATION_CMD: "_handle_resume_generation",
-        HOTPLUG_CMD: "_handle_hotplug_plugin",
-        BEGIN_ROUND_CMD: "_handle_begin_plugin_round",
-        END_ROUND_CMD: "_handle_end_plugin_round",
     }
 
     def __init__(
@@ -586,14 +566,7 @@ class EngineUtilityHandler:
 
     @staticmethod
     def _error_reply(cmd: str, exc: Exception) -> dict:
-        reply = {"cmd": cmd, "error": f"{type(exc).__name__}: {exc}"}
-        # A coded refusal (round-in-progress, reload-unsupported,
-        # reload-digest-mismatch, ...) keeps its machine-readable reason on the
-        # way to the manager and the HTTP envelope; a plain failure has none.
-        reason = getattr(exc, "reason", None)
-        if isinstance(reason, str) and reason:
-            reply["reason"] = reason
-        return reply
+        return {"cmd": cmd, "error": f"{type(exc).__name__}: {exc}"}
 
     def _handle_collective_rpc(self, args: dict):
         """Invoke an arbitrary ModelRunner method on every TP rank.
@@ -1049,227 +1022,6 @@ class EngineUtilityHandler:
         logger.info(f"{self.label}: generation resumed")
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
-
-    def _handle_hotplug_plugin(self, args: dict) -> dict:
-        """Switch the plugin plan/arm and recapture decode graphs, synchronously.
-
-        Unlike the fire-and-forget commands this one answers: the caller is
-        about to send traffic to a plan whose graphs must already be recorded
-        on every rank.  Three properties make it safe beside live traffic:
-
-        - the handler runs on EngineCore's busy-loop thread, and a forward is a
-          synchronous RPC on that same thread, so no forward is in flight when
-          it starts; pausing generation keeps it that way until the resume;
-        - the runner call is a synchronous broadcast, so every TP rank has
-          installed the plan and recaptured its graphs before the answer -- the
-          runner's own barriers make the ranks enter the capture together;
-        - refusal and failure keep the engine alive: the reason is answered as
-          a utility error (the manager raises it to the API) and generation is
-          resumed in the ``finally``.
-
-        A dev-mode reload (``payload["reload"] is True``) travels through the
-        same command and pauses nothing earlier: the round guard below still
-        refuses it with ``round-in-progress`` first, then a deployment without
-        dev mode is refused with ``reload-unsupported`` before the pause, and
-        the runner itself refuses digest mismatches before any module is
-        dropped.  No new waiting is added to the busy loop.
-        """
-        args = args if isinstance(args, dict) else {}
-        payload = args.get("payload")
-        engine = self.engine
-        config = getattr(engine, "config", None)
-        paused = False
-        was_paused = False
-        try:
-            if engine is None:
-                raise RuntimeError("no engine to hot-plug")
-            # A plugin round holds the plan for a whole benchmark run: refuse
-            # before pausing anything, so the run keeps its plan, nothing is
-            # installed or captured, and the caller retries once the round
-            # ends.  State here is written only by the round handlers, so this
-            # is the engine's own arbitration, not the manager's cache.
-            round_refusal = round_in_progress_reply(HOTPLUG_CMD, engine)
-            if round_refusal is not None:
-                logger.info(
-                    f"{self.label}: hotplug_plugin refused: plugin round "
-                    f"{round_refusal['active_round']['round_id']!r} is active"
-                )
-                self.output_queue.put_nowait(("UTILITY_RESPONSE", round_refusal))
-                return round_refusal
-            if not isinstance(payload, dict):
-                raise TypeError(
-                    "hotplug_plugin needs a payload dict carrying the plan source"
-                )
-            refusal = topology_refusal(config)
-            if not hotplug_enabled(config):
-                refusal = (
-                    "plugin hot-plug is off; start the server with "
-                    "--plugin-hotplug or ATOM_PLUGIN_HOTPLUG=1"
-                )
-            if refusal is not None:
-                raise RuntimeError(refusal)
-            if payload.get("reload") is True and not getattr(
-                config, "plugin_dev", False
-            ):
-                # Refuse before the pause: a reload on a deployment that never
-                # opted into dev mode cannot do anything, so it must not stop
-                # generation even briefly.
-                refused = RuntimeError(
-                    "reload hot-plug needs plugin dev mode: start the server with "
-                    "--plugin-hotplug --plugin-dev --plugin-dev-root DIR"
-                )
-                refused.reason = RELOAD_UNSUPPORTED_REASON
-                raise refused
-            deadline = time.monotonic() + _remaining_timeout(
-                args, _HOTPLUG_HANDLER_TIMEOUT_S
-            )
-            # A caller may have paused generation deliberately; do not lift
-            # that pause when this command resumes.
-            was_paused = bool(getattr(engine, "_generation_paused", False))
-            engine.pause_generation(deadline=deadline)
-            paused = True
-            self._await_quiescent_engine(deadline)
-            self._require_idle_for_capture(payload.get("capture", True) is not False)
-            result = self.runner_mgr.call_func(HOTPLUG_CMD, payload, wait_out=True)
-            if not isinstance(result, dict):
-                raise RuntimeError(
-                    f"{HOTPLUG_CMD} returned {type(result).__name__}, expected a "
-                    f"per-rank report"
-                )
-            if result.get("error") or result.get("status") not in (None, "ok"):
-                error = RuntimeError(
-                    result.get("error")
-                    or f"rank reported status {result.get('status')!r}"
-                )
-                # The runner names its refusal (reload-unsupported,
-                # reload-digest-mismatch, ...): keep the code so the caller can
-                # react to it rather than to prose.
-                reason = result.get("reason")
-                if isinstance(reason, str) and reason:
-                    error.reason = reason
-                raise error
-            reply = {"cmd": HOTPLUG_CMD, "result": result}
-            logger.info(
-                f"{self.label}: plugin hot-plug installed plan "
-                f"{result.get('plan_id')} rows={result.get('rows')} "
-                f"capture={result.get('capture_seconds')}s"
-                + (
-                    f" reloaded={result.get('code_digest')} "
-                    f"native={result.get('native')}"
-                    if result.get("reloaded")
-                    else ""
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 - answered, never raised at the loop
-            reply = self._error_reply(HOTPLUG_CMD, exc)
-            logger.error(f"{self.label}: hotplug_plugin failed: {reply['error']}")
-        finally:
-            if paused and not was_paused:
-                try:
-                    engine.resume_generation()
-                except Exception:  # noqa: BLE001 - a resume must not hide the reason
-                    logger.exception(f"{self.label}: could not resume after hot-plug")
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
-        return reply
-
-    def _handle_begin_plugin_round(self, args: dict) -> dict:
-        """Take the plugin-round lease; state only, nothing is rescheduled.
-
-        While the lease is held a hot-plug is refused with
-        ``round-in-progress``, so a benchmark can measure one plan without
-        another caller swapping it mid-run.  Deliberately synchronous but
-        cheap: no pause, no drain, no wait, so the busy loop never blocks on a
-        round and the caller just retries its hot-plug after ``end``.
-        """
-        args = args if isinstance(args, dict) else {}
-        try:
-            if self.engine is None:
-                raise RuntimeError("no engine to begin a plugin round on")
-            reply = {
-                "cmd": BEGIN_ROUND_CMD,
-                **take_plugin_round(self.engine, args.get("round_id")),
-            }
-            logger.info(f"{self.label}: plugin round {reply['round_id']!r} began")
-        except (PluginRefusal, HotplugPayloadError) as exc:
-            reply = {"cmd": BEGIN_ROUND_CMD, "error": str(exc), "reason": exc.reason}
-            logger.info(f"{self.label}: begin_plugin_round refused: {exc.reason}")
-        except Exception as exc:  # noqa: BLE001 - answered, never raised at the loop
-            reply = self._error_reply(BEGIN_ROUND_CMD, exc)
-            logger.error(f"{self.label}: begin_plugin_round failed: {reply['error']}")
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
-        return reply
-
-    def _handle_end_plugin_round(self, args: dict) -> dict:
-        """Release the plugin-round lease when ``round_id`` is the active one.
-
-        A mismatched id is refused and the active round stays: only the run
-        that took the lease may drop it, so one benchmark cannot end another's
-        round (or a newer one by a stale retry).
-        """
-        args = args if isinstance(args, dict) else {}
-        try:
-            if self.engine is None:
-                raise RuntimeError("no engine to end a plugin round on")
-            reply = {
-                "cmd": END_ROUND_CMD,
-                **release_plugin_round(self.engine, args.get("round_id")),
-            }
-            logger.info(
-                f"{self.label}: plugin round {reply['round_id']!r} ended after "
-                f"{reply['duration_s']:.1f}s"
-            )
-        except (PluginRefusal, HotplugPayloadError) as exc:
-            reply = {"cmd": END_ROUND_CMD, "error": str(exc), "reason": exc.reason}
-            logger.info(f"{self.label}: end_plugin_round refused: {exc.reason}")
-        except Exception as exc:  # noqa: BLE001 - answered, never raised at the loop
-            reply = self._error_reply(END_ROUND_CMD, exc)
-            logger.error(f"{self.label}: end_plugin_round failed: {reply['error']}")
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
-        return reply
-
-    def _require_idle_for_capture(self, capture: bool) -> None:
-        """A graph recapture runs the model for real on the serving caches.
-
-        Startup capture only ever ran before a request existed.  A hot-plug
-        recapture runs against live pools, and although the capture staging
-        blanks the KV slot map, the synthetic batch names per-request state
-        slots ``0..bs-1`` -- it is only safe when no request holds one.  Refuse
-        rather than corrupt live state; a plan-only switch
-        (``"capture": false``) has none of this exposure.
-        """
-        if not capture:
-            return
-        scheduler = getattr(self.engine, "scheduler", None)
-        running = list(getattr(scheduler, "running", ()) or ())
-        if running:
-            raise RuntimeError(
-                f"recapturing decode graphs needs an idle engine; {len(running)} "
-                f"request(s) are still running. Drain them first, or send "
-                f"capture=false to switch the plan without recapturing."
-            )
-        pending = getattr(self.engine, "has_pending_kv_work", None)
-        if callable(pending) and pending():
-            raise RuntimeError(
-                "KV transfers are still in flight; retry the hot-plug when idle"
-            )
-
-    def _await_quiescent_engine(self, deadline: float) -> None:
-        """Wait out any forward an engine may still have in flight.
-
-        EngineCore calls utility handlers between model forwards, and a forward
-        is a synchronous ``call_func`` on the busy loop, so today nothing is in
-        flight here.  This is the seam for an engine that grows an asynchronous
-        forward path: it can report ``_hotplug_forward_in_flight`` and this
-        waits (bounded by the caller's deadline) instead of capturing over it.
-        """
-        while time.monotonic() < deadline:
-            if not getattr(self.engine, "_hotplug_forward_in_flight", False):
-                return
-            time.sleep(0.01)
-        if getattr(self.engine, "_hotplug_forward_in_flight", False):
-            raise RuntimeError(
-                "a model forward was still in flight past the hot-plug deadline"
-            )
 
     def _handle_abort_request(self, args: dict):
         """Cancel queued work promptly; running forwards finish via postprocess."""

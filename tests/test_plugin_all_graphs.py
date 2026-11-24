@@ -23,7 +23,6 @@ def _v41_seams():
     return {n: s for n, s in host.SEAMS.items() if n.startswith("v41.")}
 
 
-WINDOW = "v41.block.transition"
 DRAFT = "v41.draft.ctx"
 CASES = (
     "v41.block.ffn",
@@ -56,7 +55,7 @@ EXTENDED = {
 
 def test_capture_contract_catalog_is_complete():
     captured = {n: s for n, s in _v41_seams().items() if n != BOOT_ONLY}
-    assert set(captured) == set(CASES) | {WINDOW} | EXTENDED
+    assert set(captured) == set(CASES) | EXTENDED
     assert host.SEAMS[BOOT_ONLY].graph == "eager"
     assert all(s.graph in {"capture_safe", "opaque_op"} for s in captured.values())
 

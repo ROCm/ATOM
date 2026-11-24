@@ -63,7 +63,7 @@ class SessionPolicy(LoadPolicy):
         self.prompts = prompts
         self.rank_count = rank_count
         self.parent_ignored = parent_ignored
-        # engine.dp_session_prefix_owner_tokens: the prefix index (a
+        # ATOM_DP_SESSION_PREFIX_OWNER_TOKENS: the prefix index (a
         # `PrefixSpreadRouter` used for its index alone) every request is
         # recorded in, and the rule a new session reads it by; None = off.
         self.prefix_index = prefix_index

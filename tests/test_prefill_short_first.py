@@ -1,4 +1,4 @@
-"""Short requests first (a recipe's engine.prefill_short_first_rows).
+"""Short requests first (ATOM_PREFILL_SHORT_FIRST_ROWS).
 
 In arrival order a rank's prefill step goes first to the chunks of the long
 prompts in progress, and a short request behind them waits a step per round.
@@ -19,23 +19,18 @@ from conftest import MockConfig
 
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
-from atom.plugin_recipe import EngineOptions
 
 
-def _sched(
-    monkeypatch, rows=None, long_rows=8, max_skips=None, engine=None, **overrides
-):
-    options = {
-        "prefill_short_first_rows": rows,
-        "prefill_short_first_long_rows": long_rows,
-        "prefill_short_first_max_skips": max_skips,
-        **(engine or {}),
-    }
-    # The recipe's engine options as the config carries them; unvalidated, so
-    # the scheduler's own checks are the ones exercised.
-    engine_options = EngineOptions(
-        **{k: v for k, v in options.items() if v is not None}
-    )
+def _sched(monkeypatch, rows=None, long_rows=8, max_skips=None, **overrides):
+    for name, value in (
+        ("ATOM_PREFILL_SHORT_FIRST_ROWS", rows),
+        ("ATOM_PREFILL_SHORT_FIRST_LONG_ROWS", long_rows),
+        ("ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS", max_skips),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, str(value))
     config = {
         "max_num_seqs": 64,
         "num_kvcache_blocks": 400,
@@ -45,9 +40,7 @@ def _sched(
         "long_prefill_token_threshold": 8,
     }
     config.update(overrides)
-    config = MockConfig(**config)
-    config.plugin_engine_options = engine_options
-    return Scheduler(config)
+    return Scheduler(MockConfig(**config))
 
 
 def _step(sched):
@@ -293,7 +286,7 @@ def test_cost_target_goes_to_short_requests_first(monkeypatch, seq_factory, rows
 def test_refuses_values_that_cannot_work(monkeypatch, rows, long_rows, max_skips):
     """The held tokens have to leave the short requests part of the 16-token
     step."""
-    with pytest.raises(ValueError, match="engine.prefill_short_first"):
+    with pytest.raises(ValueError, match="ATOM_PREFILL_SHORT_FIRST"):
         _sched(monkeypatch, rows=rows, long_rows=long_rows, max_skips=max_skips)
 
 

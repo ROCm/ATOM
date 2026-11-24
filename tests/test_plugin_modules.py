@@ -9,11 +9,11 @@ graph state a capture would report is patched in.
 
 import pickle
 import re
-import types
 from pathlib import Path
 
 import pytest
 import torch
+from plugin_plans import enable
 from torch import nn
 
 from atom import plugin_host as host
@@ -53,7 +53,7 @@ def _built():
 
 
 def _v2(**fields):
-    return {"schema": recipes.RECIPE_SCHEMA_V2, "arch": ARCH, **fields}
+    return {"schema": recipes.RECIPE_SCHEMA, "arch": ARCH, **fields}
 
 
 def _plan(**fields):
@@ -123,24 +123,14 @@ def _module_owner(slot, owner, *, value=None, select=None, seen=None, **kw):
 # -- recipe v2 ---------------------------------------------------------------
 
 
-def test_v2_options_parse_and_key_the_plan():
+def test_options_parse_and_key_the_plan():
     plan = _plan(
-        engine={"prefill_short_first_rows": 96, "prefill_cost_ceil": True},
-        model_options={
-            "ffn_mhc_fuse_quant": True,
-            "fused_attn": True,
-            "fused_attn_min_rows": 128,
-            "expert_placement": {"3": [1, 0]},
-            "mono_mode": "off",
-        },
-        dspark_options={"fused_prologue": True, "verify_argmax_once": True},
+        model_options={"target_model_cls": "pkg.Model", "draft_model_cls": "pkg.D"},
+        plugin_options={"pkg": {"lean_head": True}},
     )
-    assert plan.schema_version == 2 and plan.has_options and not plan.empty
-    assert plan.engine.prefill_short_first_rows == 96
-    assert plan.engine.prefill_cost_ceil and plan.engine.prefill_long_cap_busy == 0
-    assert plan.model_options.placement_spec() == {"3": [1, 0]}
-    assert plan.dspark_options.fused_prologue and not plan.dspark_options.lean_head
-    other = _plan(engine={"prefill_short_first_rows": 64})
+    assert plan.has_options and not plan.empty
+    assert plan.model_options.target_model_cls == "pkg.Model"
+    other = _plan(plugin_options={"pkg": {"lean_head": False}})
     assert other.plan_id != plan.plan_id
     copy = pickle.loads(pickle.dumps(plan))
     assert copy == plan and copy.dump() == plan.dump()
@@ -149,27 +139,17 @@ def test_v2_options_parse_and_key_the_plan():
 @pytest.mark.parametrize(
     "fields",
     [
-        {"engine": {"prefill_short_first_rows": -1}},
-        {"engine": {"no_such_knob": 1}},
-        {"model_options": {"fused_attn": "yes"}},
-        {"model_options": {"mono_mode": "sometimes"}},
-        {"dspark_options": {"lean_head": 1}},
+        {"engine": {"prefill_short_first_rows": 96}},
+        {"dspark_options": {"lean_head": True}},
+        {"model_options": {"fused_attn": True}},
+        {"model_options": {"target_model_cls": ""}},
         {"modules": {"layers..ffn": ["a"]}},
+        {"modules": {"@NotQualified": ["a"]}},
     ],
 )
-def test_v2_refuses_a_bad_option(fields):
+def test_a_bad_option_is_refused(fields):
     with pytest.raises(recipes.RecipeRefused):
         _plan(**fields)
-
-
-def test_v1_keeps_its_schema_and_refuses_modules():
-    doc = {
-        "schema": recipes.RECIPE_SCHEMA,
-        "model_arch": ARCH,
-        "modules": {"layers.*.ffn": ["a"]},
-    }
-    with pytest.raises(recipes.RecipeRefused, match="modules requires schema"):
-        recipes.resolve([doc])
 
 
 def test_v2_infers_plugins_and_nests_overlapping_owners():
@@ -184,24 +164,10 @@ def test_v2_infers_plugins_and_nests_overlapping_owners():
 
 
 def test_a_recipe_set_must_agree_on_options():
-    a = _v2(graph={"mode": "eager"}, model_options={"fused_attn": True})
+    a = _v2(graph={"mode": "eager"}, model_options={"target_model_cls": "pkg.M"})
     b = _v2(graph={"mode": "capture", "buckets": [8]})
     with pytest.raises(recipes.RecipeRefused, match="model_options differs"):
         recipes.resolve([a, b])
-
-
-def test_engine_options_reach_the_engine_from_the_config(tmp_path):
-    path = tmp_path / "r.json"
-    path.write_text(
-        __import__("json").dumps(_v2(engine={"dp_session_prefix_owner_tokens": 512}))
-    )
-    source = recipes.from_cli(str(path), None)
-    config = types.SimpleNamespace(plugin_source=source, plugin_arm="native")
-    options = recipes.engine_options_for(config)
-    assert options.dp_session_prefix_owner_tokens == 512
-    assert (
-        recipes.engine_options_for(types.SimpleNamespace()) == recipes.EngineOptions()
-    )
 
 
 def test_a_recipe_env_is_applied_once_and_refuses_a_conflict():
@@ -219,33 +185,10 @@ def test_a_recipe_env_is_applied_once_and_refuses_a_conflict():
     for bad in ({"PATH": "/x"}, {"ATOM_PLUGIN_HOST": "0"}, {"atom_x": "1"}):
         with pytest.raises(recipes.RecipeRefused):
             _plan(env=bad)
-    with pytest.raises(recipes.RecipeRefused, match="env requires schema"):
+    with pytest.raises(recipes.RecipeRefused, match="expected schema"):
         recipes.resolve(
-            [
-                {
-                    "schema": recipes.RECIPE_SCHEMA,
-                    "model_arch": ARCH,
-                    "env": {"ATOM_X": "1"},
-                }
-            ]
+            [{"schema": "atom.plugin_recipe/1", "arch": ARCH, "env": {"ATOM_X": "1"}}]
         )
-
-
-def test_no_new_environment_variable_carries_a_recipe_option():
-    envs = (REPO / "atom/utils/envs.py").read_text(encoding="utf-8")
-    for name in (
-        "ATOM_DSV41_FFN_SEAM_QUANT",
-        "ATOM_DSV41_SHARED_ACT_QUANT",
-        "ATOM_DSV41_FUSED_ATTN",
-        "ATOM_DSPARK_FUSED_PROLOGUE",
-        "ATOM_DSPARK_LEAN_HEAD",
-        "ATOM_SPEC_VERIFY_ARGMAX_ONCE",
-        "ATOM_PREFILL_SHORT_FIRST_ROWS",
-        "ATOM_PREFILL_COST_CEIL",
-        "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS",
-        "ATOM_MOE_EXPERT_PLACEMENT",
-    ):
-        assert name not in envs, name
 
 
 # -- the plugin model ------------------------------------------------------------
@@ -261,12 +204,11 @@ def test_atoms_own_v41_model_has_no_plugin_seam():
 def test_the_plugin_model_is_chosen_only_under_a_plan(monkeypatch):
     native = "atom.models.deepseek_v41.runtime.DeepseekV41RuntimeModel"
     assert host.model_class_for(ARCH, native) == native
-    host.configure(_plan(model_options={"fused_attn": True}), kill_switch=False)
+    host.configure(_plan(plugin_options={"pkg": {"x": 1}}), kill_switch=False)
     # ATOM has no plugin variant of its own: a plan without a target class
     # builds ATOM's model; a plugin package's model comes from the recipe.
     assert host.model_class_for(ARCH, native) == native
     assert host.model_class_for("Qwen3ForCausalLM", "q") == "q"
-    assert host.model_options().fused_attn
     host._reset_for_testing()
     host.configure(
         _plan(
@@ -280,16 +222,6 @@ def test_the_plugin_model_is_chosen_only_under_a_plan(monkeypatch):
     host.configure(_plan(), kill_switch=True)
     assert host.model_class_for(ARCH, native) == native
     assert host.model_options() == recipes.ModelOptions()
-
-
-def test_hotplug_refuses_a_plan_that_changes_the_built_model():
-    host.configure(None, hotplug=True, kill_switch=False)
-    _built()
-    host.hotplug_plan(_plan(dspark_options={"lean_head": True}))
-    assert host.dspark_options().lean_head
-    with pytest.raises(recipes.RecipeRefused, match="recipe-boot-only"):
-        host.hotplug_plan(_plan(model_options={"fused_attn": True}))
-    assert host.dspark_options().lean_head  # the serving plan stays
 
 
 # -- registration --------------------------------------------------------------
@@ -382,26 +314,6 @@ def test_overlapping_owners_compose_outer_first_inner_on_decline(monkeypatch):
     assert counts[("module:stack.*.ffn", "native", "declined", None)] == 1
 
 
-def test_a_hotplug_reinstalls_the_new_plans_owners(monkeypatch):
-    _plugins(
-        monkeypatch,
-        a=_module_owner("stack.*.attn", "a", value=1),
-        b=_module_owner("stack.*.attn", "b", value=2),
-    )
-    host.configure(
-        _plan(modules={"stack.*.attn": ["a"]}), hotplug=True, kill_switch=False
-    )
-    model = Toy(n=1)
-    _built()
-    host.install_modules(model)
-    attn = model.stack[0].attn
-    assert torch.equal(attn(torch.ones(1)), torch.ones(1))
-    host.hotplug_plan(_plan(modules={"stack.*.attn": ["b"]}))
-    assert torch.equal(attn(torch.ones(1)), torch.full((1,), 2.0))
-    host.hotplug_plan(None)
-    assert torch.equal(attn(torch.ones(1)), torch.full((1,), 5.0))
-
-
 def test_a_planned_slot_owner_that_did_not_register_refuses_the_start(monkeypatch):
     _plugins(monkeypatch, quiet=lambda h: None)
     with pytest.raises(recipes.RecipeRefused, match="recipe-coverage-miss"):
@@ -441,7 +353,7 @@ def test_a_cold_decline_in_bucket_warmup_is_asked_again_when_recording(monkeypat
         )
 
     _plugins(monkeypatch, bmm=offer)
-    host.configure(["bmm"], kill_switch=False)
+    host.configure(enable(["bmm"]), kill_switch=False)
     native = lambda *a, **k: ("native", None)
     bound = host.bind("v41.attn.out", native)
     monkeypatch.setattr(host, "_graph_state", lambda: (True, 8))
@@ -473,3 +385,112 @@ def test_a_taken_over_module_fakes_its_own_output_shape(monkeypatch):
     with FakeTensorMode() as mode:
         out = router._native_fake(mode.from_tensor(torch.ones(2, 4)))
     assert tuple(out.shape) == (2, 8)
+
+
+# -- class slots: one plugin, every instance of a class, any path -------------
+
+
+class Gate(nn.Module):
+    def __init__(self, k):
+        super().__init__()
+        self.k = k
+
+    def pick(self, x):
+        return x + self.k
+
+    def forward(self, x):
+        return self.pick(x) * 2
+
+
+class Twin(nn.Module):
+    """Two differently-pathed Gates: ``left`` and ``deep.right``."""
+
+    def __init__(self):
+        super().__init__()
+        self.left = Gate(1)
+        self.deep = nn.Module()
+        self.deep.right = Gate(10)
+
+    def forward(self, x):
+        return self.left(x) + self.deep.right(x)
+
+
+GATE = f"@{__name__}.Gate"
+
+
+def test_a_class_slot_serves_every_instance_wherever_it_sits(monkeypatch):
+    seen = []
+    _plugins(monkeypatch, g=_module_owner(GATE, "g", value=None, seen=seen))
+    # the owner reads `module.w`: give each Gate one
+    model = Twin()
+    model.left.w = 3.0
+    model.deep.right.w = 4.0
+    host.configure(_plan(modules={GATE: ["g"]}), kill_switch=False)
+    assert sorted(host.install_modules(model)) == ["deep.right", "left"]
+    assert sorted(p for p, _ in seen) == ["deep.right", "left"]
+    x = torch.ones(1)
+    assert torch.equal(model(x), torch.tensor([300.0 + 400.0]))
+    host.set_arm("native")
+    assert torch.equal(model(x), torch.tensor([(1 + 1) * 2.0 + (1 + 10) * 2.0]))
+
+
+def test_a_method_is_taken_over_on_a_class_slot(monkeypatch):
+    def offer(h):
+        h.register_module(
+            slot=GATE,
+            method="pick",
+            owner="p",
+            factory=lambda module, cap: (lambda x: x * 0 + module.k * 100),
+        )
+
+    _plugins(monkeypatch, p=offer)
+    host.configure(_plan(modules={f"{GATE}:pick": ["p"]}), kill_switch=False)
+    model = Twin()
+    assert sorted(host.install_modules(model)) == ["deep.right:pick", "left:pick"]
+    # forward stays the module's own; only pick is the owner's
+    assert torch.equal(model(torch.ones(1)), torch.tensor([100.0 * 2 + 1000.0 * 2]))
+    host._reset_for_testing()
+    assert "pick" not in model.left.__dict__  # restored
+
+
+def test_a_class_slot_needs_its_inner_seams_planned_unless_it_takes_a_method(
+    monkeypatch,
+):
+    saved = (dict(host._SEAM_SPECS), dict(host._SEAM_SOURCES))
+    try:
+        host.seam(
+            {
+                "name": "toy.gate.inner",
+                "contract": 1,
+                "kind": "op",
+                "form": "call",
+                "inputs": ("x",),
+                "kwargs": (),
+                "returns": ("y",),
+                "key": ("x",),
+                "graph": "capture_safe",
+                "target": "toy.py",
+                "scope": "deep.right",
+            }
+        )
+        whole = _module_owner(GATE, "g", value=1)
+        _plugins(monkeypatch, g=whole)
+        host.configure(_plan(modules={GATE: ["g"]}), kill_switch=False)
+        host.install_modules(Twin())
+        with pytest.raises(recipes.RecipeRefused, match="recipe-inner-unplanned"):
+            host.check_plan()
+        host._reset_for_testing()
+
+        def method_owner(h):
+            h.register_module(
+                slot=GATE, method="pick", owner="g", factory=lambda m, c: m.pick
+            )
+
+        _plugins(monkeypatch, g=method_owner)
+        host.configure(_plan(modules={f"{GATE}:pick": ["g"]}), kill_switch=False)
+        host.install_modules(Twin())
+        host.check_plan()  # a method takeover has no inner seam to plan
+    finally:
+        for live, old in zip((host._SEAM_SPECS, host._SEAM_SOURCES), saved):
+            live.clear()
+            live.update(old)

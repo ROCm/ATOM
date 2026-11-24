@@ -185,9 +185,6 @@ def _router_logits_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 def router_logits(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """[T, 384] bf16 logits of ``x`` (``router_supported``)."""
     out = torch.empty((x.shape[0], EXPERTS), dtype=torch.bfloat16, device=x.device)
-    # through the cached CompiledFunction: calling the flyc.jit launcher itself
-    # re-traces it on every call, which eager steps of <= 16 rows (a DP rank's
-    # dummy or idle forward beside a peer's prefill) would hit once per layer
     _run_compiled(
         _build(x.shape[0]),
         x.data_ptr(),

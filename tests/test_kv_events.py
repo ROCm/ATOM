@@ -730,8 +730,6 @@ class TestPPLoopPublication:
             has_pending_kv_work=lambda: work == "kv",
             _advance_idle_kv_transfer=do_work,
             _drain_kv_work_at_exit=lambda: None,
-            # The idle head blocks on new work instead of spinning (#3399).
-            _wait_for_work=lambda: None,
             kv_transfer_enabled=False,
             pp_transport=SimpleNamespace(recv_metadata=recv_metadata),
             runner_mgr=SimpleNamespace(call_func=lambda *_, **__: None),

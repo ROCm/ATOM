@@ -124,6 +124,8 @@ from typing import NamedTuple
 
 import torch
 
+from atom.utils import envs
+
 logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "true")
@@ -338,7 +340,6 @@ class PrefillDelayer:
         admit_policy: str = "interval",
         busy_decode_interval: int = 0,
         busy_decode_seqs: int = 48,
-        cost_ceil: bool = False,
     ):
         if dp_size > 1 and cpu_group is None:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
@@ -441,14 +442,14 @@ class PrefillDelayer:
         # time (n_unreachable): at 8k/1k c128 DPA its releases for stragglers
         # about to complete a decode fragmented prefills (2578 vs 2810 tok/s).
         self._cost_gate = cost_gate and exchange_prefill_costs
-        # cost_ceil (a recipe's engine.prefill_cost_ceil; upstream ROCm/ATOM #3196): this rank's cost
+        # ATOM_PREFILL_COST_CEIL=1 (upstream ROCm/ATOM #3196): this rank's cost
         # rides the reduce rounded up instead of truncated. The step's cost
         # target is set from the reduced costs, so a truncated cost puts it up
         # to 0.5 below the costliest rank's own chunk: `Scheduler._prefill_room`
         # then gives that rank one token less and the chunk grid cuts the rest
         # of the block off, which waits for the next prefill step. Read once:
         # every rank must round alike.
-        self._cost_ceil = bool(cost_ceil)
+        self._cost_ceil = envs.ATOM_PREFILL_COST_CEIL
         # The DP group is stateless (no default process group): ask it directly.
         self._rank = (
             cpu_group.rank() if self._cost_slots and cpu_group is not None else 0

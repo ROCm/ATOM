@@ -398,38 +398,6 @@ def dspark_markov_argmax(
     return _launch(base_logits, prev_ids, markov_w1, markov_w2, out, 0, None)
 
 
-def dspark_markov_argmax_into(
-    base_logits: torch.Tensor,
-    prev_ids: torch.Tensor,
-    markov_w1: torch.Tensor,
-    markov_w2: torch.Tensor,
-    out: torch.Tensor,
-    embed_out: torch.Tensor,
-) -> torch.Tensor:
-    """``dspark_markov_argmax`` for a caller that owns the ``W1[prev_ids]`` rows.
-
-    ``embed_out``, ``[B, r]`` with unit stride along ``r`` (its rows may be
-    strided: a column of a ``[B, T, r]`` block), receives them instead of a
-    fresh tensor a position, so a block of positions needs no stack afterwards.
-    The same two launches and the same ids as ``dspark_markov_argmax``. Not
-    wrapped for ``torch.compile``: for draft passes that are recorded, not
-    traced (the V4.1 draft).
-    """
-    check_markov_inputs(
-        "dspark_markov_argmax_into", base_logits, prev_ids, markov_w1, markov_w2, out
-    )
-    if base_logits.shape[0] == 0 or not _fused_is_supported(
-        base_logits, prev_ids, out, markov_w1, markov_w2
-    ):
-        embed_out.copy_(
-            _torch_dspark_markov_argmax(
-                base_logits, prev_ids, markov_w1, markov_w2, out
-            )
-        )
-        return embed_out
-    return _launch(base_logits, prev_ids, markov_w1, markov_w2, out, 0, None, embed_out)
-
-
 def _launch(
     base_logits,
     prev_ids,

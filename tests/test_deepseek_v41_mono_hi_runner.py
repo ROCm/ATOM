@@ -81,7 +81,6 @@ def test_the_recorded_forward_is_the_forward_alone(runner_module):
     """
     src = textwrap.dedent(
         inspect.getsource(runner_module.ModelRunner.capture_cudagraph)
-        + inspect.getsource(runner_module.ModelRunner._capture_request_bucket_impl)
     )
     (full,) = [
         n

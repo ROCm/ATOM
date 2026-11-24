@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Session affinity with a recipe's engine.dp_session_prefix_owner_tokens.
+"""Session affinity with ATOM_DP_SESSION_PREFIX_OWNER_TOKENS.
 
 Session affinity places a new session on the lightest rank. With the switch
 set, a new session goes to the rank whose cache holds the longest finished
@@ -261,19 +261,16 @@ def _config(**overrides):
 
 def test_index_is_built_only_with_the_switch_and_session_affinity(monkeypatch):
     mgr = _mgr(owner_tokens=0)
+    monkeypatch.delenv("ATOM_DP_SESSION_PREFIX_OWNER_TOKENS", raising=False)
     assert mgr._build_session_prefix_index(_config()) is None
-    on = {"plugin_engine_options": {"dp_session_prefix_owner_tokens": 16384}}
-    assert isinstance(
-        mgr._build_session_prefix_index(_config(**on)), PrefixSpreadRouter
-    )
+    monkeypatch.setenv("ATOM_DP_SESSION_PREFIX_OWNER_TOKENS", "16384")
+    assert isinstance(mgr._build_session_prefix_index(_config()), PrefixSpreadRouter)
     mgr._dp_session_affinity_enabled = False
-    assert mgr._build_session_prefix_index(_config(**on)) is None
+    assert mgr._build_session_prefix_index(_config()) is None
     mgr._dp_session_affinity_enabled = True
-    assert (
-        mgr._build_session_prefix_index(_config(pipeline_parallel_size=2, **on)) is None
-    )
-    with pytest.raises(ValueError, match="engine.dp_session_prefix_owner_tokens"):
-        mgr._build_session_prefix_index(_config(enable_prefix_caching=False, **on))
+    assert mgr._build_session_prefix_index(_config(pipeline_parallel_size=2)) is None
+    with pytest.raises(ValueError, match="ATOM_DP_SESSION_PREFIX_OWNER_TOKENS"):
+        mgr._build_session_prefix_index(_config(enable_prefix_caching=False))
 
 
 def test_a_session_with_nothing_to_gain_is_not_counted():

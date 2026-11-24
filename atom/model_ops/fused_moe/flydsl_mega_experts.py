@@ -19,13 +19,6 @@ MTPR also selects the p2p wire format, so the choice must use group-agreed
 metadata, never a rank's local request count. Set ATOM_MEGA_DECODE_FAST_PATH=0
 to retain the configured capacity for all forwards.
 
-AITER builds whose ``MegaMoEV2`` takes ``routed`` are built with
-``routed=True`` and get the DP-group max rows of each step
-(``_max_tokens_hint``), from which AITER picks the staged, small-input or
-large-input route on the layouts its fused kernels support. Those builds give
-the large-input route one protocol slot per MoE layer. Older builds keep the
-staged route.
-
 Weight prep uses aiter's own shuffles (``aiter.ops.shuffle``):
   w1/w1_scale: ``shuffle_weight_a16w4(., 16, gate_up=True)`` /
                ``shuffle_scale_a16w4(., E, gate_up=True)``  (g1u1 interleave)
@@ -43,8 +36,6 @@ not baked into the kernel).
 
 from __future__ import annotations
 
-import functools
-import inspect
 import logging
 import os
 
@@ -66,10 +57,6 @@ if _MEGA_DECODE_MTPR not in _MEGA_DECODE_MTPRS:
         f"got {_MEGA_DECODE_MTPR}"
     )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
-# Large-input protocol slot of each MoE module (MTP layers take the margin).
-_MEGA_LAYER_SLOTS: dict[int, int] = {}
-_MEGA_LAYER_SLOT_MARGIN = 8
-_MEGA_PRECISION_SPLITS: set[tuple[int, int]] = set()
 
 
 def _os_env(k):
@@ -90,104 +77,6 @@ def _select_decode_mtpr(mtpr: int, context, *, tbo_active: bool) -> int:
     if 0 < context.running_tokens <= _MEGA_DECODE_MTPR:
         return _MEGA_DECODE_MTPR
     return mtpr
-
-
-@functools.cache
-def _routes_calls(mega_cls) -> bool:
-    """Whether this AITER MegaMoEV2 builds its fused routes on request (routed=True)
-    and picks one per call from a max_tokens hint."""
-    return "routed" in inspect.signature(mega_cls).parameters
-
-
-def _mega_layer_slots() -> int:
-    """Large-input protocol slots of a shared operator: one per MoE layer."""
-    from atom.config import get_current_atom_config
-
-    layers = getattr(get_current_atom_config().hf_config, "num_hidden_layers", 0)
-    return int(layers or 0) + _MEGA_LAYER_SLOT_MARGIN
-
-
-def _group_rows(fc) -> int | None:
-    """DP-agreed row bound, including graph padding; never use a rank-local count."""
-    context = fc.context
-    if context is None or is_plugin_mode():
-        return None
-    from atom.utils.tbo.ubatching import tbo_active
-
-    if tbo_active():
-        return None
-    if context.running_tokens_are_unified:
-        rows = int(context.running_tokens)
-    elif context.running_tokens_across_dp:
-        rows = max(int(r) for r in context.running_tokens_across_dp)
-    else:
-        return None
-    return rows if rows > 0 else None
-
-
-def _max_tokens_hint(mega, fc) -> int | None:
-    """Keep the existing capture route unless this instance requires BF16 draft returns."""
-    rows = _group_rows(fc)
-    if rows is None:
-        return None
-    # BF16-only drafts split above the small-input capacity, including capture
-    # warmup. Do not discard the group's row bound and fall back to staged FP8.
-    if getattr(mega, "bf16_return_only", False):
-        return rows
-    in_capture = fc.in_hipgraph or torch.cuda.is_current_stream_capturing()
-    if in_capture and rows > mega.small_m_mtpr:
-        return None
-    return rows
-
-
-def _forward_bf16_return(mega, x, wts, ids, rows):
-    """A draft call under MEGA_MOE_DRAFT_SHIPPED_PRECISION=1: the small-input route only (BF16 rows back).
-
-    ``rows`` is the DP group's max rows (_group_rows), the same on every EP rank. Up to the small-input capacity
-    the call is one launch, captured or not. Above it, the call is split at the same row offsets on every rank
-    into equal small-input calls (a rank with fewer rows launches the later ones with fewer or no rows, as an idle
-    rank does), each a complete MoE of its rows: the experts see every row once, whichever call carries it.
-    Unknown rows would mean the staged route: refused."""
-    if rows is None:
-        raise RuntimeError(
-            "MEGA_MOE_DRAFT_SHIPPED_PRECISION=1: the draft MoE call has no DP-agreed row count (no forward "
-            "context, or TBO), so it could only take the staged route (FP8 rows back); refusing to serve it"
-        )
-    small = mega.small_m_mtpr
-    own = int(x.shape[0])
-    if small <= 0 or rows <= 0 or own > rows or rows > mega.mtpr:
-        raise ValueError(
-            f"MEGA_MOE_DRAFT_SHIPPED_PRECISION=1: invalid DP row bound={rows}, "
-            f"local rows={own}, small capacity={small}, instance capacity={mega.mtpr}"
-        )
-    if rows <= small:
-        return mega.forward(x, wts, ids, mask_invalid_slots=True, max_tokens=rows)
-    calls = -(-rows // small)
-    step = -(-rows // calls)
-    if (rows, calls) not in _MEGA_PRECISION_SPLITS:
-        _MEGA_PRECISION_SPLITS.add((rows, calls))
-        import logging
-
-        logging.getLogger("atom").info(
-            "[MEGA-PRECISION] draft MoE call of %d rows a rank (> small-input capacity %d): served as %d "
-            "small-input calls of <= %d rows (BF16 rows back) instead of the staged route (FP8 rows back)",
-            rows,
-            small,
-            calls,
-            step,
-        )
-    out = torch.empty_like(x)
-    for lo in range(0, rows, step):
-        hi = min(lo + step, own)
-        part = slice(min(lo, own), hi)
-        # The output is a view of the route's combine buffer, valid until the next call: copy it out.
-        # (max_tokens only picks the route: the same bound for every part keeps them on one capacity.)
-        out[part].copy_(
-            mega.forward(
-                x[part], wts[part], ids[part], mask_invalid_slots=True, max_tokens=step
-            )
-        )
-    return out
 
 
 def build_mega_weights(layer) -> None:
@@ -275,18 +164,10 @@ def get_or_build_mega_moe(
                 f"MegaMoE capacity {mtpr} was not warmed before graph capture; "
                 "its symmetric workspace must be allocated on every rank first"
             )
-        # plugin_poc PR #112: AITER #7788's MegaMoEV2 (fused routes) with the DEP8 c256 small-input switches
-        from ops.mega_moe import MegaMoEV2
+        from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 
         # MegaMoEV2 auto-selects fixed-slot vs compact and its GEMM tiles from
         # (tokens, mtpr); no gemm2_tile / enable_fused / tune-table args anymore.
-        # The per-layer slots cost memory only on a capacity that builds the
-        # large-input route.
-        extra = (
-            {"routed": True, "large_m_state_slots": _mega_layer_slots()}
-            if _routes_calls(MegaMoEV2)
-            else {}
-        )
         with torch.inference_mode(False), torch.no_grad():
             m = MegaMoEV2(
                 rank=rank,
@@ -302,17 +183,6 @@ def get_or_build_mega_moe(
                 w2_scale=w2_scale,
                 max_tok_per_rank=mtpr,
                 swiglu_limit=swiglu_limit,
-                **extra,
-            )
-        if getattr(m, "bf16_return_only", False):
-            logger.info(
-                "[MEGA-PRECISION] rank=%d experts=%d topk=%d capacity=%d small=%d: "
-                "MEGA_MOE_DRAFT_SHIPPED_PRECISION=1; BF16 returns only; other routes refused",
-                rank,
-                experts,
-                topk,
-                mtpr,
-                m.small_m_mtpr,
             )
         _MEGA_CACHE[key] = m
         if rank == 0:
@@ -338,57 +208,6 @@ def get_or_build_mega_moe(
     m.w2 = w2
     m.w2_scale = w2_scale
     return m
-
-
-_ESTATS: dict = {}
-
-
-def _record_expert_stats(layer, topk_ids, experts):
-    import os
-
-    out_dir = os.environ.get("ATOM_EXPERT_STATS_DIR", "")
-    if not out_dir:
-        return
-    from atom.utils.forward_context import get_forward_context
-
-    ctx = get_forward_context().context
-    phase = "prefill" if (ctx is not None and ctx.is_prefill) else "decode"
-    st = _ESTATS.get(id(layer))
-    if st is None:
-        st = _ESTATS[id(layer)] = {
-            "layer": getattr(layer, "layer_id", None),
-            "n": int(experts),
-            "prefill": torch.zeros(
-                experts + 1, dtype=torch.int64, device=topk_ids.device
-            ),
-            "decode": torch.zeros(
-                experts + 1, dtype=torch.int64, device=topk_ids.device
-            ),
-            "calls": 0,
-        }
-    ids = topk_ids.reshape(-1).to(torch.int64)
-    ids = torch.remainder(ids + (experts + 1), experts + 1)
-    st[phase].index_add_(0, ids, torch.ones_like(ids))
-    if phase != "prefill" or torch.cuda.is_current_stream_capturing():
-        return
-    st["calls"] += 1
-    if st["calls"] % 20 == 0 and st["layer"] in (0, None) and experts == 384:
-        from aiter.dist.parallel_state import get_dp_group
-
-        rank = get_dp_group().rank_in_group
-        os.makedirs(out_dir, exist_ok=True)
-        dump = [
-            {
-                "layer": v["layer"],
-                "n": v["n"],
-                "prefill": v["prefill"].cpu(),
-                "decode": v["decode"].cpu(),
-            }
-            for v in _ESTATS.values()
-        ]
-        tmp = os.path.join(out_dir, f"latest_rank{rank}.pt.tmp")
-        torch.save(dump, tmp)
-        os.replace(tmp, os.path.join(out_dir, f"latest_rank{rank}.pt"))
 
 
 def run_mega_moe(
@@ -492,31 +311,13 @@ def run_mega_moe(
                     selected_mtpr,
                 )
 
-    hint = {}
-    if _routes_calls(type(mega)):
-        from atom.utils.forward_context import get_forward_context
-
-        hint["max_tokens"] = _max_tokens_hint(mega, get_forward_context())
-        if mega.large_m_available:
-            # The weights are bound above; select this layer's protocol slot.
-            slot = _MEGA_LAYER_SLOTS.setdefault(id(layer), len(_MEGA_LAYER_SLOTS))
-            mega.select_layer_state(slot)
-
-    _record_expert_stats(layer, topk_ids, experts)
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
         # construction (see the cache key above). Routing sends a pad row's
         # slots to -1, which combine must skip rather than sum stale data from.
-        if getattr(mega, "bf16_return_only", False):
-            out = _forward_bf16_return(
-                mega, x.contiguous(), wts, ids, hint.get("max_tokens")
-            )
-        else:
-            out = mega.forward(
-                x.contiguous(), wts, ids, mask_invalid_slots=True, **hint
-            )
+        out = mega.forward(x.contiguous(), wts, ids, mask_invalid_slots=True)
     return out
 
 

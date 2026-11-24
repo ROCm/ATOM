@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
-"""Plugin host: named model seams that enabled plugins may serve (HOOK_API 3).
+"""Plugin host: named model seams and modules that enabled plugins may serve
+(HOOK_API 3).
 
-A seam is an op ATOM calls directly (``v41.attn.qk_norm``) or a region of
-native code whose consumer stays ATOM's (``v41.attn.out``: wo_a, whose output
-wo_b reads). ATOM declares them in ``SEAMS`` and calls them either through a
-``bind`` made at model build (hot paths) or through ``call`` (module-level
-functions). Ops AITER routes itself stay on ``aiter.plugin``; one plan drives
-both halves.
+A seam is an op a model calls directly or a region of native code whose
+consumer stays the model's. The model writes each seam's contract where it
+calls it (``seam(SeamSpec(...))``) and calls it through a ``bind`` made at
+build (hot paths) or through ``call`` (module-level functions). A whole
+``nn.Module`` forward, or one of its methods, is taken over by path or by
+class (``register_module``) with no seam at all. Ops AITER routes itself stay
+on ``aiter.plugin``; one plan drives both halves.
 
 Rules:
 - Default deny. Installing a plugin makes it available; only a plan
-  (``--plugin-recipe`` / ``--plugin-enable``) enables it. ``ATOM_PLUGIN_HOST=0``
+  (``--plugin-recipe``) enables it. ``ATOM_PLUGIN_HOST=0``
   only disables; ``ATOM_PLUGIN_HOST_STRICT=1`` only adds checks.
 - Native is untouched: a seam no plan owner registered binds to the native
   object itself, and a ``call`` costs one dict lookup.
@@ -28,14 +31,8 @@ Rules:
 - Traced Python (``torch.compiler.is_compiling()``) is native; a seam inside a
   compiled region with an owner runs as one opaque op (``atom_plugin::span``)
   that decides on every execution.
-- Hot-plug boot (``configure(..., hotplug=True)`` before the build): every
-  bindable seam binds to a ``Router`` (an opaque-op seam to the span op) and
-  every call seam dispatches even while the boot plan owns none, so a plan can
-  be installed afterwards (``hotplug_plan``) without rebuilding the model.
-  Captures made before the install keep their decisions: recapture them.
-- A boot-only seam (``v41.mono.install``) is called once, while the model is
-  built: a hot-plug plan that would change its owners is refused
-  (``recipe-boot-only``); restart instead.
+- A plan is fixed for the process. To switch plans, restart the server
+  (``ATOM_PRELOAD=1`` keeps the loaded weights on the GPUs across it).
 - Decisions, not launches, are counted: a CUDA-graph replay runs no Python.
 """
 
@@ -46,7 +43,6 @@ import functools
 import hashlib
 import importlib
 import logging
-import os
 import re
 import sys
 import threading
@@ -64,26 +60,13 @@ from typing import Any
 
 import torch
 
-from atom.plugin_transition import SPEC as _transition_spec
-
-# `register_window` is part of the host API a plugin's register(host) calls.
-from atom.plugin_transition import Phases, register_window  # noqa: F401
-
 logger = logging.getLogger("atom")
 
 HOOK_API = 3
-# The APIs a plugin or recipe may require: HOOK_API 2 plugins and recipes still
-# load (their seams are declared by their package; the host surface they use is
-# unchanged) until they move to 3.
-SUPPORTED_APIS = (2, 3)
 ENTRY_POINT_GROUP = "atom.layer_plugins"
 AITER_SOURCE = "atom plugin plan"
 GRAPHS = ("eager", "capture_safe")  # what a plugin may claim
 MX = "mxfp8_e8m0_g32"  # e4m3 values, row-major group-32 e8m0 scales
-# What a dev-mode reload hashes: plugin Python code, its precompiled native
-# libraries and the headers they were built from. Anything else under a
-# ``--plugin-dev-root`` is not plugin code (recipes, docs, test data).
-DEV_CODE_SUFFIXES = frozenset({".py", ".so", ".h", ".hpp", ".hh", ".hxx"})
 
 
 @dataclass(frozen=True)
@@ -114,7 +97,7 @@ class SeamSpec:
     parent: str | None = None
     boundary: str = "tensor"
     doc: str = ""
-    boot_only: bool = False  # called once at build: a hot-plug may not change it
+    boot_only: bool = False  # called once, while the model is built
     # Collectives an owner of this span must run itself. None declared: an
     # owner's ``owns_collectives`` is recorded, never required, so a plugin
     # written for either convention registers alike.
@@ -169,12 +152,6 @@ def _core_specs() -> list[SeamSpec]:
     ]
 
 
-def _hotplug_binds() -> frozenset[str]:
-    """What a hot-plug boot binds whatever the boot plan owns: the seams the
-    model calls through a ``bind`` made at build."""
-    return frozenset(n for n, s in _SEAM_SPECS.items() if s.form == "bind")
-
-
 def boot_only() -> frozenset[str]:
     return frozenset(n for n, s in _SEAM_SPECS.items() if s.boot_only)
 
@@ -209,7 +186,7 @@ def _spec_error(spec: SeamSpec) -> str | None:
         return "contract must be a positive int"
     if spec.kind not in ("op", "region"):
         return f"kind {spec.kind!r}"
-    if spec.form not in ("bind", "call", "window"):
+    if spec.form not in ("bind", "call"):
         return f"form {spec.form!r}"
     if spec.graph not in ("eager", "capture_safe", "opaque_op"):
         return f"graph {spec.graph!r}"
@@ -258,11 +235,6 @@ def _check_route(spec: SeamSpec, owner: str, route) -> None:
     if set(spec.collectives) - set(route.collectives):
         raise PluginContractError(
             f"{owner}: {spec.name} contains {sorted(spec.collectives)}"
-        )
-    if (spec.form == "window") != isinstance(route.impl, Phases):
-        raise PluginContractError(
-            f"{owner}: {spec.name} is a {spec.form} seam; "
-            "a window takes register_window, any other a plain impl"
         )
 
 
@@ -349,21 +321,11 @@ _CACHE_LIMIT = 4096
 _counts: Counter = Counter()
 _refusals: list[Registration] = []
 _last: Decision | None = None
-_hotplug = False  # bind every seam; a plan may be installed after the build
-_dev = False  # developer mode: re-import plugin code from disk on a reload
-_dev_roots: tuple[str, ...] = ()  # resolved allowlist of plugin source trees
 _aiter_applied: tuple[str, ...] | None = None  # the enable list AITER last got
 
 
-def api_satisfies(requires: str, api: int | None = None) -> bool:
-    """``">=2,<3"``-style clauses (``>=``, ``<``, ``==``) against ``api``, or
-    against any of ``SUPPORTED_APIS``."""
-    if api is None:
-        return any(_api_satisfies(requires, a) for a in SUPPORTED_APIS)
-    return _api_satisfies(requires, api)
-
-
-def _api_satisfies(requires: str, api: int) -> bool:
+def api_satisfies(requires: str, api: int = HOOK_API) -> bool:
+    """``">=3,<4"``-style clauses (``>=``, ``<``, ``==``) against ``api``."""
     for clause in (c.strip() for c in str(requires).split(",") if c.strip()):
         for op, test in ((">=", api.__ge__), ("==", api.__eq__), ("<", api.__lt__)):
             if clause.startswith(op):
@@ -435,12 +397,7 @@ def register(
             _refuse(seam, owner, "api-mismatch", f"{requires_api} vs {HOOK_API}")
         if graph not in GRAPHS:
             _refuse(seam, owner, "graph-unsupported", f"{graph!r} not in {GRAPHS}")
-        if isinstance(impl, Phases):
-            if select is not None or (spec is not None and spec.form != "window"):
-                _refuse(seam, owner, "window-registration", "use register_window")
-        elif spec is not None and spec.form == "window":
-            _refuse(seam, owner, "window-registration", "use register_window")
-        elif not callable(impl) or (select is not None and not callable(select)):
+        if not callable(impl) or (select is not None and not callable(select)):
             _refuse(seam, owner, "not-callable", "impl and select must be callable")
         if _loading is not None and owner != _loading:
             _refuse(seam, owner, "owner-mismatch", f"loading entry point {_loading}")
@@ -512,9 +469,12 @@ def register_module(
 ) -> Registration:
     """Offer ``owner`` for every module at ``slot`` (whole-subtree takeover).
 
-    ``method`` (or a ``slot`` written ``path:method``) takes over that method of
-    the matched modules instead of ``forward``: any Python method boundary is a
-    takeover point without a declared seam. The host installs and restores it,
+    A slot is a module path (``layers.*.ffn``, ``*`` one segment) or a class,
+    ``@<qualified.Class>``: every instance of that class (``isinstance``),
+    wherever it sits, so one plugin serves the class in any model that uses
+    it. ``method`` (or a ``slot`` written ``...:method``) takes over that
+    method of the matched modules instead of ``forward``: any Python method
+    boundary is a takeover point without a declared seam. The host installs and restores it,
     routes it per call and per capture bucket, and makes it one opaque op under
     compile, exactly as for ``forward``; the factory's callable is called as
     that method.
@@ -524,9 +484,8 @@ def register_module(
     called exactly as the module's ``forward``. ``select(capability, *args,
     **kwargs)`` is a pure per-call predicate (None: always); declining runs the
     module's own forward, inner owners included. ``fake`` gives the output of
-    a tensor-only call as a compiled graph sees it (default: like the first
-    input). A slot that is the span of a seam (`SLOT`/`SEAM` aliases) is
-    registered as that seam, so either form serves the same calls.
+    a tensor-only call as a compiled graph sees it (default: the module's own
+    forward on fake inputs).
     """
     if method is not None:
         slot = f"{slot}:{method}"
@@ -556,8 +515,13 @@ def register_module(
         return Registration(slot, owner, True, "registered")
 
 
-# ``path`` (the module's ``forward``) or ``path:method`` (one of its methods).
-_SLOT_RE = re.compile(r"^[A-Za-z0-9_*]+(\.[A-Za-z0-9_*]+)*(:[A-Za-z_][A-Za-z0-9_]*)?$")
+# A module path (``*`` one segment) or ``@<qualified.Class>``, the module's
+# ``forward``, or ``...:method`` (one of its methods).
+_SLOT_RE = re.compile(
+    r"^(@[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+"
+    r"|[A-Za-z0-9_*]+(\.[A-Za-z0-9_*]+)*)"
+    r"(:[A-Za-z_][A-Za-z0-9_]*)?$"
+)
 
 
 def _split_slot(slot: str) -> tuple[str, str]:
@@ -565,24 +529,37 @@ def _split_slot(slot: str) -> tuple[str, str]:
     return path, method or "forward"
 
 
-def _slot_matches(slot: str, path: str) -> bool:
+def _is_class_slot(pattern: str) -> bool:
+    return pattern.startswith("@")
+
+
+@functools.cache
+def _slot_class(pattern: str) -> type | None:
+    """The class a ``@<qualified.Class>`` slot names; None when it does not
+    import (no module of it can be in this model)."""
+    module_name, _, name = pattern[1:].rpartition(".")
+    try:
+        cls = getattr(importlib.import_module(module_name), name)
+    except (ImportError, AttributeError):
+        return None
+    return cls if isinstance(cls, type) else None
+
+
+def _slot_matches(slot: str, path: str, module: Any = None) -> bool:
+    if _is_class_slot(slot):
+        cls = _slot_class(slot)
+        return cls is not None and isinstance(module, cls)
     want, have = slot.split("."), path.split(".")
-    return len(want) == len(have) and all(
-        fnmatch.fnmatchcase(h, w) for w, h in zip(want, have)
+    return (
+        bool(path)
+        and len(want) == len(have)
+        and all(fnmatch.fnmatchcase(h, w) for w, h in zip(want, have))
     )
 
 
-def _module_route_tables(plan, shorthand: bool):
+def _module_route_tables(plan):
     from atom import plugin_recipe
 
-    if shorthand:
-        order = {name: i for i, name in enumerate(plan.providers)}
-        return {
-            "any": {
-                slot: tuple(sorted(routes.values(), key=lambda r: order[r.owner]))
-                for slot, routes in _module_registered.items()
-            }
-        }
     tables = {}
     for key, table in getattr(plan, "modules", {}).items():
         tables[key] = {}
@@ -766,7 +743,7 @@ def _install_into(model, prefix: str) -> list[str]:
         by_attr: dict[str, list[str]] = {}
         for s in slots:
             pattern, attr = _split_slot(s)
-            if path and _slot_matches(pattern, path):
+            if _slot_matches(pattern, path, module):
                 by_attr.setdefault(attr, []).append(s)
         for attr, matched in by_attr.items():
             if not callable(getattr(module, attr, None)):
@@ -793,14 +770,13 @@ def _uninstall_modules() -> None:
         if router.module.__dict__.get(router.attr) is router:
             delattr(router.module, router.attr)
             if getattr(router.native, "__self__", None) is not router.module:
-                setattr(router.module, router.attr, router.native)  # an earlier patch
+                setattr(router.module, router.attr, router.native)
 
 
 def install_modules(model, *, prefix: str = "") -> list[str]:
     """After the load (and the drafter's, with ``prefix="draft"``), before
     warmup and capture: route the planned slots' modules of ``model``.
-    Returns the module paths taken over. Remembered, so a hot-plug re-installs
-    the new plan's owners on the same modules."""
+    Returns the module paths taken over."""
     with _lock:
         if not any(m is model and p == prefix for m, p in _install_roots):
             _install_roots.append((model, prefix))
@@ -808,12 +784,6 @@ def install_modules(model, *, prefix: str = "") -> list[str]:
     if paths:
         logger.info("plugin_host: modules taken over: %s", paths)
     return paths
-
-
-def _reinstall_modules() -> None:
-    _uninstall_modules()
-    for model, prefix in _install_roots:
-        _install_into(model, prefix)
 
 
 # -- opaque op of N tensors -----------------------------------------------------
@@ -847,8 +817,7 @@ def span_n(
 ) -> Callable[..., torch.Tensor]:
     """``run(*tensors) -> tensor`` as one opaque op a compiled graph keeps as a
     call (``atom_plugin::span_n``): its body runs eagerly on every execution,
-    graph capture included. ``key`` names the body; re-defining a key replaces
-    it (a hot-plug)."""
+    graph capture included. ``key`` names the body."""
     _define_span_n_op()
     _spans_n[key] = (run, fake)
     op = torch.ops.atom_plugin.span_n.default
@@ -857,14 +826,74 @@ def span_n(
 
 # -- recipe options and the plugin model ---------------------------------------
 
-# The model ATOM builds while a plugin plan is in place is the recipe's
-# ``model_options.target_model_cls`` / ``draft_model_cls`` (a plugin package's
-# model, with its seams in it); without them ATOM's own model, unchanged.
-
 
 def plugin_model_active() -> bool:
     """Whether this process builds the plugin variant of a model."""
-    return not _kill_switch and (_plan is not None or _hotplug)
+    return not _kill_switch and _plan is not None
+
+
+def _module_file(module: Any) -> Path | None:
+    """The file a module was imported from, resolved; None for a fileless one."""
+    file = getattr(module, "__file__", None)
+    if not isinstance(file, str) or not file:
+        return None
+    try:
+        return Path(file).resolve()
+    except OSError:
+        return None
+
+
+_CODE_SUFFIXES = frozenset({".py", ".so", ".h", ".hpp", ".hh", ".hxx"})
+
+
+def plugin_code_digest(roots: Iterable[str]) -> str:
+    """A stable fingerprint of the plugin code under ``roots`` (what a
+    recipe's ``requires.plugins`` pins), in a fixed, documented layout so an
+    out-of-tree tool can compute exactly the same string:
+
+    - recurse the roots; regular files only; skip ``__pycache__``;
+    - keep the extensions ``.py .so .h .hpp .hh .hxx``, case-insensitive;
+    - de-duplicate by resolved absolute path (the first root wins);
+    - sort records by the path relative to its root, POSIX form;
+    - per record, feed ``<relative>\\0<sha256 hex of the file bytes>\\n``.
+
+    Returns ``"sha256:" + hexdigest()``. A missing root or an unreadable file
+    raises, never returns a digest for code it did not read.
+    """
+    resolved_roots = []
+    for root in roots:
+        path = Path(root).resolve()
+        if not path.is_dir():
+            raise ValueError(f"plugin code root {root!r} is not a directory")
+        if path not in resolved_roots:
+            resolved_roots.append(path)
+    if not resolved_roots:
+        raise ValueError("plugin_code_digest needs at least one root")
+    digest = hashlib.sha256()
+    seen: set[Path] = set()
+    entries: list[tuple[str, Path]] = []
+    for root_path in resolved_roots:
+        for path in sorted(root_path.rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            if path.suffix.lower() not in _CODE_SUFFIXES:
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            entries.append((path.relative_to(root_path).as_posix(), path))
+    for relative, path in sorted(entries, key=lambda item: item[0]):
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+        digest.update(b"\n")
+    return "sha256:" + digest.hexdigest()
+
+
+# The model ATOM builds while a plugin plan is in place is the recipe's
+# ``model_options.target_model_cls`` / ``draft_model_cls`` (a plugin package's
+# model, with its seams in it); without them ATOM's own model, unchanged.
 
 
 def model_class_for(arch: str, default: str) -> str:
@@ -900,14 +929,6 @@ def plugin_options(name: str) -> Mapping[str, Any]:
     return MappingProxyType(dict(raw.get(name, {})))
 
 
-def dspark_options():
-    """The plan's ``dspark_options`` (`plugin_recipe.DSparkOptions`)."""
-    from atom.plugin_recipe import DSparkOptions
-
-    plan = _plan
-    return getattr(plan, "dspark_options", None) or DSparkOptions()
-
-
 def owns(seam: str, rows: int | None = None) -> bool:
     """Whether the active arm has an owner of ``seam`` in any table. A native
     region that spans ``seam`` (fused attention spans qk_norm and attend)
@@ -919,209 +940,7 @@ def _entry_points() -> dict[str, metadata.EntryPoint]:
     return {ep.name: ep for ep in metadata.entry_points(group=ENTRY_POINT_GROUP)}
 
 
-# -- dev mode: reloadable plugin code -----------------------------------------
-
-
-def _dev_roots_argument(roots: Any) -> tuple[str, ...]:
-    """``dev_roots`` as a resolved, de-duplicated allowlist of existing dirs.
-
-    Only trees an operator named at boot may be reloaded: resolving here (and
-    keeping absolute paths) is what makes ``reload_plugins`` able to check that
-    a module it is about to drop lives under one of them.
-    """
-    if roots is None:
-        return ()
-    if isinstance(roots, (str, os.PathLike)):
-        roots = (roots,)
-    resolved: list[str] = []
-    seen: set[str] = set()
-    for root in roots:
-        if not isinstance(root, (str, os.PathLike)):
-            raise TypeError(
-                f"plugin dev root must be a path, got {type(root).__name__}"
-            )
-        try:
-            path = Path(root).expanduser().resolve(strict=True)
-        except OSError as error:
-            raise ValueError(
-                f"plugin dev root {root!r} is not an existing directory: {error}"
-            ) from error
-        if not path.is_dir():
-            raise ValueError(f"plugin dev root {path} is not a directory")
-        text = str(path)
-        if text not in seen:
-            seen.add(text)
-            resolved.append(text)
-    return tuple(resolved)
-
-
-def _root_paths(roots: Iterable[str]) -> tuple[Path, ...]:
-    return tuple(Path(root).resolve() for root in roots)
-
-
-def _module_file(module: Any) -> Path | None:
-    """The file a module was imported from, resolved; None for a fileless one."""
-    file = getattr(module, "__file__", None)
-    if not isinstance(file, str) or not file:
-        return None
-    try:
-        return Path(file).resolve()
-    except OSError:
-        return None
-
-
-def _under_roots(path: Path, roots: tuple[Path, ...]) -> bool:
-    return any(path == root or path.is_relative_to(root) for root in roots)
-
-
-def _snapshot_modules(roots: tuple[Path, ...]) -> dict[str, Any]:
-    """The ``sys.modules`` entries whose source file is under ``roots``."""
-    saved: dict[str, Any] = {}
-    for name, module in list(sys.modules.items()):
-        path = _module_file(module)
-        if path is not None and _under_roots(path, roots):
-            saved[name] = module
-    return saved
-
-
-def _remove_modules(modules: Mapping[str, Any]) -> None:
-    """Drop the modules under the reload roots from ``sys.modules``.
-
-    Deepest (longest path) first: the entry must be gone before its provider's
-    entry point is asked again, and submodules go before their package so a
-    re-import of the package does not hand back the previous attempt's
-    attributes.
-    """
-
-    def depth(name: str) -> int:
-        path = _module_file(modules[name])
-        return 0 if path is None else len(path.parts)
-
-    for name in sorted(modules, key=lambda item: (-depth(item), item)):
-        sys.modules.pop(name, None)
-
-
-def _drop_bytecode(modules: Mapping[str, Any], roots: tuple[Path, ...]) -> list[str]:
-    """Delete the stale ``.pyc`` of every module about to be re-imported.
-
-    ``importlib.invalidate_caches`` refinds modules but does not invalidate a
-    timestamp-based bytecode cache: an edit made within the same second and
-    changing no file-size digit would import the old code from
-    ``__pycache__``. A dev reload unlinks each module's own ``__cached__`` file
-    (under the allowlisted roots) so the re-import compiles the current source.
-    """
-    dropped: list[str] = []
-    for module in modules.values():
-        cached = getattr(module, "__cached__", None)
-        if not isinstance(cached, str) or not cached:
-            continue
-        try:
-            path = Path(cached).resolve()
-        except OSError:
-            continue
-        if not path.is_file() or not _under_roots(path, roots):
-            continue
-        try:
-            path.unlink()
-        except OSError as error:
-            logger.warning(  # still pick the source up if the pyc is stale
-                "plugin_host: could not drop bytecode cache %s: %s", path, error
-            )
-            continue
-        dropped.append(str(path))
-    if dropped:
-        logger.info(
-            "plugin_host: dropped %d bytecode cache file(s) under the dev roots",
-            len(dropped),
-        )
-    return dropped
-
-
-def _restore_modules(saved: dict[str, Any], roots: tuple[Path, ...]) -> None:
-    """Put ``sys.modules`` back after a failed reload attempt.
-
-    Modules imported during the attempt -- a refreshed version of a module the
-    boot imported, or a dependency the new code pulled in -- are closed
-    best-effort and dropped, then every module the attempt removed is restored
-    to its previous object. The previous objects are never closed: the old
-    native library stays mapped, exactly as it does after a successful reload.
-    """
-    for name, module in _snapshot_modules(roots).items():
-        if module is saved.get(name):
-            continue
-        close = getattr(module, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                logger.exception("plugin_host: closing fresh module %s failed", name)
-        if name not in saved:
-            sys.modules.pop(name, None)
-    sys.modules.update(saved)
-
-
-def _refuse_extension_modules(modules: Mapping[str, Any]) -> None:
-    """Refuse rather than re-initialize a compiled Python extension module.
-
-    A CPython extension module's init code runs once per process; removing it
-    from ``sys.modules`` and importing the new file can register its types and
-    static state twice and crash. A dev reload therefore re-imports Python
-    source only; versioned native code belongs in ``prepare(device)`` behind a
-    shared-library loader, not in the Python import system.
-    """
-    compiled = [
-        f"{name} ({path})"
-        for name, module in modules.items()
-        if (path := _module_file(module)) is not None and path.suffix.lower() != ".py"
-    ]
-    if compiled:
-        raise RuntimeError(
-            "plugin dev reload cannot re-import compiled Python extension "
-            f"module(s): {', '.join(sorted(compiled))}; load versioned native "
-            "code from a shared library in prepare(device), or restart ATOM"
-        )
-
-
-def plugin_code_digest(roots: Iterable[str] | None = None) -> str:
-    """A stable fingerprint of the plugin code under ``roots``.
-
-    The digest a dev watcher sends back as ``code_digest``: a sha256 over the
-    plugin files under the allowlisted roots, in a fixed, documented layout so
-    an out-of-tree tool can compute exactly the same string:
-
-    - recurse the roots; regular files only; skip ``__pycache__`` and ``.pyc``;
-    - keep the extensions in :data:`DEV_CODE_SUFFIXES`, case-insensitive;
-    - de-duplicate by resolved absolute path (the first root wins);
-    - sort records by the path relative to its root, POSIX form;
-    - per record, feed ``<relative>\\0<sha256 hex of the file bytes>\\n``.
-
-    Returns ``"sha256:" + hexdigest()``. A missing/unreadable root or file
-    raises, never returns a digest for code it did not read.
-    """
-    resolved_roots = _dev_roots_argument(_dev_roots if roots is None else roots)
-    if not resolved_roots:
-        raise ValueError("plugin_code_digest needs at least one plugin dev root")
-    digest = hashlib.sha256()
-    seen: set[Path] = set()
-    entries: list[tuple[str, Path]] = []
-    for root in resolved_roots:
-        root_path = Path(root)
-        for path in sorted(root_path.rglob("*")):
-            if not path.is_file() or "__pycache__" in path.parts:
-                continue
-            if path.suffix.lower() not in DEV_CODE_SUFFIXES:
-                continue
-            resolved = path.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            entries.append((path.relative_to(root_path).as_posix(), path))
-    for relative, path in sorted(entries, key=lambda item: item[0]):
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
-        digest.update(b"\n")
-    return "sha256:" + digest.hexdigest()
+# -- provider modules and their prepare hooks -----------------------------------
 
 
 def _entry_point_module(entry_point: metadata.EntryPoint) -> types.ModuleType | None:
@@ -1165,7 +984,7 @@ def _prepare_providers(plan: Any, device: Any) -> tuple[list[str], dict[str, Any
 
     A provider declares it by exporting ``prepare`` next to its ``register``;
     the call is where a plugin loads and warms its versioned native library.
-    Its return value is surfaced to the reload reply under ``native``. A
+    Its return value is reported under ``native``. A
     prepare that raises is a refusal, never a silent native fallback.
     """
     if plan is None:
@@ -1272,68 +1091,6 @@ def _check_plugin_pins(plan) -> None:
             )
 
 
-def _check_provider_roots(plan: Any, roots: tuple[Path, ...]) -> dict[str, Path]:
-    """Refuse a reload of a plan whose providers are not under the dev roots.
-
-    A provider imported from an installed copy outside the allowlist would be
-    re-registered from the module still in ``sys.modules`` -- a reload that
-    silently kept the old code. Refuse before any module is dropped instead.
-    """
-    if plan is None:
-        return {}
-    available = _entry_points()
-    files: dict[str, Path] = {}
-    for name in plan.providers:
-        entry_point = available.get(name)
-        if entry_point is None:
-            continue  # AITER-only provider: nothing under the roots to reload
-        try:
-            module = _entry_point_module(entry_point)
-        except Exception as error:
-            raise RuntimeError(
-                f"planned provider {name!r} could not be loaded to check its dev "
-                f"root: {type(error).__name__}: {error}"
-            ) from error
-        path = None if module is None else _module_file(module)
-        if path is None:
-            raise RuntimeError(
-                f"planned provider {name!r} has no source module on disk, so a "
-                f"dev reload cannot re-import it"
-            )
-        if not _under_roots(path, roots):
-            raise RuntimeError(
-                f"planned provider {name!r} is imported from {path}, which is not "
-                f"under a --plugin-dev-root {[str(root) for root in roots]}; "
-                f"install the plugin editable (pip install -e) or add that tree "
-                f"as a dev root -- a reload would otherwise keep the old module"
-            )
-        files[name] = path
-    return files
-
-
-def _reload_roots(roots: Any) -> tuple[str, ...]:
-    """The roots one reload may touch: exactly the configured allowlist."""
-    configured = _dev_roots
-    if not configured:
-        raise RuntimeError("plugin dev mode has no allowlisted dev roots configured")
-    if roots is None:
-        return configured
-    resolved = _dev_roots_argument(roots)
-    outside = [root for root in resolved if root not in set(configured)]
-    if outside:
-        raise ValueError(
-            f"reload roots {outside} are not allowlisted; the configured "
-            f"--plugin-dev-root trees are {list(configured)}"
-        )
-    missing = [root for root in configured if root not in resolved]
-    if missing:
-        raise ValueError(
-            f"reload roots must include every configured dev root; missing "
-            f"{missing} would leave its plugin modules on the old code"
-        )
-    return resolved
-
-
 def configure(
     plan=None,
     *,
@@ -1341,84 +1098,33 @@ def configure(
     config: Any = None,
     kill_switch: bool | None = None,
     strict: bool | None = None,
-    hotplug: bool = False,
-    dev: bool = False,
-    dev_roots: Iterable[str] = (),
 ) -> None:
-    """Load and route ``plan`` (a ``plugin_recipe.Plan``, the
-    ``RecipeSource`` a Config carries, or names for the ``--plugin-enable``
-    shorthand) before the model is built.
+    """Load and route ``plan`` (a ``plugin_recipe.Plan``, or the
+    ``RecipeSource`` a Config carries) before the model is built.
 
-    A recipe plan is all or nothing: a plugin that fails to load, or a planned
-    owner that did not register, refuses the start. Under the shorthand a
-    failing plugin is logged and skipped. The same plan's AITER providers go to
-    ``aiter.plugin.configure`` when AITER has it.
-
-    ``hotplug=True`` boots for a plan installed later: every seam the model
-    binds is bound now (so no rebuild is needed) even where the boot plan owns
-    nothing, and ``hotplug_plan`` may replace the plan after the build. The
-    kill switch wins: with ``ATOM_PLUGIN_HOST=0`` nothing binds and
-    ``hotplug_plan`` refuses.
-
-    ``dev=True, dev_roots=(...)`` adds developer mode on top of a hot-plug
-    boot: ``reload_plugins`` may re-import the plugin Python modules under those
-    allowlisted directories from disk. It is opt-in because a reloaded process
-    can hold an old native library and a half-old Python state; a production
-    boot never enables it.
-    """
+    A plan is all or nothing: a plugin that fails to load, or a planned owner
+    that did not register, refuses the start. The plan's AITER providers go to
+    ``aiter.plugin.configure`` when AITER has it. A plan is fixed for the
+    process: to change it, restart (``ATOM_PRELOAD=1`` keeps the weights)."""
     from atom import plugin_recipe
     from atom.utils import envs
 
     global _plan, _kill_switch, _strict, _on_decline, _loading, _owned, _requested
-    global _hotplug, _dev, _dev_roots
-    roots = _dev_roots_argument(dev_roots)
-    dev = bool(dev)
-    if roots and not dev:
-        raise ValueError(
-            "plugin dev roots were given without plugin dev mode: set --plugin-dev "
-            "(configure(dev=True, ...)) or drop the roots"
-        )
-    if dev and not hotplug:
-        raise ValueError(
-            "plugin dev mode needs a hot-plug boot: --plugin-dev requires "
-            "--plugin-hotplug (configure(..., hotplug=True))"
-        )
-    if dev and not roots:
-        raise ValueError(
-            "plugin dev mode needs at least one allowlisted root: --plugin-dev "
-            "requires --plugin-dev-root (configure(dev_roots=(...)))"
-        )
     if isinstance(plan, plugin_recipe.RecipeSource):
         plan = plan.resolve()  # Config carries the recipes; each process resolves
-    elif not isinstance(plan, (plugin_recipe.Plan, type(None))):
-        plan = plugin_recipe.shorthand(plan)
     requested = None if plan is None else plan.plan_id
     if _bound:
         # A second runner in this process may restate the plan the built binds
         # were made with; any other plan would leave them on the old one.
         if requested != _requested:
-            raise RuntimeError(
-                "plugin_host.configure after model build; use hotplug_plan or set_arm"
-            )
-        if dev != _dev or roots != _dev_roots:
-            raise RuntimeError(
-                "plugin_host.configure after model build; dev mode cannot change"
-            )
+            raise RuntimeError("plugin_host.configure after model build")
         set_arm(arm if _plan is not None else "plugin")
         return
     _requested = requested
     if plan is not None and config is not None:
         plugin_recipe.check_runtime(plan, config)
     kill = not envs.ATOM_PLUGIN_HOST if kill_switch is None else kill_switch
-    if dev and kill:
-        raise ValueError(
-            "plugin dev mode needs the plugin host enabled: ATOM_PLUGIN_HOST=0 "
-            "kills the hot-plug path a reload installs the plan through"
-        )
     with _lock:
-        _hotplug = bool(hotplug) and not kill
-        _dev = dev and not kill
-        _dev_roots = roots if _dev else ()
         _plan = None if kill else plan
         _kill_switch = kill
         _strict = (
@@ -1433,34 +1139,23 @@ def configure(
         _module_tables.clear()
         _refusals.clear()
         _spans.clear()
-        shorthand = plan is not None and None in plan.tables.values()
         if _plan is not None:
             available = _entry_points()
             for name in _plan.providers:
                 if name not in available:
-                    if not shorthand:
-                        raise plugin_recipe.RecipeRefused(
-                            "recipe-plugin-drift", f"{name} is not installed"
-                        )
-                    continue  # an AITER-only provider, or not installed
+                    continue  # an AITER-only provider
                 _loading = name
                 try:
                     available[name].load()(sys.modules[__name__])
                 except Exception as error:
-                    _refusals.append(Registration("*", name, False, "load-error"))
-                    logger.warning("plugin_host: %s failed to load: %s", name, error)
-                    if not shorthand:
-                        raise plugin_recipe.RecipeRefused(
-                            "recipe-plugin-drift", f"{name} failed to load: {error}"
-                        ) from error
+                    raise plugin_recipe.RecipeRefused(
+                        "recipe-plugin-drift", f"{name} failed to load: {error}"
+                    ) from error
                 finally:
                     _loading = None
-            _tables.update(_route_tables(_plan, shorthand))
-            _module_tables.update(_module_route_tables(_plan, shorthand))
+            _tables.update(_route_tables(_plan))
+            _module_tables.update(_module_route_tables(_plan))
         _owned = frozenset(s for table in _tables.values() for s in table)
-        if _hotplug:
-            # Bind the seams no plan owns yet: a later one may claim them.
-            _owned = _owned | _hotplug_binds()
         set_arm(arm if _plan is not None else "plugin", sync_aiter=False)
     _check_plugin_pins(_plan)
     _apply_aiter(force=True)
@@ -1468,17 +1163,9 @@ def configure(
         logger.info("plugin_host: %s", status())
 
 
-def _route_tables(plan, shorthand: bool) -> dict[Any, dict[str, tuple[_Route, ...]]]:
+def _route_tables(plan) -> dict[Any, dict[str, tuple[_Route, ...]]]:
     from atom import plugin_recipe
 
-    if shorthand:
-        order = {name: i for i, name in enumerate(plan.providers)}
-        return {
-            "any": {
-                seam: tuple(sorted(routes.values(), key=lambda r: order[r.owner]))
-                for seam, routes in _registered.items()
-            }
-        }
     tables = {}
     for key, table in plan.tables.items():
         tables[key] = {}
@@ -1543,228 +1230,6 @@ def _apply_aiter(*, force: bool) -> None:
     _aiter_applied = names
 
 
-# -- hot-plug -----------------------------------------------------------------
-
-
-def hotplug_enabled() -> bool:
-    """True when this process booted with ``configure(hotplug=True)`` and the
-    host was not killed: a plan may be installed with ``hotplug_plan``."""
-    return _hotplug
-
-
-def _plan_argument(plan: Any) -> Any:
-    """``hotplug_plan``'s argument as a ``plugin_recipe.Plan`` (or None).
-
-    Accepts the ``Plan`` itself, the ``RecipeSource`` a Config carries, a
-    payload of recipe texts + enable names
-    (``atom.plugin_recipe.from_payload``), a single recipe JSON text, or names
-    for the ``--plugin-enable`` shorthand (a ``Plan`` already).
-    """
-    from atom import plugin_recipe
-
-    if plan is None or isinstance(plan, plugin_recipe.Plan):
-        return plan
-    if isinstance(plan, (plugin_recipe.RecipeSource, Mapping, str, bytes)):
-        source = plugin_recipe.from_payload(plan)
-        return None if source is None else source.resolve()
-    # Names for the --plugin-enable shorthand: ``shorthand`` resolves to a Plan.
-    return plugin_recipe.shorthand(plan)
-
-
-def _snapshot() -> dict[str, Any]:
-    """The plan state ``hotplug_plan`` swaps and restores on any failure."""
-    return {
-        "plan": _plan,
-        "requested": _requested,
-        "kill_switch": _kill_switch,
-        "strict": _strict,
-        "on_decline": _on_decline,
-        "owned": _owned,
-        "registered": {seam: dict(routes) for seam, routes in _registered.items()},
-        "tables": dict(_tables),
-        "module_registered": {s: dict(r) for s, r in _module_registered.items()},
-        "module_tables": dict(_module_tables),
-        "arm": _arm,
-        "refusals": len(_refusals),
-        "aiter": () if _plan is None else _plan.aiter,
-    }
-
-
-def _restore(snapshot: dict[str, Any]) -> None:
-    """Put the previous plan back after a failed ``hotplug_plan``."""
-    global _plan, _requested, _kill_switch, _strict, _on_decline, _owned
-    with _lock:
-        _plan = snapshot["plan"]
-        _requested = snapshot["requested"]
-        _kill_switch = snapshot["kill_switch"]
-        _strict = snapshot["strict"]
-        _on_decline = snapshot["on_decline"]
-        _owned = snapshot["owned"]
-        _registered.clear()
-        _registered.update(snapshot["registered"])
-        _tables.clear()
-        _tables.update(snapshot["tables"])
-        _module_registered.clear()
-        _module_registered.update(snapshot["module_registered"])
-        _module_tables.clear()
-        _module_tables.update(snapshot["module_tables"])
-        del _refusals[snapshot["refusals"] :]
-        set_arm(snapshot["arm"])
-        _reinstall_modules()
-    _configure_aiter(snapshot["aiter"])
-
-
-def _build_options(plan) -> tuple:
-    """What a plan fixes when the model and the engine are built."""
-    from atom.plugin_recipe import EngineOptions, ModelOptions
-
-    return (
-        getattr(plan, "model_options", None) or ModelOptions(),
-        getattr(plan, "engine", None) or EngineOptions(),
-        dict(getattr(plan, "env", None) or {}),
-    )
-
-
-def _boot_owners(tables) -> dict[tuple[str, str], tuple[str, ...]]:
-    """Each boot-only seam's owners per table: what a hot-plug must keep."""
-    return {
-        (str(key), seam): tuple(route.owner for route in routes)
-        for key, table in tables.items()
-        for seam, routes in table.items()
-        if seam in boot_only() and routes
-    }
-
-
-def _swap_in(plan, arm: str) -> dict[str, Any]:
-    """Build the new plan's state in place; the caller restores on any error.
-
-    Every planned provider's entry point is asked again (not only the ones the
-    boot plan loaded): a plan may claim a seam the provider registered for no
-    earlier one, and ``register`` answers against the plan it runs under.
-    """
-    from atom import plugin_recipe
-    from atom.utils import envs
-
-    global _plan, _requested, _kill_switch, _strict, _on_decline, _owned, _loading
-    boot = _boot_owners(_tables)
-    previous = _plan
-    if _build_options(plan) != _build_options(previous):
-        # The model (and the engine) were built for the boot plan's options.
-        raise plugin_recipe.RecipeRefused(
-            "recipe-boot-only",
-            "model_options / engine options change the built model; restart",
-        )
-    _plan = plan
-    _kill_switch = False
-    _strict = envs.ATOM_PLUGIN_HOST_STRICT or bool(
-        plan is not None and plan.strict_overlap
-    )
-    _on_decline = plan.on_decline if plan is not None else "native"
-    _requested = None if plan is None else plan.plan_id
-    _registered.clear()
-    _tables.clear()
-    _module_registered.clear()
-    _module_tables.clear()
-    _refusals.clear()
-    _loading = None
-    shorthand = plan is not None and None in plan.tables.values()
-    if plan is not None:
-        available = _entry_points()
-        for name in plan.providers:
-            if name not in available:
-                if not shorthand:
-                    raise plugin_recipe.RecipeRefused(
-                        "recipe-plugin-drift", f"{name} is not installed"
-                    )
-                continue  # not installed, or AITER-only
-            _loading = name
-            try:
-                available[name].load()(sys.modules[__name__])
-            except Exception as error:
-                _refusals.append(Registration("*", name, False, "load-error"))
-                raise plugin_recipe.RecipeRefused(
-                    "recipe-plugin-drift", f"{name} failed to load: {error}"
-                ) from error
-            finally:
-                _loading = None
-        _tables.update(_route_tables(plan, shorthand))
-        _module_tables.update(_module_route_tables(plan, shorthand))
-    if _boot_owners(_tables) != boot:
-        raise plugin_recipe.RecipeRefused(
-            "recipe-boot-only",
-            f"{sorted(boot_only())} serve {boot or 'native'} until a restart",
-        )
-    # Conservative: seams bound before stay bound (their call sites exist), and
-    # a seam once planned keeps dispatching even under a plan that drops it.
-    _owned = _owned | frozenset(s for table in _tables.values() for s in table)
-    _configure_aiter(() if plan is None else plan.aiter)
-    set_arm(arm if plan is not None else "plugin")
-    _reinstall_modules()
-    return {
-        "hotplug": True,
-        "plan_id": None if plan is None else plan.plan_id,
-        "providers": [] if plan is None else list(plan.providers),
-        "aiter": [] if plan is None else list(plan.aiter),
-        "capture_rows": _declared_rows(),
-        "tables": sorted(str(key) for key in _tables),
-    }
-
-
-def hotplug_plan(plan, *, arm: str = "plugin", config: Any = None) -> dict[str, Any]:
-    """Install a new plan after the model build, on a hot-plug boot.
-
-    ``plan`` is a ``plugin_recipe.Plan``, the ``RecipeSource`` a Config carries,
-    a payload of recipe texts + enable names, or names for the shorthand; None
-    installs the empty plan (every seam native, every binding kept). Every
-    planned provider is loaded and must cover the plan, and the arm must be
-    valid for it; a failure raises ``RecipeRefused`` / ``RuntimeError`` and the
-    plan that was serving keeps serving. Call it with generation quiesced: the
-    swap itself is under the lock, but in-flight dispatches may have already
-    cached a decision, and captures made before it must be recaptured.
-
-    Returns ``{"hotplug", "plan_id", "providers", "aiter", "capture_rows",
-    "tables"}``: the installed plan and the capture buckets (padded rows) its
-    tables declare, so the caller knows which graphs to recapture.
-    """
-    from atom import plugin_recipe
-    from atom.utils import envs
-
-    resolved = _plan_argument(plan)
-    with _lock:
-        if not _hotplug:
-            raise RuntimeError(
-                "plugin_host.hotplug_plan needs a hot-plug boot: configure with "
-                "hotplug=True before the model build"
-            )
-        if not _bound:
-            raise RuntimeError(
-                "plugin_host.hotplug_plan is only allowed after the model build"
-            )
-        if _kill_switch or not envs.ATOM_PLUGIN_HOST:
-            raise RuntimeError(
-                "plugin_host is disabled (ATOM_PLUGIN_HOST=0); refusing to install"
-            )
-        if resolved is not None and config is not None:
-            plugin_recipe.check_runtime(resolved, config)  # before any state change
-        snapshot = _snapshot()
-        try:
-            result = _swap_in(resolved, arm)
-        except BaseException:
-            try:
-                _restore(snapshot)
-            except Exception:  # restoring is best effort; report the install error
-                logger.exception("plugin_host: restoring the previous plan failed")
-            raise
-    logger.info("plugin_host: hotplug plan installed: %s", result)
-    return result
-
-
-def dev_enabled() -> bool:
-    """True when this process booted for a dev reload: a hot-plug boot with an
-    allowlisted set of plugin source roots (``configure(dev=True, ...)``)."""
-    return bool(_dev and _dev_roots)
-
-
 def prepare_plan(device: Any = None) -> dict[str, Any]:
     """Let the boot plan's providers prepare native code once, after the build.
 
@@ -1784,125 +1249,6 @@ def prepare_plan(device: Any = None) -> dict[str, Any]:
         prepared, native = _prepare_providers(_plan, device)
     logger.info("plugin_host: boot plan prepared providers: %s", prepared)
     return {"prepared": prepared, "native": native}
-
-
-def reload_plugins(
-    plan: Any,
-    *,
-    roots: Iterable[str] | None = None,
-    arm: str = "plugin",
-    config: Any = None,
-    device: Any = None,
-) -> dict[str, Any]:
-    """Re-import the plugin code under the dev roots, then install ``plan``.
-
-    Developer mode only (``configure(dev=True, dev_roots=...)``): the host state
-    and every ``sys.modules`` entry whose source file is under the allowlisted
-    roots are snapshotted, the modules are dropped (deepest first) after
-    ``importlib.invalidate_caches()``, and ``_swap_in`` asks the planned
-    providers' entry points again -- which re-imports their new code from disk.
-    Each planned provider that exports ``prepare(device)`` is then asked to
-    prepare its versioned native library, and only then is the new plan serving.
-
-    All or nothing: on any failure (import, registration, plan coverage,
-    prepare) the saved modules and host state are restored and the error is
-    re-raised, so the previous plan keeps serving and the caller must not
-    recapture anything.
-
-    Deliberately **not** unloaded on success: the old module objects' native
-    libraries stay mapped (a versioned ``.so`` is expected to leak its previous
-    copy in dev mode), and compiled Python extension modules under the roots
-    are refused instead of re-initialized. Old decode graphs are released and
-    recaptured by the caller's existing hot-plug path, because the new module
-    code may make different routing decisions.
-
-    ``roots`` defaults to the configured allowlist and may only restate it
-    (every configured root must be present). Returns the installed plan's
-    description plus ``code_digest``, ``reloaded_modules``, ``prepared``,
-    ``native`` and ``reload_seconds``.
-    """
-    from atom import plugin_recipe
-    from atom.utils import envs
-
-    resolved = _plan_argument(plan)
-    started = time.perf_counter()
-    with _lock:
-        if not _hotplug:
-            raise RuntimeError(
-                "plugin_host.reload_plugins needs a hot-plug boot: configure with "
-                "hotplug=True before the model build"
-            )
-        if not dev_enabled():
-            raise RuntimeError(
-                "plugin_host.reload_plugins needs plugin dev mode: boot with "
-                "--plugin-dev --plugin-dev-root (configure(dev=True, dev_roots=...))"
-            )
-        if not _bound:
-            raise RuntimeError(
-                "plugin_host.reload_plugins is only allowed after the model build"
-            )
-        if _kill_switch or not envs.ATOM_PLUGIN_HOST:
-            raise RuntimeError(
-                "plugin_host is disabled (ATOM_PLUGIN_HOST=0); refusing to reload"
-            )
-        use_roots = _reload_roots(roots)
-        root_paths = _root_paths(use_roots)
-        # Read the code first: an unreadable tree must refuse without touching
-        # anything, and the caller's expected digest is checked against this.
-        code_digest = plugin_code_digest(use_roots)
-        snapshot = _snapshot()
-        before = _snapshot_modules(root_paths)
-        try:
-            if resolved is not None and config is not None:
-                plugin_recipe.check_runtime(resolved, config)  # before any change
-            # Fail closed when a provider was imported from outside the roots:
-            # re-loading a module still in sys.modules would be a silent no-op.
-            _check_provider_roots(resolved, root_paths)
-            live = _snapshot_modules(root_paths)
-            _refuse_extension_modules(live)
-            _drop_bytecode(live, root_paths)
-            importlib.invalidate_caches()
-            _remove_modules(live)
-            installed = _swap_in(resolved, arm)
-            prepared, native = _prepare_providers(resolved, device)
-        except BaseException:
-            try:
-                _restore_modules(before, root_paths)
-            except Exception:
-                logger.exception(
-                    "plugin_host: restoring sys.modules after a failed dev reload "
-                    "failed"
-                )
-            try:
-                _restore(snapshot)
-            except Exception:
-                logger.exception(
-                    "plugin_host: restoring the previous plan after a failed dev "
-                    "reload failed"
-                )
-            raise
-        elapsed = time.perf_counter() - started
-        result = dict(installed)
-        result.update(
-            reloaded=True,
-            dev=True,
-            plan_id=installed.get("plan_id"),
-            code_digest=code_digest,
-            reloaded_modules=sorted(live),
-            prepared=prepared,
-            native=native,
-            reload_seconds=elapsed,
-        )
-    logger.info(
-        "plugin_host: dev reload installed plan %s: %d module(s) re-imported, "
-        "prepared %s, digest %s, %.2fs",
-        result["plan_id"],
-        len(result["reloaded_modules"]),
-        result["prepared"],
-        result["code_digest"],
-        elapsed,
-    )
-    return result
 
 
 # -- dispatch -----------------------------------------------------------------
@@ -2149,14 +1495,20 @@ def check_plan() -> dict[str, Any]:
         )
     for table in _module_tables.values():
         for slot, routes in table.items():
-            path, _, method = slot.partition(":")
-            if not routes or (method and method != "forward"):
-                continue
+            pattern, method = _split_slot(slot)
+            if not routes or method != "forward":
+                continue  # a method takeover replaces one method, no inner seam
+            # A class slot is where its instances were installed.
+            paths = (
+                [r.path for r in _installed if slot in r.slots and r.attr == method]
+                if _is_class_slot(pattern)
+                else [pattern]
+            )
             missing = sorted(
                 n
                 for n, s in SEAMS.items()
                 if s.scope is not None
-                and _scope_inside(s.scope, path)
+                and any(_scope_inside(s.scope, path) for path in paths)
                 and n not in planned
             )
             if missing:
@@ -2530,7 +1882,7 @@ def bind(
     if spec.form != "bind":
         raise KeyError(f"seam {seam!r} is a {spec.form} seam, not a bound one")
     _bound.add(seam)
-    if seam not in _owned and not _hotplug:
+    if seam not in _owned:
         return native
     router = Router(seam, native, capability)
     if spec.graph == "opaque_op" and layer is not None and fake is not None:
@@ -2554,7 +1906,7 @@ _call_capability: dict[str, Callable[..., Mapping[str, Any]]] = {
 
 def call(seam: str, native: Callable[..., Any], *inputs: Any, **kwargs: Any) -> Any:
     """``native(*inputs, **kwargs)``, unless a planned owner of ``seam`` serves."""
-    if seam not in _owned and not _hotplug:
+    if seam not in _owned:
         return native(*inputs, **kwargs)
     return _dispatch(seam, native, _call_capability.get(seam), inputs, kwargs)
 
@@ -2619,11 +1971,10 @@ def span_op(
     No planned owner of ``seam``: ``run`` itself, inline, the graph ATOM has
     without plugins. Else one opaque op (``atom_plugin::span``, shapes from
     ``fake``) whose body runs ``run`` eagerly, where the seam's owners are
-    asked on every execution. A hot-plug boot always takes the opaque op: the
-    plan that will serve the seam is installed after the build.
+    asked on every execution.
     """
     _bound.add(seam)
-    if seam not in _owned and not _hotplug:
+    if seam not in _owned:
         return run
     if layer in _spans:
         raise ValueError(f"span layer name {layer!r} is not unique")
@@ -2688,25 +2039,9 @@ def route_proof(seam: str, owner: str, n: int = 1) -> int:
     return served
 
 
-def _code_digest_or_none() -> str | None:
-    """The dev code digest for ``status``; unreadable roots report None."""
-    if not dev_enabled():
-        return None
-    try:
-        return plugin_code_digest()
-    except (OSError, ValueError):
-        return None
-
-
 def status() -> dict[str, Any]:
     return {
         "hook_api": HOOK_API,
-        "hotplug": _hotplug,
-        "dev": _dev,
-        "dev_roots": list(_dev_roots),
-        # Cheap only in dev mode and only read at boot / on demand; a reload's
-        # reply carries the digest it actually loaded.
-        "code_digest": _code_digest_or_none(),
         "plan_id": None if _plan is None else _plan.plan_id,
         "strategy": None if _plan is None else _plan.strategy,
         "arm": _arm,
@@ -2785,9 +2120,8 @@ def overhead_probe(
 
 
 def _reset_for_testing() -> None:
-    """Forget the plan, the binds, the hot-plug boot and the record (tests only)."""
+    """Forget the plan, the binds and the record (tests only)."""
     global _plan, _owned, _last, _kill_switch, _strict, _on_decline, _requested
-    global _hotplug, _dev, _dev_roots
     with _lock:
         _uninstall_modules()
         _install_roots.clear()
@@ -2807,8 +2141,6 @@ def _reset_for_testing() -> None:
         _warned_misses.clear()
         _plan, _owned, _last, _requested = None, frozenset(), None, None
         _kill_switch, _strict, _on_decline = False, False, "native"
-        _hotplug = False
-        _dev, _dev_roots = False, ()
         set_arm("plugin", sync_aiter=False)
         global _aiter_applied
         _aiter_applied = None
@@ -2831,5 +2163,3 @@ def _configure_aiter(names: Iterable[str]) -> bool:
 # The host's own seam is declared from import on.
 for _spec in _core_specs():
     seam(_spec, source="atom.plugin_host")
-# The transition window's contract (``atom.plugin_transition.SPEC``).
-seam(_transition_spec, source="atom/plugin_transition.py")

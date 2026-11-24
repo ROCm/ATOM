@@ -128,6 +128,24 @@ def _setting(config, name: str) -> str:
     return str(config)
 
 
+def _model_classes(config) -> dict | None:
+    """The model classes a plugin recipe builds in place of ATOM's
+    (``model_options.target_model_cls`` / ``draft_model_cls``); None without a
+    recipe or under the plugin kill switch, where ATOM builds its own. A
+    daemon's weights are never mapped into another model class."""
+    source = getattr(config, "plugin_source", None)
+    if source is None or not getattr(source, "documents", None):
+        return None
+    from atom.utils import envs
+
+    if not envs.ATOM_PLUGIN_HOST:
+        return None
+    options = source.resolve().model_options
+    if options.target_model_cls is None and options.draft_model_cls is None:
+        return None
+    return {"target": options.target_model_cls, "draft": options.draft_model_cls}
+
+
 def compute_key(config, rank: int) -> dict:
     """Which checkpoint, drafter and shard, and the listed settings. Taken
     before a load, by the daemon and by a server alike: files that change
@@ -170,6 +188,8 @@ def compute_key(config, rank: int) -> dict:
         "quant": quant.compute_hash() if quant else None,
         "options": {k: _setting(config, k) for k in _CONFIG_FIELDS},
         "env": {k: os.environ.get(k) for k in _ENV_VARS},
+        # A plugin recipe's model classes, which build the modules loading fills.
+        "model_classes": _model_classes(config),
     }
 
 

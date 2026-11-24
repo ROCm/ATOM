@@ -3,32 +3,15 @@
 
 CSA and SWA have independent row spaces. A prefill's SWA source contains
 the current batch's rings followed by the current chunk; decode uses the ring directly.
-The fused MXFP8 path consumes the same independent data/scale planes.
 Legacy packed rows remain accepted by the standalone wrappers.
 """
 
 import torch
-
-try:
-    from aiter.ops.fused_norm_rope_attn_rope_cast import (
-        fused_norm_rope_attn_rope_cast,
-        is_fused_norm_rope_attn_rope_cast_supported,
-    )
-except ImportError:  # kopt r2: an AITER without ROCm/aiter#8279's support query
-    fused_norm_rope_attn_rope_cast = None
-
-    def is_fused_norm_rope_attn_rope_cast_supported(*args, **kwargs):
-        return False
-
-
 from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src_reference
 from atom.utils.decorators import mark_trace
-
-# Re-export the AITER predicate; the operator owns its capability rules.
-fused_attention_available = is_fused_norm_rope_attn_rope_cast_supported
 
 
 def _split(rows, dim, scale_dtype=torch.float8_e8m0fnu):
@@ -93,47 +76,6 @@ def sparse_attn_v41_paged_2src(
     )
 
 
-@mark_trace
-def fused_sparse_attn_v41_paged_2src(
-    query,
-    pool,
-    kv_indices_prefix,
-    kv_indptr_prefix,
-    kv,
-    kv_indices_extend,
-    kv_indptr_extend,
-    attn_sink,
-    softmax_scale,
-    *,
-    rope,
-    positions,
-    out=None,
-    out_scale=None,
-):
-    """Raw BF16 Q to inverse-rotated MXFP8 output."""
-    dim = query.shape[-1]
-    output, output_scale, _ = fused_norm_rope_attn_rope_cast(
-        query,
-        *_split(pool, dim),
-        kv_indices_prefix,
-        kv_indptr_prefix,
-        *_split(kv, dim),
-        kv_indices_extend,
-        kv_indptr_extend,
-        attn_sink,
-        softmax_scale,
-        out=out,
-        out_scale=out_scale,
-        cos=rope.cos_cache,
-        sin=rope.sin_cache,
-        positions=positions.flatten(),
-        q_is_rotated=False,
-        q_norm=False,
-        num_splits=0,
-    )
-    return output, output_scale
-
-
 def dequantize_rows(values, scales):
     """MXFP8 `(values [..., D], scales [..., D // 32])` as fp32."""
     groups = values.float().unflatten(-1, (-1, 32))
@@ -166,53 +108,3 @@ def sparse_attn_v41_paged_2src_reference(
         attn_sink,
         softmax_scale,
     )
-
-
-def attend_out_native(
-    query,
-    pool,
-    kv_indices_prefix,
-    kv_indptr_prefix,
-    kv,
-    kv_indices_extend,
-    kv_indptr_extend,
-    attn_sink,
-    softmax_scale,
-    out,
-    positions,
-    cos_cache,
-    sin_cache,
-    x_fp8,
-    x_scale,
-    *,
-    num_groups,
-):
-    """`v41.attn.attend_out`'s native (plugins import it from here): the FP8-KV decode attention into the
-    BF16 ``out``, then the inverse RoPE + group-32 quant written into
-    ``x_fp8`` / ``x_scale``. The same kernels as the unbound path."""
-    output = sparse_attn_v41_paged_2src(
-        query,
-        pool,
-        kv_indices_prefix,
-        kv_indptr_prefix,
-        kv,
-        kv_indices_extend,
-        kv_indptr_extend,
-        attn_sink,
-        softmax_scale,
-        out=out,
-    )
-    heads, head_dim = output.shape[-2:]
-    from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
-
-    values, scales = inverse_rope_group_quant(
-        output.reshape(-1, heads, head_dim),
-        positions,
-        cos_cache,
-        sin_cache,
-        num_groups=num_groups,
-        quant_group_size=32,
-    )
-    x_fp8.copy_(values.view_as(x_fp8))
-    x_scale.copy_(scales.view_as(x_scale))
-    return x_fp8, x_scale

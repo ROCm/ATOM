@@ -245,7 +245,7 @@ class _AtomMetricsCollector:
             yield moved_tokens
 
         if "affinity_new_prefix_owner_total" in dp_router:
-            # Present only with engine.dp_session_prefix_owner_tokens set.
+            # Present only with ATOM_DP_SESSION_PREFIX_OWNER_TOKENS set.
             for name, documentation, key in (
                 (
                     "atom:dp_affinity_new_prefix_owner",
@@ -273,7 +273,7 @@ class _AtomMetricsCollector:
                 "atom:dp_affinity_prefix_owner_refused",
                 "Number of new sticky DP sessions left on the lightest rank "
                 "although another rank holds more of their prefix: threshold "
-                "(fewer tokens more than engine.dp_session_prefix_owner_tokens) or "
+                "(fewer tokens more than ATOM_DP_SESSION_PREFIX_OWNER_TOKENS) or "
                 "guard (that rank has too many requests in flight).",
                 labels=["reason"],
             )
@@ -287,7 +287,7 @@ class _AtomMetricsCollector:
         index = dp_router.get("prefix_index")
         if index is not None:
             # Prefix-index budget path (`prefix_spread`, or session affinity with
-            # engine.dp_session_prefix_owner_tokens): shows whether eviction
+            # ATOM_DP_SESSION_PREFIX_OWNER_TOKENS): shows whether eviction
             # ever ran and how much history it shed.
             events = CounterMetricFamily(
                 "atom:dp_prefix_index_events",

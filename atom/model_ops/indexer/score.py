@@ -30,32 +30,12 @@ from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
-from atom import plugin_host
 from atom.distributed.dcp_utils import get_dcp_group
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
 
 from .layout import MFMA, NATURAL
 from .rows import IndexCache, IndexRows
-
-# The `v41.attn.index_topk` seam: its contract, written at its call site in this file.
-_SEAM_ATTN_INDEX_TOPK = plugin_host.seam(
-    plugin_host.SeamSpec(
-        name="v41.attn.index_topk",
-        contract=1,
-        kind="op",
-        form="call",
-        inputs=("scores", "group", "row_ends", "out", "count", "stride0", "stride1"),
-        kwargs=("k", "stable", "row_starts", "plane_width"),
-        returns=(),
-        key=("scores", "group", "row_ends", "out", "count", "stride0", "stride1"),
-        graph="capture_safe",
-        doc="packed top_k_per_row_decode, in place into out",
-        scope="layers.*.attn.indexer",
-        target="atom/model_ops/indexer/score.py",
-    ),
-    source="atom/model_ops/indexer/score.py",
-)
 
 # gfx1250 scores the FP8 plane with FlyDSL's paged MQA logits (8-row pages
 # included); it reads the same packed preshuffled pages as the Triton kernel
@@ -245,9 +225,7 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
         else:
             # Packed: a row's logits start at its offset; the top-k is told
             # the plane width the rows stand for, so it picks as that would.
-            plugin_host.call(
-                "v41.attn.index_topk",
-                top_k_per_row_decode,
+            top_k_per_row_decode(
                 scores,
                 1,
                 rows.row_ends[span],

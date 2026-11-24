@@ -13,6 +13,7 @@ import types
 
 import pytest
 import torch
+from plugin_plans import enable
 
 from atom import plugin_host as host
 from atom import plugin_recipe as recipes
@@ -84,12 +85,12 @@ def _recipe(seams, *, plugins=None, mode="any", buckets=None, **extra):
         graph["buckets"] = buckets
     return {
         "schema": recipes.RECIPE_SCHEMA,
-        "model_arch": "DeepseekV41ForCausalLM",
+        "arch": "DeepseekV41ForCausalLM",
         "strategy": "tp4-c8",
         "graph": graph,
         "plugins": plugins
         or [{"name": o, "kind": "layer", "serves": serves[o]} for o in sorted(owners)],
-        "plan": {"seams": seams},
+        "seams": seams,
         **extra,
     }
 
@@ -102,7 +103,7 @@ x = torch.zeros(8, 2, 64)
 
 def test_register_accepts_a_planned_owner(monkeypatch):
     _plugins(monkeypatch, bmm=_offer(OUT, "bmm"))
-    host.configure(["bmm"], kill_switch=False)
+    host.configure(enable(["bmm"]), kill_switch=False)
     assert host.owners(OUT) == ("bmm",)
     assert host.status()["seams"] == {OUT: {"tables": {"any": ("bmm",)}}}
 
@@ -136,7 +137,9 @@ def test_register_refuses_with_a_reason(monkeypatch, kwargs, reason):
             caught.append(refused.reason)
 
     _plugins(monkeypatch, bmm=register)
-    host.configure(["bmm"], kill_switch=False)
+    plan = recipes.resolve([_recipe({OUT: ["bmm"]})])
+    with pytest.raises(recipes.RecipeRefused, match="recipe-coverage-miss"):
+        host.configure(plan, kill_switch=False)
     assert caught == [reason]
     assert host.status()["refusals"][-1].reason == reason
     assert host.status()["seams"] == {}
@@ -153,7 +156,7 @@ def test_an_owner_registers_a_seam_once(monkeypatch):
             caught.append(refused.reason)
 
     _plugins(monkeypatch, bmm=twice)
-    host.configure(["bmm"], kill_switch=False)
+    host.configure(recipes.resolve([_recipe({OUT: ["bmm"]})]), kill_switch=False)
     assert caught == ["duplicate"] and host.owners(OUT) == ("bmm",)
 
 
@@ -180,7 +183,7 @@ def _serves(name, *seams, kind="layer"):
 def test_kill_switch_wins_and_disables_aiter_too(monkeypatch, fresh_host):
     monkeypatch.setenv("ATOM_PLUGIN_HOST", "0")
     _plugins(monkeypatch, bmm=_offer(OUT, "bmm"))
-    host.configure(["bmm"])
+    host.configure(enable(["bmm"]))
     assert host.status()["kill_switch"] is True and host.status()["seams"] == {}
     assert fresh_host[-1] == ()
 
@@ -193,17 +196,6 @@ def test_no_environment_variable_enables_a_plugin(monkeypatch):
     assert host.status()["seams"] == {} and host.status()["strict"] is True
 
 
-def test_shorthand_isolates_a_broken_plugin(monkeypatch):
-    def broken(h):
-        raise ImportError("no kernel")
-
-    _plugins(monkeypatch, x=broken)
-    host.configure(["x"], kill_switch=False)
-    assert host.status()["refusals"][-1] == host.Registration(
-        "*", "x", False, "load-error"
-    )
-
-
 def test_a_recipe_refuses_to_start_half_loaded(monkeypatch):
     def broken(h):
         raise ImportError("no kernel")
@@ -214,7 +206,7 @@ def test_a_recipe_refuses_to_start_half_loaded(monkeypatch):
         host.configure(plan, kill_switch=False)
     assert refused.value.reason == "recipe-plugin-drift"
     _plugins(monkeypatch)
-    with pytest.raises(recipes.RecipeRefused, match="not installed"):
+    with pytest.raises(recipes.RecipeRefused, match="did not register"):
         host.configure(plan, kill_switch=False)
     _plugins(monkeypatch, x=lambda h: None)
     with pytest.raises(recipes.RecipeRefused) as refused:
@@ -225,16 +217,16 @@ def test_a_recipe_refuses_to_start_half_loaded(monkeypatch):
 def test_configure_after_build_is_refused(monkeypatch):
     host.configure(None)
     host.bind(OUT, _pair)
-    with pytest.raises(RuntimeError, match="set_arm"):
-        host.configure(["bmm"])
+    with pytest.raises(RuntimeError, match="after model build"):
+        host.configure(recipes.resolve([_recipe({OUT: ["bmm"]})]))
     host.configure(None)  # restating the built plan is fine
 
 
 def test_a_second_runner_may_restate_the_built_plan(monkeypatch):
     _plugins(monkeypatch, bmm=_offer(OUT, "bmm"))
-    host.configure(["bmm"], kill_switch=False)
+    host.configure(enable(["bmm"]), kill_switch=False)
     slot = host.bind(OUT, _native)
-    host.configure(["bmm"], arm="native", kill_switch=False)
+    host.configure(enable(["bmm"]), arm="native", kill_switch=False)
     assert slot(x, x, x, x) == ("native", 8)
     host.set_arm("plugin")
     assert host.owners(OUT, "any") == ("bmm",)
@@ -253,8 +245,9 @@ def test_the_aiter_half_gets_the_plans_providers(monkeypatch, fresh_host):
     host.configure(plan, kill_switch=False)
     assert fresh_host[-1] == ("dense",)
     host._reset_for_testing()
-    host.configure(["bmm", "dense"], kill_switch=False)
-    assert fresh_host[-1] == ("bmm", "dense")
+    plan = recipes.resolve([dict(_recipe({OUT: ["bmm"]}), aiter={"bmm_op": ["dense"]})])
+    host.configure(plan, kill_switch=False)
+    assert fresh_host[-1] == ("dense",)
 
 
 def test_aiter_configure_is_driven_when_present(monkeypatch):
@@ -314,7 +307,7 @@ def _serve(monkeypatch, *owners, plan=None, **select_by_owner):
             ),
         )
     _plugins(monkeypatch, **regs)
-    host.configure(plan or list(owners), kill_switch=False)
+    host.configure(plan or enable(list(owners)), kill_switch=False)
     return host.bind(
         OUT,
         _native,
@@ -357,7 +350,7 @@ def test_select_is_asked_once_per_key(monkeypatch):
         return True
 
     _plugins(monkeypatch, bmm=_offer(OUT, "bmm", select=select))
-    host.configure(["bmm"], kill_switch=False)
+    host.configure(enable(["bmm"]), kill_switch=False)
     slot = host.bind(OUT, _native)
     for rows in (8, 8, 8, 4, 8):
         slot(torch.zeros(rows, 1), x, x, x, dtype=torch.bfloat16)
@@ -376,7 +369,7 @@ def test_draft_ctx_keys_running_tokens(monkeypatch):
 
     ctx = "v41.draft.ctx"
     _plugins(monkeypatch, aux=_offer(ctx, "aux", select=select))
-    host.configure(["aux"], kill_switch=False)
+    host.configure(enable(["aux"]), kill_switch=False)
     slot = host.bind(ctx, lambda taps, rows, n: ("native", n))
     taps = [torch.zeros(8, 4)] * 3
     assert slot(taps, None, 6) == ("y", "scale")
@@ -397,7 +390,7 @@ def test_moe_topk_keys_its_output_width(monkeypatch):
             select=lambda cap, weights, ids, *a, **k: ids.shape[1] == 6,
         ),
     )
-    host.configure(["r"], kill_switch=False)
+    host.configure(enable(["r"]), kill_switch=False)
     native = []
     logits, bias = torch.zeros(4, 256), torch.zeros(256)
     for k in (6, 8):
@@ -465,7 +458,7 @@ def test_select_reads_only_what_the_key_holds():
 def test_the_route_cache_is_bounded(monkeypatch):
     monkeypatch.setattr(host, "_CACHE_LIMIT", 3)
     _plugins(monkeypatch, bmm=_offer(OUT, "bmm"))
-    host.configure(["bmm"], kill_switch=False)
+    host.configure(enable(["bmm"]), kill_switch=False)
     slot = host.bind(OUT, _native)
     for rows in range(1, 8):
         slot(torch.zeros(rows, 1), x, x, x)
@@ -481,7 +474,7 @@ def test_same_shape_with_other_strides_or_alignment_asks_again(monkeypatch):
         return x_fp8.is_contiguous() and x_fp8.data_ptr() % 16 == 0
 
     _plugins(monkeypatch, bmm=_offer(OUT, "bmm", select=select))
-    host.configure(["bmm"], kill_switch=False)
+    host.configure(enable(["bmm"]), kill_switch=False)
     slot = host.bind(OUT, _native)
     base = torch.zeros(8, 32)
     dense = base[:, :16].contiguous()  # [8,16] stride (16, 1)
@@ -508,7 +501,7 @@ def test_a_raising_select_declines_and_a_wrong_result_raises(monkeypatch):
         a=_offer(OUT, "a", select=lambda *a, **k: 1 / 0),
         b=_offer(OUT, "b", impl=lambda *a, **k: "only-y"),
     )
-    host.configure(["a", "b"], kill_switch=False)
+    host.configure(enable(["a", "b"]), kill_switch=False)
     slot = host.bind(OUT, _native)
     with pytest.raises(host.PluginContractError):
         slot(x, x, x, x)
@@ -593,7 +586,7 @@ def test_pad_m_reaches_the_impl(monkeypatch):
         return "y", None
 
     _plugins(monkeypatch, bmm=_offer(OUT, "bmm", impl=impl))
-    host.configure(["bmm"], kill_switch=False)
+    host.configure(enable(["bmm"]), kill_switch=False)
     host.bind(OUT, _native)(x, x, x, x)
     assert seen["valid"] is valid
     assert (seen["cap"].rows, seen["cap"].captured, seen["cap"].bucket) == (8, True, 8)
@@ -652,7 +645,7 @@ def test_a_table_miss_is_recorded_never_silent(monkeypatch, caplog):
 
 def test_an_eager_only_plugin_is_never_captured(monkeypatch):
     _plugins(monkeypatch, bmm=_offer(OUT, "bmm", graph="eager"))
-    host.configure(["bmm"], kill_switch=False)
+    host.configure(enable(["bmm"]), kill_switch=False)
     slot = host.bind(OUT, _native)
     _captured(monkeypatch, 8)
     assert slot(x, x, x, x) == ("native", 8)
@@ -665,7 +658,7 @@ def test_an_eager_only_plugin_is_never_captured(monkeypatch):
 def test_traced_calls_stay_native_without_a_graph_break(monkeypatch):
     torch._dynamo.reset()
     _plugins(monkeypatch, q=_offer(QUANT, "q", impl=lambda x, **k: (x * 100, x)))
-    host.configure(["q"], kill_switch=False)
+    host.configure(enable(["q"]), kill_switch=False)
 
     @torch.compile(backend="eager", fullgraph=True)
     def forward(t):
@@ -687,7 +680,7 @@ def _ffn_plugin(monkeypatch, select=None):
         return t * 10
 
     _plugins(monkeypatch, ffn=_offer(FFN, "ffn", impl=impl, select=select))
-    host.configure(["ffn"], kill_switch=False)
+    host.configure(enable(["ffn"]), kill_switch=False)
     return served
 
 
@@ -726,7 +719,7 @@ def test_a_compiled_opaque_seam_decides_per_execution(monkeypatch):
 
 def test_overhead_probe_reports_the_three_costs(monkeypatch):
     _plugins(monkeypatch, q=_offer(QUANT, "q", impl=lambda x, **k: (x, x)))
-    host.configure(["q"], kill_switch=False)
+    host.configure(enable(["q"]), kill_switch=False)
     probe = host.overhead_probe(QUANT, lambda t: (t, t), (x,), n=10)
     assert set(probe) == {
         "native_direct_us",
@@ -739,187 +732,6 @@ def test_overhead_probe_reports_the_three_costs(monkeypatch):
 # -- hot-plug ------------------------------------------------------------------
 
 BINDS = sorted(name for name, spec in _v41_seams().items() if spec.form == "bind")
-
-
-def test_a_hotplug_boot_binds_every_seam_and_installs_a_plan_later(monkeypatch):
-    """No plan at build: every bind seam still binds, so a later plan serves."""
-    host.configure(None, hotplug=True, kill_switch=False)
-    assert host.hotplug_enabled() is True
-    slots = {seam: host.bind(seam, _native) for seam in BINDS}  # the model build
-    assert all(slot is not _native for slot in slots.values())
-    state = host.status()
-    assert state["hotplug"] is True and state["plan_id"] is None
-    assert state["bound"] == BINDS
-
-    # Call seams dispatch from boot too: no table yet, so native.
-    native_quant = lambda v, **kw: (v, v)
-    assert host.call(QUANT, native_quant, x) == (x, x)
-    assert host.last_decision().reason == "no-table"
-
-    _plugins(
-        monkeypatch,
-        bmm=_offer(OUT, "bmm"),
-        q=_offer(QUANT, "q", impl=lambda v, **kw: (v * 2, v)),
-    )
-    plan = recipes.resolve([_recipe({OUT: ["bmm"], QUANT: ["q"]})])
-    assert host.hotplug_plan(plan) == {
-        "hotplug": True,
-        "plan_id": plan.plan_id,
-        "providers": ["bmm", "q"],
-        "aiter": [],
-        "capture_rows": [],
-        "tables": ["any"],
-    }
-    assert slots[OUT](x, x, x, x) == ("y", "scale")
-    assert torch.equal(host.call(QUANT, native_quant, x)[0], x * 2)
-    assert host.status()["plan_id"] == plan.plan_id
-    assert host.owners(OUT, "any") == ("bmm",)
-
-
-def test_hotplug_plan_takes_a_source_a_payload_or_names(monkeypatch):
-    from atom import plugin_recipe
-
-    host.configure(None, hotplug=True, kill_switch=False)
-    host.bind(OUT, _native)
-    _plugins(monkeypatch, bmm=_offer(OUT, "bmm"))
-
-    source = recipes.from_cli(None, "bmm")  # the RecipeSource a Config carries
-    installed = host.hotplug_plan(source)
-    assert installed["plan_id"] == source.plan_id
-    assert installed["providers"] == ["bmm"]
-    assert host.status()["plan_id"] == source.plan_id
-
-    payload = {"documents": [json.dumps(_recipe({OUT: ["bmm"]}))], "enable": ["bmm"]}
-    described = plugin_recipe.from_payload(payload)
-    installed = host.hotplug_plan(payload)  # recipe texts + enable names
-    assert installed["plan_id"] == described.plan_id == described.resolve().plan_id
-    assert host.status()["plan_id"] == described.plan_id
-
-    with pytest.raises(plugin_recipe.RecipeRefused):
-        host.hotplug_plan({"documents": ["not a recipe"]})
-    assert host.status()["plan_id"] == described.plan_id  # nothing changed
-
-
-def test_a_build_without_hotplug_refuses_hotplug_plan(monkeypatch):
-    host.configure(None)
-    host.bind(OUT, _native)
-    _plugins(monkeypatch, bmm=_offer(OUT, "bmm"))
-    with pytest.raises(RuntimeError, match="hot-plug boot"):
-        host.hotplug_plan(recipes.resolve([_recipe({OUT: ["bmm"]})]))
-    assert host.hotplug_enabled() is False and host.status()["hotplug"] is False
-    assert host.status()["plan_id"] is None
-
-
-def test_hotplug_plan_waits_for_the_model_build():
-    host.configure(None, hotplug=True, kill_switch=False)
-    with pytest.raises(RuntimeError, match="after the model build"):
-        host.hotplug_plan(None)
-    assert host.hotplug_enabled() is True
-
-
-def test_a_refused_hotplug_leaves_the_previous_plan_serving(monkeypatch):
-    _plugins(monkeypatch, bmm=_offer(OUT, "bmm"))
-    boot = recipes.resolve([_recipe({OUT: ["bmm"]})])
-    host.configure(boot, hotplug=True, kill_switch=False)
-    slot = host.bind(OUT, _native)
-    assert slot(x, x, x, x) == ("y", "scale")
-
-    missing = recipes.resolve([_recipe({OUT: ["ghost"]})])
-    with pytest.raises(recipes.RecipeRefused) as refused:
-        host.hotplug_plan(missing)  # no such entry point
-    assert refused.value.reason == "recipe-plugin-drift"
-
-    def broken(h):
-        raise ImportError("no kernel")
-
-    _plugins(monkeypatch, bmm=_offer(OUT, "bmm"), broken=broken)
-    with pytest.raises(recipes.RecipeRefused) as refused:
-        host.hotplug_plan(recipes.resolve([_recipe({OUT: ["broken"]})]))
-    assert refused.value.reason == "recipe-plugin-drift"
-
-    _plugins(monkeypatch, bmm=_offer(OUT, "bmm"), ghost=lambda h: None)
-    with pytest.raises(recipes.RecipeRefused) as refused:
-        host.hotplug_plan(missing)  # loads, but does not register the seam
-    assert refused.value.reason == "recipe-coverage-miss"
-
-    # The old plan, its arm and its routes are untouched by all three failures.
-    assert host.status()["plan_id"] == boot.plan_id
-    assert host.owners(OUT, "any") == ("bmm",)
-    assert slot(x, x, x, x) == ("y", "scale")
-
-
-def test_hotplug_plan_replaces_a_boot_plan_and_its_arm(monkeypatch):
-    _plugins(monkeypatch, a=_offer(OUT, "a"), b=_offer(OUT, "b"))
-    boot = recipes.resolve([_recipe({OUT: ["a"]})])
-    host.configure(boot, arm="native", hotplug=True, kill_switch=False)
-    slot = host.bind(OUT, _native)
-    assert slot(x, x, x, x) == ("native", 8)  # the boot plan's arm
-    assert host.last_decision().reason == "arm-native"
-
-    plan = recipes.resolve([_recipe({OUT: ["b"]})])
-    assert host.hotplug_plan(plan)["plan_id"] == plan.plan_id
-    # Registrations were rebuilt for the new plan: `a` is not carried over.
-    assert host.owners(OUT, "any") == ("b",)
-    assert slot(x, x, x, x) == ("y", "scale")
-
-    with pytest.raises(ValueError):  # an unknown arm installs nothing
-        host.hotplug_plan(boot, arm="nope")
-    assert host.status()["plan_id"] == plan.plan_id and host.owners(OUT, "any") == (
-        "b",
-    )
-    host.hotplug_plan(boot, arm="native")
-    assert host.owners(OUT, "any") == ()
-    assert slot(x, x, x, x) == ("native", 8)
-
-
-def test_status_reports_the_hotplug_boot_and_the_installed_tables(monkeypatch):
-    host.configure(None, hotplug=True, kill_switch=False)
-    host.bind(OUT, _native)
-    _plugins(monkeypatch, bmm=_offer(OUT, "bmm"))
-    plan = recipes.resolve([_recipe({OUT: ["bmm"]}, mode="capture", buckets=[48, 40])])
-    installed = host.hotplug_plan(plan)
-    assert installed["capture_rows"] == [40, 48]
-    assert installed["tables"] == ["40", "48"]
-    state = host.status()
-    assert state["hotplug"] is True and state["plan_id"] == plan.plan_id
-    assert state["capture_rows"] == [40, 48]
-    assert state["seams"][OUT] == {"tables": {"40": ("bmm",), "48": ("bmm",)}}
-
-
-def test_a_hotplug_boot_bakes_the_opaque_span_and_routes_it_after_install(
-    monkeypatch,
-):
-    """The build-time opaque op exists before the plan that serves it does."""
-    host.configure(None, hotplug=True, kill_switch=False)
-    served = []
-
-    def impl(t, *, capability, valid_rows):
-        served.append(t.shape[0])
-        return t * 10
-
-    _plugins(monkeypatch, ffn=_offer(FFN, "ffn", impl=impl))
-    slot = host.bind(FFN, lambda t: t + 1, layer="hotplug.L", fake=torch.empty_like)
-    assert "hotplug.L" in host.status()["span_ops"]
-    # The bound callable is the opaque op's wrapper around `_spans[layer]`.
-    op = torch.ops.atom_plugin.span.default
-    assert any(cell.cell_contents is op for cell in slot.__closure__)
-    # Before the install the op's body is the seam's native call.
-    assert torch.equal(slot(torch.ones(3)), torch.full((3,), 2.0))
-    assert torch.equal(
-        host._spans["hotplug.L"][0](torch.ones(2), None), torch.full((2,), 2.0)
-    )
-    host.hotplug_plan(recipes.resolve([_recipe({FFN: ["ffn"]})]))
-    # After it, the same op runs the owner `hotplug_plan` installed.
-    assert torch.equal(slot(torch.ones(3)), torch.full((3,), 10.0))
-    assert torch.equal(
-        host._spans["hotplug.L"][0](torch.ones(2), None), torch.full((2,), 10.0)
-    )
-    assert served == [3, 2]
-    # `fake` still answers tracing, and `_spans[layer]` is what the op runs.
-    meta = slot(torch.empty(5, device="meta"))
-    assert (meta.shape, meta.device.type) == ((5,), "meta")
-    host._spans["hotplug.L"] = (lambda t, extra: t * 7, lambda t, extra: t)
-    assert torch.equal(slot(torch.ones(1)), torch.full((1,), 7.0))
 
 
 # -- recipes -------------------------------------------------------------------
@@ -945,10 +757,10 @@ def test_a_recipe_resolves_to_a_deterministic_plan():
     "mutate, reason",
     [
         (lambda d: d.update(schema="x"), "recipe-schema"),
-        (lambda d: d.update(model_arch="Llama"), "recipe-model-mismatch"),
+        (lambda d: d.update(arch="Llama"), "recipe-model-mismatch"),
         (lambda d: d.update(requires={"atom_hook_api": ">=4"}), "recipe-pin-mismatch"),
         (
-            lambda d: d["plan"]["seams"].update({OUT: ["ghost"]}),
+            lambda d: d["seams"].update({OUT: ["ghost"]}),
             "recipe-unknown-provider",
         ),
         (lambda d: d["plugins"][0].update(serves=[]), "recipe-plugin-drift"),
@@ -967,11 +779,11 @@ def test_recipe_refusals(mutate, reason):
 
 def test_two_owners_need_a_declared_partition():
     with pytest.raises(recipes.RecipeRefused) as refused:
-        recipes.resolve([_recipe({OUT: ["a", "b"]})])
+        recipes.resolve(
+            [_recipe({OUT: ["a", "b"]}, defaults={"allow_partition": False})]
+        )
     assert refused.value.reason == "recipe-conflict"
-    plan = recipes.resolve(
-        [_recipe({OUT: ["a", "b"]}, defaults={"allow_partition": True})]
-    )
+    plan = recipes.resolve([_recipe({OUT: ["a", "b"]})])  # partitions by default
     assert plan.tables["any"][OUT] == ("a", "b")
 
 
@@ -1002,22 +814,17 @@ def test_load_reads_a_strategy_directory(tmp_path):
     assert recipes.load(tmp_path / "eager.json").tables.keys() == {"eager"}
 
 
-def test_cli_may_only_narrow_a_recipe(tmp_path):
+def test_the_cli_takes_a_recipe_and_an_arm(tmp_path):
     path = tmp_path / "r.json"
-    doc = _recipe({OUT: ["a", "b"]}, defaults={"allow_partition": True})
+    doc = _recipe({OUT: ["a", "b"]}, arms={"only-b": ["b"]})
     path.write_text(json.dumps(doc))
-    narrowed = recipes.from_cli(str(path), "b").resolve()
-    assert narrowed.arms["plugin"] == ("b",)
-    assert narrowed.plan_id != recipes.from_cli(str(path), None).plan_id
-    with pytest.raises(recipes.RecipeRefused):
-        recipes.from_cli(str(path), "c")
-    with pytest.raises(recipes.RecipeRefused) as refused:
-        recipes.from_cli(str(path), None, arm="ghost")
-    assert refused.value.reason == "recipe-unknown-arm"
-    assert recipes.from_cli(None, None) is None
-    source = recipes.from_cli(None, "a, b")
-    assert source.enable == ("a", "b") and source.documents == ()
+    source = recipes.from_cli(str(path))
     assert source.resolve().providers == ("a", "b")
+    assert recipes.from_cli(str(path), "only-b").plan_id == source.plan_id
+    with pytest.raises(recipes.RecipeRefused) as refused:
+        recipes.from_cli(str(path), arm="ghost")
+    assert refused.value.reason == "recipe-unknown-arm"
+    assert recipes.from_cli(None) is None
 
 
 def test_runtime_expect_checks_the_server():
@@ -1049,15 +856,22 @@ REPO_ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
     "argv, providers, arm",
     [
         ([], None, "plugin"),
-        (["--plugin-enable", " bmm8k,,silu8k "], ("bmm8k", "silu8k"), "plugin"),
-        (["--plugin-enable", "a", "--plugin-arm", "native"], ("a",), "native"),
+        (["--plugin-recipe", "{recipe}"], ("a", "b"), "plugin"),
+        (
+            ["--plugin-recipe", "{recipe}", "--plugin-arm", "native"],
+            ("a", "b"),
+            "native",
+        ),
     ],
 )
-def test_plugin_args_reach_the_config(argv, providers, arm):
+def test_plugin_args_reach_the_config(argv, providers, arm, tmp_path):
     from atom.config import Config
     from atom.model_engine.arg_utils import EngineArgs
     from atom.utils.arg_parser import FlexibleArgumentParser
 
+    recipe = tmp_path / "r.json"
+    recipe.write_text(json.dumps(_recipe({OUT: ["a", "b"]})))
+    argv = [a.format(recipe=recipe) for a in argv]
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     kwargs = EngineArgs.from_cli_args(parser.parse_args(argv))._get_engine_kwargs()
     source = kwargs["plugin_source"]
@@ -1082,7 +896,7 @@ def _a_recipe_source(tmp_path):
     eager = _recipe({OUT: ["a"]}, mode="eager")
     (tmp_path / "b8.json").write_text(json.dumps(capture))
     (tmp_path / "eager.json").write_text(json.dumps(eager))
-    return recipes.from_cli(str(tmp_path), "a,c", "plugin")
+    return recipes.from_cli(str(tmp_path), "plugin")
 
 
 def test_a_config_with_a_plan_copies_and_pickles(tmp_path):
@@ -1099,7 +913,7 @@ def test_a_config_with_a_plan_copies_and_pickles(tmp_path):
     plan = source.resolve()
     assert pickle.loads(pickle.dumps(plan)) == plan == copy.deepcopy(plan)
     assert set(plan.tables) == {"eager", 8, 16}
-    assert plan.arms["plugin"] == ("a", "c")
+    assert plan.arms["plugin"] == ("a", "b", "c")
 
 
 def _plan_id_in_a_child(config):
@@ -1117,9 +931,12 @@ def test_a_config_with_a_plan_crosses_a_spawned_process(tmp_path):
         )
 
 
-def test_a_source_that_resolves_otherwise_refuses():
-    source = recipes.from_cli(None, "a")
-    forged = recipes.RecipeSource(source.documents, ("b",), source.plan_id, False)
+def test_a_source_that_resolves_otherwise_refuses(tmp_path):
+    path = tmp_path / "r.json"
+    path.write_text(json.dumps(_recipe({OUT: ["a"]})))
+    source = recipes.from_cli(str(path))
+    other = recipes._canonical(_recipe({OUT: ["b"]}))
+    forged = recipes.RecipeSource((other,), source.plan_id, False)
     with pytest.raises(recipes.RecipeRefused):
         forged.resolve()
 
@@ -1141,7 +958,7 @@ def test_status_lists_the_capture_rows_of_a_recipe_set(tmp_path, monkeypatch):
     eager = _recipe({QUANT: ["q16k"]}, mode="eager")
     eager["defaults"] = {"strict_overlap": True}
     (tmp_path / "eager.json").write_text(json.dumps(eager))
-    source = pickle.loads(pickle.dumps(recipes.from_cli(str(tmp_path), None)))
+    source = pickle.loads(pickle.dumps(recipes.from_cli(str(tmp_path))))
 
     def both(h):
         _offer(OUT, "bmm")(h)
@@ -1174,7 +991,7 @@ def test_a_bad_recipe_refuses_at_argument_time(tmp_path):
         args._get_engine_kwargs()
 
 
-def test_the_plan_keys_the_compile_cache_only_when_set():
+def test_the_plan_keys_the_compile_cache_only_when_set(tmp_path):
     from atom.config import Config
 
     base = {
@@ -1199,7 +1016,10 @@ def test_the_plan_keys_the_compile_cache_only_when_set():
     def key(**kw):
         return Config.compute_hash(types.SimpleNamespace(**base, **kw))
 
-    a, b = recipes.from_cli(None, "a"), recipes.from_cli(None, "b")
+    (tmp_path / "a.json").write_text(json.dumps(_recipe({OUT: ["a"]})))
+    (tmp_path / "b.json").write_text(json.dumps(_recipe({OUT: ["b"]})))
+    a = recipes.from_cli(str(tmp_path / "a.json"))
+    b = recipes.from_cli(str(tmp_path / "b.json"))
     assert key() == key(plugin_source=None)
     assert key(plugin_source=a) not in (key(), key(plugin_source=b))
 
@@ -1212,8 +1032,6 @@ def test_model_runner_configures_the_host_before_building():
     build = source.index("self.model = get_model(", configure)
     assert source.index("config.plugin_source", configure) < build
     assert source.index("arm=config.plugin_arm", configure) < build
-    hotplug = 'hotplug=getattr(config, "plugin_hotplug", False)'
-    assert hotplug in source[configure:build]
 
 
 # -- V4.1 seams --------------------------------------------------------------------
@@ -1245,28 +1063,17 @@ def test_every_seam_is_reached_exactly_once_from_its_target():
             if form != "span_op":
                 where = path.relative_to(REPO_ROOT).as_posix()
                 found.setdefault(seam, []).append((form, where))
-    expected = {
-        name: [
-            ("site" if s.form == "call" and s.name in _DECORATED else s.form, s.target)
-        ]
-        for name, s in _v41_seams().items()
-        if s.form != "window"  # verified as a paired scope by test_together_plugin_ab
-        # the seams whose call sites are ATOM's shared code (the rest are in
-        # plugin_poc's V4.1 model)
-        and (REPO_ROOT / s.target).is_file()
-        # superseded by the host's model.install; called by HOOK_API 2 ATOMs only
-        and name != "v41.mono.install"
+    # ATOM's shared code calls one V4.1 seam itself; every other seam is a
+    # call site of a plugin package's model.
+    assert {k: v for k, v in found.items() if k.startswith("v41.")} == {
+        QUANT: [("site", "atom/model_ops/blockscale.py")]
     }
-    assert {k: v for k, v in found.items() if k in expected} == expected
-
-
-_DECORATED = {"v41.op.quant_fp8_g32", "v41.attn.attend"}
 
 
 def test_seam_specs_are_self_consistent():
     for name, spec in _v41_seams().items():
         assert spec.name == name and spec.contract >= 1
-        assert spec.kind in ("op", "region") and spec.form in ("bind", "call", "window")
+        assert spec.kind in ("op", "region") and spec.form in ("bind", "call")
         assert spec.graph in ("eager", "capture_safe", "opaque_op")
         assert set(spec.key) <= set(spec.inputs)
         assert spec.parent is None or host.SEAMS[spec.parent].kind == "region"

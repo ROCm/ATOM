@@ -54,11 +54,6 @@ def _flag_env(name: str, default: str = "0") -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
-def _path_list_env(name: str) -> tuple[str, ...]:
-    """A path-separator list (``os.pathsep``: ``:`` on POSIX, ``;`` on Windows)."""
-    return tuple(part for part in os.getenv(name, "").split(os.pathsep) if part)
-
-
 def _preload_mode() -> str:
     """ATOM_PRELOAD: "off", "server" (1: take the weights from a weight cache
     daemon) or "daemon" (be one)."""
@@ -169,6 +164,36 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS": lambda: _nonnegative_int_env(
+        "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS", 0
+    ),
+    "ATOM_DP_SESSION_PREFIX_OWNER_MAX_EXTRA_REQS": lambda: _nonnegative_int_env(
+        "ATOM_DP_SESSION_PREFIX_OWNER_MAX_EXTRA_REQS", 8
+    ),
+    "ATOM_PREFILL_COST_CEIL": lambda: (
+        os.getenv("ATOM_PREFILL_COST_CEIL", "0").lower() in ("1", "true")
+    ),
+    "ATOM_PREFILL_DECODE_INTERVAL_BUSY": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL_BUSY", "0")
+    ),
+    "ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS", "48")
+    ),
+    "ATOM_PREFILL_LONG_CAP_BUSY": lambda: int(
+        os.getenv("ATOM_PREFILL_LONG_CAP_BUSY", "0")
+    ),
+    "ATOM_PREFILL_LONG_CAP_BUSY_SEQS": lambda: int(
+        os.getenv("ATOM_PREFILL_LONG_CAP_BUSY_SEQS", "48")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_ROWS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_ROWS", "0")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_LONG_ROWS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_LONG_ROWS", "4096")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS", "32")
+    ),
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
     in {"1", "true"},
@@ -730,27 +755,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # error naming why not; "0": off.
     # Plugin host kill switch (atom/plugin_host.py): "0" serves every seam
     # natively and passes AITER an empty enable list. It cannot enable a plugin;
-    # only --plugin-recipe / --plugin-enable do.
+    # only --plugin-recipe does.
     "ATOM_PLUGIN_HOST": lambda: os.getenv("ATOM_PLUGIN_HOST", "1") != "0",
     # "1": ask every owner of a seam and raise when two accept one call (their
     # cells overlap). Off by default; like the switch above it enables nothing.
     "ATOM_PLUGIN_HOST_STRICT": lambda: os.getenv("ATOM_PLUGIN_HOST_STRICT", "0") == "1",
-    # Plugin hot-plug: "1" is the env fallback for --plugin-hotplug. It makes
-    # the host bind every seam at model build and exposes the internal
-    # POST /plugin/hotplug endpoint, which switches the plan/arm and recaptures
-    # the requested decode graphs in place. It enables no plugin and changes
-    # no routing by itself.
-    "ATOM_PLUGIN_HOTPLUG": lambda: os.getenv("ATOM_PLUGIN_HOTPLUG", "0") == "1",
-    # Plugin dev mode (atom/plugin_host.py): "1" is the env fallback for
-    # --plugin-dev. It only works on a --plugin-hotplug boot and needs at least
-    # one root in ATOM_PLUGIN_DEV_ROOTS: a `reload: true` POST /plugin/hotplug
-    # then re-imports the plugin Python modules under those allowlisted trees
-    # and re-runs every planned provider's prepare(device). Off by default; it
-    # leaks the previous native library versions and is not a production path.
-    "ATOM_PLUGIN_DEV": lambda: _flag_env("ATOM_PLUGIN_DEV", "0"),
-    # Path-separator list of absolute plugin source trees a dev reload may
-    # touch (the env fallback for repeated --plugin-dev-root).
-    "ATOM_PLUGIN_DEV_ROOTS": lambda: _path_list_env("ATOM_PLUGIN_DEV_ROOTS"),
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest

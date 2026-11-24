@@ -45,28 +45,13 @@ _COVERS = {
     "v41.attn.out_full": ("v41.attn.out",),
     "v41.attn.attend_out": ("v41.attn.attend",),
 }
-# The transition window spans the FFN's native combine: the FFN stays native.
-_EXCLUDES = {"v41.block.transition": ("v41.block.ffn",)}
+_EXCLUDES: dict[str, tuple[str, ...]] = {}
 
 
 def specs() -> list[SeamSpec]:
     from dataclasses import replace
 
     out = [
-        _seam(
-            "v41.block.transition",
-            1,
-            "region",
-            "window",
-            ("routed", "shared"),
-            (),
-            ("q_lora", "kv_pre"),
-            (),
-            "capture_safe",
-            "atom/plugin_transition.py",
-            boundary="collective+state",
-            doc="native MoE combine and mHC with paired pre/post callbacks",
-        ),
         _seam(
             "v41.block.ffn",
             1,

@@ -24,7 +24,6 @@ from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_H
 from torch import nn
 from transformers import PretrainedConfig
 
-from atom import plugin_host
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -116,40 +115,6 @@ from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
 from atom.utils.tbo.ubatch_splitting import NUM_TBO_UBATCHES
 from atom.utils.tbo.ubatching import tbo_enabled, tbo_on_comm
-
-# The `v41.moe.topk` seam: its contract, written at its call site in this file.
-_SEAM_MOE_TOPK = plugin_host.seam(
-    plugin_host.SeamSpec(
-        name="v41.moe.topk",
-        contract=1,
-        kind="op",
-        form="call",
-        inputs=(
-            "topk_weights",
-            "topk_ids",
-            "router_logits",
-            "e_score_correction_bias",
-            "renormalize",
-            "route_scale",
-        ),
-        kwargs=("score_func", "num_valid_rows"),
-        returns=(),
-        key=(
-            "router_logits",
-            "topk_weights",
-            "topk_ids",
-            "e_score_correction_bias",
-            "renormalize",
-            "route_scale",
-        ),
-        graph="capture_safe",
-        parent="v41.block.ffn",
-        doc="topk_gating in FusedMoE.select_experts, in place",
-        scope="layers.*.ffn.experts",
-        target="atom/model_ops/moe.py",
-    ),
-    source="atom/model_ops/moe.py",
-)
 
 logger = logging.getLogger("atom")
 
@@ -536,43 +501,6 @@ def dp_gather_routed_rows(
 @torch_compile_guard()
 def get_max_tokens_across_dispatchers(input: torch.Tensor) -> int:
     return input.item()
-
-
-_STATIC_PLACEMENT_FILES: dict = {}
-
-
-def _load_static_placement(
-    layer_id, num_routed, expert_layout, eplb_enabled, spec=None
-):
-    """A static relabeling of one layer's routed experts (load order + router
-    rows) that spreads the experts a workload routes to most over the EP
-    ranks: perm[checkpoint expert] = the id it is served under. ``spec`` is a
-    JSON file path or a ``{layer_id: perm}`` mapping (a recipe's
-    ``model_options.expert_placement``). None when unset, when the layer has
-    no entry of this expert count, with fused shared experts or with EPLB."""
-    import json
-
-    if not spec or layer_id is None or eplb_enabled:
-        return None
-    if expert_layout.num_fused_shared_experts or expert_layout.num_redundant:
-        return None
-    if isinstance(spec, str):
-        table = _STATIC_PLACEMENT_FILES.get(spec)
-        if table is None:
-            with open(spec) as f:
-                table = _STATIC_PLACEMENT_FILES[spec] = json.load(f)
-    else:
-        table = spec
-    perm = table.get(str(layer_id))
-    if perm is None or len(perm) != num_routed:
-        return None
-    perm = [int(p) for p in perm]
-    if sorted(perm) != list(range(num_routed)):
-        raise ValueError(
-            f"expert placement: layer {layer_id} is not a permutation "
-            f"of {num_routed} experts"
-        )
-    return perm
 
 
 def _select_logical(
@@ -3825,11 +3753,6 @@ class FusedMoE(torch.nn.Module):
             use_all2all=self.moe_parallel_config.use_all2all_kernels,
             eplb_enabled=eplb_enabled,
         )
-        # Static expert placement: checkpoint expert id -> served id (or None).
-        # Off unless the owning model opts in before the load
-        # (`set_static_placement`): its router rows must be relabeled alike.
-        self._static_placement = None
-        self._placement_args = (layer_id, num_experts, eplb_enabled)
         # Dispatch space: the id bound the kernels see, not the routed width.
         self.global_num_experts = self.expert_layout.num_physical
         self.num_redundant_experts = self.expert_layout.num_redundant
@@ -4978,22 +4901,9 @@ class FusedMoE(torch.nn.Module):
             assert shard_id in ("w1", "w3")
             expert_data.copy_(loaded_weight)
 
-    def set_static_placement(self, spec) -> list[int] | None:
-        """Opt this layer into a static expert placement before its weights
-        load (`_load_static_placement`); the caller relabels its router rows.
-        Returns the permutation, or None when it does not apply here."""
-        layer_id, num_routed, eplb_enabled = self._placement_args
-        self._static_placement = _load_static_placement(
-            layer_id, num_routed, self.expert_layout, eplb_enabled, spec
-        )
-        return self._static_placement
-
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         if self.expert_map is None:
             return expert_id
-        placement = getattr(self, "_static_placement", None)
-        if placement is not None and 0 <= expert_id < len(placement):
-            expert_id = placement[expert_id]
         return self.expert_map[
             physical_expert_id(
                 expert_id,
@@ -5567,9 +5477,7 @@ class FusedMoE(torch.nn.Module):
                     if fuse_shared or scoring_func == "sqrtsoftplus"
                     else 1.0
                 )
-                plugin_host.call(
-                    "v41.moe.topk",
-                    topk_gating,
+                topk_gating(
                     topk_weights,
                     topk_ids,
                     router_logits,

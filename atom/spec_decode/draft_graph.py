@@ -20,13 +20,6 @@ if TYPE_CHECKING:
     from atom.config import Config
 
 
-def outside_pool(tensor: torch.Tensor) -> torch.Tensor:
-    """Kept for callers that mark a pass's own storage: the graph knows
-    which outputs its pool allocated (``ReqGraph.allocated``), so a mark
-    changes nothing."""
-    return tensor
-
-
 def _owned(value: Any, clones: Any) -> Any:
     """``value`` with every tensor ``clones`` marks (``ReqGraph.allocated``:
     in the graph pool) cloned out of it; the rest -- a staged input, a buffer

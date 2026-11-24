@@ -67,7 +67,6 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.observability import tracing
-from atom.plugin_recipe import engine_options_for
 from atom.sampling_params import RequiredChannel
 from atom.structured_output import StructuredRequest, is_structured
 from atom.utils import envs, get_hf_text_config
@@ -690,7 +689,7 @@ class Scheduler:
     # on to keep what was running (see `preempt_running`).
     can_recompute_prompts = True
     pd_admission: PdAdmissionController | None = None
-    # engine.prefill_short_first_rows (`_short_first_order`); off for a scheduler
+    # ATOM_PREFILL_SHORT_FIRST_ROWS (`_short_first_order`); off for a scheduler
     # assembled without `__init__`.
     _short_first_rows = 0
 
@@ -729,21 +728,19 @@ class Scheduler:
         # steps, tokens, own cost, target, steps shrunk
         self._balance_stats = [0, 0, 0.0, 0.0, 0]
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
-        # A plugin recipe's `engine` options (all off without one).
-        engine = engine_options_for(config)
         # Busy-phase long-prefill cap (0 = off); see `_long_prefill_cap`.
-        self._busy_long_prefill_cap = engine.prefill_long_cap_busy
-        self._busy_long_prefill_seqs = engine.prefill_long_cap_busy_seqs
+        self._busy_long_prefill_cap = envs.ATOM_PREFILL_LONG_CAP_BUSY
+        self._busy_long_prefill_seqs = envs.ATOM_PREFILL_LONG_CAP_BUSY_SEQS
         if self._busy_long_prefill_cap < 0 or self._busy_long_prefill_seqs < 1:
             raise ValueError(
-                "engine.prefill_long_cap_busy must be non-negative and "
-                "engine.prefill_long_cap_busy_seqs positive; got "
+                "ATOM_PREFILL_LONG_CAP_BUSY must be non-negative and "
+                "ATOM_PREFILL_LONG_CAP_BUSY_SEQS positive; got "
                 f"{self._busy_long_prefill_cap}, {self._busy_long_prefill_seqs}"
             )
         # Short requests first (0 = arrival order); see `_short_first_order`.
-        self._short_first_rows = engine.prefill_short_first_rows
-        self._short_first_long_rows = engine.prefill_short_first_long_rows
-        self._short_first_max_skips = engine.prefill_short_first_max_skips
+        self._short_first_rows = envs.ATOM_PREFILL_SHORT_FIRST_ROWS
+        self._short_first_long_rows = envs.ATOM_PREFILL_SHORT_FIRST_LONG_ROWS
+        self._short_first_max_skips = envs.ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS
         if (
             self._short_first_rows < 0
             or self._short_first_max_skips < 0
@@ -753,8 +750,8 @@ class Scheduler:
             )
         ):
             raise ValueError(
-                "engine.prefill_short_first_rows and engine.prefill_short_first_max_skips "
-                "must be non-negative, engine.prefill_short_first_long_rows positive "
+                "ATOM_PREFILL_SHORT_FIRST_ROWS and ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS "
+                "must be non-negative, ATOM_PREFILL_SHORT_FIRST_LONG_ROWS positive "
                 f"and below --max-num-batched-tokens ({self.max_num_batched_tokens}); "
                 f"got {self._short_first_rows}, {self._short_first_max_skips}, "
                 f"{self._short_first_long_rows}"
@@ -1555,7 +1552,7 @@ class Scheduler:
         num_batched_tokens: int,
     ) -> tuple[int, int]:
         """`_resume_partial_prefills` for the long prompts in progress under
-        engine.prefill_short_first_rows, after the short requests. The tokens of
+        ATOM_PREFILL_SHORT_FIRST_ROWS, after the short requests. The tokens of
         the budget held for them are the oldest prompt's whatever the cost
         target: the short requests were charged first, and without this a rank
         over the target would leave its long prompts where they are."""
@@ -1586,11 +1583,11 @@ class Scheduler:
         self,
     ) -> tuple[list[Sequence], list[Sequence], Sequence | None]:
         """This rank's prefill order for one tick under
-        engine.prefill_short_first_rows, a two-tier key. The front tier is not
+        ATOM_PREFILL_SHORT_FIRST_ROWS, a two-tier key. The front tier is not
         reordered by length: a preemption victim, and a request passed over
-        engine.prefill_short_first_max_skips times (`_count_passed_over`), which
+        ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS times (`_count_passed_over`), which
         bounds how long a long prompt can be starved. The rest goes by the
-        prefill work left: the requests with at most engine.prefill_short_first_rows
+        prefill work left: the requests with at most ATOM_PREFILL_SHORT_FIRST_ROWS
         new tokens left ("short") ahead of the longer prompts. Arrival order
         holds inside each group.
 
@@ -1598,7 +1595,7 @@ class Scheduler:
         serves it now, a partial prefill has its own progress.
 
         The long prompts in progress resume after the short requests, on the
-        engine.prefill_short_first_long_rows tokens of the step held for them
+        ATOM_PREFILL_SHORT_FIRST_LONG_ROWS tokens of the step held for them
         (`_resume_long_partials`) and what the short requests left.
 
         Reorders `waiting` in place up to the first request that cannot be
@@ -2607,7 +2604,7 @@ class Scheduler:
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
         #
-        # With engine.prefill_short_first_rows the long prompts in progress resume
+        # With ATOM_PREFILL_SHORT_FIRST_ROWS the long prompts in progress resume
         # after Phase 2 has admitted the short requests (`_short_first_order`):
         # `late_partials`, due when Phase 2 reaches `late_before` or ends. Until
         # then `held` tokens of the budget count as batched, which keeps them
@@ -4994,7 +4991,7 @@ class Scheduler:
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
         # What keeps it ahead of the short requests when
-        # engine.prefill_short_first_rows reorders `waiting`.
+        # ATOM_PREFILL_SHORT_FIRST_ROWS reorders `waiting`.
         seq.is_preempted = True
         pos = self._behind_settled_resumes()
         self.waiting.insert(pos, seq)

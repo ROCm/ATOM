@@ -119,10 +119,6 @@ class EngineCore:
         self._ingested_seqs = 0
         self._last_backlog_report: tuple[int, int] | None = None
         self._next_backlog_report = 0.0
-        # The engine's own Config. Utility handlers that gate on a server flag
-        # (`plugin_hotplug`, topology) read it from here; nothing else needs the
-        # reference, and the workers own their own copies.
-        self.config = config
         self._kv_progress_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
@@ -143,13 +139,6 @@ class EngineCore:
         self._rl_weights_inconsistent = False
         # pause_generation .. resume_generation: nothing new is scheduled.
         self._generation_paused = False
-        # The plugin round a benchmark/evaluation run is holding, if any: the
-        # run's id and when it began.  A hot-plug is refused while one is
-        # active instead of swapping the plan under the measurement; these two
-        # attributes are all a round touches, so the scheduler and the model
-        # loop never see it (see engine_utility's round handlers).
-        self.plugin_round_id: str | None = None
-        self.plugin_round_started_at: float | None = None
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the
@@ -323,9 +312,7 @@ class EngineCore:
         ):
             return
         from atom.model_engine.prefill_delayer import PrefillDelayer
-        from atom.plugin_recipe import engine_options_for
 
-        engine = engine_options_for(config)
         self.scheduler.set_prefill_delayer(
             PrefillDelayer(
                 dp_size=config.parallel_config.data_parallel_size,
@@ -342,9 +329,8 @@ class EngineCore:
                 exchange_prefill_costs=self.scheduler.cost_balance,
                 cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
                 admit_policy=config.prefill_admit_policy,
-                busy_decode_interval=engine.prefill_decode_interval_busy,
-                busy_decode_seqs=engine.prefill_decode_interval_busy_seqs,
-                cost_ceil=engine.prefill_cost_ceil,
+                busy_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL_BUSY,
+                busy_decode_seqs=envs.ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS,
             )
         )
 

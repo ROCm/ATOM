@@ -399,7 +399,7 @@ class PrefixSpreadRouter:
         )
         return Route(rank, "explicit_total", credit, loaded)
 
-    # -- index only (session affinity with engine.dp_session_prefix_owner_tokens) --
+    # -- index only (session affinity with ATOM_DP_SESSION_PREFIX_OWNER_TOKENS) --
 
     def confirmed_hits(self, seq: Any, n_ranks: int) -> dict[int, int]:
         """Longest prefix of `seq`'s prompt each rank holds from a prefill that

@@ -152,8 +152,8 @@ def get_model(config: Config, device: torch.device, load: ModelLoader) -> nn.Mod
 
     torch.set_default_dtype(config.torch_dtype)
     arch = config.hf_config.architectures[0]
-    # Under a plugin plan (or a hot-plug boot) the architecture's plugin
-    # variant, the one with the seams in it; else ATOM's own model.
+    # Under a plugin plan the recipe's model class (a plugin package's model,
+    # with its seams in it); else ATOM's own model.
     model_class = resolve_obj_by_qualname(
         plugin_host.model_class_for(arch, support_model_arch_dict[arch])
     )

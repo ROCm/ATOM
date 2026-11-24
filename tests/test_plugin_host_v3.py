@@ -47,9 +47,7 @@ def fresh_host(monkeypatch):
 
 
 def _plan(**fields):
-    return recipes.resolve(
-        [{"schema": recipes.RECIPE_SCHEMA_V2, "arch": ARCH, **fields}]
-    )
+    return recipes.resolve([{"schema": recipes.RECIPE_SCHEMA, "arch": ARCH, **fields}])
 
 
 # -- recipe: aiter by op, plugin pins -----------------------------------------
@@ -58,16 +56,8 @@ def _plan(**fields):
 def test_aiter_providers_grouped_by_op_keep_one_global_order():
     plan = _plan(aiter={"topk_gating": ["b", "a"], "quant": ["a", "c"]})
     assert plan.aiter == ("b", "a", "c")
-    with pytest.raises(recipes.RecipeRefused, match="aiter by op requires schema 2"):
-        recipes.resolve(
-            [
-                {
-                    "schema": recipes.RECIPE_SCHEMA,
-                    "model_arch": ARCH,
-                    "aiter": {"x": ["a"]},
-                }
-            ]
-        )
+    with pytest.raises(recipes.RecipeRefused, match="aiter ops must be names"):
+        _plan(aiter={"": ["a"]})
 
 
 @pytest.mark.parametrize("pins", [{"p": "sha1:00"}, {"p": "sha256:" + "0" * 63}, ["p"]])
@@ -222,8 +212,6 @@ def test_the_v41_seams_are_written_at_their_call_sites():
     root = Path(__file__).resolve().parents[1]
     site = (root / "atom/model_ops/blockscale.py").read_text(encoding="utf-8")
     assert "plugin_host.seam(" in site and 'name="v41.op.quant_fp8_g32"' in site
-    assert host.SEAMS["v41.block.transition"].target == "atom/plugin_transition.py"
-    assert host.SEAMS["v41.block.transition"].excludes == ("v41.block.ffn",)
     assert (
         "v41.mono.install" in host.boot_only() and "model.install" in host.boot_only()
     )
@@ -504,13 +492,6 @@ def test_shared_weights_are_prepared_once_for_every_configuration():
     assert host.weights_changed() == ["0.bias", "0.weight"]
     report = host.log_route_report("test")
     assert "0.weight" in report["weights_changed"]
-
-
-def test_hook_api_3_still_loads_hook_api_2_plugins_and_recipes():
-    assert host.HOOK_API == 3 and host.api_satisfies(">=2,<3")
-    assert host.api_satisfies(">=3,<4") and not host.api_satisfies(">=4")
-    assert not host.api_satisfies(">=2,<3", 3)
-    _plan(requires={"atom_hook_api": ">=2,<3"})
 
 
 def test_one_inferred_owner_may_serve_several_seams():

@@ -29,31 +29,11 @@ from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_qu
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
-from atom import plugin_host
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
-
-# The `v41.attn.qk_norm` seam: its contract, written at its call site in this file.
-_SEAM_ATTN_QK_NORM = plugin_host.seam(
-    plugin_host.SeamSpec(
-        name="v41.attn.qk_norm",
-        contract=1,
-        kind="op",
-        form="bind",
-        inputs=("q", "k", "q_weight", "k_weight", "eps_q"),
-        kwargs=("eps_k", "amax_floor"),
-        returns=("q_fp8", "q_scale", "k_out"),
-        key=("q", "k", "eps_q"),
-        graph="capture_safe",
-        doc="dual RMSNorm, q to MXFP8: the kernel DualRMSNormMXFP8 calls",
-        scope="layers.*.attn",
-        target="atom/model_ops/layernorm.py",
-    ),
-    source="atom/model_ops/layernorm.py",
-)
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -1379,11 +1359,6 @@ class DualRMSNormMXFP8:
         self.k_norm = k_norm
         self.prefix = prefix
         self.amax_floor = amax_floor
-        self._kernel = plugin_host.bind(
-            "v41.attn.qk_norm",
-            fused_dual_rmsnorm_mxfp8_quant,
-            capability={"quant": plugin_host.MX, "flags": {"amax_floor": amax_floor}},
-        )
 
     @mark_trace
     def __call__(
@@ -1392,7 +1367,7 @@ class DualRMSNormMXFP8:
         # The kernel takes matrices; fold the leading dims away and give them
         # back, as the RMSNorm branches do, so a caller does not.
         lead = q.shape[:-1]
-        q_fp8, q_scale, k_out = self._kernel(
+        q_fp8, q_scale, k_out = fused_dual_rmsnorm_mxfp8_quant(
             q.reshape(-1, q.shape[-1]),
             k.reshape(-1, k.shape[-1]),
             self.q_norm.weight,
