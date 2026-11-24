@@ -2577,9 +2577,11 @@ models:
         ATOM_DSPARK_DISABLE_COMPILE: "1"
         ATOM_DISABLE_MMAP: "true"
         ATOM_PD_RANK_MAPPING_POLICY: none
-        # The recipe's Mooncake settings, and no others.
+        # The recipe's Mooncake settings, on the fabric's lossless RoCE class
+        # (RCCL's NCCL_IB_TC): Mooncake sends on traffic class 0 otherwise.
         MC_NUM_QP_PER_EP: "1"
         MC_LOG_LEVEL: INFO
+        MC_IB_TC: "104"
         MOONCAKE_DISABLE_HIP_DMABUF: "1"
         HSA_ENABLE_IPC_MODE_LEGACY: "1"
         NCCL_DEBUG: WARN

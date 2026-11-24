@@ -379,9 +379,12 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
             '--warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \\', script
         )
 
-    def test_every_mooncake_process_runs_the_recipes_transport_settings(self):
+    def test_every_mooncake_process_runs_the_recipes_settings_on_the_lossless_class(
+        self,
+    ):
         settings = {
             "MC_NUM_QP_PER_EP": "1",
+            "MC_IB_TC": "104",
             "MC_WORKERS_PER_CTX": None,
             "MC_MAX_WR": None,
             "MC_IB_PCI_RELAXED_ORDERING": None,
