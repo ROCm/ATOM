@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Triton launch for a decode step's BF16 tail and FP4 cache write.
+"""Triton launches for the NVFP4 BF16 tail and FP4 cache writes.
 
-`ring_append_quantize` appends each row's new token to its ring row and does
-what ``mla_nvfp4_update_cache`` does to its open tile, writing it straight into
-the page64 cache (N16 AUX layout), so a layer's whole cache write is one launch.
+`ring_append_quantize` appends each decode row's new token to its ring row and
+does what ``mla_nvfp4_update_cache`` does to its open tile, writing it straight
+into the page64 cache (N16 AUX layout), so a layer's whole cache write is one
+launch. `prefill_quantize` does the same for a prefill step's tiles, gathering
+their rows from the split latent.
 """
 
 import torch
@@ -313,6 +315,98 @@ def _k_rope(
 
 
 @triton.jit
+def _k_rope_tile(
+    rope,
+    rows,
+    valid,
+    tile,
+    aux_page,
+    TILE: tl.constexpr,
+    ROPE: tl.constexpr,
+):
+    """The RoPE part of a whole tile, ``rope [TILE, ROPE]``: what `_k_rope`
+    writes for one token, for every row below ``valid``; zero codes and scale
+    0x7F past it, and the tile's padding bytes as the producer leaves them."""
+    rb = tl.reshape(rope.to(tl.float32), (TILE, ROPE // 16, 16))
+    base, base_codes, base_scale = _fp4(
+        rb, tl.max(tl.abs(rb), axis=2)[:, :, None], False, KV_GAIN, KV_RCP
+    )
+    res = rb - base
+    _, res_codes, res_scale = _fp4(
+        res, tl.max(tl.abs(res), axis=2)[:, :, None], False, KV_GAIN, KV_RCP
+    )
+    live = (rows < valid)[:, None]
+    rbytes = tl.arange(0, ROPE // 2)
+    brick = (rbytes // 16)[None, :] * 256 + rows[:, None] * 16 + (rbytes % 16)[None, :]
+    zero_codes = tl.zeros((TILE, ROPE // 2), tl.uint8)
+    base_bytes = _pack(tl.reshape(base_codes, (TILE, ROPE)), TILE, ROPE)
+    res_bytes = _pack(tl.reshape(res_codes, (TILE, ROPE)), TILE, ROPE)
+    aux_tile = aux_page + tile * 2048
+    tl.store(aux_tile + brick, tl.where(live, base_bytes, zero_codes))
+    tl.store(aux_tile + 512 + brick, tl.where(live, res_bytes, zero_codes))
+    blk = tl.arange(0, ROPE // 16)
+    base_sf = tl.reshape(base_scale, (TILE, ROPE // 16)).to(tl.uint8)
+    res_sf = tl.reshape(res_scale, (TILE, ROPE // 16)).to(tl.uint8)
+    unset_sf = tl.full((TILE, ROPE // 16), 127, tl.uint8)
+    rs_off = 1536 + rows[:, None] * 16 + blk[None, :]
+    tl.store(aux_tile + rs_off, tl.where(live, base_sf, unset_sf))
+    tl.store(aux_tile + rs_off + 4, tl.where(live, res_sf, unset_sf))
+    pad = tl.arange(0, 512)
+    poff = tl.where(pad < 128, 1536 + (pad // 8) * 16 + 8 + pad % 8, 1792 + pad - 128)
+    tl.store(aux_tile + poff, tl.full((512,), 127, tl.uint8), mask=pad < 384)
+
+
+@triton.jit
+def _prefill_quantize_kernel(
+    src_nope_ptr,  # [T, 512] latent NoPE
+    src_rope_ptr,  # [T, 64] latent RoPE, after RoPE
+    gather_ptr,  # [M * TILE] token of every tile row
+    page_ptr,
+    tile_id_ptr,
+    valid_ptr,
+    nope_ptr,  # [pages, 16384] of one layer
+    aux_ptr,  # [pages, 8192] of one layer
+    stride_src_nope,
+    stride_src_rope,
+    TILE: tl.constexpr,
+    NOPE: tl.constexpr,
+    ROPE: tl.constexpr,
+    CH: tl.constexpr,
+):
+    """One tile of `prefill_quantize`: its rows gathered from the latent,
+    quantized and written into its page, CH NoPE channels at a time."""
+    t = tl.program_id(0)
+    page = tl.load(page_ptr + t).to(tl.int64)
+    if page >= 0:
+        tile = tl.load(tile_id_ptr + t).to(tl.int64)
+        valid = tl.load(valid_ptr + t).to(tl.int64)
+        rows = tl.arange(0, TILE)
+        live = (rows < valid)[:, None]
+        tokens = tl.load(gather_ptr + t * TILE + rows).to(tl.int64)
+        newest = tl.load(gather_ptr + t * TILE + valid - 1).to(tl.int64)
+        nope_page = nope_ptr + page * 16384
+        aux_page = aux_ptr + page * 8192
+        for c0 in tl.static_range(0, NOPE, CH):
+            cc = c0 + tl.arange(0, CH)
+            old = tl.load(
+                src_nope_ptr + tokens[:, None] * stride_src_nope + cc[None, :],
+                mask=live,
+                other=0.0,
+            )
+            new = tl.load(src_nope_ptr + newest * stride_src_nope + cc)
+            _k_nope_finish(
+                c0, new, old, rows, valid, tile, nope_page, aux_page, TILE, CH
+            )
+        rc = tl.arange(0, ROPE)
+        rope = tl.load(
+            src_rope_ptr + tokens[:, None] * stride_src_rope + rc[None, :],
+            mask=live,
+            other=0.0,
+        )
+        _k_rope_tile(rope, rows, valid, tile, aux_page, TILE, ROPE)
+
+
+@triton.jit
 def _append_quantize_token(
     n,  # the token (batch row) this program writes
     ring_ptr,  # [reqs, ring, D] of one layer
@@ -509,4 +603,66 @@ def ring_append_quantize(
             ROPE=ROPE,
             ROPE_FUSED=fused,
             num_warps=8,
+        )
+
+
+def prefill_quantize(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    gather: torch.Tensor,
+    pages: torch.Tensor,
+    tile_ids: torch.Tensor,
+    valid: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_aux: torch.Tensor,
+) -> None:
+    """``mla_nvfp4_update_cache`` of a prefill step's tiles in one launch,
+    read straight from the split latent.
+
+    ``k_nope [T, 512]`` and ``k_rope [T, 64]`` are the step's BF16 latent after
+    RoPE. ``gather [M * 16]``, ``pages``, ``tile_ids`` and ``valid [M]`` are
+    the step's plan (`Nvfp4MlaCache.plan_prefill`). ``kv_nope [P, 16384]`` and
+    ``kv_aux [P, 8192]`` are one layer of the cache. The bytes written are the
+    producer's for the gathered ``[M, 16, 576]`` tiles, which are never built.
+    Tiles with page -1 update nothing.
+    """
+    tiles = pages.numel()
+    if k_nope.dtype != torch.bfloat16 or k_rope.dtype != torch.bfloat16:
+        raise ValueError("NVFP4 prefill latent must be BF16.")
+    if (
+        k_nope.dim() != 2
+        or k_nope.shape[1] != NOPE
+        or k_rope.shape != (k_nope.shape[0], ROPE)
+    ):
+        raise ValueError(
+            f"NVFP4 prefill latent is {NOPE} + {ROPE} wide, got "
+            f"{tuple(k_nope.shape)} + {tuple(k_rope.shape)}."
+        )
+    if k_nope.stride(-1) != 1 or k_rope.stride(-1) != 1:
+        raise ValueError("NVFP4 prefill latent needs a unit inner stride.")
+    if gather.numel() != tiles * TILE:
+        raise ValueError(
+            f"NVFP4 prefill plan has {tiles} tiles but gathers "
+            f"{gather.numel()} rows."
+        )
+    plan_and_cache = (gather, pages, tile_ids, valid, kv_nope, kv_aux)
+    if not all(t.is_contiguous() for t in plan_and_cache):
+        raise ValueError("NVFP4 prefill plan and cache planes must be contiguous.")
+    if tiles:
+        _prefill_quantize_kernel[(tiles,)](
+            k_nope,
+            k_rope,
+            gather,
+            pages,
+            tile_ids,
+            valid,
+            kv_nope,
+            kv_aux,
+            k_nope.stride(0),
+            k_rope.stride(0),
+            TILE=TILE,
+            NOPE=NOPE,
+            ROPE=ROPE,
+            CH=128,
+            num_warps=4,
         )

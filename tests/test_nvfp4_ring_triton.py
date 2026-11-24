@@ -2,7 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """The Triton decode tail append and FP4 write match the torch tail append
-followed by the AITER producer, bit for bit."""
+followed by the AITER producer, bit for bit, and the prefill tile write matches
+the producer on the gathered tiles."""
 
 import pytest
 import torch
@@ -155,3 +156,89 @@ def test_fused_write_replays_in_a_graph():
     torch.cuda.synchronize()
     assert torch.equal(ring.buf[:REQS], eager[0][:REQS])
     assert torch.equal(nope, eager[1]) and torch.equal(aux, eager[2])
+
+
+def test_prefill_quantize_matches_the_producer_on_gathered_tiles():
+    from atom.model_ops.attentions.nvfp4_ring_triton import prefill_quantize
+
+    kw = _aiter_kwargs()
+    from aiter.ops.mla_nvfp4 import mla_nvfp4_update_cache
+
+    gen = torch.Generator(device="cuda").manual_seed(17)
+    lengths = [16, 1, 7, 15, 16, 3, 11]
+    tiles, total = len(lengths), sum(lengths)
+    # Heavy-tailed values, exact zeros and negative zeros, like a real latent.
+    scale = torch.exp(torch.randn(DIM, generator=gen, device="cuda") * 2)
+    kv = (torch.randn(total, DIM, generator=gen, device="cuda") * scale).to(
+        torch.bfloat16
+    )
+    kv[:, :512:37] = 0
+    kv[:, 517::17] = -0.0
+    # Rows past a tile's valid repeat its last token, as `plan_prefill` does.
+    rows = torch.arange(16, device="cuda")
+    starts = torch.tensor([0] + lengths[:-1], device="cuda").cumsum(0)
+    last = torch.tensor(lengths, device="cuda") - 1
+    gather = (starts[:, None] + torch.minimum(rows[None, :], last[:, None])).view(-1)
+    pages = torch.arange(tiles, device="cuda", dtype=torch.int32) * 3
+    tile_ids = torch.arange(tiles, device="cuda", dtype=torch.int32) % 4
+    valid = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    page_count = int(pages.max()) + 1
+    nope = torch.randint(
+        0, 256, (page_count, 16384), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    aux = torch.randint(
+        0, 256, (page_count, 8192), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    ref_nope, ref_aux = nope.clone(), aux.clone()
+
+    ref_tiles = kv[gather].view(tiles, 16, DIM)
+    mla_nvfp4_update_cache(ref_tiles, pages, tile_ids, valid, ref_nope, ref_aux, **kw)
+    # NoPE as a strided view of the latent, RoPE as its own tensor.
+    prefill_quantize(
+        kv[:, :512], kv[:, 512:].clone(), gather, pages, tile_ids, valid, nope, aux
+    )
+    torch.cuda.synchronize()
+
+    bad = (nope != ref_nope).nonzero()
+    assert bad.numel() == 0, f"kv_nope differs at {bad[:8].tolist()}"
+    bad = (aux != ref_aux).nonzero()
+    assert bad.numel() == 0, f"kv_aux differs at {bad[:8].tolist()}"
+
+
+def test_split_prefill_publish_matches_the_concat_publish():
+    """Pages and the BF16 tail of each request's short last tile, which the
+    next decode token requantizes."""
+    pytest.importorskip("aiter.ops.mla_nvfp4")
+    from atom.model_ops.attentions.nvfp4_mla import Nvfp4MlaCache, aiter_aux_n16
+
+    if not aiter_aux_n16():
+        pytest.skip("the fused cache writes the N16 AUX layout")
+
+    gen = torch.Generator(device="cuda").manual_seed(23)
+    lengths = [21, 16, 5, 1, 70]
+    tables = [[3], [1], [6], [2], [7, 4]]
+    kv = torch.randn(sum(lengths), DIM, generator=gen, device="cuda").to(torch.bfloat16)
+
+    def planned_cache():
+        cache = Nvfp4MlaCache(2, 8, 8, DIM, device="cuda")
+        fill = torch.Generator(device="cuda").manual_seed(5)
+        for plane in (cache.kv_nope, cache.kv_aux):
+            plane.copy_(
+                torch.randint(0, 256, plane.shape, generator=fill, device="cuda")
+            )
+        cache.ring.buf.copy_(
+            torch.randn(cache.ring.buf.shape, generator=fill, device="cuda")
+        )
+        rows = cache.bind_rows([11, 12, 13, 14, 15])
+        plan = cache.plan_prefill(rows, [0] * len(lengths), lengths, tables)
+        return cache, cache.upload_plan(plan)
+
+    concat, concat_plan = planned_cache()
+    split, split_plan = planned_cache()
+    concat.publish_prefill(1, kv, concat_plan)
+    split.publish_prefill_split(1, kv[:, :512], kv[:, 512:].clone(), split_plan)
+    torch.cuda.synchronize()
+
+    assert torch.equal(split.kv_nope, concat.kv_nope), "kv_nope differs"
+    assert torch.equal(split.kv_aux, concat.kv_aux), "kv_aux differs"
+    assert torch.equal(split.ring.buf, concat.ring.buf), "BF16 tail differs"

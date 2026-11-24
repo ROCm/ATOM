@@ -255,6 +255,31 @@ class Nvfp4MlaCache:
                 plan["ring_tokens"]
             ].to(self.ring.buf.dtype)
 
+    def publish_prefill_split(
+        self, layer: int, k_nope: torch.Tensor, k_rope: torch.Tensor, plan: dict
+    ) -> None:
+        """`publish_prefill` from the split latent, ``k_nope [T, 512]`` and
+        ``k_rope [T, 64]`` after RoPE, without concatenating it: one Triton
+        launch gathers, quantizes and writes the tiles (`prefill_quantize`)."""
+        if plan["pages"].numel():
+            from atom.model_ops.attentions.nvfp4_ring_triton import prefill_quantize
+
+            prefill_quantize(
+                k_nope,
+                k_rope,
+                plan["gather"],
+                plan["pages"],
+                plan["tile_ids"],
+                plan["valid"],
+                self.kv_nope[layer],
+                self.kv_aux[layer],
+            )
+        if plan["ring_rows"].numel():
+            tokens = plan["ring_tokens"]
+            self.ring.buf[plan["ring_rows"], layer, plan["ring_slots"]] = torch.cat(
+                (k_nope[tokens], k_rope[tokens]), dim=-1
+            ).to(self.ring.buf.dtype)
+
     def release(self, req_ids) -> None:
         """Return the rows of finished requests. Unknown ids are ignored."""
         for rid in req_ids:
@@ -497,6 +522,14 @@ def publish_prefill_kv(attn, k_nope, k_rope, positions, attn_metadata) -> None:
         return
     plan = getattr(attn_metadata, "nvfp4_prefill_plan", None)
     if plan is not None:
+        if cache.fused:
+            cache.publish_prefill_split(
+                attn.nvfp4_layer,
+                k_nope.reshape(-1, attn.kv_lora_rank),
+                k_rope.reshape(-1, attn.qk_rope_head_dim),
+                plan,
+            )
+            return
         kv = _latent(k_nope, k_rope, attn.kv_lora_rank, attn.qk_rope_head_dim)
         cache.publish_prefill(attn.nvfp4_layer, kv, plan)
         return
