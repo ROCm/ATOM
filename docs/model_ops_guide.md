@@ -298,22 +298,15 @@ The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 meth
 
 ### `FusedMoEParallelConfig`
 
-```python
-@dataclass
-class FusedMoEParallelConfig:
-    tp_size: int       # Tensor parallel size
-    dp_size: int       # Data parallel size
-    ep_size: int       # Expert parallel size
-    tp_rank: int
-    dp_rank: int
-    ep_rank: int
-    use_ep: bool       # Whether expert parallelism is active
-    local_ep_size: int # Local EP size (GPUs per node * TP)
-```
+`FusedMoEParallelConfig.from_plan(config.worker_moe_execution_plan)` exposes
+read-only TP/DP/EP sizes, ranks, local EP width, and transport properties from
+the saved worker plan. It does not resolve topology or inspect process groups.
 
-Key properties:
-- `use_all2all_kernels`: `True` when `dp_size > 1`, EP is enabled, and MORI is available.
-- `use_mori_kernels`: Always `True` (currently).
+`use_all2all_kernels` preserves the existing selection: real DP peers with EP
+use explicit RCCL, or available and enabled MoRI; `none` disables routed
+all-to-all. `use_mori_kernels` is true only for a selected MoRI transport.
+DP gather/scatter still requires DP-attention. The original outer TP reduction
+and PCP-merge collectives remain in place, including for routed transports.
 
 ### MORI integration (`fused_moe/mori_prepare_finalize.py`)
 

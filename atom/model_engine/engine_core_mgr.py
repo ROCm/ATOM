@@ -67,6 +67,7 @@ from atom.model_engine.prefix_hash import hash_block_size_for, take_shipped_chai
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
+from atom.parallel_mapping import apply_parallel_mapping, get_parallel_mapping
 from atom.structured_output import is_structured
 from atom.utils import (
     envs,
@@ -155,31 +156,11 @@ def build_internode_dp_socket_plan(
 
 
 def iter_dp_rank_assignments(config) -> list[tuple[int, int]]:
-    """The (global_dp_rank, local_dp_rank) pairs this node owns.
-
-    The global rank identifies the rank within the whole DP group; the local
-    rank indexes this node's GPUs. They coincide on a single node and diverge
-    on every node after the first.
-
-    Under DP-attention each TP rank becomes its own engine, so both the count
-    and the global offset scale by tp_size.
-    """
-    pc = config.parallel_config
-    tp_size = config.tensor_parallel_size
-    local_dp_size = pc.data_parallel_size_local
-    rank_offset = pc.data_parallel_rank if pc.is_multinode_dp else 0
-
-    if config.enable_dp_attention:
-        return [
-            (
-                (rank_offset + local_base) * tp_size + tp_rank,
-                local_base * tp_size + tp_rank,
-            )
-            for local_base in range(local_dp_size)
-            for tp_rank in range(tp_size)
-        ]
+    """Global and node-local DP ranks from the saved launch topology."""
+    mapping = get_parallel_mapping(config)
     return [
-        (rank_offset + local_rank, local_rank) for local_rank in range(local_dp_size)
+        (mapping.dp_rank_offset + local_rank, local_rank)
+        for local_rank in range(mapping.local_dp_size)
     ]
 
 
@@ -214,70 +195,27 @@ def kv_event_sources(config) -> dict[str, dict[str, Any]]:
     return sources
 
 
-def _resolve_dp_engine_count(config: Config, logical: int) -> int:
-    """How many DP-attention EngineCores to launch for a `logical`-wide run.
-
-    Normally `logical`, one per device. Under `--fake-eplb` on a box with fewer
-    visible devices, launch only that many and record the width to keep sharding
-    experts for, so each device owns the slice it would own in the full
-    deployment; `FusedMoE` repeats the gathered tokens by the same ratio to
-    match its token volume too.
-
-    Gated on fake_eplb like `Config.tp_world_size`, and for the same reason.
-    """
-    import torch
-
-    if not config.fake_eplb:
-        return logical
-    visible = torch.cuda.device_count()
-    if not 0 < visible < logical:
-        return logical
-    if logical % visible:
-        raise ValueError(
-            f"Simulated DP-attention: {logical} ranks do not divide evenly over "
-            f"{visible} visible device(s). Make the visible device count a "
-            f"divisor of tp x dp, e.g. via HIP_VISIBLE_DEVICES."
-        )
-    config.dp_logical_size = logical
-    logger.warning(
-        "Simulated DP-attention: running %d of a %d-rank deployment. Experts "
-        "shard %d ways and each rank repeats the gathered tokens %dx, so "
-        "per-device MoE shapes match -- but collectives only cover the ranks "
-        "that exist, so THE MODEL OUTPUT IS MEANINGLESS. Benchmarking only.",
-        visible,
-        logical,
-        logical,
-        logical // visible,
-    )
-    return visible
-
-
 def layout_engines(config: Config) -> list[tuple[int, int]]:
-    """The (global_dp_rank, local_dp_rank) of every DP rank whose engines this
-    node runs. Under DP attention every TP rank becomes a DP rank of its own,
-    and ``config`` is rewritten to say so."""
-    pc = config.parallel_config
-    multinode = pc.is_multinode_dp
+    """The DP ranks this node launches, from the saved configuration mapping.
+
+    Config already resolved the DP-attention fold and simulated device width.
+    Populate legacy runtime fields for both serving and weight-cache loaders.
+    """
     rank_assignments = iter_dp_rank_assignments(config)
-    if not config.enable_dp_attention:
+    if config.enable_dp_attention:
+        assert (
+            config.pipeline_parallel_size == 1
+        ), "Pipeline parallel + DP-attention is not supported yet"
+        logger.info(
+            "Enable dp attention, using %d data parallel ranks", len(rank_assignments)
+        )
+        apply_parallel_mapping(config)
+    else:
         assert not (
-            config.pipeline_parallel_size > 1 and pc.data_parallel_size > 1
+            config.pipeline_parallel_size > 1
+            and config.parallel_config.data_parallel_size > 1
         ), "Pipeline parallel combined with data parallel is not supported yet."
-        return rank_assignments
-    assert (
-        config.pipeline_parallel_size == 1
-    ), "Pipeline parallel + DP-attention is not supported yet"
-    # One engine per assignment this node owns; on a single node that is
-    # the whole tp x dp grid. --fake-eplb may shrink it to the visible
-    # device count, taking the first N assignments.
-    count = _resolve_dp_engine_count(config, len(rank_assignments))
-    logger.info(f"Enable dp attention, using {count} data parallel ranks")
-    pc.data_parallel_size *= config.tensor_parallel_size
-    pc.data_parallel_size_local = count
-    if multinode:
-        pc.data_parallel_rank *= config.tensor_parallel_size
-    config.tensor_parallel_size = 1
-    return rank_assignments[:count]
+    return rank_assignments
 
 
 def engine_config(

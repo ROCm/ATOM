@@ -5,7 +5,6 @@
 import enum
 import fnmatch
 import hashlib
-import importlib.util
 import logging
 import os
 import re
@@ -31,7 +30,17 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
 )
 from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
+from atom.moe_config import (
+    MoEBackendConfig,
+    MoEExecutionPlan,
+    get_moe_backend_config,
+    get_moe_execution_plan,
+)
 from atom.mono import polling_env
+from atom.parallel_mapping import (
+    ParallelMapping,
+    resolve_parallel_mapping,
+)
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -2444,7 +2453,16 @@ class Config:
     # Post-routing routed-MoE implementation. This is deliberately separate
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
+    # Resolve topology and transport after entry-point normalization; workers
+    # bind this saved mapping to process groups before constructing the model.
+    moe_backend_config: MoEBackendConfig | None = field(default=None, init=False)
+    parallel_mapping: ParallelMapping | None = field(default=None, init=False)
+    moe_execution_plan: MoEExecutionPlan | None = field(default=None, init=False)
+    worker_moe_execution_plan: MoEExecutionPlan | None = field(default=None, init=False)
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # Rollout entrypoints opt into independent TP worlds for DP workers.
+    # The supplied environment name also enables isolation for a DP=1 worker.
+    dp_isolation_device_map_env: str | None = None
     # The runners take weight syncs and say which they cannot
     # (`get_worker_capabilities`), as RLHFModelRunner does: EngineCore asks
     # them once, at startup. Set by AsyncLLMEngine.
@@ -2496,10 +2514,12 @@ class Config:
 
         Gated on `fake_eplb` because such a run's output is garbage anyway;
         without it, an oversized `-tp` keeps raising in ModelRunner instead of
-        silently running smaller. A property, not a field: `enable_dp_attention`
-        rewrites `tensor_parallel_size` after Config is built.
+        silently running smaller. Once configuration is resolved, this reads
+        the saved runtime topology, including DP-attention's TP-to-DP fold.
         """
         tp = self.tensor_parallel_size
+        if self.parallel_mapping is not None:
+            return self.parallel_mapping.tp_world_size
         if not self.fake_eplb:
             return tp
         # Does not create a CUDA context, so it is safe in the parent process.
@@ -2744,24 +2764,26 @@ class Config:
         sp_head_shards(getattr(hf_text, "num_key_value_heads", None) or heads, sp)
 
     def _init_moe_backend(self) -> None:
-        self.moe_backend = self.moe_backend.strip().lower()
-        if self.moe_backend not in ("standard", "mega"):
-            raise ValueError(
-                "moe_backend must be one of {'standard', 'mega'}, "
-                f"got {self.moe_backend!r}"
-            )
-        # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead.
-        if self.moe_backend != "mega" or self.sequence_parallel_size > 1:
-            return
-        if not self.enable_expert_parallel:
-            raise ValueError(
-                "moe_backend='mega' requires expert parallelism; pass "
-                "--enable-expert-parallel, or --sequence-parallel-size for SP MegaMoE."
-            )
-        if self.moe_all2all_backend == "rccl":
-            raise ValueError(
-                "moe_backend='mega' owns its MoRI transport and cannot use the "
-                "experimental RCCL prepare/finalize backend"
+        backend = get_moe_backend_config(self)
+        self.moe_backend = backend.backend
+        self.moe_all2all_backend = backend.all2all_backend
+        backend.validate_request(
+            enable_ep=self.enable_expert_parallel,
+            sequence_parallel_size=self.sequence_parallel_size,
+        )
+
+    def _init_parallel_mapping(self) -> None:
+        visible = torch.cuda.device_count() if self.fake_eplb else None
+        self.parallel_mapping = resolve_parallel_mapping(self, visible_devices=visible)
+        get_moe_execution_plan(self)
+        mapping = self.parallel_mapping
+        if mapping.dp_logical_size > mapping.dp_size:
+            logger.warning(
+                "Simulated DP-attention: running %d of %d ranks; experts shard "
+                "%d ways. Model output is meaningless; benchmarking only.",
+                mapping.dp_size,
+                mapping.dp_logical_size,
+                mapping.dp_logical_size,
             )
 
     def _resolve_dcp_comm_backend(self) -> None:
@@ -3112,6 +3134,7 @@ class Config:
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
         self._resolve_offload_min_load_tokens()
         self._resolve_dynamic_chunking()
+        self._init_parallel_mapping()
         self._resolve_tbo()
         self._check_pp_support()
         self._check_tbo_support()
@@ -3500,7 +3523,8 @@ class Config:
         """Turn TBO off where it cannot run (`_check_tbo_support` refuses what
         it cannot run with), before anything sizes itself off
         `enable_tbo_decode`."""
-        if self.moe_all2all_backend == "rccl" and self.enable_tbo:
+        backend = get_moe_backend_config(self)
+        if backend.all2all_backend == "rccl" and self.enable_tbo:
             logger.warning(
                 "Disabling TBO for the experimental RCCL routed MoE backend; "
                 "the first implementation is synchronous."
@@ -3514,9 +3538,9 @@ class Config:
         # Keep the fallback usable by serializing it until it has dedicated
         # per-ubatch communicators, analogous to the PCP/TP guard below.
         mori_ep_enabled = (
-            getattr(self, "moe_all2all_backend", "auto") in {"auto", "mori"}
-            and not envs.ATOM_DISABLE_MORI_EP
-            and importlib.util.find_spec("mori") is not None
+            backend.all2all_backend in {"auto", "mori"}
+            and not backend.disable_mori
+            and backend.mori_available
         )
         if (
             self.enable_dp_attention
@@ -3525,7 +3549,7 @@ class Config:
             and not mori_ep_enabled
         ):
             logger.warning(
-                "Disabling TBO for the DP-attention + EP collective fallback: "
+                "Disabling TBO for the DP MoE collective fallback: "
                 "concurrent all-gather/reduce-scatter ubatches can deadlock. "
                 "Use mori EP or run the fallback without --enable-tbo."
             )
@@ -3796,6 +3820,8 @@ class Config:
         # share one artifact, as they should.
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
+        factors.append(get_moe_backend_config(self))
+        factors.append(self.parallel_mapping)
         factors.append(self.index_cache_dtype)
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the

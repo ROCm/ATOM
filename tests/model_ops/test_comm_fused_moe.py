@@ -24,6 +24,12 @@ import torch
 from aiter_stub import ActivationType, GateMode, QuantType
 from conftest import atom_config_double
 
+from atom.moe_config import (
+    MoEBackendConfig,
+    MoEParallelMapping,
+    resolve_moe_execution_plan,
+)
+
 
 @dataclass(frozen=True)
 class _ShapeKey:
@@ -940,6 +946,16 @@ def _recording_fused_moe(monkeypatch, atom_modules, *, dp_world):
     process groups are stand-ins."""
     moe = atom_modules.moe
     layer = _new_fused_moe(atom_modules)
+    plan = resolve_moe_execution_plan(
+        MoEParallelMapping.make(
+            tp_size=1,
+            dp_size=dp_world,
+            local_dp_size=dp_world,
+            enable_ep=True,
+            flatten_dp=True,
+        ),
+        MoEBackendConfig(mori_available=True),
+    )
     routed = torch.randn(4, 8)
     method = SimpleNamespace(
         routed_rows_wire=None,
@@ -956,12 +972,7 @@ def _recording_fused_moe(monkeypatch, atom_modules, *, dp_world):
         "balance_router_logits": None,
         "reduce_results": False,
         # EP all2all: forward_impl_graph does no DP gather/scatter of its own.
-        "moe_parallel_config": SimpleNamespace(
-            dp_size=dp_world,
-            pcp_merge=False,
-            dp_logical_ratio=1,
-            use_all2all_kernels=True,
-        ),
+        "moe_parallel_config": moe.FusedMoEParallelConfig.from_plan(plan),
         "global_num_experts": 16,
         "expert_map": None,
         "activation": None,
@@ -1161,34 +1172,21 @@ def test_dual_stream_gate_widens_only_decode(monkeypatch, atom_modules, rows, ph
     assert dispatch._dual_stream_is_active(other, rows) == (rows <= 1024)
 
 
-def _moe_parallel(monkeypatch, atom_modules, *, tp, dp, ep, dp_logical=0):
-    """A real `FusedMoEParallelConfig.make` for this deployment shape (rank
-    0, DP attention on, no PCP)."""
-    moe = atom_modules.moe
-    group = SimpleNamespace(rank_in_group=0)
-    monkeypatch.setattr(moe, "get_tp_group", lambda: group)
-    monkeypatch.setattr(moe, "get_dp_group", lambda: group)
-    state = sys.modules["aiter.dist.parallel_state"]
-    monkeypatch.setattr(
-        state, "get_prefill_context_model_parallel_world_size", lambda: 1, raising=False
-    )
-    monkeypatch.setattr(
-        state, "get_prefill_context_model_parallel_rank", lambda: 0, raising=False
-    )
-    monkeypatch.setattr(
-        moe,
-        "get_current_atom_config",
-        lambda: SimpleNamespace(
-            parallel_config=SimpleNamespace(data_parallel_size_local=dp)
-        ),
-    )
-    config = SimpleNamespace(
-        enable_dp_attention=dp > 1 or dp_logical > 1,
-        moe_ep_flatten_tp_across_dp=False,
-        enable_expert_parallel=ep,
+def _moe_parallel(atom_modules, *, tp, dp, ep, dp_logical=0):
+    """The saved MoE plan for this deployment (rank zero, no PCP)."""
+    dp_attention = dp > 1 or dp_logical > 1
+    mapping = MoEParallelMapping.make(
+        tp_size=tp,
+        dp_size=dp,
+        local_dp_size=dp,
+        enable_ep=ep,
         dp_logical_size=dp_logical,
+        flatten_dp=dp_attention,
+        enable_dp_attention=dp_attention,
     )
-    return moe.FusedMoEParallelConfig.make(tp, dp, config)
+    return atom_modules.moe.FusedMoEParallelConfig.from_plan(
+        resolve_moe_execution_plan(mapping, MoEBackendConfig())
+    )
 
 
 @pytest.mark.parametrize(
@@ -1205,9 +1203,7 @@ def _moe_parallel(monkeypatch, atom_modules, *, tp, dp, ep, dp_logical=0):
 def test_moe_parallel_config_exchanges_tokens(
     monkeypatch, atom_modules, tp, dp, ep, dp_logical, exchanges
 ):
-    parallel = _moe_parallel(
-        monkeypatch, atom_modules, tp=tp, dp=dp, ep=ep, dp_logical=dp_logical
-    )
+    parallel = _moe_parallel(atom_modules, tp=tp, dp=dp, ep=ep, dp_logical=dp_logical)
     assert parallel.exchanges_tokens is exchanges
     if not exchanges:
         assert parallel.selected_all2all_backend is None
@@ -1272,7 +1268,7 @@ def test_dsv4_widens_only_expert_parallel_decode(
     deployment whose experts exchange tokens; prefill, TP-only EP, plain TP
     and calls without a step context keep the generic bound."""
     monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
-    parallel = _moe_parallel(monkeypatch, atom_modules, **shape)
+    parallel = _moe_parallel(atom_modules, **shape)
     moe, _ = _v4_moe_built(monkeypatch, atom_modules, parallel=parallel)
     dispatch = sys.modules["atom.model_ops.module_dispatch_ops"]
     monkeypatch.setattr(dispatch, "plugin_graph_is_piecewise", lambda: False)
@@ -1301,7 +1297,7 @@ def test_dsv4_moe_init_sets_its_dual_stream_threshold(
         monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
     else:
         monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", env)
-    parallel = _moe_parallel(monkeypatch, atom_modules, **_DEP4)
+    parallel = _moe_parallel(atom_modules, **_DEP4)
     moe, forward_context = _v4_moe_built(monkeypatch, atom_modules, parallel=parallel)
 
     assert moe._dual_stream_decode_token_threshold == expected

@@ -22,6 +22,7 @@ which is why it must keep answering False.
 
 import pytest
 import torch
+from conftest import atom_config_double
 
 from atom.config import DCPConfig, indexer_cp_unsupported_reason
 
@@ -113,19 +114,10 @@ def test_mxfp4_caches_keep_the_cp_scorer(monkeypatch, caplog, kv_dtype):
 
 
 def _hash_with(indexer_dcp_only: bool) -> str:
-    """``Config.compute_hash`` over a stand-in carrying only what it reads.
-
-    Constructing a real ``Config`` needs a model directory, which this suite
-    runs without. ``compute_hash`` is a pure function of the attributes it
-    touches, so binding it to a namespace that supplies exactly those is a
-    faithful call -- and it fails loudly (AttributeError) if the factor list
-    ever grows a field this stub does not model, rather than silently drifting.
-    """
+    """Hash real Config fields without checkpoint loading or GPU setup."""
     from types import SimpleNamespace
 
-    from atom.config import Config
-
-    stub = SimpleNamespace(
+    stub = atom_config_double(
         quant_config=None,
         compilation_config=None,
         parallel_config=None,
@@ -143,7 +135,7 @@ def _hash_with(indexer_dcp_only: bool) -> str:
         max_num_batched_tokens=16384,
         speculative_config=None,
     )
-    return Config.compute_hash(stub)
+    return stub.compute_hash()
 
 
 def test_the_two_indexer_modes_do_not_share_a_compiled_artifact():

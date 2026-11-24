@@ -29,7 +29,7 @@ if ATOM_ROOT not in sys.path:
 
 # ── 2. Import atom submodules ──────────────────────────────────────────────
 
-from atom.config import Config
+from atom.config import Config, ParallelConfig
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
@@ -168,7 +168,30 @@ def atom_config_double(**overrides):
         f"production renamed it and this override now sets nothing."
     )
     values.update(overrides)
-    return SimpleNamespace(**values)
+    # Exercise Config's real properties and typed access without downloading a
+    # checkpoint or running __post_init__. Normalize old, partial DP doubles
+    # to the real ParallelConfig fields as well.
+    parallel = values["parallel_config"]
+    plugin = values["plugin_config"]
+    if isinstance(parallel, SimpleNamespace) and (
+        plugin is None or not plugin.is_plugin_mode
+    ):
+        normalized = object.__new__(ParallelConfig)
+        for f in dataclasses.fields(ParallelConfig):
+            if f.default is not dataclasses.MISSING:
+                setattr(normalized, f.name, f.default)
+            elif f.default_factory is not dataclasses.MISSING:
+                setattr(normalized, f.name, f.default_factory())
+        for name, value in vars(parallel).items():
+            if name != "is_multinode_dp":
+                setattr(normalized, name, value)
+        if normalized.data_parallel_size_local is None:
+            normalized.data_parallel_size_local = normalized.data_parallel_size
+        values["parallel_config"] = normalized
+    config = object.__new__(Config)
+    for name, value in values.items():
+        setattr(config, name, value)
+    return config
 
 
 # ── 4. Fixtures ────────────────────────────────────────────────────────────

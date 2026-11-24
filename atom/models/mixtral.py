@@ -66,9 +66,7 @@ class MixtralMoE(nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
-        dp_size: Optional[int] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -92,8 +90,6 @@ class MixtralMoE(nn.Module):
             reduce_results=True,
             renormalize=True,
             quant_config=quant_config,
-            tp_size=tp_size,
-            dp_size=dp_size,
             prefix=f"{prefix}.experts",
             config=config,
         )

@@ -20,6 +20,7 @@ from atom.config import get_current_atom_config
 from atom.distributed.comm_utils import gather_rows
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_ops.topK import reassign_gathered_shared_ids
+from atom.moe_config import get_moe_backend_config
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
@@ -63,7 +64,7 @@ def create_comm_fused_moe_backend(
         config.enable_dp_attention and parallel_config.dp_size > 1
     )
     if (
-        config.moe_backend != "standard"
+        get_moe_backend_config(config).backend != "standard"
         or online_quant
         or layer_quant_config is None
         or layer_quant_config.quant_dtype != dtypes.fp4x2

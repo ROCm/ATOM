@@ -21,9 +21,11 @@ from torch import nn
 from atom.config import Config, local_device_index, set_current_atom_config
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.distributed.ulysses_sp import check_aiter_sp_api, sp_is_enabled
+from atom.distributed.worker_binding import bind_worker_parallel_mapping
 from atom.model_engine.tp_multinode import managed_store_client
 from atom.model_loader.loader import load_model
 from atom.models.registry import support_model_arch_dict
+from atom.parallel_mapping import get_parallel_mapping
 from atom.spec_decode.factory import build_drafter
 from atom.utils import resolve_obj_by_qualname
 from atom.utils.distributed.utils import (
@@ -52,6 +54,7 @@ def init_model_env(
     with PP)."""
     # Read just below (sp_is_enabled) and by model construction.
     set_current_atom_config(config)
+    mapping = get_parallel_mapping(config)
     if sp_is_enabled():
         check_aiter_sp_api()
     # `rank` is this worker's local index (0..tp*pcp-1) within its stage.
@@ -62,7 +65,6 @@ def init_model_env(
         # Reject before any collective can wait for nonexistent ranks.
         reject_simulated_tp(config, "pipeline parallel")
     # tp_world_size: how many GPUs this stage actually occupies.
-    stage_span = config.tp_world_size * config.pcp_group_size
     local_device_rank = local_device_index(config, rank)
     num_gpus = torch.cuda.device_count()
     if local_device_rank >= num_gpus:
@@ -84,10 +86,9 @@ def init_model_env(
         config.parallel_config.data_parallel_master_ip,
         config.parallel_config.data_parallel_base_port,
     )
-    dp_size = config.parallel_config.data_parallel_size
-    world_size = dp_size * pp_size * stage_span
+    world_size = mapping.world_size
     dp_rank = config.parallel_config.data_parallel_rank
-    global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+    global_rank = mapping.global_rank(rank, dp_rank, pp_rank)
     raise_timeout_if_dp_spans_nodes(config.parallel_config)
     raise_timeout_if_tp_spans_nodes(config)
     if (
@@ -111,20 +112,20 @@ def init_model_env(
         # global_rank is already the physical device index. Revisit if
         # either restriction is lifted.
         init_pp_aware_dist_env(
-            tensor_model_parallel_size=config.tensor_parallel_size,
+            tensor_model_parallel_size=mapping.tp_size,
             pipeline_model_parallel_size=pp_size,
             global_rank=global_rank,
             world_size=world_size,
             distributed_init_method=distributed_init_method,
             backend="nccl",
-            data_parallel_size=dp_size,
-            prefill_context_model_parallel_size=config.pcp_group_size,
+            data_parallel_size=mapping.dp_size,
+            prefill_context_model_parallel_size=mapping.pcp_size,
         )
     else:
         # The group spans the devices that exist; apply_simulated_tp then
         # makes it *report* the logical width so layers shard that many ways.
         init_dist_env(
-            config.tp_world_size,
+            mapping.tp_world_size,
             rankID=rank,
             backend="nccl",
             distributed_init_method=distributed_init_method,
@@ -132,15 +133,16 @@ def init_model_env(
             # local rank from the DP-scaled global rank, which overruns the
             # device list on every node after the first.
             local_rank=local_device_rank,
-            data_parallel_size=config.parallel_config.data_parallel_size,
+            data_parallel_size=mapping.dp_size,
             data_parallel_rank=config.parallel_config.data_parallel_rank,
-            prefill_context_model_parallel_size=config.pcp_group_size,
+            prefill_context_model_parallel_size=mapping.pcp_size,
             decode_context_parallel_size=getattr(
                 config, "decode_context_parallel_size", 1
             ),
             device_communicators=device_communicators,
         )
         apply_simulated_tp(config)
+    bind_worker_parallel_mapping(config, global_rank=global_rank)
     return device
 
 

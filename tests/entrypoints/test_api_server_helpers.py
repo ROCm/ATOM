@@ -23,6 +23,7 @@ import types
 from types import SimpleNamespace
 
 import pytest
+from conftest import atom_config_double
 from import_guard import skip_if_dependency_missing
 
 
@@ -894,7 +895,7 @@ def _kv_events_engine(
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
     from atom.model_engine.engine_core_mgr import kv_event_sources
 
-    config = SimpleNamespace(
+    config = atom_config_double(
         kv_events_config=KVEventsConfig(**events),
         parallel_config=parallel or ParallelConfig(data_parallel_size=2),
         enable_dp_attention=enable_dp_attention,

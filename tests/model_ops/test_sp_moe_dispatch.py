@@ -22,7 +22,9 @@ def test_split_pass_gathers_once_and_counts_only_sp_real_rows(
     )
     layer = SimpleNamespace(
         quant_method=method,
-        moe_parallel_config=SimpleNamespace(pcp_merge=True),
+        moe_parallel_config=SimpleNamespace(
+            execution_plan=SimpleNamespace(needs_pcp_collectives=True)
+        ),
         use_ep=False,
         global_num_experts=128,
         expert_map=None,

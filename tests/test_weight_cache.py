@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
-from conftest import gpu_stack_import
+from conftest import atom_config_double, gpu_stack_import
 from torch import nn
 
 import atom.model_loader.weight_cache.__main__ as cli
@@ -1276,25 +1276,27 @@ def test_a_daemon_tells_servers_what_it_holds_beside_the_weights(monkeypatch):
 
 
 def test_dp_attention_gives_every_tp_rank_an_engine_config_of_its_own():
+    from atom.config import ParallelConfig
+
     # What a daemon lays its ranks out with (run_daemon), as CoreManager does.
     mgr = gpu_stack_import("atom.model_engine.engine_core_mgr")
     engine_config, layout_engines = mgr.engine_config, mgr.layout_engines
 
-    pc = SimpleNamespace(
+    pc = ParallelConfig(
         data_parallel_size=2,
         data_parallel_size_local=2,
         data_parallel_rank=0,
         data_parallel_rank_local=None,
         pipeline_parallel_rank=0,
-        is_multinode_dp=False,
     )
-    config = SimpleNamespace(
+    config = atom_config_double(
         parallel_config=pc,
         tensor_parallel_size=2,
         enable_dp_attention=True,
         pipeline_parallel_size=1,
         fake_eplb=False,
     )
+    config._init_parallel_mapping()
     # DP attention: every TP rank is a DP rank of its own.
     assert layout_engines(config) == [(0, 0), (1, 1), (2, 2), (3, 3)]
     assert (pc.data_parallel_size, config.tensor_parallel_size) == (4, 1)

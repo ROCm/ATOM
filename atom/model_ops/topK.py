@@ -11,7 +11,7 @@ from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
 from atom.model_ops.fused_moe.gathered_shared_ids import copy_shared_expert_ids_
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
-from atom.model_ops.utils import _has_module
+from atom.moe_config import MoEExecutionPlan, get_moe_execution_plan
 from atom.quant_spec import (
     fuses_mxfp8_shared_into_mxfp4,
     fuses_ptpc_shared_into_online_ptpc,
@@ -25,6 +25,7 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     quant_config,
     shared_expert_prefix: str | None = None,
     routed_expert_prefix: str | None = None,
+    execution_plan: MoEExecutionPlan | None = None,
 ) -> bool:
     config = get_current_atom_config()
     if quant_config is None:
@@ -35,15 +36,16 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # layout (set by the vLLM plugin under DP+EP); disable it there.
     if dp_size > 1 and config.moe_ep_flatten_tp_across_dp:
         return False
-    # Only the selected MoRI transport needs this switch; the TP fusion is a
-    # different mechanism, and an explicitly selected RCCL/none backend must
-    # not be inferred from the mere presence of the ``mori`` Python package.
+    # Preserve the existing MoRI request/availability gate, including when
+    # simulated DP or disabled EP selects the collective fallback. Explicit
+    # RCCL/none requests keep their own shared-expert behavior.
     # EPLB always fuses, otherwise the env decides.
-    requested_all2all = getattr(config, "moe_all2all_backend", "auto")
+    plan = execution_plan or get_moe_execution_plan(config)
+    backend = plan.backend_config
     mori_selected = (
-        requested_all2all in {"auto", "mori"}
-        and not envs.ATOM_DISABLE_MORI_EP
-        and _has_module("mori")
+        backend.all2all_backend in {"auto", "mori"}
+        and not backend.disable_mori
+        and backend.mori_available
     )
     if (
         dp_size > 1
