@@ -5,6 +5,9 @@
 The configuration is checked once; a step is then routed to mono only when it is
 a decode of 1..MAX_TOKENS tokens (a cudagraph's pad rows counted; a speculative
 verify's q tokens of a request count as q).
+The attention linears may be the checkpoint's native MXFP8 1x32 (no online quantization) or the ptpc-FP8
+requantization: ``weights.SparseMoeLayer`` decides per model, the runner builds the matching K1 / K4
+(``attn_mxfp8``), and a model mixing the two is refused there.
 Every per-step input is TP-uniform: the kernels all-reduce in-kernel, so ranks
 that disagreed would wait on each other forever (a per-rank flag such as
 ``is_dummy_run`` must never gate this).
@@ -51,10 +54,15 @@ def _dspark_mode_supported(atom_config) -> bool:
 def _config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use mono, or None."""
     checks = common_refusals(atom_config, Dims, SUPPORTED_TP) + [
-        (atom_config.kv_cache_dtype == "fp8", f"kv cache {atom_config.kv_cache_dtype}"),
+        # fp8 K/V + fp8 index, or NVFP4 K/V + NVFP4 index (single-buffer pages), not mixed
         (
-            (atom_config.index_cache_dtype or atom_config.kv_cache_dtype) == "fp8",
-            "index cache not fp8",
+            atom_config.kv_cache_dtype in ("fp8", "nvfp4"),
+            f"kv cache {atom_config.kv_cache_dtype}",
+        ),
+        (
+            (atom_config.index_cache_dtype or atom_config.kv_cache_dtype)
+            == atom_config.kv_cache_dtype,
+            f"index cache {atom_config.index_cache_dtype} with kv cache {atom_config.kv_cache_dtype}",
         ),
         (
             atom_config.kv_cache_block_size == 128,
@@ -110,7 +118,7 @@ class MonoDecode:
         intermediate_tensors,
         inputs_embeds,
     ) -> bool:
-        if not self._mono.enabled:
+        if input_ids is None or not self._mono.enabled:
             return False
         n = input_ids.numel()  # a cudagraph's pad rows included
         if intermediate_tensors is not None or inputs_embeds is not None:
