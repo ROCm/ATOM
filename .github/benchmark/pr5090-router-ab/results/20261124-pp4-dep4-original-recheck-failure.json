@@ -1,0 +1,53 @@
+{
+  "lease": "L4a09fd",
+  "node": "pit2-p03-g27",
+  "harness_sha": "4148dc59135de806c31a2ca2a0e5be27743db324",
+  "router_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+  "srt_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+  "concurrency": 40,
+  "decode_max_num_seqs_per_rank": 5,
+  "prefill_hip_order": "0,1,2,3",
+  "failing_pp3_pci": "0000:15:00.0",
+  "failure_event_count": 26,
+  "failure_events_by_pp_rank": {
+    "3": 26
+  },
+  "failure_events_by_peer": {
+    "decode-peer-1": 26
+  },
+  "first_failed_batch": {
+    "pp_rank": 3,
+    "peer": "decode-peer-1",
+    "return_code": -1,
+    "elapsed_s": 30.02300631813705,
+    "descriptors": 420,
+    "bytes": 22794240
+  },
+  "warmup_start_utc": "2026-11-24T14:14:43.875Z",
+  "first_failure_utc": "2026-11-24T14:17:05.138257Z",
+  "profiling_started_utc": "2026-11-24T14:20:54.674Z",
+  "diagnostic_stop_requested_utc": "2026-11-24T14:21:04.898807Z",
+  "exported_record_counts": {
+    "warmup error": 443,
+    "warmup valid": 1,
+    "profiling valid": 8
+  },
+  "performance_valid": false,
+  "interactivity_tok_s_user": null,
+  "token_throughput_per_chip": null,
+  "exit_codes": {
+    "pool-workload.rc": 1,
+    "pool-exit.rc": 1,
+    "gpool-release.rc": 0,
+    "srt-exit-code.txt": 1
+  },
+  "normal_release_confirmed": true,
+  "rdma_window": {
+    "start": "2026-11-24T13:50:31.773631+00:00",
+    "last_active": "2026-11-24T14:21:39.705397+00:00",
+    "nonzero_error_timeout_or_retransmit_deltas": {}
+  },
+  "archive_sha256": "e4ea9d86a72ff80d5970c628247eb510a2fa78724b2e606bcf93f7d02d09d343",
+  "conclusion": "Original-order C40 reproduced PP3 Mooncake synchronous-write timeouts. It was stopped after diagnosis, shortly after profiling began, and provides no valid performance window. C80 also failed on a different node and PCI device; root cause remains unresolved.",
+  "final_matching_container_ids": []
+}
