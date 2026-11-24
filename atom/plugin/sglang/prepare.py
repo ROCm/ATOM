@@ -47,7 +47,18 @@ def prepare_model(config: Any):
         getattr(config, "model_type", ""),
         getattr(text_cfg, "model_type", "") if text_cfg is not None else "",
     )
-    if model_arch == "DeepseekV4ForCausalLM":
+    if model_arch == "DeepseekV41ForCausalLM":
+        from atom.plugin.sglang.deepseek_v41_bridge import (
+            install_deepseek_v41_proxy_pool_patch,
+        )
+        from atom.plugin.sglang.patches.triton_constexpr_helpers_patch import (
+            apply_triton_constexpr_helpers_patch,
+        )
+
+        # V4.1's mHC kernel needs Triton's next_power_of_2; others keep SGLang's.
+        apply_triton_constexpr_helpers_patch()
+        install_deepseek_v41_proxy_pool_patch()
+    elif model_arch == "DeepseekV4ForCausalLM":
         from atom.plugin.sglang.deepseek_v4_bridge import (
             install_deepseek_v4_proxy_pool_patch,
         )
