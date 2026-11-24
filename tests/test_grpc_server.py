@@ -800,6 +800,64 @@ def test_a_finished_request_s_seq_id_is_reusable_while_its_admission_settles(
     assert [seq.id for seq in engine.submitted] == engine.made
 
 
+def test_a_finished_request_whose_send_then_fails_leaves_its_reused_seq_id_alone(
+    serve, monkeypatch
+):
+    engine, settle = FakeEngine(), threading.Event()
+    servicer = serve(engine)
+    open_session, opened = servicer.sessions.open, []
+    monkeypatch.setattr(
+        servicer.sessions, "open", lambda: opened.append(open_session()) or opened[-1]
+    )
+
+    def finish_then_fail(seqs):  # A ends, then its structured send fails
+        if seqs[0].json_schema is None:
+            return engine.add_request(seqs)  # B runs
+        engine.submitted += seqs
+        seqs[0].callback(RequestOutput(seqs[0].id, [5], True, "eos"))
+        engine.flush()
+        settle.wait(10)
+        raise RuntimeError("the send failed after A ended")
+
+    monkeypatch.setattr(engine.core_mgr, "add_request", finish_then_fail)
+    sent = asyncio.Event()
+
+    async def client():
+        batch = _submit_batch((4, "a", [1]))
+        envelope = v1.Envelope.FromString(batch[0])
+        envelope.submit.requests[0].sampling.json_schema = '{"type": "object"}'
+        yield pb.Frames(frames=[envelope.SerializeToString(), *batch[1:]])
+        await _until(lambda: opened and engine.submitted and not opened[0].requests)
+        yield pb.Frames(frames=_submit_batch((4, "b", [2])))  # A's seq_id again
+        await sent.wait()
+        abort = v1.Envelope(protocol_version=frames.PROTOCOL_VERSION)
+        abort.abort.seq_ids.append(4)  # B ends, and with it the call
+        yield pb.Frames(frames=[abort.SerializeToString()])
+
+    async def fail_a_after_b_reused_its_seq_id():
+        call = servicer.Session(client(), SimpleNamespace())
+        await anext(call)  # Ready
+        bodies = []
+
+        async def read():
+            async for message in call:
+                bodies.append(v1.Envelope.FromString(message.frames[0]))
+
+        reading = asyncio.create_task(read())
+        await _until(lambda: len(engine.running) == 1)  # B runs
+        settle.set()
+        await asyncio.sleep(0.2)  # A's failed send settles
+        b_held = [r.seq.id for r in opened[0].requests.values()]
+        sent.set()
+        await asyncio.wait_for(reading, 10)
+        return bodies, b_held
+
+    bodies, b_held = asyncio.run(fail_a_after_b_reused_its_seq_id())
+    assert b_held == [engine.made[1]]  # B is still the Session's request 4
+    rejected = [b for b in bodies if b.WhichOneof("body") == "rejected"]
+    assert rejected == [], rejected  # A ended with its Completion, nothing after
+
+
 def test_an_abort_is_applied_while_admissions_are_at_their_cap(serve, monkeypatch):
     monkeypatch.setattr(grpc_server, "SESSION_ADMISSIONS", 2)
     engine = FakeEngine([([5], None)])

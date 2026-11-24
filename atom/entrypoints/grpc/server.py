@@ -478,7 +478,9 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         try:
             await self._submit(session, request)
         except Exception as error:  # noqa: BLE001 - refused as Generate is
-            session.reject([_rejected(client_id, error)])
+            # One that ended first had its Completion; its seq_id may be another's now.
+            if session.admitting.get(client_id) is request:
+                session.reject([_rejected(client_id, error)])
         finally:
             # Unless it ended first and the client has sent its seq_id again.
             aborted = False
@@ -556,7 +558,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
         try:
             api._validate_sequence_context_length(seq, params)
         except BaseException:
-            session.drop(request.seq_id)
+            session.drop(request.seq_id, seq)
             raise
         try:
             await api._submit_engine_requests([seq])
@@ -566,7 +568,7 @@ class AtomEngineServicer(pb_grpc.AtomEngineServicer):
             raise
         except BaseException:  # a failed send may have reached one engine (P/D: decode)
             api.cleanup_stream(seq.id, aborted=True)
-            session.drop(request.seq_id)
+            session.drop(request.seq_id, seq)
             raise
 
     async def _write(self, context, request, response) -> None:
