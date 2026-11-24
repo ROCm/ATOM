@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 import warnings
 
+import numpy as np
 import torch
 from aiter import mixed_sample_outer_exponential, topk_select
 from aiter.ops.triton.fusions.fused_mixed_sample import fused_mixed_sample
@@ -31,9 +33,44 @@ _NATIVE_SAMPLING_WARNING_ISSUED = False
 # Epsilon value for numerical stability and to prevent division by 0
 SAMPLER_EPS = 1e-10
 
+logger = logging.getLogger("atom")
+# One line per process for each once-per-step shortcut, the first time it runs.
+_ANNOUNCED: set[str] = set()
+
+
+def _announce(key: str, message: str) -> None:
+    if key not in _ANNOUNCED:
+        _ANNOUNCED.add(key)
+        logger.info(message)
+
+
+def _announce_no_greedy() -> None:
+    _announce(
+        "greedy_pick",
+        "Sampler: no greedy row in the batch, the draw is returned without "
+        "the argmax + select (dspark_options.sampler_skip_greedy_pick)",
+    )
+
+
+def host_no_greedy_rows(temperatures: np.ndarray) -> bool:
+    """Whether no row of a batch is greedy, decided on the host.
+
+    The device test is ``temperatures <= SAMPLER_EPS`` on the float32 rows the
+    runner staged (``prepare_sample``: ``max(t, SAMPLER_EPS)`` stored as
+    float32). This repeats that arithmetic on the host's copy -- the clamp, the
+    narrowing, the comparison against the float32 epsilon -- so it answers
+    True exactly when the device mask would be all False. An empty batch has
+    no greedy row.
+    """
+    staged = np.maximum(np.asarray(temperatures), SAMPLER_EPS).astype(np.float32)
+    return not bool((staged <= np.float32(SAMPLER_EPS)).any())
+
 
 def _apply_greedy_tokens(
-    probs: torch.Tensor, temperatures: torch.Tensor, next_tokens: torch.Tensor
+    probs: torch.Tensor,
+    temperatures: torch.Tensor,
+    next_tokens: torch.Tensor,
+    no_greedy: bool = False,
 ) -> torch.Tensor:
     """Keep row selection on the device, with a fixed-size int32 result.
 
@@ -45,7 +82,14 @@ def _apply_greedy_tokens(
     A greedy row is one at or below ``SAMPLER_EPS``: the runner clamps every
     temperature to it before the sampler sees them (``prepare_sample``), so a
     requested 0 never arrives as 0.
+
+    ``no_greedy`` is the host's word that no row is (`host_no_greedy_rows`):
+    the mask would be all False and the select would return the draw, so the
+    draw is returned and neither the reduction nor the select is launched.
     """
+    if no_greedy:
+        _announce_no_greedy()
+        return next_tokens.view(-1).to(torch.int)
     greedy_tokens = topk_select(probs, 1, tie="low")[1].view(-1)
     return torch.where(
         temperatures <= SAMPLER_EPS, greedy_tokens, next_tokens.view(-1).to(torch.int)
@@ -106,12 +150,16 @@ class Sampler(nn.Module):
         temperatures: torch.Tensor,
         top_ks: int | torch.Tensor | None,
         top_ps: float | torch.Tensor | None,
+        no_greedy: bool = False,
     ) -> torch.Tensor:
         """Sample each draft-conditioned target row with independent noise.
 
         Accepting a draft when it matches this draw and stopping at the first
         mismatch preserves the target distribution. Sharing noise across rows
         would condition later draws on earlier acceptance decisions.
+
+        ``no_greedy`` is per request (`host_no_greedy_rows`); a row is its
+        request's temperature, so it holds for the rows as well.
         """
         rows = logits.shape[0]
         if rows == 0:
@@ -134,7 +182,39 @@ class Sampler(nn.Module):
             expand(top_ps),
             all_greedy=False,
             needs_independent_noise=True,
+            no_greedy=no_greedy,
         )
+
+    def verification_noise_only(
+        self,
+        logits: torch.Tensor,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
+    ) -> bool:
+        """`sample_verification_tokens` for a caller that reads no id of it:
+        what it draws from the generator, and nothing else.
+
+        True when done. An unfiltered temperature draw takes exactly one
+        ``[rows, vocab]`` exponential fill from the default generator
+        (`_independent_noise_sample`) and none for no rows;
+        the scoring and the greedy select after it are functions of that
+        noise, so dropping them leaves every later draw where it was. False,
+        with nothing drawn, for a filtered batch: its sampling ops draw inside,
+        and the caller keeps the whole draw.
+        """
+        if self._needs_filtering(top_ks, top_ps):
+            return False
+        rows, vocab_size = logits.shape
+        if rows:
+            torch.empty(
+                (rows, vocab_size), dtype=torch.float, device=logits.device
+            ).exponential_(1)
+        _announce(
+            "target_draw",
+            "Spec verify: forced acceptance reads no target draw, its noise is "
+            "drawn and not scored (dspark_options.verify_skip_unused_target_draw)",
+        )
+        return True
 
     def forward(
         self,
@@ -148,6 +228,8 @@ class Sampler(nn.Module):
         ) = None,  # (num_tokens,) float32, 1.0 means disabled
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
         needs_independent_noise: bool = False,
+        # True if no temperature is 0 (checked on CPU, `host_no_greedy_rows`)
+        no_greedy: bool = False,
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
@@ -187,9 +269,11 @@ class Sampler(nn.Module):
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
             if needs_independent_noise:
+                if no_greedy:
+                    return self._independent_noise_draw(logits, temperatures)
                 return self._independent_noise_sample(logits, temperatures)
             sampled = self._temperature_sample(logits, temperatures)
-            return _apply_greedy_tokens(logits, temperatures, sampled)
+            return _apply_greedy_tokens(logits, temperatures, sampled, no_greedy)
 
         # Apply top-k/top-p filtering
         return self._topk_topp_sample(
@@ -265,6 +349,27 @@ class Sampler(nn.Module):
         return fused_mixed_sample(
             logits, exponential, temperatures, eps=self.eps, greedy_eps=SAMPLER_EPS
         )
+
+    def _independent_noise_draw(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+    ) -> torch.Tensor:
+        """`_independent_noise_sample` for a batch the host knows to hold no
+        greedy row (`host_no_greedy_rows`): the override would change no row,
+        so the race alone runs, ``mixed_sample_outer_exponential`` on the same
+        ``(num_tokens, vocab_size)`` noise, and its draw is returned.
+        """
+        _announce_no_greedy()
+        num_tokens, vocab_size = logits.shape
+        sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
+        exponential = torch.empty(
+            (num_tokens, vocab_size), dtype=torch.float, device=logits.device
+        ).exponential_(1)
+        mixed_sample_outer_exponential(
+            sampled_tokens, logits, exponential, temperatures, eps=self.eps
+        )
+        return sampled_tokens
 
     def _topk_topp_sample(
         self,

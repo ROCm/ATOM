@@ -100,6 +100,9 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 | `dspark_options.two_buffer_attn` | `ATOM_V41_DRAFT_ATTN_NO_CAT` (#3645) |
 | `dspark_options.lean_head` | `ATOM_DSPARK_LEAN_HEAD` (#3645) |
 | `dspark_options.verify_argmax_once` | `ATOM_SPEC_VERIFY_ARGMAX_ONCE` (#3645) |
+| `dspark_options.dp_sharded_head` / `_max_rows` | `ATOM_DP_DSPARK_SHARDED_HEAD` / `_MAX_ROWS` |
+| `dspark_options.sampler_skip_greedy_pick` | `ATOM_SAMPLER_SKIP_GREEDY_PICK` |
+| `dspark_options.verify_skip_unused_target_draw` | `ATOM_SPEC_SKIP_UNUSED_TARGET_DRAW` |
 
 - `engine.prefill_decode_interval_slope` (a number, 0 = off) with `_slope_from`: after an
   executed prefill that leaves `g` sequences decoding in the DP group, the decode interval is
@@ -110,6 +113,16 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   left first across both). A prompt that has gone `prefill_admit_max_age_ms` without a chunk
   goes ahead of every younger one. Refused together with `prefill_short_first_rows`.
 
+- `dspark_options.dp_sharded_head`: under pure DP attention (TP 1) the draft block's rows and
+  anchors are all-gathered over the DP group, each rank projects every row onto its own
+  `V / dp` slice of the replicated LM head, and each position's id is picked from the
+  per-shard `(max, id)`. It serves a greedy block of at most `dp_sharded_head_max_rows` rows,
+  ahead of `lean_head`; every other block takes the path it took.
+- `dspark_options.sampler_skip_greedy_pick`: a sampled batch the host knows to hold no greedy
+  row returns its draw without the argmax and select (on independent noise: the race alone
+  instead of the fused race-and-override call). `verify_skip_unused_target_draw`: under forced
+  acceptance only the noise of the target's own draw is drawn. Neither applies inside an
+  owner of `v41.spec.verify_sample`, nor to an all-greedy verify (`verify_argmax_once`).
 - `engine.thp_disable`: no transparent huge pages for the server's processes
   (`PR_SET_THP_DISABLE`), set in the server's main process where the recipe's `env` is applied,
   before any worker starts, and again by each worker at its own start.

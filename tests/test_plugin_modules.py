@@ -163,6 +163,10 @@ def test_v2_options_parse_and_key_the_plan():
         {"model_options": {"fused_attn": "yes"}},
         {"model_options": {"mono_mode": "sometimes"}},
         {"dspark_options": {"lean_head": 1}},
+        {"dspark_options": {"dp_sharded_head": "on"}},
+        {"dspark_options": {"dp_sharded_head_max_rows": 0}},
+        {"dspark_options": {"sampler_skip_greedy_pick": 1}},
+        {"dspark_options": {"verify_skip_unused_target_draw": None}},
         {"modules": {"layers..ffn": ["a"]}},
     ],
 )
@@ -188,6 +192,27 @@ def test_the_scheduler_options_of_a_load_dependent_interval_and_an_admit_order()
     assert recipes.EngineOptions().prefill_decode_interval_slope == 0
     srpt = _plan(engine={"prefill_admit_order": "srpt", "prefill_admit_max_age_ms": 0})
     assert srpt.engine.prefill_admit_order == "srpt" and srpt.plan_id != plan.plan_id
+
+
+def test_the_dspark_options_of_a_sharded_head_and_the_samplers_unread_work():
+    off = recipes.DSparkOptions()
+    assert not off.dp_sharded_head and off.dp_sharded_head_max_rows == 1024
+    assert not off.sampler_skip_greedy_pick
+    assert not off.verify_skip_unused_target_draw
+    plan = _plan(
+        dspark_options={
+            "dp_sharded_head": True,
+            "dp_sharded_head_max_rows": 512,
+            "sampler_skip_greedy_pick": True,
+            "lean_head": True,
+            "verify_argmax_once": True,
+        }
+    )
+    options = plan.dspark_options
+    assert options.dp_sharded_head and options.dp_sharded_head_max_rows == 512
+    assert options.sampler_skip_greedy_pick and options.lean_head
+    assert options.verify_argmax_once and not options.verify_skip_unused_target_draw
+    assert plan.plan_id != _plan(dspark_options={"dp_sharded_head": True}).plan_id
 
 
 def test_the_host_options_reach_code_without_a_config():
@@ -286,6 +311,9 @@ def test_no_new_environment_variable_carries_a_recipe_option():
         "ATOM_PREFILL_DECODE_INTERVAL_SLOPE",
         "ATOM_PREFILL_ADMIT_ORDER",
         "ATOM_PREFILL_ADMIT_MAX_AGE_MS",
+        "ATOM_DP_DSPARK_SHARDED_HEAD",
+        "ATOM_SAMPLER_SKIP_GREEDY_PICK",
+        "ATOM_SPEC_SKIP_UNUSED_TARGET_DRAW",
         "ATOM_THP_DISABLE",
         "ATOM_ENGRAM_PIN_PAGES",
     ):

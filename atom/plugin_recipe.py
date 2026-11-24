@@ -381,6 +381,16 @@ class DSparkOptions:
     two_buffer_attn: bool = False
     lean_head: bool = False
     verify_argmax_once: bool = False
+    # The draft head's vocab split over the DP group (pure DP attention):
+    # `atom.model_ops.dspark_dp_head`. `_max_rows`: block rows above which the
+    # replicated head serves.
+    dp_sharded_head: bool = False
+    dp_sharded_head_max_rows: int = 1024
+    # Per-step sampling work nothing reads (`atom.model_ops.sampler`): the
+    # greedy select of a batch with no greedy row; under forced acceptance,
+    # the scoring of the target's own draw.
+    sampler_skip_greedy_pick: bool = False
+    verify_skip_unused_target_draw: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Any) -> DSparkOptions:
@@ -411,6 +421,26 @@ class DSparkOptions:
             verify_argmax_once=_strict_bool(
                 raw.get("verify_argmax_once", defaults.verify_argmax_once),
                 "dspark_options.verify_argmax_once",
+            ),
+            dp_sharded_head=_strict_bool(
+                raw.get("dp_sharded_head", defaults.dp_sharded_head),
+                "dspark_options.dp_sharded_head",
+            ),
+            dp_sharded_head_max_rows=_strict_int(
+                raw.get("dp_sharded_head_max_rows", defaults.dp_sharded_head_max_rows),
+                "dspark_options.dp_sharded_head_max_rows",
+                min_value=1,
+            ),
+            sampler_skip_greedy_pick=_strict_bool(
+                raw.get("sampler_skip_greedy_pick", defaults.sampler_skip_greedy_pick),
+                "dspark_options.sampler_skip_greedy_pick",
+            ),
+            verify_skip_unused_target_draw=_strict_bool(
+                raw.get(
+                    "verify_skip_unused_target_draw",
+                    defaults.verify_skip_unused_target_draw,
+                ),
+                "dspark_options.verify_skip_unused_target_draw",
             ),
         )
 

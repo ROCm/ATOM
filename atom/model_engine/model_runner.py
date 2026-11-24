@@ -131,7 +131,11 @@ from atom.model_ops.eplb import (
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RELAXED_TOP_N, RejectionSampler
 from atom.model_ops.required_channel import DeviceChannel
-from atom.model_ops.sampler import SAMPLER_EPS, sampler_from_config
+from atom.model_ops.sampler import (
+    SAMPLER_EPS,
+    host_no_greedy_rows,
+    sampler_from_config,
+)
 from atom.models.registry import mono_decode_installers
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.sampling_params import RequiredChannel
@@ -3496,6 +3500,18 @@ class ModelRunner:
                 logits, batch, spec_decode_metadata, rows=logprob_rows
             )
         constraints = TokenConstraints.apply(self, batch, logits, spec_decode_metadata)
+        # Host-known, like `all_greedy`: no row's temperature is 0, so the
+        # sampler's greedy select would return its draw
+        # (dspark_options.sampler_skip_greedy_pick). Passed only when it holds,
+        # so a sampler that predates the argument is called as before.
+        sampling_options = plugin_host.dspark_options()
+        no_greedy = (
+            {"no_greedy": True}
+            if sampling_options.sampler_skip_greedy_pick
+            and not all_greedy
+            and host_no_greedy_rows(batch.temperatures)
+            else {}
+        )
         # The head output's next ids (each request's id at its accepted
         # count), where it gives them: the gather below, done in the forward.
         head_next = head_tokens = None
@@ -3517,6 +3533,7 @@ class ModelRunner:
                 top_ps,
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
+                **no_greedy,
             )
             # Prefill has zero bonus/rejection counts, in the same contiguous
             # layout as verification. Slice before reshaping to avoid row gaps.
@@ -3621,14 +3638,33 @@ class ModelRunner:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
             # Only exact match on a sampled batch reads the target's own draw.
             elif not all_greedy and ratio is None:
-                target_token_ids = self.sampler.sample_verification_tokens(
-                    target_logits,
-                    spec_decode_metadata.cu_num_draft_tokens,
-                    temperatures,
-                    top_ks,
-                    top_ps,
-                )
-                if target_token_ids.numel() and get_tp_group().world_size > 1:
+                # Forced acceptance compares no draft with the target's draw
+                # (`rejection_sample` reads the target argmax instead), so only
+                # what the draw takes from the generator is kept
+                # (dspark_options.verify_skip_unused_target_draw). Every TP rank
+                # decides alike -- the option, the configured rates and the
+                # batch's filters are the same on all of them -- so none waits
+                # in the broadcast below for a peer that skipped it.
+                if not (
+                    sampling_options.verify_skip_unused_target_draw
+                    and self.rejection_sampler.synthetic_acceptance_rates is not None
+                    and self.sampler.verification_noise_only(
+                        target_logits, top_ks, top_ps
+                    )
+                ):
+                    target_token_ids = self.sampler.sample_verification_tokens(
+                        target_logits,
+                        spec_decode_metadata.cu_num_draft_tokens,
+                        temperatures,
+                        top_ks,
+                        top_ps,
+                        **no_greedy,
+                    )
+                if (
+                    target_token_ids is not None
+                    and target_token_ids.numel()
+                    and get_tp_group().world_size > 1
+                ):
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
             if argmax_once:
                 # The accept kernel reads its rows of `row_ids` itself.
@@ -3646,6 +3682,7 @@ class ModelRunner:
                     top_ps=top_ps,
                     all_greedy=all_greedy,
                     needs_independent_noise=needs_independent_noise or not all_greedy,
+                    **no_greedy,
                 )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,

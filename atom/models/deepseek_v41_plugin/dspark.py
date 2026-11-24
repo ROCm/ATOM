@@ -6,7 +6,7 @@ from copy import copy
 from types import SimpleNamespace
 
 import torch
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
@@ -33,6 +33,10 @@ from atom.model_ops.deepseek_v41.dspark import (
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
+from atom.model_ops.dspark_dp_head import (
+    can_use_dp_sharded_dspark_head,
+    dp_sharded_dspark_head_and_sample,
+)
 from atom.model_ops.dspark_markov_argmax import (
     dspark_markov_argmax_into,
     dspark_markov_argmax_tp,
@@ -901,6 +905,8 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return self._head_and_sample_q(*out, anchor_ids)
         if self._sharded_markov_sample():
             return self._head_and_sample_sharded(*out, anchor_ids)
+        if self._dp_sharded_markov_sample():
+            return self._head_and_sample_dp_sharded(*out, anchor_ids)
         if plugin_host.dspark_options().lean_head and self._lean_head_ok():
             return self._head_and_sample_lean(*out, anchor_ids)
         return self._head_and_sample(*out, anchor_ids)
@@ -930,6 +936,53 @@ class DeepseekV41DSpark(DSparkDraftModel):
         prev_ids = torch.cat([anchor_ids[:, None], out_ids[:, :-1]], dim=1)
         confidence = self.mtp[-1].confidence_head(hc_hidden, markov.markov_w1(prev_ids))
         return out_ids, confidence
+
+    def _dp_sharded_markov_sample(self) -> bool:
+        """Whether the block is sampled off a DP vocab shard of the replicated
+        head (pure DP attention, dspark_options.dp_sharded_head); see
+        ``can_use_dp_sharded_dspark_head``."""
+        if not plugin_host.dspark_options().dp_sharded_head:
+            return False
+        from atom.plugin import is_plugin_mode
+        from atom.utils.forward_context import get_forward_context
+
+        if is_plugin_mode():
+            return False
+        fc = get_forward_context()
+        if fc is None or fc.dp_metadata is None:
+            return False
+        # dp_metadata is built through the DP group, so the group exists.
+        return can_use_dp_sharded_dspark_head(
+            self.head,
+            self.mtp[-1].markov_head,
+            fc.context,
+            fc.dp_metadata,
+            get_dp_group(),
+        )
+
+    def _head_and_sample_dp_sharded(self, normed, hc_hidden, anchor_ids):
+        """``_head_and_sample`` with the head's vocab split over the DP group;
+        the same ids and confidences given bit-identical shard logits."""
+        from atom.utils.forward_context import get_forward_context
+
+        last = self.mtp[-1]
+        context = get_forward_context().context
+        width = hc_hidden.shape[1]
+        padded_rows, rem = divmod(int(context.running_tokens), width)
+        assert rem == 0, (
+            f"draft running_tokens {context.running_tokens} is not a multiple "
+            f"of the block width {width}"
+        )
+        return dp_sharded_dspark_head_and_sample(
+            normed,
+            hc_hidden,
+            anchor_ids,
+            self.head.weight,
+            last.markov_head,
+            last.confidence_head,
+            get_dp_group(),
+            padded_rows,
+        )
 
     def _lean_head_ok(self) -> bool:
         """The lean head needs the fused Markov op on a bias-free head."""
