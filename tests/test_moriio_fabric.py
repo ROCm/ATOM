@@ -41,6 +41,8 @@ import torch
 from aiter_stub import atom_under_stubs
 from torch import nn
 
+from atom.config import DCPConfig
+
 ROOT = Path(__file__).resolve().parents[1]
 
 # MiniMax-M3.1-Flash (config.json and dspark/config.json): 60 layers, all
@@ -157,6 +159,8 @@ def m31_runner(stack, blocks: int, role: str, kv: dict | None = None):
         index_cache_dtype="fp4",
         hf_config=hf,
         speculative_config=types.SimpleNamespace(num_speculative_tokens=7),
+        dcp_config=DCPConfig(),
+        tensor_parallel_size=TP,
     )
     runner.device = torch.device("cpu")
     runner.block_size = BLOCK

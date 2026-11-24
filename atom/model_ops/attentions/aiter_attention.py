@@ -17,6 +17,7 @@ from atom.config import (
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
+from atom.model_ops.minimax_m3.index_shard import index_shard_world
 from atom.model_ops.minimax_m3.sparse_attn import (
     make_sparse_decode_metadata,
     make_sparse_prefill_metadata,
@@ -429,8 +430,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         return work
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
-        """One paged KV pool, priced by the declaration it is built from."""
-        return [page_pool(self._paged_entry_bytes())]
+        """One paged KV pool, priced by the declaration it is built from; a
+        sharded index cache is held for 1/P of the blocks, so P divides them."""
+        return [
+            page_pool(
+                self._paged_entry_bytes(),
+                index_shard_world(self.model_runner.config),
+            )
+        ]
 
     def paged_pool_bytes(self, blocks: int) -> int:
         """The same declaration, times the blocks the budget bought."""
@@ -486,6 +493,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # multiply it out.
         entry_tokens = self.block_size * self.block_ratio
         extra_fields = self._index_cache_fields(entry_tokens)
+        # A rank keeps 1/P of a sharded index cache (`index_shard`): the blocks
+        # its CP rank scores.
+        world = index_shard_world(runner.config)
+        extra_shard = (0, 1)
+        if world > 1:
+            from atom.distributed.indexer_cp import get_indexer_cp_rank
+
+            extra_shard = (get_indexer_cp_rank(), world)
         pools = {}
         for geometry, count in self.row_counts().items():
             if not isinstance(geometry, KvGeometry):
@@ -504,6 +519,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
                 extra_fields=extra_fields,
                 kv_format=geometry.kv_format,
+                extra_shard=extra_shard if extra_fields else (0, 1),
             )
             extra_fields = ()
         return pools
@@ -784,9 +800,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Every field of every pool, indexer cache included: a unit per
             # (pool, field, layer), in declared order. The geometry is in the
             # role because a hybrid declares two pools whose per-layer regions
-            # are otherwise named alike.
+            # are otherwise named alike. A sharded index region is this rank's
+            # share (the blocks the CP decode has it score).
             pages=[
-                page_region(tensor, semantic_role=f"mha.{geometry}.{role}")
+                page_region(
+                    tensor,
+                    semantic_role=f"mha.{geometry}.{role}",
+                    shard=pool.region_shard(role),
+                )
                 for geometry, pool in self.kv_pools.items()
                 for role, tensor in pool.region_tensors()
             ],

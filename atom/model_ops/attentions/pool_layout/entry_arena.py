@@ -462,7 +462,7 @@ class EntryMajorArena:
 
 def carve_layer_major(
     groups: list[list[EntryField]],
-    entries: int,
+    entries: int | list[int],
     device,
     buf: torch.Tensor | None = None,
 ) -> list[LayerMajorArena | None]:
@@ -472,15 +472,18 @@ def carve_layer_major(
     -- an MHA block's cache, its scales and an indexer's keys. `plan_regions`
     places them, so each starts on the boundary its own field views retype
     from, and an empty group gets `None` instead of an arena over nothing.
+    ``entries`` is one count for every group, or one a group (a group held for
+    a share of the entries only, e.g. a sharded index cache).
 
     Every group's `entry_bytes_for` is aligned already, so packing adds no
     padding and the regions come to exactly what a caller summing the same
     groups was charged. `buf` is None for a pool that owns its memory.
     """
-    sizes = [entry_bytes_for(group) * entries for group in groups]
+    counts = [entries] * len(groups) if isinstance(entries, int) else entries
+    sizes = [entry_bytes_for(group) * n for group, n in zip(groups, counts)]
     return [
-        LayerMajorArena(group, entries, device, buf=region) if group else None
-        for group, region in zip(groups, carve(buf, sizes))
+        LayerMajorArena(group, n, device, buf=region) if group else None
+        for group, n, region in zip(groups, counts, carve(buf, sizes))
     ]
 
 
