@@ -2487,9 +2487,13 @@ class ModelRunner:
             # counts in its own page, and the transfer protocol addresses
             # ``req.block_ids``, which are the scheduler's.
             transfer_tensors.set_block_count(num_kvcache_blocks)
+        state_transfer = self.attn_metadata_builder.state_transfer()
         if (
             self._kv_pool_memory().shares_blocks
-            and not self.attn_metadata_builder.state_transfer().replays
+            and not state_transfer.replays
+            # No per-request state to hand over (MiniMax-M3's paged KV and
+            # index cache): another rank's PAGE block is the whole hit.
+            and state_transfer.kind != "none"
         ):
             # Another rank's block carries PAGE only; without bounded replay a
             # hit would need a STATE checkpoint it lacks.
