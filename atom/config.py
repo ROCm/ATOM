@@ -2363,6 +2363,11 @@ class Config:
     decode_context_parallel_size: int = 1
     dcp_config: DCPConfig = field(default_factory=DCPConfig)
     pipeline_parallel_size: int = 1
+    # Stage sizes ATOM_PP_LAYER_PARTITION=kv_balanced picked; None when the
+    # split is VLLM_PP_LAYER_PARTITION's or the even one. Resolved once, in
+    # __post_init__, and installed for `get_pp_indices` there and wherever this
+    # config is unpickled (`__setstate__`), so every process uses this split.
+    pp_layer_partition: tuple[int, ...] | None = field(default=None, init=False)
     prefill_context_parallel_size: int = 1
     # Ulysses shards tokens and exchanges them for heads around attention.
     # Its workers form AITER's PCP process group; see `pcp_group_size`.
@@ -3573,6 +3578,26 @@ class Config:
 
             self.state_replay_tokens = state_replay_tokens(self)
 
+        # Last: it reads the draft's KV dtype and the block size settled above.
+        from atom.models.pp_partition import resolve_pp_layer_partition
+
+        self.pp_layer_partition = resolve_pp_layer_partition(self)
+        self._install_pp_layer_partition()
+
+    def __setstate__(self, state: dict) -> None:
+        # Every process that gets this config by pickle -- the per-stage
+        # EngineCores, their workers, TP ranks on another node -- splits the
+        # layers as the process that resolved it did.
+        self.__dict__.update(state)
+        self._install_pp_layer_partition()
+
+    def _install_pp_layer_partition(self) -> None:
+        partition = self.__dict__.get("pp_layer_partition")
+        if partition is not None:
+            from atom.models.utils import install_pp_layer_partition
+
+            install_pp_layer_partition(self.hf_config.num_hidden_layers, partition)
+
     def _check_kv_cache_dtype(self) -> None:
         """Validate FP4 support and report performance guidance before sizing."""
         if self.kv_cache_dtype != "fp4":
@@ -4005,6 +4030,11 @@ class Config:
                 spec.draft_kv_dtype,
             )
         )
+        # A resolved PP split decides which layers each stage traces, so a
+        # stage must not load the artifact of another split's stage.
+        pp_layer_partition = getattr(self, "pp_layer_partition", None)
+        if pp_layer_partition is not None:
+            factors.append(("pp_layer_partition", tuple(pp_layer_partition)))
         architecture_factor = _hf_architecture_factor(self.hf_config)
         factors.append(architecture_factor)
         # hf_config also carries values ATOM writes itself (rope_parameters,

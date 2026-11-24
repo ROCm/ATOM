@@ -46,7 +46,8 @@ _MEDIA_SEED_PERSON = b"atom-kv-media-v1"
 def pp_stage_layer_spans(config: Any) -> list[tuple[int, int]]:
     """Each PP stage's ``[start, end)`` slice of the target model's layers.
 
-    Follows ``get_pp_indices``, so ``VLLM_PP_LAYER_PARTITION`` applies.
+    Follows ``get_pp_indices``, so ``VLLM_PP_LAYER_PARTITION`` and the split
+    ``ATOM_PP_LAYER_PARTITION`` resolved apply.
     """
     num_hidden_layers = int(config.hf_config.num_hidden_layers)
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)

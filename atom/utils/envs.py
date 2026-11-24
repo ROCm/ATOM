@@ -75,14 +75,28 @@ def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     return value
 
 
+def _pp_layer_partition_mode() -> str:
+    """``ATOM_PP_LAYER_PARTITION``: unset or empty is "even". A typo raises,
+    because silently keeping the even split looks like the mode not helping."""
+    from atom.models.pp_partition import EVEN, PARTITION_MODES
+
+    mode = os.getenv("ATOM_PP_LAYER_PARTITION", "").strip().lower() or EVEN
+    if mode not in PARTITION_MODES:
+        raise ValueError(
+            f"ATOM_PP_LAYER_PARTITION must be one of {PARTITION_MODES}, got {mode!r}"
+        )
+    return mode
+
+
 def _non_negative_or_none(value: int | None) -> int | None:
     """A negative value clamps to 0; None stays None."""
     return None if value is None else max(0, value)
 
 
-def _int_env(name: str, default: int) -> int:
-    """Unset or empty reads as ``default``; anything else must be an integer."""
-    value = _optional_int_env(name)
+def _int_env(name: str, default: int, *, min_value: int | None = None) -> int:
+    """Unset or empty reads as ``default``; anything else must be an integer
+    (of at least ``min_value``)."""
+    value = _optional_int_env(name, min_value=min_value)
     return default if value is None else value
 
 
@@ -1660,6 +1674,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PP_MAX_INFLIGHT": lambda: (
         _optional_int_env("ATOM_PP_MAX_INFLIGHT", min_value=0) or 0
     ),
+    # How the layers split across PP stages when VLLM_PP_LAYER_PARTITION (an
+    # explicit list, which always wins) is unset: "even" (default) by count;
+    # "kv_balanced" for the largest KV pool every stage can page, which the
+    # drafter's KV on the last stage of a hybrid caps under "even". See
+    # atom/models/pp_partition.py.
+    "ATOM_PP_LAYER_PARTITION": lambda: _pp_layer_partition_mode(),
+    # kv_balanced: layers a stage may hold above the even split's largest
+    # stage, i.e. how much compute balance it may trade for pool. 0 keeps the
+    # even split's slowest stage.
+    "ATOM_PP_PARTITION_MAX_EXTRA_LAYERS": lambda: _int_env(
+        "ATOM_PP_PARTITION_MAX_EXTRA_LAYERS", 1, min_value=0
+    ),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (`engram.host_memory.pin_rows`), not copied to HBM; the
@@ -1838,7 +1864,8 @@ def __getattr__(name: str):
 # FLA_COMPILER_MODE, FLA_CI_ENV,
 #   FLA_GDN_FIX_BT, FLA_USE_CUDA_GRAPH,
 #   FLA_TRIL_PRECISION             — FLA ops library
-# VLLM_PP_LAYER_PARTITION         — vLLM legacy (still active in models/utils.py)
+# VLLM_PP_LAYER_PARTITION         — vLLM legacy (still active in models/utils.py);
+#                                   wins over ATOM_PP_LAYER_PARTITION
 # VLLM_USE_MODELSCOPE             — vLLM legacy (benchmarks)
 # LMCACHE_EC_PIN_TIMEOUT_SEC      — LMCache library's own source-pin timeout;
 #                                   read in kv_transfer/offload/_offload_common.py
