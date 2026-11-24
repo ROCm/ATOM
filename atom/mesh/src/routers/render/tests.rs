@@ -4901,6 +4901,18 @@ mod h_atom_native_tool_calls {
         }
     }
 
+    /// A bare qwen_xml call cut off in a parameter's name, or in a tag after a closed
+    /// parameter, is kept, as ATOM's HTTP parser keeps it at end of input.
+    #[tokio::test]
+    async fn a_bare_qwen_call_cut_off_in_a_tag_is_kept() {
+        let empty = ("get_weather".to_string(), json!({}));
+        let read = cut_off_call("<function=get_weather><parameter=ci").await;
+        assert_eq!(read, [empty.clone(), empty]);
+        let reply = "<function=get_weather><parameter=city>Paris</parameter></para";
+        let paris = ("get_weather".to_string(), json!({"city": "Paris"}));
+        assert_eq!(cut_off_call(reply).await, [paris.clone(), paris]);
+    }
+
     /// A qwen_xml reply read unary, then streamed, from an ATOM worker or not: (content,
     /// names of the calls) of each.
     async fn read_qwen_xml(reply: &str, reads_as_atom: bool) -> [(String, String); 2] {

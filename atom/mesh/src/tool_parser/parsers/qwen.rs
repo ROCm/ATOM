@@ -66,11 +66,13 @@ mod coder {
     /// A call ATOM's HTTP parser reads outside a `<tool_call>` wrapper too.
     const BARE_CALL_START: &str = "<function=";
 
-    /// Wrapped calls, and bare ones, as ATOM's HTTP parser reads them.
+    /// Wrapped calls, and bare ones, as ATOM's HTTP parser reads them; a bare one's last
+    /// parameter may be cut off in its name, which is then no parameter.
     static WRAPPED_OR_BARE_CALLS: LazyLock<Regex> = LazyLock::new(|| {
         let pattern = concat!(
             r"(?s)<tool_call>\s*(.*?)\s*</tool_call>",
-            r"|(<function=[^<>]*>(?:\s*<parameter=[^>]*>.*?</parameter>)*\s*</function>)",
+            r"|(<function=[^<>]*>(?:\s*<parameter=[^>]*>.*?</parameter>)*",
+            r"(?:\s*<parameter=[^<>]*)?\s*</function>)",
         );
         Regex::new(pattern).expect("Valid regex pattern")
     });
@@ -631,22 +633,20 @@ mod coder {
                 return None;
             }
             let mut closers = String::new();
-            // Outside a value, a tag cut off where a parameter or the close starts is
-            // completed, so a bare call rereads whole (an empty name is no parameter).
+            // Outside a value, a tag cut off is completed, so a bare call rereads whole.
             if rest.rfind("<parameter=") <= rest.rfind("</parameter>") {
                 let cut = |tag: &'static str| {
                     helpers::ends_with_partial_token(rest, tag).map(|arrived| &tag[arrived..])
                 };
-                if let Some(completion) = followers.into_iter().find_map(cut) {
-                    closers.push_str(completion);
-                    if completion.ends_with('=') {
-                        closers.push('>');
-                    }
-                }
+                let tags = ["<parameter=", "</function>", "</parameter>"];
+                closers.extend(tags.into_iter().find_map(cut));
             }
             let rest = format!("{rest}{closers}");
-            if rest.rfind("<parameter=") > rest.rfind("</parameter>") {
-                closers.push_str("</parameter>");
+            // A value is closed; a parameter's cut-off name is no parameter, as on HTTP.
+            if let Some(open) = rest.rfind("<parameter=") {
+                if Some(open) > rest.rfind("</parameter>") && rest[open..].contains('>') {
+                    closers.push_str("</parameter>");
+                }
             }
             if !rest.contains("</function>") {
                 closers.push_str("</function>");
