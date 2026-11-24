@@ -861,10 +861,35 @@ class _ModuleRouter:
                     for r in table.get(slot, ())
                     if r.fake is not None
                 ),
-                lambda *xs: torch.empty_like(xs[0]),
+                self._native_fake,
             )
             self._op = span_n(f"module:{self.path}", self.run, fake)
         return self._op
+
+    def _native_fake(self, *xs):
+        """The default fake of a taken-over module: its own forward on the
+        fake inputs (an owner returns what the module returns), else a tensor
+        like the first input."""
+        from torch._guards import detect_fake_mode
+        from torch.nn.utils.stateless import _reparametrize_module
+
+        try:
+            mode = detect_fake_mode(xs)
+            if mode is None:
+                out = self.native(*xs)
+            else:
+                state = {
+                    name: mode.from_tensor(t)
+                    for name, t in (
+                        *self.module.named_parameters(),
+                        *self.module.named_buffers(),
+                    )
+                }
+                with _reparametrize_module(self.module, state):
+                    out = self.native(*xs)
+        except Exception:  # noqa: BLE001 -- a forward a fake cannot run
+            return torch.empty_like(xs[0])
+        return out if isinstance(out, torch.Tensor) else torch.empty_like(xs[0])
 
     def run(self, *args, **kwargs):
         name = f"module:{self.slots[0]}"

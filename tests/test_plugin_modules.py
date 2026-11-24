@@ -465,3 +465,24 @@ def test_a_cold_decline_in_bucket_warmup_is_asked_again_when_recording(monkeypat
     warm.append(True)  # its kernels loaded on that warmup
     monkeypatch.setattr(host, "_stream_capturing", lambda: True)  # recording
     assert bound(x, x, x, x, dtype=torch.bfloat16)[0] == "plugin"
+
+
+def test_a_taken_over_module_fakes_its_own_output_shape(monkeypatch):
+    """Under compile a taken-over module is one opaque op; its default fake is
+    the module's own forward on fake inputs (a projection changes the width)."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    _plugins(monkeypatch, proj=_module_owner("proj", "proj", value=3))
+    host.configure(_plan(modules={"proj": ["proj"]}), kill_switch=False)
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 8)
+
+    net = Net()
+    host.install_modules(net)
+    router = net.proj.forward
+    with FakeTensorMode() as mode:
+        out = router._native_fake(mode.from_tensor(torch.ones(2, 4)))
+    assert tuple(out.shape) == (2, 8)
