@@ -437,7 +437,7 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
                 self.assertEqual(value["--prefill-policy"], "agentic")
                 self.assertEqual(value["--decode-policy"], "least_load")
                 self.assertIn("--kv-events", flags)
-                self.assertEqual(float(value["--kv-storage-weight"]), 1.0)
+                self.assertEqual(float(value["--kv-storage-weight"]), 0.87)
 
 
 if __name__ == "__main__":
