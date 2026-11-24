@@ -244,7 +244,9 @@ class _PerTokenFp8Proj:
         return x
 
 
-_METADATA = SimpleNamespace(dcp_owned_counts=torch.ones(8, dtype=torch.int32))
+_METADATA = SimpleNamespace(
+    dcp_owned_counts=torch.ones(8, dtype=torch.int32), dcp_sparse_prefill_kv=None
+)
 
 
 def _merge_layer(monkeypatch, seen):
