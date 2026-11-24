@@ -60,6 +60,8 @@ struct FakeAtom {
     ranks: Mutex<Vec<Option<i32>>>,
     /// GetModelInfo fails.
     no_model_info: bool,
+    /// HealthCheck answers unhealthy.
+    unhealthy: bool,
 }
 
 #[tonic::async_trait]
@@ -112,8 +114,12 @@ impl AtomEngine for FakeAtom {
         _: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckResponse>, Status> {
         Ok(Response::new(HealthCheckResponse {
-            healthy: true,
-            message: String::new(),
+            healthy: !self.unhealthy,
+            message: if self.unhealthy {
+                "engine core died".into()
+            } else {
+                String::new()
+            },
         }))
     }
 
@@ -381,6 +387,27 @@ async fn an_atom_worker_with_another_protocol_version_is_refused() {
     let error = register(&ctx, json!({ "url": url })).await.unwrap_err();
 
     assert!(error.contains("protocol version is 2"), "{error}");
+    assert!(ctx.worker_registry.get_by_url(&url).is_none());
+}
+
+/// An ATOM worker whose HealthCheck reports it unhealthy is not registered, as an HTTP
+/// worker whose /health fails is not.
+#[tokio::test]
+async fn an_atom_worker_reporting_unhealthy_is_not_registered() {
+    let fake = FakeAtom {
+        info: model_info("atom-down", "", "{}"),
+        protocol_version: 1,
+        unhealthy: true,
+        ..Default::default()
+    };
+    let url = serve(Server::builder().add_service(AtomEngineServer::new(fake))).await;
+    let ctx = context_with(RouterConfig {
+        worker_startup_timeout_secs: 2,
+        ..Default::default()
+    });
+    let error = register(&ctx, json!({ "url": url })).await.unwrap_err();
+
+    assert!(error.contains("engine core died"), "{error}");
     assert!(ctx.worker_registry.get_by_url(&url).is_none());
 }
 
