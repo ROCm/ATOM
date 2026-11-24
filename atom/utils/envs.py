@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 """Centralized environment variable definitions for ATOM.
 
@@ -681,9 +682,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
-    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
-    # Read and checked by atom/mono/polling.py at import, which needs no ATOM
-    # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
+    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 4; 16
+    # beside a KV transfer or offload connector, set by Config). Read and
+    # checked by atom/mono/polling.py at import, which needs no ATOM import; 1
+    # restores the pre-backoff polling (ROCm/ATOM#3369).
     "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
@@ -1400,7 +1402,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
-    # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
+    # page-locked (`engram.host_memory.pin_rows`), not copied to HBM; the
     # GPU pulls only the rows a step names and dequantizes them there. On by default: the host gather gives the same rows
     # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
@@ -1412,21 +1414,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # where Qwen Mono serves the deployment (`atom/models/qwen38/mono/ple.py`),
     # which ignores it.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
-    # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
-    # into page-locked memory of exactly its size (hipHostMalloc on base pages,
-    # so a fragmented page cache costs no compaction), one copy_ below 512 MiB, else one thread per 128 MiB (at least 8) up to
-    # 16 and the CPUs this process may use, dropping the copied checkpoint
-    # pages from the process as it goes; 0 registers the checkpoint mapping in
-    # place (one thread, under the HIP runtime lock). Either way the shard is
-    # resident once. Copying needs the HIP runtime; elsewhere it registers in
-    # place regardless. Unset, DP attention (every rank holds the whole table)
-    # registers in place -- the shared checkpoint mapping, pinned once per node
-    # rather than copied once per rank -- and copies only if that is refused.
-    # `tools/engram/bench_uva_shard.py` measures both.
-    "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
-    # Optional override of the file that serializes shared in-place
-    # registration. Empty: host_memory names one from the checkpoint path.
-    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", ""),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.
