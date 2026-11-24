@@ -122,8 +122,8 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, resp_ctx) =
-            match prepare::prepare_chat(req, headers, model_id, &components) {
+        let (mut payload, resp_ctx, rendered) =
+            match prepare::prepare_chat_rendered(req, headers, model_id, &components) {
                 Ok(t) => t,
                 Err(e) => return self.record_chat_err(&model, start, e),
             };
@@ -131,6 +131,9 @@ impl Pipeline {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),
         };
+        if let Err(e) = rendered.check(&placement) {
+            return self.record_chat_err(&model, start, e);
+        }
         let guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = match self
             .engine
@@ -239,8 +242,10 @@ impl Pipeline {
             ));
         }
 
-        let (mut payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
+        let (mut payload, resp_ctx, rendered) =
+            prepare::prepare_chat_rendered(req, headers, model_id, &components)?;
         let placement = self.plan_for(&payload, &resp_ctx).await?;
+        rendered.check(&placement)?;
         let _guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = self
             .engine

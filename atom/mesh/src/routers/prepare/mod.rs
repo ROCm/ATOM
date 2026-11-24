@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     app_context::AppContext,
-    core::worker::RuntimeType,
+    core::{placement::types::PlacementPlan, worker::RuntimeType, Worker},
     protocols::{
         chat::ChatCompletionRequest,
         common::{InputIds, StringOrArray},
@@ -76,12 +76,62 @@ pub fn lookup_tokenizer(
         .ok_or_else(|| tokenizer_not_found(model_id))
 }
 
+/// The chat template a chat's prompt rendered with, which its placed workers must
+/// render with too.
+pub(crate) struct RenderedTemplate {
+    model_id: String,
+    configured: bool,
+    loaded: Option<LoadedTemplate>,
+}
+
+impl RenderedTemplate {
+    /// A 503 when `plan` places the chat on an ATOM worker advertising another template
+    /// than its prompt rendered with: one registered while it rendered.
+    pub(crate) fn check(&self, plan: &PlacementPlan) -> Result<(), Response> {
+        let placed = match plan {
+            PlacementPlan::Single { worker, .. } => vec![worker],
+            PlacementPlan::Pair {
+                prefill, decode, ..
+            } => vec![prefill, decode],
+        };
+        for worker in placed {
+            let one = std::slice::from_ref(worker);
+            if atom_template_not_loaded(one, self.configured, self.loaded.clone()).is_some() {
+                return Err(template_loading(&self.model_id, worker));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn template_loading(model_id: &str, worker: &Arc<dyn Worker>) -> Response {
+    error::service_unavailable(
+        "chat_template_loading",
+        format!(
+            "The tokenizer of model {model_id} is not yet loaded with the chat template of \
+             its ATOM worker {}; retry later.",
+            worker.url()
+        ),
+    )
+}
+
 pub fn prepare_chat(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
     model_id: Option<String>,
     components: &AppContext,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
+    let (payload, ctx, _) = prepare_chat_rendered(req, headers, model_id, components)?;
+    Ok((payload, ctx))
+}
+
+/// `prepare_chat`, with the template its prompt rendered with.
+pub(crate) fn prepare_chat_rendered(
+    req: Arc<ChatCompletionRequest>,
+    headers: Option<HeaderMap>,
+    model_id: Option<String>,
+    components: &AppContext,
+) -> Result<(GenerationPayload, ResponseContext, RenderedTemplate), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
@@ -116,15 +166,13 @@ pub fn prepare_chat(
             ),
         ));
     }
+    let rendered = RenderedTemplate {
+        model_id: model_id_str.to_string(),
+        configured: configured_template,
+        loaded: loaded_template.clone(),
+    };
     if let Some(worker) = atom_template_not_loaded(&workers, configured_template, loaded_template) {
-        return Err(error::service_unavailable(
-            "chat_template_loading",
-            format!(
-                "The tokenizer of model {model_id_str} is not yet loaded with the chat \
-                 template of its ATOM worker {}; retry later.",
-                worker.url()
-            ),
-        ));
+        return Err(template_loading(model_id_str, worker));
     }
     let tokenizer = entry
         .map(|entry| entry.tokenizer)
@@ -192,7 +240,7 @@ pub fn prepare_chat(
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
     };
 
-    Ok((payload, ctx))
+    Ok((payload, ctx, rendered))
 }
 
 pub fn prepare_generate(
