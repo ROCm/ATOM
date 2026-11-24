@@ -278,12 +278,18 @@ The router renders a chat it tokenizes with the model's chat template and the
 request's `reasoning_effort` and `chat_template_kwargs`. A checkpoint whose
 `config.json` has `model_type` `deepseek_v41` (DeepSeek-V4.1) renders with
 llm-tokenizer's port of V4.1's encoder instead, and the router gives it the
-effort and mode as ATOM's V4.1 encoder takes them: `minimal` as `low`, `medium`
-and `xhigh` as `high`, `none` as chat mode, and the mode from `thinking_mode`,
-or chat mode where `enable_thinking` is false. Other controls, such as a
-message's list of text blocks, can still render otherwise than on ATOM; ATOM
-renders the chat again, so the difference costs prefix hits, not a different
-prompt.
+effort and mode as ATOM resolves them for V4.1's encoder:
+
+- `minimal` is taken as `low`, `medium` and `xhigh` as `high`, and `none` as
+  chat mode.
+- The request's `reasoning_effort` goes over one in `chat_template_kwargs`, and
+  a named effort renders thinking mode over a `thinking_mode` there.
+- `enable_thinking` is not read, as the encoder does not take it.
+
+Other controls can still render otherwise than on ATOM: a top-level `thinking`,
+which the router's request type does not keep, and a message's list of text
+blocks. ATOM renders the chat again, so the difference costs prefix hits, not a
+different prompt.
 
 ## Tokenization
 
