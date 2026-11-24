@@ -182,6 +182,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MoRIIO P/D with moriio_backend fabric: one INFO line per push with its
     # size and timings, on the prefill.
     "ATOM_MORIIO_TRANSFER_STATS": lambda: _flag_env("ATOM_MORIIO_TRANSFER_STATS"),
+    # Diagnostic: log free HBM and the torch allocator per forward.
+    "ATOM_STEP_MEM_LOG": lambda: _flag_env("ATOM_STEP_MEM_LOG"),
     # MoRIIO P/D, prefill side: serve the decode's push requests on a thread
     # of their own as they arrive, and report each push as it lands, instead
     # of from the engine step's get_finished. Off by default.
