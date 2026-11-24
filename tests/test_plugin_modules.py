@@ -170,6 +170,8 @@ def test_v2_options_parse_and_key_the_plan():
         {"model_options": {"mono_mode": "sometimes"}},
         {"model_options": {"seg_fuse": [8]}},
         {"model_options": {"attn_out_quant_fuse": "1"}},
+        {"model_options": {"qpath_fuse": "kv,q"}},
+        {"model_options": {"qpath_fuse": ["k"]}},
         {"model_options": {"seg_fuse": "1,7"}},
         {"model_options": {"seg_fuse": [1], "ffn_mhc_fuse_quant": True}},
         {"model_options": {"seg_fuse": [7], "shared_act_quant": True}},
@@ -259,8 +261,11 @@ def test_the_model_option_seg_fuse_keys_the_plan():
     assert not recipes.ModelOptions().attn_out_quant_fuse
     fused_out = _plan(model_options={"attn_out_quant_fuse": True})
     assert fused_out.model_options.attn_out_quant_fuse
+    assert recipes.ModelOptions().qpath_fuse == ()
+    qpath = _plan(model_options={"qpath_fuse": ["q", "kv"]})
+    assert qpath.model_options.qpath_fuse == ("kv", "q")
     plan = _plan(model_options={"seg_fuse": [7, 1]})
-    assert plan.plan_id != fused_out.plan_id
+    assert len({plan.plan_id, fused_out.plan_id, qpath.plan_id}) == 3
     assert plan.model_options.seg_fuse == (1, 7)
     assert plan.dump()["model_options"]["seg_fuse"] == (1, 7)
     assert plan.plan_id != _plan(model_options={"seg_fuse": [1]}).plan_id
@@ -369,6 +374,7 @@ def test_no_new_environment_variable_carries_a_recipe_option():
         "ATOM_PREFILL_ADMIT_MAX_AGE_MS",
         "ATOM_DSV41_SEG_FUSE",
         "ATOM_DSV41_ATTN_OUT_QUANT_FUSE",
+        "ATOM_DSV41_QPATH_FUSE",
         "ATOM_DP_DSPARK_SHARDED_HEAD",
         "ATOM_SAMPLER_SKIP_GREEDY_PICK",
         "ATOM_SPEC_SKIP_UNUSED_TARGET_DRAW",

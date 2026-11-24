@@ -67,6 +67,8 @@ from atom.models.deepseek_v41.layers import converted_linear_config, native_quan
 from atom.utils import envs, forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
+from . import qpath_fuse
+
 logger = logging.getLogger("atom")
 
 
@@ -380,6 +382,10 @@ class Attention(nn.Module):
         self._fuse_attn_out_quant = _attn_out_quant_fuse_supported(
             self.heads, self.head_dim, self.groups
         )
+        # `model_options.qpath_fuse`: whether this layer's shape, and `wq_b`,
+        # are what the fused query path is written for. None until the first
+        # forward that asks (the weights have loaded by then); off, unread.
+        self._qpath_fuse_state = None
         self._wo_a_seam = plugin_host.bind(
             "v41.attn.out", self._wo_a, capability=self._wo_a_capability
         )
@@ -883,25 +889,46 @@ class Attention(nn.Module):
         # instead. A decode's window store moving ahead of the scorer is
         # safe: the scorer reads the index plane, the compressor its arena.
         fused = self._use_fused_attention(hidden, cache, rope)
-        if fused:
-            qr, qr_scale = self._prepare_fused_attention(
-                q_lora, kv_pre, cache, step, rope
+        kv_fused, q_fused = (
+            qpath_fuse.plan_forms(self, hidden, cache, step, rope, queries)
+            if not fused and qpath_fuse.items()
+            else (None, None)
+        )
+        if kv_fused or q_fused:
+            # `model_options.qpath_fuse`: the norm and / or wq_b launch also
+            # does its half of `rope_quant_window`; `_qpath_rest` runs what is
+            # left. wq_b runs ahead of the scorer here.
+            query, qr, qr_scale, kv_normed, query_fp8 = self._norm_query_qpath(
+                q_lora, kv_pre, cache, step, rope, kv_fused, q_fused
+            )
+            self._fork_select(
+                hidden, qr, qr_scale, cache, step, rope, compressed=compressed
+            )
+            prepared = self._qpath_rest(
+                query, kv_normed, cache, step, rope, query_fp8, kv_fused, q_fused
             )
         else:
-            qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
-        self._fork_select(
-            hidden, qr, qr_scale, cache, step, rope, compressed=compressed
-        )
-        if queries is not None:
-            qr, qr_scale = queries.take(qr, qr_scale)
-        query = self.wq_b(qr, x_scale=qr_scale).unflatten(
-            -1, (self.heads, self.head_dim)
-        )
-        prepared = (
-            None
-            if fused
-            else self._prepare_attention(query, kv_normed, cache, step, rope, queries)
-        )
+            if fused:
+                qr, qr_scale = self._prepare_fused_attention(
+                    q_lora, kv_pre, cache, step, rope
+                )
+            else:
+                qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
+            self._fork_select(
+                hidden, qr, qr_scale, cache, step, rope, compressed=compressed
+            )
+            if queries is not None:
+                qr, qr_scale = queries.take(qr, qr_scale)
+            query = self.wq_b(qr, x_scale=qr_scale).unflatten(
+                -1, (self.heads, self.head_dim)
+            )
+            prepared = (
+                None
+                if fused
+                else self._prepare_attention(
+                    query, kv_normed, cache, step, rope, queries
+                )
+            )
         # A forked compressor was already waited at the scorer; it is named
         # too because a TR recording holds every forked stream until it is
         # joined -- with or without a forked scorer (`ATOM_DSV41_SIDE_STREAMS`
@@ -935,6 +962,105 @@ class Attention(nn.Module):
             rope,
             cache.rope_positions(step) if queries is None else queries.positions,
         )
+
+    def _norm_query_qpath(self, q_lora, kv_pre, cache, step, rope, kv_fused, q_fused):
+        """The q/kv norm and wq_b of a decode step under
+        `model_options.qpath_fuse` (the norm native, all rows queried): the
+        same two launches, of which the norm (``kv_fused``) also rotates,
+        quantizes and stores the KV row into the window, and wq_b
+        (``q_fused``) also writes the rotated MXFP8 query. Each is None or
+        the rotation form `qpath_fuse.plan_forms` named ("P" / "G"). Returns
+        the query, `qk_norm`'s three and the query's MXFP8 pair."""
+        norm = self.qk_norm
+        lead = q_lora.shape[:-1]
+        layer = self.spec.layer_id
+        # The tables the RoPE / window launch reads, in place (BF16 here).
+        _, cos, sin = qpath_fuse.rope_tables(rope)
+        # The default form is left unnamed: the launches' own default.
+        kv_form = {"fuse_cos": True} if kv_fused == "G" else {}
+        q_form = {"fuse_cos": True} if q_fused == "G" else {}
+        if kv_fused:
+            from atom.model_ops.deepseek_v41.qpath_fuse_ops import (
+                dual_rmsnorm_mxfp8_kv_window,
+            )
+
+            q_fp8, q_scale, k_out = dual_rmsnorm_mxfp8_kv_window(
+                q_lora.reshape(-1, q_lora.shape[-1]),
+                kv_pre.reshape(-1, kv_pre.shape[-1]),
+                norm.q_norm.weight,
+                norm.k_norm.weight,
+                norm.q_norm.eps,
+                norm.k_norm.eps,
+                norm.amax_floor,
+                cos,
+                sin,
+                step.positions,
+                (
+                    cache.ring_view(layer),
+                    step,
+                    cache.geometry.window(layer, cache.num_pages),
+                ),
+                rope_dim=rope.rope_dim,
+                **kv_form,
+            )
+            # As `DualRMSNormMXFP8` hands them back.
+            qr = q_fp8.view(*lead, -1)
+            qr_scale = q_scale.view(torch.float8_e8m0fnu).view(*lead, -1)
+            kv_normed = k_out.view(*lead, -1)
+        else:
+            qr, qr_scale, kv_normed = norm(q_lora, kv_pre)
+        if q_fused:
+            rope_quant_gemm, _ = qpath_fuse._aiter_rope_quant()
+            rows = lead.numel()
+            query_fp8 = (
+                torch.empty(
+                    (*lead, self.heads, self.head_dim),
+                    dtype=FP8_DTYPE,
+                    device=qr.device,
+                ),
+                torch.empty(
+                    (*lead, self.heads, self.head_dim // 32),
+                    dtype=torch.float8_e8m0fnu,
+                    device=qr.device,
+                ),
+            )
+            # wq_b's own GEMM call (`native_quant_linear`), by the kernel it
+            # runs at this row count, with the query half of
+            # `rope_quant_window` in its epilogue.
+            query = rope_quant_gemm(
+                qr.view(rows, -1),
+                self.wq_b.weight,
+                qr_scale.view(rows, -1),
+                self.wq_b.weight_scale,
+                step.positions,
+                cos,
+                sin,
+                query_fp8[0],
+                query_fp8[1],
+                head_dim=self.head_dim,
+                rope_dim=rope.rope_dim,
+                **q_form,
+            ).view(*lead, self.heads, self.head_dim)
+        else:
+            query = self.wq_b(qr, x_scale=qr_scale).unflatten(
+                -1, (self.heads, self.head_dim)
+            )
+            query_fp8 = cache.query_fp8(query)
+        return query, qr, qr_scale, kv_normed, query_fp8
+
+    def _qpath_rest(
+        self, query, kv_normed, cache, step, rope, query_fp8, kv_fused, q_fused
+    ):
+        """The half of `rope_quant_window` `_norm_query_qpath` did not fuse,
+        by the launch that half has when it runs alone; then
+        `_attention_inputs`' result for a decode step of the MXFP8 cache."""
+        if not kv_fused:
+            cache.rope_quant_window(
+                self.spec.layer_id, None, kv_normed, rope, step, a8w4=False
+            )
+        if not q_fused:
+            cache.rotate_query(query, rope, step.positions, query_fp8)
+        return False, query_fp8, None, None
 
     def _prepare_fused_attention(self, q, kv, cache, step, rope):
         """Graph-owned Q planes; request-dependent KV destinations stay live."""

@@ -100,6 +100,7 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 | `model_options.block_transition` | `ATOM_V41_TRANSITION_AB` (#3529, still read) |
 | `model_options.seg_fuse` (items `1`, `7`) | `ATOM_DSV41_SEG_FUSE` |
 | `model_options.attn_out_quant_fuse` | `ATOM_DSV41_ATTN_OUT_QUANT_FUSE` |
+| `model_options.qpath_fuse` (items `"kv"`, `"q"`) | `ATOM_DSV41_QPATH_FUSE` |
 | `model_options.mono_mode: "off"` | skipping the mono installer |
 | `dspark_options.fused_prologue` | `ATOM_DSPARK_FUSED_PROLOGUE` (#3639) |
 | `dspark_options.two_buffer_attn` | `ATOM_V41_DRAFT_ATTN_NO_CAT` (#3645) |
@@ -137,6 +138,21 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   tail reads fp32 RoPE tables; the model's are BF16, so fp32 twins of them, value for value,
   are built with the model. Prefill, bounded replay, A8W4 and an AITER without the op are
   unchanged.
+- `model_options.qpath_fuse`: a list of items that move the two halves of a decode step's
+  RoPE / window launch (`rope_quant_window`) onto the launches that produce their inputs; with
+  both, that launch is gone. `"kv"`: the q/kv norm launch also rotates, MXFP8-quantizes and
+  stores each normed KV row into the window (`dual_rmsnorm_mxfp8_kv_window`). `"q"`: `wq_b`
+  runs AITER's `gemm_a8w8_mxscale_bpreshuffle_rope_quant`, the tuned GEMM kernel of the row
+  count, whose epilogue also writes the rotated MXFP8 query. Decode steps of the MXFP8 KV and
+  window cache only (gfx950, 64 heads of 512, the native MXFP8 q/kv norm, all rows, no owner of
+  `v41.attn.qk_norm`, not a step `fused_attn` serves); `wq_b` then runs ahead of the scorer.
+  A half that is not fused runs the launch it has alone. The rotation is computed with explicit
+  `fma` in one of two roundings, named per step from a record of what one reference build of
+  the RoPE / window kernel compiles to (`qpath_fuse.REFERENCE_FORMS`). On that build the output
+  is bit for bit the two launches'; on another kernel source or Triton build (this branch's
+  `rope_window` is one) the fused launches still compute the recorded forms, and a rotated
+  value may differ in its last bit from the tree's own RoPE / window launch, about once in a
+  million values. The log says which case a process is in.
 - `dspark_options.dp_sharded_head`: under pure DP attention (TP 1) the draft block's rows and
   anchors are all-gathered over the DP group, each rank projects every row onto its own
   `V / dp` slice of the replicated LM head, and each position's id is picked from the

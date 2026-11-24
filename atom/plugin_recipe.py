@@ -40,6 +40,7 @@ SHADOW = ("error", "shadow", "nested")
 MONO_MODES = ("auto", "off")
 PREFILL_ADMIT_ORDERS = ("fifo", "short_new", "srpt")
 SEG_FUSE_ITEMS = (1, 7)
+QPATH_FUSE_ITEMS = ("kv", "q")
 _SLOT_RE = re.compile(r"^[A-Za-z0-9_*]+(\.[A-Za-z0-9_*]+)*$")
 
 
@@ -375,6 +376,11 @@ class ModelOptions:
     # quant of its output, wo_a's input pair (AITER's
     # `mla_sparse_prefill_v41_inv_rope_quant`).
     attn_out_quant_fuse: bool = False
+    # Launch fusions of the decode query path, by item name
+    # (`atom.models.deepseek_v41_plugin.qpath_fuse`): "kv", the q/kv norm
+    # also rotates, quantizes and stores the KV row; "q", wq_b also writes
+    # the rotated MXFP8 query.
+    qpath_fuse: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, raw: Any) -> ModelOptions:
@@ -443,6 +449,11 @@ class ModelOptions:
             attn_out_quant_fuse=_strict_bool(
                 raw.get("attn_out_quant_fuse", defaults.attn_out_quant_fuse),
                 "model_options.attn_out_quant_fuse",
+            ),
+            qpath_fuse=_items(
+                raw.get("qpath_fuse", defaults.qpath_fuse),
+                "model_options.qpath_fuse",
+                QPATH_FUSE_ITEMS,
             ),
         )
         for item, other in ((1, "ffn_mhc_fuse_quant"), (7, "shared_act_quant")):
