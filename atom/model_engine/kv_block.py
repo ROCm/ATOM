@@ -18,6 +18,9 @@ class Block:
         # checked against the tokens it claims to stand for. See `update` for
         # why the type is pinned.
         self.token_ids: array.array = array.array("i")
+        # Published from a PD push (`BlockManager.register_received_prefix`)
+        # rather than computed here; any other publish or reuse clears it.
+        self.received = False
 
     def update(self, hash: int, token_ids: array.array):
         # Pinned rather than accepted as either: a list here fails twice and
@@ -31,11 +34,13 @@ class Block:
         ), f"Block.token_ids must be an array('i'), got {type(token_ids).__name__}"
         self.hash = hash
         self.token_ids = token_ids
+        self.received = False
 
     def reset(self):
         self.ref_count = 1
         self.hash = -1
         self.token_ids = array.array("i")
+        self.received = False
 
 
 # Name of the sub-pool sizing class backing the per-request state slots
