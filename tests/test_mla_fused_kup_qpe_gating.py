@@ -3,13 +3,15 @@
 # and every unsupported case falls back to the existing two-kernel path.
 
 import ast
+import builtins
+import functools
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from atom.model_ops.mla_fused import kup_qpe_fusion_ok
+from atom.model_ops.mla_fused import kup_qpe_fusion_ok, kup_qpe_fusion_reason
 from atom.utils import envs
 
 FP8 = torch.float8_e4m3fn
@@ -33,13 +35,8 @@ def test_flag_uses_standard_bool_parser(monkeypatch, value):
 
 def _kup_args(**over):
     args = {
-        "enabled": True,
-        "is_prefill": False,
         "use_qrep": False,
-        "dcp_world_size": 1,
         "q_out": torch.empty(M, H, L + R, dtype=FP8),
-        "num_tokens": M,
-        "slot_mapping": torch.zeros(M, dtype=torch.int64),
         "w_k": torch.empty(H, L, P, dtype=torch.bfloat16),
         "cos_cache": torch.empty(4096, 1, 1, R // 2, dtype=torch.bfloat16),
         "sin_cache": torch.empty(4096, 1, 1, R // 2, dtype=torch.bfloat16),
@@ -62,13 +59,9 @@ def test_kup_qpe_eligible():
 @pytest.mark.parametrize(
     "over",
     [
-        {"enabled": False},
-        {"is_prefill": True},
         {"use_qrep": True},
-        {"dcp_world_size": 2},
         {"q_out": None},
         {"kv_cache": None},
-        {"slot_mapping": torch.zeros(M + 3, dtype=torch.int64)},
         {"q_out": torch.empty(M, H, L + R, dtype=torch.bfloat16)},
         {"kv_cache": torch.empty(16, 1, BS, L + R, dtype=torch.bfloat16)},
         {"kv_cache": torch.empty(16, 1, 8, L + R, dtype=FP8)},
@@ -80,15 +73,15 @@ def test_kup_qpe_eligible():
         {"sin_cache": torch.empty(4096, R, dtype=torch.bfloat16)},
         {"sin_cache": torch.empty_strided((4096, R // 2), (R, 1), dtype=torch.bfloat16)},
         {"positions": torch.zeros(3, M, dtype=torch.int64)},
-        {"num_tokens": 0, "q_out": torch.empty(0, H, L + R, dtype=FP8),
-         "slot_mapping": torch.zeros(0, dtype=torch.int64)},
+        {"q_out": torch.empty(0, H, L + R, dtype=FP8),
+         "positions": torch.zeros(0, dtype=torch.int64)},
     ],
 )  # fmt: skip
 def test_kup_qpe_falls_back(over):
     assert not kup_qpe_fusion_ok(**_kup_args(**over))
 
 
-def _cpu_mla_method(name):
+def _cpu_mla_method(name, **globals_):
     # Execute the actual dependency-free production method without importing
     # attention_mla's GPU kernels. No stand-in copy of its branching logic.
     path = Path(__file__).parents[1] / "atom/model_ops/attention_mla.py"
@@ -99,7 +92,8 @@ def _cpu_mla_method(name):
     method = next(
         n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name
     )
-    namespace = {}
+    method.decorator_list = []
+    namespace = globals_
     exec(  # noqa: S102 - executes only the trusted production method above
         compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
         namespace,
@@ -110,7 +104,7 @@ def _cpu_mla_method(name):
 @pytest.mark.parametrize(
     "qrep,group", [(False, False), (False, True), (True, False), (True, True)]
 )
-def test_q_proj_heads_matches_independent_projection(qrep, group):
+def test_inline_q_proj_matches_independent_projection(qrep, group):
     # Distinct weights for every head expose a wrong split or the wrong qrep
     # projection. Local heads are the second rank's columns of the group weight.
     m, h, group_h, d, k = 3, 2, 4, 5, 7
@@ -135,13 +129,34 @@ def test_q_proj_heads_matches_independent_projection(qrep, group):
         num_heads=h,
         qrep_num_heads=group_h,
         qk_head_dim=d,
+        qk_nope_head_dim=3,
+        qk_rope_head_dim=2,
+        W_K=torch.arange(h * 8 * 3, dtype=torch.float32).view(h, 8, 3) / 20,
+        W_K_scale=None,
+        W_K_qrep=torch.arange(group_h * 8 * 3, dtype=torch.float32).view(group_h, 8, 3)
+        / 30,
+        W_K_qrep_scale=None,
         q_proj=project(weight if qrep else local_weight, "group"),
         _local_q_proj=lambda: project(local_weight, "local"),
     )
-    out = _cpu_mla_method("_q_proj_heads")(fake, x, scale, group=group)
+
+    def bmm(a, w, *, YQ):
+        YQ.copy_(torch.bmm(a, w.transpose(1, 2)).to(torch.bfloat16))
+
+    nope, pe = _cpu_mla_method(
+        "_q_proj_and_k_up_proj",
+        torch=torch,
+        is_rocm_aiter_fp4bmm_enabled=lambda: False,
+        _aiter_triton_bf16_bmm=bmm,
+    )(fake, x, scale, group=group)
     full = ((x * scale) @ weight).reshape(m, group_h, d)
     expected = full if qrep and group else full[:, h:, :]
-    torch.testing.assert_close(out, expected)
+    weights = fake.W_K_qrep if qrep and group else fake.W_K
+    expected_nope = torch.einsum("mhp,hlp->mhl", expected[..., :3], weights).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(nope, expected_nope.to(nope.dtype))
+    torch.testing.assert_close(pe, expected[..., 3:])
     assert calls == (["local"] if qrep and not group else ["group"])
 
 
@@ -270,8 +285,168 @@ def test_disabled_forward_gate_does_not_read_runtime_inputs():
     )
     # No q, metadata, cache, arch or env objects exist in this namespace. Any
     # accidental read on the default path therefore raises instead of passing.
-    values = {"self": SimpleNamespace(_kup_qpe_enabled=False), "fused_kup_qpe": False}
-    exec(  # noqa: S102 - trusted production gate
-        compile(ast.Module(body=[gate], type_ignores=[]), str(path), "exec"), values
+    driver = ast.FunctionDef(
+        name="driver",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg="self")],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+        body=[gate],
+        decorator_list=[],
     )
-    assert values["fused_kup_qpe"] is False
+    module = ast.fix_missing_locations(ast.Module(body=[driver], type_ignores=[]))
+    values = {}
+    exec(  # noqa: S102 - trusted production gate
+        compile(module, str(path), "exec"), values
+    )
+    assert values["driver"](SimpleNamespace(_kup_qpe_enabled=False)) is None
+
+
+def test_fallback_reasons_distinguish_failures():
+    assert "matching FP8" in kup_qpe_fusion_reason(
+        **_kup_args(q_out=torch.empty(M, H, L + R, dtype=torch.bfloat16))
+    )
+    assert "sin/cos" in kup_qpe_fusion_reason(
+        **_kup_args(sin_cache=torch.empty(4096, R, dtype=torch.bfloat16))
+    )
+
+
+def test_diagnostics_log_each_reason_once():
+    rows = []
+    layer_type = SimpleNamespace(_kup_qpe_logged=set())
+    logger = SimpleNamespace(info=lambda *args: rows.append(args))
+    log = _cpu_mla_method("_log_kup_qpe", MLAAttention=layer_type, logger=logger)
+    fake = SimpleNamespace()
+    for reason in (
+        "query/cache dtype must be matching FP8",
+        "sin/cos cache layout or dtype mismatch",
+        "eligible",
+    ):
+        log(fake, reason, 64)
+        log(fake, reason, 128)
+    assert len(rows) == 3
+    assert [row[-1] for row in rows] == [
+        "query/cache dtype must be matching FP8",
+        "sin/cos cache layout or dtype mismatch",
+        "eligible",
+    ]
+
+
+@pytest.mark.parametrize(
+    "cause", ["absorb", "shuffled", "qout", "tdm", "aiter", "waiting", "off"]
+)
+def test_initial_diagnostics_name_prerequisites(monkeypatch, cause):
+    for name in (
+        "ATOM_MLA_FUSED_KUP_QPE",
+        "ATOM_MLA_ABSORB_BF16",
+        "ATOM_MLA_ABSORB_BF16_FUSE_QOUT",
+    ):
+        monkeypatch.setenv(name, "1")
+    if cause == "absorb":
+        monkeypatch.setenv("ATOM_MLA_ABSORB_BF16", "0")
+    if cause == "qout":
+        monkeypatch.setenv("ATOM_MLA_ABSORB_BF16_FUSE_QOUT", "0")
+    if cause == "off":
+        monkeypatch.delenv("ATOM_MLA_FUSED_KUP_QPE")
+    path = Path(__file__).parents[1] / "atom/model_ops/attention_mla.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MLAAttention"
+    )
+    init = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    )
+    nodes = [
+        n
+        for n in init.body
+        if (
+            isinstance(n, ast.Assign)
+            and isinstance(n.targets[0], ast.Attribute)
+            and n.targets[0].attr in ("_kup_qpe_requested", "_kup_qpe_enabled")
+        )
+        or (
+            isinstance(n, ast.If)
+            and isinstance(n.test, ast.Attribute)
+            and n.test.attr == "_kup_qpe_requested"
+        )
+    ]
+    helpers = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name in ("_mla_absorb_bf16_enabled", "_mla_absorb_bf16_fuse_qout_enabled")
+    ]
+    reasons = []
+    fake = SimpleNamespace(
+        kv_shuffled=cause != "shuffled",
+        _q_nope_prestored_supported=cause != "aiter",
+        _log_kup_qpe=reasons.append,
+    )
+
+    def tdm():
+        assert cause != "off", "default initialization queried the architecture"
+        return cause != "tdm"
+
+    namespace = {
+        "self": fake,
+        "envs": envs,
+        "arch_info": SimpleNamespace(is_tdm_avail=tdm, get_arch=lambda: "gfx950"),
+    }
+    exec(  # noqa: S102 - trusted initialization and registered flag helpers
+        compile(ast.Module(body=helpers + nodes, type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    if cause == "off":
+        assert not reasons
+    else:
+        expected = {
+            "absorb": "ATOM_MLA_ABSORB_BF16=0",
+            "shuffled": "ATOM_MLA_KV_SHUFFLED=0",
+            "qout": "ATOM_MLA_ABSORB_BF16_FUSE_QOUT=0",
+            "tdm": "no TDM on gfx950",
+            "aiter": "q_nope_prestored is unsupported",
+            "waiting": "M>=64",
+        }
+        assert expected[cause] in reasons[0]
+
+
+def test_layout_builder_caches_each_shape():
+    path = Path(__file__).parents[1] / "atom/model_ops/mla_fused/fused_kup_qpe.py"
+    method = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "_layouts"
+    )
+    calls = []
+
+    def wmma(warps):
+        calls.append(("wmma", warps))
+        return object(), object(), object()
+
+    def shared(*args):
+        calls.append(("shared", args))
+        return object(), object()
+
+    def imports(name, *args, **kwargs):
+        if name == "aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16":
+            return SimpleNamespace(
+                create_wmma_layouts=wmma, create_shared_layouts=shared
+            )
+        return builtins.__import__(name, *args, **kwargs)
+
+    namespace = {
+        "functools": functools,
+        "__builtins__": {**vars(builtins), "__import__": imports},
+    }
+    exec(  # noqa: S102 - trusted layout builder with local import stand-ins
+        compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    layout = namespace["_layouts"]
+    first = layout(64, 256, 128, 4)
+    assert layout(64, 256, 128, 4) is first
+    assert layout(64, 256, 32, 4) is not first
+    assert len(calls) == 4

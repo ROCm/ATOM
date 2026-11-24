@@ -2,7 +2,7 @@
 """MLA decode K-up (BF16 absorb) + q_pe RoPE + shuffled KV-cache write in one
 persistent Gluon kernel for gfx1250.
 
-Replaces, bit for bit, the pair
+Targets the arithmetic and output layout of the pair
   batched_gemm_bf16(q_nope, W_K, YQ=q_out[..., :L].transpose(0, 1))
   fused_qk_rope_cat_and_cache_mla(..., q_out=q_out, shuffled_kv_cache=True,
                                   q_nope_prestored=True)
@@ -18,6 +18,8 @@ then per tile i: A(i+2), P(i+2), S(i), SQ(i). wait(4) at the top of tile i
 leaves A(i), P(i) landed and S(i-2), SQ(i-2) drained.
 """
 
+import functools
+
 import torch
 import triton.experimental.gluon.language as gl
 from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
@@ -29,6 +31,8 @@ from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
 )
 from triton.experimental import gluon
 
+from atom.model_ops.mla_fused import _KUP_QPE_LDS_BUDGET, _kup_qpe_lds_bytes
+
 
 @gluon.jit
 def _kv_idx_load(
@@ -37,7 +41,6 @@ def _kv_idx_load(
     pos_ptr,
     slot_mapping_ptr,
     pos_stride_b,
-    L: gl.constexpr,
     R: gl.constexpr,
     num_warps: gl.constexpr,
 ):
@@ -49,7 +52,7 @@ def _kv_idx_load(
     slot = gl.load(slot_mapping_ptr + tc).to(gl.int64)
     slot = gl.where(valid, slot, -1)
     pos = gl.load(pos_ptr + tc * pos_stride_b + zh).to(gl.int64)
-    return slot, slot, pos
+    return slot, pos
 
 
 @gluon.jit
@@ -117,8 +120,7 @@ def _kv_values(
 def _kv_put(
     kn8,
     kp8,
-    slot_n,
-    slot_p,
+    slot,
     kv_cache_ptr,
     kv_cache_stride_b,
     L: gl.constexpr,
@@ -134,12 +136,12 @@ def _kv_put(
     LP1: gl.constexpr = gl.BlockedLayout([2], [32], [num_warps], [0])
     dn = gl.arange(0, L, layout=LN1)
     dp = gl.arange(0, R, layout=LP1)
-    if slot_n >= 0:
+    if slot >= 0:
         _store_mla_kv_cache(
             kv_cache_ptr,
-            slot_n // BLOCK_SIZE,
+            slot // BLOCK_SIZE,
             0,
-            slot_p % BLOCK_SIZE,
+            slot % BLOCK_SIZE,
             dn,
             dp,
             kv_cache_stride_b,
@@ -243,7 +245,7 @@ def _kup_qpe_persistent_kernel(
     pid = gl.program_id(0)
     if NUM_XCDS > 1:
         # Workgroups go round-robin over XCDs: give each XCD a run of adjacent
-        # heads (their q_out rows share 128B lines) and both N-halves of a head.
+        # heads (their q_out rows share 128B lines) and all N slices of a head.
         xcd = pid % NUM_XCDS
         j = pid // NUM_XCDS
         nh = j % NSPLIT_N
@@ -365,11 +367,11 @@ def _kup_qpe_persistent_kernel(
     )
     cq, sq = _qpe_freq_load(pq0, cos_ptr, sin_ptr, cos_stride_b, R, num_warps)
     # KV: token pid + i * NUM_CTAS at tile i; index two ahead, data one ahead.
-    ksn0, ksp0, kpos0 = _kv_idx_load(
-        pid, M, pos_ptr, slot_mapping_ptr, pos_stride_b, L, R, num_warps
+    ks0, kpos0 = _kv_idx_load(
+        pid, M, pos_ptr, slot_mapping_ptr, pos_stride_b, R, num_warps
     )
-    ksn1, ksp1, kpos1 = _kv_idx_load(
-        pid + NUM_CTAS, M, pos_ptr, slot_mapping_ptr, pos_stride_b, L, R, num_warps
+    ks1, kpos1 = _kv_idx_load(
+        pid + NUM_CTAS, M, pos_ptr, slot_mapping_ptr, pos_stride_b, R, num_warps
     )
     kn, kp, kc, ks = _kv_data_load(
         pid, M, kpos0, k_nope_ptr, k_pe_ptr, cos_ptr, sin_ptr,
@@ -412,20 +414,17 @@ def _kup_qpe_persistent_kernel(
         kv_n, kv_p = _kv_values(
             kn, kp, kc, ks, k_scale_rcprl, kv_cache_ptr, R, IS_NEOX, num_warps
         )
-        ksn_s = ksn0
-        ksp_s = ksp0
-        ksn2, ksp2, kpos2 = _kv_idx_load(
+        ks_s = ks0
+        ks2, kpos2 = _kv_idx_load(
             pid + (i + 2) * NUM_CTAS, M, pos_ptr, slot_mapping_ptr, pos_stride_b,
-            L, R, num_warps,
+            R, num_warps,
         )  # fmt: skip
         kn, kp, kc, ks = _kv_data_load(
             pid + (i + 1) * NUM_CTAS, M, kpos1, k_nope_ptr, k_pe_ptr, cos_ptr, sin_ptr,
             k_nope_stride_b, k_pe_stride_b, cos_stride_b, L, R, num_warps,
         )  # fmt: skip
-        ksn0 = ksn1
-        ksp0 = ksp1
-        ksn1 = ksn2
-        ksp1 = ksp2
+        ks0 = ks1
+        ks1 = ks2
         kpos1 = kpos2
 
         c_buf.index(slot).store(acc.to(gl.bfloat16).to(c_ptr.type.element_ty))
@@ -435,14 +434,14 @@ def _kup_qpe_persistent_kernel(
         gl.amd.gfx1250.tdm.async_load(p_desc, [nxt + nh * HALF_M, 0], p_buf.index(slot))
         gl.amd.gfx1250.tdm.async_store(c_desc, [m0, n_off], c_buf.index(slot))
         gl.amd.gfx1250.tdm.async_store(q_desc, [m0 + nh * HALF_M, 0], q_buf.index(slot))
-        _kv_put(kv_n, kv_p, ksn_s, ksp_s, kv_cache_ptr, kv_cache_stride_b, L, R,
+        _kv_put(kv_n, kv_p, ks_s, kv_cache_ptr, kv_cache_stride_b, L, R,
                 BLOCK_SIZE, num_warps)  # fmt: skip
 
     # Tokens past n_local * NUM_CTAS (only when M > #CTAs * tiles per CTA).
     for k in range(n_local, gl.cdiv(M - pid, NUM_CTAS)):
         t = pid + k * NUM_CTAS
-        ksn, ksp, kpos = _kv_idx_load(
-            t, M, pos_ptr, slot_mapping_ptr, pos_stride_b, L, R, num_warps
+        ks, kpos = _kv_idx_load(
+            t, M, pos_ptr, slot_mapping_ptr, pos_stride_b, R, num_warps
         )
         k_nope, k_pe, kc2, ks2 = _kv_data_load(
             t, M, kpos, k_nope_ptr, k_pe_ptr, cos_ptr, sin_ptr,
@@ -451,12 +450,13 @@ def _kup_qpe_persistent_kernel(
         kv_n, kv_p = _kv_values(
             k_nope, k_pe, kc2, ks2, k_scale_rcprl, kv_cache_ptr, R, IS_NEOX, num_warps
         )
-        _kv_put(kv_n, kv_p, ksn, ksp, kv_cache_ptr, kv_cache_stride_b, L, R,
+        _kv_put(kv_n, kv_p, ks, kv_cache_ptr, kv_cache_stride_b, L, R,
                 BLOCK_SIZE, num_warps)  # fmt: skip
 
     gl.amd.gfx1250.tdm.async_wait(0)
 
 
+@functools.cache
 def _layouts(block_m, block_n, block_k, num_warps):
     from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
         create_shared_layouts,
@@ -488,10 +488,9 @@ def kup_qpe_fused(
     num_warps: int = 4,
     num_xcds: int = 8,
 ) -> torch.Tensor:
-    # Load-bearing gfx1250 LDS budget (bytes before padding): W=2*256*P,
-    # double A=4*64*P, double C=2*64*256, double P/Q=6*HALF_M*R,
-    # q freqs=2*HALF_M*R, KV freqs=2*R. The gate caps this at 224 KiB,
-    # reserving 32 KiB for padding under gfx1250's 256 KiB/CTA limit.
+    # The shared estimate/budget includes W, double A/C/P/Q and frequency
+    # workspace. 224 KiB is ATOM's conservative limit before layout padding;
+    # gfx1250 has 320 KiB. Retain this budget pending GPU shape validation.
     # The gate restricts P to {32,64,128}, L to {256,512,1024} and R<=256;
     # do not relax those or the fixed launch geometry without compiler/GPU QA.
     assert (m_split, block_m, block_n, num_warps) == (2, 64, 256, 4)
@@ -500,15 +499,7 @@ def kup_qpe_fused(
     R = q_pe.shape[-1]
     assert M > 0 and L in (256, 512, 1024) and P in (32, 64, 128)
     assert R in (32, 64, 128, 256)
-    half_m = block_m // (L // block_n)
-    lds_bytes = (
-        2 * block_n * P
-        + 4 * block_m * P
-        + 2 * block_m * block_n
-        + 8 * half_m * R
-        + 2 * R
-    )
-    assert lds_bytes <= 224 * 1024
+    assert _kup_qpe_lds_bytes(L, P, R) <= _KUP_QPE_LDS_BUDGET
     if cos.dim() == 4:
         cos = cos.squeeze(1).squeeze(1)
         sin = sin.squeeze(1).squeeze(1)

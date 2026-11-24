@@ -34,7 +34,7 @@ def projection(monkeypatch):
     cls = next(
         n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MLAAttention"
     )
-    method_names = {"_q_proj_heads", "_q_proj_and_k_up_proj", "forward_impl"}
+    method_names = {"_q_proj_and_k_up_proj", "forward_impl"}
     methods = [
         n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in method_names
     ]
@@ -213,6 +213,67 @@ def test_forward_selects_prestored_only_for_supported_decode(
     else:
         assert seen["destination"] is None
         assert "q_nope_prestored" not in seen.get("rope_kwargs", {})
+
+
+@pytest.mark.parametrize("eligible", [True, False])
+def test_requested_fusion_dispatches_or_falls_back(projection, eligible):
+    layer, namespace, seen = projection
+    tokens = 64
+    events = []
+    layer._kup_qpe_enabled = True
+    layer._log_kup_qpe = lambda reason, count: events.append(("log", reason))
+
+    def gate(**args):
+        events.append(("gate",))
+        assert args["q_out"].shape == (tokens, 3, 10)
+        return None if eligible else "unsupported test shape"
+
+    def fused(q, scale, kn, kr, pos, view, slots, out):
+        events.append(("fused",))
+        seen["fused_destination"] = out
+        out.view(torch.uint8).fill_(0x55)
+
+    def project(q, **args):
+        events.append(("project",))
+        seen["fallback_destination"] = args["q_nope_out"]
+        return args["q_nope_out"], torch.ones(tokens, 3, 2, dtype=torch.bfloat16)
+
+    def rope(*args, **kwargs):
+        events.append(("rope",))
+        assert kwargs["q_nope_prestored"] is True
+
+    def decode(out, cache, metadata, **kwargs):
+        events.append(("decode",))
+        return out
+
+    namespace["kup_qpe_fusion_reason"] = gate
+    namespace["triton_fused_qk_rope_cat_and_cache_mla"] = rope
+    layer._q_proj_k_up_rope_and_cache = fused
+    layer._q_proj_and_k_up_proj = project
+    layer._forward_decode = decode
+    cache = torch.empty(tokens, 1, 10)
+    metadata = SimpleNamespace(
+        slot_mapping=torch.arange(tokens), dtype_q=torch.float8_e4m3fn
+    )
+    context = SimpleNamespace(is_prefill=False, is_dummy_run=False)
+    namespace["get_forward_context"] = lambda: SimpleNamespace(
+        attn_metadata=metadata,
+        context=context,
+        kv_cache_data={"layer_0": SimpleNamespace(k_cache=cache)},
+    )
+    result = layer.forward_impl(
+        torch.zeros(tokens, 18, dtype=torch.bfloat16),
+        torch.zeros(tokens, 8),
+        torch.zeros(tokens, 1, 2),
+        positions=torch.arange(tokens),
+    )
+    if eligible:
+        assert result is seen["fused_destination"]
+        assert bool((result.view(torch.uint8) == 0x55).all())
+        assert [e[0] for e in events] == ["gate", "log", "fused", "decode"]
+    else:
+        assert result.data_ptr() == seen["fallback_destination"].data_ptr()
+        assert [e[0] for e in events] == ["gate", "log", "project", "rope", "decode"]
 
 
 def test_registered_absorb_flags_defaults_and_overrides(projection, monkeypatch):

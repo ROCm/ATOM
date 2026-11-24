@@ -79,7 +79,7 @@ from atom.model_ops.dcp_ops import (
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
-from atom.model_ops.mla_fused import kup_qpe_fusion_ok
+from atom.model_ops.mla_fused import kup_qpe_fusion_reason
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
@@ -798,6 +798,28 @@ class MLAAttention(nn.Module):
                     "aiter or set ATOM_MLA_PAGE_SIZE=1."
                 )
 
+        # Resolve this opt-in once. Only the existing prestored-q_out branch
+        # checks it in forward; the default path retains its inline projection.
+        self._kup_qpe_requested = envs.ATOM_MLA_FUSED_KUP_QPE
+        self._kup_qpe_enabled = self._kup_qpe_requested and arch_info.is_tdm_avail()
+        if self._kup_qpe_requested:
+            reasons = []
+            if not self._kup_qpe_enabled:
+                reasons.append(f"no TDM on {arch_info.get_arch()}")
+            if not _mla_absorb_bf16_enabled():
+                reasons.append("ATOM_MLA_ABSORB_BF16=0")
+            if not self.kv_shuffled:
+                reasons.append("ATOM_MLA_KV_SHUFFLED=0")
+            if not _mla_absorb_bf16_fuse_qout_enabled():
+                reasons.append("ATOM_MLA_ABSORB_BF16_FUSE_QOUT=0")
+            if not self._q_nope_prestored_supported:
+                reasons.append("aiter q_nope_prestored is unsupported")
+            self._log_kup_qpe(
+                "; ".join(reasons)
+                if reasons
+                else "waiting for pure decode M>=64 with unscaled BF16 W_K"
+            )
+
         # Context-row KV fusion (write_context_kv_latent). Resolved once here,
         # like use_seg_mla above, so a drafter pays no env/attr lookup per layer
         # per step. The seg and shuffled-KV layouts are excluded rather than
@@ -808,16 +830,6 @@ class MLAAttention(nn.Module):
         # get_rope builds -- anything else (M-RoPE, partial rotary, full-width
         # freqs) indexes the cache differently.
         rope = self.rotary_emb
-        # Resolve the opt-in once. The default path pays only a boolean branch
-        # in forward: no env lookup, arch query, cache view or shape gate. The
-        # kernel loads and stores through TDM.
-        self._kup_qpe_enabled = envs.ATOM_MLA_FUSED_KUP_QPE and arch_info.is_tdm_avail()
-        if envs.ATOM_MLA_FUSED_KUP_QPE and not self._kup_qpe_enabled:
-            logger.info(
-                "MLA K-up/q_pe fusion: two-kernel fallback "
-                "(ATOM_MLA_FUSED_KUP_QPE=1): no TDM on %s",
-                arch_info.get_arch(),
-            )
         self._ctx_kv_fusion_enabled = (
             envs.ATOM_DSPARK_FUSED_CTX_KV
             and not self.use_seg_mla
@@ -1690,17 +1702,6 @@ class MLAAttention(nn.Module):
         # Convert from (B, N, V) to (B, N * V)
         return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
 
-    def _q_proj_heads(self, x, x_scale=None, group=False):
-        if self.qrep_enabled and not group:
-            # Row-view weight: computes only this rank's heads, so the redundant
-            # group-wide GEMM never happens (the old code projected all group
-            # heads and then dropped 7/8 of the result).
-            return self._local_q_proj()(x, x_scale).view(
-                -1, self.num_heads, self.qk_head_dim
-            )
-        n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
-        return self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
-
     @mark_trace(prefix="q_proj_k_up_qpe_rope_cache", torch_compile=False)
     def _q_proj_k_up_rope_and_cache(
         self, x, x_scale, k_nope, k_rope, positions, kv_view, slot_mapping, q_out
@@ -1709,7 +1710,8 @@ class MLAAttention(nn.Module):
         q_out[..., L:] and the shuffled KV-cache write (ATOM_MLA_FUSED_KUP_QPE)."""
         from atom.model_ops.mla_fused.fused_kup_qpe import kup_qpe_fused
 
-        q = self._q_proj_heads(x, x_scale, group=False)
+        # Both gates require DCP=1 without query replication.
+        q = self.q_proj(x, x_scale).view(-1, self.num_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kup_qpe_fused(
             q_nope.transpose(0, 1),
@@ -1735,7 +1737,13 @@ class MLAAttention(nn.Module):
         # QREP: q_proj emits the full DCP-group head set. group=True (decode)
         # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
         # group=False (prefill / non-QREP) takes only this rank's heads.
-        q = self._q_proj_heads(x, x_scale, group)
+        if self.qrep_enabled and not group:
+            q = self._local_q_proj()(x, x_scale).view(
+                -1, self.num_heads, self.qk_head_dim
+            )
+        else:
+            n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
+            q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Convert from (B, N, P) to (N, B, P)
@@ -3132,7 +3140,18 @@ class MLAAttention(nn.Module):
     # path (it is what moves the rope cache to the device), so logging only the
     # very first call would report a fusion that is in fact running.
     _ctx_kv_fusion_logged: ClassVar[set[bool]] = set()
-    _kup_qpe_logged: ClassVar[set[bool]] = set()
+    _kup_qpe_logged: ClassVar[set[str]] = set()
+
+    def _log_kup_qpe(self, reason: str, num_tokens: int | None = None) -> None:
+        if reason in MLAAttention._kup_qpe_logged:
+            return
+        MLAAttention._kup_qpe_logged.add(reason)
+        logger.info(
+            "MLA K-up/q_pe fusion: %s (ATOM_MLA_FUSED_KUP_QPE=1, M=%s): %s",
+            "FUSED" if reason == "eligible" else "two-kernel fallback",
+            num_tokens if num_tokens is not None else "not yet running",
+            reason,
+        )
 
     def write_context_kv_latent(
         self,
@@ -3360,75 +3379,49 @@ class MLAAttention(nn.Module):
                     dtype=attn_metadata.dtype_q,
                     device=q.device,
                 )
-            fused_kup_qpe = False
-            if self._kup_qpe_enabled:
-                kv_view = (
-                    self._shuffled_kv_view(kv_cache)
-                    if q_out_prestored is not None
-                    else None
-                )
-                fused_kup_qpe = kup_qpe_fusion_ok(
-                    enabled=True,
-                    is_prefill=context.is_prefill,
-                    use_qrep=use_qrep,
-                    dcp_world_size=self.dcp_world_size,
-                    q_out=q_out_prestored,
-                    num_tokens=q.shape[0],
-                    slot_mapping=attn_metadata.slot_mapping,
-                    w_k=self.W_K,
-                    cos_cache=self.rotary_emb.cos_cache,
-                    sin_cache=self.rotary_emb.sin_cache,
-                    positions=positions,
-                    rope_dim=self.qk_rope_head_dim,
-                    kv_cache=kv_view,
-                    k_scale=self._k_scale,
-                )
-                # Log both the first fallback and later activation (e.g. after
-                # RoPE caches move to the GPU), once each per process.
-                if fused_kup_qpe not in MLAAttention._kup_qpe_logged:
-                    MLAAttention._kup_qpe_logged.add(fused_kup_qpe)
-                    if fused_kup_qpe:
-                        reason = "eligible"
-                    elif q_out_prestored is None:
-                        # The prestored q_out gate declined: BF16 absorb with
-                        # ATOM_MLA_ABSORB_BF16_FUSE_QOUT, shuffled KV, decode
-                        # and aiter's q_nope_prestored_supported() are needed.
-                        reason = "no prestored q_out (ATOM_MLA_ABSORB_BF16_FUSE_QOUT)"
-                    else:
-                        reason = "unsupported decode/shape/dtype/cache"
-                    logger.info(
-                        "MLA K-up/q_pe fusion: %s (ATOM_MLA_FUSED_KUP_QPE=1, "
-                        "M=%d, W_K=%s): %s",
-                        "FUSED" if fused_kup_qpe else "two-kernel fallback",
-                        q.shape[0],
-                        tuple(self.W_K.shape),
-                        reason,
+                if self._kup_qpe_enabled:
+                    kv_view = self._shuffled_kv_view(kv_cache)
+                    reason = kup_qpe_fusion_reason(
+                        use_qrep=use_qrep,
+                        q_out=q_out_prestored,
+                        w_k=self.W_K,
+                        cos_cache=self.rotary_emb.cos_cache,
+                        sin_cache=self.rotary_emb.sin_cache,
+                        positions=positions,
+                        rope_dim=self.qk_rope_head_dim,
+                        kv_cache=kv_view,
+                        k_scale=self._k_scale,
                     )
-            if fused_kup_qpe:
-                # Writes all of q_out and the KV cache; the rope/cache call below
-                # is skipped.
-                self._q_proj_k_up_rope_and_cache(
-                    q,
-                    q_scale,
-                    k_nope,
-                    k_rope,
-                    positions,
-                    kv_view,
-                    attn_metadata.slot_mapping,
-                    q_out_prestored,
-                )
-                q_nope = q_rope = None
-            else:
-                q_nope, q_rope = self._q_proj_and_k_up_proj(
-                    q,
-                    x_scale=q_scale,
-                    group=use_qrep,
-                    q_nope_out=(
-                        None
-                        if q_out_prestored is None
-                        else q_out_prestored[..., : self.kv_lora_rank]
-                    ),
-                )
+                    self._log_kup_qpe(reason or "eligible", q.shape[0])
+                    if reason is None:
+                        self._q_proj_k_up_rope_and_cache(
+                            q,
+                            q_scale,
+                            k_nope,
+                            k_rope,
+                            positions,
+                            kv_view,
+                            attn_metadata.slot_mapping,
+                            q_out_prestored,
+                        )
+                        # The parent gate requires pure decode, DCP=1 and no
+                        # head padding. This is the normal decode tail.
+                        return self._forward_decode(
+                            q_out_prestored,
+                            kv_cache,
+                            attn_metadata,
+                            q_prepadded=self._fused_q_head_pad,
+                        )
+            q_nope, q_rope = self._q_proj_and_k_up_proj(
+                q,
+                x_scale=q_scale,
+                group=use_qrep,
+                q_nope_out=(
+                    None
+                    if q_out_prestored is None
+                    else q_out_prestored[..., : self.kv_lora_rank]
+                ),
+            )
 
             # ---- Prefill Context Parallel --------------------------------
             # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But
@@ -3503,7 +3496,7 @@ class MLAAttention(nn.Module):
             q_out_write = (
                 q_out[:, : self.num_heads] if self._fused_q_head_pad else q_out
             )
-            if kv_cache.numel() > 0 and not fused_kup_qpe:
+            if kv_cache.numel() > 0:
                 if self.kv_shuffled:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_fused_qk_rope_cat_and_cache_mla(

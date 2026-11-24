@@ -338,7 +338,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
     # gfx1250 MLA decode, BF16 absorb + fp8 shuffled KV + prestored q_out:
-    # one Gluon kernel for K-up GEMM + q_pe RoPE + KV-cache write. Bit-exact.
+    # one Gluon kernel for K-up GEMM + q_pe RoPE + KV-cache write. Default off
+    # pending current-head GPU byte comparisons and end-to-end measurements.
     "ATOM_MLA_FUSED_KUP_QPE": lambda: _flag_env("ATOM_MLA_FUSED_KUP_QPE", "0"),
     # Shuffled MLA KV cache: block_size=64 pages, NoPE/RoPE split into 16x16
     # tiles. Independent of the decode kernel.
