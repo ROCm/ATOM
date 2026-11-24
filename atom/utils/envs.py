@@ -1226,6 +1226,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # WARNING, ...); applied by atom.utils.set_atom_log_level(), which turns
     # NOTSET and unknown names into INFO.
     "ATOM_LOG_LEVEL": lambda: os.getenv("ATOM_LOG_LEVEL", "INFO"),
+    # Path prefix of a per-prefill prefix-cache trace: when set, a scheduler
+    # appends one JSON line per prefill sequence to "<prefix>.<pid>.jsonl"
+    # (`Scheduler._record_cache_reuse`), its tokens along the reuse chain
+    # full >= reusable >= compressed >= wanted >= cached plus what the CPU
+    # tier served, so a run can split the reuse it declined by request.
+    # Empty: off.
+    "ATOM_PREFIX_CACHE_TRACE": lambda: os.getenv("ATOM_PREFIX_CACHE_TRACE", ""),
     # RTL (rocm-trace-lite) GPU kernel tracing. No Python code outside tests
     # consumes this value: it names the output directory that
     # .github/scripts/atom_test.sh passes to `rtl trace -o` when

@@ -742,3 +742,25 @@ def test_large_batch_contexts_have_finite_buckets_through_exposition(
     assert values[(f"atom:{phase}_context_tokens_bucket", bucket_labels)] == 1
     assert values[(f"atom:{phase}_context_tokens_sum", labels)] == total
     assert values[(f"atom:{phase}_context_tokens_count", labels)] == 1
+
+
+def test_prefix_cache_trace_writes_one_line_per_prefill(tmp_path, monkeypatch):
+    """ATOM_PREFIX_CACHE_TRACE: each prefill's reuse chain, one JSON line, so a
+    run can split the reuse it declined by request."""
+    import json
+
+    monkeypatch.setenv("ATOM_PREFIX_CACHE_TRACE", str(tmp_path / "trace"))
+    scheduler = Scheduler(MockConfig(enable_prefix_caching=True, num_kvcache_blocks=50))
+    bm = scheduler.block_manager
+    prompt = list(range(100, 100 + 4 * bm.hash_block_size))
+    seq = Sequence(prompt, block_size=4)
+    scheduler.add(seq)
+    scheduler.schedule()
+
+    (path,) = tmp_path.glob("trace.*.jsonl")
+    (line,) = path.read_text().splitlines()
+    row = json.loads(line)
+    assert row["seq"] == seq.id and row["full"] == len(prompt)
+    assert row["full"] >= row["reusable"] >= row["compressed"] >= row["wanted"]
+    assert row["wanted"] >= row["cached"] == 0 and row["offload"] == 0
+    assert {"end", "session"} <= row.keys()
