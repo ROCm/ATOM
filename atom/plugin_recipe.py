@@ -468,7 +468,7 @@ def _names(value: Any, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _api_ok(requires: str, api: int = plugin_host.HOOK_API) -> bool:
+def _api_ok(requires: str, api: int | None = None) -> bool:
     return plugin_host.api_satisfies(requires, api)
 
 

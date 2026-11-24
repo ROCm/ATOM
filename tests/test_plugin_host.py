@@ -112,7 +112,7 @@ def test_register_accepts_a_planned_owner(monkeypatch):
     [
         ({"seam": "v41.attn.nope"}, "unknown-seam"),
         ({"contract": 9}, "contract-mismatch"),
-        ({"requires_api": ">=3"}, "api-mismatch"),
+        ({"requires_api": ">=4"}, "api-mismatch"),
         ({"requires_api": "nonsense"}, "api-mismatch"),
         ({"graph": "opaque_op"}, "graph-unsupported"),
         ({"select": "yes"}, "not-callable"),
@@ -946,7 +946,7 @@ def test_a_recipe_resolves_to_a_deterministic_plan():
     [
         (lambda d: d.update(schema="x"), "recipe-schema"),
         (lambda d: d.update(model_arch="Llama"), "recipe-model-mismatch"),
-        (lambda d: d.update(requires={"atom_hook_api": ">=3"}), "recipe-pin-mismatch"),
+        (lambda d: d.update(requires={"atom_hook_api": ">=4"}), "recipe-pin-mismatch"),
         (lambda d: d.update(requires={"seams": {OUT: 2}}), "recipe-contract-mismatch"),
         (lambda d: d["plan"]["seams"].update({"v41.nope": []}), "recipe-unknown-seam"),
         (

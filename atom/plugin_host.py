@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Plugin host: named model seams that enabled plugins may serve (HOOK_API 2).
+"""Plugin host: named model seams that enabled plugins may serve (HOOK_API 3).
 
 A seam is an op ATOM calls directly (``v41.attn.qk_norm``) or a region of
 native code whose consumer stays ATOM's (``v41.attn.out``: wo_a, whose output
@@ -69,7 +69,11 @@ from atom.plugin_transition import Phases, register_window  # noqa: F401
 
 logger = logging.getLogger("atom")
 
-HOOK_API = 2
+HOOK_API = 3
+# The APIs a plugin or recipe may require: HOOK_API 2 plugins and recipes still
+# load (their seams are declared by their package; the host surface they use is
+# unchanged) until they move to 3.
+SUPPORTED_APIS = (2, 3)
 ENTRY_POINT_GROUP = "atom.layer_plugins"
 AITER_SOURCE = "atom plugin plan"
 GRAPHS = ("eager", "capture_safe")  # what a plugin may claim
@@ -371,8 +375,15 @@ _dev_roots: tuple[str, ...] = ()  # resolved allowlist of plugin source trees
 _aiter_applied: tuple[str, ...] | None = None  # the enable list AITER last got
 
 
-def api_satisfies(requires: str, api: int = HOOK_API) -> bool:
-    """``">=2,<3"``-style clauses (``>=``, ``<``, ``==``) against ``api``."""
+def api_satisfies(requires: str, api: int | None = None) -> bool:
+    """``">=2,<3"``-style clauses (``>=``, ``<``, ``==``) against ``api``, or
+    against any of ``SUPPORTED_APIS``."""
+    if api is None:
+        return any(_api_satisfies(requires, a) for a in SUPPORTED_APIS)
+    return _api_satisfies(requires, api)
+
+
+def _api_satisfies(requires: str, api: int) -> bool:
     for clause in (c.strip() for c in str(requires).split(",") if c.strip()):
         for op, test in ((">=", api.__ge__), ("==", api.__eq__), ("<", api.__lt__)):
             if clause.startswith(op):
