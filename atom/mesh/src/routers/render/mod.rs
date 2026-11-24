@@ -1,5 +1,6 @@
 //! Transport-neutral response rendering: TokenHandle<TokenChunk> + ResponseContext → axum::Response.
 
+pub(crate) mod atom_usage;
 pub mod chat_aggregator;
 pub mod chat_streaming;
 pub mod generate_aggregator;
