@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The FP4 (MXFP4 / NVFP4) index scorer's persistent state as one record, and its
-allocation, in a module that imports no aiter or triton at the top: the kernels' modules
-(`sparse_attn`, `index_topk`) import aiter, and the non-GPU test suite has to be able to
-build the record."""
+"""The FP4 (MXFP4 / NVFP4) index scorer's persistent state as one record, the FP8
+prefill score plane, and their allocation, in a module that imports no aiter or triton
+at the top: the kernels' modules (`sparse_attn`, `index_topk`) import aiter, and the
+non-GPU test suite has to be able to build the record."""
 
+import logging
 from dataclasses import dataclass, replace
 
 import torch
@@ -12,6 +13,8 @@ import torch
 from atom.config import FP4_CACHE_DTYPES
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+logger = logging.getLogger("atom")
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,38 @@ def _shard(cp_world: int, cp_rank: int) -> dict:
     if cp_world == 1:
         return {}
     return {"cp_world": cp_world, "cp_rank": cp_rank}
+
+
+# The TP1 shape the FP8 index prefill workspace serves.
+_PREFILL_SCORES_IDX_HEADS = 4
+
+
+def prefill_score_capacity(config, *, num_idx_heads: int) -> int:
+    """fp32 cells of the widest prefill chunk's score plane: (index head, token) rows by
+    the model length's blocks, each row padded to `index_topk._SCORE_ROW_ALIGN`."""
+    blocks = -(-config.max_model_len // SPARSE_BLOCK_SIZE)
+    return num_idx_heads * config.max_num_batched_tokens * (-(-blocks // 4) * 4)
+
+
+def allocate_prefill_scores(
+    config, device, *, num_idx_heads: int, gfx: str
+) -> LogitsWorkspace | None:
+    """The FP8 index prefill's score plane, allocated once so the memory profile counts
+    it; None off gfx950 TP1 (4 index heads) or without aiter's FlyDSL scorer."""
+    if (
+        config.index_cache_dtype != "fp8"
+        or num_idx_heads != _PREFILL_SCORES_IDX_HEADS
+        or gfx != "gfx950"
+    ):
+        return None
+    try:
+        from aiter.ops.flydsl import minimax_m3_index_score_prefill_flydsl  # noqa: F401
+    except ImportError as e:
+        logger.info("FP8 index prefill keeps a score plane per call (no FlyDSL: %s)", e)
+        return None
+    capacity = prefill_score_capacity(config, num_idx_heads=num_idx_heads)
+    logger.info("FP8 index prefill score workspace: %.2f GiB", capacity * 4 / 2**30)
+    return LogitsWorkspace(capacity, device)
 
 
 def allocate_index_scorers(

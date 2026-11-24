@@ -50,7 +50,8 @@ from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views as nvfp4_page
 @functools.cache
 def flydsl_ops():
     """aiter's FlyDSL module (FP4 index scorers, work map), imported on first use:
-    every bf16 / fp8 deployment imports this module and must not need FlyDSL."""
+    every bf16 / fp8 deployment imports this module and must not need FlyDSL (the FP8
+    prefill scorer runs only with the workspace `allocate_prefill_scores` gives)."""
     from aiter.ops import flydsl
 
     return flydsl
@@ -1097,8 +1098,8 @@ def _select_with_aiter(
 
     Declines rather than raises: k past the wave width, or a survivor buffer
     past the LDS budget, are shapes the Triton selector still handles. `topk_idx`
-    and `score` are contiguous (every scorer writes one, the FP4 ones into the
-    index workspace), so their flattenings are views.
+    is contiguous and `score` one plane of evenly strided rows (a workspace may pad
+    them), so their flattenings are views.
     """
     heads, total_q, max_block = score.shape
     rows = heads * total_q
@@ -1547,6 +1548,7 @@ def minimax_m3_index_topk(
     n_valid_column_per_row: torch.Tensor | None = None,
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
     index_scorer=None,
+    score_workspace=None,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
@@ -1580,6 +1582,8 @@ def minimax_m3_index_topk(
     selector eligible -- the row width decides whether it is actually cheaper
     (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
     same bound in registers.
+    ``score_workspace`` is the FP8 index's fixed plane (`allocate_prefill_scores`):
+    the scorer writes into it, aiter's FlyDSL one where `_fp8_prefill_takes_flydsl`.
     """
     total_q, num_idx_heads, _ = idx_q.shape
     assert (
@@ -1589,6 +1593,7 @@ def minimax_m3_index_topk(
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
 
+    score_out = _prefill_score_view(score_workspace, num_idx_heads, total_q, max_block)
     if index_scorer is not None:
         views, score_prefill, _ = _fp4_index_ops(index_scorer)
         k_data, k_scale = views(index_kv_cache)
@@ -1607,6 +1612,21 @@ def minimax_m3_index_topk(
                 num_idx_heads, total_q, max_block
             ),
         )
+    elif score_out is not None and _fp8_prefill_takes_flydsl(
+        idx_q, batch, max_query_len, max_block
+    ):
+        score = flydsl_ops().minimax_m3_index_score_prefill_flydsl(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            max_query_len,
+            max_seq_len,
+            sm_scale,
+            out=score_out,
+        )
     else:
         score = _triton_prefill_score(
             idx_q,
@@ -1618,6 +1638,7 @@ def minimax_m3_index_topk(
             max_query_len,
             max_block,
             sm_scale,
+            out=score_out,
         )
 
     topk_idx = torch.empty(
@@ -1656,6 +1677,45 @@ def minimax_m3_index_topk(
     return (topk_idx, *emit_out) if emit_out else topk_idx
 
 
+# The FP8 prefill plane's row stride is a multiple of this: aiter's FlyDSL scorer merges
+# its stores only then; the selectors read a row only up to its valid blocks.
+_SCORE_ROW_ALIGN = 4
+# aiter's FlyDSL FP8 prefill scorer (bit-identical scores) on single-request steps of
+# >= 128 blocks with >= 6144 new tokens, or >= 1024 blocks; ragged steps keep Triton.
+_FLYDSL_PREFILL_MIN_BLOCKS = 128
+_FLYDSL_PREFILL_MIN_QUERY = 6144
+_FLYDSL_PREFILL_ANY_QUERY_BLOCKS = 1024
+# aiter addresses the FlyDSL scorer's `out` in 32 bits: its padded plane stays < 4 GiB.
+_FLYDSL_PREFILL_MAX_CELLS = 1 << 30
+
+
+def _prefill_score_view(workspace, heads, total_q, max_block):
+    """`[heads, total_q, max_block]` of the workspace, rows `_SCORE_ROW_ALIGN`-strided;
+    None without one or past its capacity (the scorer then allocates its own)."""
+    if workspace is None:
+        return None
+    width = -(-max_block // _SCORE_ROW_ALIGN) * _SCORE_ROW_ALIGN
+    if heads * total_q * width > workspace.capacity:
+        return None
+    plane = workspace.logits(heads * total_q, width).view(heads, total_q, width)
+    return plane[:, :, :max_block]
+
+
+def _fp8_prefill_takes_flydsl(idx_q, batch, max_query_len, max_block):
+    total_q, heads, _ = idx_q.shape
+    width = -(-max_block // _SCORE_ROW_ALIGN) * _SCORE_ROW_ALIGN
+    return (
+        batch == 1
+        and max_block >= _FLYDSL_PREFILL_MIN_BLOCKS
+        and (
+            max_query_len >= _FLYDSL_PREFILL_MIN_QUERY
+            or max_block >= _FLYDSL_PREFILL_ANY_QUERY_BLOCKS
+        )
+        and heads * total_q * width < _FLYDSL_PREFILL_MAX_CELLS
+        and idx_q.dtype == torch.bfloat16
+    )
+
+
 def _triton_prefill_score(
     idx_q,
     index_kv_cache,
@@ -1666,14 +1726,17 @@ def _triton_prefill_score(
     max_query_len,
     max_block,
     sm_scale,
+    out=None,
 ):
     total_q, num_idx_heads, head_dim = idx_q.shape
     batch = cu_seqlens_q.shape[0] - 1
-    score = torch.empty(
-        (num_idx_heads, total_q, max_block),
-        dtype=torch.float32,
-        device=idx_q.device,
-    )
+    score = out
+    if score is None:
+        score = torch.empty(
+            (num_idx_heads, total_q, max_block),
+            dtype=torch.float32,
+            device=idx_q.device,
+        )
     arch = get_gfx_runtime()
     is_fp8 = index_kv_cache.dtype in _FP8_DTYPES
     score_config = _prefill_score_config(

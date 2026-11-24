@@ -29,6 +29,7 @@ from atom.model_ops.minimax_m3.index_topk import (
     flydsl_ops,
 )
 from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import prefill_row_positions
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
 # Page-16 SHUFFLE layout for the AITER paged-attention path. The KV
 # cache is allocated with physical page size 16 (the ASM kernel page), and each
@@ -76,6 +77,8 @@ class MiniMaxM3SparsePrefillMetadata:
     """``(row_req_id, row_kv_lens)`` of every prefill row, int32: what the NVFP4 sparse
     PA takes per row. Built once with the step's metadata and read by every sparse layer;
     None unless the KV cache is NVFP4 (``make_sparse_prefill_metadata(nvfp4_kv=True)``)."""
+    score_workspace: LogitsWorkspace | None = None
+    """The FP8 index scorer's fixed plane (``allocate_prefill_scores``); None elsewhere."""
 
 
 @dataclass
@@ -123,6 +126,7 @@ def make_sparse_prefill_metadata(
     n_valid_column_per_row_out: torch.Tensor | None = None,
     index_scorer: IndexScoreBuffers | None = None,
     nvfp4_kv: bool = False,
+    score_workspace: LogitsWorkspace | None = None,
 ) -> MiniMaxM3SparseMetadata:
     """``index_scorer`` is the builder's FP4 (MXFP4 or NVFP4) index scorer record (None
     for any other index cache); a prefill step uses only its score workspace, so the map
@@ -145,6 +149,7 @@ def make_sparse_prefill_metadata(
             if nvfp4_kv
             else None
         ),
+        score_workspace=score_workspace,
     )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
