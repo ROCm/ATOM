@@ -16,7 +16,8 @@ timing probe, which also checks the rule:
 - ``pp_runs``: a ping-pong (16 B tagged puts, one CTA each way, ``ITERS`` round trips) in each listed run, between
   the CTA among 0-7 on XCD ``xp`` and the CTA among 8-15 on XCD ``xc`` (the hardware's XCC id: the dealing of CTAs to
   XCDs may move). A round trip is fast when the run is homed on both CTAs' IOD.
-- ``calibrate``: every XCD pair on one even and one odd run: pairs on one IOD show the parity gap, and its sign is
+- ``calibrate`` / ``page_parity`` (``atom.mono.runtime.numa``'s, the shared mono path's, on this probe): every
+  XCD pair on one even and one odd run: pairs on one IOD show the parity gap, and its sign is
   the run parity local to them -> each XCD's copy (``word``: bit x = the copy XCD x reads). Then a sweep of every run
   of the area with one pair of each IOD: every run must take the home the rule gives it (agreement 1.0). A run whose
   home disagrees is timed again (``RETIME`` repetitions, up to ``RETIME_ROUNDS`` rounds) before it counts: one noisy
@@ -41,6 +42,8 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu
 from flydsl.expr.typing import T
 
+from atom.mono.runtime.numa import calibrate, page_parity
+
 from ..device.gfx950 import buffer_ops as bo
 from ..device.gfx950.ops import CM_DEV, memrealtime, rsrc, spin_pause, traced
 from ..plan.program import DUAL_PAGE, DUAL_RUN, Program, Scenario, Stage
@@ -49,13 +52,6 @@ logger = logging.getLogger("atom")
 
 ITERS = 24  # round trips a run
 SPIN_MAX = 1 << 18  # a poll gives up (a role no CTA took: the check then fails)
-GAP = (
-    0.08  # a pair's parity gap (fraction of its round trip) that counts as "on one IOD"
-)
-RETIME = 8  # repetitions a run whose measured home disagrees with the rule is timed again with
-RETIME_ROUNDS = (
-    2  # rounds of that (a run still disagreeing after them counts against the rule)
-)
 ATTEMPTS = 3  # calibrations of a scratch's page 0 before it settles on copy 0 (``scratch_word``)
 REPORT: dict = (
     {}
@@ -156,101 +152,12 @@ def pp_runs(buf: torch.Tensor, runs: list[int], xp: int, xc: int) -> torch.Tenso
     return out.float().cpu() * 0.01 / ITERS
 
 
-def _homes(page: torch.Tensor, nruns: int, pairs, want: torch.Tensor, reps: int = 2,
-           either: bool = False) -> tuple[torch.Tensor, dict]:  # fmt: skip
-    """Each of the first ``nruns`` runs of ``page``: 1 when it is local to ``pairs[0]``'s IOD rather than
-    ``pairs[1]``'s. A run that disagrees with ``want`` (``either``: or with ``1 - want`` when most runs do) is timed
-    again (``RETIME`` repetitions, ``RETIME_ROUNDS`` rounds) and its last measurement counts. -> (the homes, facts:
-    the margin and the runs timed again)."""
-
-    def time(idx, n):
-        runs = [i * DUAL_RUN for i in idx]
-        t = [
-            torch.stack([pp_runs(page, runs, *ab) for _ in range(n)]).min(0).values
-            for ab in pairs
-        ]
-        return (t[0] < t[1]).int(), (t[0] - t[1]).abs()
-
-    near0, diff = time(range(nruns), reps)
-    if (
-        either and float((near0 == want).float().mean()) < 0.5
-    ):  # the page's other parity
-        want = 1 - want
-    retimed = []
-    for _ in range(RETIME_ROUNDS):
-        bad = [i for i in range(nruns) if int(near0[i]) != int(want[i])]
-        if not bad:
-            break
-        retimed += bad
-        again, _ = time(bad, RETIME)
-        near0[bad] = again
-    return near0, {
-        "margin": round(float(diff.median()), 3),
-        "retimed": sorted(set(retimed)),
-    }
-
-
-def calibrate(page: torch.Tensor, nruns: int, reps: int = 3) -> tuple[int, float, dict]:
-    """``page``: a zeroed int32 tensor at a 2 MiB boundary, at least ``nruns`` runs. -> (word, agreement, facts):
-    bit x of ``word`` = the copy (run parity) local to XCD x; agreement = the share of the runs whose measured home
-    is the rule's (1.0 when the rule holds; a disagreeing run is timed again first, ``_homes``).
-    """
-    even, odd = 0, DUAL_RUN
-    gap = torch.zeros(8, 8)
-    for xp in range(8):
-        for xc in range(8):
-            t = (
-                torch.stack([pp_runs(page, [even, odd], xp, xc) for _ in range(reps)])
-                .min(0)
-                .values
-            )
-            gap[xp, xc] = float(
-                (t[1] - t[0]) / t.min()
-            )  # > 0: the even run (copy 0) is local to the pair
-    strong = gap.abs() > GAP
-    vote = (gap * strong).sum(1) + (gap * strong).sum(
-        0
-    )  # each XCD's pairs on its own IOD
-    word = sum(
-        int(vote[x] < 0) << x for x in range(8)
-    )  # bit x: copy 1 (odd runs) is XCD x's
-    facts = {"gap": [[round(float(v), 3) for v in r] for r in gap], "word": word}
-    groups = [[x for x in range(8) if (word >> x) & 1 == c] for c in (0, 1)]
-    if any(len(g) != 4 for g in groups):
-        facts["error"] = f"XCD groups {groups} (expected 4 + 4)"
-        return word, 0.0, facts
-    # one pair of each IOD (its strongest), every run of the area: the measured home must be the rule's
-    pairs = [
-        max(
-            ((a, b) for a in g for b in g if a != b), key=lambda ab: abs(float(gap[ab]))
-        )
-        for g in groups
-    ]
-    want = 1 - torch.arange(nruns) % 2  # group 0 reads copy 0 = the even runs
-    near0, f = _homes(
-        page, nruns, pairs, want
-    )  # 1: the run is local to group 0 (copy 0's XCDs) rather than group 1
-    agree = float((near0 == want).float().mean())
-    facts.update(pairs=pairs, agree=agree, **f)
-    return word, agree, facts
-
-
-def page_parity(page: torch.Tensor, nruns: int, pairs) -> tuple[int | None, dict]:
-    """A further page of the run area: with page 0's IOD pairs, its first ``nruns`` runs -> (0: its even runs are
-    local to the same XCDs as page 0's, 1: to the others, None: the rule does not hold there; facts).
-    """
-    even = 1 - torch.arange(nruns) % 2
-    near0, facts = _homes(page, nruns, pairs, even, either=True)
-    same = float((near0 == even).float().mean())
-    facts["same"] = same
-    return (0 if same == 1.0 else 1 if same == 0.0 else None), facts
-
-
 def _calibrated(page: torch.Tensor, nruns: int) -> tuple[int, float, dict]:
-    """``calibrate`` up to ``ATTEMPTS`` times (the page zeroed after each, more repetitions each time) until the rule
-    holds; the last attempt's result otherwise (facts["attempts"])."""
+    """``calibrate`` (``atom.mono.runtime.numa``'s, on this module's probe) up to ``ATTEMPTS`` times (the page zeroed
+    after each, more repetitions each time) until the rule holds; the last attempt's result otherwise
+    (facts["attempts"])."""
     for attempt in range(1, ATTEMPTS + 1):
-        word, agree, facts = calibrate(page, nruns, reps=3 * attempt)
+        word, agree, facts = calibrate(page, nruns, reps=3 * attempt, probe=pp_runs)
         page.zero_()
         if agree == 1.0:
             break
@@ -283,7 +190,7 @@ def scratch_word(scratch: torch.Tensor, area: int, name: str = "") -> int:
     for p in range(1, pages):
         n = max(min(area - p * DUAL_PAGE, DUAL_PAGE), 2 * DUAL_RUN)
         pg = scratch[p * DUAL_PAGE : p * DUAL_PAGE + n].view(torch.int32)
-        flip, f = page_parity(pg, n // DUAL_RUN, facts["pairs"])
+        flip, f = page_parity(pg, n // DUAL_RUN, facts["pairs"], probe=pp_runs)
         pg.zero_()
         facts[f"page{p}"] = f
         if flip is None:
