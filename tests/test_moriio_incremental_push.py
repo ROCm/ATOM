@@ -102,7 +102,7 @@ def asker(write_path, rank, verify_side=None):
         conn._stage_digests = {}
         conn._page_views = [p.view for p in verify_side.tt.pages]
         conn._page_regions = [
-            (r.base_addr, r.unit_bytes, f"region{i}")
+            (r.base_addr, r.unit_bytes, f"region{i}", r.shard_rank, r.shard_world)
             for i, r in enumerate(verify_side.tt.block_regions)
         ]
     return conn

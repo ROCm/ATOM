@@ -44,6 +44,8 @@ from test_moriio_fabric import (
 )
 from torch import nn
 
+from atom.config import DCPConfig
+
 PARTITION = (17, 17, 17, 9)  # kv_balanced for M3.1 PP4 x TP1 with DSpark
 D_TP = 4
 
@@ -105,6 +107,7 @@ def rank_pools(stack, layers, tp, draft, blocks, role):
     runner = object.__new__(mr.ModelRunner)
     runner.config = types.SimpleNamespace(
         kv_transfer_config=kv_config(role),
+        dcp_config=DCPConfig(),
         kv_cache_dtype="fp8",
         index_cache_dtype="fp4",
         hf_config=hf,

@@ -15,6 +15,10 @@
   session. With ROCm/mori#1021 mori copies up to 512 segments per launch of its
   fabric copy kernel and runs them concurrently, so the destinations of one
   batch must not overlap: no block may be written twice.
+- A region sharded by block id (`KVTransferRegion.shard_units`: MiniMax-M3's
+  index cache under ``ATOM_M3_INDEX_SHARD``) holds 1/n of the blocks on each
+  rank; rank i pushes only its own (`shard_pairs`) into rank i, whose share is
+  the same blocks because both ends allocate a logical block in the same lane.
 
 The pure helpers here (`page_table`, `page_batch`) take plain numbers, so the
 region checks and the batch plan run without mori or a GPU.
@@ -111,16 +115,17 @@ def page_table(
     regions: Sequence[Any],
     num_blocks: int,
     pool: tuple[int, int] | None = None,
-) -> tuple[int, int, list[tuple[int, int, str]]]:
-    """``(pool base, pool bytes, [(offset, bytes per block, role)])`` of ``regions``.
+) -> tuple[int, int, list[tuple[int, int, str, int, int]]]:
+    """``(pool base, pool bytes, [(offset, bytes per block, role, shard rank,
+    shard world)])`` of ``regions``.
 
     ``regions`` are the published PAGE regions (``KVTransferRegion``), ``pool``
     the fabric allocation they must live in, by default the one this process
     made (`allocate_fabric_pool`). Raises unless every region is forward
-    indexed, holds exactly ``num_blocks`` blocks, and lies inside the pool,
-    and unless no two regions overlap: a region outside the pool has no fabric
-    handle to reach it, and two overlapping ones would write the same bytes
-    twice in one batch.
+    indexed, holds exactly ``num_blocks`` blocks (its share of them, sharded),
+    and lies inside the pool, and unless no two regions overlap: a region
+    outside the pool has no fabric handle to reach it, and two overlapping ones
+    would write the same bytes twice in one batch.
     """
     if pool is None:
         pool = _pool_range
@@ -138,31 +143,43 @@ def page_table(
                 f"moriio_backend fabric addresses PAGE blocks forward only; "
                 f"region {role!r} is reverse indexed"
             )
-        entries.append((int(region.base_addr) - base, int(region.unit_bytes), role))
-        if int(region.total_bytes) != num_blocks * int(region.unit_bytes):
+        world = int(region.shard_world)
+        entries.append(
+            (
+                int(region.base_addr) - base,
+                int(region.unit_bytes),
+                role,
+                int(region.shard_rank),
+                world,
+            )
+        )
+        if num_blocks % world or int(region.total_bytes) != (
+            num_blocks // world * int(region.unit_bytes)
+        ):
             raise ValueError(
-                f"PAGE region {role!r} holds {region.total_bytes} B, not "
-                f"{num_blocks} blocks of {region.unit_bytes} B"
+                f"PAGE region {role!r} holds {region.total_bytes} B, not 1/{world} "
+                f"of {num_blocks} blocks of {region.unit_bytes} B"
             )
     check_page_table(entries, num_blocks, size, "local")
     return base, size, entries
 
 
 def check_page_table(
-    entries: Sequence[tuple[int, int, str]],
+    entries: Sequence[tuple[int, int, str, int, int]],
     num_blocks: int,
     pool_bytes: int,
     side: str,
 ) -> None:
-    """Raise unless every ``(offset, unit, role)`` region of ``num_blocks``
-    blocks lies inside ``pool_bytes`` and no two of them overlap."""
+    """Raise unless every ``(offset, unit, role, shard rank, shard world)``
+    region of ``num_blocks`` blocks (its share of them) lies inside
+    ``pool_bytes`` and no two of them overlap."""
     if not entries:
         raise ValueError(f"{side} PAGE table is empty")
     if num_blocks <= 0:
         raise ValueError(f"{side} PAGE table has {num_blocks} blocks")
     spans = []
-    for offset, unit, role in entries:
-        end = offset + num_blocks * unit
+    for offset, unit, role, _rank, world in entries:
+        end = offset + num_blocks // world * unit
         if unit <= 0 or offset < 0 or end > pool_bytes:
             raise ValueError(
                 f"{side} PAGE region {role!r} [{offset}, {end}) of {num_blocks} "
@@ -322,6 +339,29 @@ def unit_batch(
         np.concatenate(remote_offs).tolist(),
         np.concatenate(sizes).tolist(),
     )
+
+
+def shard_pairs(
+    src_blocks: Sequence[int], dst_blocks: Sequence[int], rank: int, world: int
+) -> tuple[list[int], list[int]]:
+    """The ``(source units, destination units)`` of the pairs a region sharded
+    ``world`` ways holds on rank ``rank`` at both ends: ``src % world == rank``,
+    at unit ``src // world``. Raises when a destination's share differs from its
+    source's: the consumer's allocator broke the lane rule, and its rank would
+    keep the block's index in some other rank's lane."""
+    src = np.asarray(src_blocks, dtype=np.int64).reshape(-1)
+    dst = np.asarray(dst_blocks, dtype=np.int64).reshape(-1)
+    if src.size != dst.size:
+        raise ValueError(f"{src.size} source blocks for {dst.size} destinations")
+    if np.any(src % world != dst % world):
+        bad = np.flatnonzero(src % world != dst % world)[:4].tolist()
+        raise ValueError(
+            f"blocks {src[bad].tolist()} -> {dst[bad].tolist()} change their "
+            f"shard (block id mod {world}): the two ends do not allocate a "
+            "logical block in the same lane"
+        )
+    mine = src % world == rank
+    return (src[mine] // world).tolist(), (dst[mine] // world).tolist()
 
 
 def desc_fabric_info(packed_desc: bytes) -> tuple[bool, int]:

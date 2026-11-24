@@ -41,6 +41,8 @@ import torch
 from aiter_stub import atom_under_stubs
 from torch import nn
 
+from atom.config import DCPConfig
+
 ROOT = Path(__file__).resolve().parents[1]
 
 # MiniMax-M3.1-Flash (config.json and dspark/config.json): 60 layers, all
@@ -137,12 +139,17 @@ class _DraftKVBinding(nn.Module):
         self.layer_num = layer_num
 
 
-def m31_runner(stack, blocks: int, role: str, kv: dict | None = None):
+def m31_runner(
+    stack, blocks: int, role: str, kv: dict | None = None, shard_rank: int | None = None
+):
     """A ModelRunner with M3.1's builders and pool backed for ``blocks`` blocks,
-    under ``kv`` (default: the plan's fabric config for ``role``).
+    under ``kv`` (default: the plan's fabric config for ``role``); with
+    ``shard_rank``, TP rank ``shard_rank`` of an index-sharded deployment
+    (``ATOM_M3_INDEX_SHARD=1``).
 
     Returns the runner, its transfer tensors and the pool tensor.
     """
+    sharded = shard_rank is not None
     mr, attn, draft = stack.runner, stack.attn, stack.draft
     hf = types.SimpleNamespace(
         text_config=types.SimpleNamespace(
@@ -159,6 +166,8 @@ def m31_runner(stack, blocks: int, role: str, kv: dict | None = None):
         index_cache_dtype="fp4",
         hf_config=hf,
         speculative_config=types.SimpleNamespace(num_speculative_tokens=7),
+        dcp_config=DCPConfig(indexer_dcp_only=sharded, index_shard=sharded),
+        tensor_parallel_size=TP,
     )
     runner.device = torch.device("cpu")
     runner.block_size = BLOCK
@@ -175,6 +184,8 @@ def m31_runner(stack, blocks: int, role: str, kv: dict | None = None):
     builder._has_sparse_attention = True
     builder._pool_rows = None
     builder.kv_pools = {}
+    if sharded:  # the indexer-CP rank, which the stand-in TP group has not
+        builder.index_shard = (shard_rank, TP)
     runner.attn_metadata_builder = builder
     # `draft_kv_builder()` with the M3.1 draft's backend, which is the target's.
     runner.draft_kv_builder = draft.DraftKvBuilder(
@@ -358,7 +369,13 @@ class TestM31RegionCoverage:
         meta = conn._register_pages({}, tt, tt.num_blocks)
         # Mooncake registers and moves `tt.block_regions`, in this order.
         assert conn._page_regions == [
-            (r.base_addr - pool.data_ptr(), r.unit_bytes, r.semantic_role)
+            (
+                r.base_addr - pool.data_ptr(),
+                r.unit_bytes,
+                r.semantic_role,
+                r.shard_rank,
+                r.shard_world,
+            )
             for r in tt.block_regions
         ]
         # The whole pool, one descriptor.
@@ -374,8 +391,8 @@ class TestM31RegionCoverage:
         _d, tt_d, pool_d = m31_runner(stack, 11, "kv_consumer")
         consumer = fabric_connector(stack, producer=False)
         handshake(stack, producer, consumer._register_pages({}, tt_d, tt_d.num_blocks))
-        assert [o for o, _, _ in producer._page_regions] != [
-            o for o, _, _ in consumer._page_regions
+        assert [entry[0] for entry in producer._page_regions] != [
+            entry[0] for entry in consumer._page_regions
         ]
 
         generator = torch.Generator().manual_seed(0)
@@ -467,6 +484,152 @@ class TestM31RegionCoverage:
         assert stack.fabric._pool_range == (pool.data_ptr(), pool.numel())
 
 
+class TestM31IndexShard:
+    """``ATOM_M3_INDEX_SHARD=1``: a rank's index regions hold the blocks
+    ``b % TP == rank`` at ``b // TP``, and its push moves only those."""
+
+    RANK = 1
+
+    @pytest.fixture(autouse=True)
+    def _device(self):
+        with mock.patch("torch.cuda.current_device", lambda: 0):
+            yield
+
+    @staticmethod
+    def index_region(role: str) -> bool:
+        return role.split(".")[-2] in ("index", "index_scale")
+
+    def pair(self, stack, p_blocks=8, d_blocks=12, p_rank=RANK, d_rank=RANK):
+        _p, tt_p, pool_p = m31_runner(stack, p_blocks, "kv_producer", shard_rank=p_rank)
+        producer = fabric_connector(stack, producer=True)
+        producer.tp_rank = self.RANK
+        producer._register_pages({}, tt_p, tt_p.num_blocks)
+        _d, tt_d, pool_d = m31_runner(stack, d_blocks, "kv_consumer", shard_rank=d_rank)
+        consumer = fabric_connector(stack, producer=False)
+        handshake(stack, producer, consumer._register_pages({}, tt_d, tt_d.num_blocks))
+        return (_p, tt_p, pool_p, producer), (_d, tt_d, pool_d)
+
+    def test_a_ranks_index_regions_are_its_share(self, stack):
+        runner, tt, _pool = m31_runner(stack, 8, "kv_producer", shard_rank=self.RANK)
+        for region in tt.block_regions:
+            share = (
+                (self.RANK, TP) if self.index_region(region.semantic_role) else (0, 1)
+            )
+            assert (region.shard_rank, region.shard_world) == share
+            blocks = 8 // share[1]
+            assert region.total_bytes == blocks * region.unit_bytes
+        # A sparse layer binds the local planes, and them by block id.
+        runner.config.max_model_len = 8 * BLOCK
+        builder = runner.attn_metadata_builder
+        layer = runner.model[7]
+        builder.build_kv_cache_tensor(layer)
+        impl = layer.impl
+        assert impl.index_shard == (self.RANK, TP)
+        assert impl.index_cache.shape[0] == impl.index_scale.shape[0] == 2
+        for block in (1, 5):
+            assert impl.index_cache_by_page[block].data_ptr() == (
+                impl.index_cache[block // TP].data_ptr()
+            )
+            assert impl.index_scale_by_page[block].data_ptr() == (
+                impl.index_scale[block // TP].data_ptr()
+            )
+
+    def test_the_push_moves_the_ranks_own_index_blocks_once(self, stack):
+        (_p, tt_p, pool_p, producer), (_d, tt_d, pool_d) = self.pair(stack)
+        generator = torch.Generator().manual_seed(0)
+        pool_p.copy_(torch.randint(0, 256, pool_p.shape, generator=generator))
+        pool_d.copy_(torch.randint(0, 256, pool_d.shape, generator=generator))
+        before = pool_d.clone()
+        # Both ends allocate logical block j in lane j % 4.
+        src, dst = [4, 1, 6, 3, 5], [8, 9, 2, 11, 1]
+        producer._write_pages(
+            {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
+        )
+        [(_session, _l, _r, sizes)] = producer.posted
+        written = apply_batch(producer.posted, pool_p, pool_d)
+        assert int(written.max()) == 1
+
+        expected = before.clone()
+        moved = 0
+        for page_p, page_d in zip(tt_p.pages, tt_d.pages):
+            region = page_p.region
+            (_, src_units), (_, dst_units) = (
+                region.shard_units(src),
+                page_d.region.shard_units(dst),
+            )
+            view = expected[page_d.region.base_addr - pool_d.data_ptr() :][
+                : page_d.region.total_bytes
+            ].view(-1, page_d.region.unit_bytes)
+            for s, d in zip(src_units, dst_units):
+                view[d] = page_p.view[s].reshape(-1)
+                moved += region.unit_bytes
+            if self.index_region(region.semantic_role):
+                # Rank 1 holds logical blocks 1 and 5 of these five.
+                assert src_units == [0, 1] and dst_units == [2, 0]
+        assert torch.equal(pool_d, expected)
+        assert sum(sizes) == moved
+        # Per block: every K/V and draft byte, a quarter of the index on average.
+        full = sum(r.unit_bytes for r in tt_p.block_regions)
+        index = sum(
+            r.unit_bytes
+            for r in tt_p.block_regions
+            if self.index_region(r.semantic_role)
+        )
+        assert moved == len(src) * (full - index) + 2 * index
+
+    def test_a_pair_that_changes_lanes_is_refused(self, stack):
+        (_p, _tt, _pool, producer), _d = self.pair(stack)
+        with pytest.raises(ValueError, match="change their shard"):
+            producer._write_pages(
+                {"transfer_id": 9, "decode_tp_size": TP}, "decode", [1, 2], [5, 7]
+            )
+        assert producer.posted == []
+
+    @pytest.mark.parametrize("p_rank,d_rank", [(RANK, None), (None, RANK), (1, 2)])
+    def test_ends_in_different_modes_are_refused(self, stack, p_rank, d_rank):
+        _p, tt_p, _pool_p = m31_runner(stack, 8, "kv_producer", shard_rank=p_rank)
+        producer = fabric_connector(stack, producer=True)
+        producer._register_pages({}, tt_p, tt_p.num_blocks)
+        _d, tt_d, _pool_d = m31_runner(stack, 8, "kv_consumer", shard_rank=d_rank)
+        consumer = fabric_connector(stack, producer=False)
+        handshake(stack, producer, consumer._register_pages({}, tt_d, tt_d.num_blocks))
+        with pytest.raises(ValueError, match="ATOM_M3_INDEX_SHARD"):
+            producer._write_pages({"transfer_id": 9}, "decode", [1], [1])
+        assert producer.posted == []
+
+    def test_a_peer_from_before_shards_reads_as_unsharded(self, stack):
+        _p, tt_p, _pool_p = m31_runner(stack, 8, "kv_producer", shard_rank=self.RANK)
+        producer = fabric_connector(stack, producer=True)
+        producer._register_pages({}, tt_p, tt_p.num_blocks)
+        _d, tt_d, _pool_d = m31_runner(stack, 8, "kv_consumer")
+        consumer = fabric_connector(stack, producer=False)
+        meta = consumer._register_pages({}, tt_d, tt_d.num_blocks)
+        meta.page_regions = [entry[:3] for entry in meta.page_regions]
+        handshake(stack, producer, meta)
+        with pytest.raises(ValueError, match="ATOM_M3_INDEX_SHARD"):
+            producer._write_pages({"transfer_id": 9}, "decode", [1], [1])
+
+    def test_verify_digests_cover_a_ranks_share(self, stack):
+        (_p, _tt_p, pool_p, producer), (_d, tt_d, pool_d) = self.pair(stack)
+        consumer = fabric_connector(stack, producer=False)
+        consumer._register_pages({}, tt_d, tt_d.num_blocks)
+        generator = torch.Generator().manual_seed(1)
+        pool_p.copy_(torch.randint(0, 256, pool_p.shape, generator=generator))
+        src, dst = [4, 1, 6, 3, 5], [8, 9, 2, 11, 1]
+        producer._write_pages(
+            {"transfer_id": 9, "decode_tp_size": TP}, "decode", src, dst
+        )
+        apply_batch(producer.posted, pool_p, pool_d)
+        assert consumer._page_digests(dst) == producer._page_digests(src)
+
+    def test_rdma_is_refused(self, stack, monkeypatch):
+        monkeypatch.delenv("ATOM_MORIIO_MODE", raising=False)
+        rdma = {"kv_connector": "moriio", "kv_role": "kv_producer"}
+        sharded = DCPConfig(indexer_dcp_only=True, index_shard=True)
+        with pytest.raises(ValueError, match="needs moriio_backend fabric"):
+            TestConfigPath().connector(stack, rdma, None, dcp_config=sharded)
+
+
 class TestDigests:
     """One digest helper for the three verify paths, the same sums as before."""
 
@@ -538,11 +701,15 @@ class TestPageBatch:
 
     def test_a_table_must_fit_its_pool_without_overlaps(self, stack):
         check = stack.fabric.check_page_table
-        check([(0, 4, "k"), (32, 4, "v")], 8, 64, "local")
+        check([(0, 4, "k", 0, 1), (32, 4, "v", 0, 1)], 8, 64, "local")
+        # A region sharded 4 ways holds 2 of the 8 blocks.
+        check(
+            [(0, 4, "k", 0, 1), (32, 4, "index", 3, 4), (40, 4, "v", 0, 1)], 8, 72, ""
+        )
         for entries, pool in (
-            ([(0, 4, "k"), (28, 4, "v")], 64),  # v starts inside k
-            ([(0, 4, "k"), (40, 4, "v")], 64),  # v runs past the pool
-            ([(-4, 4, "k")], 64),
+            ([(0, 4, "k", 0, 1), (28, 4, "v", 0, 1)], 64),  # v starts inside k
+            ([(0, 4, "k", 0, 1), (40, 4, "v", 0, 1)], 64),  # v runs past the pool
+            ([(-4, 4, "k", 0, 1)], 64),
         ):
             with pytest.raises(ValueError):
                 check(entries, 8, pool, "local")
@@ -653,7 +820,7 @@ class TestConfigPath:
                 assert runner._kv_pool_outside_torch_bytes == 0
                 assert buf.numel() == 2048 and regions[0].numel() == 2048
 
-    def connector(self, stack, kv, create_backend):
+    def connector(self, stack, kv, create_backend, dcp_config=None):
         """MoRIIOConnector.__init__ on a fake mori whose engine's
         `create_backend` is ``create_backend``."""
         conn_mod = stack.conn
@@ -693,7 +860,11 @@ class TestConfigPath:
             patch.start()
         try:
             conn = conn_mod.MoRIIOConnector(
-                types.SimpleNamespace(kv_transfer_config=kv, kv_cache_block_size=BLOCK)
+                types.SimpleNamespace(
+                    kv_transfer_config=kv,
+                    kv_cache_block_size=BLOCK,
+                    dcp_config=dcp_config or DCPConfig(),
+                )
             )
         finally:
             for patch in patches:

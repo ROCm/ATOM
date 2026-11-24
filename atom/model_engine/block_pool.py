@@ -3,10 +3,10 @@
 
 import array
 from collections import OrderedDict
-from collections.abc import Callable, Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable, Sequence
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
-from itertools import chain, islice
+from itertools import chain, islice, zip_longest
 
 from atom.model_engine.kv_block import Block
 
@@ -65,11 +65,20 @@ class BlockPool:
     stream of one-off prefixes cannot evict the whole hot set. Vacant blocks
     still go first; referenced blocks are never candidates in either policy.
 
+    ``residues`` > 1 splits the free blocks into that many lanes by
+    ``block_id % residues``, each with its own vacant / cached / protected
+    containers, and `pop` takes from the lane the caller names. MiniMax-M3's
+    index sharding hands logical block j a block of lane ``j % residues``, so a
+    block's id says which rank keeps its index (`minimax_m3/index_shard.py`).
+    One lane is the pool as it always was. A lane is a fixed share of the ids,
+    so a pool with lanes does not move its boundary (`extend`, `retire_top`)
+    and keeps no raw units.
+
     Optional write-back (`set_write_back`): a block a lower tier has not stored
     yet ("dirty") is recomputed if evicted, one it holds is only reloaded. An
-    allocation that reaches a dirty block moves it to `_held`, still free and
-    claimable, and evicts the next clean one; held blocks go only once no clean
-    block with content is left, coldest first, counted in
+    allocation that reaches a dirty block moves it to its lane's `_held`, still
+    free and claimable, and evicts the next clean one; held blocks go only once
+    no clean block with content is left in the lane, coldest first, counted in
     `blocks_evicted_dirty`. The writer stores them meanwhile (`held_blocks`).
     """
 
@@ -81,6 +90,7 @@ class BlockPool:
         cache_policy: str = "lru",
         protected_ratio: float = 0.5,
         on_remap: Callable[[int], None] | None = None,
+        residues: int = 1,
     ):
         cache_policy = cache_policy.strip().lower()
         if cache_policy not in {"lru", "slru"}:
@@ -89,7 +99,20 @@ class BlockPool:
             raise ValueError("protected_ratio must be between 0 and 1")
         self.cache_policy = cache_policy
         self.protected_ratio = protected_ratio
-        self._protected: OrderedDict[int, None] = OrderedDict()
+        if residues < 1:
+            raise ValueError(f"a pool has at least one lane, not {residues}")
+        if residues > 1 and (
+            num_blocks % residues or max_blocks not in (None, num_blocks)
+        ):
+            raise ValueError(
+                f"{residues} lanes need a fixed pool of a multiple of {residues} "
+                f"blocks, not {num_blocks} (max {max_blocks})"
+            )
+        self.residues = residues
+        # Per lane (`block_id % residues`), as every free-list container below.
+        self._protected: list[OrderedDict[int, None]] = [
+            OrderedDict() for _ in range(residues)
+        ]
         self._reused: set[int] = set()
         # `max_blocks` is how far `extend` may go, and so how many Block
         # objects exist. It is the pool's share of a fixed plane rather than
@@ -111,14 +134,21 @@ class BlockPool:
         # Both containers may hold ids that were re-claimed straight off the
         # free list (`claim`) or retired, so membership in the set — not
         # presence in a container — is what makes an id free. `pop` skips the
-        # stale entries.
-        self._vacant: list[int] = list(range(num_blocks))
-        self._cached: OrderedDict[int, None] = OrderedDict()
+        # stale entries. A lane's ascending ids are already a heap.
+        self._vacant: list[list[int]] = [
+            list(range(lane, num_blocks, residues)) for lane in range(residues)
+        ]
+        self._cached: list[OrderedDict[int, None]] = [
+            OrderedDict() for _ in range(residues)
+        ]
         # Dirty free blocks an allocation passed over, coldest first (see the
         # class doc); empty without `set_write_back`.
-        self._held: OrderedDict[int, None] = OrderedDict()
+        self._held: list[OrderedDict[int, None]] = [
+            OrderedDict() for _ in range(residues)
+        ]
         self._is_dirty: Callable[[int], bool] | None = None
         self._free: set[int] = set(range(num_blocks))
+        self._free_count: list[int] = [len(v) for v in self._vacant]
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
@@ -156,14 +186,30 @@ class BlockPool:
     def has_free(self, n: int) -> bool:
         return len(self._free) >= n
 
+    def has_free_per_residue(self, demand: Sequence[int]) -> bool:
+        """Whether lane r holds `demand[r]` free blocks, for every lane."""
+        return all(have >= want for have, want in zip(self._free_count, demand))
+
     def next_evicted(self, count: int):
         """The free blocks with content that the next `count` allocations
         would evict, coldest first (`_take_free`'s order). Vacant blocks go
         first and lose nothing, so they shorten the list rather than appear in
-        it. Lazy: consume it before changing the pool. Held blocks are not in
-        it (`held_blocks`)."""
-        vacant = len(self._free) - self.num_reusable_free
-        return islice(chain(self._cached, self._protected), max(0, count - vacant))
+        it. Allocations draw on the lanes evenly, so each lane gives its next
+        ``ceil(count / residues)`` victims, interleaved. Lazy: consume it
+        before changing the pool. Held blocks are not in it (`held_blocks`)."""
+        share = -(-count // self.residues)
+        lanes = [
+            islice(
+                chain(cached, protected),
+                max(0, share - (free - len(cached) - len(protected) - len(held))),
+            )
+            for free, cached, protected, held in zip(
+                self._free_count, self._cached, self._protected, self._held
+            )
+        ]
+        if len(lanes) == 1:
+            return lanes[0]
+        return (b for group in zip_longest(*lanes) for b in group if b is not None)
 
     def set_write_back(self, is_dirty: Callable[[int], bool] | None) -> None:
         """Evict clean blocks before dirty ones (class doc). `is_dirty(block_id)`
@@ -172,13 +218,18 @@ class BlockPool:
         self._is_dirty = is_dirty
 
     def held_blocks(self):
-        """The free blocks an allocation passed over as dirty, coldest first.
-        Lazy: consume it before changing the pool."""
-        return iter(self._held)
+        """The free blocks an allocation passed over as dirty, coldest first
+        in each lane, the lanes interleaved. Lazy: consume it before changing
+        the pool."""
+        if len(self._held) == 1:
+            return iter(self._held[0])
+        return (
+            b for group in zip_longest(*self._held) for b in group if b is not None
+        )
 
     @property
     def num_held(self) -> int:
-        return len(self._held)
+        return sum(map(len, self._held))
 
     def is_used(self, block_id: int) -> bool:
         return block_id in self._used
@@ -196,7 +247,11 @@ class BlockPool:
         vacant count, which is the number that actually has to reach zero
         before `blocks_evicted` can start moving.
         """
-        return len(self._cached) + len(self._protected) + len(self._held)
+        return (
+            sum(map(len, self._cached))
+            + sum(map(len, self._protected))
+            + self.num_held
+        )
 
     def eviction_stats(self) -> dict[str, int]:
         """Content this pool destroyed, and the headroom it has left.
@@ -207,8 +262,8 @@ class BlockPool:
         """
         return {
             "blocks_evicted": self.blocks_evicted,
-            "blocks_retired": self.blocks_retired,
             "blocks_evicted_dirty": self.blocks_evicted_dirty,
+            "blocks_retired": self.blocks_retired,
             "blocks_total": self.num_blocks,
             "blocks_used": self.num_used,
             "blocks_free": self.num_free,
@@ -227,11 +282,11 @@ class BlockPool:
         of a whole chain with `map`. Read it per walk, not once per pool."""
         return self._hash_to_block_id.get
 
-    def count_used(self, block_ids: list[int], n: int) -> int:
-        """How many of the first `n` of `block_ids` (distinct) some live
-        sequence holds. No slice; the set it builds holds only the used ids,
-        and a waiting head's hit blocks are mostly free."""
-        return len(self._used.intersection(islice(block_ids, n)))
+    def used_among(self, block_ids: list[int], n: int) -> set[int]:
+        """Which of the first `n` of `block_ids` (distinct) some live sequence
+        holds. No slice; the set holds only the used ids, and a waiting head's
+        hit blocks are mostly free."""
+        return self._used.intersection(islice(block_ids, n))
 
     def claim_many(self, block_ids) -> None:
         """`claim` each of `block_ids`, in order, with the lookups hoisted."""
@@ -286,12 +341,14 @@ class BlockPool:
         # Every free block is vacant now, and which container an id is in is
         # only ever decided from its hash — so the split has to be redrawn
         # here rather than left to drift.
-        self._cached.clear()
-        self._protected.clear()
-        self._held.clear()
+        for cached, protected, held in zip(self._cached, self._protected, self._held):
+            cached.clear()
+            protected.clear()
+            held.clear()
         self._reused.clear()
-        self._vacant = sorted(self._free)
-        heapify(self._vacant)
+        self._vacant = [[] for _ in range(self.residues)]
+        for block_id in sorted(self._free):
+            self._vacant[block_id % self.residues].append(block_id)
 
     def _unindex(self, block_id: int) -> bool:
         """Drop `block_id`'s index entry and forget what it held.
@@ -302,8 +359,8 @@ class BlockPool:
         callers that count evictions must not count those.
         """
         block = self.blocks[block_id]
-        self._protected.pop(block_id, None)
-        self._held.pop(block_id, None)
+        self._protected[block_id % self.residues].pop(block_id, None)
+        self._held[block_id % self.residues].pop(block_id, None)
         self._reused.discard(block_id)
         dropped = False
         if block.hash != -1 and self._hash_to_block_id.get(block.hash) == block_id:
@@ -317,8 +374,9 @@ class BlockPool:
         return dropped
 
     # ---------------------------- allocation ------------------------------- #
-    def _take_free(self) -> int:
-        """Next free block id, or -1. Vacant before cached; see the class doc.
+    def _take_free(self, lane: int = 0) -> int:
+        """Next free block id of `lane`, or -1. Vacant before cached; see the
+        class doc.
 
         An entry is stale when the block has since been taken, or when it has
         gained or lost a hash and so belongs in the other container — an id can
@@ -327,34 +385,40 @@ class BlockPool:
         decide which half it belongs to anyway, so the test is the definition
         rather than a guard bolted on top.
         """
-        while self._vacant:
-            block_id = heappop(self._vacant)
+        vacant = self._vacant[lane]
+        while vacant:
+            block_id = heappop(vacant)
             if block_id in self._free and self.blocks[block_id].hash == -1:
                 self._free.discard(block_id)
+                self._free_count[lane] -= 1
                 return block_id
         is_dirty = self._is_dirty
-        for queue in (self._cached, self._protected):
+        held = self._held[lane]
+        for queue in (self._cached[lane], self._protected[lane]):
             while queue:
                 block_id, _ = queue.popitem(last=False)
                 if block_id in self._free and self.blocks[block_id].hash != -1:
                     if is_dirty is not None and is_dirty(block_id):
-                        self._held[block_id] = None
+                        held[block_id] = None
                         continue
                     self._free.discard(block_id)
+                    self._free_count[lane] -= 1
                     return block_id
-        while self._held:
-            block_id, _ = self._held.popitem(last=False)
+        while held:
+            block_id, _ = held.popitem(last=False)
             if block_id in self._free and self.blocks[block_id].hash != -1:
                 self._free.discard(block_id)
+                self._free_count[lane] -= 1
                 if is_dirty is not None and is_dirty(block_id):
                     self.blocks_evicted_dirty += 1
                 return block_id
         return -1
 
-    def pop(self) -> int:
-        block_id = self._take_free()
+    def pop(self, lane: int = 0) -> int:
+        """A free block of `lane` (`block_id % residues`), see `_take_free`."""
+        block_id = self._take_free(lane)
         if block_id < 0:
-            raise AssertionError("No free blocks available")
+            raise AssertionError(f"No free blocks available in lane {lane}")
         return block_id
 
     def _take_named(self, block_id: int) -> None:
@@ -365,10 +429,13 @@ class BlockPool:
         the end — see the class doc. The vacant half is ordered by id, where a
         leftover entry is only a wasted pop.
         """
-        self._free.discard(block_id)
-        self._cached.pop(block_id, None)
-        self._protected.pop(block_id, None)
-        self._held.pop(block_id, None)
+        lane = block_id % self.residues
+        if block_id in self._free:
+            self._free.remove(block_id)
+            self._free_count[lane] -= 1
+        self._cached[lane].pop(block_id, None)
+        self._protected[lane].pop(block_id, None)
+        self._held[lane].pop(block_id, None)
 
     def allocate(self, block_id: int) -> Block:
         """Take `block_id` for fresh content, evicting whatever it held."""
@@ -426,38 +493,49 @@ class BlockPool:
         block.ref_count -= 1
         if block.ref_count:
             return
+        lane = block_id % self.residues
         self._used.remove(block_id)
         self._free.add(block_id)
+        self._free_count[lane] += 1
         if block.hash != -1:
+            protected = self._protected[lane]
             if coldest:
                 # At the head before the trim: a full protected queue then
                 # demotes this block rather than a hotter one.
-                queue = self._protected if block_id in self._reused else self._cached
+                queue = protected if block_id in self._reused else self._cached[lane]
                 queue[block_id] = None
                 queue.move_to_end(block_id, last=False)
-                if queue is self._protected:
-                    self._trim_protected()
+                if queue is protected:
+                    self._trim_protected(lane)
             elif block_id in self._reused:
-                self._protected[block_id] = None
-                self._trim_protected()
+                protected[block_id] = None
+                self._trim_protected(lane)
             else:
-                self._cached[block_id] = None
+                self._cached[lane][block_id] = None
             return
-        heappush(self._vacant, block_id)
+        vacant = self._vacant[lane]
+        heappush(vacant, block_id)
         # Stale entries are skipped, not removed, so the heap can outgrow the
         # pool under churn. Rebuilding costs one pass and buys at least
         # `num_blocks` pushes.
-        if len(self._vacant) > 2 * self.num_blocks + 2:
-            self._vacant = [b for b in self._free if self.blocks[b].hash == -1]
-            heapify(self._vacant)
+        if len(vacant) > 2 * self.num_blocks // self.residues + 2:
+            vacant = [
+                b
+                for b in self._free
+                if b % self.residues == lane and self.blocks[b].hash == -1
+            ]
+            heapify(vacant)
+            self._vacant[lane] = vacant
 
-    def _trim_protected(self) -> None:
-        # Bound protection so new prefixes can compete for cache space.
-        limit = int(self.num_blocks * self.protected_ratio)
-        while len(self._protected) > limit:
-            block_id, _ = self._protected.popitem(last=False)
+    def _trim_protected(self, lane: int) -> None:
+        # Bound protection so new prefixes can compete for cache space: a
+        # lane's share of the bound.
+        limit = int(self.num_blocks // self.residues * self.protected_ratio)
+        protected = self._protected[lane]
+        while len(protected) > limit:
+            block_id, _ = protected.popitem(last=False)
             self._reused.discard(block_id)
-            self._cached[block_id] = None
+            self._cached[lane][block_id] = None
 
     def reserve_units(self, count: int, owner: Hashable) -> list[int] | None:
         """Reserve arbitrary PAGE-sized units for raw storage."""
@@ -465,6 +543,7 @@ class BlockPool:
             raise ValueError(f"unit count must be non-negative, got {count}")
         if owner is None:
             raise ValueError("a raw-unit reservation needs an owner")
+        self._require_one_lane("raw units")
         if not self.has_free(count):
             return None
         unit_ids: list[int] = []
@@ -528,12 +607,18 @@ class BlockPool:
         Capped at `max_blocks`, which is how many blocks the plane can address
         — beyond it there is nothing to hand out even if the caller has bytes.
         """
+        self._require_one_lane("growing")
         taken = min(count, self.max_blocks - self.num_blocks)
         for block_id in range(self.num_blocks, self.num_blocks + taken):
             self._free.add(block_id)
-            heappush(self._vacant, block_id)
+            heappush(self._vacant[0], block_id)
+        self._free_count[0] += taken
         self.num_blocks += taken
         return taken
+
+    def _require_one_lane(self, what: str) -> None:
+        if self.residues > 1:
+            raise NotImplementedError(f"{what}: a pool with lanes is fixed")
 
     def retire_top(self) -> BlockRetirement | None:
         """Take the highest block id out of the pool, or None if it cannot.
@@ -548,6 +633,7 @@ class BlockPool:
         into, which is the same condition that would block admitting the
         request in the first place.
         """
+        self._require_one_lane("retiring")
         top = self.num_blocks - 1
         if top < 0:
             return None
@@ -565,7 +651,7 @@ class BlockPool:
                 return None
             self._adopt(destination, top)
         self.num_blocks -= 1
-        self._trim_protected()
+        self._trim_protected(0)
         return BlockRetirement(top, destination)
 
     def _adopt(self, destination: int, source: int) -> None:

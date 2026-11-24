@@ -1638,7 +1638,7 @@ class TestPagedCopyCheckpoint:
         an exact fit.
         """
         while bm.kv.num_free > free_target:
-            bm._fresh_block()
+            bm._fresh_block(0)
         assert bm.kv.num_free == free_target
 
     def test_a_live_tail_on_an_exact_fit_pool_keeps_the_hbm_hit(self):

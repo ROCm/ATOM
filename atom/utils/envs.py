@@ -623,6 +623,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 under indexer CP: rank r keeps only the index cache of the
+    # blocks it scores (logical block % TP == r), a 1/TP index pool, as an ops
+    # override for dcp_config.index_shard. Unset leaves the config field alone.
+    "ATOM_M3_INDEX_SHARD": lambda: os.getenv("ATOM_M3_INDEX_SHARD"),
     # MiniMax-M3 indexer CP on gfx1250 with the FP4 index cache: score with the
     # FlyDSL kernel (minimax_m3/indexer_cp_score_flydsl.py) instead of the Triton
     # `_context_score`. Bit-identical scores; opt-in until it has served.

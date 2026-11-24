@@ -44,6 +44,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
+from math import lcm
 
 
 class Pool(Enum):
@@ -67,12 +68,20 @@ class SubPoolSpec:
     # per-request term. What it covers is the declaring backend's business.
     entries_per_req: int = 0
     extra_entries: int = 0
+    # PAGE only: the entry count is a multiple of this. A pool that holds some
+    # field for 1/n of its entries (MiniMax-M3's sharded index cache) is
+    # charged 1/n of that field an entry, which is exact at multiples of n.
+    entries_multiple: int = 1
 
     def __post_init__(self):
         if self.pool is Pool.STATE and self.entries_per_req < 1:
             raise ValueError(f"{self.name}: STATE entries need entries_per_req >= 1")
         if self.pool is Pool.PAGE and (self.entries_per_req or self.extra_entries):
             raise ValueError(f"{self.name}: PAGE entries are sized from the remainder")
+        if self.entries_multiple < 1 or (
+            self.pool is Pool.STATE and self.entries_multiple != 1
+        ):
+            raise ValueError(f"{self.name}: entries_multiple {self.entries_multiple}")
 
 
 # The paged class every backend contributes to. There is one block index
@@ -81,9 +90,12 @@ class SubPoolSpec:
 PAGED_CLASS = "kv"
 
 
-def page_pool(entry_bytes: int) -> SubPoolSpec:
-    """The paged KV entry class: sized from whatever the STATE pool leaves."""
-    return SubPoolSpec(Pool.PAGE, PAGED_CLASS, entry_bytes)
+def page_pool(entry_bytes: int, entries_multiple: int = 1) -> SubPoolSpec:
+    """The paged KV entry class: sized from whatever the STATE pool leaves, in
+    multiples of ``entries_multiple``."""
+    return SubPoolSpec(
+        Pool.PAGE, PAGED_CLASS, entry_bytes, entries_multiple=entries_multiple
+    )
 
 
 def state_pool(
@@ -168,7 +180,8 @@ class InsufficientPoolBudget(RuntimeError):
 def merge_specs(specs: list[SubPoolSpec]) -> dict[str, SubPoolSpec]:
     """Collapse specs naming the same entry class, summing `entry_bytes`.
 
-    Same name means same index space, so pool and multiplicity must agree.
+    Same name means same index space, so pool and multiplicity must agree;
+    the entry count is a multiple of every contributor's `entries_multiple`.
     Different names stay separate even within one pool.
     """
     merged: dict[str, SubPoolSpec] = {}
@@ -196,6 +209,7 @@ def merge_specs(specs: list[SubPoolSpec]) -> dict[str, SubPoolSpec]:
             prev.entry_bytes + spec.entry_bytes,
             spec.entries_per_req,
             spec.extra_entries,
+            lcm(prev.entries_multiple, spec.entries_multiple),
         )
     return merged
 
@@ -235,6 +249,7 @@ def plan_pools(
     for name in paged:
         spec = merged[name]
         count = max(0, remaining // spec.entry_bytes)
+        count -= count % spec.entries_multiple
         entries[name], reserved[name] = count, count * spec.entry_bytes
 
     return PoolPlan(

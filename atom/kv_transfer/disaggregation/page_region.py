@@ -26,6 +26,7 @@ def page_region(
     total_bytes: int | None = None,
     head_major_runs: tuple[int, int] | None = None,
     unit_spec: PageUnitSpec | None = None,
+    shard: tuple[int, int] = (0, 1),
 ) -> PageRegion:
     """The region of ``tensor``'s PAGE blocks and a byte view aliasing them.
 
@@ -35,7 +36,9 @@ def page_region(
 
     ``unit_bytes`` defaults to ``tensor``'s row stride and ``total_bytes`` to
     all of it. An allocation that holds more than its PAGE blocks (DSV4's
-    planes also hold SLOT rows after them) passes both.
+    planes also hold SLOT rows after them) passes both. ``shard``
+    ``(rank, world)``: the region is this rank's share of a block-sharded one
+    (`KVTransferRegion.shard_units`).
     """
     if not tensor.is_contiguous():
         raise ValueError(f"PAGE tensor {semantic_role!r} must be contiguous")
@@ -57,6 +60,8 @@ def page_region(
             total_bytes=total_bytes,
             unit_bytes=unit_bytes,
             semantic_role=semantic_role,
+            shard_rank=shard[0],
+            shard_world=shard[1],
         ),
         view=byte_view.view(-1, 1, unit_bytes),
         head_major_runs=head_major_runs,

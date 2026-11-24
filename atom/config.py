@@ -1880,11 +1880,16 @@ class DCPConfig:
     # attention, KV geometry and MoE stay TP. Requires
     # decode_context_parallel_size == 1 -- see indexer_cp_unsupported_reason.
     indexer_dcp_only: bool = False
+    # With indexer_dcp_only: rank r stores the index cache of the logical blocks
+    # it scores (block % P == r) only, a 1/P index pool. See
+    # minimax_m3/index_shard.py; refusals in index_shard_unsupported_reason.
+    index_shard: bool = False
 
     def __post_init__(self):
         self.interleave_size = int(self.interleave_size)
         assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
         self.indexer_dcp_only = bool(self.indexer_dcp_only)
+        self.index_shard = bool(self.index_shard)
         self.enable_query_replication = bool(self.enable_query_replication)
         self.enable_project_before_merge = bool(self.enable_project_before_merge)
         self.comm_backend = str(self.comm_backend)
@@ -2079,6 +2084,66 @@ def indexer_cp_fp4_index_unsupported_reason(gfx: str) -> str | None:
             f"(whole-row FP4 reads), not {gfx}"
         )
     return None
+
+
+def _index_shard_transport_refusal(kv_transfer_config: dict | None) -> str | None:
+    """Why the KV transfer connectors cannot move a sharded index cache, or None.
+
+    Two read the shard of a PAGE region (`KVTransferRegion.shard_world`):
+    MoRIIO's fabric push, which refuses its RDMA paths itself
+    (`MoRIIOConnector.__init__`), and the LMCache offload tier's M3 PAGE codec
+    (the only layout M3 takes, `select_offload_layout`). Every other transport
+    would address a 1/P index region as a whole one.
+    """
+    cfg = kv_transfer_config or {}
+    if not cfg:
+        return None
+    name = cfg.get("kv_connector", "moriio")
+    if name == "multi":
+        for sub in cfg.get("connectors", []) or []:
+            refusal = _index_shard_transport_refusal(sub or {})
+            if refusal is not None:
+                return refusal
+        return None
+    if name in ("moriio", "lmcache_offload"):
+        return None
+    return (
+        "a KV transfer connector that moves region shards (moriio with "
+        f"moriio_backend fabric, lmcache_offload), not {name!r}"
+    )
+
+
+def index_shard_unsupported_reason(
+    indexer_cp: bool,
+    index_cache_dtype: str | None,
+    kv_cache_block_size: int,
+    sparse_block_size: int,
+    kv_transfer_config: dict | None,
+) -> str | None:
+    """What MiniMax-M3 index sharding (``dcp_config.index_shard``) needs and
+    this deployment lacks, or None.
+
+    Pure, like ``indexer_cp_unsupported_reason``, whose verdict it takes as
+    ``indexer_cp`` (so plugin mode, DCP, TBO and TP != kv heads are refused
+    there). A rank keeps the index of the blocks it scores at decode, so it
+    needs the CP decode; the FP4 index, whose CP scorers read a page through
+    the tensor's page stride (`index_shard.page_view`), where the FP8 / BF16
+    one hard-codes 128 x 128 B pages; and one scheduler block a sparse block,
+    so a block id's residue is its logical block's owner.
+    """
+    if not indexer_cp:
+        return (
+            "MiniMax-M3 indexer context parallelism (ATOM_M3_INDEXER_CP=1 or "
+            "dcp_config.indexer_dcp_only), which is off here"
+        )
+    if index_cache_dtype != "fp4":
+        return f"--index-cache-dtype fp4, not {index_cache_dtype!r}"
+    if kv_cache_block_size != sparse_block_size:
+        return (
+            f"--block-size {sparse_block_size} (the sparse block), not "
+            f"{kv_cache_block_size}"
+        )
+    return _index_shard_transport_refusal(kv_transfer_config)
 
 
 def indexer_cp_unsupported_reason(
@@ -3085,6 +3150,31 @@ class Config:
                 )
                 if fp4_off is not None:
                     raise ValueError(fp4_off)
+
+        # MiniMax-M3 index sharding: a memory layout, so refused, not dropped.
+        # Read after the indexer-CP verdict and the index dtype resolved above.
+        if envs.ATOM_M3_INDEX_SHARD is not None:
+            self.dcp_config.index_shard = envs.ATOM_M3_INDEX_SHARD == "1"
+        if self.dcp_config.index_shard:
+            text_cfg = getattr(self.hf_config, "text_config", self.hf_config)
+            sparse_cfg = getattr(text_cfg, "sparse_attention_config", None) or {}
+            index_shard_off = index_shard_unsupported_reason(
+                self.dcp_config.indexer_dcp_only,
+                self.index_cache_dtype,
+                self.kv_cache_block_size,
+                sparse_cfg.get("sparse_block_size", 0),
+                self.kv_transfer_config,
+            )
+            if index_shard_off is not None:
+                raise ValueError(
+                    "ATOM_M3_INDEX_SHARD=1 (dcp_config.index_shard) needs "
+                    f"{index_shard_off}"
+                )
+            logger.info(
+                "dcp_config.index_shard enabled: each of the %d ranks keeps the "
+                "MiniMax-M3 index cache of the blocks it scores.",
+                self.tensor_parallel_size,
+            )
 
         if self.hf_config.model_type == "deepseek_v41_text":
             # CSA2's index plane is paged by the same scorer GLM's is, so a

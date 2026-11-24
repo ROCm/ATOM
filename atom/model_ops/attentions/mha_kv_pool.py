@@ -93,7 +93,10 @@ class MhaKvPool:
     MiniMax-M3's indexer key cache, owned by only some of the layers. Declared
     by the caller, because what it holds is the caller's subject; charged and
     allocated by the same two lines as K and V, because where it lives is this
-    one's.
+    one's. `extra_shard` ``(rank, n)`` holds them for 1/n of the entries, the
+    blocks ``b % n == rank`` at entry ``b // n`` (a rank's share of a sharded
+    index cache, `minimax_m3/index_shard.py`), at 1/n of their bytes an entry:
+    the pool is then built at multiples of n entries.
     """
 
     def __init__(
@@ -107,6 +110,7 @@ class MhaKvPool:
         blocks_per_entry: int = 1,
         extra_fields: Sequence[EntryField] = (),
         kv_format: str = "",
+        extra_shard: tuple[int, int] = (0, 1),
     ):
         # `block_size` is the caller's block, the only token count the pool
         # shapes anything by. `blocks_per_entry` is how many of them the entry
@@ -153,7 +157,7 @@ class MhaKvPool:
             ]
         else:
             self._fp_fields(layers, entry_tokens, num_kv_heads, head_dim, kv_dtype)
-        self._finish_init(extra_fields)
+        self._finish_init(extra_fields, extra_shard)
 
     def _fp_fields(self, layers, entry_tokens, num_kv_heads, head_dim, kv_dtype):
         self.cache_fields = mha_kv_fields(
@@ -170,14 +174,27 @@ class MhaKvPool:
             kv_dtype=kv_dtype,
         )
 
-    def _finish_init(self, extra_fields):
+    def _finish_init(self, extra_fields, extra_shard):
         self.extra_fields = [f for f in extra_fields if f.layers]
+        self.extra_shard = extra_shard
+        extra_entry_divisor = extra_shard[1]
         # The regions an entry is charged for, in layout order. One list, walked
         # by both the price and the allocation, so a fourth group cannot be
         # added to one and missed by the other. A group a model does not need
         # is empty rather than absent, which keeps the positions fixed.
         self.field_groups = [self.cache_fields, self.scale_fields, self.extra_fields]
-        self.entry_bytes = sum(entry_bytes_for(g) for g in self.field_groups)
+        # Entries a group is held for, per entry of the pool (`entry_counts`).
+        self.group_divisors = [1, 1, extra_entry_divisor]
+        extra_bytes = entry_bytes_for(self.extra_fields)
+        if extra_bytes % extra_entry_divisor:
+            raise ValueError(
+                f"{extra_bytes} B of extra fields an entry do not split "
+                f"{extra_entry_divisor} ways"
+            )
+        self.entry_bytes = sum(
+            entry_bytes_for(g) // d
+            for g, d in zip(self.field_groups, self.group_divisors)
+        )
         self.cache: LayerMajorArena | None = None
         self.scale: LayerMajorArena | None = None
         self.extra: LayerMajorArena | None = None
@@ -232,7 +249,19 @@ class MhaKvPool:
         """Bytes the pool takes at `entries` entries -- the size of the region
         `allocate` wants, and what sizing charged for them. Entries and not
         blocks: in here a block is the caller's, and an entry holds several."""
+        self.entry_counts(entries)
         return self.entry_bytes * entries
+
+    def entry_counts(self, entries: int) -> list[int]:
+        """Entries each field group is allocated for, the pool holding
+        `entries`; refuses a count a group's divisor does not divide."""
+        divisor = max(self.group_divisors)
+        if entries % divisor:
+            raise ValueError(
+                f"a pool whose extra fields cover 1/{divisor} of its entries is "
+                f"built at multiples of {divisor} entries, not {entries}"
+            )
+        return [entries // d for d in self.group_divisors]
 
     def allocate(self, entries: int, device, buf: torch.Tensor | None = None) -> None:
         """Back the declaration, in memory of its own or a region of the
@@ -244,7 +273,7 @@ class MhaKvPool:
         into them.
         """
         self.cache, self.scale, self.extra = carve_layer_major(
-            self.field_groups, entries, device, buf
+            self.field_groups, self.entry_counts(entries), device, buf
         )
         self._views = {
             field.name: arena.view(field.name)
@@ -380,6 +409,18 @@ class MhaKvPool:
                         semantic_role=f"{role_prefix}.{name}.layer_{row}",
                         head_major_runs=runs,
                         unit_spec=PageUnitSpec(namespace, name, layer, dim, str(dtype)),
+                        shard=self.region_shard(f"{name}.layer_{row}"),
                     )
                 )
         return pages
+
+    def region_shard(self, role: str) -> tuple[int, int]:
+        """``(rank, n)``: `region_tensors`' region ``role`` holds the blocks
+        ``b % n == rank`` (`KVTransferRegion.shard_units`); ``(0, 1)`` for
+        K / V and their scales, and for unsharded extra fields."""
+        name = role.rsplit(".layer_", 1)[0]
+        if any(f.name == name for f in self.extra_fields):
+            return self.extra_shard
+        if not any(f.name == name for g in self.field_groups for f in g):
+            raise KeyError(role)
+        return (0, 1)
