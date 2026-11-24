@@ -6,7 +6,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
-from itertools import islice
+from itertools import chain, islice
 
 from atom.model_engine.kv_block import Block
 
@@ -142,6 +142,14 @@ class BlockPool:
 
     def has_free(self, n: int) -> bool:
         return len(self._free) >= n
+
+    def next_evicted(self, count: int):
+        """The free blocks with content that the next `count` allocations
+        would evict, coldest first (`_take_free`'s order). Vacant blocks go
+        first and lose nothing, so they shorten the list rather than appear in
+        it. Lazy: consume it before changing the pool."""
+        vacant = len(self._free) - len(self._cached) - len(self._protected)
+        return islice(chain(self._cached, self._protected), max(0, count - vacant))
 
     def is_used(self, block_id: int) -> bool:
         return block_id in self._used
@@ -352,7 +360,24 @@ class BlockPool:
             self._used.add(block_id)
         return block
 
-    def free(self, block_id: int) -> None:
+    def claim_unreused(self, block_id: int) -> Block:
+        """`claim` without counting a reuse, for a holder that only copies the
+        block out (a lazy offload demotion): under SLRU, freeing it must not
+        promote it into the protected queue. Not a `claim` flag, which every
+        prefix hit would pay to test."""
+        reused = block_id in self._reused
+        block = self.claim(block_id)
+        if not reused:
+            self._reused.discard(block_id)
+        return block
+
+    def free(self, block_id: int, coldest: bool = False) -> None:
+        """Drop a share of `block_id`; the last one returns it to the free list.
+
+        `coldest` puts a block with content back at the head of its queue
+        instead of the tail, to be evicted first, for a holder that took it
+        from there only to copy it out (a lazy offload demotion).
+        """
         if block_id in self._raw_unit_owner:
             raise AssertionError(
                 f"block {block_id} is a reserved raw unit; use release_units"
@@ -364,7 +389,15 @@ class BlockPool:
         self._used.remove(block_id)
         self._free.add(block_id)
         if block.hash != -1:
-            if block_id in self._reused:
+            if coldest:
+                # At the head before the trim: a full protected queue then
+                # demotes this block rather than a hotter one.
+                queue = self._protected if block_id in self._reused else self._cached
+                queue[block_id] = None
+                queue.move_to_end(block_id, last=False)
+                if queue is self._protected:
+                    self._trim_protected()
+            elif block_id in self._reused:
                 self._protected[block_id] = None
                 self._trim_protected()
             else:

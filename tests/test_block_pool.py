@@ -376,3 +376,81 @@ class TestEvictionAccounting:
         assert stats["blocks_free_reusable"] == 1
         assert stats["blocks_free"] - stats["blocks_free_reusable"] == 2
         assert stats["blocks_indexed"] == 1
+
+
+class TestDemotionPins:
+    """`claim_unreused` and `free(coldest=True)`: a lazy offload demotion
+    pins a block off the cold end of the free list while it stores it, and
+    puts it back there afterwards. An ordinary claim's invariants hold."""
+
+    def test_a_pin_does_not_promote_and_returns_to_the_head(self):
+        pool = BlockPool(num_blocks=3, cache_policy="slru")
+        for h in (100, 200, 300):
+            published(pool, pool.pop(), h)
+        pool.claim_unreused(1)
+        pool.free(1, coldest=True)
+        # Still probationary, and coldest: evicted first.
+        assert [pool.pop(), pool.pop(), pool.pop()] == [1, 0, 2]
+
+    def test_a_plain_free_after_a_pin_goes_to_the_tail(self):
+        pool = BlockPool(num_blocks=3)
+        for h in (100, 200, 300):
+            published(pool, pool.pop(), h)
+        pool.claim_unreused(0)
+        pool.free(0)
+        assert [pool.pop(), pool.pop(), pool.pop()] == [1, 2, 0]
+
+    @pytest.mark.parametrize(
+        "coldest,order", [(True, [3, 0, 1, 2]), (False, [3, 1, 2, 0])]
+    )
+    def test_a_protected_pin_returns_ahead_of_the_trim(self, coldest, order):
+        pool = BlockPool(num_blocks=4, cache_policy="slru", protected_ratio=0.5)
+        for h in range(4):
+            published(pool, pool.pop(), h)
+        for block_id in (0, 1):  # reused: protected [0, 1], at its limit of 2
+            pool.claim(block_id)
+            pool.free(block_id)
+        pool.claim_unreused(0)  # pinned off the protected head
+        pool.claim(2)
+        pool.free(2)  # protected [1, 2]
+        pool.free(0, coldest=coldest)
+        # Back at the head first, so the full queue demotes 0 rather than the
+        # hotter 1; freed to the tail, 1 would have gone instead. Either way
+        # the queue is trimmed back to its limit.
+        assert len(pool._protected) == 2 and len(pool._reused) == 2
+        assert [pool.pop() for _ in range(4)] == order
+
+    def test_a_pinned_block_is_held_like_a_claimed_one(self):
+        pool = BlockPool(num_blocks=3)
+        for h in (100, 200, 300):
+            published(pool, pool.pop(), h)
+        pool.claim_unreused(0)
+        assert pool.is_used(0) and pool.num_used + pool.num_free == 3
+        assert pool.has_free(2) and not pool.has_free(3)
+        assert pool.lookup(100) == 0  # its content stays reachable
+        assert sorted([pool.pop(), pool.pop()]) == [1, 2]
+        with pytest.raises(AssertionError):
+            pool.pop()
+
+    def test_a_held_block_is_only_unshared(self):
+        pool = BlockPool(num_blocks=2)
+        published(pool, pool.pop(), 100)
+        pool.claim(0)  # a request's prefix hit
+        pool.claim_unreused(0)
+        pool.free(0, coldest=True)
+        assert pool.is_used(0) and pool.block(0).ref_count == 1
+
+
+class TestNextEvicted:
+    def test_cached_then_protected_after_the_vacant_blocks(self):
+        pool = BlockPool(num_blocks=6, cache_policy="slru")
+        for h in range(4):
+            published(pool, pool.pop(), h)
+        pool.claim(0)
+        pool.free(0)  # protected
+        # Vacant 4 and 5 go first, so 4 allocations evict two cached blocks.
+        assert list(pool.next_evicted(4)) == [1, 2]
+        assert list(pool.next_evicted(10)) == [1, 2, 3, 0]
+        assert list(pool.next_evicted(2)) == []
+        # The order is the one allocation follows.
+        assert [pool.pop() for _ in range(6)] == [4, 5, 1, 2, 3, 0]

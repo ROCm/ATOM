@@ -107,6 +107,10 @@ class KVConnectorSchedulerBase(ABC):
     """
 
     is_producer: bool
+    # A tier holding what HBM evicted rather than a copy of it is asked only
+    # past the HBM hit, which the scheduler then probes before every lookup
+    # (`Sequence.offload_hbm_probe_tokens`).
+    needs_hbm_probe_before_lookup: bool = False
 
     @abstractmethod
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:

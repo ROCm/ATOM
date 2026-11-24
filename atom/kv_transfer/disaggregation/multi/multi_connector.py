@@ -402,6 +402,12 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         methods = (getattr(c, name, None) for c in self._connectors)
         return [m for m in methods if callable(m)]
 
+    @property
+    def needs_hbm_probe_before_lookup(self) -> bool:
+        return any(
+            getattr(c, "needs_hbm_probe_before_lookup", False) for c in self._connectors
+        )
+
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         """True only if every sub-connector with a tier lookup can detach it."""
         checks = self._sub_methods("can_detach_lookup")
