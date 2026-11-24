@@ -973,9 +973,9 @@ def layer_part(E, Ly, part):
             if ob < FS.NOWN:
                 FS.mix_owner_g(dict(t=tqa, b=ob, fnh=ltab(fp, Lp, "afnh")(), fnl=ltab(fp, Lp, "afnl")(), Rq=fptr(fp, "aRout"),
                                     part2=plog(P2A), cnt2=lc + i64(AMIX_POST)), TR)
-        if (b >= FS.SK0) & (b < FS.SK0 + FS.NL1):
-            FS.mix_l1(dict(t=tqa, part2=plog(P2A), part3=plog(P3A), cnt2=lc + i64(AMIX_POST), cnt3=lc + i64(AMIX_L1)), b - FS.SK0)
-            if b == FS.SK0 + FS.NL1 - 1:
+        if (b >= FS.ASK0) & (b < FS.ASK0 + FS.NL1):
+            FS.mix_l1(dict(t=tqa, part2=plog(P2A), part3=plog(P3A), cnt2=lc + i64(AMIX_POST), cnt3=lc + i64(AMIX_L1)), b - FS.ASK0)
+            if b == FS.ASK0 + FS.NL1 - 1:
                 FS.sinkhorn2(dict(t=tqa, w=tqa // 32, l=tqa % 32, sm=sm + FLO + 160000, part3=plog(P3A),
                                   hsc=ltab(fp, Lp, "ahsc")(), hbs=ltab(fp, Lp, "ahbs")(), npre=fptr(fp, "anpre"),
                                   npost=fptr(fp, "anpost"), ncomb=fptr(fp, "ancomb"), rms_eps=D.RMS_EPS, hc_eps=1e-6,

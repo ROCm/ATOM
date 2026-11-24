@@ -1319,6 +1319,8 @@ def ffn_c2(c, TR):
 
 NL1 = 6          # level-1 summing CTAs of the mix partials (CTAs SK0 .. SK0 + 5: idle until the scores)
 SK0 = 250   # (router CTAs past the UG units at c1: idle through the UG)
+ASK0 = 186   # the attention side's level-1 / Sinkhorn CTAs: past the column owners, before wo_a's CTAs 192..255 (at
+# SK0 CTA 255 ran the Sinkhorn, then its wo_a tile's 128 KB weights: wo_a's last CTA, ~0.5 us a layer on the chain)
 OPL = (NOWN + NL1 - 1) // NL1   # owners a level-1 CTA (43)
 
 

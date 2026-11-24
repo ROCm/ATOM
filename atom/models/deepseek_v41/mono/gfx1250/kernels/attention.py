@@ -1345,11 +1345,10 @@ def stage_F3(c):
         hx.bar()
         lr = fx.min(l % 16, I32(TR - 1))   # (rows past TR: the last row again, cached)
         arow = c["y8"] + i64(lr * NWOA + kq * 512)
-        acc = fx.Vector.filled(8, 0.0, F32)
-        for s in range_constexpr(4):
-            av = ld_op(arow, s * 128, l)
-            sa = hx.gload(c["ys"] + i64(lr * (NWOA // 32) + (kq * 512 + s * 128) // 32), I32, align=4)
-            acc = hx.wmma_mx(av, sa, Bw[s], Bs[s], acc)
+        # (f3r) A: all 4 K steps of y8 in flight from the flag's exit (mx_loop's ring)
+        acc = mx_loop(4, lambda s: (ld_op(arow, s * 128, l),
+                                    hx.gload(c["ys"] + i64(lr * (NWOA // 32) + (kq * 512 + s * 128) // 32), I32, align=4)),
+                      lambda s: (Bw[s], Bs[s]), D=4)
         hx.lstore(sm + 8192 + ((w * 32 + l) * 8) * 4, acc)
         hx.bar()
         if kq == 0:
@@ -1442,11 +1441,11 @@ def stage_E4(c):
         hx.bar()
         lr = fx.min(l % 16, I32(TR - 1))   # (rows past TR: the last row again, cached)
         arow = c["o8"] + i64(lr * NQ + g * KWOA + kq * 1024)
-        acc = fx.Vector.filled(8, 0.0, F32)
-        for s in range_constexpr(8):
-            av = ld_op(arow, s * 128, l)
-            sa = hx.gload(c["os"] + i64(lr * (NQ // 32) + (g * KWOA + kq * 1024 + s * 128) // 32), I32, align=4)
-            acc = hx.wmma_mx(av, sa, Bw[s], Bs[s], acc)
+        # (e4r) A through a 4-deep ring: 4 K steps of o8 in flight from the flag's exit (it ran ~1 step ahead: the A phase
+        # 2.3 us in-step with the other wo_a CTAs, 1.0 for a CTA reading alone)
+        acc = mx_loop(8, lambda s: (ld_op(arow, s * 128, l),
+                                    hx.gload(c["os"] + i64(lr * (NQ // 32) + (g * KWOA + kq * 1024 + s * 128) // 32), I32, align=4)),
+                      lambda s: (Bw[s], Bs[s]), D=4)
         hx.lstore(sm + ((w * 32 + l) * 8) * 4, acc)
         hx.bar()
         if kq == 0:
