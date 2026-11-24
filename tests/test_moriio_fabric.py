@@ -323,6 +323,32 @@ class TestM31RegionCoverage:
             M31_DRAFT_LAYERS * BLOCK * (2 * M31_HEAD_DIM + 2 * 4)
         )
 
+    def test_the_units_say_how_a_tp1_stage_cuts_them_per_head(self, stack):
+        """NVFP4 K/V and their scales are head-major per 128-token page (the
+        page the sparse layers read them in), so each unit is one run of this
+        rank's heads; the FP4 index keys are the same on every rank."""
+        _runner, tt, _pool = m31_runner(stack, 6, "kv_producer")
+        target = [p for p in tt.pages if p.region.semantic_role.startswith("mha.")]
+        for page in target:
+            spec = page.unit_spec
+            assert spec.namespace == "mha"
+            assert spec.layer == int(page.region.semantic_role.rsplit("_", 1)[1])
+            if spec.field.startswith("index"):
+                assert page.head_major_runs is None
+            else:
+                assert page.head_major_runs == (1, M31_KV_HEADS // TP)
+        formats = {
+            (p.unit_spec.field, p.unit_spec.dim, p.unit_spec.dtype) for p in target
+        }
+        assert formats == {
+            ("k", M31_HEAD_DIM, "nvfp4"),
+            ("v", M31_HEAD_DIM, "nvfp4"),
+            ("k_scale", M31_HEAD_DIM // 16, "e4m3"),
+            ("v_scale", M31_HEAD_DIM // 16, "e4m3"),
+            ("index", M31_INDEX_DIM, "fp4"),
+            ("index_scale", M31_INDEX_DIM // 16, "e4m3"),
+        }
+
     def test_registration_covers_every_region_the_mooncake_path_moves(self, stack):
         _runner, tt, pool = m31_runner(stack, 6, "kv_producer")
         conn = fabric_connector(stack, producer=True)

@@ -791,12 +791,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         pages = []
         for geometry, pool in self.kv_pools.items():
             # Each unit names its layer, so a PP stage's match the unsplit
-            # model's; M3's sparse layers view their cache in page-16 SHUFFLE.
+            # model's. M3's sparse layers view an FP8/BF16 cache in page-16
+            # SHUFFLE (`rope_cache`), and an NVFP4 one in the pool's own
+            # 128-token page (`sparse_attn_nvfp4`: "sparse block == cache page").
             modules = sorted(self.pool_rows[geometry], key=self.pool_rows[geometry].get)
             extra = {}
             if pool.extra_fields:
-                layers = sorted(index_rows, key=index_rows.get)
-                extra["index"] = ([m.layer_num for m in layers], index.dim, index.dtype)
+                rows = sorted(index_rows, key=index_rows.get)
+                layers = [m.layer_num for m in rows]
+                if index.fp4:
+                    from atom.model_ops.minimax_m3.index_fp4 import FP4_GROUP
+
+                    # Per token: an e2m1 key and an E4M3 scale per FP4_GROUP.
+                    extra["index"] = (layers, index.dim, "fp4")
+                    extra["index_scale"] = (layers, index.dim // FP4_GROUP, "e4m3")
+                else:
+                    extra["index"] = (layers, index.dim, index.dtype)
             pages += pool.transfer_pages(
                 "mha",
                 f"mha.{geometry}",
@@ -804,7 +814,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 [
                     (
                         ASM_PAGE_SIZE
-                        if _is_indexed_sparse_attention(m)
+                        if _is_indexed_sparse_attention(m) and pool.kv_format != "nvfp4"
                         else pool.block_size
                     )
                     for m in modules

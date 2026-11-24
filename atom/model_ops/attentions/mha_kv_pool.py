@@ -333,12 +333,14 @@ class MhaKvPool:
         role_prefix: str,
         layers: Sequence[int],
         page_tokens: Sequence[int] | None = None,
-        extra: Mapping[str, tuple[Sequence[int], int, torch.dtype]] | None = None,
+        extra: Mapping[str, tuple[Sequence[int], int, torch.dtype | str]] | None = None,
     ) -> list:
         """`region_tensors` as PAGE regions, each with its head runs and spec.
 
         `layers[row]` is a KV row's `layer_num` and `page_tokens[row]` the page
         its writer views it in; `extra[field]` is `(layer per row, dim, dtype)`.
+        An NVFP4 pool's K/V and scales are head-major per page like the others
+        (`kv_views`), so they cut by head the same way.
         """
         from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import PageUnitSpec
@@ -355,11 +357,20 @@ class MhaKvPool:
                         raise ValueError(f"{page}-token pages do not tile {name}")
                     runs = (self.entry_tokens // page, self.num_kv_heads)
                     layer = layers[row]
-                    dim, dtype = (
-                        (self.head_dim, self.kv_dtype)
-                        if name in cache
-                        else (1, torch.float32)
-                    )
+                    if self.kv_format == "nvfp4":
+                        # Per head and token: an e2m1 payload, and an E4M3
+                        # scale per 16 elements (`kv_views` / `scale_views`).
+                        dim, dtype = (
+                            (self.head_dim, "nvfp4")
+                            if name in cache
+                            else (self.head_dim // 16, "e4m3")
+                        )
+                    else:
+                        dim, dtype = (
+                            (self.head_dim, self.kv_dtype)
+                            if name in cache
+                            else (1, torch.float32)
+                        )
                 else:
                     rows, dim, dtype = (extra or {})[name]
                     layer = rows[row]
