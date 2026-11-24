@@ -1,0 +1,68 @@
+{
+  "balance": {
+    "req_equiv": 512,
+    "session_affinity": false,
+    "strategy": "least_requests"
+  },
+  "engines": [
+    {
+      "control": "ipc:///tmp/core-0-control",
+      "dp_rank": 0,
+      "input": "ipc:///tmp/core-0-input",
+      "output": "ipc:///tmp/core-0-output",
+      "pid": 100
+    },
+    {
+      "control": "ipc:///tmp/core-1-control",
+      "dp_rank": 1,
+      "input": "ipc:///tmp/core-1-input",
+      "output": "ipc:///tmp/core-1-output",
+      "pid": 101
+    }
+  ],
+  "model": {
+    "chat_template": "/t/chat.jinja",
+    "default_chat_template_kwargs": {
+      "k": 1
+    },
+    "default_max_tokens": 8192,
+    "max_model_len": 4096,
+    "max_output_tokens": 2048,
+    "model_card": {
+      "context_window": 2048,
+      "max_output_tokens": 2048,
+      "output_modalities": [
+        "text"
+      ]
+    },
+    "preserve_tool_call_arguments": true,
+    "reasoning_toggle": {
+      "name": "enable_thinking",
+      "off": false,
+      "on": true
+    },
+    "required_channel": {
+      "after": [
+        1
+      ],
+      "end_ids": [
+        3,
+        7,
+        9
+      ],
+      "opening": [
+        2
+      ],
+      "opens_at": 1
+    },
+    "served_name": "served",
+    "synthetic_acceptance": false,
+    "synthetic_token_text": "synthetic ",
+    "template_efforts": [
+      "high",
+      "low",
+      "max"
+    ],
+    "tokenizer_path": "/models/m"
+  }
+}
