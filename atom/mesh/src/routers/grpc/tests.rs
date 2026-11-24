@@ -259,49 +259,6 @@ mod b_execute_chat {
         let p = pipeline_regular();
         _assert_signature(&p);
     }
-
-    /// A chat placed on an ATOM worker advertising another template than its prompt
-    /// rendered with (one registered while it rendered) gets a 503; one placed on a
-    /// worker advertising that template is served.
-    #[tokio::test]
-    async fn test_a_chat_placed_on_a_worker_with_another_template_is_refused() {
-        use crate::core::{BasicWorkerBuilder, RuntimeType, Worker};
-
-        let atom = |url: &str, template: &str| -> Arc<dyn Worker> {
-            Arc::new(
-                BasicWorkerBuilder::new(url)
-                    .runtime_type(RuntimeType::Atom)
-                    .model_id("m")
-                    .label("chat_template", template)
-                    .build(),
-            )
-        };
-        let ctx = shared();
-        ctx.worker_registry.register(atom("grpc://atom:1", "old"));
-        let loaded = ctx.tokenizer_registry.get_by_name("m").unwrap().id;
-        ctx.tokenizer_inline_templates
-            .write()
-            .insert(loaded, "old".into());
-        for (placed, status) in [
-            (
-                atom("grpc://atom:2", "new"),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
-            (atom("grpc://atom:1", "old"), StatusCode::OK),
-        ] {
-            let p = test_mocks::pipeline_with(
-                Arc::new(test_mocks::MockPdPlanner::repeat_single(placed, "random")),
-                Arc::new(test_mocks::MockDispatcher::repeat_with_stream(|| {
-                    Ok(synthetic_single_stream(scripted_chunks()))
-                })),
-                metrics_labels::BACKEND_REGULAR,
-            );
-            let resp = p
-                .execute_chat(chat_req(false), None, Some("m".to_string()), ctx.clone())
-                .await;
-            assert_eq!(resp.status(), status);
-        }
-    }
 }
 
 mod c_execute_generate {

@@ -443,42 +443,51 @@ async fn the_tokenizer_job_renders_with_the_label_template_without_a_flag() {
     assert_eq!(rendered, "label: hi");
 }
 
-/// A worker registered later for a model whose tokenizer is loaded already, with another
-/// template (a replaced worker's), has the tokenizer loaded again with its own.
+/// Runs the worker removal workflow on `url`, as a RemoveWorker job does.
+async fn remove(ctx: &Arc<AppContext>, url: &str) {
+    let engine = &ctx.workflow_engines.get().unwrap().worker_removal;
+    let data = super::create_worker_removal_workflow_data(url.into(), false, ctx.clone());
+    let id = engine
+        .start_workflow(WorkflowId::new("worker_removal"), data)
+        .await
+        .unwrap();
+    let done = engine.wait_for_completion(id, url, Duration::from_secs(30));
+    done.await.unwrap();
+}
+
+/// All live workers of a model serve one template: a worker advertising another is
+/// refused while one is registered; once the last leaves, its tokenizer goes, and the
+/// next worker's template loads afresh.
 #[tokio::test]
-async fn a_later_worker_s_template_replaces_the_loaded_one() {
+async fn a_worker_with_another_template_is_refused_until_the_model_s_last_worker_leaves() {
     let ctx = context();
-    for template in ["first", "second"] {
-        let info = model_info(
-            "atom-retemplate",
-            &format!("{template}: {{{{ messages[0].content }}}}"),
-            "{}",
-        );
-        register(&ctx, json!({ "url": serve_atom(info, 1).await }))
-            .await
-            .unwrap();
-        let expected = format!("{template}: hi");
-        // Until the tokenizer is loaded with the new worker's template, its chats get 503.
-        let rendered = async {
-            loop {
-                let body = json!({"model": "atom-retemplate",
-                    "messages": [{"role": "user", "content": "hi"}]});
-                let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-                let model = Some("atom-retemplate".into());
-                match prepare_chat(Arc::new(request), None, model, &ctx) {
-                    Ok((_, resp)) if resp.original_text.as_deref() == Some(&expected) => break,
-                    Err(refused) => {
-                        assert_eq!(refused.status(), http::StatusCode::SERVICE_UNAVAILABLE)
-                    }
-                    Ok(_) => {}
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(15), rendered)
-            .await
-            .unwrap_or_else(|_| panic!("the tokenizer never rendered {expected:?}"));
-    }
+    let worker = |template: &str| {
+        let template = format!("{template}: {{{{ messages[0].content }}}}");
+        serve_atom(model_info("atom-retemplate", &template, "{}"), 1)
+    };
+    let first = worker("first").await;
+    register(&ctx, json!({ "url": first })).await.unwrap();
+    assert_eq!(
+        render(&ctx, "atom-retemplate", Value::Null).await,
+        "first: hi"
+    );
+
+    let second = worker("second").await;
+    let refused = register(&ctx, json!({ "url": second })).await.unwrap_err();
+    assert!(refused.contains("redeploying"), "{refused}");
+    assert!(ctx.worker_registry.get_by_url(&second).is_none());
+    assert_eq!(
+        render(&ctx, "atom-retemplate", Value::Null).await,
+        "first: hi"
+    );
+
+    remove(&ctx, &first).await;
+    assert!(!ctx.tokenizer_registry.contains("atom-retemplate"));
+    register(&ctx, json!({ "url": second })).await.unwrap();
+    assert_eq!(
+        render(&ctx, "atom-retemplate", Value::Null).await,
+        "second: hi"
+    );
 }
 
 /// The label template is set before fastokens wraps the tokenizer: a FastTokenizer

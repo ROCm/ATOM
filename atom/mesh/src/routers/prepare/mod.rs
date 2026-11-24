@@ -9,14 +9,14 @@ use uuid::Uuid;
 
 use crate::{
     app_context::AppContext,
-    core::{placement::types::PlacementPlan, worker::RuntimeType, Worker},
+    core::worker::RuntimeType,
     protocols::{
         chat::ChatCompletionRequest,
         common::{InputIds, StringOrArray},
         generate::GenerateRequest,
     },
     routers::comm::error,
-    tokenizer::{registry::TokenizerEntry, traits::Tokenizer},
+    tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
 };
 
 pub(crate) mod chat_template;
@@ -32,87 +32,25 @@ pub(crate) mod tool_constraints;
 mod tests;
 
 use chat_template::{
-    atom_chat_render_gap, atom_template_not_loaded, default_template_kwargs,
-    process_chat_messages_with_defaults, AtomChat, LoadedTemplate, ProcessedMessages,
+    atom_chat_render_gap, default_template_kwargs, process_chat_messages_with_defaults, AtomChat,
+    ProcessedMessages,
 };
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
 use tool_constraints::{filter_chat_request_by_tool_choice, generate_tool_constraints};
 
-/// The model's tokenizer entry; while a registration swaps it, the one being replaced.
-pub(crate) fn tokenizer_entry(model_id: &str, components: &AppContext) -> Option<TokenizerEntry> {
-    let registry = &components.tokenizer_registry;
-    let registered = || {
-        registry
-            .get_by_name(model_id)
-            .or_else(|| registry.get_by_id(model_id))
-    };
-    // Missed between a swap's removal and insert: the replaced entry, or, once it
-    // is forgotten, the replacement.
-    let replaced = || {
-        components
-            .tokenizers_replaced
-            .get(model_id)
-            .map(|e| e.clone())
-    };
-    registered().or_else(replaced).or_else(registered)
-}
-
-fn tokenizer_not_found(model_id: &str) -> Response {
-    error!(model = %model_id, "Tokenizer not found for model");
-    error::internal_error(
-        "tokenizer_not_found",
-        format!("Tokenizer not found for model: {}", model_id),
-    )
-}
-
 pub fn lookup_tokenizer(
     model_id: &str,
-    components: &AppContext,
+    registry: &TokenizerRegistry,
 ) -> Result<Arc<dyn Tokenizer>, Response> {
-    tokenizer_entry(model_id, components)
-        .map(|entry| entry.tokenizer)
-        .ok_or_else(|| tokenizer_not_found(model_id))
-}
-
-/// The chat template a chat's prompt rendered with, which its placed workers must
-/// render with too.
-pub(crate) struct RenderedTemplate {
-    model_id: String,
-    configured: bool,
-    loaded: Option<LoadedTemplate>,
-}
-
-impl RenderedTemplate {
-    /// A 503 when `plan` places the chat on an ATOM worker advertising another template
-    /// than its prompt rendered with: one registered while it rendered.
-    pub(crate) fn check(&self, plan: &PlacementPlan) -> Result<(), Response> {
-        let placed = match plan {
-            PlacementPlan::Single { worker, .. } => vec![worker],
-            PlacementPlan::Pair {
-                prefill, decode, ..
-            } => vec![prefill, decode],
-        };
-        for worker in placed {
-            let one = std::slice::from_ref(worker);
-            if atom_template_not_loaded(one, self.configured, self.loaded.clone()).is_some() {
-                return Err(template_loading(&self.model_id, worker));
-            }
-        }
-        Ok(())
-    }
-}
-
-fn template_loading(model_id: &str, worker: &Arc<dyn Worker>) -> Response {
-    error::service_unavailable(
-        "chat_template_loading",
-        format!(
-            "The tokenizer of model {model_id} is not yet loaded with the chat template of \
-             its ATOM worker {}; retry later.",
-            worker.url()
-        ),
-    )
+    registry.get(model_id).ok_or_else(|| {
+        error!(model = %model_id, "Tokenizer not found for model");
+        error::internal_error(
+            "tokenizer_not_found",
+            format!("Tokenizer not found for model: {}", model_id),
+        )
+    })
 }
 
 /// A chat prompt rendered outside the router, for a model whose template the
@@ -145,55 +83,28 @@ pub fn prepare_chat_with(
     rendered: Option<RenderedChat>,
     reads_prompt_opener: bool,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
-    let prepared = prepare_chat_checked(
-        req,
-        headers,
-        model_id,
-        components,
-        rendered,
-        reads_prompt_opener,
-    )?;
-    Ok((prepared.0, prepared.1))
-}
-
-/// `prepare_chat_with`, with the template a prompt it renders is rendered with; a
-/// prompt rendered outside the router is not checked against any.
-pub(crate) fn prepare_chat_checked(
-    req: Arc<ChatCompletionRequest>,
-    headers: Option<HeaderMap>,
-    model_id: Option<String>,
-    components: &AppContext,
-    rendered: Option<RenderedChat>,
-    reads_prompt_opener: bool,
-) -> Result<(GenerationPayload, ResponseContext, Option<RenderedTemplate>), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
+    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
     let workers = components.worker_registry.get_by_model(model_id_str);
-    let configured_template = components.router_config.chat_template.is_some();
-    // The entry, its mark and its worker template read under one lock, which a swap
-    // takes to forget the replaced entry's.
-    let (entry, built_in_encoder, loaded_template) = {
-        let marked = components.chats_without_template.read();
-        let entry = tokenizer_entry(model_id_str, components);
-        let built_in = entry
+    // What its tokenizer was loaded with: a template file is a template, as
+    // --chat-template is; a built-in encoder renders without one.
+    let id = components
+        .tokenizer_registry
+        .get_by_name(model_id_str)
+        .map(|e| e.id);
+    let templated = components.router_config.chat_template.is_some()
+        || id
             .as_ref()
-            .is_some_and(|entry| marked.contains(&entry.id));
-        let templates = components.tokenizer_inline_templates.read();
-        let files = components.tokenizer_template_files.read();
-        let loaded = entry.as_ref().map(|e| match templates.get(&e.id) {
-            Some(template) => LoadedTemplate::Worker(template.clone()),
-            None if files.contains_key(&e.id) => LoadedTemplate::File,
-            None => LoadedTemplate::Own,
-        });
-        (entry, built_in, loaded)
-    };
-    // A template file the tokenizer was loaded with is a template, as --chat-template is.
-    let templated = configured_template || loaded_template == Some(LoadedTemplate::File);
-    // A prompt rendered outside the router needs neither.
-    let renders = rendered.is_none();
-    if let Some(gap) = renders
+            .is_some_and(|id| components.tokenizer_template_files.read().contains_key(id));
+    let built_in_encoder = id
+        .as_ref()
+        .is_some_and(|id| components.chats_without_template.read().contains(id));
+    // A prompt rendered outside the router needs no template.
+    if let Some(gap) = rendered
+        .is_none()
         .then(|| atom_chat_render_gap(&workers, templated, built_in_encoder))
         .flatten()
     {
@@ -205,20 +116,6 @@ pub(crate) fn prepare_chat_checked(
             ),
         ));
     }
-    let template = renders.then(|| RenderedTemplate {
-        model_id: model_id_str.to_string(),
-        configured: configured_template,
-        loaded: loaded_template.clone(),
-    });
-    if let Some(worker) = template
-        .as_ref()
-        .and_then(|_| atom_template_not_loaded(&workers, configured_template, loaded_template))
-    {
-        return Err(template_loading(model_id_str, worker));
-    }
-    let tokenizer = entry
-        .map(|entry| entry.tokenizer)
-        .ok_or_else(|| tokenizer_not_found(model_id_str))?;
     let default_kwargs = default_template_kwargs(&workers)
         .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
@@ -305,7 +202,7 @@ pub(crate) fn prepare_chat_checked(
         prompt_opener,
     };
 
-    Ok((payload, ctx, template))
+    Ok((payload, ctx))
 }
 
 pub fn prepare_generate(
@@ -318,7 +215,7 @@ pub fn prepare_generate(
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
-    let tokenizer = lookup_tokenizer(model_id_str, components)?;
+    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
 
     let (original_text, token_ids) = resolve_generate_input(&req, &tokenizer)
         .map_err(|e| error::bad_request("resolve_input_failed", e))?;

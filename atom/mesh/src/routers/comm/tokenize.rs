@@ -79,15 +79,22 @@ fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, IngressError> {
     serde_json::from_slice(body).map_err(|error| IngressError::invalid(error.to_string()))
 }
 
-fn tokenizer_entry(context: &AppContext, model: &str) -> Result<TokenizerEntry, IngressError> {
-    get_tokenizer_entry(context, model)
+fn tokenizer_entry(
+    registry: &TokenizerRegistry,
+    model: &str,
+) -> Result<TokenizerEntry, IngressError> {
+    get_tokenizer_entry(registry, model)
         .map_err(|e| IngressError::new(StatusCode::BAD_REQUEST, "tokenizer_not_found", e))
 }
 
-fn get_tokenizer_entry(context: &AppContext, model: &str) -> Result<TokenizerEntry, String> {
-    let registry = &context.tokenizer_registry;
-    // As a chat looks it up: during a swap, the entry being replaced.
-    if let Some(entry) = crate::routers::prepare::tokenizer_entry(model, context) {
+fn get_tokenizer_entry(
+    registry: &TokenizerRegistry,
+    model: &str,
+) -> Result<TokenizerEntry, String> {
+    if let Some(entry) = registry
+        .get_by_name(model)
+        .or_else(|| registry.get_by_id(model))
+    {
         debug!("Found tokenizer for model: {}", model);
         return Ok(entry);
     }
@@ -121,22 +128,22 @@ pub async fn tokenize(context: &Arc<AppContext>, request: Request) -> Response {
         Ok(body) => body,
         Err(error) => return ingress_error_response(error),
     };
-    let task_context = context.clone();
+    let registry = context.tokenizer_registry.clone();
     let limits = context.tokenize_limits;
     run_on_prepare_pool(context, move |_| {
-        tokenize_body(&task_context, limits, &body).unwrap_or_else(ingress_error_response)
+        tokenize_body(&registry, limits, &body).unwrap_or_else(ingress_error_response)
     })
     .await
 }
 
 fn tokenize_body(
-    context: &AppContext,
+    registry: &TokenizerRegistry,
     limits: TokenizeLimits,
     body: &[u8],
 ) -> Result<Response, IngressError> {
     let request: TokenizeRequest = parse_body(body)?;
     debug!("Tokenize request for model: {}", request.model);
-    let entry = tokenizer_entry(context, &request.model)?;
+    let entry = tokenizer_entry(registry, &request.model)?;
 
     // The whole batch encodes in one preparation job, so the limit covers its total.
     let input_bytes = request
@@ -208,17 +215,17 @@ pub async fn detokenize(context: &Arc<AppContext>, request: Request) -> Response
         Ok(body) => body,
         Err(error) => return ingress_error_response(error),
     };
-    let task_context = context.clone();
+    let registry = context.tokenizer_registry.clone();
     run_on_prepare_pool(context, move |_| {
-        detokenize_body(&task_context, &body).unwrap_or_else(ingress_error_response)
+        detokenize_body(&registry, &body).unwrap_or_else(ingress_error_response)
     })
     .await
 }
 
-fn detokenize_body(context: &AppContext, body: &[u8]) -> Result<Response, IngressError> {
+fn detokenize_body(registry: &TokenizerRegistry, body: &[u8]) -> Result<Response, IngressError> {
     let request: DetokenizeRequest = parse_body(body)?;
     debug!("Detokenize request for model: {}", request.model);
-    let entry = tokenizer_entry(context, &request.model)?;
+    let entry = tokenizer_entry(registry, &request.model)?;
     Ok(decode_sequences(&*entry.tokenizer, &request))
 }
 
@@ -293,7 +300,6 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         source: request.source.clone(),
         chat_template_path: request.chat_template_path.clone(),
         inline_chat_template: None,
-        worker_url: None,
         cache_config: None,
         fail_on_duplicate: true,
     };
@@ -443,28 +449,4 @@ pub async fn get_tokenizer_status(context: &Arc<AppContext>, tokenizer_id: &str)
         &format!("Tokenizer '{}' not found and no pending job", tokenizer_id),
         "not_found",
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routers::test_mocks;
-
-    /// Between a template swap's removal of the model's tokenizer and its insert of the
-    /// replacement, both endpoints use the replaced one, as a chat does.
-    #[test]
-    fn tokenize_and_detokenize_find_a_tokenizer_during_a_swap() {
-        let registry = test_mocks::tokenizer_registry_with("m");
-        let context = test_mocks::app_context_with_tokenizer_registry(registry.clone());
-        let old = registry.get_by_name("m").unwrap();
-        context.tokenizers_replaced.insert("m".into(), old.clone());
-        registry.remove_by_id(&old.id).unwrap();
-
-        let body = br#"{"model": "m", "prompt": "Hello"}"#;
-        let tokenized = tokenize_body(&context, context.tokenize_limits, body);
-        assert_eq!(tokenized.unwrap().status(), StatusCode::OK);
-        let body = br#"{"model": "m", "tokens": [1, 2]}"#;
-        let detokenized = detokenize_body(&context, body);
-        assert_eq!(detokenized.unwrap().status(), StatusCode::OK);
-    }
 }

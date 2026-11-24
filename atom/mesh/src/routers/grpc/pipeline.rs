@@ -203,7 +203,7 @@ impl Pipeline {
             bool_to_static_str(streaming),
         );
 
-        let (mut payload, mut resp_ctx, template) = match prepare::prepare_chat_checked(
+        let (mut payload, mut resp_ctx) = match prepare::prepare_chat_with(
             req,
             headers,
             model_id,
@@ -219,9 +219,6 @@ impl Pipeline {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),
         };
-        if let Some(Err(e)) = template.map(|template| template.check(&placement)) {
-            return self.record_chat_err(&model, start, e);
-        }
         let guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = match self
             .engine
@@ -331,12 +328,8 @@ impl Pipeline {
             ));
         }
 
-        let (mut payload, resp_ctx, template) =
-            prepare::prepare_chat_checked(req, headers, model_id, &components, None, false)?;
+        let (mut payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
         let placement = self.plan_for(&payload, &resp_ctx).await?;
-        if let Some(template) = template {
-            template.check(&placement)?;
-        }
         let _guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = self
             .engine
