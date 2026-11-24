@@ -87,6 +87,8 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
 | `engine.prefill_long_cap_busy` / `_seqs` | `ATOM_PREFILL_LONG_CAP_BUSY*` (#3644) |
 | `engine.dp_session_prefix_owner_tokens` / `_max_extra_reqs` | `ATOM_DP_SESSION_PREFIX_OWNER_*` (#3644) |
 | `engine.prefill_admit_order` / `prefill_admit_max_age_ms` | `ATOM_PREFILL_ADMIT_ORDER` / `ATOM_PREFILL_ADMIT_MAX_AGE_MS` |
+| `engine.thp_disable` | `ATOM_THP_DISABLE` |
+| `engine.engram_pin_pages` | `ATOM_ENGRAM_PIN_PAGES` |
 | `model_options.ffn_mhc_fuse_quant` | `ATOM_DSV41_FFN_SEAM_QUANT` (#3645) |
 | `model_options.shared_act_quant` | `ATOM_DSV41_SHARED_ACT_QUANT` (#3645) |
 | `model_options.fused_attn` / `fused_attn_min_rows` | `ATOM_DSV41_FUSED_ATTN*` (#3645) |
@@ -107,6 +109,13 @@ weights layout, loader, runtime (graphs, bounded replay, guarded ops) and mono d
   arrived), `"short_new"` (new prompts with the fewest tokens left first) or `"srpt"` (fewest
   left first across both). A prompt that has gone `prefill_admit_max_age_ms` without a chunk
   goes ahead of every younger one. Refused together with `prefill_short_first_rows`.
+
+- `engine.thp_disable`: no transparent huge pages for the server's processes
+  (`PR_SET_THP_DISABLE`), set in the server's main process where the recipe's `env` is applied,
+  before any worker starts, and again by each worker at its own start.
+- `engine.engram_pin_pages`: the page-locked copy of an Engram shard is also registered as fixed
+  buffers of an `io_uring` instance that does no I/O, which pins its pages against page
+  migration, and marked `MADV_DONTFORK`. A refused pin warns and the copy stays as it was.
 
 None of these are environment variables in this branch. The host keeps its own:
 `ATOM_PLUGIN_HOST` (kill switch), `ATOM_PLUGIN_HOST_STRICT`, `ATOM_PLUGIN_HOTPLUG`,

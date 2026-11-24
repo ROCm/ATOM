@@ -43,6 +43,57 @@ from unittest.mock import patch
 logger = logging.getLogger("atom")
 
 
+_PR_SET_THP_DISABLE = 41
+_PR_GET_THP_DISABLE = 42
+
+
+def disable_thp(label: str = "", *, enabled: bool = False) -> bool:
+    """A recipe's ``engine.thp_disable`` (``enabled``): turn transparent huge
+    pages off for this process.
+
+    The flag is inherited by the processes it starts (fork and exec), so one
+    call before the engine-core subprocesses exist covers the server; a rank
+    calls it again at its own start, which costs nothing when already set.
+
+    Why: memory from `hipHostMalloc` is registered with the GPU driver and
+    marked for huge pages. Where the kernel could not give huge pages at
+    allocation, khugepaged comes back for those ranges while the server runs,
+    and a collapse inside a registered range evicts and restores the GPU
+    queues of the process that owns it; with ranks in lock step every rank
+    waits. With the flag set khugepaged leaves the process alone. Memory
+    faulted in afterwards is on base pages, which costs huge-page TLB reach
+    on the CPU side and nothing else.
+
+    Returns whether huge pages are off for the process on return. Never
+    raises: a kernel without the prctl leaves the server as it was.
+    """
+    if not enabled:
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.restype = ctypes.c_int
+        libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+        if libc.prctl(_PR_GET_THP_DISABLE, 0, 0, 0, 0) == 1:
+            return True
+        if libc.prctl(_PR_SET_THP_DISABLE, 1, 0, 0, 0) != 0:
+            logger.warning(
+                "engine.thp_disable: prctl(PR_SET_THP_DISABLE) failed (errno %d)%s",
+                ctypes.get_errno(),
+                f" in {label}" if label else "",
+            )
+            return False
+    except Exception as e:  # noqa: BLE001 - an optimization, never fatal
+        logger.warning("engine.thp_disable: not applied (%s: %s)", type(e).__name__, e)
+        return False
+    logger.info(
+        "engine.thp_disable: transparent huge pages off for this process%s",
+        f" ({label})" if label else "",
+    )
+    return True
+
+
 def set_ulimit(target_soft_limit: int = 65535) -> None:
     """Raise the open-file soft limit toward ``target_soft_limit`` (capped at
     the hard limit).

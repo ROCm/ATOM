@@ -46,6 +46,7 @@ from atom.model_engine.collective_rpc import (
     is_plain_rpc_value,
 )
 from atom.utils import (
+    disable_thp,
     envs,
     get_mp_context,
     get_open_port,
@@ -81,6 +82,17 @@ class _PendingKvAggregation:
         return [
             rank for rank, output in enumerate(self.worker_outputs) if output is None
         ]
+
+
+def _thp_disable_wanted(config) -> bool:
+    """The recipe's ``engine.thp_disable`` for the worker ``config`` starts."""
+    try:
+        from atom.plugin_recipe import engine_options_for
+
+        return bool(engine_options_for(config).thp_disable)
+    except Exception as e:  # noqa: BLE001 - an optimization, never fatal
+        logger.warning("engine.thp_disable: not read (%s: %s)", type(e).__name__, e)
+        return False
 
 
 class AsyncIOProc:
@@ -146,6 +158,11 @@ class AsyncIOProc:
         # happens later, via the EngineCore's `freeze_gc_heap` RPC.
         tune_gc()
         maybe_attach_gc_debug_callback(name)
+
+        # engine.thp_disable: normally inherited from the server process; set
+        # here too so a rank started some other way is covered. Before the
+        # model is built, i.e. before any pinned host memory exists.
+        disable_thp(label, enabled=_thp_disable_wanted(args[0] if args else None))
 
         # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
         # Auto-detects the GPU's local node by default; gated by

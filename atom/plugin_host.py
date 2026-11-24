@@ -1093,6 +1093,16 @@ def model_options():
     return getattr(plan, "model_options", None) or ModelOptions()
 
 
+def engine_options():
+    """The plan's ``engine`` options (`plugin_recipe.EngineOptions`) for code
+    that has no Config at hand; `plugin_recipe.engine_options_for` otherwise.
+    The defaults without a plan."""
+    from atom.plugin_recipe import EngineOptions
+
+    plan = _plan
+    return getattr(plan, "engine", None) or EngineOptions()
+
+
 def dspark_options():
     """The plan's ``dspark_options`` (`plugin_recipe.DSparkOptions`)."""
     from atom.plugin_recipe import DSparkOptions

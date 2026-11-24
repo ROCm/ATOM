@@ -157,6 +157,8 @@ def test_v2_options_parse_and_key_the_plan():
         {"engine": {"prefill_decode_interval_slope_from": 1.5}},
         {"engine": {"prefill_admit_order": "shortest"}},
         {"engine": {"prefill_admit_max_age_ms": -1}},
+        {"engine": {"thp_disable": 1}},
+        {"engine": {"engram_pin_pages": "1"}},
         {"engine": {"prefill_short_first_rows": 96, "prefill_admit_order": "srpt"}},
         {"model_options": {"fused_attn": "yes"}},
         {"model_options": {"mono_mode": "sometimes"}},
@@ -186,6 +188,16 @@ def test_the_scheduler_options_of_a_load_dependent_interval_and_an_admit_order()
     assert recipes.EngineOptions().prefill_decode_interval_slope == 0
     srpt = _plan(engine={"prefill_admit_order": "srpt", "prefill_admit_max_age_ms": 0})
     assert srpt.engine.prefill_admit_order == "srpt" and srpt.plan_id != plan.plan_id
+
+
+def test_the_host_options_reach_code_without_a_config():
+    assert not host.engine_options().thp_disable
+    plan = _plan(engine={"thp_disable": True, "engram_pin_pages": True})
+    assert plan.engine.thp_disable and plan.engine.engram_pin_pages
+    host.configure(plan, kill_switch=False)
+    assert host.engine_options().engram_pin_pages
+    host._reset_for_testing()
+    assert not host.engine_options().engram_pin_pages
 
 
 def test_v1_keeps_its_schema_and_refuses_modules():
@@ -274,6 +286,8 @@ def test_no_new_environment_variable_carries_a_recipe_option():
         "ATOM_PREFILL_DECODE_INTERVAL_SLOPE",
         "ATOM_PREFILL_ADMIT_ORDER",
         "ATOM_PREFILL_ADMIT_MAX_AGE_MS",
+        "ATOM_THP_DISABLE",
+        "ATOM_ENGRAM_PIN_PAGES",
     ):
         assert name not in envs, name
 

@@ -143,6 +143,12 @@ class EngineOptions:
     # `Scheduler._order_waiting_prefills`.
     prefill_admit_order: str = "fifo"
     prefill_admit_max_age_ms: int = 3000
+    # No transparent huge pages for the server and every process it starts
+    # (`atom.utils.disable_thp`).
+    thp_disable: bool = False
+    # Pin the pages of a copied Engram shard against page migration
+    # (`atom.model_ops.engram.host_memory._pin_pages`).
+    engram_pin_pages: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Any) -> EngineOptions:
@@ -250,6 +256,13 @@ class EngineOptions:
                 raw.get("prefill_admit_max_age_ms", defaults.prefill_admit_max_age_ms),
                 "engine.prefill_admit_max_age_ms",
                 min_value=0,
+            ),
+            thp_disable=_strict_bool(
+                raw.get("thp_disable", defaults.thp_disable), "engine.thp_disable"
+            ),
+            engram_pin_pages=_strict_bool(
+                raw.get("engram_pin_pages", defaults.engram_pin_pages),
+                "engine.engram_pin_pages",
             ),
         )
         if options.prefill_decode_interval_slope > 0 and (
@@ -1030,7 +1043,19 @@ def from_cli(
     if arm not in plan.arms:
         raise RecipeRefused("recipe-unknown-arm", f"{arm!r} not in {sorted(plan.arms)}")
     apply_env(plan)
+    apply_host_options(plan)
     return RecipeSource(documents, names, plan.plan_id, plan.empty)
+
+
+def apply_host_options(plan: Plan | None) -> None:
+    """The engine options that act on the server's main process, before any
+    worker starts: ``engine.thp_disable`` (inherited by every process the
+    server starts). Nothing under the kill switch, as `engine_options_for`."""
+    from atom.utils import disable_thp, envs
+
+    if plan is None or not envs.ATOM_PLUGIN_HOST:
+        return
+    disable_thp("server", enabled=plan.engine.thp_disable)
 
 
 def apply_env(plan: Plan | None, environ=None) -> dict[str, str]:

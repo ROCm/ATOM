@@ -60,6 +60,7 @@ logger = logging.getLogger("atom")
 
 _PAGE = 4096
 _MADV_DONTNEED = 4
+_MADV_DONTFORK = 10
 _MADV_NOHUGEPAGE = 15
 _MADV_POPULATE_READ = 22  # Linux 5.14+; elsewhere EINVAL, and nothing is lost
 _MLOCK_ONFAULT = 1
@@ -226,6 +227,86 @@ def _clear_hip_error() -> None:
         hip.hipGetLastError()
 
 
+_SYS_IO_URING_SETUP = 425
+_SYS_IO_URING_REGISTER = 427
+_IORING_REGISTER_BUFFERS = 0
+# The kernel takes at most 1 GiB per fixed buffer.
+_PIN_PIECE_BYTES = 1 << 30
+
+
+def _pin_pages_wanted() -> bool:
+    """A recipe's ``engine.engram_pin_pages``: pin the pages of a copied shard."""
+    from atom import plugin_host
+
+    return bool(plugin_host.engine_options().engram_pin_pages)
+
+
+class _Iovec(ctypes.Structure):
+    _fields_ = [("iov_base", ctypes.c_void_p), ("iov_len", ctypes.c_size_t)]
+
+
+def _pin_pages(ptr: int, nbytes: int) -> int | None:
+    """Pin the pages of `[ptr, ptr + nbytes)` until the returned descriptor is
+    closed; None, with a warning, if the kernel refuses.
+
+    Why: page-locked host memory is a KFD userptr range, and its pages stay
+    movable. When the kernel migrates one of them (compaction), the MMU
+    notifier stops every GPU queue of the process until the whole range is
+    revalidated, and every rank coupled to this one waits with it. A
+    long-term pin takes the pages out of
+    compaction's reach: it skips pinned anonymous pages before unmapping them.
+
+    How: the pages are registered as fixed buffers of an io_uring instance
+    that is never used for I/O; registration pins them (FOLL_LONGTERM) and
+    closing the ring unpins them. Unprivileged, counted against
+    RLIMIT_MEMLOCK.
+    """
+    libc = _libc()
+    libc.syscall.restype = ctypes.c_long
+    params = (ctypes.c_char * 120)()  # struct io_uring_params, zeroed
+    fd = libc.syscall(_SYS_IO_URING_SETUP, 1, params)
+    if fd < 0:
+        logger.warning(
+            "engram: no page pin, io_uring_setup refused (%s)",
+            os.strerror(ctypes.get_errno()),
+        )
+        return None
+    count = -(-nbytes // _PIN_PIECE_BYTES)
+    iov = (_Iovec * count)()
+    for i in range(count):
+        iov[i].iov_base = ptr + i * _PIN_PIECE_BYTES
+        iov[i].iov_len = min(_PIN_PIECE_BYTES, nbytes - i * _PIN_PIECE_BYTES)
+    t0 = time.monotonic()
+    if (
+        libc.syscall(_SYS_IO_URING_REGISTER, fd, _IORING_REGISTER_BUFFERS, iov, count)
+        < 0
+    ):
+        logger.warning(
+            "engram: no page pin for %.2f GiB (%s)",
+            nbytes / 2**30,
+            os.strerror(ctypes.get_errno()),
+        )
+        os.close(fd)
+        return None
+    # A fork() would copy every pinned page into the child at once (the
+    # kernel does not share pinned anonymous pages copy-on-write): keep the
+    # range out of children. Nothing forked from a runner reads a table.
+    lo = ptr - ptr % _PAGE
+    hi = -(-(ptr + nbytes) // _PAGE) * _PAGE
+    if libc.madvise(lo, hi - lo, _MADV_DONTFORK) != 0:
+        logger.warning(
+            "engram: MADV_DONTFORK on the pinned range refused (%s); a fork of "
+            "this process would copy it",
+            os.strerror(ctypes.get_errno()),
+        )
+    logger.info(
+        "engram: pinned %.2f GiB of page-locked memory against page migration in %.1f s",
+        nbytes / 2**30,
+        time.monotonic() - t0,
+    )
+    return fd
+
+
 class _HipHostAllocator:
     """`hipHostMalloc`/`hipHostFree` through ctypes, on base pages.
 
@@ -257,6 +338,8 @@ class _HipHostAllocator:
         self._free.argtypes = [ctypes.c_void_p]
         self._prctl = libc.prctl
         self._madvise = libc.madvise
+        # Block address -> the descriptor that pins its pages (`_pin_pages`).
+        self._pins: dict[int, int] = {}
 
     def alloc(self, nbytes: int) -> int | None:
         was = self._prctl(_PR_GET_THP_DISABLE, 0, 0, 0, 0)
@@ -273,9 +356,16 @@ class _HipHostAllocator:
         start = ptr.value - ptr.value % _PAGE  # the kernel rounds the length up
         # best effort: a kernel without THP answers EINVAL, and nothing is lost
         self._madvise(start, ptr.value + nbytes - start, _MADV_NOHUGEPAGE)
+        if nbytes > 0 and _pin_pages_wanted():
+            fd = _pin_pages(ptr.value, nbytes)
+            if fd is not None:
+                self._pins[ptr.value] = fd
         return ptr.value
 
     def free(self, ptr: int) -> None:
+        fd = self._pins.pop(ptr, None)
+        if fd is not None:
+            os.close(fd)
         # Synchronizes the device first (an implicit hipDeviceSynchronize).
         rc = self._free(ptr)
         if rc != 0:
