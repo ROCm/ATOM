@@ -138,7 +138,9 @@ pub fn prepare_chat_declaring(
         });
         (entry, built_in, loaded)
     };
-    if let Some(gap) = atom_chat_render_gap(&workers, configured_template, built_in_encoder) {
+    // A template file the tokenizer was loaded with is a template, as --chat-template is.
+    let templated = configured_template || loaded_template == Some(LoadedTemplate::File);
+    if let Some(gap) = atom_chat_render_gap(&workers, templated, built_in_encoder) {
         return Err(error::not_implemented(
             "chat_template_unavailable",
             format!(
