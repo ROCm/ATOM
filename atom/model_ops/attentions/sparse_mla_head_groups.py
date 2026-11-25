@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Independent head groups for small BF16 persistent sparse-prefill batches,
 and the work-plan granularity shared by the builder, the DCP rebuild and the
 sglang GLM-5.2 bridge."""
@@ -32,9 +33,10 @@ PERSISTENT_WORK_BUFFERS = (
 def sparse_prefill_kv_granularity(dtype_q, dtype_kv, row_width, page_size=1):
     """kv_granularity of a sparse-prefill work plan. A BF16 row is planned
     whole: splitting its candidates by batch occupancy changes the reduction
-    order, so a row's output would depend on what it is batched with."""
+    order, so a row's output would depend on what it is batched with.
+    Runs per step, hence the bit trick over `triton.next_power_of_2`."""
     if dtype_q == dtype_kv == torch.bfloat16:
-        return max(triton.next_power_of_2(row_width), page_size, 16)
+        return max(1 << max(row_width - 1, 0).bit_length(), page_size, 16)
     return max(page_size, 16)
 
 
@@ -113,14 +115,14 @@ class SparsePrefillHeadGroups:
     ) -> bool:
         """Whether this step's sparse-prefill call has the geometry above.
         `row_width` (the layer's top-k output row width, `topk_out_width`)
-        bounds each row's region."""
+        bounds each row's region; it rounds up to REGION."""
         return (
             0 < q.shape[0] <= MAX_HEAD_GROUP_ROWS
             and q.dtype == kv_cache.dtype == torch.bfloat16
             and q.shape[1:] == (HEADS, Q_DIM)
             and output.shape[1:] == (HEADS, KV_LORA_RANK)
             and q.is_contiguous()
-            and row_width == REGION
+            and REGION // 2 < row_width <= REGION
         )
 
     def prepare(self, q, output, indptr, indices):

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """GLM-5.2 SGLang sparse prefill plans BF16 rows whole, as the native builder does."""
 
 import importlib

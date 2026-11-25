@@ -861,12 +861,11 @@ class MLAAttention(nn.Module):
             else mla_modules.topk_tokens
         )
         # One work unit covers every candidate in a BF16 sparse-prefill row.
-        # Pooled indexers publish their wider physical row capacity, including
-        # the incomplete pool tail; ordinary indexers are bounded by top-k.
+        # Raw candidate-row width (not rounded). Pooled indexers publish their
+        # wider physical row capacity, including the incomplete pool tail;
+        # ordinary indexers are bounded by top-k.
         self._sparse_prefill_row_width = (
-            triton.next_power_of_2(
-                getattr(mla_modules.indexer, "topk_out_width", self.topk_tokens)
-            )
+            getattr(mla_modules.indexer, "topk_out_width", self.topk_tokens)
             if self.topk_tokens is not None
             else 16
         )
@@ -2598,10 +2597,8 @@ class MLAAttention(nn.Module):
 
         final_lse = None
         if kv_c_and_k_pe_cache.numel() > 0:
-            if envs.ATOM_MLA_PAGE_SIZE is not None:
-                page_size = envs.ATOM_MLA_PAGE_SIZE
-            else:
-                page_size = 1
+            # Sparse MLA refuses ATOM_MLA_PAGE_SIZE > 1 at init.
+            page_size = 1
             # Every KV dtype runs on mla_decode_fwd: it returns the LSE DCP
             # merges, and for bf16 KV it is faster than the asm prefill kernel,
             # which also mis-addresses KV past 4 GiB on gfx942.
@@ -2624,7 +2621,7 @@ class MLAAttention(nn.Module):
                 dcp_sparse
                 and self.sparse_dcp_metadata_rebuild
                 and self.dcp_persistent_supported
-                and page_size <= 1
+                # The predicate's page-size term holds: sparse page is always 1.
                 and not self.dcp_sparse_prefill_nonps
             ), (
                 "DCP sparse prefill would run in a different mode than the "

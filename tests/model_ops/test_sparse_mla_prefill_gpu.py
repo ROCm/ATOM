@@ -270,7 +270,10 @@ def test_indexer_to_sparse_mla_matches_attention_reference(length):
 
 @pytest.mark.parametrize(
     "plan,heads",
-    [("dcp_rebuild", 96), ("builder", 16), ("builder", 96), ("builder", 128)],
+    [
+        ("dcp_rebuild", 96),
+        *(("builder", heads) for heads in (16, 32, 48, 64, 96, 128)),
+    ],
 )
 @pytest.mark.parametrize("candidate_width", [2048, 2176])
 def test_bf16_sparse_prefill_is_independent_of_batch_composition(
@@ -287,7 +290,6 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(
     from itertools import accumulate
     from types import SimpleNamespace
 
-    import triton
     from aiter import get_mla_metadata_info_v1
     from aiter.mla import mla_decode_fwd
 
@@ -315,9 +317,7 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(
         "reduce_partial_map",
     )
     first = None
-    impl = SimpleNamespace(
-        _sparse_prefill_row_width=triton.next_power_of_2(candidate_width)
-    )
+    impl = SimpleNamespace(_sparse_prefill_row_width=candidate_width)
     for rows in (65, 97, 162, 481):
         repeats = (rows + len(lengths) - 1) // len(lengths)
         q = fixed.repeat(repeats, 1, 1)[:rows].contiguous()

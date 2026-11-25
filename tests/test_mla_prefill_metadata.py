@@ -19,23 +19,15 @@ to exceed `index_topk`, which is every 16-shot GSM8K prompt.
 
 from types import SimpleNamespace
 
-import pytest
 import torch
+from aiter_stub import atom_under_stubs
 
-try:
-    from atom.model_ops import attention_mla
-    from atom.model_ops.attention_mla import MLAAttention
-    from atom.model_ops.attentions.sparse_mla_head_groups import (
-        PERSISTENT_WORK_BUFFERS,
-    )
-
-    _IMPORT_ERR = None
-except ImportError as _e:  # aiter/triton absent on a CPU-only runner
-    _IMPORT_ERR = str(_e)
-
-needs_atom_mla = pytest.mark.skipif(
-    _IMPORT_ERR is not None, reason=f"requires full atom import env: {_IMPORT_ERR}"
-)
+# Against the stand-in AITER, so Pre Checkin (no AITER) runs this file.
+with atom_under_stubs() as load:
+    attention_mla = load("atom.model_ops.attention_mla")
+    head_groups = load("atom.model_ops.attentions.sparse_mla_head_groups")
+MLAAttention = attention_mla.MLAAttention
+PERSISTENT_WORK_BUFFERS = head_groups.PERSISTENT_WORK_BUFFERS
 
 KV_LORA_RANK = 8
 QK_ROPE_HEAD_DIM = 4
@@ -92,7 +84,6 @@ def _capture(monkeypatch):
     return seen
 
 
-@needs_atom_mla
 def test_sparse_prefill_does_not_read_the_dense_last_page_lens(monkeypatch):
     """A sparse prefill with no drafter and no cached prefix must still run.
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Sparse MLA (DSA) runs only at ATOM_MLA_PAGE_SIZE=1: the indexer's top-k
 indices are token slots, which a paged MLA kernel would read as page ids.
 
