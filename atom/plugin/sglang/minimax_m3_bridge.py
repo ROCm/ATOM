@@ -681,7 +681,6 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
             slot_mapping=slot_mapping,
             context_lens=seq_lens,
             block_tables=block_table,
-            has_cached=min_prefix_len > 0,
         )
         md.sparse_attention_metadata = sparse_md
         return md

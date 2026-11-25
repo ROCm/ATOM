@@ -1543,10 +1543,10 @@ def sparse_pa_per_row(
         ps=True,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
-        # A cached prefill has a flat selected-length distribution instead of
-        # the cold prefill's causal ramp. Let the GPU planner spend its default
-        # capacity there; the host-resident prefix bit selects the graph-stable
-        # allocation without reading a device length.
+        # Once every row's prefix covers the selected window, the selected
+        # lengths are flat instead of the cold prefill's causal ramp: the GPU
+        # planner spends its default capacity there. The decision reads only
+        # host values (the minimum prefix, the window), never a device length.
         plan_partition_cap=(
             None if use_dynamic_partition_plan else max_context_partition_num
         ),
