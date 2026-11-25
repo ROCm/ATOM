@@ -76,6 +76,7 @@ class RemotePrefillLookupTest(unittest.TestCase):
             dcp_size=1,
             hash_block_size=4,
             _same_page_geometry=lambda params: True,
+            _local_prefix_blocks=lambda seq: 0,
         )
         seq = types.SimpleNamespace(
             id=7,
@@ -266,7 +267,13 @@ class ConnectorSourceTest(unittest.TestCase):
         self.assertNotIn("os.environ", self.source)
         defined = (ROOT / "atom/utils/envs.py").read_text()
         documented = (ROOT / "docs/environment_variables.md").read_text()
-        for suffix in ("MODE", "HANDSHAKE_TIMEOUT_S", "WRITE_TIMEOUT_S", "VERIFY"):
+        for suffix in (
+            "MODE",
+            "HANDSHAKE_TIMEOUT_S",
+            "WRITE_TIMEOUT_S",
+            "VERIFY",
+            "INCREMENTAL_PUSH",
+        ):
             name = f"ATOM_MORIIO_{suffix}"
             self.assertIn(f"envs.{name}", self.source)
             self.assertIn(f'"{name}"', defined)
@@ -689,6 +696,8 @@ class WritePathTest(unittest.TestCase):
         conn._built_state_sessions = {}
         conn._verify_state_before = {}
         conn._write_state_digests = {}
+        conn._verify_block_sums = {}
+        conn._verify_held = {}
 
         conn.sent = []
         conn.writes = []

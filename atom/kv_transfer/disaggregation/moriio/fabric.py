@@ -182,3 +182,19 @@ def page_region_digests(views: list[torch.Tensor], block_ids: list[int]) -> list
         ) % 65521 + 1
         terms.append(torch.sum(rows * weights))
     return [int(t) for t in torch.stack(terms).tolist()]
+
+
+def page_block_digests(views: list[torch.Tensor], block_ids: list[int]) -> list[int]:
+    """`page_digest` of each of ``block_ids`` alone, in their order."""
+    if not block_ids:
+        return []
+    device = views[0].device
+    idx = torch.as_tensor(block_ids, dtype=torch.int64, device=device)
+    total = torch.zeros(len(block_ids), dtype=torch.int64, device=device)
+    for i, view in enumerate(views):
+        rows = view.index_select(0, idx).reshape(len(block_ids), -1).to(torch.int64)
+        weights = (
+            torch.arange(rows.shape[1], dtype=torch.int64, device=device) + 7919 * i
+        ) % 65521 + 1
+        total += (rows * weights).sum(1)
+    return [int(t) for t in total.tolist()]

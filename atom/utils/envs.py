@@ -192,6 +192,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # EAGLE3 draft KV is final, so ATOM_MORIIO_VERIFY finds a few receives
     # whose draft.k/v regions differ (the target's always match).
     "ATOM_MORIIO_WRITE_THREAD": lambda: _flag_env("ATOM_MORIIO_WRITE_THREAD", "0"),
+    # MoRIIO P/D write mode, decode side: ask the prefill to push only the
+    # blocks past this decode's own prefix-cache hit on the prompt, not the
+    # whole prompt (a model without per-request state). Off by default.
+    "ATOM_MORIIO_INCREMENTAL_PUSH": lambda: _flag_env(
+        "ATOM_MORIIO_INCREMENTAL_PUSH", "0"
+    ),
     # MoRIIO P/D: log the layers a receive left unchanged (debugging). With
     # moriio_backend fabric: compare a digest of every PAGE region's blocks
     # between the producer's source and the consumer's destination.
