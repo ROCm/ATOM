@@ -28,6 +28,7 @@ except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
 ROOT = Path(__file__).resolve().parent.parent
 SWITCHES = (
     "ATOM_EPLB_GATE_PERMUTE",
+    "ATOM_EPLB_ALL_LAYERS",
     "ATOM_EPLB_DECODE_SAMPLE_EVERY",
     "ATOM_EPLB_FIRST_REBALANCE_STEPS",
     "ATOM_EPLB_MAX_REBALANCES",
@@ -1066,6 +1067,40 @@ def test_gate_permute_place_experts_hands_the_ids_through(monkeypatch):
     weights, out = place(None, layer, "weights", ids, False)
     assert out is ids and weights == "weights"
     assert seen == [(layer, ids)] and calls == []
+
+
+def _eplb_layer_end(monkeypatch, replay):
+    from atom.utils import envs
+
+    namespace = {"envs": envs}
+    source = method_source(
+        "atom/models/deepseek_v41/runtime.py",
+        "DeepseekV41RuntimeModel",
+        "eplb_layer_end",
+    )
+    exec(  # noqa: S102 - the source is this repository's own, read above
+        source.replace("@property\n", ""), namespace
+    )
+    return namespace["eplb_layer_end"](SimpleNamespace(replay=replay, decoder_start=20))
+
+
+def test_eplb_layer_end(monkeypatch):
+    assert _eplb_layer_end(monkeypatch, True) == 20
+    assert _eplb_layer_end(monkeypatch, False) is None
+    monkeypatch.setenv("ATOM_EPLB_ALL_LAYERS", "1")
+    assert _eplb_layer_end(monkeypatch, True) is None
+    assert _eplb_layer_end(monkeypatch, False) is None
+
+
+def test_eplb_layer_end_on_the_model(monkeypatch):
+    from conftest import gpu_stack_import
+
+    runtime = gpu_stack_import("atom.models.deepseek_v41.runtime")
+    model = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
+    model.__dict__.update(replay=True, decoder_start=20)
+    assert model.eplb_layer_end == 20
+    monkeypatch.setenv("ATOM_EPLB_ALL_LAYERS", "1")
+    assert model.eplb_layer_end is None
 
 
 # ---------------------------------------------------------------- config

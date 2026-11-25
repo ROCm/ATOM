@@ -1203,6 +1203,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_FIRST_REBALANCE_STEPS": lambda: _optional_int_env(
         "ATOM_EPLB_FIRST_REBALANCE_STEPS", min_value=1
     ),
+    # DeepSeek-V4.1 under decoder bounded replay: EPLB places every target
+    # layer, the decoder's too (default: the layers before it only).
+    "ATOM_EPLB_ALL_LAYERS": lambda: _flag_env("ATOM_EPLB_ALL_LAYERS"),
     # Gate-permute EPLB (`atom/model_ops/eplb_gate_permute.py`), R = 0 only:
     # a rebalance moves the gate's rows with the expert weights, so the router
     # emits physical ids and no id remap is launched. Load statistics come

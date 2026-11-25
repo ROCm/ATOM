@@ -9,6 +9,7 @@ from torch import nn
 
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.engram.device.staging import EngramStagedRows
+from atom.utils import envs
 from atom.utils.backends import set_model_tag
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
@@ -334,7 +335,12 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     @property
     def eplb_layer_end(self) -> int | None:
         """EPLB balances on prefill load, and under replay only the layers
-        before the decoder run a prefill's every row: it places those."""
+        before the decoder run a prefill's every row: it places those.
+        ATOM_EPLB_ALL_LAYERS places the decoder's too, on the load they do
+        see (a prefill's tails, and with ATOM_EPLB_GATE_PERMUTE the sampled
+        decode steps)."""
+        if envs.ATOM_EPLB_ALL_LAYERS:
+            return None
         return self.decoder_start if self.replay else None
 
     def set_aux_hidden_state_rows(self, layer_ids, buffers):
