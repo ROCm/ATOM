@@ -176,3 +176,41 @@ def test_analyze_log_kv_budget():
 def test_analyze_log_argparse_error():
     r = analyze_log("openai_server.py: error: unrecognized arguments: --levle 3\n")
     assert r["findings"][0]["key"] == "bad_flag"
+
+
+def test_partial_downloads_are_detected(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    cfg = {"architectures": ["LlamaForCausalLM"], "model_type": "llama"}
+    for name, present in (("Whole", 3), ("Partial", 1)):
+        d = tmp_path / "data" / name
+        d.mkdir(parents=True)
+        (d / "config.json").write_text(json.dumps(cfg))
+        shards = [f"model-0000{i}-of-00003.safetensors" for i in range(1, 4)]
+        (d / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {"total_size": 3 * 2**30},
+                    "weight_map": {f"w{i}": s for i, s in enumerate(shards)},
+                }
+            )
+        )
+        for s in shards[:present]:
+            (d / s).write_bytes(b"\0")
+    # A HF-cache snapshot whose shard is a link to a blob that never arrived.
+    snap = tmp_path / "hub" / "models--org--Linky" / "snapshots" / "abc"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text(json.dumps(cfg))
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"w": "model.safetensors"}})
+    )
+    (snap / "model.safetensors").symlink_to("../../blobs/missing")
+    (snap / "extra.bin").write_bytes(b"\0")  # so the scan sees a weight file
+
+    found = models.find_models(roots=(str(tmp_path / "data"),))
+    by = {m["name"]: m for m in found["models"]}
+    assert by["Whole"]["complete"] and not by["Partial"]["complete"]
+    assert by["Partial"]["shards"] == "1/3" and not by["org/Linky"]["complete"]
+    assert found["incomplete"] == 2 and found["total_found"] == 3
+    assert [m["name"] for m in found["models"]][0] == "Whole"  # complete first
+    info = models.inspect_model(str(tmp_path / "data" / "Partial"))
+    assert not info["complete"] and "incomplete checkpoint: 1 of 3" in info["warning"]

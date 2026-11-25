@@ -430,6 +430,9 @@ def make_plan(
     info = inspect_model(model, vram, model_roots)
     if not info.get("found"):
         return {"ok": False, "error": f"model {model!r} not found", **info}
+    if not info.get("complete", True):
+        # Fail now, not after minutes of loading the shards that are there.
+        return {"ok": False, "error": info.get("warning"), "model_info": info}
     if not info.get("atom_supported"):
         return {"ok": False, "error": info.get("warning"), "model_info": info}
     model_path = info["path"]

@@ -65,15 +65,19 @@ def resolve_model(ref: str, search_roots: tuple[str, ...] = ()) -> Path | None:
     return None
 
 
-def weight_bytes(model_dir: Path) -> int:
+def _read_index(model_dir: Path) -> dict | None:
     index = model_dir / "model.safetensors.index.json"
-    if index.is_file():
-        try:
-            total = json.loads(index.read_text()).get("metadata", {}).get("total_size")
-            if total:
-                return int(total)
-        except (OSError, ValueError):
-            pass
+    try:
+        return json.loads(index.read_text()) if index.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def weight_bytes(model_dir: Path, index: dict | None = None) -> int:
+    index = index if index is not None else _read_index(model_dir)
+    total = (index or {}).get("metadata", {}).get("total_size")
+    if total:
+        return int(total)
     total = 0
     for f in model_dir.iterdir():
         if f.suffix in WEIGHT_SUFFIXES:
@@ -82,6 +86,41 @@ def weight_bytes(model_dir: Path) -> int:
             except OSError:
                 pass
     return total
+
+
+def shard_status(model_dir: Path, index: dict | None = None) -> dict:
+    """Are all shards the index names on disk? Partial downloads look like
+    models (config + some weights) but fail minutes into loading."""
+    index = index if index is not None else _read_index(model_dir)
+    shards = set((index or {}).get("weight_map", {}).values())
+    if not shards:
+        return {"complete": True}  # single-file checkpoint or no index
+    # One directory listing instead of a stat per shard (checkpoints live on
+    # NFS; 141 round trips per model add up). Only symlinks -- HF-cache
+    # snapshots link to blobs -- need their target checked.
+    present: set[str] = set()
+    try:
+        with os.scandir(model_dir) as it:
+            for e in it:
+                if e.name in shards and (
+                    e.is_file(follow_symlinks=False)
+                    or (e.is_symlink() and os.path.exists(e.path))
+                ):
+                    present.add(e.name)
+    except OSError:
+        pass
+    # Shards in subdirectories (rare) fall back to a direct check.
+    missing = sorted(
+        s
+        for s in shards
+        if s not in present and ("/" not in s or not (model_dir / s).is_file())
+    )
+    return {
+        "complete": not missing,
+        "shards_present": len(shards) - len(missing),
+        "shards_total": len(shards),
+        "missing_examples": missing[:3],
+    }
 
 
 def _text_config(cfg: dict) -> dict:
@@ -225,7 +264,9 @@ def inspect_model(
     except (OSError, ValueError) as e:
         return {"model": ref, "found": True, "path": str(model_dir), "error": str(e)}
     desc = describe_config(cfg)
-    wbytes = weight_bytes(model_dir)
+    index = _read_index(model_dir)
+    wbytes = weight_bytes(model_dir, index)
+    shards = shard_status(model_dir, index)
     report = {
         "model": ref,
         "found": True,
@@ -240,7 +281,15 @@ def inspect_model(
             else ""
         ),
     }
-    if not desc["atom_supported"]:
+    report.update(shards)
+    if not shards["complete"]:
+        report["warning"] = (
+            f"incomplete checkpoint: {shards['shards_present']} of "
+            f"{shards['shards_total']} weight shards on disk (missing e.g. "
+            f"{', '.join(shards['missing_examples'])}); finish the download "
+            "before serving it."
+        )
+    elif not desc["atom_supported"]:
         report["warning"] = (
             f"Architecture {desc['architecture']!r} is not in ATOM's model "
             "registry (atom/models/registry.py); ATOM cannot serve it natively. "
@@ -260,6 +309,7 @@ def find_models(
     roots: tuple[str, ...] = (),
     max_depth: int = 3,
     time_budget_s: float = 8.0,
+    limit: int | None = 60,
 ) -> dict:
     """Directories with a config.json and weights under the given roots.
 
@@ -269,10 +319,12 @@ def find_models(
     key = (query, tuple(roots), max_depth)
     hit = _FIND_CACHE.get(key)
     if hit and time.monotonic() - hit[0] < FIND_CACHE_TTL_S:
-        return hit[1]
-    result = _scan_models(query, roots, max_depth, time_budget_s)
-    _FIND_CACHE[key] = (time.monotonic(), result)
-    return result
+        result = hit[1]
+    else:
+        result = _scan_models(query, roots, max_depth, time_budget_s)
+        _FIND_CACHE[key] = (time.monotonic(), result)
+    # The LLM gets a bounded list; programmatic callers can ask for all.
+    return {**result, "models": result["models"][:limit] if limit else result["models"]}
 
 
 def _scan_models(query, roots, max_depth, time_budget_s) -> dict:
@@ -299,13 +351,23 @@ def _scan_models(query, roots, max_depth, time_budget_s) -> dict:
         if real in found:
             return
         arch = (cfg.get("architectures") or [None])[0]
+        supported = arch in support_model_arch_dict
+        index = _read_index(d)
+        # Completeness matters only for what ATOM could serve; most of a
+        # shared cache is embedding models and other engines' checkpoints.
+        shards = shard_status(d, index) if supported else {"complete": True}
         found[real] = {
             "name": name,
             "path": str(d),
             "architecture": arch,
-            "atom_supported": arch in support_model_arch_dict,
-            "weights_gib": round(weight_bytes(d) / 2**30, 1),
+            "atom_supported": supported,
+            "weights_gib": round(weight_bytes(d, index) / 2**30, 1),
+            "complete": shards["complete"],
         }
+        if not shards["complete"]:
+            found[real][
+                "shards"
+            ] = f"{shards['shards_present']}/{shards['shards_total']}"
 
     def walk(d: Path, depth: int) -> None:
         if time.monotonic() > deadline or depth > max_depth:
@@ -338,14 +400,17 @@ def _scan_models(query, roots, max_depth, time_budget_s) -> dict:
                 walk(Path(root), 0)
         except OSError:
             continue
-    # Servable models first: on shared boxes the caches are mostly embedding
-    # models and other engines' test checkpoints.
+    # Servable, complete models first: on shared boxes the caches are mostly
+    # embedding models, other engines' test checkpoints and partial downloads.
     models = sorted(
-        found.values(), key=lambda m: (not m["atom_supported"], m["name"].lower())
+        found.values(),
+        key=lambda m: (not m["atom_supported"], not m["complete"], m["name"].lower()),
     )
     return {
         "query": query,
         "searched": list(roots) + [str(d) for d in hf_cache_dirs()],
         "truncated": time.monotonic() > deadline,
-        "models": models[:60],
+        "total_found": len(models),
+        "incomplete": sum(not m["complete"] for m in models),
+        "models": models,
     }

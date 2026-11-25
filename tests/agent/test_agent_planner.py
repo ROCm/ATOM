@@ -214,3 +214,14 @@ def test_port_selection_skips_taken(fake_machine):
     plan = planner.make_plan(kb, str(model), port=18000, taken_ports={18000})
     assert plan["port"] != 18000
     assert Path(plan["model"]) == model
+
+
+def test_make_plan_refuses_partial_downloads(fake_machine):
+    kb, model = fake_machine
+    (model / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {"a": "model.safetensors", "b": "model-2.safetensors"}}
+        )
+    )
+    plan = planner.make_plan(kb, str(model))
+    assert not plan["ok"] and "incomplete checkpoint: 1 of 2" in plan["error"]

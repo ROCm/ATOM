@@ -22,6 +22,7 @@ from pathlib import Path
 
 from atom.agent import deploy, hardware
 from atom.agent.brain import Brain, connect, discover
+from atom.agent.models import find_models
 from atom.agent.config import DEFAULT_MODEL_ROOTS, DEFAULT_STATE_DIR, AgentConfig
 from atom.agent.policy import MODES, Policy
 from atom.agent.prompts import build_system_prompt, machine_brief
@@ -126,14 +127,21 @@ def summarize_result(name: str, r: dict) -> str:
             else ""
         )
     if name == "find_models":
-        return f"{len(r.get('models', []))} model(s)"
+        bad = f", {r['incomplete']} incomplete" if r.get("incomplete") else ""
+        return f"{r.get('total_found', len(r.get('models', [])))} model(s){bad}"
     if name == "search_docs":
         return "; ".join(f"{h['path']}" for h in r.get("results", [])[:3]) or "no hits"
     if name == "inspect_model":
+        if not r.get("found"):
+            return "not found"
+        part = (
+            ""
+            if r.get("complete", True)
+            else f" INCOMPLETE {r.get('shards_present')}/{r.get('shards_total')} shards"
+        )
         return (
-            f"{r.get('architecture')} {r.get('weights_gib')} GiB supported={r.get('atom_supported')}"
-            if r.get("found")
-            else "not found"
+            f"{r.get('architecture')} {r.get('weights_gib')} GiB "
+            f"supported={r.get('atom_supported')}{part}"
         )
     if name == "diagnose":
         f = (r.get("status") or {}).get("findings") or []
@@ -359,11 +367,11 @@ def ctx_tool(ctx: ToolContext, name: str, **kw) -> dict:
 
 def offer_bootstrap(ctx: ToolContext, term: Terminal) -> str | None:
     """No brain anywhere: suggest local models ATOM can serve with tool calls."""
-    found = [
-        m
-        for m in ctx_tool(ctx, "find_models")["models"]
-        if m["architecture"] in TOOL_CAPABLE_ARCHS
-    ]
+    scan = find_models(None, roots=ctx.cfg.model_roots, limit=None)
+    capable = [m for m in scan["models"] if m["architecture"] in TOOL_CAPABLE_ARCHS]
+    # Partial downloads would fail minutes into loading: never offer them.
+    found = [m for m in capable if m["complete"]]
+    partial = [m for m in capable if not m["complete"]]
     print(term.st.yellow("No LLM endpoint found for the agent's brain."))
     print("Options:\n  1) give an OpenAI-compatible URL (--brain-url)")
     if found:
@@ -372,6 +380,19 @@ def offer_bootstrap(ctx: ToolContext, term: Terminal) -> str | None:
             print(
                 f"       {chr(97 + i)}) {m['name']}  ({m['weights_gib']} GiB)  {m['path']}"
             )
+    if partial:
+        print(
+            term.st.dim(
+                f"     (not offered: {len(partial)} incomplete download(s), e.g. "
+                f"{partial[0]['name']} with {partial[0]['shards']} shards)"
+            )
+        )
+    if scan["truncated"]:
+        print(
+            term.st.dim(
+                "     (disk scan hit its time limit; --model-root DIR narrows it)"
+            )
+        )
     print("  3) guided mode without an LLM (--guided)")
     if not term.interactive:
         return None
@@ -399,7 +420,11 @@ def guided(ctx: ToolContext, term: Terminal) -> None:
         + "  "
         + machine_brief(report).replace("\n", "\n  ")
     )
-    models = [m for m in box.call("find_models", {})["models"] if m["atom_supported"]]
+    models = [
+        m
+        for m in box.call("find_models", {})["models"]
+        if m["atom_supported"] and m["complete"]
+    ]
     for i, m in enumerate(models[:20]):
         print(f"  {i + 1:>2}) {m['name']}  ({m['weights_gib']} GiB)")
     choice = input("model (number or path): ").strip()
