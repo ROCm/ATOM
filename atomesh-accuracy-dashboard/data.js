@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795621019589,
+  "lastUpdate": 1795626724549,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -5466,6 +5466,46 @@ window.BENCHMARK_DATA = {
             "value": 0.8961,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45628567248 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611241524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1342 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "yifehuan-amd",
+            "username": "yifehuan",
+            "email": "Yifeng.Huang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "f3d0b30fbc076b178293838cf7059a1271258ef7",
+          "message": "[Fix] Initialize V4.1 DSpark noise embedding before graph warmup (#3842)\n\n* fix(dsv41): initialize DSpark noise embedding before graph warmup\n\nSigned-off-by: yifehuan <yifehuan@amd.com>\n\n* fix(dsv41): prepare DSpark noise embedding after drafter load\n\nSigned-off-by: yifehuan <yifehuan@amd.com>\n\n* fix(dsv41): bind the DSpark noise row and anchors outside the custom all-reduce\n\nThe noise row was first embedded inside a draft graph's warmup, where the\ncustom all-reduce returns zeros, and was kept as zeros for every native draft.\n\n- Bind the shared embedding once on the first eager draft step (refused under\n  graph capture): a bf16 vocab-parallel table through the peer embedding mono\n  already maps, else the noise row by masked lookup + one NCCL all-reduce.\n- Read the anchors from their owner shards inside the block-state launch\n  (build_peer_block_state): no lookup and no all-reduce per draft step,\n  10-24 us saved at TP4/TP8, B 16-256, bit-identical.\n- Drop the prepare_for_serving hooks from the runner, drafter and proposer.\n\n* test(dsv41): guard the sharded noise-row tests behind the aiter importorskip\n\nThe two sharded tests imported atom.models.deepseek_v41.dspark directly, so\nthe non-GPU CI job (no aiter) failed at import instead of skipping them as it\nskips the other draft-model tests.\n\n---------\n\nSigned-off-by: yifehuan <yifehuan@amd.com>\nCo-authored-by: Lingpeng Jin <103567126+valarLip@users.noreply.github.com>",
+          "timestamp": "2026-11-25T14:29:02Z",
+          "url": "https://github.com/ROCm/ATOM/commit/f3d0b30fbc076b178293838cf7059a1271258ef7"
+        },
+        "date": 1795626723726,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9462,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45652077139 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611251520 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9416 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8923,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45652077139 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611251520 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1827 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b-1p1d accuracy (GSM8K)",
+            "value": 0.9007,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45652077139 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611251520 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1751 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
