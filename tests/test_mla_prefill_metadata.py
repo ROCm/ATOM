@@ -71,6 +71,7 @@ def _capture(monkeypatch):
         seen.update(
             q=q,
             num_kv_splits=kw.get("num_kv_splits"),
+            has_partials=kw.get("has_partials", True),
             cu_seqlens_q=cu_seqlens_q,
             kv_indptr=kv_indptr,
             kv_indices=kv_indices,
@@ -125,5 +126,7 @@ def test_sparse_prefill_does_not_read_the_dense_last_page_lens(monkeypatch):
     assert seen["max_q_len"] == 1
     assert seen["q"].shape[1] == NUM_HEADS
     assert seen["num_kv_splits"] is not None
+    # bf16 rows are planned whole, so aiter's reduce has nothing to do.
+    assert seen["has_partials"] is False
     for name in PERSISTENT_WORK_BUFFERS:
         assert seen["work"][name] is getattr(md, f"sparse_prefill_{name}")

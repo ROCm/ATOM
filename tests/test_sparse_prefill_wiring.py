@@ -39,6 +39,16 @@ def test_granularity(dtype, row_width, page_size, expected):
     assert granularity(dtype, dtype, row_width, page_size) == expected
 
 
+@pytest.mark.parametrize(
+    "dtype_q, dtype_kv, whole",
+    [(BF16, BF16, True), (FP8, FP8, False), (BF16, FP8, False)],
+)
+def test_rows_whole_matches_the_granularity(dtype_q, dtype_kv, whole):
+    # has_partials=False is safe only where the plan keeps rows whole.
+    assert head_groups.sparse_prefill_rows_whole(dtype_q, dtype_kv) is whole
+    assert (granularity(dtype_q, dtype_kv, 2176) >= 2176) is whole
+
+
 def test_granularity_rounds_to_the_next_power_of_two():
     power = 1
     for row_width in range(1, 70000):

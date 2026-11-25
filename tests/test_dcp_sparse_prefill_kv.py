@@ -769,6 +769,8 @@ def test_a_kv_step_runs_the_dcp1_kernel_arguments(monkeypatch):
     assert {w: seen[w] for w in PERSISTENT_WORK_BUFFERS} == {
         w: w for w in PERSISTENT_WORK_BUFFERS
     }
+    # An fp8 plan may split rows, so aiter must keep its split buffers.
+    assert seen["has_partials"] is True
 
 
 class _Stop(Exception):

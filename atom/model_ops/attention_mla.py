@@ -69,6 +69,7 @@ from atom.distributed.pcp_utils import (
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     PERSISTENT_WORK_BUFFERS,
     sparse_prefill_kv_granularity,
+    sparse_prefill_rows_whole,
 )
 from atom.model_ops.dcp_ops import (
     dcp_all_gather_prefill_query_heads,
@@ -2699,6 +2700,11 @@ class MLAAttention(nn.Module):
                 q_scale=self._q_scale if is_fp8 else None,
                 kv_scale=self._k_scale if is_fp8 else None,
                 return_lse=return_lse,
+                # A whole-row plan has no split rows: skip the reduce launch.
+                # Ignored without a work plan (non-persistent split-KV kernel).
+                has_partials=not sparse_prefill_rows_whole(
+                    kernel_q.dtype, kv_c_and_k_pe_cache.dtype
+                ),
                 **work,
             )
             if group_heads and final_lse is not None:

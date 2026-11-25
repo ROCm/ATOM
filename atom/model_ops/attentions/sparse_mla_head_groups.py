@@ -30,12 +30,22 @@ PERSISTENT_WORK_BUFFERS = (
 )
 
 
+def sparse_prefill_rows_whole(dtype_q, dtype_kv):
+    """Whether a sparse-prefill work plan keeps each row in one work item. Such
+    a plan has no split rows, so `mla_decode_fwd` is called with
+    has_partials=False and allocates no split buffers: a split row would then
+    write out of bounds. Every planner of these rows (metadata builder, DCP
+    rebuild, head groups, the sglang GLM-5.2 bridge) takes its kv_granularity
+    from `sparse_prefill_kv_granularity`, which keeps them whole."""
+    return dtype_q == dtype_kv == torch.bfloat16
+
+
 def sparse_prefill_kv_granularity(dtype_q, dtype_kv, row_width, page_size=1):
     """kv_granularity of a sparse-prefill work plan. A BF16 row is planned
     whole: splitting its candidates by batch occupancy changes the reduction
     order, so a row's output would depend on what it is batched with.
     Runs per step, hence the bit trick over `triton.next_power_of_2`."""
-    if dtype_q == dtype_kv == torch.bfloat16:
+    if sparse_prefill_rows_whole(dtype_q, dtype_kv):
         return max(1 << max(row_width - 1, 0).bit_length(), page_size, 16)
     return max(page_size, 16)
 

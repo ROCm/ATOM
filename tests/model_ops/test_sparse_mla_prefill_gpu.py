@@ -387,6 +387,7 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(
         intervals = [tuple(iv) for iv in info[:, 4:6].tolist()]
         for row, count in enumerate(counts):
             assert intervals.count((starts[row], starts[row] + count)) == fold
+        assert int(work["reduce_indptr"][-1]) == 0
         output = torch.empty(rows, heads, 512, dtype=torch.bfloat16, device="cuda")
         mla_decode_fwd(
             q,
@@ -401,6 +402,7 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(
             # ATOM's form; without it aiter drops 16 heads to the split-KV kernel
             num_kv_splits=mla_dcp_sparse_prefill_kv_splits(False, 1),
             sm_scale=576**-0.5,
+            has_partials=False,
             **work,
         )
         actual = output[: len(lengths)].cpu()
