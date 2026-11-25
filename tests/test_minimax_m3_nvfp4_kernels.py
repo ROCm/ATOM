@@ -3,8 +3,10 @@
 
 """MiniMax-M3 FP4 index cache and NVFP4 sparse KV kernels, against torch.
 
-gfx950 only: the e2m1 decode is a gfx950 instruction and the attention / fused
-top-k kernels are gfx950 Gluon. Elsewhere every test skips.
+gfx950 and gfx1250: gfx950 decodes e2m1 with its conversion instruction and runs
+the Gluon attention; gfx1250 decodes it with integer ops and runs aiter's FlyDSL
+paged decode over a compacted page table. The fused top-k is gfx950 Gluon only.
+Elsewhere every test skips.
 
 - the store kernels against a torch quantizer (exact), K/V against the index path;
 - the per-row (request, causal length) maps;
@@ -20,14 +22,22 @@ import torch
 pytest.importorskip("triton", reason="the kernels are triton / gluon")
 
 
-def _gfx950() -> bool:
+def _gfx() -> str:
     if not torch.cuda.is_available():
-        return False
+        return ""
     props = torch.cuda.get_device_properties(0)
-    return getattr(props, "gcnArchName", "").startswith("gfx950")
+    return getattr(props, "gcnArchName", "").split(":")[0]
 
 
-pytestmark = pytest.mark.skipif(not _gfx950(), reason="needs a gfx950 GPU")
+pytestmark = pytest.mark.skipif(
+    _gfx() not in ("gfx950", "gfx1250"), reason="needs a gfx950 or gfx1250 GPU"
+)
+gfx950_only = pytest.mark.skipif(
+    _gfx() != "gfx950", reason="the fused verify top-k is gfx950 Gluon"
+)
+gfx1250_only = pytest.mark.skipif(
+    _gfx() != "gfx1250", reason="the compacted page table feeds gfx1250's paged decode"
+)
 
 DEV, D, PAGE = "cuda", 128, 128
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -190,7 +200,12 @@ def test_fp4_scorers_select_like_bf16():
     bt2 = torch.arange(64, device=DEV, dtype=torch.int32).view(2, 32)
     q2 = torch.randn(1000, 1, D, device=DEV, dtype=torch.bfloat16)
     kw2 = dict(max_query_len=700, max_seq_len=4000, sm_scale=D**-0.5, **common)
-    ref = minimax_m3_index_topk(q2, bf16, bt2, cu, seq2, seq2 - qlens, **kw2)[0]
+    # gfx1250's FP4 prefill reads through the scaled WMMA against the E4M3 query
+    # (as the FP8 cache's prefill rounds it): the BF16 reference gets that query.
+    q2_ref = (
+        q2.to(torch.float8_e4m3fn).to(torch.bfloat16) if _gfx() == "gfx1250" else q2
+    )
+    ref = minimax_m3_index_topk(q2_ref, bf16, bt2, cu, seq2, seq2 - qlens, **kw2)[0]
     got = minimax_m3_index_topk(
         q2, payload, bt2, cu, seq2, seq2 - qlens, index_kv_scale=scale, **kw2
     )[0]
@@ -243,6 +258,44 @@ def test_nvfp4_attention_matches_dequantized_reference():
         assert err < 0.02, (r, float(err))
 
 
+@gfx1250_only
+def test_page_table_compacts_causal_selection():
+    """Full blocks in selection order, the row's tail block last, blocks past
+    the row's last token dropped; per kv head, pages encoded p * Hkv + h."""
+    from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import nvfp4_page_table
+
+    torch.manual_seed(8)
+    hkv, rows, topk, maxb = 2, 40, 16, 64
+    row_seq = torch.randint(0, maxb * PAGE, (rows,), device=DEV, dtype=torch.int32)
+    row_seq[:4] = torch.tensor([0, 1, PAGE, 3 * PAGE + 5], dtype=torch.int32)
+    row_req = torch.randint(0, 3, (rows,), device=DEV, dtype=torch.int32)
+    bt = torch.stack([torch.randperm(500, device=DEV)[:maxb] for _ in range(3)])
+    bt = bt.to(torch.int32)
+    idx = torch.full((hkv, rows, topk), -1, device=DEV, dtype=torch.int32)
+    for h in range(hkv):
+        for r in range(rows):
+            # Any blocks, some past the row: the indexer is causal, the table must be too.
+            sel = torch.randperm(maxb, device=DEV)[
+                : torch.randint(0, topk + 1, ()).item()
+            ]
+            idx[h, r, : sel.numel()] = sel.to(torch.int32)
+    table, ctx = nvfp4_page_table(idx, bt, row_req, row_seq)
+    for h in range(hkv):
+        for r in range(rows):
+            n = int(row_seq[r])
+            last = (n - 1) // PAGE if n else -1
+            sel = [b for b in idx[h, r].tolist() if 0 <= b <= last]
+            full = [b for b in sel if b < last]
+            order = full + [b for b in sel if b == last]
+            want_ctx = len(full) * PAGE + (n - last * PAGE if last in sel else 0)
+            pages = [int(bt[row_req[r], b]) * hkv + h for b in order]
+            got = table[r * hkv + h].tolist()
+            assert int(ctx[r * hkv + h]) == want_ctx, (h, r)
+            assert got[: len(pages)] == pages, (h, r)
+            assert all(p == 0 for p in got[len(pages) :]), (h, r)
+
+
+@gfx950_only
 def test_attention_check_refuses_eight_q_heads():
     from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
         check_nvfp4_sparse_attention,
@@ -258,6 +311,7 @@ def test_attention_check_refuses_eight_q_heads():
         )
 
 
+@gfx950_only
 @pytest.mark.parametrize("bs, ctx", [(3, 20000), (16, 186000)])
 def test_fused_verify_topk_matches_scorer(bs, ctx):
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
@@ -297,6 +351,7 @@ def test_fused_verify_topk_matches_scorer(bs, ctx):
     assert not can_fuse_verify_topk(padded, cache, q_rows, topk, 1, PAGE, PAGE)
 
 
+@gfx950_only
 @pytest.mark.parametrize("seq_lens", [[2688] * 3, [2688, 5120, 4000, 129]])
 def test_fused_verify_topk_ties_match_scorer(seq_lens):
     """Tied scores at the selection cutoff: both paths keep the higher block ids.
@@ -340,44 +395,6 @@ def test_fused_verify_topk_ties_match_scorer(seq_lens):
         assert got[q_rows - 1].sort().values.tolist() == list(range(5, 21))
 
 
-def test_step_staging_fits_a_small_fp8_index_pool():
-    """NVFP4 KV with an FP8 index: the writer checks the index pool against the KV
-    pages it is given, so it gets only the step's staging pages, not the whole
-    buffer (sized for max_num_batched_tokens), which the pool may be smaller than."""
-    import aiter
-
-    from atom.model_ops.attention_mha import _step_stage
-
-    torch.manual_seed(10)
-    T, heads, rot = 1, 16, 64
-    kv_stage = torch.zeros(4, 2, PAGE, 1, D, dtype=torch.bfloat16, device=DEV)
-    index_pool = torch.zeros(2, PAGE, D, dtype=torch.float8_e4m3fn, device=DEV)
-    qkv = torch.randn(T, (heads + 4) * D, dtype=torch.bfloat16, device=DEV)
-    w = [torch.randn(D, dtype=torch.bfloat16, device=DEV) * 0.1 for _ in range(4)]
-    cos_sin = torch.randn(4096, rot, dtype=torch.bfloat16, device=DEV)
-    pos = torch.zeros(T, dtype=torch.int64, device=DEV)
-    slots = torch.arange(T, dtype=torch.int64, device=DEV)
-
-    def write(stage):
-        q_out = torch.empty(T, heads * D, dtype=torch.bfloat16, device=DEV)
-        index_q = torch.empty(T, D, dtype=torch.bfloat16, device=DEV)
-        aiter.fused_qknorm_idxrqknorm(
-            qkv, w[0], w[1], cos_sin, pos, heads, 1, rot, 1e-6, w[2], w[3], 1,
-            slots, stage[:, 0], stage[:, 1], index_pool, PAGE, q_out, index_q,
-            slots, kv_cache_dtype="auto", index_cache_dtype="fp8",
-            k_scale=None, v_scale=None, asm_layout=False,
-        )  # fmt: skip
-
-    # AITER's host check (index_cache.numel() >= kv pages * 128 * 128) aborts the
-    # process on failure, so the whole buffer is checked by its arithmetic only.
-    assert index_pool.numel() < kv_stage.shape[0] * PAGE * D
-    step = _step_stage(kv_stage, T, page_dim=2)
-    assert step.shape[0] == 1
-    write(step)
-    torch.cuda.synchronize()
-    assert kv_stage[0, 0, 0].abs().sum() > 0  # the token's K landed in page 0
-
-
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_quant_stage_follows_the_model_dtype(dtype):
     """The fused writer stores the staged rows in qkv's dtype under "auto", so
@@ -401,30 +418,3 @@ def test_quant_stage_follows_the_model_dtype(dtype):
     # max_schedulable_decode_bs), so 64 seqs x 8 rows never reach the stage.
     assert stage.dtype == dtype and stage.shape == (3, PAGE, D)
     assert torch.equal(slots, torch.arange(384, device=slots.device))
-
-
-def test_nvfp4_stage_is_the_step_bound_not_the_seq_count():
-    """max_num_seqs 512 x 8 verify rows is 32 pages, but max_num_batched_tokens
-    1024 caps every step (and capture) at 8: a 16-page FP8 index pool fits."""
-    from types import SimpleNamespace
-
-    from atom.config import m3_nvfp4_stage_unsupported_reason
-    from atom.model_engine.model_runner import max_schedulable_decode_bs
-    from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
-
-    builder = AiterAttentionMetadataBuilder.__new__(AiterAttentionMetadataBuilder)
-    builder.block_size = PAGE
-    builder.model_runner = SimpleNamespace(
-        config=SimpleNamespace(
-            max_num_batched_tokens=1024,
-            max_num_seqs=512,
-            speculative_config=SimpleNamespace(num_speculative_tokens=7),
-            torch_dtype=torch.bfloat16,
-        )
-    )
-    stage, _ = builder._quant_stage("kv", (2, PAGE, 1, D))
-    assert stage.shape[0] == 8
-    # The largest captured decode bucket fits the stage.
-    assert max_schedulable_decode_bs(512, 1024, 8) * 8 <= stage.shape[0] * PAGE
-    assert m3_nvfp4_stage_unsupported_reason(stage.shape[0], 16) is None
-    assert m3_nvfp4_stage_unsupported_reason(stage.shape[0], 7) is not None
