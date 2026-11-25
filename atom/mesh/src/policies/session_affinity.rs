@@ -1225,4 +1225,90 @@ mod tests {
         assert_eq!(policy.name(), "cache_aware");
         assert!(as_cache_aware(policy.as_ref()).is_some());
     }
+
+    fn soft_around(inner: Arc<dyn LoadBalancingPolicy>) -> SessionAffinityPolicy {
+        let config = SessionAffinityConfig {
+            mode: SessionAffinityMode::Soft,
+            ..SessionAffinityConfig::default()
+        };
+        SessionAffinityPolicy::around(config, inner)
+    }
+
+    fn released(policy: &SessionAffinityPolicy, key: &str) -> bool {
+        policy
+            .table
+            .assignments
+            .get(key)
+            .is_some_and(|assignment| assignment.failed)
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_policy_keeps_the_new_binding_when_an_earlier_request_fails() {
+        let policy = SessionAffinityPolicy::around(
+            SessionAffinityConfig::default(),
+            Arc::new(MoveOffPreferred),
+        );
+        let workers = workers();
+        let headers = header_map(&[("x-session-id", "session-1")]);
+        let info = info(&headers);
+
+        // A PD relay request reserves decode worker 0; its decode is sent
+        // after its prefill.
+        let (reserved, stale) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!(reserved, Some(0));
+        // Meanwhile another request of the session hits worker 0 and fails,
+        // and the next one is placed on worker 1 and sent there.
+        let (_, failed) = policy.select_with_decision(&workers, &info).await;
+        policy.on_dispatch_failed(Some(&headers), &workers[0], failed.binding);
+        let (moved, rebind) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!(moved, Some(1));
+        policy.on_dispatch("decode", Some(&headers), &workers[1], rebind.binding);
+        // The first request's decode is now sent to worker 0 and fails.
+        policy.on_dispatch("decode", Some(&headers), &workers[0], stale.binding);
+        policy.on_dispatch_failed(Some(&headers), &workers[0], stale.binding);
+
+        assert_eq!(
+            route(&policy, &workers, &headers).await,
+            (Some(1), AFFINITY_HIT)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_soft_move_gets_a_binding_that_an_earlier_request_cannot_release() {
+        let policy = soft_around(Arc::new(MoveOffPreferred));
+        let workers = workers();
+        let headers = header_map(&[("x-session-id", "session-1")]);
+        let info = info(&headers);
+
+        let (placed, stale) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!(placed, Some(0));
+        // The inner policy moves the session off worker 0.
+        let (moved, soft) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!(moved, Some(1));
+        assert_ne!(soft.binding, stale.binding);
+        policy.on_dispatch("regular", Some(&headers), &workers[1], soft.binding);
+        // The request placed before the move is sent to worker 0 and fails.
+        policy.on_dispatch("regular", Some(&headers), &workers[0], stale.binding);
+        policy.on_dispatch_failed(Some(&headers), &workers[0], stale.binding);
+        assert!(!released(&policy, "session-1"));
+        // The moved request's failure releases the session.
+        policy.on_dispatch_failed(Some(&headers), &workers[1], soft.binding);
+        assert!(released(&policy, "session-1"));
+    }
+
+    #[tokio::test]
+    async fn a_soft_mode_hit_returns_the_sessions_binding() {
+        let policy = soft_around(Arc::new(MoveOffPreferred));
+        // With one worker the inner policy keeps the bound one.
+        let all = workers();
+        let workers = &all[..1];
+        let headers = header_map(&[("x-session-id", "session-1")]);
+        let info = info(&headers);
+
+        assert_eq!(policy.select_worker(workers, &info).await, Some(0));
+        let (kept, hit) = policy.select_with_decision(workers, &info).await;
+        assert_eq!((kept, hit.branch), (Some(0), AFFINITY_HIT));
+        assert!(hit.binding.is_some());
+        assert_eq!(hit.binding, policy.binding("session-1"));
+    }
 }
