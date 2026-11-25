@@ -56,7 +56,10 @@ from atom.kv_transfer.disaggregation.mooncake.landing import (
     LandingCredits,
     LandingReceiver,
 )
-from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
+from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import (
+    RailEnginePool,
+    RailRecoveryPolicy,
+)
 from atom.kv_transfer.disaggregation.pd_producer import (
     STAGING_SLOT_BYTES,
     send_worker_count,
@@ -407,6 +410,13 @@ def _configure_mooncake_transport(protocol: str) -> None:
     """
     if protocol.strip().lower() == "tcp":
         os.environ["MC_FORCE_TCP"] = "true"
+    if envs.ATOM_PD_ENDPOINT_RECOVERY:
+        # ATOM signals completion over ZMQ and never uses Mooncake's native
+        # RDMA notification, yet every endpoint would carry a notification
+        # QP and two 16 MiB registered buffers for the life of the engine.
+        # Mooncake reads this once per process, at its first engine, so an
+        # explicit launch setting is the reliable form; this is best effort.
+        os.environ.setdefault("MC_RDMA_NOTIFY_ENABLED", "0")
 
 
 # ZMQ side-channel message types
@@ -1253,6 +1263,15 @@ class MooncakeConnector(KVConnectorBase):
                 # Every engine uses the reachable control address. Each
                 # engine's device filter independently selects its RDMA rail.
                 local_ip_for_device=lambda _device: self.local_ip,
+                recovery=(
+                    RailRecoveryPolicy(
+                        rebuild_after_failures=envs.ATOM_PD_RAIL_REBUILD_AFTER_FAILURES,
+                        max_stale_peers=envs.ATOM_PD_RAIL_MAX_STALE_PEERS,
+                        min_interval_s=envs.ATOM_PD_RAIL_REBUILD_MIN_INTERVAL_S,
+                    )
+                    if envs.ATOM_PD_ENDPOINT_RECOVERY
+                    else None
+                ),
             )
             logger.info(
                 "Mooncake matched rails enabled: primary=%s rails=%s",
@@ -1373,6 +1392,14 @@ class MooncakeConnector(KVConnectorBase):
         # (time.monotonic()): a write Mooncake gave up on may still land in
         # their pages until then (see _complete_recv).
         self._held_failures: dict[ReqId, float] = {}
+        # ATOM_PD_ENDPOINT_RECOVERY: failed receives some producer rank may
+        # have written to (it did not report ``write_posted=False``). Only
+        # these are held ATOM_PD_FAILED_WRITE_HOLD_S; a failure no rank wrote
+        # for is reported at once.
+        self._pending_recv_maybe_written: set[ReqId] = set()
+        # Sent with every write request under ATOM_PD_ENDPOINT_RECOVERY so a
+        # producer tells a restarted decode from the one it replaced.
+        self._instance_id = os.urandom(8).hex()
         # PP-prefill: consumer stashes stage-0's release address per request, and
         # the producer (stage-0) counts releases to defer freeing the shared page
         # table until every stage has written the KV out.
@@ -2099,6 +2126,8 @@ class MooncakeConnector(KVConnectorBase):
                 "consumer_dcp_rank": self.dcp_rank,
                 "consumer_dcp_interleave": self.dcp_interleave_size,
             }
+            if envs.ATOM_PD_ENDPOINT_RECOVERY:
+                request_body["consumer_instance"] = getattr(self, "_instance_id", None)
 
             consumer_staging_pool_idx = -1
             if self._has_slot_regions or (
@@ -2638,6 +2667,9 @@ class MooncakeConnector(KVConnectorBase):
 
     def _execute_transfer(self, request_data: dict) -> None:
         """Compute offsets and perform RDMA write for a single request."""
+        # False until the first RDMA write of this request can be posted: a
+        # failure before it leaves nothing in flight (_mark_unwritten).
+        writes_started = False
         try:
             req_id = request_data["request_id"]
             transfer_id = request_data.get("transfer_id", req_id)
@@ -2685,6 +2717,7 @@ class MooncakeConnector(KVConnectorBase):
                         req_id,
                         list(self._completed_prefills.keys()),
                     )
+                    self._mark_unwritten(request_data)
                     self._notify_transfer_result(request_data, success=False)
                     return
             else:
@@ -2701,6 +2734,7 @@ class MooncakeConnector(KVConnectorBase):
                         transfer_id,
                         req_id,
                     )
+                    self._mark_unwritten(request_data)
                     self._notify_transfer_result(request_data, success=False)
                     return
                 with self._completed_prefills_lock:
@@ -2736,6 +2770,7 @@ class MooncakeConnector(KVConnectorBase):
                     src_block_skip_factor,
                     consumer_dcp_size,
                 )
+                self._mark_unwritten(request_data)
                 self._notify_transfer_result(request_data, success=False)
                 return
             if (
@@ -2780,6 +2815,7 @@ class MooncakeConnector(KVConnectorBase):
                     request_data.get("consumer_dp_rank"),
                     request_data.get("consumer_ib_device"),
                 )
+                self._note_rail_peer(request_data)
 
             if hasattr(engine, "get_first_buffer_address"):
                 remote_buf = engine.get_first_buffer_address(target)
@@ -2789,6 +2825,7 @@ class MooncakeConnector(KVConnectorBase):
                         target,
                     )
 
+            writes_started = True
             if has_slot_data:
                 transfer_ok = self._execute_block_slot_transfer(
                     request_data,
@@ -2865,6 +2902,8 @@ class MooncakeConnector(KVConnectorBase):
                 request_data.get("request_id"),
                 request_data.get("transfer_id"),
             )
+            if not writes_started:
+                self._mark_unwritten(request_data)
             try:
                 self._notify_transfer_result(request_data, success=False)
             except Exception:
@@ -2969,6 +3008,16 @@ class MooncakeConnector(KVConnectorBase):
                         submissions.append((data, state))
             self._pending_chunked_requests = pending
         for data in failures:
+            # No reader of this consumer request was ever admitted here (a
+            # duplicate of an admitted one returns False above, never fails),
+            # so this rank posted none of its writes.
+            logger.warning(
+                "[PRODUCER] chunked req %s (transfer_id=%s) failed before any "
+                "write: its source is released or was never admitted",
+                data.get("request_id"),
+                data.get("transfer_id"),
+            )
+            self._mark_unwritten(data)
             self._send_executor.submit(
                 self._notify_transfer_result, data, success=False
             )
@@ -2979,6 +3028,8 @@ class MooncakeConnector(KVConnectorBase):
         self, request_data: dict, state: ChunkedPrefill
     ) -> None:
         """Send an already-claimed source; only the dispatcher admits readers."""
+        # False until the first RDMA write of this reader can be posted.
+        writes_started = False
         try:
             # The admission deadline covers waiting for P capacity. Start the
             # write window only once a send worker actually starts this reader.
@@ -3016,6 +3067,7 @@ class MooncakeConnector(KVConnectorBase):
             engine = self.transfer_engine
             if self._rail_pool is not None:
                 engine = self._rail_pool.get(request_data.get("consumer_ib_device"))
+                self._note_rail_peer(request_data)
             prefill_data = {
                 "slot_index": state.slot_index,
                 "swa_block_ids": state.swa_block_ids,
@@ -3037,6 +3089,7 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_offset : dst_block_offset + num_chunk_dst_blocks
                 ]
                 request_data["_transfer_dst_offset"] = dst_block_offset
+                writes_started = True
                 if has_slots:
                     ok = self._execute_block_slot_transfer(
                         request_data,
@@ -3070,6 +3123,7 @@ class MooncakeConnector(KVConnectorBase):
                 }
                 # Mutable recurrent/SWA state is sent exactly once, after the
                 # final forward and sampling, including all local PP layers.
+                writes_started = True
                 if not self._execute_block_slot_transfer(
                     request_data,
                     target,
@@ -3086,6 +3140,8 @@ class MooncakeConnector(KVConnectorBase):
             logger.exception(
                 "Chunked KV transfer failed for %s", request_data.get("transfer_id")
             )
+            if not writes_started:
+                self._mark_unwritten(request_data)
             self._notify_transfer_result(request_data, success=False)
         finally:
             state.release()
@@ -4249,8 +4305,10 @@ class MooncakeConnector(KVConnectorBase):
                     chunk_end,
                     total_entries,
                 )
+                self._report_rail_result(engine, False)
                 return False
             if ret != 0:
+                self._report_rail_result(engine, False)
                 elapsed = time.monotonic() - started
                 logger.error(
                     "[PRODUCER] %s RDMA chunk error %d for req %s → %s "
@@ -4271,6 +4329,8 @@ class MooncakeConnector(KVConnectorBase):
                     ),
                 )
                 return False
+        if total_entries:
+            self._report_rail_result(engine, True)
         return True
 
     def _send_on_socket(self, addr: str, parts: list, repeat: int = 1) -> None:
@@ -4299,12 +4359,65 @@ class MooncakeConnector(KVConnectorBase):
                 sock.close()
                 raise
 
+    def _maybe_written(self) -> set:
+        """``_pending_recv_maybe_written``; the caller holds ``_completion_lock``.
+
+        Created on first use for connectors built without ``__init__``.
+        """
+        return self.__dict__.setdefault("_pending_recv_maybe_written", set())
+
+    @staticmethod
+    def _mark_unwritten(request_data: dict) -> None:
+        """Record that this rank posted no RDMA write for ``request_data``.
+
+        Call only where no write of this request can have been posted on this
+        rank; a failure notified afterwards lets the decode fail the request
+        without holding its pages (ATOM_PD_ENDPOINT_RECOVERY).
+        """
+        if envs.ATOM_PD_ENDPOINT_RECOVERY:
+            request_data["_write_posted"] = False
+
+    def _note_rail_peer(self, request_data: dict) -> None:
+        """Tell the rail pool which decode instance this request targets."""
+        pool = self._rail_pool
+        if pool is None:
+            return
+        try:
+            host = request_data.get("consumer_host")
+            pool.note_peer(
+                request_data.get("consumer_ib_device"),
+                (
+                    host,
+                    request_data.get("consumer_dp_rank"),
+                    request_data.get("consumer_tp_rank"),
+                    request_data.get("consumer_dcp_rank"),
+                ),
+                f"{host}:{request_data.get('consumer_rpc_port')}",
+                request_data.get("consumer_instance"),
+            )
+        except Exception:
+            # Bookkeeping only; the transfer itself must go on.
+            logger.exception("[PRODUCER] rail peer bookkeeping failed")
+
+    def _report_rail_result(self, engine, ok: bool) -> None:
+        pool = self._rail_pool
+        if pool is None:
+            return
+        try:
+            pool.report(engine, ok)
+        except Exception:
+            logger.exception("[PRODUCER] rail result bookkeeping failed")
+
     def _notify_transfer_result(self, request_data: dict, *, success: bool) -> None:
         host = request_data.get("notify_host")
         port = request_data.get("notify_port")
         req_id = request_data.get("request_id")
         if host is None or port is None or req_id is None:
             return
+        extra = {}
+        if not success and request_data.get("_write_posted") is False:
+            # Only set by _mark_unwritten, under ATOM_PD_ENDPOINT_RECOVERY.
+            extra["write_posted"] = False
         self._send_write_done(
             host,
             port,
@@ -4312,6 +4425,7 @@ class MooncakeConnector(KVConnectorBase):
             self.pp_rank,
             request_data.get("write_nonce", 0),
             success=success,
+            **extra,
             # None unless the consumer offered landing slots and this stage
             # can land (it has a KV staging pool), so the consumer can tell
             # "landed none" from "cannot land" and take a partition back.
@@ -4335,6 +4449,7 @@ class MooncakeConnector(KVConnectorBase):
         success: bool = True,
         landed_slots: list[int] | None = None,
         handoff: dict | None = None,
+        write_posted: bool | None = None,
     ) -> None:
         """Send write-done notification to consumer via persistent socket.
 
@@ -4346,17 +4461,20 @@ class MooncakeConnector(KVConnectorBase):
         without treating the KV as ready.
         """
         path = make_zmq_path("tcp", host, port)
-        notification = msgpack.dumps(
-            {
-                "request_id": req_id,
-                "pp_rank": pp_rank,
-                "tp_rank": self.tp_rank,
-                "write_nonce": write_nonce,
-                "success": success,
-                "landed_slots": landed_slots,
-                "prefill_handoff": handoff,
-            }
-        )
+        message = {
+            "request_id": req_id,
+            "pp_rank": pp_rank,
+            "tp_rank": self.tp_rank,
+            "write_nonce": write_nonce,
+            "success": success,
+            "landed_slots": landed_slots,
+            "prefill_handoff": handoff,
+        }
+        if write_posted is not None:
+            # False: this rank posted no RDMA write for the request, so
+            # nothing of it can still land (ATOM_PD_ENDPOINT_RECOVERY).
+            message["write_posted"] = write_posted
+        notification = msgpack.dumps(message)
         self._send_on_socket(path, [MSG_WRITE_DONE, notification], repeat=3)
         logger.debug(
             "[PRODUCER] write-done sent for req %s success=%s", req_id, success
@@ -4395,6 +4513,7 @@ class MooncakeConnector(KVConnectorBase):
                                 success=data.get("success", True),
                                 landed_slots=data.get("landed_slots"),
                                 handoff=data.get("prefill_handoff"),
+                                write_posted=data.get("write_posted"),
                             )
                         except Exception:
                             # Every later receive on this rank needs this thread.
@@ -4445,6 +4564,7 @@ class MooncakeConnector(KVConnectorBase):
         success: bool = True,
         landed_slots: list[int] | None = None,
         handoff: dict | None = None,
+        write_posted: bool | None = None,
     ) -> bool:
         """Register a producer rank's write-done for ``req_id``.
 
@@ -4500,6 +4620,13 @@ class MooncakeConnector(KVConnectorBase):
                     write_nonce,
                 )
                 return False
+            if (
+                not success
+                and write_posted is not False
+                and envs.ATOM_PD_ENDPOINT_RECOVERY
+            ):
+                # This rank may have posted writes that can still land.
+                self._maybe_written().add(req_id)
             pending_handoff = self._pending_handoffs.get(req_id)
             if pending_handoff is not None:
                 stages = self._pending_recv_stages.setdefault(req_id, set())
@@ -4536,8 +4663,15 @@ class MooncakeConnector(KVConnectorBase):
             self._pending_recv_stall_watch.pop(req_id, None)
             failed = req_id in self._pending_recv_failed
             self._pending_recv_failed.discard(req_id)
+            hold = True
+            if envs.ATOM_PD_ENDPOINT_RECOVERY:
+                # Every rank answered; hold only if one of them may have
+                # written (a success wrote fully and has nothing in flight).
+                maybe_written = self._maybe_written()
+                hold = req_id in maybe_written
+                maybe_written.discard(req_id)
 
-        self._complete_recv(req_id, failed)
+        self._complete_recv(req_id, failed, hold=hold)
         return True
 
     def _record_write_ack(self, data: dict) -> None:
@@ -4621,6 +4755,9 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_nonce.pop(req_id, None)
                 self._pending_recv_failed.discard(req_id)
                 self._pending_recv_stall_watch.pop(req_id, None)
+                if envs.ATOM_PD_ENDPOINT_RECOVERY:
+                    # Expiry always holds: a silent rank may still be writing.
+                    self._maybe_written().discard(req_id)
         for req_id, waited, reported, expected, unacked in stalled:
             (logger.error if unacked > 0 else logger.warning)(
                 "[CONSUMER] req %s has waited %.0fs for its producer ranks: %d of "
@@ -4650,7 +4787,7 @@ class MooncakeConnector(KVConnectorBase):
                 # The other expired requests still have to be reported.
                 logger.exception("[CONSUMER] reporting expired req %s failed", req_id)
 
-    def _complete_recv(self, req_id: str, failed: bool) -> None:
+    def _complete_recv(self, req_id: str, failed: bool, *, hold: bool = True) -> None:
         """Publish a finished receive and let stage-0 free its page table.
 
         A failure is reported only ``ATOM_PD_FAILED_WRITE_HOLD_S`` later
@@ -4658,13 +4795,22 @@ class MooncakeConnector(KVConnectorBase):
         cancelling the work it posted, so a failed write may still land in
         the request's pages, which the scheduler frees once it hears of the
         failure (it aborts the request). The staging row and stage-0's page
-        table stay held as long.
+        table stay held as long. ``hold=False``: no producer rank posted a
+        write for it, so the failure is reported at once.
         """
         with self._completion_lock:
             pending_handoff = self._pending_handoffs.pop(req_id, None)
         if failed:
             hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S
-            if hold_s > 0:
+            if not hold:
+                logger.warning(
+                    "[CONSUMER] req %s failed before any producer write; "
+                    "reporting it without the %.0fs hold",
+                    req_id,
+                    hold_s,
+                )
+                self._fail_recv(req_id)
+            elif hold_s > 0:
                 with self._completion_lock:
                     self._held_failures[req_id] = time.monotonic() + hold_s
                 logger.warning(

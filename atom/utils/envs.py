@@ -174,6 +174,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # Mooncake P/D: recover from peer churn (decode restarts) without
+    # restarting the prefill. Off keeps the legacy behavior exactly. See
+    # docs/environment_variables.md for what it switches on.
+    "ATOM_PD_ENDPOINT_RECOVERY": lambda: _flag_env("ATOM_PD_ENDPOINT_RECOVERY", "0"),
+    # With ATOM_PD_ENDPOINT_RECOVERY: rebuild a non-primary rail engine after
+    # this many RDMA failures in a row on it (no success in between).
+    "ATOM_PD_RAIL_REBUILD_AFTER_FAILURES": lambda: max(
+        1, int(os.getenv("ATOM_PD_RAIL_REBUILD_AFTER_FAILURES", "").strip() or 2)
+    ),
+    # With ATOM_PD_ENDPOINT_RECOVERY: rebuild a non-primary rail engine once
+    # this many of its decode peers were replaced by a restarted decode.
+    "ATOM_PD_RAIL_MAX_STALE_PEERS": lambda: max(
+        1, int(os.getenv("ATOM_PD_RAIL_MAX_STALE_PEERS", "").strip() or 8)
+    ),
+    # With ATOM_PD_ENDPOINT_RECOVERY: minimum seconds between two rebuilds of
+    # one rail; doubles after each failed rebuild, capped at one hour.
+    "ATOM_PD_RAIL_REBUILD_MIN_INTERVAL_S": lambda: max(
+        0.0,
+        float(os.getenv("ATOM_PD_RAIL_REBUILD_MIN_INTERVAL_S", "").strip() or 300),
+    ),
     # Mooncake P/D, prefill (`kv_producer`) only: answer the router's prefill
     # request as soon as the request has a DP rank, with chunked-transfer
     # metadata, instead of after prefill. The unchanged legacy router relay
