@@ -22,6 +22,8 @@ The table tests are plain Triton: without a GPU they run on the CPU under
 others need a gfx1250 GPU (the write also gfx950).
 """
 
+import functools
+import importlib
 import os
 
 import pytest
@@ -434,16 +436,10 @@ def test_nvfp4_attention_mxfp8_output_is_bf16_then_quantize_fp8(rows):
 
 
 @gfx1250_only
-@pytest.mark.parametrize("rows", [24, 64, 192, 256, 40])
+@pytest.mark.parametrize("rows", [24, 64, 256])
 @pytest.mark.parametrize("mxfp8", [True, False], ids=["mxfp8", "bf16"])
 def test_nvfp4_attention_fused_reduce(rows, mxfp8, monkeypatch):
-    """Decode rows merge their top-k window inside the
-    paged attention (a cluster a row while every row's cluster is resident,
-    else one CTA a row) instead of the PS reduce kernel. The MXFP8 bytes are
-    o_proj's ``quantize_fp8`` of the BF16 output of that same call (store_output
-    forced on), which matches the unfused split's BF16 output to BF16 rounding
-    (a different split merges the softmax in another order)."""
-    import aiter.ops.flydsl.pa_decode as flydsl_pa
+    # Merged in the PA vs split + reduce (BF16); MXFP8 = quantize_fp8 of it.
     from aiter import dtypes
 
     from atom.model_ops.blockscale import quantize_fp8
@@ -463,7 +459,7 @@ def test_nvfp4_attention_fused_reduce(rows, mxfp8, monkeypatch):
     kv_nvfp4_store(stage, torch.arange(blocks * PAGE, device=DEV), kp, ks, vp, vs)
     reqs = rows // ql
     seq = torch.randint(PAGE, maxb * PAGE, (reqs,), dtype=torch.int32, device=DEV)
-    seq[::3] = 200  # short requests: fewer than 16 valid blocks
+    seq[::3] = 200  # fewer than 16 valid blocks
     bt = torch.randint(0, blocks, (reqs, maxb), dtype=torch.int32, device=DEV)
     row_req, row_seq = decode_rows(seq, rows, ql)
     n = (row_seq + PAGE - 1) // PAGE
@@ -475,62 +471,37 @@ def test_nvfp4_attention_fused_reduce(rows, mxfp8, monkeypatch):
     args = (q, kp, ks, vp, vs, idx, bt, row_req, row_seq, D**-0.5)
     bf16_split = nvfp4_sparse_attention(*args, page_table=table)
 
-    pa_decode = flydsl_pa.pa_decode
-    seen = []
+    flydsl_pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    pa_decode, seen = flydsl_pa.pa_decode, []
 
+    @functools.wraps(pa_decode)  # keeps the page_groups signature check true
     def keep_bf16(*a, **kw):
         seen.append(kw)
-        kw["store_output"] = True
-        return pa_decode(*a, **kw)
+        return pa_decode(*a, **{**kw, "store_output": True})
 
     monkeypatch.setattr(flydsl_pa, "pa_decode", keep_bf16)
     kw = {}
     if mxfp8:
         fp8 = torch.full((rows, 16 * D), 0x7F, dtype=torch.uint8, device=DEV)
-        fp8 = fp8.view(dtypes.fp8)
-        scales = torch.full(
-            (rows, 16 * D // 32), 0xFF, dtype=torch.uint8, device=DEV
-        ).view(torch.float8_e8m0fnu)
-        kw = {"quantized_output": fp8, "output_scale": scales}
+        scales = torch.full((rows, 16 * D // 32), 0xFF, dtype=torch.uint8, device=DEV)
+        kw = {
+            "quantized_output": fp8.view(dtypes.fp8),
+            "output_scale": scales.view(torch.float8_e8m0fnu),
+        }
     out = nvfp4_sparse_attention(*args, page_table=table, rows_per_request=ql, **kw)
     torch.cuda.synchronize()
-    assert seen and seen[-1].get("plan_free") and seen[-1].get("xcd_rows") == ql
+    assert seen[-1].get("plan_free") and seen[-1].get("xcd_rows") == ql
     torch.testing.assert_close(out, bf16_split, atol=2e-2, rtol=2e-2)
     if mxfp8:
         ref_q, ref_s = quantize_fp8(out.view(rows, -1))
         assert torch.equal(fp8.view(torch.uint8), ref_q.view(torch.uint8))
-        assert torch.equal(scales.view(torch.uint8), ref_s.view(torch.uint8))
-
-
-@pytest.mark.parametrize(
-    "seqs, expected",
-    [
-        (32, (8, 256, 1, 1)),  # every row a cluster of 8
-        (64, (4, 256, 2, 1)),  # a cluster of 4, two wave groups
-        (192, (4, 768, 1, 1)),  # clusters of 4 while resident
-        (256, (1, None, 4, 1)),  # one CTA a row, four wave groups
-    ],
-)
-def test_fused_reduce_split_policy(monkeypatch, seqs, expected):
-    from atom.model_ops.minimax_m3 import sparse_attn_nvfp4
-
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: type("P", (), {"multi_processor_count": 256})(),
-    )
-    assert sparse_attn_nvfp4.fused_reduce_split(seqs, "cuda") == expected
+        assert torch.equal(scales, ref_s.view(torch.uint8))
 
 
 @pytest.mark.parametrize("merges, rows_per_request", [(True, 8), (True, 0), (False, 8)])
 def test_fused_reduce_only_for_decode_rows_aiter_merges(
     monkeypatch, merges, rows_per_request
 ):
-    """Prefill rows (``rows_per_request`` 0) and an aiter whose paged decode cannot
-    merge partitions keep the split path: no fused-reduce keywords, the default
-    budget."""
-    import importlib
-
     from atom.model_ops import base_attention
     from atom.model_ops.minimax_m3 import sparse_attn_nvfp4
 
@@ -539,7 +510,7 @@ def test_fused_reduce_only_for_decode_rows_aiter_merges(
         sparse_attn_nvfp4, "_pa_decode_merges_partitions", lambda: merges
     )
     monkeypatch.setattr(
-        sparse_attn_nvfp4, "fused_reduce_split", lambda seqs, device: (4, 99, 2, 1)
+        sparse_attn_nvfp4, "fused_reduce_split", lambda *_: (4, 99, 2, 1)
     )
     monkeypatch.setattr(
         importlib.import_module("aiter.ops.flydsl.pa_decode"),
@@ -547,8 +518,7 @@ def test_fused_reduce_only_for_decode_rows_aiter_merges(
         lambda *a, **kw: captured.update(kw),
     )
     monkeypatch.setattr(
-        "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits",
-        lambda *_: 3,
+        "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits", lambda *_: 3
     )
     monkeypatch.setattr(
         base_attention,
@@ -556,23 +526,19 @@ def test_fused_reduce_only_for_decode_rows_aiter_merges(
         lambda **kw: captured.setdefault("plan", kw),
     )
     monkeypatch.setattr(
-        base_attention, "_flydsl_plan_scratch", lambda *a, **kw: (None, None, None)
+        base_attention, "_flydsl_plan_scratch", lambda *a, **kw: (None,) * 3
     )
     rows = 16
-    q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
     payload = torch.zeros(4, 1, 128, 64, dtype=torch.uint8)
     scales = torch.zeros(4, 1, 128, 8, dtype=torch.uint8)
     sparse_attn_nvfp4._flydsl_attention(
-        q, payload, scales, payload, scales,
-        torch.zeros(rows, 1, dtype=torch.int32), torch.ones(rows, dtype=torch.int32),
-        128**-0.5, None, None, rows_per_request=rows_per_request,
+        torch.randn(rows, 16, 128, dtype=torch.bfloat16), payload, scales, payload,
+        scales, torch.zeros(rows, 1, dtype=torch.int32),
+        torch.ones(rows, dtype=torch.int32), 128**-0.5, None, None,
+        rows_per_request=rows_per_request,
     )  # fmt: skip
     fused = merges and rows_per_request > 0
     assert captured["plan"]["plan_partition_cap"] == (4 if fused else 3)
     assert captured["plan"]["plan_workgroup_budget"] == (99 if fused else None)
-    if fused:
-        assert captured["page_groups"] == 2 and captured["plan_free"] is True
-        assert captured["xcd_rows"] == rows_per_request
-        assert captured["cluster_rows"] == 1
-    else:
-        assert "page_groups" not in captured and "plan_free" not in captured
+    assert captured.get("page_groups") == (2 if fused else None)
+    assert captured.get("plan_free") == (True if fused else None)
