@@ -432,7 +432,7 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::WORKER_PREFILL_TOKENS,
         kind: MetricKind::Gauge,
-        help: "Prompt tokens charged to a worker (url@rank) whose prefill has not finished; only HTTP P/D prefills and streaming HTTP requests with counted or estimated tokens are charged",
+        help: "Tokens charged to a worker (url@rank) whose prefill has not finished: the policy's uncached estimate when it gives one (agentic), else the whole prompt; only HTTP P/D prefills and streaming HTTP requests with counted or estimated tokens are charged",
         status: MetricStatus::Active,
     },
     MetricSpec {
