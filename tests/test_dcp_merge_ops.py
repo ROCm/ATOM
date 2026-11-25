@@ -853,19 +853,15 @@ def _on_every_rank(monkeypatch, n, run):
 
 
 def _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs):
-    from atom.model_ops.dcp_ops import cp_lse_a2a
+    from atom.model_ops.dcp_ops import cp_lse_a2a, cp_lse_a2a_head_major
 
+    head_major = kwargs.pop("head_major", False)
+    merge = cp_lse_a2a_head_major if head_major else cp_lse_a2a
     group = SimpleNamespace(world_size=len(o), device_group=None)
 
     def run(rank):
-        x = (
-            o[rank].transpose(0, 1).contiguous()
-            if kwargs.get("head_major")
-            else o[rank]
-        )
-        return cp_lse_a2a(
-            x, lse[rank], group, owned_counts=owned_counts[rank], **kwargs
-        )
+        x = o[rank].transpose(0, 1).contiguous() if head_major else o[rank]
+        return merge(x, lse[rank], group, owned_counts=owned_counts[rank], **kwargs)
 
     return _on_every_rank(monkeypatch, len(o), run)[0]
 
@@ -878,7 +874,7 @@ def _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs):
 def test_head_major_a2a_matches_the_packed_one_bitwise(monkeypatch, dtype, quant):
     """Sending the head-major output with its LSE apart feeds the combine the
     same values the pack did, so every rank's result is the same bits, the
-    dummy-backed empty row included. The fused quant keeps the packed path."""
+    dummy-backed empty row included. Head-major fused quant is rejected."""
     b, h, d, n_ranks = 5, 16, 32, 4
     g = torch.Generator(device=DEV).manual_seed(3)
     o = [
@@ -891,6 +887,13 @@ def test_head_major_a2a_matches_the_packed_one_bitwise(monkeypatch, dtype, quant
     ]
     owned_counts[0][1] = 0
     kwargs = {"quant_dtype": dtypes.fp8} if quant else {"return_lse": True}
+
+    if quant:
+        with pytest.raises(TypeError):
+            _cp_lse_a2a_on_every_rank(
+                monkeypatch, o, lse, owned_counts, head_major=True, **kwargs
+            )
+        return
 
     packed = _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs)
     head_major = _cp_lse_a2a_on_every_rank(
@@ -943,12 +946,15 @@ def test_project_merge_out_head_major_matches_the_packed_one(
         return _on_every_rank(
             monkeypatch,
             n_ranks,
-            lambda r: layer._dcp_project_merge_out(
+            lambda r: (
+                layer._dcp_project_merge_out_head_major
+                if head_major and not fp8_absorb
+                else layer._dcp_project_merge_out
+            )(
                 o[r],
                 lse[r],
                 merge_in_fp32=merge_in_fp32,
                 owned_counts=owned_counts[r],
-                head_major=head_major,
             ),
         )
 
@@ -984,16 +990,13 @@ def test_cp_lse_a2a_is_a_no_op_without_a_dcp_group():
 
 
 @needs_dcp_ops
-@pytest.mark.parametrize("backend", ["a2a", "ag_rs"])
-def test_head_major_merge_without_a_dcp_group_returns_b_h_d(backend):
-    """dcp==1: a head-major input comes back as the ``[B, H, D]`` o_proj reads."""
-    from atom.model_ops.dcp_ops import dcp_lse_merge
+def test_head_major_merge_requires_a_dcp_group():
+    from atom.model_ops.dcp_ops import cp_lse_a2a_head_major
 
-    o = torch.randn(2, 4, 8)
-    group = SimpleNamespace(world_size=1)
-    head_major = o.transpose(0, 1).contiguous()
-    got = dcp_lse_merge(head_major, torch.randn(2, 4), group, backend, head_major=True)
-    assert torch.equal(got, o)
+    with pytest.raises(AssertionError, match="requires DCP"):
+        cp_lse_a2a_head_major(
+            torch.randn(4, 2, 8), torch.randn(2, 4), SimpleNamespace(world_size=1)
+        )
 
 
 # ─────────────────────────────────────────────────────────── DCPConfig parsing ──
@@ -1246,9 +1249,19 @@ def test_pcp_reindex_builds_work_plan_only_when_read(
     forward_vars["sparse_kv_last_page_lens"] = SimpleNamespace(
         gpu=torch.ones(4, dtype=torch.int32)
     )
-    builder._sparse_prefill_work_plan = MethodType(
-        aiter_mla.AiterMLAMetadataBuilder._sparse_prefill_work_plan, builder
-    )
+    builder._dcp_sparse_prefill_mode = "q"
+    builder._sparse_prefill_kv_granularity = 16
+    builder._sparse_prefill_work_view_cache = {}
+    for name in (
+        "_sparse_prefill_work_plan",
+        "_sparse_prefill_work_views",
+        "_sparse_prefill_work_widths",
+    ):
+        setattr(
+            builder,
+            name,
+            MethodType(getattr(aiter_mla.AiterMLAMetadataBuilder, name), builder),
+        )
     md = SimpleNamespace(
         cu_seqlen_ks=torch.zeros(4, dtype=torch.int32),
         cu_seqlen_ke=torch.arange(4, dtype=torch.int32),
@@ -1498,6 +1511,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         kv_cache_dtype=cache_dtype,
         index_cache_dtype="fp8",
         attn_prefill_chunk_size=0,
+        speculative_config=None,
         enable_tbo=False,
         enable_tbo_decode=False,
         compilation_config=SimpleNamespace(static_forward_context={}),
@@ -1641,7 +1655,7 @@ def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge(monkeypatch):
                 persistent=True,
                 dtype_q=torch.bfloat16,
                 dtype_kv=torch.bfloat16,
-            ),
+            )[0],
         )
         for dcp in (4, 8)
     }
@@ -1649,7 +1663,7 @@ def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge(monkeypatch):
     assert (
         mla_dcp_sparse_prefill_num_heads(
             12, 8, persistent=False, dtype_q=torch.bfloat16, dtype_kv=torch.bfloat16
-        )
+        )[0]
         == 128
     )
 
@@ -2165,7 +2179,7 @@ def test_sparse_prefill_width_matches_its_own_persistence_predicate(
         persistent=persistent,
         dtype_q=torch.bfloat16,
         dtype_kv=torch.bfloat16,
-    )
+    )[0]
     allowed = range(16, 129, 16) if persistent else _MLA_DCP_SPARSE_PREFILL_WIDTHS
     gathered = max(num_heads * dcp, HEAD_WIDTH_MIN)
     if gathered <= allowed[-1]:
@@ -2333,7 +2347,7 @@ def test_sparse_prefill_queries_native_gqa64(monkeypatch):
             persistent=True,
             dtype_q=torch.bfloat16,
             dtype_kv=torch.bfloat16,
-        )
+        )[0]
         == 64
     ), "persistent sparse prefill should reach gqa=64, not pad past it"
     assert (
@@ -2344,7 +2358,7 @@ def test_sparse_prefill_queries_native_gqa64(monkeypatch):
             persistent=False,
             dtype_q=torch.bfloat16,
             dtype_kv=torch.bfloat16,
-        )
+        )[0]
         == 128
     ), (
         "the non-persistent pad table still pads 64 to 128; only the "

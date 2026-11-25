@@ -69,4 +69,17 @@ pub struct WorkerMeta {
     pub request_id: String,
     pub weight_version: Option<String>,
     pub cached_tokens: u32,
+    /// The ATOM standalone backend's alone: a sequence's timing, as ATOM's
+    /// Python server reports it in `usage`. Where it is set, the OpenAI
+    /// renderers add ATOM's usage fields (`render::atom_usage`).
+    pub timing: Option<SeqTiming>,
+}
+
+/// A sequence's timing in seconds, as `api_server.py` measures it: to its
+/// first token, per output token after the first, and end to end.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SeqTiming {
+    pub ttft: f64,
+    pub tpot: f64,
+    pub latency: f64,
 }

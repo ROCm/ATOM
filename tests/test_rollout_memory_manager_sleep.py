@@ -58,6 +58,7 @@ class _Runner(MemoryManagerMixin):
     def __init__(
         self, *, enforce_eager, keep_resident, with_graphs=True, available_blocks=7
     ):
+        self._init_memory_manager()
         self.device = torch.device("cpu")
         self.label = "test"
         self.enforce_eager = enforce_eager

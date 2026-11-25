@@ -48,6 +48,6 @@ def patch_work_kv_ranges(
         "aiter's MlaWorkInfo layout changed: work_info_set is "
         f"{tuple(work_info_set.shape)} {work_info_set.dtype}, the patch writes [*, 8] int32"
     )
-    _patch_work_kv_ranges[(triton.cdiv(rows, BLOCK),)](
+    _patch_work_kv_ranges[(-(-rows // BLOCK),)](
         work_info_set, work_indptr[-1:], kv_indptr, BLOCK=BLOCK
     )

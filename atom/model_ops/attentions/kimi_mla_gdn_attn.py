@@ -419,7 +419,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             f":spec={self.num_spec}"
             ":carry=all"
         )
-        return StateTransfer.copy(layout_id)
+        return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN
@@ -512,6 +512,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 "kpool tail bytes do not form an equal per-layer checkpoint plane"
             )
         return total // layers, layers
+
+    def _decode_image_is_conv_and_ssm(self) -> bool:
+        # By the model's kpool, not this stage's planes: under PP only the
+        # stages with indexer layers hold a tail.
+        return self._kpool_size() <= 1
 
     def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
         """KDA planes plus the partial kpool keys needed to resume exactly."""

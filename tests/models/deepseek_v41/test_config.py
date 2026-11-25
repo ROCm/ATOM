@@ -10,12 +10,12 @@ from atom.models.deepseek_v41.config import (
     AttentionMode,
     build_attention_topology,
     normalize_hf_config,
-    validate_native_quantization,
+    quantization_format,
 )
 from atom.quant_spec import get_quant_parser
 from atom.utils.selector import Family, attn_family, get_attn_backend_cls
 
-from .reference import FIXTURES
+from .reference import FIXTURES, FP4PTPC_QUANTIZATION, fp4ptpc_config
 
 
 @pytest.fixture
@@ -47,8 +47,9 @@ def test_hf_config_preserves_text_vision_quantization_and_root_tokens(raw_config
     config.validate_parallelism(8, 8)
 
 
-def test_the_published_quantization_block_is_accepted(raw_config):
-    validate_native_quantization(raw_config["quantization_config"])
+def test_the_published_quantization_blocks_are_accepted(raw_config):
+    assert quantization_format(raw_config["quantization_config"]) == "native"
+    assert quantization_format(FP4PTPC_QUANTIZATION) == "fp4ptpc"
 
 
 def test_the_published_block_parses_to_the_group32_spec(raw_config):
@@ -68,28 +69,62 @@ def test_the_published_block_parses_to_the_group32_spec(raw_config):
         )
 
 
+@pytest.mark.parametrize("fmt", ["native", "fp4ptpc"])
 @pytest.mark.parametrize(
     "field,value,message",
     [
-        ("quant_method", "awq", "native FP8 checkpoint format"),
+        ("quant_method", "awq", "native FP8 checkpoint format or FP4PTPC"),
         ("weight_block_size", [128, 128], "weight_block_size must be"),
-        ("scale_fmt", "e8m0", "dense scales must be ue8m0"),
-        ("activation_scheme", "static", "dynamic per-32 FP8 activations"),
+        ("scale_fmt", "e8m0", "native scales must be ue8m0"),
+        ("activation_scheme", "static", "dynamic FP8 activations"),
         ("expert_dtype", "fp8", "routed experts must use native fp4"),
     ],
 )
 def test_every_unsupported_quantization_field_is_refused(
-    raw_config, field, value, message
+    raw_config, fmt, field, value, message
 ):
-    """Each of the five is a separate refusal, not one collapsed check.
+    """Each is a separate refusal, not one collapsed check, in both formats.
 
-    The kernels read exactly one format, so a checkpoint declaring another has
-    no slower path to fall back to -- and a refusal that named only the first
-    wrong field would send the next one back for a second round trip.
+    The kernels read exactly these formats, so a checkpoint declaring another
+    has no slower path to fall back to -- and a refusal that named only the
+    first wrong field would send the next one back for a second round trip.
     """
-    cfg = {**raw_config["quantization_config"], field: value}
+    if fmt == "fp4ptpc" and field == "weight_block_size":
+        pytest.skip("FP4PTPC declares no block size")
+    base = (
+        raw_config["quantization_config"] if fmt == "native" else FP4PTPC_QUANTIZATION
+    )
     with pytest.raises(ValueError, match=message):
-        validate_native_quantization(cfg)
+        quantization_format({**base, field: value})
+
+
+def test_fp4ptpc_reads_as_native_outside_its_converted_linears(raw_config):
+    """The rest of the model reads FP4PTPC through the native contract;
+    `fp4ptpc` alone marks the converted linears."""
+    native = normalize_hf_config(raw_config)
+    ptpc = fp4ptpc_config()
+    assert native.fp4ptpc is False and ptpc.fp4ptpc is True
+    assert native.quantization_config == raw_config["quantization_config"]
+    assert quantization_format(ptpc.quantization_config) == "native"
+
+
+def test_fp4ptpc_keeps_online_quant_and_fp4_routed_experts():
+    """The two readers the native contract is for: online quant (the routed
+    experts' FP4 -> FP8) stays enabled, and V4's routed-expert detection still
+    sees FP4 experts."""
+    pytest.importorskip("aiter", reason="the quant types are AITER enums")
+    from aiter import QuantType
+
+    from atom.models.deepseek_v4 import make_v4_quant_config
+
+    ptpc = fp4ptpc_config()
+    config = make_v4_quant_config(
+        ptpc,
+        online_quant_config={"layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"}},
+    )
+    assert config.online_quant
+    routed = config.get_layer_quant_config("layers.0.ffn.experts")
+    assert routed.quant_type == QuantType.per_1x32
 
 
 def test_topology_resolves_four_physical_owners(raw_config):

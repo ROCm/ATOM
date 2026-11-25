@@ -29,6 +29,7 @@ if not torch.cuda.is_available():
     )
 
 from aiter import QuantType, dtypes
+from conftest import atom_config_double
 
 from atom.model_ops import linear as linear_mod
 from atom.model_ops.linear import (
@@ -37,6 +38,7 @@ from atom.model_ops.linear import (
     weight_is_stored_preshuffled,
 )
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 PRESHUFFLE_ENV = "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE"
 
@@ -180,8 +182,12 @@ def _updater_double():
         device = torch.device("cpu")
         rank = 0
         world_size = 1
+        config = atom_config_double()
+        attn_family = Family.MHA
 
-    return _Updater()
+    updater = _Updater()
+    updater._init_weight_updater()
+    return updater
 
 
 def _loader_shuffles(monkeypatch, case, *, dim=2):

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""ATOM_MONO_POLL_SLEEP_UNITS: the gfx950 Mono mailbox retry spacing (16 unless
-set; 1 is main's polling, ROCm/ATOM#3369). Plain Python: no GPU, no FlyDSL."""
+# Copyright (c) 2026 ATOM Project Contributors
+"""ATOM_MONO_POLL_SLEEP_UNITS: the gfx950 Mono mailbox retry spacing (4 unless
+set, 16 beside a KV transfer or offload connector; 1 is main's polling,
+ROCm/ATOM#3369). Plain Python: no GPU, no FlyDSL."""
 
 import json
 import logging
@@ -11,30 +13,31 @@ import sys
 
 import pytest
 
-from atom.mono import polling
+from atom.config import _resolve_mono_poll_sleep_units
+from atom.mono import polling_env
 
 
 @pytest.mark.parametrize(
-    "raw, units", [(None, 16), ("", 16), (" ", 16), ("1", 1), ("8", 8), ("127", 127)]
+    "raw, units", [(None, 4), ("", 4), (" ", 4), ("1", 1), ("16", 16), ("127", 127)]
 )
 def test_units(raw, units):
-    assert polling._units(raw) == units
+    assert polling_env.units(raw) == units
 
 
 @pytest.mark.parametrize("raw", ["0", "128", "-1", "65536", "abc", "1.5", "16x"])
 def test_a_bad_value_is_an_error(raw):
     # s_sleep keeps bits [6:0] of its immediate: 128 would sleep as 0
-    with pytest.raises(ValueError, match=polling.ENV):
-        polling._units(raw)
+    with pytest.raises(ValueError, match=polling_env.ENV):
+        polling_env.units(raw)
 
 
 def _probe(value):
     """polling's constants and the digests that hash polling.py, in a fresh
     process with the variable set to ``value`` (None: unset), as a spawned
     worker sees them."""
-    env = {k: v for k, v in os.environ.items() if k != polling.ENV}
+    env = {k: v for k, v in os.environ.items() if k != polling_env.ENV}
     if value is not None:
-        env[polling.ENV] = value
+        env[polling_env.ENV] = value
     code = (
         "import json;from atom.mono import polling as p;"
         "from atom.mono.plan.build_key import source_digest as d;"
@@ -57,33 +60,69 @@ def _constants(value):
     return json.loads(out.strip().splitlines()[-1])
 
 
-def test_the_default_is_16_and_1_is_main():
-    unset, sixteen, one, eight = (_constants(v) for v in (None, "16", "1", "8"))
-    assert unset == sixteen
-    assert unset[:3] == [16, "s_sleep 16", False]
+def test_the_default_is_4_and_1_is_main():
+    unset, four, one, sixteen = (_constants(v) for v in (None, "4", "1", "16"))
+    assert unset == four
+    assert unset[:3] == [4, "s_sleep 4", False]
     # main: s_sleep 1 in sync / step_begin, s_nop 0 in spin_pause and helpers.poll
     assert one[:3] == [1, "s_nop 0", True]
-    assert eight[:3] == [8, "s_sleep 8", False]
+    assert sixteen[:3] == [16, "s_sleep 16", False]
     # every digest that hashes polling.py tells the values apart ...
     for i in (3, 4):
-        assert len({unset[i], one[i], eight[i]}) == 3
+        assert len({unset[i], one[i], sixteen[i]}) == 3
     # ... and one that does not is left alone
-    assert unset[5] == one[5] == eight[5]
+    assert unset[5] == one[5] == sixteen[5]
 
 
 def test_a_bad_value_fails_the_import():
     code, _, err = _probe("128")
-    assert code != 0 and f"{polling.ENV}='128'" in err
+    assert code != 0 and f"{polling_env.ENV}='128'" in err
+
+
+def test_the_process_that_builds_config_reads_copy_safe():
+    """Config sets the spacing before its own process imports ``polling``:
+    a process that builds Config and then the kernels (a plugin worker) gets
+    ``COPY_SAFE`` beside KV copies, not the default its import froze."""
+    env = {k: v for k, v in os.environ.items() if k != polling_env.ENV}
+    code = (
+        "import sys;import atom.config as c;"
+        "early='atom.mono.polling' in sys.modules;"
+        "c._resolve_mono_poll_sleep_units(True);"
+        "from atom.mono import polling as p;"
+        "print(early, p.POLL_SLEEP_UNITS)"
+    )
+    run = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.split()[-2:] == ["False", str(polling_env.COPY_SAFE)]
+
+
+@pytest.mark.parametrize("kv_copies, units", [(False, None), (True, "16")])
+def test_config_defaults_beside_kv_copies(kv_copies, units, monkeypatch):
+
+    # set first: teardown then restores the original state, removing what the
+    # resolver writes (a bare delenv of an unset name records nothing)
+    monkeypatch.setenv(polling_env.ENV, "4")
+    monkeypatch.delenv(polling_env.ENV)
+    _resolve_mono_poll_sleep_units(kv_copies)
+    assert os.environ.get(polling_env.ENV) == units
 
 
 @pytest.mark.parametrize(
-    "units, warns", [(1, True), (15, True), (16, False), (32, False)]
-)
-def test_config_warns_below_the_default(units, warns, monkeypatch, caplog):
-    from atom.config import _check_mono_poll_sleep_units
+    "kv_copies, units, warns",
+    [(True, 1, True), (True, 15, True), (True, 16, False), (True, 32, False),
+     (False, 1, False)],
+)  # fmt: skip
+def test_config_warns_below_copy_safe(kv_copies, units, warns, monkeypatch, caplog):
 
-    monkeypatch.setattr(polling, "POLL_SLEEP_UNITS", units)
+    monkeypatch.setenv(polling_env.ENV, str(units))
     with caplog.at_level(logging.WARNING, logger="atom"):
-        _check_mono_poll_sleep_units()
-    hits = [r for r in caplog.records if polling.ENV in r.getMessage()]
+        _resolve_mono_poll_sleep_units(kv_copies)
+    hits = [r for r in caplog.records if polling_env.ENV in r.getMessage()]
     assert len(hits) == (1 if warns else 0)
+    assert os.environ[polling_env.ENV] == str(units)

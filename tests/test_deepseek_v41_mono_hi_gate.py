@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """``ATOM_DSV41_MONO_HI`` (``mono/hi_gate.py``): "auto" (the default) serves exactly the supported deployment and
 leaves every other on ATOM's mono path, with one info line; "1" refuses loudly; "0" is off. The decision reads the
 configuration, the environment and the device properties only: no hi module is imported.
@@ -28,6 +29,14 @@ from atom.models.deepseek_v41.mono import hi_gate
 from atom.utils import envs
 
 FIXTURES = Path(__file__).parent / "models" / "deepseek_v41" / "fixtures"
+# a runner's staging buffers as ATOM's mono install reads them
+_STAGED = {
+    "outputs": None,
+    "temperatures": SimpleNamespace(gpu=None),
+    "top_ps": SimpleNamespace(gpu=None),
+}
+# a metadata builder whose runner stages them
+BUILDER = SimpleNamespace(model_runner=SimpleNamespace(forward_vars=_STAGED))
 # serve_v41.sh's ATOM arguments (the InferenceX dsv41flash recipe at TP4) but the model path and the server's own
 CAPTURE = "[" + ",".join(map(str, [*range(1, 33), 48, 64, 128])) + "]"
 SERVED_ARGS = (
@@ -377,8 +386,8 @@ def test_triton_moe_keeps_atoms_path(mi355x, served, monkeypatch):
 
 @pytest.fixture
 def dispatch_module(monkeypatch):
-    """``mono.dispatch`` with ATOM's own mono runners (FlyDSL kernels) stood in for: loaded fresh, dropped after."""
-    import importlib
+    """``mono.dispatch`` (AITER stood in for where it cannot run: its verify head reaches ``pcp_utils``) with ATOM's
+    own mono runners (FlyDSL kernels) stood in for: loaded fresh, dropped after."""
     import types
 
     from aiter_stub import _drop
@@ -394,7 +403,8 @@ def dispatch_module(monkeypatch):
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
     _drop(name)
     try:
-        yield importlib.import_module(name)
+        with atom_without_aiter() as load:
+            yield load(name)
     finally:
         _drop(name)
         if saved is not None:
@@ -427,10 +437,14 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
     if mode == "1":
         with pytest.raises(MonoUnsupported, match="FlyDSL layout"):
-            dispatch.install_mono_decode("model", served, None, metadata_builder=None)
+            dispatch.install_mono_decode(
+                "model", served, None, metadata_builder=BUILDER
+            )
         return
     with caplog.at_level(logging.INFO, logger="atom"):
-        got = dispatch.install_mono_decode("model", served, None, metadata_builder=None)
+        got = dispatch.install_mono_decode(
+            "model", served, None, metadata_builder=BUILDER
+        )
     assert got == "atom mono"
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: routed experts not in the gfx950 FlyDSL layout"
@@ -523,7 +537,9 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
     drafter = SimpleNamespace(model=draft)
     builder = SimpleNamespace(
         engram=SimpleNamespace(mapping=None, host=None),
-        model_runner=None,
+        # ATOM's mono path takes the forward's output buffer and the step's
+        # staged temperatures from it
+        model_runner=SimpleNamespace(forward_vars=_STAGED),
         use_decode_round=lambda rnd: log.append("use round"),
     )
     cfg = SimpleNamespace(max_model_len=4096, index_cache_dtype="fp4")
@@ -636,17 +652,20 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    decoder = SimpleNamespace(write_context="atom mono context write")
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: decoder)
     monkeypatch.setattr(
-        dispatch, "MonoDraftModel", lambda m, dp: ("atom mono draft", m)
+        dispatch, "MonoDraftModel", lambda m, dp: SimpleNamespace(model=m)
     )
     model, cfg, drafter, builder, _ = args
     with caplog.at_level(logging.INFO, logger="atom"):
         got = dispatch.install_mono_decode(
             model, cfg, drafter, metadata_builder=builder
         )
-    assert got == "atom mono"
-    assert drafter.model == ("atom mono draft", draft)
+    assert got is decoder
+    # the draft wrapped, its context written on the target's mono launch
+    assert drafter.model.model is draft
+    assert drafter.model.context_writer == decoder.write_context
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: refused at install: rank 0: MonoUnsupported: shard"
     ]

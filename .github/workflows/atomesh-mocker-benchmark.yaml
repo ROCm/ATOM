@@ -14,14 +14,8 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'atom/mesh/**'
-      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by --features atom-engine
-      - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
-      - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
-      - '.github/workflows/atomesh-mocker-benchmark.yaml'
-      - '.github/dashboard/atomesh_mocker_index.html'
-      - 'docs/assets/atomesh_logo.png'
+    # Do not use paths here. The required unit test gate must be published for
+    # every PR; unit-test-scope below keeps the path filter for the tests.
   schedule:
     # Nightly at 02:00 Beijing time (18:00 UTC)
     - cron: '0 18 * * *'
@@ -50,8 +44,57 @@ permissions:
   contents: write
 
 jobs:
+  unit-test-scope:
+    name: Check ATOMesh unit test scope
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.scope.outputs.should_run }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - name: Match the changed files
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # The push trigger's paths; keep the two lists the same.
+          PATHS_INCLUDE: |
+            atom/mesh/**
+            atom/model_engine/zmq_protocol/**
+            .github/scripts/atomesh/atomesh_mocker_benchmark.sh
+            .github/scripts/atomesh/atomesh_mocker_benchmark_summary.py
+            .github/workflows/atomesh-mocker-benchmark.yaml
+            .github/dashboard/atomesh_mocker_index.html
+            docs/assets/atomesh_logo.png
+        run: |
+          set -euo pipefail
+          should_run=false
+          if [ -z "${PR_NUMBER}" ]; then
+            should_run=true reason=non-pull-request-event
+          # Not the event's draft flag: a re-run keeps the payload it started with.
+          elif [ "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.draft')" = "true" ]; then
+            reason=draft-pull-request
+          else
+            reason=paths-not-included
+            # A file renamed out of a path still changes that path.
+            files="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --jq '.[] | .filename, (.previous_filename // empty)')"
+            while IFS= read -r pattern; do
+              while IFS= read -r file; do
+                # Unquoted, the pattern is a glob, and its * matches across /.
+                if [ -n "${pattern}" ] && [[ "${file}" == ${pattern} ]]; then
+                  should_run=true reason=paths-included
+                fi
+              done <<< "${files}"
+            done <<< "${PATHS_INCLUDE}"
+          fi
+          echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+
   run_atomesh_test_harness:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    needs: [unit-test-scope]
+    if: ${{ needs.unit-test-scope.outputs.should_run == 'true' }}
     name: run_atomesh_test_harness
     runs-on: ubuntu-latest
     outputs:
@@ -64,7 +107,7 @@ jobs:
       - name: Set up build environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler python3-dev
+          sudo apt-get install -y protobuf-compiler python3-dev python3-venv
           # pyo3 caches the detected Python in the restored target dir and only
           # re-detects when an env var changes, so a runner-image Python upgrade
           # would keep linking the old -lpython3.X. Key the detection on it.
@@ -112,6 +155,32 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib --features atom-engine
 
+      # The token parity test compares the router's tokens with the ones ATOM's
+      # own endpoints give, here on CPU, for a DeepSeek-V4.1-Flash revision whose
+      # tokenizer files and chat encoder the script downloads from HuggingFace.
+      # So the unit tests leave it out and it runs here, once.
+      - name: Test token parity with ATOM
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/atom"
+          "${RUNNER_TEMP}/atom/bin/pip" install -q torch --index-url https://download.pytorch.org/whl/cpu
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci \
+            "${RUNNER_TEMP}/atom/bin/pip" install -q -e . httpx
+          "${RUNNER_TEMP}/atom/bin/python" atom/mesh/scripts/atom_token_parity.py \
+            deepseek-ai/DeepSeek-V4.1-Flash@314113f8a7dadb388215396ba5fbee2c610a04d6 \
+            --out "${RUNNER_TEMP}/atom_tokens.json"
+          ATOM_TOKEN_PARITY="${RUNNER_TEMP}/atom_tokens.json" cargo test \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --profile ci --lib --features atom-engine -- \
+            --ignored routers::ingress::token_parity
+
+      # The vendored ext-proc protos must match the checksums pinned in
+      # manifest.json; offline, so a drifted file or manifest fails here.
+      - name: Check vendored ext-proc protos
+        run: python3 atom/mesh/proto/vendor_ext_proc.py --check
+
       # Nothing else builds the optional ext-proc feature or its protox
       # codegen; checking it, its tests included, keeps that path compiling.
       - name: Check atomesh with ext-proc
@@ -122,8 +191,8 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --features ext-proc --tests
 
-      # KV events: following the engines' streams, the prefix index, and the routing and
-      # observability code it feeds.
+      # KV events: following the engines' streams, the prefix index, the shared store, and
+      # the routing and observability code they feed.
       - name: Test KV events
         run: |
           set -euo pipefail
@@ -131,7 +200,7 @@ jobs:
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib -- \
-            kv_events:: kv_index:: policies::cache_aware policies::registry \
+            kv_events:: kv_index:: kv_storage:: policies::cache_aware policies::registry \
             observability:: routers::prepare routers::ingress
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
@@ -158,6 +227,29 @@ jobs:
             ~/.cargo/git
             atom/mesh/mocker/target
           key: ${{ steps.cargo-deps.outputs.key }}
+
+  unit-test-gate:
+    name: ATOMesh non-GPU unit tests
+    if: always()
+    needs: [unit-test-scope, run_atomesh_test_harness]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Evaluate ATOMesh unit test gate
+        uses: ./.github/actions/evaluate-test-gate
+        with:
+          gate-name: ATOMesh non-GPU unit tests
+          suite-name: ATOMesh unit tests
+          should-run: ${{ needs.unit-test-scope.outputs.should_run }}
+          decidable: 'true'
+          reason: ${{ needs.unit-test-scope.outputs.reason }}
+          ci-gate-result: ${{ needs.unit-test-scope.result }}
+          required-results: |
+            run_atomesh_test_harness=${{ needs.run_atomesh_test_harness.result }}
 
   run_atomesh_mocker_benchmark:
     # Not on pull requests: their numbers are compared against no baseline and
