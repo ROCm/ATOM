@@ -99,6 +99,25 @@ jobs:
       - name: Record checked-out commit
         id: revision
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Check plugin_poc request
+        if: ${{ inputs.plugin_poc_ref != '' }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PLUGIN_RECIPE: ${{ inputs.plugin_recipe }}
+          PLUGIN_POC_ENABLED: ${{ vars.PLUGIN_POC_ENABLED }}
+        run: |
+          if [[ "$EVENT_NAME" != workflow_dispatch ]]; then
+            echo "::error::plugin_poc runs are dispatched only"
+            exit 1
+          fi
+          if [[ "$PLUGIN_POC_ENABLED" == 0 ]]; then
+            echo "::error::plugin_poc runs are switched off (repository variable PLUGIN_POC_ENABLED=0)"
+            exit 1
+          fi
+          if [[ -z "$PLUGIN_RECIPE" ]]; then
+            echo "::error::plugin_poc_ref needs plugin_recipe"
+            exit 1
+          fi
       - id: build
         env:
           EVENT_NAME: ${{ github.event_name }}

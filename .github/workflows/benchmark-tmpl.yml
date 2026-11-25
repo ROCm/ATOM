@@ -122,6 +122,9 @@ jobs:
         conc: ${{ fromJson(inputs.concurrency) }}
 
     runs-on: ${{ inputs.runner }}
+    # PLUGIN_POC_DEPLOY_KEY is a secret of this environment only; its reviewers
+    # and deployment branches decide which plugin runs start.
+    environment: ${{ inputs.plugin_poc_ref != '' && 'plugin-poc' || '' }}
 
     env:
       BENCH_KIND: ${{ inputs.bench_kind }}
@@ -168,16 +171,10 @@ jobs:
       - name: Validate plugin_poc selection
         if: ${{ inputs.plugin_poc_ref != '' }}
         env:
-          PLUGIN_RECIPE: ${{ inputs.plugin_recipe }}
           PLUGIN_POC_DEPLOY_KEY: ${{ secrets.PLUGIN_POC_DEPLOY_KEY }}
         run: |
-          if [[ -z "$PLUGIN_RECIPE" ]]; then
-            echo "::error::plugin_poc_ref needs plugin_recipe"
-            exit 1
-          fi
-          # Secrets do not reach runs from forks; plugin runs are dispatched or scheduled ones.
           if [[ -z "$PLUGIN_POC_DEPLOY_KEY" ]]; then
-            echo "::error::secret PLUGIN_POC_DEPLOY_KEY is not available to this run"
+            echo "::error::secret PLUGIN_POC_DEPLOY_KEY of environment plugin-poc is not available to this run"
             exit 1
           fi
 
