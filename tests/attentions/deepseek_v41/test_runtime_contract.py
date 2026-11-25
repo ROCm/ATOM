@@ -94,6 +94,7 @@ def runtime_config(**overrides):
         "enable_encoder_swa_bounded_replay": False,
     }
     fields.update(overrides)
+    vars(fields["hf_config"]).setdefault("fp4ptpc", False)
     return SimpleNamespace(**fields)
 
 
@@ -152,10 +153,25 @@ def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
         validate_runtime_config(
             runtime_config(kv_transfer_config={"kv_connector": "mooncake"})
         )
+    # The shared UMBP L1 pool, like the Store, moves PAGEs and replays state.
+    umbp_pool = {
+        "kv_connector": "umbp_pool",
+        "kv_connector_extra_config": {"address": "unix:///unused"},
+    }
+    validate_runtime_config(
+        runtime_config(
+            kv_transfer_config=umbp_pool,
+            enable_encoder_swa_bounded_replay=True,
+            kv_cache_block_size=256,
+        )
+    )
+    with pytest.raises(ValueError, match="shared UMBP L1 pool without encoder SWA"):
+        validate_runtime_config(runtime_config(kv_transfer_config=umbp_pool))
     for connector in ("lmcache_offload", "moriio"):
         with pytest.raises(
             ValueError,
-            match="KV transfer other than lmcache_mp, mooncake_store or mooncake",
+            match="KV transfer other than lmcache_mp, mooncake_store, mooncake or "
+            "umbp_pool",
         ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
@@ -775,6 +791,27 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
         assert (
             out.shape[:-2].numel() == tokens
         ), f"{shape} gave {out.shape[:-2].numel()} rows, expected {tokens}"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"enable_expert_parallel": True},
+        {
+            "parallel_config": SimpleNamespace(data_parallel_size=2),
+            "enable_dp_attention": True,
+        },
+    ],
+)
+def test_fp4ptpc_runs_only_tensor_parallel(override):
+    fp4ptpc = {
+        "hf_config": SimpleNamespace(sliding_window=128, fp4ptpc=True),
+        "online_quant_config": {"layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"}},
+        "enable_expert_parallel": False,
+    }
+    validate_runtime_config(runtime_config(**fp4ptpc))
+    with pytest.raises(ValueError, match="FP4PTPC with expert or data parallel"):
+        validate_runtime_config(runtime_config(**{**fp4ptpc, **override}))
 
 
 def test_pd_store_requires_bounded_replay_for_the_offload_leaf():

@@ -4,7 +4,7 @@
 for gfx950 (no GPU launch), every program of the one-request width (each layer kind, the verify head, the Engram
 token-only launch, the DSpark context write and the draft's one-request plan) checked at every served TP size in
 every FP4 index layout, its Linear fits derived and held to the frozen table. The engine's builds at load
-skip these checks (FlyDSL's disk cache); this is where they run. Every served width:
+skip these checks (``hi.emit.compile.serving``); this is where they run. Every served width:
 ``python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json``."""
 
 from pathlib import Path

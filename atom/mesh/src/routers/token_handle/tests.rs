@@ -12,6 +12,7 @@ mod a_token_chunk {
             request_id: "req-1".to_string(),
             weight_version: Some("w1".to_string()),
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -295,6 +296,7 @@ mod c_token_handle {
                 request_id: "r".to_string(),
                 weight_version: None,
                 cached_tokens: 0,
+                timing: None,
             },
         }
     }

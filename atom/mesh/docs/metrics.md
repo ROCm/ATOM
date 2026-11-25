@@ -96,15 +96,14 @@ Defaults are the CLI defaults.
 
 | Policy | Branch | Selected worker | Samples |
 | --- | --- | --- | --- |
-| `random` | `random` | A random healthy worker. | |
-| `round_robin` | `round_robin` | The next healthy worker. | |
-| `power_of_two` | `single_worker` | The only healthy worker. | |
+| `random` | `random` | A random healthy candidate. | |
+| `round_robin` | `round_robin` | The next healthy candidate. | |
+| `power_of_two` | `single_worker` | The only healthy candidate. | |
 | | `token_load` | The lower of two random workers by the token load the load monitor last reported. | |
 | | `request_load` | The same by active requests, when either worker has no token load. | |
-| `cache_aware` | `affinity` | Match ratio above `--cache-threshold` (0.3): the worker holding the longest match. | ratio |
-| | `relocate` | Match ratio at or below the threshold: the least-loaded worker, ties broken at random. | ratio |
+| `cache_aware` | `affinity` | The longest match a healthy candidate holds has a ratio above `--cache-threshold` (0.3): that candidate. | ratio |
+| | `relocate` | That ratio is at or below the threshold: the least-loaded worker, ties broken at random. Workers outside the candidates keep their matches in the tree. | ratio |
 | | `imbalanced` | The max minus min load exceeds `--balance-abs-threshold` (64) and the max exceeds `--balance-rel-threshold` (1.5) times the min: the least-loaded worker, without a tree lookup. | |
-| | `stale_tenant` | Affinity, but that worker is gone or unhealthy: it leaves the tree and the first healthy worker is used. | |
 | | `no_tree` | No tree for the model and pool: a random healthy worker. | |
 | `prefix_hash` | `ring_hit` | The hash ring owner of the first `--prefix-token-count` (256) tokens, when its load is at most `--prefix-hash-load-factor` (1.25) times the average load including this request. | |
 | | `load_balance_walk` | The owner is over that bound: the least-loaded worker within it, or the owner if none is. | |
@@ -118,15 +117,14 @@ Defaults are the CLI defaults.
 ### Prefix match ratio
 
 `cache_aware` keeps a character tree of the request texts it routed, per model
-and pool, and records matched characters over input characters for the best
-match. It counts characters of the prompt text, not tokens or KV blocks. The
+and pool, and records matched characters over input characters for the longest
+match a healthy candidate holds. It counts characters of the prompt text, not tokens or KV blocks. The
 router prunes the tree on its own schedule (`--eviction-interval`,
 `--max-tree-size`) and does not see engine eviction, so the ratio estimates
-reuse rather than measuring it. `imbalanced` and `no_tree` skip the lookup, and
-the match of a `stale_tenant` is on a worker that is gone, so none of them
-records a ratio and the histogram count can be lower than the `cache_aware`
-decision count. Mass above the threshold corresponds to `affinity`; mass near 0
-comes from first turns and unrelated prompts.
+reuse rather than measuring it. `imbalanced` and `no_tree` skip the lookup, so
+neither records a ratio and the histogram count can be lower than the
+`cache_aware` decision count. Mass above the threshold corresponds to `affinity`;
+mass near 0 comes from first turns and unrelated prompts.
 
 ### Selected worker's active requests
 
@@ -154,7 +152,8 @@ the least-loaded worker (`no_session`). Its branches:
 - `new`: first request of the session; it goes to the worker holding the
   fewest bindings, ties broken by load. An idle binding still counts until the
   next sweep drops it;
-- `rebind`: the pinned worker is unhealthy, removed or circuit-open, or a
+- `rebind`: the pinned worker is unhealthy, removed or circuit-open, or under
+  idx2idx not among the prefill candidates the decode's rank leaves, or a
   request placed on the current pin failed with a server error or got no
   response, so the session's next request (a retry included) is placed again
   like a new one, away from every worker it failed on since its last hit
@@ -171,7 +170,12 @@ the least-loaded worker (`no_session`). Its branches:
   since its last hit.
 
 With N turns per session and stable workers, the hit rate approaches
-(N - 1) / N. `rebind` points at worker churn or failing requests; a router
+(N - 1) / N, and `rebind` points at worker churn or failing requests. Under
+idx2idx a prefill pin holds only while decode lands on its rank: with a decode
+policy that does not follow the session, about (D - 1) / D of turns rebind, D
+being the decode's DP size. A rebind picks the prefill holding the fewest
+bindings on the decode's rank, which can be another instance than the old
+pin's, where `main` kept the instance and remapped only the rank. A router
 restart makes every session `new` again. Each pool that runs `dp_sticky` keeps
 its own table. Idle bindings are dropped every 30 seconds, so a session that
 returns after that counts as `new`, not `expired`, and its move to another
@@ -193,10 +197,18 @@ the session's previous worker. `rebind` and `expired` name the affinity result
 that moved the session; an expired session reassigned to its old worker counts
 nothing. `rank_mapping` means the pin held, but
 `--atom-pd-rank-mapping-policy idx2idx` mapped the prefill request to a
-different DP rank than the previous one. A session that moves leaves its KV
-cache on the old worker. The HTTP routers and the external-processing PD
-executor record it when they send the request, and external-processing
-single-worker routes when they hand the route to Envoy; gRPC routers do not.
+different DP rank than the previous one. Under idx2idx the planner selects
+decode first and offers prefill the workers idx2idx keeps for the decode: those
+on its rank, and those it does not move (no DP size, or one the decode's rank
+is outside). A session pinned to another rank is re-pinned and counts as
+`rebind`. Only when idx2idx would move every healthy prefill are all of them
+offered, and then the remap leaves the selected one in place, as its target on
+the decode's rank is unavailable; a remap therefore takes a health or
+membership change between planning and reservation. A session that moves
+leaves its KV cache on the old worker. The HTTP routers and the
+external-processing PD executor record it when they send the request, and
+external-processing single-worker routes when they hand the route to Envoy;
+gRPC routers do not.
 
 ### DP ranks
 
@@ -227,8 +239,9 @@ every `affinity` decision and any `relocate` that happened to pick it. With
 event index, short of the block of the prompt's last token, which the engine
 always computes. The
 router drops the estimate when it sends the prompt to a different worker than
-the policy chose, such as another DP rank under
-`--atom-pd-rank-mapping-policy idx2idx`, because ranks keep separate KV caches.
+the policy chose, because DP ranks keep separate KV caches; under
+`--atom-pd-rank-mapping-policy idx2idx` that takes a health or membership change
+between planning and reservation.
 `kind="actual"` repeats the engine count for exactly those requests, so
 `estimated` and `actual` compare like for like.
 

@@ -212,10 +212,11 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
     core._is_rl_weights_offloaded = core._weight_sync_fenced = False
     core._generation_paused = False
     core._sync_dp_state = lambda *a: (False, True, False)
+    # Teardown is tested without a DP group; interval agreement has its own tests.
+    core._validate_dp_sync_interval = lambda interval: interval
     monkeypatch.setattr(tracing, "shutdown", lambda: calls.append("trace"))
-    if failure in {"drain", "shutdown"} and not (
-        engine_kind == "pp_downstream" and failure == "drain"
-    ):
+    # A later PP stage neither drains KV work nor shuts a KV event publisher down.
+    if failure in {"drain", "shutdown"} and engine_kind != "pp_downstream":
         with pytest.raises(RuntimeError, match=failure):
             core.busy_loop()
     else:
@@ -297,6 +298,7 @@ def test_real_engine_dispatch_keeps_tracing_when_metrics_returns_early(
         core._pending_prefix_hash = deque()
         core._defer_prefix_hash = False
         core.pp_size = pp_size
+        core.pp_max_inflight = pp_size
         completions = deque()
         core.pp_transport = SimpleNamespace(
             send_metadata=lambda batch: None,
@@ -391,6 +393,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
         is_multinode_tp=False,
         pcp_group_size=1,
         runner_qualname="unused",
+        weight_sync_runner=False,
         enforce_eager=True,
         disagg_is_decode=False,
         pipeline_parallel_size=1,

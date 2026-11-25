@@ -146,6 +146,7 @@ class StateCopies:
             (page if storing else state).copy_(state if storing else page)
 
     def warmup(self):
+        # Match the base builder's self-copy pattern; this object owns its cache.
         if self.spec is None or not self.cache.pool.is_cuda:
             return
         src = np.asarray([self._range_addresses(0)], dtype=np.int64)
