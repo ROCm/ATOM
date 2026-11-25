@@ -31,15 +31,18 @@ start, `--plugin-arm` to pick an arm. To switch recipes, restart;
   "seams": {"v41.block.ffn": ["tp4-ar-add-provider"], "v41.attn.out": []},
   "modules": {
     "layers.*.attn": ["my-whole-attention"],
-    "@atom.model_ops.moe.FusedMoE:select_experts": ["router-provider"]
+    "@pp_models.dsv41.moe.MoE:_topk": ["router-top6-provider"]
   },
-  "aiter": {"quant": ["route-quant-provider"]},
+  "aiter": {"quantize_fp8_group32": ["quant16k-provider"]},
   "plugin_options": {"dsv41": {"lean_head": true}},
   "env": {"ATOM_DSV41_MONO_HI": "auto"},
   "requires": {"atom_hook_api": ">=3,<4", "plugins": {"tp4-ar-add-provider": "sha256:..."}},
   "runtime": {"expect": {"tensor_parallel_size": 4}}
 }
 ```
+
+The owner tables may also sit under `plan` (`plan.seams`, `plan.modules`); a
+top-level `seams` / `modules` wins.
 
 - `seams`: ordered owners per seam (several for disjoint cells, `allow_partition`);
   `[]` plans a seam native by decision (it counts as planned for a taken-over
@@ -54,6 +57,8 @@ start, `--plugin-arm` to pick an arm. To switch recipes, restart;
   `TORCH_*`; never `ATOM_PLUGIN_*`), set once by the server's main process
   before any worker starts. A name the environment already sets to another value
   refuses the recipe (`recipe-env-conflict`).
+- `runtime.expect`: what the server must be (`level`, `cudagraph_mode`,
+  `tensor_parallel_size`, `model_arch`, `mono`); a mismatch refuses the start.
 - `requires`: `atom_hook_api`, the seam contracts the recipe was written for
   (checked against the built model), and optional plugin code digests. No ATOM or
   AITER version is pinned.
@@ -61,8 +66,11 @@ start, `--plugin-arm` to pick an arm. To switch recipes, restart;
   are always there); an arm changes routes only, never the model.
 - `plugins` is optional: every owner named under `seams` / `modules` is a layer
   plugin, every name under `aiter` an AITER provider.
-- An unknown field or a wrong type refuses the recipe. One strategy's recipe set
-  (one file per capture bucket set) must agree on everything but its tables.
+- A wrong type refuses the recipe. Top-level fields ATOM does not read are the
+  document's own metadata (a tool's `plan_id`, `purpose`, `baseline`, notes) and
+  are ignored; the removed sections `engine` and `dspark_options` are refused (a
+  model's options go to `plugin_options`). One strategy's recipe set (one file per
+  capture bucket set) must agree on everything but its tables.
 
 ## Whole-module and method takeover
 
@@ -71,9 +79,9 @@ def register(host):
     def factory(module, capability):          # once per module, after the load
         return lambda *args, **kwargs: ...     # called exactly as the taken-over method
     return host.register_module(
-        slot="@atom.model_ops.moe.FusedMoE", method="select_experts",
-        owner="router-provider", factory=factory,
-        select=lambda cap, *args, **kwargs: cap.flags["module"].top_k == 8,  # pure
+        slot="@pp_models.dsv41.moe.MoE", method="_topk",
+        owner="router-top6-provider", factory=factory,
+        select=lambda cap, *args, **kwargs: covers(*args, **kwargs),  # pure: shapes / dtypes only
         graph="capture_safe",
     )
 ```
@@ -84,3 +92,6 @@ def register(host):
   module's own forward, which reaches the inner owners: overlapping plugins
   compose by construction (`shadow_policy` defaults to `"nested"`).
 - Under `torch.compile` a tensor-only call is one opaque op (`atom_plugin::span_n`).
+- A method is taken over on the instance: a `@staticmethod` called through its
+  class (`FusedMoE.select_experts(...)`) is never reached; take over the caller (as
+  above, the model's routing method).
