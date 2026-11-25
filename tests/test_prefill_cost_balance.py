@@ -130,13 +130,10 @@ def test_estimate_prices_the_chunk_the_prefill_budget_allows(
         sched.running.append(decode)
     sched.add(seq_factory(list(range(100, 164))))
     chunk = 64 - 6 if mixed else 64  # one row per decode (no drafts)
-    assert sched._estimate_prefill_chunk_cost(
-        limits=sched._prefill_limits() if mixed else sched._unreserved_prefill_limits
-    ) == sched._chunk_cost(0, chunk)
-    assert (
-        sched._prefill_limits()
-        if mixed
-        else sched._unreserved_prefill_limits.tokens == chunk
+    limits = sched._prefill_limits() if mixed else sched._unreserved_prefill_limits
+    assert limits.tokens == chunk
+    assert sched._estimate_prefill_chunk_cost(limits=limits) == sched._chunk_cost(
+        0, chunk
     )
 
 
