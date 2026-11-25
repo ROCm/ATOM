@@ -1,0 +1,31 @@
+== DSR1 target run on gfx1250-atom-20261123-dsr1, CI recipe, c4 MLPerf endpoint bench (temperature 1.0), 2026-11-25 16:19 BJ: ModelRunner0 aborts in a JIT compile at the first requests
+[atom 08:18:50] Engine Core Mgr: add rank0: 1 req / 2105 tok | in-flight reqs=[1, 0, 0, 0] queued_prefill_tokens=[2105, 0, 0, 0]
+[atom 08:18:50] Engine Core Mgr: add rank1: 1 req / 1226 tok | in-flight reqs=[1, 1, 0, 0] queued_prefill_tokens=[2105, 1226, 0, 0]
+INFO:     127.0.0.1:50594 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50616 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[atom 08:18:50] Scheduled prefill batch: 1 reqs, 2105 new tokens (done: [0], new: [2105]), req_ids: (0,)
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (26621 > 16384). Running this sequence through the model will result in indexing errors
+[atom 08:18:50] Request 2 arrived, input tokens: 26621, pending requests: 3
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (26605 > 16384). Running this sequence through the model will result in indexing errors
+[atom 08:18:50] Request 3 arrived, input tokens: 26605, pending requests: 4
+[atom 08:18:50] Engine Core Mgr: add rank2: 1 req / 26621 tok | in-flight reqs=[1, 1, 1, 0] queued_prefill_tokens=[2105, 1226, 26621, 0]
+[atom 08:18:50] Engine Core Mgr: add rank3: 1 req / 26605 tok | in-flight reqs=[1, 1, 1, 1] queued_prefill_tokens=[2105, 1226, 26621, 26605]
+INFO:     127.0.0.1:50600 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50618 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[aiter] Ignoring invalid OPUS tuned row for gfx=gfx1250, shape=(1,129280,7168), kid=13, splitK=1; trying the next padded row or default backend
+[aiter] Ignoring invalid OPUS tuned row for gfx=gfx1250, shape=(1,129280,7168), kid=13, splitK=1; trying the next padded row or default backend
+[aiter] Ignoring invalid OPUS tuned row for gfx=gfx1250, shape=(1,129280,7168), kid=13, splitK=1; trying the next padded row or default backend
+[atom 08:19:20] Engine 000: Avg prompt throughput: 65.5 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%
+[atom 08:19:20] Engine 003: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 1 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: n/a
+[atom 08:19:20] Engine 002: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 1 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: n/a
+[atom 08:19:20] Engine 001: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 1 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: n/a
+[atom 08:19:20] Scheduled prefill batch: 1 reqs, 1226 new tokens (done: [0], new: [1226]), req_ids: (1,)
+[atom 08:19:20] Scheduled prefill batch: 1 reqs, 12480 new tokens (done: [0], new: [12480]), req_ids: (3,)
+[atom 08:19:20] Scheduled prefill batch: 1 reqs, 12480 new tokens (done: [0], new: [12480]), req_ids: (2,)
+[atom 08:19:24] Scheduled prefill batch: 1 reqs, 14080 new tokens (done: [12480], new: [14080]), req_ids: (2,)
+[atom 08:19:24] Scheduled prefill batch: 1 reqs, 14125 new tokens (done: [12480], new: [14125]), req_ids: (3,)
+/app/llvm-project/llvm/include/llvm/IR/Instructions.h:2790: void llvm::PHINode::setIncomingValue(unsigned int, llvm::Value*): Assertion `getType() == V->getType() && "All operands to PHI node must be the same type as the PHI node!"' failed.
+/app/llvm-project/llvm/include/llvm/IR/Instructions.h:2790: void llvm::PHINode::setIncomingValue(unsigned int, llvm::Value*): Assertion `getType() == V->getType() && "All operands to PHI node must be the same type as the PHI node!"' failed.
+[atom 08:19:28] AsyncIOProcManager(ModelRunner): [ModelRunner0/1] proc died unexpectedly (exitcode=-6), shutting down.
+[atom 08:19:28] AsyncIOProcManager(ModelRunner): shutdown all runners...
+[atom 08:19:28] AsyncIOProcManager(ModelRunner): [ModelRunner0/1] proc died unexpectedly (exitcode=-6), shutting down.
