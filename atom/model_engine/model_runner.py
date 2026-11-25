@@ -2075,10 +2075,6 @@ class ModelRunner:
         # RCCL/NCCL buffers etc. held outside the allocator: device-used minus
         # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
         non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
-        # A weight cache daemon's weights count here, as a disk load's would;
-        # what it holds beside them is left out (the headroom holds it).
-        non_torch = max(non_torch - daemon_load_extra(), 0)
-
         # Preserve the ordinary warmup estimate before the eager mixed sweep
         # resets allocator peaks. Mixed workspace does not belong to graph pools.
         cudagraph_overhead = self._estimate_cudagraph_overhead()
@@ -2102,6 +2098,9 @@ class ModelRunner:
                 mixed_non_torch,
                 (total - free) - torch.cuda.memory_reserved(),
             )
+        # A weight cache daemon's weights count here, as a disk load's would;
+        # what it holds beside them is left out (the headroom holds it).
+        non_torch = max(non_torch - daemon_load_extra(), 0)
         safety_margin = int(total * 0.02)
 
         budget = int(total * config.gpu_memory_utilization)

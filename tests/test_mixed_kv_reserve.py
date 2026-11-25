@@ -416,8 +416,9 @@ def test_binding_falls_back_only_for_unrecognized_draft_modules():
 
 
 @pytest.mark.parametrize("paged_state", [False, True])
+@pytest.mark.parametrize("daemon_extra_gib", [0, 3])
 def test_mixed_profile_is_not_charged_to_graph_pools(
-    monkeypatch, caplog, paged_state, runner_module
+    monkeypatch, caplog, paged_state, daemon_extra_gib, runner_module
 ):
     import torch
 
@@ -435,8 +436,13 @@ def test_mixed_profile_is_not_charged_to_graph_pools(
         "allocated_bytes.all.current": 100 * gib,
     }
     monkeypatch.setattr(torch.cuda, "memory_stats", lambda: stats)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (100 * gib, 200 * gib))
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda: ((100 - daemon_extra_gib) * gib, 200 * gib)
+    )
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 100 * gib)
+    monkeypatch.setattr(
+        runner_module, "daemon_load_extra", lambda: daemon_extra_gib * gib
+    )
     monkeypatch.setattr(
         runner_module.KVConnectorFactory, "kv_budget_reserve_bytes", lambda config: 0
     )
@@ -455,6 +461,7 @@ def test_mixed_profile_is_not_charged_to_graph_pools(
         pipeline_parallel_size=1,
         is_multinode_tp=False,
         enable_rapidserve=False,
+        kv_transfer_config=None,
     )
     runner.drafter = SimpleNamespace(uses_confidence_schedule=True, mtp_k=7)
     runner._tr_hybrid_active = lambda: False
@@ -463,6 +470,7 @@ def test_mixed_profile_is_not_charged_to_graph_pools(
         [state_pool(STATE_SLOT_CLASS, 512, entries_per_req=1)] if paged_state else []
     )
     runner.attn_metadata_builder = SimpleNamespace(
+        state_transfer_slots=lambda: 0,
         state_transfer=lambda: (
             StateTransfer.copy("test-layout")
             if paged_state
@@ -486,7 +494,7 @@ def test_mixed_profile_is_not_charged_to_graph_pools(
         else:
             assert spec is None
         stats["allocated_bytes.all.peak"] = 100 * gib
-        return 112 * gib, 2 * gib
+        return 112 * gib, (2 + daemon_extra_gib) * gib
 
     profile = Mock(side_effect=profile)
     monkeypatch.setattr(runner_module, "profile_mixed_memory", profile)
