@@ -434,7 +434,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         if not midstep:
             return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
         return kda_midstep_transfer(
-            layout_id, self.model_runner.config.hf_config.linear_conv_kernel_dim
+            layout_id,
+            self.model_runner.config.hf_config.linear_conv_kernel_dim,
+            decode_keep=self._decode_keep(),
         )
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:

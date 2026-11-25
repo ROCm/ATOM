@@ -79,7 +79,7 @@ def _clean_switches(monkeypatch):
 def k3_runtime(midstep_on: bool) -> StateRuntime:
     """What the Kimi-K3 backend's `state_transfer()` declares, either way."""
     transfer = (
-        kda_midstep_transfer(KDA_SPEC.layout_id, CONV_KERNEL)
+        kda_midstep_transfer(KDA_SPEC.layout_id, CONV_KERNEL, decode_keep="settled")
         if midstep_on
         else StateTransfer.copy(KDA_SPEC.layout_id)
     )
@@ -126,11 +126,14 @@ def test_the_switch_is_refused_under_pipeline_parallelism():
 
 
 def test_the_transfer_reads_midstep_on_the_flash_kda_grid():
-    transfer = kda_midstep_transfer(KDA_SPEC.layout_id, CONV_KERNEL)
+    transfer = kda_midstep_transfer(
+        KDA_SPEC.layout_id, CONV_KERNEL, decode_keep="snapshot"
+    )
     assert transfer.copies and transfer.paged_layout_id == KDA_SPEC.layout_id
     assert transfer.readable_midstep
     assert transfer.midstep_grid == 32
     assert transfer.midstep_min_offset == CONV_LEN
+    assert transfer.decode_keep == "snapshot"
     assert StateTransfer.from_wire(transfer.to_wire()) == transfer
 
 

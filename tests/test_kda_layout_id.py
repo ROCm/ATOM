@@ -52,6 +52,7 @@ def builder(
     config = SimpleNamespace(
         pipeline_parallel_size=pp,
         enable_rapidserve=rapidserve,
+        hf_config=SimpleNamespace(linear_conv_kernel_dim=4),
     )
     if kpool_tail is None:
         kpool_tail = kpool > 1
@@ -207,6 +208,20 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
                 builder(replayssm=True, pp=2, kpool=4, kpool_tail=kpool_tail)
             )
         assert transfer.decode_keep == "none"
+
+    @pytest.mark.parametrize(
+        "num_spec, kpool, keep", [(2, 1, "snapshot"), (0, 1, "settled"), (2, 4, "none")]
+    )
+    def test_the_midstep_switch_leaves_a_decode_boundary_as_it_was(
+        self, monkeypatch, num_spec, kpool, keep
+    ):
+        """The switch moves where a prefill checkpoint is taken. What a decode
+        boundary keeps is still the backend's `_decode_keep`."""
+        monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
+        with tp_world(TP):
+            transfer = Builder.state_transfer(builder(num_spec=num_spec, kpool=kpool))
+        assert transfer.readable_midstep
+        assert transfer.decode_keep == keep
 
     def test_the_midstep_switch_is_refused_under_pipeline_parallelism(
         self, monkeypatch
