@@ -482,6 +482,146 @@ _GROUP = 32  # quantize_fp8's group, fixed by the V4.1 QAT the cache stores
 
 
 @triton.jit
+def _draft_prologue_kernel(
+    positions_ptr,  # [B] anchor position per request
+    ids_ptr,  # [B] anchor token id per request
+    embed_ptr,  # [V, H] the embedding table
+    noise_ptr,  # [H] the noise token's row
+    out_positions_ptr,  # [B, width]
+    out_indices_ptr,  # [B, width, ring + width] int32
+    out_context_ptr,  # [B, ring]
+    residual_ptr,  # [B, width, M, H]
+    pre_mix_ptr,  # [B, width, M] fp32
+    hidden,
+    ring,
+    window,
+    width,
+    stride_embed_row,
+    M: tl.constexpr,  # hc_mult
+    BLOCK_H: tl.constexpr,
+    H_BLOCKS: tl.constexpr,  # cdiv(hidden, BLOCK_H)
+    WIDTH_BLOCK: tl.constexpr,  # next_pow2(width)
+    ENTRIES: tl.constexpr,  # next_pow2(ring + width)
+):
+    """`_draft_step_kernel`, the anchors' embedding gather and
+    `build_block_state` in one launch.
+
+    Grid ``(B * width, H_BLOCKS + 1)``: program ``(row, part)`` with
+    ``part < H_BLOCKS`` writes one H tile of one block row's state, as
+    `build_block_state` does, reading the anchor's row straight out of the
+    table; ``part == H_BLOCKS`` writes that row's index list, as
+    `_draft_step_kernel` does. Copies and integer arithmetic only, so the five
+    outputs are the three launches' own, bit for bit.
+    """
+    row = tl.program_id(0)  # flat (batch, draft position)
+    part = tl.program_id(1)
+    batch = row // width
+    pos = row % width
+
+    if part == H_BLOCKS:
+        anchor = tl.load(positions_ptr + batch).to(tl.int64)
+        if pos == 0:
+            steps = tl.arange(0, WIDTH_BLOCK)
+            tl.store(
+                out_positions_ptr + batch.to(tl.int64) * width + steps,
+                anchor + 1 + steps,
+                mask=steps < width,
+            )
+        slot = tl.arange(0, ENTRIES)
+        total = ring + width
+        is_history = slot < ring
+        context, valid = _history_slots(anchor, slot, ring, window)
+        if pos == 0:
+            tl.store(
+                out_context_ptr + batch.to(tl.int64) * ring + slot,
+                context,
+                mask=is_history,
+            )
+        index = tl.where(valid, slot, -1)
+        index = tl.where(is_history, index, slot)
+        tl.store(
+            out_indices_ptr + row.to(tl.int64) * total + slot,
+            index.to(tl.int32),
+            mask=slot < total,
+        )
+    else:
+        offs = part * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask = offs < hidden
+        token = tl.load(ids_ptr + batch).to(tl.int64)
+        src = tl.where(pos == 0, embed_ptr + token * stride_embed_row, noise_ptr)
+        value = tl.load(src + offs, mask=mask)
+        dst = residual_ptr + row.to(tl.int64) * M * hidden
+        for stream in tl.static_range(M):
+            tl.store(dst + stream * hidden + offs, value, mask=mask)
+        if part == 0:
+            streams = tl.arange(0, M)
+            tl.store(
+                pre_mix_ptr + row.to(tl.int64) * M + streams,
+                tl.where(streams == 0, 1.0, 0.0).to(tl.float32),
+            )
+
+
+def fused_draft_prologue(
+    positions: torch.Tensor,
+    anchor_ids: torch.Tensor,
+    embed_weight: torch.Tensor,
+    noise_embed: torch.Tensor,
+    ring: int,
+    window: int,
+    width: int,
+    hc_mult: int,
+):
+    """`draft_step_indices` and `build_block_state(embed(anchor_ids), ...)` in
+    one launch instead of three.
+
+    For an embedding that is a plain local table (no TP all-reduce): the kernel
+    reads each anchor's row where it lies. ``anchor_ids`` must be in range, as
+    `F.embedding` needs them (the proposer clamps the staged ids).
+
+    Returns ``(step_positions, indices, context_positions, (residual, pre_mix))``
+    -- what the two calls return.
+    """
+    batch = positions.shape[0]
+    hidden = embed_weight.shape[1]
+    device = positions.device
+    out_positions = torch.empty(batch, width, device=device, dtype=positions.dtype)
+    out_indices = torch.empty(
+        batch, width, ring + width, device=device, dtype=torch.int32
+    )
+    out_context = torch.empty(batch, ring, device=device, dtype=positions.dtype)
+    residual = torch.empty(
+        batch, width, hc_mult, hidden, device=device, dtype=embed_weight.dtype
+    )
+    pre_mix = torch.empty(batch, width, hc_mult, device=device, dtype=torch.float32)
+    if batch:
+        block = 1024
+        h_blocks = triton.cdiv(hidden, block)
+        _draft_prologue_kernel[(batch * width, h_blocks + 1)](
+            positions,
+            anchor_ids,
+            embed_weight,
+            noise_embed,
+            out_positions,
+            out_indices,
+            out_context,
+            residual,
+            pre_mix,
+            hidden,
+            ring,
+            window,
+            width,
+            embed_weight.stride(0),
+            M=hc_mult,
+            BLOCK_H=block,
+            H_BLOCKS=h_blocks,
+            WIDTH_BLOCK=triton.next_power_of_2(width),
+            ENTRIES=triton.next_power_of_2(ring + width),
+            num_warps=4,
+        )
+    return out_positions, out_indices, out_context, (residual, pre_mix)
+
+
+@triton.jit
 def _fused_draft_kv_tail_kernel(
     kv_ptr,  # [W, L, D] fused-GEMM output, rows contiguous
     norm_weight_ptr,  # [L, D] the stages' kv_norm weights, stacked

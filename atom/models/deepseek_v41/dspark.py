@@ -27,6 +27,7 @@ from atom.model_ops.deepseek_v41.dspark import (
     draft_src_indices,
     draft_step_indices,
     fused_draft_kv_tail,
+    fused_draft_prologue,
 )
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
@@ -640,9 +641,24 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # launch-floor work on [B, ring] rows, four of them an `arange`
         # rebuilding a constant.
         ring = cache.geometry.ring_slots
-        step_positions, indices, context_positions = draft_step_indices(
-            positions, ring, self.window_size, width
-        )
+        state = None
+        if self._fused_prologue_ok():
+            # ATOM_DSPARK_FUSED_PROLOGUE: the same five tensors from one launch
+            # (index lists + embedding gather + block state).
+            step_positions, indices, context_positions, state = fused_draft_prologue(
+                positions,
+                input_ids,
+                self.embed.weight,
+                self._noise_embedding(),
+                ring,
+                self.window_size,
+                width,
+                self.config.hc_mult,
+            )
+        else:
+            step_positions, indices, context_positions = draft_step_indices(
+                positions, ring, self.window_size, width
+            )
         # One build for whichever draft runs: the FP8 draft always reads these
         # lists (`DraftAttention.forward` picks it by the window's type); the
         # BF16 one only where `two_source_draft()` says, None keeping its
@@ -662,6 +678,23 @@ class DeepseekV41DSpark(DSparkDraftModel):
             context_positions,
             num_draft=num_draft,
             step=DraftStep(step_positions, indices, src_indices=src),
+            state=state,
+        )
+
+    def _fused_prologue_ok(self) -> bool:
+        """The fused prologue reads anchor rows straight out of a local table."""
+        if not envs.ATOM_DSPARK_FUSED_PROLOGUE:
+            return False
+        # `getattr`: a draft built without its shared embedding (a test's, or
+        # before `share_with_target`) keeps the three-launch prologue.
+        embed = getattr(self, "embed", None)
+        weight = getattr(embed, "weight", None)
+        return (
+            weight is not None
+            and getattr(embed, "tp_size", 0) == 1
+            and weight.is_cuda
+            and weight.dim() == 2
+            and weight.stride(1) == 1
         )
 
     def forward_spec(self, input_ids, positions, num_draft=None):
@@ -679,6 +712,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         *,
         num_draft=None,
         step=None,
+        state=None,
     ):
         """Pure block math; the caller supplies a committed per-request window.
 
@@ -697,14 +731,16 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # kept. That takes `width` out of the embedding's TP all-reduce, and
         # the block state is then written straight out rather than broadcast
         # and copied. See `build_block_state`.
-        state = SinglePassHCState(
-            *build_block_state(
+        if state is None:
+            state = build_block_state(
                 self.embed(anchor_ids),
                 self._noise_embedding(),
                 width,
                 self.config.hc_mult,
             )
-        )
+        # `state`: the block's `(residual, pre_mix)` when the caller built it
+        # already (`block_backbone`'s fused prologue).
+        state = SinglePassHCState(*state)
         if step is None:
             step = draft_step(context_positions, anchors, width, self.window_size)
         for layer in self.mtp:
