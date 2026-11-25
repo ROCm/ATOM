@@ -1,0 +1,66 @@
+name: Sandbox Evaluator
+
+# CI evaluator design sandbox (ci-sandbox/* only; not for main). Acts with the
+# workflow's GITHUB_TOKEN, as the real evaluator would.
+
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        required: true
+        type: choice
+        options: [rerun, rerun-failed, cancel, status]
+      run_id:
+        required: false
+        type: string
+        default: ""
+      sha:
+        required: false
+        type: string
+        default: ""
+      context:
+        required: false
+        type: string
+        default: sandbox-status-gate
+      state:
+        required: false
+        type: choice
+        options: [pending, success, failure, error]
+        default: success
+
+permissions:
+  actions: write
+  statuses: write
+
+jobs:
+  act:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Act
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OP: ${{ inputs.op }}
+          RUN_ID: ${{ inputs.run_id }}
+          SHA: ${{ inputs.sha }}
+          CONTEXT: ${{ inputs.context }}
+          STATE: ${{ inputs.state }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          case "${OP}" in
+            rerun|rerun-failed|cancel)
+              [[ "${RUN_ID}" =~ ^[0-9]+$ ]]
+              path="rerun"
+              [ "${OP}" = rerun-failed ] && path="rerun-failed-jobs"
+              [ "${OP}" = cancel ] && path="cancel"
+              gh api -X POST "repos/${repo}/actions/runs/${RUN_ID}/${path}" -i | head -1
+              ;;
+            status)
+              [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]]
+              [[ "${CONTEXT}" =~ ^sandbox[-/a-z]*$ ]]
+              gh api -X POST "repos/${repo}/statuses/${SHA}" \
+                -f state="${STATE}" -f context="${CONTEXT}" \
+                -f description="sandbox evaluator (GITHUB_TOKEN)" \
+                --jq '{id, state, context, creator: .creator.login}'
+              ;;
+          esac
