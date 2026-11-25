@@ -52,7 +52,7 @@ class _Attention:
 
 
 def _layer(*, enabled=True):
-    return SimpleNamespace(
+    layer = SimpleNamespace(
         qkv_proj=_QKV(),
         o_proj=_OProj(1),
         attn=_Attention(),
@@ -64,6 +64,10 @@ def _layer(*, enabled=True):
         fast_oproj=False,
         o_proj_name="model.layers.0.self_attn.o_proj",
     )
+    for name in ("attend_mxfp8", "_qkv"):
+        fn = getattr(MiniMaxM3SparseAttention, name)
+        setattr(layer, name, fn.__get__(layer))
+    return layer
 
 
 def test_mxfp8_out_hands_the_attention_fp8_and_scales_to_o_proj():

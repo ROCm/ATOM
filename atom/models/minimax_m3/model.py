@@ -50,6 +50,7 @@ from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
+from atom.models.minimax_m3 import stage_o
 from atom.models.minimax_m3.index_schedule import (
     should_skip_index_topk as _should_skip_minimax_m3_index_topk,
 )
@@ -729,6 +730,32 @@ class MiniMaxM3SparseAttention(nn.Module):
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.sparse_pa_mxfp8_out:
+            attn_output, attn_scale = self.attend_mxfp8(
+                positions, hidden_states, hidden_states_scale
+            )
+            if self.fast_oproj:
+                return torch.ops.aiter.minimax_m3_o_proj_mxfp8(
+                    attn_output, attn_scale, self.o_proj_name
+                )
+            return self.o_proj(attn_output, x_scale=attn_scale)
+        q, k, v, qkv = self._qkv(hidden_states, hidden_states_scale)
+        attn_output = self.attn(q, k, v, positions, qkv=qkv)
+        return self.o_proj(attn_output)
+
+    def attend_mxfp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The attention up to o_proj's MXFP8 input (``sparse_pa_mxfp8_out``):
+        (E4M3 rows, row-major E8M0 scales). ``forward`` runs o_proj on them; a
+        decoder layer with a Stage O seam hands them to its post-attention op."""
+        q, k, v, qkv = self._qkv(hidden_states, hidden_states_scale)
+        return self.attn.forward_mxfp8(q, k, v, positions, qkv=qkv)
+
+    def _qkv(self, hidden_states, hidden_states_scale):
         # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
         # the indexer norm/rope/top-k path, but still compute the packed GEMM.
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
@@ -742,17 +769,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
-        if self.sparse_pa_mxfp8_out:
-            attn_output, attn_scale = self.attn.forward_mxfp8(
-                q, k, v, positions, qkv=qkv
-            )
-            if self.fast_oproj:
-                return torch.ops.aiter.minimax_m3_o_proj_mxfp8(
-                    attn_output, attn_scale, self.o_proj_name
-                )
-            return self.o_proj(attn_output, x_scale=attn_scale)
-        attn_output = self.attn(q, k, v, positions, qkv=qkv)
-        return self.o_proj(attn_output)
+        return q, k, v, qkv
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -803,6 +820,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # Stage O (gfx1250 TP4 decode): the name of this layer's post-attention op
+        # (`stage_o.minimax_m3_attn_tail`), or None. Fixed at construction, so the
+        # traced forward keeps one branch; the op picks the one-launch o_proj +
+        # all-reduce + norm or production's calls per call.
+        self.stage_o = stage_o.bind(self, prefix)
 
     def forward(
         self,
@@ -842,6 +864,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # TP-partial / NaN-prone under CUDAGraph.
         aux_hidden_state = residual.clone() if capture_aux else None
 
+        if self.stage_o is not None:
+            # a MoE layer: o_proj and the AR + norm below, inside one op
+            attn_output, attn_scale = self.self_attn.attend_mxfp8(
+                positions, hidden_states, hidden_states_scale
+            )
+            hidden_states, residual = torch.ops.aiter.minimax_m3_attn_tail(
+                attn_output,
+                attn_scale,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                self.stage_o,
+            )
+            hidden_states = self.block_sparse_moe(hidden_states)
+            if aux_hidden_state is not None:
+                return hidden_states, residual, aux_hidden_state
+            return hidden_states, residual
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
