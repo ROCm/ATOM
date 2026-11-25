@@ -542,6 +542,59 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
 
+    def prepare_paged_block_fused(
+        self,
+        attn_metadata,
+        block_tables: torch.Tensor,  # [running_bs, W] page ids (page-128)
+        anchor_positions: torch.Tensor,  # [running_bs] int64
+        offsets: torch.Tensor,  # [T] int64, 1..T
+        block_positions: torch.Tensor,  # [running_bs, T] out
+        slots: torch.Tensor,  # [running_bs, T] out -- the block's KV write slots
+        ctx_lens: torch.Tensor,  # [running_bs] out, anchor + 1 + T
+        allocated_pages,  # [>= scheduled_bs] host, pages each request holds
+        scheduled_bs: int,
+        entry_tokens: int,  # tokens one page id spans, the slots' unit
+        pad_ctx_len: int,  # a pad row's KV length
+    ) -> None:
+        """The proposer's block positions, slots and context lengths (no DCP)
+        and `prepare_paged_block`, in ONE launch (`dspark_block_meta`): the
+        same numbers as those ~30 small launches."""
+        from atom.model_ops.dspark_block_meta import PACKED_MAX_ROWS, block_meta
+
+        running_bs, T = block_positions.shape
+        W = block_tables.shape[1]
+        P = PAGES_PER_SPARSE_BLOCK * W
+        if self._bt16 is None or self._bt16.shape[1] != P:
+            self._alloc_block_rows(P, T, block_tables.device)
+        if running_bs <= PACKED_MAX_ROWS and W < 1 << 16:
+            # A few requests: their page counts (each at most W) go in as kernel
+            # scalars, with no staging copy.
+            alloc = AllocationCap.page_counts(allocated_pages, scheduled_bs, running_bs)
+        else:
+            alloc = self._alloc_cap.stage(allocated_pages, scheduled_bs, running_bs)
+        rows = running_bs * T
+        block_meta(
+            anchor_positions,
+            offsets,
+            block_tables,
+            alloc,
+            block_positions,
+            slots.view(-1),
+            ctx_lens,
+            self._ctx_eff[:running_bs],
+            self._bt16_flat,
+            self._bt16_rows[:rows],
+            self._ctx_rows[:rows],
+            entry_tokens=entry_tokens,
+            sub_pages=PAGES_PER_SPARSE_BLOCK,
+            window_page=ASM_PAGE_SIZE,
+            window=self.sliding_window,
+            scheduled_bs=scheduled_bs,
+            pad_ctx_len=pad_ctx_len,
+        )
+        attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
+        attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
+
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]
         base_logits = self.lm_head(hidden).view(bs, num_draft, -1)
