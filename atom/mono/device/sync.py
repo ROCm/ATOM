@@ -17,7 +17,7 @@ from flydsl.expr.typing import T
 from atom.mono.device.ops import CM_DEV, CM_SYS, bf16_pair, memrealtime, rsrc, traced
 from atom.mono.plan.layout import DIAG_WORDS, NUMA_RUN, dual_word
 from atom.mono.plan.trace import Space, note
-from atom.mono.polling import POLL_ESCALATE, POLL_SLEEP_UNITS
+from atom.mono.polling import POLL_SLEEP_UNITS
 
 POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
 
@@ -27,21 +27,9 @@ def _spin(load_all, pending):
     """Re-issue ``load_all`` until ``pending`` clears; a side-effecting op in the
     loop keeps the loads from being hoisted."""
     v = load_all()
-    if const_expr(POLL_SLEEP_UNITS > 1):
-        # the first POLL_ESCALATE retries one unit, the later ones the full
-        # backoff (``polling.POLL_ESCALATE``)
-        n = fx.Int32(0)
-        while pending(v):
-            if n < POLL_ESCALATE:
-                rocdl.s_sleep(1)
-            else:
-                rocdl.s_sleep(POLL_SLEEP_UNITS)
-            n = n + 1
-            v = load_all()
-    else:
-        while pending(v):
-            rocdl.s_sleep(POLL_SLEEP_UNITS)
-            v = load_all()
+    while pending(v):
+        rocdl.s_sleep(POLL_SLEEP_UNITS)
+        v = load_all()
     return v
 
 

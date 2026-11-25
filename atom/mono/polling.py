@@ -38,18 +38,7 @@ from atom.mono.polling_env import ENV, units
 # the V4 helpers' poll). Below COPY_SAFE beside concurrent KV copies, 1 and 4
 # hung and 8 hung once (above); `Config` warns once at startup.
 POLL_SLEEP_UNITS = units(os.environ.get(ENV))
-# A mailbox wait's first POLL_ESCALATE retries sleep one unit (s_sleep 1), only
-# its later ones POLL_SLEEP_UNITS: a step's waits end in a few retries, so the
-# backoff the copy hang asked for (``COPY_SAFE`` beside KV copies) spaces the
-# long waits alone, as the gfx1250 step's wait loop escalates its backoff past
-# BACKOFF_ROUNDS. At COPY_SAFE the TP8 layer kernel's TPOT is 2.5 .. 3.7% below
-# a fixed 16 (three nodes), within 0.6% of DEFAULT's. Reproducer (`--mode side
-# --repeats 1024`): on #3350's code, where 4 hung 2/2 (rounds 8 and 18), an
-# escalating 16 passed 16/16 and a fixed 16 13/13; on this code (since #3736's
-# sync rework) even 1 and 4 pass, so its passes (escalating 24/24) prove
-# nothing alone.
-POLL_ESCALATE = 32
 # `spin_pause` and the V4 helpers' poll: main had `s_nop 0` there
 MAIN_POLLING = POLL_SLEEP_UNITS == 1
 SPIN_PAUSE_ASM = "s_nop 0" if MAIN_POLLING else f"s_sleep {POLL_SLEEP_UNITS}"
-CACHE_TAG = f"poll_sleep_units={POLL_SLEEP_UNITS},escalate={POLL_ESCALATE}".encode()
+CACHE_TAG = f"poll_sleep_units={POLL_SLEEP_UNITS}".encode()
