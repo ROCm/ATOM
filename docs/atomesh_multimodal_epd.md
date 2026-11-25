@@ -599,7 +599,7 @@ mode.** *#3408 (declaration), #3409 (dispatch).*
 
 **D16. An E failure falls back to PD.** *#3409.* With no available encode
 worker, a failed selection, an E error, a non-success status, a timeout
-(the router's request timeout) or an answer without an
+(`--encode-timeout-secs`, default 30) or an answer without an
 `ec_transfer_params` object, ATOMesh logs a warning and sends the request
 to P without `ec_transfer_params`, and P encodes.
 - Basis: D12 keeps P's tower loaded. This is the easier choice to reverse.
