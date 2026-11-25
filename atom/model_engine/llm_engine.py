@@ -21,6 +21,7 @@ from atom.sampling_params import RequiredChannel, SamplingParams
 from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     WorkerGrammarPreflight,
+    require_available,
     validate_execution_options,
 )
 from atom.utils import envs
@@ -134,6 +135,7 @@ class LLMEngine:
     def prepare_structured_request(self, params, kv_transfer=None, multimodal=False):
         if not is_structured(params):
             return
+        require_available()
         validate_execution_options(
             self.config,
             params,
@@ -259,6 +261,16 @@ class LLMEngine:
 
     def is_finished(self):
         return not self.io_processor.has_pending_requests()
+
+    def reset_prefix_cache(self) -> bool:
+        """Drop all rank-local KV/prefix-cache state.
+
+        The collective is an engine implementation detail.  Exposing the
+        operation here keeps integrations from reaching through ``core_mgr``
+        or inventing their own worker RPC for a cache reset.
+        """
+        self.core_mgr.broadcast_utility_command_sync("clear_kv_cache")
+        return True
 
     def generate(
         self,

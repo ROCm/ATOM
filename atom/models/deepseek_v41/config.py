@@ -422,13 +422,15 @@ def validate_runtime_config(config):
             # restores PAGE bytes and rebuilds the state by replay. MoRI-IO and
             # in-process offload read SLOT codecs this runtime does not publish.
             # P/D with CPU offload composes one Mooncake leg and one offload tier.
+            # A shared UMBP L1 pool (`umbp_pool`) moves PAGEs and replays STATE,
+            # like the Store; it provides the pool, so it stands alone.
             (
-                "KV transfer other than lmcache_mp, mooncake_store or mooncake "
-                "(multi: mooncake plus one offload tier)"
+                "KV transfer other than lmcache_mp, mooncake_store, mooncake or "
+                "umbp_pool (multi: mooncake plus one offload tier)"
             ),
             names is None
             or any(
-                name not in ("lmcache_mp", "mooncake", "mooncake_store")
+                name not in ("lmcache_mp", "mooncake", "mooncake_store", "umbp_pool")
                 for name in names
             )
             or (
@@ -456,6 +458,13 @@ def validate_runtime_config(config):
             # copies state instead and the Store's PAGE-only load is unsound.
             "Mooncake Store without encoder SWA bounded replay",
             "mooncake_store" in (names or ())
+            and not config.enable_encoder_swa_bounded_replay,
+        ),
+        (
+            # Another rank's blocks carry PAGE only, like the Store's: a hit on
+            # one rebuilds its state by replay.
+            "a shared UMBP L1 pool without encoder SWA bounded replay",
+            "umbp_pool" in (names or ())
             and not config.enable_encoder_swa_bounded_replay,
         ),
         ("RapidServe", config.enable_rapidserve),

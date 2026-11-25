@@ -100,6 +100,7 @@ class MockConfig:
             "decode_context_parallel_size": 1,
             "pipeline_parallel_size": 1,
             "kv_transfer_config": {},
+            "state_transfer_slots": 0,
             "max_model_len": 64,
             "bos_token_id": 1,
             "eos_token_id": 2,
