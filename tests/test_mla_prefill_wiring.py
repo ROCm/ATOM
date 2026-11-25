@@ -180,21 +180,17 @@ def absorb():
     ]
     for node in nodes:
         node.decorator_list = []
-    support = next(
-        n
-        for n in _tree("atom/model_ops/triton_mla_absorb_qpack.py").body
-        if isinstance(n, ast.FunctionDef) and n.name == "mla_absorb_q_pack_supports"
-    )
     namespace = {
         "torch": torch,
         "dtypes": SimpleNamespace(fp8=torch.float8_e4m3fn),
         "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
-        "_BLOCK_N": 64,
     }
-    _run([support, *nodes], namespace)
+    _run(nodes, namespace)
     layer = SimpleNamespace(
         qrep_enabled=True,
         W_K_qrep_scale=None,
+        W_K_qrep=torch.empty(1, dtype=torch.bfloat16),
+        dtype=torch.bfloat16,
         kv_shuffled=False,
         qk_nope_head_dim=128,
         kv_lora_rank=512,
@@ -223,6 +219,8 @@ def absorb():
         ({"qk_nope_head_dim": 512}, False),
         ({"kv_lora_rank": 96}, False),
         ({"W_K_qrep_scale": object()}, False),
+        ({"W_K_qrep": torch.empty(1, dtype=torch.float16)}, False),
+        ({"model_dtype": torch.float16}, False),
         ({"qrep_enabled": False}, False),
     ],
 )
@@ -232,6 +230,7 @@ def test_absorb_fixed_gate_is_cached_and_live_cache_dtype_still_gates(
     layer, namespace = absorb
     change = dict(change)
     dtype = change.pop("dtype", torch.float8_e4m3fn)
+    layer.dtype = change.pop("model_dtype", torch.bfloat16)
     empty = change.pop("empty", False)
     namespace["_runs_on_gfx950"] = lambda: change.get("gfx", True)
     namespace["is_rocm_aiter_fp4bmm_enabled"] = lambda: change.get("fp4", False)
@@ -239,9 +238,6 @@ def test_absorb_fixed_gate_is_cached_and_live_cache_dtype_still_gates(
         if name not in ("gfx", "fp4"):
             setattr(layer, name, value)
     layer._configure_dcp_prefill_routes()
-    namespace["mla_absorb_q_pack_supports"] = lambda *a: pytest.fail(
-        "support repeated in forward"
-    )
     namespace["_runs_on_gfx950"] = lambda: pytest.fail(
         "architecture repeated in forward"
     )
@@ -296,17 +292,11 @@ def test_default_and_decode_steps_do_not_call_the_absorb_gate(qrep, prefill, cal
     assert bool(calls) is called and ns["absorb_into_q_out"] is called
 
 
-@pytest.mark.parametrize("kind", ["plan", "absorb"])
-def test_patch_wrappers_use_integer_launch_geometry_without_runtime_support_queries(
-    kind,
-):
-    path, name = (
-        ("atom/model_ops/sparse_mla_work_plan.py", "patch_work_kv_ranges")
-        if kind == "plan"
-        else ("atom/model_ops/triton_mla_absorb_qpack.py", "mla_absorb_q_pack")
-    )
+def test_patch_work_ranges_uses_integer_launch_geometry():
     fn = next(
-        n for n in _tree(path).body if isinstance(n, ast.FunctionDef) and n.name == name
+        n
+        for n in _tree("atom/model_ops/sparse_mla_work_plan.py").body
+        if isinstance(n, ast.FunctionDef) and n.name == "patch_work_kv_ranges"
     )
     grids = []
 
@@ -321,26 +311,57 @@ def test_patch_wrappers_use_integer_launch_geometry_without_runtime_support_quer
     ns = {
         "torch": torch,
         "triton": SimpleNamespace(cdiv=repeated),
-        "mla_absorb_q_pack_supports": repeated,
         "BLOCK": 256,
-        "_BLOCK_N": 64,
         "_patch_work_kv_ranges": Kernel(),
-        "_mla_absorb_q_pack_kernel": Kernel(),
     }
     _run([fn], ns)
-    if kind == "plan":
-        ns[name](
-            torch.zeros(257, 8, dtype=torch.int32),
-            torch.zeros(2, dtype=torch.int32),
-            torch.zeros(258, dtype=torch.int32),
-            257,
-        )
-        assert grids == [(2,)]
-    else:
-        ns[name](
-            torch.zeros(2, 257, 128, dtype=torch.bfloat16),
-            torch.zeros(2, 64, 128, dtype=torch.bfloat16),
-            torch.empty(257, 2, 128, dtype=torch.float8_e4m3fn),
-            torch.ones(1),
-        )
-        assert grids == [(3, 2)]
+    ns["patch_work_kv_ranges"](
+        torch.zeros(257, 8, dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32),
+        torch.zeros(258, dtype=torch.int32),
+        257,
+    )
+    assert grids == [(2,)]
+
+
+@pytest.mark.parametrize("tokens", [0, 33])
+@pytest.mark.parametrize("storage_heads", [96, 128])
+def test_prefill_binds_aiter_nope_writer_to_real_head_output(tokens, storage_heads):
+    calls = [
+        n
+        for n in ast.walk(_tree("atom/model_ops/attention_mla.py"))
+        if isinstance(n, ast.Expr)
+        and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Name)
+        and n.value.func.id == "fused_bf16_bmm_cat_quant_pad_mla"
+    ]
+    assert len(calls) == 1
+    query = torch.empty(tokens, 96, 192, dtype=torch.bfloat16)
+    q_nope = query[..., :128]
+    weight = torch.empty(96, 512, 128, dtype=torch.bfloat16)
+    output = torch.empty(tokens, storage_heads, 576, dtype=torch.float8_e4m3fn)
+    real_output = output[:, :96]
+    scale = torch.tensor([0.37])
+    observed = []
+
+    def absorb(q, w, rope, q_scale, *, out):
+        assert q.shape == (96, tokens, 128)
+        assert q.stride() == q_nope.transpose(0, 1).stride()
+        assert q.data_ptr() == q_nope.data_ptr()
+        assert w.shape == (96, 128, 512)
+        assert w.stride() == (65536, 1, 128)
+        assert w.data_ptr() == weight.data_ptr()
+        assert rope is None and q_scale is scale
+        assert out is real_output and out.shape == (tokens, 96, 576)
+        observed.append(out)
+
+    _run(
+        calls,
+        {
+            "fused_bf16_bmm_cat_quant_pad_mla": absorb,
+            "q_nope": q_nope,
+            "q_out_write": real_output,
+            "self": SimpleNamespace(W_K_qrep=weight, _q_scale=scale),
+        },
+    )
+    assert observed == [real_output]

@@ -35,6 +35,9 @@ from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_ra
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.attention import get_mla_decode_shape_support
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
+from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
+    fused_bf16_bmm_cat_quant_pad_mla,
+)
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
 )
@@ -83,10 +86,6 @@ from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
     fused_qkv_per_tensor_quant,
-)
-from atom.model_ops.triton_mla_absorb_qpack import (
-    mla_absorb_q_pack,
-    mla_absorb_q_pack_supports,
 )
 from atom.model_ops.utils import (
     dynamic_per_batched_tensor_quant,
@@ -223,8 +222,10 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
         prefix="rope_and_kv_cache",
         torch_compile=False,
     )
-mla_absorb_q_pack = mark_trace(
-    mla_absorb_q_pack, prefix="k_up_proj_q_pack", torch_compile=False
+fused_bf16_bmm_cat_quant_pad_mla = mark_trace(
+    fused_bf16_bmm_cat_quant_pad_mla,
+    prefix="k_up_proj_q_pack",
+    torch_compile=False,
 )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
@@ -1533,13 +1534,18 @@ class MLAAttention(nn.Module):
 
     def _configure_dcp_prefill_routes(self):
         """Bind fixed projection/absorb choices after weights and scales exist."""
+        # Keep the existing prefill shape restrictions with AITER's NoPE writer.
         self._absorb_q_pack_enabled = (
             not is_rocm_aiter_fp4bmm_enabled()
             and self.qrep_enabled
             and self.W_K_qrep_scale is None
+            and self.dtype == torch.bfloat16
+            and self.W_K_qrep.dtype == torch.bfloat16
             and not self.kv_shuffled
             and _runs_on_gfx950()
-            and mla_absorb_q_pack_supports(self.qk_nope_head_dim, self.kv_lora_rank)
+            and self.qk_nope_head_dim == triton.next_power_of_2(self.qk_nope_head_dim)
+            and self.qk_nope_head_dim <= 256
+            and self.kv_lora_rank % 64 == 0
         )
         head_major = (
             self.pbm_enabled
@@ -3673,11 +3679,12 @@ class MLAAttention(nn.Module):
                         compute_all_q_rope=self.dcp_world_size > 1,
                     )
                     if absorb_into_q_out:
-                        mla_absorb_q_pack(
+                        fused_bf16_bmm_cat_quant_pad_mla(
                             q_nope.transpose(0, 1),
-                            self.W_K_qrep,
-                            q_out_write,
+                            self.W_K_qrep.transpose(1, 2),
+                            None,
                             self._q_scale,
+                            out=q_out_write,
                         )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 

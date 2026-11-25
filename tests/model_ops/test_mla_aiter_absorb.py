@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 from types import SimpleNamespace
 
 import pytest
@@ -8,10 +10,12 @@ if not torch.version.hip or not torch.cuda.is_available():
     pytest.skip("requires a ROCm GPU", allow_module_level=True)
 
 from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
+from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
+    fused_bf16_bmm_cat_quant_pad_mla,
+)
 
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
-from atom.model_ops.triton_mla_absorb_qpack import mla_absorb_q_pack
 
 # Kimi-K3.1 DSA prefill under QREP: 96 replicated heads, 128 nope, 64 rope,
 # 512 latent.
@@ -46,7 +50,7 @@ def _pack(q_nope, q_pe, k_nope, k_pe, q_out, kv_cache, slots, rope, q_scale):
 
 @pytest.mark.parametrize("q_scale", [1.0, 2.0**-10])
 @pytest.mark.parametrize("tokens", [77, 16384])
-def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
+def test_aiter_absorb_preserves_native_pack_tails_and_cache(tokens, q_scale):
     torch.manual_seed(tokens)
     q = torch.randn(tokens, HEADS * (NOPE + PE), device="cuda", dtype=torch.bfloat16)
     w_k = 0.05 * torch.randn(HEADS, LORA, NOPE, device="cuda", dtype=torch.bfloat16)
@@ -89,7 +93,9 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     new_q, new_kv = buffers()
     stand_in = q_pe.new_empty(LORA).expand(tokens, HEADS, -1)
     _pack(stand_in, q_pe, k_nope, k_pe, new_q, new_kv, slots, rope, scale)
-    mla_absorb_q_pack(q_nope.transpose(0, 1), w_k, new_q, scale)
+    fused_bf16_bmm_cat_quant_pad_mla(
+        q_nope.transpose(0, 1), w_k.transpose(1, 2), None, scale, out=new_q
+    )
 
     torch.testing.assert_close(new_kv.view(torch.uint8), ref_kv.view(torch.uint8))
     torch.testing.assert_close(
@@ -100,14 +106,7 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     assert not new_q[..., :LORA].float().isnan().any(), "nope half stores an FP8 NaN"
     steps = (_ordinal(new_q[..., :LORA]) - _ordinal(ref_q[..., :LORA])).abs()
     assert steps.max().item() <= 1, f"nope half off by {steps.max().item()} e4m3 steps"
-    # Rounding alone moves about 3% of codes one step; a systematic error
-    # under one step moves far more.
+    # Bound each head separately so a systematically wrong head cannot hide
+    # in an average over all heads.
     share = (steps == 1).float().mean(dim=(0, 2))
     assert torch.all(share < 0.06), f"per-head one-step shares: {share.tolist()}"
-
-
-# GLM-5.x has 192 nope dims, which the absorb kernel does not compile for, and
-# 512 overruns gfx950's shared memory. The kernel has not run on gfx942.
-
-
-# L=96 would store its second 64-column block over half the rope columns.
