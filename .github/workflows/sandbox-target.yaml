@@ -1,0 +1,22 @@
+name: Sandbox Target
+
+# CI evaluator design sandbox (ci-sandbox/* only; not for main). Logs which
+# pull_request_target events reach a PR based on a sandbox branch.
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log event
+        env:
+          ACTION: ${{ github.event.action }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          ACTOR: ${{ github.actor }}
+          CHANGES: ${{ toJSON(github.event.changes) }}
+        run: printf 'action=%s base=%s actor=%s\nchanges=%s\n' "${ACTION}" "${BASE}" "${ACTOR}" "${CHANGES}"
