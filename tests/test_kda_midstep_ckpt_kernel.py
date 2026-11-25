@@ -6,8 +6,9 @@
 One launch per layer writes every checkpoint of a step: an interior target's
 state from its row of FlashKDA's `snapshot_out` (`h_rows`), an end target's
 from the runtime slot, and each one's conv window from the step's conv input.
-The pool's speculation-rollback columns are left as they were. GDN's use of
-the same kernel, from a chunk kernel's per-chunk states, is checked alongside.
+The pool's speculation-rollback columns are left as they were. (GDN's use of
+the same kernel, from a chunk kernel's per-chunk states, is
+test_gdn_midstep_state_gpu.py's.)
 
 The writer is loaded from its file: importing it through `atom.model_ops.fla_ops`
 would pull in AITER. On a GPU the checks run in-process; on the CPU, under
@@ -111,38 +112,11 @@ def check_an_end_target_alone(write, device):
     assert torch.equal(conv[4, :, :CONV_LEN], mixed_qkv[61:64].T)
 
 
-def check_gdn_chunk_states(write, device):
-    """GDN's path, unchanged: target i reads h[chunk_offsets[row] + off // 64]."""
-    ssm, conv = _pools(False, device)
-    h = torch.randn(1, 6, H, V, K).to(device)
-    x = torch.randn(200, D).to(device)
-    i32 = {"dtype": torch.int32, "device": device}
-    write(
-        h,
-        ssm,
-        x,
-        conv,
-        torch.tensor([0, 1], **i32),
-        torch.tensor([4, 5], **i32),
-        torch.tensor([64, 64], **i32),
-        torch.tensor([0, 0], **i32),
-        torch.tensor([1, 2], **i32),
-        torch.tensor([0, 2, 6], **i32),
-        torch.tensor([0, 128, 200], **i32),
-        64,
-        CONV_LEN,
-    )
-    assert torch.equal(ssm[4], h[0, 1])
-    assert torch.equal(ssm[5], h[0, 3])
-    assert torch.equal(conv[5, :, :CONV_LEN], x[128 + 61 : 128 + 64].T)
-
-
 def run_all_checks(device):
     write = load_writer()
     for conv_transposed in (False, True):
         check_interior_and_end_targets(write, device, conv_transposed)
     check_an_end_target_alone(write, device)
-    check_gdn_chunk_states(write, device)
 
 
 def test_the_writer_passes_every_check_under_the_triton_interpreter():
@@ -181,8 +155,3 @@ def test_one_launch_writes_interior_and_end_targets(conv_transposed):
 @GPU
 def test_an_end_target_alone_needs_no_snapshot():
     check_an_end_target_alone(load_writer(), "cuda")
-
-
-@GPU
-def test_gdn_chunk_states_still_read_by_chunk():
-    check_gdn_chunk_states(load_writer(), "cuda")

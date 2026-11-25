@@ -8,13 +8,16 @@ test_gdn_midstep_checkpoints.py pins that for any readable backend. What is
 Kimi-K3's own lives in `atom.models.kimi_k3.midstep`, which imports no AITER,
 so it is pinned here on the CPU:
 
-  * the switch, off by default, and its refusal under pipeline parallelism;
+  * the switch, off by default (its refusal under pipeline parallelism is in
+    test_kda_layout_id.py, at the builder that makes it);
   * the transfer it declares: readable, on FlashKDA's 32-token grid, at least
     `conv_kernel - 1` tokens into the forward;
   * the targets one prefill step yields -- several per forward, rows that hold
-    no state, an end-of-forward position;
-  * how a KDA layer writes them: an interior snapshot and its conv window into
-    the scratch slot, an end position copied whole from the runtime slot.
+    no state, an end-of-forward position.
+
+How a KDA layer writes them is pinned where it happens: the builder and the
+layer in test_kimi_k3_midstep_wiring.py, the kernel in
+test_kda_midstep_ckpt_kernel.py.
 """
 
 import pytest
@@ -36,7 +39,6 @@ from atom.models.kimi_k3.midstep import (
     kda_midstep_enabled,
     kda_midstep_transfer,
     kda_snapshots,
-    refuse_midstep_under_pipeline,
 )
 from atom.utils import envs
 
@@ -108,23 +110,29 @@ def saves_of(seq):
     return [(slot, pos) for slot, pos, _h in seq.midstep_reservations]
 
 
+def snaps_of(saves, scheduled, *, rows=(0,), cached=(0,), runtime=(1,)):
+    """`kda_snapshots` for one step, as the builder calls it."""
+    return kda_snapshots(
+        saves,
+        list(rows),
+        list(cached),
+        list(scheduled),
+        list(runtime),
+        num_slots=8,
+        grid=GRID,
+        conv_len=CONV_LEN,
+        device="cpu",
+    )
+
+
 # ── the switch and the transfer ──────────────────────────────────────────────
 
 
-def test_the_switch_is_off_by_default():
+def test_the_switch_is_off_unless_its_env_is_1(monkeypatch):
     assert envs.ATOM_K3_KDA_STATE_MIDSTEP is False
     assert kda_midstep_enabled() is False
-
-
-def test_the_switch_reads_its_env(monkeypatch):
     monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
     assert kda_midstep_enabled() is True
-
-
-def test_the_switch_is_refused_under_pipeline_parallelism():
-    refuse_midstep_under_pipeline(1)
-    with pytest.raises(RuntimeError, match=r"pipeline_parallel_size=2\)"):
-        refuse_midstep_under_pipeline(2)
 
 
 def test_the_transfer_reads_midstep_on_the_flash_kda_grid():
@@ -171,16 +179,12 @@ def test_one_scheduler_pass(on, monkeypatch):
     assert n == len(PROMPT)
     ((slot, pos),) = batch.state_save_all[0]
     assert pos == ANCHOR // GRID * GRID
-    snaps = kda_snapshots(
+    snaps = snaps_of(
         batch.state_save_all,
-        batch.state_rows,
-        batch.num_cached_tokens,
         batch.num_scheduled_tokens,
-        batch.state_slots_committed,
-        num_slots=8,
-        grid=GRID,
-        conv_len=CONV_LEN,
-        device="cpu",
+        rows=batch.state_rows,
+        cached=batch.num_cached_tokens,
+        runtime=batch.state_slots_committed,
     )
     assert snaps.targets == ((0, pos),)
     assert snaps.slots.tolist() == [slot]
@@ -202,17 +206,7 @@ def test_several_positions_in_one_forward_become_several_targets():
     bm.plan_midstep(seq, 0, 100)
     saves = saves_of(seq)
     assert [pos for _slot, pos in saves] == [32, 96]
-    snaps = kda_snapshots(
-        [saves],
-        [0],
-        [0],
-        [100],
-        [seq.state_slot],
-        num_slots=8,
-        grid=GRID,
-        conv_len=CONV_LEN,
-        device="cpu",
-    )
+    snaps = snaps_of([saves], [100], runtime=[seq.state_slot])
     assert snaps.targets == ((0, 32), (0, 96))
     assert snaps.slots.tolist() == [slot for slot, _pos in saves]
     assert seq.state_slot not in snaps.slots.tolist()
@@ -229,17 +223,7 @@ def test_an_interior_and_an_end_position_in_one_forward():
     bm.plan_midstep(seq, 0, ANCHOR)
     saves = saves_of(seq)
     assert [pos for _slot, pos in saves] == [32, ANCHOR]
-    snaps = kda_snapshots(
-        [saves],
-        [0],
-        [0],
-        [ANCHOR],
-        [seq.state_slot],
-        num_slots=8,
-        grid=GRID,
-        conv_len=CONV_LEN,
-        device="cpu",
-    )
+    snaps = snaps_of([saves], [ANCHOR], runtime=[seq.state_slot])
     assert snaps.targets == ((0, 32),)
     assert snaps.slots.tolist() == [slot for slot, _pos in saves]
     assert snaps.offs.tolist() == [32, ANCHOR]
@@ -251,16 +235,8 @@ def test_targets_follow_the_batch_row_of_each_state_holding_seq():
     """Row 1 holds no state, so the second save list is row 2's, and its conv
     window sits after rows 0 and 1 in the step's flat token layout. Positions
     are absolute; row 2 resumes at 64, so its 96 is 32 tokens into the step."""
-    snaps = kda_snapshots(
-        [[], [(5, 96)]],
-        state_rows=[0, 2],
-        num_cached_tokens=[0, 0, 64],
-        num_scheduled_tokens=[40, 10, 64],
-        runtime_slots=[1, 2],
-        num_slots=8,
-        grid=GRID,
-        conv_len=CONV_LEN,
-        device="cpu",
+    snaps = snaps_of(
+        [[], [(5, 96)]], [40, 10, 64], rows=[0, 2], cached=[0, 0, 64], runtime=[1, 2]
     )
     assert snaps.targets == ((2, 32),)
     assert snaps.slots.tolist() == [5] and snaps.runtime_slots.tolist() == [2]
@@ -269,25 +245,14 @@ def test_targets_follow_the_batch_row_of_each_state_holding_seq():
 
 
 def test_a_step_without_saves_builds_nothing():
-    kw = {"num_slots": 8, "grid": GRID, "conv_len": CONV_LEN, "device": "cpu"}
-    assert kda_snapshots(None, [0], [0], [64], [1], **kw) is None
-    assert kda_snapshots([[]], [0], [0], [64], [1], **kw) is None
+    assert snaps_of(None, [64]) is None
+    assert snaps_of([[]], [64]) is None
 
 
 def test_a_position_off_the_grid_is_an_error_not_a_skip():
     """The scheduler publishes every reserved hash after the forward."""
     with pytest.raises(RuntimeError, match="not writable"):
-        kda_snapshots(
-            [[(5, 40)]],
-            [0],
-            [0],
-            [64],
-            [1],
-            num_slots=8,
-            grid=GRID,
-            conv_len=CONV_LEN,
-            device="cpu",
-        )
+        snaps_of([[(5, 40)]], [64])
 
 
 def test_a_full_state_pool_drops_the_checkpoint():
@@ -314,77 +279,12 @@ def test_every_position_without_a_scratch_slot_is_counted():
     assert bm.paged_state_checkpoints.checkpoints_dropped == 2
 
 
-# ── how a KDA layer writes them ──────────────────────────────────────────────
-#
-# One `write_state_checkpoints` launch per layer (the kernel itself is pinned
-# in test_kda_midstep_ckpt_kernel.py, which needs Triton).
-
-
-def test_interior_and_end_targets_share_one_launch():
-    """Interior targets first, in aiter's snapshot order, each reading its row
-    of `snapshot_out`; the anchor at the forward's end reads the runtime slot."""
-    snaps = kda_snapshots(
-        [[(4, 32), (5, 64), (6, 96)]],
-        [0],
-        [0],
-        [96],
-        [1],
-        num_slots=8,
-        grid=GRID,
-        conv_len=CONV_LEN,
-        device="cpu",
-    )
-    assert snaps.targets == ((0, 32), (0, 64))
-    assert snaps.slots.tolist() == [4, 5, 6]
-    assert snaps.offs.tolist() == [32, 64, 96]
-    assert snaps.is_end.tolist() == [0, 0, 1]
-    assert snaps.h_rows.tolist()[:2] == [0, 1]
-    assert snaps.runtime_slots.tolist() == [1, 1, 1]
-    ssm, conv = torch.zeros(8, 2, 4, 4), torch.zeros(8, 5, CONV_LEN + 2)
-    snap_out, mixed_qkv = torch.zeros(2, 2, 4, 4), torch.zeros(96, 5)
-    args = snaps.checkpoint_args(snap_out, ssm, mixed_qkv, conv)
-    assert args["h"] is snap_out and args["h_rows"] is snaps.h_rows
-    assert args["ssm_state"] is ssm and args["conv_state"] is conv
-    assert args["x"] is mixed_qkv and args["cu_seqlens"] is snaps.cu_seqlens
-    assert args["conv_state_len"] == CONV_LEN
-
-
 def test_a_snapshot_buffer_strided_unlike_the_pool_is_refused():
     """The writer reads row i of `snap_out` at i times the pool's slot stride."""
-    snaps = kda_snapshots(
-        [[(4, 32), (5, 96)]],
-        [0],
-        [0],
-        [96],
-        [1],
-        num_slots=8,
-        grid=GRID,
-        conv_len=CONV_LEN,
-        device="cpu",
-    )
+    snaps = snaps_of([[(4, 32), (5, 96)]], [96])
     padded = torch.zeros(8 * 36).as_strided((8, 2, 4, 4), (36, 16, 4, 1))
     snap_out = torch.zeros(len(snaps.targets), 2, 4, 4)
     with pytest.raises(ValueError, match="as far apart as the slots"):
         snaps.checkpoint_args(
             snap_out, padded, torch.zeros(96, 5), torch.zeros(8, 5, CONV_LEN)
         )
-
-
-def test_an_end_position_alone_reads_the_pool():
-    snaps = kda_snapshots(
-        [[(4, 64)]],
-        [0],
-        [0],
-        [64],
-        [1],
-        num_slots=6,
-        grid=GRID,
-        conv_len=CONV_LEN,
-        device="cpu",
-    )
-    assert snaps.targets == () and snaps.is_end.tolist() == [1]
-    ssm = torch.zeros(6, 2, 4, 4)
-    args = snaps.checkpoint_args(
-        None, ssm, torch.zeros(64, 5), torch.zeros(6, 5, CONV_LEN)
-    )
-    assert args["h"] is ssm

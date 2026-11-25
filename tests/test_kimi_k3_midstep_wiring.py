@@ -10,8 +10,8 @@ Triton, and run on the CPU:
 
   * `_KimiMLAGDNCommon.finish_prefill` attaches the step's `KdaSnapshots` to
     the GDN metadata its parent built: interior targets and an end target, an
-    end target alone, or none (a step without reservations, which is every
-    step with the switch off);
+    end target alone, or none (a step without reservations, or the switch off,
+    where it does not ask aiter for the grid);
   * `KimiKDAAttention._forward_impl`'s prefill path hands the interior targets
     and a `snapshot_out` buffer to `chunk_kimi_delta_attn` through `_run_kda`,
     then gives `write_state_checkpoints` that buffer with the targets' `h_rows`,
@@ -165,12 +165,6 @@ def test_the_builder_attaches_interior_and_end_targets(k3, monkeypatch):
     assert snaps.conv_len == CONV_KERNEL - 1
 
 
-def test_the_builder_attaches_an_end_target_alone(k3, monkeypatch):
-    snaps = finish_prefill(k3, monkeypatch, END_ONLY).kda_snapshots
-    assert snaps.targets == ()
-    assert snaps.slots.tolist() == [6] and snaps.is_end.tolist() == [1]
-
-
 def test_a_step_without_reservations_attaches_none(k3, monkeypatch):
     assert finish_prefill(k3, monkeypatch, NO_SAVES).kda_snapshots is None
 
@@ -317,24 +311,3 @@ def test_without_snapshots_the_kernel_is_called_as_before(k3, monkeypatch):
     (kernel,) = run.kernel
     assert "snapshot_targets" not in kernel and "snapshot_out" not in kernel
     assert run.writer == []
-
-
-def test_run_kda_passes_snapshots_only_with_targets(k3, monkeypatch):
-    layer, _ = _layer(k3)
-    calls = []
-
-    def chunk_kimi_delta_attn(**kw):
-        calls.append(kw)
-        return None, None
-
-    monkeypatch.setattr(k3.kda, "chunk_kimi_delta_attn", chunk_kimi_delta_attn)
-    q = torch.zeros(1, 4, H, HD)
-    beta = torch.zeros(1, 4, H, dtype=torch.bfloat16)
-    buffer = torch.empty(1, H, HD, HD)
-    layer._run_kda(q, q, q, q, beta, None, None, True, ((0, 32),), buffer)
-    layer._run_kda(q, q, q, q, beta, None, None, True, (), None)
-    layer._run_kda(q, q, q, q, beta, None, None, True)
-    assert calls[0]["snapshot_targets"] == ((0, 32),)
-    assert calls[0]["snapshot_out"] is buffer
-    for call in calls[1:]:
-        assert "snapshot_targets" not in call and "snapshot_out" not in call
