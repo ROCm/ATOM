@@ -8,12 +8,14 @@ from atom.models.minimax_m3.mono import layout
 from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
+    INTER,
     LOCAL_Q_HEADS,
     MAX_TOKENS,
     TOP_K,
     IndexHeads,
 )
 from atom.mono.plan.execution import BLOCKS
+from atom.mono.plan.preshuffle import w8_offset
 
 TOKEN_COUNTS = range(1, MAX_TOKENS + 1)
 
@@ -92,3 +94,14 @@ def test_index_heads_locate_the_fused_projection_segments(count, own):
 def test_index_heads_reject_other_head_sets(count, own):
     with pytest.raises(AssertionError):
         IndexHeads(count, own)
+
+
+def test_mxfp8_tile_dword_is_w8_offset():
+    # mxfp8_tile_dword is w8_offset's (16, 16) preshuffle: lane group g's
+    # first 16 B at chunk kc is element (row, 128 kc + 16 g)
+    for cols in (HIDDEN, INTER):
+        for row in range(64):
+            for kc in range(cols // 128):
+                for g in range(4):
+                    at = w8_offset(row - row % 16, row % 16, 128 * kc + 16 * g, cols)
+                    assert 4 * layout.mxfp8_tile_dword(row, cols, kc, g) == at

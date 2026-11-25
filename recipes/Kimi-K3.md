@@ -6,7 +6,7 @@ This guide targets **AMD MI355 (gfx950) only**, `-tp 8`.
 
 | Variant | Quantization | Description |
 |---------|-------------|-------------|
-| **MXFP4** | MXFP4 (w4a4, e8m0 scales, group_size=32) | Routed MoE expert weights in microscale FP4. On gfx950 the SiTU experts run the FlyDSL **native SiTUv2** grouped-MoE path. Attention, shared experts, and dense MLP remain BF16. |
+| **MXFP4** | MXFP4 (w4a4, e8m0 scales, group_size=32) | Routed MoE expert weights in microscale FP4. On gfx950 the SiTU experts run the FlyDSL **native SiTUv2** grouped-MoE path. Attention, shared experts, and dense MLP are BF16 in the checkpoint; the launch below quantizes them online to per-token FP8 (`ptpc_fp8`). |
 
 **Validated (full 1319, GSM8K 5-shot, base completions, tp8, seed 42):**
 
@@ -66,15 +66,12 @@ context parallelism are all served:
 - `ATOM_ENABLE_REPLAYSSM` (default ON whenever spec decode is used) is served:
   K1 rebuilds a request's state from its checkpoint and the committed (k, u, g)
   records, and writes records instead of per-token states.
-- **Five projections must stay out of the online quant.** The kernels read
-  them as plain BF16 (`kimi_k3/mono/weights.py`, five `_plain_bf16` call
-  sites): `self_attn.in_proj`, `self_attn.f_b_proj`, `self_attn.o_proj`, and
-  the shared experts' `gate_up_proj` and `down_proj`. The baseline
-  `exclude_layer` list above covers none of them, and
-  `*block_sparse_moe.experts*` does **not** match `shared_experts`. Miss any
-  one and mono refuses the whole model -- the server answers correctly on the
-  production path and says so once, e.g. `mono decode off: layer 1 shared
-  gate_up_proj is torch.float8_e4m3fn`.
+- The dense projections (`self_attn.in_proj`, `f_b_proj`, `o_proj` and the
+  shared experts) are read as the launch above leaves them, per-token FP8, or
+  as BF16 where a deployment excludes them from the quant; mono needs no
+  `exclude_layer` entry. Per layer, `in_proj` and `f_b_proj` must share one
+  format, as must `o_proj` and both shared-expert projections: a KDA layer
+  that mixes them turns mono off, an MLA layer keeps its production K2.
 
 With a drafter:
 
@@ -100,13 +97,8 @@ Add these to the launch command:
 Seven draft tokens make one request exactly 8 rows. The buffers hold 64 rows
 (`atom/models/kimi_k3/mono/config.py:MAX_ROWS`; past 16, 16-row token groups),
 so `--max-num-seqs 8` keeps every verify step on the kernels; every number
-below was measured at 7.
-
-Add these to the launch's `exclude_layer` list:
-
-```
-"*self_attn.in_proj*", "*self_attn.f_b_proj*", "*self_attn.o_proj*", "*shared_experts*"
-```
+below was measured at 7, and with the five dense projections in BF16 (excluded
+from the quant), not the per-token FP8 the launch above gives them.
 
 The server log says which way it went -- `Kimi-K3 mono decode armed (TP8)`, or
 `Kimi-K3 mono decode off: <why>` naming the first condition that failed. Read
@@ -146,8 +138,8 @@ the MLA layers:
   8-row cap (paired z = +2.4); MLA K2 against the 8-row control was +0.0038
   (z = +0.6). Neither run showed a regression; the second is not distinguishable
   from no change.
-- An MLA layer whose K2 cannot bind (for example a quantized `o_proj`; the
-  `exclude_layer` list above keeps `o_proj` bf16) stays on the production K2
+- An MLA layer whose K2 cannot bind (for example an `o_proj` quantized other
+  than per-token FP8) stays on the production K2
   alone and logs `Kimi-K3 mono: layer N keeps its production K2`; the other
   layers keep mono. A KDA layer that cannot bind still turns the whole runner
   off, as before.

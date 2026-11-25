@@ -7,20 +7,21 @@
 """K2b ``moe``: one Kimi-K3 latent-MoE layer, from the MoE input row x to the
 layer's output, every TP reduction inside the kernel.
 
-One launch a layer and rank, ``BLOCKS`` x ``THREADS``, up to ``MAX_ROWS``
-rows: the MFMA's B operand holds 16 token rows, so past 16 the GEMVs after
-lnorm and the final reduce run a token group at a time (``group_view``). The original path (vLLM ROCm, see MOE_SPEC.md) replicates the
-router and the latent down projection on every rank; here each rank computes
-its eighth and the rows are all-gathered over the peer buffer.
+Stages ``layer.build`` places in K2's launch, up to ``MAX_ROWS`` rows: the
+MFMA's B operand holds 16 token rows, so past 16 the GEMVs after lnorm and the
+final reduce run a token group at a time (``group_view``). The original path
+(vLLM ROCm) replicates the router and the latent down projection on every
+rank; here each rank computes its eighth and the rows are all-gathered over
+the peer buffer.
 
-    early (CTAs 0 .. 130, one task each, x from the input row; weights first):
+    early (one task each, x the row K2a's AttnRes publishes; weights first):
       router  (7 x 16 rows of this rank's 112 experts): fp32 logits -> every
               rank's RLOG
       latent  (28 x 16 rows of this rank's 448): bf16, quantized once a
               32-column block (two row groups) to MXFP4 as aiter's inline
               quant -> every rank's LATQ / LATSC
       sgu     (96 x 16 rows of the shared gate | up): bf16 -> SGU
-    route   (S, CTAs 131 ..): sigmoid (v_rcp), + bias, top-16, the pre-bias
+    route   (S): sigmoid (v_rcp), + bias, top-16, the pre-bias
             sigmoids renormalized (IEEE 1 / sum) -> ROUTE (every rank alike)
     sdown   (448 x 16 rows, K 768): SiTU of SGU (vLLM's kernel) -> bf16 ->
             GEMV -> bf16 partial; this rank's up columns -> SHP (plain, SHRDY
@@ -45,20 +46,16 @@ zeroed and peer-fenced (``StepMailboxes.begin_step``).
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, T, as_ir_value
+from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.kimi_k3.mono.config import group_rows, groups
 from atom.models.kimi_k3.mono.kernels import token_groups
-from atom.models.kimi_k3.mono.kernels.attention.kda import (
-    _SOURCES,
-    TG,
-)
+from atom.models.kimi_k3.mono.kernels.attention.kda import TG
 from atom.mono.device import gemv, queue, route
 from atom.mono.device.mx import (
     FP4,
@@ -79,9 +76,7 @@ from atom.mono.device.ops import (
     hw_exp2,
     hw_rcp,
     hw_rsq,
-    kernel_symbol,
     ld_f32,
-    load_ptr64,
     popcount,
     row_sum,
     rsrc,
@@ -90,7 +85,7 @@ from atom.mono.device.ops import (
     uniform,
     wave_sum,
 )
-from atom.mono.device.ranks import peer_bases, sum_partials
+from atom.mono.device.ranks import sum_partials
 from atom.mono.device.select import (
     BATCH,
     count_beaten,
@@ -100,13 +95,10 @@ from atom.mono.device.select import (
     wave_floor,
     wave_kth,
 )
-from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import Mailbox, preg, publish, sreg
-from atom.mono.plan.build_key import key_tuple, symbol_params
+from atom.mono.device.stamps import stamp
+from atom.mono.device.sync import publish
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.layout import PAIR_BYTES, byte_layout, pair_layout
-from atom.mono.runtime.abi import KernelAbi
-from atom.mono.runtime.debug import region_ids
 
 REGIONS = (
     "sgu",
@@ -148,9 +140,6 @@ L_PARTS = 2  # K halves: the latent is on the path to ug
 R_TASKS = R_GROUPS * R_PARTS  # 28
 L_TASKS = L_GROUPS * L_PARTS  # 56
 G_TASKS = 2 * SI // ROWS  # 96
-EARLY = R_TASKS + L_TASKS + G_TASKS  # 180
-LATE0 = EARLY  # route from here
-H_CTA = LATE0 + 8  # the shared experts' SiTU (standalone: route takes LATE0 ..)
 SD_TASKS = HIDDEN // ROWS  # 448
 UP_N = HIDDEN // TP  # 896 columns a rank up-projects
 UP_TASKS = UP_N // ROWS  # 56
@@ -235,51 +224,12 @@ def group_row(src, t, s):
     return g * TP * TG + src * rows + t % TG
 
 
-TL_POINTS = 8  # start, early, sdown, ug, down, lnorm, up, reduce
-
-_STREAM = fx.Stream(None)
-
-
 @dataclass(frozen=True)
 class MoeBuild:
-    # ``sym``: the field's short name in the kernel symbol (``symbol_params``)
-    tokens: int = field(metadata={"sym": "s"})
-    eps: float = 1e-5  # the latent RMSNorm
-    # the final reduce in this launch (standalone)
-    reduce: bool = field(default=True, metadata={"sym": "r"})
-    timeline: bool = field(default=False, metadata={"sym": "t"})
-    # bounded waits recording into ``diag`` (debug)
-    diag: bool = field(default=False, metadata={"sym": "g"})
-    # debug: run phases < stop only (1 early, 2 route/sdown, 3 ug, 4 down,
-    # 5 lnorm, 6 up)
-    stop: int = field(default=99, metadata={"sym": "st"})
+    """The step's shape ``scratch_layout`` / ``plain_layout`` size K2b's
+    regions for."""
 
-
-ABI = KernelAbi(
-    (
-        "x",
-        "w_gate",
-        "bias",
-        "w_ld",
-        "w_sgu",
-        "w_sd",
-        "w13",
-        "w13s",
-        "w2",
-        "w2s",
-        "ln_w",
-        "w_up",
-        "out",
-        "scratch",
-        "plain",
-        "queue",
-        "peers",
-        "rank",
-        "layer",
-        "diag",
-        "tl",
-    )
-)
+    tokens: int
 
 
 def peer_pairs(s):
@@ -302,15 +252,6 @@ def peer_pairs(s):
     }
 
 
-def peer_layout(s):
-    return pair_layout(peer_pairs(s).items())
-
-
-def peer_bytes(s):
-    lay = peer_layout(s)
-    return max(o + n for o, n in lay.values())
-
-
 def scratch_layout(key: MoeBuild) -> dict:
     s = key.tokens
     pairs = {
@@ -327,10 +268,6 @@ def scratch_layout(key: MoeBuild) -> dict:
     return pair_layout(pairs.items())
 
 
-def scratch_bytes(key: MoeBuild) -> int:
-    return max(o + n for o, n in scratch_layout(key).values())
-
-
 def plain_layout(key: MoeBuild) -> dict:
     """The plain words, in the step's ``plain`` buffer (``byte_layout``): INTER
     and ISC, a pick a row in the slot order (``load_route``), its MXFP4
@@ -345,10 +282,6 @@ def plain_layout(key: MoeBuild) -> dict:
             ("shp", s * UP_N * 2),
         )
     )
-
-
-def plain_bytes(key: MoeBuild) -> int:
-    return max(o + n for o, n in plain_layout(key).values())
 
 
 def group_view(c, g: int):
@@ -427,11 +360,12 @@ def pk_fp4_bf16(old, word, scale, j):
 
 # ---------------------------------------------------------------- early
 @traced
-def early_out(c, kind, i, q, red, t0=0):
+def early_out(c, kind, i, q, red, t0=0, scales=None):
     """Task (i, q) of ``kind`` (0 router, 1 latent, 2 sgu): its 16 rows for
     tokens t0 .. (``red`` holds that token group). The router's parts q > 0
     publish fp32 partials, part 0 adds them in part order and sends the fp32
-    rows to every rank's RLOG; the latent: ``latent_out``; sgu bf16 to SGU."""
+    rows to every rank's RLOG; the latent: ``latent_out``; sgu bf16 to SGU
+    (``scales``: a ``w8`` sgu's, ``gemv.pair_scales``)."""
     s, tid = c["S"], c["tid"]
     sg = group_rows(s, t0 // TG)
     if const_expr(kind == 1):
@@ -441,8 +375,7 @@ def early_out(c, kind, i, q, red, t0=0):
         if tid < (ROWS // 2) * sg:
             rp = tid % (ROWS // 2)
             t = tid // (ROWS // 2)
-            v0 = bf16_round(row_sum(red, 2 * rp, t))
-            v1 = bf16_round(row_sum(red, 2 * rp + 1, t))
+            v0, v1 = gemv.row_pair(red, rp, t, scales)
             c["put_bf"](c["sgu"], (t0 + t) * 2 * SI + i * ROWS + 2 * rp, [v0, v1])
     else:
         if tid < ROWS * sg:
@@ -556,6 +489,12 @@ def early_shape(kind):
     }[kind]
 
 
+def early_w8(c, kind):
+    """Whether early ``kind``'s weight is FP8 (``w8``): sgu's alone, the
+    router and the latent are not dense linears of the quant."""
+    return kind == 2 and c["w8"]
+
+
 def early_loads(c, kind, i, q):
     """Early task (i, q) of ``kind``'s weights for this wave: issued as early as
     the CTA can, then ``early_compute`` takes them."""
@@ -577,6 +516,7 @@ def early_loads(c, kind, i, q):
             ldk=HIDDEN,
             k0=q * klen + k0,
             paired=True,
+            w8=early_w8(c, kind),
         )
         for k0, n in gemv.slabs(klen, min(c["S"], TG))
     ]
@@ -584,8 +524,8 @@ def early_loads(c, kind, i, q):
 
 @traced
 def early_compute(c, kind, i, q, ops):
-    """Early task (i, q): x's K slice (the input row, or -- ``xflags`` -- the
-    row this launch's AttnRes stage publishes) against ``ops`` -> ``early_out``.
+    """Early task (i, q): x's K slice (the row this launch's AttnRes stage
+    publishes, once its ``xflags`` flags are up) against ``ops`` -> ``early_out``.
 
     The slice is staged a slab at a time (``gemv.slabs``). At every row count up
     to 8 that is one slab and the whole slice, as it always was; a wider step
@@ -596,23 +536,25 @@ def early_compute(c, kind, i, q, ops):
     klen, _ = early_shape(kind)
     plan = gemv.slabs(klen, sg)
     xrow = gemv.slab_width(klen, sg) + gemv.LDS_PAD
-    if const_expr(c.get("xflags") is not None):
-        if tid < c["xflags"]:
-            c["poll"]([(c["xrdy"], tid, 1)])
-        gpu.barrier()
+    scales = None
+    if const_expr(early_w8(c, kind)):
+        scales = gemv.pair_scales(c["args"]["w_sgu_s"], i * ROWS, tid)
+    if tid < c["xflags"]:
+        c["poll"]([(c["xrdy"], tid, 1)])
+    gpu.barrier()
     if const_expr(groups(s) > 1):
-        acc = early_units(c, q, klen, [op for sl_ops in ops for op in sl_ops])
+        acc = early_units(
+            c, q, klen, [op for sl_ops in ops for op in sl_ops], early_w8(c, kind)
+        )
         for g in range_constexpr(groups(s)):
             fx.ptr_store(acc[g], red + (wave * 64 + lane) * 4)
             gpu.barrier()
-            early_out(c, kind, i, q, red, TG * g)
+            early_out(c, kind, i, q, red, TG * g, scales)
         return
     # one token group: its rows staged a slab at a time against the slab's
     # weights. ``range_constexpr`` + indexing, not ``enumerate``: this body is
     # AST-rewritten (``@traced``), and a ``for`` over an arbitrary Python
     # iterable with tuple unpacking is not a form the rewriter is meant to see.
-    src = c["xbuf"] if const_expr(c.get("xflags") is not None) else c["args"]["x"]
-    cm = CM_DEV if const_expr(c.get("xflags") is not None) else 0
     acc = None
     for sl in range_constexpr(len(plan)):
         k0 = plan[sl][0]
@@ -621,15 +563,17 @@ def early_compute(c, kind, i, q, ops):
             # the previous slab's readers before its LDS is overwritten
             gpu.barrier()
         gemv.rows_to_lds(
-            tid, src, n, sg, c["xl"], xrow, cm, ldk=HIDDEN, k0=q * klen + k0
+            tid, c["xbuf"], n, sg, c["xl"], xrow, CM_DEV, ldk=HIDDEN, k0=q * klen + k0
         )
-        acc = gemv.mfmas(lane, wave, c["xl"], xrow, n, sg, ops[sl], acc)
+        acc = gemv.mfmas(
+            lane, wave, c["xl"], xrow, n, sg, ops[sl], acc, early_w8(c, kind)
+        )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
-    early_out(c, kind, i, q, red, 0)
+    early_out(c, kind, i, q, red, 0, scales)
 
 
-def early_units(c, q, klen, ops):
+def early_units(c, q, klen, ops, w8=False):
     """``early_compute`` past one token group: ``gemv.staged_units`` over the
     units -- a column group (``gemv.KGROUP``) of a token group -- with x one
     unit ahead (``ops``: ``gemv.loads``' entries, one a column group, all in
@@ -638,8 +582,6 @@ def early_units(c, q, klen, ops):
     tid, lane, wave, G = c["tid"], c["lane"], c["wave"], groups(c["S"])
     xrow = gemv.KGROUP + gemv.LDS_PAD
     bufs = [c["xl"], c["xl"] + TG * xrow // 2]
-    src = c["xbuf"] if const_expr(c.get("xflags") is not None) else c["args"]["x"]
-    cm = CM_DEV if const_expr(c.get("xflags") is not None) else 0
 
     def width(i):
         return min(gemv.KGROUP, klen - i * gemv.KGROUP)
@@ -650,12 +592,12 @@ def early_units(c, q, klen, ops):
     def unit_loads(i, g):
         return gemv.rows_loads(
             tid,
-            src + fx.Int64(TG * g * HIDDEN * 2),
+            c["xbuf"] + fx.Int64(TG * g * HIDDEN * 2),
             rows(g),
             width(i),
             HIDDEN,
             k0=q * klen + i * gemv.KGROUP,
-            cm=cm,
+            cm=CM_DEV,
         )
 
     units = [(i, g) for i in range(len(ops)) for g in range(G)]
@@ -668,38 +610,13 @@ def early_units(c, q, klen, ops):
     def multiply(u, buf):
         i, g = units[u]
         acc[g] = gemv.mfmas_unit(
-            lane, wave, buf, xrow, i, klen, rows(g), ops[i], acc[g]
+            lane, wave, buf, xrow, i, klen, rows(g), ops[i], acc[g], w8
         )
 
     gemv.staged_units(
         len(units), 1, bufs, lambda u: unit_loads(*units[u]), store, multiply
     )
     return acc
-
-
-@traced
-def stage_early(c, bid):
-    """K2b alone: CTA bid's early task (router parts, latent parts, sgu)."""
-    lb = bid - R_TASKS
-    gb = bid - R_TASKS - L_TASKS
-    if bid < R_TASKS:
-        early_compute(
-            c,
-            0,
-            bid // R_PARTS,
-            bid % R_PARTS,
-            early_loads(c, 0, bid // R_PARTS, bid % R_PARTS),
-        )
-    if (bid >= R_TASKS) & (bid < R_TASKS + L_TASKS):
-        early_compute(
-            c,
-            1,
-            lb // L_PARTS,
-            lb % L_PARTS,
-            early_loads(c, 1, lb // L_PARTS, lb % L_PARTS),
-        )
-    if bid >= R_TASKS + L_TASKS:
-        early_compute(c, 2, gb, 0, early_loads(c, 2, gb, 0))
 
 
 # ---------------------------------------------------------------- route
@@ -1353,10 +1270,13 @@ def stage_sdown(c, j, ops):
     tid = c["tid"]
     lo = c["rank"] * UP_TASKS
     mine = (j >= lo) & (j < lo + UP_TASKS)
+    scales = None
+    if const_expr(c["w8"]):
+        scales = gemv.pair_scales(c["args"]["w_sd_s"], j * ROWS, tid)
     for g in range_constexpr(groups(c["S"])):
         if const_expr(g):
             gpu.barrier()  # the previous group's readers of ``red``
-        sdown_rows(group_view(c, g), j, ops, TG * g)
+        sdown_rows(group_view(c, g), j, ops, TG * g, scales)
     publish(
         c["put"],
         c["shrdy"],
@@ -1368,11 +1288,12 @@ def stage_sdown(c, j, ops):
 
 
 @traced
-def sdown_rows(c, j, ops, t0):
-    """``stage_sdown`` for one token group: h rows t0 .. of LDS."""
+def sdown_rows(c, j, ops, t0, scales=None):
+    """``stage_sdown`` for one token group: h rows t0 .. of LDS (``scales``: a
+    ``w8`` shared down's, ``gemv.pair_scales``)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     hrow = SI + gemv.LDS_PAD
-    acc = gemv.mfmas(lane, wave, c["xl"] + t0 * hrow // 2, hrow, SI, s, ops)
+    acc = gemv.mfmas(lane, wave, c["xl"] + t0 * hrow // 2, hrow, SI, s, ops, w8=c["w8"])
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     lo = c["rank"] * UP_TASKS
@@ -1380,8 +1301,7 @@ def sdown_rows(c, j, ops, t0):
     if tid < (ROWS // 2) * s:
         rp = tid % (ROWS // 2)
         tt = tid // (ROWS // 2)
-        v0 = bf16_round(row_sum(red, 2 * rp, tt))
-        v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
+        v0, v1 = gemv.row_pair(red, rp, tt, scales)
         if mine:
             w = (
                 fx.Vector.from_elements([v0, v1], fx.Float32)
@@ -1446,7 +1366,9 @@ def run_sdown(c, bid, w_sd):
             stage_sdown(
                 c,
                 j,
-                gemv.loads(c["lane"], c["wave"], w_sd, j * ROWS, SI, paired=True),
+                gemv.loads(
+                    c["lane"], c["wave"], w_sd, j * ROWS, SI, paired=True, w8=c["w8"]
+                ),
             )
         more = k < SD_TASKS
 
@@ -1665,9 +1587,6 @@ def reduce_rows(c, j):
 
 
 # ---------------------------------------------------------------- kernel
-_BUILDS: dict = {}
-
-
 def route_lds(s: int):
     """LDS of the route table (``load_route``) for an s-row step; ug and down
     read it. The bitmaps it is built from: ``mask_lds``."""
@@ -1723,249 +1642,3 @@ def route_table(rl, ml):
         "order": rl.order.ptr,
         "mask": ml.mask.ptr,
     }
-
-
-def build(key: MoeBuild):
-    if key in _BUILDS:
-        return _BUILDS[key]
-    s = key.tokens
-    # the standalone K2b launch; the shipped path is ``layer.build``'s fused K2
-    assert 1 <= s <= 16
-    lay = scratch_layout(key)
-    plain_lay = plain_layout(key)
-    play = peer_layout(s)
-    RouteLds = route_lds(s)
-
-    @fx.struct
-    class EarlyLds:
-        xl: fx.Array[fx.Int32, s * (HIDDEN + gemv.LDS_PAD) // 2, 16]
-
-    @fx.union
-    class StageLds:
-        early: EarlyLds
-        ug: ug_lds(s)
-        down: down_lds(s)
-        rmask: mask_lds(s)
-        rsel: RouteSelLds
-
-    @fx.struct
-    class Smem:
-        red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
-        tls: fx.Array[fx.Int64, TL_POINTS, 16]
-
-    keyed = key_tuple(key, _SOURCES)
-    name = kernel_symbol("k3_mono_moe", **symbol_params(key))
-
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def moe(
-        x: Int64,
-        w_gate: Int64,
-        bias: Int64,
-        w_ld: Int64,
-        w_sgu: Int64,
-        w_sd: Int64,
-        w13: Int64,
-        w13s: Int64,
-        w2: Int64,
-        w2s: Int64,
-        ln_w: Int64,
-        w_up: Int64,
-        out: Int64,
-        scratch: Int64,
-        plain: Int64,
-        queue: Int64,
-        peers: Int64,
-        rank: Int32,
-        layer: Int32,
-        diag: Int64,
-        tl: Int64,
-    ):
-        _ = keyed
-        tid = fx.thread_idx.x
-        bid = fx.block_idx.x
-        alloc = fx.SharedAllocator()
-        lds = alloc.allocate(Smem).peek()
-        rl = alloc.allocate(RouteLds).peek()
-        st_lds = alloc.allocate(StageLds)
-        el, ul, dl = st_lds.early.peek(), st_lds.ug.peek(), st_lds.down.peek()
-        rsel = st_lds.rsel.peek()
-        if const_expr(key.diag):
-            mb = Mailbox(layer, diag, region_ids(REGIONS))
-        else:
-            mb = Mailbox(layer)
-        bases = peer_bases(peers, TP)
-        own = load_ptr64(peers, rank)
-        peer = {}
-        for region in PEER_REGIONS:
-            off = play[region][0]
-            peer[region] = [preg(b, off, region) for b in bases]
-            peer[region + "_own"] = preg(own, off, region)
-        c = {
-            "S": s,
-            "tid": tid,
-            "bid": bid,
-            "lane": tid % 64,
-            "wave": tid // 64,
-            "rank": rank,
-            "ln_eps": key.eps,
-            "put": mb.put,
-            "put_bf": mb.put_bf,
-            "put_words": mb.put_words,
-            "poll": mb.poll,
-            "queue": queue,
-            "red": lds.red.ptr,
-            "peer": peer,
-            "xl": el.xl.ptr,
-            "rcand": rsel.cand.ptr,
-            "rsig": rsel.sig.ptr,
-            "latq": ul.latq.ptr,
-            "latsc": ul.latsc.ptr,
-            "av": ul.av.ptr,
-            "contrib": dl.contrib.ptr,
-            "scan": rl.scan.ptr,
-            "rt": route_table(rl, st_lds.rmask.peek()),
-            "inter": plain + fx.Int64(plain_lay["inter"][0]),
-            "isc": plain + fx.Int64(plain_lay["isc"][0]),
-            "ln": plain + fx.Int64(plain_lay["ln"][0]),
-            "shp": plain + fx.Int64(plain_lay["shp"][0]),
-            "args": {
-                "x": x,
-                "w_gate": w_gate,
-                "bias": bias,
-                "w_ld": w_ld,
-                "w_sgu": w_sgu,
-                "w_sd": w_sd,
-                "w13": w13,
-                "w13s": w13s,
-                "w2": w2,
-                "w2s": w2s,
-                "ln_w": ln_w,
-                "w_up": w_up,
-                "out": out,
-            },
-        }
-        for region in (
-            "sgu",
-            "h",
-            "rpart",
-            "lpart",
-            "route",
-            "ugf",
-            "lmsq",
-            "lnrdy",
-            "shrdy",
-        ):
-            c[region] = sreg(scratch, lay[region][0], region)
-        on, tls = key.timeline, lds.tls.ptr
-        stamp_begin(on, tls, tid, TL_POINTS)
-        # compile-time gate outside, traced condition inside
-        if const_expr(key.stop > 1):  # noqa: SIM102
-            if bid < EARLY:
-                stage_early(c, bid)
-        stamp(on, tls, tid, 1)
-        if const_expr(key.stop <= 2):
-            stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
-            return
-        if (bid >= LATE0) & (bid < LATE0 + s):
-            stage_route(c, bid - LATE0)
-        if (bid >= H_CTA) & (bid < H_CTA + s):
-            stage_h(c, bid - H_CTA)
-        stamp(on, tls, tid, 2)
-        if const_expr(key.stop <= 3):
-            return
-        nu = load_route(c)
-        if const_expr(key.stop == 35):
-            # debug: the route table, |U| and U into ``out`` (as int32), CTA 0
-            if bid == 0:
-                n = s * 2 * TOPK
-                if tid < n:
-                    bo.buffer_store(fx.ptr_load(c["rt"]["route"] + tid), rsrc(out), tid)
-                if tid < max_u(s):
-                    bo.buffer_store(
-                        fx.ptr_load(c["rt"]["expert"] + tid), rsrc(out), n + 1 + tid
-                    )
-                if tid == 0:
-                    bo.buffer_store(nu, rsrc(out), n)
-            return
-        load_latq(c)
-        if const_expr(key.stop == 36):
-            return
-        run_ug(c, bid, nu)
-        stamp(on, tls, tid, 3)
-        if const_expr(key.stop <= 4):
-            stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
-            return
-        if bid < DOWN_TASKS:
-            # the first w2 batch in flight before any ug flag is waited for
-            dops = down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
-            stage_down(c, bid, nu, dops)
-        run_sdown(c, bid, w_sd)
-        stamp(on, tls, tid, 4)
-        if const_expr(key.stop <= 5):
-            return
-        if (bid >= LN0) & (bid < LN0 + LN_TASKS):
-            stage_lnorm(c, bid - LN0)
-        stamp(on, tls, tid, 5)
-        if const_expr(key.stop <= 6):
-            return
-        run_up(c, bid)
-        stamp(on, tls, tid, 6)
-        if const_expr(key.reduce):  # noqa: SIM102
-            if (bid >= RED0) & (bid < RED0 + RED_TASKS):
-                stage_reduce(c, bid - RED0)
-        stamp(on, tls, tid, 7)
-        stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
-
-    @flyc.jit
-    def launch(
-        x: Int64,
-        w_gate: Int64,
-        bias: Int64,
-        w_ld: Int64,
-        w_sgu: Int64,
-        w_sd: Int64,
-        w13: Int64,
-        w13s: Int64,
-        w2: Int64,
-        w2s: Int64,
-        ln_w: Int64,
-        w_up: Int64,
-        out: Int64,
-        scratch: Int64,
-        plain: Int64,
-        queue: Int64,
-        peers: Int64,
-        rank: Int32,
-        layer: Int32,
-        diag: Int64,
-        tl: Int64,
-        stream: fx.Stream = _STREAM,
-    ):
-        _ = keyed
-        moe(
-            x,
-            w_gate,
-            bias,
-            w_ld,
-            w_sgu,
-            w_sd,
-            w13,
-            w13s,
-            w2,
-            w2s,
-            ln_w,
-            w_up,
-            out,
-            scratch,
-            plain,
-            queue,
-            peers,
-            rank,
-            layer,
-            diag,
-            tl,
-        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
-
-    ABI.check(moe, launch)
-    _BUILDS[key] = launch
-    return launch

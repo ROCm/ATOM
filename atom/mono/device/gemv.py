@@ -4,14 +4,23 @@
 # fork of ATOM's atom/mono (MIT, Copyright (C) 2026, Advanced Micro
 # Devices, Inc.). This port reads those primitives from atom.mono
 # directly and takes ATOM's mailbox discipline in place of the fork's.
-"""bf16 GEMV pieces mono kernels share (K3's K1 / K2, the DSA indexer): 16
-weight rows a task against up to 16 token rows in LDS, one
+"""GEMV pieces mono kernels share (K3's K1 / K2, the DSA indexer): 16 bf16
+(or ``w8``) weight rows a task against up to 16 token rows in LDS, one
 ``mfma_f32_16x16x32_bf16`` per 32 K.
 
 K is walked in 128-wide chunks, wave w taking chunks w, w + 8, ...; a lane reads
-64 contiguous bytes of its row a chunk (4 dwordx4 at q 32 + g 8 elements: lane
-group g = lane / 16), and the token rows are read at the same K. The K order
-inside a chunk is a permutation both operands share, so the dot is unchanged.
+8 elements of its row at each of a chunk's 4 q steps (from 32 q + 8 g: lane group
+g = lane / 16; a dwordx4 each, a dwordx2 with ``w8``), and the token rows are
+read at the same K. The K order inside a chunk is a permutation both operands
+share, so the dot is unchanged.
+
+``w8``: the weight is ATOM's per-token FP8 linear as the production GEMM holds
+it -- E4M3 in AITER's (16, 16) preshuffle, ``[N/16][K/32][2][16 rows][16 B]``,
+with an fp32 scale a row. A lane's 8 elements of a q step are then 8 contiguous
+bytes (``preshuffle.w8_offset``), widened to the same bf16 operand exactly
+(``fp8x8_bf16_pk``): the MFMAs and the K order are the bf16 path's, and the
+row's scale multiplies the reduced sum (``row_value``), loaded before the MFMAs
+so that it lands under them (``pair_scales``).
 """
 
 import flydsl.expr as fx
@@ -19,8 +28,20 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from atom.mono.device.ops import CM_DEV, CM_NT, mfma_bf16, rsrc, traced, xshfl
+from atom.mono.device.ops import (
+    CM_DEV,
+    CM_NT,
+    bf16_round,
+    fp8x8_bf16_pk,
+    ld_f32,
+    mfma_bf16,
+    row_sum,
+    rsrc,
+    traced,
+    xshfl,
+)
 from atom.mono.plan.execution import THREADS, WAVES
+from atom.mono.plan.preshuffle import w8_lane_dwords
 
 ROWS = 16
 KCH = 128
@@ -69,33 +90,38 @@ def chunks(k):
     return (n + WAVES - 1) // WAVES, n
 
 
-def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, paired=False):
-    """This wave's operands of weight rows ``row0`` .. + 16 (row-major, ``ldk``
-    bf16 a row at ``w``, K columns ``k0`` .. ``k0 + k``): a list a chunk
-    (clamped into K: ``mfmas`` zeroes the extra), ``chunk_ops``' each."""
+def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, paired=False, w8=False):
+    """This wave's operands of weight rows ``row0`` .. + 16 (``ldk`` columns a
+    row at ``w``: row-major bf16, or with ``w8`` the preshuffled E4M3 plane; K
+    columns ``k0`` .. ``k0 + k``): a list a chunk (clamped into K: ``mfmas``
+    zeroes the extra), ``chunk_ops``' each."""
     per, n = chunks(k)
     ldk = k if ldk is None else ldk
     r_w = rsrc(w)
     cm = CM_NT if nt else 0
+
+    def kcol(i):
+        return k0 + fx.min(wave + WAVES * i, n - 1) * KCH
+
     return [
-        chunk_ops(
-            r_w, row0, ldk, k0 + fx.min(wave + WAVES * i, n - 1) * KCH, lane, paired, cm
-        )
-        for i in range(per)
+        chunk_ops(r_w, row0, ldk, kcol(i), lane, paired, cm, w8) for i in range(per)
     ]
 
 
-def chunk_ops(r_w, row0, ldk, kcol, lane, paired=False, cm=CM_NT):
+def chunk_ops(r_w, row0, ldk, kcol, lane, paired=False, cm=CM_NT, w8=False):
     """The four MFMA A operands of one 128-column chunk (columns ``kcol`` ..)
-    of weight rows ``row0`` .. + 16 (``ldk`` bf16 a row): slab q's lane holds
-    row lane % 16, 8 columns from 32 q + (lane / 16) 8.
+    of weight rows ``row0`` .. + 16 (``ldk`` columns a row: row-major bf16, or
+    with ``w8`` the preshuffled E4M3 plane, ``w8_chunk_ops``'): slab q's lane
+    holds row lane % 16, 8 columns from 32 q + (lane / 16) 8.
 
-    A load takes one slab of the 16 rows (64 B each, rows a row apart), or
+    A bf16 load takes one slab of the 16 rows (64 B each, rows a row apart), or
     with ``paired`` two slabs of 8 rows -- whole 128 B lines: lane r < 8 the
     even slab of row r, lane r >= 8 the odd slab of row r - 8, and a lane ^ 8
     swap and a select put the layout back, the same values. Coalescing sees a
     load's addresses, not its lane order. It holds the pair's registers a
     while: a build at the VGPR edge spills with it (K3 K1 at S <= 16)."""
+    if w8:
+        return w8_chunk_ops(r_w, row0, ldk, kcol, lane, cm)
     r16 = lane % ROWS
     k = kcol + (lane // ROWS) * 8
 
@@ -133,12 +159,54 @@ def _select4(cond, a, b):
     )
 
 
-def mfmas(lane, wave, xl, xrow, k, s, ops, acc=None):
+def w8_chunk_ops(r_w, row0, ldk, kcol, lane, cm=CM_NT):
+    """``chunk_ops`` of a preshuffled E4M3 plane: two dwords a lane a q step
+    (``w8_lane_dwords``), which ``operand`` widens. A wave's 64 lanes read a
+    step's 512 B in one piece, so there is no ``paired`` form."""
+    return [
+        fx.Vector(bo.buffer_load(r_w, at, vec_width=2, dtype=T.i32, cache_modifier=cm))
+        for at in w8_lane_dwords(row0, lane, kcol, ldk)
+    ]
+
+
+def operand(op, w8=False):
+    """A ``chunk_ops`` operand, or (``w8``) a ``w8_chunk_ops`` one widened:
+    the bf16 MFMA A operand."""
+    return fp8x8_bf16_pk([op[0], op[1]]) if w8 else op.bitcast(fx.BFloat16)
+
+
+def pair_scales(scale, row0, tid):
+    """A ``w8`` GEMV's row scales (fp32 at ``scale``) of thread tid's
+    ``row_pair``, rows row0 + 2 (tid % 8) and the next: loaded before the
+    MFMAs, so that they land under them rather than after the reduce."""
+    r = row0 + 2 * (tid % (ROWS // 2))
+    return [ld_f32(scale, r), ld_f32(scale, r + 1)]
+
+
+def row_value(red, r, t, scale=None):
+    """Row r, token t of the waves' accumulators at ``red`` (``row_sum``), times
+    ``scale`` (a ``w8`` GEMV's row scale), rounded to bf16."""
+    v = row_sum(red, r, t)
+    if scale is not None:
+        v = v * scale
+    return bf16_round(v)
+
+
+def row_pair(red, rp, t, scales=None):
+    """Rows 2 rp and 2 rp + 1, token t (``row_value``; ``scales``:
+    ``pair_scales``'): a thread's column pair."""
+    scales = [None, None] if scales is None else scales
+    return [row_value(red, 2 * rp + i, t, scales[i]) for i in range(2)]
+
+
+def mfmas(lane, wave, xl, xrow, k, s, ops, acc=None, w8=False):
     """``loads``' operands against token rows 0 .. s - 1 of the LDS rows ``xl``
     (``xrow`` bf16 a row) -> this wave's 16x16 accumulator.
 
     ``acc`` carries an earlier slab's partial in, so a K split on group
     boundaries accumulates in the same order one pass over the whole K would.
+    ``w8``: the operands are ``loads(w8=True)``'s; the sum is unscaled (the
+    caller scales the reduced row: ``row_value``).
     """
     per, n = chunks(k)
     g = lane // ROWS
@@ -160,13 +228,11 @@ def mfmas(lane, wave, xl, xrow, k, s, ops, acc=None):
                 xb = fx.Vector.from_elements(
                     [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
                 )
-            acc = mfma_bf16(
-                ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
-            )
+            acc = mfma_bf16(operand(ops[i][q], w8), xb.bitcast(fx.BFloat16), acc)
     return acc
 
 
-def mfmas_unit(lane, wave, xl, xrow, i, k, s, op, acc):
+def mfmas_unit(lane, wave, xl, xrow, i, k, s, op, acc, w8=False):
     """``mfmas``' chunk ``i`` alone: ``op`` (``loads``' entry i) against the
     LDS rows of column group i only (``KGROUP`` columns from local column 0,
     ``xrow`` bf16 a row) -> ``acc``. Groups i = 0, 1, .. in turn accumulate in
@@ -189,7 +255,7 @@ def mfmas_unit(lane, wave, xl, xrow, i, k, s, op, acc):
             xb = fx.Vector.from_elements(
                 [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
             )
-        acc = mfma_bf16(op[q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc)
+        acc = mfma_bf16(operand(op[q], w8), xb.bitcast(fx.BFloat16), acc)
     return acc
 
 

@@ -136,7 +136,7 @@ def _norm(n):
 
 
 def _lin(*shape):
-    return types.SimpleNamespace(weight=_bf16(*shape))
+    return types.SimpleNamespace(weight=_bf16(*shape), bias=None)
 
 
 def _moe_layer(dims, plane):
