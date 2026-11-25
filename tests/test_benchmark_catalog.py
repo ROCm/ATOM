@@ -608,6 +608,99 @@ def test_agentic_dispatch_replay_preserves_profile(tmp_path, monkeypatch, profil
     assert "atom-agentic-benchmark.yaml" in (config_dir / "README.md").read_text()
 
 
+PLUGIN_NIGHTLY = {
+    "ref": "dsv41tp-20261125-b067a57",
+    "recipe": "dsv41/tp4-c8-mono",
+    "wheel_sha256": "d" * 64,
+    "cell": "deepseek-v41-flash-agentic-dspark5-tp4-al351",
+    "concurrency": [8],
+    "aiter_commit": "f" * 40,
+}
+
+
+def test_agentic_dispatch_plugin_serves_every_cell():
+    from build_agentic_benchmark_matrix import add_plugin_cells, build_configs
+
+    inputs = {
+        "profile": "nightly",
+        "plugin_poc_ref": "dsv41tp-20261125-b067a57",
+        "plugin_recipe": "dsv41/tp4-c8-mono",
+    }
+    configs = add_plugin_cells(
+        build_configs(inputs=inputs), inputs, "workflow_dispatch", {}
+    )
+    assert len(configs) == len(build_configs(inputs={"profile": "nightly"}))
+    assert {c["plugin_poc_ref"] for c in configs} == {"dsv41tp-20261125-b067a57"}
+    assert {c["plugin_wheel_sha256"] for c in configs} == {""}
+    with pytest.raises(ValueError, match="switched off"):
+        add_plugin_cells(
+            build_configs(inputs=inputs),
+            inputs,
+            "workflow_dispatch",
+            {"PLUGIN_POC_ENABLED": "0"},
+        )
+    with pytest.raises(ValueError, match="needs plugin_recipe"):
+        add_plugin_cells(
+            build_configs(), {"plugin_poc_ref": "x"}, "workflow_dispatch", {}
+        )
+
+
+def test_agentic_nightly_adds_one_plugin_cell_and_keeps_native():
+    import json
+
+    from build_agentic_benchmark_matrix import add_plugin_cells, build_configs
+
+    native = build_configs(inputs={"profile": "nightly"})
+    env = {"PLUGIN_POC_NIGHTLY": json.dumps(PLUGIN_NIGHTLY)}
+    configs = add_plugin_cells(
+        build_configs(inputs={"profile": "nightly"}), {}, "schedule", env
+    )
+    assert configs[:-1] == native
+    cell = configs[-1]
+    base = next(
+        c for c in native if c["prefix"] + c["suffix"] == PLUGIN_NIGHTLY["cell"]
+    )
+    assert cell["server_args"] == base["server_args"]
+    assert cell["suffix"] == base["suffix"] + "-plugin"
+    assert json.loads(cell["concurrency"]) == [8]
+    assert cell["plugin_poc_ref"] == PLUGIN_NIGHTLY["ref"]
+    assert cell["plugin_wheel_sha256"] == PLUGIN_NIGHTLY["wheel_sha256"]
+    assert cell["aiter_commit"] == PLUGIN_NIGHTLY["aiter_commit"]
+    assert all("plugin_poc_ref" not in c and "aiter_commit" not in c for c in native)
+    for off in ({}, {**env, "PLUGIN_POC_ENABLED": "0"}):
+        assert (
+            add_plugin_cells(
+                build_configs(inputs={"profile": "nightly"}), {}, "schedule", off
+            )
+            == native
+        )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"cell": "deepseek-v41-flash-unknown"},
+        {"concurrency": [16]},
+        {"wheel_sha256": ""},
+        {"aiter_commit": "f35545c"},
+        {"extra": 1},
+    ],
+)
+def test_agentic_nightly_plugin_variable_is_checked(change):
+    import json
+
+    from build_agentic_benchmark_matrix import add_plugin_cells, build_configs
+
+    value = {**PLUGIN_NIGHTLY, **change}
+    with pytest.raises(ValueError):
+        add_plugin_cells(
+            build_configs(inputs={"profile": "nightly"}),
+            {},
+            "schedule",
+            {"PLUGIN_POC_NIGHTLY": json.dumps(value)},
+        )
+
+
 def test_agentic_latest_resolves_to_digest_not_mutable_nightly_tag(monkeypatch):
     from build_agentic_benchmark_matrix import resolve_run_image
 

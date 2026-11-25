@@ -99,29 +99,12 @@ jobs:
       - name: Record checked-out commit
         id: revision
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Check plugin_poc request
-        if: ${{ inputs.plugin_poc_ref != '' }}
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PLUGIN_RECIPE: ${{ inputs.plugin_recipe }}
-          PLUGIN_POC_ENABLED: ${{ vars.PLUGIN_POC_ENABLED }}
-        run: |
-          if [[ "$EVENT_NAME" != workflow_dispatch ]]; then
-            echo "::error::plugin_poc runs are dispatched only"
-            exit 1
-          fi
-          if [[ "$PLUGIN_POC_ENABLED" == 0 ]]; then
-            echo "::error::plugin_poc runs are switched off (repository variable PLUGIN_POC_ENABLED=0)"
-            exit 1
-          fi
-          if [[ -z "$PLUGIN_RECIPE" ]]; then
-            echo "::error::plugin_poc_ref needs plugin_recipe"
-            exit 1
-          fi
       - id: build
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUTS_JSON: ${{ toJson(inputs) }}
+          PLUGIN_POC_ENABLED: ${{ vars.PLUGIN_POC_ENABLED }}
+          PLUGIN_POC_NIGHTLY: ${{ vars.PLUGIN_POC_NIGHTLY }}
           AGENTIC_RUN_CONFIG_DIR: agentic-run-config
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
@@ -178,10 +161,10 @@ jobs:
       image_display: ${{ matrix.config.image_display }}
       extra_args: ${{ inputs.extra_args || '' }}
       atom_commit: ${{ needs.build-matrix.outputs.checkout_sha }}
-      aiter_commit: ${{ inputs.aiter_commit || '' }}
+      aiter_commit: ${{ inputs.aiter_commit || matrix.config.aiter_commit || '' }}
       aiter_wheel_artifact_id: ${{ needs.build-matrix.outputs.aiter_wheel_artifact_id }}
-      plugin_poc_ref: ${{ inputs.plugin_poc_ref || '' }}
-      plugin_recipe: ${{ inputs.plugin_recipe || '' }}
-      plugin_wheel_sha256: ${{ inputs.plugin_wheel_sha256 || '' }}
+      plugin_poc_ref: ${{ matrix.config.plugin_poc_ref || '' }}
+      plugin_recipe: ${{ matrix.config.plugin_recipe || '' }}
+      plugin_wheel_sha256: ${{ matrix.config.plugin_wheel_sha256 || '' }}
       enable_profiler: ${{ inputs.enable_profiler || false }}
       enable_rtl: ${{ inputs.enable_rtl || false }}
