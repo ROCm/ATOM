@@ -35,6 +35,17 @@ def parse_size_list(size_str: str) -> list[int]:
         raise ValueError(f"Error parsing size list: {size_str}") from e
 
 
+def json_or_file(value: str):
+    """A JSON argument given inline, or as the path of a file holding it: a
+    launcher that cannot quote a JSON object passes the path."""
+    import os
+
+    if os.path.isfile(value):
+        with open(value) as f:
+            return json.load(f)
+    return json.loads(value)
+
+
 # ATOM_KV_OFFLOAD value -> the offload connector it selects.
 _KV_OFFLOAD_MODES = {
     "lmcache": "lmcache_offload",
@@ -914,12 +925,13 @@ class EngineArgs:
         )
         eplb_group.add_argument(
             "--eplb-config",
-            type=json.loads,
+            type=json_or_file,
             default=None,
             help=(
                 "EPLB config as a JSON dict, parsed straight into an EPLBConfig "
-                "object (no per-field flags). --eplb-enable turns EPLB on; "
-                "--eplb-config only tunes it. Supported keys:\n"
+                "object (no per-field flags), or the path of a file holding "
+                "it. --eplb-enable turns EPLB on; --eplb-config only tunes it. "
+                "Supported keys:\n"
                 '  - "load_window_size": int, non-dummy forwards accumulated '
                 "for EPLB load stats.\n"
                 '  - "rebalance_interval": int, forward-pass interval for '
@@ -934,9 +946,11 @@ class EngineArgs:
                 "aggregation used by the EPLB balancedness gate.\n"
                 '  - "p2p_batch_chunk_size": int, P2P batch chunk size used '
                 "while migrating expert weights.\n"
-                '  - "placement_policy": "naive"|"biased", how to spend the '
-                "redundant budget: 'naive' (spread) or 'biased' (fully "
-                "replicate top-K hottest experts to all GPUs).\n"
+                '  - "placement_policy": "naive"|"biased"|"swap", how to '
+                "spend the redundant budget: 'naive' (spread) or 'biased' "
+                "(fully replicate top-K hottest experts to all GPUs); 'swap' "
+                "(no redundant experts) swaps a few experts a layer from the "
+                "live placement.\n"
                 "Example:\n"
                 """  '{"num_redundant_experts": 8, "placement_policy": """
                 """"biased"}'"""

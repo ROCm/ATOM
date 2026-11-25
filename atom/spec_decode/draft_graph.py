@@ -8,6 +8,7 @@ passes still live with the flavor; only the machine is here.
 """
 
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,12 @@ from atom.utils.region_graph import ReqGraph
 
 if TYPE_CHECKING:
     from atom.config import Config
+
+
+# Set by a component that keeps something of a pass's recording (EPLB's
+# placement of the drafter's MoE layers keeps the top-k ids): called with the
+# pass and the batch, returns the context its recording runs in. None: none.
+record_scope: Callable[["DraftGraph", int], Any] | None = None
 
 
 def _owned(value: Any, clones: Any) -> Any:
@@ -318,9 +325,13 @@ class DraftGraph:
         self._forward_and_epilogue(running_bs, **staged)
         if not self.will_capture:
             return
-        out = self._graph.record(
-            lambda: self._to_capture(running_bs, **staged), key=running_bs
+        scope = (
+            nullcontext() if record_scope is None else record_scope(self, running_bs)
         )
+        with scope:
+            out = self._graph.record(
+                lambda: self._to_capture(running_bs, **staged), key=running_bs
+            )
         if self.capture_epilogue:
             # which outputs a replay copies, worked out here, not mid-serving
             self._graph.allocated(running_bs, out)
