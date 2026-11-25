@@ -83,11 +83,19 @@ from atom.models.deepseek_v41.mono.kernels.moe import (
 )
 from atom.models.deepseek_v41.mono.kernels.moe_shape import route_shape
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, rsrc
+from atom.mono.device.ops import (
+    CM_DEV,
+    kernel_symbol,
+    launcher,
+    rsrc,
+    traced,
+    uniform,
+    warm_code,
+)
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp_begin, stamp_flush
 from atom.mono.plan.build_key import key_tuple
-from atom.mono.plan.execution import BLOCKS, THREADS
+from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.layout import pair_layout
 from atom.mono.runtime.abi import KernelAbi
 
@@ -98,6 +106,23 @@ TL_STAGES = k1.TL_STAGES + k2.TL_STAGES
 TL_POINTS = 1 + len(TL_STAGES)
 # K1's hand-over flags (module docstring), in its scratch past K2's regions
 FLAGS = ("sdone", "gdone", "krdy", "qp", "iqdone")
+# An index layer's code (296 .. 308 KB at s6) runs once a step, tens of MB of weights
+# after its last launch: L2-cold, its I-cache misses go to HBM (an ordinary
+# layer's ~100 KB, launched every layer, stays warm). At entry one wave of each
+# of the last 8 CTAs (one an XCD) reads it into its XCD's L2 (``warm_code``,
+# from its pc up to CODE_WARM_SPAN bytes, clamped at the code's end) and waits
+# for it there: those CTAs hold no slice, gate (block) or seam norm task, their
+# first wait the normed rows' (wqkv_a, a compressor's projection). 0: off
+CODE_WARM_SPAN = 320 * 1024
+CODE_WARM_CTA0 = BLOCKS - 8
+CODE_WARM_WAVE = WAVES - 1
+
+
+@traced
+def warm_index_code(on, tid, bid):
+    if const_expr(on):  # noqa: SIM102
+        if (bid >= CODE_WARM_CTA0) & (uniform(tid // 64) == CODE_WARM_WAVE):
+            warm_code(tid % 64, CODE_WARM_SPAN)
 
 
 @dataclass(frozen=True)
@@ -256,6 +281,11 @@ def build_layer(key: LayerBuild):
     if comp is not None:
         members["cp"] = compress_smem(comp)
     Parts = lds_union("LayerLds", members)
+    warm = pre.feeds_index and CODE_WARM_SPAN > 0
+    if warm:
+        # the seam norm's CTAs end before WQKV0 or at NORM0 + its rows
+        norm_rows = s // pre.tp if pre.tok_par else s
+        assert max(k1.NORM0 + norm_rows, k1.WQKV0) <= CODE_WARM_CTA0
 
     @fx.struct
     class Stamps:
@@ -311,6 +341,7 @@ def build_layer(key: LayerBuild):
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
+        warm_index_code(warm, tid, bid)
         alloc = fx.SharedAllocator()
         tls = alloc.allocate(Stamps).peek().tls.ptr
         smem = alloc.allocate(Parts)
