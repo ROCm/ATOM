@@ -2,3 +2,7 @@ model,scenario,concurrency,tok_s_per_gpu,source
 kimi-k3,endpoint,64,250,"zejun, 2026-11-23"
 qwen-3.8-flash,8k1k,4,8535,"zejun, 2026-11-23"
 qwen-3.8-flash,8k1k,64,35433,"zejun, 2026-11-23"
+deepseek-v4.1-flash,endpoint,64,3043,"qichu, 2026-11-25: DSV4.1 endpoints daily report 2026-11-20, MI455 1P4G c64 on gfx1250-atom-dsv41-pd-20261119, 1.01x Vera Rubin"
+minimax-m3,8k1k,64,12986,"qichu, 2026-11-25: M3 perf-stack image gfx1250-minimax-m3-20261116 (ATOM 8e06245e, aiter d7ecaaff) on node 09, TP4 EAGLE3, recipe as-is (TG=0)"
+minimax-m3,8k1k,4,3324,"qichu, 2026-11-25: M3 perf-stack image gfx1250-minimax-m3-20261116 (ATOM 8e06245e, aiter d7ecaaff) on node 09, TP4 EAGLE3, recipe as-is (TG=0)"
+deepseek-v4.1-flash,endpoint,4,228,"qichu, 2026-11-25: measured on e15-07, CI tp4 recipe on gfx1250-atom-dsv41-pd-20261119 with aiter#8267 DEFAULT.json, tps 911.76 / 4 GPUs, 1141/1141 samples"
