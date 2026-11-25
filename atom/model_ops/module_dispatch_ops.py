@@ -80,7 +80,8 @@ def _dual_stream_is_active(self, num_tokens: int) -> bool:
 
 def graph_records_single_stream() -> bool:
     """Whether a CUDA graph is being recorded under ATOM_GRAPH_SIDE_STREAMS=0,
-    which keeps every recording on one stream: no side-stream fork then.
+    which keeps every recording on one stream: no side-stream fork then
+    (dual-stream MoE here, the Engram lookup in `EngramStaging.start`).
 
     HIP replays each recorded branch on a parallel stream of the graph's own,
     bound to one of `GPU_MAX_HW_QUEUES` hardware queues. A branch whose queue
