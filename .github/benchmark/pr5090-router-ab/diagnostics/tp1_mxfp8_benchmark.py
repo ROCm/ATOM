@@ -37,6 +37,34 @@ def validate_plan():
     assert PLAN["rotating_weights"] * PLAN["N"] * PLAN["K"] > 512_000_000 // 2
 
 
+def kernel_resources(kernel):
+    resources = {
+        "registers": kernel.n_regs,
+        "spills": kernel.n_spills,
+        "lds_bytes": kernel.metadata.shared,
+        "warps": kernel.metadata.num_warps,
+    }
+    try:
+        hip = ctypes.CDLL("libamdhip64.so")
+        blocks = ctypes.c_int()
+        # Triton returns a module function handle, not a runtime host-stub pointer.
+        rc = hip.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+            ctypes.byref(blocks),
+            ctypes.c_void_p(kernel.function),
+            ctypes.c_int(kernel.metadata.num_warps * 64),
+            ctypes.c_size_t(0),
+        )
+        last_error = hip.hipGetLastError()
+        resources.update(
+            occupancy_query_rc=rc,
+            occupancy_last_error=last_error,
+            max_blocks_per_cu=blocks.value if rc == 0 else None,
+        )
+    except (OSError, TypeError, AttributeError) as error:
+        resources["occupancy_unavailable"] = repr(error)
+    return resources
+
+
 def benchmark(output):
     import torch
     from triton.compiler.errors import CompilationError
@@ -162,28 +190,7 @@ def benchmark(output):
                     record.update(
                         correct=True, relative_rms_error=rms, timing=timed(call)
                     )
-                    kernel = handles[-1]
-                    record["resources"] = {
-                        "registers": kernel.n_regs,
-                        "spills": kernel.n_spills,
-                        "lds_bytes": kernel.metadata.shared,
-                        "warps": kernel.metadata.num_warps,
-                    }
-                    try:
-                        hip = ctypes.CDLL("libamdhip64.so")
-                        blocks = ctypes.c_int()
-                        rc = hip.hipOccupancyMaxActiveBlocksPerMultiprocessor(
-                            ctypes.byref(blocks),
-                            ctypes.c_void_p(kernel.function),
-                            ctypes.c_int(kernel.metadata.num_warps * 64),
-                            ctypes.c_size_t(0),
-                        )
-                        record["resources"].update(
-                            occupancy_query_rc=rc,
-                            max_blocks_per_cu=blocks.value if rc == 0 else None,
-                        )
-                    except (OSError, TypeError, AttributeError) as error:
-                        record["resources"]["occupancy_unavailable"] = repr(error)
+                    record["resources"] = kernel_resources(handles[-1])
                 except (
                     AssertionError,
                     ValueError,
