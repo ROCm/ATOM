@@ -62,8 +62,10 @@ export GPU_ARCHS=gfx1250 PYTORCH_ROCM_ARCH=gfx1250
 ```bash
 BRANCH=xiaobingsuper/m31-c4-gfx1250-opt
 # ATOM (pure Python)
-git clone --depth 2 -b $BRANCH https://github.com/ROCm/ATOM.git /opt/ATOM
-git -C /opt/ATOM log --oneline -2            # tip = recipe commit, its parent = 51930f366 (the measured code)
+git clone --depth 1 -b $BRANCH https://github.com/ROCm/ATOM.git /opt/ATOM
+# the tip only adds recipes/ on top of the measured code 51930f366; this prints nothing:
+git -C /opt/ATOM fetch -q --depth 1 origin 51930f366844faf9c100a77ec1c621b651a84573 && \
+  git -C /opt/ATOM diff --stat FETCH_HEAD HEAD -- . ':!recipes'
 pip install --no-deps --no-build-isolation -e /opt/ATOM
 # aiter (Python + JIT-built HIP modules; nothing is compiled here)
 git clone --depth 1 -b $BRANCH https://github.com/ROCm/aiter.git /opt/aiter
@@ -105,8 +107,8 @@ pip install -c /tmp/cons.txt prometheus_client aiofile aiofiles caio blake3 redi
   cryptography numba openai opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 opentelemetry-exporter-otlp==1.40.0 \
   opentelemetry-exporter-prometheus==0.61b0 'grpcio>=1.78.0' 'protobuf>=6.31.1,<7' py-cpuinfo
 pip install --no-deps /opt/wheels/lmcache-0.5.6rc3.dev20-*.whl
+cd -    # leave the source tree before the check, or `import lmcache` finds /opt/LMCache/lmcache (no extensions)
 python3 -c 'import lmcache, lmcache.cuda_ops; from lmcache.v1.cache_engine import LMCacheEngineBuilder; print(lmcache.__version__)'
-cd -
 ```
 
 (pip then reports that grpcio-tools 1.85.3 wants protobuf >= 7.35; it is a build tool and the server does not use
