@@ -527,7 +527,9 @@ class EngineCore:
         Waits until KV transfers in flight have reported back (with
         ``ATOM_STORE_ASYNC_RENEW`` a load parked on its lease renewal counts,
         and the metadata build may dispatch its GET meanwhile), then preempts
-        what is running so it recomputes on what follows. When the weights
+        what is running so it recomputes on what follows; an image decode leg
+        whose media its prefill kept cannot recompute, and is finished
+        instead (`Scheduler.preempt_running`). When the weights
         change, the KV connector must also drop what it keeps for later
         requests. Raises with the reason, changing nothing that was running.
         """

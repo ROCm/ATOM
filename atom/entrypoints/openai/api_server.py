@@ -53,7 +53,7 @@ from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
-from atom.model_engine.sequence import new_token_ids
+from atom.model_engine.sequence import leaves_media_on_prefill, new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
 from atom.observability.tracing import TraceMiddleware, set_request_id
@@ -108,6 +108,7 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    check_media_handoff,
     ended_by_stop,
     validate_max_tokens,
 )
@@ -1064,6 +1065,7 @@ async def generate_async_multimodal(
     multimodal_data: dict[str, Any],
     sampling_params: SamplingParams,
     request_id: str,
+    kv_transfer_params: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
@@ -1079,8 +1081,11 @@ async def generate_async_multimodal(
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
+    kv_transfer_output_meta_info = None
 
     def completion_callback(request_output: RequestOutput):
+        nonlocal kv_transfer_output_meta_info
+        kv_transfer_output_meta_info = request_output.kv_transfer_params_output
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -1097,6 +1102,7 @@ async def generate_async_multimodal(
             token_ids,
             sampling_params,
             stream_callback=completion_callback,
+            kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
@@ -1158,6 +1164,13 @@ async def generate_async_multimodal(
         "tpot": tpot,
         "latency": finished_at - started_at,
     }
+    if kv_transfer_output_meta_info is not None:
+        # Decode has no media: it seeds its prefix cache and positions with these.
+        response["kv_transfer_output_meta_info"] = {
+            **kv_transfer_output_meta_info,
+            "cache_seed": seq.cache_seed,
+            "mrope_position_delta": seq.mrope_position_delta,
+        }
     if return_token_ids and seq is not None:
         response["prompt_token_ids"] = list(seq.prompt_token_ids)
     yield response
@@ -1368,6 +1381,17 @@ def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
         )
 
 
+def _validate_kv_transfer_params(params: dict[str, Any] | None) -> None:
+    """Refuse handoff metadata no leg can serve, before enqueue or SSE headers.
+
+    Every endpoint that takes `kv_transfer_params` calls this first.
+    """
+    if not params:
+        return
+    _validate_chunked_receive(params)
+    check_media_handoff(params, _get_engine_max_model_len())
+
+
 def _engine_kv_transfer_params(
     kv_transfer_params: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
@@ -1439,8 +1463,10 @@ async def _prepare_engine_input(
     on the chat path, one without through ``_prepare_prompt``."""
     if _has_multimodal_content(messages):
         if kv_transfer_params is not None:
-            # A prefill leg cannot hand an image request off, so neither leg
-            # can finish it: refused here, not as a router error or a stall.
+            # Only `/v1/chat/completions` hands an image request off (its
+            # prefill returns the cache seed and MRoPE delta the decode needs);
+            # here neither leg could finish it: refused, not a router error or
+            # a stall.
             raise ValueError("image input cannot be combined with kv_transfer_params")
         _get_multimodal_processor()  # on the loop, as the chat path does
         token_ids, multimodal_data = await asyncio.to_thread(
@@ -2128,7 +2154,7 @@ async def _chat_completions(
     beta = isinstance(request, BetaChatCompletionRequest)
     route = "beta_chat_completions" if beta else "chat_completions"
     validate_model(request.model)
-    _validate_chunked_receive(request.kv_transfer_params)
+    _validate_kv_transfer_params(request.kv_transfer_params)
 
     try:
         request.tools = normalize_chat_tools(request.tools)
@@ -2230,12 +2256,15 @@ async def _chat_completions(
 
         _log_request_model("request", request_id, request)
 
-        is_multimodal = _has_multimodal_content(messages)
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
-        if assistant_prefix is not None and (
-            is_multimodal or request.get_prompt_token_ids() is not None
-        ):
+        pretokenized = request.get_prompt_token_ids()
+        # A decode leg takes its prefill's expanded ids; its media went to P.
+        # Without P's cache seed its blocks would hash as text: keep the media.
+        is_multimodal = _has_multimodal_content(messages) and not (
+            pretokenized is not None and leaves_media_on_prefill(kv_transfer_params)
+        )
+        if assistant_prefix is not None and (is_multimodal or pretokenized is not None):
             # Only rendered text can be continued.
             raise ValueError(
                 "an assistant prefix cannot be combined with image input or "
@@ -2255,7 +2284,7 @@ async def _chat_completions(
                 merged_kwargs,
                 request.tools,
             )
-        elif (pretokenized := request.get_prompt_token_ids()) is not None:
+        elif pretokenized is not None:
             # Reuse prefill IDs to skip template rendering and tokenization.
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
@@ -2401,6 +2430,7 @@ async def _chat_completions(
                     multimodal_data,
                     sampling_params,
                     request_id,
+                    kv_transfer_params=kv_transfer_params,
                     return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
@@ -2628,7 +2658,7 @@ async def _completions(
     beta = isinstance(request, BetaCompletionRequest)
     route = "beta_completions" if beta else "completions"
     validate_model(request.model)
-    _validate_chunked_receive(request.kv_transfer_params)
+    _validate_kv_transfer_params(request.kv_transfer_params)
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
@@ -2815,7 +2845,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     and returns Anthropic-formatted responses. Enables Claude Code and other
     Anthropic-compatible tools to use ATOM as a backend.
     """
-    _validate_chunked_receive(request.kv_transfer_params)
+    _validate_kv_transfer_params(request.kv_transfer_params)
     # One validator over the shape both endpoints share: this path already
     # converts, so validating the conversion leaves a single rule rather than
     # a second one in Anthropic's spelling. It checked nothing before, so a
@@ -3248,7 +3278,7 @@ async def responses_create(raw_request: Request):
                 }
             },
         )
-    _validate_chunked_receive(kv_transfer_params)
+    _validate_kv_transfer_params(kv_transfer_params)
     kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
 
     compatibility = api_compatibility_for(custom_message_encoder)
