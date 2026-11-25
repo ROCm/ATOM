@@ -177,9 +177,7 @@ def kda_snapshots(
     for n in num_scheduled_tokens:
         cu_seqlens.append(cu_seqlens[-1] + int(n))
 
-    rows, slots, offs, is_end, runtime_slots = checkpoint_target_columns(
-        ordered, device
-    )
+    rows, slots, offs, is_end, runtime = checkpoint_target_columns(ordered, device)
     return KdaSnapshots(
         targets=tuple((row, off) for row, _dst, off, _end, _rt in interior),
         conv_len=conv_len,
@@ -187,7 +185,7 @@ def kda_snapshots(
         slots=slots,
         offs=offs,
         is_end=is_end,
-        runtime_slots=runtime_slots,
+        runtime_slots=runtime,
         h_rows=torch.tensor(
             list(range(len(interior))) + [0] * (len(ordered) - len(interior)),
             dtype=torch.int32,

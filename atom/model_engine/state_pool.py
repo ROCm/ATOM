@@ -506,9 +506,10 @@ class StateSlotPool:
 
         Returns `(slot, position, hash)` per reservation actually made — the
         runner needs `slot` and `position`, `publish_midstep` needs the hash.
-        Best-effort and order-preserving: reservations stop at the first one the
-        free list cannot fill, so the earliest position (the one an earlier
-        forward reaches first) is the one that survives a shortage.
+        Best-effort and order-preserving: once the free list cannot fill one,
+        that position and every later one are dropped, each counted, so the
+        earliest position (the one an earlier forward reaches first) is the one
+        that survives a shortage.
 
         Nothing is indexed here. `pop` takes the slot off the free list, so an
         admission in the same pass cannot be handed it, and it carries no hash
@@ -527,7 +528,7 @@ class StateSlotPool:
         for pos, h in positions:
             if not self.has_free():
                 self.checkpoints_dropped += 1
-                break
+                continue
             out.append((self.pop(), pos, h))
         return out
 

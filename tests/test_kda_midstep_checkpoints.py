@@ -303,6 +303,17 @@ def test_a_full_state_pool_drops_the_checkpoint():
     assert bm.paged_state_checkpoints.checkpoints_dropped == 1
 
 
+def test_every_position_without_a_scratch_slot_is_counted():
+    """Not only the first: the rung at 32 and the anchor are both lost."""
+    bm = make_block_manager(
+        demand_config(pool_entries={"state": 1}), state_runtime=k3_runtime(True)
+    )
+    seq = admitted(bm)
+    bm.plan_midstep(seq, 0, ANCHOR)
+    assert saves_of(seq) == []
+    assert bm.paged_state_checkpoints.checkpoints_dropped == 2
+
+
 # ── how a KDA layer writes them ──────────────────────────────────────────────
 #
 # One `write_state_checkpoints` launch per layer (the kernel itself is pinned
