@@ -74,7 +74,8 @@ class BatchStep:
     # its candidates bound
     candidate_blocks: dict[int, object] = field(default_factory=dict)
     # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
-    # launch wrote for the whole run.
+    # launch wrote for the whole run. Graph entries also hold the shared
+    # cached-until buffer consumed by each layer's captured ring commit.
     group_indices: dict[int | tuple[int, str], tuple[torch.Tensor, ...]] = field(
         default_factory=dict
     )
@@ -86,6 +87,10 @@ class BatchStep:
     # The serving cache binds the parent's; TBO gives each child its own.
     # Keep this across begin_forward: only its live views depend on the step.
     prefill_window_staging: torch.Tensor | None = None
+    # Native token-graph preparation publishes a fixed request capacity for
+    # each token bucket. Only ordinary prefill may capture its quantized
+    # attention; plugin, decode/verify, DPA, TBO and bounded replay leave this off.
+    prefill_attention_graph: bool = False
     # A bounded-replay forward's `ReplayPlan` (`models.deepseek_v41.
     # bounded_replay`): the rows its decoder ran on, for what else reads the
     # decoder's rows after it (the DSpark draft's window). None where the

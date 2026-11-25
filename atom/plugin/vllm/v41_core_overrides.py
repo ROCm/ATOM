@@ -277,7 +277,10 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             raise RuntimeError("CSA2 cache must be allocated before serving")
         # No runner token inputs carry the query metadata here.
         self.publish_query_metadata(
-            np.asarray(batch.num_scheduled_tokens, np.int32), running_bs, running_tokens
+            np.asarray(batch.num_scheduled_tokens, np.int32),
+            running_bs,
+            running_tokens,
+            is_prefill=is_prefill and not tentative,
         )
         with (
             _unverified_steps(cache)

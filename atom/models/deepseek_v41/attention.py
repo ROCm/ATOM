@@ -545,7 +545,16 @@ class Attention(nn.Module):
         # joined -- with or without a forked scorer (`ATOM_DSV41_SIDE_STREAMS`
         # 1 forks the compressor alone).
         join_stream(self.index_stream, self.compress_stream)
-        output = self._attend(query, cache, step, queries, prepared)
+        if (
+            getattr(step, "prefill_attention_graph", False)
+            and not step.decode
+            and queries is None
+            and prepared is not None
+            and (cache.kv_fp8 or prepared[0])
+        ):
+            output = self._attend_prefill_graph(query, cache, step, prepared)
+        else:
+            output = self._attend(query, cache, step, queries, prepared)
         return self._project_out(
             output.view_as(query),
             rope,
@@ -556,9 +565,20 @@ class Attention(nn.Module):
         """Capture fixed-shape preparation; stage variable sources live.
 
         A token bucket fixes ordinary BF16/fallback Q and current-KV buffers.
-        Quantized prefill also stages per-request SWA history, and bounded
-        replay may change the query rows, so those paths need live preparation.
+        Native quantized prefill may also fix its request capacity per token
+        bucket. Otherwise its SWA source addresses, and bounded replay's query
+        rows, still need live preparation.
         """
+        if (
+            getattr(step, "prefill_attention_graph", False)
+            and not step.decode
+            and queries is None
+        ):
+            a8w4 = self._use_a8w4_attention(query, cache)
+            if cache.kv_fp8 or a8w4:
+                return self._attention_inputs(
+                    query, kv_normed, cache, step, rope, queries, a8w4=a8w4
+                )
         if queries is not None or (
             not step.decode
             and (cache.kv_fp8 or (cache.packed and envs.ATOM_DSV41_A8W4_ATTN != "off"))
@@ -594,6 +614,53 @@ class Attention(nn.Module):
             )
             cache.rotate_query(query, rope, queries.positions, query_fp8)
         return a8w4, query_fp8, kv, window_kv
+
+    @eager_region(live=_live_step)
+    def _prefill_indices_live(self, prefix, extend, cached_until, cache, step, *, a8w4):
+        """Publish the live CSR and ring boundary into graph-owned buffers."""
+        if step.request_cached_until.any():
+            cached_until.copy_(step.swa_cached_until)
+        else:
+            cached_until.zero_()
+        if not step.requests:
+            # Idle DP ranks have no scorer result. Publish empty lists through
+            # zero indptrs; the captured MLA must not read stale indices.
+            cache.indptrs(step, a8w4=a8w4)
+            return
+        first = (
+            self.spec.index_group_start
+            if self.spec.index_group_size > 1
+            else self.spec.layer_id
+        )
+        cache._index_group(self.spec, step, first, 1, a8w4=a8w4, out=(prefix, extend))
+
+    def _attend_prefill_graph(self, query, cache, step, prepared):
+        """Capture quantized MLA and ring commit; CSR publication remains live."""
+        a8w4, query_fp8, kv, window_kv = prepared
+        buffers, fill = cache.prefill_graph_buffers(self.spec, step, a8w4=a8w4)
+        prefix, prefix_ptr, extend, extend_ptr, cached_until = buffers
+        if fill:
+            self._prefill_indices_live(
+                prefix, extend, cached_until, cache, step, a8w4=a8w4
+            )
+        kwargs = {"pool_scale_dtype": torch.float8_e4m3fn} if a8w4 else {}
+        output = sparse_attn_v41_paged_2src(
+            tuple(part.flatten(0, 1) for part in query_fp8),
+            cache.main_view(self.spec.kv_owner),
+            prefix,
+            prefix_ptr,
+            kv,
+            extend,
+            extend_ptr,
+            self.attn_sink,
+            self.softmax_scale,
+            out=query.flatten(0, 1),
+            **kwargs,
+        )
+        cache.write_prefill_window_graph(
+            self.spec.layer_id, window_kv, step, cached_until
+        )
+        return output
 
     @eager_region(live=_live_rows)
     def _attend(self, query, cache, step, queries, prepared=None):

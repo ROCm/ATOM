@@ -2966,6 +2966,7 @@ class ModelRunner:
             forward_mode.running_bs,
             forward_mode.running_tokens,
             forward_mode.decode_ubatch_slices,
+            is_prefill=forward_mode.is_prefill,
         )
         token_group.set_counts(query_counts)
         spec_group = self.h2d_groups.get("spec_decode")

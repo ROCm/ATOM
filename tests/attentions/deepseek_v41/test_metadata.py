@@ -442,6 +442,139 @@ def test_idle_dp_rank_refreshes_captured_pool_metadata(device):
     torch.testing.assert_close(cache.backing, before, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("cache_dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize(
+    "phase", ["prefill", "single_token_prefill", "decode", "verify"]
+)
+@pytest.mark.parametrize("graph_enabled", [False, True])
+@pytest.mark.parametrize("publication", ["unbound", "direct", "packed"])
+def test_prefill_attention_graph_fixes_only_prefill_request_capacity(
+    monkeypatch, cache_dtype, phase, graph_enabled, publication
+):
+    from atom.utils.h2d import PublicationOwner
+
+    is_prefill = phase in ("prefill", "single_token_prefill")
+    device = "cuda" if publication == "packed" else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required for packed metadata publication")
+    geo = V41PoolGeometry(
+        1,
+        (),
+        32,
+        4,
+        512,
+        32,
+        kv_dtype=cache_dtype,
+        speculative_tokens=2,
+        layer_ratios=(0,),
+    )
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry, builder.device, builder.block_size = geo, device, 32
+    builder.max_bs = 4
+    builder._prefill_attention_graph = graph_enabled
+    builder.cache = PagedAttentionCache(geo, 4, 4, device, max_tokens=8)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(4, 8, 2, device, geo)
+    )
+    owner = None
+    if publication != "unbound":
+        owner = PublicationOwner(
+            device, torch.cuda.Event() if device == "cuda" else None
+        )
+        names = ("cu_seqlens_q", "batch_id_per_q_token")
+        early = owner.group(
+            "early",
+            [owner.bind(builder.model_runner.forward_vars[n], n) for n in names],
+        )
+        if publication == "packed":
+            assert early.use_packed() == "packed"
+    late_accesses = []
+    cu = builder.model_runner.forward_vars["cu_seqlens_q"]
+    original_copy = cu.copy_to_gpu
+
+    def track_copy(*args, **kwargs):
+        late_accesses.append("prefix copy")
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(cu, "copy_to_gpu", track_copy)
+    if owner is not None:
+        original_wait = owner._wait_sources
+
+        def track_wait():
+            late_accesses.append("source wait")
+            return original_wait()
+
+        monkeypatch.setattr(owner, "_wait_sources", track_wait)
+    pointers = None
+    for count in (2, 1, 0, 2) if is_prefill else (2, 1):
+        length = 3 if phase == "verify" else (2 if phase == "prefill" else 1)
+        batch = SimpleNamespace(
+            is_dummy_run=False,
+            is_final_chunk=None,
+            replaying={},
+            state_slots_committed=list(range(count)),
+            req_ids=tuple(range(count)),
+            num_scheduled_tokens=(length,) * count,
+            context_lens=(8 + length,) * count,
+            block_tables=((0, 1),) * count,
+            total_seqs_num=count,
+            total_tokens_num=count * length,
+        )
+        if owner is not None:
+            owner.begin()
+        counts = builder.prepare_query_metadata(
+            np.asarray((length,) * count, dtype=np.int32),
+            count,
+            8,
+            is_prefill=is_prefill,
+        )
+        capacity = 4 if graph_enabled and is_prefill else count
+        assert counts == {"cu_seqlens_q": capacity + 1, "batch_id_per_q_token": 8}
+        if owner is None:
+            for name, width in counts.items():
+                builder.model_runner.forward_vars[name].copy_to_gpu(width)
+        else:
+            early.set_counts(counts)
+            early.publish()
+        late_accesses.clear()
+        metadata, _ = builder._prepare(
+            batch,
+            count,
+            8,
+            is_prefill=is_prefill,
+            tentative=phase == "verify",
+            max_q_len=None if is_prefill else length,
+        )
+        assert late_accesses == [], "The published query source must remain untouched"
+        step = metadata.step
+        if owner is not None:
+            owner.finish()
+        if device == "cuda":
+            torch.cuda.synchronize()
+        assert step.prefill_attention_graph is (graph_enabled and is_prefill)
+        assert step.decode is (not is_prefill)
+        assert step.slots.numel() == capacity
+        assert step.cu_seqlens_q.tolist() == (
+            [i * length for i in range(count + 1)]
+            + [count * length] * (capacity - count)
+        )
+        assert step.batch_ids[count * length :].tolist() == [-1] * (8 - count * length)
+        if graph_enabled and is_prefill:
+            from atom.model_ops.attentions.deepseek_v41.planes import split_source
+
+            size = (capacity * geo.ring_slots + 8) * geo.window_row_bytes
+            planes = split_source(step.prefill_window_staging[:size], geo.head_dim)
+            current = tuple(p[capacity * geo.ring_slots :] for p in planes)
+            addresses = tuple(p.data_ptr() for p in (*planes, *current))
+            pointers = addresses if pointers is None else pointers
+            assert addresses == pointers
+        elif is_prefill:
+            # Eager prefill also stages its window, at the live request width.
+            assert step.prefill_window_staging is not None
+        else:
+            assert step.prefill_window_staging is None
+
+
 def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
     geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)

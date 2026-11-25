@@ -1181,6 +1181,10 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
 
         return self._stage_mrope(width, group)
 
+    def query_metadata_bs(self, running_bs, running_tokens, *, is_prefill=False):
+        """Request width to stage before the query metadata's first upload."""
+        return running_bs
+
     @h2d_producer("early", runner="model_runner")
     def prepare_query_metadata(
         self,
@@ -1188,6 +1192,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         running_bs: int,
         running_tokens: int,
         decode_ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+        *,
+        is_prefill: bool = False,
     ) -> dict[str, int]:
         """Stage the query-side metadata of ``lengths`` (each scheduled
         request's query tokens): what depends on the query layout alone, and
@@ -1201,16 +1207,22 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         `prepare_model` publishes them with the token inputs, everything else
         through `publish_query_metadata`.
         """
+        # A backend may need a fixed request width for token-graph replay.
+        # Resolve it before publication; the token map still describes only
+        # the scheduled lengths. Phase is explicit, including one-token prefill.
+        query_bs = self.query_metadata_bs(
+            running_bs, running_tokens, is_prefill=is_prefill
+        )
         var = self.model_runner.forward_vars
         build_query_layout(
             lengths,
-            running_bs,
+            query_bs,
             running_tokens,
             cu_seqlens_q=var["cu_seqlens_q"].np,
             batch_ids=var["batch_id_per_q_token"].np,
         )
         counts = {
-            "cu_seqlens_q": running_bs + 1,
+            "cu_seqlens_q": query_bs + 1,
             "batch_id_per_q_token": running_tokens,
         }
         if decode_ubatch_slices:
@@ -1231,11 +1243,17 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         running_bs: int,
         running_tokens: int,
         decode_ubatch_slices: tuple[UBatchSlice, ...] | None = None,
+        *,
+        is_prefill: bool = False,
     ) -> None:
         """`prepare_query_metadata`, published on its own: for a step no token
         inputs carry (a capture, the vLLM plugin)."""
         counts = self.prepare_query_metadata(
-            lengths, running_bs, running_tokens, decode_ubatch_slices
+            lengths,
+            running_bs,
+            running_tokens,
+            decode_ubatch_slices,
+            is_prefill=is_prefill,
         )
         group = self.model_runner.h2d_groups["early"]
         group.set_counts(counts)

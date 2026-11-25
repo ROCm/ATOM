@@ -55,6 +55,87 @@ def v41_runner(monkeypatch, pp_size):
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
+@pytest.mark.parametrize("graph_enabled", [False, True])
+def test_v41_query_prefix_first_publication_survives_slot_rotation(
+    monkeypatch, pp_size, graph_enabled
+):
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+    from tests.test_h2d_runner_publication import runner_with_buffers
+
+    runner = runner_with_buffers(
+        monkeypatch, pp_size, builder_cls=DeepseekV41MetadataBuilder
+    )
+    builder = runner.attn_metadata_builder
+    builder.max_bs = 8
+    builder._prefill_attention_graph = graph_enabled
+    graphs, copies = [], []
+    for variables in runner._fv_ring:
+        outputs = [
+            torch.empty_like(variables[n].gpu)
+            for n in ("cu_seqlens_q", "batch_id_per_q_token")
+        ]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for output, name in zip(outputs, ("cu_seqlens_q", "batch_id_per_q_token")):
+                output.copy_(variables[name].gpu)
+        graphs.append(graph)
+        copies.append(outputs)
+    torch.cuda.synchronize()
+    cases = [
+        ([3, 1], True),
+        ([1], True),
+        ([], True),
+        ([2, 1], False),
+        ([1], False),
+        ([2], True),
+        ([1, 2, 1], True),
+        ([1, 1], False),
+    ] * 2
+    saved = []
+    for lengths, is_prefill in cases:
+        runner._advance_forward_vars()
+        runner._gate_staging_reuse()
+        variables = runner.forward_vars
+        cu, ids = (variables[n] for n in ("cu_seqlens_q", "batch_id_per_q_token"))
+        cu.cpu.fill_(-77)
+        cu.gpu.fill_(-99)
+        ids.gpu.fill_(-99)
+        torch.cuda._sleep(2_000_000)
+        counts = builder.prepare_query_metadata(
+            np.asarray(lengths, dtype=np.int32),
+            len(lengths),
+            8,
+            is_prefill=is_prefill,
+        )
+        capacity = 8 if graph_enabled and is_prefill else len(lengths)
+        assert counts == {"cu_seqlens_q": capacity + 1, "batch_id_per_q_token": 8}
+        # Native serving carries the prefix in the combined token-input group.
+        group = runner.h2d_groups["token_inputs"]
+        group.set_counts(counts)
+        group.publish()
+        source_before = cu.cpu.clone()
+        with pytest.raises(PublicationError):
+            builder.prepare_query_metadata(
+                np.asarray([8], dtype=np.int32), 1, 8, is_prefill=True
+            )
+        assert torch.equal(cu.cpu, source_before)
+        slot = next(i for i, v in enumerate(runner._fv_ring) if v is variables)
+        graphs[slot].replay()
+        saved.append((tuple(out.clone() for out in copies[slot]), lengths, capacity))
+        runner._mark_staging_h2d_enqueued()
+    torch.cuda.synchronize()
+    for (prefix, ids), lengths, capacity in saved:
+        expected_cu = [0] + np.cumsum(lengths).tolist()
+        expected_cu += [sum(lengths)] * (capacity - len(lengths))
+        assert prefix[: capacity + 1].tolist() == expected_cu
+        assert prefix[capacity + 1 :].tolist() == [-99] * (8 - capacity)
+        expected_ids = [i for i, n in enumerate(lengths) for _ in range(n)]
+        assert ids[:8].tolist() == expected_ids + [-1] * (8 - len(expected_ids))
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
 def test_v41_plans_and_step_replay_preserve_padding_and_slots(monkeypatch, pp_size):
 
     runner, builder = v41_runner(monkeypatch, pp_size)
@@ -413,6 +494,8 @@ def test_dummy_storage_isolation_survives_shared_metadata():
     builder.geometry = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     builder.block_size, builder.device = 32, "cuda"
     builder.score_workspace = None
+    builder._prefill_window_staging = None
+    builder.a8w4_attention = False
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(4, 36, 4, "cuda", builder.geometry)
     )
@@ -431,6 +514,9 @@ def test_dummy_storage_isolation_survives_shared_metadata():
         replaying=None,
         is_final_chunk=None,
     )
+    from tests.attentions.deepseek_v41.helpers import stage_query_layout
+
+    stage_query_layout(builder, batch.num_scheduled_tokens, 4, 36)
     metadata, _ = builder._prepare(batch, 4, 36)
     private, step = metadata.cache, metadata.step
     assert private is not serving and metadata.dummy

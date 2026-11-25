@@ -413,6 +413,7 @@ class PagedAttentionCache:
         ):
             raise RuntimeError("Indptr buffers cannot be reallocated under capture")
         self.max_tokens = max(tokens, self.max_tokens)
+        self._a8w4_graph_indptr_buffers = None
         self.indptr_buffers = {
             ratio: tuple(
                 torch.empty(
@@ -906,14 +907,18 @@ class PagedAttentionCache:
                 # Owned by this step, inside its attention capture region.
                 # A TBO child or bounded query step must not overwrite the
                 # parent's BF16 adapter indptrs or another child's buffers.
-                buffers = {
-                    ratio: torch.empty(
-                        (2, step.running_tokens + 1),
-                        dtype=torch.int32,
-                        device=step.positions.device,
-                    ).unbind()
-                    for ratio in self.geometry.layer_ratios
-                }
+                buffers = (
+                    self._prefill_graph_indptrs(a8w4=True)
+                    if getattr(step, "prefill_attention_graph", False)
+                    else {
+                        ratio: torch.empty(
+                            (2, step.running_tokens + 1),
+                            dtype=torch.int32,
+                            device=step.positions.device,
+                        ).unbind()
+                        for ratio in self.geometry.layer_ratios
+                    }
+                )
                 step.a8w4_indptrs = fill_step_indptrs(
                     step, self.geometry, buffers, split=True
                 )
@@ -1178,6 +1183,22 @@ class PagedAttentionCache:
                 cached_until=cached,
             )
 
+    def write_prefill_window_graph(self, layer, kv, step, cached_until):
+        """Capture the existing fused data/scale writer after MLA.
+
+        Its token grid is fixed by the bucket. Live batch IDs and lengths
+        mask padding and select each request's final ring, even when replay
+        has a longer request than capture. The resume boundary is graph-owned.
+        """
+        write_window_planes(
+            *kv,
+            self.ring_view(layer),
+            step,
+            self.geometry.window(layer, self.num_pages),
+            self.geometry.head_dim,
+            cached_until,
+        )
+
     def window_target(self, layers, step):
         """Where a kernel writing ``layers``' fp8 windows itself puts a step's
         rows (``write_window``'s rule): ``(window_ptrs, the layers' ids, the
@@ -1272,7 +1293,57 @@ class PagedAttentionCache:
             ]
         return [self.state_bytes[slot]]
 
-    def _index_group(self, spec, step, first, layers, *, a8w4=False):
+    def _prefill_graph_indptrs(self, *, a8w4=False):
+        """Fixed CSR pointers for native prefill graphs only.
+
+        Keep A8W4 separate from the BF16 adapter's pointers. Allocate once
+        before the graph's first live fill; flag-off, TBO and bounded-query
+        steps keep their existing per-step A8W4 allocations.
+        """
+        if not a8w4:
+            return self.indptr_buffers
+        if self._a8w4_graph_indptr_buffers is None:
+            self._a8w4_graph_indptr_buffers = {
+                ratio: tuple(torch.empty_like(p) for p in pair)
+                for ratio, pair in self.indptr_buffers.items()
+            }
+        return self._a8w4_graph_indptr_buffers
+
+    def prefill_graph_buffers(self, spec, step, *, a8w4=False):
+        """Graph-owned CSR lists and ring-write boundaries, shared by a group.
+
+        The caller records one eager fill for the first layer. It writes these
+        lists directly from the live selection; MLA replays their fixed addresses.
+        No per-replay CSR allocation or copy is needed. The small cached-until
+        buffer is refreshed in that same callback for every layer's ring write.
+        """
+        first = spec.index_group_start if spec.index_group_size > 1 else spec.layer_id
+        key = (first, "graph_a8w4" if a8w4 else "graph_fp8")
+        built = step.group_indices.get(key)
+        if built is not None:
+            return built, False
+        buffers = self._prefill_graph_indptrs(a8w4=a8w4)
+        prefix_ptr, extend_ptr = buffers[spec.ratio]
+        tokens = step.running_tokens
+        built = (
+            torch.empty(
+                tokens * self.geometry.batch_topk(spec.ratio),
+                dtype=torch.int32,
+                device=step.positions.device,
+            ),
+            prefix_ptr[: tokens + 1],
+            torch.empty(
+                tokens * self.geometry.window_size,
+                dtype=torch.int32,
+                device=step.positions.device,
+            ),
+            extend_ptr[: tokens + 1],
+            torch.empty_like(step.slots),
+        )
+        step.group_indices[key] = built
+        return built, True
+
+    def _index_group(self, spec, step, first, layers, *, a8w4=False, out=None):
         """One build covering `layers` consecutive layers from `first`.
 
         The per-layer ring offset is read off the geometry rather than
@@ -1296,4 +1367,5 @@ class PagedAttentionCache:
             layers,
             stride,
             split=True if a8w4 else None,
+            out=out,
         )

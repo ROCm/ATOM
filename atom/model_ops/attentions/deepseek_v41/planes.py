@@ -59,8 +59,9 @@ def prefill_window(history, step, ring):
 
     The producer writes current KV directly to the tail views. The persistent
     rings remain unchanged until attention completes and write_window commits.
-    Reuse the step's reserved storage, but derive plane and tail offsets from
-    its live request count. Token graphs keep this beside the live CSR build.
+    Plane and tail offsets follow the published request width. Native
+    quantized-attention token graphs pad that width to a fixed capacity;
+    other callers keep preparation beside their live CSR build.
     """
     dim = history[0].shape[-1]
     batches = step.cu_seqlens_q.numel() - 1
