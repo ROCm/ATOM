@@ -4062,24 +4062,28 @@ def _setup_stream_dispatch(args) -> None:
     )
 
 
-_JEMALLOC_CANDIDATES = (
-    "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
-    "/usr/lib/aarch64-linux-gnu/libjemalloc.so.2",
-    "/usr/lib64/libjemalloc.so.2",
-    "/usr/local/lib/libjemalloc.so.2",
-    "/usr/lib/libjemalloc.so.2",
-)
-
-
 def _find_jemalloc() -> str | None:
-    """Path of libjemalloc.so.2 on this host, or None."""
-    for path in _JEMALLOC_CANDIDATES:
-        if os.path.exists(path):
-            return path
+    """jemalloc's soname if the dynamic linker can find it, else None.
+
+    LD_PRELOAD takes a soname and resolves it like any other library, so no
+    distro-specific paths are needed.
+    """
     import ctypes.util
 
-    name = ctypes.util.find_library("jemalloc")
-    return name or None
+    return ctypes.util.find_library("jemalloc")
+
+
+def _loaded_allocator(maps_path="/proc/self/maps") -> str:
+    """The malloc this process actually runs on: ld.so only warns when an
+    LD_PRELOAD entry fails to load and goes on with glibc malloc."""
+    try:
+        with open(maps_path) as maps:
+            for line in maps:
+                if "jemalloc" in line:
+                    return line.split()[-1]
+    except OSError:
+        pass
+    return "glibc malloc"
 
 
 @contextlib.contextmanager
@@ -4151,9 +4155,9 @@ def _start_frontend_workers(args) -> None:
             proc.start()
             processes.append(proc)
     logger.info(
-        "Front-end workers %s use allocator %s",
+        "Front-end workers %s spawned with LD_PRELOAD allocator %s",
         [proc.pid for proc in processes],
-        allocator or "glibc malloc",
+        allocator or "none",
     )
     try:
         hub.wait_for_workers(processes)
@@ -4212,10 +4216,11 @@ def _frontend_worker_main(args, config, info, parent_pid) -> None:
         timeout_keep_alive=args.timeout_keep_alive,
     )
     logger.info(
-        "Front-end worker %d serving %s:%s",
+        "Front-end worker %d serving %s:%s on %s",
         info["index"],
         args.host,
         args.server_port,
+        _loaded_allocator(),
     )
     uvicorn.Server(uv_config).run(sockets=[listener])
 

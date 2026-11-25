@@ -1381,18 +1381,18 @@ def no_preload(monkeypatch):
 
 
 def test_preload_is_set_only_while_the_workers_are_spawned(monkeypatch, no_preload):
-    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: "/lib/libjemalloc.so.2")
+    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: "libjemalloc.so.2")
     with api_server._frontend_allocator_env() as lib:
-        assert lib == "/lib/libjemalloc.so.2"
-        assert os.environ["LD_PRELOAD"] == "/lib/libjemalloc.so.2"
+        assert lib == "libjemalloc.so.2"
+        assert os.environ["LD_PRELOAD"] == "libjemalloc.so.2"
     assert "LD_PRELOAD" not in os.environ
 
 
 def test_an_existing_preload_is_kept_behind_jemalloc_and_restored(monkeypatch):
     monkeypatch.setenv("LD_PRELOAD", "/lib/libother.so")
-    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: "/lib/libjemalloc.so.2")
+    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: "libjemalloc.so.2")
     with api_server._frontend_allocator_env():
-        assert os.environ["LD_PRELOAD"] == "/lib/libjemalloc.so.2:/lib/libother.so"
+        assert os.environ["LD_PRELOAD"] == "libjemalloc.so.2:/lib/libother.so"
     assert os.environ["LD_PRELOAD"] == "/lib/libother.so"
 
 
@@ -1416,7 +1416,74 @@ def test_without_jemalloc_the_workers_keep_glibc(monkeypatch, no_preload, caplog
 
 
 def test_the_preload_is_restored_when_a_spawn_fails(monkeypatch, no_preload):
-    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: "/lib/libjemalloc.so.2")
+    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: "libjemalloc.so.2")
     with pytest.raises(RuntimeError), api_server._frontend_allocator_env():
         raise RuntimeError("spawn failed")
     assert "LD_PRELOAD" not in os.environ
+
+
+def test_the_workers_are_started_with_jemalloc_preloaded(monkeypatch, no_preload):
+    # The spawn loop must run inside _frontend_allocator_env: each worker
+    # inherits LD_PRELOAD as it is when its start() runs.
+    preload_at_start = []
+
+    class FakeProcess:
+        def __init__(self, **kwargs):
+            self.pid = len(preload_at_start)
+
+        def start(self):
+            preload_at_start.append(os.environ.get("LD_PRELOAD"))
+
+    class FakeHub:
+        admin_uds = "/tmp/hub.sock"
+        stats = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def connection_info(self, index):
+            return {"index": index}
+
+        def wait_for_workers(self, processes):
+            pass
+
+    from atom.entrypoints.openai import frontend_workers
+
+    monkeypatch.setattr(frontend_workers, "FrontendHub", FakeHub)
+    monkeypatch.setattr(
+        "multiprocessing.get_context",
+        lambda method: SimpleNamespace(Process=FakeProcess),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(
+            core_mgr=SimpleNamespace(_flush_stream_batch_fn=None),
+            config=None,
+            prepare_structured_request=None,
+        ),
+    )
+    monkeypatch.setattr(
+        api_server._metrics_exporter, "attach_frontend_board", lambda stats: None
+    )
+    monkeypatch.setattr(api_server, "_find_jemalloc", lambda: "libjemalloc.so.2")
+    monkeypatch.setattr(api_server, "_frontend_hub", None)
+    args = SimpleNamespace(api_server_count=2, host="0.0.0.0", server_port=8000)
+
+    api_server._start_frontend_workers(args)
+
+    assert preload_at_start == ["libjemalloc.so.2", "libjemalloc.so.2"]
+    assert "LD_PRELOAD" not in os.environ
+
+
+def test_the_loaded_allocator_is_read_from_the_process_maps(tmp_path):
+    maps = tmp_path / "maps"
+    libc = "7f00-7f01 r-xp 00000000 08:01 1 /usr/lib/x86_64-linux-gnu/libc.so.6\n"
+    jemalloc = "7f02-7f03 r-xp 00000000 08:01 2 /usr/lib/libjemalloc.so.2\n"
+    maps.write_text(libc + jemalloc)
+    assert api_server._loaded_allocator(maps) == "/usr/lib/libjemalloc.so.2"
+    maps.write_text(libc)
+    assert api_server._loaded_allocator(maps) == "glibc malloc"
