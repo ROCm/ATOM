@@ -18,6 +18,7 @@ from atom.model_ops.fused_moe.expert_layout import zero_unpacked_expert_padding
 from atom.rollout.reload_policy import (
     FP8_REQUANTISERS,
     ReloadPolicyMixin,
+    requantizes_synced_experts,
 )
 from atom.rollout.weight_bucket import bucket_entries, decode_bucket
 from atom.rollout.weight_sync_record import WeightSyncRecord
@@ -43,6 +44,9 @@ _FUSED_EXPERT_LEAVES = {
     "gate_up_proj": ("w13_weight", ("w1", "w3")),
     "down_proj": ("w2_weight", ("w2",)),
 }
+
+# The shards a fused buffer stacks along its out dim, in that order.
+_EXPERT_BUFFER_STACKING = dict(_FUSED_EXPERT_LEAVES.values())
 
 _EXPERTS_PREFIX_SUFFIX = ".experts"
 
@@ -495,14 +499,23 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
                 continue
 
             self._check_expert_sync_supported(name, param_name)
-            self._load_into_param(
-                param,
-                weight_loader,
-                tensor.to(device=self.device),
-                weight_name=name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
+            if self._requantizes_sent(name, module, param, tensor):
+                self._load_into_param(
+                    param,
+                    module.requantize_expert_shard,
+                    tensor.to(device=self.device),
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+            else:
+                self._load_into_param(
+                    param,
+                    weight_loader,
+                    tensor.to(device=self.device),
+                    weight_name=name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
             # The layout these buffers must end up in is re-established once
             # per sync -- see _finalize_expert_weight_sync.
             arrived = self._expert_relayout_pending.setdefault((module, param_name), {})
@@ -527,6 +540,9 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         the *destination* under ``load_full``; they skip the branch that slices
         the source by ``tp_rank``, so under TP the incoming halves have to be
         this rank's shard already, not the global intermediate dimension.
+        A requantized buffer refuses any other shape: ``requantize_expert_shard``
+        takes each expert's leading ``intermediate_size_per_partition`` rows,
+        so a global tensor would land as rank 0's shard on every rank.
 
         Returns 'updated' or 'skipped'.
         """
@@ -550,6 +566,9 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
                 f"{atom_name}, which needs a 3D (experts, out, in) tensor; got "
                 f"{tuple(tensor.shape)}."
             )
+        requantize = self._requantizes_sent(name, module, param, tensor)
+        if requantize:
+            self._check_rank_local_experts(name, param_name, module, param, tensor)
 
         gpu = tensor.to(device=self.device)
         # Split w13's gate and up halves along the intermediate dim, the way
@@ -557,6 +576,9 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         # loader's copy handles a strided source, and materialising these
         # would double the largest tensor in the sync.
         for shard_id, chunk in zip(shard_ids, gpu.chunk(len(shard_ids), dim=1)):
+            if requantize:
+                self._requantize_rank_local_experts(module, param, chunk, shard_id)
+                continue
             self._load_into_param(
                 param,
                 weight_loader,
@@ -619,14 +641,22 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
                 f"buffer whole -- under TP{self.world_size} that is its own "
                 f"shard, not the global tensor -- or one tensor per expert."
             )
-        self._copy_into_param(param, tensor.to(device=self.device, dtype=param.dtype))
-        # Whole-buffer copies bypass the loaders' tail clearing. Only this
-        # buffer is row-major now; its unwritten counterpart may still be shuffled.
-        zero_unpacked_expert_padding(
-            param.data if param_name == "w13_weight" else None,
-            param.data if param_name == "w2_weight" else None,
-            module.intermediate_size_per_partition,
-        )
+        if self._requantizes_sent(name, module, param, tensor):
+            gpu = tensor.to(device=self.device)
+            shard_ids = _EXPERT_BUFFER_STACKING[param_name]
+            for shard_id, chunk in zip(shard_ids, gpu.chunk(len(shard_ids), dim=1)):
+                self._requantize_rank_local_experts(module, param, chunk, shard_id)
+        else:
+            self._copy_into_param(
+                param, tensor.to(device=self.device, dtype=param.dtype)
+            )
+            # Whole-buffer copies bypass the loaders' tail clearing. Only this
+            # buffer is row-major now; its unwritten counterpart may still be shuffled.
+            zero_unpacked_expert_padding(
+                param.data if param_name == "w13_weight" else None,
+                param.data if param_name == "w2_weight" else None,
+                module.intermediate_size_per_partition,
+            )
         # One tensor covers every expert, so every slice of the buffer is new.
         arrived = self._expert_relayout_pending.setdefault((module, param_name), {})
         for expert_id in range(param.shape[0]):
@@ -634,10 +664,90 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
                 _EXPERT_BUFFER_SHARDS[param_name]
             )
 
+    @staticmethod
+    def _requantizes_into(module: torch.nn.Module, param: torch.nn.Parameter) -> bool:
+        """Whether a full-precision expert written to *param* is requantized
+        (an FP8 buffer of an MoE that does that) rather than copied as sent."""
+        return param.element_size() == 1 and requantizes_synced_experts(module)
+
+    def _requantizes_sent(
+        self,
+        name: str,
+        module: torch.nn.Module,
+        param: torch.nn.Parameter,
+        tensor: torch.Tensor,
+    ) -> bool:
+        """Whether *tensor* is requantized into *param*, refusing one that
+        arrives quantized already: expert scales are not synced, and
+        requantizing FP8 values would drop the scale they were stored under.
+        Any one-byte dtype counts, so FP8 of another variant is refused too."""
+        if not self._requantizes_into(module, param):
+            return False
+        if not tensor.is_floating_point() or tensor.element_size() < 2:
+            raise NotImplementedError(
+                f"{self.label}: {name} arrived as {tensor.dtype} for an FP8 "
+                f"expert buffer that a sync requantizes from full precision. "
+                f"Expert scales are not synced, so a quantized expert cannot "
+                f"be written as sent; send an unquantized MoE checkpoint."
+            )
+        return True
+
+    def _check_rank_local_experts(
+        self,
+        name: str,
+        param_name: str,
+        module: torch.nn.Module,
+        param: torch.nn.Parameter,
+        tensor: torch.Tensor,
+    ) -> None:
+        """Refuse a fused expert tensor that is not this rank's shard of
+        *param*: every expert, with ``intermediate_size_per_partition`` rows
+        per w13 half or columns of w2.
+
+        A global per-channel w2 under TP is refused too, on purpose, although
+        ``requantize_expert_shard`` could scale it over the whole row: one
+        rank-local rule holds for every fused leaf and for the BF16 branch. Such
+        a w2 syncs one tensor per expert, which takes that whole-row path."""
+        inter = module.intermediate_size_per_partition
+        experts, rows, cols = param.shape
+        if param_name == "w2_weight":
+            expected = (experts, rows, inter)
+        else:
+            expected = (experts, 2 * inter, cols)
+        if tuple(tensor.shape) != expected:
+            raise NotImplementedError(
+                f"{self.label}: {name} resolves to the FP8 expert buffer "
+                f"{param_name}, which requantizes this rank's {expected} shard, "
+                f"but arrived as {tuple(tensor.shape)}. Send this rank's "
+                f"shard -- under TP{self.world_size} that is its own slice of "
+                f"the intermediate dim, not the global tensor -- or one tensor "
+                f"per expert."
+            )
+
+    def _requantize_rank_local_experts(
+        self,
+        module: torch.nn.Module,
+        param: torch.nn.Parameter,
+        experts: torch.Tensor,
+        shard_id: str,
+    ) -> None:
+        """Requantize one shard of every expert from an (E, out, in) tensor
+        that holds this rank's slice already."""
+        for expert_id in range(experts.shape[0]):
+            self._load_into_param(
+                param,
+                module.requantize_expert_shard,
+                experts[expert_id],
+                shard_id=shard_id,
+                expert_id=expert_id,
+                rank_local=True,
+            )
+
     def _check_expert_sync_supported(self, name: str, param_name: str) -> None:
         """Refuse an expert tensor that resolves to a buffer this path does
-        not write. Quantized and expert-parallel layers never reach it:
-        ``_reload_refusal`` refuses them before a sync writes anything."""
+        not write. Expert-parallel layers and FP8 ones a sync cannot
+        requantize never reach it: ``_reload_refusal`` refuses them before a
+        sync writes anything."""
         if param_name not in _EXPERT_BUFFER_SHARDS:
             raise NotImplementedError(
                 f"{self.label}: routed-expert weight sync writes "
@@ -833,8 +943,9 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
 
         A loader narrows and copies into whatever buffer it is handed, so its
         write is as in-place as ours. This is the only fence the MoE expert
-        path can have: ``_check_expert_sync_supported`` requires an unquantized
-        MoE, so the experts never reach ``_post_process_fp8_weight``.
+        path can have: its writers are the module's own (``weight_loader``,
+        ``requantize_expert_shard``), and the experts never reach
+        ``_post_process_fp8_weight``.
         """
         self._await_readers_of(param)
         weight_loader(param, tensor, *args, **kwargs)
@@ -1187,23 +1298,26 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         """Re-establish the expert layout, then count the slices it covered.
 
         Counted only once the relayout has returned: a slice is rewritten when
-        its layout is back, not when its bytes are.
+        its layout is back, not when its bytes are. A requantized slice
+        rewrote its scale too, which no sender sends.
         """
-        relaid = [
-            (
-                getattr(module, param_name),
-                [
-                    expert
-                    for expert, shards in arrived.items()
-                    if _EXPERT_BUFFER_SHARDS[param_name] <= shards
-                ],
-            )
-            for (module, param_name), arrived in self._expert_relayout_pending.items()
-        ]
+        relaid = []
+        for (module, param_name), arrived in self._expert_relayout_pending.items():
+            buffer = getattr(module, param_name)
+            params = [buffer]
+            if self._requantizes_into(module, buffer):
+                params.append(getattr(module, f"{param_name}_scale"))
+            complete = [
+                expert
+                for expert, shards in arrived.items()
+                if _EXPERT_BUFFER_SHARDS[param_name] <= shards
+            ]
+            relaid.append((params, complete))
         self._finalize_expert_weight_sync()
-        for buffer, experts in relaid:
-            for expert in experts:
-                self._sync.credit_part(buffer, expert, range(buffer.shape[0]))
+        for params, experts in relaid:
+            for param in params:
+                for expert in experts:
+                    self._sync.credit_part(param, expert, range(param.shape[0]))
 
     def _complete_sync(self, require_full: bool, clear_kv_cache: bool = True) -> None:
         """Finish this rank's part of the open sync.

@@ -54,6 +54,17 @@ FP8_REQUANTISERS = {
 }
 
 
+# The fused buffers a sync requantizes when their MoE can (`requantizes_synced_experts`).
+REQUANTIZED_EXPERT_BUFFERS = frozenset({"w13_weight", "w2_weight"})
+
+
+def requantizes_synced_experts(module: torch.nn.Module) -> bool:
+    """Whether a sync writes this MoE's FP8 experts by requantizing what it is
+    sent (``FusedMoE.requantize_expert_shard``)."""
+    ask = getattr(module, "requantizes_synced_experts", None)
+    return callable(ask) and bool(ask())
+
+
 def is_expert_parallel(module: torch.nn.Module) -> bool:
     return getattr(module, "expert_map", None) is not None or bool(
         getattr(module, "num_redundant_experts", 0)
@@ -70,8 +81,9 @@ class ReloadPolicyMixin:
 
         A floating-point parameter of two bytes or more is written as sent,
         and an FP8 one is requantised if ``FP8_REQUANTISERS`` has its quant
-        type. Anything else -- FP4 or MXFP4 packed bytes, integer quantisation,
-        FP8 of another scheme -- is cast into garbage where the shapes agree.
+        type, or if it is the expert buffer of an MoE that requantizes them.
+        Anything else -- FP4 or MXFP4 packed bytes, integer quantisation, FP8
+        of another scheme -- is cast into garbage where the shapes agree.
         A module that writes its weights itself (``sync_weight``) knows their
         format, an int64 parameter is a constant, an index or a hash: no
         quantisation stores weights in it, and no sync sends a calibrated one
@@ -82,6 +94,7 @@ class ReloadPolicyMixin:
             if callable(getattr(module, "sync_weight", None)):
                 continue
             quant_type = getattr(getattr(module, "quant_type", None), "name", None)
+            requantized_experts = requantizes_synced_experts(module)
             for name, param in module.named_parameters(recurse=False):
                 if (
                     is_calibrated(name)
@@ -90,6 +103,8 @@ class ReloadPolicyMixin:
                 ):
                     continue
                 if self._is_fp8_param(module, param) and quant_type in FP8_REQUANTISERS:
+                    continue
+                if requantized_experts and name in REQUANTIZED_EXPERT_BUFFERS:
                     continue
                 unreloadable.append(f"{prefix}.{name}" if prefix else name)
         return unreloadable
