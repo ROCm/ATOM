@@ -42,6 +42,7 @@ from atom.model_ops.attentions.mla_kv_pool import (
     NVFP4_PAGE_TOKENS,
 )
 from atom.model_ops.attentions.nvfp4_hp_ring import Nvfp4HpRing
+from atom.utils import envs
 
 NVFP4_PAGE = NVFP4_PAGE_TOKENS
 NVFP4_HEADS = 128
@@ -136,6 +137,9 @@ class Nvfp4MlaCache:
                 "NVFP4 MLA decode writes the N16 AUX layout; this AITER's NVFP4 "
                 "MLA uses N32 (PR 7987). Use an AITER with PR 8200."
             )
+        # ATOM_MLA_NVFP4_QROPE: append KV alone and let the decoder rotate and
+        # quantize Q RoPE (needs the fused K-up's NVFP4 NoPE Q).
+        self.qrope = self.fused and envs.ATOM_MLA_NVFP4_QROPE
         # One row per live request, plus `pad_row`: padding rows of a batch
         # write their throwaway token there instead of into a request's tail.
         self.pad_row = max_reqs
@@ -445,6 +449,65 @@ class Nvfp4MlaCache:
             q_planes=q_planes,
         )
 
+    def decode_qrope(
+        self,
+        layer,
+        q_planes,
+        q_rope,
+        req_ids,
+        k_nope,
+        k_rope,
+        positions,
+        slots,
+        cos,
+        sin,
+        csr,
+        sm_scale,
+    ):
+        """KV append (`mla_nvfp4_decode_update_cache`) then the decoder that
+        rotates and quantizes Q RoPE itself (`mla_decode_nvfp4_qrope_fwd`).
+        ``q_planes`` is the fused K-up's ``(qn, qa)``; its NoPE scales are
+        ``qa[..., 64:96]``. ``q_rope`` is pre-RoPE BF16. Graph-safe."""
+        from aiter.ops.mla_nvfp4 import (
+            mla_decode_nvfp4_qrope_fwd,
+            mla_nvfp4_decode_update_cache,
+        )
+
+        mla_nvfp4_decode_update_cache(
+            self.ring.buf[:, layer],
+            req_ids,
+            k_nope,
+            k_rope,
+            positions,
+            slots,
+            self.kv_nope[layer],
+            self.kv_aux[layer],
+            cos,
+            sin,
+        )
+        qn, qa = q_planes
+        batch = qn.shape[0]
+        indptr, indices, last = csr
+        out = torch.empty(
+            batch, NVFP4_HEADS, 512, dtype=torch.bfloat16, device=self.device
+        )
+        mla_decode_nvfp4_qrope_fwd(
+            qn,
+            qa[..., 64:96],
+            q_rope,
+            self.kv_nope[layer],
+            self.kv_aux[layer],
+            out,
+            indptr,
+            indices,
+            last,
+            params=self.params(sm_scale),
+            positions=positions,
+            cos=cos,
+            sin=sin,
+        )
+        return out
+
     def decode(
         self,
         layer: int,
@@ -664,7 +727,25 @@ def try_nvfp4_decode(
 
         q_planes = kup_quantize_q_nope(q_nope[:rows], w_k)
     q_in = None if q_planes is not None else q_nope
-    if _fused_rope_ok(cache, rope, q_nope, k_nope, k_rope):
+    fused_rope = _fused_rope_ok(cache, rope, q_nope, k_nope, k_rope)
+    if fused_rope and cache.qrope and q_planes is not None:
+        indptr, indices, last = csr
+        out = cache.decode_qrope(
+            attn.nvfp4_layer,
+            q_planes,
+            q_rope[:rows],
+            tail_rows[:rows],
+            k_nope_rows,
+            k_rope[:rows].reshape(rows, attn.qk_rope_head_dim),
+            positions,
+            slots,
+            rope.cos_cache,
+            rope.sin_cache,
+            (indptr[: rows + 1], indices, last[:rows]),
+            attn.scale,
+        )
+        return attn._v_up_proj_and_o_proj(out)
+    if fused_rope:
         # One launch: RoPE, Q quantization, tail append and the FP4 write.
         q = cache.prep_decode(
             attn.nvfp4_layer,

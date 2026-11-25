@@ -436,6 +436,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and block size 64; docs/environment_variables.md lists the features it
     # refuses. Off by default, so the FP8 path is unchanged.
     "ATOM_MLA_NVFP4": lambda: os.getenv("ATOM_MLA_NVFP4", "0") == "1",
+    # NVFP4 decode with the fused K-up: append KV alone and let the decoder
+    # rotate and quantize Q RoPE itself (one launch fewer per layer).
+    "ATOM_MLA_NVFP4_QROPE": lambda: os.getenv("ATOM_MLA_NVFP4_QROPE", "0") == "1",
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.
     # Set to 0 for the BF16 flash_attn_varlen_func fallback.
