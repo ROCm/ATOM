@@ -1,66 +1,57 @@
 name: Sandbox Evaluator
 
 # CI evaluator design sandbox (ci-sandbox/* only; not for main). Acts with the
-# workflow's GITHUB_TOKEN, as the real evaluator would.
+# workflow's GITHUB_TOKEN, as the real evaluator would. workflow_dispatch needs
+# the file on the default branch, so an operation is a push of sandbox/op.json
+# to ci-sandbox/ctl: {"op": "rerun|rerun-failed|cancel|status", "run_id": "",
+# "sha": "", "context": "", "state": ""}.
 
 on:
-  workflow_dispatch:
-    inputs:
-      op:
-        required: true
-        type: choice
-        options: [rerun, rerun-failed, cancel, status]
-      run_id:
-        required: false
-        type: string
-        default: ""
-      sha:
-        required: false
-        type: string
-        default: ""
-      context:
-        required: false
-        type: string
-        default: sandbox-status-gate
-      state:
-        required: false
-        type: choice
-        options: [pending, success, failure, error]
-        default: success
+  push:
+    branches: [ci-sandbox/ctl]
+    paths: [sandbox/op.json]
 
 permissions:
   actions: write
   statuses: write
+  contents: read
 
 jobs:
   act:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
       - name: Act
         env:
           GH_TOKEN: ${{ github.token }}
-          OP: ${{ inputs.op }}
-          RUN_ID: ${{ inputs.run_id }}
-          SHA: ${{ inputs.sha }}
-          CONTEXT: ${{ inputs.context }}
-          STATE: ${{ inputs.state }}
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
-          case "${OP}" in
+          op="$(jq -r '.op' sandbox/op.json)"
+          run_id="$(jq -r '.run_id // ""' sandbox/op.json)"
+          sha="$(jq -r '.sha // ""' sandbox/op.json)"
+          context="$(jq -r '.context // "sandbox-status-gate"' sandbox/op.json)"
+          state="$(jq -r '.state // "success"' sandbox/op.json)"
+          echo "op=${op} run_id=${run_id} sha=${sha} context=${context} state=${state}"
+          case "${op}" in
             rerun|rerun-failed|cancel)
-              [[ "${RUN_ID}" =~ ^[0-9]+$ ]]
+              [[ "${run_id}" =~ ^[0-9]+$ ]]
               path="rerun"
-              [ "${OP}" = rerun-failed ] && path="rerun-failed-jobs"
-              [ "${OP}" = cancel ] && path="cancel"
-              gh api -X POST "repos/${repo}/actions/runs/${RUN_ID}/${path}" -i | head -1
+              [ "${op}" = rerun-failed ] && path="rerun-failed-jobs"
+              [ "${op}" = cancel ] && path="cancel"
+              gh api -X POST "repos/${repo}/actions/runs/${run_id}/${path}" -i | head -1
               ;;
             status)
-              [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]]
-              [[ "${CONTEXT}" =~ ^sandbox[-/a-z]*$ ]]
-              gh api -X POST "repos/${repo}/statuses/${SHA}" \
-                -f state="${STATE}" -f context="${CONTEXT}" \
+              [[ "${sha}" =~ ^[0-9a-f]{40}$ ]]
+              [[ "${context}" =~ ^sandbox[-/a-z]*$ ]]
+              [[ "${state}" =~ ^(pending|success|failure|error)$ ]]
+              gh api -X POST "repos/${repo}/statuses/${sha}" \
+                -f state="${state}" -f context="${context}" \
                 -f description="sandbox evaluator (GITHUB_TOKEN)" \
                 --jq '{id, state, context, creator: .creator.login}'
+              ;;
+            *)
+              echo "unknown op" >&2
+              exit 2
               ;;
           esac
