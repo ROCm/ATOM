@@ -2720,7 +2720,7 @@ models:
           <<: *dsv41_8p16d_umbp
           name: ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-c1228
           display_topology: 8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV
-          router:
+          router: &dsv41_umbp_kvev_router
             policy: cache_aware
             prefill_policy: agentic
             decode_policy: least_load
@@ -2747,11 +2747,51 @@ models:
             <<: *dsv41_d4noep_decode
             workers: 1
           env:
+            # With the prefill and the decode on one node, Mooncake moves the
+            # KV between their GPUs over HIP IPC instead of the NICs, and a
+            # prefill that sees two devices cannot open the memory of the
+            # decode's third and fourth (hipIpcOpenMemHandle: invalid
+            # argument): every transfer to those two ranks failed. Off, the KV
+            # goes over the NICs, as it does between the three-node cells' nodes.
+            common: &dsv41_one_node_env_common
+              MC_DISABLE_HIP: "1"
             prefill:
               <<: *dsv41_umbp_env_prefill
               HIP_VISIBLE_DEVICES: "0,1"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
-          benchmark:
+          benchmark: &dsv41_one_node_aiperf
             <<: *dsv41_share_cache_aiperf
             benchmark_duration: 300
+
+      # Two prefill workers and the decode packed on one node (GPUs 0-1, 2-3
+      # and 4-7). What the three-node cells add to the smoke is a second engine
+      # process on the node's server, with a pool namespace and device ordinals
+      # of its own, whose ranks copy from the first's: this is that, on a
+      # third of the GPUs, and a router that places among four prefill ranks.
+      # Suite umbp_2p1d has the recipe's router, umbp_2p1d_kv_events the
+      # cache-aware one.
+      umbp_2p1d:
+        - &dsv41_2p1d_umbp
+          <<: *dsv41_8p16d_umbp
+          name: ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-c64
+          display_topology: 2P1D-P2EP2-D4NOEP-DSPARK5-UMBP
+          topology: 2p1d_dpa
+          nodes: "${ATOMESH_1P1D_NODES}"
+          concurrency: [64]
+          prefill:
+            <<: *dsv41_p2ep2_prefill
+            workers: 2
+          decode:
+            <<: *dsv41_d4noep_decode
+            workers: 1
+          env:
+            common: *dsv41_one_node_env_common
+            prefill: *dsv41_umbp_env_prefill
+          benchmark: *dsv41_one_node_aiperf
+
+      umbp_2p1d_kv_events:
+        - <<: *dsv41_2p1d_umbp
+          name: ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-c64
+          display_topology: 2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV
+          router: *dsv41_umbp_kvev_router

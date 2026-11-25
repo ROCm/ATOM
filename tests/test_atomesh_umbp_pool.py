@@ -394,9 +394,10 @@ cleanup_processes $!
             ({"AGGREGATED": "1"}, "an aggregated cell starts none"),
         ):
             with self.subTest(env=env):
-                if "/opt/umbp-l1" in message and Path(
-                    "/opt/umbp-l1/umbp_standalone_server"
-                ).exists():
+                if (
+                    "/opt/umbp-l1" in message
+                    and Path("/opt/umbp-l1/umbp_standalone_server").exists()
+                ):
                     self.skipTest("this host has the UMBP standalone server")
                 result = self.run_shell(
                     "validate_umbp_pool_settings\n", expect_rc=2, **{**ok, **env}
@@ -529,7 +530,7 @@ run_benchmark_and_eval() { echo "BENCHMARK"; }
         exports = submit[start : submit.index("\nPY\n", start)]
         cls.exports = {}
         with tempfile.TemporaryDirectory() as directory:
-            for suite in ("umbp_kv_events", "umbp_smoke"):
+            for suite in ("umbp_kv_events", "umbp_smoke", "umbp_2p1d_kv_events"):
                 output = Path(directory) / f"{suite}.json"
                 subprocess.run(
                     [
@@ -662,6 +663,50 @@ run_benchmark_and_eval() { echo "BENCHMARK"; }
         )
         self.assert_one_server_served_and_stopped()
 
+    def test_two_prefill_workers_share_the_decodes_node_and_one_server(self):
+        workers = self.launch("umbp_2p1d_kv_events", rank=0, nodes=1)
+        self.assertEqual(
+            sorted(workers),
+            [
+                "decode-rank-0-worker-0",
+                "prefill-rank-0-worker-0",
+                "prefill-rank-0-worker-1",
+            ],
+        )
+        for index in range(2):
+            with self.subTest(worker=index):
+                devices, env, command = workers[f"prefill-rank-0-worker-{index}"]
+                self.assertEqual(devices, f"{2 * index},{2 * index + 1}")
+                self.assertEqual(env["ATOM_UMBP_DEVICE_ORDINALS"], devices)
+                self.assertEqual(self.flag(command, "--server-port"), str(8010 + index))
+                p_d, pool = json.loads(self.flag(command, "--kv-transfer-config"))[
+                    "connectors"
+                ]
+                self.assertEqual(p_d["handshake_port"], 6301 + 2 * index)
+                self.assertEqual(
+                    pool["kv_connector_extra_config"]["namespace"],
+                    f"p{6301 + 2 * index}",
+                )
+        devices, env, command = workers["decode-rank-0-worker-0"]
+        self.assertEqual(devices, "4,5,6,7")
+        self.assertNotIn("ATOM_UMBP_DEVICE_ORDINALS", env)
+        self.assertEqual(
+            json.loads(self.flag(command, "--kv-transfer-config"))["handshake_port"],
+            6305,
+        )
+        self.assert_one_server_served_and_stopped()
+
+    def test_only_the_cells_of_one_node_take_mooncake_off_hip_ipc(self):
+        # Where the prefill and the decode share a node, a prefill worker's two
+        # devices cannot open the memory of the decode's third and fourth.
+        self.assertEqual(
+            {
+                suite: exports.get("ATOMESH_ENV_MC_DISABLE_HIP")
+                for suite, exports in self.exports.items()
+            },
+            {"umbp_kv_events": None, "umbp_smoke": "1", "umbp_2p1d_kv_events": "1"},
+        )
+
     def test_the_prefill_node_runs_one_server_for_its_four_workers(self):
         workers = self.launch("umbp_kv_events", rank=0, nodes=3)
         self.assertEqual(
@@ -674,9 +719,7 @@ run_benchmark_and_eval() { echo "BENCHMARK"; }
                 # Two GPUs each, and the handshake port of the first one's rank.
                 self.assertEqual(devices, f"{2 * index},{2 * index + 1}")
                 self.assertEqual(env["ATOM_UMBP_DEVICE_ORDINALS"], devices)
-                self.assertEqual(
-                    self.flag(command, "--server-port"), str(8010 + index)
-                )
+                self.assertEqual(self.flag(command, "--server-port"), str(8010 + index))
                 self.assertEqual(
                     env["ATOM_KV_EVENTS_ENDPOINT"], f"tcp://*:{5557 + 32 * index}"
                 )

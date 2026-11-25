@@ -452,14 +452,21 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
 
 class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
     """The share-cache cells with a UMBP pool in the Store's place: both routers
-    on three nodes, and the cache-aware one's smoke on a single node."""
+    on three nodes, both with two prefill workers on a single node, and the
+    cache-aware one's smoke there."""
 
     STORE = DeepSeekV41ShareCacheCellsTest.BASELINE
     NAMES = {
         "umbp_pool": STORE.replace("-mcstore-", "-umbp-"),
         "umbp_kv_events": STORE.replace("-mcstore-", "-umbp-kvev-"),
         "umbp_smoke": "ds-v41-flash-1p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-c16",
+        "umbp_2p1d": "ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-c64",
+        "umbp_2p1d_kv_events": (
+            "ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-c64"
+        ),
     }
+    # The cells whose prefill and decode share their one node.
+    ONE_NODE = ("umbp_smoke", "umbp_2p1d", "umbp_2p1d_kv_events")
     # Each pool cell and the Store cell it is.
     STORE_SUITE = {"umbp_pool": "mooncake_store", "umbp_kv_events": "kv_events"}
     run_script = KvEventsCellsTest.run_script
@@ -512,7 +519,10 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
 
     def test_each_suite_holds_its_one_cell(self):
         self.assertEqual(
-            {suite: [cell["name"] for cell in self.suites[suite]] for suite in self.NAMES},
+            {
+                suite: [cell["name"] for cell in self.suites[suite]]
+                for suite in self.NAMES
+            },
             {suite: [name] for suite, name in self.NAMES.items()},
         )
         self.assertEqual(
@@ -521,6 +531,8 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
                 "umbp_pool": "8P16D-P2EP2-D4NOEP-DSPARK5-UMBP",
                 "umbp_kv_events": "8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV",
                 "umbp_smoke": "1P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV",
+                "umbp_2p1d": "2P1D-P2EP2-D4NOEP-DSPARK5-UMBP",
+                "umbp_2p1d_kv_events": "2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV",
             },
         )
 
@@ -538,7 +550,11 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
                 router.pop("kv_storage_weight", None)
                 self.assertEqual(cell["service"], dict(store["service"], router=router))
                 self.assertEqual(
-                    {role for role in store["env"] if cell["env"][role] != store["env"][role]},
+                    {
+                        role
+                        for role in store["env"]
+                        if cell["env"][role] != store["env"][role]
+                    },
                     {"prefill"},
                 )
                 prefill, store_prefill = cell["env"]["prefill"], store["env"]["prefill"]
@@ -552,10 +568,12 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
                 )
 
     def test_the_launcher_reads_the_pool_on_and_the_store_off(self):
-        script = shell_functions("mooncake_store_requested", "umbp_pool_requested") + """
+        script = (
+            shell_functions("mooncake_store_requested", "umbp_pool_requested") + """
 if mooncake_store_requested; then echo "ARG:store"; fi
 if umbp_pool_requested; then echo "ARG:pool"; fi
 """
+        )
         for suite in self.cells:
             with self.subTest(suite=suite):
                 self.assertEqual(
@@ -603,15 +621,17 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
                     )
 
     def test_cells_launch_the_recipe_router_or_route_by_the_events(self):
-        self.assertEqual(
-            self.submitted_router_args(self.cells["umbp_pool"]),
-            self.submitted_router_args(self.cells["mooncake_store"]),
-        )
+        for suite in ("umbp_pool", "umbp_2p1d"):
+            with self.subTest(suite=suite):
+                self.assertEqual(
+                    self.submitted_router_args(self.cells[suite]),
+                    self.submitted_router_args(self.cells["mooncake_store"]),
+                )
         # The Store cell's flow without the Store's hits: the router counts what
         # a rank's pool group holds at its own --kv-share-weight.
         store = self.submitted_router_args(self.cells["kv_events"])
         weight = store.index("--kv-storage-weight")
-        for suite in ("umbp_kv_events", "umbp_smoke"):
+        for suite in ("umbp_kv_events", "umbp_smoke", "umbp_2p1d_kv_events"):
             with self.subTest(suite=suite):
                 args = self.submitted_router_args(self.cells[suite])
                 self.assertEqual(args, store[:weight] + store[weight + 2 :])
@@ -664,7 +684,53 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
                 self.assertEqual(len(devices[role].split(",")), tp)
                 self.assertEqual(
                     smoke["env"][role],
-                    dict(cell["env"][role], HIP_VISIBLE_DEVICES=devices[role]),
+                    dict(
+                        cell["env"][role],
+                        MC_DISABLE_HIP="1",
+                        HIP_VISIBLE_DEVICES=devices[role],
+                    ),
+                )
+
+    def test_two_prefill_workers_and_the_decode_pack_one_node(self):
+        smoke = self.cells["umbp_smoke"]
+        for suite, three_nodes in (
+            ("umbp_2p1d", "umbp_pool"),
+            ("umbp_2p1d_kv_events", "umbp_kv_events"),
+        ):
+            with self.subTest(suite=suite):
+                packed, cell = self.cells[suite], self.cells[three_nodes]
+                self.assertEqual(
+                    (packed["topology"], packed["pd_worker_layout"], packed["nodes"]),
+                    ("2p1d_dpa", "packed_nodes", ["pit2-p03-g27"]),
+                )
+                # Two GPUs a prefill worker and the decode's four: one node's eight.
+                self.assertEqual(packed["num_nodes"], 1)
+                self.assertEqual(packed["concurrency"], [64])
+                self.assertEqual(packed["benchmark"], smoke["benchmark"])
+                self.assertEqual(
+                    packed["service"],
+                    dict(
+                        cell["service"],
+                        prefill=dict(cell["service"]["prefill"], workers=2),
+                        decode=dict(cell["service"]["decode"], workers=1),
+                    ),
+                )
+                # packed_nodes gives each worker its devices: the role env names none.
+                for role in ("prefill", "decode"):
+                    self.assertEqual(
+                        packed["env"][role], dict(cell["env"][role], MC_DISABLE_HIP="1")
+                    )
+
+    def test_only_the_cells_of_one_node_take_mooncake_off_hip_ipc(self):
+        # A prefill worker's two devices cannot open the memory of the third
+        # and fourth of a decode on its node, which HIP IPC would have it do.
+        for suite in self.cells:
+            with self.subTest(suite=suite):
+                self.assertEqual(
+                    self.submitted_exports(self.cells[suite]).get(
+                        "ATOMESH_ENV_MC_DISABLE_HIP"
+                    ),
+                    "1" if suite in self.ONE_NODE else None,
                 )
 
 
