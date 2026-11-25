@@ -231,11 +231,19 @@ def test_the_ragged_gemm2_copy_needs_pp_the_switch_and_the_op(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "block_m, blocks, ragged", [(128, 4096, True), (128, 4097, False), (64, 8, False)]
+    "block_m, blocks, w8, ragged",
+    [
+        (128, 4096, None, "p6"),
+        (128, 4096, True, "w8"),
+        (128, 4096, False, "p6"),
+        (128, 4097, True, None),
+        (64, 8, True, None),
+    ],
 )
-def test_the_ragged_gemm2_takes_up_to_4096_blocks_of_128(block_m, blocks, ragged):
-    """With the w2 copy, moe_g2_p6 writes the route rows for a sort of at most 4096
-    blocks of 128 rows; any other sort keeps the v2 reduce GEMM2."""
+def test_the_ragged_gemm2_takes_up_to_4096_blocks_of_128(block_m, blocks, w8, ragged):
+    """With the w2 copy, moe_g2_w8 (where aiter has it and it serves the rows) or
+    moe_g2_p6 writes the route rows for a sort of at most 4096 blocks of 128 rows;
+    any other sort keeps the v2 reduce GEMM2."""
     import functools
     import sys
     from types import ModuleType
@@ -262,15 +270,19 @@ def test_the_ragged_gemm2_takes_up_to_4096_blocks_of_128(block_m, blocks, ragged
     fused.fused_moe_run_stage2 = lambda inputs, out: calls.append(("summed", 0))
     ops = ModuleType("aiter.ops.m3_tp1_prefill")
     ops.moe_g2_p6 = lambda *args: calls.append(("p6", args[9]))  # m
+    if w8 is not None:  # None: an aiter without the 8-wave kernel
+        ops.moe_g2_w8 = lambda *args: calls.append(("w8", args[9]))
+        ops.moe_g2_w8_serves = lambda m, topk: w8 and topk == 4
     layer = Unset(w13_weight=torch.empty(2, 16, 4), w2_g2_weight=None)
     x, routes = torch.zeros(3, 8), torch.empty(3, 4, 8)
     with atom_without_aiter() as load, pytest.MonkeyPatch.context() as mp:
         moe = load("atom.model_ops.moe")
         mp.setitem(sys.modules, "aiter.fused_moe", fused)
         mp.setitem(sys.modules, "aiter.ops.m3_tp1_prefill", ops)
+        mp.setattr(load("aiter.ops"), "m3_tp1_prefill", ops, raising=False)
         args = (layer, x, None, None, None, None, None, routes, True)
         assert moe.Mxfp4MoEMethod.apply_tp1_routes(Unset(), *args)
-    assert calls == [("p6", 3) if ragged else ("v2", block_m)]
+    assert calls == [(ragged, 3) if ragged else ("v2", block_m)]
 
 
 @pytest.fixture(scope="module")
@@ -688,19 +700,26 @@ def test_ragged_gemm2_route_rows_equal_the_v2_gemm2(dev, moe_layer, m, monkeypat
     used, v2 = _routes(moe_layer, x, weights, ids, True)
     if not used:
         pytest.skip("aiter's MoE rows at this size do not run the reduce GEMM2")
-    calls, p6_op = [], K.moe_g2_p6
+    calls = []
 
-    def p6_spy(*args):
-        calls.append(args[9])  # m
-        return p6_op(*args)
+    def spy(name):
+        op = getattr(K, name)
 
-    monkeypatch.setattr(K, "moe_g2_p6", p6_spy)
+        def run(*args):
+            calls.append((name, args[9]))  # m
+            return op(*args)
+
+        monkeypatch.setattr(K, name, run)
+
+    names = [name for name in ("moe_g2_p6", "moe_g2_w8") if hasattr(K, name)]
+    for name in names:
+        spy(name)
     lay.w2_g2_weight, lay.w2_g2_scale = K.relayout_w2(*moe_layer.w2_raw)
     try:
-        used, p6 = _routes(moe_layer, x, weights, ids, True)
+        used, rows = _routes(moe_layer, x, weights, ids, True)
     finally:
         del lay.w2_g2_weight, lay.w2_g2_scale
-    assert used and calls == [m] and _bytes_equal(p6, v2)
+    assert used and calls == [(names[-1], m)] and _bytes_equal(rows, v2)
 
 
 @gpu

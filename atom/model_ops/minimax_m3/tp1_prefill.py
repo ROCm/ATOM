@@ -106,14 +106,16 @@ def model_enabled(atom_config, hidden_size: int) -> bool:
 
 
 def moe_g2_ragged(pp_size: int) -> bool:
-    """Whether MoE layers keep the second w2 copy aiter's ragged-tile GEMM2
-    reads (+1.28 GB a layer): ATOM_M3_TP1_MOE_G2_P6 under PP (at PP1 the copies
-    do not fit beside the weights) with aiter's moe_g2_p6."""
+    """Whether MoE layers keep the second w2 copy aiter's ragged-tile GEMM2s
+    read (+1.28 GB a layer): ATOM_M3_TP1_MOE_G2_P6 under PP (at PP1 the copies
+    do not fit beside the weights) with aiter's moe_g2_p6 (and moe_g2_w8)."""
     if not envs.ATOM_M3_TP1_MOE_G2_P6 or pp_size == 1:
         return False
     if _K is None or not hasattr(_K, "moe_g2_p6"):
         _log_once("MiniMax-M3 TP1 prefill: aiter has no moe_g2_p6, the v2 GEMM2 runs")
         return False
+    if not hasattr(_K, "moe_g2_w8"):
+        _log_once("MiniMax-M3 TP1 prefill: aiter has no moe_g2_w8, moe_g2_p6 runs")
     return True
 
 

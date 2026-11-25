@@ -2288,9 +2288,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             and kw["block_m"] == 128
             and sorted_ids.shape[0] // 128 <= 4096
         ):
-            from aiter.ops.m3_tp1_prefill import moe_g2_p6
+            from aiter.ops import m3_tp1_prefill as g2
 
-            moe_g2_p6(
+            # its 8-wave kernel (same bytes) where aiter has it and its offsets reach
+            ragged_gemm2 = g2.moe_g2_p6
+            if hasattr(g2, "moe_g2_w8") and g2.moe_g2_w8_serves(m, topk):
+                ragged_gemm2 = g2.moe_g2_w8
+            ragged_gemm2(
                 inputs.a2.view(torch.uint8),
                 inputs.a2_scale.view(torch.uint8),
                 layer.w2_g2_weight,
