@@ -449,13 +449,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # mori.
     "ATOM_MEGA_STAGE1_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE1_FUSED", "1") == "1"),
     # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
-    # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
+    # verify/draft forwards on the supported EP8 layouts: 48 experts per rank,
+    # or 16 (the V4.1-Flash DSpark draft) where aiter runs it fixed-slot. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
     "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
         os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
     ),
     # Rows per rank of that small instance: 128, 256, 512 or 1024 (see docs).
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
+    # Activation quant of the gfx950 MegaMoEV2 experts (--moe-backend mega):
+    # "a8w4" dispatches MXFP8 activations, "a4w4" MXFP4. The weights are MXFP4
+    # either way.
+    "ATOM_MEGA_QUANT": lambda: os.getenv("ATOM_MEGA_QUANT", "a8w4"),
+    # Row format the gfx950 MegaMoEV2 combine sends between ranks: "auto" (aiter
+    # picks FP8 from 1024 tokens per rank, else BF16), "none" (BF16),
+    # "fp8_blockwise_1x32" or "fp4_blockwise_1x32".
+    "ATOM_MEGA_P2P_QUANT": lambda: os.getenv("ATOM_MEGA_P2P_QUANT", "auto"),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.

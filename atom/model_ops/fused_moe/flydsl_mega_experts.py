@@ -12,8 +12,10 @@ MegaMoEV2 auto-selects its execution config from the runtime token count and
 ``max_tok_per_rank`` (MTPR): MTPR<=255 -> low-latency fixed-slot path,
 MTPR>=256 -> compact path (``FIXED_SLOT_MAX_MTPR``). MTPR must be a positive
 power of two. The configured ``max_num_tokens`` remains the fallback capacity.
-For native ATOM EP8 with 48 experts per rank, DP-unified forwards with at most 128
-padded token rows can use a second, 128-token instance. Target verification
+For native ATOM EP8 with 48 experts per rank (or 16, the V4.1-Flash DSpark
+draft, when aiter dispatches that width fixed-slot), DP-unified forwards with at
+most ATOM_MEGA_DECODE_MTPR (default 128) padded token rows can use a second,
+smaller instance. Target verification
 and draft passes use their own token counts, including MTP and graph padding.
 MTPR also selects the p2p wire format, so the choice must use group-agreed
 metadata, never a rank's local request count. Set ATOM_MEGA_DECODE_FAST_PATH=0
@@ -28,14 +30,15 @@ Shuffled tensors stay expert-major + contiguous, so EPLB can migrate their
 expert-major views in place.
 
 Memory: MegaMoEV2 instances are shared across all MoE layers (process-level
-cache keyed by shape/quant/mtpr); both capacities are built in the same order
-on all ranks before capture. Per-layer weights are swapped in before forward
+cache keyed by shape/quant/combine format/mtpr); both capacities are built in
+the same order on all ranks before capture. Per-layer weights are swapped in before forward
 (``_s1_w1`` / ``_s1_w1_scale`` / ``w2`` / ``w2_scale`` are runtime pointer args,
 not baked into the kernel).
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -56,11 +59,40 @@ if _MEGA_DECODE_MTPR not in _MEGA_DECODE_MTPRS:
         f"ATOM_MEGA_DECODE_MTPR must be one of {_MEGA_DECODE_MTPRS}, "
         f"got {_MEGA_DECODE_MTPR}"
     )
+_MEGA_QUANTS = ("a8w4", "a4w4")
+_MEGA_QUANT = envs.ATOM_MEGA_QUANT
+if _MEGA_QUANT not in _MEGA_QUANTS:
+    raise ValueError(
+        f"ATOM_MEGA_QUANT must be one of {_MEGA_QUANTS}, got {_MEGA_QUANT!r}"
+    )
+_MEGA_P2P_QUANTS = ("auto", "none", "fp8_blockwise_1x32", "fp4_blockwise_1x32")
+_MEGA_P2P_QUANT = envs.ATOM_MEGA_P2P_QUANT
+if _MEGA_P2P_QUANT not in _MEGA_P2P_QUANTS:
+    raise ValueError(
+        f"ATOM_MEGA_P2P_QUANT must be one of {_MEGA_P2P_QUANTS}, "
+        f"got {_MEGA_P2P_QUANT!r}"
+    )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
 
 
 def _os_env(k):
     return os.environ.get(k, "<unset>")
+
+
+@functools.cache
+def _decode_experts_per_rank() -> tuple[int, ...]:
+    """Experts-per-rank widths that get the small decode instance at EP8.
+
+    The widths aiter dispatches fixed-slot: V4's 48 and, from ROCm/aiter#8186,
+    the V4.1-Flash DSpark draft's 16. An aiter without the table has only 48.
+    """
+    try:
+        from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+            FIXED_SLOT_EXPERTS_PER_RANK,
+        )
+    except ImportError:
+        return (48,)
+    return tuple(FIXED_SLOT_EXPERTS_PER_RANK)
 
 
 def _select_decode_mtpr(mtpr: int, context, *, tbo_active: bool) -> int:
@@ -85,9 +117,10 @@ def build_mega_weights(layer) -> None:
     shuffle_weight in process_weights_after_loading (uses raw layout)."""
     from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
-    # a8w4 MegaMoEV2 uses the g1u1 gate-up INTERLEAVE layout for w1/w1_scale
-    # (gate_up=True); w2 has no gate/up split (gate_up=False). This matches the
-    # aiter reference op_tests/multigpu_tests/test_mega_moe_v2.py weight prep.
+    # MegaMoEV2 (a8w4 and a4w4) uses the g1u1 gate-up INTERLEAVE layout for
+    # w1/w1_scale (gate_up=True); w2 has no gate/up split (gate_up=False). This
+    # matches the aiter reference op_tests/multigpu_tests/test_mega_moe_v2.py
+    # weight prep.
     w13 = layer.w13_weight.data  # [E, 2*inter, hidden//2] fp4-packed uint8
     E = int(w13.shape[0])
     expected_local = layer.local_num_experts
@@ -134,6 +167,7 @@ def get_or_build_mega_moe(
     experts,
     topk,
     quant,
+    p2p_quant,
     mtpr,
     swiglu_limit,
     w1,
@@ -154,6 +188,7 @@ def get_or_build_mega_moe(
         experts,
         topk,
         quant,
+        p2p_quant,
         mtpr,
         swiglu_limit,
     )
@@ -182,15 +217,19 @@ def get_or_build_mega_moe(
                 w2=w2,
                 w2_scale=w2_scale,
                 max_tok_per_rank=mtpr,
+                stage2_p2p_quant=p2p_quant,
                 swiglu_limit=swiglu_limit,
             )
         _MEGA_CACHE[key] = m
         if rank == 0:
             logger.info(
-                "[MEGA-CAPACITY] built capacity=%d, ep=%d, experts/rank=%d",
+                "[MEGA-CAPACITY] built capacity=%d, ep=%d, experts/rank=%d, "
+                "quant=%s, p2p_quant=%s",
                 mtpr,
                 world_size,
                 experts // world_size,
+                quant,
+                p2p_quant,
             )
 
     # Bind this layer's weights on EVERY call, not only on build: the cache key
@@ -223,6 +262,7 @@ def run_mega_moe(
     mtpr: int,
     swiglu_limit: float,
     quant: str = "a8w4",
+    p2p_quant: str = "auto",
 ) -> torch.Tensor:
     """Replace EP experts with MegaMoEV2. x: [tokens, model_dim] bf16 (this rank's
     local tokens, pre-dispatch). topk_ids: global (physical) expert ids. Returns
@@ -254,6 +294,7 @@ def run_mega_moe(
         "experts": experts,
         "topk": topk,
         "quant": quant,
+        "p2p_quant": p2p_quant,
         "swiglu_limit": float(swiglu_limit),
         "w1": layer._mega_w1,
         "w1_scale": layer._mega_w1_scale,
@@ -271,7 +312,8 @@ def run_mega_moe(
         and not is_plugin_mode()
         and mtpr > _MEGA_DECODE_MTPR
         and world == 8
-        and experts == world * 48
+        and experts % world == 0
+        and experts // world in _decode_experts_per_rank()
     )
     if use_decode_capacity:
         from atom.utils.tbo.ubatching import tbo_active
@@ -349,13 +391,15 @@ class MegaFusedExperts:
         model_dim: int,
         inter_dim: int,
         mtpr: int,
-        quant: str = "a8w4",
+        quant: str = _MEGA_QUANT,
+        p2p_quant: str = _MEGA_P2P_QUANT,
     ) -> None:
         self._layer = layer
         self._model_dim = model_dim
         self._inter_dim = inter_dim
         self._mtpr = mtpr
         self._quant = quant
+        self._p2p_quant = p2p_quant
 
     def __call__(
         self,
@@ -412,4 +456,5 @@ class MegaFusedExperts:
             mtpr=self._mtpr,
             swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
             quant=self._quant,
+            p2p_quant=self._p2p_quant,
         )

@@ -88,6 +88,73 @@ run under whole-expert EP or shard across TP, whichever the launch selects.
 V4.1 initializes the same distributed environment as every other model and has no
 collective policy of its own.
 
+## DEP8 MegaMoE: A4W4 with the MXFP4 combine (gfx950)
+
+On 8x MI355X at DEP8 (DP attention, expert parallel MoE), `--moe-backend mega`
+runs each routed-MoE layer as one aiter `MegaMoEV2` op: dispatch, both GEMMs and
+combine. Two switches select its formats (both default to the A8W4 / `auto`
+behaviour):
+
+- `ATOM_MEGA_QUANT=a4w4` dispatches MXFP4 activations instead of MXFP8.
+- `ATOM_MEGA_P2P_QUANT=fp4_blockwise_1x32` sends the combine rows as MXFP4
+  instead of BF16 (or FP8 from 1024 tokens per rank).
+
+With both set, an aiter that includes
+[ROCm/aiter#8186](https://github.com/ROCm/aiter/pull/8186) selects its tuned
+V4.1-Flash EP8 configs (target: 48 experts per rank; DSpark draft: 16) and the
+optional Stage1/Stage2 optimizations below. Its tuned decode configs are for a
+fixed-slot instance at MTPR 512, hence `ATOM_MEGA_DECODE_MTPR=512` and
+`AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023`; DP-unified decode, verify and draft
+passes of up to 512 padded rows a rank use it, and larger passes use the
+instance sized for `--max-num-batched-tokens` (the tuned prefill configs are at
+4096). Keep the shared expert out of the dispatch space (the default under DP
+attention with MoRI; do not set `ATOM_FUSE_SHARED_EXPERT` or enable EPLB): a
+fused replica makes it 49 experts per rank, which none of these configs or the
+decode instance cover.
+
+```bash
+export MODEL_PATH=/models/deepseek-ai/DeepSeek-V4.1-Flash
+export OMP_NUM_THREADS=4 ATOM_DISABLE_MMAP=true AITER_LOG_LEVEL=WARNING
+export MORI_SHMEM_HEAP_SIZE=16G
+
+# A4W4 MegaMoE, MXFP4 combine, 512-token fixed-slot decode instance
+export ATOM_MEGA_QUANT=a4w4
+export ATOM_MEGA_P2P_QUANT=fp4_blockwise_1x32
+export ATOM_MEGA_DECODE_MTPR=512
+export AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023
+
+# ROCm/aiter#8186 optimizations (read by aiter; all default off)
+export AITER_MEGA_S1_FIXED_FUSED_STAGE2=1
+export AITER_MEGA_S1_FIXED_EARLY_TILES=1
+export AITER_MEGA_S1_FIXED_LIGHT_RELEASE=1
+export AITER_MEGA_S1_FIXED_RESIDENT_GRID=1
+export AITER_MEGA_S1_FIXED_TUNED_GEMM1=1
+export AITER_MEGA_S1_FIXED_TUNED_GEMM1_WIDE=1
+export AITER_MEGA_S1_FIXED_TUNED_GEMM1_V2=1
+export AITER_MEGA_S2_FIXED_TUNED_GEMM2=1
+export AITER_MEGA_S2_FIXED_TUNED_GEMM2_V2=1
+
+python3 -u -m atom.entrypoints.openai_server \
+  --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+  --trust-remote-code --host 0.0.0.0 --server-port 8000 \
+  --tensor-parallel-size 8 --enable-dp-attention --enable-expert-parallel \
+  --all2all-backend high-throughput --moe-backend mega \
+  --kv_cache_dtype fp8 --index-cache-dtype fp4 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 4096 --attn-prefill-chunk-size 4096 \
+  --block-size 16 --level 3 --cudagraph-mode FULL \
+  --cudagraph-capture-sizes '[1,2,4,8,12,16,20,24,28,32]' \
+  --method dspark --num-speculative-tokens 5
+```
+
+`--cudagraph-capture-sizes` counts requests per DP rank: concurrency 256 is 32
+a rank, and with 5 speculative tokens a verify step is 192 rows, inside the
+512-row instance. The `[MEGA-CAPACITY] built ...` log lines show each instance's
+capacity, `quant` and `p2p_quant`. These settings follow the vLLM measurements in
+[vllm-project/vllm#68385](https://github.com/vllm-project/vllm/pull/68385)
+(output throughput +22% at DEP8, concurrency 256, GSM8K unchanged); they have
+not been measured on ATOM's native server yet.
+
 ## Shared Mooncake Store across data-parallel ranks
 
 A Mooncake Store shared by every DP rank lets a request run on any rank and load

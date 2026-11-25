@@ -62,6 +62,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(plugin_prepare, "_CURRENT_FRAMEWORK", "atom")
     monkeypatch.setattr(mega, "_MEGA_CACHE", {})
     monkeypatch.setattr(mega, "_MEGA_CAPACITY_LOGGED", set())
+    monkeypatch.setattr(mega, "_decode_experts_per_rank", lambda: (48,))
     monkeypatch.setattr(
         torch.cuda, "is_current_stream_capturing", lambda: state.capturing
     )
@@ -81,6 +82,8 @@ def runtime(monkeypatch):
             assert not state.capturing, "constructor reached during capture"
             self.rank = kwargs["rank"]
             self.capacity = kwargs["max_tok_per_rank"]
+            self.quant = kwargs["quant"]
+            self.p2p_quant = kwargs["stage2_p2p_quant"]
             state.events.append(("build", self.rank, self.capacity))
             state.instances[self.rank, self.capacity] = self
 
@@ -111,6 +114,7 @@ def runtime(monkeypatch):
         experts=384,
         mtpr=LARGE_CAPACITY,
         layer=None,
+        **quant_kwargs,
     ):
         state.manager.rank = rank
         state.manager.world_size = world
@@ -128,6 +132,7 @@ def runtime(monkeypatch):
             topk=6,
             mtpr=mtpr,
             swiglu_limit=0.0,
+            **quant_kwargs,
         )
 
     state.run = run
@@ -240,6 +245,21 @@ def test_disabled_or_unsupported_cases_keep_the_original_instance(
     assert _forwarded(runtime) == [mtpr]
 
 
+@pytest.mark.parametrize(
+    ("fixed_slot_widths", "expected"),
+    [((48,), [LARGE_CAPACITY]), ((48, 16), [LARGE_CAPACITY, 128])],
+)
+def test_draft_width_gets_decode_capacity_when_aiter_runs_it_fixed_slot(
+    runtime, monkeypatch, fixed_slot_widths, expected
+):
+    # The V4.1-Flash DSpark draft MoE: 128 experts, 16 per rank at EP8.
+    monkeypatch.setattr(mega, "_decode_experts_per_rank", lambda: fixed_slot_widths)
+    runtime.run(_context(64, is_draft=True), experts=128)
+
+    assert _built(runtime) == expected
+    assert _forwarded(runtime) == expected[-1:]
+
+
 @pytest.mark.parametrize("framework", ["vllm", "sglang", "sgl", "rtpllm"])
 @pytest.mark.parametrize("prefill", [False, True])
 def test_plugin_context_cannot_enable_native_capacity_selection(
@@ -330,6 +350,24 @@ def test_capture_cache_miss_is_rejected_before_symmetric_allocation(
         runtime.run(_context(64))
 
     assert runtime.events == before_capture
+
+
+def test_quant_and_combine_format_reach_both_capacities(runtime):
+    runtime.run(_context(256), quant="a4w4", p2p_quant="fp4_blockwise_1x32")
+
+    assert _built(runtime) == [LARGE_CAPACITY, 128]
+    for instance in runtime.instances.values():
+        assert instance.quant == "a4w4"
+        assert instance.p2p_quant == "fp4_blockwise_1x32"
+
+
+def test_combine_format_is_part_of_the_instance_key(runtime):
+    # The combine format is baked into each instance's kernels and wire, so an
+    # instance built for one format must not be reused for another.
+    runtime.run(_context(256))
+    runtime.run(_context(256), p2p_quant="fp4_blockwise_1x32")
+
+    assert _built(runtime) == [LARGE_CAPACITY, 128, LARGE_CAPACITY, 128]
 
 
 def test_cached_capacities_rebind_layer_weights_without_breaking_eplb_aliases(runtime):

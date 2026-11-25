@@ -290,3 +290,5 @@ def test_mega_backend_uses_global_dispatch_width(monkeypatch):
     assert output == "output"
     assert captured["experts"] == 264
     assert captured["topk"] == 9
+    assert captured["quant"] == mega_module._MEGA_QUANT
+    assert captured["p2p_quant"] == mega_module._MEGA_P2P_QUANT

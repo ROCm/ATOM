@@ -2728,12 +2728,13 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         from atom.model_ops.fused_moe.flydsl_mega_experts import MegaFusedExperts
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        # Activation quant and combine format come from ATOM_MEGA_QUANT and
+        # ATOM_MEGA_P2P_QUANT.
         self.fused_experts = MegaFusedExperts(
             layer,
             model_dim=self.hidden_size,
             inter_dim=self.intermediate_size,
             mtpr=self.moe.max_num_tokens,
-            quant="a8w4",
         )
         # MegaMoE quantizes the bf16 rows itself, inside its dispatch.
         self.routed_rows_wire = None
@@ -4065,7 +4066,7 @@ class FusedMoE(torch.nn.Module):
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
             raise TypeError(
-                "moe_backend='mega' currently supports only MXFP4/A8W4 MoE, "
+                "moe_backend='mega' currently supports only MXFP4-weight MoE, "
                 f"got {type(self.quant_method).__name__}"
             )
         if self.expert_layout.mode is SharedExpertMode.LEGACY_AITER:
