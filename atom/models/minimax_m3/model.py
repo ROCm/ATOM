@@ -3,6 +3,7 @@
 
 """Inference-only MiniMax-M3 model support for ATOM."""
 
+import logging
 from typing import ClassVar
 
 import torch
@@ -31,6 +32,8 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_mxfp8_quant,
+    fused_allreduce_gemma_rms_norm_mxfp8_supported,
     fused_allreduce_gemma_rms_norm_quant,
 )
 from atom.model_ops.linear import (
@@ -42,6 +45,9 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
+)
+from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
+    reads_page_table as nvfp4_reads_page_table,
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
@@ -63,6 +69,13 @@ from atom.models.utils import (
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
+
+try:
+    from aiter.ops.flydsl.mxfp8_qkv_rope_nvfp4_gfx1250 import (
+        mxfp8_qkv_chain_supported,
+    )
+except ImportError:  # an aiter without ROCm/aiter#8432
+    mxfp8_qkv_chain_supported = None
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -122,6 +135,85 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
     return (
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
+    )
+
+
+def _sparse_pa_mxfp8_conditions(attn: nn.Module, o_proj: nn.Module) -> dict:
+    """What the sparse attention needs to write o_proj's MXFP8 input
+    (ATOM_MINIMAX_M3_PA_MXFP8_OUT): NVFP4 K/V, which gfx1250 attends through
+    aiter's paged decode, and an o_proj that is a native group-32 A8 GEMM, whose
+    own input quant (``quantize_fp8``) the attention's epilogue replaces bit for
+    bit.
+
+    All of it is known at construction, and has to be: torch.compile traces the
+    forward once, in the warmup run, before the KV cache is bound, and the
+    compiled graph keeps the branch it saw. The K/V format is the one the layer
+    declares (``SparseMHAPagedAttentionImpl.kv_format``, which sizes and binds
+    its pool), not ``impl.kv_nvfp4``: that is only set when the cache is bound,
+    so a forward that asked it traced the BF16 output and o_proj's own quant
+    into every phase."""
+    return {
+        "ATOM_MINIMAX_M3_PA_MXFP8_OUT": bool(envs.ATOM_MINIMAX_M3_PA_MXFP8_OUT),
+        "gfx1250 paged decode": nvfp4_reads_page_table(),
+        "NVFP4 K/V (declared)": getattr(attn.impl, "kv_format", "") == "nvfp4",
+        "native group-32 o_proj": getattr(o_proj, "native_a8_group_rows", None)
+        is not None,
+    }
+
+
+_logged_once: set[str] = set()
+
+
+def _log_conditions_once(what: str, conditions: dict, prefix: str) -> None:
+    """Log each condition of a fused path once per process: the first layer's,
+    and any later layer whose verdict differs from it."""
+    verdict = all(conditions.values())
+    key = f"{what}:{verdict}"
+    if key in _logged_once:
+        return
+    first = not any(k.startswith(f"{what}:") for k in _logged_once)
+    _logged_once.add(key)
+    text = ", ".join(f"{name}={value}" for name, value in conditions.items())
+    logging.getLogger("atom").log(
+        logging.INFO if first else logging.WARNING,
+        f"MiniMax-M3 {what} {'ON' if verdict else 'OFF'} ({prefix}): {text}",
+    )
+
+
+def _linear_consumes_mxfp8(linear: nn.Module) -> bool:
+    """Whether a linear consumes native E4M3 plus row-major group-32 E8M0."""
+    quant_type = getattr(linear, "quant_type", None)
+    quant_type_value = getattr(quant_type, "value", quant_type)
+    params_dtype = getattr(linear, "params_dtype", None)
+    return (
+        quant_type_value == QuantType.per_1x32.value
+        and params_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        and getattr(linear, "native_a8_group_rows", None) is not None
+        and not getattr(linear, "runs_bf16", False)
+    )
+
+
+def _fused_qkv_chain_supported(attn: nn.Module) -> bool:
+    """Whether ``attn`` (a MiniMaxM3SparseAttention) may route its MXFP8 QKV input
+    into rope_cache's fused chain: aiter's kernel present and serving the head
+    shape (gfx1250, the M3 TP4 heads), a layer that runs the indexer, and no
+    plugin bridge. The per-call conditions are rope_cache's."""
+    if mxfp8_qkv_chain_supported is None or attn.skip_index_topk:
+        return False
+    from atom.plugin.prepare import is_plugin_mode
+
+    return (
+        not is_plugin_mode()
+        and attn.idx_head_dim == attn.head_dim
+        and mxfp8_qkv_chain_supported(
+            1,
+            attn.num_heads,
+            attn.num_kv_heads,
+            attn.head_dim,
+            attn.rotary_emb.rotary_dim,
+            attn.hidden_size,
+        )
+        and isinstance(getattr(attn.attn, "impl", None), SparseMHAPagedAttentionImpl)
     )
 
 
@@ -550,6 +642,24 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_layer_ordinal=self.sparse_layer_ordinal,
             index_cache_dtype=index_cache_config,
         )
+        # Opt-in: the NVFP4 sparse attention writes o_proj's MXFP8 input. Only
+        # gfx1250's NVFP4 attention (aiter's paged decode) has that output.
+        # Decided here, never in forward (see _sparse_pa_mxfp8_conditions).
+        mxfp8_conditions = _sparse_pa_mxfp8_conditions(self.attn, self.o_proj)
+        self.sparse_pa_mxfp8_out = all(mxfp8_conditions.values())
+        if envs.ATOM_MINIMAX_M3_PA_MXFP8_OUT:
+            _log_conditions_once(
+                "sparse PA -> o_proj MXFP8 input (ATOM_MINIMAX_M3_PA_MXFP8_OUT)",
+                mxfp8_conditions,
+                prefix,
+            )
+        # The QKV GEMM moves into rope_cache, which fuses it with the norm / RoPE /
+        # NVFP4 inserts where aiter's chain kernel takes the call and runs the
+        # GEMM itself otherwise (SparseMHAPagedAttentionImpl).
+        self.fused_qkv_chain = _fused_qkv_chain_supported(self)
+        if self.fused_qkv_chain:
+            # A tuple: the impl reads the linear, it does not own it.
+            self.attn.impl.fused_qkv_linear = (self.qkv_proj,)
 
     def forward(
         self,
@@ -557,20 +667,42 @@ class MiniMaxM3SparseAttention(nn.Module):
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
-        # the indexer norm/rope/top-k path, but still compute the packed GEMM.
-        qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
-        q, k, v, _, _ = qkv.split(
-            [
-                self.q_size,
-                self.kv_size,
-                self.kv_size,
-                self.index_q_size,
-                self.idx_head_dim,
-            ],
-            dim=-1,
-        )
-        attn_output = self.attn(q, k, v, positions, qkv=qkv)
+        x_scale = None
+        if (
+            self.fused_qkv_chain
+            and hidden_states_scale is not None
+            and hidden_states.dtype == torch.float8_e4m3fn
+            and _linear_consumes_mxfp8(self.qkv_proj)
+        ):
+            # The MXFP8 activation rides to rope_cache as `qkv` with its E8M0
+            # scales as `q_scale`; q/k/v only size the attention's outputs.
+            qkv, x_scale = hidden_states, hidden_states_scale
+            rows = hidden_states.new_empty(
+                (hidden_states.shape[0], self.q_size + 2 * self.kv_size),
+                dtype=torch.bfloat16,
+            )
+            q, k, v = rows.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            # Keep index Q/K packed with main QKV. Layers that reuse cached top-k
+            # skip the indexer norm/rope/top-k path, but still compute the packed
+            # GEMM.
+            qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
+            q, k, v, _, _ = qkv.split(
+                [
+                    self.q_size,
+                    self.kv_size,
+                    self.kv_size,
+                    self.index_q_size,
+                    self.idx_head_dim,
+                ],
+                dim=-1,
+            )
+        if self.sparse_pa_mxfp8_out:
+            attn_output, attn_scale = self.attn.forward_mxfp8(
+                q, k, v, positions, q_scale=x_scale, qkv=qkv
+            )
+            return self.o_proj(attn_output, x_scale=attn_scale)
+        attn_output = self.attn(q, k, v, positions, q_scale=x_scale, qkv=qkv)
         return self.o_proj(attn_output)
 
 
@@ -622,6 +754,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # Resolved here, not in forward: the arch probe must stay out of the graph.
+        self.mxfp8_fused_ar = fused_allreduce_gemma_rms_norm_mxfp8_supported()
 
     def forward(
         self,
@@ -641,6 +775,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
             not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
         )
+        fuse_input_ar_rmsnorm_mxfp8 = self.mxfp8_fused_ar and _linear_consumes_mxfp8(
+            self.self_attn.qkv_proj
+        )
+        fuse_post_attention_ar_rmsnorm_mxfp8 = (
+            self.mxfp8_fused_ar
+            and not self.is_moe_layer
+            and _linear_consumes_mxfp8(self.mlp.gate_up_proj)
+        )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -648,6 +790,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
                     hidden_states, residual, self.input_layernorm
+                )
+            )
+        elif fuse_input_ar_rmsnorm_mxfp8:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8_quant(
+                    hidden_states,
+                    residual,
+                    self.input_layernorm,
                 )
             )
         else:
@@ -671,6 +821,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
                     hidden_states, residual, self.post_attention_layernorm
+                )
+            )
+            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        elif fuse_post_attention_ar_rmsnorm_mxfp8:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8_quant(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm,
                 )
             )
             hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
