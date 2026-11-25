@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """The GDN checkpoint writer refuses a chunk-state layout it cannot read.
 
 `write_state_checkpoints` reads off `h`'s strides whether its states are stored

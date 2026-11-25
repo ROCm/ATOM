@@ -226,8 +226,9 @@ def prefill(
 
     The default KV snapshot keeps the public contract -- ``[B, NT, H, K, V]``,
     one row per chunk boundary -- as a view over the kernel's VK storage, like
-    the final state; consumers address it by its strides. A caller that writes
-    native FlyDSL checkpoints may request the VK tensor itself instead.
+    the final state; consumers address it by its strides. RTP's own checkpoint
+    writer (``install_rtp_native_prefill_snapshot``) requests the VK tensor
+    itself; the shared ``write_state_checkpoints`` must get the default KV view.
     """
     if snapshot_layout not in ("kv", "vk"):
         raise ValueError(f"Unsupported GDN snapshot layout: {snapshot_layout}")

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
 """SGLang radix track reads FlyDSL's chunk states as a view, not a copy.
 
 FlyDSL's prefill hands out its per-chunk states `h` as a logical KV view over
