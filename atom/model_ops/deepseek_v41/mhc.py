@@ -120,6 +120,49 @@ def _stream_state_kernel(
         row % width == 0, anchor_ptr + (row // width) * hidden_size, fill_ptr
     )
     value = tl.load(src + cols, mask=mask)
+    _store_streams(value, row, cols, mask, residual_ptr, pre_mix_ptr, hidden_size, M)
+
+
+@triton.jit
+def _peer_stream_state_kernel(
+    ids_ptr,  # [rows / width]: the token of every width-th row
+    shards_ptr,  # [ranks] int64: every rank's vocab shard (`PeerEmbedding`)
+    fill_ptr,  # [H]: the embedding of every other row, local
+    residual_ptr,  # [rows, M, H]
+    pre_mix_ptr,  # [rows, M] fp32
+    hidden_size,
+    width,
+    rows_per_rank,
+    ranks,
+    M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    # `_stream_state_kernel` with the anchors read where they lie: an anchor
+    # row from its owner rank's shard, zeros for an id no rank owns (the rows
+    # the masked lookup + all-reduce of `VocabParallelEmbedding` gives).
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = cols < hidden_size
+    if row % width == 0:
+        token = tl.load(ids_ptr + row // width).to(tl.int64)
+        owner = token // rows_per_rank
+        owned = (token >= 0) & (owner < ranks)
+        owner = tl.where(owned, owner, 0)
+        local = tl.where(owned, token - owner * rows_per_rank, 0)
+        shard = tl.load(shards_ptr + owner).to(tl.pointer_type(tl.bfloat16))
+        value = tl.load(
+            shard + local * hidden_size + cols, mask=mask & owned, other=0.0
+        )
+    else:
+        value = tl.load(fill_ptr + cols, mask=mask)
+    _store_streams(value, row, cols, mask, residual_ptr, pre_mix_ptr, hidden_size, M)
+
+
+@triton.jit
+def _store_streams(
+    value, row, cols, mask, residual_ptr, pre_mix_ptr, hidden_size, M: tl.constexpr
+):
+    # Row `row`'s M streams all `value`, and a pre-mix of (1, 0, ..., 0).
     dst = residual_ptr + row * M * hidden_size
     for stream in tl.static_range(M):
         tl.store(dst + stream * hidden_size + cols, value, mask=mask)
@@ -129,6 +172,29 @@ def _stream_state_kernel(
             pre_mix_ptr + row * M + streams,
             tl.where(streams == 0, 1.0, 0.0).to(tl.float32),
         )
+
+
+def write_peer_stream_state(residual, pre_mix, peer, ids, fill, *, block_h, width):
+    """`write_stream_state` of a draft block whose anchors ``ids`` are read
+    from ``peer``'s vocab shards (`PeerEmbedding`) rather than embedded first:
+    no lookup launch, no all-reduce. ``fill`` [H] is local."""
+    rows, hc_mult, hidden_size = residual.shape
+    if not rows:
+        return
+    _peer_stream_state_kernel[(rows, triton.cdiv(hidden_size, block_h))](
+        ids,
+        peer.view.addresses,
+        fill,
+        residual,
+        pre_mix,
+        hidden_size,
+        width,
+        peer.rows_per_rank,
+        peer.ranks,
+        M=hc_mult,
+        BLOCK_H=block_h,
+        num_warps=4,
+    )
 
 
 def write_stream_state(residual, pre_mix, anchors, *, block_h, width=1, fill=None):
