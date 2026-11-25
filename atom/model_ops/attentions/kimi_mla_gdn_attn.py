@@ -41,6 +41,18 @@ from .token_layout.slots import slot_mapping
 from .triton_mla import TritonMLAMetadataBuilder
 
 
+def flash_kda_chunk() -> int:
+    """aiter FlashKDA's recurrence chunk: the grid a midstep KDA checkpoint
+    sits on, counted from each forward's first token.
+
+    Imported on use, by the midstep path alone: only an aiter with
+    ROCm/aiter#7413 exports it, and the switch needs that aiter anyway.
+    """
+    from aiter.ops.triton.kimi_delta_attn import FLASH_KDA_CHUNK
+
+    return FLASH_KDA_CHUNK
+
+
 class KimiMLAGDNBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -436,6 +448,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         return kda_midstep_transfer(
             layout_id,
             self.model_runner.config.hf_config.linear_conv_kernel_dim,
+            grid=flash_kda_chunk(),
             decode_keep=self._decode_keep(),
         )
 
@@ -786,7 +799,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         return None
 
     def _kda_snapshots(self, batch: ScheduledBatch) -> KdaSnapshots | None:
-        """The midstep checkpoints this prefill writes (`kda_snapshots`)."""
+        """The midstep checkpoints this prefill writes (`kda_snapshots`), None
+        with the switch off: the scheduler then reserves none."""
+        if not kda_midstep_enabled():
+            return None
         return kda_snapshots(
             batch.state_save_all,
             batch.state_rows,
@@ -794,6 +810,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             batch.num_scheduled_tokens,
             batch.state_slots_committed,
             num_slots=self.model_runner.mamba_k_cache.shape[1],
+            grid=flash_kda_chunk(),
             conv_len=self.model_runner.config.hf_config.linear_conv_kernel_dim - 1,
             device=self.device,
         )

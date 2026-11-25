@@ -29,7 +29,7 @@ pytest.importorskip("triton", reason="the checkpoint writer is a Triton kernel")
 from atom.models.kimi_k3.midstep import kda_snapshots
 
 ROOT = Path(__file__).resolve().parents[1]
-CONV_LEN, ROLLBACK = 3, 2
+CONV_LEN, ROLLBACK, GRID = 3, 2, 32
 SLOTS, H, V, K, D = 9, 2, 4, 4, 6
 
 
@@ -66,6 +66,7 @@ def check_interior_and_end_targets(write, device, conv_transposed):
         num_scheduled_tokens=[96, 48],
         runtime_slots=[1, 2],
         num_slots=SLOTS,
+        grid=GRID,
         conv_len=CONV_LEN,
         device=device,
     )
@@ -99,6 +100,7 @@ def check_an_end_target_alone(write, device):
         [64],
         [1],
         num_slots=SLOTS,
+        grid=GRID,
         conv_len=CONV_LEN,
         device=device,
     )

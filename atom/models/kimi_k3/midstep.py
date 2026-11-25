@@ -20,10 +20,6 @@ from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_ta
 from atom.model_ops.gdn_midstep_snapshots import checkpoint_target_columns
 from atom.utils import envs
 
-#: aiter FlashKDA's recurrence chunk: the state exists only at a chunk's top,
-#: counted from each forward's first token.
-FLASH_KDA_CHUNK = 32
-
 
 def kda_midstep_enabled() -> bool:
     """ATOM_K3_KDA_STATE_MIDSTEP=1. It needs an aiter with ROCm/aiter#7413,
@@ -49,7 +45,7 @@ def refuse_midstep_under_pipeline(pipeline_parallel_size: int) -> None:
 
 
 def kda_midstep_transfer(
-    layout_id: str, conv_kernel_dim: int, *, decode_keep: str
+    layout_id: str, conv_kernel_dim: int, *, grid: int, decode_keep: str
 ) -> StateTransfer:
     """The PAGE transfer of a midstep-readable Kimi-K3 state, for `layout_id`.
 
@@ -57,15 +53,17 @@ def kda_midstep_transfer(
     alike) is written into a scratch slot and stored from there, so the chunk is
     no longer cut onto them: an interior position from the FlashKDA recurrence's
     snapshot, one at the forward's end from the runtime slot (`KdaSnapshots`).
-    Grid: the recurrence's chunk; offset: the conv window this forward has to
-    supply. `decode_keep` is the backend's own (`_decode_keep`): the switch
+    `grid` is the recurrence's chunk, aiter's `FLASH_KDA_CHUNK`, which the
+    backend reads from aiter and passes in: the state exists only at a chunk's
+    top, counted from each forward's first token. Offset: the conv window this
+    forward has to supply. `decode_keep` is the backend's own (`_decode_keep`): the switch
     changes where a prefill checkpoint is taken, not what a decode boundary
     keeps.
     """
     return StateTransfer.copy(
         layout_id,
         readable_midstep=True,
-        midstep_grid=FLASH_KDA_CHUNK,
+        midstep_grid=grid,
         midstep_min_offset=conv_kernel_dim - 1,
         decode_keep=decode_keep,
     )
@@ -146,10 +144,12 @@ def kda_snapshots(
     runtime_slots,
     *,
     num_slots: int,
+    grid: int,
     conv_len: int,
     device,
 ) -> KdaSnapshots | None:
     """The midstep checkpoints one prefill step writes into scratch slots.
+    `grid` is the transfer's (`kda_midstep_transfer`).
 
     Read off the step's `state_save_all` through `midstep_checkpoint_targets`,
     which raises rather than skips: the scheduler publishes every reserved hash
@@ -165,7 +165,7 @@ def kda_snapshots(
         runtime_slots,
         saves,
         num_slots=num_slots,
-        grid=FLASH_KDA_CHUNK,
+        grid=grid,
         min_offset=conv_len,
     )
     if not found:

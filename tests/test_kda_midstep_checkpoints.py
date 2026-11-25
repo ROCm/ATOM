@@ -33,7 +33,6 @@ from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 # From the submodule: `from atom.models.kimi_k3 import midstep` would ask the
 # package, which resolves names from `model` and so imports AITER.
 from atom.models.kimi_k3.midstep import (
-    FLASH_KDA_CHUNK,
     kda_midstep_enabled,
     kda_midstep_transfer,
     kda_snapshots,
@@ -61,7 +60,8 @@ def window_rows(snaps):
     return rows
 
 
-GRID = FLASH_KDA_CHUNK
+#: aiter's `FLASH_KDA_CHUNK`, which the backend passes in.
+GRID = 32
 # PROMPT is 44 tokens; a PAGE class needs no successor room, so its prompt-end
 # anchor is the last hittable block's end.
 ANCHOR = 40
@@ -79,7 +79,9 @@ def _clean_switches(monkeypatch):
 def k3_runtime(midstep_on: bool) -> StateRuntime:
     """What the Kimi-K3 backend's `state_transfer()` declares, either way."""
     transfer = (
-        kda_midstep_transfer(KDA_SPEC.layout_id, CONV_KERNEL, decode_keep="settled")
+        kda_midstep_transfer(
+            KDA_SPEC.layout_id, CONV_KERNEL, grid=GRID, decode_keep="settled"
+        )
         if midstep_on
         else StateTransfer.copy(KDA_SPEC.layout_id)
     )
@@ -127,11 +129,11 @@ def test_the_switch_is_refused_under_pipeline_parallelism():
 
 def test_the_transfer_reads_midstep_on_the_flash_kda_grid():
     transfer = kda_midstep_transfer(
-        KDA_SPEC.layout_id, CONV_KERNEL, decode_keep="snapshot"
+        KDA_SPEC.layout_id, CONV_KERNEL, grid=GRID, decode_keep="snapshot"
     )
     assert transfer.copies and transfer.paged_layout_id == KDA_SPEC.layout_id
     assert transfer.readable_midstep
-    assert transfer.midstep_grid == 32
+    assert transfer.midstep_grid == GRID
     assert transfer.midstep_min_offset == CONV_LEN
     assert transfer.decode_keep == "snapshot"
     assert StateTransfer.from_wire(transfer.to_wire()) == transfer
@@ -176,6 +178,7 @@ def test_one_scheduler_pass(on, monkeypatch):
         batch.num_scheduled_tokens,
         batch.state_slots_committed,
         num_slots=8,
+        grid=GRID,
         conv_len=CONV_LEN,
         device="cpu",
     )
@@ -206,6 +209,7 @@ def test_several_positions_in_one_forward_become_several_targets():
         [100],
         [seq.state_slot],
         num_slots=8,
+        grid=GRID,
         conv_len=CONV_LEN,
         device="cpu",
     )
@@ -232,6 +236,7 @@ def test_an_interior_and_an_end_position_in_one_forward():
         [ANCHOR],
         [seq.state_slot],
         num_slots=8,
+        grid=GRID,
         conv_len=CONV_LEN,
         device="cpu",
     )
@@ -253,6 +258,7 @@ def test_targets_follow_the_batch_row_of_each_state_holding_seq():
         num_scheduled_tokens=[40, 10, 64],
         runtime_slots=[1, 2],
         num_slots=8,
+        grid=GRID,
         conv_len=CONV_LEN,
         device="cpu",
     )
@@ -263,7 +269,7 @@ def test_targets_follow_the_batch_row_of_each_state_holding_seq():
 
 
 def test_a_step_without_saves_builds_nothing():
-    kw = {"num_slots": 8, "conv_len": CONV_LEN, "device": "cpu"}
+    kw = {"num_slots": 8, "grid": GRID, "conv_len": CONV_LEN, "device": "cpu"}
     assert kda_snapshots(None, [0], [0], [64], [1], **kw) is None
     assert kda_snapshots([[]], [0], [0], [64], [1], **kw) is None
 
@@ -278,6 +284,7 @@ def test_a_position_off_the_grid_is_an_error_not_a_skip():
             [64],
             [1],
             num_slots=8,
+            grid=GRID,
             conv_len=CONV_LEN,
             device="cpu",
         )
@@ -312,6 +319,7 @@ def test_interior_and_end_targets_share_one_launch():
         [96],
         [1],
         num_slots=8,
+        grid=GRID,
         conv_len=CONV_LEN,
         device="cpu",
     )
@@ -339,6 +347,7 @@ def test_a_snapshot_buffer_strided_unlike_the_pool_is_refused():
         [96],
         [1],
         num_slots=8,
+        grid=GRID,
         conv_len=CONV_LEN,
         device="cpu",
     )
@@ -358,6 +367,7 @@ def test_an_end_position_alone_reads_the_pool():
         [64],
         [1],
         num_slots=6,
+        grid=GRID,
         conv_len=CONV_LEN,
         device="cpu",
     )

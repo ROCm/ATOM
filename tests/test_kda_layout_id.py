@@ -218,10 +218,23 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
         """The switch moves where a prefill checkpoint is taken. What a decode
         boundary keeps is still the backend's `_decode_keep`."""
         monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
+        monkeypatch.setattr(K3, "flash_kda_chunk", lambda: 32)
         with tp_world(TP):
             transfer = Builder.state_transfer(builder(num_spec=num_spec, kpool=kpool))
-        assert transfer.readable_midstep
+        assert transfer.readable_midstep and transfer.midstep_grid == 32
         assert transfer.decode_keep == keep
+
+    def test_without_the_midstep_switch_aiter_is_not_asked_for_the_grid(
+        self, monkeypatch
+    ):
+        """An aiter without ROCm/aiter#7413 has no `FLASH_KDA_CHUNK` to import."""
+
+        def no_grid():
+            raise ImportError("FLASH_KDA_CHUNK")
+
+        monkeypatch.setattr(K3, "flash_kda_chunk", no_grid)
+        with tp_world(TP):
+            assert not Builder.state_transfer(builder()).readable_midstep
 
     def test_the_midstep_switch_is_refused_under_pipeline_parallelism(
         self, monkeypatch

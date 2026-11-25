@@ -38,6 +38,7 @@ H, HD = 2, 4  # KDA heads and head dim of the layer under test
 LP = H * HD  # the q / k / v width
 CONV_KERNEL = 4
 NUM_SLOTS = 9
+GRID = 32  # aiter's FLASH_KDA_CHUNK, which the builder reads from aiter
 # Row 0 resumes at token 64 and runs 96 more: interior checkpoints 32 and 64
 # tokens in, and one at its end. Row 1 is a fresh 48-token prompt with one 32
 # tokens in. Row 2 reserved none. Positions are absolute, as the scheduler
@@ -101,10 +102,19 @@ def k3():
 # ── the builder ──────────────────────────────────────────────────────────────
 
 
-def finish_prefill(k3, monkeypatch, saves, *, builds_gdn_metadata=True):
+def _no_grid():
+    raise ImportError("an aiter without ROCm/aiter#7413 has no FLASH_KDA_CHUNK")
+
+
+def finish_prefill(k3, monkeypatch, saves, *, builds_gdn_metadata=True, switch=True):
     """`finish_prefill` on a Kimi builder holding only what it reads, over a
     parent hook that builds the GDN metadata as `GDNStateMixin` does (or leaves
-    None, for a prefill without block tables). Returns that metadata."""
+    None, for a prefill without block tables). Returns that metadata. With the
+    switch off, asking aiter for the grid raises."""
+    monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1" if switch else "0")
+    monkeypatch.setattr(
+        k3.backend, "flash_kda_chunk", (lambda: GRID) if switch else _no_grid
+    )
     cls = k3.backend.KimiAiterMLAGDNMetadataBuilder
     mro = cls.__mro__
     parent = next(
@@ -162,8 +172,14 @@ def test_the_builder_attaches_an_end_target_alone(k3, monkeypatch):
 
 
 def test_a_step_without_reservations_attaches_none(k3, monkeypatch):
-    """Every step with the switch off: the scheduler reserves nothing."""
     assert finish_prefill(k3, monkeypatch, NO_SAVES).kda_snapshots is None
+
+
+def test_with_the_switch_off_the_builder_does_not_ask_aiter_for_the_grid(
+    k3, monkeypatch
+):
+    metadata = finish_prefill(k3, monkeypatch, NO_SAVES, switch=False)
+    assert metadata.kda_snapshots is None
 
 
 def test_a_prefill_without_gdn_metadata_is_left_alone(k3, monkeypatch):
