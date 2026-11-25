@@ -261,6 +261,14 @@ where it lands and the router places it by the lockstep step time it adds:
   level with each other, and a request stays on the rank holding its prefix
   in HBM unless that rank is near the busiest. Ties go to the prefix owner,
   then round-robin. `ATOM_DP_LB_REQ_EQUIV` does not apply.
+- **P/D engines**: on a prefill or decode engine of a P/D deployment (a
+  `mooncake` / `moriio` connector with `kv_role` `kv_producer` or
+  `kv_consumer`, directly or inside `multi`), `share_cache` keeps the backlog
+  rule `argmin(rank_backlog + (prompt - shared_prefix_hit) +
+  ATOM_DP_LB_REQ_EQUIV * num_reqs)` (`SharedWorkPlacement`): such an engine
+  does not run both the prefill and the decode of a request, which the
+  lockstep costs assume. An offload tier's own `kv_role` does not make an
+  engine P/D.
 
 With a Mooncake Store, `share_cache` likewise refuses distinct per-NIC
 `mooncake_store.pools` pairs (see the `prefix_spread` section below); aliases

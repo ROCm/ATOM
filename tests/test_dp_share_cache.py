@@ -14,6 +14,7 @@ from atom.model_engine.dp_routing.backlog import BacklogLedger
 from atom.model_engine.dp_routing.share_cache import (
     LockstepCostPlacement,
     ShareCacheRouter,
+    SharedWorkPlacement,
     _smooth_max,
     _smooth_max_rise,
 )
@@ -691,3 +692,110 @@ def test_router_passes_tier_loads_to_the_placement():
         reqs,
     )
     assert route.rank != first.rank
+
+
+def _backlog_rule(req_equiv, cursor):
+    """The share_cache score before the lockstep rule, written out."""
+
+    def choose(backlog, requests, costs, owner):
+        width = len(backlog)
+        return min(
+            range(width),
+            key=lambda rank: (
+                backlog[rank] + costs[rank] + req_equiv * requests[rank],
+                rank != owner,
+                (rank - cursor) % width,
+            ),
+        )
+
+    return choose
+
+
+def test_pd_placement_matches_the_backlog_rule_bit_for_bit():
+    """On a P/D engine the placement is the backlog rule, whatever the loads."""
+    import random
+
+    rng = random.Random(1125)
+    for req_equiv in (0, 64, 512):
+        placement = SharedWorkPlacement(req_equiv)
+        for cursor in range(400):
+            n = rng.choice((2, 4, 8))
+            backlog = [rng.choice((0, rng.randrange(0, 200_000))) for _ in range(n)]
+            reqs = [rng.randrange(0, 64) for _ in range(n)]
+            costs = [rng.choice((0, rng.randrange(0, 50_000))) for _ in range(n)]
+            loads = [rng.randrange(0, 90_000) for _ in range(n)]
+            owner = rng.choice([None] + list(range(n)))
+            expected = _backlog_rule(req_equiv, cursor)(backlog, reqs, costs, owner)
+            assert placement(backlog, reqs, costs, owner, loads) == expected
+
+
+def test_pd_router_places_like_the_backlog_rule():
+    """The same request stream through a P/D router and through the written-out
+    backlog rule: every placement and credit is the same."""
+    import random
+
+    rng = random.Random(7)
+    router = ShareCacheRouter(_store_tier(512), pd_req_equiv=512)
+    assert isinstance(router.placement, SharedWorkPlacement)
+    seen = []
+    inner = router.placement
+
+    def spy(backlog, reqs, costs, owner, loads):
+        seen.append((list(backlog), list(reqs), list(costs), owner))
+        return inner(backlog, reqs, costs, owner, loads)
+
+    router.placement = spy
+    backlog, reqs = [0, 0, 0, 0], [0, 0, 0, 0]
+    for i in range(40):
+        head = rng.randrange(3)
+        tokens = PREFIX[: 4_096 * (head + 1)] + list(
+            range(10**6 * (i + 1), 10**6 * (i + 1) + rng.randrange(16, 3_000))
+        )
+        route, _ = _route(router, _seq(i, tokens), backlog, reqs)
+        b, r, c, owner = seen[-1]
+        assert route.rank == _backlog_rule(512, i)(b, r, c, owner)
+        if rng.random() < 0.7:
+            router.prefill_complete(i)
+
+
+def test_share_cache_keeps_the_backlog_rule_on_pd_engines_only():
+    """kv_producer / kv_consumer of a P/D connector, directly or inside multi,
+    keep the backlog rule; an offload tier's own kv_role does not."""
+    store = {
+        "kv_connector": "mooncake_store",
+        "kv_role": "offload",
+        "kv_connector_extra_config": {
+            "mooncake_store.master": "127.0.0.1:1",
+            "mooncake_store.metadata": "http://127.0.0.1:2/metadata",
+        },
+    }
+
+    def build(kv_transfer_config):
+        mgr = _bare_mgr(2)
+        mgr.global_engine_count = 2
+        mgr._dp_session_affinity_enabled = False
+        mgr._dp_lb_strategy = "share_cache"
+        mgr._dp_lb_req_equiv = 384
+        config = SimpleNamespace(
+            offload_min_load_tokens=512,
+            dp_load_balance="share_cache",
+            enable_prefix_caching=True,
+            kv_transfer_config=kv_transfer_config,
+        )
+        return mgr._build_prefix_router(config).placement
+
+    assert isinstance(build(store), LockstepCostPlacement)
+    assert isinstance(build(dict(store, kv_role="kv_both")), LockstepCostPlacement)
+    for connector in ("moriio", "mooncake"):
+        for role in ("kv_producer", "kv_consumer"):
+            placement = build(
+                {
+                    "kv_connector": "multi",
+                    "connectors": [
+                        {"kv_connector": connector, "kv_role": role},
+                        store,
+                    ],
+                }
+            )
+            assert isinstance(placement, SharedWorkPlacement)
+            assert placement.req_equiv == 384

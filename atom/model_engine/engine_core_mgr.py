@@ -25,6 +25,7 @@ import zmq.asyncio
 from atom.config import Config
 from atom.distributed.kv_events import offset_endpoint
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
 from atom.model_engine.capabilities import WEIGHT_RELOAD_FEATURE, pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
@@ -1267,6 +1268,10 @@ class CoreManager:
                 f"rank shares and loads from ({', '.join(shared)}, kv_role "
                 f"offload or kv_both); the KV connectors are {names!r}"
             )
+        if disaggregated_kv_role(config) is not None:
+            # A P/D prefill or decode engine does not run both halves of a
+            # request: keep the backlog rule. An offload tier alone is not P/D.
+            return ShareCacheRouter(tier, pd_req_equiv=self._dp_lb_req_equiv)
         return ShareCacheRouter(tier)
 
     @property

@@ -94,11 +94,38 @@ class LockstepCostPlacement:
         )
 
 
+class SharedWorkPlacement:
+    """Balance actual backlog plus this request's cost and decode slot pressure.
+
+    The rule for P/D prefill and decode engines, where one engine does not run
+    both the prefill and the decode of a request, so the lockstep costs above
+    (fitted on engines that do both) do not describe its step."""
+
+    def __init__(self, req_equiv: int) -> None:
+        self.req_equiv = int(req_equiv)
+        self.cursor = 0
+
+    def __call__(self, backlog, requests, costs, owner, loads=None):
+        width = len(backlog)
+        cursor = self.cursor
+        self.cursor += 1
+        return min(
+            range(width),
+            key=lambda rank: (
+                backlog[rank] + costs[rank] + self.req_equiv * requests[rank],
+                rank != owner,
+                (rank - cursor) % width,
+            ),
+        )
+
+
 class ShareCacheRouter(PrefixSpreadRouter):
     """Shared-tier placement: the prefix router's index, balanced on lockstep cost.
 
     All prefix state belongs to `PrefixSpreadRouter`; this class only picks the
-    placement rule and names the decision counters.
+    placement rule and names the decision counters. `pd_req_equiv` is set on a
+    P/D prefill or decode engine: it keeps `SharedWorkPlacement` with that
+    per-request weight instead of `LockstepCostPlacement`.
     """
 
     DECISIONS: ClassVar[dict[str, str]] = {
@@ -108,9 +135,13 @@ class ShareCacheRouter(PrefixSpreadRouter):
         "share_cache_stale_total": "Actual reuse reports corrected stale prefix hints.",
     }
 
-    def __init__(self, tier) -> None:
+    def __init__(self, tier, pd_req_equiv: int | None = None) -> None:
         super().__init__(idle_tokens=0, tier=tier, max_seqs=0)
-        self.placement = LockstepCostPlacement()
+        self.placement = (
+            LockstepCostPlacement()
+            if pd_req_equiv is None
+            else SharedWorkPlacement(pd_req_equiv)
+        )
 
     def place(self, seq, rank, n_ranks):
         route = super().place(seq, rank, n_ranks)
