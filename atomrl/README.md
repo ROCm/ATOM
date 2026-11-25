@@ -42,7 +42,7 @@ for rollout and [Lumen](Lumen) for training.
 | Quantization | FP8 rollout (blockwise W8A8), FP8 KV cache, FP8 training (hybrid E4M3/E5M2), MXFP8 / MXFP4 inference; TIS / MIS rollout correction |
 | MoE | R3 routing replay, fused routing with aux loss, expert parallelism |
 | Kernels and communication | [AITER](https://github.com/ROCm/aiter) (ASM / FlyDSL / HIP / Triton), [MORI](https://github.com/ROCm/mori), [Mooncake](https://github.com/kvcache-ai/Mooncake) |
-| Integrations | In-tree integrations for [verl](examples/plugin/verl/README.md) and [vime](examples/plugin/vime/README.md); slime and miles are external compatibility targets with no in-tree adapter |
+| Integrations | In-tree adapters for [verl](examples/plugin/verl/README.md), [vime](examples/plugin/vime/README.md), [miles](examples/plugin/miles/README.md), and slime |
 | Hardware | AMD Instinct MI300 / MI350 architecture coverage; the release image is validated on MI350X / MI355X (gfx950). MI450 is a target with no recorded run |
 
 ### Model coverage
@@ -200,7 +200,7 @@ bash examples/run.sh 1
 | [GRPO](examples/GRPO/README.md) | Trainer and rollout on separate nodes over RDMA; Qwen3-30B-A3B with vLLM or ATOM, DeepSeek-V4-Flash | Qwen3-30B-A3B at 196–239 s/step with vLLM or ATOM, weight sync 4–5 s |
 | [FlowGRPO](examples/FlowGRPO/README.md) | Qwen-Image full-parameter RL on verl-omni, with and without Lumen | Validation reward 0.978; actor −8% with Lumen |
 | [SDDD](examples/SDDD/README.md) | Eagle3 draft distillation; Kimi K2.5 with an ATOM MXFP4 teacher | Smoke validated in the release image |
-| [Framework integrations](examples/plugin/README.md) | In-tree verl and vime integrations; external slime and miles compatibility targets | Plugin examples cover verl GRPO with ATOM/vLLM rollout and vime Megatron hooks |
+| [Framework integrations](examples/plugin/README.md) | In-tree verl, vime, miles, and slime adapters | Examples cover verl, vime, and miles; slime has adapter/unit coverage but no upstream example |
 
 ```bash
 bash examples/run.sh list          # every example, its hardware and status

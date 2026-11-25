@@ -103,6 +103,18 @@ and does not copy MILES implementation code.
 - Local file:
   `atomrl/atomrl/lumen/kernels/dsv4/quant/act_quant.py`
 
+## Lumen-RL plugin adapter updates
+
+- Upstream: <https://github.com/ZhangDanyang-AMD/Lumen-RL>
+- Revision: `1e42e9238517e1675447f21c9d90c31959b4e488`
+- License: MIT
+- Copyright: `Copyright (c) 2026 ZhangDanyang-AMD`
+
+The AtomRL framework adapters under `atomrl/atomrl/plugin/` and the plugin
+validation assets under `atomrl/examples/plugin/` adapt the lifecycle,
+checkpoint reload, and host hook interfaces from this revision. File headers
+preserve the upstream copyright and identify subsequent AMD modifications.
+
 ## Container-only third-party distributions
 
 `atomrl/lumen/examples/dsv4/prepare_bootstrap.sh` can copy installed Python

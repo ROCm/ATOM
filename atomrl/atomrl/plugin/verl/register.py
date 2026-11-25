@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ZhangDanyang-AMD
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 
@@ -35,10 +36,6 @@ _megatron_engine_registered = False
 class ATOMRolloutAdapter:
     """Thin verl ``BaseRollout`` adapter around ``ATOMReplicaManager``.
 
-    Weight sync is NOT implemented here — ATOM manages its own weight
-    lifecycle via ``sleep`` / ``wake_up`` / ``load_weights``.
-    ``update_weights`` is intentionally a no-op.
-
     The adapter is instantiated by verl's engine worker via the FQDN string
     stored in ``_ROLLOUT_REGISTRY``. verl resolves it with ``importlib`` and
     calls ``cls(config, model_config, device_mesh)``.
@@ -52,6 +49,7 @@ class ATOMRolloutAdapter:
         except ImportError:
             pass
         self._manager = None
+        self._weight_version = 0
 
     def set_manager(self, manager: Any) -> None:
         """Inject the ``ATOMReplicaManager`` created by the trainer."""
@@ -67,7 +65,28 @@ class ATOMRolloutAdapter:
         wire_format: str = "named_tensors",
         **kw: Any,
     ) -> None:
-        logger.debug("ATOMRolloutAdapter.update_weights: no-op (ATOM-native sync).")
+        """Write one scoped safetensors checkpoint and reload ATOM."""
+        if self._manager is None:
+            logger.debug("ATOMRolloutAdapter.update_weights: no manager; skipping")
+            return
+
+        import tempfile
+
+        from safetensors.torch import save_file
+
+        state_dict = {
+            name: tensor.detach().contiguous().cpu() for name, tensor in weights
+        }
+        if not state_dict:
+            logger.warning("ATOMRolloutAdapter.update_weights: empty weight stream")
+            return
+
+        self._weight_version += 1
+        with tempfile.TemporaryDirectory(
+            prefix=f"atomrl-verl-v{self._weight_version:06d}-"
+        ) as weight_dir:
+            save_file(state_dict, f"{weight_dir}/model.safetensors")
+            self._manager.reload_weights_from_path(weight_dir)
 
     async def release(self) -> None:
         if self._manager is not None:
@@ -511,6 +530,22 @@ def _make_engine_classes():
             self._restore_standard_attention()
             output = self._inner.forward_backward_batch(plain, *args, **kwargs)
             return self._flatten_output(output, data)
+
+        def get_per_tensor_param_shard(self, **kwargs):
+            if hasattr(self._inner, "get_per_tensor_param_shard"):
+                return self._inner.get_per_tensor_param_shard(**kwargs)
+            raise NotImplementedError(
+                "AtomRL FSDP2 does not support delta_sharded checkpoint export; "
+                "use the naive or nccl checkpoint backend"
+            )
+
+        def get_per_tensor_param_delta_shard(self, **kwargs):
+            if hasattr(self._inner, "get_per_tensor_param_delta_shard"):
+                return self._inner.get_per_tensor_param_delta_shard(**kwargs)
+            raise NotImplementedError(
+                "AtomRL FSDP2 does not support delta_sharded checkpoint export; "
+                "use the naive or nccl checkpoint backend"
+            )
 
     # Dynamically add forwarding methods for all BaseEngine abstract methods
     for _mname in _delegate_methods:

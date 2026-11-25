@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ZhangDanyang-AMD
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 
@@ -45,7 +46,13 @@ fi
 
 # Verify hooks are importable
 python3 -c "
-from atomrl.plugin.vime.hooks import custom_megatron_init, custom_model_provider, generate_rollout
+from atomrl.plugin.vime.hooks import (
+    custom_megatron_init,
+    custom_model_provider,
+    custom_update_weight_post_write,
+    generate_rollout,
+)
+from atomrl.plugin.vime.lifecycle import setup_atom_manager, teardown_atom_manager
 import inspect
 sig = inspect.signature(custom_megatron_init)
 assert list(sig.parameters) == ['args'], f'Wrong signature: {sig}'
@@ -59,6 +66,14 @@ echo "    STEPS=$STEPS  TRAIN_FP8=$TRAIN_FP8  LOG=$LOG"
 PLUGIN_ARGS=(
     --custom-megatron-init-path  atomrl.plugin.vime.hooks.custom_megatron_init
     --custom-model-provider-path atomrl.plugin.vime.hooks.custom_model_provider
+    --custom-megatron-before-train-step-hook-path
+        atomrl.plugin.vime.hooks.custom_megatron_before_train_step_hook
+    --custom-megatron-before-log-prob-hook-path
+        atomrl.plugin.vime.hooks.custom_megatron_before_log_prob_hook
+    --custom-megatron-post-save-hook-path
+        atomrl.plugin.vime.hooks.custom_megatron_post_save_hook
+    --custom-update-weight-post-write-path
+        atomrl.plugin.vime.hooks.custom_update_weight_post_write
 )
 
 cd "$VIME_ROOT"
