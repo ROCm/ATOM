@@ -163,6 +163,8 @@ def benchmark(output):
             del dx, dw
             baseline = list(native._select_cfg(m, n, k))
             configs = [baseline] + [c for c in PLAN["configs"] if c != baseline]
+            if PLAN.get("confirmation_abba"):
+                configs += list(reversed(configs))
             for config in configs:
                 if time.monotonic() - started > 900:
                     raise TimeoutError("15-minute operator budget reached")
@@ -214,8 +216,15 @@ def benchmark(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="store_true")
+    parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.confirm:
+        PLAN.update(
+            M=[16, 24, 32, 40, 48, 56, 64, 80],
+            configs=[[64, 64, 512, 8, 2]],
+            confirmation_abba=True,
+        )
     validate_plan()
     if args.plan:
         print(json.dumps(PLAN, indent=2))
