@@ -31,6 +31,11 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 
 ## Scheduling algorithm
 
+The default phase policy is ATOM's PrefillDelayer. Native colocated DP
+attention can opt into `--dp-scheduler deepinfer`; the
+[DeepInfer policy guide](deepinfer_dp_scheduler.md) describes its ALL/ANY
+votes and the native allocation behavior it retains.
+
 The scheduler implements a **prefill-first** policy: all waiting (prefill) requests are scheduled before any running (decode) requests. The entry point is `Scheduler.schedule()`, which returns a `(ScheduledBatch, dict[int, Sequence])` tuple or `None` if both queues are empty.
 
 ### Scheduler initialization
