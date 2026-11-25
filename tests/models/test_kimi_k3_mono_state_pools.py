@@ -64,9 +64,12 @@ def _runner(monkeypatch, caches, *, mono_layers=(0, 1, 2)):
     return runner
 
 
-def test_matching_pools_give_the_build_constant(monkeypatch):
-    runner = _runner(monkeypatch, {lid: _pools() for lid in range(4)})
-    assert runner._state_constants() == (WINDOW, False)
+@pytest.mark.parametrize(
+    ("rec", "state16"), [(torch.float32, False), (torch.float16, True)]
+)
+def test_matching_pools_give_the_build_constant(monkeypatch, rec, state16):
+    runner = _runner(monkeypatch, {lid: _pools(rec=rec) for lid in range(4)})
+    assert runner._state_constants() == (WINDOW, state16)
 
 
 @pytest.mark.parametrize(
@@ -105,13 +108,6 @@ def test_a_non_mono_layers_pool_is_not_checked(monkeypatch):
     caches[3] = _pools(WINDOW + 7, conv=torch.float16)
     runner = _runner(monkeypatch, caches)
     assert runner._state_constants() == (WINDOW, False)
-
-
-def test_an_fp16_recurrent_pool_is_admitted(monkeypatch):
-    # the recurrence widens fp16 to fp32 and rounds each state it writes back;
-    # a bf16 pool is refused (`test_a_later_mono_layers_bad_pool_is_refused_at_bind`)
-    runner = _runner(monkeypatch, {lid: _pools(rec=torch.float16) for lid in range(4)})
-    assert runner._state_constants() == (WINDOW, True)
 
 
 def test_mono_layers_that_disagree_on_the_recurrent_dtype_are_refused(monkeypatch):
