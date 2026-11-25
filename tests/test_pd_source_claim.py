@@ -81,6 +81,7 @@ def _moriio(is_producer=True):
 def _seq(seq_id=7, **params):
     return SimpleNamespace(
         id=seq_id,
+        num_prompt_tokens=40,
         block_table=[1, 2, 3],
         kv_transfer_params=dict(params),
         output_tokens=[42],
@@ -204,6 +205,7 @@ def test_mooncake_preadmission_cancel_cannot_release_a_dispatched_source():
 def test_nonchunked_mooncake_publishes_only_a_completed_prefill():
     sched = _mooncake()
     seq = _seq(do_remote_decode=True)
+    seq.num_prompt_tokens = 60
     seq.output_tokens = []
     sched.update_state_after_alloc(seq)
     assert not sched.build_connector_meta().reqs_to_save

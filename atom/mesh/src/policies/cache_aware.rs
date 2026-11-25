@@ -23,11 +23,11 @@
     instead of token IDs to avoid tokenization overhead.
 
     Process:
-    a. For each request, find the worker with the highest prefix match
+    a. For each request, find the healthy candidate with the highest prefix match
     b. If match rate > cache_threshold:
     Route to the worker with highest match (likely has relevant data cached)
     c. If match rate ≤ cache_threshold:
-    Route to the worker with smallest tree size (most available cache capacity)
+    Route to the least-loaded candidate
     d. Background maintenance:
     Periodically evict least recently used leaf nodes to prevent memory overflow
 
@@ -40,7 +40,7 @@
     ------------------------
     1. cache_threshold: (float, 0.0 to 1.0)
     Minimum prefix match ratio to use highest-match routing.
-    Below this threshold, routes to worker with most available cache space.
+    At or below this threshold, routes to the least-loaded candidate.
 
     2. balance_abs_threshold: (integer)
     Absolute difference threshold for load imbalance detection.
@@ -55,8 +55,8 @@
     Interval between LRU eviction cycles for the approximate trees.
 
     5. max_tree_size: (integer)
-    Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
-    during the next eviction cycle.
+    Maximum characters each worker may hold in a tree. Above it, that worker's
+    LRU leaves are evicted during the next eviction cycle.
 
     With --kv-events, a request the router can tokenize goes to the worker whose
     device cache, as its KV events show, holds the largest share of its tokens,
@@ -78,7 +78,9 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{
-    get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
+    get_healthy_worker_indices, normalize_model_key,
+    tree::{Candidates, Tree},
+    utils::PeriodicTask,
     CacheAwareConfig, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo, NO_HEALTHY_WORKERS,
 };
 use crate::{
@@ -123,6 +125,22 @@ pub struct CacheAwarePolicy {
     missing_tree_warned: Arc<DashSet<String>>,
     kv_events: OnceLock<Arc<dyn PrefixMatchProvider>>,
     _eviction_task: Option<PeriodicTask>,
+}
+
+/// The URLs of the healthy candidates, which a tree match may credit.
+struct HealthyUrls<'a> {
+    workers: &'a [Arc<dyn Worker>],
+    healthy_indices: &'a [usize],
+}
+
+impl Candidates for HealthyUrls<'_> {
+    fn count(&self) -> usize {
+        self.healthy_indices.len()
+    }
+
+    fn name(&self, index: usize) -> &str {
+        self.workers[self.healthy_indices[index]].url()
+    }
 }
 
 /// The least loaded of `healthy_indices`, ties broken at random so that equally loaded
@@ -467,60 +485,42 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let tree = self.trees.get(&model_id).map(|entry| entry.value().clone());
 
         if let Some(tree) = tree {
-            // Now we work with the tree without holding the HashMap lock
-            // Use prefix_match_with_counts to avoid redundant chars().count() calls
-            let result = tree.prefix_match_with_counts(text);
+            // Match among the healthy candidates only. Other tenants may be alive outside
+            // them (another DP rank under idx2idx, or an ext-proc subset), so they stay in
+            // the tree; removed workers leave it through `remove_worker_by_url`.
+            let candidates = HealthyUrls {
+                workers,
+                healthy_indices: &healthy_indices,
+            };
+            let result = tree.prefix_match_in(text, &candidates);
             let match_rate = if result.input_char_count == 0 {
                 0.0
             } else {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
-            let affinity = match_rate > self.config.cache_threshold;
-            let tenant_url: &str = &result.tenant;
+            let holder = result.candidate.map(|index| healthy_indices[index]);
+            let tenant_idx = holder.filter(|_| match_rate > self.config.cache_threshold);
+            let idx = tenant_idx
+                .or_else(|| least_loaded(workers, &healthy_indices))
+                .unwrap_or(healthy_indices[0]);
+
+            // Update the tree with this request (use worker URL directly, no allocation)
+            tree.insert(text, workers[idx].url());
+            self.routed(info, workers[idx].as_ref());
+
+            // Increment processed counter
+            workers[idx].increment_processed();
+
             let decision = RouteDecision {
                 match_ratio: Some(match_rate as f64),
-                ..RouteDecision::branch(if affinity { "affinity" } else { "relocate" })
+                estimated_hit_ratio: (holder == Some(idx)).then_some(match_rate as f64),
+                ..RouteDecision::branch(if tenant_idx.is_some() {
+                    "affinity"
+                } else {
+                    "relocate"
+                })
             };
-
-            // Select worker without String allocation
-            let selected_idx = if affinity {
-                // Cache hit path: find worker by URL (compare &str directly, no allocation)
-                workers
-                    .iter()
-                    .position(|w| w.url() == tenant_url)
-                    .filter(|&idx| workers[idx].is_healthy())
-            } else {
-                // Low cache match: use the least loaded worker.
-                least_loaded(workers, &healthy_indices)
-            };
-
-            if let Some(idx) = selected_idx {
-                // Update the tree with this request (use worker URL directly, no allocation)
-                tree.insert(text, workers[idx].url());
-                self.routed(info, workers[idx].as_ref());
-
-                // Increment processed counter
-                workers[idx].increment_processed();
-
-                let decision = RouteDecision {
-                    estimated_hit_ratio: (workers[idx].url() == tenant_url)
-                        .then_some(match_rate as f64),
-                    ..decision
-                };
-                return (Some(idx), decision);
-            }
-
-            // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-            if affinity {
-                tree.remove_tenant(tenant_url);
-                debug!("Removed stale worker {} from cache tree", tenant_url);
-            }
-
-            // Fallback to first healthy worker
-            (
-                healthy_indices.first().copied(),
-                RouteDecision::branch("stale_tenant"),
-            )
+            (Some(idx), decision)
         } else {
             // No tree for this key: cache affinity is dead and every request is
             // placed at random, which is indistinguishable from "cache_aware is
@@ -803,10 +803,11 @@ mod tests {
             select("hello, friend").await,
             (first, "relocate", (ratio(5.0, 13.0), ratio(5.0, 13.0)))
         );
+        // An unhealthy tenant's match does not count; the healthy worker is credited its own.
         workers[first].set_healthy(false);
         assert_eq!(
             select("hello world").await,
-            (1 - first, "stale_tenant", (None, None))
+            (1 - first, "relocate", (ratio(3.0, 11.0), ratio(3.0, 11.0)))
         );
         workers[first].set_healthy(true);
         for _ in 0..20 {

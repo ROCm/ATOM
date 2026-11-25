@@ -109,16 +109,15 @@ The `stateless_init_dp_group()` method (in `ParallelConfig`) calls `stateless_in
 
 ### Synchronized busy loop
 
-The DP busy loop overrides the base `EngineCore.busy_loop()` to synchronize state across DP ranks before each step. The `_sync_dp_state()` method packs four signals into an int64 tensor and performs a single `AllReduce(MAX)`:
+The DP busy loop overrides the base `EngineCore.busy_loop()` to synchronize state across DP ranks: every round by default, every N paired rounds after a busy sync with `ATOM_DP_SYNC_INTERVAL` (see [DP state sync interval](#dp-state-sync-interval)). The `_sync_dp_state()` method packs three signals into an int64 tensor and performs a single `AllReduce(MAX)`:
 
 ```python
-# State synced: [is_prefill, num_tokens, has_unfinished, shutdown]
+# State synced: [has_unfinished, shutdown, held]
 state_tensor = torch.tensor(
     [
-        1 if local_is_prefill else 0,
-        local_num_tokens,
         1 if local_has_unfinished else 0,
         1 if local_shutdown else 0,
+        1 if local_held else 0,
     ],
     dtype=torch.int64, device="cpu",
 )
@@ -128,15 +127,15 @@ torch.distributed.all_reduce(
 ```
 
 This ensures:
-- **All ranks agree on the batch type** (prefill vs. decode). Since MORI requires all DP ranks to execute the same phase, a rank that has no prefill work must run a dummy prefill when any other rank does prefill.
+- **All ranks run a step together**: when any rank has unfinished work, every rank steps, an idle one with a dummy batch. The step's phase and padded shape are agreed per step by `ForwardMode.decide`.
 - **Graceful shutdown**: all ranks must agree before exiting.
-- **Token count alignment**: the maximum token count across ranks is used for padding.
+- **One hold holds the group**: a rank paused, offloaded or fenced for a weight sync holds every rank, so their forwards stay paired.
 
 ### Dummy batch execution
 
 When a DP rank has no real work but other ranks do, it executes dummy batches to participate in collective operations:
 
-- **`_execute_dummy_batch()`** — runs `ModelRunner.dummy_execution`, a batch with no request, through the model, triggering AllReduce and MORI collectives so other ranks are not blocked. `ForwardMode.decide` gives it the group's phase (prefill when any peer prefills) and its width: the group's `running_bs` / `running_tokens` on a decode or a token-graph prefill, one running token on a ragged step (two under TBO, so it splits). Its rows have batch id -1, slot -1 and position 0. It runs everything its peers run, the LM head included (its collective under the DP-sharded head), and samples nothing: `postprocess` cuts the logits to its zero scheduled rows. A pass where no rank has a request runs nothing: the busy loop skips it. A step that reaches the runner with no rank scheduling a request (requests exist but none could be scheduled) runs the same way on every rank, at the smallest captured `running_bs` (one request with none captured).
+- **`_execute_dummy_batch()`** — runs `ModelRunner.dummy_execution`, a batch with no request, through the model, triggering AllReduce and MORI collectives so other ranks are not blocked. `ForwardMode.decide` gives it the group's phase (prefill when any peer prefills) and its width: the group's `running_bs` / `running_tokens` on a decode or a token-graph prefill, one running token on a ragged step (two under TBO, so it splits). Its rows have batch id -1, slot -1 and position 0. It runs everything its peers run, the LM head included (its collective under the DP-sharded head), and samples nothing: `postprocess` cuts the logits to its zero scheduled rows. A pass where no rank has a request runs nothing: the busy loop skips it (every round by default; with `ATOM_DP_SYNC_INTERVAL=N`, up to N-1 dummy rounds still run after a drain, see [DP state sync interval](#dp-state-sync-interval)). A step that reaches the runner with no rank scheduling a request (requests exist but none could be scheduled) runs the same way on every rank, at the smallest captured `running_bs` (one request with none captured).
 - **Yielding a decode** — when prefill token graphs are recorded, a peer prefills and the group's prefill delayer (not a rank-local one) lets it, a decoding rank skips its own decode and runs the dummy too (`Scheduler._schedule`, on `_group_prefill_tick`). Its dummy brings back the tokens its last decode sampled (deferred output), which `_execute_dummy_batch` postprocesses like any step's whenever the rank has running requests. `ForwardMode._pad_to_token_graph` raises every rank to the bucket the step replays, since ranks replaying different buckets hang the group.
 
 ### Device assignment
@@ -193,7 +192,7 @@ if config.enable_dp_attention:
 ### DP request load balancing
 
 Because the DP busy loop is **lockstep** (all ranks `AllReduce` `has_unfinished`
-each step, and an idle rank runs `_execute_dummy_batch()` when any other rank is
+every round by default, see [DP state sync interval](#dp-state-sync-interval), and an idle rank runs `_execute_dummy_batch()` when any other rank is
 busy), an unbalanced request distribution directly wastes GPU: the step time is
 bounded by the busiest rank while lighter ranks burn cycles on dummy batches.
 `CoreManager` therefore routes each request to the *least-loaded* rank rather
@@ -633,6 +632,31 @@ start at 0 and index its own GPUs; the global rank identifies the engine within
 the whole group. Conflating the two is the classic multi-node bug — global ranks
 drive process groups and expert sharding, local ranks drive GPU index, NUMA
 binding, and MoRI's `gpu_per_node`.
+
+### DP state sync interval
+
+`ATOM_DP_SYNC_INTERVAL=N` reduces CPU Gloo state synchronization to once per
+N paired engine rounds after a sync that found unfinished work in the DP
+group. It applies to every DP > 1 run, single-node included; pipeline parallel
+uses its own stage loops and does not read it. A rank with no local batch
+completes a dummy step alongside its peers. The default `1` keeps per-round
+synchronization; `0` and negative values also mean `1`.
+
+Set the same value on every node before starting the engines. One startup
+collective checks the minimum and maximum interval and any invalid input.
+Every rank raises on a mismatch, a non-integer value or a value above 16 before
+entering the busy loop. Restart to change the interval.
+
+The rounds after such a sync run paired without looking at the group's state,
+so once the group drains every rank still runs up to N-1 dummy rounds before
+the next sync sees it idle; only then do idle and held phases synchronize every
+round. Utility commands are applied on sync rounds, so a command queued just
+after a sync can wait through the next N-1 paired rounds. That includes
+`abort_request`: an aborted request keeps decoding and holding its KV until
+then. This is a bound in engine rounds, not seconds, and includes the time to
+finish the current forward. Shutdown is observed on a sync round and still
+drains unfinished work before exit. Validate command latency and multi-node
+correctness before selecting N.
 
 ### Ports
 

@@ -13,6 +13,13 @@ impl ConfigValidator {
                 reason: "Must be greater than zero".to_string(),
             });
         }
+        if config.resolved_fastokens_max_tokenize_bytes() == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "fastokens.max_tokenize_bytes".to_string(),
+                value: "0".to_string(),
+                reason: "Must be greater than zero".to_string(),
+            });
+        }
         #[cfg(feature = "ext-proc")]
         config.ext_proc.validate(config)?;
         Self::validate_mode(&config.mode)?;
@@ -479,6 +486,19 @@ mod tests {
             let error = config.validate().unwrap_err();
             assert!(error.to_string().contains("kv_share_weight"), "{error}");
         }
+    }
+
+    #[test]
+    fn fastokens_tokenize_limit_must_be_positive() {
+        let mut config = RouterConfig::default();
+        config.fastokens.max_tokenize_bytes = Some(0);
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("fastokens.max_tokenize_bytes"),
+            "{error}"
+        );
+        config.fastokens.max_tokenize_bytes = Some(1);
+        config.validate().unwrap();
     }
 
     #[test]

@@ -23,18 +23,72 @@ CONNECTOR = ROOT / "atom/kv_transfer/disaggregation/moriio/moriio_connector.py"
 COMMON = ROOT / "atom/kv_transfer/disaggregation/moriio/moriio_common.py"
 
 
-def load_function(path: Path, name: str, namespace: dict | None = None):
-    """Execute a single top-level function from a module we cannot import."""
-    source = path.read_text()
-    tree = ast.parse(source)
-    for node in tree.body:
+def load_function(
+    path: Path, name: str, namespace: dict | None = None, *, cls: str | None = None
+):
+    """Execute one top-level function, or one method of class `cls`, from a
+    module we cannot import, as a plain function."""
+    body = ast.parse(path.read_text()).body
+    if cls is not None:
+        classes = [n for n in body if isinstance(n, ast.ClassDef) and n.name == cls]
+        body = classes[0].body if classes else []
+    for node in body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             scope: dict = dict(namespace or {})
             # Our own source, lifted so the CPU lane can run it.
             code = compile(ast.Module([node], []), str(path), "exec")
             exec(code, scope)  # noqa: S102
             return scope[name]
-    raise AssertionError(f"{name} not found in {path}")
+    raise AssertionError(f"{cls + '.' if cls else ''}{name} not found in {path}")
+
+
+class RemotePrefillLookupTest(unittest.TestCase):
+    """The consumer's lookup keeps answering until its receive is queued."""
+
+    @classmethod
+    def setUpClass(cls):
+        import logging
+
+        namespace = {"logger": logging.getLogger("atom")}
+        scheduler = "MoRIIOConnectorScheduler"
+        cls.lookup = staticmethod(
+            load_function(CONNECTOR, "get_num_new_matched_tokens", cls=scheduler)
+        )
+        cls.after_alloc = staticmethod(
+            load_function(
+                CONNECTOR, "update_state_after_alloc", namespace, cls=scheduler
+            )
+        )
+
+    def test_a_held_back_request_is_still_a_remote_load(self):
+        import types
+
+        # The consumer's mode and paging too, which a kept-prefix receive reads.
+        sched = types.SimpleNamespace(
+            is_producer=False,
+            transfer_id_to_request_id={},
+            request_id_to_transfer_id={},
+            _reqs_need_recv={},
+            transfer_mode="write",
+            block_size=4,
+            dcp_size=1,
+            hash_block_size=4,
+            _same_page_geometry=lambda params: True,
+        )
+        seq = types.SimpleNamespace(
+            id=7,
+            prompt_token_ids=[1, 2, 3],
+            block_table=[4],
+            state_slot=-1,
+            num_cached_tokens=0,
+            kv_transfer_params={"do_remote_prefill": True, "transfer_id": 7},
+        )
+        # Held back after the first yes (a full running set), asked again.
+        self.assertEqual(self.lookup(sched, seq), (3, True))
+        self.assertEqual(self.lookup(sched, seq), (3, True))
+        self.after_alloc(sched, seq)
+        self.assertEqual(self.lookup(sched, seq), (0, False))
+        self.assertIn(7, sched._reqs_need_recv)
 
 
 class PortOffsetTest(unittest.TestCase):
@@ -608,6 +662,10 @@ class WritePathTest(unittest.TestCase):
         conn._built_state_sessions = {}
         conn._verify_state_before = {}
         conn._write_state_digests = {}
+        conn._first_transfer_slot = 0
+        conn._has_transfer_slots = False
+        conn._staged_sources = {}
+        conn._config = types.SimpleNamespace(state_transfer_slots=0)
 
         conn.sent = []
         conn.writes = []

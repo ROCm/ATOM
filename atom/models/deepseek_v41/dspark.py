@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """V4.1 DSpark math and checkpoint layout; context storage is caller-owned."""
 
 import logging
 from copy import copy
-from types import SimpleNamespace
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
@@ -280,23 +281,6 @@ class DeepseekV41DSpark(DSparkDraftModel):
             args.qk_rope_head_dim, capacity + self.block_size, base=args.rope_theta
         )
         self.embed = self.head = None
-        # Stage 0's main_norm, as a fused RMSNorm + MXFP8 quant. Outside the
-        # module tree so the loader looks for no new weight; it holds
-        # main_norm's own weight tensor, so loads and weight syncs reach it.
-        self._build_main_norm_quant()
-
-    def _build_main_norm_quant(self):
-        main = self.mtp[0].main_norm
-        norm = RMSNorm(
-            main.dim,
-            main.eps,
-            fused_quant=True,
-            quant_config=native_quant_config(),
-        )
-        norm.weight = main.weight
-        # A plain object, not a child module: assigning the RMSNorm itself
-        # would register it and make the loader look for a second weight.
-        self._main_norm_quant_holder = SimpleNamespace(norm=norm)
 
     @property
     def model(self):
@@ -348,22 +332,6 @@ class DeepseekV41DSpark(DSparkDraftModel):
         """`main_norm(main_proj(concat(taps)))` as `[1, N, hidden]`."""
         return self.mtp[0].main_norm(self._project_taps(taps))
 
-    def project_context_quant(self, taps):
-        """`project_context`, emitted as the fused KV GEMM's quantized input.
-
-        Returns E4M3 values and their row-major group-32 UE8M0 scales, the
-        `(x, x_scale)` pair `native_quant_linear` would otherwise make itself
-        with `quantize_fp8`, from one RMSNorm + MXFP8 launch.
-
-        Not bit-identical to `project_context` followed by that quantize: the
-        fused kernel quantizes the fp32 normalized value, where the chain
-        rounds it to bf16 first and quantizes the rounded value, so an element
-        near an E4M3 code boundary can land on the other code. It also has no
-        `ATOM_USE_MODEL_SENSITIVE_RMSNORM` rounding mode, so `write_context_kv`
-        keeps the chain when that is set.
-        """
-        return self._main_norm_quant()(self._project_taps(taps))
-
     def _project_taps(self, taps):
         """`main_proj(concat(taps))` as `[1, N, hidden]`, before the norm.
 
@@ -379,10 +347,6 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return main_proj(self.concat_taps(taps).unsqueeze(0))
         x, x_scale = quantize_fp8_taps(taps)
         return main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
-
-    def _main_norm_quant(self):
-        """The fused norm built in ``__init__``."""
-        return self._main_norm_quant_holder.norm
 
     @property
     def context_layers(self):
@@ -422,20 +386,15 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 )
                 cache.write_window(attention.spec.layer_id, keys, step)
             return
-        weight, weight_scale, group_rows, width, preshuffled = fused
-        if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
-            hidden, hidden_scale = self.project_context(taps), None
-        else:
-            # The norm emits the GEMM's quantized input, so the GEMM does not
-            # run its own quantize_fp8 on the bf16 norm output.
-            hidden, hidden_scale = self.project_context_quant(taps)
+        weight, weight_scale, group_rows, width = fused
+        # main_norm lands in bf16 and the GEMM quantizes that, as the original
+        # model rounds.
         kv = native_quant_linear(
-            hidden,
+            self.project_context(taps),
             weight,
             weight_scale,
             weight_group_rows=group_rows,
-            weight_preshuffled=preshuffled,
-            x_scale=hidden_scale,
+            weight_preshuffled=weight.is_shuffled,
         ).unflatten(-1, (len(layers), width))
         tail = self._draft_kv_tail_fusion()
         if tail is None:
@@ -458,8 +417,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
             )
         else:
             # Same stage-major result, one kernel: the cat is not fused but
-            # deleted, each program writing its row straight to its stage slot.
+            # deleted, each program writing its row straight to its stage slot,
+            # or, when the stages' fp8 windows share a ring, to its window.
             norm_weight, eps = tail
+            window = cache.window_target([a.spec.layer_id for a in layers], step)
             keys = fused_draft_kv_tail(
                 kv,
                 norm_weight,
@@ -468,7 +429,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 self.rope.sin_cache,
                 eps,
                 packed=cache.window_fp8,
+                window=window,
+                step=step,
             )
+            if window is not None:
+                return
         for i, attention in enumerate(layers):
             cache.write_window(
                 attention.spec.layer_id,
@@ -542,12 +507,15 @@ class DeepseekV41DSpark(DSparkDraftModel):
         ):
             fused = None
         else:
+            weight = torch.cat([s.weight for s in shards])
+            # the concatenation is a new tensor in the stages' layout: it
+            # carries their layout flag, as every loaded weight does
+            weight.is_shuffled = preshuffled
             fused = (
-                torch.cat([s.weight for s in shards]),
+                weight,
                 torch.cat([s.weight_scale for s in shards]),
                 group_rows,
                 width,
-                preshuffled,
             )
         self._context_kv_fused = fused
         return fused

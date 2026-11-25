@@ -1,0 +1,66 @@
+{
+  "runs": [
+    {
+      "path": "examples/qwen3/results/lumen_qwen3_8b_ab_lumlinear_mxfp4.log",
+      "iterations": 200,
+      "total_iterations": 200,
+      "tail_mean": 6.75076332,
+      "final_loss": 6.805355,
+      "median_step_ms": 1428.9,
+      "skipped": 0,
+      "nan": 0
+    },
+    {
+      "path": "examples/qwen3/results/lumen_qwen3_8b_ab_lumlinear2_mxfp4.log",
+      "iterations": 200,
+      "total_iterations": 200,
+      "tail_mean": 6.75721832,
+      "final_loss": 6.812429,
+      "median_step_ms": 1430.8,
+      "skipped": 0,
+      "nan": 0
+    },
+    {
+      "path": "examples/qwen3/results/lumen_qwen3_8b_noise1_mxfp4.log",
+      "iterations": 200,
+      "total_iterations": 200,
+      "tail_mean": 6.75985254,
+      "final_loss": 6.814254,
+      "median_step_ms": 1428.9,
+      "skipped": 0,
+      "nan": 0
+    },
+    {
+      "path": "examples/qwen3/results/lumen_qwen3_8b_noise2_mxfp4.log",
+      "iterations": 200,
+      "total_iterations": 200,
+      "tail_mean": 6.75532508,
+      "final_loss": 6.810031,
+      "median_step_ms": 1430.9,
+      "skipped": 0,
+      "nan": 0
+    },
+    {
+      "path": "examples/qwen3/results/lumen_qwen3_8b_noise3_mxfp4.log",
+      "iterations": 200,
+      "total_iterations": 200,
+      "tail_mean": 6.7447693,
+      "final_loss": 6.798375,
+      "median_step_ms": 1431.9,
+      "skipped": 0,
+      "nan": 0
+    }
+  ],
+  "n_runs": 5,
+  "warmup": 5,
+  "tail": 50,
+  "iterations": 200,
+  "loss_tail_mean": 6.753585712,
+  "loss_noise_pct": 0.08797041135089549,
+  "loss_range_pct": 0.2233367672109298,
+  "loss_threshold_pct": 0.35188164540358197,
+  "step_median_ms": 1430.28,
+  "step_noise_pct": 0.09307023124028062,
+  "step_range_pct": 0.20974914002852588,
+  "step_threshold_pct": 1.0
+}

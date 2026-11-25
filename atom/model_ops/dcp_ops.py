@@ -16,10 +16,13 @@ They are mathematically equivalent but not bitwise identical; see the A2A
 section below for why one collective can replace two.
 
 Also here: the sparse indexer's DCP support -- the decode candidate exchange
-(fused into one aiter op) and the sparse-prefill owned-slot filter.
+(fused into one aiter op) and the sparse-prefill owned-slot filter, which the
+"q" prefill transport merges like decode -- and the "kv" prefill transport,
+which all-gathers the step's KV rows instead and needs no merge.
 """
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -33,6 +36,7 @@ from atom.distributed.dcp_layout import (  # noqa: F401
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
+from atom.utils import envs, upload_numpy
 from atom.utils.forward_context import get_published_dcp_local_context_lens
 
 logger = logging.getLogger("atom")
@@ -1841,3 +1845,298 @@ def triton_filter_and_convert_dcp_index_prefill(
         bt_stride1,
     )
     return out
+
+
+# ───────────────────────────────── sparse prefill: transfer KV, not q ──
+#
+# The "q" sparse prefill gathers the group's query heads, attends this rank's
+# 1/dcp of the KV and merges the partials by LSE. The "kv" one all-gathers the
+# step's KV rows instead -- every prefill request's [0, context_len) from the
+# DCP-sharded fp8 cache, rank-major -- and attends this rank's own heads over
+# the whole top-k, as without DCP: no LSE, no merge. Each rank receives KV
+# rows (576 B a context token) instead of query heads and partial outputs
+# (tens of KB a new token).
+
+
+# "auto" takes "kv" while the step's context stays under
+# CONTEXT_BASE + context_per_new_token(heads a rank) * its new tokens: the
+# gather grows with the context, "q" with the new tokens. Fitted on
+# GLM-5.2-FP8 fp8 KV with a cached prefix + 64 / 1K / 16K new tokens,
+# 32K-960K on MI355X (gfx950): k in [48.5, 57) classifies all 18 tp4/dcp4
+# points (16 heads a rank), 40 all tp8/dcp8 ones (8 heads a rank); on MI300X
+# at tp8/dcp8 the bound is conservative. k follows the heads a rank attends,
+# which "kv" pays for: fewer heads, less attention for the gather to save. 16
+# or more heads a rank take 52, fewer take 40. A forced "kv" skips it; both
+# stay under the cap.
+DCP_SPARSE_PREFILL_KV_CONTEXT_BASE = 200 * 1024
+
+
+def dcp_sparse_prefill_kv_context_per_new_token(local_heads: int) -> int:
+    return 52 if local_heads >= 16 else 40
+
+
+def dcp_sparse_prefill_kv_context_bound(local_heads: int, num_tokens: int) -> int:
+    """The most context "auto" takes "kv" for, in a step of ``num_tokens``
+    new tokens."""
+    return (
+        DCP_SPARSE_PREFILL_KV_CONTEXT_BASE
+        + dcp_sparse_prefill_kv_context_per_new_token(local_heads) * num_tokens
+    )
+
+
+def dcp_sparse_prefill_mode_env() -> str:
+    mode = envs.ATOM_DCP_SPARSE_PREFILL
+    if mode not in ("auto", "q", "kv"):
+        raise ValueError(f"ATOM_DCP_SPARSE_PREFILL={mode!r}: auto, q or kv")
+    return mode
+
+
+def dcp_sparse_prefill_kv_max_tokens_env() -> int:
+    cap = envs.ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS
+    if cap < 0:
+        raise ValueError(f"ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS={cap}: must be >= 0")
+    return cap
+
+
+def dcp_sparse_prefill_kv_blocker(kv_cache_dtype: str, mla_page_size: int):
+    """Why a DCP sparse prefill cannot take "kv" here, or None. It gathers fp8
+    cache rows and runs the dcp=1 kernel at page size 1. Plugins keep "q", and
+    so does PCP: its reindex rewrites the token order and indptr the "kv"
+    layout reads."""
+    from atom.distributed.pcp_utils import pcp_is_enabled
+    from atom.plugin import is_plugin_mode
+
+    if not kv_cache_dtype.startswith("fp8"):
+        return "a non-fp8 KV cache"
+    if mla_page_size != 1:
+        return f"MLA page size {mla_page_size}"
+    if is_plugin_mode():
+        return "plugin mode"
+    if pcp_is_enabled():
+        return "PCP"
+    return None
+
+
+def dcp_sparse_prefill_kv_profile_rows(
+    mode: str,
+    num_tokens: int,
+    local_heads: int,
+    max_num_seqs: int,
+    block_size: int,
+    dcp_world_size: int,
+    kv_max_rows: int,
+) -> int:
+    """The most gathered rows a "kv" step of ``num_tokens`` new tokens can
+    take: the cap for a forced "kv"; for "auto", its context bound plus each
+    request's padding to whole local blocks."""
+    if mode == "kv":
+        return kv_max_rows
+    requests = min(num_tokens, max_num_seqs)
+    return min(
+        kv_max_rows,
+        dcp_sparse_prefill_kv_context_bound(local_heads, num_tokens)
+        + requests * block_size * dcp_world_size,
+    )
+
+
+def dcp_sparse_prefill_kv_scratch_bytes(
+    num_tokens: int,
+    local_heads: int,
+    padded_heads: int,
+    kv_lora_rank: int,
+    rope_dim: int,
+    kv_itemsize: int,
+    dcp_world_size: int,
+    kv_max_rows: int,
+) -> int:
+    """What a "kv" sparse prefill adds in one layer at ``kv_max_rows``, for the
+    memory profile, whose dummy run skips the attention: this rank's rows, the
+    gathered KV, the query padded to the kernel's heads (a copy, when it pads)
+    and the per-rank output. The "q" transport's own buffers are not profiled,
+    as before this transport existed."""
+    d = kv_lora_rank + rope_dim
+    local_rows = -(-kv_max_rows // dcp_world_size)
+    padded_q = num_tokens * padded_heads * d * kv_itemsize
+    return (
+        (kv_max_rows + local_rows) * d * kv_itemsize
+        + (padded_q if padded_heads > local_heads else 0)
+        + num_tokens * padded_heads * kv_lora_rank * 2
+    )
+
+
+@dataclass(frozen=True)
+class DcpSparsePrefillKV:
+    """This step's "kv" sparse prefill layout: rank ``r``'s rows of request
+    ``i`` land at ``r * rows_pad + shard_base[i] + local_index`` of the
+    gathered KV."""
+
+    slot_ids: torch.Tensor  # int32 [rows_pad], this rank's rows, padded per request
+    shard_base: torch.Tensor  # int32 [num_requests + 1], exclusive cumsum
+    rows_pad: int
+
+
+def dcp_padded_local_lens(
+    context_lens, dcp_world_size: int, block_size: int
+) -> np.ndarray:
+    """Each request's length on one DCP rank padded to whole local blocks: the
+    same on every rank, since every rank holds ceil(len / (block_size * dcp))
+    blocks of it."""
+    context_lens = np.asarray(context_lens, dtype=np.int64)
+    return -(-context_lens // (block_size * dcp_world_size)) * block_size
+
+
+def dcp_sparse_prefill_kv_rows(context_lens, dcp_world_size: int, block_size: int):
+    """Rows one rank contributes to a "kv" step."""
+    return int(dcp_padded_local_lens(context_lens, dcp_world_size, block_size).sum())
+
+
+def dcp_sparse_prefill_kv_plan(
+    context_lens: np.ndarray,
+    block_tables,
+    dcp_world_size: int,
+    block_size: int,
+    max_tokens: int,
+    device: torch.device,
+) -> DcpSparsePrefillKV | None:
+    """The "kv" layout for a prefill step, or None to keep the "q" path.
+
+    Every input is the step's batch, identical on every DCP rank, so every rank
+    returns the same choice and gathers the same row count. A request owns
+    ``cdiv(context_len, block_size * dcp)`` local blocks on every rank, so its
+    padded local length is the same everywhere; padding rows read allocated
+    slots and are never selected. Raises if a block table is shorter than its
+    context: those blocks already hold the step's KV.
+    """
+    context_lens = np.asarray(context_lens, dtype=np.int64)
+    if len(context_lens) == 0 or len(block_tables) < len(context_lens):
+        return None
+    padded = dcp_padded_local_lens(context_lens, dcp_world_size, block_size)
+    rows_pad = int(padded.sum())
+    if rows_pad == 0 or rows_pad * dcp_world_size > max_tokens:
+        return None
+    # Upload each request's local blocks, not its slots, and expand on GPU: 4 B
+    # a local block, so a plan at the default cap (2^20 rows) stays under the
+    # pageable-copy cliff (512 KiB) while dcp * block_size >= 8.
+    blocks = []
+    for i, n in enumerate(padded.tolist()):
+        block_ids = np.asarray(block_tables[i], dtype=np.int32)
+        if len(block_ids) * block_size < n:
+            raise ValueError(f"request {i}: {len(block_ids)} blocks for {n} local rows")
+        blocks.append(block_ids[: n // block_size])
+    shard_base = np.zeros(len(padded) + 1, dtype=np.int32)
+    np.cumsum(padded, out=shard_base[1:])
+    block_ids = upload_numpy(np.concatenate(blocks), device)
+    offsets = torch.arange(block_size, dtype=torch.int32, device=device)
+    return DcpSparsePrefillKV(
+        slot_ids=(block_ids[:, None] * block_size + offsets).view(-1),
+        shard_base=upload_numpy(shard_base, device),
+        rows_pad=rows_pad,
+    )
+
+
+def dcp_gather_sparse_prefill_kv(
+    cp_group, kv_cache: torch.Tensor, plan: DcpSparsePrefillKV
+) -> torch.Tensor:
+    """All-gather the step's KV rows: ``[dcp * rows_pad, 1, d]`` in the cache
+    dtype, rank-major. fp8 rows travel as bytes; the gather is a copy."""
+    local = dcp_gather_compressed_kv(kv_cache, plan.slot_ids)
+    return dcp_all_gather(cp_group, local, 0).unsqueeze(1)
+
+
+@triton.jit(do_not_specialize=["rows_pad", "out_numel"])
+def _dcp_sparse_prefill_kv_index_kernel(
+    dsa_kv_indptr,  # int32 [num_tokens + 1], GLOBAL per-token candidate counts
+    batch_id_per_q_token,  # int32 [num_tokens]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS], positions in the request
+    shard_base,  # int32 [num_requests + 1]
+    out_kv_indices,  # int32
+    rows_pad,
+    out_numel,
+    DCP_WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0: tl.int64,
+    ti_stride1: tl.constexpr,
+):
+    """Each candidate's row in the gathered KV, written where the dcp=1 prefill
+    writes its cache slot: the same positions and the same zero for an invalid
+    one (negative, or past the request's padded rows), so the attention reads
+    the same rows in the same order."""
+    token_id = tl.program_id(0)
+    col_id = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    kv_start = tl.load(dsa_kv_indptr + token_id)
+    kv_len = tl.load(dsa_kv_indptr + token_id + 1) - kv_start
+    indice = tl.load(topk_indices + token_id * ti_stride0 + col_id * ti_stride1)
+    base = tl.load(shard_base + req_id, mask=valid_req, other=0)
+    end = tl.load(shard_base + req_id + 1, mask=valid_req, other=0)
+    owner = (indice // INTERLEAVE) % DCP_WORLD
+    local = (indice // (INTERLEAVE * DCP_WORLD)) * INTERLEAVE + indice % INTERLEAVE
+    row = owner * rows_pad + base + local
+    out_offset = kv_start + col_id
+    store_mask = (col_id < kv_len) & (out_offset < out_numel)
+    valid = valid_req & store_mask & (indice >= 0) & (base + local < end)
+    tl.store(out_kv_indices + out_offset, tl.where(valid, row, 0), mask=store_mask)
+
+
+def triton_dcp_sparse_prefill_kv_index(
+    dsa_kv_indptr: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
+    topk_indices: torch.Tensor,
+    plan: DcpSparsePrefillKV,
+    dcp_world_size: int,
+    out: torch.Tensor,
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,
+    cp_kv_cache_interleave_size: int = 1,
+) -> torch.Tensor:
+    """Map a sparse-prefill top-k (positions in each token's request) to rows of
+    the gathered KV (``dcp_gather_sparse_prefill_kv``), at the global
+    ``dsa_kv_indptr`` offsets: no ownership filter, no compaction."""
+    assert topk_indices.dtype == torch.int32
+    assert topk_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0
+    num_tokens = min(
+        dsa_kv_indptr.shape[0] - 1,
+        batch_id_per_q_token.shape[0],
+        topk_indices.shape[0],
+    )
+    if num_tokens == 0:
+        return out
+    ti_stride0, ti_stride1 = topk_indices.stride()
+    _dcp_sparse_prefill_kv_index_kernel[(num_tokens, NUM_TOPK_TOKENS // BLOCK_N)](
+        dsa_kv_indptr,
+        batch_id_per_q_token,
+        topk_indices,
+        plan.shard_base,
+        out,
+        plan.rows_pad,
+        out.numel(),
+        dcp_world_size,
+        cp_kv_cache_interleave_size,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        ti_stride0,
+        ti_stride1,
+    )
+    return out
+
+
+def warm_dcp_sparse_prefill_kv_index(
+    dcp_world_size: int, interleave: int, num_topk_tokens: int, device
+) -> None:
+    """Compile the "kv" index kernel with one candidate-free token: dummy runs
+    build no plan, so the first live "kv" step would JIT it."""
+    zeros = torch.zeros(2, dtype=torch.int32, device=device)
+    triton_dcp_sparse_prefill_kv_index(
+        zeros,
+        zeros[:1],
+        torch.zeros(1, num_topk_tokens, dtype=torch.int32, device=device),
+        DcpSparsePrefillKV(slot_ids=zeros[:0], shard_base=zeros, rows_pad=0),
+        dcp_world_size,
+        zeros[:0],
+        NUM_TOPK_TOKENS=num_topk_tokens,
+        cp_kv_cache_interleave_size=interleave,
+    )

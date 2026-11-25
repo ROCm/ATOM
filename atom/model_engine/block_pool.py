@@ -9,6 +9,7 @@ from heapq import heapify, heappop, heappush
 from itertools import islice
 
 from atom.model_engine.kv_block import Block
+from atom.model_engine.kv_block_pool import KVBlockPool
 
 
 @dataclass(frozen=True)
@@ -25,8 +26,11 @@ class BlockRetirement:
     moved_to: int
 
 
-class BlockPool:
+class BlockPool(KVBlockPool):
     """Paged blocks with ref counts and a content-addressed index.
+
+    ATOM's own `KVBlockPool`: the bookkeeping lives in this process, over a
+    tensor this process allocated.
 
     `BlockManager` owns the one instance, over the compressed KV blocks. This
     was split out when a second pool existed — the sliding window was its own
@@ -74,6 +78,7 @@ class BlockPool:
         cache_policy: str = "lru",
         protected_ratio: float = 0.5,
         on_remap: Callable[[int], None] | None = None,
+        reserve_null_block: bool = False,
     ):
         cache_policy = cache_policy.strip().lower()
         if cache_policy not in {"lru", "slru"}:
@@ -89,8 +94,13 @@ class BlockPool:
         # its current size; a pool with a pinned boundary passes neither and
         # gets a maximum equal to its size.
         self.max_blocks: int = num_blocks if max_blocks is None else max_blocks
-        if not 0 <= num_blocks <= self.max_blocks:
-            raise ValueError(f"{num_blocks} blocks outside 0..{self.max_blocks}")
+        # Zero-padded block tables must never read a raw checkpoint image.
+        self._first_block = int(reserve_null_block)
+        if not self._first_block <= num_blocks <= self.max_blocks:
+            raise ValueError(
+                f"{num_blocks} blocks outside {self._first_block}..{self.max_blocks}"
+            )
+        # Physical exclusive block-ID bound; capacity is num_usable_blocks.
         self.num_blocks: int = num_blocks
         self._on_evict = on_evict
         # Called with a hash whose index entry moved to another block id
@@ -105,9 +115,9 @@ class BlockPool:
         # free list (`claim`) or retired, so membership in the set — not
         # presence in a container — is what makes an id free. `pop` skips the
         # stale entries.
-        self._vacant: list[int] = list(range(num_blocks))
+        self._vacant: list[int] = list(range(self._first_block, num_blocks))
         self._cached: OrderedDict[int, None] = OrderedDict()
-        self._free: set[int] = set(range(num_blocks))
+        self._free: set[int] = set(self._vacant)
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
@@ -127,6 +137,11 @@ class BlockPool:
         self.blocks_retired: int = 0
 
     # ------------------------------- counts -------------------------------- #
+    @property
+    def num_usable_blocks(self) -> int:
+        """Allocation capacity, excluding the reserved padding block."""
+        return self.num_blocks - self._first_block
+
     @property
     def num_free(self) -> int:
         return len(self._free)
@@ -171,7 +186,7 @@ class BlockPool:
         return {
             "blocks_evicted": self.blocks_evicted,
             "blocks_retired": self.blocks_retired,
-            "blocks_total": self.num_blocks,
+            "blocks_total": self.num_usable_blocks,
             "blocks_used": self.num_used,
             "blocks_free": self.num_free,
             "blocks_free_reusable": self.num_reusable_free,
@@ -380,7 +395,7 @@ class BlockPool:
 
     def _trim_protected(self) -> None:
         # Bound protection so new prefixes can compete for cache space.
-        limit = int(self.num_blocks * self.protected_ratio)
+        limit = int(self.num_usable_blocks * self.protected_ratio)
         while len(self._protected) > limit:
             block_id, _ = self._protected.popitem(last=False)
             self._reused.discard(block_id)
@@ -476,7 +491,7 @@ class BlockPool:
         request in the first place.
         """
         top = self.num_blocks - 1
-        if top < 0:
+        if top < self._first_block:
             return None
         # Raw units cannot move without updating their owning record.
         if top in self._raw_unit_owner:
