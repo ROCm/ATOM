@@ -59,6 +59,13 @@ def test_topology_gate_truth_table(arches, tp, kv_heads, block, dcp, tbo, expect
         assert reason is not None and expected in reason
 
 
+def test_topology_gate_refuses_dp_attention():
+    """`-tp 4 --enable-dp-attention` reaches the gate as TP4 (CoreManager folds TP
+    into DP afterwards), so the square case alone would let the flag through."""
+    reason = indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False, dp_attention=True)
+    assert reason is not None and "--enable-dp-attention" in reason
+
+
 def test_topology_gate_does_not_reject_speculative_decode():
     """Spec decode is the configuration this feature is FOR, not a blocker.
 

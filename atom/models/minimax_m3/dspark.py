@@ -34,9 +34,10 @@ through the per-row ASM / Gluon decode the target's sparse layers run and a
 page-16 table ``prepare_paged_block`` builds outside the graph; the block's own K/V
 are written into the cache first, except at positions past the request's
 allocated pages. No host sync and fixed shapes, so the block pass is CUDA-graph
-captured like the other drafts. The per-row decode takes one KV head per rank,
-so the draft needs TP >= its KV head count (4) to draft; a P/D producer only
-writes context K/V, so it may hold several (all four on a TP1 PP stage).
+captured like the other drafts. The per-row decode runs one KV head per row: a
+rank holding several (all four at attention TP1, e.g. under DP attention) gets
+one row per (block row, KV head), its pages KV-head encoded as the target's
+fused top-k emit encodes them for the same kernel.
 
 Checkpoint layout (``<draft>/dspark``, MXFP8 [1, 32] linears, BF16 rest):
   language_model.model.dspark.fc.weight                       [6144, 5 * 6144]
@@ -60,7 +61,6 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.config import QuantizationConfig
-from atom.kv_transfer.disaggregation import kv_config_has_producer
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -172,15 +172,6 @@ class M3DSparkAttention(nn.Module):
                 f"DSpark draft has {self.total_num_heads} attention heads, which "
                 f"is not divisible by TP size {tp_size}."
             )
-        # A P/D producer never runs the block pass
-        # (`Drafter.context_kv_only`); it only writes context K/V.
-        producer = kv_config_has_producer(atom_config.kv_transfer_config)
-        if self.total_num_kv_heads > tp_size and not producer:
-            raise ValueError(
-                "The MiniMax-M3.1 DSpark draft decodes its block per row with one "
-                f"KV head per rank, so it needs TP >= {self.total_num_kv_heads} "
-                f"(its KV head count); got TP {tp_size}."
-            )
         self.num_heads = self.total_num_heads // tp_size
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = config.head_dim
@@ -285,13 +276,6 @@ class M3DSparkAttention(nn.Module):
         page another request owns (under prefix caching, a shared prefix) --
         then decode per row.
         """
-        if self.num_kv_heads != 1:
-            # Before any K/V is written: only a P/D producer, which never
-            # drafts, is built with more than one KV head per rank.
-            raise RuntimeError(
-                f"The block pass decodes one KV head per rank; this rank holds "
-                f"{self.num_kv_heads} of {self.total_num_kv_heads}"
-            )
         qkv = linear_out(self.qkv_proj(hidden_states))
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         cache = self._bound_cache()
@@ -320,7 +304,8 @@ class M3DSparkAttention(nn.Module):
         (``dspark_bt16_rows`` / ``dspark_ctx_rows``, sliding window applied
         there), through the same per-row ASM / Gluon decode the target's sparse
         layers run -- no host sync, fixed shapes, so the block can be captured.
-        The context is read once per block position, one KV head per rank.
+        The context is read once per block position and KV head: with several
+        KV heads a rank, the tables hold one KV-head-encoded row per pair.
         """
         k16, v16, ks16, vs16 = cache  # page-16 views, see _bound_cache
         rows = q.shape[0]
@@ -384,6 +369,8 @@ class MiniMaxM3DSpark(DSparkDraftModel):
 
     # Per-row MHA decode; its tables are built in `prepare_paged_block`.
     block_attention_is_mla = False
+    # KV heads this rank's draft layers hold: 1 at TP4, 4 at attention TP1.
+    kv_heads_per_rank = 1
 
     weights_mapping: ClassVar[dict[str, str]] = {
         "language_model.model.dspark.": "",
@@ -456,6 +443,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         # `prepare_paged_block`'s buffers, sized here and allocated on its
         # first call.
         self.max_num_seqs = atom_config.max_num_seqs
+        self.kv_heads_per_rank = self.layers[0].self_attn.num_kv_heads
         self._bt16 = None
 
     # ---- drafting entry points (called by the proposer) --------------------
@@ -481,6 +469,15 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
         self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        H = self.kv_heads_per_rank
+        if H > 1:
+            # One row per (block row, KV head), as `sparse_pa_per_row` reads them.
+            rows_kv = max_bs * T * H
+            self._bt16_rows_kv = torch.zeros(
+                rows_kv, P, dtype=torch.int32, device=device
+            )
+            self._ctx_rows_kv = torch.zeros(rows_kv, dtype=torch.int32, device=device)
+            self._kv_heads = torch.arange(H, dtype=torch.int32, device=device)
 
     def prepare_paged_block(
         self,
@@ -539,8 +536,18 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             self._bt16_rows[:rows],
             self._ctx_rows[:rows],
         )
-        attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
-        attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
+        tables, lens = self._bt16_rows[:rows], self._ctx_rows[:rows]
+        H = self.kv_heads_per_rank
+        if H > 1:
+            # Page p of KV head h is p * H + h in the KV-head-collapsed cache view.
+            kv_tables = self._bt16_rows_kv[: rows * H].view(rows, H, P)
+            kv_tables.copy_(tables.unsqueeze(1).expand(rows, H, P))
+            kv_tables.mul_(H).add_(self._kv_heads.view(1, H, 1))
+            kv_lens = self._ctx_rows_kv[: rows * H].view(rows, H)
+            kv_lens.copy_(lens.unsqueeze(1).expand(rows, H))
+            tables, lens = kv_tables.view(rows * H, P), kv_lens.view(rows * H)
+        attn_metadata.dspark_bt16_rows = tables
+        attn_metadata.dspark_ctx_rows = lens
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]
