@@ -1742,9 +1742,18 @@ def _launch_split_decode_selector(
 
 
 def _prefill_topk_block_size_k(max_block: int) -> int:
-    """Widest tile the row can use, so the merge chain is as short as it gets."""
+    """Widest tile the row can use, so the merge chain is as short as it gets,
+    up to ``ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K`` (default 1024, the value of
+    PREFILL_TOPK_MAX_BLOCK_SIZE_K): a narrower tile folds more of them but each
+    sort is cheaper, and which wins is measured per GPU and head count."""
+    cap = envs.ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K
+    if cap < PREFILL_TOPK_MIN_BLOCK_SIZE_K or cap & (cap - 1):
+        raise ValueError(
+            "ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K must be a power of two of at least "
+            f"{PREFILL_TOPK_MIN_BLOCK_SIZE_K}, got {cap}"
+        )
     return min(
-        PREFILL_TOPK_MAX_BLOCK_SIZE_K,
+        cap,
         max(PREFILL_TOPK_MIN_BLOCK_SIZE_K, triton.next_power_of_2(max(1, max_block))),
     )
 
@@ -2181,6 +2190,24 @@ def _decode_index_score_transposed_kernel(
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
+@functools.cache
+def _flydsl_prefill_score_opts(spec: str) -> tuple[tuple[str, int], ...]:
+    """``ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS`` ("key=int,...") as the launch
+    keywords handed to aiter's prefill scorer (its tile: ``block_q``, ``waves``,
+    ``ring``, ``lds_scores``). Empty: aiter's defaults. aiter validates them;
+    none it accepts changes a score."""
+    opts = []
+    for item in filter(None, (x.strip() for x in spec.split(","))):
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise ValueError(
+                "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS must be 'key=int,...', "
+                f"got {spec!r}"
+            )
+        opts.append((key.strip(), int(value)))
+    return tuple(opts)
+
+
 def _flydsl_prefill_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len):
     """aiter's FlyDSL prefill scorer when ``ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL``
     asks for it and it serves the call (gfx1250, FP4 index cache, a prefill of
@@ -2195,15 +2222,16 @@ def _flydsl_prefill_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len)
         or max_query_len < envs.ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS
     ):
         return None
-    try:
-        from aiter.ops.flydsl.index_score_prefill import (
-            index_score_prefill_nvfp4,
-            index_score_prefill_nvfp4_supported,
-        )
-    except ImportError:
-        return None
+    from aiter.ops.flydsl.index_score_prefill import (
+        index_score_prefill_nvfp4,
+        index_score_prefill_nvfp4_supported,
+    )
+
     if not index_score_prefill_nvfp4_supported(idx_q, index_kv_cache, index_kv_scale):
         return None
+    opts = _flydsl_prefill_score_opts(envs.ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS)
+    if opts:
+        return functools.partial(index_score_prefill_nvfp4, **dict(opts))
     return index_score_prefill_nvfp4
 
 

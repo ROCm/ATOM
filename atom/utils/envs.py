@@ -895,6 +895,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS": lambda: int(
         os.getenv("ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS", "2048")
     ),
+    # With ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL: launch keywords for aiter's
+    # scorer, "key=int,..." (block_q, waves, ring, lds_scores). Empty: aiter's
+    # defaults. aiter validates them; the scores do not depend on them.
+    "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS": lambda: os.getenv(
+        "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS", ""
+    ),
+    # MiniMax-M3 prefill index top-k: the widest tile (blocks, a power of two)
+    # the Triton packed selector sorts at once. Same selection at any value.
+    "ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K": lambda: int(
+        os.getenv("ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K", "1024")
+    ),
     # Debug: save rank 0's fresh MiniMax-M3 prefill top-k selections of the
     # first ATOM_M3_DUMP_PREFILL_TOPK_CHUNKS prefill forwards whose longest
     # cached prefix is at least ATOM_M3_DUMP_PREFILL_TOPK_MIN_PREFIX tokens to
