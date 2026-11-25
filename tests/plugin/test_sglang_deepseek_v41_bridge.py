@@ -14,6 +14,7 @@ from the V4.1 geometry. All of it runs here on CPU against a real
 SGLang (the bridge imports it). No checkpoint is read.
 """
 
+import itertools
 import sys
 from types import SimpleNamespace
 
@@ -45,6 +46,7 @@ from atom.plugin.sglang.deepseek_v41_bridge import (
     refuse_unsupported_sglang_features,
     sglang_v41_kv_cache_dtype,
 )
+from atom.plugin.sglang.runtime import model_arch as model_arch_module
 from atom.plugin.sglang.runtime.model_arch import (
     MODEL_ADAPTER_SPECS,
     resolve_model_arch_spec,
@@ -177,19 +179,16 @@ class TestKVCacheDtype:
     def test_bfloat16_selects_the_bf16_pool(self):
         assert sglang_v41_kv_cache_dtype("bfloat16") == "bf16"
 
+    def test_fp8_e4m3_selects_fp8(self):
+        assert sglang_v41_kv_cache_dtype("fp8_e4m3") == "fp8"
+
     def test_auto_is_refused_as_sglangs_fp8(self):
         with pytest.raises(
             ValueError,
-            match=r"--kv-cache-dtype bfloat16, got 'auto' \(SGLang resolves "
-            r"auto to fp8_e4m3",
+            match=r"--kv-cache-dtype bfloat16 or fp8_e4m3, got 'auto' \(SGLang "
+            r"resolves auto to fp8_e4m3",
         ):
             sglang_v41_kv_cache_dtype("auto")
-
-    def test_fp8_is_refused(self):
-        with pytest.raises(
-            ValueError, match="--kv-cache-dtype bfloat16, got 'fp8_e4m3'$"
-        ):
-            sglang_v41_kv_cache_dtype("fp8_e4m3")
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +203,11 @@ def _supported_bags(**overrides):
             disable_radix_cache=True,
             enable_hierarchical_cache=False,
             enable_unified_memory=False,
+            enable_session_radix_cache=False,
+            radix_cache_backend=None,
+            enable_lmcache=False,
+            enable_flexkv=False,
+            enable_unified_cache_external_linker=False,
         ),
         "exec": SimpleNamespace(
             features=SimpleNamespace(
@@ -211,9 +215,10 @@ def _supported_bags(**overrides):
                 enable_decoder_swa_bounded_replay=False,
                 enable_memory_saver=False,
             ),
+            moe=SimpleNamespace(moe_a2a_backend="none"),
             graph=SimpleNamespace(
                 cuda_graph_config=SimpleNamespace(
-                    decode=SimpleNamespace(backend="disabled"),
+                    decode=SimpleNamespace(backend="full"),
                     prefill=SimpleNamespace(backend="disabled"),
                 )
             ),
@@ -223,13 +228,17 @@ def _supported_bags(**overrides):
             disaggregation_mode="null",
             language_model_only=True,
         ),
-        "parallel": SimpleNamespace(enable_dp_attention=False, dcp_size=1),
+        "parallel": SimpleNamespace(
+            enable_dp_attention=False, dcp_size=1, moe_dense_tp_size=None
+        ),
         "schedule": SimpleNamespace(
             disable_hybrid_swa_memory=False,
             chunked_prefill_size=8192,
             max_prefill_tokens=16384,
             max_running_requests=256,
             mem_fraction_static=0.83,
+            enable_mixed_chunk=False,
+            disable_overlap_schedule=False,
         ),
     }
     bags.update(overrides)
@@ -246,6 +255,12 @@ def sglang_launch(real_sglang, monkeypatch):
         monkeypatch.setattr(
             runtime_context, f"get_{name}", lambda name=name: state.bags[name]
         )
+    for name in (
+        "SGLANG_ENABLE_METADATA_GLUE_GRAPH",
+        "ATOM_ENGRAM_UVA",
+        "ATOM_ENGRAM_OVERLAP",
+    ):
+        monkeypatch.delenv(name, raising=False)
     return state
 
 
@@ -256,9 +271,7 @@ class TestLaunchContract:
     @pytest.mark.parametrize(
         ("bag", "field", "value", "match"),
         [
-            ("memory", "disable_radix_cache", False, "radix cache"),
             ("memory", "enable_hierarchical_cache", True, "hierarchical cache"),
-            ("memory", "enable_unified_memory", True, "unified-memory"),
             # The one algorithm SGLang admits for V4.1.
             ("spec", "speculative_algorithm", "DSPARK", "speculative decoding"),
             ("disagg", "disaggregation_mode", "prefill", "PD disaggregation"),
@@ -275,7 +288,6 @@ class TestLaunchContract:
         ("field", "match"),
         [
             ("enable_encoder_swa_bounded_replay", "encoder SWA bounded replay"),
-            ("enable_decoder_swa_bounded_replay", "decoder SWA bounded replay"),
             ("enable_memory_saver", "memory-saver"),
         ],
     )
@@ -285,10 +297,34 @@ class TestLaunchContract:
             refuse_unsupported_sglang_features()
 
     @pytest.mark.parametrize(
+        ("env", "refused"),
+        # An empty value is off too (`_flag_env`).
+        [(None, False), ("1", False), ("0", True), ("off", True), ("", True)],
+    )
+    def test_sglang_decoder_replay_flag_restates_the_default(
+        self, sglang_launch, monkeypatch, env, refused
+    ):
+        # Decoder replay is on unless ATOM_SGLANG_V41_DECODER_REPLAY turns it
+        # off; SGLang's flag may restate that, never contradict it.
+        if env is None:
+            monkeypatch.delenv("ATOM_SGLANG_V41_DECODER_REPLAY", raising=False)
+        else:
+            monkeypatch.setenv("ATOM_SGLANG_V41_DECODER_REPLAY", env)
+        sglang_launch.bags["exec"].features.enable_decoder_swa_bounded_replay = True
+        if refused:
+            with pytest.raises(ValueError, match="DECODER_REPLAY off"):
+                refuse_unsupported_sglang_features()
+        else:
+            refuse_unsupported_sglang_features()
+
+    @pytest.mark.parametrize(
         ("field", "value", "match"),
         [
             ("enable_dp_attention", True, "DP attention"),
             ("dcp_size", 2, "decode context parallelism"),
+            # SGLang would gather attention inputs the model does not read,
+            # and align its graph buckets past the builder.
+            ("moe_dense_tp_size", 1, "--moe-dense-tp-size"),
         ],
     )
     def test_parallel_features_are_refused(self, sglang_launch, field, value, match):
@@ -296,11 +332,61 @@ class TestLaunchContract:
         with pytest.raises(ValueError, match=match):
             refuse_unsupported_sglang_features()
 
-    @pytest.mark.parametrize("phase", ["decode", "prefill"])
-    def test_cuda_graphs_are_refused(self, sglang_launch, phase):
+    @pytest.mark.parametrize("backend", ["deepep", "mori", "megamoe"])
+    def test_moe_all_to_all_is_refused(self, sglang_launch, backend):
+        sglang_launch.bags["exec"].moe.moe_a2a_backend = backend
+        with pytest.raises(
+            ValueError,
+            match=f"MoE all-to-all backend \\(resolved moe_a2a_backend={backend}",
+        ):
+            refuse_unsupported_sglang_features()
+
+    def test_moe_fields_are_where_sglang_publishes_them(self, real_sglang):
+        # The bags above are fakes; the fields the refusals read are SGLang
+        # 0.5.22's (`get_exec().moe.moe_a2a_backend`,
+        # `get_parallel().moe_dense_tp_size`).
+        from sglang.srt.arg_groups.fields.exec_ import ExecMoe
+        from sglang.srt.arg_groups.fields.parallel import Parallel
+
+        assert "moe_a2a_backend" in ExecMoe.__struct_fields__
+        assert "moe_dense_tp_size" in Parallel.__struct_fields__
+
+    @pytest.mark.parametrize("backend", ["full", "breakable"])
+    def test_prefill_graphs_are_refused(self, sglang_launch, backend):
         graphs = sglang_launch.bags["exec"].graph.cuda_graph_config
-        getattr(graphs, phase).backend = "full"
-        with pytest.raises(ValueError, match="CUDA graphs"):
+        graphs.prefill.backend = backend
+        with pytest.raises(ValueError, match="prefill CUDA graphs"):
+            refuse_unsupported_sglang_features()
+
+    @pytest.mark.parametrize(
+        ("env", "value", "match"),
+        [
+            ("SGLANG_ENABLE_METADATA_GLUE_GRAPH", "1", "METADATA_GLUE_GRAPH"),
+            ("ATOM_ENGRAM_UVA", "0", "ATOM_ENGRAM_UVA=0 or ATOM_ENGRAM_OVERLAP=0"),
+            ("ATOM_ENGRAM_OVERLAP", "0", "ATOM_ENGRAM_UVA=0 or ATOM_ENGRAM_OVERLAP=0"),
+        ],
+    )
+    def test_host_staging_is_refused_with_decode_graphs(
+        self, sglang_launch, monkeypatch, env, value, match
+    ):
+        # Refused before the weights load, and only with decode graphs on.
+        monkeypatch.setenv(env, value)
+        with pytest.raises(ValueError, match=f"{match} with decode CUDA graphs"):
+            refuse_unsupported_sglang_features()
+        graphs = sglang_launch.bags["exec"].graph.cuda_graph_config
+        graphs.decode.backend = "disabled"
+        refuse_unsupported_sglang_features()
+
+    def test_radix_cache_is_served_by_default(self, sglang_launch, monkeypatch):
+        # On by default, radix cache itself is not refused; what it cannot
+        # run beside is (`test_sglang_deepseek_v41_radix.py`). Overlap
+        # scheduling runs beside it (the radix seam drops a slot's host rows
+        # on every checkpoint).
+        monkeypatch.delenv("ATOM_SGLANG_V41_RADIX", raising=False)
+        sglang_launch.bags["memory"].disable_radix_cache = False
+        refuse_unsupported_sglang_features()
+        sglang_launch.bags["schedule"].enable_mixed_chunk = True
+        with pytest.raises(ValueError, match="mixed chunk with radix cache"):
             refuse_unsupported_sglang_features()
 
     def test_unpublished_bags_raise(self, real_sglang):
@@ -315,9 +401,11 @@ class TestLaunchContract:
             align_atom_config_with_sglang(SimpleNamespace(max_num_batched_tokens=1))
 
     def test_every_refusal_is_reported_at_once(self, sglang_launch):
-        sglang_launch.bags["memory"].disable_radix_cache = False
+        sglang_launch.bags["memory"].enable_hierarchical_cache = True
         sglang_launch.bags["parallel"].dcp_size = 2
-        with pytest.raises(ValueError, match="radix cache.*decode context parallelism"):
+        with pytest.raises(
+            ValueError, match="hierarchical cache.*decode context parallelism"
+        ):
             refuse_unsupported_sglang_features()
 
     def test_atom_config_takes_sglang_resolved_schedule(self, sglang_launch):
@@ -368,13 +456,19 @@ class TestPrepareConfig:
             register, "_ATOM_SUPPORTED_MODELS", {DEEPSEEK_V41_ARCH: object}
         )
 
-        def prepare(fp4ptpc=False, online_quant_config=None):
+        def prepare(
+            env=None, fp4ptpc=False, online_quant_config=None, kv_cache_dtype="bf16"
+        ):
+            if env is None:
+                monkeypatch.delenv("ATOM_SGLANG_V41_DECODER_REPLAY", raising=False)
+            else:
+                monkeypatch.setenv("ATOM_SGLANG_V41_DECODER_REPLAY", env)
             config = SimpleNamespace(
                 max_num_batched_tokens=16384,
                 max_num_seqs=64,
                 gpu_memory_utilization=None,
                 kv_cache_block_size=128,
-                kv_cache_dtype="bf16",
+                kv_cache_dtype=kv_cache_dtype,
                 index_cache_dtype="fp8",
                 hf_config=SimpleNamespace(fp4ptpc=fp4ptpc),
                 online_quant_config=online_quant_config,
@@ -411,9 +505,102 @@ class TestPrepareConfig:
             }
         }
 
-    def test_no_decoder_replay_yet(self, prepared):
-        config = prepared()
-        assert config.enable_decoder_swa_bounded_replay is False
+    def test_fp8_kv_is_refused_where_aiter_has_no_backend(self, prepared, monkeypatch):
+        # MI308X: the FP8 pool would build, then the first decode-graph capture
+        # forward fails in `mla_sparse_prefill_v41`, as natively.
+        monkeypatch.setattr(bridge, "fp8_kv_attention_backend", lambda config: None)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda index: SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-"),
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"backend, which this device \(gfx942\) lacks; launch with "
+            r"--kv-cache-dtype bfloat16$",
+        ):
+            prepared(kv_cache_dtype="fp8")
+
+    def test_fp8_kv_passes_where_aiter_has_a_backend(self, prepared, monkeypatch):
+        monkeypatch.setattr(bridge, "fp8_kv_attention_backend", lambda config: "opus")
+        assert prepared(kv_cache_dtype="fp8").kv_cache_dtype == "fp8"
+
+    def test_bf16_kv_is_never_probed(self, prepared, monkeypatch):
+        # `bfloat16` reaches the bridge as "bf16" (`auto` is refused first).
+        def probe(config):
+            raise AssertionError("BF16 KV probed AITER's FP8 attention")
+
+        monkeypatch.setattr(bridge, "fp8_kv_attention_backend", probe)
+        prepared(kv_cache_dtype="bf16")
+
+    def test_the_probe_asks_for_the_fp8_pools_attention_call(self, monkeypatch):
+        # The probe must describe the call the FP8 pool's attention makes
+        # (`sparse_attn_v41_paged_2src` over `PagedAttentionCache.query_fp8`
+        # and MXFP8 planes), dtype for dtype, on one TP4 rank's heads.
+        import types
+
+        fp8_attention = pytest.importorskip(
+            "atom.model_ops.attentions.deepseek_v41.fp8_attention"
+        )
+        from atom.model_ops.attentions.deepseek_v41.cache import (
+            PagedAttentionCache,
+        )
+
+        heads, dim = 16, 512
+        attended = {}
+        monkeypatch.setattr(
+            fp8_attention,
+            "mla_sparse_prefill_v41",
+            lambda *args, **kwargs: attended.update(args=args),
+        )
+        query = PagedAttentionCache.query_fp8(
+            SimpleNamespace(kv_fp8=True), torch.zeros(1, heads, dim)
+        )
+
+        def plane(rows):
+            return (
+                torch.zeros(rows, dim, dtype=torch.uint8),
+                torch.zeros(rows, dim // 32, dtype=torch.uint8),
+            )
+
+        index = torch.zeros(1, dtype=torch.int32)
+        fp8_attention.sparse_attn_v41_paged_2src(
+            query, plane(2), index, index, plane(3), index, index, None, 1.0
+        )
+        q, q_scale, csa, csa_scale, _, _, swa, swa_scale = attended["args"][:8]
+
+        probed = []
+        aiter_module = types.ModuleType("aiter.ops.mla_sparse_prefill")
+        aiter_module.get_mla_sparse_prefill_v41_backend = (
+            lambda *args, **kwargs: probed.append((args, kwargs)) or "opus"
+        )
+        monkeypatch.setitem(sys.modules, aiter_module.__name__, aiter_module)
+        config = SimpleNamespace(
+            tensor_parallel_size=4,
+            hf_config=SimpleNamespace(num_attention_heads=4 * heads, head_dim=dim),
+        )
+        assert bridge.fp8_kv_attention_backend(config) == "opus"
+        (device, shape), kwargs = probed[0]
+        assert (device, shape) == (torch.device("cuda"), (1, heads, dim))
+        assert kwargs == {
+            "q_dtype": q.dtype,
+            "q_scale_dtype": q_scale.dtype,
+            "unified_kv_dtype": csa.dtype,
+            "unified_kv_scale_dtype": csa_scale.dtype,
+            "kv_dtype": swa.dtype,
+            "kv_scale_dtype": swa_scale.dtype,
+            "softmax_scale": dim**-0.5,
+            "layout": "contiguous",
+        }
+
+    @pytest.mark.parametrize(
+        ("env", "replay"),
+        [(None, True), ("1", True), ("0", False), ("off", False), ("", False)],
+    )
+    def test_decoder_replay_is_on_unless_turned_off(self, prepared, env, replay):
+        config = prepared(env)
+        assert config.enable_decoder_swa_bounded_replay is replay
         assert config.enable_encoder_swa_bounded_replay is False
         assert config.kv_cache_block_size == PAGE
         assert (config.max_num_seqs, config.max_num_batched_tokens) == (256, 16384)
@@ -455,13 +642,14 @@ def _forward_batch(
     seq_lens,
     extend_seq_lens=None,
     extend_prefix_lens=None,
+    rids=None,
     cpu_lengths=True,
 ):
     bs = len(req_pool_indices)
     # Every ForwardBatch field the bridge reads, at SGLang's defaults.
     batch = SimpleNamespace(
         forward_mode=mode,
-        rids=[f"r{i}" for i in range(bs)],
+        rids=list(rids) if rids is not None else [f"r{i}" for i in range(bs)],
         batch_size=bs,
         seq_lens=torch.tensor(seq_lens, dtype=torch.int64),
         seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64) if cpu_lengths else None,
@@ -700,6 +888,8 @@ def _staged_rows(calls):
 
 
 class _RecordingBuilder:
+    _decoder_replays = False
+
     def __init__(self, max_bs=4, max_num_batched_tokens=1024, positions=None):
         self.block_size = PAGE
         self.max_bs = max_bs
@@ -762,6 +952,43 @@ class TestForwardMetadata:
         assert metadata.staged_outside_forward is True
         assert builder.calls[0] == ("decode", 2, 2, 1)
 
+    def test_extend_carries_the_replay_verdict(self, monkeypatch, req_to_token):
+        builder = _RecordingBuilder(positions=torch.arange(5))
+        builder._decoder_replays = True
+        builder.geometry = SimpleNamespace(window_size=128)
+        fb = _forward_batch(
+            ForwardMode.EXTEND,
+            req_pool_indices=[1, 2],
+            seq_lens=[PAGE + 3, 2],
+            extend_seq_lens=[3, 2],
+            extend_prefix_lens=[PAGE, 0],
+        )
+        _staged(monkeypatch, builder, fb, torch.arange(5))
+        # A resumed request of 3 < 128 rows: every row runs.
+        assert builder.batch.decoder_replays is False
+        fb = _forward_batch(
+            ForwardMode.EXTEND,
+            req_pool_indices=[1],
+            seq_lens=[PAGE + 200],
+            extend_seq_lens=[200],
+            extend_prefix_lens=[PAGE],
+        )
+        _staged(monkeypatch, builder, fb, torch.arange(200))
+        assert builder.batch.decoder_replays is True
+
+    def test_default_verdict_without_replay(self, monkeypatch, req_to_token):
+        builder = _RecordingBuilder(positions=torch.arange(2))
+        fb = _forward_batch(
+            ForwardMode.EXTEND,
+            req_pool_indices=[1],
+            seq_lens=[2],
+            extend_seq_lens=[2],
+            extend_prefix_lens=[0],
+        )
+        _staged(monkeypatch, builder, fb, torch.arange(2))
+        # The builder reads it for every batch; without replay nothing decides.
+        assert builder.batch.decoder_replays is True
+
     def test_uninitialized_builder_is_refused(self):
         fb = _forward_batch(ForwardMode.DECODE, req_pool_indices=[1], seq_lens=[5])
         with pytest.raises(RuntimeError, match="not initialized"):
@@ -773,12 +1000,16 @@ class TestForwardMetadata:
 # ---------------------------------------------------------------------------
 
 
+# Decode-graph capture slots the small test builder reserves (its max_bs).
+CAPTURE_SLOTS = 2
+
+
 def _install_builder(monkeypatch, geometry, max_num_batched_tokens=32):
     builder = SimpleNamespace(
         geometry=geometry,
         device=torch.device("cpu"),
         block_size=PAGE,
-        max_bs=2,
+        max_bs=CAPTURE_SLOTS,
         max_num_batched_tokens=max_num_batched_tokens,
         engram=None,
         score_workspace=SimpleNamespace(packed=False),
@@ -809,19 +1040,26 @@ def _proxy(**overrides):
 
 
 class TestProxyPool:
+    @pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
     def test_arena_is_pages_plus_padding_page_plus_state_slots(
-        self, real_sglang, monkeypatch
+        self, real_sglang, monkeypatch, kv_dtype
     ):
-        geometry = _small_geometry()
+        geometry = _small_geometry(kv_dtype)
         builder = _install_builder(monkeypatch, geometry)
         pool = _proxy()
 
-        # 4 usable PAGEs and SGLang's padding page 0; one slot per req row.
+        # 4 usable PAGEs and SGLang's padding page 0; one slot per req row,
+        # then one reserved decode-graph capture slot per builder request.
         assert pool.num_pages == 5
         assert pool.num_req_slots == 4
-        assert pool.num_slots == 4
-        slots = 4
+        assert pool.num_slots == 4 + CAPTURE_SLOTS
+        slots = 4 + CAPTURE_SLOTS
         expected = geometry.paged_extents(5)[1] + slots * geometry.state_bytes
+        if kv_dtype == "fp8":
+            # A quantized pool is separate source buffers (auxiliary, one
+            # main per owner, one window per layer), each started on its own
+            # 256-byte boundary.
+            expected += 256 * (1 + len(geometry.owners) + geometry.layers)
         assert pool.raw_arena.numel() == expected
         assert pool.get_kv_size_bytes() == expected
         assert pool.get_contiguous_buf_infos() == (
@@ -835,9 +1073,32 @@ class TestProxyPool:
         assert builder.num_blocks == 5
         assert (cache.num_pages, cache.num_slots) == (5, slots)
         assert cache.backing.data_ptr() == pool.raw_arena.data_ptr()
-        assert cache.backing.numel() == expected
+        base, end = pool.raw_arena.data_ptr(), pool.raw_arena.data_ptr() + expected
+        spans = sorted(
+            (buf.data_ptr(), buf.data_ptr() + buf.numel()) for buf in cache.allocations
+        )
+        # Every buffer the cache allocated is the arena's, aligned, disjoint.
+        assert len(spans) == (
+            1 + len(geometry.owners) + geometry.layers if kv_dtype == "fp8" else 1
+        )
+        assert all(
+            base <= lo and hi <= end and (lo - base) % 256 == 0 for lo, hi in spans
+        )
+        assert all(a[1] <= b[0] for a, b in itertools.pairwise(spans))
+        if kv_dtype == "bf16":
+            assert cache.backing.numel() == expected
         # Its publication owner is made at the first staged step.
         assert cache._sglang_h2d_owner is None
+
+    @pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+    def test_cache_takes_the_builders_prefill_window_staging(
+        self, real_sglang, monkeypatch, kv_dtype
+    ):
+        builder = _install_builder(monkeypatch, _small_geometry(kv_dtype))
+        staging = torch.empty(64, dtype=torch.uint8)
+        builder._prefill_window_staging = staging
+        _proxy()
+        assert builder.cache.prefill_window_staging is staging
 
     def test_sglang_facing_contract(self, real_sglang, monkeypatch):
         _install_builder(monkeypatch, _small_geometry())
@@ -854,7 +1115,7 @@ class TestProxyPool:
         assert pool.store_dtype == torch.uint8
         assert pool.dtype == torch.bfloat16
         assert pool.get_state_buf_infos() == ([], [], [])
-        with pytest.raises(NotImplementedError, match="radix-cache"):
+        with pytest.raises(NotImplementedError, match="relocation"):
             pool.move_kv_cache(torch.zeros(1), torch.zeros(1))
         with pytest.raises(NotImplementedError):
             pool.get_kv_buffer(0)
@@ -989,7 +1250,7 @@ def sizing(sglang_launch, monkeypatch):
 def _pool_cost(geometry, pages, slots, context_len):
     return (
         geometry.paged_extents(pages + 1)[1]
-        + slots * geometry.state_bytes
+        + (slots + CAPTURE_SLOTS) * geometry.state_bytes
         + slots * context_len * 4
     )
 
@@ -1128,6 +1389,93 @@ def test_flash_geometry_prices(kv_dtype, paged_bytes, state_bytes):
 # ---------------------------------------------------------------------------
 
 
+class TestMoeCompaction:
+    def _layer(self, rebuilt):
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.nn.Parameter(
+            torch.arange(12.0).view(3, 4), requires_grad=False
+        )
+        layer.w2_weight = torch.nn.Parameter(torch.ones(3, 2), requires_grad=False)
+        layer.w13_weight.is_shuffled = True
+        layer.quant_method = SimpleNamespace(
+            moe_quant_config="built during the load",
+            get_fused_moe_quant_config=lambda module: rebuilt.append(module)
+            or ("current", module),
+        )
+        return layer
+
+    def test_layers_get_fresh_storage_same_values_and_parameters(self, monkeypatch):
+        emptied, rebuilt = [], []
+        monkeypatch.setattr(torch.cuda, "memory_stats", dict)
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(1))
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([self._layer(rebuilt) for _ in range(2)])
+        model.norm = torch.nn.LayerNorm(4)
+        before = [
+            (p, p.data.data_ptr(), p.data.clone())
+            for layer in model.layers
+            for p in (layer.w13_weight, layer.w2_weight)
+        ]
+        norm_ptr = model.norm.weight.data_ptr()
+
+        assert bridge.compact_v41_moe_buffers(model) == 2
+        for (param, ptr, values), now in zip(
+            before,
+            [p for layer in model.layers for p in (layer.w13_weight, layer.w2_weight)],
+        ):
+            assert now is param and now.data_ptr() != ptr
+            assert torch.equal(now.data, values)
+        assert model.layers[0].w13_weight.is_shuffled
+        # Only MoE layers are copied.
+        assert model.norm.weight.data_ptr() == norm_ptr
+        for layer in model.layers:
+            assert layer.quant_method.moe_quant_config == ("current", layer)
+        assert rebuilt == list(model.layers)
+        # Once before, once per layer, once at the end.
+        assert len(emptied) == 4
+
+    def test_memory_profile_compacts_once_then_builds(self, monkeypatch):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.model_executor import pool_configurator
+
+        calls = []
+        monkeypatch.setattr(
+            bridge,
+            "compact_v41_moe_buffers",
+            lambda model, role="target": calls.append(("compact", model, role)),
+        )
+        monkeypatch.setattr(
+            bridge,
+            "init_deepseek_v41_builder",
+            lambda config: calls.append(("builder", config))
+            or monkeypatch.setattr(bridge, "_V41_BUILDER", object()),
+        )
+        monkeypatch.setattr(bridge, "_V41_BUILDER", None)
+        monkeypatch.setattr(bridge, "_is_atom_v41_target", lambda kvc: True)
+        monkeypatch.setattr(
+            KVCacheConfigurator, "_profile_available_bytes", lambda self, m: 7
+        )
+        monkeypatch.setattr(
+            pool_configurator, "_atom_v41_sizing_patched", False, raising=False
+        )
+        monkeypatch.setattr(
+            pool_configurator,
+            "create_memory_pool_configurator",
+            pool_configurator.create_memory_pool_configurator,
+        )
+        bridge._install_pool_sizing_patch()
+        config = object()
+        model = SimpleNamespace(atom_config=config)
+        kvc = SimpleNamespace(model=model)
+        assert KVCacheConfigurator._profile_available_bytes(kvc, 0) == 7
+        assert calls == [("compact", model, "target"), ("builder", config)]
+        # A second profile builds nothing new and compacts nothing.
+        calls.clear()
+        KVCacheConfigurator._profile_available_bytes(kvc, 0)
+        assert calls == [("builder", config)]
+
+
 class TestBackendShim:
     def _runner(self, pool):
         return SimpleNamespace(
@@ -1145,6 +1493,620 @@ class TestBackendShim:
         assert backend.needs_cpu_seq_lens
         backend.init_forward_metadata(object())
         assert backend.forward_metadata is None
+
+
+# ---------------------------------------------------------------------------
+# Decode CUDA graphs
+# ---------------------------------------------------------------------------
+
+
+class _Step(SimpleNamespace):
+    pass
+
+
+def _graph_metadata(builder, running_tokens, *, decode=True, tentative=False):
+    from atom.utils.forward_context import RoundService
+
+    return SimpleNamespace(
+        cache=builder.cache,
+        served_by_round=RoundService.NONE,
+        dummy=False,
+        step=_Step(running_tokens=running_tokens, decode=decode, tentative=tentative),
+    )
+
+
+class _CoreCaptureRecorder:
+    """Stands in for `_prepare` / `prepare_model_inputs` on a real builder
+    class, recording what a capture asks of them."""
+
+    def __init__(self, builder):
+        self.builder = builder
+        self.prepared = []
+        self.inputs = []
+
+    def prepare(self, batch, running_bs, running_tokens, **kwargs):
+        self.prepared.append((batch, running_bs, running_tokens, kwargs))
+        return _graph_metadata(self.builder, running_tokens), torch.zeros(
+            running_tokens, dtype=torch.int64
+        )
+
+    def prepare_model_inputs(self, input_ids, metadata):
+        self.inputs.append((input_ids, metadata.dummy, metadata))
+
+
+@pytest.fixture
+def capture_builder():
+    """The SGLang builder class over a stub cache: everything a capture reads
+    off it, without a GPU."""
+    pytest.importorskip("aiter", reason="the V4.1 builder module reaches AITER")
+    cls = bridge._make_builder_cls()
+    builder = cls.__new__(cls)
+    builder.block_size = PAGE
+    builder.max_bs = 8
+    builder.max_num_batched_tokens = 64
+    builder.cache = SimpleNamespace(
+        geometry=SimpleNamespace(window_size=128, speculative_tokens=0)
+    )
+    builder.model_runner = SimpleNamespace(
+        forward_vars={"input_ids": SimpleNamespace(gpu=torch.arange(64))}
+    )
+    recorder = _CoreCaptureRecorder(builder)
+    builder._prepare = recorder.prepare
+    builder.prepare_model_inputs = recorder.prepare_model_inputs
+    return builder, recorder
+
+
+class TestGraphCaptureStep:
+    def test_matches_core_capture_but_slots_and_input_ids(self, capture_builder):
+        builder, recorder = capture_builder
+        bs, slots = 3, (10, 11, 12)
+        input_ids = torch.zeros(bs, dtype=torch.int64)
+        metadata = builder.build_for_sglang_capture(
+            bs, input_ids=input_ids, slots=slots
+        )
+        builder.build_for_cudagraph_capture(bs)
+        (ours, *ours_args), (core, *core_args) = recorder.prepared
+        # Same widths and options: a decode step, Engram live count 0.
+        assert ours_args == core_args
+        assert ours_args == [
+            bs,
+            bs,
+            {"max_q_len": 1, "tentative": False, "engram_live": False},
+        ]
+        for name in (
+            "is_dummy_run",
+            "num_scheduled_tokens",
+            "context_lens",
+            "block_tables",
+            "total_seqs_num",
+            "total_tokens_num",
+            "is_final_chunk",
+            "replaying",
+        ):
+            assert getattr(ours, name) == getattr(core, name), name
+        # A full window in, every entry SGLang's padding page 0.
+        assert ours.context_lens == (129,) * bs
+        assert ours.block_tables == ((0,),) * bs
+        # The caller's capture slots instead of core's 0..bs-1.
+        assert ours.state_slots_committed == slots
+        assert ours.req_ids == slots
+        assert core.state_slots_committed == (0, 1, 2)
+        # SGLang's input_ids buffer itself, not the shim's forward_vars.
+        (ours_ids, ours_dummy, ours_md), (core_ids, core_dummy, _) = recorder.inputs
+        assert ours_ids is input_ids
+        assert (
+            core_ids.data_ptr()
+            == builder.model_runner.forward_vars["input_ids"].gpu.data_ptr()
+        )
+        assert ours_dummy and core_dummy
+        assert ours_md is metadata
+        # The forward stages Engram itself: in the recorded graph.
+        assert not getattr(metadata, "staged_outside_forward", False)
+
+    def test_a_speculative_geometry_captures_a_tentative_step(self, capture_builder):
+        # As native's capture: `tentative` makes a multi-token bucket a decode.
+        builder, recorder = capture_builder
+        builder.cache.geometry.speculative_tokens = 2
+        builder.build_for_sglang_capture(
+            1, input_ids=torch.zeros(1, dtype=torch.int64), slots=(5,)
+        )
+        builder.build_for_cudagraph_capture(1)
+        (_, *ours), (_, *core) = recorder.prepared
+        assert ours[2]["tentative"] is core[2]["tentative"] is True
+
+    def test_window_spanning_pages(self, capture_builder):
+        builder, recorder = capture_builder
+        builder.cache.geometry.window_size = PAGE
+        builder.build_for_sglang_capture(
+            1, input_ids=torch.zeros(1, dtype=torch.int64), slots=(5,)
+        )
+        assert recorder.prepared[0][0].block_tables == ((0, 0),)
+
+
+class _GraphBuilder:
+    """A builder that records the graph staging calls the bridge makes."""
+
+    def __init__(self, max_bs=8, cache=None):
+        self.block_size = PAGE
+        self.max_bs = max_bs
+        self.max_num_batched_tokens = 64
+        self.cache = cache if cache is not None else SimpleNamespace()
+        self.engram = None
+        self.calls = []
+
+    def build_for_sglang_capture(self, bs, *, input_ids, slots):
+        self.calls.append(("capture", bs, input_ids, tuple(slots)))
+        return _graph_metadata(self, bs)
+
+    def prepare_decode(self, batch, running_bs, running_tokens, max_seqlen_q):
+        self.calls.append(("decode", running_bs, running_tokens, max_seqlen_q))
+        self.batch = batch
+        metadata = _graph_metadata(self, running_tokens)
+        # Graph steps never stage Engram outside the forward.
+        metadata.engram_embeddings = SimpleNamespace(
+            stage=lambda: self.calls.append("stage"),
+            join=lambda: self.calls.append("join"),
+        )
+        return metadata, None
+
+    def prepare_model_inputs(self, input_ids, metadata):
+        self.calls.append(("inputs", input_ids))
+
+
+@pytest.fixture
+def replay_table():
+    # Rows 1..6 hold live requests; row 0 is padding. Row 6 names page 0.
+    return _req_to_token(
+        rows=8,
+        context_len=4 * PAGE,
+        pages_by_row={
+            1: [7, 3, 9],
+            2: [5],
+            3: [2, 11, 4, 8],
+            4: [6],
+            5: [10, 12],
+            6: [13, 0],
+        },
+    )
+
+
+def _fb_view(req_pool_indices, seq_lens, bs, rids=None):
+    """A replay view (`build_replay_fb_view`) with the host request rows every
+    V4.1 decode batch carries (`_install_host_mirror_patch`)."""
+    raw = len(req_pool_indices)
+    pad = bs - raw
+    lengths = torch.tensor(list(seq_lens) + [1] * pad, dtype=torch.int64)
+    return SimpleNamespace(
+        batch_size=bs,
+        num_padding=pad,
+        forward_mode=ForwardMode.DECODE,
+        actual_forward_mode=ForwardMode.DECODE,
+        input_ids=torch.zeros(bs, dtype=torch.int64),
+        req_pool_indices=torch.tensor(
+            list(req_pool_indices) + [0] * pad, dtype=torch.int64
+        ),
+        seq_lens=lengths.clone(),
+        seq_lens_cpu=lengths,
+        atom_v41_req_pool_indices_cpu=torch.tensor(req_pool_indices, dtype=torch.int64),
+        atom_v41_rids=(
+            list(rids) if rids is not None else [f"r{i}" for i in req_pool_indices]
+        ),
+    )
+
+
+class TestGraphReplayStep:
+    def test_padded_replay_stages_live_rows_at_bucket_width(
+        self, monkeypatch, replay_table
+    ):
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        fb = _fb_view([3, 1, 5, 2, 4], [3 * PAGE + 9, 2 * PAGE + 1, PAGE + 1, 7, 1], 8)
+        metadata = bridge.stage_deepseek_v41_graph_replay(fb, replay_table)
+
+        assert builder.calls == [("decode", 8, 8, 1), ("inputs", fb.input_ids)]
+        assert builder.calls[1][1] is fb.input_ids
+        batch = builder.batch
+        assert batch.total_seqs_num == batch.total_tokens_num == 5
+        assert batch.state_slots_committed == [3, 1, 5, 2, 4]
+        assert batch.req_ids == [3, 1, 5, 2, 4]
+        assert batch.context_lens.tolist() == [
+            3 * PAGE + 9,
+            2 * PAGE + 1,
+            PAGE + 1,
+            7,
+            1,
+        ]
+        assert batch.num_scheduled_tokens.tolist() == [1] * 5
+        assert _tables(batch) == [[2, 11, 4, 8], [7, 3, 9], [10, 12], [5], [6]]
+        assert batch.is_dummy_run is False and batch.replaying == {}
+        # No Engram stage/join and no outside-forward mark: the graph runs it.
+        assert not getattr(metadata, "staged_outside_forward", False)
+
+    def test_unpadded_replay(self, monkeypatch, replay_table):
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        fb = _fb_view([2], [PAGE], 1)
+        bridge.stage_deepseek_v41_graph_replay(fb, replay_table)
+        assert builder.calls[0] == ("decode", 1, 1, 1)
+        assert _tables(builder.batch) == [[5]]
+
+    @pytest.mark.parametrize(
+        ("indices", "lengths", "match"),
+        [
+            ([1, 1], [5, 6], "req_pool_idx"),
+            ([0, 2], [5, 6], "req_pool_idx"),
+            ([6, 2], [PAGE + 1, 6], "padding page 0"),
+        ],
+    )
+    def test_bad_rows_are_refused(
+        self, monkeypatch, replay_table, indices, lengths, match
+    ):
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        with pytest.raises(ValueError, match=match):
+            bridge.stage_deepseek_v41_graph_replay(
+                _fb_view(indices, lengths, 4), replay_table
+            )
+        assert builder.calls == []
+
+    def test_live_first_page_of_a_page0_row_is_fine(self, monkeypatch, replay_table):
+        # Row 6's second page is 0, but a request of PAGE tokens never reads it.
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        bridge.stage_deepseek_v41_graph_replay(_fb_view([6], [PAGE], 2), replay_table)
+        assert _tables(builder.batch) == [[13]]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_host_rows(monkeypatch):
+    # The bridge keeps one host PAGE-row cache per process; no test may leak one.
+    monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+
+
+@pytest.fixture
+def device_reads(monkeypatch):
+    # Rows read back from req_to_token (`_block_rows`), per read.
+    reads = []
+    original = bridge._block_rows
+
+    def counted(req_to_token, req_pool_indices, *args, **kwargs):
+        reads.append(len(req_pool_indices))
+        return original(req_to_token, req_pool_indices, *args, **kwargs)
+
+    monkeypatch.setattr(bridge, "_block_rows", counted)
+    return reads
+
+
+class TestHostPageRows:
+    def _replay(self, monkeypatch, table, view):
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        bridge.stage_deepseek_v41_graph_replay(view, table)
+        return builder.batch
+
+    def test_steady_decode_reads_the_device_once(
+        self, monkeypatch, replay_table, device_reads
+    ):
+        rids = ["a", "b", "c"]
+        first = self._replay(
+            monkeypatch, replay_table, _fb_view([3, 1, 2], [700, 300, 9], 4, rids)
+        )
+        again = self._replay(
+            monkeypatch,
+            replay_table,
+            _fb_view([3, 1, 2], [701, 301, 10], 4, rids),
+        )
+        assert device_reads == [3]
+        assert _tables(first) == _tables(again) == [[2, 11, 4], [7, 3], [5]]
+        assert again.state_slots_committed == [3, 1, 2]
+
+    def test_an_extend_seeds_the_replay(self, monkeypatch, req_to_token, device_reads):
+        build_v41_scheduled_batch(
+            _forward_batch(
+                ForwardMode.EXTEND,
+                req_pool_indices=[1, 3],
+                seq_lens=[PAGE + 5, 2 * PAGE + 1],
+                extend_seq_lens=[PAGE + 5, 2 * PAGE + 1],
+                extend_prefix_lens=[0, 0],
+                rids=["x", "y"],
+            ),
+            PAGE,
+        )
+        assert device_reads == [2]  # The EXTEND's own read.
+        device_reads.clear()
+        batch = self._replay(
+            monkeypatch,
+            req_to_token,
+            _fb_view([3, 1], [2 * PAGE + 2, PAGE + 6], 2, ["y", "x"]),
+        )
+        assert device_reads == []
+        assert _tables(batch) == [[2, 11, 4], [7, 3]]
+
+    def test_a_new_page_or_tenant_reads_the_device(
+        self, monkeypatch, replay_table, device_reads
+    ):
+        self._replay(monkeypatch, replay_table, _fb_view([1], [PAGE], 1, ["a"]))
+        # Entering its second page.
+        batch = self._replay(
+            monkeypatch, replay_table, _fb_view([1], [PAGE + 1], 1, ["a"])
+        )
+        assert _tables(batch) == [[7, 3]]
+        # Another request in the same slot.
+        self._replay(monkeypatch, replay_table, _fb_view([1], [5], 1, ["b"]))
+        assert device_reads == [1, 1, 1]
+
+
+def test_host_mirror_patch_carries_v41_decode_rows(real_sglang, monkeypatch):
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+    runner_module = pytest.importorskip(
+        "sglang.srt.model_executor.runner.decode_cuda_graph_runner"
+    )
+
+    def fake_init_new(cls, batch, model_runner, **kwargs):
+        return SimpleNamespace(forward_mode=batch.mode, rids=batch.rids)
+
+    def fake_view(*, forward_batch, **kwargs):
+        return SimpleNamespace(batch_size=kwargs.get("bs"))
+
+    monkeypatch.setattr(ForwardBatch, "init_new", classmethod(fake_init_new))
+    monkeypatch.setattr(
+        ForwardBatch, "_atom_v41_host_mirror_patched", False, raising=False
+    )
+    monkeypatch.setattr(runner_module, "build_replay_fb_view", fake_view)
+    bridge._install_host_mirror_patch()
+    bridge._install_host_mirror_patch()  # idempotent
+
+    v41 = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=_sglang_normalized_v41())
+    )
+    v4 = SimpleNamespace(model_config=SimpleNamespace(hf_config=_deepseek_v4()))
+    slots = torch.tensor([4, 2])
+
+    def batch(mode):
+        return SimpleNamespace(mode=mode, rids=["a", "b"], req_pool_indices_cpu=slots)
+
+    decode = ForwardBatch.init_new(batch(ForwardMode.DECODE), v41)
+    assert decode.atom_v41_req_pool_indices_cpu is slots
+    extend = ForwardBatch.init_new(batch(ForwardMode.EXTEND), v41)
+    assert not hasattr(extend, "atom_v41_req_pool_indices_cpu")
+    other = ForwardBatch.init_new(batch(ForwardMode.DECODE), v4)
+    assert not hasattr(other, "atom_v41_req_pool_indices_cpu")
+
+    view = runner_module.build_replay_fb_view(forward_batch=decode, bs=2)
+    assert view.atom_v41_req_pool_indices_cpu is slots
+    assert view.atom_v41_rids == ["a", "b"]
+    assert not hasattr(
+        runner_module.build_replay_fb_view(forward_batch=other, bs=2),
+        "atom_v41_rids",
+    )
+
+
+class TestGraphAdapter:
+    # The adapter calls the bridge's staging through model_arch's import.
+    def _adapter(self):
+        return MODEL_ADAPTER_SPECS[DEEPSEEK_V41_ARCH].build_forward_metadata
+
+    def test_capture_stash_is_returned_untouched(self, monkeypatch):
+        monkeypatch.setattr(
+            model_arch_module,
+            "build_deepseek_v41_forward_metadata",
+            lambda *a: pytest.fail("eager staging ran for a captured step"),
+        )
+        stash = object()
+        fb = SimpleNamespace(atom_v41_graph_metadata=stash)
+        assert self._adapter()(None, fb, torch.zeros(1)) is stash
+
+    def test_eager_still_stages_in_the_forward(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            model_arch_module,
+            "build_deepseek_v41_forward_metadata",
+            lambda fb: calls.append(fb) or "eager",
+        )
+        fb = SimpleNamespace()
+        assert self._adapter()(None, fb, torch.zeros(1)) == "eager"
+        assert calls == [fb]
+
+
+@pytest.fixture
+def graph_backend(real_sglang, monkeypatch):
+    """The real backend over a real proxy pool (2 capture slots, 4 req rows)."""
+    builder = _install_builder(monkeypatch, _small_geometry())
+    pool = _proxy()
+    table = torch.zeros(4, 4 * PAGE, dtype=torch.int32)
+    runner = SimpleNamespace(
+        device="cpu",
+        token_to_kv_pool=pool,
+        req_to_token_pool=SimpleNamespace(req_to_token=table),
+    )
+    return SimpleNamespace(
+        backend=ATOMDeepseekV41BackendForSgl(runner),
+        builder=builder,
+        pool=pool,
+        table=table,
+    )
+
+
+def _capture_fb(bs):
+    return SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        batch_size=bs,
+        input_ids=torch.zeros(bs, dtype=torch.int64),
+    )
+
+
+class TestGraphBackend:
+    def test_capture_slots_follow_the_request_rows(self, graph_backend):
+        pool = graph_backend.pool
+        assert pool.capture_slot_base == pool.num_req_slots == 4
+        assert pool.num_capture_slots == CAPTURE_SLOTS
+        assert pool.capture_slots == (4, 5)
+        assert pool.num_slots == 6
+
+    def test_graph_state_is_validated(self, graph_backend, monkeypatch):
+        # SGLang aligns its largest bucket up past the request rows it holds.
+        backend = graph_backend.backend
+        with pytest.raises(ValueError, match="exceed the builder"):
+            backend.init_cuda_graph_state(CAPTURE_SLOTS + 1, CAPTURE_SLOTS + 1)
+        with pytest.raises(ValueError, match="exceed the builder"):
+            backend.init_cuda_graph_state(1, 64)
+        backend.init_cuda_graph_state(2, 2)
+        # The staging is bound once, here, not looked up per replay.
+        assert backend._stage_capture is bridge.stage_deepseek_v41_graph_capture
+        assert backend._stage_replay is bridge.stage_deepseek_v41_graph_replay
+
+    def test_engram_host_fallback_is_refused(self, graph_backend):
+        # Engram's tables could not be page-locked at load (the variables
+        # that force the host path are refused at launch).
+        graph_backend.builder.engram = SimpleNamespace(
+            host=SimpleNamespace(overlap=None)
+        )
+        with pytest.raises(NotImplementedError, match="device staging"):
+            graph_backend.backend.init_cuda_graph_state(2, 2)
+
+    def _capture(self, graph_backend, bs):
+        builder = graph_backend.builder
+        builder.calls = []
+        builder.build_for_sglang_capture = (
+            lambda bs, *, input_ids, slots: builder.calls.append(
+                ("capture", bs, input_ids, tuple(slots))
+            )
+            or "captured-md"
+        )
+        fb = _capture_fb(bs)
+        graph_backend.backend.init_forward_metadata_out_graph(fb, in_capture=True)
+        return fb
+
+    def test_capture_stages_on_reserved_slots(self, graph_backend):
+        backend = graph_backend.backend
+        backend.init_cuda_graph_state(2, 2)
+        fb = self._capture(graph_backend, 2)
+        ((kind, bs, input_ids, slots),) = graph_backend.builder.calls
+        assert (kind, bs, slots) == ("capture", 2, (4, 5))
+        assert input_ids is fb.input_ids
+        assert fb.atom_v41_graph_metadata == "captured-md"
+        assert backend.forward_metadata is None
+
+    def test_capture_is_decode_only(self, graph_backend):
+        backend = graph_backend.backend
+        backend.init_cuda_graph_state(2, 2)
+        fb = _capture_fb(1)
+        fb.forward_mode = ForwardMode.TARGET_VERIFY
+        with pytest.raises(NotImplementedError, match="plain decode only"):
+            backend.init_forward_metadata_out_graph(fb, in_capture=True)
+
+    def test_replay_stages_through_the_bridge(self, graph_backend, monkeypatch):
+        staged = []
+        monkeypatch.setattr(
+            bridge,
+            "stage_deepseek_v41_graph_replay",
+            lambda view, table: staged.append((view, table)) or "replay-md",
+        )
+        backend = graph_backend.backend
+        backend.init_cuda_graph_state(2, 2)
+        fb = self._capture(graph_backend, 2)
+
+        def replay_view(bs, input_ids, actual=ForwardMode.DECODE):
+            # `build_replay_fb_view`: the capture's mode and the batch's own.
+            return SimpleNamespace(
+                batch_size=bs,
+                num_padding=1,
+                input_ids=input_ids,
+                forward_mode=ForwardMode.DECODE,
+                actual_forward_mode=actual,
+            )
+
+        view = replay_view(2, fb.input_ids)
+        backend.init_forward_metadata_out_graph(view)
+        assert staged == [(view, graph_backend.table)]
+        assert backend._v41_replayed_buckets == {2}
+
+        # A batch that is not a decode (an IDLE rank's) is refused.
+        with pytest.raises(NotImplementedError, match="IDLE"):
+            backend.init_forward_metadata_out_graph(
+                replay_view(2, fb.input_ids, ForwardMode.IDLE)
+            )
+        assert len(staged) == 1
+
+    def test_eager_metadata_is_untouched(self, graph_backend):
+        backend = graph_backend.backend
+        backend.init_cuda_graph_state(2, 2)
+        backend.init_forward_metadata(object())
+        assert backend.forward_metadata is None
+
+
+def test_candidate_graph_variants_are_off_for_v41(real_sglang, monkeypatch):
+    runner_module = pytest.importorskip(
+        "sglang.srt.model_executor.runner.decode_cuda_graph_runner"
+    )
+    calls = []
+
+    def original(model_runner, *args, **kwargs):
+        calls.append(model_runner)
+        return "variants"
+
+    monkeypatch.setattr(
+        runner_module, "create_dsv41_candidate_graph_variants", original
+    )
+    bridge._install_graph_variants_patch()
+    bridge._install_graph_variants_patch()  # idempotent
+    patched = runner_module.create_dsv41_candidate_graph_variants
+    v41 = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=_sglang_normalized_v41())
+    )
+    v4 = SimpleNamespace(model_config=SimpleNamespace(hf_config=_deepseek_v4()))
+    assert patched(v41, "DECODE", 0) is None
+    assert patched(v4, "DECODE", 0) == "variants"
+    assert calls == [v4]
+
+
+# ---------------------------------------------------------------------------
+# Decoder SWA bounded replay per EXTEND
+# ---------------------------------------------------------------------------
+
+
+def _replays(lengths, prefix, window=128, **fields):
+    fb = SimpleNamespace(
+        is_prefill_only=False,
+        capture_hidden_mode=None,
+        return_logprob=False,
+        extend_logprob_start_lens_cpu=None,
+    )
+    fb.__dict__.update(fields)
+    batch = SimpleNamespace(
+        num_scheduled_tokens=np.asarray(lengths, np.int32),
+        context_lens=np.asarray(prefix, np.int64) + np.asarray(lengths, np.int64),
+        replay_rows=np.zeros(len(lengths), np.int64),
+    )
+    return bridge.v41_extend_replays(fb, batch, window)
+
+
+class TestExtendReplays:
+    def test_fresh_and_long_resumed_prefills_replay(self):
+        assert _replays([8192], [0])
+        assert _replays([5, 8192], [0, 8192])  # a short fresh prompt is whole
+        assert _replays([128], [8192])  # exactly a window
+
+    def test_short_resumed_chunk_runs_every_row(self):
+        assert not _replays([127], [8192])
+        assert not _replays([4096, 1], [0, 300])  # MIXED: a decode row
+
+    def test_rows_sglang_reads_beyond_the_last_refuse(self):
+        full = SimpleNamespace(is_full=lambda: True)
+        last = SimpleNamespace(is_full=lambda: False)
+        assert not _replays([4096], [0], capture_hidden_mode=full)
+        assert _replays([4096], [0], capture_hidden_mode=last)
+        assert not _replays([4096], [0], is_prefill_only=True)
+        # Input logprobs on any row before the last.
+        assert not _replays(
+            [4096], [0], return_logprob=True, extend_logprob_start_lens_cpu=[0]
+        )
+        # Output logprobs only (start == length): the last row alone.
+        assert _replays(
+            [4096], [0], return_logprob=True, extend_logprob_start_lens_cpu=[4096]
+        )
+        assert not _replays([4096], [0], return_logprob=True)
 
 
 def test_runtime_log_names_the_constructed_attention(caplog):

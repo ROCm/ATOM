@@ -129,6 +129,7 @@ def _batch(mode):
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
         extend_prefix_lens=torch.tensor([0, 64], dtype=torch.int32),
         extend_seq_lens_cpu=[3, 2],
+        mamba_track_mask=None,
     )
 
 
@@ -148,7 +149,7 @@ def _run_gdn_layers(monkeypatch, forward_batch, num_layers):
         GatedDeltaNet, "forward", lambda self, mixed_qkv, b, a, out, name: out
     )
     monkeypatch.setattr(
-        SGLangGatedDeltaNet, "_track_mamba_states", lambda self, fb, mixed_qkv: None
+        SGLangGatedDeltaNet, "_track_mamba_states", lambda self, step, mixed_qkv: None
     )
     layer = SGLangGatedDeltaNet.__new__(SGLangGatedDeltaNet)
     torch.nn.Module.__init__(layer)

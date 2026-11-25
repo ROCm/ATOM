@@ -2349,6 +2349,8 @@ class Config:
     stop_token_ids: list[int] = field(default_factory=list)
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
+    # A MoRIIO producer's state transfer slots, sized by the runner.
+    state_transfer_slots: int = field(default=0, init=False)
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
     # FP4 physical layout, resolved before config is sent to scheduler/workers.
@@ -2447,6 +2449,10 @@ class Config:
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # Disable AITER's custom IPC all-reduce path during distributed setup.
+    # This is a public runner option so callers do not need to patch AITER
+    # internals when a platform cannot provide HIP IPC handles.
+    disable_custom_all_reduce: bool = False
     # The runners take weight syncs and say which they cannot
     # (`get_worker_capabilities`), as RLHFModelRunner does: EngineCore asks
     # them once, at startup. Set by AsyncLLMEngine.
