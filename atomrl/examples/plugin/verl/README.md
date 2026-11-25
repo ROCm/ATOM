@@ -56,9 +56,8 @@ built on an ATOM base. ATOM needs its AITER kernels compiled once per container 
 **Build your own image** from the ATOM repository root:
 
 ```bash
-docker build -f atomrl/examples/plugin/verl/Dockerfile.test -t atomrl-verl-plugin .   # vLLM base
-docker build --build-arg BASE_IMAGE="${ATOM_BASE_IMAGE:?set ATOM_BASE_IMAGE}" \
-  -f atomrl/examples/plugin/verl/Dockerfile.test -t atomrl-atom-plugin .              # ATOM base
+docker build -f atomrl/examples/plugin/Dockerfile.plugin \
+  --target verl-test -t atomrl-plugin-test-verl .
 ```
 
 ## Configuration
@@ -71,8 +70,7 @@ verl's v0 trainer.
 
 | Issue | Workaround |
 |---|---|
-| Installing verl replaces the image's ROCm torch with PyPI's CUDA torch | back up the ROCm torch before `pip install` and restore it after (`Dockerfile.test`) |
-| verl's `FSDPEngineConfig` only accepts `fsdp` / `fsdp2` | remove the strategy assertion (`Dockerfile.test`) |
-| Ray sees no AMD GPU without `amdsmi` | `pip install amdsmi` (`Dockerfile.test`) |
+| Framework/API drift | the plugin validation image pins `verl==0.9.1` |
+| ROCm stack replacement | the dedicated target asserts `torch.version.hip` after installation |
 | verl's v1 trainer imports `transfer_queue`, which is not on PyPI | `trainer.use_v1: false` (both configs) |
 | Several ATOM replicas can deadlock on shared-memory broadcast | the plugin launches one ATOM server with `max_concurrency=1` |

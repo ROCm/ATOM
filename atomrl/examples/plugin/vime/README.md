@@ -12,8 +12,12 @@ training, injected through vime's `--custom-*-path` hooks without modifying vime
 | `--custom-megatron-init-path` | `custom_megatron_init` | creates the Lumen `FP8TrainingManager` when `TRAIN_FP8=1` |
 | `--custom-model-provider-path` | `custom_model_provider` | builds the Megatron GPTModel with AtomRL's transformer config and applies FP8 |
 | `--custom-generate-function-path` | `generate_rollout` | optional: ATOM rollout instead of vime's vLLM |
+| `--custom-megatron-before-train-step-hook-path` | `custom_megatron_before_train_step_hook` | resets Lumen FP8 state |
+| `--custom-megatron-before-log-prob-hook-path` | `custom_megatron_before_log_prob_hook` | resets Lumen FP8 state |
+| `--custom-update-weight-post-write-path` | `custom_update_weight_post_write` | rank-zero ATOM checkpoint reload |
 
-Weight updates stay on vime's own path (NCCL broadcast).
+vime still decides when to write weights. The post-write hook reloads the
+resulting HF checkpoint through the public ATOM manager.
 
 ## Requirements
 
@@ -26,7 +30,7 @@ Weight updates stay on vime's own path (NCCL broadcast).
 ```bash
 # Build from the ATOM repository root
 docker build -f atomrl/examples/plugin/vime/Dockerfile \
-  --build-arg VIME_REPO=<vime repository URL> --build-arg VIME_BRANCH=main \
+  --build-arg VIME_REPO=<vime repository URL> --build-arg VIME_REF=<revision> \
   -t atomrl-vime-plugin .
 
 # 3-step smoke; add -e TRAIN_FP8=1 for FP8 training, -e STEPS=<n> for longer runs

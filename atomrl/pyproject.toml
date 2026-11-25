@@ -25,6 +25,9 @@ Homepage = "https://github.com/ROCm/ATOM/tree/main/atomrl"
 Repository = "https://github.com/ROCm/ATOM"
 Issues = "https://github.com/ROCm/ATOM/issues"
 
+[project.entry-points."verl.plugins"]
+atomrl = "atomrl.plugin.verl.register:register"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["atomrl", "atomrl.*"]

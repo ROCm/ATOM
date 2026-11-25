@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ZhangDanyang-AMD
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 
@@ -170,7 +171,7 @@ class ATOMRolloutReplica(RolloutReplica):
         # need to release memory for the training engine.
         pass
 
-    async def abort_all_requests(self):
+    async def abort_all_requests(self, reject_request: bool = False):
         await asyncio.gather(
             *[s.wait_for_requests_to_drain.remote() for s in self.servers]
         )

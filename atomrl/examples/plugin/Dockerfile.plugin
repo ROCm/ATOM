@@ -1,0 +1,110 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ZhangDanyang-AMD
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Plugin-only validation layers. Nothing installed here enters public images.
+ARG BASE_IMAGE=rocm/atom-dev:vllm-latest@sha256:effdfba286199b916331e7a7b7396485110296d01730da0cd7cfb353c4c1629c
+ARG SGLANG_BASE_IMAGE=rocm/atom-dev:sglang-latest@sha256:d68905e4bdb62e9782953fc37f8ea421c43e4dd648855271eec34d91df1fe0ac
+FROM ${BASE_IMAGE} AS plugin-base
+
+WORKDIR /workspace
+RUN git --version
+
+COPY . /workspace/ATOM
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-build-isolation --no-deps -e /workspace/ATOM && \
+    pip install --no-build-isolation --no-deps -e /workspace/ATOM/atomrl && \
+    pip install --no-cache-dir pytest pyyaml safetensors \
+        omegaconf==2.3.0 "ray[default]==2.60.1"
+ENV PYTHONPATH="/workspace/ATOM:/workspace/ATOM/atomrl" \
+    PYTHONDONTWRITEBYTECODE=1
+
+
+FROM ${SGLANG_BASE_IMAGE} AS plugin-sglang-base
+
+WORKDIR /workspace
+RUN git --version
+
+COPY . /workspace/ATOM
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-build-isolation --no-deps -e /workspace/ATOM && \
+    pip install --no-build-isolation --no-deps -e /workspace/ATOM/atomrl && \
+    pip install --no-cache-dir pytest pyyaml safetensors \
+        omegaconf==2.3.0 "ray[default]==2.60.1"
+ENV PYTHONPATH="/workspace/ATOM:/workspace/ATOM/atomrl" \
+    PYTHONDONTWRITEBYTECODE=1
+
+
+FROM plugin-base AS verl-test
+ARG VERL_VERSION=0.9.1
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps \
+        "verl==${VERL_VERSION}" \
+        "tensordict==0.10.0" \
+        "pyvers==0.1.0" \
+        "codetiming==1.4.0" \
+        "hydra-core==1.3.2" \
+        "pylatexenc==2.10" \
+        "torchdata==0.11.0" \
+        "transformers==5.10.2" \
+        "tokenizers==0.22.1" \
+        "orjson==3.11.4" \
+        "tensorboard==2.20.0" && \
+    python -c "import torch; assert torch.version.hip is not None"
+RUN python -m pytest /workspace/ATOM/atomrl/examples/plugin/test_plugin_adapters.py -q && \
+    python /workspace/ATOM/atomrl/examples/plugin/verify_installed_plugin.py verl
+
+
+FROM plugin-base AS vime-test
+ARG VIME_REPOSITORY=https://github.com/vllm-project/vime.git
+ARG VIME_REF=8707a5a7156223ce1d92c65279e2eed748addb82
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git init /workspace/vime && \
+    git -C /workspace/vime remote add origin "${VIME_REPOSITORY}" && \
+    git -C /workspace/vime fetch --depth 1 origin "${VIME_REF}" && \
+    git -C /workspace/vime checkout --detach FETCH_HEAD && \
+    pip install --no-deps -e /workspace/vime && \
+    python -c "import torch; assert torch.version.hip is not None"
+RUN python -m pytest /workspace/ATOM/atomrl/examples/plugin/test_plugin_adapters.py -q && \
+    python /workspace/ATOM/atomrl/examples/plugin/verify_installed_plugin.py vime
+
+
+FROM plugin-sglang-base AS miles-test
+ARG MILES_REPOSITORY=https://github.com/radixark/miles.git
+ARG MILES_REF=fe7037f561910f26ac4eccf9082bc5f4410488f8
+ARG MILES_MEGATRON_REPOSITORY=https://github.com/radixark/Megatron-LM.git
+ARG MILES_MEGATRON_REF=8e43d38528aac22fef29d30db7a709041bf257cc
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git init /workspace/Megatron-LM && \
+    git -C /workspace/Megatron-LM remote add origin "${MILES_MEGATRON_REPOSITORY}" && \
+    git -C /workspace/Megatron-LM fetch --depth 1 origin "${MILES_MEGATRON_REF}" && \
+    git -C /workspace/Megatron-LM checkout --detach FETCH_HEAD && \
+    pip install --no-deps -e /workspace/Megatron-LM && \
+    git init /workspace/miles && \
+    git -C /workspace/miles remote add origin "${MILES_REPOSITORY}" && \
+    git -C /workspace/miles fetch --depth 1 origin "${MILES_REF}" && \
+    git -C /workspace/miles checkout --detach FETCH_HEAD && \
+    git -C /workspace/miles submodule update --init --recursive --depth 1 && \
+    pip install --no-deps -e /workspace/miles && \
+    pip install --no-deps "sglang-router==0.2.3" && \
+    python -c "import sglang, torch; assert torch.version.hip is not None"
+ENV PYTHONPATH="/workspace/Megatron-LM:/workspace/ATOM:/workspace/ATOM/atomrl"
+RUN python -m pytest /workspace/ATOM/atomrl/examples/plugin/test_plugin_adapters.py -q && \
+    python /workspace/ATOM/atomrl/examples/plugin/verify_installed_plugin.py miles
+
+
+FROM plugin-sglang-base AS slime-test
+ARG SLIME_REPOSITORY=https://github.com/THUDM/slime.git
+ARG SLIME_REF=79aa41a884ab0bf65222c94418f6357d3c31192b
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git init /workspace/slime && \
+    git -C /workspace/slime remote add origin "${SLIME_REPOSITORY}" && \
+    git -C /workspace/slime fetch --depth 1 origin "${SLIME_REF}" && \
+    git -C /workspace/slime checkout --detach FETCH_HEAD && \
+    git -C /workspace/slime submodule update --init --recursive --depth 1 && \
+    pip install --no-deps -e /workspace/slime && \
+    python -c "import sglang, torch; assert torch.version.hip is not None"
+RUN python -m pytest /workspace/ATOM/atomrl/examples/plugin/test_plugin_adapters.py -q && \
+    python /workspace/ATOM/atomrl/examples/plugin/verify_installed_plugin.py slime
