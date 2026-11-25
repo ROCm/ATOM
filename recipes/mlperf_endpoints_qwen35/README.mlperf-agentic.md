@@ -1,7 +1,37 @@
-# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-23 points
+# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-24 points
 
 How to reproduce the numbers below: the exact code, the settings, the run, and how each number is computed.
 They are 10-minute measurement points, not official results (see [What these numbers are](#what-these-numbers-are)).
+
+## 2026-11-24: low-concurrency decode bundle at c64, XCD rotation at c1024
+
+`agentic_20261124.env` on top of the 11-01 to 11-23 env files. Code: `alizaidy/gfx1250-qwen-support` (ATOM 21f211740, aiter
+375152d4e) plus, all opt-in: the aiter MXFP8 GEMM early residual / XCD-grouped tiles (`AITER_GEMM_RES_FAST`), the router +
+shared-expert kernel scheduling (`AITER_ROUTER_SHARED_V2_LATE_WAIT`, `_XCD_ORDER`), MoE stage 1 + 2 in one launch
+(`AITER_MOE_FUSED12`), the Qwen3.6 grouped-MoE CSV rows for 9-32 and 257-512 rows, and the ATOM low-concurrency step cuts
+(embedding + layer-0 norm fold, packed prologue upload, presence anchors, final norm into the output, stage cache,
+persistent verdict). Every configuration warmed first; the GPU driver loaded as on previous days (`mtype_local=0`).
+
+c64: the 11-23 settings plus the bundle in `agentic_20261124.env` (the 11-21 low-concurrency flags, which were optional
+until now, the ATOM step cuts and the aiter changes). Interleaved 10-minute runs:
+
+| c64 | run 1 | run 2 | mean | accuracy |
+|---|---:|---:|---:|---|
+| 11-23 settings | 1154.5 | 1163.4 | 1159.0 | 0.5602 / 0.5657 |
+| + 11-24 bundle | 1233.5 | 1221.3 | **1227.4 (+5.9%)** | 0.5615 / 0.5603 |
+
+MTP acceptance 73.8% vs 73.9%; no failed requests. Official-length run of the bundle at c64 (`run_official_host.sh
+<container> 64`): **e2e 1176.1, 12,675 tok/s, accuracy 0.5609** (coding 0.5308, workflow 0.7002), 120,914 / 120,914
+requests, 0 failed, 59.5 minutes, TTFT p99 102 ms.
+
+c1024: `AITER_UA3D_XCD_ROTATE=1` (bitwise) 173.4 vs 172.3 (+0.6%), and +0.6% again in a second pair.
+
+Notes:
+- The parts were also run alone at c64: the aiter GEMM and router changes and the MoE config each stayed within run-to-run
+  noise (step traces show 6-60 us saved per step at batch 1-4). Only the full bundle was measured above noise.
+- All parts are bitwise except `ATOM_MTP_DRAFT_LMHEAD_STATS` (draft-head sampling statistics differ in the last bits;
+  sampled tokens identical).
+- The bundle is set at the c64 point only; c32 and c128 were not measured.
 
 ## 2026-11-23: one-shot split reduce sized by the launch, 3D decode XCD rotation, 896 token-split programs at c256-c512
 
