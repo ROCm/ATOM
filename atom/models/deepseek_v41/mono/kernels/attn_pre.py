@@ -173,6 +173,11 @@ WQKV0 = NORM0 + 8
 # q's 96 on the CTAs no slice holds, kv's 16 on slice CTAs 0 .. 15 (their
 # weights out only past the slice; kv_norm's path is not wq_b's)
 SLICE_X8_GB0 = 16
+# a ``slice_x8`` build's rows at most: past 12 (a 16-row tile) wqkv_a's poll of
+# every row's quads at once (``load_slice_x8``, 20 a thread) takes the K1's 256
+# VGPRs and spills to 28 B of scratch, which the widths refuse (18 and 24 rows
+# then took the original path); a wider step keeps the seam norm
+SLICE_X8_MAX_TOKENS = 12
 QKV0 = (WQKV0 + WQKV_TASKS) % BLOCKS
 # kv_norm's tokens on CTAs of their own, apart from q_norm's: in the
 # layer kernel between the scores' CTAs and wq_b's (``WQB_LAYER0``)
@@ -292,8 +297,16 @@ class AttnPreBuild:
         kv_norm cancel the row's scale), MXFP8 over a slice's 32 columns, each
         word to its destination rank's X8G with its code in its tag
         (``slice_direct_pair``, ``load_slice_x8``). No norm stage, no LIN /
-        LSSQ pushes, no X8 flag: wqkv_a waits on the words themselves."""
-        return self.shard and self.fold and not self.feeds_index and not self.embed_in
+        LSSQ pushes, no X8 flag: wqkv_a waits on the words themselves.
+        At most ``SLICE_X8_MAX_TOKENS`` rows: ``load_slice_x8`` polls every
+        row's quads at once."""
+        return (
+            self.shard
+            and self.fold
+            and not self.feeds_index
+            and not self.embed_in
+            and self.tokens <= SLICE_X8_MAX_TOKENS
+        )
 
     def __post_init__(self):
         assert not (self.shard and self.tok_par), "a seam is sharded by columns or rows"
