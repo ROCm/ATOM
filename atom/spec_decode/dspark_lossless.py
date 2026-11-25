@@ -24,6 +24,7 @@ from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore, store_widt
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_q_slots import DraftQSlots
 from atom.spec_decode.draft_q_staging import DraftQStaging
+from atom.spec_decode.dspark_verify import require_ell_from_older_drafts
 from atom.utils import CpuGpuBuffer, envs
 
 logger = logging.getLogger("atom")
@@ -60,9 +61,15 @@ def lossless_unsupported_reason(drafter) -> str | None:
             "native fallback filters differently."
         )
     head = drafter.model.markov_head
-    unsupported = markov_weights_unsupported(
-        head.markov_w1.weight, head.markov_w2.weight
-    )
+    weights = [head.markov_w1.weight, head.markov_w2.weight]
+    if weights[0].is_meta:
+        # Built ahead of its weights, which then land on the drafter's device:
+        # ask about weights like them there.
+        weights = [
+            torch.empty(0, *w.shape[1:], dtype=w.dtype, device=drafter.device)
+            for w in weights
+        ]
+    unsupported = markov_weights_unsupported(*weights)
     if unsupported is not None:
         # Checked once here so the sampled op never has to fail mid-serve.
         return f"cannot run the fused sampled draft ({unsupported})."
@@ -140,6 +147,10 @@ class DSparkLossless:
                 reason,
             )
             return None
+        # A confidence-scheduled verify takes its length from the confidence
+        # head, which reads the sampled drafts: lossless only if that length
+        # comes from older drafts than the ones it verifies.
+        require_ell_from_older_drafts()
         if envs.ATOM_ENABLE_RELAXED_MTP:
             # Relaxed top-N accepts tokens the target would not have drawn.
             raise ValueError(
@@ -186,7 +197,9 @@ class DSparkLossless:
         # it a step later, after the batch may have been reordered.
         self.q_store = SparseQStore.allocate(q_slots * t, store_width(vocab), device)
         # The draft's own: the verify reads q from the store, not from here.
-        self.draft_scratch = dspark_markov_sample_scratch(max_bs, vocab, device)
+        self.draft_scratch = dspark_markov_sample_scratch(
+            max_bs, vocab, device, tp_size=drafter.config.tensor_parallel_size
+        )
         # Members of the runner's `sampling` publication, uploaded by the H2D
         # `prepare_sample` issues; its `begin()` waits out the previous upload.
         # The Philox key, the first q row each batch row drafts into, and the
@@ -202,6 +215,9 @@ class DSparkLossless:
                 "draft_verify_q_row_base": self.verify_q_row_base,
             }
         )
+        # Verify a sampled request's drafts as one block, where the flavor
+        # says so (`DSparkDraftModel.lossless_block_verify`).
+        self.block_verify = bool(drafter.model.lossless_block_verify)
         self.staging = DraftQStaging(
             DraftQSlots(q_slots, t),
             seed=self.seed.np,
@@ -273,6 +289,7 @@ class DSparkLossless:
             temperatures,
             top_ks,
             top_ps,
+            block=self.block_verify,
         )
 
     def clear_destinations(self) -> None:

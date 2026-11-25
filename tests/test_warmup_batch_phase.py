@@ -70,3 +70,35 @@ def test_every_stage_warms_up_on_the_rows_the_last_stage_does(monkeypatch):
         )
         runner.warmup_model()
     assert rows == [(2, 8192), (2, 8192)]
+
+
+def test_a_block_drafter_warms_up_on_no_more_sequences_than_a_step_holds(
+    monkeypatch,
+):
+    """``--max-num-seqs 1``: the step's buffers hold one sequence, so the
+    block drafter's two-sequence warmup floor stops at one (a deployment that
+    never batches two requests never needs the batch dim dynamic); two wrote
+    past the sampling buffers and failed every rank's warmup."""
+    monkeypatch.setattr(runner_module.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        runner_module.torch.cuda, "reset_peak_memory_stats", lambda: None
+    )
+    monkeypatch.setattr(
+        runner_module, "get_dp_group", lambda: SimpleNamespace(world_size=1)
+    )
+    runner = object.__new__(runner_module.ModelRunner)
+    runner.config = SimpleNamespace(
+        max_model_len=1 << 20,
+        max_num_seqs=1,
+        max_num_batched_tokens=16384,
+        enable_dp_attention=False,
+        prefill_context_parallel_size=1,
+        speculative_config=SimpleNamespace(use_dspark=lambda: True),
+    )
+    runner.drafter = SimpleNamespace(is_block_drafter=True)
+    runner.block_size, runner.label = 16, "stage"
+    runner.tokenID_processor = SimpleNamespace(clean=lambda: None)
+    rows = []
+    runner.forward = lambda batch: rows.append(batch.total_seqs_num)
+    runner.warmup_model()
+    assert rows == [1]

@@ -455,6 +455,23 @@ def test_abort_of_an_early_loaded_request_releases_its_blocks(setup):
     assert seq.id not in sched.deferred_free_blocks
 
 
+@pytest.mark.parametrize("stale", ["offload_loaded", "offload_load_failed"])
+def test_abort_of_an_early_load_waits_whatever_an_earlier_load_left(setup, stale):
+    # An earlier tier load left its flag; the early load's fresh allocation
+    # resets it, so the abort still waits for the load in flight.
+    sched, _, seq = setup
+    setattr(seq, stale, True)
+    free = _free(sched)
+    sched.schedule()
+
+    assert sched.abort_request(seq.id)
+
+    assert seq._awaiting_aborted_load_cleanup
+    assert _free(sched) < free
+    assert sched._finish_aborted_load_cleanup(seq.id)
+    assert _free(sched) == free
+
+
 def test_abort_of_a_loaded_early_request_releases_its_blocks(setup):
     sched, _, seq = setup
     free = _free(sched)

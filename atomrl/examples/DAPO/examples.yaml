@@ -1,0 +1,333 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# DAPO examples. `bash examples/run.sh list` shows them; `bash examples/run.sh <id>`
+# runs one. Aliases 1-7 and 9 are the numbers of the release table in
+# docs/08-release.md.
+#
+# References are step-1 values measured on the release image; see
+# release/VALIDATION.md for every run behind them.
+#
+# Why k3_kl and not kl: `rollout_corr/kl` is a signed token mean of
+# (rollout_logp - train_logp), so symmetric disagreement cancels inside it: six
+# runs of example 1 with one seed spread it by +-50% around its mean. `k3_kl` is
+# the non-negative k3 estimator of the same gap and stayed within 9% over those
+# runs. k3_kl and entropy carry the tolerances; kl only has to stay within 10x,
+# the published "one order of magnitude" criterion.
+#
+# Why the tolerances differ: run-to-run jitter grows with max_response_length,
+# because dynamic sampling (filter_groups) then picks a visibly different batch
+# each time. Floors: k3_kl 30% at 512 tokens and 50% at 4096; entropy 25% at
+# 512, 50% at 4096, 60% for the MoE examples and example 5. Example 4, the
+# widest spread (0.00241, 0.00243, 0.00377 over three runs), uses 62% of its band.
+#
+# The ATOM examples set ATOM_FORCE_ATTN_TRITON=1 (run_dapo.sh defaults it too):
+# ATOM's assembly paged-decode kernel returns finite but wrong logprobs when a
+# context fills exactly 16 pages with a partial last one, visible only in
+# mismatch/chi2_token. Example 4's reference was re-measured on the Triton path.
+
+defaults:
+  image: release
+  command: bash {examples}/DAPO/run_dapo.sh
+  prepare: python3 {examples}/DAPO/tools/prepare_data.py --data-root {data_root} --models Qwen3-8B-Base Qwen3-30B-A3B-Base
+  status: validated
+  env:
+    SCRATCH_ROOT: "{data_root}"
+    PYTORCH_CUDA_ALLOC_CONF: ""
+    CONFIG_OVERRIDE: "{config}"
+  smoke:
+    timeout_min: 60
+    stall_min: 40
+  full:
+    steps: 1000
+    timeout_min: 20160
+    stall_min: 60
+
+examples:
+  - id: dapo-qwen3-8b-vllm-bf16
+    aliases: ["1"]
+    title: "Qwen3-8B, FSDP2 BF16, vLLM BF16 rollout (baseline)"
+    tier: t1
+    env: {MODE: bf16, TRAIN_FP8: "0", MODEL_PATH: "{data_root}/models/Qwen3-8B-Base"}
+    requires: &dense
+      - models/Qwen3-8B-Base
+      - data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
+      - data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet
+    smoke:
+      config: configs/dapo_qwen3_8b_ray_vllm_smoke.yaml
+      steps: 3
+      checks:
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.00110, rtol: 0.30}
+          - {name: entropy, ref: 0.628, rtol: 0.25}
+          - {name: rollout_corr/kl, ref: 0.00102, band: 10}
+          - {name: rollout_corr/ppl_ratio, info: true}
+    full: {config: configs/dapo_qwen3_8b_ray_vllm_longrun.yaml}
+
+  - id: dapo-qwen3-8b-vllm-fp8-rollout
+    aliases: ["2"]
+    title: "Qwen3-8B, FSDP2 BF16, vLLM FP8 (per-block) rollout"
+    tier: t1
+    env: {MODE: fp8, TRAIN_FP8: "0", MODEL_PATH: "{data_root}/models/Qwen3-8B-Base"}
+    requires: *dense
+    smoke:
+      config: configs/dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml
+      steps: 3
+      checks:
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.00481, rtol: 0.30}
+          - {name: entropy, ref: 0.791, rtol: 0.25}
+          - {name: rollout_corr/kl, ref: 0.00467, band: 10}
+          - {name: rollout_corr/ppl_ratio, info: true}
+    full: {config: configs/dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml}
+
+  - id: dapo-qwen3-8b-vllm-fp8-e2e
+    aliases: ["3"]
+    title: "Qwen3-8B, FSDP2 FP8 (blockwise2d) training, vLLM FP8 rollout"
+    tier: t1
+    env: {MODE: fp8, TRAIN_FP8: "1", MODEL_PATH: "{data_root}/models/Qwen3-8B-Base"}
+    requires: *dense
+    smoke:
+      config: configs/dapo_qwen3_8b_ray_vllm_fp8_smoke.yaml
+      steps: 3
+      checks:
+        metrics:
+          # Three pinned-model runs measured 0.002857, 0.003380 and 0.003592.
+          - {name: rollout_corr/k3_kl, ref: 0.00410, rtol: 0.35}
+          - {name: entropy, ref: 0.790, rtol: 0.25}
+          - {name: rollout_corr/kl, ref: 0.00408, band: 10}
+          - {name: rollout_corr/ppl_ratio, info: true}
+    full: {config: configs/dapo_qwen3_8b_ray_vllm_fp8_longrun.yaml}
+
+  - id: dapo-qwen3-8b-atom-fp8
+    aliases: ["4"]
+    title: "Qwen3-8B, FSDP2 FP8 training, ATOM FP8 (per-block) rollout"
+    tier: t1
+    compile_cache_key: atomfp8 Qwen3-8B-Base
+    env:
+      MODE: atomfp8
+      TRAIN_FP8: "1"
+      MODEL_PATH: "{data_root}/models/Qwen3-8B-Base"
+      ATOM_FORCE_ATTN_TRITON: "1"
+    requires: *dense
+    smoke:
+      config: configs/dapo_qwen3_8b_ray_atom_fp8_4k_smoke.yaml
+      steps: 3
+      checks:
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.00399, rtol: 0.50}
+          - {name: entropy, ref: 0.599, rtol: 0.50}
+          - {name: rollout_corr/kl, ref: 0.00374, band: 10}
+          - {name: rollout_corr/ppl_ratio, info: true}
+    full: {config: configs/dapo_qwen3_8b_ray_atom_fp8_longrun.yaml}
+
+  - id: dapo-qwen3-8b-atom-bf16
+    aliases: ["5"]
+    title: "Qwen3-8B, FSDP2 BF16, ATOM BF16 rollout"
+    tier: t1
+    compile_cache_key: atombf16 Qwen3-8B-Base
+    env:
+      MODE: atombf16
+      TRAIN_FP8: "0"
+      MODEL_PATH: "{data_root}/models/Qwen3-8B-Base"
+      ATOM_FORCE_ATTN_TRITON: "1"
+    requires: *dense
+    smoke:
+      config: configs/dapo_qwen3_8b_ray_atom_bf16_4k_smoke.yaml
+      steps: 1
+      checks:
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.000954, rtol: 0.50}
+          - {name: entropy, ref: 0.667, rtol: 0.60}
+          - {name: rollout_corr/kl, ref: 0.000899, band: 10}
+          - {name: rollout_corr/ppl_ratio, info: true}
+    full: {config: configs/dapo_qwen3_8b_ray_atom_bf16_longrun.yaml}
+
+  - id: dapo-qwen3moe-vllm-bf16
+    aliases: ["6"]
+    title: "Qwen3-30B-A3B, FSDP2 BF16, vLLM BF16 rollout"
+    tier: t1
+    env:
+      MODE: bf16
+      TRAIN_FP8: "0"
+      MODEL_PATH: "{data_root}/models/Qwen3-30B-A3B-Base"
+      ATOMRL_FP32_MOE_ROUTER: "0"
+      RAY_memory_monitor_refresh_ms: "0"
+    requires: &moe
+      - models/Qwen3-30B-A3B-Base
+      - data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
+      - data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet
+    smoke:
+      config: configs/dapo_qwen3moe_a3b_ray_vllm_verlref_4k_smoke.yaml
+      steps: 3
+      checks:
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.00144, rtol: 0.50}
+          - {name: entropy, ref: 0.620, rtol: 0.60}
+          - {name: rollout_corr/kl, ref: 0.00140, band: 10}
+          - {name: rollout_corr/ppl_ratio, info: true}
+    full: {config: configs/dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml}
+
+  - id: dapo-qwen3moe-megatron-ep8
+    aliases: ["7"]
+    title: "Qwen3-30B-A3B, Megatron EP=8 BF16, vLLM BF16 rollout"
+    tier: t1
+    notes: >-
+      MORI expert dispatch (ENABLE_MORI=1) needs the ROCm fork of Megatron-LM:
+      pass --env MEGATRON_PATH=<tree visible in the container>.
+    env:
+      MODE: bf16
+      TRAIN_FP8: "0"
+      MODEL_PATH: "{data_root}/models/Qwen3-30B-A3B-Base"
+      ATOMRL_FP32_MOE_ROUTER: "0"
+    requires: *moe
+    smoke:
+      config: configs/dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml
+      steps: 3
+      checks:
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.00161, rtol: 0.50}
+          # Pinned-model runs measured 0.686, 0.986 and 1.243 at step 1.
+          - {name: entropy, ref: 0.986, rtol: 0.32}
+          - {name: rollout_corr/kl, ref: 0.00161, band: 10}
+          - {name: rollout_corr/ppl_ratio, info: true}
+    full: {config: configs/dapo_qwen3moe_a3b_ray_megatron_verlref_4k_longrun.yaml}
+
+  - id: dapo-qwen3moe-atom-bf16
+    aliases: ["9"]
+    title: "Qwen3-30B-A3B, FSDP2 BF16, ATOM BF16 rollout"
+    tier: t1
+    compile_cache_key: atombf16 Qwen3-30B-A3B-Base
+    env:
+      MODE: atombf16
+      TRAIN_FP8: "0"
+      MODEL_PATH: "{data_root}/models/Qwen3-30B-A3B-Base"
+      ATOMRL_FP32_MOE_ROUTER: "0"
+      ATOM_FORCE_ATTN_TRITON: "1"
+      RAY_memory_monitor_refresh_ms: "0"
+    requires: *moe
+    smoke:
+      config: configs/dapo_qwen3moe_a3b_ray_atom_bf16_4k_smoke.yaml
+      steps: 3
+      checks:
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.00153, rtol: 0.50}
+          - {name: entropy, ref: 0.683, rtol: 0.60}
+          - {name: rollout_corr/kl, ref: 0.00149, band: 10}
+          - {name: rollout_corr/ppl_ratio, info: true}
+    full: {config: configs/dapo_qwen3moe_a3b_ray_atom_bf16_longrun.yaml}
+
+  - id: dapo-qwen3moe-vllm-fully-async
+    title: "Qwen3-30B-A3B fully async, 4 trainer + 4 rollout GPUs, vLLM BF16"
+    tier: t1
+    # Weights go trainer -> rollout over RCCL on this node's RDMA NIC, named in the site file.
+    needs: [rdma]
+    env:
+      MODE: bf16
+      TRAIN_FP8: "0"
+      MODEL_PATH: "{data_root}/models/Qwen3-30B-A3B-Base"
+      ATOMRL_FP32_MOE_ROUTER: "0"
+    requires: *moe
+    smoke:
+      config: configs/dapo_qwen3moe_a3b_ray_vllm_verlref_fully_async_longrun.yaml
+      steps: 3
+      overrides: &fa1_overrides
+        - weight_sync.rdma.interface={rdma.interface}
+        - weight_sync.rdma.hca={rdma.hca}
+        - weight_sync.rdma.gid_index={rdma.gid_index}
+        - val_steps=0
+        - checkpointing.save_steps=100000
+        - logger.wandb_enabled=false
+      timeout_min: 90
+      checks:
+        # One run so far (2026-11-17, 8x MI355X): a band, not a tolerance.
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.00157, band: 3}
+          - {name: entropy, info: true}
+    full:
+      config: configs/dapo_qwen3moe_a3b_ray_vllm_verlref_fully_async_longrun.yaml
+      steps: 60
+      overrides: *fa1_overrides
+
+  # Two nodes, rollout and training on separate machines, weights over RDMA.
+  # The ATOM variant needs the RDMA weight receiver of ROCm/ATOM#3058, which the
+  # release image's ATOM has since -261119; with an older image, pass --atom-src.
+  - id: dapo-qwen3moe-fully-async-atom-2node
+    title: "Qwen3-30B-A3B fully async, 8 trainer + 8 rollout GPUs on two nodes, ATOM BF16, RDMA sync"
+    tier: t2
+    nodes: 2
+    needs: [rdma, atom_rdma]
+    compile_cache_key: atombf16 Qwen3-30B-A3B-Base
+    env: &fa2_atom
+      MODE: atombf16
+      TRAIN_FP8: "0"
+      MODEL_PATH: "{data_root}/models/Qwen3-30B-A3B-Base"
+      ATOMRL_FP32_MOE_ROUTER: "0"
+      ATOM_FORCE_ATTN_TRITON: "1"
+    requires: *moe
+    smoke:
+      config: configs/dapo_qwen3moe_a3b_ray_atom_bf16_longrun.yaml
+      steps: 10
+      timeout_min: 90
+      overrides: &fa2_overrides
+        - cluster.num_nodes=2
+        - cluster.gpus_per_node=8
+        - cluster.ray_address=auto
+        - controller.ray.actor.num_workers=8
+        - controller.ray.rollout.num_workers=8
+        - controller.ray.actor.process_on_nodes=[8]
+        - controller.ray.rollout.process_on_nodes=[8]
+        - controller.ray.actor.topology_tags.node_ip={hosts[0].ip}
+        - controller.ray.rollout.topology_tags.node_ip={hosts[1].ip}
+        - weight_sync.backend=rdma
+        - weight_sync.rdma.require_rdma=true
+        - weight_sync.rdma.interface={rdma.interface}
+        - weight_sync.rdma.hca={rdma.hca}
+        - weight_sync.rdma.gid_index={rdma.gid_index}
+        - controller.ray.fully_async.enabled=true
+        - controller.ray.fully_async.staleness_threshold=2.0
+        - controller.ray.fully_async.partial_rollout=true
+        - policy.generation.vllm_cfg.max_num_seqs=768
+        - policy.generation.vllm_cfg.gpu_memory_utilization=0.85
+        - policy.generation.atom_cfg.gpu_memory_utilization=0.85
+        - policy.generation.vllm_cfg.enable_sleep_mode=false
+        - val_steps=0
+        - checkpointing.save_steps=100000
+        - logger.wandb_enabled=false
+      checks:
+        # With ROCm/ATOM#3058 1166920f2 mounted: 0.00152 (2026-11-16, Lumen-RL
+        # image) and 0.00162 (2026-11-17, release image) at step 1.
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.00157, band: 3}
+          - {name: entropy, info: true}
+    full:
+      config: configs/dapo_qwen3moe_a3b_ray_atom_bf16_longrun.yaml
+      steps: 60
+      overrides: *fa2_overrides
+
+  - id: dapo-qwen3moe-fully-async-vllm-2node
+    title: "Qwen3-30B-A3B fully async, 8 trainer + 8 rollout GPUs on two nodes, vLLM BF16, RDMA sync"
+    tier: t2
+    nodes: 2
+    needs: [rdma]
+    env:
+      MODE: bf16
+      TRAIN_FP8: "0"
+      MODEL_PATH: "{data_root}/models/Qwen3-30B-A3B-Base"
+      ATOMRL_FP32_MOE_ROUTER: "0"
+    requires: *moe
+    smoke:
+      config: configs/dapo_qwen3moe_a3b_ray_vllm_verlref_fully_async_longrun.yaml
+      steps: 10
+      timeout_min: 90
+      overrides: *fa2_overrides
+      checks:
+        # One run so far (2026-11-17, 2x 8x MI355X): a band, not a tolerance.
+        metrics:
+          - {name: rollout_corr/k3_kl, ref: 0.00156, band: 3}
+          - {name: entropy, info: true}
+    full:
+      config: configs/dapo_qwen3moe_a3b_ray_vllm_verlref_fully_async_longrun.yaml
+      steps: 60
+      overrides: *fa2_overrides

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""What an engine and its workers support, so a caller can ask instead of guess.
+"""Collective-safe capabilities exposed by an engine and all of its workers.
 
-LumenRL currently probes ATOM with ``hasattr(self.engine, ...)`` in four places
-and otherwise hard-codes behaviour per backend. That works only while the two
-repos move together; the moment they do not, a missing method is discovered as a
-runtime failure mid-rollout rather than at negotiation time.
+Callers use this public contract to negotiate optional collective operations
+before starting them. Required in-tree engine methods are called directly;
+capabilities describe whether every rank can participate in an optional
+operation, not whether a Python attribute happens to exist.
 
 Two layers, answering different questions:
 
@@ -29,6 +29,12 @@ from dataclasses import dataclass, field
 # Bump when the collective-RPC wire contract changes incompatibly. A consumer
 # that pins a version can refuse to negotiate rather than fail mid-collective.
 COLLECTIVE_RPC_PROTOCOL_VERSION = 1
+
+# The weight syncs a runner may be unable to take, as keys of a capability
+# report's ``unavailable``: a reload in place (direct, SHM, IPC), and a stream
+# over the trainer's RDMA group.
+WEIGHT_RELOAD_FEATURE = "weight_reload"
+RDMA_WEIGHT_RECEIVE_FEATURE = "rdma_weight_receive"
 
 
 def pcp_group_size_of(config) -> int:

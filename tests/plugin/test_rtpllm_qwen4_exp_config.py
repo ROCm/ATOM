@@ -199,6 +199,7 @@ def test_qwen4_exp_rtp_gdn_policy_requires_vk_decode_state(
         num_spec_decodes=spec_decodes,
         non_spec_query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
         flydsl_prefill_metadata=None,
+        replayssm=False,
     )
     state = torch.empty((4, 2, 128, 128), dtype=torch.float32)
     if vk_layout:
@@ -235,7 +236,12 @@ def test_qwen4_exp_rtp_gdn_decode_does_not_build_prefill_schedule(monkeypatch):
         allow_aiter_flydsl=True,
         dt_bias=torch.empty((), dtype=torch.bfloat16),
     )
-    metadata = SimpleNamespace(num_prefills=0, flydsl_prefill_metadata=None)
+    metadata = SimpleNamespace(
+        num_prefills=0,
+        num_spec_decodes=0,
+        flydsl_prefill_metadata=None,
+        replayssm=False,
+    )
     monkeypatch.setattr(
         qwen4_exp_context,
         "select_policy",
@@ -263,7 +269,7 @@ def test_qwen4_exp_rtp_gdn_decode_supports_non_128_head_dimensions(monkeypatch):
         allow_aiter_flydsl=True,
         dt_bias=torch.empty((), dtype=torch.bfloat16),
     )
-    metadata = SimpleNamespace(num_prefills=0, num_spec_decodes=0)
+    metadata = SimpleNamespace(num_prefills=0, num_spec_decodes=0, replayssm=False)
     monkeypatch.setattr(
         qwen4_exp_context,
         "select_policy",

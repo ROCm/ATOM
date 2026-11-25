@@ -517,17 +517,22 @@ def _tbo_mark_used_on_compute(*tensors):
     mark(tensors)
 
 
-def tbo_on_comm(fn: Callable, *args):
+def tbo_on_comm(fn: Callable, *args, hold: bool = True):
     """`fn(*args)` as a comm phase: under TBO, yield to the other ubatch, run it
-    on the comm stream, switch back to compute, and hold what it returns (a
-    tensor, or a list / tuple of them) for the compute stream. Outside TBO,
-    just `fn(*args)`."""
+    on the comm stream, switch back to compute, and, with `hold`, hold what it
+    returns (a tensor, or a list / tuple of them) for the compute stream.
+    Outside TBO, just `fn(*args)`.
+
+    `hold=False` skips the hold and keeps the reuse race it closes. The TP
+    all-reduce and DP gather / scatter use it: held there, V4-Pro TP / DP TBO
+    hits a GPU fault (HSA_STATUS_ERROR_OUT_OF_RESOURCES)."""
     if not tbo_active():
         return fn(*args)
     _tbo_yield_and_switch_from_compute_to_comm()
     out = fn(*args)
     tbo_switch_to_compute_sync()
-    _tbo_mark_used_on_compute(out)
+    if hold:
+        _tbo_mark_used_on_compute(out)
     return out
 
 

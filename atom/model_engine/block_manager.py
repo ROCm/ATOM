@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from math import inf, isinf
 from time import monotonic
+from typing import Any
 from weakref import WeakKeyDictionary
 
 import numpy as np
@@ -22,8 +23,8 @@ from atom.distributed.kv_events import (
     KVCacheEvent,
 )
 from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
-from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_block_pool import KVBlockPool, make_block_pool
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     checkpoint_copy_ops_per_batch,
@@ -36,7 +37,7 @@ from atom.model_engine.prefix_hash import (
     prompt_fingerprint,
 )
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.state_cache import StateCache, StateCheckpointCache
+from atom.model_engine.state_cache import KEEP_NONE, StateCache, StateCheckpointCache
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     DEFAULT_STATE_RUNTIME,
@@ -178,13 +179,11 @@ def draft_kv_lookahead(
     `C - 1`, so it writes through `C + k - 1` and needs `k` positions past
     `len(seq)` -- one more than the serial count.
 
-    A position past the row's allocated blocks reads its block id from the
-    zeroed tail of the block table, so the write lands in physical block 0 --
-    another request's KV, or the units of a PAGE state checkpoint. For a
-    block drafter that is not hypothetical: a fully accepted step whose last
-    block position starts a new block writes the draft rows of physical
-    block 0, and a PAGE state checkpoint stored there is then restored
-    corrupted by every later request that hits its prefix.
+    A position past the row's allocated blocks resolves to physical block 0
+    through the zeroed block-table tail. PAGE-capable pools keep that block
+    reserved for padding; other pools may use it for live KV. Neither is a
+    valid destination for this row's draft writes, so its whole reach must
+    have allocated blocks even when a padding block is reserved.
     """
     k = max(0, int(num_speculative_tokens or 0))
     return k if block_drafter else max(0, k - 1)
@@ -233,6 +232,7 @@ class BlockManager:
         config: Config,
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
+        kv_connector: Any = None,
     ):
         self._min_load_tokens = config.offload_min_load_tokens
         block_size = config.kv_cache_block_size
@@ -294,12 +294,20 @@ class BlockManager:
         # The compressed KV blocks. Same class the sliding window uses for its
         # own index space — hash eviction has to happen at the same moment in
         # both or a prefix hit could be honoured by one pool and not the other.
-        self.kv = BlockPool(
+        self.kv: KVBlockPool = make_block_pool(
+            config,
             num_blocks,
             on_evict=self._record_evicted,
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
+            reserve_null_block=state_runtime.checkpoint_spec is not None,
+            kv_connector=kv_connector,
+        )
+        # Sequences whose prompt chain a content-sharing pool was already asked
+        # for (`_fetch_shared_prefix`), by the seed it was asked under.
+        self._shared_prefix_asked: WeakKeyDictionary[Sequence, int] = (
+            WeakKeyDictionary()
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -314,10 +322,30 @@ class BlockManager:
         # `state_slots_per_req` is what a live request asks for.
         pool_entries: dict = getattr(config, "pool_entries", None) or {}
         pool_per_req: dict = getattr(config, "pool_entries_per_req", None) or {}
-        # Total capacity, kept so callers can tell "all slots busy" (transient)
-        # from "no slots were ever created" (permanent).
+        # Slots live requests can take (transfer slots are carved off below), kept
+        # so callers can tell "all slots busy" from "no slots were ever created".
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        # A P/D producer's transfer slots, sized by the runner past the live ones:
+        # the top of the pool, where a finished request's state waits for its push.
+        self.num_state_transfer_slots = config.state_transfer_slots
+        if self.num_state_transfer_slots:
+            self.num_state_slots -= self.num_state_transfer_slots
+            logger.info(
+                "State pool: %d slots for live requests, %d P/D transfer slots",
+                self.num_state_slots,
+                self.num_state_transfer_slots,
+            )
+        self._free_transfer_slots: deque[int] = deque(
+            range(
+                self.num_state_slots,
+                self.num_state_slots + self.num_state_transfer_slots,
+            )
+        )
+        # Finished requests moved to a transfer slot, and those that kept
+        # their live slot because every transfer slot was taken.
+        self.transfer_slot_moves = 0
+        self.transfer_slots_full = 0
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -397,6 +425,7 @@ class BlockManager:
                 checkpoint_spec,
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
+                decode_keep=state_runtime.transfer.decode_keep,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -414,14 +443,18 @@ class BlockManager:
         self._state_checkpoint_cache: StateCheckpointCache = (
             self.paged_state_checkpoints or self.state
         )
+        if self.num_state_transfer_slots:
+            # `deallocate` then hands a transfer slot back to its own list.
+            self.state.release_many = self._release_live_or_transfer_slots
         # Where a readable backend can snapshot inside a forward; see
         # `midstep_target_ok`. Zero for a backend that cannot.
         self.midstep_grid = state_runtime.transfer.midstep_grid
         self.midstep_min_offset = state_runtime.transfer.midstep_min_offset
         if self.paged_state_checkpoints is not None:
-            # A PAGE midstep checkpoint is copied into a scratch slot from
-            # this pool, then stored from there, within the copy budget the
-            # runner's descriptor staging is sized to: one definition for both.
+            # A PAGE midstep checkpoint or decode image is built in a scratch
+            # slot from this pool, then stored from there, within the copy
+            # budget the runner's descriptor staging is sized to: one
+            # definition for both.
             self.paged_state_checkpoints.attach_midstep_scratch(
                 self.state,
                 checkpoint_copy_ops_per_batch(getattr(config, "max_num_seqs", 0)),
@@ -563,6 +596,10 @@ class BlockManager:
         self.demands_recorded: int = 0
         self.chunks_cut_for_demand: int = 0
         self.demands_declined_no_room: int = 0
+        # Dropped because the demand's chunk floor is a nonzero hit: the shape a
+        # floored anchor leaves the next turn, and also a real fork under one
+        # chunk above a grid rung (`_record_checkpoint_demand`).
+        self.demands_dropped_at_grid_hit: int = 0
         # The anchor's own cut counter, kept separate from the demand's: the
         # anchor fires on nearly every prompt and would drown the convergence
         # signal `chunks_cut_for_demand` exists to expose.
@@ -593,6 +630,7 @@ class BlockManager:
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
+            block_copies=self.kv.take_block_copies(),
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:
@@ -758,7 +796,7 @@ class BlockManager:
         Under DCP a rank stores only its interleaved shard, so this is a factor
         of `dcp_world_size` below the global `ceil(seq_len / block_size)`. The
         pool is sized in these same per-rank units, so this is the only count
-        that may be compared against `kv.num_blocks` — whether to draw from the
+        that may be compared against `kv.num_usable_blocks` — whether to draw from the
         pool (`can_allocate`/`allocate`) or to reject a prompt as too large for
         it (`Scheduler._unschedulable_reason`).
         """
@@ -801,10 +839,11 @@ class BlockManager:
         frontend can predict that verdict and refuse an oversized prompt with an
         error while it is still answering the client, instead of leaving the
         scheduler to discover it once the client is already waiting. The API
-        server needs it published because `num_kvcache_blocks` is measured in
-        the engine subprocess and its own Config never learns the value.
+        server needs it published because the engine measures the physical
+        `num_kvcache_blocks`, while this limit uses `kv.num_usable_blocks`
+        after reserving padding; the frontend's Config knows neither value.
         """
-        capacity = self.kv.num_blocks
+        capacity = self.kv.num_usable_blocks
         # A prompt this long needs more than `capacity` blocks on some rank, so
         # it bounds the search from above: each rank holds at least
         # `1 / dcp_world_size` of it, i.e. over `capacity` blocks' worth.
@@ -995,7 +1034,7 @@ class BlockManager:
         return {
             "used": used,
             "free": free,
-            "total": self.kv.num_blocks,
+            "total": self.kv.num_usable_blocks,
             "hashed": hashed,
             "retained": max(0, hashed - used),
             "evicted_total": self.total_evicted_blocks,
@@ -1253,10 +1292,13 @@ class BlockManager:
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_page_units(
-                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
-            ):
+            num_new_blocks = self.num_pool_blocks(
+                len(seq)
+            ) + self.draft_lookahead_blocks(len(seq))
+            if not self._has_page_units(num_new_blocks):
                 return -1
+            if probe is not None:
+                probe.num_new_blocks = num_new_blocks
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
@@ -1401,6 +1443,8 @@ class BlockManager:
 
     def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
         """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`."""
+        if self.kv.shares_content and self.enable_prefix_caching:
+            self._fetch_shared_prefix(seq)
         prompt = self._prompt_hashes(seq)
         if self.fast_prefix_walk:
             hashes, ids = self._hit_walk(seq, prompt)
@@ -1418,6 +1462,53 @@ class BlockManager:
         return _PrefixWalk(
             seq.num_tokens, seq.cache_seed, self.kv.index_version, hashes, ids
         )
+
+    def _fetch_shared_prefix(self, seq: Sequence) -> None:
+        """Have the pool bring in what other pools hold of `seq`'s prompt.
+
+        Once per sequence and cache seed, before its first walk: the blocks
+        arrive free and indexed, so the walk that follows hits them like any
+        local prefix and `allocate` claims them. Only the part of the chain
+        past the local hit is asked for, and never the last hash block, which
+        the walk does not match either.
+        """
+        if self._shared_prefix_asked.get(seq) == seq.cache_seed:
+            return
+        self._shared_prefix_asked[seq] = seq.cache_seed
+        n = self._n_hash_blocks(seq) - 1
+        if n <= 0:
+            return
+        chain = chained_block_hashes(
+            seq.token_ids, self.hash_block_size, 0, n, seq.cache_seed
+        )
+        get = self.kv.index_get
+        local = 0
+        while local < n and get(chain[local]) is not None:
+            local += 1
+        if local == n:
+            return
+        tokens_of = lambda i: self._hash_block_tokens(seq, local + i)
+        if self.kv.async_fetch:
+            # Copied in the background; the scheduler holds the sequence back
+            # while it is in flight (`shared_prefix_pending`).
+            self.kv.fetch_async(seq.id, chain[local:], tokens_of)
+            return
+        self.kv.fetch(chain[local:], tokens_of)
+
+    def shared_prefix_pending(self, seq: Sequence) -> bool:
+        """Whether `seq` should wait for its prefix to arrive from other pools.
+
+        Starts the copy on the first ask (`_fetch_shared_prefix`, which a
+        walk would otherwise start), so the scheduler can ask before probing.
+        """
+        if not (
+            self.kv.shares_content
+            and self.enable_prefix_caching
+            and self.kv.async_fetch
+        ):
+            return False
+        self._fetch_shared_prefix(seq)
+        return self.kv.fetch_pending(seq.id)
 
     def _admission_walk(self, seq: Sequence) -> _PrefixWalk:
         """The exact probe's walk, kept on the fast walk for `seq`'s `allocate`
@@ -1938,6 +2029,7 @@ class BlockManager:
                 seq,
                 self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
+        self.kv.prepare(self.num_pool_blocks(len(seq)) - len(seq.block_table))
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
         seq.num_cached_tokens = num_cached_blocks * hbs
@@ -2482,6 +2574,7 @@ class BlockManager:
         next_forward_tokens: int | None = None,
         aimed: bool = True,
         replay_until: int | None = None,
+        snapshot_step: int = -1,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -2509,6 +2602,8 @@ class BlockManager:
         replay has rebuilt the state whole there, so that may be checkpointed.
         Left unset it reads `seq.replay_until`, which under pipeline
         parallelism a later chunk's scheduling may already have moved.
+
+        `snapshot_step` reaches `StateCache.checkpoint`; see `hash_decode_blocks`.
         """
         if not self.enable_prefix_caching:
             return
@@ -2561,12 +2656,12 @@ class BlockManager:
             )
         pos = base + num_new_tokens
         kept = (
-            self.checkpointers_at(seq, pos, next_forward_tokens, aimed)
+            self.checkpointers_at(seq, pos, next_forward_tokens, aimed, snapshot_step)
             if pos > seq.scheduled_checkpoint_pos
             else []
         )
         for cache in kept:
-            cache.checkpoint(seq, end, h)
+            cache.checkpoint(seq, end, h, snapshot_step)
         if kept:
             seq.last_checkpoint_pos = pos
         # The midstep half of the same moment. Here rather than at each of the
@@ -2603,7 +2698,12 @@ class BlockManager:
         return True
 
     def hash_decode_blocks(
-        self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
+        self,
+        seq: Sequence,
+        committed_kv_len: int,
+        next_forward_tokens: int = 0,
+        *,
+        snapshot_step: int,
     ) -> None:
         """Register hashes for generated blocks filled up to `committed_kv_len`.
 
@@ -2626,6 +2726,9 @@ class BlockManager:
         `next_forward_tokens` reaches `checkpointers_at`; see there. It
         defaults to "no next forward", i.e. hash but never checkpoint, so a
         caller opts into decode-point checkpointing rather than out of it.
+
+        `snapshot_step` is the step of the slot's last verify window that
+        `committed_kv_len` ends on, as the slot stands when the store runs.
         """
         if not self.enable_prefix_caching:
             return
@@ -2640,6 +2743,7 @@ class BlockManager:
                 # speculative one, so it is held to spacing rather than to the
                 # grid.
                 aimed=False,
+                snapshot_step=snapshot_step,
             )
 
     def cancel_state_fork(self, seq: Sequence) -> bool:
@@ -2741,8 +2845,11 @@ class BlockManager:
         The shape that pays for this is a template header whose checkpoint is
         invalidated before anyone reaches it — there each request cuts a chunk
         and none collects. What bounds that is convergence rather than a
-        threshold: found once, filled once, gone. `chunks_cut_for_demand`
-        against `demands_recorded` is where it would show if it did not.
+        threshold: found once, filled once, gone. On the LMCache chunk grid
+        the rung can settle at the header's chunk floor rather than at the
+        header, and every fork then recomputes the gap (below).
+        `chunks_cut_for_demand` against `demands_recorded` is where it would
+        show if it did not converge.
 
         `--no-state-checkpoint-demand` drops the rung and leaves the prompt-end
         anchor alone. Worth measuring: the rung is most of the write traffic
@@ -2768,6 +2875,14 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
+        # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
+        # replay bounds what the missing checkpoint costs. A demand would cut
+        # every replay admission's forward at the hit and write a checkpoint
+        # there, for a branch at that exact hit that may never come:
+        # conversations resume at prompt ends, which the anchor covers, the
+        # hit included (`scheduler._cut_floor` lets it land there).
+        if seq.replays_hit:
+            demand = 0
         # Onto the LMCache chunk grid when the joint load serves this tier, as
         # the prompt-end anchor is (`_record_checkpoint_end`), and for the same
         # missing chunk. A demand sits where prompts fork, so the chunk covering
@@ -2777,25 +2892,37 @@ class BlockManager:
         # lookup, so an off-grid demand is never reached and the fork recomputes
         # from its HBM hit (`no_rung_above_hbm`). An unaligned HBM hit is not
         # the problem; the joint load reloads its partial chunk. Flooring costs
-        # each fork under one chunk while the prefix is still in HBM. A floor
-        # at or below the hit would be no rung at all, so the demand then stays
-        # where it was and serves HBM alone.
+        # each fork under one chunk while the prefix is still in HBM.
+        #
+        # A floor below an unaligned hit would be no rung at all, so the demand
+        # stays where it was and serves HBM alone. A floor right at a nonzero
+        # hit is what a floored prompt-end anchor leaves the next turn: the hit
+        # stops at the anchor while the KV runs on to the unfloored end. The
+        # demand is dropped there and this forward recomputes the gap, instead
+        # of cutting a second chunk and storing a second image every turn. A
+        # real fork that close above a grid rung is dropped too: later requests
+        # through it recompute at least that gap while the prefix is in HBM,
+        # and past HBM its off-grid demand is out of reach anyway. The rung can
+        # be the fork's own floor: a shared header S at least a chunk long and
+        # off the grid has its first demand floored to G, every later fork
+        # then hits G and drops its demand, and each request recomputes S - G
+        # for as long as the prefix stays in HBM, where one more cut would
+        # have let them resume at S. A hit at 0 is no floored anchor (one under
+        # a chunk never is), so a short shared header keeps its rung.
         chunk = self._joint_chunk_tokens
+        hit_tokens = hit * self.hash_block_size
         if (
             demand
             and chunk > self.hash_block_size
             and chunk % self.hash_block_size == 0
-            and demand - demand % chunk > hit * self.hash_block_size
         ):
-            demand -= demand % chunk
-        # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
-        # replay bounds what the missing checkpoint costs. A demand would cut
-        # every replay admission's forward at the hit and write a checkpoint
-        # there, for a branch at that exact hit that may never come:
-        # conversations resume at prompt ends, which the anchor covers, the
-        # hit included (`scheduler._cut_floor` lets it land there).
-        if seq.replays_hit:
-            demand = 0
+            floor = demand - demand % chunk
+            if floor > hit_tokens:
+                demand = floor
+            elif floor == hit_tokens > 0:
+                self.demands_dropped_at_grid_hit += not seq.checkpoint_demand_dropped
+                seq.checkpoint_demand_dropped = True
+                demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
         # `begin_store` is about to refuse is the only part of this funnel
@@ -2916,16 +3043,22 @@ class BlockManager:
         # than merely getting no better. Capping costs the continuation at most
         # one block of reuse — the same trade `room` above already takes.
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
-        # Onto the LMCache chunk grid when the joint load serves this tier. HBM
+        # Onto the LMCache chunk grid when the joint load serves this tier and
+        # its chunk is a multiple of the hash block, coarser than it. HBM
         # keeps a checkpoint only as long as its KV (`_record_evicted`), so past
         # an eviction the anchor resumes only through `_joint_kv_boundary`,
         # whose KV leg needs the whole chunk covering it -- and for an off-grid
         # anchor that chunk runs past this prompt, so no store ever holds it.
-        # A hash block finer than the chunk (PP: 128 against 1024) otherwise
-        # loses 7 anchors in 8 once the prompt leaves HBM; flooring costs under
-        # one chunk of reuse while it is still there. An anchor below one chunk
-        # stays put: the joint load has no whole chunk to restore it from, so
-        # flooring it to 0 would only take away its HBM reuse.
+        # A hash block finer than the chunk (block 128 against chunk 1024
+        # without DCP) otherwise loses 7 anchors in 8 once the prompt leaves
+        # HBM. While it is still there, the next turn resumes from the floored
+        # anchor, under one chunk below the stepped-back end, and the demand its
+        # KV would ask for just above is dropped (`_record_checkpoint_demand`).
+        # If the step-back above (`room`, the last-block cap) crosses a chunk
+        # boundary, the demand is kept and cut, as it would be without the
+        # floor. Either way the floor costs no extra cut. An anchor below one
+        # chunk stays put: the joint load has no whole chunk to restore it from,
+        # so flooring it to 0 would only take away its HBM reuse.
         chunk = self._joint_chunk_tokens
         if (
             chunk > self.hash_block_size
@@ -3218,6 +3351,7 @@ class BlockManager:
         return {
             "demands_recorded": self.demands_recorded,
             "demands_declined_no_room": self.demands_declined_no_room,
+            "demands_dropped_at_grid_hit": self.demands_dropped_at_grid_hit,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
             "chunks_cut_for_end": self.chunks_cut_for_end,
             "midstep_positions_unreadable": self.midstep_positions_unreadable,
@@ -3265,6 +3399,7 @@ class BlockManager:
         pos: int,
         next_forward_tokens: int | None = None,
         aimed: bool = True,
+        snapshot_step: int = -1,
     ) -> list[StateCache]:
         """State classes that should keep a checkpoint at `pos`, in class order.
 
@@ -3279,12 +3414,13 @@ class BlockManager:
         `next_forward_tokens` is how many tokens the forward right after this
         one carries, and is what each class's `successor_room` is compared
         against. Unset means the prompt's remainder, the prefill answer; decode
-        passes one. Everything else follows from that one number — a class
+        passes 1 or 0. Everything else follows from that one number — a class
         needing a long hand-over (V4's ring, 131) simply never qualifies
         mid-generation, one that hands nothing over (a retaining SWA pool, 0)
         always does, one that cannot keep a checkpoint at all (`inf`) never
         does, and a request stopping on this step passes 0 and keeps nothing
-        that nothing will ever resume from.
+        that nothing will ever resume from. A decode boundary (`snapshot_step`
+        >= 0) is kept only by a class whose `decode_keep` is not `KEEP_NONE`.
 
         The position must be exact. A checkpoint holds state as of the forward's
         last token, so a forward that overshoots a rung is ahead of the hash it
@@ -3353,7 +3489,13 @@ class BlockManager:
             # aimed placements are both prompt positions, so nothing here is
             # reachable and generation keeps no checkpoints under -1.
             return []
-        elif pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
+        elif (
+            # A finishing step: the slot is freed, and a stop may have cut the
+            # end inside the window `snapshot_step` names.
+            next_forward_tokens == 0
+            or pos % self.hash_block_size
+            or pos - seq.last_checkpoint_pos < interval
+        ):
             return []
         if next_forward_tokens is None:
             next_forward_tokens = seq.num_prompt_tokens - pos
@@ -3375,6 +3517,7 @@ class BlockManager:
             if not (aimed and c.readable_midstep)
             and c.applies(seq)
             and next_forward_tokens >= c.successor_room
+            and (snapshot_step < 0 or c.decode_keep != KEEP_NONE)
         ]
 
     def publish_loaded_prefix(
@@ -3662,10 +3805,11 @@ class BlockManager:
         seq.replays_hit = seq.replay_kv_load = False
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
-        # — including a fresh place in both funnel counters.
+        # — including a fresh place in each funnel counter.
         seq.checkpoint_demand_pos = 0
         seq.checkpoint_demand_counted = False
         seq.checkpoint_demand_declined = False
+        seq.checkpoint_demand_dropped = False
         # The anchor is derived from `num_prompt_tokens` alone, so it would
         # still be correct on re-admission — but `_record_checkpoint_end` runs
         # unconditionally in `can_allocate`, and leaving a stale value here
@@ -3729,6 +3873,41 @@ class BlockManager:
         seq.offload_joint.load_hash = -1
         seq.offload_joint.reset_joint()
 
+    def _release_live_or_transfer_slots(self, slots) -> None:
+        """Hand back live slots to the pool, transfer slots to their own list."""
+        for slot in slots or ():
+            if slot >= self.num_state_slots:
+                self._free_transfer_slots.append(slot)
+            elif slot >= 0:
+                self.state.release(slot)
+
+    def move_state_to_transfer_slot(self, seq: Sequence) -> tuple[int, int] | None:
+        """Re-home a finished P/D request's state in a transfer slot.
+
+        Returns ``(src, dst)``: the caller must copy slot ``src`` into ``dst``
+        before the next forward, which may reuse ``src``. None when every
+        transfer slot is taken: the request keeps its live slot.
+        """
+        if not self._free_transfer_slots:
+            self.transfer_slots_full += 1
+            return None
+        src = seq.state_slot
+        dst = self._free_transfer_slots.popleft()
+        self.state.release_many(seq.state_slots)
+        seq.state_slots = [dst]
+        self.transfer_slot_moves += 1
+        return src, dst
+
+    def transfer_slot_occupancy(self) -> dict[str, int]:
+        """Transfer slots in use and in total, and the moves made or missed."""
+        total = self.num_state_transfer_slots
+        return {
+            "transfer_slots_total": total,
+            "transfer_slots_used": total - len(self._free_transfer_slots),
+            "transfer_slot_moves": self.transfer_slot_moves,
+            "transfer_slots_full": self.transfer_slots_full,
+        }
+
     def can_append(
         self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
     ) -> bool:
@@ -3754,7 +3933,7 @@ class BlockManager:
         `lookahead` positions past that (`draft_kv_lookahead`). Checking that
         the pool has room (`can_append`) is not the same as allocating it: a
         position past the last allocated block reads block id 0 from the zeroed
-        block-table tail, and the write lands in whoever owns physical block 0.
+        block-table tail, overwriting the padding block or unrelated live KV.
         """
         # Note: in disaggregated (P/D) mode the scheduler skips the
         # `num_new_tokens` half on the first decode step after remote prefill,
