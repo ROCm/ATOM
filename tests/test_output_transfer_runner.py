@@ -184,6 +184,8 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     runner.sampler.sample_verification_tokens = mock.Mock(
         return_value=torch.zeros(bs, dtype=torch.int32)
     )
+    # A filtered batch is not the fused picks' (`Sampler.verify_picks`) path.
+    runner.sampler.fuses_verify_picks = mock.Mock(return_value=False)
     with pytest.raises(_Reached):
         runner_module.ModelRunner.postprocess(
             runner,

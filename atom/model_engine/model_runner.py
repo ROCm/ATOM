@@ -3749,8 +3749,8 @@ class ModelRunner:
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
+            bonus_logits = None
             if constraints is None:
-                bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
                 target_logits = torch.index_select(logits, 0, target_logits_indices)
             else:
                 bonus_logits, target_logits = constraints.logits, constraints.target
@@ -3759,28 +3759,45 @@ class ModelRunner:
             lossless = _draft_lossless(self)
             if lossless is not None and not all_greedy:
                 ratio = lossless.verify_inputs(bs, temperatures, top_ks, top_ps)
-            target_token_ids = None
+            target_token_ids = bonus_token_ids = None
             # Only exact match on a sampled batch reads the target's own draw.
             if not all_greedy and ratio is None:
-                target_token_ids = self.sampler.sample_verification_tokens(
-                    target_logits,
-                    spec_decode_metadata.cu_num_draft_tokens,
-                    temperatures,
-                    top_ks,
-                    top_ps,
-                    any_greedy=any_greedy,
-                )
+                if (
+                    constraints is None
+                    and target_logits_indices.numel()
+                    and self.sampler.fuses_verify_picks(top_ks, top_ps)
+                ):
+                    # Both picks in one launch, on the two calls' own draws.
+                    target_token_ids, bonus_token_ids = self.sampler.verify_picks(
+                        logits,
+                        target_logits_indices,
+                        bonus_logits_indices,
+                        spec_decode_metadata.cu_num_draft_tokens,
+                        temperatures,
+                    )
+                else:
+                    target_token_ids = self.sampler.sample_verification_tokens(
+                        target_logits,
+                        spec_decode_metadata.cu_num_draft_tokens,
+                        temperatures,
+                        top_ks,
+                        top_ps,
+                        any_greedy=any_greedy,
+                    )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
-            bonus_token_ids = self.sampler(
-                logits=bonus_logits,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise or not all_greedy,
-                any_greedy=any_greedy,
-            )
+            if bonus_token_ids is None:
+                if bonus_logits is None:
+                    bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+                bonus_token_ids = self.sampler(
+                    logits=bonus_logits,
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=all_greedy,
+                    needs_independent_noise=needs_independent_noise or not all_greedy,
+                    any_greedy=any_greedy,
+                )
             sampled_tokens, spec_status = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
