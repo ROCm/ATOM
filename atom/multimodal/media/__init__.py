@@ -8,6 +8,7 @@ from __future__ import annotations
 from ..inputs import (
     AudioData,
     AudioItem,
+    EncodedMedia,
     ImageItem,
     MediaData,
     Modality,
@@ -20,10 +21,12 @@ from .image import load_image
 
 
 class MediaLoader:
-    """Decode images and accept decoded audio/video with timing metadata.
+    """Decode images, read encoded video, accept decoded audio/video.
 
-    Encoded audio/video require a codec implementation of load_audio/load_video.
-    The native engine rejects unsupported modalities before loading media.
+    Encoded video is read but not decoded: sampling and frame size are the
+    model's, so its input builder decodes it (see ``media.video``). Encoded
+    audio requires a codec implementation of load_audio. The native engine
+    rejects unsupported modalities before loading media.
     """
 
     def __init__(self, timeout: float = 30):
@@ -42,13 +45,11 @@ class MediaLoader:
             "or implement MediaLoader.load_audio"
         )
 
-    def load_video(self, data: VideoItem) -> VideoData:
-        if isinstance(data, VideoData):
+    def load_video(self, data: VideoItem) -> VideoData | EncodedMedia:
+        """Decoded ``VideoData`` as given, or the encoded video's bytes."""
+        if isinstance(data, (VideoData, EncodedMedia)):
             return data
-        raise ValueError(
-            "Video decoding requires a media loader; pass decoded VideoData "
-            "or implement MediaLoader.load_video"
-        )
+        return EncodedMedia(self.connector.read(data))
 
     def load(self, modality: Modality, data: MediaData):
         loaders = {

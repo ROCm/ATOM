@@ -15,10 +15,13 @@ dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", 
 [project.optional-dependencies]
 structured-output = ["llguidance==1.9.1", "google-re2>=1.1"]
 tracing = ["opentelemetry-api>=1.40,<2", "opentelemetry-sdk>=1.40,<2", "opentelemetry-exporter-otlp-proto-http>=1.40,<2"]
-# atom/diffusion only. Kept out of the base install because none of it is
-# reachable from the LLM engine: PyAV muxes the H.264 + AAC MP4, Pillow does
-# canvas preparation for image conditioning, and torchaudio resamples reference
-# audio to the audio VAE's 32 kHz.
+# Multimodal LLM inputs: Pillow decodes images and PyAV decodes video for the
+# models whose input builders accept it (Kimi-K3). A plain install rejects a
+# video request with an error naming this extra.
+vision = ["av", "pillow"]
+# atom/diffusion: PyAV muxes the H.264 + AAC MP4, Pillow does canvas
+# preparation for image conditioning, and torchaudio resamples reference audio
+# to the audio VAE's 32 kHz.
 diffusion = ["av", "pillow", "torchaudio"]
 
 [project.urls]

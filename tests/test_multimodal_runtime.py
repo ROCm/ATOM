@@ -214,12 +214,20 @@ def test_kimi_k3_image_prompt_longer_than_the_token_budget_is_chunked():
     # got an empty response (OCRBench document images at the 8192 default).
     from atom.models.kimi_k3.image_processing import build_kimi_k3_inputs
 
-    def processor(**kwargs):
-        return {
-            "input_ids": torch.tensor([[9, 42, 7]]),
-            "pixel_values": torch.ones(64, 3, 14, 14),
-            "grid_thws": torch.tensor([[1, 4, 16]]),
-        }
+    processor = SimpleNamespace(
+        preprocess_medias=lambda medias: (medias, ["<image>"]),
+        media_processor=SimpleNamespace(
+            preprocess=lambda medias, return_tensors=None: {
+                "pixel_values": torch.ones(64, 3, 14, 14),
+                "grid_thws": torch.tensor([[1, 4, 16]]),
+            }
+        ),
+        tokenizer=SimpleNamespace(
+            apply_chat_template=lambda *args, **kwargs: {
+                "input_ids": torch.tensor([[9, 42, 7]])
+            }
+        ),
+    )
 
     atom_config = SimpleNamespace(
         multimodal_config=SimpleNamespace(
@@ -228,7 +236,11 @@ def test_kimi_k3_image_prompt_longer_than_the_token_budget_is_chunked():
         )
     )
     token_ids, data = build_kimi_k3_inputs(
-        atom_config, processor, [{"role": "user", "content": []}], [object()], {}
+        atom_config,
+        processor,
+        [{"role": "user", "content": [{"type": "image"}]}],
+        [object()],
+        {},
     )
     assert token_ids == [9] + [42] * 16 + [7]
     assert data["embedding_spans"] == ((1, 16),)
