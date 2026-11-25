@@ -97,8 +97,19 @@ class PPEngineCoreProc(EngineCore):
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
                     self._pp_head_step()
-                elif self.has_pending_kv_work():
+                    continue
+                # Idle. The drain polls the stages' ZMQ status socket, which
+                # drops the GIL and takes it straight back. Each drop restarts
+                # the 5 ms wait after which a waiting thread may demand the
+                # GIL, so a loop that drains every millisecond without blocking
+                # keeps it for good: the input thread cannot hand over a new
+                # request, nor the KV output thread the report this drain
+                # waits for. Block instead; both threads set the event.
+                # Cleared before the drain, so a report it misses is latched.
+                self._kv_progress_event.clear()
+                if self.has_pending_kv_work():
                     self._advance_idle_kv_transfer()
+                self._wait_for_kv_progress()
         finally:
             self._drain_kv_work_at_exit()
             try:
