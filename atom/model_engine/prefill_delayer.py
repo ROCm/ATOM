@@ -141,6 +141,7 @@ class PrefillDelayer:
         "_cost_slots",
         "_decode_interval_remaining",
         "_decode_tick_us",
+        "_mixed_prefill_ran",
         "_fired_cost",
         "_first",
         "_gate_at",
@@ -307,6 +308,7 @@ class PrefillDelayer:
         self._first = True
         self._decode_interval_remaining = 0
         self._prefill_executed_since_last_decision = False
+        self._mixed_prefill_ran = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
         # is counted separately so the log shows WHICH reason released prefill —
@@ -517,6 +519,9 @@ class PrefillDelayer:
         # decode/empty batch, which must not start a decode-protection window.
         if prefill_ran_n > 0:
             self._decode_interval_remaining = self.prefill_decode_interval
+            if self._mixed_prefill_ran:
+                self._decode_interval_remaining = max(self.prefill_decode_interval - 1, 0)
+        self._mixed_prefill_ran = False
 
         # First call fires unconditionally (one-time warmup seed).
         if self._first:
@@ -663,14 +668,20 @@ class PrefillDelayer:
         self._maybe_log()
         return True
 
-    def notify_prefill_executed(self) -> None:
+    def notify_prefill_executed(self, mixed: bool = False) -> None:
         """Report a completed local prefill forward.
 
         The next lockstep decision folds this flag into the existing SUM
         reduction, so every DP rank arms the interval together without adding
         a second collective to the scheduler hot path.
+
+        ``mixed`` (ATOM_MIXED_STEP, local delayer only): the forward also
+        advanced the running decodes, so the interval it arms is one decode
+        step shorter -- the decode advances between two prefills stay the same.
         """
         self._prefill_executed_since_last_decision = True
+        if mixed and self.is_local:
+            self._mixed_prefill_ran = True
 
     def notify_idle(self) -> None:
         """Report a tick the DP group spent with no work, which schedules

@@ -145,6 +145,8 @@ _FUSED_PROLOGUE = _EARLY_META and os.environ.get("ATOM_HOSTNEXT_FUSED_PROLOGUE",
 # per step shape (`model_ops.post_verify_graph`); the same bits as the eager
 # chain, which runs wherever the recording does not apply.
 _POST_GRAPH = os.environ.get("ATOM_HOSTNEXT_POST_GRAPH", "0") == "1"
+# ATOM_MX_STEPLOG=<csv path> (debug, agent mx): one line per forward (host ns at entry, kind, tokens, seqs).
+_MX_STEPLOG = os.environ.get("ATOM_MX_STEPLOG", "")
 # ATOM_PRESENCE_IN_SAMPLER=1 (default off): a verify step's presence penalty is not
 # applied to the verify logits in place (`PresencePenaltyStep.apply`, one launch) but
 # made in the rejection sampler's stats / select kernels (aiter topk_topp_sample
@@ -701,7 +703,10 @@ class tokenIDProcessor:
                 self.num_bonus[locs.deferred_curr] = 0
             return input_ids
         if batch.produces_output():
-            if locs is None and envs.ATOM_EARLY_PREFILL_SCHEDULE:
+            if locs is None and (
+                envs.ATOM_EARLY_PREFILL_SCHEDULE
+                or getattr(self, "_mixed_defer_status", False)
+            ):
                 # ATOM_EARLY_PREFILL_SCHEDULE: a pure prefill reads no carried
                 # status before its launch (`locs` is None), only its
                 # postprocess does. Taking it there lets the prefill launch
@@ -2964,6 +2969,10 @@ class ModelRunner:
             graph_shapes=self._producer_graph_shapes(),
             tbo_decode_graphs=self.tbo_decode_graphs,
         )
+        if getattr(self, "_mixed_rows", None):
+            # ATOM_MIXED_STEP: the prefill half lays its step out at the height
+            # of both segments (`mixed_step.forward_mixed`).
+            forward_mode = self._mixed_forward_mode(forward_mode, self._mixed_rows)
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
         self._eplb_any_rank_has_prefill = forward_mode.sync.any_rank_has_prefill
@@ -3061,6 +3070,26 @@ class ModelRunner:
         ):
             return
         late_pack.begin(self.device, early=True)
+
+    def _mixed_forward_mode(self, forward_mode: ForwardMode, rows: int) -> ForwardMode:
+        """ATOM_MIXED_STEP: the prefill half's shape at `rows` (prefill rows,
+        then the decode rows), on the prefill token-graph bucket holding them."""
+        import dataclasses as _dc
+
+        from atom.utils import region_graph as _rg
+
+        rows = max(rows, forward_mode.scheduled_tokens)
+        bucket = None
+        if forward_mode.token_graph:
+            bucket = _rg.TokenGraph.bucket(rows, "prefill")
+        running = bucket if bucket is not None else rows
+        self.running_tokens_per_dp_rank.fill(running)
+        return _dc.replace(
+            forward_mode,
+            running_tokens=running,
+            token_graph=bucket is not None,
+            prefill_token_graph=bucket is not None,
+        )
 
     @staticmethod
     def _detailed_label_suffix(batch: ScheduledBatch | None) -> str:
@@ -4737,6 +4766,16 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        if _MX_STEPLOG:
+            from atom.model_engine.mixed_step import steplog
+
+            steplog(batch)
+        mixed = getattr(batch, "mixed_decode", None)
+        if mixed is not None:
+            # ATOM_MIXED_STEP: (decode output, prefill output), in that order.
+            from atom.model_engine.mixed_step import forward_mixed
+
+            return forward_mixed(self, batch, mixed)
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.

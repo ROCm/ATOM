@@ -1180,7 +1180,9 @@ class Scheduler:
         tick: the batch budget, and under cost balancing the cost left to the
         step's target (largest k with `_chunk_cost(start, k)` <= what is left),
         but never below the balancing floor of `_balance_min_tokens`."""
-        cap_room = self.max_num_batched_tokens - batched_tokens
+        cap_room = (
+            self.max_num_batched_tokens - getattr(self, "_mixed_reserve", 0) - batched_tokens
+        )
         if self._tick_cost_limit == math.inf:
             return max(cap_room, 0)
         left = self._tick_cost_limit - self._tick_cost
@@ -2087,6 +2089,10 @@ class Scheduler:
         # balancing decision and must not see the previous step's cost limit.
         self._tick_cost_limit = math.inf
         self._tick_cost = 0.0
+        # ATOM_MIXED_STEP: leave the running decode batch's rows out of the
+        # prefill half's token budget, so a full-budget prefill (16k chunks at
+        # c1024) still has room for the decode rows that ride the step.
+        self._mixed_reserve = self._mixed_rows_reserve() if envs.ATOM_MIXED_STEP else 0
         skipped_waiting_requests: deque[Sequence] = deque()
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
@@ -2796,6 +2802,9 @@ class Scheduler:
                     scheduled_seqs, num_scheduled_tokens, is_final_chunk
                 )
 
+            if envs.ATOM_MIXED_STEP:
+                # The decode batch rides this step (atom/model_engine/mixed_step.py).
+                self._attach_mixed_decode(prefill_batch, scheduled_seqs)
             return (prefill_batch, scheduled_seqs)
 
         if self.dummy_prefill:
@@ -2945,6 +2954,116 @@ class Scheduler:
         )
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
+
+    # ------------------------------------------------------------------
+    # ATOM_MIXED_STEP
+    # ------------------------------------------------------------------
+    mixed_decode_seqs: dict | None = None
+
+    def _attach_mixed_decode(self, prefill_batch, prefill_seqs) -> None:
+        """Schedule this tick's decode half too and hang it on the prefill batch
+        (`ScheduledBatch.mixed_decode`); its seqs wait in `mixed_decode_seqs`
+        for the engine's post-process. Nothing when no seq decodes or the two
+        halves would not fit one step's rows."""
+        self.mixed_decode_seqs = None
+        if not self.spec_decode_local or self.kv_connector is not None:
+            return
+        width = self.mtp_k + 1
+        decodable = sum(
+            1
+            for seq in self.running
+            if seq.id not in prefill_seqs and not seq.is_partial_prefill
+        )
+        if decodable == 0:
+            return
+        rows = -(-prefill_batch.total_tokens_num // 32) * 32
+        if rows + -(-decodable * width // 32) * 32 + 32 > self.max_num_batched_tokens:
+            return
+        if len(prefill_seqs) + decodable > self.max_num_seqs:
+            return
+        result = self._schedule_mixed_decode(set(prefill_seqs))
+        if result is None:
+            return
+        decode_batch, decode_seqs = result
+        prefill_batch.mixed_decode = decode_batch
+        self.mixed_decode_seqs = decode_seqs
+
+    def _mixed_rows_reserve(self) -> int:
+        """Rows the decode half of a mixed step needs (32-aligned, + the 32-row
+        gap after the prefill rows), from the running seqs; 0 with
+        ATOM_MIXED_RESERVE=0. Never more than half the budget."""
+        if os.environ.get("ATOM_MIXED_RESERVE", "1") != "1" or not self.spec_decode_local:
+            return 0
+        n = sum(1 for seq in self.running if not seq.is_partial_prefill)
+        if n == 0:
+            return 0
+        rows = -(-n * (self.mtp_k + 1) // 32) * 32 + 32
+        return min(rows, self.max_num_batched_tokens // 2)
+
+    def take_mixed_decode_seqs(self) -> dict | None:
+        seqs, self.mixed_decode_seqs = self.mixed_decode_seqs, None
+        return seqs
+
+    def _schedule_mixed_decode(self, exclude: set):
+        """The decode half of `_schedule_gen` for a mixed step: the running
+        seqs not in this step's prefill, as their own decode batch."""
+        scheduled_seqs: dict[int, Sequence] = {}
+        num_scheduled_tokens: list[int] = []
+        scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
+        num_seqs_decode = 0
+        num_decode_tokens = 0
+        num_new_tokens = self.mtp_k + 1
+        skipped: list[Sequence] = []
+        budget = self.max_num_seqs - len(exclude)
+        while self.running and num_seqs_decode < budget:
+            seq = self.running.popleft()
+            if seq.id in exclude or seq.is_partial_prefill:
+                skipped.append(seq)
+                continue
+            if getattr(seq, "is_first_decode", False) and not seq.block_table:
+                skipped.append(seq)
+                continue
+            if not self.block_manager.can_append(
+                seq, num_new_tokens, self.draft_lookahead
+            ):
+                # No preemption inside a mixed step: the seq waits for the
+                # next (plain) decode step, which may preempt.
+                skipped.append(seq)
+                continue
+            if seq.spec_token_ids.size > 0:
+                scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
+            num_seqs_decode += 1
+            num_decode_tokens += num_new_tokens
+            self.block_manager.may_append(
+                seq, num_new_tokens, lookahead=self.draft_lookahead
+            )
+            scheduled_seqs[seq.id] = seq
+            seq.type = SequenceType.DECODE
+            num_scheduled_tokens.append(num_new_tokens)
+            seq.is_first_decode = False
+        # Keep `running`'s order: scheduled first (as the decode half leaves
+        # them), then the rest in their original order.
+        if skipped:
+            self.running.extendleft(reversed(skipped))
+        if scheduled_seqs:
+            self.running.extendleft(reversed(scheduled_seqs.values()))
+        if not scheduled_seqs:
+            return None
+        self._check_draft_writes_allocated(scheduled_seqs.values())
+        decode_batch = ScheduledBatch(
+            seqs=scheduled_seqs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_tokens_num=num_decode_tokens,
+            total_tokens_num_decode=num_decode_tokens,
+            total_seqs_num=num_seqs_decode,
+            total_seqs_num_prefill=0,
+            total_seqs_num_decode=num_seqs_decode,
+            num_spec_step=self.mtp_k,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
+        )
+        self._consume_state_forks(scheduled_seqs)
+        return decode_batch, scheduled_seqs
 
     @staticmethod
     def _consume_state_forks(scheduled_seqs: dict[int, Sequence]) -> None:

@@ -952,6 +952,14 @@ def unified_attention_with_output_base(
     unified attention's epilogue where it can)."""
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
+    if envs.ATOM_MIXED_STEP and not use_mla:
+        from atom.model_engine import mixed_step
+
+        mx = mixed_step.mixed_info()
+        if mx is not None:
+            return mixed_step.attention_with_output(
+                self, q, q_scale, k, v, positions, qkv, output_gate, mx
+            )
     if use_mla:
         return self.impl.forward(
             query=q,
@@ -1025,6 +1033,15 @@ def unified_attention_into_output(
 ) -> None:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
+    if envs.ATOM_MIXED_STEP:
+        from atom.model_engine import mixed_step
+
+        mx = mixed_step.mixed_info()
+        if mx is not None:
+            mixed_step.attention_into_output(
+                self, q, q_scale, k, v, positions, qkv, output, output_gate, mx
+            )
+            return
     out = self.impl.forward(
         query=q,
         key=k,
@@ -1272,6 +1289,12 @@ class LinearAttention(nn.Module):
             torch.ops.aiter.linear_attention_into_output(
                 mixed_qkv, b, a, core_attn_out, self.layer_name, z, out_scale
             )
+            if envs.ATOM_MIXED_STEP:
+                from atom.model_engine import mixed_step
+
+                mixed_step.run_gdn_decode_region(
+                    mixed_qkv, b, a, core_attn_out, self.layer_name, z, out_scale
+                )
             return core_attn_out, out_scale
         if torch.compiler.is_compiling():
             # The piecewise backend splits at the returning op; a mutating op
@@ -1282,4 +1305,10 @@ class LinearAttention(nn.Module):
         torch.ops.aiter.linear_attention_into_output(
             mixed_qkv, b, a, core_attn_out, self.layer_name, z
         )
+        if envs.ATOM_MIXED_STEP:
+            from atom.model_engine import mixed_step
+
+            mixed_step.run_gdn_decode_region(
+                mixed_qkv, b, a, core_attn_out, self.layer_name, z
+            )
         return core_attn_out
