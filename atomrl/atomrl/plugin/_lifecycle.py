@@ -41,9 +41,6 @@ def default_engine_kwargs(args: Any, framework: str) -> dict[str, Any]:
         getattr(args, "enable_chunked_prefill", True)
     )
 
-    dtype = getattr(args, "dtype", None)
-    if dtype is not None:
-        kwargs["dtype"] = str(dtype)
     memory = getattr(args, "gpu_memory_utilization", None)
     if memory is not None:
         kwargs["gpu_memory_utilization"] = float(memory)

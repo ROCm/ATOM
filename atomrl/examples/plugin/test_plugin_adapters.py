@@ -131,6 +131,7 @@ class _FakeManager:
         self.created = False
         self.stopped = False
         self.reloaded = []
+        self.events = []
         self.num_replicas = 2
         self.servers = [object(), object()]
         self.__class__.instances.append(self)
@@ -143,9 +144,11 @@ class _FakeManager:
 
     def reload_weights_from_path(self, path):
         assert Path(path).exists()
+        self.events.append(("reload", str(path)))
         self.reloaded.append(str(path))
 
     def wake_all(self, tags=None):
+        self.events.append(("wake", tags))
         self.wake_tags = tags
 
     def sleep_all(self):
@@ -188,6 +191,23 @@ def test_framework_lifecycle_uses_public_atom_manager(
     lifecycle.teardown_atom_manager(args)
     assert manager.stopped
     assert args._atomrl_atom_manager is None
+
+
+def test_framework_lifecycle_accepts_model_name_and_drops_unsupported_dtype(
+    monkeypatch,
+):
+    atom_server = importlib.import_module("atomrl.engine.inference.atom_ray_server")
+    monkeypatch.setattr(atom_server, "ATOMReplicaManager", _FakeManager)
+    _FakeManager.instances.clear()
+
+    lifecycle = importlib.import_module("atomrl.plugin.miles.lifecycle")
+    manager = lifecycle.setup_atom_manager(
+        SimpleNamespace(model_name="/models/qwen", dtype="bfloat16"),
+        actor_wg=SimpleNamespace(),
+    )
+
+    assert manager.kwargs["model_name"] == "/models/qwen"
+    assert "dtype" not in manager.kwargs["engine_kwargs"]
 
 
 def test_lifecycle_cleans_up_when_create_or_injection_fails(monkeypatch):
@@ -237,6 +257,11 @@ def test_checkpoint_reload_runs_on_rank_zero_only(monkeypatch, framework):
     monkeypatch.setattr(Path, "exists", lambda self: True)
     hooks.custom_update_weight_post_write(args, "/weights/v1", [])
     assert manager.reloaded == ["/weights/v1"]
+    assert manager.events == [
+        ("wake", ["weights"]),
+        ("reload", "/weights/v1"),
+        ("wake", ["kv_cache"]),
+    ]
 
 
 @pytest.mark.parametrize("framework", ("vime", "miles", "slime"))
@@ -320,12 +345,17 @@ def test_training_rollout_converts_chat_samples_and_always_sleeps(
     )
     manager = _FakeManager()
     manager.servers = [server]
+    model_arg = (
+        {"model_name": "/models/qwen"}
+        if framework == "miles"
+        else {"hf_checkpoint": "/models/qwen"}
+    )
     args = SimpleNamespace(
         _atomrl_atom_manager=manager,
-        hf_checkpoint="/models/qwen",
         rollout_batch_size=1,
         rollout_max_response_len=3,
         n_samples_per_prompt=2,
+        **model_arg,
     )
 
     package = types.ModuleType(framework)

@@ -172,6 +172,10 @@ class ATOMRolloutReplica(RolloutReplica):
         pass
 
     async def abort_all_requests(self, reject_request: bool = False):
+        """Drain in-flight requests; ATOM does not reject newly submitted work.
+
+        ``reject_request`` is retained only for verl API compatibility.
+        """
         await asyncio.gather(
             *[s.wait_for_requests_to_drain.remote() for s in self.servers]
         )

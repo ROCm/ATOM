@@ -95,5 +95,7 @@ def update_weight_post_write(
     if manager is None:
         logger.debug("atomrl: no ATOM manager; checkpoint reload skipped")
         return
+    manager.wake_all(tags=["weights"])
     manager.reload_weights_from_path(version_dir)
+    manager.wake_all(tags=["kv_cache"])
     logger.info("atomrl: ATOM weights reloaded from %s", version_dir)

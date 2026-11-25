@@ -84,8 +84,13 @@ def generate_rollout(
     import ray
 
     processing = importlib.import_module(f"{framework}.utils.processing_utils")
+    model_path = getattr(args, "hf_checkpoint", None) or getattr(
+        args, "model_name", None
+    )
+    if not model_path:
+        raise ValueError("args must define 'hf_checkpoint' or 'model_name'")
     tokenizer = processing.load_tokenizer(
-        args.hf_checkpoint,
+        model_path,
         trust_remote_code=True,
     )
     max_tokens = int(getattr(args, "rollout_max_response_len", 2048))

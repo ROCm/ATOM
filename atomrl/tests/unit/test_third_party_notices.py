@@ -190,6 +190,13 @@ def test_bootstrap_preserves_distribution_license_metadata():
     assert "THIRD_PARTY_IMAGE_SOURCES" in script
 
 
+def test_dsv4_trainer_preserves_base_image_pythonpath():
+    dockerfile = (
+        ATOMRL_ROOT / "examples" / "GRPO" / "docker" / "Dockerfile"
+    ).read_text(encoding="utf-8")
+    assert 'ENV PYTHONPATH="/workspace/ATOM/atomrl:${PYTHONPATH:-}"' in dockerfile
+
+
 def test_build_py_removes_stale_deleted_package_sources(tmp_path):
     build_lib = tmp_path / "build"
     stale = build_lib / "atomrl" / "trainer" / "bf16_optimizer.py"

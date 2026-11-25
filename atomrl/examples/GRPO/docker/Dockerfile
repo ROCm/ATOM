@@ -455,7 +455,7 @@ RUN pip install --no-cache-dir \
     LUMEN_BUILD_EXTENSIONS=1 pip install --no-cache-dir --no-build-isolation --no-deps \
       -e /workspace/ATOM
 
-ENV PYTHONPATH="/workspace/ATOM/atomrl" \
+ENV PYTHONPATH="/workspace/ATOM/atomrl:${PYTHONPATH:-}" \
     PYTHONUNBUFFERED=1 \
     TOKENIZERS_PARALLELISM=false \
     HIP_FORCE_DEV_KERNARG=1 \
