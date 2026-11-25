@@ -27,12 +27,16 @@ pub enum PlacementPlan {
     Single {
         worker: Arc<dyn Worker>,
         policy_name: &'static str,
+        /// The selection's `RouteDecision::binding`, for the dispatch hooks.
+        binding: Option<u64>,
     },
     Pair {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         prefill_policy: &'static str,
         decode_policy: &'static str,
+        prefill_binding: Option<u64>,
+        decode_binding: Option<u64>,
     },
 }
 
