@@ -1201,6 +1201,9 @@ class Scheduler:
         self._inflight_prefix_wait: dict[int, int] = {}
         # Tier loads started early, and the skip reasons of those not started.
         self._early_load = EarlyLoadState()
+        # seq id -> when `has_forward_work` first saw it blocked on a tier lookup
+        # (ATOM_DP_IDLE_WHEN_BLOCKED). Bounded by the waiting queue.
+        self._forward_blocked_since: dict[int, float] = {}
         # (seq id, prompt tokens reused) of requests `share_cache` routing placed
         # on an estimated prefix, for the CoreManager (`_note_dp_reuse`).
         self.dp_reuse_reports: list[tuple] = []
@@ -2083,12 +2086,14 @@ class Scheduler:
     def has_forward_work(self) -> bool:
         """Whether a scheduling pass on this rank may produce a batch now.
 
-        `is_finished` with three kinds of waiting taken out, none of which a
+        `is_finished` with four kinds of waiting taken out, none of which a
         forward advances (`ATOM_DP_IDLE_WHEN_BLOCKED`):
         - `deferred_free_blocks`: finished requests whose KV a peer (D) or the
           tier still reads; the idle drain polls them;
         - a waiting request whose remote/tier load is in flight
           (`_still_loading`; once it lands or fails, a pass takes it);
+        - a P request held at the P/D admission gate until D reserved its
+          pages (`admission_ready`, as Phase 2 checks it);
         - a waiting request Phase 2 would pass over for its in-flight tier
           lookup (`_head_waits_on_tier_lookup`), for at most
           `OFFLOAD_LOOKUP_DEFER_S` from when it was first seen here.
@@ -2120,18 +2125,29 @@ class Scheduler:
                 prefetch(
                     itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
                 )
+        admission_ready = getattr(conn, "admission_ready", None)
         now = time.monotonic()
         live = set()
+        # Phase 2's order: rejection first, then the load, the P/D admission
+        # gate and the lookup.
         for seq in self.waiting:
             if seq.status == SequenceStatus.ABORTED:
                 return True  # reclaimed by a pass
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                if self._still_loading(seq):
-                    continue
+            if self._unschedulable_reason(seq) is not None:
+                return True  # rejected by a pass at once, whatever it waits on
+            loading = seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+            if loading and self._still_loading(seq):
+                continue
+            if callable(admission_ready) and not admission_ready(seq):
+                # Held at the P/D admission gate until D reserved its pages
+                # (chunked transfer, ATOM_PD_EARLY_HANDOFF): Phase 2 skips it
+                # too. The idle drain ships its admission metadata and polls
+                # D's answer; an admission that expires aborts the request,
+                # which the next vote counts.
+                continue
+            if loading:
                 return True  # landed or failed: a pass resumes or recomputes it
-            if self._unschedulable_reason(seq) is None and (
-                self._head_waits_on_tier_lookup(seq)
-            ):
+            if self._head_waits_on_tier_lookup(seq):
                 first = blocked_since.get(seq.id)
                 if first is None:
                     first = blocked_since[seq.id] = now
@@ -2144,13 +2160,6 @@ class Scheduler:
             if sid not in live:
                 del blocked_since[sid]
         return False
-
-    @property
-    def _forward_blocked_since(self) -> dict:
-        """seq id -> when `has_forward_work` first saw it blocked on a lookup.
-        Created on first use, so a scheduler built without `__init__` (tests,
-        subclasses) has it too."""
-        return self.__dict__.setdefault("_forward_blocked_since_by_id", {})
 
     def add(self, seq: Sequence):
         tracing.enqueue(seq)

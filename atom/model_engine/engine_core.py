@@ -1130,6 +1130,8 @@ class DPEngineCoreProc(EngineCore):
         # `share_cache` routing reads each rank's own prefill backlog.
         self._report_backlog = config.dp_load_balance == "share_cache"
         self._idle_when_blocked = self._resolve_idle_when_blocked()
+        # Reduced by `_sync_dp_state`: some rank's vote hid unfinished work.
+        self._dp_group_hidden_work = False
 
     def _resolve_idle_when_blocked(self) -> bool:
         """`ATOM_DP_IDLE_WHEN_BLOCKED`: whether this rank reports work to its DP
@@ -1137,14 +1139,7 @@ class DPEngineCoreProc(EngineCore):
         Off with a prefill delayer, whose cadence counts passes."""
         if not envs.ATOM_DP_IDLE_WHEN_BLOCKED:
             return False
-        if getattr(self.scheduler, "has_forward_work", None) is None:
-            logger.warning(
-                "%s: ATOM_DP_IDLE_WHEN_BLOCKED ignored: %s has no has_forward_work",
-                self.label,
-                type(self.scheduler).__name__,
-            )
-            return False
-        if getattr(self.scheduler, "prefill_delayer", None) is not None:
+        if self.scheduler.prefill_delayer is not None:
             logger.warning(
                 "%s: ATOM_DP_IDLE_WHEN_BLOCKED ignored with the prefill delayer on",
                 self.label,
@@ -1212,37 +1207,37 @@ class DPEngineCoreProc(EngineCore):
                     or self._weight_sync_fenced
                     or self._generation_paused
                 )
-                # This rank's vote. By default any unfinished state,
-                # `deferred_free_blocks` included, so a group whose only work
-                # is waiting runs DP dummy forwards back to back. With
-                # ATOM_DP_IDLE_WHEN_BLOCKED only what a pass could forward
-                # (`has_forward_work`); the idle drain below advances the rest.
-                idle_when_blocked = (
-                    getattr(self, "_idle_when_blocked", False) and not draining
-                )
-                # Held first: a held rank runs no pass, so it must not send
-                # lookups or start their defer windows (`has_forward_work`).
-                local_unfinished = not local_held and (
-                    self.scheduler.has_forward_work()
-                    if idle_when_blocked
-                    else not self.scheduler.is_finished()
-                )
-
+                idle_when_blocked = self._idle_when_blocked and not draining
                 # MAX-reduced: one held rank holds every rank of the group, so
                 # their forwards stay paired.
                 if sync_now:
-                    sync_kwargs = {}
-                    if idle_when_blocked:
-                        # Work this narrower vote hides (blocked requests, deferred
-                        # frees), reduced with the vote; see the exit below.
-                        sync_kwargs["local_hidden"] = (
-                            not local_unfinished
-                            and not local_held
-                            and not self.scheduler.is_finished()
+                    # This rank's vote. By default any unfinished state,
+                    # `deferred_free_blocks` included, so a group whose only
+                    # work is waiting runs DP dummy forwards back to back. With
+                    # ATOM_DP_IDLE_WHEN_BLOCKED only what a pass could forward
+                    # (`has_forward_work`); the idle drain below advances the
+                    # rest. Only on rounds that sync, so a skipped round sends
+                    # no lookups and starts no defer windows.
+                    if not idle_when_blocked:
+                        local_unfinished = (
+                            not self.scheduler.is_finished() and not local_held
+                        )
+                        local_hidden = False
+                    elif local_held:
+                        # Held first: a held rank runs no pass, so it must not
+                        # send lookups or start their defer windows.
+                        local_unfinished = local_hidden = False
+                    else:
+                        local_unfinished = self.scheduler.has_forward_work()
+                        # Work this narrower vote hides (blocked requests,
+                        # deferred frees), reduced with the vote; see the
+                        # shutdown exit below.
+                        local_hidden = (
+                            not local_unfinished and not self.scheduler.is_finished()
                         )
                     global_has_unfinished, global_shutdown, global_held = (
                         self._sync_dp_state(
-                            local_unfinished, shutdown, local_held, **sync_kwargs
+                            local_unfinished, shutdown, local_held, local_hidden
                         )
                     )
                     if gate is not None:
@@ -1257,7 +1252,7 @@ class DPEngineCoreProc(EngineCore):
                     )
 
                 if global_shutdown and not global_has_unfinished:
-                    if getattr(self, "_dp_group_hidden_work", False):
+                    if self._dp_group_hidden_work:
                         # Some rank's blocked request or deferred free voted
                         # "no work": every rank votes as with the flag off from
                         # here, so they settle before the exit as they do off.
@@ -1374,10 +1369,10 @@ class DPEngineCoreProc(EngineCore):
         try:
             state_tensor = torch.tensor(
                 [
-                    1 if local_has_unfinished else 0,
-                    1 if local_shutdown else 0,
-                    1 if local_held else 0,
-                    1 if local_hidden else 0,
+                    int(local_has_unfinished),
+                    int(local_shutdown),
+                    int(local_held),
+                    int(local_hidden),
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -1385,11 +1380,10 @@ class DPEngineCoreProc(EngineCore):
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
-            global_has_unfinished = state_tensor[0].item() == 1
-            global_shutdown = state_tensor[1].item() == 1
-            global_held = state_tensor[2].item() == 1
-            self._dp_group_hidden_work = state_tensor[3].item() == 1
-            return global_has_unfinished, global_shutdown, global_held
+            # One decode for the four flags.
+            unfinished, shutdown, held, hidden = state_tensor.tolist()
+            self._dp_group_hidden_work = hidden == 1
+            return unfinished == 1, shutdown == 1, held == 1
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             self._shutting_down = True

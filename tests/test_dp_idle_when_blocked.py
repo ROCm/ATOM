@@ -17,6 +17,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import torch
 from aiter_stub import stubbed_aiter
 from conftest import MockConfig
 from test_scheduler_early_load import _Connector
@@ -243,6 +244,54 @@ def test_blocked_since_stays_bounded_while_runnable_work_remains(make, seq_facto
     assert not s._forward_blocked_since
 
 
+class _StickyLookupConnector(_LookupConnector):
+    """A tier that keeps deferring a request past `OFFLOAD_LOOKUP_DEFER_S`
+    (e.g. the native restore-slot hold): only the vote's own bound ends it."""
+
+    def lookup_would_defer(self, seq):
+        return seq.id in self.in_flight
+
+
+def test_vote_bounds_a_lookup_the_tier_keeps_deferring(make, monkeypatch):
+    monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "0.5")
+    clock = _Clock(monkeypatch)
+    s, _ = make(1)
+    s.kv_connector = _StickyLookupConnector()
+    assert not s.has_forward_work()  # t=100.0, first seen
+    clock.now = 100.6
+    assert s.kv_connector.lookup_would_defer(s.waiting[0])  # still deferring
+    assert s.has_forward_work()  # the vote's window has run out: a pass
+
+
+def test_request_held_at_the_pd_admission_gate_is_blocked(make):
+    """A P request waiting for D's reservation (chunked transfer, early
+    handoff): Phase 2 skips it, so the vote must not ask for a pass."""
+    s, (seq,) = make(1)
+    conn = s.kv_connector
+    conn.answer_on_prefetch = True  # its lookup is no obstacle
+    ready = {"d": False}
+    conn.admission_ready = lambda q: ready["d"]
+    assert not s.has_forward_work()
+    _, scheduled = s.schedule()
+    assert scheduled == {}  # Phase 2 agrees: nothing to forward
+    ready["d"] = True  # D reserved its pages
+    assert s.has_forward_work()
+    _, scheduled = s.schedule()
+    assert list(scheduled) == [seq.id]
+
+
+def test_rejection_is_checked_before_the_load(make, seq_factory):
+    """Phase 2 rejects an unschedulable request at once, load in flight or
+    not; the vote must not wait for the load first."""
+    s, _ = make()
+    seq = seq_factory(list(range(100)))  # longer than max_model_len
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    s.waiting.append(seq)
+    assert s._still_loading(seq)
+    assert s._unschedulable_reason(seq) is not None
+    assert s.has_forward_work()
+
+
 # ------------------------------ busy loop ---------------------------------- #
 
 
@@ -270,6 +319,7 @@ class Loop:
         p._weight_sync_fenced = False
         p._generation_paused = False
         p._idle_when_blocked = enabled
+        p._dp_group_hidden_work = False
         p.dp_group = None  # a single rank: the interval agreement is local
         self.events = []
         self.votes = []
@@ -392,6 +442,57 @@ def test_request_waiting_on_its_lookup(make, monkeypatch, seq_factory, enabled):
         assert events == ["dummy"] * 3 + ["schedule", "exit"]
 
 
+@pytest.mark.parametrize("blocked", [False, True])
+def test_idle_loop_sleeps_only_for_blocked_requests(
+    make, monkeypatch, seq_factory, blocked
+):
+    """The 0.5 ms sleep is for requests blocked on a lookup or load (their
+    threads need the GIL); deferred frees alone poll as with the flag off."""
+    if blocked:
+        s, (seq,) = make(1, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
+        script = {3: lambda: s.finished_recving_kv_req_ids.append(seq.id)}
+    else:
+        s, _ = make(conn=False)
+        s.deferred_free_blocks[1] = object()
+        script = {3: s.deferred_free_blocks.clear}
+    sleeps = []
+    loop = Loop(s, enabled=True, shutdown_at=4, script=script)
+    monkeypatch.setattr(ec.time, "sleep", sleeps.append)
+    loop.run(monkeypatch)
+    assert sleeps == ([ec.BLOCKED_IDLE_SLEEP_S] * 3 if blocked else [])
+
+
+def test_vote_runs_only_on_rounds_that_sync(make, monkeypatch):
+    """`ATOM_DP_SYNC_INTERVAL` > 1: rounds that skip the sync run paired and
+    must not call `has_forward_work` (no lookups sent, no windows started).
+    After the sync that saw work, interval - 1 paired rounds still run before
+    the next sync lets the group idle."""
+    monkeypatch.setenv("ATOM_DP_SYNC_INTERVAL", "3")
+    s, _ = make(conn=False)
+    s.deferred_free_blocks[1] = object()
+    calls = []
+    vote = s.has_forward_work
+    monkeypatch.setattr(s, "has_forward_work", lambda: calls.append(1) or vote())
+    holder = SimpleNamespace(loop=None)
+
+    def peer_quiet():
+        holder.loop.state.peers = 0
+
+    # Script keys count syncs (utility commands run only on rounds that sync).
+    loop = holder.loop = Loop(
+        s,
+        enabled=True,
+        shutdown_at=3,
+        script={1: peer_quiet, 3: s.deferred_free_blocks.clear},
+        peers=1,
+    )
+    events = loop.run(monkeypatch)
+    # Sync 0 sees the busy peer: its dummy, then 2 rounds without a sync.
+    # Syncs 1-2 idle-poll the deferred free; sync 3 settles and exits.
+    assert events == ["dummy"] * 3 + ["drain"] * 2 + ["exit"]
+    assert len(calls) == len(loop.votes) == 4
+
+
 def test_on_lets_a_landed_load_through(make, monkeypatch):
     s, (seq,) = make(1, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
     script = {2: lambda: s.finished_recving_kv_req_ids.append(seq.id)}
@@ -498,14 +599,14 @@ def test_sync_reduces_hidden_work_with_the_vote(monkeypatch):
     p = DPEngineCoreProc.__new__(DPEngineCoreProc)
     p.label = "dp0"
     p._shutting_down = False
-    p.dp_group = None
+    p.dp_group = object()  # a real group: the flags go through all_reduce
     sent = []
 
     def all_reduce(tensor, op=None, group=None):
         sent.append(tensor.tolist())
         tensor[3] = 1  # a peer's hidden work
 
-    monkeypatch.setattr(ec.torch.distributed, "all_reduce", all_reduce)
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     assert p._sync_dp_state(False, True, False) == (False, True, False)
     assert sent == [[0, 1, 0, 0]]
     assert p._dp_group_hidden_work is True
@@ -531,14 +632,6 @@ def test_switch(make, monkeypatch, env, delayer, expected):
     p.scheduler, _ = make()
     p.scheduler.prefill_delayer = delayer
     assert p._resolve_idle_when_blocked() is expected
-
-
-def test_switch_needs_has_forward_work(monkeypatch):
-    monkeypatch.setenv("ATOM_DP_IDLE_WHEN_BLOCKED", "1")
-    p = DPEngineCoreProc.__new__(DPEngineCoreProc)
-    p.label = "dp0"
-    p.scheduler = SimpleNamespace(prefill_delayer=None)
-    assert p._resolve_idle_when_blocked() is False
 
 
 def test_default_is_off(make, monkeypatch):
