@@ -723,13 +723,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSV41_A8W4_ATTN": lambda: os.getenv("ATOM_DSV41_A8W4_ATTN", "auto")
     .strip()
     .lower(),
-    # Experimental native TP quantized-prefill token graphs: capture SWA staging,
-    # RoPE/quantization, MLA and ring commits. Request-dependent CSR stays
-    # eager. Decode/verify, DPA, TBO and bounded replay keep their paths.
-    "ATOM_DSV41_PREFILL_ATTN_GRAPH": lambda: os.getenv(
-        "ATOM_DSV41_PREFILL_ATTN_GRAPH", "0"
-    )
-    == "1",
     # DeepSeek-V4.1 mono decode's high-interactivity (hi) monokernels (the
     # `mono/hi` package, imported only with this on): on the decode steps it
     # serves, every decoder layer, the verify head, the DSpark draft and the

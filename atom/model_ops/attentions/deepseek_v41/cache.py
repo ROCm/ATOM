@@ -1297,7 +1297,7 @@ class PagedAttentionCache:
         """Fixed CSR pointers for native prefill graphs only.
 
         Keep A8W4 separate from the BF16 adapter's pointers. Allocate once
-        before the graph's first live fill; flag-off, TBO and bounded-query
+        before the graph's first live fill; eager, TBO and bounded-query
         steps keep their existing per-step A8W4 allocations.
         """
         if not a8w4:

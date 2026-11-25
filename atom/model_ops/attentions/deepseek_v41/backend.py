@@ -222,8 +222,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # Layers consume it serially; TBO children overlap and need disjoint
         # sources. Reserve before profiling so this scratch is in the budget.
         self._prefill_attention_graph = (
-            envs.ATOM_DSV41_PREFILL_ATTN_GRAPH
-            and model_runner.config.plugin_config is None
+            model_runner.config.plugin_config is None
+            and not model_runner.enforce_eager
+            and not model_runner.config.disagg_is_decode
+            and any(
+                0 < tokens <= model_runner.warmup_max_tokens()
+                for tokens in envs.ATOM_TOKEN_GRAPH_SIZES
+            )
             # Mixed DPA steps can replay prefill graphs on decoding peers.
             and not model_runner.config.enable_dp_attention
             and not model_runner.config.enable_tbo
