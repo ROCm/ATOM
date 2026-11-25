@@ -32,6 +32,7 @@ from atom.model_ops.deepseek_v41.router import (
     router_logits as fixed_order_router_logits,
 )
 from atom.model_ops.deepseek_v41.router import router_supported
+from atom.model_ops.fused_moe.fused_route import FusedRoute
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import mm_topk, topk_meta_rows
 from atom.model_ops.utils import atom_parameter
@@ -48,6 +49,11 @@ def v41_record_tbo_expert_output(output: torch.Tensor) -> None:
 
     if tbo_active():
         output.record_stream(torch.cuda.current_stream())
+
+
+def _text_only_step() -> bool:
+    """No image rows this step: `MoE._topk` routes with the one bias."""
+    return getattr(get_forward_context().attn_metadata, "image_mask", None) is None
 
 
 class MoE(V4MoE):
@@ -79,6 +85,12 @@ class MoE(V4MoE):
         )
 
         self.experts.custom_routing_function = self._topk
+        # `_topk` on a text-only step, in one launch with the placement.
+        self.experts.fused_route = FusedRoute.for_layer(
+            self.experts,
+            applies=_text_only_step,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
 
     def _topk(self, hidden_states, gating_output, topk, renormalize):
         image_mask = getattr(get_forward_context().attn_metadata, "image_mask", None)
