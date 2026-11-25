@@ -210,6 +210,9 @@ def main():
     (experiment / "contract.json").write_text(json.dumps(contract, indent=2))
     source = Path(__file__).with_name("pd_recipe_router_ab.py")
     (experiment / source.name).write_text(source.read_text())
+    if contract.get("torch_profile"):
+        helper = source.with_name("pd_agentic_profile.py")
+        (experiment / helper.name).write_bytes(helper.read_bytes())
     if lock := contract.get("client_constraints"):
         content = (Path(os.environ["REPO_ROOT"]) / lock["path"]).read_bytes()
         if hashlib.sha256(content).hexdigest() != lock["sha256"]:

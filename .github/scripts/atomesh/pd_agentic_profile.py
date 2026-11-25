@@ -27,11 +27,19 @@ def inspect_trace(path):
     rank = re.search(r"rank(\d+)\.", path.name)
     if rank is None:
         raise ValueError(f"Missing worker rank: {path}")
+    parallel_ranks = {
+        axis: int(value)
+        for axis, value in re.findall(
+            r"(?:^|_)(dp|pp|tp|dcp|ep|rank)(\d+)(?=_|\.)", path.name
+        )
+    }
+    parallel_ranks["rank"] = int(rank[1])
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     return {
         "file": str(path),
         "rank": int(rank[1]),
+        "parallel_ranks": parallel_ranks,
         "bytes": path.stat().st_size,
         "sha256": digest,
         "events": len(events),
@@ -131,11 +139,13 @@ class Capture:
                 set((self.args.traces / role).glob("*.pt.trace.json*")) - before
             )
             records = [inspect_trace(path) for path in paths]
-            if len(records) != self.args.ranks or {r["rank"] for r in records} != set(
+            axis = getattr(self.args, f"{role}_rank_axis", "rank")
+            observed = {r["parallel_ranks"].get(axis) for r in records}
+            if len(records) != self.args.ranks or observed != set(
                 range(self.args.ranks)
             ):
                 raise ValueError(
-                    f"{role}: expected {self.args.ranks} unique GPU ranks, got {records}"
+                    f"{role}: expected {self.args.ranks} unique {axis} ranks, got {records}"
                 )
             dest = self.args.traces / f"window-{number}" / role
             dest.mkdir(parents=True, exist_ok=False)
@@ -158,7 +168,11 @@ class Capture:
     def run(self, command):
         self.event("workload_start", argv=command)
         with (self.args.output / "workload-console.log").open("w") as log:
-            child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+            child = subprocess.Popen(
+                command,
+                stdout=None if getattr(self.args, "inherit_stdout", False) else log,
+                stderr=subprocess.STDOUT,
+            )
             errors, windows = [], []
             try:
                 deadline = time.monotonic() + self.args.phase_timeout
@@ -195,10 +209,22 @@ class Capture:
             except (OSError, ValueError, RuntimeError, EOFError, KeyError) as exc:
                 errors.append(repr(exc))
                 self.event("capture_failed", error=repr(exc))
+                if (
+                    getattr(self.args, "stop_on_capture_error", False)
+                    and child.poll() is None
+                ):
+                    child.terminate()
             finally:
                 # Keep AIPerf's normal result export/draining; bound failed workloads.
                 try:
-                    rc = child.wait(timeout=self.args.finish_timeout)
+                    rc = child.wait(
+                        timeout=(
+                            30
+                            if errors
+                            and getattr(self.args, "stop_on_capture_error", False)
+                            else self.args.finish_timeout
+                        )
+                    )
                 except subprocess.TimeoutExpired:
                     child.terminate()
                     try:
@@ -238,6 +264,14 @@ def main():
     parser.add_argument("--seconds", type=float, default=10)
     parser.add_argument("--offsets", type=float, nargs="+", default=[60, 240])
     parser.add_argument("--ranks", type=int, default=8)
+    for role in ("prefill", "decode"):
+        parser.add_argument(
+            f"--{role}-rank-axis",
+            choices=["rank", "dp", "pp", "tp", "dcp", "ep"],
+            default="rank",
+        )
+    parser.add_argument("--inherit-stdout", action="store_true")
+    parser.add_argument("--stop-on-capture-error", action="store_true")
     parser.add_argument("--phase-timeout", type=float, default=7200)
     parser.add_argument("--finish-timeout", type=float, default=1800)
     parser.add_argument("command", nargs=argparse.REMAINDER)

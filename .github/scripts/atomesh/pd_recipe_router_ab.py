@@ -295,6 +295,55 @@ def validate_client_contract(contract):
     # AgentX 1.0.14 requires this window even for runs marked diagnostic_only.
     if not contract.get("functional_only") and contract["duration"] < 900:
         raise ValueError("AgentX requires a benchmark duration of at least 900 seconds")
+    if profile := contract.get("torch_profile"):
+        if not contract.get("diagnostic_only") or contract.get("functional_only"):
+            raise ValueError("Torch capture requires a diagnostic performance workload")
+        offsets = profile["offsets"]
+        if (
+            not offsets
+            or offsets != sorted(set(offsets))
+            or offsets[0] < 0
+            or profile["seconds"] <= 0
+            or offsets[-1] + profile["seconds"] >= contract["duration"]
+        ):
+            raise ValueError("Capture windows must fit inside the profiling phase")
+
+
+def profile_command(contract, argv, workers, output):
+    if not (profile := contract.get("torch_profile")):
+        return argv
+    return [
+        sys.executable,
+        str(Path(__file__).with_name("pd_agentic_profile.py")),
+        "--prefill",
+        workers[0],
+        "--decode",
+        workers[1],
+        "--output",
+        str(output / "torch-profile"),
+        "--traces",
+        str(output.parent / "torch-traces"),
+        "--aiperf-log",
+        str(output / "aiperf_artifacts/logs/aiperf.log"),
+        "--ranks",
+        str(profile["ranks"]),
+        "--prefill-rank-axis",
+        profile["prefill_rank_axis"],
+        "--decode-rank-axis",
+        profile["decode_rank_axis"],
+        "--seconds",
+        str(profile["seconds"]),
+        "--offsets",
+        *map(str, profile["offsets"]),
+        "--phase-timeout",
+        "1200",
+        "--finish-timeout",
+        "1200",
+        "--inherit-stdout",
+        "--stop-on-capture-error",
+        "--",
+        *argv,
+    ]
 
 
 def benchmark(contract, args):
@@ -442,17 +491,19 @@ def benchmark(contract, args):
     env = dict(os.environ) | contract["benchmark_env"]
     # Preserve the recipe/client defaults in both arms, including session headers.
     env.pop("AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID", None)
+    launch_argv = profile_command(contract, argv, args.workers, output)
     (output / "benchmark-command.json").write_text(
         json.dumps(
             {
                 "argv": argv,
+                "launch_argv": launch_argv,
                 "recipe_env": contract["benchmark_env"],
                 "new_session_header": False,
             },
             indent=2,
         )
     )
-    result = subprocess.run(argv, env=env, check=False)
+    result = subprocess.run(launch_argv, env=env, check=False)
     scrape(args.workers, output, "final")
     for name, url in (("workers", args.router + "/workers"),):
         try:
