@@ -543,9 +543,10 @@ class MoRIIOConnector(KVConnectorBase):
         if not has_handle:
             raise RuntimeError(
                 f"the KV pool at {base:#x} ({size} B) has no fabric handle, so "
-                "FABRIC cannot move it: it was not allocated by "
-                "MoRIIOConnector.kv_pool_memory, or the device cannot export "
-                "fabric memory"
+                "FABRIC cannot move it: it was not allocated in fabric memory "
+                "(MoRIIOConnector.kv_pool_memory, or another sub-connector's "
+                "pool with exports_fabric), or the device cannot export fabric "
+                "memory"
             )
         self._page_desc = desc
         self._page_regions = [

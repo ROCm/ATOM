@@ -289,15 +289,31 @@ class MultiConnector(KVConnectorBase):
         self._state_tier = None
 
     def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory | None:
-        """The pool memory of whichever sub provides the pool (at most one)."""
+        """The pool memory of whichever sub provides the pool (at most one).
+
+        A `transport_only` pool (moriio fabric's) only asks for memory of a
+        kind; another sub's pool that `serves` it is used instead, and the
+        transport registers that one.
+        """
         provided = [
             memory
             for connector in self._connectors
             if (memory := connector.kv_pool_memory(config, rank)) is not None
         ]
-        if len(provided) > 1:
+        if len(provided) <= 1:
+            return provided[0] if provided else None
+        owners = [m for m in provided if not m.transport_only]
+        if len(owners) != 1:
             raise ValueError("at most one sub-connector may provide the KV pool")
-        return provided[0] if provided else None
+        owner = owners[0]
+        for memory in provided:
+            if memory is not owner and not owner.serves(memory):
+                raise ValueError(
+                    f"{type(memory).__name__} needs fabric-exportable memory, and "
+                    f"{type(owner).__name__}, which provides the pool, does not "
+                    "allocate it"
+                )
+        return owner
 
     def register_kv_caches(
         self,

@@ -94,9 +94,13 @@ def allocate_fabric_pool(nbytes: int, device: Any) -> torch.Tensor:
 
 class FabricPoolMemory(KVPoolMemory):
     """The paged KV pool in fabric-exportable memory, outside torch's allocator
-    statistics: one allocation, so the connector registers it once."""
+    statistics: one allocation, so the connector registers it once. Under
+    `multi`, a pool another sub provides in fabric memory takes its place,
+    and the connector registers that."""
 
     counted_by_torch = False
+    exports_fabric = True
+    transport_only = True
 
     def allocate(self, nbytes: int, device: Any) -> torch.Tensor:
         return allocate_fabric_pool(nbytes, device)

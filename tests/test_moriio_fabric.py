@@ -225,32 +225,52 @@ class FabricPoolMemoryTest(unittest.TestCase):
             self.kv_pool_memory(SimpleNamespace(use_fabric=False), None, 0)
         )
 
-    def test_umbp_pool_next_to_the_fabric_backend_is_refused(self):
-        # Both would provide the pool, and fabric memory has no IPC handle to
-        # give UMBP's server.
+    def multi_pool_memory(self, *others):
+        """`multi.kv_pool_memory` over moriio fabric and `others` (pool memories)."""
         from atom.kv_transfer.disaggregation.multi.multi_connector import (
             MultiConnector,
         )
-        from atom.kv_transfer.pool.umbp.connector import UmbpPoolConnector
 
         moriio = SimpleNamespace(
             kv_pool_memory=lambda config, rank: self.kv_pool_memory(
                 SimpleNamespace(use_fabric=True), config, rank
             )
         )
-        umbp = UmbpPoolConnector.__new__(UmbpPoolConnector)
-        umbp.settings = None
-        umbp.memory = None
         multi = MultiConnector.__new__(MultiConnector)
-        multi._connectors = [moriio, umbp]
-        with (
-            mock.patch(
-                "atom.kv_transfer.pool.umbp.pool.make_umbp_pool_memory",
-                return_value=object(),
-            ),
-            self.assertRaisesRegex(ValueError, "at most one"),
-        ):
-            multi.kv_pool_memory(None, 0)
+        multi._connectors = [moriio] + [
+            SimpleNamespace(kv_pool_memory=lambda config, rank, m=m: m) for m in others
+        ]
+        return multi.kv_pool_memory(None, 0)
+
+    @staticmethod
+    def shared_pool(fabric: bool):
+        from atom.model_engine.kv_block_pool import KVPoolMemory
+
+        class Shared(KVPoolMemory):
+            shares_blocks = True
+            exports_fabric = fabric
+
+            def allocate(self, nbytes, device):
+                raise AssertionError("not allocated here")
+
+        return Shared()
+
+    def test_a_shared_pool_in_fabric_memory_serves_the_fabric_backend(self):
+        # Its arena is fabric memory already, so moriio registers that pool
+        # instead of allocating its own.
+        shared = self.shared_pool(fabric=True)
+        self.assertIs(self.multi_pool_memory(shared), shared)
+
+    def test_a_shared_pool_without_a_fabric_handle_is_refused(self):
+        # umbp_pool today: hipMalloc memory for IPC, which FABRIC cannot move.
+        with self.assertRaisesRegex(ValueError, "needs fabric-exportable memory"):
+            self.multi_pool_memory(self.shared_pool(fabric=False))
+
+    def test_two_pools_that_own_their_memory_are_refused(self):
+        with self.assertRaisesRegex(ValueError, "at most one"):
+            self.multi_pool_memory(
+                self.shared_pool(fabric=True), self.shared_pool(fabric=True)
+            )
 
 
 class ConnectorWiringTest(unittest.TestCase):

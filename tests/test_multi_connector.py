@@ -1249,7 +1249,7 @@ class _PoolProvider:
         return ("pool", num_blocks, kwargs.get("reserve_null_block"))
 
     def kv_pool_memory(self, config, rank):
-        return ("memory", rank)
+        return SimpleNamespace(rank=rank, transport_only=False)
 
 
 def test_the_one_pool_provider_supplies_the_pool_and_its_memory():
@@ -1260,7 +1260,7 @@ def test_the_one_pool_provider_supplies_the_pool_and_its_memory():
         True,
     )
     worker = _worker([FakeWorkerSub(), _PoolProvider()])
-    assert worker.kv_pool_memory(None, 3) == ("memory", 3)
+    assert worker.kv_pool_memory(None, 3).rank == 3
     assert _sched([FakeSchedSub()]).make_block_pool(None, 8) is None
     assert _worker([FakeWorkerSub()]).kv_pool_memory(None, 0) is None
 
