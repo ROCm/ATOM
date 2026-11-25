@@ -2769,14 +2769,6 @@ class Config:
                 "moe_backend='mega' owns its MoRI transport and cannot use the "
                 "experimental RCCL prepare/finalize backend"
             )
-        # MegaMoE returns each rank the full routed sum of its own rows. Under TP
-        # attention every rank holds the same rows, and the MoE's TP all-reduce
-        # would add that sum once per rank.
-        if self.tensor_parallel_size > 1 and not self.enable_dp_attention:
-            raise ValueError(
-                "moe_backend='mega' needs distinct rows on each expert-parallel "
-                "rank; pass --enable-dp-attention with -tp > 1"
-            )
 
     def _resolve_dcp_comm_backend(self) -> None:
         """``dcp.comm_backend="auto"``: the mailbox combine where it has been

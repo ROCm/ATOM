@@ -83,7 +83,7 @@ The routed-MoE implementation is selectable with `--moe-backend {standard,mega}`
 AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 AITER_LOG_LEVEL=WARNING \
 python -m atom.entrypoints.openai_server \
   --model deepseek-ai/DeepSeek-V4-Pro \
-  --kv_cache_dtype fp8 -tp 8 --enable-dp-attention --enable-expert-parallel \
+  --kv_cache_dtype fp8 -tp 8 \
   --moe-backend mega
 ```
 

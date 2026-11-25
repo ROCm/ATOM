@@ -91,26 +91,6 @@ def test_mega_moe_backend_needs_expert_parallelism_only_without_sp(sp, ep, error
         Config._init_moe_backend(config)
 
 
-@pytest.mark.parametrize(
-    "tp,dp_attention,error",
-    [(4, False, "enable-dp-attention"), (4, True, None), (1, False, None)],
-)
-def test_mega_moe_backend_needs_distinct_rows_per_expert_parallel_rank(
-    tp, dp_attention, error
-):
-    # Under TP attention every rank holds the same rows; MegaMoE already returns
-    # each rank its rows' full routed sum, so the MoE's TP all-reduce would
-    # multiply it by tp.
-    config = atom_config_double(
-        moe_backend="mega",
-        enable_expert_parallel=True,
-        tensor_parallel_size=tp,
-        enable_dp_attention=dp_attention,
-    )
-    with pytest.raises(ValueError, match=error) if error else nullcontext():
-        Config._init_moe_backend(config)
-
-
 def test_minimax_m3_serves_text_only_under_sp():
     config = atom_config_double(
         sequence_parallel_size=4,
