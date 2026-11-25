@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use rand::{seq::IteratorRandom, Rng};
 
 use super::{
@@ -130,6 +131,44 @@ impl Default for AgenticConfig {
     }
 }
 
+/// The prompts [`StoreShare`] remembers of each size, give or take a half.
+const SHARE_WINDOW: u64 = 64;
+
+/// What a store held, while it answered, of the tokens of a prompt that no device did:
+/// both summed over the last prompts, apart for each size of that gap, a power of two
+/// to the next. A turn's few tokens are new to the store, and a conversation no device
+/// holds any longer is nearly all in it.
+#[derive(Debug, Default)]
+struct StoreShare(Mutex<[(u64, u64); u32::BITS as usize]>);
+
+impl StoreShare {
+    /// A store held `held` of the `gap` tokens of a prompt that no device did.
+    fn learn(&self, gap: u32, held: u32) {
+        let Some(size) = gap.checked_ilog2() else {
+            return;
+        };
+        let (held_sum, gap_sum) = &mut self.0.lock()[size as usize];
+        *held_sum += u64::from(held.min(gap));
+        *gap_sum += u64::from(gap);
+        if *gap_sum >= SHARE_WINDOW << size {
+            (*held_sum, *gap_sum) = (*held_sum / 2, *gap_sum / 2);
+        }
+    }
+
+    /// The tokens a store that does not answer is taken to hold of the `gap` no device
+    /// does: none until one has answered for a gap of that size.
+    fn of(&self, gap: u32) -> u32 {
+        let Some(size) = gap.checked_ilog2() else {
+            return 0;
+        };
+        let (held_sum, gap_sum) = self.0.lock()[size as usize];
+        match gap_sum {
+            0 => 0,
+            _ => (u128::from(gap) * u128::from(held_sum) / u128::from(gap_sum)) as u32,
+        }
+    }
+}
+
 /// Where a selection's cache hits came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hits {
@@ -148,6 +187,7 @@ enum Hits {
 pub struct AgenticPolicy {
     cost: AgenticCost,
     kv_events: OnceLock<Arc<dyn PrefixMatchProvider>>,
+    store_share: StoreShare,
     trees: Arc<DashMap<String, Arc<Tree>>>,
     _eviction_task: Option<PeriodicTask>,
 }
@@ -170,6 +210,7 @@ impl AgenticPolicy {
         Self {
             cost: config.cost,
             kv_events: OnceLock::new(),
+            store_share: StoreShare::default(),
             trees,
             _eviction_task: eviction_task,
         }
@@ -290,7 +331,31 @@ impl LoadBalancingPolicy for AgenticPolicy {
                     let loads = held > device;
                     Some(weighed.min(held.saturating_sub(if loads { load_cost } else { 0 })))
                 });
-                (Some(credited.collect::<Vec<_>>()), Some(held))
+                let credited = credited.collect::<Vec<_>>();
+                // Past that prefix a silent store is taken to hold what it held of such
+                // prompts while it answered, for the charge alone: every worker would
+                // load it alike. A conversation no device holds any longer is nearly all
+                // in the store. Charged whole, a burst of them weighs a hundred times
+                // what it computes, and once the store answers again the requests
+                // charged what they compute all go to the few workers charged least.
+                let prompt = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+                let silent = |(device, cached): (&Option<u32>, &Option<u32>)| {
+                    device.is_some() && cached.is_none()
+                };
+                if !device.iter().zip(&cached).any(silent) {
+                    let stored = cached.iter().flatten().copied().max().unwrap_or(0);
+                    let (gap, past) = (prompt.saturating_sub(known), stored.saturating_sub(known));
+                    self.store_share.learn(gap, past);
+                }
+                let reported = held.iter().zip(&cached).map(|(&held, cached)| {
+                    let held = held?;
+                    let past = match cached {
+                        Some(_) => 0,
+                        None => self.store_share.of(prompt.saturating_sub(held)),
+                    };
+                    Some(held + past)
+                });
+                (Some(credited), Some(reported.collect::<Vec<_>>()))
             }
             (hits, _) => (hits, None),
         };
@@ -566,12 +631,13 @@ mod tests {
     /// store (None when the store does not answer), the weight of those loads, and what
     /// a load costs at least.
     #[derive(Debug)]
-    struct Stored(Vec<(u32, Option<u32>)>, f64, u32);
+    struct Stored(Mutex<Vec<(u32, Option<u32>)>>, f64, u32);
 
     #[async_trait]
     impl PrefixMatchProvider for Stored {
         fn match_workers(&self, _tokens: &[u32], _: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
-            self.0.iter().map(|&(device, _)| Some(device)).collect()
+            let hits = self.0.lock();
+            hits.iter().map(|&(device, _)| Some(device)).collect()
         }
 
         async fn cached_tokens(
@@ -581,7 +647,8 @@ mod tests {
             device: &[Option<u32>],
         ) -> Vec<Option<u32>> {
             assert_eq!(device, self.match_workers(&[], &[]));
-            self.0.iter().map(|&(_, cached)| cached).collect()
+            let hits = self.0.lock();
+            hits.iter().map(|&(_, cached)| cached).collect()
         }
 
         fn store_weight(&self) -> f64 {
@@ -612,7 +679,7 @@ mod tests {
         ] {
             let policy = agentic(512, None);
             policy.set_kv_events(Arc::new(Stored(
-                vec![(40, Some(40)), (0, b_cached)],
+                vec![(40, Some(40)), (0, b_cached)].into(),
                 weight,
                 0,
             )));
@@ -635,7 +702,8 @@ mod tests {
         // b's device holds 98 of the 100 tokens, as it ran the turn before; a's 90, from
         // an earlier turn, and its store the 8 more. Either is estimated to report 98
         // and charged the 2 it computes.
-        let stored = |load_cost| Stored(vec![(90, Some(98)), (98, Some(98))], 0.5, load_cost);
+        let stored =
+            |load_cost| Stored(vec![(90, Some(98)), (98, Some(98))].into(), 0.5, load_cost);
         let stays = (Some(1), "hit", Some(0.98), Some(2));
         let moves = (Some(0), "relocate", Some(0.98), Some(2));
         // By its size the load costs 4 tokens: 5 queued on b send the turn to a.
@@ -671,7 +739,8 @@ mod tests {
         // a's device holds 40 of the 100 tokens, b's none, and the store both read
         // does not answer: a keeps its lead, and is charged the 60 it computes.
         let policy = agentic(512, None);
-        policy.set_kv_events(Arc::new(Stored(vec![(40, None), (0, None)], 0.5, 0)));
+        let silent = |device: [u32; 2]| device.map(|device| (device, None)).to_vec();
+        policy.set_kv_events(Arc::new(Stored(silent([40, 0]).into(), 0.5, 0)));
         let hit = (Some(0), "hit", Some(0.4), Some(60));
         assert_eq!(decide(&policy, &workers, &info).await, hit);
         // b, chosen over a's queue, is taken to load those 40 and charged as much.
@@ -681,9 +750,43 @@ mod tests {
         workers[0].release_prefill_tokens(1000);
         // With nothing on a device, the one chosen is charged the whole prompt.
         let policy = agentic(512, None);
-        policy.set_kv_events(Arc::new(Stored(vec![(0, None), (0, None)], 0.5, 0)));
-        let (_, branch, ratio, charge) = decide(&policy, &workers, &info).await;
-        assert_eq!((branch, ratio, charge), ("miss", Some(0.0), Some(100)));
+        let stored = Arc::new(Stored(silent([0, 0]).into(), 0.5, 0));
+        policy.set_kv_events(stored.clone());
+        // Either worker is chosen: they cost the same.
+        let charged = || async {
+            let (_, branch, ratio, charge) = decide(&policy, &workers, &info).await;
+            (branch, ratio, charge)
+        };
+        assert_eq!(charged().await, ("miss", Some(0.0), Some(100)));
+        // Unless the store held 90 of such a prompt when it last answered: the one
+        // chosen is then charged the 10 it would compute, as it was while it answered.
+        *stored.0.lock() = vec![(0, Some(90)), (0, Some(90))];
+        assert_eq!(charged().await, ("hit", Some(0.9), Some(10)));
+        *stored.0.lock() = silent([0, 0]);
+        assert_eq!(charged().await, ("miss", Some(0.9), Some(10)));
+        // Of a turn's few tokens past what a device holds it never held any.
+        *stored.0.lock() = silent([98, 0]);
+        let turn = (Some(0), "hit", Some(0.98), Some(2));
+        assert_eq!(decide(&policy, &workers, &info).await, turn);
+    }
+
+    #[test]
+    fn a_store_share_follows_the_last_prompts_of_a_size() {
+        let share = StoreShare::default();
+        assert_eq!(share.of(100_000), 0);
+        // By the size of what no device holds: 65536 to 131071 tokens here.
+        share.learn(100_000, 97_000);
+        let of = |gaps: [u32; 4]| gaps.map(|gap| share.of(gap));
+        assert_eq!(
+            of([80_000, 131_071, 4_000, 131_072]),
+            [77_600, 127_138, 0, 0]
+        );
+        // A store that then holds none of them is soon taken to hold nearly none.
+        for _ in 0..4 * SHARE_WINDOW {
+            share.learn(100_000, 0);
+        }
+        assert!(share.of(100_000) < 100, "{}", share.of(100_000));
+        assert_eq!((share.of(0), share.of(u32::MAX)), (0, 0));
     }
 
     #[tokio::test]
