@@ -1,0 +1,20 @@
+{
+  "kind": "CPU-only native srtctl mock orchestration",
+  "srt_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+  "result": [
+    {
+      "case": "single-node-pp4-dep4-c80-profile.json",
+      "mock_orchestrator_exit": 0,
+      "single_node": true,
+      "gpu_split": [
+        "0,1,2,3",
+        "4,5,6,7"
+      ],
+      "worker_args_preserved": true,
+      "native_atomesh_frontend": true,
+      "decode_only_image_override": true,
+      "rocm_docker_command": "passed"
+    }
+  ],
+  "scope": "The existing roles.decode.container field selects a separate D worker image; P retains model.container. The D image in this check is a placeholder, not a built worker. No GPU or model run was dispatched by this preflight."
+}

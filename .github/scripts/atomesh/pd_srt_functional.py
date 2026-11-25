@@ -55,6 +55,8 @@ def configurations(
                 for key, value in spec["env"].items()
             },
         }
+        if "container" in spec:
+            roles[role]["container"] = spec["container"]
     environment = {
         key: (
             fabric[str(value).removeprefix("@fabric.")]
