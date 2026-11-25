@@ -41,7 +41,7 @@ use crate::{
             traits::PdPlanner,
             types::{PlacementPlan, Protocol, RequestDescriptor},
         },
-        RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -419,7 +419,7 @@ impl PDRouter {
             policies,
             adapter,
             atom_adapter,
-            encode_timeout: Duration::from_secs(ctx.router_config.request_timeout_secs),
+            encode_timeout: Duration::from_secs(ctx.router_config.encode_timeout_secs),
         })
     }
 
@@ -822,12 +822,19 @@ impl PDRouter {
             .worker_registry
             .get_encode_workers()
             .into_iter()
-            .filter(|w| w.is_available() && context.model_id.is_none_or(|m| w.model_id() == m))
+            // E is reached over HTTP only.
+            .filter(|w| {
+                w.is_available()
+                    && matches!(w.connection_mode(), ConnectionMode::Http)
+                    && context.model_id.is_none_or(|m| w.model_id() == m)
+            })
             .collect();
         if candidates.is_empty() {
             debug!("no available encode worker; prefill encodes the media");
             return;
         }
+        // E is dispatched before the planner records the media count.
+        crate::observability::route_trace::record_media_count(context.media_count);
         let policy = self.policy_registry.get_encode_policy();
         let descriptor = RequestDescriptor {
             model_id: context.model_id,
@@ -2687,7 +2694,7 @@ mod tests {
             prefill_bodies[0].1.get("ec_transfer_params").is_none(),
             "{bodies:?}"
         );
-}
+    }
 
     #[derive(Debug)]
     struct EstimatingPolicy;

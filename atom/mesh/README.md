@@ -236,6 +236,9 @@ pick their policy with `--encode-policy` (defaults to `--policy`):
 Startup waits for encode workers like prefill and decode, and `/workers`
 counts them as `encode_count`.
 
+For an image chat request, prefill waits at most `--encode-timeout-secs`
+(default 30) for an encode worker, then encodes the media itself.
+
 Messages and Responses have no PD adapter: in PD mode `/v1/messages` and
 `/v1/responses` return `501 unsupported_api_topology`. Serve them from regular
 HTTP workers.
