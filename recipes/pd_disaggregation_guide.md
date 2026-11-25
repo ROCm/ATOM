@@ -140,7 +140,9 @@ GPU memory and does not need this setting.
   HCA selection is enabled. It is an index range to scan, not a guarantee that
   eight HCAs will be selected. Automatic selection checks `rdmaN`, then
   `ionic_N`, for each physical GPU/HCA index; GPU masking is resolved through
-  `HIP_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES`.
+  `ROCR_VISIBLE_DEVICES`, then `HIP_VISIBLE_DEVICES`, then
+  `CUDA_VISIBLE_DEVICES`. A mask entry is a physical GPU index or a ROCm UUID,
+  `GPU-<unique id>`, resolved to its amd-smi index.
 - An explicit `ib_device` in the connector config, or
   `ATOM_MOONCAKE_IB_DEVICE` in the environment, overrides automatic selection.
   Comma-separated lists are trimmed and deduplicated; the first device is used

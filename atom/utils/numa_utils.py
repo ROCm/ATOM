@@ -14,11 +14,11 @@ Knobs live in :mod:`atom.utils.envs` (``ATOM_NUMA_BIND``, ``ATOM_AUTO_NUMA_BIND`
 """
 
 import ctypes
-import glob
 import logging
 import os
 
 from atom.utils import envs
+from atom.utils.visible_devices import physical_gpu_index, physical_gpus
 
 logger = logging.getLogger("atom")
 
@@ -44,36 +44,13 @@ def _node_cpus(node: int) -> set[int]:
         return _parse_cpulist(f.read())
 
 
-def _physical_index(gpu_id: int) -> int:
-    """Map a logical GPU id to the physical index, honoring *_VISIBLE_DEVICES.
-
-    System tools (amdsmi) and sysfs enumerate every physical GPU regardless of
-    the visible-device mask, so a logical worker id must be translated back to
-    the physical device it actually drives.
-    """
-    # ROCR first: it filters the device table before HIP sees it, so when both
-    # are set HIP's indices are already relative to the filtered list. A recipe
-    # that sets ROCR alone (the only correct way to split across NUMA nodes --
-    # setting both cuts the count twice) would otherwise fall through to the
-    # identity mapping and bind every rank to node 0.
-    visible = (
-        os.environ.get("ROCR_VISIBLE_DEVICES")
-        or os.environ.get("HIP_VISIBLE_DEVICES")
-        or os.environ.get("CUDA_VISIBLE_DEVICES")
-    )
-    if not visible:
-        return gpu_id
-    vis = [int(x) for x in visible.split(",") if x.strip() != ""]
-    return vis[gpu_id] if gpu_id < len(vis) else gpu_id
-
-
 def _query_node_amdsmi(gpu_id: int) -> int | None:
     """Physical GPU -> NUMA node via amdsmi (ROCm analog of NVML affinity)."""
     try:
         import amdsmi
-    except Exception:
+    except Exception:  # noqa: BLE001 - a broken amdsmi falls back to sysfs
         return None
-    phys = _physical_index(gpu_id)
+    phys = physical_gpu_index(gpu_id)
     try:
         amdsmi.amdsmi_init()
         try:
@@ -84,31 +61,23 @@ def _query_node_amdsmi(gpu_id: int) -> int | None:
             return node if node >= 0 else None
         finally:
             amdsmi.amdsmi_shut_down()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - any amdsmi failure falls back to sysfs
         logger.debug(f"amdsmi NUMA query failed for gpu {gpu_id}: {e}")
         return None
 
 
 def _query_node_sysfs(gpu_id: int) -> int | None:
-    """Fallback: physical GPU -> node via DRM cards sorted by PCI BDF.
+    """Fallback: physical GPU -> node via AMD DRM cards sorted by PCI BDF.
 
-    Assumes ROCm enumerates GPUs in PCI-BDF order, which a non-identity
-    *_VISIBLE_DEVICES permutation can break -- so this is only used when amdsmi
-    is unavailable. Prefer the explicit ``ATOM_NUMA_NODE`` list on such setups.
+    Sorted that way they are in amdsmi's handle order. Only used when amdsmi
+    is unavailable; prefer the explicit ``ATOM_NUMA_NODE`` list where sysfs
+    reports no node.
     """
-    phys = _physical_index(gpu_id)
-    cards: list[tuple[str, int]] = []
-    for dev in glob.glob("/sys/class/drm/card*/device"):
-        nn = os.path.join(dev, "numa_node")
-        if not os.path.exists(nn):
-            continue
-        bdf = os.path.basename(os.path.realpath(dev))
-        with open(nn) as f:
-            cards.append((bdf, int(f.read())))
-    cards.sort()
-    if phys >= len(cards):
+    phys = physical_gpu_index(gpu_id)
+    gpus = physical_gpus()
+    if phys >= len(gpus):
         return None
-    node = cards[phys][1]
+    node = gpus[phys].numa_node
     return node if node >= 0 else None
 
 
@@ -137,7 +106,7 @@ def _set_preferred_memory(node: int) -> None:
         if libnuma.numa_available() < 0:
             return
         libnuma.numa_set_preferred(ctypes.c_int(node))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - preferred memory is best-effort
         logger.debug(f"numa_set_preferred({node}) skipped: {e}")
 
 
