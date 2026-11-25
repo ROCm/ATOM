@@ -1,0 +1,92 @@
+name: Sandbox Executor
+
+# CI evaluator design sandbox (ci-sandbox/* only; not for main). Stands in for
+# a heavy-CI executor: sandbox/control in the PR picks its behaviour.
+
+on:
+  pull_request:
+    branches: [ci-sandbox/base]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: sandbox-executor-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record run context
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: echo "attempt=${GITHUB_RUN_ATTEMPT} github_sha=${GITHUB_SHA} head=${HEAD_SHA} started=$(date -u +%FT%TZ)"
+
+  read-status-contents-only:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Read commit statuses
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" --jq length; then
+            echo "READ_OK"
+          else
+            echo "READ_FAILED"
+          fi
+
+  read-status-with-statuses:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: read
+    steps:
+      - name: Read commit statuses
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/statuses" --jq length; then
+            echo "READ_OK"
+          else
+            echo "READ_FAILED"
+          fi
+
+  work:
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Behave as sandbox/control says
+        run: |
+          mode="$(cat sandbox/control 2>/dev/null || echo pass)"
+          echo "mode=${mode} attempt=${GITHUB_RUN_ATTEMPT}"
+          case "${mode}" in
+            fail-first) [ "${GITHUB_RUN_ATTEMPT}" != 1 ] ;;
+            fail) exit 1 ;;
+            slow) sleep 300 ;;
+            *) true ;;
+          esac
+
+  sandbox-gate:
+    needs: work
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror work result
+        env:
+          WORK: ${{ needs.work.result }}
+        run: '[ "${WORK}" = success ]'
+
+  result:
+    needs: work
+    if: always()
+    name: ${{ github.run_attempt == 1 && 'Sandbox Result A' || 'Sandbox Result B' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "attempt=${GITHUB_RUN_ATTEMPT}"
