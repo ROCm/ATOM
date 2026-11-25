@@ -38,7 +38,12 @@ logger = logging.getLogger("atom")
 
 # The models whose attention backend lays its pool out for UMBP (PAGE regions
 # for `bind_layout`, whole-block copies for a split pool).
-_SUPPORTED_ARCHITECTURES = ("DeepseekV41ForCausalLM",)
+_SUPPORTED_ARCHITECTURES = (
+    "DeepseekV41ForCausalLM",
+    # MiniMax-M3 / M3.1: one paged buffer a runner (KV, index cache and the
+    # DSpark draft's region), all of it PAGE and none of it per-request state.
+    "MiniMaxM3SparseForConditionalGeneration",
+)
 
 
 def _settings(config: Any) -> UmbpPoolSettings:
@@ -55,12 +60,22 @@ def _check_supported(config: Any) -> None:
             f"the umbp_pool connector supports {', '.join(_SUPPORTED_ARCHITECTURES)}, "
             f"not {architectures}"
         )
-    # Under DP attention `tensor_parallel_size` is the attention TP of a rank.
-    if config.tensor_parallel_size > 1:
+    # Tensor-parallel attention within a rank is one pool of several parts, a
+    # runner's buffer each (`pool.pool_parts`). Every part has to reach the one
+    # UMBP server, and one scheduler has to own the pool.
+    if getattr(config, "is_multinode_tp", False):
         raise ValueError(
-            "the umbp_pool connector backs one runner per engine rank: use "
-            "data-parallel attention (--enable-dp-attention), not tensor-"
-            "parallel attention"
+            "the umbp_pool connector needs a rank's tensor-parallel group on one "
+            "node: its runners' buffers are parts of one pool on one UMBP server"
+        )
+    if int(getattr(config, "pcp_group_size", 1) or 1) > 1:
+        raise ValueError(
+            "the umbp_pool connector does not support prefill context parallel"
+        )
+    if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
+        raise ValueError(
+            "the umbp_pool connector does not support pipeline parallel: each "
+            "stage has its own scheduler, and a pool has one"
         )
 
 
