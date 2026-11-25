@@ -768,6 +768,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_request_placed_before_a_sweep_keeps_the_sessions_new_binding() {
+        let policy = dp_sticky(SessionAffinityConfig {
+            ttl_secs: 30,
+            ..SessionAffinityConfig::default()
+        });
+        let workers = workers();
+        let workers = &workers[..1];
+        let session_a = header_map(&[("x-session-id", "session-a")]);
+        let (_, stale) = policy
+            .select_with_decision(workers, &info(&session_a))
+            .await;
+        let idle = Instant::now() - Duration::from_secs(31);
+        policy.set_last_access("session-a", idle);
+        *policy.last_sweep.lock().unwrap() = idle;
+        let session_b = header_map(&[("x-session-id", "session-b")]);
+        route(&policy, workers, &session_b).await;
+        assert!(!bound(&policy, "session-a"));
+
+        // session-a returns to the same worker, then its request from before
+        // the sweep fails there.
+        assert_eq!(
+            route(&policy, workers, &session_a).await,
+            (Some(0), AFFINITY_NEW)
+        );
+        policy.on_dispatch_failed(Some(&session_a), &workers[0], stale.binding);
+        assert_eq!(
+            route(&policy, workers, &session_a).await,
+            (Some(0), AFFINITY_HIT)
+        );
+    }
+
+    #[tokio::test]
     async fn group_mode_shares_one_binding_across_a_parents_children() {
         for (parent_mode, second_child) in [
             (SessionParentMode::Group, Some(1)),
