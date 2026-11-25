@@ -491,13 +491,16 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.hash_block_size = self.block_size * self.dcp_size
         # ATOM_PD_EARLY_HANDOFF drives the same chunked machinery from P's own
         # early HTTP answer (see api_server.generate_async); it is not
-        # advertised to the router, which keeps its legacy relay. Its requests
-        # keep the D-first admission gate below: P allocates a source only
-        # once D has reserved its pages, so P admits in D's order and the two
-        # pools cannot wait on each other.
+        # advertised to the router, which keeps its legacy relay. With
+        # ATOM_PD_EARLY_HANDOFF_SKIP_GATE (default) its requests may allocate
+        # before D's write request arrives (`admission_ready`), so the
+        # router->D hop overlaps P's prefill; 0 keeps the D-first gate.
         early_handoff = bool(self.is_producer and envs.ATOM_PD_EARLY_HANDOFF)
         self.enable_chunked_transfer = (
             kv_transfer_config.get("enable_chunked_transfer", False) or early_handoff
+        )
+        self._early_skip_gate = bool(
+            early_handoff and envs.ATOM_PD_EARLY_HANDOFF_SKIP_GATE
         )
         self._chunked_receiving: dict[ReqId, Sequence] = {}
         self._chunked_admission_timeout_s = float(
@@ -929,7 +932,18 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         _, deadline = self._chunked_waiting[seq.id]
         if self._expire_chunked_admission(seq, deadline, now):
             return False
-        return seq.id in self._chunked_ready
+        if seq.id in self._chunked_ready:
+            return True
+        # An early-handoff request is registered exactly like a gated one
+        # (the worker reports D's arrival, and a write request that arrives
+        # while P still queues is not expired as an orphan), but need not
+        # wait for D: P answered the router before admission, D is on its
+        # way, the source is pinned from allocation and every reader starts
+        # from block 0.
+        return self._may_skip_gate(seq, params)
+
+    def _may_skip_gate(self, seq: Sequence, params: dict) -> bool:
+        return bool(params.get("pd_early_handoff") and self._early_skip_gate)
 
     def _expire_chunked_admission(
         self, seq: Sequence, deadline: float, now: float

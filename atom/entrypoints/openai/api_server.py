@@ -993,6 +993,9 @@ def _early_handoff_params(
         **kv_transfer_params,
         "chunked_transfer": True,
         "transfer_id": f"early-{uuid.uuid4().hex}",
+        # P answered before admission: the connector may let it allocate
+        # before D's write request (ATOM_PD_EARLY_HANDOFF_SKIP_GATE).
+        "pd_early_handoff": True,
     }
 
 

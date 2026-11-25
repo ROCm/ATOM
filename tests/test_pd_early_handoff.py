@@ -29,11 +29,19 @@ from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 TRANSFER = "early-xfer"
 
 
-def make_scheduler_connector(monkeypatch, is_producer, *, early, enable=False):
+def make_scheduler_connector(
+    monkeypatch, is_producer, *, early, enable=False, skip_gate=None
+):
+    """`skip_gate`: None leaves ATOM_PD_EARLY_HANDOFF_SKIP_GATE at its
+    default (on), else sets it."""
     if early:
         monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", "1")
     else:
         monkeypatch.delenv("ATOM_PD_EARLY_HANDOFF", raising=False)
+    if skip_gate is None:
+        monkeypatch.delenv("ATOM_PD_EARLY_HANDOFF_SKIP_GATE", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_SKIP_GATE", "1" if skip_gate else "0")
     monkeypatch.setattr(mc, "get_ip", lambda: "127.0.0.1")
     monkeypatch.setattr(mc, "get_open_port", lambda: 6400)
     cfg = {"kv_role": "kv_producer" if is_producer else "kv_consumer"}
@@ -51,14 +59,18 @@ def make_scheduler_connector(monkeypatch, is_producer, *, early, enable=False):
     )
 
 
-def p_params(transfer_id=TRANSFER):
-    """What `api_server._early_handoff_params` makes of the router's leg."""
-    return {
+def p_params(transfer_id=TRANSFER, early=True):
+    """What `api_server._early_handoff_params` makes of the router's leg
+    (`early=False`: a router-chunked leg, which never skips the gate)."""
+    params = {
         "chunked_transfer": True,
         "do_remote_decode": True,
         "do_remote_prefill": False,
         "transfer_id": transfer_id,
     }
+    if early:
+        params["pd_early_handoff"] = True
+    return params
 
 
 def d_params(transfer_id=TRANSFER):
@@ -100,11 +112,58 @@ def test_flag_enables_chunked_producer_but_not_consumer(monkeypatch):
     assert not d.enable_chunked_transfer
 
 
-def test_early_request_waits_for_d_and_is_registered_once(monkeypatch, seq_factory):
-    """P allocates an early request's source only after D reserved its pages
-    (the chunked admission gate), so P admits in D's order. The transfer ID
-    is registered with the worker once, on the first pass."""
+def _ack(p, seq, succeeded=True):
+    """D's write request reached every P rank (the worker's report)."""
+    p.process_pd_completions(
+        KVConnectorOutput(
+            connector_completions={
+                mc.ConnectorCompletion("pd_admission_ready", seq.id, succeeded)
+            }
+        )
+    )
+
+
+def test_early_request_skips_the_gate_and_is_registered_once(
+    monkeypatch, seq_factory
+):
+    """Default (SKIP_GATE=1): P may allocate an early request at once, so the
+    router->D hop overlaps P's prefill. It is still registered with the
+    worker once, like a gated request, so D's arrival is reported and a write
+    request that arrives while P queues is not expired as an orphan."""
     p = make_scheduler_connector(monkeypatch, True, early=True)
+    seq = seq_factory(list(range(10)), kv_transfer_params=p_params())
+    for _ in range(3):  # The scheduler asks on every pass.
+        assert p.admission_ready(seq)
+    assert seq.id in p._chunked_waiting
+    assert p.build_connector_meta().chunked_admissions == {seq.id: TRANSFER}
+    assert p.admission_ready(seq)
+    assert p.build_connector_meta().chunked_admissions == {}
+
+
+def test_only_flagged_early_requests_skip_the_gate(monkeypatch, seq_factory):
+    """A router-chunked leg (no `pd_early_handoff`) keeps the gate even with
+    early handoff on: its D may admit in any order."""
+    p = make_scheduler_connector(monkeypatch, True, early=True, enable=True)
+    seq = seq_factory(list(range(10)), kv_transfer_params=p_params(early=False))
+    assert not p.admission_ready(seq)
+    _ack(p, seq)
+    assert p.admission_ready(seq)
+
+
+def test_skip_gate_needs_early_handoff_on(monkeypatch, seq_factory):
+    """The skip is an early-handoff knob: without ATOM_PD_EARLY_HANDOFF a
+    flagged request on a router-chunked producer still waits for D."""
+    p = make_scheduler_connector(monkeypatch, True, early=False, enable=True)
+    seq = seq_factory(list(range(10)), kv_transfer_params=p_params())
+    assert not p.admission_ready(seq)
+
+
+def test_early_request_waits_for_d_and_is_registered_once(monkeypatch, seq_factory):
+    """SKIP_GATE=0: P allocates an early request's source only after D
+    reserved its pages (the chunked admission gate), so P admits in D's
+    order. The transfer ID is registered with the worker once, on the first
+    pass."""
+    p = make_scheduler_connector(monkeypatch, True, early=True, skip_gate=False)
     seq = seq_factory(list(range(10)), kv_transfer_params=p_params())
     for _ in range(3):  # The scheduler asks on every pass.
         assert not p.admission_ready(seq)
@@ -113,26 +172,23 @@ def test_early_request_waits_for_d_and_is_registered_once(monkeypatch, seq_facto
     assert not p.admission_ready(seq)
     assert p.build_connector_meta().chunked_admissions == {}
     # D's write request reached every P rank: the gate opens.
-    p.process_pd_completions(
-        KVConnectorOutput(
-            connector_completions={
-                mc.ConnectorCompletion("pd_admission_ready", seq.id, True)
-            }
-        )
-    )
+    _ack(p, seq)
     assert p.admission_ready(seq)
 
 
+@pytest.mark.parametrize("skip_gate", [False, True])
 def test_early_request_whose_d_never_comes_expires_without_a_source(
-    monkeypatch, seq_factory
+    monkeypatch, seq_factory, skip_gate
 ):
+    """Gated, or skipping the gate but never allocated (P stays full): the
+    admission timeout still aborts it before it takes a source."""
     from atom.model_engine.sequence import SequenceStatus
 
-    p = make_scheduler_connector(monkeypatch, True, early=True)
+    p = make_scheduler_connector(monkeypatch, True, early=True, skip_gate=skip_gate)
     seq = seq_factory(list(range(10)), kv_transfer_params=p_params())
     clock = [100.0]
     monkeypatch.setattr(mc.time, "monotonic", lambda: clock[0])
-    assert not p.admission_ready(seq)
+    assert p.admission_ready(seq) is skip_gate
     clock[0] += p._chunked_admission_timeout_s
     assert not p.admission_ready(seq)
     assert seq.status == SequenceStatus.ABORTED
@@ -142,13 +198,15 @@ def test_early_request_whose_d_never_comes_expires_without_a_source(
 # ------------------------------------------------ real P and D, D arrives late
 
 
-def _p_scheduler(monkeypatch, num_blocks=6):
+def _p_scheduler(monkeypatch, num_blocks=6, skip_gate=None):
     from conftest import MockConfig
 
     from atom.model_engine.scheduler import Scheduler
 
     p = Scheduler(MockConfig(num_kvcache_blocks=num_blocks, max_num_batched_tokens=4))
-    p.kv_connector = make_scheduler_connector(monkeypatch, True, early=True)
+    p.kv_connector = make_scheduler_connector(
+        monkeypatch, True, early=True, skip_gate=skip_gate
+    )
     return p
 
 
@@ -201,15 +259,15 @@ def test_d_arriving_while_p_queues_receives_every_page(
     """P answered the router at dispatch; D arrives while P still queues.
 
     `p_passes_before_d` counts P scheduling passes before D's reservation
-    (0 = D's write request reaches P before P registered the transfer). P
-    allocates nothing until D reserved; then every page must land
-    byte-identical, D gets the first token, and P frees its source only after
-    D's reader finished.
+    (0 = D's write request reaches P before P registered the transfer). With
+    SKIP_GATE=0 P allocates nothing until D reserved; then every page must
+    land byte-identical, D gets the first token, and P frees its source only
+    after D's reader finished.
     """
     from atom.model_engine.scheduler import ScheduledBatchOutput
     from atom.sampling_params import SamplingParams
 
-    p = _p_scheduler(monkeypatch)
+    p = _p_scheduler(monkeypatch, skip_gate=False)
     d = _d_scheduler(monkeypatch)
     prompt = list(range(10))
     ps = seq_factory(
@@ -299,6 +357,97 @@ def test_d_arriving_while_p_queues_receives_every_page(
     assert not pw._pending_chunked_requests
 
 
+def _assert_pages_landed(pw, src, dst, total):
+    sent = []
+    while not pw.transfer_engine.writes.empty():
+        sources, dsts, sizes = pw.transfer_engine.writes.get_nowait()
+        sent += list(zip(sources, dsts, sizes, strict=True))
+    base_src = ctypes.addressof(src)
+    base_dst = ctypes.addressof(dst)
+    assert sum(size for _, _, size in sent) == total
+    for s, t, size in sent:
+        assert bytes(src[s - base_src : s - base_src + size]) == bytes(
+            dst[t - base_dst : t - base_dst + size]
+        )
+
+
+@pytest.mark.parametrize("forwards_before_d", [1, 3])
+def test_p_prefills_before_d_arrives_and_d_receives_every_page(
+    monkeypatch, seq_factory, forwards_before_d
+):
+    """Default (SKIP_GATE=1): P allocates and prefills at once, before D's
+    write request (3 = the whole prefill, the handoff included, is done
+    before D arrives). D's reader then starts from block 0: every page lands
+    byte-identical, D gets the first token, and P frees its source only once
+    D's reader finished."""
+    from atom.model_engine.scheduler import ScheduledBatchOutput
+    from atom.sampling_params import SamplingParams
+
+    p = _p_scheduler(monkeypatch)
+    d = _d_scheduler(monkeypatch)
+    prompt = list(range(10))
+    ps = seq_factory(
+        prompt,
+        sampling_params=SamplingParams(max_tokens=1),
+        kv_transfer_params=p_params(),
+    )
+    ds = seq_factory(
+        prompt,
+        sampling_params=SamplingParams(max_tokens=2),
+        kv_transfer_params=d_params(),
+    )
+    pw, _, src, destinations = idle_producer()
+    dw = decode_worker(destinations[0])
+    _wire(pw, dw)
+    p.extend([ps])
+
+    def p_forward(forward):
+        batch, seqs = p.schedule()
+        assert list(seqs) == [ps.id]
+        assert batch.context_lens.tolist() == [min(4 * (forward + 1), 10)]
+        pw.start_load_kv(batch.connector_meta_output)
+        publish(pw._chunked_prefills[TRANSFER], int(batch.context_lens[0]))
+        pw._dispatch_ready_chunked_requests()
+        p.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput([ps.id], [(42,)], None, None, None),
+            batch=batch,
+        )
+        pw.start_load_kv(p.kv_connector.build_connector_meta())
+
+    pool = ThreadPoolExecutor(1)
+    pw._send_executor = pool
+    try:
+        for forward in range(forwards_before_d):
+            p_forward(forward)
+            # No D yet: the source is pinned, nothing is sent.
+            assert ps.block_table and not p._is_preemptable(ps)
+            assert pw.transfer_engine.writes.empty()
+        d.extend([ds])
+        batch, seqs = d.schedule()
+        assert not seqs and len(ds.block_table) == 3
+        dw.start_load_kv(batch.connector_meta_output)
+        post_write_requests(dw, monkeypatch)
+        p._update_from_kv_xfer_finished(pw.get_finished())
+        for forward in range(forwards_before_d, 3):
+            p_forward(forward)
+        pool.shutdown(wait=True)
+    finally:
+        pool.shutdown(wait=True)
+    pw._send_executor = SimpleNamespace(submit=lambda fn, *a, **kw: fn(*a, **kw))
+    p._update_from_kv_xfer_finished(pw.get_finished())
+    assert not ps.block_table, "P must free its source once D's reader finished"
+    assert not p.deferred_free_blocks
+    assert not p.kv_connector._chunked_waiting
+    d._update_from_kv_xfer_finished(dw.get_finished())
+    batch, seqs = d.schedule()
+    assert list(seqs) == [ds.id]
+    assert ds.kv_transfer_params["first_token_id"] == 42
+    assert pw._notify_transfer_result.call_count == 1
+    _assert_pages_landed(pw, src, destinations[0], 12)
+    assert not pw._pending_chunked_requests
+
+
 @pytest.mark.parametrize("byte_limit", [False, True])
 def test_opposite_admission_order_progresses_in_early_mode(
     monkeypatch, seq_factory, byte_limit
@@ -316,7 +465,7 @@ def test_opposite_admission_order_progresses_in_early_mode(
     from atom.model_engine.scheduler import ScheduledBatchOutput
     from atom.sampling_params import SamplingParams
 
-    p = _p_scheduler(monkeypatch, num_blocks=3)
+    p = _p_scheduler(monkeypatch, num_blocks=3, skip_gate=False)
     d_blocks = 6 if byte_limit else 3
     d = _d_scheduler(monkeypatch, num_blocks=d_blocks)
     if byte_limit:
@@ -513,6 +662,7 @@ def test_api_answers_at_dispatch_with_rank_and_keeps_prefill_running(monkeypatch
         **router_params,
         "chunked_transfer": True,
         "transfer_id": tid,
+        "pd_early_handoff": True,
     }
     assert router_params == {"do_remote_decode": True, "do_remote_prefill": False}
     assert kv == {

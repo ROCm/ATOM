@@ -202,14 +202,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Mooncake P/D, prefill (`kv_producer`) only: answer the router's prefill
     # request as soon as the request has a DP rank, with chunked-transfer
     # metadata, instead of after prefill. The legacy router relay (protocol
-    # unchanged) then sends D in while P still queues; D reserves its pages and P, which
-    # still allocates its source only after D's reservation (the chunked
-    # admission gate), pushes each completed forward's pages plus a final
-    # handoff. Does not advertise chunked transfer in /kv_transfer_info, so
+    # unchanged) then sends D in while P still queues and computes; P pushes
+    # each completed forward's pages plus a final handoff once D's write
+    # request arrives. Does not advertise chunked transfer in /kv_transfer_info, so
     # the router keeps its legacy path. The router releases P's load guard at
     # the early answer and does not see a P failure after it (see the docs
     # row). Single-node DP only. 0 = off.
     "ATOM_PD_EARLY_HANDOFF": lambda: _flag_env("ATOM_PD_EARLY_HANDOFF", "0"),
+    # With ATOM_PD_EARLY_HANDOFF on P: an early request may allocate its
+    # source and prefill before D's write request arrives (it skips the
+    # D-first chunked admission gate), so the router->D hop overlaps P's
+    # prefill instead of preceding it. 0 = keep the gate: P allocates only
+    # after D reserved its pages.
+    "ATOM_PD_EARLY_HANDOFF_SKIP_GATE": lambda: _flag_env(
+        "ATOM_PD_EARLY_HANDOFF_SKIP_GATE", "1"
+    ),
     # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
     # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
     "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
