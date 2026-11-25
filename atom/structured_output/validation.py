@@ -18,6 +18,12 @@ from atom import structured_output
 logger = logging.getLogger("atom")
 
 
+def require_available():
+    """A 400 naming the backend, before any schema check imports llguidance or RE2."""
+    if not structured_output.available():
+        raise ValueError(structured_output.UNAVAILABLE)
+
+
 def schema_from_format(fmt, *, responses=False):
     if fmt is None:
         return None
@@ -29,6 +35,7 @@ def schema_from_format(fmt, *, responses=False):
         raise ValueError("format.type must be text, json_object, or json_schema")
     if fmt["type"] == "text":
         return None
+    require_available()
     if fmt["type"] == "json_object":
         return json.dumps({"type": "object"})
     spec = fmt if responses else fmt.get("json_schema")
@@ -713,7 +720,7 @@ async def configure_tool_call_grammar(
     """Hold the tool calls of a request without a response format to the
     declared schemas, when the parser declares a grammar for them.
 
-    Admission never fails because of it: without the optional dependency, on
+    Admission never fails because of it: without the backend, on
     a deployment or request that cannot run a grammar, with a schema that does
     not pass the safety checks, or when preparation fails or times out, the
     output stays unconstrained. A grammar error during decoding fails the

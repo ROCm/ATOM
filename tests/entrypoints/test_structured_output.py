@@ -23,6 +23,16 @@ from atom.structured_output.validation import (
 pytest.importorskip("jsonschema")
 
 
+@pytest.fixture(autouse=True)
+def _structured_output_installed(monkeypatch):
+    """These cases stub the engine and the grammar backend: they describe a
+    deployment with the backend available, whatever this environment installed.
+    Its absence is covered in test_structured_output_availability.py."""
+    from atom import structured_output
+
+    monkeypatch.setattr(structured_output, "available", lambda: True)
+
+
 @pytest.mark.parametrize(
     "name", ["$ref", "$dynamicRef", "const", "enum", "default", "examples"]
 )

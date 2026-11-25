@@ -60,6 +60,7 @@ def _batch(seqs, mask=None):
     )
     return types.SimpleNamespace(
         total_seqs_num=seqs,
+        is_mixed=False,
         total_tokens_num=seqs,
         req_ids=list(range(seqs)),
         return_logprobs=mask,

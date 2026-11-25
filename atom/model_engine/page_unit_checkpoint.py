@@ -376,7 +376,7 @@ class PageUnitCheckpointStore:
         """Whether `count` units could be had, evicting if it came to that.
 
         Asked once per waiting sequence in `can_allocate` and once per running
-        one in `can_append`, so it is per-sequence per-pass and the walk has to
+        one in the decode append room check, so it is per-sequence per-pass and the walk has to
         be paid for. Two things keep it cheap. The free list is checked first,
         which is the whole answer whenever the pool is not tight. And the walk
         below stops at the shortfall rather than totalling the cache: the
