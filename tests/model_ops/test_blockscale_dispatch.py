@@ -67,16 +67,12 @@ def test_aiter_execution_errors_are_not_hidden(monkeypatch, error_type):
 
 
 @pytest.mark.parametrize(
-    "weight_preshuffled, row_major_supported, expected",
-    [(False, False, False), (False, True, True), (True, False, True)],
+    "weight_preshuffled, arch, expected",
+    [(False, "gfx1250", False), (False, "gfx950", True), (True, "gfx1250", True)],
 )
-def test_fp8_backend_capability_gate(
-    monkeypatch, weight_preshuffled, row_major_supported, expected
-):
+def test_fp8_backend_capability_gate(monkeypatch, weight_preshuffled, arch, expected):
+    from aiter.jit.utils import chip_info
+
     monkeypatch.setattr(blockscale, "_aiter_fp8_gemm", object())
-    monkeypatch.setattr(
-        blockscale,
-        "_aiter_row_major_group32_supported",
-        lambda: row_major_supported,
-    )
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: arch)
     assert blockscale._use_aiter_fp8_gemm(weight_preshuffled) is expected
