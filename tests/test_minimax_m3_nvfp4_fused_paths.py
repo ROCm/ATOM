@@ -433,8 +433,51 @@ def test_nvfp4_attention_mxfp8_output_is_bf16_then_quantize_fp8(rows):
     assert torch.equal(scales.view(torch.uint8), ref_s.view(torch.uint8))
 
 
-def _reuse_call(monkeypatch, *, prefill, rows, served=True, mx=False):
-    """`_flydsl_attention` with aiter stubbed: which kernel ran, with what."""
+@gfx1250_only
+def test_nvfp4_prefill_reuse_matches_the_paged_decode(monkeypatch):
+    from atom.model_ops.minimax_m3 import sparse_attn_nvfp4 as sa
+    from atom.model_ops.minimax_m3.index_fp4 import kv_nvfp4_store
+
+    torch.manual_seed(17)
+    blocks, topk, maxb, rows = 1024, 16, 48, 512
+    stage = torch.randn(blocks, 2, PAGE, 1, D, device=DEV).to(torch.bfloat16)
+    kp = torch.zeros(blocks, 1, PAGE, D // 2, dtype=torch.uint8, device=DEV)
+    ks = torch.zeros(blocks, 1, PAGE, D // 16, dtype=torch.uint8, device=DEV)
+    vp, vs = torch.zeros_like(kp), torch.zeros_like(ks)
+    kv_nvfp4_store(stage, torch.arange(blocks * PAGE, device=DEV), kp, ks, vp, vs)
+    # One request: 512 new tokens on a 4096-token prefix (33-36 valid pages).
+    cu = torch.tensor([0, rows], dtype=torch.int32, device=DEV)
+    prefix = torch.tensor([4096], dtype=torch.int32, device=DEV)
+    row_req, row_seq = sa.prefill_rows(cu, prefix, rows)
+    bt = torch.randperm(blocks, device=DEV)[:maxb].int().unsqueeze(0)
+    idx = torch.rand(rows, 32, device=DEV).argsort(-1)[:, :topk].int()
+    idx[:, -1] = (row_seq + PAGE - 1) // PAGE - 1
+    idx = idx.sort(-1).values.unsqueeze(0)
+    q = torch.randn(rows, 16, D, device=DEV).to(torch.bfloat16)
+    table = sa.nvfp4_page_table(idx, bt, row_req, row_seq)
+    args = (q, kp, ks, vp, vs, idx, bt, row_req, row_seq, D**-0.5)
+    paged = sa.nvfp4_sparse_attention(*args, page_table=table)
+
+    kernel, served = sa._prefill_reuse_kernel()
+    used = []
+    monkeypatch.setattr(
+        sa,
+        "_prefill_reuse_kernel",
+        lambda: (lambda *a, **kw: used.append(1) or kernel(*a, **kw), served),
+    )
+    out = sa.nvfp4_sparse_attention(*args, page_table=table, prefill=True)
+    torch.cuda.synchronize()
+    assert used, "the K/V-reuse kernel did not take the prefill"
+    torch.testing.assert_close(out, paged, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "prefill, rows, served, reuse",
+    [(True, 256, True, True), (False, 512, True, False), (True, 255, True, False),
+     (True, 512, False, False)],
+    ids=["long-prefill", "decode", "short-prefill", "unserved"],
+)  # fmt: skip
+def test_prefill_reuse_dispatch(monkeypatch, prefill, rows, served, reuse):
     import importlib
 
     from atom.model_ops import base_attention
@@ -444,10 +487,7 @@ def _reuse_call(monkeypatch, *, prefill, rows, served=True, mx=False):
     monkeypatch.setattr(
         sparse_attn_nvfp4,
         "_prefill_reuse_kernel",
-        lambda: (
-            lambda *a, **kw: calls["reuse"].append(kw),
-            lambda q, k, table: served,
-        ),
+        lambda: (lambda *a, **kw: calls["reuse"].append(kw), lambda *_: served),
     )
     monkeypatch.setattr(
         importlib.import_module("aiter.ops.flydsl.pa_decode"),
@@ -455,54 +495,29 @@ def _reuse_call(monkeypatch, *, prefill, rows, served=True, mx=False):
         lambda *a, **kw: calls["pa_decode"].append(kw),
     )
     monkeypatch.setattr(
-        "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits",
-        lambda *_: 3,
+        "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits", lambda *_: 3
     )
     monkeypatch.setattr(
         base_attention, "_flydsl_prepare_explicit_plan", lambda **kw: None
     )
     monkeypatch.setattr(
-        base_attention, "_flydsl_plan_scratch", lambda *a, **kw: (None, None, None)
+        base_attention, "_flydsl_plan_scratch", lambda *a, **kw: (None,) * 3
     )
-    q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
     payload = torch.zeros(4, 1, 128, 64, dtype=torch.uint8)
     scales = torch.zeros(4, 1, 128, 8, dtype=torch.uint8)
-    mx_kw = {}
-    if mx:
-        mx_kw = {
-            "quantized_output": torch.empty(rows, 16 * 128, dtype=torch.uint8),
-            "output_scale": torch.empty(rows, 64, dtype=torch.uint8).view(
-                torch.float8_e8m0fnu
-            ),
-        }
+    e8m0 = torch.empty(rows, 64, dtype=torch.uint8).view(torch.float8_e8m0fnu)
     sparse_attn_nvfp4._flydsl_attention(
-        q, payload, scales, payload, scales,
-        torch.zeros(rows, 1, dtype=torch.int32), torch.ones(rows, dtype=torch.int32),
-        128**-0.5, None, None, prefill=prefill, **mx_kw,
+        torch.randn(rows, 16, 128, dtype=torch.bfloat16), payload, scales, payload,
+        scales, torch.zeros(rows, 1, dtype=torch.int32),
+        torch.ones(rows, dtype=torch.int32), 128**-0.5, None, None, prefill=prefill,
+        quantized_output=torch.empty(rows, 16 * 128, dtype=torch.uint8),
+        output_scale=e8m0,
     )  # fmt: skip
-    return calls
-
-
-@pytest.mark.parametrize("mx", [False, True])
-def test_prefill_reuse_takes_long_prefills(monkeypatch, mx):
-    calls = _reuse_call(monkeypatch, prefill=True, rows=256, mx=mx)
-    assert not calls["pa_decode"] and len(calls["reuse"]) == 1
-    kw = calls["reuse"][0]
-    assert kw["tile_rows"] == 2 and kw["kv_heads"] == 1 and kw["impl"] == "v2"
-    if mx:
-        assert kw["quantized_output"].shape == (256, 16, 128)
-        assert kw["output_scale"].dtype == torch.float8_e8m0fnu
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"prefill": False, "rows": 512},  # decode rows
-        {"prefill": True, "rows": 255},  # below the row floor
-        {"prefill": True, "rows": 512, "served": False},  # aiter declines
-    ],
-    ids=["decode", "short-prefill", "unserved"],
-)
-def test_prefill_reuse_keeps_the_paged_decode_otherwise(monkeypatch, kwargs):
-    calls = _reuse_call(monkeypatch, **kwargs)
-    assert not calls["reuse"] and len(calls["pa_decode"]) == 1
+    assert (len(calls["reuse"]), len(calls["pa_decode"])) == (
+        (1, 0) if reuse else (0, 1)
+    )
+    if reuse:
+        kw = calls["reuse"][0]
+        assert kw["tile_rows"] == 2 and kw["impl"] == "v2"
+        assert kw["quantized_output"].shape == (rows, 16, 128)
+        assert kw["output_scale"] is e8m0
