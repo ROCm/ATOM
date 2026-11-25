@@ -292,6 +292,7 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(
 
     from aiter import get_mla_metadata_info_v1
     from aiter.mla import mla_decode_fwd
+    from aiter.ops.attention import get_mla_decode_shape_support
 
     from atom.distributed.dcp_utils import mla_dcp_sparse_prefill_kv_splits
     from atom.model_ops.attention_mla import MLAAttention
@@ -374,14 +375,18 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(
             AiterMLAMetadataBuilder._sparse_prefill_work_plan(
                 builder, meta, "", heads, last
             )
-        # Each live row has one whole interval, even at the smallest batch.
+        # Each live row is planned whole, even at the smallest batch: one work
+        # item per row, or one per 16-head group where aiter folds the heads
+        # (gfx942 bf16 has only the qh16 kernel).
+        fold = get_mla_decode_shape_support(
+            heads, 1, q.dtype, kv.dtype, persistent=True, page_size=1
+        ).fold_factor
         info = work["work_info_set"][: int(work["work_indptr"][-1])].cpu()
         starts = kvptr.cpu().tolist()
-        assert len(info) == rows
+        assert len(info) == rows * fold
+        intervals = [tuple(iv) for iv in info[:, 4:6].tolist()]
         for row, count in enumerate(counts):
-            row_work = info[info[:, 0] == row]
-            assert len(row_work) == 1
-            assert row_work[0, 4:6].tolist() == [starts[row], starts[row] + count]
+            assert intervals.count((starts[row], starts[row] + count)) == fold
         output = torch.empty(rows, heads, 512, dtype=torch.bfloat16, device="cuda")
         mla_decode_fwd(
             q,
