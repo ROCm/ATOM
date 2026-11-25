@@ -1,0 +1,275 @@
+# MiniMax-M3.1-Flash (Quark MXFP4) on 4 x MI455X: C4-optimized ATOM + aiter
+
+This recipe installs the C4-decode-optimized ATOM and aiter branches into the official ATOM base image for
+gfx1250, starts MiniMax-M3.1-Flash with TP4 + DSpark (K = 7), and reproduces our accuracy and InferenceX AgentX
+numbers (C4 and C64, 1 hour).
+
+| | |
+|---|---|
+| Model | `amd/MiniMax-M3.1-Flash-Quark-MXFP4` (MXFP4 MoE, MXFP8 dense), with its DSpark draft in `dspark/` |
+| Hardware | 4 x AMD Instinct MI455X (gfx1250), TP4 |
+| Base image | `rocm/atom-dev:ub24-dcgpu-rk-10.2.0-pyt2.14.0-rocmtri3.9-24d5394c-atomsrc-gfx1250-b1123` (torch 2.14.0 + ROCm 10.2, triton 3.9.0, ATOM / aiter in `/root/venv/atom-venv-gfx1250`) |
+| ATOM | branch `xiaobingsuper/m31-c4-gfx1250-opt` of ROCm/ATOM; measured code = commit `51930f366844faf9c100a77ec1c621b651a84573` (the branch tip adds only this recipe and its helpers under `recipes/`) |
+| aiter | branch `xiaobingsuper/m31-c4-gfx1250-opt` of ROCm/aiter, commit `c390792879a5af356226e09a5da0e0919cfc9d74` (composable_kernel submodule `96afae1d`) |
+| LMCache (C64 only) | LMCache/LMCache `f22dec28` (0.5.6rc3.dev20), built in the container |
+| Benchmark clients | aiperf (SemiAnalysisAI/aiperf `754356e9`, scenario `inferencex-agentx-mvp`), lm_eval 0.4.12 |
+
+## What the branches contain
+
+Both branches are the code we measured, unchanged:
+
+- **ATOM** = the MiniMax-M3.1 gfx1250 "1123 stack" (`61c8db8`: ROCm/ATOM main + the M3.1 PRs + the combo16 fusions)
+  plus one commit with the C4 decode work: async verdict and early output, one-launch draft metadata / sampler /
+  verify, draft KV inside the decode graph, Markov-chain resident kernel, stream-capture and H2D host trims, the LM
+  head in its own graph, o_proj + post-attention all-reduce + residual + RMSNorm in one launch ("Stage O"), DSpark draft
+  layers as two launches each.
+- **aiter** = the matching aiter "1123 stack" (`9c3f0ef`) plus one commit with the C4 kernels (Stage O kernels, 8-row
+  router, QKV / o_proj tiles, GEMM1 wave-level route for <= 16 tokens, split-K GEMM1 plan for 8 tokens) and one commit
+  that puts the routed-MoE tuning rows into `aiter/configs/model_configs/minimax_m3_gfx1250_tuned_grouped_fmoe.csv`, so
+  aiter's default config lookup picks them (no `AITER_CONFIG_GROUPED_FMOE`, no file copy).
+
+The C4 pieces are on by default and gate themselves (gfx1250, TP4, a decode step of one request x 8 rows, ...); other
+shapes run the 1123 path. The 1123 stack's own fusions are opt-in flags of that stack and are set in the launch
+command below. Target numerics are bit-exact to the 1123 stack (greedy GSM8K responses identical).
+
+## 1. Host
+
+- amdgpu loaded with `sudo modprobe amdgpu gpu_recovery=0 halt_if_hws_hang=1` (how our nodes load it).
+- `sudo sysctl -w kernel.numa_balancing=0` for the benchmark runs.
+- About 230 GB of disk for the model, 60 GB for the image, ~25 GB for the container's build outputs.
+- For C64 with LMCache at the reference size (384 GiB per rank): about **1,690 GiB of available host memory**
+  (4 x 384 x 1.1 GiB). On a node with less RAM use a smaller tier (section 4); that
+  changes the C64 numbers.
+
+## 2. Container
+
+```bash
+IMAGE=rocm/atom-dev:ub24-dcgpu-rk-10.2.0-pyt2.14.0-rocmtri3.9-24d5394c-atomsrc-gfx1250-b1123
+MODEL_DIR=/path/to/MiniMax-M3.1-Flash-Quark-MXFP4      # with dspark/ inside
+docker pull $IMAGE
+docker run -d --name m31 --network host --ipc host --group-add video --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined --security-opt label=disable \
+  --device /dev/kfd --device /dev/dri --shm-size 64g --ulimit memlock=-1 \
+  -v $MODEL_DIR:/models/MiniMax-M3.1-Flash-Quark-MXFP4:ro \
+  --entrypoint sleep $IMAGE infinity
+docker exec -it m31 bash
+# inside the container: the image's default PATH has /root/venv/rocm-venv; use the ATOM venv
+source /root/venv/atom-venv-gfx1250/bin/activate
+export GPU_ARCHS=gfx1250 PYTORCH_ROCM_ARCH=gfx1250
+```
+
+## 3. Install the branches (replaces the image's ATOM and aiter)
+
+```bash
+BRANCH=xiaobingsuper/m31-c4-gfx1250-opt
+# ATOM (pure Python)
+git clone --depth 2 -b $BRANCH https://github.com/ROCm/ATOM.git /opt/ATOM
+git -C /opt/ATOM log --oneline -2            # tip = recipe commit, its parent = 51930f366 (the measured code)
+pip install --no-deps --no-build-isolation -e /opt/ATOM
+# aiter (Python + JIT-built HIP modules; nothing is compiled here)
+git clone --depth 1 -b $BRANCH https://github.com/ROCm/aiter.git /opt/aiter
+git -C /opt/aiter log -1 --format=%H         # c390792879a5af356226e09a5da0e0919cfc9d74
+git -C /opt/aiter submodule update --init --depth 1 3rdparty/composable_kernel
+pip uninstall -y amd-aiter
+cd /opt/aiter && PREBUILD_KERNELS=0 pip install --no-deps --no-build-isolation -e . && cd -
+python3 -c 'import atom, aiter, flydsl; print(atom.__file__, aiter.__file__, flydsl.__version__)'
+# -> /opt/ATOM/atom/__init__.py /opt/aiter/aiter/__init__.py 0.5.0
+```
+
+Notes:
+- The aiter branch pins `flydsl==0.5.0` (the FlyDSL the numbers were measured with); its editable install puts 0.5.0
+  into the ATOM venv, in front of the image's 0.5.3 in `/root/venv/rocm-venv`. Do not upgrade it.
+- aiter's HIP modules (custom all-reduce, the k5 / two-shot AR + RMSNorm, the fused router, ...) are JIT-built into
+  `/opt/aiter/aiter/jit/build` on the server's first start (a few minutes; the first start took ~8 minutes to healthy in
+  our runs, later starts ~5); FlyDSL kernels compile on first use. Keep the container to keep the builds.
+
+### LMCache (only for the C64 LMCache-on configuration)
+
+The base image has no LMCache. Build the LMCache commit the numbers were measured with for this torch / ROCm. torch
+2.14's headers need C++20, which this LMCache commit does not set yet:
+
+```bash
+git init -q /opt/LMCache && cd /opt/LMCache
+git remote add origin https://github.com/LMCache/LMCache.git
+git fetch -q --depth 1 origin f22dec2832124ea4ffeb464553b819a6369d4a30 && git checkout -q FETCH_HEAD
+sed -i 's/"-std=c++17"/"-std=c++20"/' setup_extensions/build_profiles/rocm.py setup_extensions/common_cpp.py
+BUILD_WITH_HIP=1 CXX=hipcc SETUPTOOLS_SCM_PRETEND_VERSION=0.5.6rc3.dev20 \
+  pip wheel --no-build-isolation --no-deps -w /opt/wheels .
+# its runtime dependencies, without moving any package the image already has (protobuf moves into LMCache's range)
+pip freeze | grep -vE '^-e |@ file:|^#|^(protobuf|importlib_metadata)==' > /tmp/cons.txt
+pip install -c /tmp/cons.txt prometheus_client aiofile aiofiles caio blake3 redis sortedcontainers pyzmq cachetools \
+  cryptography numba openai opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 opentelemetry-exporter-otlp==1.40.0 \
+  opentelemetry-exporter-prometheus==0.61b0 'grpcio>=1.78.0' 'protobuf>=6.31.1,<7' py-cpuinfo
+pip install --no-deps /opt/wheels/lmcache-0.5.6rc3.dev20-*.whl
+python3 -c 'import lmcache, lmcache.cuda_ops; from lmcache.v1.cache_engine import LMCacheEngineBuilder; print(lmcache.__version__)'
+cd -
+```
+
+(pip then reports that grpcio-tools 1.85.3 wants protobuf >= 7.35; it is a build tool and the server does not use it.
+The 1123 bring-up image had the same protobuf 6.33.)
+
+### Benchmark clients (separate venv, so the server's packages do not move)
+
+```bash
+/root/venv/rocm-venv/bin/python3 -m venv /opt/bench
+/opt/bench/bin/pip install "aiperf @ git+https://github.com/SemiAnalysisAI/aiperf.git@754356e9a39acc6cc6afb242d123bb57c3fb6f75" \
+  'lm_eval[api]==0.4.12'
+```
+
+## 4. Launch the server
+
+aiter.plugin's config snapshot must be built when it is imported, outside torch.compile's trace (otherwise Dynamo
+breaks the graph on its lock and the start fails with "VllmBackend can only be called once"); the hook
+`recipes/minimax-m31-gfx1250/pyhooks/sitecustomize.py` does that and is on `PYTHONPATH` below. It must be a
+sitecustomize: inside the venv Python never imports a usercustomize.
+
+```bash
+cd /opt/ATOM
+M=/models/MiniMax-M3.1-Flash-Quark-MXFP4
+CONC=4                     # 4 for C4; 64 for C64
+MAX_SEQS=$((2 * CONC))     # 8 for C4, 128 for C64
+CG_SIZES=$(python3 -c "print([s for s in [1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128] if s <= $MAX_SEQS])")
+TG_SIZES=256$(seq -s '' -f ',%g' 512 512 11264)
+env NCCL_IB_DISABLE=1 RCCL_IB_DISABLE=1 ATOM_FORCE_ATTN_TRITON=1 AITER_LOG_LEVEL=WARNING \
+  ATOM_GC_THRESHOLD=20000,50,50 ATOM_PA_FLYDSL=1 ATOM_MONO_ENABLE=0 \
+  PYTORCH_ROCM_ARCH=gfx1250 GPU_ARCHS=gfx1250 HSA_OVERRIDE_GFX_VERSION=12.5.0 \
+  ATOM_MOE_GU_ITLV=1 AITER_ROPE_TRITON_BACKEND=1 AITER_USE_SYSTEM_TRITON=1 AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=1 \
+  RCCL_DDA_THRESHOLD=67108864 \
+  ATOM_MINIMAX_M3_GLUON_AR_MXFP8=1 ATOM_MINIMAX_M3_SWIGLU_MXFP8=1 ATOM_MINIMAX_M3_PA_MXFP8_OUT=1 \
+  LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libgomp.so.1 \
+  PYTHONPATH=/opt/ATOM/recipes/minimax-m31-gfx1250/pyhooks \
+  ATOM_PREFILL_DECODE_INTERVAL=20000 \
+  ATOM_M3_INDEXER_CP=1 ATOM_M3_SPARSE_KV_NVFP4=1 \
+  ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH=1 ATOM_TOKEN_GRAPH_SIZES=$TG_SIZES \
+  ATOM_MINIMAX_M3_MOE_FRONT_FUSION=1 ATOM_MINIMAX_M3_MOE_GLUE_FUSION=1 ATOM_MINIMAX_M3_MOE_ROUTED_FIRST=1 \
+  ATOM_MINIMAX_M3_MOE_TAIL_IN_AR=1 ATOM_MINIMAX_M3_MOE_ROUTER_QUANT=1 AITER_K5_AR=1 AITER_K5_AR_FUSED_MXFP8=1 \
+  ATOM_M3_FUSED_QKV_CHAIN=1 ATOM_M3_FAST_OPROJ=1 ATOM_M3_PA_FUSED_REDUCE=1 ATOM_M3_CP_SCORE_FLYDSL=1 \
+  ATOM_MINIMAX_M3_SHARED_FOLD=0 ATOM_MINIMAX_M3_MOE_QUANT_SHARED=0 \
+  ATOM_M3_PREFILL_SP_AR=1 AITER_AR2S_RMS_MAX_SIZE=201326592 ATOM_M3_SP_MOE_FRONT=2 ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL=1 \
+  ATOM_M3_SPARSE_PREFILL_REUSE=1 ATOM_M3_SPARSE_PREFILL_REUSE_IMPL=v2 ATOM_M3_SPARSE_PREFILL_REUSE_TQ=2 \
+  ATOM_SAMPLER_SPLIT_V=1 ATOM_DSPARK_FUSED_AR=1 ATOM_DSPARK_SWIGLU_MXFP8=1 AITER_MOE_ROUTER_QUANT_ROWS_MIN_TOKENS=8 \
+  ATOM_ENGINE_IDLE_YIELD_S=0.0002 ATOM_OFFLOAD_PREHASHED_SAVE=1 ATOM_LOADER_PREFETCH=false \
+  python3 -u -m atom.entrypoints.openai_server \
+    --model $M --served-model-name $M \
+    --host 0.0.0.0 --port 8796 --server-port 8790 \
+    --tensor-parallel-size 4 --trust-remote-code \
+    --kv_cache_dtype fp8 --index-cache-dtype fp4 --block-size 128 \
+    --max-model-len 1048576 --max-num-seqs $MAX_SEQS --max-num-batched-tokens 32768 \
+    --gpu-memory-utilization 0.9 --enable-prefix-caching \
+    --cudagraph-capture-sizes "$CG_SIZES" \
+    --method dspark --draft-model $M/dspark --num-speculative-tokens 7 \
+    --spec-decode-acceptance-length 4.04 \
+    > /tmp/server.log 2>&1 &
+until curl -sf -m 5 http://127.0.0.1:8790/health > /dev/null; do sleep 30; done
+```
+
+- **Accuracy runs** (section 5): drop `--spec-decode-acceptance-length 4.04` (real DSpark acceptance), `CONC=4`.
+- **AgentX C4**: as above (`CONC=4`, delayer 20000, forced acceptance 4.04, LMCache off).
+- **AgentX C64**: `CONC=64` (max-num-seqs 128), `ATOM_PREFILL_DECODE_INTERVAL=8` instead of 20000, forced acceptance
+  4.04, and the LMCache CPU tier: add to the env
+  `PYTHONHASHSEED=0 LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=384 LMCACHE_CHUNK_SIZE=256
+  ATOM_PREFIX_CACHE_POLICY=slru ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5 LMCACHE_CACHE_POLICY=ATOM_SLRU
+  LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3`
+  and to the arguments `--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'`.
+  - `LMCACHE_MAX_LOCAL_CPU_SIZE` is GiB **per TP rank**: 384 is the size of the reference C64 LMCache-on run and needs
+    4 x 384 x 1.1 = ~1,690 GiB of `MemAvailable` before the start (a 2 TB node) (check `grep MemAvailable /proc/meminfo`).
+  - With less RAM, set it to at most `MemAvailable_GiB / 4.4` (e.g. 160 on a 1 TB node). A smaller tier holds fewer
+    evicted prefixes, so the C64 numbers move (expected numbers below say which size each run used).
+  - Without LMCache (C64 LMCache-off reference): leave out the LMCache env and `--kv-transfer-config`; `PYTHONHASHSEED`
+    and the slru policy then do not matter.
+- The forced acceptance length 4.04 is InferenceX's golden DSpark acceptance for M3.1 at K = 7; the generated text is
+  synthetic under it, so never measure accuracy with it.
+- Stop the server with `pkill -INT -f atom.entrypoints.openai_server` and wait until no `ATOM::` process is left.
+
+## 5. Accuracy
+
+On a fresh server without `--spec-decode-acceptance-length` (`CONC=4`):
+
+```bash
+M=/models/MiniMax-M3.1-Flash-Quark-MXFP4
+# sanity gate: 17 * 23 = 391 and a parsed tool call
+python3 /opt/ATOM/recipes/minimax-m31-gfx1250/gate.py http://127.0.0.1:8790 $M          # last line: GATE PASS
+# GSM8K 5-shot, greedy, one request at a time (first 250), then all 1319 at 16 concurrent requests
+/opt/bench/bin/lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn \
+  --model_args "model=$M,base_url=http://localhost:8790/v1/chat/completions,num_concurrent=1,max_retries=3,max_gen_toks=16384,tokenized_requests=False,trust_remote_code=True" \
+  --tasks gsm8k --num_fewshot 5 --limit 250 --log_samples --output_path /tmp/gsm8k_c1
+/opt/bench/bin/lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn \
+  --model_args "model=$M,base_url=http://localhost:8790/v1/chat/completions,num_concurrent=16,max_retries=3,max_gen_toks=16384,tokenized_requests=False,trust_remote_code=True" \
+  --tasks gsm8k --num_fewshot 5 --log_samples --output_path /tmp/gsm8k_c16
+```
+
+Accepted length: the server log prints cumulative `[MTP Stats ...] Accepted/Total Draft tokens: A/T`; over a phase,
+accepted length = 1 + dA / (dT / 7) (take the line before and after the phase).
+
+## 6. AgentX (InferenceX, 1 hour)
+
+With the server up in the C4 or C64 configuration, run the AgentX replay (it downloads the dataset
+`semianalysisai/cc-traces-weka-062126` from Hugging Face on first use):
+
+```bash
+CONC=4   # or 64
+M=/models/MiniMax-M3.1-Flash-Quark-MXFP4
+env AIPERF_HTTP_TCP_USER_TIMEOUT=900000 AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800 \
+  AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800 AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=30 \
+  AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0 AIPERF_UI_REALTIME_METRICS_ENABLED=true \
+  AIPERF_FAILED_REQUEST_THRESHOLD=0.10 AIPERF_LIVE_FAILED_REQUEST_THRESHOLD=0.10 \
+  AIPERF_WARMUP_REQUESTS_PER_LANE=10 AIPERF_BENCHMARK_GRACE_PERIOD=30 \
+  AIPERF_SERVER_METRICS_URLS=http://localhost:8790/metrics AIPERF_REQUIRED_SERVER_METRIC_PREFIX=atom: \
+  /opt/bench/bin/aiperf profile --scenario inferencex-agentx-mvp \
+    --url http://localhost:8790 --endpoint /v1/chat/completions --endpoint-type chat --streaming \
+    --model $M --tokenizer $M --tokenizer-trust-remote-code --apply-chat-template \
+    --concurrency $CONC --benchmark-duration 3600 --stats-interval 30 \
+    --random-seed 42 --failed-request-threshold 0.10 \
+    --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
+    --warmup-requests-per-lane 10 --trace-idle-gap-cap-seconds 300 --agentic-warmup-grace-period 1800 \
+    --use-server-token-count --no-gpu-telemetry \
+    --num-dataset-entries 393 --slice-duration 1.0 \
+    --server-metrics http://localhost:8790/metrics \
+    --public-dataset semianalysis_cc_traces_weka_062126 \
+    --output-artifact-dir /tmp/agentx_c$CONC
+TP=4 python3 /opt/ATOM/recipes/minimax-m31-gfx1250/summarize.py /tmp/agentx_c$CONC
+```
+
+`summarize.py` prints one line with InferenceX's per-request formulas: **tok/s/chip** = (sum of input + output tokens
+of the successful profiling requests) / (first start .. last end) / 4, and **interactivity P90** = 1 / (p90 of the
+per-request inter-token latency) in tok/s/user (higher is better; the InferenceX "P90" number), plus the median,
+ITL / TTFT percentiles, the prefix-cache hit and the request counts.
+
+bs1 decode step (optional): `python3 /opt/ATOM/recipes/minimax-m31-gfx1250/a1_fixed.py --url http://localhost:8790
+--model $M --summary /tmp/step.json --phases '[{"name":"b1_110k","bs":1,"ctx":110038,"settle_s":3,"dec_tokens":10000,"ref_s":6,"win_s":0,"pf_reps":0}]'`
+on the C4 server (forced 4.04); `ref step` is the client-side time of one decode step at 110K context.
+
+## 7. Expected numbers
+
+Measured on one 4 x MI455X node with exactly this recipe (base image + the two branches), November 2026.
+
+**Accuracy** (fresh server, real DSpark acceptance, `CONC=4`):
+
+| Check | Result |
+|---|---|
+| gate.py (17 x 23, tool call) | PASS |
+| GSM8K 5-shot c1, first 250 | EM 0.960 (flexible) / 0.956 (strict); greedy responses byte-identical to the 1123 stack's on 250 / 250 |
+| Accepted length, c1 phase | 4.637 |
+| GSM8K 5-shot c16, all 1319 | 0.9522 (flexible) / 0.9500 (strict) |
+| Accepted length, c16 phase | 4.740 |
+
+**bs1 decode step** (C4 server, forced acceptance 4.04, `a1_fixed.py`): 4.099 ms at 110K context, 4.353 ms at 500K.
+
+**AgentX, 1 hour** (InferenceX AgentX replay, forced acceptance 4.04):
+
+Our node ("node A" below) is a different machine from the one the 1123 references were measured on ("node B", which
+measured ~6% below other nodes in earlier comparisons); compare across nodes with that in mind.
+
+| Run | Node | tok/s/chip | Interactivity P90 (tok/s/user) | Median | ITL p50 / p90 | TTFT p50 / p90 | Prefix hit | Requests / failed |
+|---|---|---:|---:|---:|---|---|---|---|
+| **C4, these branches** (LMCache off) | A | **10,460** | **874.4** | 923.7 | 1.1 / 1.1 ms | 0.24 / 0.98 s | 97.7% | 764 / 0 |
+| C4, 1123 stack (reference) | B | 10,390 | 763.5 | 804.0 | 1.2 / 1.3 ms | 0.26 / 1.42 s | 97.7% | 773 / 0 |
+| C4, vLLM on MI355X (InferenceX) | | 10,322 | 581.4 | | | | | |
+| C64, these branches, LMCache on, 160 GiB/rank | A | (run in progress; added on completion) | | | | | | |
+| C64, 1123 stack, LMCache on, 384 GiB/rank (reference) | B | 127,454 | 261.6 | 362.0 | 2.8 / 3.8 ms | 0.35 / 0.87 s | 97.2% | 12,172 / 1 |
+| C64, 1123 stack, LMCache off (reference) | B | 126,691 | 253.7 | 380.8 | 2.6 / 3.9 ms | 0.33 / 1.08 s | 95.8% | 12,158 / 3 |
+| C64, vLLM on MI355X (InferenceX) | | 112,879 | 114.7 | | | | | |
+
+C4 with these branches: P90 **1.50x** vLLM MI355X and +14.5% over the 1123 stack's reference (different node).
+
+
