@@ -1138,8 +1138,10 @@ _TOOL_SPECS = (
 _SKILL_SPECS = (
     (
         "list_skills",
-        "Procedures ATOM's and AITER's engineers wrote down (benchmark, "
-        "accuracy, traces, debugging, ...), read from the image that runs.",
+        (
+            "Procedures ATOM's and AITER's engineers wrote down (benchmark, "
+            "accuracy, traces, debugging, ...), read from the image that runs."
+        ),
         _obj({}),
         t_list_skills,
         False,

@@ -49,7 +49,7 @@ def test_list_gpus_from_fake_sysfs(tmp_path, monkeypatch):
     monkeypatch.setattr(hardware, "KFD_TOPOLOGY", topo)
     monkeypatch.setattr(hardware, "DRM", drm)
     monkeypatch.setattr(hardware, "KFD_PROC", procs)
-    monkeypatch.setattr(hardware, "_amd_smi_names", lambda: {})
+    monkeypatch.setattr(hardware, "_amd_smi_names", dict)
     gpus = hardware.list_gpus()
     assert [g.index for g in gpus] == [0, 1]
     assert gpus[0].pci_bus == "0000:75:00.0" and gpus[0].free
@@ -211,6 +211,6 @@ def test_partial_downloads_are_detected(tmp_path, monkeypatch):
     assert by["Whole"]["complete"] and not by["Partial"]["complete"]
     assert by["Partial"]["shards"] == "1/3" and not by["org/Linky"]["complete"]
     assert found["incomplete"] == 2 and found["total_found"] == 3
-    assert [m["name"] for m in found["models"]][0] == "Whole"  # complete first
+    assert next(m["name"] for m in found["models"]) == "Whole"  # complete first
     info = models.inspect_model(str(tmp_path / "data" / "Partial"))
     assert not info["complete"] and "incomplete checkpoint: 1 of 3" in info["warning"]

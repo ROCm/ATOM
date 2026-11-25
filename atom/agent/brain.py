@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import time
 import urllib.error
 import urllib.request
@@ -100,7 +99,7 @@ def _sse_events(resp):
                 yield event, line[5:].strip()
             elif not line:
                 event = None
-    except (TimeoutError, socket.timeout) as e:
+    except TimeoutError as e:
         raise BrainError("the stream stalled (no data within the timeout)", True) from e
     except (ConnectionError, OSError) as e:
         raise BrainError(f"the stream broke: {e}", retryable=True) from e

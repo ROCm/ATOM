@@ -120,7 +120,7 @@ def test_deb_package_is_complete(tmp_path):
     )
     assert res.returncode == 0, res.stderr
     deb = out / "amd-atom_0.0.1~test_all.deb"
-    field = lambda f: subprocess.run(  # noqa: E731
+    field = lambda f: subprocess.run(
         ["dpkg-deb", "-f", str(deb), f], capture_output=True, text=True, check=True
     ).stdout.strip()
     assert field("Package") == "amd-atom" and field("Architecture") == "all"

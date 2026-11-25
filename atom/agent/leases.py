@@ -215,11 +215,13 @@ class LeaseManager:
                 why = gpu_busy(g)
                 if why:
                     holders.append({"gpus": [g], "held_by": why})
-            if port is not None and check_port and not _port_bindable(port):
-                if not any(h.get("port") == port for h in holders):
-                    holders.append(
-                        {"port": port, "held_by": "a process outside any lease"}
-                    )
+            if (
+                port is not None
+                and check_port
+                and not _port_bindable(port)
+                and not any(h.get("port") == port for h in holders)
+            ):
+                holders.append({"port": port, "held_by": "a process outside any lease"})
             if holders:
                 raise LeaseConflict(f"GPUs {gpus} / port {port} are not free", holders)
             lease = Lease(

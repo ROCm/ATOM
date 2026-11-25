@@ -29,9 +29,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from atom.agent import deploy, planner
+from atom.agent import deploy, planner, shell_policy
 from atom.agent import jobs as jobs_mod
-from atom.agent import shell_policy
 from atom.agent.brain import connect
 from atom.agent.config import AgentConfig
 from atom.agent.leases import LeaseManager
@@ -432,8 +431,10 @@ def scenarios(small_model: str = SMALL_MODEL) -> list[Scenario]:
             "docs_qa",
             "Answer an ATOM question from the docs, changing nothing.",
             [
-                "In two sentences: what is the difference between --level 0 and "
-                "--enforce-eager in ATOM, and when would I use both?"
+                (
+                    "In two sentences: what is the difference between --level 0 and "
+                    "--enforce-eager in ATOM, and when would I use both?"
+                )
             ],
             [
                 no_mutation(),
@@ -446,8 +447,10 @@ def scenarios(small_model: str = SMALL_MODEL) -> list[Scenario]:
             "deploy_small",
             "Deploy a small checkpoint on one GPU, verify it, report the endpoint.",
             [
-                f"Deploy the test checkpoint at {small_model} on one free GPU and "
-                "verify that it works."
+                (
+                    f"Deploy the test checkpoint at {small_model} on one free GPU and "
+                    "verify that it works."
+                )
             ],
             [
                 called("launch_server"),
@@ -462,8 +465,10 @@ def scenarios(small_model: str = SMALL_MODEL) -> list[Scenario]:
             "fail_then_fix",
             "A launch that fails by construction; diagnose, change the cause, recover.",
             [
-                f"Launch {small_model} on one free GPU with --gpu-memory-utilization "
-                "0.04 -- I want to see how you handle a failure.",
+                (
+                    f"Launch {small_model} on one free GPU with --gpu-memory-utilization "
+                    "0.04 -- I want to see how you handle a failure."
+                ),
                 "OK, fix it and get it serving.",
             ],
             [
@@ -504,10 +509,12 @@ def scenarios(small_model: str = SMALL_MODEL) -> list[Scenario]:
             "benchmark_via_skill",
             "Benchmark a deployment the way ATOM's run-atom-workload skill does.",
             [
-                f"Deploy the test checkpoint at {small_model} on one free GPU. Then run "
-                "ATOM's standard serving benchmark on it -- ISL 512, OSL 128, "
-                "concurrency 4, prompt multiplier 2 -- following the ATOM team's "
-                "workflow, and tell me the total token throughput."
+                (
+                    f"Deploy the test checkpoint at {small_model} on one free GPU. Then run "
+                    "ATOM's standard serving benchmark on it -- ISL 512, OSL 128, "
+                    "concurrency 4, prompt multiplier 2 -- following the ATOM team's "
+                    "workflow, and tell me the total token throughput."
+                )
             ],
             [
                 loaded_skill("run-atom-workload", "benchmark-guide"),
@@ -525,9 +532,11 @@ def scenarios(small_model: str = SMALL_MODEL) -> list[Scenario]:
             "accuracy_via_skill",
             "GSM8K on the first 20 samples through the repo's lm_eval workflow.",
             [
-                f"Deploy the test checkpoint at {small_model} on one free GPU and check "
-                "its GSM8K accuracy on the first 20 samples (3-shot), following the "
-                "ATOM workflow. Report the flexible-extract score."
+                (
+                    f"Deploy the test checkpoint at {small_model} on one free GPU and check "
+                    "its GSM8K accuracy on the first 20 samples (3-shot), following the "
+                    "ATOM workflow. Report the flexible-extract score."
+                )
             ],
             [
                 loaded_skill("run-atom-workload"),
@@ -546,10 +555,12 @@ def scenarios(small_model: str = SMALL_MODEL) -> list[Scenario]:
             "trace_via_skill",
             "Capture a profiler trace per the capture-trace skill and bring it back.",
             [
-                f"Capture a short PyTorch profiler trace of the test checkpoint at "
-                f"{small_model} serving on one free GPU (ISL 256, OSL 64, "
-                "concurrency 2), following ATOM's capture-trace workflow, and copy "
-                "the trace files back to this machine."
+                (
+                    f"Capture a short PyTorch profiler trace of the test checkpoint at "
+                    f"{small_model} serving on one free GPU (ISL 256, OSL 64, "
+                    "concurrency 2), following ATOM's capture-trace workflow, and copy "
+                    "the trace files back to this machine."
+                )
             ],
             [
                 loaded_skill("capture-trace"),

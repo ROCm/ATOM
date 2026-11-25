@@ -87,7 +87,7 @@ def test_no_mutation_allows_read_only_commands():
 
 
 class Scripted:
-    fallbacks: list = []
+    fallbacks: tuple = ()
 
     def __init__(self, replies):
         self.replies = list(replies)

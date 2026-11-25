@@ -22,7 +22,7 @@ from atom.agent.tools import ToolBox, ToolContext
 
 TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS))
-import fake_openai_server  # noqa: E402
+import fake_openai_server
 
 
 @pytest.fixture

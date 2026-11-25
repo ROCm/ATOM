@@ -25,7 +25,7 @@ from atom.agent.tools import ToolBox, ToolContext
 
 TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS))
-import fake_openai_server as fake  # noqa: E402
+import fake_openai_server as fake
 
 WEATHER = {
     "type": "function",
@@ -180,7 +180,7 @@ def test_session_runs_tools_over_anthropic_api(server, cfg):
 
 
 class Scripted:
-    fallbacks: list = []
+    fallbacks: tuple = ()
 
     def __init__(self, replies):
         self.replies = list(replies)
@@ -213,7 +213,7 @@ def test_session_log_round_trip_and_resume(cfg):
         log=log,
     )
     s.send("q1")
-    meta, history = SessionLog.load(cfg.state_dir, log.id)
+    _, history = SessionLog.load(cfg.state_dir, log.id)
     assert [m["role"] for m in history] == ["user", "assistant", "tool", "assistant"]
     assert SessionLog.resolve(cfg.state_dir, "last") == log.id
     assert SessionLog.list(cfg.state_dir)[0]["first_message"] == "q1"

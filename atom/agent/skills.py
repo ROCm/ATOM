@@ -48,7 +48,8 @@ class Skill:
 
     @property
     def root(self) -> Path:
-        return self.path.parent if self.kind == "skill" else self.path.parent
+        """The skill's directory (a command's: the commands directory)."""
+        return self.path.parent
 
     def files(self) -> list[str]:
         if self.kind != "skill":

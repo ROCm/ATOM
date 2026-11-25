@@ -22,8 +22,8 @@ from pathlib import Path
 
 from atom.agent import deploy, hardware
 from atom.agent.brain import Brain, connect, discover
-from atom.agent.models import find_models
 from atom.agent.config import DEFAULT_MODEL_ROOTS, DEFAULT_STATE_DIR, AgentConfig
+from atom.agent.models import find_models
 from atom.agent.policy import MODES, Policy
 from atom.agent.prompts import build_system_prompt, machine_brief
 from atom.agent.session import ChatSession, Hooks, SessionLog

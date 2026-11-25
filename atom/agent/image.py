@@ -144,7 +144,7 @@ def _extract(image: str, root: str, paths: tuple[str, ...], dest: Path) -> None:
             and not m.name.startswith(("/", ".."))
             and ".." not in Path(m.name).parts
         ]
-        tar.extractall(dest, members=safe)  # noqa: S202 -- members filtered above
+        tar.extractall(dest, members=safe)
 
 
 def probe(image: str, state_dir: Path) -> ImageInfo | None:
@@ -232,7 +232,7 @@ def _package_dir(name: str) -> Path | None:
     spec = importlib.util.find_spec(name)
     if spec is None or not spec.submodule_search_locations:
         return None
-    return Path(list(spec.submodule_search_locations)[0])
+    return Path(next(iter(spec.submodule_search_locations)))
 
 
 def local_provenance() -> dict:
