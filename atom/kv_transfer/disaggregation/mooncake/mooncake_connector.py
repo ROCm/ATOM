@@ -1688,6 +1688,11 @@ class MooncakeConnector(KVConnectorBase):
 
         if self._rail_pool is not None:
             self._rail_pool.set_regions(reg_ptrs, reg_sizes)
+            # Register every matched rail now. Done lazily on the first
+            # transfer, each rail's registration stalls this process for about
+            # as long as the primary's (mmap lock) and the transfer misses its
+            # deadline.
+            self._rail_pool.build_all()
         if self._landing is not None:
             # Registered and warmed up before any producer can learn its
             # address, and before CUDA graph capture.
