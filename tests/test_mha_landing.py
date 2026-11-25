@@ -171,7 +171,7 @@ class Harness:
             send=lambda addr, parts: c._landing_credits.release(
                 "cpu:1", self.recv.epoch, msgpack.loads(parts[-1])["slots"]
             ),
-            finish=lambda req, failed: self.finished.append((req, failed)),
+            finish=lambda req, failed, wrote: self.finished.append((req, failed)),
             table_segments=16,
         )
         if self.device.type == "cpu":

@@ -271,6 +271,8 @@ class _Request:
     # may yet report holds slots, so its late messages return them.
     reported: bool = False
     stall_logged: bool = False
+    # A stage may have written its pages: a failure then holds them.
+    wrote: bool = False
 
 
 @dataclass
@@ -311,7 +313,7 @@ class LandingReceiver:
     """A decode rank's landing pool, request bookkeeping and scatter thread.
 
     ``send(addr, parts)`` sends a ZMQ message to a prefill stage endpoint;
-    ``finish(req_id, failed)`` reports a request to the connector. Both are
+    ``finish(req_id, failed, wrote)`` reports a request to the connector. Both are
     called without this object's lock held.
     """
 
@@ -327,7 +329,7 @@ class LandingReceiver:
         region_block_bytes: list[int],
         region_indices: list[int],
         send: Callable[[str, list], None],
-        finish: Callable[[str, bool], None],
+        finish: Callable[[str, bool, bool], None],
         table_segments: int,
     ) -> None:
         if not region_indices:
@@ -615,6 +617,7 @@ class LandingReceiver:
         nonce: int,
         success: bool,
         landed_slots: list[int] | None,
+        wrote: bool = True,
     ) -> bool:
         """Record a stage's write-done; False if this request is not tracked.
 
@@ -625,6 +628,7 @@ class LandingReceiver:
         that disagrees with the READYs that arrived, fails the request and
         returns nothing. ``None`` comes from a stage that cannot land, which
         never takes a credit, so its partition goes back to the pool.
+        ``wrote=False`` says the stage never started writing the request.
         """
         outcome = None
         lost: dict[int, int] = {}
@@ -680,6 +684,7 @@ class LandingReceiver:
                     if seq not in stage.seen
                 }
             stage.done = True
+            request.wrote |= wrote
             # Returned here: a lost READY that a reconnect reordered behind
             # this write-done is then a duplicate.
             stage.seen.update(lost)
@@ -709,7 +714,7 @@ class LandingReceiver:
         if lost:
             self._send_credits(stage.stage_addr, list(lost.values()))
         if outcome is not None:
-            self._finish(req_id, outcome)
+            self._finish(req_id, *outcome)
         return True
 
     # -- sweep (main thread) ----------------------------------------------------
@@ -727,7 +732,7 @@ class LandingReceiver:
         stalled: list[tuple[str, float, list[int], list[int]]] = []
         expired: list[tuple[str, list[int]]] = []
         abandoned: list[tuple[str, list[int]]] = []
-        outcomes: list[tuple[str, bool]] = []
+        outcomes: list[tuple[str, tuple[bool, bool]]] = []
         with self._lock:
             for req_id, request in list(self._requests.items()):
                 if request.expired:
@@ -751,6 +756,8 @@ class LandingReceiver:
                     for s in silent.values()
                 ):
                     request.expired, request.expired_at = True, now
+                    # Its silent stages acknowledged, so they may be writing.
+                    request.wrote = True
                     self._fail_locked(request)
                     expired.append((req_id, list(silent)))
                     outcome = self._settle_locked(req_id, request)
@@ -807,9 +814,9 @@ class LandingReceiver:
                 req_id,
                 silent,
             )
-        for req_id, failed in outcomes:
+        for req_id, outcome in outcomes:
             try:
-                self._finish(req_id, failed)
+                self._finish(req_id, *outcome)
             except Exception:
                 # The other requests still have to be reported.
                 logger.exception("[PD-LANDING] reporting req %s failed", req_id)
@@ -973,7 +980,7 @@ class LandingReceiver:
     def _complete(self, tasks: list[_Task], failed_ids: set[str]) -> None:
         """Release the tasks' pending counts and credits; settle requests."""
         credits: dict[str, list[int]] = {}
-        outcomes: list[tuple[str, bool]] = []
+        outcomes: list[tuple[str, tuple[bool, bool]]] = []
         with self._lock:
             touched: dict[str, _Request] = {}
             for task in tasks:
@@ -992,9 +999,9 @@ class LandingReceiver:
                     outcomes.append((req_id, outcome))
         for addr, slots in credits.items():
             self._send_credits(addr, slots)
-        for req_id, failed in outcomes:
+        for req_id, outcome in outcomes:
             try:
-                self._finish(req_id, failed)
+                self._finish(req_id, *outcome)
             except Exception:
                 logger.exception("[PD-LANDING] reporting req %s failed", req_id)
 
@@ -1016,15 +1023,18 @@ class LandingReceiver:
     def _fail_locked(self, request: _Request) -> None:
         request.failed = True
 
-    def _settle_locked(self, req_id: str, request: _Request) -> bool | None:
+    def _settle_locked(
+        self, req_id: str, request: _Request
+    ) -> tuple[bool, bool] | None:
         """Report and retire the request when it is ready; the outcome to report.
 
         A request is reported once nothing is pending and every stage ended,
         or, expired, once nothing is pending. An expired request stays
         tracked until its silent stages end too, so their late READYs and
         write-done still return the slots they name, the way they would for
-        a request still open. Returns whether it failed when the connector
-        is to hear of it now, else None.
+        a request still open. Returns whether it failed and whether a stage
+        may have written it when the connector is to hear of it now, else
+        None.
         """
         if request.pending:
             return None
@@ -1038,7 +1048,7 @@ class LandingReceiver:
         request.reported = True
         if ended:
             self._retire_locked(req_id, request)
-        return request.failed
+        return request.failed, request.wrote
 
     def _retire_locked(self, req_id: str, request: _Request) -> None:
         del self._requests[req_id]

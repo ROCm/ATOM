@@ -1176,6 +1176,7 @@ def _make_connector(**overrides):
     conn._received_handoffs = {}
     conn._pending_recv_stages = {}
     conn._pending_recv_failed = set()
+    conn._pending_recv_wrote = set()
     conn._pending_recv_nonce = {}
     conn._pending_recv_acks = {}
     conn._pending_recv_stall_watch = {}
@@ -1573,7 +1574,7 @@ def test_a_stalled_receive_is_logged_once(monkeypatch, caplog, acked):
         conn._expire_pending_recvs()
     (record,) = [r for r in caplog.records if "has waited" in r.getMessage()]
     assert "1 of 2 reported" in record.getMessage()
-    assert ("never acknowledged" in record.getMessage()) == (not acked)
+    assert ("not started sending" in record.getMessage()) == (not acked)
     assert record.levelno == (logging.WARNING if acked else logging.ERROR)
     assert conn.failed_recving == set()
 
