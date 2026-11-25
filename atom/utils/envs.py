@@ -1383,6 +1383,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KV_EVENTS_ENDPOINT", "tcp://127.0.0.1:5557"
     ),
     "ATOM_KV_EVENTS_TOPIC": lambda: os.getenv("ATOM_KV_EVENTS_TOPIC", ""),
+    # For each device this process sees, in its own order, the ordinal the
+    # node's UMBP server knows it by. An engine launched with its devices
+    # masked (HIP_VISIBLE_DEVICES) numbers them from 0, while one server for
+    # the node sees them all. Empty: the server numbers them as this process.
+    "ATOM_UMBP_DEVICE_ORDINALS": lambda: os.getenv("ATOM_UMBP_DEVICE_ORDINALS", ""),
     # ROUTER endpoint for the replay socket; empty string disables replay.
     "ATOM_KV_EVENTS_REPLAY_ENDPOINT": lambda: os.getenv(
         "ATOM_KV_EVENTS_REPLAY_ENDPOINT", ""

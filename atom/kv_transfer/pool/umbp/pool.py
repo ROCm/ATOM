@@ -58,6 +58,7 @@ from typing import Any
 
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 from atom.model_engine.block_pool import BlockPool
+from atom.utils import envs
 from atom.model_engine.kv_block import Block
 from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
 
@@ -80,6 +81,27 @@ def _load_client_module():
 def _connect(settings: UmbpPoolSettings):
     module = _load_client_module()
     return module, module.L1Client(settings.address)
+
+
+def server_device(index: int | None) -> int:
+    """This process's device `index` as the UMBP server numbers it.
+
+    The server opens a pool's memory on the device it is told. One server
+    serves every engine of its node, and an engine launched with its devices
+    masked counts them from 0: `ATOM_UMBP_DEVICE_ORDINALS` then names, for each
+    device this process sees, the server's ordinal. Unset, both number alike.
+    """
+    index = index or 0
+    raw = envs.ATOM_UMBP_DEVICE_ORDINALS.strip()
+    if not raw:
+        return index
+    ordinals = [int(part) for part in raw.split(",") if part.strip()]
+    if index >= len(ordinals):
+        raise ValueError(
+            f"ATOM_UMBP_DEVICE_ORDINALS={raw!r} names {len(ordinals)} devices, "
+            f"and this pool is on device {index}"
+        )
+    return ordinals[index]
 
 
 def pool_id_for(config, settings: UmbpPoolSettings, rank: int = 0) -> str:
@@ -721,7 +743,7 @@ class UmbpPoolMemory(KVPoolMemory):
             )
         allocation = hip_ipc.get_allocation_base(base)
         handle = hip_ipc.get_ipc_handle(allocation)
-        device = buf.device.index if buf.device.index is not None else 0
+        device = server_device(buf.device.index)
         self._client.attach(
             self.pool_id,
             self.group,
@@ -734,13 +756,14 @@ class UmbpPoolMemory(KVPoolMemory):
         self._mapped_base = base
         logger.info(
             "UMBP pool %s: adopted %d of %d blocks (ratio %.2f) of this process's "
-            "%.2f GiB pool on %s",
+            "%.2f GiB pool on %s (the server's device %d)",
             self.pool_id,
             slots,
             num_blocks,
             self.ratio,
             buf.numel() / (1 << 30),
             buf.device,
+            device,
         )
 
 

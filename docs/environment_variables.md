@@ -467,7 +467,7 @@ and catches it; set it when chasing a corruption that does not reproduce.
 
 ## KV pool backend
 
-No variables. The paged KV pool is the engine's own unless a KV connector
+The paged KV pool is the engine's own unless a KV connector
 provides it (`KVConnectorBase.kv_pool_memory`,
 `KVConnectorSchedulerBase.make_block_pool`). The `umbp_pool` connector hands it to
 a MORI-UMBP standalone server so DP ranks share cached prefixes; it is set up
@@ -480,6 +480,10 @@ are documented in `atom/kv_transfer/pool/umbp/settings.py`. It serves
 DeepSeek-V4.1 under data-parallel attention (one runner per engine rank) and
 needs a MORI build whose UMBP L1 client copies into held slots (`Fetch` with
 `dst_slots`); startup refuses other models and tensor-parallel attention.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_UMBP_DEVICE_ORDINALS** | str | "" | For each device this process sees, in its own order, the ordinal the node's UMBP server knows it by (comma separated). One server serves every engine of its node and opens a pool's memory on the device it is told; an engine launched with its devices masked (`HIP_VISIBLE_DEVICES=4,5`) counts them from 0, so it is given `4,5`. Empty: the server numbers the devices as this process does. |
 
 ## State checkpoints
 

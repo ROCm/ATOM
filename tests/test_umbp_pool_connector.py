@@ -99,6 +99,23 @@ class TestRegistry:
         assert KVConnectorFactory.pool_sharing(config_with(cfg)) is None
 
 
+class TestServerDevice:
+    """One server for a node sees every device; an engine launched under a
+    device mask counts its own from 0 (`pool.server_device`)."""
+
+    def test_unset_both_number_alike(self, monkeypatch):
+        monkeypatch.delenv("ATOM_UMBP_DEVICE_ORDINALS", raising=False)
+        assert [umbp_pool.server_device(i) for i in (None, 0, 1)] == [0, 0, 1]
+
+    def test_a_masked_engine_names_the_servers_ordinals(self, monkeypatch):
+        # The third of four two-device engines on a node: its devices are the
+        # server's 4 and 5.
+        monkeypatch.setenv("ATOM_UMBP_DEVICE_ORDINALS", "4,5")
+        assert [umbp_pool.server_device(i) for i in (0, 1)] == [4, 5]
+        with pytest.raises(ValueError, match="names 2 devices"):
+            umbp_pool.server_device(2)
+
+
 class TestRouterReport:
     """What `/kv_event_sources` tells a router of the pool a rank's blocks live
     in: the ranks of one node that report one address and group, with `fetch`
