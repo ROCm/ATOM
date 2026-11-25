@@ -10,10 +10,12 @@ to drop the field on both legs, so the decode recomputed the whole prompt.
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
 import pytest
+from jinja2 import TemplateError
 
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.serving_anthropic import (
@@ -52,8 +54,7 @@ def server(monkeypatch):
     def encode(text, **_kw):
         return [0] * (LONG_PROMPT_TOKENS if text == "<long prompt>" else 2)
 
-    # Only what the engine does: count what it is handed. Any cut is the
-    # production code's (`_prepare_prompt`).
+    # Only what the engine does: count what it is handed.
     async def fake_generate_async(prompt, _sampling, _request_id, **kwargs):
         calls.generate.append((prompt, kwargs))
         output = {
@@ -110,15 +111,19 @@ def _messages(**kwargs):
     return asyncio.run(api_server.anthropic_messages(request, None))
 
 
-def _responses(body):
+def _post(path, body):
     async def post():
         transport = httpx.ASGITransport(app=api_server.app)
         async with httpx.AsyncClient(
             transport=transport, base_url="http://test"
         ) as client:
-            return await client.post("/v1/responses", json=body)
+            return await client.post(path, json=body)
 
     return asyncio.run(post())
+
+
+def _responses(body):
+    return _post("/v1/responses", body)
 
 
 class TestMessages:
@@ -180,12 +185,33 @@ class TestResponses:
         assert server.generate == []
 
 
-class TestBothLegsTruncateAlike:
-    """Prefill gets max_tokens=1, decode the client's value: same prompt."""
+def _admit(monkeypatch):
+    """Run the admission check the real engine call runs."""
 
-    @staticmethod
-    def _sent_prompt(server, endpoint, max_tokens, kv):
-        server.generate.clear()
+    async def admit(prompt, sampling, _request_id, **_kw):
+        seq = SimpleNamespace(
+            num_prompt_tokens=len(prompt), max_tokens=sampling.max_tokens
+        )
+        api_server._validate_sequence_context_length(seq, sampling)
+        yield {}
+
+    monkeypatch.setattr(api_server, "generate_async", admit)
+
+
+class TestNotCut:
+    """Neither endpoint cuts an over-long prompt: a cut drops its end, the
+    latest turn and the generation prompt, and answers 200 on the rest.
+    Admission refuses it instead, and both PD legs run the same prompt."""
+
+    @pytest.mark.parametrize("endpoint", ["messages", "responses"])
+    @pytest.mark.parametrize("kv", [None, HANDOFF])
+    @pytest.mark.parametrize("max_tokens", [1, 4096])
+    def test_the_whole_prompt_reaches_the_engine(
+        self, server, endpoint, kv, max_tokens
+    ):
+        # The stub engine skips admission, so with 4096 this request, which
+        # admission refuses, still shows what the engine would be handed.
+        server.template = "<long prompt>"
         if endpoint == "messages":
             _messages(max_tokens=max_tokens, kv_transfer_params=kv)
         else:
@@ -193,49 +219,245 @@ class TestBothLegsTruncateAlike:
             if kv is not None:
                 body["kv_transfer_params"] = kv
             _responses(body)
-        return server.generate[0][0]
+        assert len(server.generate[0][0]) == LONG_PROMPT_TOKENS
 
     @pytest.mark.parametrize("endpoint", ["messages", "responses"])
-    def test_with_handoff_the_prompt_does_not_depend_on_max_tokens(
-        self, server, endpoint
-    ):
-        server.template = "<long prompt>"
-
-        prefill = self._sent_prompt(server, endpoint, 1, HANDOFF)
-        decode = self._sent_prompt(server, endpoint, 4096, HANDOFF)
-
-        assert len(prefill) == len(decode) == MAX_CTX - MAX_CTX // 8
-
-    @pytest.mark.parametrize("endpoint", ["messages", "responses"])
-    def test_without_handoff_truncation_still_follows_max_tokens(
-        self, server, endpoint
-    ):
-        server.template = "<long prompt>"
-
-        # max_tokens=1 leaves room for the whole prompt; 4096 does not.
-        assert len(self._sent_prompt(server, endpoint, 1, None)) == LONG_PROMPT_TOKENS
-        assert (
-            len(self._sent_prompt(server, endpoint, 4096, None))
-            == MAX_CTX - MAX_CTX // 8
-        )
-
-    @pytest.mark.parametrize("endpoint", ["messages", "responses"])
-    def test_input_tokens_are_the_engine_count_of_what_it_ran(self, server, endpoint):
+    def test_input_tokens_are_the_whole_prompt(self, server, endpoint):
         server.template = "<long prompt>"
         if endpoint == "messages":
-            usage = _messages(max_tokens=4096)["usage"]
+            usage = _messages(max_tokens=1)["usage"]
         else:
-            body = {"model": "m", "input": "hi", "max_output_tokens": 4096}
+            body = {"model": "m", "input": "hi", "max_output_tokens": 1}
             usage = _responses(body).json()["usage"]
-        assert usage["input_tokens"] == MAX_CTX - MAX_CTX // 8
+        assert usage["input_tokens"] == LONG_PROMPT_TOKENS
+
+    def test_responses_refuses_with_openais_context_code(self, server, monkeypatch):
+        # Codex reads this code: it compacts, or reports an exhausted context.
+        _admit(monkeypatch)
+        server.template = "<long prompt>"
+        reply = _responses({"model": "m", "input": "hi", "max_output_tokens": 4096})
+        assert reply.status_code == 400
+        error = reply.json()["error"]
+        assert error["code"] == "context_length_exceeded"
+        assert error["message"].startswith("This model's maximum context length")
+
+    @pytest.mark.parametrize(
+        "path, body",
+        [
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+            ("/v1/completions", {"prompt": "<long prompt>"}),
+        ],
+    )
+    def test_chat_and_completions_refuse_with_openais_context_code(
+        self, server, monkeypatch, path, body
+    ):
+        async def refuse(*_a, **_kw):
+            # What admission raises for an over-long request.
+            api_server._validate_context_length(8000, 4096, MAX_CTX)
+            yield {}
+
+        monkeypatch.setattr(api_server, "generate_async", refuse)
+        reply = _post(path, {"model": "m", "max_tokens": 4096, **body})
+        assert reply.status_code == 400
+        error = reply.json()["error"]
+        assert error["code"] == "context_length_exceeded"
+        assert error["message"].startswith("This model's maximum context length")
+
+    @pytest.mark.parametrize(
+        "path, body",
+        [
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+            ("/v1/responses", {"input": "hi"}),
+        ],
+    )
+    def test_any_other_value_error_keeps_code_400(
+        self, server, monkeypatch, path, body
+    ):
+        async def refuse(*_a, **_kw):
+            raise ValueError("bad request")
+            yield {}
+
+        monkeypatch.setattr(api_server, "generate_async", refuse)
+        reply = _post(path, {"model": "m", "max_tokens": 16, **body})
+        assert reply.status_code == 400
+        assert reply.json()["error"] == {
+            "message": "bad request",
+            "type": "invalid_request_error",
+            "code": 400,
+        }
+
+    @pytest.mark.parametrize(
+        "prompt_tokens, max_tokens, message",
+        [
+            # The prompt fits, its output does not: Claude Code lowers max_tokens.
+            (
+                8000,
+                4096,
+                (
+                    "input length and `max_tokens` exceed context limit: 8000 + "
+                    "4096 > 8192, decrease input length or `max_tokens` and try again"
+                ),
+            ),
+            # The prompt alone fills the context: Claude Code compacts.
+            (8192, 16, "prompt is too long: 8192 tokens > 8191 maximum"),
+            # max_tokens omitted: admission clamps it, and refuses only a full one.
+            (8192, None, "prompt is too long: 8192 tokens > 8191 maximum"),
+        ],
+    )
+    def test_an_over_long_request_is_refused_in_anthropic_wording(
+        self, server, monkeypatch, prompt_tokens, max_tokens, message
+    ):
+        monkeypatch.setattr(
+            api_server.engine.io_processor,
+            "encode_prompt",
+            lambda _text, **_kw: [0] * prompt_tokens,
+        )
+
+        _admit(monkeypatch)
+        kwargs = {} if max_tokens is None else {"max_tokens": max_tokens}
+        reply = _messages(**kwargs)
+        assert reply.status_code == 400
+        assert json.loads(reply.body)["error"] == {
+            "type": "invalid_request_error",
+            "message": message,
+        }
+
+    @pytest.mark.parametrize("max_tokens", [16, 4096])
+    def test_a_prompt_the_kv_pool_cannot_hold_is_too_long(
+        self, server, monkeypatch, max_tokens
+    ):
+        # With 4096 the context limit fails too (8000 + 4096 > 8192); the pool
+        # answers first, since a smaller max_tokens cannot help.
+        monkeypatch.setattr(api_server, "_get_engine_max_pool_tokens", lambda: 4000)
+        _admit(monkeypatch)
+        server.template = "<long prompt>"
+        reply = _messages(max_tokens=max_tokens)
+        assert reply.status_code == 400
+        assert json.loads(reply.body)["error"]["message"] == (
+            "prompt is too long: 8000 tokens > 4000 maximum"
+        )
+
+    def test_a_pool_larger_than_the_context_is_not_the_limit_reported(
+        self, server, monkeypatch
+    ):
+        # The pool is sized from free memory, so it is often larger than the
+        # context. A prompt past both is too long for the context, not the pool.
+        monkeypatch.setattr(api_server, "_get_engine_max_pool_tokens", lambda: 20000)
+        monkeypatch.setattr(
+            api_server.engine.io_processor,
+            "encode_prompt",
+            lambda _text, **_kw: [0] * 30000,
+        )
+        _admit(monkeypatch)
+        reply = _messages(max_tokens=16)
+        assert reply.status_code == 400
+        assert json.loads(reply.body)["error"]["message"] == (
+            "prompt is too long: 30000 tokens > 8191 maximum"
+        )
+
+    def test_a_smaller_pool_answers_before_the_default_output_clamp(
+        self, server, monkeypatch
+    ):
+        # max_tokens omitted and the prompt fills the context: the pool, the
+        # tighter limit, is what the client is told.
+        monkeypatch.setattr(api_server, "_get_engine_max_pool_tokens", lambda: 4000)
+        monkeypatch.setattr(
+            api_server.engine.io_processor,
+            "encode_prompt",
+            lambda _text, **_kw: [0] * MAX_CTX,
+        )
+        _admit(monkeypatch)
+        reply = _messages()
+        assert reply.status_code == 400
+        assert json.loads(reply.body)["error"]["message"] == (
+            f"prompt is too long: {MAX_CTX} tokens > 4000 maximum"
+        )
+
+    @staticmethod
+    def _with_mid_system(server, monkeypatch, template, **request_kw):
+        monkeypatch.setattr(api_server, "apply_chat_template", template)
+        messages = request_kw.pop(
+            "messages",
+            [
+                AnthropicMessage(role="user", content="hi"),
+                AnthropicMessage(role="system", content="reminder"),
+            ],
+        )
+        request = AnthropicMessagesRequest(
+            model="m", max_tokens=16, messages=messages, **request_kw
+        )
+        return asyncio.run(api_server.anthropic_messages(request, None))
+
+    def test_a_template_that_refuses_a_system_message_is_a_400(
+        self, server, monkeypatch
+    ):
+        def refuse(_tok, _enc, messages, **_kw):
+            if any(m.role == "system" for m in messages[1:]):
+                raise TemplateError("System message must be at the beginning.")
+            return "<rendered prompt>"
+
+        reply = self._with_mid_system(server, monkeypatch, refuse)
+        assert reply.status_code == 400
+        # The wording Claude Code retries on, folding the message into a user turn.
+        assert json.loads(reply.body)["error"]["message"].startswith(
+            'Unexpected role "system"'
+        )
+
+    def test_a_template_that_fails_for_another_reason_is_not_blamed_on_it(
+        self, server, monkeypatch
+    ):
+        def fail(*_a, **_kw):
+            raise TemplateError("Tool names may not contain '::'.")
+
+        reply = self._with_mid_system(server, monkeypatch, fail)
+        # Not the retry-on-fold 400: folding would fail the same way.
+        assert reply.status_code == 500
+        assert json.loads(reply.body)["error"]["message"] == (
+            "Tool names may not contain '::'."
+        )
+
+    def test_a_template_with_no_system_role_is_not_blamed_on_a_mid_one(
+        self, server, monkeypatch
+    ):
+        # Gemma style: no system message at all. With only the top-level system
+        # prompt there is nothing mid-conversation to fold, so the original
+        # error comes back.
+        def no_system(_tok, _enc, messages, **_kw):
+            if any(m.role == "system" for m in messages):
+                raise TemplateError("System role not supported")
+            return "<rendered prompt>"
+
+        reply = self._with_mid_system(
+            server,
+            monkeypatch,
+            no_system,
+            system="top",
+            messages=[AnthropicMessage(role="user", content="hi")],
+        )
+        assert reply.status_code == 500
+        assert json.loads(reply.body)["error"]["message"] == "System role not supported"
+
+    def test_a_failing_re_render_keeps_the_original_error(self, server, monkeypatch):
+        def refuse_then_raise(_tok, _enc, messages, **_kw):
+            if any(m.role == "system" for m in messages[1:]):
+                raise TemplateError("System message must be at the beginning.")
+            raise ValueError("something unrelated")
+
+        reply = self._with_mid_system(server, monkeypatch, refuse_then_raise)
+        assert reply.status_code == 500
+        assert json.loads(reply.body)["error"]["message"] == (
+            "System message must be at the beginning."
+        )
 
 
-class TestStructuredResponsesCutFirst:
+class TestStructuredResponsesSeeding:
     """A structured /v1/responses request builds its reasoning channel into the
     sampling params before the engine call; both are seeded from the text the
     engine runs."""
 
-    def test_over_the_cap_the_engine_gets_the_kept_ids(self, server, monkeypatch):
+    def test_the_engine_gets_the_encoded_ids_and_the_channel_its_text(
+        self, server, monkeypatch
+    ):
         server.template = "<long prompt>"
         configured = []
         seeds = []
@@ -257,16 +479,14 @@ class TestStructuredResponsesCutFirst:
             {
                 "model": "m",
                 "input": "hi",
-                "max_output_tokens": 4096,
+                "max_output_tokens": 16,
                 "text": {"format": {"type": "json_object"}},
             }
         )
 
         assert response.status_code == 200, response.text
         sent, _kwargs = server.generate[0]
-        kept = MAX_CTX - MAX_CTX // 8
         assert configured == ['{"type": "object"}']
-        # The engine is handed the kept ids, and does not tokenize again.
-        assert sent == [0] * kept
-        # The channel was seeded from the cut text, before the engine call.
-        assert seeds[0] == f"<{kept}>"
+        # The engine is handed the encoded ids, and does not tokenize again.
+        assert sent == [0] * LONG_PROMPT_TOKENS
+        assert seeds[0] == "<long prompt>"

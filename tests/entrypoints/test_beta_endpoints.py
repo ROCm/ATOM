@@ -778,9 +778,10 @@ def test_zero_max_tokens_records_no_time_to_first_token(no_generation, stream, n
 
 
 def test_zero_max_tokens_still_needs_the_prompt_to_fit(no_generation):
-    with pytest.raises(HTTPException) as exc:
-        _beta_complete(prompt="x" * 65, echo=True, max_tokens=0)
-    assert exc.value.status_code == 400
+    request = BetaCompletionRequest(model="m", prompt="x" * 65, echo=True, max_tokens=0)
+    response = asyncio.run(api_server.beta_completions(request, None))
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["code"] == "context_length_exceeded"
 
 
 def test_v1_completions_still_need_a_token(engine):
