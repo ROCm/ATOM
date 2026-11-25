@@ -115,14 +115,21 @@ def project_query_fp4(query, rope, positions, hidden, weights_proj_weight):
     hidden], `weights_proj_weight` [heads, hidden]. `(values, scales)` match
     `quantize_query_fp4`'s NATURAL output, which rounds the rotated values to
     the query dtype (`round_rope=True`); `weights` [rows, heads] is the raw
-    bf16 projection `Indexer.project` returns, which `score_quantized` then
-    folds `weights_scale` into (so no scale is applied here).
+    bf16 projection `Indexer.project` returns, written as bf16 by the kernel,
+    which `score_quantized` then folds `weights_scale` into (so no scale is
+    applied here).
 
     `Indexer.project` decides whether to call this. `rope.cos_sin_cache` is
     the `[max_pos, rope_dim]` cos|sin table `DeepseekV41ForCausalLM.__init__`
-    builds for `global_rope` only, the rope an indexer layer receives."""
+    builds for `global_rope` only, the rope an indexer layer receives.
+
+    Requires aiter's `q_rope_mxfp4_quant(weights_dtype=...)`."""
     from aiter.ops.triton.rope.q_rope_mxfp4_quant import q_rope_mxfp4_quant
 
+    # The OPUS FP4 MQA scorer reads BF16 head weights, as the baseline
+    # `weights_proj` GEMM emits. The kernel already rounds the projection
+    # through bf16, so it stores bf16 directly (lossless): no f32 round trip
+    # and no separate cast launch.
     q_fp4, q_scale, weights = q_rope_mxfp4_quant(
         query,
         positions,
@@ -130,8 +137,6 @@ def project_query_fp4(query, rope, positions, hidden, weights_proj_weight):
         weights_scale=1.0,
         hidden=hidden.contiguous(),
         weights_proj=weights_proj_weight,
+        weights_dtype=torch.bfloat16,
     )
-    # The OPUS FP4 MQA scorer reads BF16 head weights, as the baseline
-    # `weights_proj` GEMM emits; the aiter op returns them f32, so round back
-    # (lossless -- the kernel already rounded the projection through bf16).
-    return (q_fp4.unsqueeze(1), q_scale.unsqueeze(1)), weights.to(torch.bfloat16)
+    return (q_fp4.unsqueeze(1), q_scale.unsqueeze(1)), weights
