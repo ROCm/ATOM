@@ -1208,11 +1208,13 @@ impl PrefillCharge {
         })
     }
 
-    pub fn release(&self) {
+    /// True when this call released the tokens, false when there were none left.
+    pub fn release(&self) -> bool {
         let tokens = self.tokens.swap(0, Ordering::AcqRel);
         if tokens > 0 {
             self.worker.release_prefill_tokens(tokens);
         }
+        tokens > 0
     }
 }
 

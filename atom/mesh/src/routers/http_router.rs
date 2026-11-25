@@ -22,6 +22,7 @@ use crate::{
         ConnectionMode, RetryExecutor, WorkerLoadGuard, WorkerRegistry, WorkerType,
         UNKNOWN_MODEL_ID,
     },
+    kv_events::KvEventMonitor,
     observability::{
         events::{self, Event},
         metrics::{metrics_labels, MeshMetrics},
@@ -70,6 +71,7 @@ impl Router {
         descriptor: &RequestDescriptor<'_>,
         planner: &dyn PdPlanner,
         policy: Arc<dyn crate::policies::LoadBalancingPolicy>,
+        kv_events: Option<&KvEventMonitor>,
     ) -> Response {
         use super::comm::error::IngressError;
         let metadata = &request.metadata;
@@ -97,6 +99,11 @@ impl Router {
         );
         let load = WorkerLoadGuard::new(worker.clone(), Some(&request.headers))
             .with_prefill_tokens(prefill_tokens);
+        if let (false, Some(monitor), Some(tokens)) =
+            (descriptor.stream, kv_events, descriptor.tokens)
+        {
+            monitor.watch_prefill(worker.url(), tokens, &load.prefill_charge());
+        }
         let headers = match header_utils::inference_request_headers(
             &request.headers,
             metadata.route,
@@ -476,7 +483,13 @@ impl RouterTrait for Router {
             &self.retry_config,
             |_| async {
                 let response = self
-                    .send_inference_once(&request, &descriptor, &planner, policy.clone())
+                    .send_inference_once(
+                        &request,
+                        &descriptor,
+                        &planner,
+                        policy.clone(),
+                        app.kv_event_monitor.as_deref(),
+                    )
                     .await;
                 MeshMetrics::record_router_upstream_response(
                     metrics_labels::ROUTER_HTTP,

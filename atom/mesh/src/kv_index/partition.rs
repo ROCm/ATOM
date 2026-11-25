@@ -2,10 +2,11 @@
 //! and the writer thread that alone applies their admitted batches, in order. The prompts
 //! routed to each worker are predictions on lanes of a second index, kept apart from the
 //! events. A predicted block matches until the first sweep after a TTL from its last
-//! routing, so for up to TTL + TTL/8.
+//! routing, so for up to TTL + TTL/8. A non-streaming prefill's charge waits on its rank's
+//! lane for the store of its last full prompt block.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Weak,
@@ -26,7 +27,13 @@ use super::{
     index::{find_matches, HolderTable, Op, PrefixIndex},
     HolderId, PrefixHash,
 };
-use crate::kv_events::{model::KvEvent, SourceStatus};
+use crate::{
+    core::worker::PrefillCharge,
+    kv_events::{
+        model::{KvEvent, StoredBlock},
+        SourceStatus,
+    },
+};
 
 /// Admitted batches a partition's writer may fall behind by before its ranks wait.
 const QUEUED_BATCHES: usize = 1024;
@@ -55,6 +62,8 @@ pub(crate) struct Partition {
     predictions: mpsc::Sender<Write>,
     /// Tokens of the prompts queued in `predictions`.
     queued_tokens: AtomicUsize,
+    /// Prefill charges by the lane and last full prompt block they wait for, oldest first.
+    pub(super) watches: Mutex<HashMap<(HolderId, PrefixHash), VecDeque<Weak<PrefillCharge>>>>,
 }
 
 enum Write {
@@ -92,6 +101,7 @@ impl Partition {
             behind: AtomicBool::new(false),
             predictions,
             queued_tokens: AtomicUsize::new(0),
+            watches: Mutex::default(),
         });
         let writer = Arc::downgrade(&partition);
         std::thread::Builder::new()
@@ -129,6 +139,40 @@ impl Partition {
             );
         }
         predictor
+    }
+
+    /// Releases `charge` when the rank on `lane` stores the last full block of `tokens`;
+    /// a prompt shorter than a block has none to wait for.
+    pub(crate) fn watch_prefill(
+        &self,
+        lane: HolderId,
+        tokens: &[u32],
+        charge: &Arc<PrefillCharge>,
+    ) {
+        if let Some(&last) = hash::prefix_hashes(tokens, self.block_size).last() {
+            let mut watches = self.watches.lock();
+            let waiting = watches.entry((lane, last)).or_default();
+            waiting.push_back(Arc::downgrade(charge));
+        }
+    }
+
+    /// Each block stored on `lane` releases the oldest charge waiting for it that is still
+    /// held, as each prefill that computes the block stores it once.
+    fn release_prefills(&self, lane: HolderId, stored: &[PrefixHash]) {
+        let mut watches = self.watches.lock();
+        for &hash in stored {
+            let Some(waiting) = watches.get_mut(&(lane, hash)) else {
+                continue;
+            };
+            while let Some(watch) = waiting.pop_front() {
+                if watch.upgrade().is_some_and(|charge| charge.release()) {
+                    break;
+                }
+            }
+            if waiting.is_empty() {
+                watches.remove(&(lane, hash));
+            }
+        }
     }
 }
 
@@ -277,6 +321,10 @@ async fn write(
                     });
                     partition.predicted.apply(lane, &mut ops);
                 }
+                partition.watches.lock().retain(|_, waiting| {
+                    waiting.retain(|watch| watch.strong_count() > 0);
+                    !waiting.is_empty()
+                });
                 continue;
             }
         };
@@ -294,11 +342,22 @@ async fn write(
                 if reset {
                     table.clear(&mut ops);
                 }
+                // Each stored block's prefix, held already or new.
+                let mut stored = Vec::new();
                 let dropped: Vec<_> = events
                     .iter()
-                    .filter_map(|event| table.apply(event, &mut ops).err())
+                    .filter_map(|event| {
+                        let applied = table.apply(event, &mut ops);
+                        if let KvEvent::Stored { blocks, .. } = event {
+                            let prefix =
+                                |block: &StoredBlock| table.prefixes.get(&block.hash).copied();
+                            stored.extend(blocks.iter().filter_map(prefix));
+                        }
+                        applied.err()
+                    })
                     .collect();
                 partition.index.apply(holder, &mut ops);
+                partition.release_prefills(holder, &stored);
                 let mut status = status.lock();
                 status.indexed_blocks = Some(table.len() as u64);
                 for reason in dropped {
@@ -310,6 +369,10 @@ async fn write(
                     table.clear(&mut ops);
                     partition.index.apply(holder, &mut ops);
                 }
+                partition
+                    .watches
+                    .lock()
+                    .retain(|&(lane, _), _| lane != holder);
                 *partition.lanes.lock() &= !(1 << holder.0);
             }
             Write::Predict(lane, tokens) => {

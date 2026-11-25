@@ -34,7 +34,7 @@ use super::{
     wire::{self, DecodedBatch},
 };
 use crate::{
-    core::Worker,
+    core::{worker::PrefillCharge, Worker},
     kv_index::{match_lanes, Holder, Lane, Partition, Predictor, PrefixMatchProvider},
     observability::metrics::schema::names,
 };
@@ -208,6 +208,19 @@ impl KvEventMonitor {
     pub fn detach(&self, worker: &str) {
         self.predictors.remove(worker);
         self.subscriptions.remove(worker);
+    }
+
+    /// Releases `charge` when `worker`'s followed rank stores the last full block of
+    /// `tokens`. Nothing waits without a followed rank or a full block.
+    pub fn watch_prefill(&self, worker: &str, tokens: &[u32], charge: &Arc<PrefillCharge>) {
+        // Under the entry's lock, so the rank keeps its lane until the charge waits on it, and
+        // the lane's release drops the charge with the rank's other watches.
+        let Some(subscription) = self.subscriptions.get(worker) else {
+            return;
+        };
+        if let Some(((partition, lane), _)) = subscription.events() {
+            partition.watch_prefill(lane, tokens, charge);
+        }
     }
 
     fn partition(&self, model_id: &str, pool: &'static str, block_size: u32) -> Arc<Partition> {
@@ -599,7 +612,7 @@ fn record(status: &mut SourceStatus, trust: Trust, seq: u64, batch: &DecodedBatc
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use zeromq::{util::PeerIdentity, PubSocket, RouterSocket};
 
     use super::*;
@@ -738,6 +751,33 @@ mod tests {
     fn free_endpoint() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         format!("tcp://{}", listener.local_addr().unwrap())
+    }
+
+    /// Follows rank 1 of `worker`, alone on `monitor`, from a publisher of blocks of 4
+    /// tokens, once its stream is joined.
+    pub(crate) async fn followed(monitor: &KvEventMonitor, worker: &str) -> PubSocket {
+        let endpoint = free_endpoint();
+        let source = KvEventSource {
+            endpoint: endpoint.clone(),
+            topic: "kv".into(),
+            block_size: 4,
+            ..Default::default()
+        };
+        monitor.attach(worker, "m", "regular", 1, source);
+        let mut publisher = bind(&endpoint).await;
+        clear_until(&mut publisher, monitor, |s| s.batches > 0).await;
+        publisher
+    }
+
+    /// Publishes rank 1's store of the full blocks of `tokens` from the root, each block
+    /// hashed as its last token.
+    pub(crate) async fn publish_stored(publisher: &mut PubSocket, seq: u64, tokens: &[u32]) {
+        let blocks = &tokens[..tokens.len() / 4 * 4];
+        let hashes: Vec<u32> = blocks.chunks(4).map(|block| block[3]).collect();
+        let stored = format!(
+            r#"[{{"type": "BlockStored", "block_hashes": {hashes:?}, "token_ids": {blocks:?}, "block_size": 4, "medium": "GPU"}}]"#
+        );
+        publish(publisher, "kv", seq, &stored, 1).await;
     }
 
     /// Waits for the writers to apply the prompts routed, until `workers` match `hits`.

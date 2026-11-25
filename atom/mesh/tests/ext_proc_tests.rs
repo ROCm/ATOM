@@ -299,6 +299,83 @@ async fn streaming_prefill_charge_is_released_at_first_response_body() {
     fixture.runtime.shutdown().await.unwrap();
 }
 
+/// Publishes ATOM's batch of `events` at rank 0, as an engine with an empty topic does.
+async fn publish(publisher: &mut zeromq::PubSocket, seq: u64, events: serde_json::Value) {
+    use zeromq::SocketSend;
+    let batch = rmpv::ext::to_value(serde_json::json!([1.0, events, 0])).unwrap();
+    let mut payload = Vec::new();
+    rmpv::encode::write_value(&mut payload, &batch).unwrap();
+    let mut message = zeromq::ZmqMessage::from(bytes::Bytes::new());
+    message.push_back(bytes::Bytes::copy_from_slice(&seq.to_be_bytes()));
+    message.push_back(payload.into());
+    publisher.send(message).await.unwrap();
+}
+
+#[tokio::test]
+async fn non_streaming_prefill_is_released_by_the_kv_event_or_the_first_response_body() {
+    use zeromq::Socket;
+    let fixture = Fixture::new(RouterConfig {
+        policy: mesh::config::PolicyConfig::Agentic {
+            request_token_equivalent: 512,
+            eviction_interval_secs: 120,
+            max_tree_size: 1 << 20,
+        },
+        kv_events: true,
+        ..Default::default()
+    })
+    .await;
+    let mut publisher = zeromq::PubSocket::new();
+    let endpoint = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
+    let monitor = fixture.app.kv_event_monitor.clone().unwrap();
+    let source = mesh::kv_events::KvEventSource {
+        endpoint: endpoint.to_string(),
+        block_size: 4,
+        ..Default::default()
+    };
+    monitor.attach(fixture.worker.url(), "test-model", "regular", 0, source);
+    // What is published before the subscription reaches the publisher is lost.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while monitor.sources()[0].batches == 0 {
+            let clear = serde_json::json!([{"type": "AllBlocksCleared"}]);
+            publish(&mut publisher, 0, clear).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for (prompt, event) in [
+        ((1..=8).collect::<Vec<u32>>(), false),
+        ((11..=18).collect(), true),
+    ] {
+        let mut stream = fixture.open().await;
+        stream.request_headers("/generate").await;
+        let body = serde_json::json!({"model": "test-model", "input_ids": prompt});
+        stream.body(body.to_string().as_bytes(), true).await;
+        assert!(matches!(stream.recv().await, Response::RequestHeaders(_)));
+        assert!(matches!(stream.recv().await, Response::RequestBody(_)));
+        assert_eq!(fixture.worker.prefill_tokens(), 8);
+        if event {
+            let stored = serde_json::json!([{"type": "BlockStored", "block_hashes": [14, 18],
+                "token_ids": prompt, "block_size": 4, "medium": "GPU"}]);
+            publish(&mut publisher, 1, stored).await;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while fixture.worker.prefill_tokens() != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        stream.response_headers(false).await;
+        // Released by the event before the response; without it, by the first body.
+        assert_eq!(fixture.worker.prefill_tokens(), if event { 0 } else { 8 });
+        stream.response_body(b"{}", true).await;
+        fixture.unloaded().await;
+        assert_eq!(fixture.worker.prefill_tokens(), 0);
+    }
+    fixture.runtime.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn trailers_finish_request_and_response_without_body_eos() {
     let fixture = Fixture::new(RouterConfig::default()).await;

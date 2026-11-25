@@ -615,18 +615,18 @@ mod c_regular_planning {
     }
 
     #[tokio::test]
-    async fn test_single_charges_the_prompt_only_when_streaming() {
+    async fn test_single_charges_the_prompt_prefill_streaming_or_not() {
         let src = MockWorkerSource::new().add_worker(make_regular_http("http://m1-w:8000", "m1"));
         let planner = make_planner(src, MockPolicySource::new());
         let tokens = [1u32, 2, 3];
-        for (stream, charged) in [(true, 3), (false, 0)] {
+        for stream in [true, false] {
             let descriptor = RequestDescriptor {
                 stream,
                 ..make_descriptor(Some("m1"), None, Some(&tokens), None)
             };
             match planner.plan(&descriptor).await.unwrap() {
                 PlacementPlan::Single { prefill_tokens, .. } => {
-                    assert_eq!(prefill_tokens, charged, "stream={stream}");
+                    assert_eq!(prefill_tokens, 3, "stream={stream}");
                 }
                 other => panic!("expected Single, got {:?}", other),
             }

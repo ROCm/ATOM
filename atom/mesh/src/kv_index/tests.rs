@@ -15,9 +15,12 @@ use super::{
     index::{HolderTable, Op, PrefixIndex},
     match_lanes, HolderId, Lane, Partition, PrefixHash,
 };
-use crate::kv_events::{
-    model::{DropReason, EngineHash, KvEvent, StoredBlock},
-    SourceStatus,
+use crate::{
+    core::{BasicWorkerBuilder, Worker, WorkerLoadGuard},
+    kv_events::{
+        model::{DropReason, EngineHash, KvEvent, StoredBlock},
+        SourceStatus,
+    },
 };
 
 /// Golden values from python-xxhash's `xxh3_64_intdigest` with SMG's formulas.
@@ -389,6 +392,110 @@ async fn predictions_go_on_where_the_events_end() {
         .unzip();
     let want = [Some(16), Some(12), Some(8), Some(4)];
     assert_eq!(match_lanes(&seq, &events, &predicted), want);
+}
+
+/// A guard charging `tokens` of prefill to a worker of its own.
+fn charged(tokens: usize) -> (Arc<dyn Worker>, WorkerLoadGuard) {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w:1").build());
+    let guard = WorkerLoadGuard::new(worker.clone(), None).with_prefill_tokens(tokens);
+    (worker, guard)
+}
+
+async fn until(done: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out");
+}
+
+/// Identical prompts on one rank wait for one key: each store of the last full block
+/// releases the oldest charge still held, skipping one its first byte released. A store
+/// on another lane, or a prompt shorter than a block, releases nothing.
+#[tokio::test]
+async fn each_stored_block_releases_the_oldest_held_prefill() {
+    let partition = Partition::start(
+        4,
+        Duration::from_secs(120),
+        &tokio::runtime::Handle::current(),
+    );
+    let status = Arc::new(Mutex::new(SourceStatus::default()));
+    let holders: Vec<_> = (0..2)
+        .map(|_| partition.hold(status.clone()).unwrap())
+        .collect();
+    let lane = holders[0].lane().1;
+    let seq: Vec<u32> = (0..8).collect();
+    let charges: Vec<_> = (0..3).map(|_| charged(8)).collect();
+    for (_, guard) in &charges {
+        partition.watch_prefill(lane, &seq, &guard.prefill_charge());
+    }
+    let (short, short_guard) = charged(3);
+    partition.watch_prefill(lane, &seq[..3], &short_guard.prefill_charge());
+    let held = || {
+        charges
+            .iter()
+            .map(|(w, _)| w.prefill_tokens())
+            .collect::<Vec<_>>()
+    };
+
+    holders[1]
+        .write(false, vec![stored(1, &seq, 0..2, 4)])
+        .await;
+    let other = [Some(holders[1].lane())];
+    // The match leaves out the prompt's last token, so one more matches both blocks.
+    let probe: Vec<u32> = (0..9).collect();
+    settles(match_holders, &probe, &other, &[Some(8)]).await;
+    assert_eq!(held(), [8, 8, 8]);
+    charges[1].1.prefill_charge().release();
+    holders[0]
+        .write(false, vec![stored(0, &seq, 0..2, 4)])
+        .await;
+    until(|| held() == [0, 0, 8]).await;
+    // Stored again by a second prefill, while the rank still holds it.
+    holders[0]
+        .write(false, vec![stored(0, &seq, 1..2, 4)])
+        .await;
+    until(|| held() == [0, 0, 0]).await;
+    assert_eq!(short.prefill_tokens(), 3);
+    assert!(partition.watches.lock().is_empty());
+}
+
+/// A lane given back drops its watches, so the rank given it next releases none of them;
+/// a watch whose charge is gone leaves at the next sweep.
+#[tokio::test]
+async fn a_released_lane_and_a_sweep_drop_prefill_watches() {
+    let partition = Partition::start(
+        4,
+        Duration::from_millis(800),
+        &tokio::runtime::Handle::current(),
+    );
+    let status = Arc::new(Mutex::new(SourceStatus::default()));
+    let holder = partition.hold(status.clone()).unwrap();
+    let seq: Vec<u32> = (0..8).collect();
+    let lane = holder.lane().1;
+    let (worker, guard) = charged(8);
+    partition.watch_prefill(lane, &seq, &guard.prefill_charge());
+    drop(holder);
+    // The lowest free lane is taken, so the released one once the writer frees it.
+    let holder = loop {
+        let holder = partition.hold(status.clone()).unwrap();
+        if holder.lane().1 == lane {
+            break holder;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(partition.watches.lock().is_empty());
+    holder.write(false, vec![stored(0, &seq, 0..2, 4)]).await;
+    let probe: Vec<u32> = (0..9).collect();
+    settles(match_holders, &probe, &[Some(holder.lane())], &[Some(8)]).await;
+    assert_eq!(worker.prefill_tokens(), 8);
+
+    let (_, dropped) = charged(8);
+    partition.watch_prefill(holder.lane().1, &seq[..4], &dropped.prefill_charge());
+    drop(dropped);
+    until(|| partition.watches.lock().is_empty()).await;
 }
 
 fn resident_bytes() -> u64 {
