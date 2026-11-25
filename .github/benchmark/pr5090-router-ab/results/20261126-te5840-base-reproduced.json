@@ -1,0 +1,40 @@
+{
+  "lease": "La5f14b",
+  "node": "g23",
+  "harness_sha": "8e1c42075e26e75d8a372c38bef59d9db4b0be5d",
+  "arm": "rebuilt unpatched v0.3.14 producer",
+  "engine_sha256": "2833931581a1e3b0d676fd237185d3350ace814b6e2ba034bbf5ff0da726b16d",
+  "connector_sha256": "45e05e355bba98ec51783ba0fc0a5267f7ef3a60e427444c3df075eed0ce8997",
+  "vllm_kernel_sha256": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395",
+  "native_layout_probe": false,
+  "sender_workers": 10,
+  "async_sender_tasks": 20,
+  "pp_rank": 3,
+  "failure_time_ns": 1795643952233391002,
+  "duration_s": 32.233466286212206,
+  "descriptor_count": 19600,
+  "total_bytes": 2231936000,
+  "return_code": -1,
+  "source_outside_ranges": [],
+  "first_failure_utc": "2026-11-25T21:59:12.233391Z",
+  "cleanup_started_utc": "2026-11-25T21:59:13Z",
+  "post_cleanup_failures_excluded": true,
+  "protocol_check_responses": 5,
+  "kv_transfer": {
+    "metric": "vllm:mooncake_bytes_transferred_sum",
+    "prefill_before": 0.0,
+    "prefill_after": 101376000.0,
+    "transferred_bytes_delta": 101376000.0,
+    "passed": true
+  },
+  "exit_codes": {
+    "pool-workload.rc": 86,
+    "pool-exit.rc": 86,
+    "gpool-release.rc": 0
+  },
+  "srt_left_one_container": true,
+  "outer_pool_removed_container": true,
+  "archive_sha256": "530637874b1f44f36e0c483131852a5d0137808d962d5f8004bed91d7b0db09f",
+  "conclusion": "Rebuilt unpatched baseline reproduced PP3 native write timeout during the original C80 warmup before cleanup. This preserves a discriminating control for the PR5840 candidate. It does not validate the candidate or establish a new performance point.",
+  "candidate_status": "Queued Rd2d5d6, no lease granted at 06:03 Beijing; only P changes to patched build. If assigned a different node, a passing candidate still needs a same-node unpatched reversal control."
+}
