@@ -91,7 +91,7 @@ def quantize_query_rows(query: torch.Tensor):
     """FP8 `quantize_query` of a query already rotated: E4M3 with one fp32
     scale per `(token, head)` row, `(values [..., dim], scales [rows, 1])`."""
     rows = query.reshape(-1, query.shape[-1])
-    values = torch.empty_like(rows, dtype=torch.float8_e4m3fn)
+    values = torch.empty_like(rows, dtype=dtypes.fp8)
     scales = torch.empty((rows.shape[0], 1), dtype=torch.float32, device=rows.device)
     dynamic_per_token_scaled_quant(values, rows, scales)
     return values.view_as(query), scales

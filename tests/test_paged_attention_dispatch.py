@@ -1126,6 +1126,7 @@ class TestExplicitPlan:
         cap=8,
         head_dim=128,
         segment=0,
+        budget=None,
     ):
         import torch
 
@@ -1142,6 +1143,7 @@ class TestExplicitPlan:
             plan_step_owner=owner,
             plan_cache_owner=cache_owner,
             plan_segment=segment,
+            plan_workgroup_budget=budget,
         )
 
     def test_segments_of_one_call_keep_their_own_plans(self, monkeypatch):
@@ -1253,18 +1255,34 @@ class TestExplicitPlan:
         assert capped is not uncapped
         assert [kw.get("workgroup_budget") for kw in built] == [256, None], built
 
+    def test_a_caller_budget_is_the_plans(self, monkeypatch):
+        """A caller's budget replaces aiter's (the sparse PA writing FP8 passes one)."""
+        ba, built = self._setup(monkeypatch)
+        self._call(ba, cap=8, budget=128, head_dim=256)
+        assert built[-1] == {
+            "max_partitions": 8,
+            "query_length": 1,
+            "workgroup_budget": 128,
+        }, built[-1]
+
     @staticmethod
-    def _call_kwargs(relpath, func):
-        """Keyword arguments of every call to ``func`` in an atom source file."""
+    def _call_kwargs(relpath, func, within=None):
+        """Keyword arguments of every call to ``func`` in an atom source file,
+        or only in its functions named ``within``."""
         import ast
         import pathlib
 
         import atom
 
-        src = (pathlib.Path(atom.__file__).parent / relpath).read_text()
+        tree = ast.parse((pathlib.Path(atom.__file__).parent / relpath).read_text())
+        roots = [tree] if within is None else [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == within
+        ]  # fmt: skip
         calls = [
             {k.arg: k.value for k in node.keywords}
-            for node in ast.walk(ast.parse(src))
+            for root in roots
+            for node in ast.walk(root)
             if isinstance(node, ast.Call)
             and (getattr(node.func, "id", None) or getattr(node.func, "attr", None))
             == func
@@ -1312,11 +1330,14 @@ class TestExplicitPlan:
         """
         import ast
 
-        for relpath in (
-            "model_ops/attention_mha.py",
-            "plugin/vllm/attention/minimax_m3_attnetion.py",
+        decode = "minimax_m3_sparse_attn_decode_asm"
+        for relpath, func, within in (
+            ("model_ops/attention_mha.py", decode, None),
+            ("plugin/vllm/attention/minimax_m3_attnetion.py", decode, None),
+            # the FP8 output's PA, in the same scope
+            ("model_ops/attention_mha.py", "sparse_pa_fp8_per_row", "_sparse_decode"),
         ):
-            for kw in self._call_kwargs(relpath, "minimax_m3_sparse_attn_decode_asm"):
+            for kw in self._call_kwargs(relpath, func, within):
                 owner = kw.get("plan_step_owner")
                 # `decode_md if self.local_blocks >= 1 else None`: once per
                 # step only while the tail block is forced.
@@ -1330,11 +1351,14 @@ class TestExplicitPlan:
         """Variable prefill rows must not enter the process-wide plan cache."""
         import ast
 
-        for relpath in (
-            "model_ops/attention_mha.py",
-            "plugin/vllm/attention/minimax_m3_attnetion.py",
+        prefill = "minimax_m3_sparse_attn_prefill_asm"
+        for relpath, func, within in (
+            ("model_ops/attention_mha.py", prefill, None),
+            ("plugin/vllm/attention/minimax_m3_attnetion.py", prefill, None),
+            # the FP8 output's PA, in the same scope
+            ("model_ops/attention_mha.py", "sparse_pa_fp8_per_row", "_sparse_prefill"),
         ):
-            calls = self._call_kwargs(relpath, "minimax_m3_sparse_attn_prefill_asm")
+            calls = self._call_kwargs(relpath, func, within)
             assert len(calls) == 1
             owner = calls[0].get("plan_step_owner")
             assert isinstance(owner, ast.IfExp), f"{relpath}: {owner}"

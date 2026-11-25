@@ -266,8 +266,9 @@ def register_plugin() -> None:
     # 0.5.20 recognizes Flash. This call only installs MTP draft-arch and
     # HC hidden-width adapters that upstream still does not provide.
     apply_qwen4_exp_recognition_patch()
-    # EP decode asm MoE and HIP topk=1 Triton tree/verify. Plugin-only;
-    # keeps Ling's Flash MTP adapter off atom/model_ops and eagle3_llama.
+    # HIP topk=1 Triton tree/verify and the gfx950 BF16 hipBLASLt bypass.
+    # Plugin-only; keeps Ling's Flash MTP adapter off atom/model_ops and
+    # eagle3_llama.
     apply_qwen4_exp_rocm_patch()
     _keep_atom_full_attn_for_native_qwen4_exp()
     install_sglang_replayssm_commit()

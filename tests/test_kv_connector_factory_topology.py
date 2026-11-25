@@ -68,6 +68,16 @@ def test_names_resolve_through_aliases():
     ]
 
 
+def test_the_lmcache_tiers_alone_read_page_images(pool_backend):
+    for spelling in ("LMCacheConnectorV1", " LMCache_MP", "LMCacheMPConnector"):
+        name = KVConnectorFactory.canonical_name(spelling)
+        assert KVConnectorFactory.reads_page_images(name)
+    # An offload tier, but not one that carries the image.
+    assert KVConnectorFactory.is_offload_backend("mooncake_store")
+    assert not KVConnectorFactory.reads_page_images("mooncake_store")
+    assert not KVConnectorFactory.reads_page_images("pool_probe")  # undeclared
+
+
 def test_multi_expands_into_its_subs_each_seeing_its_own_config():
     mp = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
     pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
@@ -185,3 +195,29 @@ def test_mooncake_store_m3_reads_regions_dense_does_not():
     assert not KVConnectorFactory.topology_region_readers_copy_whole_blocks(dense)
     assert KVConnectorFactory.topology_reads_block_regions(m3)
     assert KVConnectorFactory.topology_region_readers_copy_whole_blocks(m3)
+
+
+def test_nvfp4_pages_move_only_where_every_transport_declares_it():
+    """`moves_nvfp4_pages` on the registration: LMCache offload, Mooncake P/D and
+    the Store, alone or in a `multi`; one other transport beside them says no."""
+    pd, store = {"kv_connector": "mooncake"}, {"kv_connector": "mooncake_store"}
+    lmcache = {"kv_connector": "lmcache_offload"}
+
+    def moves(kv_transfer_config):
+        return KVConnectorFactory.topology_moves_nvfp4_pages(
+            _config(kv_transfer_config)
+        )
+
+    def multi(*subs):
+        return {"kv_connector": "multi", "connectors": list(subs)}
+
+    assert KVConnectorFactory.nvfp4_page_connectors() == (
+        "lmcache_offload",
+        "mooncake",
+        "mooncake_store",
+    )
+    assert moves(pd) and moves(store) and moves(lmcache)
+    assert moves(multi(pd, store)) and moves(multi(pd, lmcache))
+    assert not moves(multi(pd, {"kv_connector": "lmcache_mp"}))
+    assert not moves({"kv_connector": "moriio"}) and not moves({})
+    assert not moves(multi())  # unparsable: `_build_subconnectors` raises on it

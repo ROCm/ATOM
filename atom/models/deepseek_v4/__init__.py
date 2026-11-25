@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2026 ATOM Project Contributors
 
 """
 DeepSeek-V4 model for ATOM (PR1: skeleton + tiny-config eager forward).
@@ -614,7 +615,14 @@ def _wo_a_is_bf16_on_disk(model_path):
     return False
 
 
-def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
+def make_v4_quant_config(
+    hf_config,
+    model_path=None,
+    online_quant_config=None,
+    *,
+    shared_expert_spec=None,
+    online_routed_experts=False,
+):
     """Build a QuantizationConfig that knows V4's per-layer quant scheme.
 
     Two V4 SKUs supported:
@@ -646,6 +654,10 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
     preserved on BOTH the source lookup AND the online lookup — returning
     the same spec on the online path triggers the FusedMoE/Linear
     ``source == online_target`` early-return so those layers stay untouched.
+
+    ``shared_expert_spec`` pins the shared experts on both lookups.
+    ``online_routed_experts`` lets an online layer pattern convert the routed
+    experts.
     """
 
     base = QuantizationConfig(hf_config, online_quant_config=online_quant_config)
@@ -695,7 +707,17 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
         # dequant→requant round-trip for these layers (which would either
         # crash on the moe assert or further damage already-quantized weights).
         if ".ffn.experts" in layer_name:
+            if (
+                online_routed_experts
+                and use_online_quant
+                and base.online_pattern_spec(layer_name) is not None
+            ):
+                return orig_lookup(
+                    layer_name, use_online_quant=True, check_children=check_children
+                )
             return routed_spec
+        if shared_expert_spec is not None and ".shared_experts" in layer_name:
+            return shared_expert_spec
         # BF16 / fp32 raw paths
         if (
             ".compressor.wkv" in layer_name
@@ -2798,7 +2820,13 @@ class Expert(nn.Module):
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
-        if self.use_fused_clamp_act_mul:
+        # A BF16 w2 (no group32 FP8 GEMM here) takes no quantized input, and a
+        # per-channel one quantizes its own.
+        scale_kwargs = fused_scale_kwargs(
+            self.w2.native_a8_group_rows,
+            self.w2.quant_type.value == QuantType.per_1x128.value,
+        )
+        if self.use_fused_clamp_act_mul and scale_kwargs and not self.w2.runs_bf16:
             native_mx = self.w2.native_a8_group_rows is not None
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,
@@ -2806,7 +2834,7 @@ class Expert(nn.Module):
                 activation="silu",
                 weights=weights,
                 dtype_quant=dtypes.fp8,
-                **fused_scale_kwargs(self.w2.native_a8_group_rows),
+                **scale_kwargs,
             )
             if native_mx:
                 x_scale = x_scale.view(torch.float8_e8m0fnu)
@@ -2822,6 +2850,33 @@ class Expert(nn.Module):
         if weights is not None:
             out = weights.to(dtype) * out
         return self.w2(out)  # [num_tokens, dim]
+
+
+# The V4 family's dual-stream MoE row bound on expert-parallel decode steps
+# when ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD is not set. 1536 = 256 requests a rank
+# x 6 DSpark rows a request: the largest of the 1152/1344/1536-row decode
+# graphs of a 1024-request expert-parallel batch, the shapes the shared/routed
+# overlap was measured on (a multi-rank MegaMoE bench, shared on the side
+# stream against shared in series). Row counts above it were not measured, so
+# they keep the single-stream path. It is a fixed bound rather than the
+# configured graph size because larger decode graphs are untested. The gain
+# comes from hiding the shared expert behind the routed MoE's expert-parallel
+# token exchange (dispatch/combine waits), so a deployment without one
+# (`FusedMoEParallelConfig.exchanges_tokens`: no EP, TP-only EP, simulated DP)
+# keeps the generic bound, as do prefill steps (chunks of these sizes were not
+# measured).
+V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD = 1536
+
+
+def v4_dual_stream_decode_token_threshold(exchanges_tokens: bool) -> int:
+    """The V4 MoE's dual-stream row bound on decode steps:
+    ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD where it is set (0 still turns the
+    dual stream off), else `V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD` where the
+    routed MoE exchanges tokens across ranks (``exchanges_tokens``) and the
+    variable's default where it does not."""
+    if envs.is_set("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD") or not exchanges_tokens:
+        return envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+    return V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD
 
 
 class MoE(nn.Module):
@@ -2940,12 +2995,25 @@ class MoE(nn.Module):
         # routed experts on the current stream. Mirrors V2's pattern. Only
         # active when shared_experts exist (not fused into routed) AND the
         # env threshold is positive AND we got an alt_stream from the model.
-        # Per-call token count gating happens inside the custom op dispatcher
-        # — prefill (large batch) skips dual-stream (overhead > benefit).
+        # Per-call row gating happens inside the custom op dispatcher: a call
+        # with more rows than its step's bound (set below) stays single-stream.
         self._use_dual_stream = (
             self.shared_experts is not None
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+        )
+        # V4 family with an expert-parallel token exchange: the routed MoE
+        # waits on it for a large part of each layer, which the side-stream
+        # shared expert fills up to larger decode batches than the generic
+        # default. Prefill steps and deployments without such an exchange keep
+        # the generic bound; an explicitly set ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD applies
+        # to every case. Decided here from the parallel config, never in
+        # forward.
+        self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        self._dual_stream_decode_token_threshold = (
+            v4_dual_stream_decode_token_threshold(
+                self.experts.moe_parallel_config.exchanges_tokens
+            )
         )
         # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
         self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None
@@ -3075,12 +3143,50 @@ class MoE(nn.Module):
             routed = tensor_model_parallel_all_reduce(routed)
         return routed
 
+    def _routed_with_shared_in_combine(
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        shared: torch.Tensor,  # [num_tokens, dim]
+        shared_ready: torch.cuda.Event,
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """Routed pass whose combine adds `shared` once `shared_ready` fires.
+
+        Shared by the single- and dual-stream paths; only the stream the
+        caller recorded `shared_ready` on differs. Comm-fused steps never take
+        this path (`combine_accepts_shared` excludes them), so a complete
+        result here is an error.
+        """
+        routed, is_complete = self.routed_expert_forward(
+            x, shared_partial=shared, shared_ready=shared_ready
+        )
+        if is_complete:
+            raise RuntimeError("a comm-fused step reached the shared-in-combine path")
+        return self.combine_outputs(
+            routed, None, prefix=f"{self.prefix}.combine_outputs"
+        )
+
     def single_stream_moe_forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
-        """Sequential: shared_experts → routed_experts → combine."""
+        """Sequential: shared_experts → routed_experts → combine.
+
+        Where the routed combine adds the shared output
+        (`FusedMoE.combine_accepts_shared`), it is handed down through
+        `_routed_with_shared_in_combine` with the event recorded on this same
+        stream, and there is no separate add. That branch is skipped while
+        `torch.compile` traces this method (the CUDA event is not traceable);
+        the traced graph keeps the separate add in `combine_outputs`.
+        """
         shared = self.shared_experts(x) if self.shared_experts is not None else None
+        if (
+            shared is not None
+            and not torch.compiler.is_compiling()
+            and self.experts.combine_accepts_shared(x.shape[0])
+        ):
+            shared_ready = torch.cuda.Event()
+            shared_ready.record()
+            return self._routed_with_shared_in_combine(x, shared, shared_ready)
         routed, is_complete = self.routed_expert_forward(x, shared_partial=shared)
         if is_complete:
             return routed
@@ -3108,16 +3214,7 @@ class MoE(nn.Module):
                 shared_ready = torch.cuda.Event()
                 shared_ready.record(self.alt_stream)
             shared.record_stream(routed_stream)
-            routed, is_complete = self.routed_expert_forward(
-                x, shared_partial=shared, shared_ready=shared_ready
-            )
-            if is_complete:
-                raise RuntimeError(
-                    "a comm-fused step reached the shared-in-combine path"
-                )
-            return self.combine_outputs(
-                routed, None, prefix=f"{self.prefix}.combine_outputs"
-            )
+            return self._routed_with_shared_in_combine(x, shared, shared_ready)
         shared_produced = False
         shared_waited = False
 
@@ -3562,6 +3659,9 @@ class ParallelHead(ParallelLMHead):
     fp32 path while halving VRAM and using the faster a16w16 kernel.
     """
 
+    # its logits are the mHC reduction and norm, then the projection
+    logits_are_head = False
+
     def __init__(
         self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6
     ):
@@ -3855,15 +3955,17 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @property
     def disable_fused_shared_loading(self) -> bool:
-        """True when shared experts are NOT fused into the routed MoE kernel, so
-        the weight loader must keep `ffn.shared_experts.*` on the standalone
-        Expert module instead of rewriting them into the fused slot. Read from
-        the actual built MoE layers so it always agrees with model structure.
+        """True when no MoE layer fuses its shared experts into the routed
+        kernel, so the weight loader must keep `ffn.shared_experts.*` on the
+        standalone Expert module instead of rewriting them into the fused slot.
+        Read from the actual built MoE layers so it always agrees with model
+        structure.
         """
-        for m in self.model.modules():
-            if m.__class__.__name__ == "MoE":
-                return not getattr(m, "_fuse_shared_into_routed", True)
-        return False
+        return not any(
+            m._fuse_shared_into_routed
+            for m in self.model.modules()
+            if m.__class__.__name__ == "MoE"
+        )
 
     def forward(
         self,

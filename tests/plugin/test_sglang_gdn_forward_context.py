@@ -1,7 +1,9 @@
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from atom.plugin.sglang.attention_backend import attention_gdn
 from atom.plugin.sglang.attention_backend.attention_gdn import (
@@ -263,6 +265,59 @@ def test_extend_metadata_carries_per_step_prefill_indices():
     assert torch.equal(metadata.no_initial_state, torch.tensor([True, False]))
 
 
+class _ScalarReadSpy(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is torch.ops.aten._local_scalar_dense.default:
+            self.reads += 1
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize(
+    "from_sglang, expected_tokens, expected_reads",
+    [(True, 5, 0), (False, 99, 1)],
+    ids=["sglang-host-count", "reconstructed"],
+)
+def test_extend_token_count_comes_from_sglang_host_count(
+    from_sglang, expected_tokens, expected_reads
+):
+    """``logical_num_tokens`` is SGLang's host sum of extend_seq_lens.
+
+    Reading ``query_start_loc[-1]`` instead syncs the stream once per prefill;
+    only metadata rebuilt from the mamba pool, which has no host count, does.
+    """
+    forward_metadata = SimpleNamespace(
+        # The device offsets disagree with the host count, to show which is read.
+        query_start_loc=torch.tensor([0, 3, 99], dtype=torch.int32),
+        mamba_cache_indices=torch.tensor([4, 7], dtype=torch.int32),
+        logical_num_tokens=5,
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=2,
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        # The rebuild takes the same device offsets from these.
+        extend_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([3, 96], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0, 2], dtype=torch.int32),
+        extend_seq_lens_cpu=[3, 2],
+    )
+    linear = SimpleNamespace(
+        forward_metadata=forward_metadata if from_sglang else None,
+        req_to_token_pool=_MambaPool(),
+    )
+
+    with _ScalarReadSpy() as spy:
+        metadata = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
+
+    assert spy.reads == expected_reads
+    assert metadata.num_prefill_tokens == expected_tokens
+    assert metadata.num_actual_tokens == expected_tokens
+
+
 def test_build_context_falls_back_to_local_decode_mode(monkeypatch):
     monkeypatch.setattr(
         attention_gdn,
@@ -339,6 +394,7 @@ def test_bind_preserves_outer_attention_metadata(monkeypatch):
     forward_context = SimpleNamespace(
         gdn_metadata=gdn_metadata,
         kv_cache_data=inner_kv,
+        step=None,
     )
     kv_updates = []
 
@@ -389,24 +445,25 @@ def _qwen4_flydsl_atom_config():
 
 class _TemporalPool:
     def __init__(self, temporal):
-        self.mamba_map = {0: None}
-        self._cache = SimpleNamespace(
-            conv=[torch.zeros(2, 4)],
-            temporal=temporal,
+        self.mamba_map = {0: 0}
+        self.mamba_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(
+                conv=[torch.zeros(1, 2, 4)], temporal=temporal[None]
+            )
         )
 
     @staticmethod
     def get_mamba_indices(req_pool_indices):
         return req_pool_indices
 
-    def mamba2_layer_cache(self, layer_id):
-        return self._cache
+    def mamba2_layer_index(self, layer_id):
+        return self.mamba_map[layer_id]
 
 
 def test_extend_attaches_flydsl_prefill_metadata_for_qwen4(monkeypatch):
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
-    attention_gdn._PREFILL_SCHEDULES.clear()
+    monkeypatch.setattr(attention_gdn, "_PREFILL_SCHEDULES", OrderedDict())
     cfg, impl = _qwen4_flydsl_atom_config()
     impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
     monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
@@ -437,7 +494,7 @@ def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
     """Same query lengths keep one schedule and do not reread the GPU offsets."""
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
-    attention_gdn._PREFILL_SCHEDULES.clear()
+    monkeypatch.setattr(attention_gdn, "_PREFILL_SCHEDULES", OrderedDict())
     cfg, impl = _qwen4_flydsl_atom_config()
     impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
     monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
@@ -466,6 +523,7 @@ def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
         forward_metadata=SimpleNamespace(
             query_start_loc=query_start_loc,
             mamba_cache_indices=indices,
+            logical_num_tokens=8,
         ),
         req_to_token_pool=_MambaPool(),
     )
@@ -480,6 +538,51 @@ def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
     third = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
     assert calls == [(8,), (8,)]
     assert third.flydsl_prefill_metadata is not first.flydsl_prefill_metadata
+
+
+def test_flydsl_prefill_schedules_keep_only_the_most_recent(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    monkeypatch.setattr(attention_gdn, "_PREFILL_SCHEDULES", OrderedDict())
+    cfg, impl = _qwen4_flydsl_atom_config()
+    impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    builds = []
+
+    def _build(lengths, cu_seqlens):
+        builds.append(cu_seqlens)
+        return ("schedule", len(builds))
+
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.build_prefill_metadata",
+        _build,
+    )
+    limit = attention_gdn._PREFILL_SCHEDULES_MAX
+    forward_batch = SimpleNamespace(extend_seq_lens_cpu=[8])
+
+    def schedule_for(loc):
+        return attention_gdn._flydsl_prefill_metadata(loc, forward_batch)
+
+    # SGLang allocates a fresh offset tensor for every eager extend.
+    locs = [torch.tensor([0, 8], dtype=torch.int32) for _ in range(limit + 4)]
+    first = [schedule_for(loc) for loc in locs[: limit + 3]]
+    assert len(builds) == limit + 3
+    assert len(attention_gdn._PREFILL_SCHEDULES) == limit
+
+    # The same unchanged buffer still reuses its schedule, and a hit makes it
+    # the most recent entry.
+    assert schedule_for(locs[3]) is first[3]
+    assert len(builds) == limit + 3
+    schedule_for(locs[limit + 3])
+    assert len(attention_gdn._PREFILL_SCHEDULES) == limit
+    assert schedule_for(locs[3]) is first[3]
+    # The least recently used one was dropped and rebuilds on its next use.
+    rebuilt = schedule_for(locs[4])
+    assert rebuilt is not first[4] and builds[-1] is locs[4]
+    assert len(attention_gdn._PREFILL_SCHEDULES) == limit
+    # Writing to the buffer invalidates it, exactly as before the bound.
+    locs[3][1] = 8
+    assert schedule_for(locs[3]) is not first[3]
 
 
 def test_extend_skips_flydsl_metadata_when_prefill_disabled(monkeypatch):
@@ -591,5 +694,5 @@ def test_kv_cache_keeps_mamba_layout_without_qwen4_flydsl(monkeypatch):
         SimpleNamespace(req_to_token_pool=pool),
     )
     view = out["layer_0"].v_cache
-    assert view is raw
+    assert view.data_ptr() == raw.data_ptr() and view.shape == raw.shape
     assert view.stride()[-2:] == (128, 1)

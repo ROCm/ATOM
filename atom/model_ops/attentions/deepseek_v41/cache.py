@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """PAGE-backed global keys and complete, relocatable CSA2 request state."""
 
 import numpy as np
@@ -132,6 +134,8 @@ class PagedAttentionCache:
         # Layer pointers let DSpark gather several separately allocated windows
         # in one kernel, without joining or duplicating the persistent sources.
         self.window_layer_ids = torch.arange(g.layers, dtype=torch.int64, device=device)
+        # a layer set's ids, made once (``window_target``)
+        self.window_ids = {}
         self.window_ptrs = torch.tensor(
             [
                 [v.data_ptr() for v in self.ring_view(layer)]
@@ -624,6 +628,20 @@ class PagedAttentionCache:
         for _, region in regions:
             region.index_fill_(0, slots, 0)
 
+    def continues_previous(self, step):
+        """Whether ``step`` serves the requests the previous prepared step
+        served, in the same order, none starting over (fresh) or resuming:
+        their slots and cursors are the ones that step left."""
+        count = step.scheduled_bs
+        resumes = step.request_cached_until[:count]
+        fresh = (step.request_positions[:count] == step.request_floors[:count]) & (
+            resumes == 0
+        )
+        return (
+            not (fresh.any() or resumes.any())
+            and [span.request_id for span in step.requests] == self._prepared_requests
+        )
+
     def prepare_device_round_state(self, step, *, histories=True):
         """`prepare_state` for a device-round step (`RoundService.DEVICE`: the
         model's decode round advanced its positions on the device from the
@@ -639,13 +657,13 @@ class PagedAttentionCache:
             raise RuntimeError("A device-round step on the host Engram path")
         self.require_committed()
         self._judge_previous_probe()
-        count = step.scheduled_bs
-        ids = [span.request_id for span in step.requests]
-        resumes = step.request_cached_until[:count]
-        fresh = (step.request_positions[:count] == step.request_floors[:count]) & (
-            resumes == 0
-        )
-        if ids != self._prepared_requests or fresh.any() or resumes.any():
+        if not self.continues_previous(step):
+            count = step.scheduled_bs
+            ids = [span.request_id for span in step.requests]
+            resumes = step.request_cached_until[:count]
+            fresh = (step.request_positions[:count] == step.request_floors[:count]) & (
+                resumes == 0
+            )
             raise RuntimeError(
                 f"A device-round step of requests {ids} (fresh "
                 f"{np.flatnonzero(fresh).tolist()}, resuming "
@@ -671,9 +689,18 @@ class PagedAttentionCache:
         thinks are both decided over the whole batch at once -- the per-request
         walk this replaced was 58 us of every decode step, spent branching on
         `span.position` one Python attribute at a time.
+
+        A step that `continues_previous` with ``histories`` False ships no
+        probe: as for a device-round step (`prepare_device_round_state`), its
+        slots and cursors are the ones the previous step left, which the host
+        has just checked.
         """
         self.require_committed()
         self._judge_previous_probe()
+        if not histories and self.continues_previous(step):
+            if step.tentative:
+                self.pending = TentativeState(self, step)
+            return None
         count = step.scheduled_bs
         starts = step.request_positions[:count]
         ids = self._prepared_requests = [span.request_id for span in step.requests]
@@ -758,19 +785,20 @@ class PagedAttentionCache:
         self.pending.commit(anchors)
         self.pending = None
 
+    def compressed_rows(self, owner, ratio):
+        """Where an owner's compressor writes its rows: (pages [page, row,
+        width], the scale plane alike or None, the quantization mode
+        ``fused_compress_attn`` names)."""
+        if not self.window_fp8:
+            return self.pages.view(f"main_{owner}")[0], None, "none"
+        pages, scale = (
+            plane.view(self.num_pages, self.geometry.rows_per_page(ratio), -1)
+            for plane in self.main_view(owner)
+        )
+        return pages, scale, "planar_fp4" if self.packed else "planar_fp8"
+
     def compress(self, owner, compressor, values, scores, step, rope):
-        scale = None
-        mode = "none"
-        if self.window_fp8:
-            pages, scale = (
-                plane.view(
-                    self.num_pages, self.geometry.rows_per_page(compressor.ratio), -1
-                )
-                for plane in self.main_view(owner)
-            )
-            mode = "planar_fp4" if self.packed else "planar_fp8"
-        else:
-            pages = self.pages.view(f"main_{owner}")[0]
+        pages, scale, mode = self.compressed_rows(owner, compressor.ratio)
         return compress_batch(
             self,
             owner,
@@ -1098,6 +1126,23 @@ class PagedAttentionCache:
                 min(step.max_q_len, window.ring_slots),
                 cached_until=cached,
             )
+
+    def window_target(self, layers, step):
+        """Where a kernel writing ``layers``' fp8 windows itself puts a step's
+        rows (``write_window``'s rule): ``(window_ptrs, the layers' ids, the
+        ring, cached_until or None)``; None when the windows are not fp8 or
+        their rings differ (``write_window`` a layer at a time then)."""
+        rings = {
+            self.geometry.window(layer, self.num_pages).ring_slots for layer in layers
+        }
+        if not (self.window_fp8 and len(rings) == 1):
+            return None
+        cached = step.swa_cached_until if step.request_cached_until.any() else None
+        key = tuple(layers)
+        ids = self.window_ids.get(key)
+        if ids is None:
+            ids = self.window_ids[key] = self.window_layer_ids[list(layers)]
+        return self.window_ptrs, ids, rings.pop(), cached
 
     def attention_indices(self, spec, step, *, a8w4=False):
         """This layer's `(prefix, pptr, second, sptr)`: rows into the pool, and

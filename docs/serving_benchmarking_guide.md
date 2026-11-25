@@ -839,8 +839,9 @@ Script-specific arguments:
 | `--bs` | `1` | Batch size (number of parallel requests) |
 | `--random-input` | `False` | Use random token input instead of predefined text |
 
-If `--torch-profiler-dir` is not specified, the script defaults to
-`./profiler_traces`.
+If `--torch-profiler-dir` is not specified, the script writes to
+`ATOM_TORCH_PROFILER_DIR` when that is set (and not empty), and otherwise
+defaults to `./profiler_traces`.
 
 ### Profiling during benchmarks
 

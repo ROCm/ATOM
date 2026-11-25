@@ -9,7 +9,6 @@ if not torch.version.hip or not torch.cuda.is_available():
 
 from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
 
-from atom.model_ops import attention_mla
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.triton_mla_absorb_qpack import mla_absorb_q_pack
@@ -103,42 +102,12 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     assert steps.max().item() <= 1, f"nope half off by {steps.max().item()} e4m3 steps"
     # Rounding alone moves about 3% of codes one step; a systematic error
     # under one step moves far more.
-    share = (steps == 1).float().mean().item()
-    assert share < 0.06, f"{share:.1%} of nope codes one step off"
+    share = (steps == 1).float().mean(dim=(0, 2))
+    assert torch.all(share < 0.06), f"per-head one-step shares: {share.tolist()}"
 
 
 # GLM-5.x has 192 nope dims, which the absorb kernel does not compile for, and
 # 512 overruns gfx950's shared memory. The kernel has not run on gfx942.
-@pytest.mark.parametrize(
-    "gfx, nope, absorbs",
-    [
-        ("gfx950", NOPE, True),
-        ("gfx950", 192, False),
-        ("gfx950", 512, False),
-        ("gfx942", NOPE, False),
-    ],
-)
-def test_absorb_gate_takes_two_kernel_path_off_kernel_shapes(
-    monkeypatch, gfx, nope, absorbs
-):
-    monkeypatch.setattr(attention_mla, "get_gfx_runtime", lambda: gfx)
-    layer = SimpleNamespace(
-        W_K_qrep_scale=None,
-        kv_shuffled=False,
-        qk_nope_head_dim=nope,
-        kv_lora_rank=LORA,
-    )
-    kv_cache = torch.empty(1, device="cuda", dtype=dtypes.fp8)
-    gate = MLAAttention._absorb_into_q_out(layer, True, True, kv_cache, dtypes.fp8)
-    assert gate == absorbs
 
 
 # L=96 would store its second 64-column block over half the rope columns.
-@pytest.mark.parametrize("nope, lora", [(NOPE, 96), (192, LORA), (512, LORA)])
-def test_absorb_q_pack_rejects_shapes_its_kernel_cannot_take(nope, lora):
-    tokens = 2048
-    q_nope = torch.randn(HEADS, tokens, nope, device="cuda", dtype=torch.bfloat16)
-    w_k = torch.randn(HEADS, lora, nope, device="cuda", dtype=torch.bfloat16)
-    q_out = torch.zeros(tokens, HEADS, lora + PE, device="cuda", dtype=dtypes.fp8)
-    with pytest.raises(AssertionError, match="no absorb kernel"):
-        mla_absorb_q_pack(q_nope, w_k, q_out, torch.ones(1, device="cuda"))

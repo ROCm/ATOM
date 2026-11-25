@@ -4,8 +4,9 @@
 """Exercise V-up's output layout on CPU with only the GPU BMMs stubbed."""
 
 import ast
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -22,7 +23,14 @@ def projection():
         for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "MLAAttention"
     )
-    names = {"_v_up_proj", "_v_up_proj_and_o_proj", "_dcp_project_merge_out"}
+    names = {
+        "_v_up_proj",
+        "_v_up_proj_and_o_proj",
+        "_dcp_project_merge_out",
+        "_dcp_project_merge_out_prefill",
+        "_dcp_project_merge_out_head_major",
+        "_configure_dcp_prefill_routes",
+    }
     methods = [
         node
         for node in cls.body
@@ -37,10 +45,18 @@ def projection():
         namespace,
     )
     attn = type("Projection", (), {name: namespace[name] for name in names})()
+    attn.qrep_enabled = False
+    attn.dcp_prefill_merge_bf16_ok = True
     attn.num_heads = 3
     attn.kv_lora_rank = 8
     attn.v_head_dim = 4
     return attn, namespace
+
+
+def _transport(monkeypatch, function):
+    module = ModuleType("atom.model_ops.dcp_ops")
+    module.cp_lse_a2a_head_major = function
+    monkeypatch.setitem(sys.modules, module.__name__, module)
 
 
 def _stub_bmm(namespace, branch, weights, scale):
@@ -146,25 +162,24 @@ def test_v_up_output_uses_the_dcp_head_and_weight_overrides(projection, branch):
     assert torch.equal(result, expected.to(torch.bfloat16))
 
 
-@pytest.mark.parametrize("branch", ["bf16", "fp8", "fp4"])
-def test_prefill_layout_request_only_changes_bf16_storage(projection, branch):
+def test_head_major_projection_stores_heads_for_exchange(projection, monkeypatch):
     attn, namespace = projection
     tokens, heads = 5, attn.num_heads
     x, weights = _inputs(tokens, heads, attn.kv_lora_rank, attn.v_head_dim, True)
-    scale = None if branch == "bf16" else torch.ones(heads)
-    attn.W_V, attn.W_V_scale = weights, scale
-    seen = _stub_bmm(namespace, branch, weights, scale)
+    attn.W_V_dcp, attn.dcp_group = weights, object()
+    attn.o_proj = lambda flat: flat
+    seen = _stub_bmm(namespace, "bf16", weights, None)
 
-    result = attn._v_up_proj(x, head_major=True)
+    def exchange(output, lse, group, **kwargs):
+        assert group is attn.dcp_group
+        assert output.shape == (heads, tokens, attn.v_head_dim)
+        assert output.is_contiguous() and output.data_ptr() == seen["YQ"].data_ptr()
+        return output.transpose(0, 1).contiguous()
 
-    assert result.shape == (tokens, heads, attn.v_head_dim)
-    assert result.is_contiguous() == (branch != "bf16")
-    if branch == "bf16":
-        assert seen["YQ"].is_contiguous()
-        assert result.transpose(0, 1).is_contiguous()
-        assert result.data_ptr() == seen["YQ"].data_ptr()
+    _transport(monkeypatch, exchange)
+    result = attn._dcp_project_merge_out_head_major(x, None)
     expected = torch.einsum("tnl,nvl->tnv", x.float(), weights.float())
-    assert torch.equal(result, expected.to(torch.bfloat16))
+    assert torch.equal(result, expected.to(torch.bfloat16).reshape(tokens, -1))
 
 
 @pytest.mark.parametrize(
@@ -178,11 +193,13 @@ def test_prefill_layout_request_only_changes_bf16_storage(projection, branch):
         ("a2a", False, False, True, True),
     ],
 )
+@pytest.mark.parametrize("tokens", [1, 32, 33])
 def test_projection_layout_follows_the_merge_that_can_use_it(
-    projection, backend, decode, fused, fp32, heads_layout
+    projection, monkeypatch, backend, decode, fused, fp32, heads_layout, tokens
 ):
     attn, namespace = projection
-    tokens, heads = 5, attn.num_heads
+    heads = attn.num_heads
+    heads_layout = heads_layout and tokens > 32
     x, weights = _inputs(tokens, heads, attn.kv_lora_rank, attn.v_head_dim)
     attn.W_V, attn.W_V_dcp = weights, weights
     attn.W_V_scale = attn.W_V_dcp_scale = None
@@ -191,65 +208,73 @@ def test_projection_layout_follows_the_merge_that_can_use_it(
     attn._dcp_fused_quant_dtype = lambda: dtype if fused else None
     attn.o_proj = lambda flat: flat
     seen = _stub_bmm(namespace, "bf16", weights, None)
+    counts = torch.ones(tokens, dtype=torch.int32)
 
     def merge(out, lse, **kwargs):
-        assert kwargs.get("head_major", False) == heads_layout
-        assert kwargs["decode"] == decode
-        assert seen["output"].is_contiguous() == (not heads_layout)
-        logical = out.transpose(0, 1) if heads_layout else out
-        logical = logical.contiguous()
-        return (logical, None) if kwargs.get("quant_dtype") is not None else logical
+        assert "head_major" not in kwargs and not heads_layout
+        assert kwargs.get("decode", False) == decode
+        assert kwargs["owned_counts"] is counts
+        assert out.dtype == (torch.float32 if fp32 else torch.bfloat16)
+        assert seen["output"].is_contiguous()
+        return (out, None) if kwargs.get("quant_dtype") is not None else out
 
+    def head_merge(out, lse, group, **kwargs):
+        assert heads_layout and out.is_contiguous()
+        assert kwargs["owned_counts"] is counts
+        assert out.dtype == (torch.float32 if fp32 else torch.bfloat16)
+        return out.transpose(0, 1).contiguous()
+
+    attn.dcp_group = object()
+    attn.dcp_prefill_merge_bf16_ok = not fp32
     attn._dcp_merge = merge
-    result = attn._dcp_project_merge_out(
-        x, None, head_major=True, decode=decode, merge_in_fp32=fp32
-    )
+    _transport(monkeypatch, head_merge)
+    attn._configure_dcp_prefill_routes()
+    if decode:
+        result = attn._dcp_project_merge_out(
+            x, None, decode=True, merge_in_fp32=fp32, owned_counts=counts
+        )
+    else:
+        result = attn._dcp_prefill_merge_out(
+            x, None, merge_in_fp32=fp32, owned_counts=counts
+        )
     expected = torch.einsum("tnl,nvl->tnv", x.float(), weights.float())
     assert torch.equal(result, expected.to(torch.bfloat16).reshape(tokens, -1))
 
 
-@pytest.mark.parametrize("backend", ["mailbox", "ag_rs"])
-def test_head_major_rejects_non_a2a_backend(backend):
+@pytest.mark.parametrize("name", ["dcp_lse_merge", "cp_lse_a2a"])
+def test_ordinary_merge_interface_has_no_head_major_switch(name):
     path = Path(__file__).resolve().parents[1] / "atom/model_ops/dcp_ops.py"
     function = next(
-        node
-        for node in ast.parse(path.read_text(encoding="utf-8")).body
-        if isinstance(node, ast.FunctionDef) and node.name == "dcp_lse_merge"
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == name
     )
-    namespace = {}
-    exec(  # noqa: S102 - execute only the checked-in dispatcher body
-        compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"),
-        namespace,
-    )
-    # Equal H and T would pass a shape-only check while interchanging axes.
-    output = torch.arange(4 * 4 * 8).reshape(4, 4, 8)
-
-    with pytest.raises(AssertionError):
-        namespace["dcp_lse_merge"](output, None, None, backend=backend, head_major=True)
+    assert "head_major" not in {a.arg for a in function.args.args}
 
 
-@pytest.mark.parametrize("branch,collectives", [("fp8", 1), ("fp4", 1), ("bf16", 2)])
-def test_one_row_prefill_keeps_the_projection_transport(
-    projection, monkeypatch, branch, collectives
+@pytest.mark.parametrize("branch", ["fp8", "fp4", "bf16"])
+@pytest.mark.parametrize("tokens", [1, 32, 33])
+def test_prefill_row_count_selects_projection_and_transport_together(
+    projection, monkeypatch, branch, tokens
 ):
     attn, namespace = projection
     attn.num_heads = 2
     heads = 2 * attn.num_heads
-    x, weights = _inputs(1, heads, attn.kv_lora_rank, attn.v_head_dim)
+    x, weights = _inputs(tokens, heads, attn.kv_lora_rank, attn.v_head_dim)
     scale = None if branch == "bf16" else torch.ones(heads)
     attn.W_V = attn.W_V_dcp = weights
     attn.W_V_scale = attn.W_V_dcp_scale = scale
     attn.pbm_enabled, attn.dcp_comm_backend = True, "a2a"
     attn._dcp_fused_quant_dtype = lambda: None
     attn.o_proj = lambda value: value
-    _stub_bmm(namespace, branch, weights, scale)
+    seen = _stub_bmm(namespace, branch, weights, scale)
 
     path = Path(__file__).resolve().parents[1] / "atom/model_ops/dcp_ops.py"
     functions = [
         node
         for node in ast.parse(path.read_text()).body
         if isinstance(node, ast.FunctionDef)
-        and node.name in {"cp_lse_a2a", "_lse_pack_slots"}
+        and node.name in {"cp_lse_a2a", "cp_lse_a2a_head_major", "_lse_pack_slots"}
     ]
     transport = {
         "torch": torch,
@@ -275,20 +300,27 @@ def test_one_row_prefill_keeps_the_projection_transport(
     transport.update(
         _dcp_a2a_pack_kernel=Kernel(3),
         _dcp_a2a_unpack_combine_kernel=Kernel(1),
-        _dcp_a2a_head_major_combine_kernel=Kernel(1),
+        _dcp_a2a_combine_kernel=Kernel(2),
     )
     monkeypatch.setattr(torch.distributed, "all_to_all_single", exchange)
     cp_group = SimpleNamespace(world_size=2, device_group=object())
 
     def merge(out, lse, **kwargs):
-        return transport["cp_lse_a2a"](
-            out, lse, cp_group, head_major=kwargs.get("head_major", False)
-        )
+        return transport["cp_lse_a2a"](out, lse, cp_group)
 
     attn._dcp_merge = merge
-    result = attn._dcp_project_merge_out(x, torch.zeros(1, heads), head_major=True)
-    assert result.shape == (1, attn.num_heads * attn.v_head_dim)
-    assert len(calls) == collectives
+    attn.dcp_group = cp_group
+    _transport(monkeypatch, transport["cp_lse_a2a_head_major"])
+    attn._configure_dcp_prefill_routes()
+    result = attn._dcp_prefill_merge_out(x, torch.zeros(tokens, heads))
+    assert result.shape == (tokens, attn.num_heads * attn.v_head_dim)
+    head_major = branch == "bf16" and tokens > 32
+    if head_major:
+        assert calls == [(heads, tokens, attn.v_head_dim), (heads, tokens)]
+        assert seen["YQ"].is_contiguous()
+    else:
+        assert calls == [(2, tokens, attn.num_heads, attn.v_head_dim + 2)]
+        assert seen["output"].is_contiguous()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -299,7 +331,7 @@ def test_head_major_exchange_preserves_partials_and_fp32_lse(
 ):
     """Exercise the real exchange wrapper; only the collective/kernel are CPU stand-ins."""
     path = Path(__file__).resolve().parents[1] / "atom/model_ops/dcp_ops.py"
-    names = {"cp_lse_a2a", "_lse_pack_slots", "mask_empty_dcp_lse"}
+    names = {"cp_lse_a2a_head_major", "_lse_pack_slots", "mask_empty_dcp_lse"}
     functions = [
         node
         for node in ast.parse(path.read_text(encoding="utf-8")).body
@@ -352,21 +384,21 @@ def test_head_major_exchange_preserves_partials_and_fp32_lse(
         def run(
             self,
             recv,
+            recv_lse_ptr,
             out,
             out_lse,
             recv_stride_n,
             recv_stride_b,
             recv_stride_h,
+            recv_lse_stride_n,
+            recv_lse_stride_b,
+            recv_lse_stride_h,
             out_stride_b,
             out_stride_h,
             lse_stride_b,
             lse_stride_h,
             n_ranks,
             *,
-            recv_lse_ptr,
-            recv_lse_stride_n,
-            recv_lse_stride_b,
-            recv_lse_stride_h,
             WRITE_LSE,
             **kwargs,
         ):
@@ -404,13 +436,12 @@ def test_head_major_exchange_preserves_partials_and_fp32_lse(
 
     cp_group = SimpleNamespace(world_size=ranks, device_group=group)
     monkeypatch.setattr(torch.distributed, "all_to_all_single", exchange)
-    namespace["_dcp_a2a_head_major_combine_kernel"] = Combine()
-    result = namespace["cp_lse_a2a"](
+    namespace["_dcp_a2a_combine_kernel"] = Combine()
+    result = namespace["cp_lse_a2a_head_major"](
         partials[0].transpose(0, 1).contiguous(),
         lse[0],
         cp_group,
         owned_counts=counts[0] if mask_empty else None,
-        head_major=True,
         return_lse=return_lse,
     )
     out, out_lse = result if return_lse else (result, None)

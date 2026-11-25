@@ -55,7 +55,9 @@ Ext-proc parsing and tokenization use the shared request preparation pool,
 configured with the Mesh `--prepare-*` options (see the Mesh README). The legacy
 `--ext-proc-parser-concurrency` and `--ext-proc-max-tokenize-bytes` options are
 still accepted; each applies only when `--prepare-workers` or
-`--prepare-max-tokenize-bytes`, respectively, is unset.
+`--prepare-max-tokenize-bytes`, respectively, is unset. The models fastokens
+encodes have the larger of that byte limit and 64 MiB, unless
+`--fastokens-max-tokenize-bytes` sets theirs.
 
 The Envoy template disables automatic request ID generation and preserves client
 request IDs. Keep `generate_request_id: false` and

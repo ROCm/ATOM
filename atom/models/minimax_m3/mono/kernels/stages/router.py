@@ -9,11 +9,23 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
-from atom.models.minimax_m3.mono.config import HIDDEN, N_ROUTED, SHARED_EXPERT, TOP_K
+from atom.models.minimax_m3.mono.config import (
+    HIDDEN,
+    N_ROUTED,
+    SHARED_EXPERT,
+    TOP_K,
+)
 from atom.models.minimax_m3.mono.kernels.common import ld_bf16x12
 from atom.models.minimax_m3.mono.kernels.stages.shared import XN_SLICE
-from atom.models.minimax_m3.mono.layout import N_ROUTER, SCORE_COPIES
-from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, pow2
+from atom.models.minimax_m3.mono.layout import N_ROUTER, SCORE_COPIES, XN4_WORDS
+from atom.mono.device.mx import (
+    FP8_MAX,
+    clamp_fp8,
+    code_ceil,
+    fp4_pack2,
+    fp4_scale,
+    pow2,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     bf2_f32,
@@ -27,6 +39,7 @@ from atom.mono.device.ops import (
     rsrc,
     traced,
     wave_sum,
+    xshfl,
 )
 from atom.mono.device.sync import preg, publish
 from atom.mono.plan.execution import THREADS, WAVES
@@ -47,6 +60,7 @@ def router_defs(k4ctx):
     bias = k4ctx["bias"]
     eps = k4ctx["eps"]
     fuse_k1 = k4ctx["fuse_k1"]
+    fused_shared = k4ctx["fused_shared"]
     g4 = k4ctx["g4"]
     g_post = k4ctx["g_post"]
     h_in = k4ctx["h_in"]
@@ -95,7 +109,8 @@ def router_defs(k4ctx):
         64``, sigmoid + bias, see route_key) and unbiased sigmoids (wave k % WAVES
         computes it, looking the sigmoids up in LDS at ``sig``): a pick is one
         wave max; the weights are the picks' sigmoids renormalized and scaled by
-        route_scale. Slot 4 is the fused shared expert. ``wave_mask``: this
+        route_scale. Slot 4 is the shared expert's (``SHARED_EXPERT``, its fixed
+        ``shared_weight``). ``wave_mask``: this
         wave's expert -> token mask, ``mask_bit`` or-ed in at the picks (they
         are distinct, and the wave's tokens run in program order): bit k, or 0
         for a pad row (``row_live``), whose experts then join no token's work.
@@ -141,7 +156,7 @@ def router_defs(k4ctx):
     def lds_b8(chunk_word):
         """This lane's B operand of the 128-k chunk at LDS word ``chunk_word``:
         fp8 k 16 g .. + 16 then 64 + 16 g .. + 16 (g = lane // 16), the
-        f8f6f4 MFMA's B layout (harness/mfma_f4f8_probe.py)."""
+        f8f6f4 MFMA's B layout."""
         h = [
             fx.Vector(
                 fx.ptr_load(xs + (chunk_word + 16 * j + 4 * g4), result_type=v4f)
@@ -150,6 +165,14 @@ def router_defs(k4ctx):
         ]
         return fx.Vector.from_elements(
             [h[j][e] for j in range(2) for e in range(4)], fx.Int32
+        )
+
+    def lds_b4(word):
+        """This lane's MXFP4 B operand (a4w4) of the 128-k chunk at LDS word ``word``: k 32 g .. + 32
+        (g = lane // 16), 16 B, the fp4 A tile's K assignment.
+        """
+        return fx.Vector(fx.ptr_load(xs + (word + 4 * g4), result_type=v4f)).bitcast(
+            fx.Int32
         )
 
     def bf16x2(word):
@@ -272,6 +295,34 @@ def router_defs(k4ctx):
                     mb_put_words(mr("xn8"), xw, [word])
                     if tid % 8 == 0:
                         mb_put_words(mr("xsc"), xsw, [e])
+                # the routed experts' MXFP4 xn (a4w4; ``fused_shared``: they read the
+                # MXFP8 one): the same 32-blocks, E8M0 RoundUp; a lane's 4 elements
+                # are 2 bytes, an even lane stores its neighbour's beside its own
+                if const_expr(not fused_shared):
+                    amax4 = fx.max(fx.max(f[0], -f[0]), fx.max(f[1], -f[1]))
+                    amax4 = fx.max(
+                        amax4, fx.max(fx.max(f[2], -f[2]), fx.max(f[3], -f[3]))
+                    )
+                    e4, sc4 = fp4_scale(butterfly(amax4, (1, 2, 4), fx.max))
+                    w16 = fp4_pack2(fx.Int32(0), f[0], f[1], sc4, 0)
+                    w16 = fp4_pack2(w16, f[2], f[3], sc4, 1) & 0xFFFF
+                    word4 = w16 | (xshfl(w16, 1) << 16)
+                    xw4 = k * XN4_WORDS + t * (XN_SLICE // 8) + tid // 2
+                    xsw4 = k * XSC_WORDS + t * (XN_SLICE // 32) + tid // 8
+                    if const_expr(WIDE):
+                        if tid % 2 == 0:
+                            bo.buffer_store(
+                                word4, rsrc(mb("xn4p")), xw4, cache_modifier=CM_DEV
+                            )
+                        if tid % 8 == 0:
+                            bo.buffer_store(
+                                e4, rsrc(mb("xs4p")), xsw4, cache_modifier=CM_DEV
+                            )
+                    else:
+                        if tid % 2 == 0:
+                            mb_put_words(mr("xn4"), xw4, [word4])
+                        if tid % 8 == 0:
+                            mb_put_words(mr("xs4"), xsw4, [e4])
             stamp(26)
             # bf16 pair dot products, one accumulator per pair position: four
             # 12-long chains instead of one 96-long FMA chain behind 192 widenings
@@ -310,6 +361,7 @@ def router_defs(k4ctx):
         "mx8_scale": mx8_scale,
         "mx8_q": mx8_q,
         "lds_b8": lds_b8,
+        "lds_b4": lds_b4,
         "bf16x2": bf16x2,
         "lds_i32": lds_i32,
         "stage_router": stage_router,

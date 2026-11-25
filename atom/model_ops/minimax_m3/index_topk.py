@@ -9,14 +9,14 @@ sparse block maps to exactly one page.
 
 The two phases score differently -- prefill over whole query tiles, decode over
 one request's rows at a time -- and then share a selector. A bf16 / fp8 index cache
-is scored by the Triton kernels here; an MXFP4 one (``--index-cache-dtype fp4``) by
-aiter's FlyDSL scorers, which write the same fp32 block scores (see
-:func:`minimax_m3_index_topk_decode` for their layout). The selector after either is
-this module's Triton one, or aiter's per-row one where it is cheaper.
+is scored by the Triton kernels here; an FP4 one (``--index-cache-dtype fp4`` for MXFP4,
+``nvfp4`` for NVFP4) by aiter's FlyDSL scorers, which write the same fp32 block scores
+(see :func:`minimax_m3_index_topk_decode` for their layout). The selector after either
+is this module's Triton one, or aiter's per-row one where it is cheaper.
 
 Index-K cache layout: ``(num_blocks, 128, idx_head_dim)`` for bf16 / fp8, uint8
-``(num_blocks, 8704)`` MXFP4 pages otherwise. The indexer is MQA: index_q carries
-num_idx_heads heads, index_k one, shared by all of them.
+``(num_blocks, 8704)`` MXFP4 pages or ``(num_blocks, 9216)`` NVFP4 pages otherwise. The
+indexer is MQA: index_q carries num_idx_heads heads, index_k one, shared by all of them.
 
 Only the paths MiniMax M3 uses are implemented: score_type="max", index value
 disabled (score-only indexer). The selected block ids feed the block-sparse
@@ -31,19 +31,46 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
+from . import prefill_policy as _prefill_policy
+
+SCORE_BLOCK_SIZE_Q = _prefill_policy.SCORE_BLOCK_SIZE_Q
+_prefill_score_config = _prefill_policy.prefill_score_config
+_parallel_prefill_selector_wins = _prefill_policy.parallel_prefill_selector_wins
+PREFILL_TOPK_MIN_BLOCK_SIZE_K = _prefill_policy.PREFILL_TOPK_MIN_BLOCK_SIZE_K
+PREFILL_TOPK_MAX_BLOCK_SIZE_K = _prefill_policy.PREFILL_TOPK_MAX_BLOCK_SIZE_K
+PREFILL_TOPK_NUM_WARPS = _prefill_policy.PREFILL_TOPK_NUM_WARPS
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
+from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views as nvfp4_page_views
 
 
 @functools.cache
 def flydsl_ops():
-    """aiter's FlyDSL module (MXFP4 index scorers, work map), imported on first use:
+    """aiter's FlyDSL module (FP4 index scorers, work map), imported on first use:
     every bf16 / fp8 deployment imports this module and must not need FlyDSL."""
     from aiter.ops import flydsl
 
     return flydsl
+
+
+def _fp4_index_ops(index_scorer):
+    """The page views, prefill scorer and decode scorer of the FP4 index cache an
+    `IndexScoreBuffers` record is for: MXFP4, or NVFP4 when ``index_scorer.nvfp4``."""
+    ops = flydsl_ops()
+    if index_scorer.nvfp4:
+        return (
+            nvfp4_page_views,
+            ops.minimax_m3_index_score_prefill_nvfp4_flydsl,
+            ops.minimax_m3_index_score_nvfp4_flydsl,
+        )
+    return (
+        page_views,
+        ops.minimax_m3_index_score_prefill_fp4_flydsl,
+        ops.minimax_m3_index_score_fp4_flydsl,
+    )
 
 
 @functools.cache
@@ -61,43 +88,17 @@ def _small_k_selector():
     return topk_per_row_small_k, topk_per_row_small_k_supported
 
 
-# Query rows one prefill score program owns.
-#
-# Before the block axis was split, this and the grid were the same knob, so it
-# had to be chosen per shape -- narrow wherever a wide one would drop the grid
-# below a CTA per compute unit, which on an fp8 cache was everywhere. Chunks
-# supply the parallelism now, so a flat tile is free to be the widest one that
-# still amortizes: 128 was best or within noise on all 20 measured
-# (dtype x heads x shape) points, while the old occupancy rule gives away 12x
-# more than it does and no other flat tile comes close (64 gives away 25x, 256
-# gives away 9x).
-SCORE_BLOCK_SIZE_Q = 128
-# Workgroups per compute unit the block-axis split aims for (_score_chunk_blocks).
-SCORE_CHUNK_CTAS_PER_CU = 8
-# Stages, both score kernels. 2 -- triton's default -- was the worst of 1/2/3
-# nearly everywhere. Between 1 and 3, 3 wins on fp8 and ties on bf16; 1 wins the
-# short-context rows, which is not where a step spends its time.
-SCORE_NUM_STAGES = 3
 DECODE_SCORE_NUM_STAGES = 3
-
-
-@functools.cache
-def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
-    """Return (warps, stages) without changing the tuned gfx950 path."""
-    if get_gfx() != "gfx1250":
-        return 4, SCORE_NUM_STAGES
-
-    # For FP8 on wave32, a single pipeline stage cuts LDS/register pressure
-    # enough that four warps outperform eight on long-context prefill. Keep
-    # the BF16 configuration separate: it does not have the same tradeoff.
-    fp8_dtypes = (
+_FP8_DTYPES = tuple(
+    dtype
+    for dtype in (
         getattr(torch, "float8_e4m3fn", None),
         getattr(torch, "float8_e4m3fnuz", None),
         getattr(torch, "float8_e5m2", None),
         getattr(torch, "float8_e5m2fnuz", None),
     )
-    return (4, 1) if dtype in fp8_dtypes else (8, SCORE_NUM_STAGES)
-
+    if dtype is not None
+)
 
 # Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
 # floors the blocks a chunk walks -- the query tile is loaded once outside the
@@ -118,6 +119,14 @@ DECODE_SCORE_MIN_BLOCKS = 3
 # (`SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE`); `tests/test_minimax_m3_page_geometry.py`
 # asserts that rather than leaving it to a comment.
 PAGES_PER_SPARSE_BLOCK = 8
+
+# Packed candidate keys occupy bits 0..48: 16 block-id bits, 32 ordered-score
+# bits and one real-candidate bit. Mailbox users put their tag above this.
+SCORE_KEY_BITS = 49
+_SCORE_KEY_REAL_BIT = tl.constexpr(SCORE_KEY_BITS - 1)
+assert (
+    (1 << 48) | (0xFFFFFFFF << 16) | 0xFFFF
+) < 1 << SCORE_KEY_BITS, "packed score keys overlap the mailbox tag"
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +429,47 @@ def _emit_sparse_block_table_kernel(
 # does not move between steps.
 # ---------------------------------------------------------------------------
 @triton.jit
+def _index_block_score_page(
+    q,
+    ik_cache_ptr,
+    page,
+    blk,
+    off_q,
+    off_k,
+    off_d,
+    q_start,
+    sm_scale_log2e,
+    stride_ik_blk,
+    stride_ik_pos,
+    stride_ik_d,
+    BLOCK_SIZE_K: tl.constexpr,
+    POST_REDUCE_SCALE: tl.constexpr,
+):
+    """One page's dot, causal mask and block max."""
+    i = blk * BLOCK_SIZE_K
+    # Every page id names a fully allocated 128-row cache page; the causal mask
+    # below removes positions past the live sequence, so this load needs no mask.
+    k = tl.load(
+        ik_cache_ptr
+        + page * stride_ik_blk
+        + off_k[None, :] * stride_ik_pos
+        + off_d[:, None] * stride_ik_d,
+    )
+    if k.dtype.is_fp8():
+        qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32)
+    else:
+        qk = tl.dot(q, k, out_dtype=tl.float32)
+    if not POST_REDUCE_SCALE:
+        qk *= sm_scale_log2e
+    if q_start < i + BLOCK_SIZE_K:
+        qk = tl.where(off_q[:, None] >= (i + off_k)[None, :], qk, float("-inf"))
+    score = tl.max(qk, axis=1)
+    if POST_REDUCE_SCALE:
+        score *= sm_scale_log2e
+    return score
+
+
+@triton.jit
 def _index_block_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
@@ -444,6 +494,9 @@ def _index_block_score_kernel(
     stride_bt_b,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    STORE_GROUP: tl.constexpr = 1,
+    PREFETCH_PAGES: tl.constexpr = False,
+    POST_REDUCE_SCALE: tl.constexpr = False,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -486,38 +539,93 @@ def _index_block_score_kernel(
     if blk_lo >= blk_end:
         return
     blk_hi = min(blk_lo + chunk_blocks, blk_end)
-    for blk in tl.range(blk_lo, blk_hi):
-        i = blk * BLOCK_SIZE_K
-        page = tl.load(bt_row + blk).to(tl.int64)
-        pos = i + off_k
-        # index-K for this page: [BLOCK_SIZE_D, BLOCK_SIZE_K] (transposed)
-        # we don't need masked load for K, because KV cache ensures
-        # allocation is multiple of BLOCK_SIZE_K.
-        # for tokens beyond seqlen, they will be masked in qk later.
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[None, :] * stride_ik_pos
-            + off_d[:, None] * stride_ik_d,
-        )
-        if k.dtype.is_fp8():
-            qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale_log2e
-        else:
-            qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale_log2e
-        # apply causal mask as needed
-        if q_start < i + BLOCK_SIZE_K:
-            qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
-        # one sparse block per K-tile -> max over the 128 positions
-        score = tl.max(qk, axis=1)  # [BLOCK_SIZE_Q]
-        s_ptrs = (
-            score_ptr
-            + pid_h * stride_s_h
-            + (seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q))
-            * stride_s_n
-            + blk * stride_s_k
-        )
-        q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
-        tl.store(s_ptrs, score, mask=q_store_mask)
+    q_row = seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
+    if STORE_GROUP == 1:
+        for blk in tl.range(blk_lo, blk_hi):
+            page = tl.load(bt_row + blk).to(tl.int64)
+            score = _index_block_score_page(
+                q,
+                ik_cache_ptr,
+                page,
+                blk,
+                off_q,
+                off_k,
+                off_d,
+                q_start,
+                sm_scale_log2e,
+                stride_ik_blk,
+                stride_ik_pos,
+                stride_ik_d,
+                BLOCK_SIZE_K,
+                POST_REDUCE_SCALE,
+            )
+            s_ptrs = (
+                score_ptr + pid_h * stride_s_h + q_row * stride_s_n + blk * stride_s_k
+            )
+            tl.store(s_ptrs, score, mask=q_store_mask)
+    else:
+        tl.static_assert(STORE_GROUP == 4)
+        slots = tl.arange(0, STORE_GROUP)
+        num_groups = tl.cdiv(blk_hi - blk_lo, STORE_GROUP)
+        for group in tl.range(0, num_groups):
+            group_start = blk_lo + group * STORE_GROUP
+            if PREFETCH_PAGES:
+                pages = (
+                    tl.load(bt_row + group_start).to(tl.int64),
+                    tl.load(
+                        bt_row + group_start + 1,
+                        mask=group_start + 1 < blk_hi,
+                        other=0,
+                    ).to(tl.int64),
+                    tl.load(
+                        bt_row + group_start + 2,
+                        mask=group_start + 2 < blk_hi,
+                        other=0,
+                    ).to(tl.int64),
+                    tl.load(
+                        bt_row + group_start + 3,
+                        mask=group_start + 3 < blk_hi,
+                        other=0,
+                    ).to(tl.int64),
+                )
+            scores = tl.full((BLOCK_SIZE_Q, STORE_GROUP), float("-inf"), tl.float32)
+            for slot in tl.static_range(0, STORE_GROUP):
+                blk = group_start + slot
+                if blk < blk_hi:
+                    if PREFETCH_PAGES:
+                        page = pages[slot]
+                    else:
+                        page = tl.load(bt_row + blk).to(tl.int64)
+                    score = _index_block_score_page(
+                        q,
+                        ik_cache_ptr,
+                        page,
+                        blk,
+                        off_q,
+                        off_k,
+                        off_d,
+                        q_start,
+                        sm_scale_log2e,
+                        stride_ik_blk,
+                        stride_ik_pos,
+                        stride_ik_d,
+                        BLOCK_SIZE_K,
+                        POST_REDUCE_SCALE,
+                    )
+                    scores = tl.where(slots[None, :] == slot, score[:, None], scores)
+            blocks = group_start + slots
+            s_ptrs = (
+                score_ptr
+                + pid_h * stride_s_h
+                + q_row[:, None] * stride_s_n
+                + blocks[None, :] * stride_s_k
+            )
+            tl.store(
+                s_ptrs,
+                scores,
+                mask=q_store_mask[:, None] & (blocks[None, :] < blk_hi),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +673,7 @@ def _pack_score_key(score, index, valid):
     # (exponent all ones, mantissa nonzero) rather than `x != x` keeps this in
     # the integer domain and leaves the infinities exactly where they belong.
     ordered = tl.where((bits & 0x7FFFFFFF) > 0x7F800000, 0, ordered)
-    key = (1 << 48) | (ordered.to(tl.int64) << 16) | index.to(tl.int64)
+    key = (1 << _SCORE_KEY_REAL_BIT) | (ordered.to(tl.int64) << 16) | index.to(tl.int64)
     return tl.where(valid, key, 0)
 
 
@@ -623,14 +731,8 @@ def _score_tile_keys(
 # a process sees would fix the width for every later one. That lottery is not
 # academic -- the widths differ by more than 4x across these shapes.
 #
-# Warps go opposite ways for the same reason the widths do. Prefill runs one
-# program per query token (16k CTAs), so one warp per row is plenty and more
-# only adds cross-lane work: 1 won all 28 cells of the sweep. Decode's selector
-# grid is 50-200 CTAs, far too few to fill the machine on their own, so it wants
-# the warps instead.
-PREFILL_TOPK_MIN_BLOCK_SIZE_K = 128
-PREFILL_TOPK_MAX_BLOCK_SIZE_K = 1024
-PREFILL_TOPK_NUM_WARPS = 1
+# (512, 8) is the chosen pair; the warps are needed because decode's selector
+# grid is only 50-200 CTAs.
 DECODE_TOPK_BLOCK_SIZE_K = 512
 DECODE_TOPK_NUM_WARPS = 8
 
@@ -638,25 +740,6 @@ DECODE_TOPK_NUM_WARPS = 8
 @functools.cache
 def _compute_units(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-def _score_chunk_blocks(max_block: int, q_tiles: int, batch: int, heads: int, device):
-    """128-blocks one prefill score program owns.
-
-    The query tile decides how many rows share a loaded page; this decides how
-    many programs there are. Keeping them separate is the point -- without it
-    the only way to raise the grid is to shrink the tile, which is the same
-    thing as reading every page more times.
-
-    Derived from max_block, which is a launch-time bound, so a cuda graph
-    replays the grid it captured. Chunks are sized rather than counted so that
-    chunk z is the same pages for every query tile that reaches it.
-    """
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    want = _compute_units(index) * SCORE_CHUNK_CTAS_PER_CU
-    chunks = max(1, want // max(1, q_tiles * batch * heads))
-    chunks = min(1 << (chunks.bit_length() - 1), max(1, max_block))
-    return triton.cdiv(max_block, chunks)
 
 
 def _decode_score_chunks(batch: int, max_block: int) -> int:
@@ -702,7 +785,8 @@ def _require_packable(max_block: int) -> None:
     if max_block >= 0xFFFF:
         raise ValueError(
             f"packed top-k addresses at most {0xFFFF - 1} blocks, got "
-            f"{max_block}; widen the tie-break field"
+            f"{max_block}; widening the tie-break field also requires updating "
+            "SCORE_KEY_BITS and the indexer-CP mailbox tag layout"
         )
 
 
@@ -741,8 +825,7 @@ def _alloc_emit(
 
 # Row widths (in 128-blocks) from which aiter's selector is the cheaper way to
 # serve the call; under them the fused Triton kernel is, being one launch that
-# also emits. Device us, MI355X, topk=16, rows 1..512, rocprofv3-attributed
-# (`/app/logs_claude/m3_emit_gate_device*.log`), as triton/aiter:
+# also emits. Device us, MI355X, topk=16, rows 1..512, as triton/aiter:
 #
 #     width        64     512    1024    2048    8192
 #     emit=True   0.6x    0.7x    1.0x    1.4x    3.7x
@@ -751,12 +834,239 @@ def _alloc_emit(
 # Width decides, not rows: at fixed width the ratio moves <0.2x across 1..512
 # rows. Emission raises the bar because it costs a second kernel there, 26us
 # against the ~4us the fusion charges for the same work.
+#
+# gfx1250's wave32 build has a different crossover: the row count reaches tens
+# of thousands in DPEP prefill, and its one-pass narrowing repays the separate
+# emit launch once rows * width supplies 16K cells per CU. The work gate keeps
+# short eager calls on the fused Triton selector instead of turning a device win
+# into two host submissions. Complete-path A/B at width 1895/3942 was
+# 128.2 -> 113.9us and 189.4 -> 167.8us; DPEP q16K was 655.2 -> 579.2us
+# (raw logs: https://gist.github.com/XiaobingSuper/8c205499e3dac1349c24d1914fde771d).
 _AITER_MIN_WIDTH = 1024
 _AITER_MIN_WIDTH_WITH_EMIT = 2048
+_GFX1250_AITER_MIN_WIDTH = 512
+_GFX1250_AITER_MIN_CELLS_PER_CU = 1 << 14
 
 
-def _aiter_selector_wins(width, emit):
+def _aiter_selector_wins(
+    width,
+    emit,
+    *,
+    arch,
+    selector_rows,
+    compute_units,
+    decode_max_q=0,
+):
+    if arch == "gfx1250":
+        # Decode is graph-captured and keeps the width-only crossover
+        # (_AITER_MIN_WIDTH / _AITER_MIN_WIDTH_WITH_EMIT).
+        if decode_max_q > 0:
+            return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
+        return (
+            width >= _GFX1250_AITER_MIN_WIDTH
+            and selector_rows * width >= compute_units * _GFX1250_AITER_MIN_CELLS_PER_CU
+        )
     return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
+
+
+@triton.jit
+def _prefill_partial_topk_kernel(
+    score_ptr,
+    partial_key_ptr,
+    row_starts,
+    row_prefix,
+    num_idx_heads,
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
+    stride_p_h,
+    stride_p_n,
+    stride_p_k,
+    SPARSE_BLOCK: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+    pid_group = tl.program_id(2)
+    pid_b = pid_bh // num_idx_heads
+    pid_h = pid_bh % num_idx_heads
+
+    seq_start = tl.load(row_starts + pid_b)
+    block_num = tl.load(row_starts + pid_b + 1) - seq_start
+    if pid_q >= block_num:
+        return
+    prefix_len = tl.load(row_prefix + pid_b)
+    valid_blocks = (prefix_len + pid_q + SPARSE_BLOCK) // SPARSE_BLOCK
+    local_start = tl.maximum(0, valid_blocks - local_blocks)
+    offset = pid_group * BLOCK_SIZE_K
+    score_row = score_ptr + pid_h * stride_s_h + (seq_start + pid_q) * stride_s_n
+    winners = tl.topk(
+        _score_tile_keys(
+            score_row,
+            offset,
+            valid_blocks,
+            local_start,
+            stride_s_k,
+            init_blocks,
+            BLOCK_SIZE_K,
+        ),
+        BLOCK_SIZE_T,
+    )
+    slots = tl.arange(0, BLOCK_SIZE_T)
+    tl.store(
+        partial_key_ptr
+        + pid_h * stride_p_h
+        + (seq_start + pid_q) * stride_p_n
+        + (pid_group * BLOCK_SIZE_T + slots) * stride_p_k,
+        winners,
+    )
+
+
+@triton.jit
+def _prefill_merge_topk_kernel(
+    partial_key_ptr,
+    topk_ptr,
+    row_starts,
+    row_prefix,
+    topk,
+    num_partial,
+    stride_p_h,
+    stride_p_n,
+    stride_p_k,
+    stride_ti_h,
+    stride_ti_n,
+    stride_ti_t,
+    block_table_ptr,
+    sparse_bt_ptr,
+    sparse_ctx_ptr,
+    stride_bt_b,
+    stride_sbt_n,
+    NUM_KV_HEADS: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    MERGE_SIZE: tl.constexpr,
+    pages_per_block: tl.constexpr,
+    block_page_stride: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    seq_start = tl.load(row_starts + pid_b)
+    block_num = tl.load(row_starts + pid_b + 1) - seq_start
+    if pid_q >= block_num:
+        return
+    prefix_len = tl.load(row_prefix + pid_b)
+    valid_blocks = (prefix_len + pid_q + SPARSE_BLOCK) // SPARSE_BLOCK
+
+    cols = tl.arange(0, MERGE_SIZE)
+    keys = tl.load(
+        partial_key_ptr
+        + pid_h * stride_p_h
+        + (seq_start + pid_q) * stride_p_n
+        + cols * stride_p_k,
+        mask=cols < num_partial,
+        other=0,
+    )
+    winners = tl.topk(keys, BLOCK_SIZE_T)
+    slots = tl.arange(0, BLOCK_SIZE_T)
+    topk_idx = (winners & 0xFFFF).to(tl.int32) - 1
+    topk_idx = tl.where(slots < tl.minimum(topk, valid_blocks), topk_idx, -1)
+    tl.store(
+        topk_ptr
+        + pid_h * stride_ti_h
+        + (seq_start + pid_q) * stride_ti_n
+        + slots * stride_ti_t,
+        topk_idx,
+        mask=slots < topk,
+    )
+
+    emit_row = (seq_start + pid_q) * NUM_KV_HEADS + pid_h
+    _emit_sparse_block_table_row(
+        topk_idx,
+        block_table_ptr + pid_b * stride_bt_b,
+        sparse_bt_ptr + emit_row * stride_sbt_n,
+        sparse_ctx_ptr + emit_row,
+        prefix_len + pid_q + 1,
+        topk,
+        pid_h,
+        SPARSE_BLOCK,
+        pages_per_block,
+        block_page_stride=block_page_stride,
+        NUM_KV_HEADS=NUM_KV_HEADS,
+        BLOCK_SIZE_T=BLOCK_SIZE_T,
+    )
+
+
+def _launch_parallel_prefill_selector(
+    score,
+    topk_idx,
+    row_starts,
+    row_prefix,
+    block_table,
+    emit_args,
+    rows_per_req,
+    topk,
+    init_blocks,
+    local_blocks,
+    block_page_stride,
+    pages_per_block,
+):
+    """Select exact top-k, using sparse_bt as the partial-key workspace."""
+    num_idx_heads, total_q, max_block = score.shape
+    batch = row_starts.shape[0] - 1
+    num_groups = triton.cdiv(max_block, PREFILL_TOPK_MAX_BLOCK_SIZE_K)
+    block_size_t = triton.next_power_of_2(topk)
+    sparse_bt, sparse_ctx, stride_bt_b, stride_sbt_n = emit_args
+    partial_keys = sparse_bt.view(torch.int64).view(num_idx_heads, total_q, -1)
+    required_keys = num_groups * block_size_t
+    if required_keys > partial_keys.shape[2]:
+        raise RuntimeError(
+            "parallel prefill selector needs "
+            f"{required_keys} int64 workspace keys per row, but the emitted "
+            f"block table provides {partial_keys.shape[2]}"
+        )
+    _prefill_partial_topk_kernel[(rows_per_req, batch * num_idx_heads, num_groups)](
+        score,
+        partial_keys,
+        row_starts,
+        row_prefix,
+        num_idx_heads,
+        init_blocks,
+        local_blocks,
+        *score.stride(),
+        *partial_keys.stride(),
+        SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+        BLOCK_SIZE_K=PREFILL_TOPK_MAX_BLOCK_SIZE_K,
+        BLOCK_SIZE_T=block_size_t,
+        num_warps=1,
+    )
+
+    num_partial = num_groups * block_size_t
+    _prefill_merge_topk_kernel[(rows_per_req, batch, num_idx_heads)](
+        partial_keys,
+        topk_idx,
+        row_starts,
+        row_prefix,
+        topk,
+        num_partial,
+        *partial_keys.stride(),
+        *topk_idx.stride(),
+        block_table,
+        sparse_bt,
+        sparse_ctx,
+        stride_bt_b,
+        stride_sbt_n,
+        NUM_KV_HEADS=num_idx_heads,
+        SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+        BLOCK_SIZE_T=block_size_t,
+        MERGE_SIZE=triton.next_power_of_2(num_partial),
+        pages_per_block=pages_per_block,
+        block_page_stride=block_page_stride,
+        num_warps=1,
+    )
 
 
 # aiter's support predicate answers from shape, dtype and arch alone, but costs
@@ -772,7 +1082,7 @@ def _select_with_aiter(
 
     Declines rather than raises: k past the wave width, or a survivor buffer
     past the LDS budget, are shapes the Triton selector still handles. `topk_idx`
-    and `score` are contiguous (every scorer writes one, the MXFP4 ones into the
+    and `score` are contiguous (every scorer writes one, the FP4 ones into the
     index workspace), so their flattenings are views.
     """
     heads, total_q, max_block = score.shape
@@ -795,6 +1105,48 @@ def _select_with_aiter(
         flat_score, n_valid_column_per_row, flat_idx, topk, init_blocks, local_blocks
     )
     return True
+
+
+def _launch_sparse_block_table_emit(
+    topk_idx,
+    *,
+    row_starts,
+    row_prefix,
+    batch,
+    topk,
+    block_table,
+    emit_args,
+    num_idx_heads,
+    rows_per_req,
+    decode_max_q,
+    block_page_stride,
+    pages_per_block,
+):
+    """Emit the sparse table after a selector that cannot fuse the write."""
+    sbt, sctx, bt_stride0, sbt_stride0 = emit_args
+    _emit_sparse_block_table_kernel[(rows_per_req, batch, num_idx_heads)](
+        topk_idx,
+        row_starts,
+        row_prefix,
+        topk,
+        *topk_idx.stride(),
+        block_table,
+        sbt,
+        sctx,
+        bt_stride0,
+        sbt_stride0,
+        1,  # sample_interval (block_size_q)
+        SPARSE_BLOCK_SIZE,
+        NUM_KV_HEADS=num_idx_heads,
+        DECODE_MAX_Q=decode_max_q,
+        pages_per_block=pages_per_block,
+        # A cache may pack several planes into a physical block, making its
+        # stride wider than the number of pages this logical block emits.
+        block_page_stride=block_page_stride,
+        # The 16x8 compaction has less work than one wave. More warps only add
+        # cross-wave work (prefill 8.03us -> 4.66us at one warp).
+        num_warps=1,
+    )
 
 
 def _launch_select(
@@ -825,53 +1177,75 @@ def _launch_select(
     picks its tile from the shape, decode's are dense so both index arrays
     collapse to seq_lens and the tile and warp count have to be constants.
     """
-    sbt, sctx, bt_stride0, sbt_stride0 = emit_args
     # Bounds published and the row wide enough to pay for aiter; the selection
     # runs inside the check, which returns False on a shape aiter declines.
     # Without bounds the Triton kernel serves, holding the bound in registers --
     # deriving a private copy here is the per-layer rebuild that
     # `MiniMaxM3SparseMetadata.n_valid_column_per_row` exists to avoid.
+    device_index = (
+        score.device.index
+        if score.device.index is not None
+        else torch.cuda.current_device()
+    )
+    arch = get_gfx_runtime()
+    compute_units = _compute_units(device_index)
     take_aiter = n_valid_column_per_row is not None and _aiter_selector_wins(
-        score.shape[2], emit
+        score.shape[2],
+        emit,
+        arch=arch,
+        selector_rows=score.shape[0] * score.shape[1],
+        compute_units=compute_units,
+        decode_max_q=decode_max_q,
     )
     if take_aiter and _select_with_aiter(
         score, topk_idx, n_valid_column_per_row, topk, init_blocks, local_blocks
     ):
         if emit:
-            _emit_sparse_block_table_kernel[(rows_per_req, batch, num_idx_heads)](
+            _launch_sparse_block_table_emit(
                 topk_idx,
-                row_starts,
-                row_prefix,
-                topk,
-                *topk_idx.stride(),
-                block_table,
-                sbt,
-                sctx,
-                bt_stride0,
-                sbt_stride0,
-                1,  # sample_interval (block_size_q)
-                SPARSE_BLOCK_SIZE,
-                NUM_KV_HEADS=num_idx_heads,
-                DECODE_MAX_Q=decode_max_q,
-                pages_per_block=pages_per_block,
-                # Not PAGES_PER_SPARSE_BLOCK: a caller whose cache packs
-                # several planes into one block has a stride wider than the
-                # pages a block fills. Hard-coding the two to the same constant
-                # would emit a block table off by that difference per logical
-                # block on this path only -- the fused path below already
-                # takes the caller's value.
+                row_starts=row_starts,
+                row_prefix=row_prefix,
+                batch=batch,
+                topk=topk,
+                block_table=block_table,
+                emit_args=emit_args,
+                num_idx_heads=num_idx_heads,
+                rows_per_req=rows_per_req,
+                decode_max_q=decode_max_q,
                 block_page_stride=block_page_stride,
-                # The compaction alone is a `topk x pages_per_block` tile --
-                # 16x8 here -- so a wave is already more lanes than it has
-                # work, and the helper's cumsum stops crossing warps. The
-                # fused kernel reaches the same number from the other side
-                # (`PREFILL_TOPK_NUM_WARPS`); `DECODE_TOPK_NUM_WARPS` is 8 for
-                # the scoring this one does not do. Measured prefill device
-                # time 8.03us -> 4.66us, decode 2.63 -> 2.50, same bytes out.
-                num_warps=1,
+                pages_per_block=pages_per_block,
             )
         return
 
+    # The partial keys reuse sparse_bt until the merge overwrites that row.
+    if _parallel_prefill_selector_wins(
+        arch=arch,
+        width=score.shape[2],
+        query_rows=score.shape[1],
+        compute_units=compute_units,
+        emit=emit,
+        topk=topk,
+        num_idx_heads=num_idx_heads,
+        decode_max_q=decode_max_q,
+        pages_per_block=pages_per_block,
+    ):
+        _launch_parallel_prefill_selector(
+            score,
+            topk_idx,
+            row_starts,
+            row_prefix,
+            block_table,
+            emit_args,
+            rows_per_req,
+            topk,
+            init_blocks,
+            local_blocks,
+            block_page_stride,
+            pages_per_block,
+        )
+        return
+
+    sbt, sctx, bt_stride0, sbt_stride0 = emit_args
     _topk_index_packed_kernel[(rows_per_req, batch, num_idx_heads)](
         score,
         topk_idx,
@@ -1159,13 +1533,14 @@ def minimax_m3_index_topk(
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
-    With an ``index_scorer`` (an `IndexScoreBuffers`, MXFP4 index cache only)
-    ``index_kv_cache`` is the uint8 ``[num_blocks, 8704]`` page cache and aiter's
-    FlyDSL prefill scorer writes the scores into ``index_scorer.scores`` (shared by
+    With an ``index_scorer`` (an `IndexScoreBuffers`, an FP4 index cache only)
+    ``index_kv_cache`` is the uint8 page cache (``[num_blocks, 8704]`` MXFP4,
+    ``[num_blocks, 9216]`` NVFP4 as ``index_scorer.nvfp4`` says) and aiter's FlyDSL
+    prefill scorer writes the scores into ``index_scorer.scores`` (shared by
     every layer, never filled: the selection reads a row only up to its valid
     blocks). Without one the Triton scorer runs. ``pages_per_block`` /
     ``block_page_stride`` describe the emitted block table: 8 / 8 page-16 SHUFFLE,
-    1 / 1 MXFP4 KV.
+    1 / 1 MXFP4 KV (the NVFP4 KV takes the logical block ids, no emitted table).
 
     Returns topk_idx [num_kv_heads, total_q, topk] of 0-indexed block ids
     (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
@@ -1198,8 +1573,9 @@ def minimax_m3_index_topk(
     _require_packable(max_block)
 
     if index_scorer is not None:
-        k_data, k_scale = page_views(index_kv_cache)
-        score = flydsl_ops().minimax_m3_index_score_prefill_fp4_flydsl(
+        views, score_prefill, _ = _fp4_index_ops(index_scorer)
+        k_data, k_scale = views(index_kv_cache)
+        score = score_prefill(
             idx_q,
             k_data,
             k_scale,
@@ -1281,17 +1657,27 @@ def _triton_prefill_score(
         dtype=torch.float32,
         device=idx_q.device,
     )
-    q_tiles = triton.cdiv(max_query_len, SCORE_BLOCK_SIZE_Q)
-    chunk_blocks = _score_chunk_blocks(
-        max_block, q_tiles, batch, num_idx_heads, idx_q.device
+    arch = get_gfx_runtime()
+    is_fp8 = index_kv_cache.dtype in _FP8_DTYPES
+    score_config = _prefill_score_config(
+        arch,
+        is_fp8,
+        max_query_len,
+        max_block,
+        batch,
+        num_idx_heads,
+        _compute_units(
+            idx_q.device.index
+            if idx_q.device.index is not None
+            else torch.cuda.current_device()
+        ),
     )
+    q_tiles = triton.cdiv(max_query_len, score_config.block_size_q)
+    chunk_blocks = score_config.chunk_blocks
     grid_score = (
         q_tiles,
         batch * num_idx_heads,
         triton.cdiv(max_block, chunk_blocks),
-    )
-    score_num_warps, score_num_stages = _prefill_score_launch_config(
-        index_kv_cache.dtype
     )
     _index_block_score_kernel[grid_score](
         idx_q,
@@ -1315,10 +1701,13 @@ def _triton_prefill_score(
         score.stride(1),
         score.stride(2),
         block_table.stride(0),
-        BLOCK_SIZE_Q=SCORE_BLOCK_SIZE_Q,
+        BLOCK_SIZE_Q=score_config.block_size_q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        num_warps=score_num_warps,
-        num_stages=score_num_stages,
+        STORE_GROUP=score_config.store_group,
+        PREFETCH_PAGES=score_config.prefetch_pages,
+        POST_REDUCE_SCALE=score_config.post_reduce_scale,
+        num_warps=score_config.num_warps,
+        num_stages=score_config.num_stages,
     )
     return score
 
@@ -1389,8 +1778,9 @@ def minimax_m3_index_topk_decode(
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
     ``index_scorer`` (here with the step's work map) and ``pages_per_block`` as in
-    :func:`minimax_m3_index_topk`. The MXFP4 scorer takes an e4m3 query; the record's
-    ``max_block`` must not move between graph replays (the map's rows are its grid).
+    :func:`minimax_m3_index_topk`. The FP4 scorers take an e4m3 query (the NVFP4 one
+    widens it to bf16); the record's ``max_block`` must not move between graph replays
+    (the map's rows are its grid).
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1445,9 +1835,10 @@ def minimax_m3_index_topk_decode(
     )
 
     if index_scorer is not None:
+        views, _, score_decode = _fp4_index_ops(index_scorer)
         if index_scorer.work_map is None:
             raise ValueError(
-                "the MXFP4 index decode needs the step's index_scorer "
+                "the FP4 index decode needs the step's index_scorer "
                 "(a work map and the score workspace)"
             )
         score_max_block = index_scorer.max_block
@@ -1461,8 +1852,8 @@ def minimax_m3_index_topk_decode(
         score_out = index_scorer.scores.logits(
             num_idx_heads * total_q, score_max_block
         ).view(num_idx_heads, total_q, score_max_block)
-        k_data, k_scale = page_views(index_kv_cache)
-        score = flydsl_ops().minimax_m3_index_score_fp4_flydsl(
+        k_data, k_scale = views(index_kv_cache)
+        score = score_decode(
             idx_q,
             k_data,
             k_scale,

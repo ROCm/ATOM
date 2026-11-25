@@ -27,6 +27,7 @@ def _forward_work_plan(meta, heads, dtype, topk_out):
         dtype_q=dtype,
         dtype_kv=dtype,
         index_topk_out=topk_out,
+        _sparse_prefill_kv_granularity=1 << (topk_out - 1).bit_length(),
         model_runner=SimpleNamespace(
             forward_vars={
                 name: value
@@ -194,6 +195,15 @@ def test_indexer_to_sparse_mla_matches_attention_reference(
         )
         q = mla_q.to(dtypes.fp8) if fp8 else mla_q
         cache = kv.to(dtypes.fp8) if fp8 else kv
+        support = attention_mla.get_mla_decode_shape_support(
+            width,
+            1,
+            q.dtype,
+            cache.dtype,
+            persistent=True,
+            return_lse=True,
+            page_size=1,
+        )
         unit = torch.ones(1, dtype=torch.float32, device="cuda")
         attn = MLAAttention.__new__(MLAAttention)
         torch.nn.Module.__init__(attn)
@@ -210,6 +220,8 @@ def test_indexer_to_sparse_mla_matches_attention_reference(
             "scale": scale,
             "dcp_sparse_prefill_num_heads": width,
             "dcp_sparse_prefill_persistent": True,
+            "dcp_sparse_prefill_plan_native": support.supported is True
+            and support.native,
             "sparse_dcp_metadata_rebuild": True,
             "dcp_persistent_supported": True,
             "dcp_sparse_prefill_nonps": False,
@@ -526,6 +538,9 @@ def test_small_prefill_head_groups_refresh_graph_metadata(
     indices = torch.empty(rows * 2048, dtype=torch.int32, device="cuda")
 
     def make_attn(allow_groups):
+        support = attention_mla.get_mla_decode_shape_support(
+            128, 1, q.dtype, kv.dtype, persistent=True, return_lse=True, page_size=1
+        )
         attn = MLAAttention.__new__(MLAAttention)
         torch.nn.Module.__init__(attn)
         for name, value in {
@@ -539,6 +554,8 @@ def test_small_prefill_head_groups_refresh_graph_metadata(
             "scale": 576**-0.5,
             "dcp_sparse_prefill_num_heads": 128,
             "dcp_sparse_prefill_persistent": True,
+            "dcp_sparse_prefill_plan_native": support.supported is True
+            and support.native,
             "sparse_dcp_metadata_rebuild": True,
             "dcp_persistent_supported": True,
             "dcp_sparse_prefill_nonps": False,

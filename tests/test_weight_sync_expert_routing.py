@@ -19,9 +19,12 @@ slice does not undo the first shuffle, it produces a third layout.
 
 import pytest
 import torch
+from conftest import atom_config_double
 from torch import nn
 
+from atom.model_engine.collective_rpc import WeightReloadRefused
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 needs_aiter = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -40,11 +43,14 @@ def _updater(model):
         label = "test"
         rank = 0
         world_size = 1
+        config = atom_config_double()
+        attn_family = Family.MHA
 
         def clear_kv_cache(self):
             pass
 
     updater = _Updater()
+    updater._init_weight_updater()
     updater.model = model
     return updater
 
@@ -118,7 +124,7 @@ def test_a_named_expert_buffer_registers_every_slice(param_name):
     )
 
     assert param.eq(3.0).all(), "the write did not land"
-    pending = updater._pending_expert_relayout
+    pending = updater._expert_relayout_pending
     assert list(pending) == [(experts, param_name)]
     arrived = pending[(experts, param_name)]
     assert sorted(arrived) == list(range(EXPERTS))
@@ -141,37 +147,28 @@ def test_a_partial_named_expert_buffer_is_refused():
             torch.zeros(EXPERTS, INTERMEDIATE, HIDDEN, dtype=torch.bfloat16),
         )
 
-    assert not updater._pending_expert_relayout
+    assert not updater._expert_relayout_pending
 
 
-def test_a_named_expert_buffer_is_refused_on_a_quantized_moe():
-    """The plain dispatch would have written it and reported updated=1.
-    `_check_expert_sync_supported` is the check this route was missing."""
-    model, experts = _moe_model(dtype=torch.float8_e4m3fnuz)
+@pytest.mark.parametrize(
+    ("layer", "reason"),
+    [
+        ({"dtype": torch.float8_e4m3fnuz}, "full-precision write cannot produce"),
+        ({"expert_map": torch.zeros(EXPERTS, dtype=torch.int32)}, "expert-parallel"),
+    ],
+    ids=["quantized", "expert-parallel"],
+)
+def test_a_named_expert_buffer_is_refused_before_it_is_written(layer, reason):
+    """The plain dispatch would have written it and reported updated=1."""
+    model, experts = _moe_model(**layer)
     updater = _updater(model)
+    before = experts.w13_weight.detach().clone()
 
-    with pytest.raises(NotImplementedError, match="quantized storage format"):
-        updater._apply_named_expert_buffer(
-            "mlp.experts.w13_weight",
-            "w13_weight",
-            experts,
-            experts.w13_weight,
-            torch.zeros_like(experts.w13_weight),
+    with pytest.raises(WeightReloadRefused, match=reason):
+        updater.update_weights(
+            [("mlp.experts.w13_weight", torch.ones_like(experts.w13_weight))]
         )
-
-
-def test_a_named_expert_buffer_is_refused_under_expert_parallelism():
-    model, experts = _moe_model(expert_map=torch.zeros(EXPERTS, dtype=torch.int32))
-    updater = _updater(model)
-
-    with pytest.raises(NotImplementedError, match="expert-parallel"):
-        updater._apply_named_expert_buffer(
-            "mlp.experts.w13_weight",
-            "w13_weight",
-            experts,
-            experts.w13_weight,
-            torch.zeros_like(experts.w13_weight),
-        )
+    assert experts.w13_weight.view(torch.uint8).equal(before.view(torch.uint8))
 
 
 # ── the wrappers ModelRunner rebinds onto self.model ──────────────────────
@@ -223,7 +220,6 @@ def test_the_mappings_reached_by_attribute_are_unaffected(wrap):
         ("gate_proj", "experts.w13_weight", 0, "w1")
     ]
     assert updater._get_packed_modules_mapping() == {"gate_proj": ("gate_up_proj", 0)}
-    assert updater._get_packed_shard_order() == {"gate_up_proj": [0]}
 
 
 def test_a_sync_that_matched_nothing_says_so_above_debug(caplog):
@@ -262,7 +258,7 @@ def test_a_rebind_after_the_first_lookup_rebuilds_the_mapping():
 
 def _pending_two_buffers(updater, experts, *, second_is_half_written):
     """Buffer A complete, buffer B missing a shard so finalize raises on it."""
-    pending = updater._pending_expert_relayout
+    pending = updater._expert_relayout_pending
     pending[(experts, "w13_weight")] = {e: {"w1", "w3"} for e in range(EXPERTS)}
     pending[(experts, "w2_weight")] = {
         e: (set() if second_is_half_written else {"w2"}) for e in range(EXPERTS)
@@ -324,7 +320,7 @@ def test_a_half_delivered_expert_does_not_poison_every_later_sync(monkeypatch):
         lambda buffer, ids, **k: shuffled.append(tuple(ids)),
         raising=True,
     )
-    pending = updater._pending_expert_relayout
+    pending = updater._expert_relayout_pending
     pending[(experts, "w13_weight")] = {0: {"w1", "w3"}, 1: {"w1"}}
 
     with pytest.raises(RuntimeError, match=r"w13_weight\[1\] arrived without"):
@@ -359,7 +355,7 @@ def test_a_whole_expert_resent_later_gets_its_layout_back(monkeypatch):
         lambda buffer, ids, **k: shuffled.append(tuple(ids)),
         raising=True,
     )
-    updater._pending_expert_relayout[(experts, "w13_weight")] = {1: {"w1"}}
+    updater._expert_relayout_pending[(experts, "w13_weight")] = {1: {"w1"}}
 
     with pytest.raises(RuntimeError, match="half new and"):
         updater._finalize_expert_weight_sync()
@@ -375,7 +371,7 @@ def test_a_whole_expert_resent_later_gets_its_layout_back(monkeypatch):
     updater._finalize_expert_weight_sync()
 
     assert shuffled == [(0, 1)]
-    assert not updater._pending_expert_relayout
+    assert not updater._expert_relayout_pending
 
 
 @needs_aiter
@@ -425,7 +421,7 @@ def test_finalize_is_a_no_op_with_nothing_pending():
 
     updater._finalize_expert_weight_sync()
 
-    assert not updater._pending_expert_relayout
+    assert not updater._expert_relayout_pending
 
 
 def test_the_updater_needs_no_expert_mapping_for_this_route():

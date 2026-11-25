@@ -160,6 +160,17 @@ def shared_expert_prefixes(name: str, matching_name: str) -> tuple[str, str]:
     )
 
 
+def shared_expert_slot_name(name: str, matching_name: str, n_routed: int) -> str:
+    """`name`, a shared expert's, rewritten onto the fused MoE buffer's slot
+    after its `n_routed` routed experts.
+
+    Keeps the module-naming prefix (mlp. / ffn.) so the rewritten name matches
+    the model's routed-expert parameter naming.
+    """
+    module_prefix = matching_name.split("shared_expert", 1)[0]
+    return name.replace(matching_name, f"{module_prefix}experts.{n_routed}.")
+
+
 @dataclass
 class CheckpointNameRewriter:
     """Turns an on-disk tensor name into the parameter name it belongs to.
@@ -244,15 +255,10 @@ class CheckpointNameRewriter:
                 "Cannot remap shared expert weights without n_routed_experts, "
                 "num_local_experts, or num_experts on the model config."
             )
-        # Keep the module-naming prefix (mlp. / ffn.) so the rewritten name
-        # matches this model's routed-expert parameter naming. The id follows
-        # the *logical* routed experts, matching
+        # The id follows the *logical* routed experts, matching
         # `FusedMoE.make_expert_params_mapping`; FusedMoE translates it to a
         # physical slot, which under EPLB also has to clear the replicas.
-        module_prefix = matching_name.split("shared_expert", 1)[0]
-        return name.replace(
-            matching_name, f"{module_prefix}experts.{self.n_routed_experts}."
-        )
+        return shared_expert_slot_name(name, matching_name, self.n_routed_experts)
 
 
 def extract_expert_target_and_id(name: str) -> tuple[str, int] | None:
