@@ -25,7 +25,7 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 | `max_num_seqs` | 512 | Maximum sequences in a single batch |
 | `max_num_batched_tokens` | 16384 | Maximum tokens scheduled in a single step |
 | `kv_cache_block_size` | 16 | Tokens per KV cache block (must be multiple of 16, or 1; exactly 64 for the FP4 sparse indexer) |
-| `enable_prefix_caching` | `False` | Enable hash-based prefix block sharing |
+| `enable_prefix_caching` | `True` | Enable hash-based prefix block sharing |
 | `scheduler_delay_factor` | 0.0 | Delay factor for batching prompt requests (0 = no delay) |
 | `gpu_memory_utilization` | 0.9 | Fraction of GPU memory for KV cache |
 
@@ -285,6 +285,9 @@ class BlockManager:
         pool_per_req: dict = getattr(config, "pool_entries_per_req", None) or {}
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        # A P/D producer's transfer slots sit above the live ones.
+        self.num_state_transfer_slots = config.state_transfer_slots
+        self.num_state_slots -= self.num_state_transfer_slots
         checkpoint_spec = state_runtime.checkpoint_spec
         self.paged_state_checkpoints = None
         if checkpoint_spec is not None:
@@ -341,7 +344,7 @@ What it costs:
 
 **Per-Request Cache Pools (Stateful-Attention Models):** For models whose attention type maintains per-request state outside the paged KV pool (GDN: Qwen3-Next, Qwen3.5, Kimi-Linear; DeepSeek-V4's compressor ring):
 - `state` — a [`StateSlotPool`](../atom/model_engine/state_pool.py), owning the Active Slot free list and the fork-checkpoint index. PAGE-copy checkpoints are owned separately by [`PagedStateCheckpointCoordinator`](../atom/model_engine/page_unit_checkpoint.py). Slots are handed out per need rather than in fixed-width groups: a live request takes `state_slots_per_req` of them (1 for a single committed state, `1 + num_speculative_tokens` where a rollback slot per speculated token is kept) while a checkpoint takes exactly one, because a resumed prefix has no speculation to roll back. See **State checkpoints** below.
-- `num_state_slots` — total capacity, so callers can tell "all slots busy" (transient) from "the pool can never hold one request" (permanent). Compared against `state_slots_per_req`, not against zero.
+- `num_state_slots` — the slots live requests can take (a P/D producer's transfer slots are carved off above them), so callers can tell "all slots busy" (transient) from "the pool can never hold one request" (permanent). Compared against `state_slots_per_req`, not against zero.
 
 The state class costs no paged blocks at admission time: sizing reserves every STATE class's floor before the paged class is sized (see [`sub_pool_spec.py`](../atom/model_ops/attentions/pool_layout/sub_pool_spec.py)), so a sequence only needs a free slot index. Because that floor is exactly `max_num_seqs` requests' worth, the slot pool never binds before `max_num_seqs` does.
 
@@ -447,11 +450,23 @@ def deallocate(self, seq: Sequence):
 
 **Per-request cache deallocation (if `seq.has_per_req_cache`):**
 
-1. Returns **every** slot the seq held — `release_many`, not one `release`. The committed slot and its speculation scratch go back together; the scratch is this request's alone and means nothing to the next one. Releasing only `state_slots[0]` leaks `num_spec` slots per request, which admission then cannot see.
+1. Returns **every** slot the seq held — `release_many`, not one `release`. The committed slot and its speculation scratch go back together; the scratch is this request's alone and means nothing to the next one. Releasing only `state_slots[0]` leaks `num_spec` slots per request, which admission then cannot see. With transfer slots, `BlockManager.__init__` binds the pool's `release_many` to one that hands a transfer slot back to its own list.
 2. Drops the pending fork source: no next forward is going to read it, so it should not sit out a pass for a reader that no longer exists.
 3. Clears `state_slots` and `state_fork_src`.
 
 A checkpoint the seq resumed from is not released here — it went back to the free list under the state index when it was taken, and it is read-only.
+
+#### P/D producer: state transfer slots
+
+A P/D producer keeps a finished request's KV blocks until the decode takes them, which can be seconds when the decode is full. Without transfer slots it keeps the request's state slots for that time too, and those requests can fill the state pool (`max_num_seqs` x slots per request) and block new prefills.
+
+`"state_transfer_slots": N` in a MoRIIO producer's `--kv-transfer-config` adds N slots at the top of the state pool, which admission never hands out:
+
+- **Finish.** When a request finishes with a hand-off, `Scheduler._stage_state_for_send` moves it to a free transfer slot (`BlockManager.move_state_to_transfer_slot`) before `request_finished` advertises the slot to the decode. Its live slots go back to admission at once; its KV blocks stay deferred as before.
+- **Copy.** `MoRIIOConnectorMetadata.state_stages` carries the (live slot, transfer slot) pair to the workers on the next step or idle tick. `ModelRunner._process_kvconnector_output_relocating` (bound over `process_kvconnector_output` at sizing) copies it with the builder's `relocate_state_slots`, ahead of the next forward on the same stream, and hands the pairs to the connector (`note_state_stages`), which records a CUDA event after the copy and pushes from the transfer slot only once it has fired. Without transfer slots none of this runs: the metadata is a plain `ConnectorMetadata` and the runner never reads `state_stages`.
+- **Fallback.** A request keeps its live slot when every transfer slot is taken.
+- **Sizing.** Each transfer slot costs one state slot's bytes per rank, taken from the KV budget (Kimi-K3 TP8: 57.4 MB with an fp32 SSM state). A request uses one whatever its DSpark size. Size N for the finished prefills that wait for the decode at once; P's `max_num_seqs` is a reasonable start.
+- **Scope.** The KDA/GDN builder sizes them only for MoRIIO as the producer's only connector. Set anywhere else (a consumer, Mooncake, `kv_connector: multi`, a model other than KDA/GDN), the key sizes nothing and the runner logs a warning. A value that is not a non-negative integer is refused at startup. The split is logged at startup, and a `[Transfer Slots]` line after `[Pool Pressure]` reports `used/total, moved, found full`.
 
 ### Can-allocate and can-append checks
 

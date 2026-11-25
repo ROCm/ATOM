@@ -39,6 +39,7 @@ from fastapi.exception_handlers import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from jinja2 import TemplateError
 from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
@@ -135,6 +136,7 @@ from .request_timing import (
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
+    anthropic_context_length_message,
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
@@ -663,6 +665,17 @@ def _coerce_n(requested_n: int | None, temperature: float | None) -> int:
     return n
 
 
+class ContextLengthError(ValueError):
+    """A request that does not fit the context: a 400, which an endpoint may
+    word in its own API's terms from the counts."""
+
+    def __init__(self, message: str, prompt_tokens: int, max_tokens: int, limit: int):
+        super().__init__(message)
+        self.prompt_tokens = prompt_tokens
+        self.max_tokens = max_tokens
+        self.limit = limit
+
+
 def _validate_context_length(
     num_prompt_tokens: int,
     max_tokens: int,
@@ -676,12 +689,15 @@ def _validate_context_length(
     if total_tokens <= int(max_model_len):
         return
 
-    raise ValueError(
+    raise ContextLengthError(
         f"This model's maximum context length is {max_model_len} tokens. "
         f"However, you requested {requested_output_tokens} output tokens and "
         f"your prompt contains at least {num_prompt_tokens} input tokens, for "
         f"a total of at least {total_tokens} tokens. Please reduce the length "
-        f"of the input prompt or the number of requested output tokens."
+        f"of the input prompt or the number of requested output tokens.",
+        int(num_prompt_tokens),
+        requested_output_tokens,
+        int(max_model_len),
     )
 
 
@@ -719,27 +735,37 @@ def _validate_pool_capacity(
     if max_pool_tokens is None or int(num_prompt_tokens) <= int(max_pool_tokens):
         return
 
-    raise ValueError(
+    raise ContextLengthError(
         f"This server's KV cache holds at most {max_pool_tokens} tokens for a "
         f"single request, and your prompt contains at least {num_prompt_tokens} "
         f"input tokens. Please shorten the prompt, or restart the server with a "
-        f"higher --gpu-memory-utilization to enlarge the cache."
+        f"higher --gpu-memory-utilization to enlarge the cache.",
+        int(num_prompt_tokens),
+        0,
+        # The prompt alone is too long: a limit it fills.
+        int(max_pool_tokens) + 1,
     )
 
 
 def _validate_sequence_context_length(seq, sampling_params=None) -> None:
     limit = _get_engine_max_model_len()
+    pool = _get_engine_max_pool_tokens()
+    # The tighter limit answers first. A pool smaller than the context refuses
+    # a prompt it cannot hold whatever max_tokens is; a pool at least as large
+    # never binds once the context check passes.
+    if pool is not None and (limit is None or pool < limit):
+        _validate_pool_capacity(seq.num_prompt_tokens, pool)
     if getattr(sampling_params, "max_tokens_is_default", False) and limit is not None:
         remaining = limit - seq.num_prompt_tokens
         if remaining <= 0:
-            raise ValueError("The prompt leaves no context space for output tokens")
+            raise ContextLengthError(
+                "The prompt leaves no context space for output tokens",
+                seq.num_prompt_tokens,
+                0,
+                limit,
+            )
         seq.max_tokens = min(seq.max_tokens, remaining)
-    _validate_context_length(
-        seq.num_prompt_tokens,
-        seq.max_tokens,
-        _get_engine_max_model_len(),
-    )
-    _validate_pool_capacity(seq.num_prompt_tokens, _get_engine_max_pool_tokens())
+    _validate_context_length(seq.num_prompt_tokens, seq.max_tokens, limit)
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:
@@ -1375,39 +1401,21 @@ def _engine_kv_transfer_params(
     return {k: v for k, v in kv_transfer_params.items() if k != "prompt_token_ids"}
 
 
-def _prompt_headroom(
-    max_tokens: int, max_ctx: int, kv_transfer_params: dict[str, Any] | None
-) -> int:
-    """Output tokens to reserve when an over-long prompt is truncated.
-
-    A PD router sends the prefill leg ``max_tokens=1`` and the decode leg the
-    client's value. With a KV handoff the reservation therefore cannot depend
-    on ``max_tokens``, or the two legs truncate to different prompts and the
-    transferred blocks no longer match the decode-side sequence.
-    """
-    headroom = max(1024, max_ctx // 8)
-    if kv_transfer_params is None:
-        headroom = min(max_tokens, headroom)
-    return headroom
-
-
 def _prepare_prompt(
     messages,
     template_kwargs: dict[str, Any],
     *,
     tools,
     preserve_tool_call_arguments: bool,
-    max_tokens: int,
-    kv_transfer_params: dict[str, Any] | None,
 ) -> tuple[PrefixEncoding | list[int], str]:
-    """Render, tokenize the engine's way and cut to the context, in one
-    executor step for ``/v1/messages`` and ``/v1/responses``.
+    """Render and tokenize the engine's way, in one executor step for
+    ``/v1/messages`` and ``/v1/responses``.
 
     Returns ``(engine_input, text)``: what preprocess takes in place of the
     prompt (no second tokenize), and the text the engine runs, which seeds the
-    reasoning channel. A prompt longer than the context minus the output
-    headroom is cut from the end; a context with no room for any prompt is
-    refused (ValueError, a 400)."""
+    reasoning channel. The prompt is never cut: cutting drops its end, the
+    latest turn and the generation prompt. Admission refuses an over-long one
+    (``ContextLengthError``)."""
     prompt = apply_chat_template(
         tokenizer,
         custom_message_encoder,
@@ -1416,23 +1424,31 @@ def _prepare_prompt(
         preserve_tool_call_arguments=preserve_tool_call_arguments,
         **template_kwargs,
     )
-    encoded = engine.io_processor.encode_prompt(prompt)
-    max_ctx = int(_get_engine_max_model_len() or 30720)
-    cap = max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
-    if cap < 1:
-        raise ValueError(
-            f"max_tokens={max_tokens} leaves no room for a prompt in this "
-            f"model's {max_ctx}-token context"
+    return engine.io_processor.encode_prompt(prompt), prompt
+
+
+def _renders_without_mid_system(
+    messages, template_kwargs: dict[str, Any], tools
+) -> bool:
+    """Whether the template takes ``messages`` once every system message other
+    than ``messages[0]`` is dropped: run only after it refused them, to tell a
+    template that wants its system message first from one that failed for
+    another reason."""
+    kept = [m for i, m in enumerate(messages) if i == 0 or m.role != "system"]
+    if len(kept) == len(messages):
+        return False
+    try:
+        apply_chat_template(
+            tokenizer,
+            custom_message_encoder,
+            kept,
+            tools=tools,
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            **template_kwargs,
         )
-    token_ids = encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded
-    if len(token_ids) <= cap:
-        return encoded, prompt
-    logger.warning("Prompt too long (%d > %d), truncating", len(token_ids), cap)
-    token_ids = list(token_ids[:cap])
-    text = tokenizer.decode(token_ids, skip_special_tokens=False)
-    if not text:
-        raise ValueError("The prompt is empty after truncation to the context")
-    return token_ids, text
+    except Exception:  # noqa: BLE001 - the caller re-raises the original
+        return False
+    return True
 
 
 async def _prepare_engine_input(
@@ -1440,15 +1456,11 @@ async def _prepare_engine_input(
     template_kwargs: dict[str, Any],
     *,
     tools,
-    max_tokens: int,
     kv_transfer_params: dict[str, Any] | None,
 ) -> tuple[PrefixEncoding | list[int], dict[str, Any] | None, bool]:
     """``(engine_input, multimodal_data, starts_in_reasoning)`` for
-    ``/v1/messages`` and ``/v1/responses``.
-
-    A request with images is prepared as on the chat path, and is not cut to
-    the context: a cut could end inside an image. One without goes through
-    ``_prepare_prompt`` as before."""
+    ``/v1/messages`` and ``/v1/responses``: a request with images prepared as
+    on the chat path, one without through ``_prepare_prompt``."""
     if _has_multimodal_content(messages):
         if kv_transfer_params is not None:
             # Only `/v1/chat/completions` hands an image request off (its
@@ -1468,8 +1480,6 @@ async def _prepare_engine_input(
         template_kwargs,
         tools=tools,
         preserve_tool_call_arguments=preserve_tool_call_arguments,
-        max_tokens=max_tokens,
-        kv_transfer_params=kv_transfer_params,
     )
     return engine_input, None, prompt_starts_in_reasoning(prompt)
 
@@ -2037,7 +2047,13 @@ async def value_error_handler(request: Request, exc: ValueError):
             "error": {
                 "message": str(exc),
                 "type": "invalid_request_error",
-                "code": 400,
+                # OpenAI's code for it, on which Codex compacts or reports an
+                # exhausted context instead of a generic 400.
+                "code": (
+                    "context_length_exceeded"
+                    if isinstance(exc, ContextLengthError)
+                    else 400
+                ),
             }
         },
     )
@@ -2510,6 +2526,11 @@ async def _chat_completions(
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ContextLengthError as e:
+        logger.error(f"Validation error in {route}: {e}")
+        # The same 400 body as any other, but with OpenAI's
+        # context_length_exceeded code, which Codex reads.
+        return await value_error_handler(raw_request, e)
     except ValueError as e:
         logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -2803,6 +2824,11 @@ async def _completions(
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ContextLengthError as e:
+        logger.error(f"Validation error in {route}: {e}")
+        # The same 400 body as any other, but with OpenAI's
+        # context_length_exceeded code, which Codex reads.
+        return await value_error_handler(raw_request, e)
     except ValueError as e:
         logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -2911,15 +2937,30 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        engine_input, multimodal_data, starts_in_reasoning = (
-            await _prepare_engine_input(
+        try:
+            engine_input, multimodal_data, starts_in_reasoning = (
+                await _prepare_engine_input(
+                    messages,
+                    merged_kwargs,
+                    tools=anthropic_to_openai_tools(request.tools),
+                    kv_transfer_params=kv_transfer_params,
+                )
+            )
+        except TemplateError as exc:
+            # A template that only takes a system message first. Claude Code
+            # answers this 400 by resending with those messages folded into
+            # user turns -- so only when they are what the template refused.
+            if await asyncio.to_thread(
+                _renders_without_mid_system,
                 messages,
                 merged_kwargs,
-                tools=anthropic_to_openai_tools(request.tools),
-                max_tokens=sampling_params.max_tokens,
-                kv_transfer_params=kv_transfer_params,
-            )
-        )
+                anthropic_to_openai_tools(request.tools),
+            ):
+                raise ValueError(
+                    f'Unexpected role "system" in messages: this model\'s chat '
+                    f"template rejected it ({exc})"
+                ) from exc
+            raise
 
         if request.stream:
             # Streaming response
@@ -3165,11 +3206,18 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as exc:
+        message = (
+            anthropic_context_length_message(
+                exc.prompt_tokens, exc.max_tokens, exc.limit
+            )
+            if isinstance(exc, ContextLengthError)
+            else str(exc)
+        )
         return JSONResponse(
             status_code=400,
             content={
                 "type": "error",
-                "error": {"type": "invalid_request_error", "message": str(exc)},
+                "error": {"type": "invalid_request_error", "message": message},
             },
         )
     except Exception as e:
@@ -3334,7 +3382,6 @@ async def responses_create(raw_request: Request):
                 messages,
                 merged_kwargs,
                 tools=openai_tools,
-                max_tokens=sampling_params.max_tokens,
                 kv_transfer_params=kv_transfer_params,
             )
         )
@@ -3817,6 +3864,16 @@ def main():
     args = parser.parse_args()
     if args.api_server_count < 1:
         parser.error("--api-server-count must be at least 1")
+    if envs.ATOM_PRELOAD == "daemon":
+        # A weight cache daemon serves weights, not requests.
+        from atom.model_loader.weight_cache.daemon import run_daemon
+
+        run_daemon(EngineArgs.from_cli_args(args))
+        return
+    if envs.ATOM_PRELOAD == "server":
+        from atom.model_loader.weight_cache.preload import record_launch
+
+        record_launch()  # the runners start a daemon with it
 
     _setup_frontend(args)
 
