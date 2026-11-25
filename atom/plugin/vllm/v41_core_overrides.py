@@ -7,8 +7,9 @@ The metadata builder, the CSA2 cache, attention and the Engram staging each
 need one thing here that ATOM's own engine does not, and each gets it the same
 way: an override on a subclass, or an attribute set on the class before any
 model is built. Nothing in this file changes what native computes -- core
-allocates its own pool, frees its own scratch, forks its own stream and hands
-attention's rows back by return value, exactly as it did before any of this.
+allocates its own pool, frees its own scratch and forks its own stream. Native
+unfused attention returns BF16 rows; fused attention writes caller-owned MXFP8
+data/scale planes and returns None. This frontend keeps those arithmetic paths.
 
 They are collected here because they are the same kind of thing and have the
 same reason to exist, which in every case is a property of vLLM rather than of
@@ -30,6 +31,7 @@ from atom.model_ops.attentions.deepseek_v41.backend import (
 )
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+    fused_sparse_attn_v41_paged_2src,
     sparse_attn_v41_paged_2src,
 )
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
@@ -549,6 +551,9 @@ def _attend_block(
     queries,
     hidden_fp8=None,
     hidden_scale_dtype=None,
+    attn_out_scale=None,
+    *,
+    fused=False,
 ):
     """Everything from the compressor fork to the attention rows, in place.
 
@@ -559,36 +564,55 @@ def _attend_block(
     one on it. `_step` is the fallback for the window before a pool is bound.
 
     `hidden_scale_dtype` is set when `_forward` passed the scale as a uint8
-    view; the scale is viewed back to it here.
+    view; the scale is viewed back to it here. `fused` explicitly selects
+    MXFP8 output and requires both `attn_out` and `attn_out_scale`; the latter
+    crosses the capture break as uint8. A fused step with no requests zeros
+    the data, writes unit scales and returns before launching attention.
     """
     if hidden_scale_dtype is not None:
         hidden_scale = hidden_scale.view(hidden_scale_dtype)
     step = getattr(cache, "current_step", None) or _step
+    if fused:
+        assert attn_out is not None and attn_out_scale is not None
+    else:
+        assert attn_out_scale is None
+    if fused and not step.requests:
+        self._zero_mxfp8(attn_out, attn_out_scale)
+        return
     compressed = self._fork_compress(hidden, cache, step, rope)
     # Auxiliary readers keep BF16; QKV can reuse the preceding MHC quantization.
     q_lora, kv_pre = self.project_qkv(
         hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
     )
-    qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
+    if fused:
+        # The norm/window write precedes the scorer's fork; it writes the ring,
+        # while the compressor and scorer use their arena and index planes.
+        qr, qr_scale, kv, window_kv = cache.norm_rope_quant_window(
+            self.spec.layer_id, self.qk_norm, q_lora, kv_pre, rope, step
+        )
+    else:
+        qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
     self._fork_select(hidden, qr, qr_scale, cache, step, rope, compressed=compressed)
     if queries is not None:
         qr, qr_scale = queries.take(qr, qr_scale)
     query = self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim))
-    # One launch for both rotations, the KV row's FP8 bytes and, where a
+    # On the unfused path, one launch for both rotations, KV FP8 bytes and, where a
     # decode allows it, the window write. `window_kv` is what is left for
     # `write_window` below, which is nothing when that fold happened. The
-    # FP8 pool's attention reads the query as MXFP8 (`query_fp8`).
-    a8w4 = self._use_a8w4_attention(query, cache)
-    query_fp8 = cache.query_fp8(query, a8w4=a8w4)
-    if queries is None:
-        kv, window_kv = cache.rope_quant_window(
-            self.spec.layer_id, query, kv_normed, rope, step, query_fp8, a8w4=a8w4
-        )
-    else:
-        kv, window_kv = cache.rope_quant_window(
-            self.spec.layer_id, None, kv_normed, rope, step, a8w4=a8w4
-        )
-        cache.rotate_query(query, rope, queries.positions, query_fp8)
+    # unfused FP8 attention reads MXFP8 Q (`query_fp8`); fused attention takes BF16 Q.
+    a8w4, query_fp8 = False, None
+    if not fused:
+        a8w4 = self._use_a8w4_attention(query, cache)
+        query_fp8 = cache.query_fp8(query, a8w4=a8w4)
+        if queries is None:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, query, kv_normed, rope, step, query_fp8, a8w4=a8w4
+            )
+        else:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, None, kv_normed, rope, step, a8w4=a8w4
+            )
+            cache.rotate_query(query, rope, queries.positions, query_fp8)
     # A forked compressor was already waited at the scorer, on whichever
     # stream that ran; joining it again costs one wait and keeps one rule.
     join_stream(self.index_stream, self.compress_stream)
@@ -602,7 +626,18 @@ def _attend_block(
     if cache.packed and not a8w4:
         pool = (pool, cache.ring_view(self.spec.layer_id))
     kwargs = {"out": flat_query}
-    if a8w4 or cache.kv_fp8:
+    if fused:
+        attend = fused_sparse_attn_v41_paged_2src
+        attending = flat_query
+        kwargs = {
+            "rope": rope,
+            "positions": (
+                cache.rope_positions(step) if queries is None else queries.positions
+            ),
+            "out": attn_out,
+            "out_scale": attn_out_scale.view(torch.float8_e8m0fnu),
+        }
+    elif a8w4 or cache.kv_fp8:
         attend = sparse_attn_v41_paged_2src
         attending = tuple(part.flatten(0, 1) for part in query_fp8)
         if a8w4:
@@ -651,6 +686,9 @@ def _attend_block(
         )
         # Preserve the prior ring until every query has consumed its prefix.
         cache.write_window(self.spec.layer_id, window_kv, step)
+    if fused:
+        # AITER wrote both caller-owned planes; neither may be rebound on replay.
+        return
     flat_out = attn_out.flatten(0, 1)
     # `out=` is a request, not a guarantee: these kernels are shared with
     # V4 and may answer in a buffer of their own, and the decode pair is
@@ -666,14 +704,27 @@ def _forward(
     self, hidden, hidden_scale, cache, step, rope, queries=None, *, hidden_fp8=None
 ):
     """`Attention.forward` with its attention half inside a capture break."""
-    attn_out = _attn_out_buffer(self, hidden)
+    fused = self._use_fused_attention(hidden, cache, rope)
+    scale_view_kwargs = {}
+    if fused:
+        leading_shape = (
+            hidden.shape[:-1]
+            if queries is None
+            else torch.Size((*hidden.shape[:-2], queries.rows.numel()))
+        )
+        attn_out, attn_out_scale = self._fused_output_buffers(
+            leading_shape.numel(), hidden.device
+        )
+        # E8M0 output scales obey the same weak-ref restriction as input scales.
+        scale_view_kwargs["attn_out_scale"] = attn_out_scale.view(torch.uint8)
+    else:
+        attn_out = _attn_out_buffer(self, hidden)
     # The break weak-refs every argument through a stable-ABI op that refuses
     # float8_e8m0fnu ("Not yet supported ScalarType 44"), the MX scale the
     # fused MHC quant hands QKV. The scale crosses as a uint8 view of the same
     # bytes, so the weak ref still points at the caller's buffer on replay.
-    scale_view_kwargs = {}
     if hidden_scale is not None and hidden_scale.dtype == torch.float8_e8m0fnu:
-        scale_view_kwargs = {"hidden_scale_dtype": hidden_scale.dtype}
+        scale_view_kwargs["hidden_scale_dtype"] = hidden_scale.dtype
         hidden_scale = hidden_scale.view(torch.uint8)
     type(self)._atom_v41_attend_block(
         self,
@@ -685,8 +736,13 @@ def _forward(
         rope,
         queries,
         hidden_fp8,
+        fused=fused,
         **scale_view_kwargs,
     )
+    if fused:
+        return self._project_quantized_out(
+            attn_out, attn_out_scale, leading_shape, hidden.dtype
+        )
     return self._project_out(
         attn_out,
         rope,

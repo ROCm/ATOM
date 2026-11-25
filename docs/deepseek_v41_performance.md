@@ -9,21 +9,25 @@ commands.
 ## Shared V4 primitives
 
 Target and draft use `atom.model_ops.layernorm.RMSNorm` for attention and FFN
-inputs, Q/KV, index keys and compressor output. Forward RoPE uses AITER's
-`rope_cached_positions_fwd_inplace`; the V4.1 adapter supplies its positions,
-rotary lanes and YaRN cache. Inverse RoPE is fused into the `wo_a` input quant,
-as on V4. V4.1 does not apply
-V4's weightless per-head Q normalization.
+inputs, Q/KV, index keys and compressor output. Eligible fused FP8 layers
+combine Q/KV normalization with KV RoPE, quantization and window storage in
+`norm_rope_quant_window`; Q rotation belongs to fused attention. The unfused
+path retains `DualRMSNormMXFP8` followed by `rope_quant_window` (or the
+per-token/BF16 normalization required by its projections). Other forward
+RoPE uses AITER's `rope_cached_positions_fwd_inplace`; the V4.1 adapter
+supplies its positions, rotary lanes and YaRN cache. V4.1 does not apply V4's
+weightless per-head Q normalization.
 
 Dense projections use native FP8 microscaling with FP32 accumulation. On
 gfx950 their 32x32 FP8 weights are (16, 16)-shuffled at load for AITER's
 preshuffled group32 GEMM, a FlyDSL kernel with its own tuned table
 (`ATOM_GROUP32_WEIGHT_PRESHUFFLE=0` keeps checkpoint bytes). The
 grouped `wo_a` output projection keeps its FP8 weight and 32x32 e8m0 scale:
-AITER's `inverse_rope_group_quant` un-rotates the attention output against
-the BF16 RoPE table and quantizes it to MXFP8 (1x32) in one launch, and
-`batched_gemm_a8w8_mxscale_bpreshuffle` runs the grouped GEMM. Delayed mHC
-uses AITER stages.
+fused attention writes the inverse-rotated MXFP8 (1x32) input directly.
+On the unfused path, AITER's `inverse_rope_group_quant` performs that step
+against the BF16 RoPE table. Both feed the existing preshuffled grouped
+`wo_a` GEMM, including its fused output quantization when supported.
+Delayed mHC uses AITER stages.
 
 Native group32 FP8 linears need an AITER build with
 [ROCm/aiter#8086](https://github.com/ROCm/aiter/pull/8086); an older one fails
@@ -72,9 +76,18 @@ KV in the SWA source, while decode reads the persistent ring directly.
 
 The FP8 pool holds 1.84x the rows of the BF16 one. Its sources use int32 row
 indices, and attention reads the data and scale planes as they are stored:
-the query is quantized to the same MXFP8 format, and AITER's
-`mla_sparse_prefill_v41` (`fp8_attention.sparse_attn_v41_paged_2src`) attends
-over the pool and the window, prefill and decode alike.
+eligible native and vLLM plugin layers use AITER's
+`fused_norm_rope_attn_rope_cast` by default. It takes raw BF16 Q, fuses Q
+RoPE/quantization and sparse attention, and writes inverse-rotated MXFP8
+output into caller-owned data/scale planes. ATOM requires MXFP8 Q latents,
+eight-head output groups and a quantized `wo_a`. AITER's public
+`is_fused_norm_rope_attn_rope_cast_supported` query owns device, shape and
+RoPE support; ATOM caches its answer per layer for that metadata.
+FP4PTPC, BF16 projections and other ineligible FP8 layers retain explicit
+query quantization and AITER's `mla_sparse_prefill_v41`
+(`fp8_attention.sparse_attn_v41_paged_2src`) over the same pool and window,
+prefill and decode alike. These paths describe the ordinary attention
+forward; eligible Mono decode has its own execution path.
 
 The index writer stores scales as FP32 in preshuffled tiles. Global owner
 regions share block IDs while keeping separate index planes. FP32 compressor
