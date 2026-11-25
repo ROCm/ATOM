@@ -11,9 +11,6 @@ import functools
 import importlib
 import logging
 
-import torch
-
-from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import prefill_row_positions
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -71,28 +68,15 @@ def step_takes(prefill_md, rows: int) -> bool:
 
 def _tile_map(prefill_md, total_q: int):
     """Each row's request and causal key count, and tiles of at most TT_TQ rows of one
-    request padded to a host-known count: built once a step, without a host sync."""
+    request padded to a host-known count: one launch a step, without a host sync."""
     cached = getattr(prefill_md, "_tt_tile_map", None)
     if cached is not None:
         return cached
+    from atom.model_ops.minimax_m3.tt_tile_map import tile_map
+
     cu, prefix = prefill_md.cu_seqlens_q, prefill_md.context_lens
-    nreq = prefix.shape[0]
-    req, kv_lens = prefill_row_positions(cu, prefix, total_q)
-    tq = _ops().TT_TQ
-    lens = (cu[1 : nreq + 1] - cu[:nreq]).to(torch.int64)
-    tiles = (lens + tq - 1) // tq
-    ends = torch.cumsum(tiles, 0)
-    ntiles = (total_q + tq - 1) // tq + nreq  # at most one partial tile a request
-    k = torch.arange(ntiles, device=cu.device, dtype=torch.int64)
-    b = torch.searchsorted(ends, k, right=True)
-    live = b < nreq
-    b = b.clamp(max=nreq - 1)
-    local = k - (ends[b] - tiles[b])
-    t0 = torch.where(live, cu[b].to(torch.int64) + local * tq, 0)
-    n = torch.where(live, torch.clamp(lens[b] - local * tq, 0, tq), 0)
-    tile_map = (req, kv_lens, t0.to(torch.int32), n.to(torch.int32), ntiles)
-    prefill_md._tt_tile_map = tile_map
-    return tile_map
+    prefill_md._tt_tile_map = tile_map(cu, prefix, total_q, _ops().TT_TQ)
+    return prefill_md._tt_tile_map
 
 
 def run(
