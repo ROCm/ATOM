@@ -1070,14 +1070,14 @@ def fb_loads(c, k):
     with a task's other inputs on a plain decode, after ``kda_gates``' polls
     on a verify (its f_a poll is L tokens' worth, and in vmcnt order it would
     wait for the 32 KB, 16 KB with ``w8``). ``w8``: each 16 B half of the
-    lane's 32-column K block holds two operands (``fb_w8_dword``), and the
+    lane's 32-column K block (``fb_w8_dword``) holds two operands, and the
     lane's four output rows' scales go into ``k["fbs"]``."""
     if const_expr(c["w8"]):
         halves = [
             fx.Vector(
                 bo.buffer_load(
                     rsrc(c["args"]["w_fb"]),
-                    fb_w8_dword(k["fb_at"], 2 * j),
+                    fb_w8_dword(k["fb_at"], j),
                     vec_width=4,
                     dtype=T.i32,
                 )

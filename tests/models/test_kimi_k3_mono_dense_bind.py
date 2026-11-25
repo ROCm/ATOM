@@ -230,19 +230,23 @@ def test_the_kernels_index_through_these():
 
 
 def test_fb_offset_indexes_the_production_preshuffle():
-    # kda_gates' f_b operands (fb_offset's FP8 branch, fb_w8_dword): wave w's
-    # rows 16 w .. of head h, lane group g's K columns 32 g + 8 q
+    # kda_gates' f_b operands as fb_loads reads them (fb_offset's FP8 branch,
+    # fb_w8_dword's 16 B halves, then operand q's 2 dwords of half q / 2): wave
+    # w's rows 16 w .. of head h, lane group g's K columns 32 g + 8 q
     hd = HEAD_DIM
     plain, flat = preshuffled(2 * hd, hd)
+    words = flat.view(torch.int32)
     for h in range(2):
         for wave in range(hd // 16):
             for lane in range(64):
                 base = kda_plan.fb_w8_offset(h, wave, lane)
+                ats = (kda_plan.fb_w8_dword(base, j) for j in range(2))
+                halves = [words[at : at + 4] for at in ats]
                 for q in range(4):
-                    at = 4 * kda_plan.fb_w8_dword(base, q)
+                    op = torch.stack([halves[q // 2][q % 2 * 2 + d] for d in range(2)])
                     row = h * hd + 16 * wave + lane % 16
                     col = 32 * (lane // 16) + 8 * q
-                    assert torch.equal(flat[at : at + 8], plain[row, col : col + 8])
+                    assert torch.equal(op.view(torch.uint8), plain[row, col : col + 8])
 
 
 def _gemv_kernel(rows, k, s, w8):

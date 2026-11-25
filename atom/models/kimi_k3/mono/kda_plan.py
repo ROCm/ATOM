@@ -22,8 +22,8 @@ def fb_w8_offset(h, wave, lane):
     )
 
 
-def fb_w8_dword(at, q):
-    """The dword of f_b operand q (K columns 32 g + 8 q of the lane's row) in
-    the FP8 plane, ``at`` the lane's first (``fb_w8_offset``): 16 B half q / 2
-    of its 32-column K block, 8 B q % 2 into it."""
-    return at + w8_offset(0, 0, 16 * (q // 2), HEAD_DIM) // 4 + q % 2 * 2
+def fb_w8_dword(at, j):
+    """The dword of the lane's 16 B half j in the FP8 plane (K columns
+    32 g + 16 j .. of its row: f_b operands 2 j and 2 j + 1, 8 B apart),
+    ``at`` the lane's first (``fb_w8_offset``)."""
+    return at + w8_offset(0, 0, 16 * j, HEAD_DIM) // 4
