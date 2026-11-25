@@ -16,6 +16,12 @@ Example::
 `group`          share group; pools exchange blocks only within one. Derived
                  from the model and KV format when empty.
 `fetch`          copy prefixes in from other ranks' pools. Default true.
+`fetch_wait_ms`  how long the scheduling pass that starts such a copy waits
+                 for it, in milliseconds. A copy that lands within it is
+                 indexed in that pass and its request prefills in the forward
+                 that follows; one that does not is indexed at the next pass,
+                 a forward later. Default 0: no pass waits, and every copy is
+                 indexed at the next one.
 `share_ratio`    fraction of the paged blocks UMBP manages and shares, in
                  (0, 1]. This process always allocates the pool; UMBP adopts
                  that fraction of its blocks and the rest stays private. 1
@@ -50,6 +56,7 @@ class UmbpPoolSettings:
     namespace: str = "atom"
     group: str = ""
     fetch: bool = True
+    fetch_wait_ms: float = 0.0
     share_ratio: float = 1.0
     placement: str = "private"
     session_migrate_margin: float | None = None
@@ -82,11 +89,15 @@ class UmbpPoolSettings:
         fetch = extra.get("fetch", True)
         if isinstance(fetch, str):
             fetch = fetch.strip().lower() not in ("0", "false", "no", "off")
+        wait = float(extra.get("fetch_wait_ms", 0.0) or 0.0)
+        if wait < 0:
+            raise ValueError(f"umbp_pool fetch_wait_ms={wait} < 0")
         return cls(
             address=address,
             namespace=str(extra.get("namespace", "atom") or "atom"),
             group=str(extra.get("group", "") or ""),
             fetch=bool(fetch),
+            fetch_wait_ms=wait,
             share_ratio=ratio,
             placement=placement,
             session_migrate_margin=margin,

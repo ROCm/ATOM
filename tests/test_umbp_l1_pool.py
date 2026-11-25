@@ -21,6 +21,7 @@ importable. The second run is what keeps the model honest.
 import array
 import os
 import random
+import threading
 import time
 from collections import OrderedDict
 
@@ -733,6 +734,65 @@ class TestThroughBlockManager:
         rank1.poll_shared_fetches()
         assert len(rank1._event_log) == 1
 
+    def test_a_copy_that_lands_within_the_pools_wait_hits_in_the_pass_that_asked(
+        self, ranks, seq_factory
+    ):
+        rank0, rank1 = ranks
+        if not rank1.kv.async_fetch:
+            pytest.skip("only a background copy is waited for")
+        rank1.kv.fetch_wait_s = 10
+        tokens = list(range(20))
+        first = seq_factory(tokens)
+        rank0.allocate(first, 0)
+        rank0.hash_blocks(first, len(tokens))
+        settle(rank0.kv)
+
+        second = seq_factory(tokens + [100, 101])
+        # Asked, copied and indexed by the one probe: the scheduler has nothing
+        # to hold the sequence back for.
+        assert not rank1.shared_prefix_pending(second)
+        assert not rank1.kv.fetch_pending(second.id)
+        assert rank1.can_allocate(second) == 5
+        assert rank1.kv.blocks_fetched == 5
+
+    def test_a_copy_indexed_in_the_pass_that_asked_is_told_to_the_event_stream(
+        self, l1, monkeypatch, seq_factory
+    ):
+        from types import SimpleNamespace
+
+        from atom.distributed.kv_events import BlockStored
+
+        cfg = MockConfig(
+            num_kvcache_blocks=32,
+            kv_cache_block_size=4,
+            enable_prefix_caching=True,
+            kv_events_config=SimpleNamespace(enable=True),
+        )
+        made = iter(range(8))
+
+        def make(config, num_blocks, *, on_evict=None, on_remap=None, **_):
+            return make_pool(
+                l1, f"wt{next(made)}", num_blocks, on_evict=on_evict, on_remap=on_remap
+            )
+
+        monkeypatch.setattr(bm_module, "make_block_pool", make)
+        rank0, rank1 = BlockManager(cfg), BlockManager(cfg)
+        if not rank1.kv.async_fetch:
+            pytest.skip("only a background copy is waited for")
+        rank1.kv.fetch_wait_s = 10
+        tokens = list(range(20))
+        first = seq_factory(tokens)
+        rank0.allocate(first, 0)
+        rank0.hash_blocks(first, len(tokens))
+        settle(rank0.kv)
+        second = seq_factory(tokens + [100, 101])
+        assert not rank1.shared_prefix_pending(second)
+        (event,) = rank1._event_log
+        assert isinstance(event, BlockStored) and len(event.block_hashes) == 5
+        # The pass's own poll finds nothing more to index or to report.
+        rank1.poll_shared_fetches()
+        assert len(rank1._event_log) == 1
+
     def test_the_pool_is_asked_once_per_sequence(self, ranks, seq_factory):
         _, rank1 = ranks
         calls = []
@@ -786,6 +846,62 @@ class TestBackgroundFetch:
         assert [b.lookup(h) != -1 for h in (1, 2, 3)] == [True] * 3
         assert b.num_used == 0 and b.num_reusable_free == 3
         assert b.blocks_fetched == 3
+
+    def test_a_copy_is_not_waited_for_unless_the_pool_is_given_a_wait(self, pools):
+        a, b = pools
+        cache(a, [1, 2])
+        assert b.fetch_wait_s == 0
+        assert b.fetch_async("s", [1, 2], lambda i: toks(i))
+        assert not b.await_fetch("s")
+        self.wait(b, "s")
+        # Nothing in flight for the owner: nothing to wait for either.
+        b.fetch_wait_s = 10
+        assert not b.await_fetch("s")
+
+    def test_a_copy_that_lands_within_the_wait_is_indexed_at_once(self, pools):
+        a, b = pools
+        cache(a, [1, 2, 3])
+        b.fetch_wait_s = 10
+        assert b.fetch_async("s", [1, 2, 3], lambda i: toks(i))
+        assert b.await_fetch("s")
+        assert b.poll_fetches() == [("s", [0, 1, 2])]
+        assert not b.fetch_pending("s")
+        assert [b.lookup(h) != -1 for h in (1, 2, 3)] == [True] * 3
+        assert b.num_used == 0 and b.blocks_fetched == 3
+
+    def test_a_copy_slower_than_the_wait_stays_in_flight(self, pools):
+        a, b = pools
+        if not isinstance(b._client, FakeL1):
+            pytest.skip("the model is what holds a copy back on demand")
+        cache(a, [1, 2])
+        gate = threading.Event()
+        fetch = b._client.fetch
+
+        def held(pool_id, keys, dst_slots=(), probe_only=False):
+            if dst_slots:
+                assert gate.wait(10)
+            return fetch(pool_id, keys, dst_slots=dst_slots, probe_only=probe_only)
+
+        b._client.fetch = held
+        b.fetch_wait_s = 0.01
+        assert b.fetch_async("s", [1, 2], lambda i: toks(i))
+        assert not b.await_fetch("s")
+        assert b.fetch_pending("s") and b.poll_fetches() == []
+        gate.set()
+        self.wait(b, "s")
+        assert b.lookup(1) != -1 and b.lookup(2) != -1
+
+    def test_a_failed_copy_has_finished_for_the_wait_too(self, pools):
+        a, b = pools
+        if not isinstance(b._client, FakeL1):
+            pytest.skip("the model is what fails a copy on demand")
+        cache(a, [1, 2])
+        b._client.fail_fetch_into = True
+        b.fetch_wait_s = 10
+        assert b.fetch_async("s", [1, 2], lambda i: toks(i))
+        assert b.await_fetch("s")
+        assert b.poll_fetches() == [("s", [])]
+        assert b.lookup(1) == -1 and b.num_used == 0
 
     def test_only_the_leading_run_is_reserved(self, pools):
         a, b = pools

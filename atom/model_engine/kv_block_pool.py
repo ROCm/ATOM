@@ -203,6 +203,12 @@ class KVBlockPool(ABC):
         """Whether a background copy for `owner` is still in flight."""
         return False
 
+    def await_fetch(self, owner: Hashable) -> bool:
+        """Give `owner`'s background copy the time this pool lets a scheduling
+        pass wait for one. True once the copy has finished: `poll_fetches` then
+        indexes it in this pass rather than at the start of the next."""
+        return False
+
     def poll_fetches(self) -> list[tuple[Hashable, list[int]]]:
         """Index what finished background copies brought in. Once per
         scheduling pass, before any prefix walk. For each owner whose copy

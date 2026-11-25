@@ -46,6 +46,7 @@ module and a running UMBP standalone server.
 from __future__ import annotations
 
 import array
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -58,9 +59,9 @@ from typing import Any
 
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 from atom.model_engine.block_pool import BlockPool
-from atom.utils import envs
 from atom.model_engine.kv_block import Block
 from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -156,6 +157,9 @@ class UmbpL1Pool(KVBlockPool):
 
     shares_content = True
     async_fetch = True
+    #: Seconds the pass that starts a background copy waits for it
+    #: (`await_fetch`): the connector's `fetch_wait_ms`.
+    fetch_wait_s = 0.0
 
     def __init__(
         self,
@@ -544,6 +548,20 @@ class UmbpL1Pool(KVBlockPool):
     def fetch_pending(self, owner: Hashable) -> bool:
         return owner in self._fetches
 
+    def await_fetch(self, owner: Hashable) -> bool:
+        """Wait up to `fetch_wait_s` for `owner`'s copy.
+
+        UMBP copies a prefix between two pools of a node in milliseconds, and
+        the pass after the one that asked starts a forward later: a copy that
+        has finished by the end of the wait is worth indexing at once. A copy
+        that failed has finished too; `poll_fetches` frees its blocks.
+        """
+        entry = self._fetches.get(owner)
+        if entry is None or self.fetch_wait_s <= 0:
+            return False
+        done, _ = concurrent.futures.wait([entry[0]], timeout=self.fetch_wait_s)
+        return bool(done)
+
     def poll_fetches(self) -> list[tuple[Hashable, list[int]]]:
         """Index what finished copies brought in; release the rest."""
         if not self._fetches:
@@ -785,6 +803,7 @@ def make_umbp_l1_pool(
         on_remap=on_remap,
     )
     pool.shares_content = settings.fetch
+    pool.fetch_wait_s = settings.fetch_wait_ms / 1e3
     return pool
 
 
@@ -1178,6 +1197,9 @@ class UmbpBlockPool(KVBlockPool):
 
     def fetch_pending(self, owner: Hashable) -> bool:
         return self.umbp.fetch_pending(owner)
+
+    def await_fetch(self, owner: Hashable) -> bool:
+        return self.umbp.await_fetch(owner)
 
     def poll_fetches(self) -> list[tuple[Hashable, list[int]]]:
         return self.umbp.poll_fetches()

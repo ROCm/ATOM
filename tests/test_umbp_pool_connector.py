@@ -54,6 +54,7 @@ class TestSettings:
             1.0,
         )
         assert s.session_migrate_margin is None
+        assert s.fetch_wait_ms == 0
 
     def test_the_address_is_required(self):
         with pytest.raises(ValueError, match="address"):
@@ -66,6 +67,28 @@ class TestSettings:
 
     def test_fetch_accepts_text(self):
         assert not UmbpPoolSettings.from_transfer_config(transfer(fetch="false")).fetch
+
+    def test_the_fetch_wait_is_a_time(self):
+        settings = UmbpPoolSettings.from_transfer_config(transfer(fetch_wait_ms="20"))
+        assert settings.fetch_wait_ms == 20.0
+        with pytest.raises(ValueError, match="fetch_wait_ms"):
+            UmbpPoolSettings.from_transfer_config(transfer(fetch_wait_ms=-1))
+
+    def test_the_pool_waits_for_a_copy_as_long_as_the_connector_says(self, monkeypatch):
+        class Module:
+            OP_HOLD, OP_RELEASE, OP_PUBLISH = 1, 2, 3
+
+        class Client:
+            def open(self, pool_id):
+                return 8
+
+        monkeypatch.setattr(umbp_pool, "_connect", lambda settings: (Module, Client()))
+        monkeypatch.setattr(umbp_pool, "pool_id_for", lambda *_, **__: "p")
+        for extra, wait in (({}, 0.0), ({"fetch_wait_ms": 20}, 0.02)):
+            config = config_with(transfer(**extra))
+            settings = UmbpPoolSettings.from_transfer_config(config.kv_transfer_config)
+            pool = umbp_pool.make_umbp_l1_pool(config, settings, 8)
+            assert pool.fetch_wait_s == pytest.approx(wait)
 
 
 class TestRegistry:

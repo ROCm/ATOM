@@ -1534,6 +1534,10 @@ class BlockManager:
             started = self.kv.fetch_async(seq.id, chain[local:], tokens_of)
             if started and self._events_enabled:
                 self._shared_fetches[seq.id] = (seq, local, chain)
+            # A copy that lands within the pool's wait is indexed in this
+            # pass: the sequence is not held back for the next one.
+            if started and self.kv.await_fetch(seq.id):
+                self.poll_shared_fetches()
             return
         landed = self.kv.fetch(chain[local:], tokens_of)
         if landed and self._events_enabled:
