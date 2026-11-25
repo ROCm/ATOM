@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Where K1 (``kernels.attention.kda``) reads ``f_b_proj`` when it is a
 per-token FP8 plane: E4M3 in AITER's (16, 16) preshuffle
 (``atom.mono.plan.preshuffle``), ``HEAD_DIM`` columns a row.

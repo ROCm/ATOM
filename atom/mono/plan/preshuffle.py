@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Addresses in an E4M3 plane in AITER's (16, 16) preshuffle,
 ``[N/16][K/32][2][16 rows][16 B]``: ATOM's per-token FP8 linears as the
 production GEMM holds them, which ``gemv``'s ``w8`` loads read in place.
