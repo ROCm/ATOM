@@ -276,7 +276,7 @@ class EngineCore:
                 and config.pipeline_parallel_size == 1
                 and (
                     envs.ATOM_PREFILL_DECODE_INTERVAL > 0
-                    or config.prefill_admit_policy == "adaptive"
+                    or config.prefill_admit_policy in ("adaptive", "protect")
                 )
             ):
                 self._init_prefill_delayer(config)
@@ -332,6 +332,7 @@ class EngineCore:
                 exchange_prefill_costs=self.scheduler.cost_balance,
                 cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
                 admit_policy=config.prefill_admit_policy,
+                protect_tokens=envs.ATOM_PREFILL_PROTECT_TOKENS,
             )
         )
 

@@ -792,7 +792,9 @@ class EngineArgs:
             "'adaptive' fires once the held requests' accumulated cost reaches "
             "the fixed prefill cost times the decode batch, fitted from measured "
             "step times; on DP=1, PP=1 it enables the delayer as a positive "
-            "interval does.",
+            "interval does. 'protect' (DP=1 only) holds new prefills while any "
+            "running decode has emitted fewer than ATOM_PREFILL_PROTECT_TOKENS "
+            "tokens; a chunked prefill in flight continues at once.",
         )
         parser.add_argument(
             "--mark-trace",

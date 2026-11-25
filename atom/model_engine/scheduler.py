@@ -2314,12 +2314,16 @@ class Scheduler:
                 0, len(self.running) - self._partial_prefill_count
             )
             protects_decode = self.prefill_delayer.protects_decode(running_decode_batch)
-            if protects_decode or (
-                self._local_prefill_coalescing and not running_decode_batch
+            protect_policy = self.prefill_delayer.admit_policy == "protect"
+            if (
+                protects_decode
+                or protect_policy
+                or (self._local_prefill_coalescing and not running_decode_batch)
             ):
                 # Existence is sufficient during the hard protection window:
                 # fit probes cannot change its decision. Coalescer hold bounds
                 # start afterwards. With no decode, admission proceeds directly.
+                # The protect policy decides on decode age, never on fill.
                 prefillable = (
                     self._partial_prefill_count > 0
                     or next(self._waiting_prefills(), None) is not None
@@ -2375,6 +2379,22 @@ class Scheduler:
                 + min(
                     len(self.waiting),
                     max(0, self.max_num_seqs - len(self.running)),
+                ),
+                # prefill_admit_policy protect: the youngest running decode's
+                # output so far. A partial is not decoding even when it
+                # carries output from before a preemption; read only when
+                # there is prefill to admit.
+                youngest_decode_tokens=(
+                    min(
+                        (
+                            s.num_completion_tokens
+                            for s in self.running
+                            if not s.is_partial_prefill and s.num_completion_tokens > 0
+                        ),
+                        default=None,
+                    )
+                    if protect_policy and prefillable
+                    else None
                 ),
             )
         else:

@@ -1373,6 +1373,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
+    # --prefill-admit-policy protect: hold new prefills while any running
+    # decode has emitted fewer than this many tokens (prefill_delayer.py).
+    "ATOM_PREFILL_PROTECT_TOKENS": lambda: int(
+        os.getenv("ATOM_PREFILL_PROTECT_TOKENS", "150")
+    ),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
     # "0" re-walks every tick.

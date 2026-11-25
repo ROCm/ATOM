@@ -1792,6 +1792,7 @@ class _LocalDelayer:
     """A local coalescer that releases prefill every tick."""
 
     is_local = True
+    admit_policy = "interval"
     max_queue_ms = None
     ttft_max_ticks = 5
     rank_prefill_costs = ()

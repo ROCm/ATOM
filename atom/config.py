@@ -2839,6 +2839,13 @@ class Config:
                 f"prefill_admit_policy must be one of {PREFILL_ADMIT_POLICIES}, "
                 f"got {self.prefill_admit_policy!r}"
             )
+        if self.prefill_admit_policy == "protect" and (
+            self.parallel_config.data_parallel_size > 1
+            or self.pipeline_parallel_size > 1
+        ):
+            # Fail before loading weights: the delayer is built only for
+            # DP=1, PP=1, and protect reads one rank's running decodes.
+            raise ValueError("prefill_admit_policy=protect requires DP=1 and PP=1")
 
         self._init_moe_backend()
 

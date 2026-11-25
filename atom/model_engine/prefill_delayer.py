@@ -172,7 +172,32 @@ def _ema(avg: float, sample: float) -> float:
 # rank decides from the identical reduced means.
 # --------------------------------------------------------------------------
 # --prefill-admit-policy values; Config and the CLI take them from here.
-PREFILL_ADMIT_POLICIES = ("interval", "adaptive")
+PREFILL_ADMIT_POLICIES = ("interval", "adaptive", "protect")
+# --------------------------------------------------------------------------
+# --prefill-admit-policy protect  (TP only: dp_size=1)
+#
+# Places the remaining prefill where it costs the per-request ITL tail least,
+# instead of coalescing it. A prefill forward stalls every running decode, and
+# a request's ITL is its stall time divided by its output length, so a stall
+# hurts a request that has emitted few tokens most -- and agentic outputs are
+# short (median ~300 tokens). The rule:
+#
+#   * a chunked prefill in flight continues at once ("chunk"): its next chunk
+#     is not new work, and holding it would stretch its TTFT by a window per
+#     chunk;
+#   * otherwise HOLD while some running decode has emitted fewer than
+#     ATOM_PREFILL_PROTECT_TOKENS tokens; FIRE ("aged") once none has.
+#
+# Requests that arrive during a prefill are not admitted right after it: on
+# TP4 c16 AgentX that "burst" was 36% of releases and put prefill stalls on
+# the first decode steps of the requests just admitted.
+#
+# The KV, queue-age and TTFT must-fire bounds still release first. A hold ends
+# by itself: no prefill runs during it, so the youngest request only ages.
+# SGLang reaches a similar placement blindly with --scheduler-recv-interval
+# (no request is received for N decode passes after each receive); this rule
+# also releases early once the young requests have finished.
+# --------------------------------------------------------------------------
 # decode / prefill fit half-lives in samples, and identifiability guards
 _DEC_HALF_LIFE = 2000.0
 _PF_HALF_LIFE = 200.0
@@ -277,6 +302,7 @@ class PrefillDelayer:
         "_prev_pending",
         "_prev_prefillable",
         "_prev_running_dec",
+        "_protect_tokens",
         # buffer / episode state
         "_rank",
         "_reduce_buf",
@@ -286,6 +312,8 @@ class PrefillDelayer:
         "_stat_adapt_hold_ticks",
         "_stat_fire_adaptcap",
         "_stat_fire_adaptive",
+        "_stat_fire_aged",
+        "_stat_fire_chunk",
         # stats
         "_stat_fire_cost",
         "_stat_fire_fill",
@@ -298,7 +326,9 @@ class PrefillDelayer:
         "_stat_fire_vacuous",
         "_stat_hold",
         "_stat_hold_decode_interval",
+        "_stat_hold_protect",
         "_stat_log_every",
+        "_youngest_decode_tokens",
         "admit_policy",
         "cpu_group",
         "dp_size",
@@ -331,6 +361,7 @@ class PrefillDelayer:
         cost_gate: bool = False,
         clock=time.perf_counter,
         admit_policy: str = "interval",
+        protect_tokens: int = 0,
     ):
         if dp_size > 1 and cpu_group is None:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
@@ -382,9 +413,19 @@ class PrefillDelayer:
         if admit_policy not in PREFILL_ADMIT_POLICIES:
             raise ValueError(f"unknown admit_policy={admit_policy!r}")
         self.admit_policy = admit_policy
-        if admit_policy == "adaptive" and prefill_decode_interval:
+        if admit_policy == "protect":
+            if dp_size > 1:
+                raise ValueError("prefill_admit_policy=protect supports dp_size=1 only")
+            if protect_tokens < 1:
+                raise ValueError(
+                    "prefill_admit_policy=protect needs protect_tokens >= 1; "
+                    f"got {protect_tokens}"
+                )
+        self._protect_tokens = protect_tokens
+        self._youngest_decode_tokens = None
+        if admit_policy in ("adaptive", "protect") and prefill_decode_interval:
             logger.info(
-                "prefill_admit_policy=adaptive: ignoring "
+                f"prefill_admit_policy={admit_policy}: ignoring "
                 f"prefill_decode_interval={prefill_decode_interval}"
             )
             prefill_decode_interval = 0
@@ -446,6 +487,9 @@ class PrefillDelayer:
         self._stat_adapt_hold_ticks = 0
         self._stat_fire_adaptive = 0
         self._stat_fire_adaptcap = 0
+        self._stat_fire_chunk = 0
+        self._stat_fire_aged = 0
+        self._stat_hold_protect = 0
         self.rank_prefill_costs: list[float] = []
         # the alignment gate's waiting cost this hold episode (µs x requests)
         self._hold_cost_us = 0.0
@@ -506,7 +550,8 @@ class PrefillDelayer:
             f"max_queue_ms={max_queue_ms} "
             f"prefill_decode_interval={prefill_decode_interval} "
             f"cost_gate={self._cost_gate} "
-            f"admit_policy={admit_policy!r}"
+            f"admit_policy={admit_policy!r} "
+            f"protect_tokens={protect_tokens}"
         )
 
     @staticmethod
@@ -551,6 +596,7 @@ class PrefillDelayer:
         arrived_requests: int = 0,
         next_completion_steps: int | None = None,
         admittable_requests: int | None = None,
+        youngest_decode_tokens: int | None = None,
     ) -> PrefillDecision:
         """Whether this rank may admit new prefills this tick (FIRE), and how
         many ranks have prefill to admit.
@@ -598,7 +644,10 @@ class PrefillDelayer:
                 FIRE could put into this rank's decode batch now: resumable
                 partials plus waiting heads that fit the free seq slots.
                 None falls back to `waiting_requests`.
+            youngest_decode_tokens: (prefill_admit_policy protect) fewest
+                tokens any running decode has emitted; None when none runs.
         """
+        self._youngest_decode_tokens = youngest_decode_tokens
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
         low = self.token_usage_low_watermark
@@ -788,6 +837,8 @@ class PrefillDelayer:
             return self._adapt_decide(reduced, g_running_dec, g_pending)
         if any_partial and self._hold_ticks >= self.partial_max_ticks:
             return self._fire("partial", g_pending)
+        if self.admit_policy == "protect":
+            return self._protect_decide(any_partial, g_pending)
 
         # Stall: the group's work stopped changing, so more waiting will not
         # fill or align the forward. Pending tokens are capped per rank and can
@@ -912,7 +963,8 @@ class PrefillDelayer:
         if _DEBUG:
             logger.info(
                 f"[PrefillDelayer] FIRE ({reason}): g_pending={g_pending} "
-                f"hold_ticks={self._hold_ticks} stall={self._stall_count}"
+                f"hold_ticks={self._hold_ticks} stall={self._stall_count} "
+                f"youngest_decode_tokens={self._youngest_decode_tokens}"
             )
         self._reset()
         self._maybe_log()
@@ -995,6 +1047,17 @@ class PrefillDelayer:
         self._stat_adapt_hold_ticks += 1
         return self._hold(g_pending)
 
+    # ---------------- prefill_admit_policy protect ----------------
+    def _protect_decide(self, any_partial: bool, g_pending: int) -> bool:
+        """Continue a chunked prefill, else hold while a young decode runs."""
+        if any_partial:
+            return self._fire("chunk", g_pending)
+        young = self._youngest_decode_tokens
+        if young is None or young >= self._protect_tokens:
+            return self._fire("aged", g_pending)
+        self._stat_hold_protect += 1
+        return self._hold(g_pending)
+
     def notify_prefill_executed(self, tokens: int = 0) -> None:
         """Report a completed local prefill forward.
 
@@ -1047,6 +1110,8 @@ class PrefillDelayer:
             + self._stat_fire_vacuous
             + self._stat_fire_adaptive
             + self._stat_fire_adaptcap
+            + self._stat_fire_chunk
+            + self._stat_fire_aged
             + self._stat_hold
         )
         if total == 0:
@@ -1078,4 +1143,12 @@ class PrefillDelayer:
                     f"T0_us={t0:.0f} A_us={a:.0f} thr={thr:.0f} "
                     f"dec_fit_n={self._adapt_dec_fit.n} pf_fit_n={self._adapt_pf_fit.n} "
                     f"hold_ticks/cycle={self._stat_adapt_hold_ticks / max(cyc, 1):.1f}"
+                )
+            if self.admit_policy == "protect":
+                logger.info(
+                    "[PrefillDelayer protect] "
+                    f"fire_chunk={self._stat_fire_chunk} "
+                    f"fire_aged={self._stat_fire_aged} "
+                    f"hold_protect={self._stat_hold_protect} "
+                    f"protect_tokens={self._protect_tokens}"
                 )
