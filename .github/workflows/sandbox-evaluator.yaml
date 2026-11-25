@@ -1,57 +1,29 @@
 name: Sandbox Evaluator
 
-# CI evaluator design sandbox (ci-sandbox/* only; not for main). Acts with the
-# workflow's GITHUB_TOKEN, as the real evaluator would. workflow_dispatch needs
-# the file on the default branch, so an operation is a push of sandbox/op.json
-# to ci-sandbox/ctl: {"op": "rerun|rerun-failed|cancel|status", "run_id": "",
-# "sha": "", "context": "", "state": ""}.
+# CI evaluator design sandbox (ci-sandbox/* only; not for main). Checks what
+# the collaborator-permission endpoint returns to a GITHUB_TOKEN with no
+# permissions, as dispatch-approval.yaml would call it.
 
 on:
   push:
     branches: [ci-sandbox/ctl]
     paths: [sandbox/op.json]
 
-permissions:
-  actions: write
-  statuses: write
-  contents: read
+permissions: {}
 
 jobs:
-  act:
+  role:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - name: Act
+      - name: Read roles with an empty-permission token
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          repo="${GITHUB_REPOSITORY}"
-          op="$(jq -r '.op' sandbox/op.json)"
-          run_id="$(jq -r '.run_id // ""' sandbox/op.json)"
-          sha="$(jq -r '.sha // ""' sandbox/op.json)"
-          context="$(jq -r '.context // "sandbox-status-gate"' sandbox/op.json)"
-          state="$(jq -r '.state // "success"' sandbox/op.json)"
-          echo "op=${op} run_id=${run_id} sha=${sha} context=${context} state=${state}"
-          case "${op}" in
-            rerun|rerun-failed|cancel)
-              [[ "${run_id}" =~ ^[0-9]+$ ]]
-              path="rerun"
-              [ "${op}" = rerun-failed ] && path="rerun-failed-jobs"
-              [ "${op}" = cancel ] && path="cancel"
-              gh api -X POST "repos/${repo}/actions/runs/${run_id}/${path}" -i | head -1
-              ;;
-            status)
-              [[ "${sha}" =~ ^[0-9a-f]{40}$ ]]
-              [[ "${context}" =~ ^sandbox[-/a-z]*$ ]]
-              [[ "${state}" =~ ^(pending|success|failure|error)$ ]]
-              gh api -X POST "repos/${repo}/statuses/${sha}" \
-                -f state="${state}" -f context="${context}" \
-                -f description="sandbox evaluator (GITHUB_TOKEN)" \
-                --jq '{id, state, context, creator: .creator.login}'
-              ;;
-            *)
-              echo "unknown op" >&2
-              exit 2
-              ;;
-          esac
+          for user in valarLip whx-sjtu; do
+            if out="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${user}/permission" \
+                --jq '"\(.permission) role=\(.role_name) admin=\(.user.permissions.admin) maintain=\(.user.permissions.maintain)"' 2>&1)"; then
+              echo "ROLE ${user}: ${out}"
+            else
+              echo "ROLE_FAILED ${user}: ${out}"
+            fi
+          done
