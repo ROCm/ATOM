@@ -464,6 +464,33 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self._v_scale_float = 1.0
         self._prob_scale_float = 1.0
 
+    def _concat_k_nope_k_pe(
+        self, k_nope: torch.Tensor, k_pe: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Efficiently concatenate k_nope and k_pe tensors along the last dimension.
+
+        This function avoids the performance penalty of torch.cat with expanded
+        non-contiguous tensors by pre-allocating the output and using direct copies.
+
+        Args:
+            k_nope: Tensor of shape [..., nope_dim]
+            k_pe: Tensor to broadcast and concatenate, typically shape [..., 1, pe_dim]
+                or [..., pe_dim]
+
+        Returns:
+            Tensor of shape [..., nope_dim + pe_dim]
+        """
+        k = torch.empty(
+            (*k_nope.shape[:-1], k_nope.shape[-1] + k_pe.shape[-1]),
+            dtype=k_nope.dtype,
+            device=k_nope.device,
+        )
+        # Direct copies with efficient broadcasting
+        k[..., : k_nope.shape[-1]] = k_nope
+        k[..., k_nope.shape[-1] :] = k_pe
+        return k
+
     def _v_up_proj(self, x, out):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
@@ -638,7 +665,11 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = cat_prefill_k(k_nope, k_pe, copies=True)
+            k = (
+                cat_prefill_k(k_nope, k_pe, copies=True)
+                if self._prefill_k_cat_arch
+                else self._concat_k_nope_k_pe(k_nope, k_pe)
+            )
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
@@ -707,7 +738,11 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-            k = cat_prefill_k(k_nope, k_pe, copies=True)
+            k = (
+                cat_prefill_k(k_nope, k_pe, copies=True)
+                if self._prefill_k_cat_arch
+                else self._concat_k_nope_k_pe(k_nope, k_pe)
+            )
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
@@ -827,13 +862,23 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     [self.qk_nope_head_dim, self.v_head_dim], dim=-1
                 )
 
-                k = cat_prefill_k(k_nope, k_pe)
+                k = (
+                    cat_prefill_k(k_nope, k_pe)
+                    if self._prefill_k_cat_arch
+                    else torch.cat(
+                        (k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1
+                    )
+                )
         else:
             kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = cat_prefill_k(k_nope, k_pe)
+            k = (
+                cat_prefill_k(k_nope, k_pe)
+                if self._prefill_k_cat_arch
+                else torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+            )
 
         output_prefill = self._run_prefill_new_tokens(
             prefill=attn_metadata.prefill,

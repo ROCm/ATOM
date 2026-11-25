@@ -80,7 +80,7 @@ from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
     fused_qkv_per_tensor_quant,
 )
-from atom.model_ops.triton_mla_prefill_k_cat import cat_prefill_k, on_kernel_arch
+from atom.model_ops.triton_mla_prefill_k_cat import cat_prefill_k, kernel_arch
 from atom.model_ops.utils import (
     dynamic_per_batched_tensor_quant,
     get_and_maybe_dequant_weights,
@@ -646,6 +646,8 @@ class MLAAttention(nn.Module):
         super().__init__()
         self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
         self._flydsl_fp8_mha_ok: bool | None = None
+        # Prefill K by `cat_prefill_k` on gfx1250 layers; main's torch.cat elsewhere.
+        self._prefill_k_cat_arch = kernel_arch()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -1176,13 +1178,18 @@ class MLAAttention(nn.Module):
     def _prepare_prefill_k(self, k_nope, k_rope):
         """Keep K split for FP8 quantization; materialize it for BF16 attention.
 
-        On gfx1250 with a zero rope pad, K is the kv_b_proj split view itself
-        (row pitch ``qk_nope_head_dim + v_head_dim``, like V); `_drop_rope_pad`
-        is then a no-op on it. Other arches concatenate K as on main.
+        Other arches concatenate K as on main. On gfx1250 with a zero rope pad,
+        K is the kv_b_proj split view itself (row pitch ``qk_nope_head_dim +
+        v_head_dim``, like V); `_drop_rope_pad` is then a no-op on it.
         """
         if self._flydsl_fp8_mha_ok:
             return k_nope, None if self.rope_is_zero_pad else k_rope
-        if self.rope_is_zero_pad and on_kernel_arch(k_nope):
+        if not self._prefill_k_cat_arch:
+            return (
+                torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1),
+                None,
+            )
+        if self.rope_is_zero_pad:
             return k_nope, None
         return cat_prefill_k(k_nope, k_rope), None
 

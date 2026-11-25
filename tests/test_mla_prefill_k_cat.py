@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """CPU bit checks for the shared K copy and native BF16 dispatch.
 
 Kernel cases run in child processes so TRITON_INTERPRET precedes the Triton
@@ -60,7 +62,6 @@ mla = ModuleType("mla_dispatch_probe")
 mla.__dict__.update(
     torch=torch,
     cat_prefill_k=kcat.cat_prefill_k,
-    on_kernel_arch=kcat.on_kernel_arch,
     use_triton_gemm=lambda: False,
     flash_attn_varlen_func=None,
     fused_gemm_afp4wfp4_preshuffle_split_cat=None,
@@ -237,31 +238,61 @@ def test_fallback_is_the_sites_own(monkeypatch, copies):
         _assert_same(out, ref)
 
 
-def test_vllm_plugin_k_sites_call_cat_prefill_k():
+def test_vllm_plugin_k_sites_keep_main_off_gfx1250():
     """The plugin is not imported on the CPU job, so check its source: every
-    MLA prefill K is built by `cat_prefill_k`, none by `torch.cat` of the
-    expanded rope, and the two sites that used two copies on main keep them
-    below the gate (`copies=True`)."""
+    MLA prefill K is `cat_prefill_k` on a gfx1250 layer (`_prefill_k_cat_arch`,
+    decided once at init) and main's own expression on any other, so other
+    arches run no per-call gate. The two sites that used two copies on main
+    keep them (`copies=True`, `_concat_k_nope_k_pe`)."""
     tree = ast.parse(
         (ROOT / "atom/plugin/vllm/attention/layer_mla.py").read_text(encoding="utf-8")
     )
-    k_sites, rope_cats = [], []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = ast.unparse(node.func)
-        if name == "cat_prefill_k":
-            copies = any(
-                kw.arg == "copies" and ast.literal_eval(kw.value)
-                for kw in node.keywords
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and ast.unparse(n.func) == "cat_prefill_k"
+    ]
+    sites = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.IfExp)
+        and isinstance(n.body, ast.Call)
+        and ast.unparse(n.body.func) == "cat_prefill_k"
+    ]
+    assert len(calls) == len(sites) == 4
+    expanded = "torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)"
+    kinds = []
+    for site in sorted(sites, key=lambda n: n.lineno):
+        assert ast.unparse(site.test) == "self._prefill_k_cat_arch"
+        copies = any(
+            kw.arg == "copies" and ast.literal_eval(kw.value)
+            for kw in site.body.keywords
+        )
+        main = "self._concat_k_nope_k_pe(k_nope, k_pe)" if copies else expanded
+        assert ast.unparse(site.orelse) == main
+        kinds.append(copies)
+    # The two prefill-context sites used two copies on main, the two
+    # `_forward_prefill` sites torch.cat.
+    assert kinds == [True, True, False, False]
+
+
+def test_layers_decide_the_kernel_arch_once():
+    """`MLAAttention.__init__` decides the arch once; `kernel_arch` is False
+    without a CUDA device."""
+    init = next(
+        n
+        for n in ast.walk(
+            ast.parse(
+                (ROOT / "atom/model_ops/attention_mla.py").read_text(encoding="utf-8")
             )
-            k_sites.append((node.lineno, copies))
-        elif name == "torch.cat" and ".expand(" in ast.unparse(node):
-            rope_cats.append(ast.unparse(node))
-    assert not rope_cats, rope_cats
-    # In source order: the two prefill-context sites (context-parallel and
-    # plain) used two copies on main, the two `_forward_prefill` sites torch.cat.
-    assert [c for _, c in sorted(k_sites)] == [True, True, False, False], k_sites
+        )
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "__init__"
+        and "self._flydsl_fp8_mha_ok" in ast.unparse(n)
+    )
+    assert "self._prefill_k_cat_arch = kernel_arch()" in ast.unparse(init)
+    if not torch.cuda.is_available():
+        assert kcat.kernel_arch() is False
 
 
 class _KvB:
@@ -280,6 +311,7 @@ class _KvB:
 def _impl(fp8_ok, heads, kv=None):
     impl = SimpleNamespace(
         _flydsl_fp8_mha_ok=fp8_ok,
+        _prefill_k_cat_arch=False,
         use_flydsl_fp8_prefill_attn=False,
         num_heads=heads,
         qk_nope_head_dim=128,
@@ -301,12 +333,12 @@ def _impl(fp8_ok, heads, kv=None):
 
 
 @pytest.mark.parametrize("gfx1250", [True, False])
-def test_prepare_prefill_k_zero_rope_pad(monkeypatch, gfx1250):
+def test_prepare_prefill_k_zero_rope_pad(gfx1250):
     # On gfx1250 the pad lanes are sliced off before attention, so no copy is
     # made; other arches concatenate K as on main.
-    monkeypatch.setitem(mla.__dict__, "on_kernel_arch", lambda t: gfx1250)
     k_nope, _, k_rope = _inputs(3, 16)
     impl = _impl(False, 16)
+    impl._prefill_k_cat_arch = gfx1250
     impl.rope_is_zero_pad = True
     pad = torch.zeros_like(k_rope)
     k, rope = impl._prepare_prefill_k(k_nope, pad)
@@ -324,11 +356,14 @@ def test_prepare_prefill_k_fp8_split_unchanged():
 
 
 @pytest.mark.parametrize("force_kernel", [False, True])
-def test_forward_prefill_mha_hands_attention_the_cat(monkeypatch, force_kernel):
+@pytest.mark.parametrize("gfx1250", [False, True])
+def test_forward_prefill_mha_hands_attention_the_cat(
+    monkeypatch, force_kernel, gfx1250
+):
     if force_kernel:
         if os.environ.get("TRITON_INTERPRET") != "1":
             _interpreter(
-                "m.test_forward_prefill_mha_hands_attention_the_cat(m.pytest.MonkeyPatch(), True)"
+                f"m.test_forward_prefill_mha_hands_attention_the_cat(m.pytest.MonkeyPatch(), True, {gfx1250})"
             )
             return
         monkeypatch.setattr(kcat, "_prefill_k_cat_supported", lambda *a: True)
@@ -340,6 +375,7 @@ def test_forward_prefill_mha_hands_attention_the_cat(monkeypatch, force_kernel):
     rope2d = qkv_a[:, 2048:]
     q = torch.randn(tokens, heads, 192, generator=g).to(torch.bfloat16)
     impl = _impl(False, heads, kv)
+    impl._prefill_k_cat_arch = gfx1250
     seen = {}
 
     def attend(**kw):
@@ -362,7 +398,8 @@ def test_forward_prefill_mha_hands_attention_the_cat(monkeypatch, force_kernel):
     )
     out = mla.MLAAttention._forward_prefill_mha(impl, q, None, rope2d, None, meta)
     assert out.shape == (tokens, heads * 128)
-    assert built == [1]  # K comes from cat_prefill_k, not a torch.cat of its own
+    # gfx1250 layers build K with cat_prefill_k; others with main's torch.cat
+    assert built == ([1] if gfx1250 else [])
     k_nope, v = kv.view(tokens, heads, 256).split([128, 128], dim=-1)
     _assert_same(seen["k"], _ref(k_nope, rope2d.unsqueeze(1)))
     assert seen["v"].data_ptr() == v.data_ptr() and seen["v"].stride() == v.stride()

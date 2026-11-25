@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Shared MLA prefill K concatenation; imports only Torch and Triton."""
 
 import functools
@@ -64,9 +65,11 @@ def _kernel_arch(device_index: int) -> bool:
     return arch.split(":")[0] == _PREFILL_K_CAT_ARCH
 
 
-def on_kernel_arch(t: torch.Tensor) -> bool:
-    """Whether ``t`` is on a gfx1250 device, the arch this file was measured on."""
-    return t.is_cuda and _kernel_arch(t.device.index)
+def kernel_arch() -> bool:
+    """Whether the current device is gfx1250, the arch this file was measured
+    on. Call sites decide it once per layer and call `cat_prefill_k` only there;
+    elsewhere they keep main's expression, with no per-call check."""
+    return torch.cuda.is_available() and _kernel_arch(torch.cuda.current_device())
 
 
 def _prefill_k_cat_supported(k_nope: torch.Tensor, k_rope: torch.Tensor) -> bool:
