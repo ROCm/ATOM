@@ -491,7 +491,8 @@ class EngineArgs:
             choices=["standard", "mega"],
             help="MoE implementation. 'standard' uses the existing "
             "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE, "
-            "or AITER MegaMoeTP under --sequence-parallel-size.",
+            "AITER MegaMoeTP under --sequence-parallel-size, or "
+            "AITER MegaMoEInternode for two-node EP16.",
         )
         parser.add_argument(
             "--method",

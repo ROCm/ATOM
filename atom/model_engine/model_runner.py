@@ -12,7 +12,7 @@ import math
 import os
 import time
 from collections import OrderedDict
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
@@ -31,7 +31,7 @@ from aiter.dist.parallel_state import (
 from torch.profiler import record_function
 
 from atom import structured_output
-from atom.config import Config, set_current_atom_config
+from atom.config import Config, is_internode_mega, set_current_atom_config
 from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
@@ -1211,19 +1211,26 @@ class ModelRunner:
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
-        # MegaMoE's arenas live on the EP all2all manager's cco communicator,
-        # and SP MegaMoE's runtime on the SP group; destroy_dist_env() destroys
-        # both. A close error propagates once the rest of the teardown has run.
+        # Close operators while their communicators and distributed groups
+        # are alive. Internode operators own independent CCO communicators.
+        # Attempt every backend and the remaining teardown if one close fails.
         try:
-            sp_mega_moe = getattr(self, "sp_mega_moe", None)
-            if sp_mega_moe is not None:
-                sp_mega_moe.close()
-            if envs.ATOM_MORI_V2:
-                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
-                    close_mega_transports,
-                )
+            with ExitStack() as cleanup:
+                if envs.ATOM_MORI_V2:
+                    from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                        close_mega_transports,
+                    )
 
-                close_mega_transports()
+                    cleanup.callback(close_mega_transports)
+                if is_internode_mega(self.config):
+                    from atom.model_ops.fused_moe.megamoe_internode_experts import (
+                        close_internode_instances,
+                    )
+
+                    cleanup.callback(close_internode_instances)
+                sp_mega_moe = getattr(self, "sp_mega_moe", None)
+                if sp_mega_moe is not None:
+                    cleanup.callback(sp_mega_moe.close)
         finally:
             # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
             #    Must happen while ops module is still alive for CustomAllreduce

@@ -2233,6 +2233,41 @@ def _hf_architecture_factor(hf_config) -> tuple:
     return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
+def is_internode_mega(config: "Config") -> bool:
+    """Select the internode implementation of `mega` from the DP topology."""
+    return (
+        config.moe_backend == "mega"
+        and config.sequence_parallel_size == 1
+        and config.parallel_config.is_multinode_dp
+    )
+
+
+def validate_internode_mega_topology(
+    *,
+    use_ep: bool,
+    tp_size: int,
+    dp_size: int,
+    ep_size: int,
+    local_ep_size: int,
+    pp_size: int = 1,
+    pcp_size: int = 1,
+    dp_logical_ratio: int = 1,
+) -> None:
+    """Validate requested and resolved topology against the same EP16 contract."""
+    if (
+        not use_ep
+        or (tp_size, pp_size, pcp_size) != (1, 1, 1)
+        or dp_size != 16
+        or ep_size != 16
+        or local_ep_size != 8
+        or dp_logical_ratio != 1
+    ):
+        raise ValueError(
+            "internode MegaMoE requires two-node EP16: TP/PP/PCP=1, "
+            "DP=EP=16, eight local EP ranks, and real expert sharding"
+        )
+
+
 def _resolve_mono_poll_sleep_units(kv_copies: bool) -> None:
     """The Mono mailbox retry spacing of this deployment, fixed before this
     process or the workers it spawns import ``atom.mono.polling`` (which reads
@@ -2759,6 +2794,25 @@ class Config:
         # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead.
         if self.moe_backend != "mega" or self.sequence_parallel_size > 1:
             return
+        if is_internode_mega(self):
+            validate_internode_mega_topology(
+                use_ep=self.enable_expert_parallel,
+                tp_size=self.tensor_parallel_size,
+                pp_size=self.pipeline_parallel_size,
+                pcp_size=self.prefill_context_parallel_size,
+                dp_size=self.parallel_config.data_parallel_size,
+                ep_size=self.dp_logical_size or self.parallel_config.data_parallel_size,
+                local_ep_size=self.parallel_config.data_parallel_size_local,
+            )
+            if not (self.enable_dp_attention or self.moe_ep_flatten_tp_across_dp):
+                raise ValueError(
+                    "internode MegaMoE requires enable_dp_attention or "
+                    "moe_ep_flatten_tp_across_dp to shard experts across DP ranks"
+                )
+            if self.enable_tbo or self.enable_tbo_decode:
+                raise ValueError(
+                    "internode MegaMoE supports one in-flight forward per instance; disable TBO"
+                )
         if not self.enable_expert_parallel:
             raise ValueError(
                 "moe_backend='mega' requires expert parallelism; pass "

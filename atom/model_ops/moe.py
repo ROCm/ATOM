@@ -28,6 +28,8 @@ from atom.config import (
     Config,
     QuantizationConfig,
     get_current_atom_config,
+    is_internode_mega,
+    validate_internode_mega_topology,
 )
 from atom.distributed.comm_utils import gather_rows
 from atom.distributed.pcp_utils import (
@@ -2704,13 +2706,19 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         self.use_triton = False
         self.use_triton_decode = False
 
-    def _process_weight_layout_after_loading(self, layer) -> None:
+    # The prepared weights (`_build_weights`), expert-major for EPLB.
+    _weight_names = ("_mega_w1", "_mega_w1_scale", "_mega_w2", "_mega_w2_scale")
+
+    def _build_weights(self, layer) -> None:
         from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
 
         build_mega_weights(layer)
 
-        # Mega reads only _mega_* weights. Release the raw AITER weight copies
-        # and skip the standard shuffle so both layouts are not retained.
+    def _process_weight_layout_after_loading(self, layer) -> None:
+        self._build_weights(layer)
+
+        # Mega reads only its prepared weights. Release the raw AITER weight
+        # copies and skip the standard shuffle so both layouts are not retained.
         layer.w13_weight.data = torch.empty(
             0, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
         )
@@ -2742,12 +2750,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         """Return expert-major views owned by EPLB."""
         views: list[torch.Tensor] = []
         local_num_experts = layer.local_num_experts
-        for name in (
-            "_mega_w1",
-            "_mega_w1_scale",
-            "_mega_w2",
-            "_mega_w2_scale",
-        ):
+        for name in self._weight_names:
             tensor = getattr(layer, name, None)
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"MegaMoE weight {name!r} was not prepared")
@@ -2762,11 +2765,70 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         return views
 
 
+class MegaInternodeMxfp4MoEMethod(MegaMxfp4MoEMethod):
+    """MXFP4 routed experts backed by the two-node EP16 A8W4 pipeline."""
+
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        parallel = moe.moe_parallel_config
+        validate_internode_mega_topology(
+            use_ep=parallel.use_ep,
+            tp_size=parallel.tp_size,
+            dp_size=parallel.dp_size,
+            ep_size=parallel.ep_size,
+            local_ep_size=parallel.local_ep_size,
+            dp_logical_ratio=parallel.dp_logical_ratio,
+        )
+        # The inherited routing/layout/forward paths use this selector to keep
+        # rows local. Refuse the DP-gather fallback before allocating weights.
+        if not parallel.use_mori_kernels:
+            raise ValueError(
+                "internode MegaMoE requires the MoRI all-to-all path: use "
+                "moe_all2all_backend='auto' or 'mori', install MoRI, and unset "
+                "ATOM_DISABLE_MORI_EP"
+            )
+        super().__init__(quant_config, moe)
+        self.use_triton_ep = False
+
+    _weight_names = ("_mi_w1", "_mi_w1_scale", "_mi_w2", "_mi_w2_scale")
+
+    def _build_weights(self, layer) -> None:
+        from atom.model_ops.fused_moe.megamoe_internode_experts import (
+            build_internode_weights,
+        )
+
+        if layer.w13_bias is not None or layer.w2_bias is not None:
+            raise NotImplementedError(
+                "internode MegaMoE does not support expert biases"
+            )
+        build_internode_weights(layer)
+        # The raw scales are rebuilt into the op's layouts as well.
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            tensor = getattr(layer, name)
+            tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
+
+    def init_prepare_finalize(self, layer: torch.nn.Module):
+        from atom.model_ops.fused_moe.megamoe_internode_experts import (
+            MegaInternodeFusedExperts,
+        )
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        self.fused_experts = MegaInternodeFusedExperts(
+            layer,
+            model_dim=self.hidden_size,
+            inter_dim=self.intermediate_size,
+            max_tokens=self.moe.max_num_tokens,
+        )
+        self.routed_rows_wire = None
+
+
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
     # Under SP, `mega` runs SP MegaMoE over the native weights instead.
-    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
+    config = get_current_atom_config()
+    if config.moe_backend == "mega" and not sp_is_enabled():
+        if is_internode_mega(config):
+            return MegaInternodeMxfp4MoEMethod(quant_config, moe)
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
@@ -4061,7 +4123,14 @@ class FusedMoE(torch.nn.Module):
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
-        if get_current_atom_config().moe_backend != "mega" or sp_is_enabled():
+        config = get_current_atom_config()
+        if config.moe_backend != "mega" or sp_is_enabled():
+            return
+        if is_internode_mega(config):
+            if not isinstance(self.quant_method, MegaInternodeMxfp4MoEMethod):
+                raise TypeError("internode MegaMoE supports only MXFP4 routed experts")
+            if self.num_fused_shared_experts:
+                raise ValueError("internode MegaMoE requires separate shared experts")
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
             raise TypeError(

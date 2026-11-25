@@ -7,7 +7,7 @@ import torch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from atom.config import get_current_atom_config
+from atom.config import get_current_atom_config, is_internode_mega
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
 from atom.model_ops.fused_moe.gathered_shared_ids import copy_shared_expert_ids_
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
@@ -27,6 +27,10 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     routed_expert_prefix: str | None = None,
 ) -> bool:
     config = get_current_atom_config()
+    if is_internode_mega(config):
+        # The internode kernel owns contiguous routed experts; shared experts
+        # retain their independent MLP and quantization.
+        return False
     if quant_config is None:
         quant_config = config.quant_config
 
