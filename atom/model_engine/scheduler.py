@@ -35,6 +35,7 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
+from atom.kv_transfer.disaggregation.types import produced_no_handoff
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -733,6 +734,7 @@ class Scheduler:
             config,
             state_runtime=state_runtime,
         )
+        self.stages_state_on_finish = self.block_manager.num_state_transfer_slots > 0
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
@@ -940,6 +942,11 @@ class Scheduler:
             throughput_log_interval_steps=config.throughput_log_interval_steps,
             cache_hit_rate_window=config.cache_hit_rate_window,
             pool_pressure=self.block_manager.pool_pressure,
+            transfer_slot_occupancy=(
+                self.block_manager.transfer_slot_occupancy
+                if self.stages_state_on_finish
+                else None
+            ),
         )
         if config.enable_prefix_caching:
             self.engine_stats.block_manager = self.block_manager
@@ -1891,6 +1898,18 @@ class Scheduler:
         callback = getattr(self.kv_connector, "abandon_save", None)
         if callable(callback):
             callback(str(seq.id))
+
+    def _stage_state_for_send(self, seq: Sequence) -> None:
+        """Move a finished P/D request's state to a transfer slot, if one is free.
+
+        Its live slots go back to admission now; the runner copies the state
+        before the next forward, and the connector pushes it from the transfer slot.
+        """
+        if produced_no_handoff(seq):
+            return
+        moved = self.block_manager.move_state_to_transfer_slot(seq)
+        if moved is not None:
+            self.kv_connector.stage_state_for_send(seq, *moved)
 
     def _connector_send_finished(self, req_id) -> None:
         """Drop the connector's send claim on a request's source blocks.
@@ -5482,6 +5501,9 @@ class Scheduler:
         # without sampled output and requests without a stream queue.
         seq.leave_reason = reason
         if self.kv_connector is not None:
+            if self.stages_state_on_finish:
+                # Before `request_finished`, which advertises the slot.
+                self._stage_state_for_send(seq)
             callback = getattr(self.kv_connector, "request_finished", None)
             if callable(callback):
                 callback(seq)

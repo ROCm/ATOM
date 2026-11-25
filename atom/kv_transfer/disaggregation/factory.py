@@ -63,6 +63,29 @@ def pd_transfer_config(kv_transfer_config: dict | None) -> dict | None:
     return cfg if name in PD_TRANSFER_BACKENDS else None
 
 
+def requested_state_transfer_slots(connector: dict) -> int:
+    """A connector entry's validated ``state_transfer_slots``, 0 when unset."""
+    slots = connector.get("state_transfer_slots", 0)
+    if isinstance(slots, bool) or not isinstance(slots, int) or slots < 0:
+        raise ValueError(
+            f"state_transfer_slots must be a non-negative integer, got {slots!r}"
+        )
+    return slots
+
+
+def warn_unsized_state_transfer_slots(kv_transfer_config: dict | None, sized: int):
+    """Warn when `state_transfer_slots` is set anywhere but sized no slots."""
+    cfg = kv_transfer_config or {}
+    subs = [cfg, *(sub or {} for sub in cfg.get("connectors") or ())]
+    requested = max(requested_state_transfer_slots(sub) for sub in subs)
+    if requested and not sized:
+        logger.warning(
+            "state_transfer_slots=%d is ignored: only a MoRIIO producer that is "
+            "the only connector, serving a KDA/GDN model, uses it",
+            requested,
+        )
+
+
 class KVConnectorFactory:
     """Registry + factory for KV connector backends.
 
