@@ -521,8 +521,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Set by `allocate_kv_cache_tensors`, which runs long after
         # construction -- on the P/D decode side too, over the imported pool.
         self.kv_pool: MlaKvPool | None = None
-        # BF16 originals of the open NVFP4 tile. None unless kv_cache_dtype
-        # is nvfp4; the FP8 pool does not allocate one.
+        # The NVFP4 pages and the BF16 tail of each request's open tile. None
+        # unless ATOM_MLA_NVFP4 is set; the FP8 pool does not allocate one.
         self.nvfp4_cache: Nvfp4MlaCache | None = None
         # Each prefill batch's host-side sparse plan, by buffer prefix, from
         # `_stage_prefill_batch` to `_finish_prefill_batch`; None for a dense
