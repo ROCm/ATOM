@@ -315,6 +315,9 @@ class CoreManager:
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
     _dispatch_send_lock = Lock()
+    # `add_request` records the dispatched DP rank on each request
+    # (`Sequence.pd_routed_dp_rank`), which ATOM_PD_EARLY_HANDOFF relies on.
+    reports_dp_rank = True
 
     def _init_shared_state(
         self,
@@ -2653,6 +2656,9 @@ class DisaggCoreManager(CoreManager):
     The two processes coordinate via direct ZMQ PUSH/PULL sockets whose
     addresses are established here before spawning and passed through config.
     """
+
+    # Its `add_request` fans out to both halves and records no DP rank.
+    reports_dp_rank = False
 
     def _build_prefix_router(self, config) -> None:
         """The prefill/decode pair fans out requests; neither engine is a DP target."""

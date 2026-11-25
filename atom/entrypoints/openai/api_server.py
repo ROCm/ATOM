@@ -930,6 +930,32 @@ _early_handoff_tasks: set[asyncio.Task] = set()
 _early_handoff_endpoint_cache: list[dict[str, Any] | None] = []
 
 
+def _mooncake_producer_endpoint(
+    cfg, *, advertised_only: bool = False
+) -> dict[str, Any] | None:
+    """The chunked-transfer endpoint of this server's Mooncake producer
+    connector, or None without one. `advertised_only` keeps only a producer
+    configured with `enable_chunked_transfer` (what `/kv_transfer_info`
+    advertises to the router)."""
+    from atom.kv_transfer.disaggregation.pd_producer import iter_connector_configs
+    from atom.utils.network import get_ip
+
+    for sub, _ in iter_connector_configs(cfg.kv_transfer_config or {}):
+        if (
+            sub.get("kv_connector") == "mooncake"
+            and sub.get("kv_role", "kv_producer") == "kv_producer"
+            and (not advertised_only or sub.get("enable_chunked_transfer", False))
+        ):
+            return producer_endpoint(
+                host=get_ip(),
+                handshake_port=sub.get("handshake_port", DEFAULT_HANDSHAKE_PORT),
+                pp_size=cfg.pipeline_parallel_size,
+                block_size=cfg.kv_cache_block_size,
+                dcp_size=cfg.decode_context_parallel_size,
+            )
+    return None
+
+
 def _early_handoff_endpoint() -> dict[str, Any] | None:
     """This P's Mooncake producer endpoint, or None when early handoff cannot
     apply here (flag off, no Mooncake producer, multi-node DP, or a front-end
@@ -938,29 +964,14 @@ def _early_handoff_endpoint() -> dict[str, Any] | None:
         return _early_handoff_endpoint_cache[0]
     endpoint = None
     cfg = engine.config
-    pc = cfg.parallel_config
     if (
         envs.ATOM_PD_EARLY_HANDOFF
-        and hasattr(engine.core_mgr, "_add_prepared_requests")
-        and not getattr(pc, "is_multinode_dp", False)
+        and engine.core_mgr.reports_dp_rank
+        and not cfg.parallel_config.is_multinode_dp
     ):
-        from atom.kv_transfer.disaggregation.pd_producer import iter_connector_configs
-        from atom.utils.network import get_ip
-
-        for sub, _ in iter_connector_configs(cfg.kv_transfer_config or {}):
-            if (
-                sub.get("kv_connector") == "mooncake"
-                and sub.get("kv_role", "kv_producer") == "kv_producer"
-            ):
-                endpoint = producer_endpoint(
-                    host=get_ip(),
-                    handshake_port=sub.get("handshake_port", DEFAULT_HANDSHAKE_PORT),
-                    pp_size=cfg.pipeline_parallel_size,
-                    block_size=cfg.kv_cache_block_size,
-                    dcp_size=cfg.decode_context_parallel_size,
-                )
-                endpoint["tp_size"] = cfg.tensor_parallel_size
-                break
+        endpoint = _mooncake_producer_endpoint(cfg)
+        if endpoint is not None:
+            endpoint["tp_size"] = cfg.tensor_parallel_size
     _early_handoff_endpoint_cache.append(endpoint)
     return endpoint
 
@@ -1084,7 +1095,7 @@ async def generate_async(
     await _submit_engine_requests([seq])
 
     if early_params is not None:
-        dp_rank = getattr(seq, "pd_routed_dp_rank", None)
+        dp_rank = seq.pd_routed_dp_rank
         if dp_rank is None:
             # Admission happened somewhere that does not report the rank, so
             # no D can find this source. Fail closed instead of stranding P.
@@ -3848,23 +3859,9 @@ async def kv_transfer_info():
         "kv_role": kv_role,
         "handshake_port": handshake_port,
     }
-    from atom.kv_transfer.disaggregation.pd_producer import iter_connector_configs
-    from atom.utils.network import get_ip
-
-    for sub, _ in iter_connector_configs(kv_cfg):
-        if (
-            sub.get("kv_connector") == "mooncake"
-            and sub.get("kv_role", "kv_producer") == "kv_producer"
-            and sub.get("enable_chunked_transfer", False)
-        ):
-            info["chunked_transfer"] = producer_endpoint(
-                host=get_ip(),
-                handshake_port=sub.get("handshake_port", DEFAULT_HANDSHAKE_PORT),
-                pp_size=cfg.pipeline_parallel_size,
-                block_size=cfg.kv_cache_block_size,
-                dcp_size=cfg.decode_context_parallel_size,
-            )
-            break
+    chunked = _mooncake_producer_endpoint(cfg, advertised_only=True)
+    if chunked is not None:
+        info["chunked_transfer"] = chunked
     return info
 
 

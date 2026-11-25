@@ -495,10 +495,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # keep the D-first admission gate below: P allocates a source only
         # once D has reserved its pages, so P admits in D's order and the two
         # pools cannot wait on each other.
-        self.early_handoff = bool(self.is_producer and envs.ATOM_PD_EARLY_HANDOFF)
+        early_handoff = bool(self.is_producer and envs.ATOM_PD_EARLY_HANDOFF)
         self.enable_chunked_transfer = (
-            kv_transfer_config.get("enable_chunked_transfer", False)
-            or self.early_handoff
+            kv_transfer_config.get("enable_chunked_transfer", False) or early_handoff
         )
         self._chunked_receiving: dict[ReqId, Sequence] = {}
         self._chunked_admission_timeout_s = float(

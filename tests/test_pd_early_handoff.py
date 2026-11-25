@@ -85,7 +85,7 @@ def d_params(transfer_id=TRANSFER):
 
 def test_flag_off_keeps_existing_config(monkeypatch, seq_factory):
     plain = make_scheduler_connector(monkeypatch, True, early=False)
-    assert not plain.early_handoff and not plain.enable_chunked_transfer
+    assert not plain.enable_chunked_transfer
     # Without the flag (and without enable_chunked_transfer) a chunked P leg
     # is refused exactly as before.
     seq = seq_factory(list(range(10)), kv_transfer_params=p_params())
@@ -95,9 +95,9 @@ def test_flag_off_keeps_existing_config(monkeypatch, seq_factory):
 
 def test_flag_enables_chunked_producer_but_not_consumer(monkeypatch):
     p = make_scheduler_connector(monkeypatch, True, early=True)
-    assert p.early_handoff and p.enable_chunked_transfer
+    assert p.enable_chunked_transfer
     d = make_scheduler_connector(monkeypatch, False, early=True)
-    assert not d.early_handoff and not d.enable_chunked_transfer
+    assert not d.enable_chunked_transfer
 
 
 def test_early_request_waits_for_d_and_is_registered_once(monkeypatch, seq_factory):
@@ -432,7 +432,11 @@ def api(monkeypatch):
 
 def _engine(api, monkeypatch, *, rank=2, finish_after=False, multinode=False):
     seq = SimpleNamespace(
-        id=11, prompt_token_ids=[1, 2, 3], num_prompt_tokens=3, max_tokens=1
+        id=11,
+        prompt_token_ids=[1, 2, 3],
+        num_prompt_tokens=3,
+        max_tokens=1,
+        pd_routed_dp_rank=None,
     )
     calls = SimpleNamespace(aborted=[], params=None, callback=None)
 
@@ -442,8 +446,7 @@ def _engine(api, monkeypatch, *, rank=2, finish_after=False, multinode=False):
         return seq
 
     class CoreMgr:
-        def _add_prepared_requests(self, seqs):  # marks a routing CoreManager
-            pass
+        reports_dp_rank = True
 
         def add_request(self, seqs):
             if rank is not None:
@@ -588,6 +591,46 @@ def test_api_keeps_legacy_path_otherwise(monkeypatch, api, flag, params, multino
     monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", flag)
     _engine(api, monkeypatch, multinode=multinode)
     assert api._early_handoff_params(params) is None
+
+
+def test_core_managers_that_do_not_report_the_rank_keep_the_legacy_path(
+    monkeypatch, api
+):
+    """Only `CoreManager` records the dispatched rank. RapidServe's
+    `DisaggCoreManager` inherits `_add_prepared_requests` but overrides
+    `add_request`, and a front-end worker's `RemoteCoreManager` leaves
+    dispatch to the hub: both must keep the legacy path, not fail closed."""
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.entrypoints.openai.frontend_workers import RemoteCoreManager
+        from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+
+    assert CoreManager.reports_dp_rank is True
+    assert DisaggCoreManager.reports_dp_rank is False
+    assert RemoteCoreManager.reports_dp_rank is False
+
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", "1")
+    for mgr_cls in (DisaggCoreManager, RemoteCoreManager):
+        _engine(api, monkeypatch)
+        api.engine.core_mgr = mgr_cls.__new__(mgr_cls)
+        api._early_handoff_endpoint_cache.clear()
+        assert api._early_handoff_params({"do_remote_decode": True}) is None
+    # Positive control: the routing CoreManager takes the early path.
+    _engine(api, monkeypatch)
+    api.engine.core_mgr = CoreManager.__new__(CoreManager)
+    api._early_handoff_endpoint_cache.clear()
+    assert api._early_handoff_params({"do_remote_decode": True}) is not None
+
+
+def test_unset_routed_rank_is_not_pickled(seq_factory):
+    import pickle
+
+    seq = seq_factory([1, 2, 3])
+    assert seq.pd_routed_dp_rank is None
+    assert "pd_routed_dp_rank" not in seq.__getstate__()
+    seq.pd_routed_dp_rank = 3  # as CoreManager sets it after the send
+    assert pickle.loads(pickle.dumps(seq)).pd_routed_dp_rank == 3
 
 
 @pytest.mark.parametrize("flag", ["0", "1"])
