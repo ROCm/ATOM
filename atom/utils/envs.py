@@ -677,6 +677,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 at TP 1: the norm in front of a native MXFP8 linear writes
+    # its E4M3 + E8M0 input in the same aiter launch (opt-in for A/B).
+    "ATOM_M3_TP1_NORM_MXFP8": lambda: _flag_env("ATOM_M3_TP1_NORM_MXFP8"),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
