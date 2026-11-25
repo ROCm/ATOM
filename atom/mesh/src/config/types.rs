@@ -355,7 +355,13 @@ pub enum PolicyConfig {
     /// Session-affinity policy for data-parallel workers.
     /// Requests with the same `X-Session-ID` are routed to the same healthy worker.
     #[serde(rename = "dp_sticky")]
-    DpSticky,
+    DpSticky {
+        /// Move a session off its worker when that worker runs more than
+        /// `1 + threshold` times the least-loaded worker's requests (and at
+        /// least two more). `None` keeps strict affinity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rebalance_threshold: Option<f32>,
+    },
 
     #[serde(rename = "cache_aware")]
     CacheAware {
@@ -399,7 +405,7 @@ impl PolicyConfig {
         match self {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
-            PolicyConfig::DpSticky => "dp_sticky",
+            PolicyConfig::DpSticky { .. } => "dp_sticky",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
@@ -912,7 +918,13 @@ mod tests {
     fn test_policy_config_name() {
         assert_eq!(PolicyConfig::Random.name(), "random");
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
-        assert_eq!(PolicyConfig::DpSticky.name(), "dp_sticky");
+        assert_eq!(
+            PolicyConfig::DpSticky {
+                rebalance_threshold: None
+            }
+            .name(),
+            "dp_sticky"
+        );
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
@@ -935,9 +947,19 @@ mod tests {
         let json = serde_json::to_string(&random).unwrap();
         assert_eq!(json, r#"{"type":"random"}"#);
 
-        let dp_sticky = PolicyConfig::DpSticky;
+        let dp_sticky = PolicyConfig::DpSticky {
+            rebalance_threshold: None,
+        };
         let json = serde_json::to_string(&dp_sticky).unwrap();
         assert_eq!(json, r#"{"type":"dp_sticky"}"#);
+        let rebalancing: PolicyConfig =
+            serde_json::from_str(r#"{"type":"dp_sticky","rebalance_threshold":0.25}"#).unwrap();
+        assert!(matches!(
+            rebalancing,
+            PolicyConfig::DpSticky {
+                rebalance_threshold: Some(t)
+            } if (t - 0.25).abs() < 1e-6
+        ));
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,

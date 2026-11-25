@@ -66,7 +66,7 @@ skipped after a failed prefill adds none.
 | `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every selection, including one in a pool without candidates. |
 | `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity` and `relocate`. |
 | `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). |
-| `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
+| `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `rebalance`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
 | `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers send a request, after DP rank mapping (see [below](#dp-ranks)). |
 | `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy (see [below](#router-estimate-and-engine-reported-cached-tokens)). |
 | `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit on the worker the prompt ran on; today only `cache_aware`. |
@@ -107,7 +107,7 @@ Defaults are the CLI defaults.
 | | `load_balance_walk` | The owner is over that bound: the least-loaded worker within it, or the owner if none is. | |
 | | `fallback_least_load` | No ring, or the owner is not healthy: the least-loaded worker. | |
 | | `no_tokens` | The request has no tokens: no worker. | |
-| `dp_sticky` | `hit`, `new`, `rebind`, `expired` | See [session affinity](#session-affinity). | |
+| `dp_sticky` | `hit`, `new`, `rebind`, `rebalance`, `expired` | See [session affinity](#session-affinity). | |
 | | `no_session` | No `x-session-id` header: the least-loaded worker. | |
 
 ## Reading the values
@@ -147,6 +147,11 @@ to a worker (URL and DP rank) in router memory:
 - `rebind`: the pinned worker is unhealthy, removed or circuit-open, or under
   idx2idx not among the prefill candidates the decode's rank leaves, so the
   session is reassigned like a new one;
+- `rebalance`: only with `--dp-sticky-rebalance-threshold T`: the pinned worker
+  runs more than `(1 + T)` times the in-flight requests of the least-loaded
+  healthy worker, and at least two more, so the session is re-pinned to that
+  worker. With `T` set, `new` sessions also go to the least-loaded worker,
+  ties broken by live sessions;
 - `expired`: the session was idle for more than 120 minutes and is reassigned.
 
 With N turns per session and stable workers, the hit rate approaches
@@ -166,7 +171,7 @@ the one the request is sent to, after DP rank mapping, so ranks behind one URL
 are different workers. It is counted when the request is sent: a reserved
 worker that receives nothing, such as the decode worker after a failed prefill
 or an unexecuted external-processing reservation, neither counts nor becomes
-the session's previous worker. `rebind` and `expired` name the affinity result
+the session's previous worker. `rebind`, `rebalance` and `expired` name the affinity result
 that moved the session; an expired session reassigned to its old worker counts
 nothing. `rank_mapping` means the pin held, but
 `--atom-pd-rank-mapping-policy idx2idx` mapped the prefill request to a

@@ -263,6 +263,13 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     pub prefix_hash_load_factor: f64,
 
+    /// dp_sticky: move a session off its worker when that worker runs more than
+    /// (1 + threshold) times the in-flight requests of the least-loaded worker, and at
+    /// least two more; new sessions then go to the least-loaded worker. Unset keeps
+    /// strict affinity
+    #[arg(long, help_heading = "Routing Policy")]
+    pub dp_sticky_rebalance_threshold: Option<f32>,
+
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     pub dp_aware: bool,
@@ -546,7 +553,9 @@ impl CliArgs {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
-            "dp_sticky" => PolicyConfig::DpSticky,
+            "dp_sticky" => PolicyConfig::DpSticky {
+                rebalance_threshold: self.dp_sticky_rebalance_threshold,
+            },
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
@@ -872,7 +881,9 @@ mod tests {
         let args = CliArgs::default();
         assert!(matches!(
             args.parse_policy("dp_sticky"),
-            PolicyConfig::DpSticky
+            PolicyConfig::DpSticky {
+                rebalance_threshold: None
+            }
         ));
     }
 
@@ -889,7 +900,33 @@ mod tests {
         assert_eq!(args.policy, "dp_sticky");
         assert!(matches!(
             args.parse_policy(&args.policy),
-            PolicyConfig::DpSticky
+            PolicyConfig::DpSticky {
+                rebalance_threshold: None
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_passes_the_dp_sticky_rebalance_threshold() {
+        let cli = Cli::try_parse_from([
+            "atomesh",
+            "launch",
+            "--pd-disaggregation",
+            "--decode-policy",
+            "dp_sticky",
+            "--dp-sticky-rebalance-threshold",
+            "0.2",
+        ])
+        .unwrap();
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+        assert!(matches!(
+            args.parse_policy(args.decode_policy.as_deref().unwrap()),
+            PolicyConfig::DpSticky {
+                rebalance_threshold: Some(t)
+            } if (t - 0.2).abs() < 1e-6
         ));
     }
 
@@ -915,11 +952,15 @@ mod tests {
         assert_eq!(args.decode_policy.as_deref(), Some("dp_sticky"));
         assert!(matches!(
             args.parse_policy(args.prefill_policy.as_deref().unwrap()),
-            PolicyConfig::DpSticky
+            PolicyConfig::DpSticky {
+                rebalance_threshold: None
+            }
         ));
         assert!(matches!(
             args.parse_policy(args.decode_policy.as_deref().unwrap()),
-            PolicyConfig::DpSticky
+            PolicyConfig::DpSticky {
+                rebalance_threshold: None
+            }
         ));
     }
 }
@@ -942,6 +983,7 @@ impl Default for CliArgs {
             max_tree_size: 67_108_864,
             prefix_token_count: 256,
             prefix_hash_load_factor: 1.25,
+            dp_sticky_rebalance_threshold: None,
             dp_aware: false,
             kv_events: false,
             mooncake_admin_port: 9003,

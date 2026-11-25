@@ -17,7 +17,11 @@ impl PolicyFactory {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
-            PolicyConfig::DpSticky => Arc::new(DpStickyPolicy::new()),
+            PolicyConfig::DpSticky {
+                rebalance_threshold,
+            } => Arc::new(DpStickyPolicy::with_rebalance_threshold(
+                *rebalance_threshold,
+            )),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::CacheAware {
                 cache_threshold,
@@ -74,7 +78,9 @@ mod tests {
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RoundRobin);
         assert_eq!(policy.name(), "round_robin");
 
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::DpSticky);
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::DpSticky {
+            rebalance_threshold: None,
+        });
         assert_eq!(policy.name(), "dp_sticky");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PowerOfTwo {
@@ -137,7 +143,12 @@ mod tests {
         let configs = vec![
             ("random", PolicyConfig::Random),
             ("round_robin", PolicyConfig::RoundRobin),
-            ("dp_sticky", PolicyConfig::DpSticky),
+            (
+                "dp_sticky",
+                PolicyConfig::DpSticky {
+                    rebalance_threshold: None,
+                },
+            ),
             (
                 "power_of_two",
                 PolicyConfig::PowerOfTwo {

@@ -92,7 +92,20 @@ impl ConfigValidator {
 
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::DpSticky => {}
+            PolicyConfig::Random | PolicyConfig::RoundRobin => {}
+            PolicyConfig::DpSticky {
+                rebalance_threshold,
+            } => {
+                if let Some(threshold) = rebalance_threshold {
+                    if !(threshold.is_finite() && *threshold >= 0.0) {
+                        return Err(ConfigError::InvalidValue {
+                            field: "dp_sticky_rebalance_threshold".to_string(),
+                            value: threshold.to_string(),
+                            reason: "Must be a finite value >= 0".to_string(),
+                        });
+                    }
+                }
+            }
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,
@@ -434,6 +447,24 @@ mod tests {
             assert!(error.to_string().contains("prepare_pool."), "{error}");
         }
         RouterConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn dp_sticky_rebalance_threshold_must_be_finite_and_non_negative() {
+        let mut config = RouterConfig::default();
+        for (threshold, valid) in [
+            (None, true),
+            (Some(0.0), true),
+            (Some(0.2), true),
+            (Some(-0.1), false),
+            (Some(f32::NAN), false),
+            (Some(f32::INFINITY), false),
+        ] {
+            config.policy = PolicyConfig::DpSticky {
+                rebalance_threshold: threshold,
+            };
+            assert_eq!(config.validate().is_ok(), valid, "{threshold:?}");
+        }
     }
 
     #[test]

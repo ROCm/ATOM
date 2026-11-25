@@ -201,6 +201,7 @@ pub mod labels {
     pub const AFFINITY_HIT: &str = "hit";
     pub const AFFINITY_NEW: &str = "new";
     pub const AFFINITY_REBIND: &str = "rebind";
+    pub const AFFINITY_REBALANCE: &str = "rebalance";
     pub const AFFINITY_EXPIRED: &str = "expired";
     pub const WORKER_CHANGE_RANK_MAPPING: &str = "rank_mapping";
     pub const DP_RANK_NONE: &str = "none";
