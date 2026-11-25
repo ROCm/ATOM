@@ -236,8 +236,8 @@ def zero_pad_tail(tensor: torch.Tensor, dim: int, logical_size: int) -> None:
 
 
 def zero_unpacked_expert_padding(
-    w13: torch.Tensor,
-    w2: torch.Tensor,
+    w13: torch.Tensor | None,
+    w2: torch.Tensor | None,
     logical_intermediate: int,
     w13_channel_scale: torch.Tensor | None = None,
 ) -> None:
@@ -245,6 +245,7 @@ def zero_unpacked_expert_padding(
 
     Dummy initialization writes whole tensors rather than going through the
     checkpoint loaders. This is not valid on already shuffled/bit-packed weights.
+    Pass None for a buffer a sync did not rewrite: it may still be shuffled.
     W2's per-channel scale is on H, so it has no intermediate tail to clear.
     """
     for tensor in (w13, w13_channel_scale):
@@ -252,7 +253,8 @@ def zero_unpacked_expert_padding(
             continue
         for shard in ("w1", "w3"):
             zero_pad_tail(expert_shard_view(tensor, shard, 1), 1, logical_intermediate)
-    zero_pad_tail(w2, 2, logical_intermediate)
+    if w2 is not None:
+        zero_pad_tail(w2, 2, logical_intermediate)
 
 
 def expert_region(
