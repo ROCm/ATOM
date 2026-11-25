@@ -311,11 +311,10 @@ class K3MonoDecodeRunner:
 
         `config_refusal` checks `ATOM_GDN_SSM_DTYPE`, which is the *request*;
         this is the pool that was actually allocated. The recurrence reads and
-        writes it in place as fp32, or as fp16 under ``state16`` (widened to
-        fp32 on load, rounded to nearest on every store), so any other dtype is
-        reinterpreted rather than converted -- wrong numbers, no error. A step
-        admits only ``state_dtypes``: K1 reads the pool at the element size its
-        build was made for.
+        writes it in place as fp32, or as fp16 under ``state16``, so any other
+        dtype is reinterpreted rather than converted -- wrong numbers, no
+        error. A step admits only ``state_dtypes``: K1 reads the pool at the
+        element size its build was made for.
         """
         cache = get_forward_context().kv_cache_data[f"layer_{layer_id}"]
         state = cache.v_cache

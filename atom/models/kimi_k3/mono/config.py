@@ -28,8 +28,7 @@ closes each one:
   divide every width.
 * **weight layouts** -- ``weights.py`` checks each tensor it binds.
 * **KV dtype** -- the conv state must be bf16 and the recurrent state fp32 or
-  fp16 (computed in fp32 either way: an fp16 pool is widened on load and each
-  state written back rounded to fp16). ``ATOM_GDN_SSM_DTYPE`` is checked here, but
+  fp16 (``KdaPreBuild.state16``). ``ATOM_GDN_SSM_DTYPE`` is checked here, but
   that is the *request*; the pools that were actually allocated are checked in
   ``runner._conv_state`` and ``runner._recurrent_state`` -- at build for every
   mono layer, and again, against the build, where each step packs them.
