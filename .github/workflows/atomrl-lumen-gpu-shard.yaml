@@ -18,20 +18,20 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - {id: unit, name: gpu-unit-tests, runner: linux-atom-do-mi350x-8, execution: unit, model: none, data: none, command: "python3 -m pytest atomrl/tests/lumen -q"}
-          - {id: 1, name: llama2-bf16-megatron, runner: linux-atom-do-mi350x-8, execution: host, model: none, data: none, command: "PRECISION=bf16 TRAIN_STEPS=20 bash examples/llama2/run_pretrain_llama2_7b.sh"}
-          - {id: 2, name: llama2-fp8-delayed-megatron, runner: linux-atom-do-mi350x-8, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/llama2/run_pretrain_llama2_7b.sh"}
-          - {id: 3, name: llama2-fp8-blockwise-megatron, runner: linux-atom-do-mi350x-8, execution: host, model: none, data: none, command: "MODEL=llama2 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"}
-          - {id: 4, name: llama2-fp8-blockwise-fsdp, runner: linux-atom-do-mi350x-8, execution: host, model: llama2, data: npy, command: "MODE=fp8_blockwise SEQ_LEN=2048 TRAIN_STEPS=20 bash examples/llama2/run_fsdp_lora_7b.sh"}
-          - {id: 5, name: llama31-bf16-megatron, runner: linux-atom-do-mi350x-8, execution: host, model: none, data: none, command: "PRECISION=bf16 TRAIN_STEPS=20 bash examples/llama31/run_pretrain_llama31_8b.sh"}
-          - {id: 6, name: llama31-fp8-delayed-megatron, runner: linux-atom-do-mi350x-8, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/llama31/run_pretrain_llama31_8b.sh"}
-          - {id: 7, name: llama31-fp8-blockwise-megatron, runner: linux-atom-do-mi350x-8, execution: host, model: none, data: none, command: "MODEL=llama31 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"}
-          - {id: 8, name: qwen3-bf16-megatron, runner: linux-atom-do-mi350x-8, execution: host, model: none, data: none, command: "PRECISION=bf16 TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b.sh"}
-          - {id: 9, name: qwen3-fp8-delayed-megatron, runner: linux-atom-do-mi350x-8, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b.sh"}
-          - {id: 10, name: qwen3-fp8-blockwise-megatron, runner: linux-atom-do-mi350x-8, execution: host, model: none, data: none, command: "MODEL=qwen3 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"}
-          - {id: 11, name: qwen3-fp8-blockwise-fsdp, runner: linux-atom-do-mi350x-8, execution: host, model: qwen3, data: alpaca, command: "MAX_STEPS=20 EVAL_INTERVAL=20 bash examples/qwen3/run_qwen3_fsdp.sh"}
-          - {id: 12, name: qwen3-mxfp4-megatron, runner: linux-atom-do-mi350x-8, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b_mxfp4.sh"}
-          - {id: 13, name: qwen3-mxfp4-fsdp2-lora, runner: linux-atom-do-mi350x-8, execution: container, model: qwen3, data: alpaca, command: "TRAIN_STEPS=20 WARMUP_STEPS=2 bash examples/qwen3/run_qwen3_fsdp_mxfp4_sft.sh"}
+          - {id: unit, name: gpu-unit-tests, runner: linux-atom-pitt-mi350x-8, execution: unit, model: none, data: none, command: "python3 -m pytest atomrl/tests/lumen -q"}
+          - {id: 1, name: llama2-bf16-megatron, runner: linux-atom-pitt-mi350x-8, execution: host, model: none, data: none, command: "PRECISION=bf16 TRAIN_STEPS=20 bash examples/llama2/run_pretrain_llama2_7b.sh"}
+          - {id: 2, name: llama2-fp8-delayed-megatron, runner: linux-atom-pitt-mi350x-8, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/llama2/run_pretrain_llama2_7b.sh"}
+          - {id: 3, name: llama2-fp8-blockwise-megatron, runner: linux-atom-pitt-mi350x-8, execution: host, model: none, data: none, command: "MODEL=llama2 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"}
+          - {id: 4, name: llama2-fp8-blockwise-fsdp, runner: linux-atom-pitt-mi350x-8, execution: host, model: llama2, data: npy, command: "MODE=fp8_blockwise SEQ_LEN=2048 TRAIN_STEPS=20 bash examples/llama2/run_fsdp_lora_7b.sh"}
+          - {id: 5, name: llama31-bf16-megatron, runner: linux-atom-pitt-mi350x-8, execution: host, model: none, data: none, command: "PRECISION=bf16 TRAIN_STEPS=20 bash examples/llama31/run_pretrain_llama31_8b.sh"}
+          - {id: 6, name: llama31-fp8-delayed-megatron, runner: linux-atom-pitt-mi350x-8, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/llama31/run_pretrain_llama31_8b.sh"}
+          - {id: 7, name: llama31-fp8-blockwise-megatron, runner: linux-atom-pitt-mi350x-8, execution: host, model: none, data: none, command: "MODEL=llama31 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"}
+          - {id: 8, name: qwen3-bf16-megatron, runner: linux-atom-pitt-mi350x-8, execution: host, model: none, data: none, command: "PRECISION=bf16 TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b.sh"}
+          - {id: 9, name: qwen3-fp8-delayed-megatron, runner: linux-atom-pitt-mi350x-8, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b.sh"}
+          - {id: 10, name: qwen3-fp8-blockwise-megatron, runner: linux-atom-pitt-mi350x-8, execution: host, model: none, data: none, command: "MODEL=qwen3 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"}
+          - {id: 11, name: qwen3-fp8-blockwise-fsdp, runner: linux-atom-pitt-mi350x-8, execution: host, model: qwen3, data: alpaca, command: "MAX_STEPS=20 EVAL_INTERVAL=20 bash examples/qwen3/run_qwen3_fsdp.sh"}
+          - {id: 12, name: qwen3-mxfp4-megatron, runner: linux-atom-pitt-mi350x-8, execution: host, model: none, data: none, command: "TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b_mxfp4.sh"}
+          - {id: 13, name: qwen3-mxfp4-fsdp2-lora, runner: linux-atom-pitt-mi350x-8, execution: container, model: qwen3, data: alpaca, command: "TRAIN_STEPS=20 WARMUP_STEPS=2 bash examples/qwen3/run_qwen3_fsdp_mxfp4_sft.sh"}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     concurrency:

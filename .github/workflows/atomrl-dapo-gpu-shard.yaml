@@ -18,13 +18,13 @@ jobs:
   atomrl-gpu-unit:
     name: AtomRL GPU unit tests
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
-    runs-on: linux-atom-do-mi350x-8
+    runs-on: linux-atom-pitt-mi350x-8
     timeout-minutes: 120
     # Keep this group separate from the example matrix below. The unit job and
     # the matrix start together, and a group holds at most one running and one
     # pending job, so a shared group makes one of them cancel the other.
     concurrency:
-      group: atomrl-dapo-unit-linux-atom-do-mi350x-8
+      group: atomrl-dapo-unit-linux-atom-pitt-mi350x-8
       cancel-in-progress: false
     permissions:
       contents: read
@@ -94,28 +94,28 @@ jobs:
         include:
           - id: "1"
             name: Qwen3-8B BF16 vLLM
-            runner: linux-atom-do-mi350x-8
+            runner: linux-atom-pitt-mi350x-8
           - id: "2"
             name: Qwen3-8B FP8 rollout
-            runner: linux-atom-do-mi350x-8
+            runner: linux-atom-pitt-mi350x-8
           - id: "3"
             name: Qwen3-8B FP8 end-to-end
-            runner: linux-atom-do-mi350x-8
+            runner: linux-atom-pitt-mi350x-8
           - id: "4"
             name: Qwen3-8B ATOM FP8
-            runner: linux-atom-do-mi350x-8
+            runner: linux-atom-pitt-mi350x-8
           - id: "5"
             name: Qwen3-8B ATOM BF16
-            runner: linux-atom-do-mi350x-8
+            runner: linux-atom-pitt-mi350x-8
           - id: "6"
             name: Qwen3-30B-A3B vLLM
-            runner: linux-atom-do-mi350x-8
+            runner: linux-atom-pitt-mi350x-8
           - id: "7"
             name: Qwen3-30B-A3B Megatron EP8
-            runner: linux-atom-do-mi350x-8
+            runner: linux-atom-pitt-mi350x-8
           - id: "9"
             name: Qwen3-30B-A3B ATOM BF16
-            runner: linux-atom-do-mi350x-8
+            runner: linux-atom-pitt-mi350x-8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     concurrency:
