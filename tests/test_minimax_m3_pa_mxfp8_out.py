@@ -189,9 +189,7 @@ def _mxfp8_hidden(rows=3, hidden=96):
 
 
 @pytest.mark.parametrize("mxfp8_out", [True, False])
-def test_fused_qkv_chain_hands_the_mxfp8_activation_to_the_attention(
-    monkeypatch, mxfp8_out
-):
+def test_fused_qkv_chain_takes_only_an_mxfp8_activation(monkeypatch, mxfp8_out):
     monkeypatch.setattr(m3_model, "_linear_consumes_mxfp8", lambda linear: True)
     layer = _layer(enabled=mxfp8_out)
     layer.fused_qkv_chain = True
@@ -201,59 +199,30 @@ def test_fused_qkv_chain_hands_the_mxfp8_activation_to_the_attention(
     )
     assert layer.qkv_proj.calls == 0
     assert layer.attn.qkvs == [hidden] and layer.attn.q_scales == [scale]
-
-
-def test_fused_qkv_chain_keeps_the_gemm_without_an_mxfp8_activation(monkeypatch):
-    monkeypatch.setattr(m3_model, "_linear_consumes_mxfp8", lambda linear: True)
-    layer = _layer()
-    layer.fused_qkv_chain = True
+    # A BF16 activation keeps the QKV GEMM.
     MiniMaxM3SparseAttention.forward(layer, torch.arange(3), torch.randn(3, 72))
-    assert layer.qkv_proj.calls == 1 and layer.attn.q_scales == [None]
+    assert layer.qkv_proj.calls == 1 and layer.attn.q_scales[-1] is None
 
 
-def _sparse_impl(fused: bool):
-    from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+def test_sparse_impl_holds_the_mxfp8_scales_for_rope_cache(monkeypatch):
+    from atom.model_ops.attention_mha import (
+        PagedAttentionImpl,
+        SparseMHAPagedAttentionImpl,
+    )
 
-    impl = SparseMHAPagedAttentionImpl.__new__(SparseMHAPagedAttentionImpl)
-    impl.fused_qkv_linear = (object(),) if fused else None
-    impl._fused_x_scale = None
-    return impl
-
-
-def test_sparse_impl_keeps_the_mxfp8_scales_for_rope_cache(monkeypatch):
-    """An e4m3 `qkv` is the QKV GEMM's input: its scales wait for rope_cache and
-    the attention itself is handed no q scale."""
-    from atom.model_ops.attention_mha import PagedAttentionImpl
-
-    seen = {}
+    seen = []
     monkeypatch.setattr(
         PagedAttentionImpl,
         "forward_impl",
-        lambda self, q, k, v, position=None, q_scale=None, qkv=None, **kw: seen.update(
-            q_scale=q_scale
-        ),
+        lambda self, q, k, v, q_scale=None, **kw: seen.append(q_scale),
     )
-    impl = _sparse_impl(fused=True)
+    impl = SparseMHAPagedAttentionImpl.__new__(SparseMHAPagedAttentionImpl)
+    impl.fused_qkv_linear = (object(),)
     hidden, scale = _mxfp8_hidden()
     impl.forward_impl(hidden, hidden, hidden, q_scale=scale, qkv=hidden)
-    assert impl._fused_x_scale is scale and seen["q_scale"] is None
+    assert impl._fused_x_scale is scale and seen == [None]
+    bf16 = torch.randn(3, 8)
+    impl.forward_impl(bf16, bf16, bf16, q_scale=scale, qkv=bf16)
+    assert impl._fused_x_scale is None and seen[-1] is scale
     with pytest.raises(RuntimeError):
         impl.forward_impl(hidden, hidden, hidden, q_scale=None, qkv=hidden)
-
-
-def test_sparse_impl_passes_a_bf16_qkv_through(monkeypatch):
-    from atom.model_ops.attention_mha import PagedAttentionImpl
-
-    seen = {}
-    monkeypatch.setattr(
-        PagedAttentionImpl,
-        "forward_impl",
-        lambda self, q, k, v, position=None, q_scale=None, qkv=None, **kw: seen.update(
-            q_scale=q_scale
-        ),
-    )
-    impl = _sparse_impl(fused=True)
-    qkv = torch.randn(3, 8)
-    marker = torch.ones(1)
-    impl.forward_impl(qkv, qkv, qkv, q_scale=marker, qkv=qkv)
-    assert impl._fused_x_scale is None and seen["q_scale"] is marker
