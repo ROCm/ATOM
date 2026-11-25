@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """`ATOM_DP_LM_HEAD_MODE=argmax`: which heads shard the vocab, which runners
 take the greedy-ids head (`_init_dp_argmax_head`), and which requests are
 admitted (`InputOutputProcessor`)."""
@@ -79,12 +81,11 @@ def test_argmax_mode_takes_the_one_dp_sharded_head(monkeypatch, modules, subclas
     head = _head(head_type)
     runner, sampler = _runner(mr, [head])
     runner._init_dp_argmax_head()
-    assert runner.dp_argmax_head is head
     assert isinstance(runner.sampler, mr.GreedyIdsOrSample)
     ids = torch.tensor([5.0, 7.0])
     out = runner.sampler(ids, None)
     assert out.dtype == torch.int32 and out.tolist() == [5, 7]
-    assert out.data_ptr() != ids.data_ptr()  # out of a replay's graph pool
+    assert out.data_ptr() != ids.data_ptr()  # a new int32 tensor
     assert runner.sampler(torch.zeros(2, 8), None) == "sampled"
     sampler.assert_called_once()
     assert runner.sampler.keep_ties is sampler.keep_ties  # the rest is the sampler
@@ -115,7 +116,7 @@ def test_other_modes_take_no_head_and_keep_the_sampler(monkeypatch, modules, mod
     monkeypatch.setenv("ATOM_DP_LM_HEAD_MODE", mode)
     runner, sampler = _runner(mr, [], spec=object())
     runner._init_dp_argmax_head()
-    assert runner.dp_argmax_head is None and runner.sampler is sampler
+    assert runner.sampler is sampler
 
 
 # ------------------------------------------------------------- admission ---

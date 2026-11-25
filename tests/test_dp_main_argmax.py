@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """CPU checks for the DP greedy argmax head, with external kernels stubbed.
 
 The real head exchange runs without AITER or a GPU. The

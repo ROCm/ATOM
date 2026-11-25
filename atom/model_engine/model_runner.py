@@ -15,7 +15,7 @@ from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial, wraps
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -170,9 +170,6 @@ from atom.utils.tbo import (
 from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
 logger = logging.getLogger("atom")
-
-if TYPE_CHECKING:
-    from atom.model_ops.embed_head import ParallelLMHead
 
 
 class GreedyIdsOrSample:
@@ -866,9 +863,6 @@ class ModelRunner:
     # head output; whether this step deferred the previous verify's status
     # past the target's launch (`prepare_model`).
     verify_head: VerifyHead | None = None
-    # The LM head whose decode output is greedy ids
-    # (`ATOM_DP_LM_HEAD_MODE=argmax`), else None.
-    dp_argmax_head: "ParallelLMHead | None" = None
     spec_status_deferred = False
 
     def __init__(self, rank: int, config: Config):
@@ -1122,9 +1116,10 @@ class ModelRunner:
             )
 
     def _init_dp_argmax_head(self):
-        """Under `ATOM_DP_LM_HEAD_MODE=argmax`, the model's one DP-sharded
-        `ParallelLMHead`, its logits the head output and no draft verified;
-        startup fails otherwise."""
+        """Under `ATOM_DP_LM_HEAD_MODE=argmax`, check for the model's one
+        DP-sharded `ParallelLMHead`, its logits the head output and no draft
+        verified (startup fails otherwise), and bind the sampler that passes
+        its greedy ids through."""
         if envs.ATOM_DP_LM_HEAD_MODE != "argmax":
             return
         from atom.model_ops.embed_head import ParallelLMHead
@@ -1141,7 +1136,6 @@ class ModelRunner:
                 "vocab divisible by DP), one ParallelLMHead whose logits are the "
                 "model's head output, and no speculative decoding"
             )
-        self.dp_argmax_head = heads[0]
         self.sampler = GreedyIdsOrSample(self.sampler)
 
     def poll_forward_metrics(self):
@@ -3476,7 +3470,9 @@ class ModelRunner:
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """The model's logits of ``hidden_states``: every sampling path's."""
+        """The model's logits of ``hidden_states``: every sampling path's; or fp32
+        greedy ids [rows] on a decode the DP-sharded head serves under
+        ``ATOM_DP_LM_HEAD_MODE=argmax``."""
         return self.model.compute_logits(hidden_states)
 
     def run_lm_head(
@@ -3484,8 +3480,9 @@ class ModelRunner:
     ) -> LmHeadOutput:
         """The step's LM head, after the forward and outside its graph, on the
         forward's stream: the verify head's verify where its ids stand for
-        the step, else the logits (neither on a step the model ran whole,
-        `_served`). A lossless drafter's sampled step verifies by the
+        the step, else the logits (or fp32 greedy ids on a decode the DP-sharded
+        head serves under `ATOM_DP_LM_HEAD_MODE=argmax`; neither on a step the
+        model ran whole, `_served`). A lossless drafter's sampled step verifies by the
         probability ratio, which reads the logits."""
         if self._served is not None:
             return LmHeadOutput(None, None)
