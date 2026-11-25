@@ -18,7 +18,8 @@ A layer runs:
 * a MoE layer's post-attention norm as one kernel: bf16 for the router, MXFP8
   for the shared expert and, from aiter's 4096-row MoE bucket, MXFP4 for the
   routed experts (``norm_moe_input``);
-* the shared expert with SwiGLU-OAI fused into its MXFP8 quant, and the routed
+* the shared expert with SwiGLU-OAI fused into its MXFP8 quant (into the gate_up
+  GEMM's epilogue where both its GEMMs run the 8-wave psc kernel), and the routed
   experts (``moe_ffn``). The pair (routed rows, shared output) goes to the next
   layer, whose input norm folds it; the stage's last layer and DSpark taps fold
   it themselves (``materialize``). Where aiter runs its reduce GEMM2 (from the
@@ -456,6 +457,29 @@ materialize = direct_register_custom_op(
 # ---------------------------------------------------------------------------
 
 
+@functools.cache
+def _gateup_swiglu_op():
+    """aiter's 8-wave gate_up GEMM with SwiGLU-OAI + MXFP8 (w4) in its epilogue."""
+    from aiter.ops.flydsl import gemm_a8w8_mxfp8_8wave
+
+    op = getattr(gemm_a8w8_mxfp8_8wave, "flydsl_mxfp8_8wave_gemm_swiglu_w4", None)
+    if op is None:
+        logger.info("MiniMax-M3 TP1 prefill: aiter has no fused gate_up SwiGLU GEMM")
+    return op
+
+
+def gateup_swiglu_fused(m: int, n_gu: int, k: int, n_dn: int, mlp) -> bool:
+    """Whether gate_up runs with SwiGLU-OAI and down's MXFP8 quant in its epilogue
+    (same bytes): both GEMMs on the psc path, a clamped SwiGLU and aiter's kernel."""
+    return (
+        mlp.swiglu_limit is not None
+        and n_gu % 512 == 0
+        and psc_layout(m, n_gu, k)
+        and psc_layout(m, n_dn, n_gu // 2)
+        and _gateup_swiglu_op() is not None
+    )
+
+
 def mlp_forward(mlp, q8: torch.Tensor, s8: torch.Tensor) -> torch.Tensor:
     """MiniMaxM3MLP on an MXFP8 input: gate_up -> SwiGLU+MXFP8 -> down."""
     from atom.model_ops.minimax_m3.tp1_swiglu import (
@@ -464,6 +488,22 @@ def mlp_forward(mlp, q8: torch.Tensor, s8: torch.Tensor) -> torch.Tensor:
     )
 
     gu, dn = mlp.gate_up_proj, mlp.down_proj
+    m, k = q8.shape
+    n_gu = gu.weight.shape[0]
+    if gateup_swiglu_fused(m, n_gu, k, dn.weight.shape[0], mlp):
+        waves_per_eu, xcd_swizzle = _psc_row(m, n_gu, k)
+        y, s = _gateup_swiglu_op()(
+            q8,
+            gu.weight,
+            s8.view(-1).view(_E8M0),
+            gu.weight_scale_w4,
+            alpha=mlp.swiglu_alpha,
+            beta=mlp.swiglu_beta,
+            limit=mlp.swiglu_limit,
+            waves_per_eu=waves_per_eu,
+            xcd_swizzle=xcd_swizzle,
+        )
+        return gemm_mxfp8(y, s, dn.weight, dn.weight_scale, dn.weight_scale_w4)
     gate_up = gemm_mxfp8(q8, s8, gu.weight, gu.weight_scale, gu.weight_scale_w4)
     m, inter = gate_up.shape[0], gate_up.shape[1] // 2
     swiglu = (
