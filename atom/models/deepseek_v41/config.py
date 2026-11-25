@@ -429,10 +429,13 @@ def validate_runtime_config(config):
             # in-process offload read SLOT codecs this runtime does not publish.
             # P/D with CPU offload composes one Mooncake leg and one offload tier.
             # A shared UMBP L1 pool (`umbp_pool`) moves PAGEs and replays STATE,
-            # like the Store; it provides the pool, so it stands alone.
+            # like the Store; it provides the pool. Eval-only: it is also admitted
+            # beside the Mooncake P/D leg, which then moves a request's PAGEs out
+            # of the pool the connector provides, for a P/D prefill whose ranks
+            # share their pools instead of a Store. Not validated upstream.
             (
                 "KV transfer other than lmcache_mp, mooncake_store, mooncake or "
-                "umbp_pool (multi: mooncake plus one offload tier)"
+                "umbp_pool (multi: mooncake plus one offload tier or the pool)"
             ),
             names is None
             or any(
@@ -442,7 +445,11 @@ def validate_runtime_config(config):
             or (
                 is_multi
                 and names
-                not in (["lmcache_mp", "mooncake"], ["mooncake", "mooncake_store"])
+                not in (
+                    ["lmcache_mp", "mooncake"],
+                    ["mooncake", "mooncake_store"],
+                    ["mooncake", "umbp_pool"],
+                )
             ),
         ),
         (

@@ -260,10 +260,32 @@ def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
             )
-    # `multi` is admitted only as mooncake plus one offload tier.
+    # `multi` is admitted only as mooncake plus one offload tier, or plus the
+    # shared pool (eval-only: a P/D prefill whose ranks share their pools).
     with pytest.raises(ValueError, match="multi: mooncake plus one offload tier"):
         validate_runtime_config(
             runtime_config(kv_transfer_config={"kv_connector": "multi"})
+        )
+    pd_prefill = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    shared = {"kv_connector": "multi", "connectors": [pd_prefill, umbp_pool]}
+    validate_runtime_config(
+        runtime_config(
+            kv_transfer_config=shared,
+            enable_encoder_swa_bounded_replay=True,
+            kv_cache_block_size=256,
+        )
+    )
+    with pytest.raises(ValueError, match="multi: mooncake plus one offload tier"):
+        store = {"kv_connector": "mooncake_store", "kv_role": "offload"}
+        validate_runtime_config(
+            runtime_config(
+                kv_transfer_config={
+                    "kv_connector": "multi",
+                    "connectors": [pd_prefill, store, umbp_pool],
+                },
+                enable_encoder_swa_bounded_replay=True,
+                kv_cache_block_size=256,
+            )
         )
     with pytest.raises(ValueError, match="RapidServe"):
         validate_runtime_config(
