@@ -432,6 +432,64 @@ class TestGroupPrefillTick:
         assert sched._group_prefill_tick(decision) is recorded
 
 
+class _SyncDelayer:
+    """DP prefill-sync delayer stub: releases every tick. `last_fire_aligned`
+    toggles whether this tick was a full-group align (which arms the
+    one-sequence cap) or a quorum/escape (which keeps the normal budget)."""
+
+    is_local = False
+    max_queue_ms = None
+    ttft_max_ticks = 5
+    rank_prefill_costs = ()
+    sync_prefill = True
+    dp_size = 4
+
+    def __init__(self, last_fire_aligned):
+        self.last_fire_aligned = last_fire_aligned
+
+    def protects_decode(self, running_decode_batch):
+        return False
+
+    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
+        return PrefillDecision(allow=True, prefillable_ranks=4)
+
+
+def _sync_cap_sched():
+    return Scheduler(
+        MockConfig(
+            enable_prefix_caching=False,
+            enable_chunked_prefill=True,
+            kv_cache_block_size=4,
+            num_kvcache_blocks=200,
+            max_num_seqs=8,
+            max_num_batched_tokens=64,
+            max_model_len=128,
+        )
+    )
+
+
+class TestSyncPrefillSeqCap:
+    """#2600 one-sequence cap: the scheduler admits a single prefill per rank
+    only on the delayer's aligned fire, and keeps the normal token budget
+    otherwise."""
+
+    def test_aligned_release_admits_one_prefill(self, seq_factory):
+        sched = _sync_cap_sched()
+        sched.set_prefill_delayer(_SyncDelayer(last_fire_aligned=True))
+        for i in range(4):  # four 4-token prompts all fit the 64-token budget
+            sched.add(seq_factory([10 * i + j for j in range(4)]))
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 1
+
+    def test_unaligned_release_keeps_the_token_budget(self, seq_factory):
+        sched = _sync_cap_sched()
+        sched.set_prefill_delayer(_SyncDelayer(last_fire_aligned=False))
+        for i in range(4):
+            sched.add(seq_factory([10 * i + j for j in range(4)]))
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 4
+
+
 # ── add / extend / query ───────────────────────────────────────────────────
 
 
@@ -1795,6 +1853,7 @@ class _LocalDelayer:
     max_queue_ms = None
     ttft_max_ticks = 5
     rank_prefill_costs = ()
+    sync_prefill = False
 
     def protects_decode(self, running_decode_batch):
         return False

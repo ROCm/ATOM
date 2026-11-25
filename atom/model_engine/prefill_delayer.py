@@ -287,12 +287,14 @@ class PrefillDelayer:
         "_stat_fire_adaptcap",
         "_stat_fire_adaptive",
         # stats
+        "_stat_fire_align",
         "_stat_fire_cost",
         "_stat_fire_fill",
         "_stat_fire_kv",
         "_stat_fire_nodecode",
         "_stat_fire_partial",
         "_stat_fire_queue_ms",
+        "_stat_fire_quorum",
         "_stat_fire_stall",
         "_stat_fire_ttft",
         "_stat_fire_vacuous",
@@ -303,12 +305,14 @@ class PrefillDelayer:
         "cpu_group",
         "dp_size",
         "kv_high_watermark",
+        "last_fire_aligned",
         "max_num_batched_tokens",
         "max_queue_ms",
         "partial_max_ticks",
         "prefill_decode_interval",
         "rank_prefill_costs",
         "stall_ticks",
+        "sync_prefill",
         "target_fill",
         "token_usage_low_watermark",
         "ttft_max_ticks",
@@ -331,6 +335,7 @@ class PrefillDelayer:
         cost_gate: bool = False,
         clock=time.perf_counter,
         admit_policy: str = "interval",
+        sync_prefill: bool = False,
     ):
         if dp_size > 1 and cpu_group is None:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
@@ -389,6 +394,12 @@ class PrefillDelayer:
             )
             prefill_decode_interval = 0
         self.prefill_decode_interval = prefill_decode_interval
+        # When set, a prefill wave is held until the DP ranks can prefill
+        # together (prefillable + blocked reach dp_size), or a quorum/escape
+        # releases it, so the group does not turn every lone arrival into a
+        # group prefill tick. Passed in from envs.ATOM_DP_PREFILL_SYNC by
+        # EngineCore, like every other delayer knob.
+        self.sync_prefill = sync_prefill
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
         #   slot 0 = prefillable        (SUM → n_prefillable)
@@ -479,6 +490,7 @@ class PrefillDelayer:
         # is counted separately so the log shows WHICH reason released prefill —
         # a high fire_stall/fire_ttft vs fire_fill means the queue rarely reaches
         # target and the coalescer is mostly giving up rather than batching.
+        self._stat_fire_align = 0
         self._stat_fire_cost = 0
         self._stat_fire_fill = 0
         self._stat_fire_stall = 0
@@ -487,7 +499,11 @@ class PrefillDelayer:
         self._stat_fire_partial = 0
         self._stat_fire_nodecode = 0
         self._stat_fire_queue_ms = 0
+        self._stat_fire_quorum = 0
         self._stat_fire_vacuous = 0
+        # True only for this tick's full-group align. The scheduler's
+        # one-sequence cap reads it; a quorum or escape release leaves it false.
+        self.last_fire_aligned = False
         self._stat_hold = 0
         self._stat_hold_decode_interval = 0
         self._stat_log_every = int(
@@ -506,7 +522,8 @@ class PrefillDelayer:
             f"max_queue_ms={max_queue_ms} "
             f"prefill_decode_interval={prefill_decode_interval} "
             f"cost_gate={self._cost_gate} "
-            f"admit_policy={admit_policy!r}"
+            f"admit_policy={admit_policy!r} "
+            f"sync_prefill={self.sync_prefill}"
         )
 
     @staticmethod
@@ -731,6 +748,7 @@ class PrefillDelayer:
         # This local execution report has now participated in the global
         # decision. A later successful prefill forward sets it again.
         self._prefill_executed_since_last_decision = False
+        self.last_fire_aligned = False
         any_kv_high = kv_high_n > 0
         any_kv_low = kv_low_n > 0
         any_partial = partial_n > 0
@@ -743,11 +761,14 @@ class PrefillDelayer:
         if prefill_ran_n > 0:
             self._decode_interval_remaining = self.prefill_decode_interval
 
-        # First call fires unconditionally (one-time warmup seed).
+        # First call fires unconditionally (one-time warmup seed), except in
+        # sync mode: that seed is exactly a one-rank prefill, which drops the
+        # group's CUDA graphs on the first tick that has work.
         if self._first:
             self._first = False
             self._reset()
-            return True
+            if not (self.sync_prefill and self.dp_size > 1):
+                return True
 
         # Hard post-prefill decode protection. The countdown is identical on
         # all ranks because it is armed from the globally reduced execution
@@ -772,6 +793,44 @@ class PrefillDelayer:
             self._stat_fire_vacuous += 1
             self._maybe_log()
             return True
+
+        # Sync mode. With prefill token graphs a lone prefill already makes
+        # idle ranks run a dummy prefill, so this is not what keeps peers off
+        # an eager decode. It holds a wave until the ranks can prefill together,
+        # instead of turning every arrival into a group prefill tick. Alignment
+        # counts prefillable + blocked ranks exactly as the base gate below: a
+        # blocked rank admits none of its tokens but keeps its peers company
+        # with a dummy prefill, so it is aligned rather than a straggler to wait
+        # on. Only a full alignment caps admission at one sequence per rank.
+        if self.sync_prefill and self.dp_size > 1:
+            n_aligned = n_prefillable + n_blocked
+            if n_aligned >= self.dp_size:
+                return self._fire("align", g_pending)
+            # Quorum: every rank that is not aligned is unreachable (no prefill,
+            # no waiting work, and no decode completes within the remaining TTFT
+            # budget), so holding for it only burns the bound -- it cannot align
+            # in time. Release once the reachable ranks are all aligned. This is
+            # reachable at dp_size 2 and 3, unlike a round-up fraction of
+            # dp_size. A reachable straggler (will decode-complete and take a
+            # new request in time) is none of these, so the group still holds
+            # for it up to the TTFT bound, as the base gate does.
+            if n_unreachable > 0 and n_aligned + n_unreachable >= self.dp_size:
+                return self._fire("quorum", g_pending)
+            # Escapes still release a short wave, matching the base must-fire
+            # order (no decode, KV high/low, queue age, TTFT, adaptive, partial).
+            if g_running_dec == 0:
+                return self._fire("nodecode", g_pending)
+            if any_kv_high or any_kv_low:
+                return self._fire("kv", g_pending)
+            if any_queue_hot:
+                return self._fire("queue_ms", g_pending)
+            if self._hold_ticks >= self.ttft_max_ticks:
+                return self._fire("ttft", g_pending)
+            if self.admit_policy == "adaptive":
+                return self._adapt_decide(reduced, g_running_dec, g_pending)
+            if any_partial and self._hold_ticks >= self.partial_max_ticks:
+                return self._fire("partial", g_pending)
+            return self._hold(g_pending)
 
         # ---- must-fire bounds (release even if unaligned / underfilled) ----
         if g_running_dec == 0:
@@ -903,9 +962,12 @@ class PrefillDelayer:
             self._decode_tick_us = _ema(self._decode_tick_us, step_s * 1e6)
 
     def _fire(self, reason: str, g_pending: int) -> bool:
-        # reason ∈ {fill, stall, cost, ttft, kv, partial, nodecode, queue_ms};
-        # each maps to a dedicated _stat_fire_<reason> slot so the log shows
-        # what released.
+        # reason ∈ {align, quorum, fill, stall, cost, ttft, kv, partial,
+        # nodecode, queue_ms, vacuous}; each maps to a dedicated
+        # _stat_fire_<reason> slot so the log shows what released.
+        # last_fire_aligned is the scheduler's one-sequence cap, not the
+        # lockstep idle gate.
+        self.last_fire_aligned = reason == "align"
         attr = f"_stat_fire_{reason}"
         setattr(self, attr, getattr(self, attr) + 1)
         self._fired_cost = max(self.rank_prefill_costs, default=0.0)
@@ -1036,7 +1098,8 @@ class PrefillDelayer:
         if self._stat_log_every <= 0:
             return
         total = (
-            self._stat_fire_fill
+            self._stat_fire_align
+            + self._stat_fire_fill
             + self._stat_fire_stall
             + self._stat_fire_cost
             + self._stat_fire_ttft
@@ -1044,6 +1107,7 @@ class PrefillDelayer:
             + self._stat_fire_partial
             + self._stat_fire_nodecode
             + self._stat_fire_queue_ms
+            + self._stat_fire_quorum
             + self._stat_fire_vacuous
             + self._stat_fire_adaptive
             + self._stat_fire_adaptcap
@@ -1054,6 +1118,7 @@ class PrefillDelayer:
         if total % self._stat_log_every == 0:
             logger.info(
                 f"[PrefillDelayer stats] total={total} "
+                f"fire_align={self._stat_fire_align} "
                 f"fire_fill={self._stat_fire_fill} "
                 f"fire_stall={self._stat_fire_stall} "
                 f"fire_cost={self._stat_fire_cost} "
@@ -1062,6 +1127,7 @@ class PrefillDelayer:
                 f"fire_partial={self._stat_fire_partial} "
                 f"fire_nodecode={self._stat_fire_nodecode} "
                 f"fire_queue_ms={self._stat_fire_queue_ms} "
+                f"fire_quorum={self._stat_fire_quorum} "
                 f"fire_vacuous={self._stat_fire_vacuous} "
                 f"hold_decode_interval={self._stat_hold_decode_interval} "
                 f"hold={self._stat_hold} "

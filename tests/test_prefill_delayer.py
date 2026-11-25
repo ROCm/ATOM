@@ -694,6 +694,90 @@ class TestPrefillDecodeInterval:
         assert d._stat_hold_decode_interval == 1
 
 
+class TestSyncPrefill:
+    def test_full_align_sets_the_one_seq_cap(self):
+        # 4 of 4 ranks prefillable → align, and only align arms the one-seq cap.
+        d = make_delayer(
+            dp_size=4, sync_prefill=True, ttft_max_ticks=1000, stall_ticks=1000
+        )
+        fired = call(d, pending_tokens=1000, reduce=_add_rank({0: 3, 2: 64}))
+        assert fired is True
+        assert d._stat_fire_align == 1
+        assert d.last_fire_aligned is True
+
+    def test_blocked_rank_counts_toward_alignment(self):
+        # valar-cop #2600: a blocked rank (waiting work it cannot admit) keeps
+        # its peers company with a dummy prefill, so it is aligned. At dp_size=2
+        # one prefillable + one blocked is a full align — not held to ttft.
+        d = make_delayer(
+            dp_size=2, sync_prefill=True, ttft_max_ticks=1000, stall_ticks=1000
+        )
+        fired = call(d, pending_tokens=1000, reduce=_add_rank({BLOCKED: 1, 2: 64}))
+        assert fired is True
+        assert d._stat_fire_align == 1
+        assert d.last_fire_aligned is True
+
+    def test_quorum_releases_when_the_rest_are_unreachable(self):
+        # 3 prefillable + 1 unreachable (no work, no decode completing in time)
+        # at dp_size=4: holding for the idle rank only burns the ttft budget, so
+        # the quorum releases — without the one-seq cap.
+        d = make_delayer(
+            dp_size=4, sync_prefill=True, ttft_max_ticks=1000, stall_ticks=1000
+        )
+        fired = call(
+            d, pending_tokens=1000, reduce=_add_rank({0: 2, UNREACHABLE: 1, 2: 64})
+        )
+        assert fired is True
+        assert d._stat_fire_quorum == 1
+        assert d.last_fire_aligned is False
+
+    def test_quorum_reachable_at_dp2(self):
+        # The old round-up quorum max(1,(dp*3+3)//4) == dp_size at dp 2/3, so it
+        # never fired there. One prefillable + one unreachable at dp_size=2 now
+        # releases as a quorum instead of waiting out ttft.
+        d = make_delayer(
+            dp_size=2, sync_prefill=True, ttft_max_ticks=1000, stall_ticks=1000
+        )
+        fired = call(d, pending_tokens=1000, reduce=_add_rank({UNREACHABLE: 1, 2: 64}))
+        assert fired is True
+        assert d._stat_fire_quorum == 1
+        assert d.last_fire_aligned is False
+
+    def test_reachable_straggler_holds_then_ttft_is_not_a_cap(self):
+        # A sibling that is neither prefillable, blocked, nor unreachable is a
+        # reachable straggler (a decode will complete and take a request in
+        # time); the group holds for it until the ttft escape, which does not
+        # arm the one-seq cap.
+        d = make_delayer(
+            dp_size=4, sync_prefill=True, ttft_max_ticks=1, stall_ticks=1000
+        )
+        assert call(d, pending_tokens=1000, reduce=_add_rank({2: 64})) is False
+        fired = call(d, pending_tokens=1000, reduce=_add_rank({2: 64}))
+        assert fired is True
+        assert d._stat_fire_ttft == 1
+        assert d.last_fire_aligned is False
+
+    def test_kv_high_escape_does_not_cap(self):
+        # An escape releases a short unaligned wave but never arms the one-seq
+        # cap (valar-cop/ZhangLirong: escapes keep the normal token budget).
+        d = make_delayer(
+            dp_size=4, sync_prefill=True, ttft_max_ticks=1000, stall_ticks=1000
+        )
+        fired = call(
+            d, pending_tokens=1000, kv_usage=0.95, reduce=_add_rank({0: 1, 2: 64})
+        )
+        assert fired is True
+        assert d._stat_fire_kv == 1
+        assert d.last_fire_aligned is False
+
+    def test_dp1_keeps_the_warmup_fire(self):
+        # sync mode only engages at dp_size > 1; a local (TP-only) delayer keeps
+        # the unconditional warmup fire and never caps.
+        d = make_delayer(dp_size=1, sync_prefill=True)
+        assert call(d, pending_tokens=0) is True
+        assert d.last_fire_aligned is False
+
+
 class TestStatsDistinct:
     def test_fill_and_stall_counted_separately(self):
         d = make_delayer(stall_ticks=2, ttft_max_ticks=1000)
