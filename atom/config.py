@@ -2233,6 +2233,24 @@ def _hf_architecture_factor(hf_config) -> tuple:
     return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
+def _kv_copies_beside_mono(kv_transfer_config: Any, model_type: str) -> bool:
+    """Whether this deployment's KV connector copies on GPU streams beside the
+    forward's, where a Mono grid that needs every CTA co-resident can wait for
+    CUs those copies hold while its polls starve them (ROCm/ATOM#3369). The
+    Mooncake connector's DeepSeek-V4.1 copies (slot regions: no landing, no KV
+    or index staging) are two device copies of a compressor-state slot on the
+    forward's own stream (``MooncakeConnector.set_forward_stream``, else the
+    default stream the plain runner's forward runs on): they run before or
+    after a step's Mono launches, never beside them. Any other connector is
+    taken to copy beside them."""
+    if not kv_transfer_config:
+        return False
+    if not isinstance(kv_transfer_config, dict):
+        return True
+    name = str(kv_transfer_config.get("kv_connector", "")).strip().casefold()
+    return not (name == "mooncake" and model_type.startswith("deepseek_v41"))
+
+
 def _resolve_mono_poll_sleep_units(kv_copies: bool) -> None:
     """The Mono mailbox retry spacing of this deployment, fixed before this
     process or the workers it spawns import ``atom.mono.polling`` (which reads
@@ -2992,7 +3010,12 @@ class Config:
             validate_multi_config(self.kv_transfer_config)
         # after the CLI's JSON string ("{}" when unset) is parsed: the string
         # itself is truthy
-        _resolve_mono_poll_sleep_units(bool(self.kv_transfer_config))
+        _resolve_mono_poll_sleep_units(
+            _kv_copies_beside_mono(
+                self.kv_transfer_config,
+                str(getattr(self.hf_config, "model_type", "") or ""),
+            )
+        )
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.

@@ -2,8 +2,9 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 """ATOM_MONO_POLL_SLEEP_UNITS: the gfx950 Mono mailbox retry spacing (4 unless
-set, 16 beside a KV transfer or offload connector; 1 is main's polling,
-ROCm/ATOM#3369). Plain Python: no GPU, no FlyDSL."""
+set, 16 beside a KV transfer or offload connector that copies on streams
+beside the forward's; 1 is main's polling, ROCm/ATOM#3369). Plain Python: no
+GPU, no FlyDSL."""
 
 import json
 import logging
@@ -13,7 +14,7 @@ import sys
 
 import pytest
 
-from atom.config import _resolve_mono_poll_sleep_units
+from atom.config import _kv_copies_beside_mono, _resolve_mono_poll_sleep_units
 from atom.mono import polling_env
 
 
@@ -126,3 +127,21 @@ def test_config_warns_below_copy_safe(kv_copies, units, warns, monkeypatch, capl
     hits = [r for r in caplog.records if polling_env.ENV in r.getMessage()]
     assert len(hits) == (1 if warns else 0)
     assert os.environ[polling_env.ENV] == str(units)
+
+
+@pytest.mark.parametrize(
+    "kvc, model_type, beside",
+    [({}, "deepseek_v41", False),
+     (None, "deepseek_v41", False),
+     ({"kv_connector": "mooncake", "kv_role": "kv_consumer"}, "deepseek_v41", False),
+     ({"kv_connector": " Mooncake "}, "deepseek_v41_dspark", False),
+     ({"kv_connector": "mooncake"}, "minimax_m3", True),
+     ({"kv_connector": "mooncake"}, "", True),
+     ({"kv_connector": "multi"}, "deepseek_v41", True),
+     ({"kv_connector": "lmcache"}, "deepseek_v41", True),
+     ("mooncake", "deepseek_v41", True)],
+)  # fmt: skip
+def test_kv_copies_beside_mono(kvc, model_type, beside):
+    """Only a connector whose copies run on the forward's stream (Mooncake
+    with V4.1's slot regions) leaves the Mono polls at the default spacing."""
+    assert _kv_copies_beside_mono(kvc, model_type) is beside

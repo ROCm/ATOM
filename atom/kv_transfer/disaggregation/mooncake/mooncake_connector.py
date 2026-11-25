@@ -1291,6 +1291,8 @@ class MooncakeConnector(KVConnectorBase):
         self._page_staging_enabled = minimax_page_staging(config)
         self._send_worker_streams = threading.local()
         self._landing: LandingReceiver | None = None
+        # the forward's stream when the runner reports one (`set_forward_stream`)
+        self._forward_stream: Any = None
         self._landing_spec = landing_spec(config)
         self._landing_credits = LandingCredits() if self.is_producer else None
 
@@ -1428,6 +1430,22 @@ class MooncakeConnector(KVConnectorBase):
     # paths; register_kv_caches sets the instance values.
     _kv_staging: torch.Tensor | None = None
     _landing: LandingReceiver | None = None
+    _forward_stream: Any = None
+
+    def set_forward_stream(self, stream: Any) -> None:
+        """The stream the runner runs its forward on (``RapidServeModelRunner``,
+        per forward). The compressor-state gather (producer) and scatter
+        (consumer) copies go on it, so they run before or after the forward's
+        kernels, never beside them: a Mono grid that needs every CTA
+        co-resident can hold beside a copy that keeps CUs it needs while its
+        polls starve that copy (ROCm/ATOM#3369, ``config._kv_copies_beside_mono``).
+        Without one they go on the default stream, which is the plain runner's
+        forward stream."""
+        self._forward_stream = stream
+
+    def _copy_stream(self) -> Any:
+        """The stream the connector's GPU copies go on (``set_forward_stream``)."""
+        return self._forward_stream or torch.cuda.current_stream()
 
     def _rdma_chunk_units(self, unit_bytes: int) -> int:
         """Units per MR chunk of a region registered by ``_rdma_chunk_sizes``.
@@ -4120,11 +4138,15 @@ class MooncakeConnector(KVConnectorBase):
         consumer_staging_addr = request_data.get("consumer_staging_addr", 0)
         if self._gather_slot is not None and consumer_staging_addr:
             producer_pool_idx = self._staging_slots.acquire()
-            self._gather_slot(src_slot, producer_pool_idx)
+            copy_stream = self._copy_stream()
+            with torch.cuda.stream(copy_stream):
+                self._gather_slot(src_slot, producer_pool_idx)
+                gathered = torch.cuda.Event()
+                gathered.record(copy_stream)
             # Synchronize on the gather kernel before NIC starts reading the
             # staging buffer. Without this, the RDMA can race the still-in-flight
             # gather kernel on TBO prefill (page fault under high concurrency).
-            torch.cuda.current_stream().synchronize()
+            gathered.synchronize()
             slot_src.append(
                 self._staging_base_addr + producer_pool_idx * self._staging_slot_bytes
             )
@@ -4661,7 +4683,8 @@ class MooncakeConnector(KVConnectorBase):
         if slot_info is not None and self._scatter_slot is not None:
             compute_slot, pool_idx = slot_info
             if pool_idx >= 0:
-                self._scatter_slot(compute_slot, pool_idx)
+                with torch.cuda.stream(self._copy_stream()):
+                    self._scatter_slot(compute_slot, pool_idx)
                 self._staging_slots.release(pool_idx)
         dst_blocks = self._pending_recv_blocks.pop(req_id, None)
         if dst_blocks:
