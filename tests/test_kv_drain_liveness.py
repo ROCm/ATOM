@@ -8,17 +8,27 @@ send or save is still in flight. The busy loops therefore gate on
 is never polled, its blocks are never freed, and its save is never reported.
 """
 
+import pickle
+import queue
+import subprocess
+import sys
+import threading
 import time
+from collections import deque
 from types import SimpleNamespace
 
+import pytest
+import zmq
 from aiter_stub import stubbed_aiter
 
 with stubbed_aiter():
+    from atom.distributed.pp_transport import PPStageTransport
     from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
     from atom.kv_transfer.disaggregation.types import KVConnectorOutput
     from atom.model_engine import engine_core as engine_core_mod
-    from atom.model_engine.engine_core import EngineCore
+    from atom.model_engine.engine_core import EngineCore, EngineCoreRequestType
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
+    from atom.model_engine.sequence import Sequence, SequenceStatus
 
 
 class FakeConnector:
@@ -288,3 +298,144 @@ def test_exit_drain_does_not_publish_new_state_work():
     assert proc.scheduler.state_publishes == 0
     assert connector.builds == 1  # in-flight work still flushed
     assert proc.runner_mgr.dispatched == ["process_kvconnector_output"]
+
+
+# -- the idle head blocks between drains -------------------------------------
+
+
+class IdleScheduler(FakeScheduler):
+    """Never has a request to schedule; counts the head's passes."""
+
+    def __init__(self, connector, max_passes=None):
+        super().__init__(connector=connector)
+        self.passes = 0
+        self.max_passes = max_passes
+        self.added = []
+
+    def heartbeat_throughput(self, now):
+        self.passes += 1
+        assert (
+            self.max_passes is None or self.passes <= self.max_passes
+        ), f"the idle head made {self.passes} passes without blocking"
+
+    def is_finished(self):
+        return True
+
+    def extend(self, seqs):
+        self.added.append((time.monotonic(), [seq.id for seq in seqs]))
+
+    def publish_kv_events(self):
+        pass
+
+    def shutdown_kv_events(self):
+        pass
+
+
+def _idle_head(monkeypatch, *, pending, max_passes=None):
+    monkeypatch.setattr(engine_core_mod, "KV_SHUTDOWN_DRAIN_TIMEOUT_S", 0.01)
+    proc = _head(2)
+    proc.scheduler = IdleScheduler(
+        FakeConnector(pending=pending, requests=()), max_passes
+    )
+    proc.utility_handler = SimpleNamespace(
+        process_queue=lambda *_: None, push_metrics=lambda: None
+    )
+    proc.utility_queue = queue.Queue()
+    proc.input_queue = queue.Queue()
+    proc._kv_progress_event = threading.Event()
+    proc._is_rl_weights_offloaded = proc._weight_sync_fenced = False
+    proc._has_pending_utility = False
+    proc._in_flight = deque()
+    return proc
+
+
+@pytest.mark.parametrize("pending", [True, False])
+def test_idle_head_blocks_between_passes(monkeypatch, pending):
+    proc = _idle_head(monkeypatch, pending=pending, max_passes=100)
+    waits = []
+
+    class Progress:
+        def clear(self):
+            pass
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            if len(waits) == 3:
+                exit_seq = SimpleNamespace(status=SequenceStatus.EXIT_ENGINE)
+                proc.input_queue.put([exit_seq])
+
+    proc._kv_progress_event = Progress()
+    proc._head_busy_loop()
+    assert waits == [engine_core_mod.KV_IDLE_DRAIN_INTERVAL_S] * 3
+    assert bool(proc.runner_mgr.polls) is pending
+
+
+# A front end in its own process, as in a server: its sends need no GIL here.
+_FRONTEND = """
+import sys, time, zmq
+input_addr, control_addr = sys.argv[1:3]
+add, shutdown = (bytes.fromhex(frame) for frame in sys.argv[3:5])
+ctx = zmq.Context()
+socks = []
+for addr in (input_addr, control_addr):
+    sock = ctx.socket(zmq.ROUTER)
+    sock.bind(addr)
+    socks.append((sock, sock.recv_multipart()[0]))
+(sock, engine), _ = socks
+time.sleep(0.3)  # the head is draining by now
+print(time.monotonic(), flush=True)
+sock.send_multipart([engine, add])
+time.sleep(0.5)
+sock.send_multipart([engine, shutdown])
+"""
+
+
+def test_idle_drain_does_not_starve_the_input_thread(monkeypatch, tmp_path):
+    """A request reaches the scheduler while the head drains pending KV work.
+
+    The drain's non-blocking poll of the stages' status socket releases the
+    GIL and retakes it at once, every millisecond. The input thread, woken by
+    each release, finds the GIL taken and starts its 5 ms wait over, so it
+    never asks for the GIL and a head that only drains never gives it up:
+    requests the front end had sent sat unread for a minute at a time.
+    """
+    proc = _idle_head(monkeypatch, pending=True)
+    ctx = zmq.Context()
+    status = ctx.socket(zmq.PULL)
+    status.bind(f"ipc://{tmp_path}/kv_status")
+    proc.pp_transport = PPStageTransport.__new__(PPStageTransport)
+    proc.pp_transport._kv_status_recv = status
+
+    addrs = [f"ipc://{tmp_path}/input", f"ipc://{tmp_path}/control"]
+    frames = [
+        pickle.dumps((EngineCoreRequestType.ADD, [Sequence([1, 2, 3], 4, id=7)])),
+        pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)),
+    ]
+    frontend = subprocess.Popen(
+        [sys.executable, "-c", _FRONTEND, *addrs, *(f.hex() for f in frames)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    reader = threading.Thread(
+        target=proc.process_input_sockets, args=addrs, daemon=True
+    )
+    reader.start()
+    # A head that never hears of the shutdown stops here rather than hang.
+    deadline = time.monotonic() + 10.0
+
+    def stop_at_deadline(*_):
+        if time.monotonic() > deadline:
+            raise TimeoutError("the head never saw the shutdown")
+
+    proc.utility_handler.process_queue = stop_at_deadline
+    try:
+        proc._head_busy_loop()
+    finally:
+        sent_at = float(frontend.stdout.readline())
+        frontend.wait(timeout=10)
+        reader.join(timeout=10)
+        status.close(linger=0)
+        ctx.term()
+    [(added_at, ids)] = proc.scheduler.added
+    assert ids == [7]
+    assert added_at - sent_at < 0.25
