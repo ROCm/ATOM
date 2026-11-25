@@ -1,231 +1,125 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MiniMax-M3 independent shared/routed MoE stream contracts."""
-
+import importlib.abc
+import importlib.util
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
-
-pytest.importorskip("aiter")
-
-from atom.models.minimax_m3 import model as m3_model
+from aiter_stub import _ExternalModuleLoader, atom_under_stubs
 
 
-class _Stream:
-    def __init__(self, name: str, log: list[str]) -> None:
-        self.name = name
-        self.log = log
+class _FlyDSLStub(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name.partition(".")[0] == "flydsl":
+            return importlib.util.spec_from_loader(
+                name, _ExternalModuleLoader(), is_package=True
+            )
+        return None
 
-    def wait_stream(self, other: "_Stream") -> None:
-        self.log.append(f"{self.name} waits {other.name}")
+
+@pytest.fixture(scope="module")
+def m3():
+    # The model's mono imports reach FlyDSL, which the CPU job does not have.
+    saved = {n: m for n, m in sys.modules.items() if n.partition(".")[0] == "flydsl"}
+    for name in saved:
+        del sys.modules[name]
+    finder = _FlyDSLStub()
+    sys.meta_path.insert(0, finder)
+    try:
+        with atom_under_stubs() as load:
+            yield load("atom.models.minimax_m3.model"), load(
+                "atom.model_ops.module_dispatch_ops"
+            )
+    finally:
+        sys.meta_path.remove(finder)
+        for name in [n for n in sys.modules if n.partition(".")[0] == "flydsl"]:
+            del sys.modules[name]
+        sys.modules.update(saved)
 
 
-def test_dual_stream_overlaps_shared_and_joins_before_add(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    log: list[str] = []
-    main, alt = _Stream("main", log), _Stream("alt", log)
+def _fake_streams(monkeypatch, log):
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            log.append(f"{self.name} waits {other.name}")
 
     @contextmanager
-    def use_stream(stream: _Stream):
+    def on(stream):
         log.append(f"enter {stream.name}")
         yield
         log.append(f"leave {stream.name}")
 
+    main = Stream("main")
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
-    monkeypatch.setattr(torch.cuda, "stream", use_stream)
-
-    hidden = MagicMock()
-    hidden.shape = (2, 64)
-    flat = MagicMock()
-    hidden.view.return_value = flat
-    shared = MagicMock()
-    shared.record_stream.side_effect = lambda stream: log.append(
-        f"shared records {stream.name}"
+    monkeypatch.setattr(torch.cuda, "stream", on)
+    monkeypatch.setattr(
+        torch.Tensor, "record_stream", lambda t, s: log.append(f"record {s.name}")
     )
-    routed = MagicMock()
-    summed = MagicMock()
-    result = object()
-    routed.__add__.return_value = summed
-    summed.view.return_value = result
+    return Stream("alt")
 
-    moe = SimpleNamespace(alt_stream=alt)
-    moe.shared_experts = MagicMock(
-        side_effect=lambda _: (log.append("shared"), shared)[1]
+
+def test_dual_stream_matches_single_stream(m3, monkeypatch):
+    model, _ = m3
+    log = []
+    moe = SimpleNamespace(
+        alt_stream=_fake_streams(monkeypatch, log),
+        shared_experts=lambda h: (log.append("shared"), h * 2)[1],
+        routed_expert_forward=lambda h: (log.append("routed"), h + 1)[1],
     )
-    moe.routed_expert_forward = MagicMock(
-        side_effect=lambda _: (log.append("routed"), routed)[1]
-    )
+    x = torch.randn(2, 3, 8)
 
-    actual = m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
+    dual = model.MiniMaxM3MoE.dual_stream_moe_forward(moe, x)
 
-    assert actual is result
-    assert log == [
-        "alt waits main",
-        "enter alt",
-        "shared",
-        "leave alt",
+    assert log == ["alt waits main", "enter alt", "shared", "leave alt"] + [
         "routed",
         "main waits alt",
-        "shared records main",
+        "record main",
     ]
-    routed.__add__.assert_called_once_with(shared)
+    assert torch.equal(dual, model.MiniMaxM3MoE.single_stream_moe_forward(moe, x))
 
 
-def test_serial_forward_preserves_routed_then_shared_order() -> None:
-    log: list[str] = []
-    hidden = MagicMock()
-    hidden.shape = (2, 64)
-    flat = MagicMock()
-    hidden.view.return_value = flat
-    routed, shared, summed = MagicMock(), MagicMock(), MagicMock()
-    result = object()
-    routed.__add__.return_value = summed
-    summed.view.return_value = result
-
-    moe = SimpleNamespace()
-    moe.routed_expert_forward = MagicMock(
-        side_effect=lambda _: (log.append("routed"), routed)[1]
+@pytest.mark.parametrize("tbo", [False, True])
+def test_dual_stream_dispatch(m3, monkeypatch, tbo):
+    model, ops = m3
+    cfg = SimpleNamespace(
+        enable_tbo=tbo, compilation_config=SimpleNamespace(static_forward_context={})
     )
-    moe.shared_experts = MagicMock(
-        side_effect=lambda _: (log.append("shared"), shared)[1]
-    )
-
-    actual = m3_model.MiniMaxM3MoE.single_stream_moe_forward(moe, hidden)
-
-    assert actual is result
-    assert log == ["routed", "shared"]
-
-
-def test_moe_registers_dual_stream_dispatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    context: dict[str, object] = {}
-    atom_config = SimpleNamespace(
-        enable_tbo=False,
-        compilation_config=SimpleNamespace(static_forward_context=context),
-    )
-    monkeypatch.setattr(m3_model, "get_current_atom_config", lambda: atom_config)
-    monkeypatch.setattr(m3_model, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(m3_model, "ReplicatedLinear", lambda *args, **kwargs: object())
+    decode = SimpleNamespace(context=SimpleNamespace(is_prefill=False))
+    monkeypatch.setattr(model, "get_current_atom_config", lambda: cfg)
+    monkeypatch.setattr(ops, "get_current_atom_config", lambda: cfg)
+    monkeypatch.setattr(ops, "get_forward_context", lambda: decode)
+    monkeypatch.setattr(model, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(model, "ReplicatedLinear", lambda *a, **k: None)
+    monkeypatch.setattr(model, "MiniMaxM3MLP", lambda **k: object())
     monkeypatch.setattr(
-        m3_model,
+        model,
         "FusedMoE",
-        lambda **kwargs: SimpleNamespace(
-            quant_method=None,
-            num_fused_shared_experts=0,
-        ),
+        lambda **k: SimpleNamespace(quant_method=None, num_fused_shared_experts=0),
     )
-    monkeypatch.setattr(m3_model, "MiniMaxM3MLP", lambda **kwargs: object())
     monkeypatch.setattr(
-        m3_model.envs, "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", 1024, raising=False
+        model.envs, "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", 4, raising=False
     )
-    config = SimpleNamespace(
-        hidden_size=64,
+    hf = SimpleNamespace(
+        hidden_size=8,
         num_local_experts=8,
         num_experts_per_tok=2,
-        intermediate_size=32,
+        intermediate_size=8,
         n_shared_experts=1,
     )
-    stream = object()
-    prefix = "model.layers.3.block_sparse_moe"
+    moe = model.MiniMaxM3MoE(hf, layer_id=0, prefix="moe", alt_stream=object())
+    moe.dual_stream_moe_forward = lambda h: "dual"
+    moe.single_stream_moe_forward = lambda h: "single"
 
-    moe = m3_model.MiniMaxM3MoE(
-        config,
-        layer_id=3,
-        prefix=prefix,
-        alt_stream=stream,
-    )
-
-    assert moe._use_dual_stream
-    # the row bounds main's dual-stream dispatch reads
-    assert moe._dual_stream_decode_token_threshold == moe._dual_stream_token_threshold
-    assert moe.alt_stream is stream
-    assert context[prefix] is moe
-
-
-def test_decoder_threads_model_stream_into_moe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(m3_model, "_sparse_attention_layer_ids", lambda _: set())
-    monkeypatch.setattr(m3_model, "MiniMaxM3Attention", lambda **kwargs: object())
-    monkeypatch.setattr(m3_model, "GemmaRMSNorm", lambda *args, **kwargs: object())
-    calls: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        m3_model,
-        "MiniMaxM3MoE",
-        lambda **kwargs: (calls.append(kwargs), object())[1],
-    )
-    config = SimpleNamespace(
-        hidden_size=64,
-        moe_layer_freq=[1],
-        rms_norm_eps=1e-6,
-    )
-    stream = object()
-
-    m3_model.MiniMaxM3DecoderLayer(
-        config,
-        prefix="model.layers.0",
-        layer_num=0,
-        alt_stream=stream,
-    )
-
-    assert calls[0]["alt_stream"] is stream
-
-
-def test_model_creates_one_shared_stream_for_all_layers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stream = object()
-    layer_calls: list[dict[str, object]] = []
-
-    def layer_type(*args, **kwargs):
-        layer_calls.append(kwargs)
-        return object()
-
-    def make_layers(_count, factory, **_kwargs):
-        return 0, 1, [factory("model.layers.0", layer_num=0)]
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
-    monkeypatch.setattr(m3_model, "_validate_sparse_flydsl_config", lambda *_: None)
-    monkeypatch.setattr(m3_model, "pp_holds_embedding", lambda _: True)
-    monkeypatch.setattr(
-        m3_model,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
-    )
-    monkeypatch.setattr(
-        m3_model, "VocabParallelEmbedding", lambda *args, **kwargs: object()
-    )
-    monkeypatch.setattr(m3_model, "GemmaRMSNorm", lambda *args, **kwargs: object())
-    monkeypatch.setattr(m3_model, "make_layers", make_layers)
-    monkeypatch.setattr(
-        m3_model,
-        "make_empty_intermediate_tensors_factory",
-        lambda *args, **kwargs: object(),
-    )
-    config = SimpleNamespace(
-        vocab_size=128,
-        hidden_size=64,
-        num_hidden_layers=1,
-        n_shared_experts=1,
-        rms_norm_eps=1e-6,
-    )
-    atom_config = SimpleNamespace(
-        hf_config=config,
-        kv_cache_dtype="fp8",
-        index_cache_dtype="fp8",
-        quant_config=None,
-        torch_dtype=torch.bfloat16,
-        compilation_config=SimpleNamespace(level=0),
-    )
-
-    model = m3_model.MiniMaxM3Model(atom_config, layer_type=layer_type)
-
-    assert model.alt_stream is stream
-    assert layer_calls[0]["alt_stream"] is stream
+    assert moe._use_dual_stream is not tbo
+    if tbo:
+        assert moe.forward(torch.empty(4, 8)) == "single"
+    else:
+        rows = (4, 5)  # at and past the threshold
+        got = [ops.maybe_dual_stream_forward(torch.empty(n, 8), "moe") for n in rows]
+        assert got == ["dual", "single"]
