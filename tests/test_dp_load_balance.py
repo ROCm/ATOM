@@ -2532,3 +2532,67 @@ def test_prefix_spread_index_counters_are_exported_in_router_statistics():
     assert snapshot["prefix_index"]["tail_trim_total"] == 1
     # Without the prefix router the section is absent.
     assert "prefix_index" not in _make_mgr(2).get_dp_router_statistics()
+
+
+def test_a_pool_sharing_margin_lets_sessions_move():
+    """A connector whose ranks share their pools sets the margin; the session
+    policy then watches each rank's requests (`SessionPolicy.rank_reqs`)."""
+    plain = _make_mgr(4, session_affinity=True)
+    assert plain._get_dp_policy().rank_reqs is None
+    shared = _make_mgr(4, session_affinity=True)
+    shared._session_migrate_margin = 0.25
+    policy = shared._get_dp_policy()
+    assert policy.margin == 0.25
+    assert policy.rank_reqs() is shared._rank_reqs
+
+
+def _session_on_rank(mgr, session, reqs):
+    """Pin `session` to a rank, then set every rank's request count."""
+    (owner,) = _route(mgr, [_FakeSeq(f"{session}-0", dp_session_id=session)])
+    mgr._rank_reqs = list(reqs(owner))
+    return owner
+
+
+def test_a_crowded_rank_moves_its_session_to_the_emptiest_over_a_shared_pool():
+    mgr = _make_mgr(4, session_affinity=True)
+    mgr._session_migrate_margin = 0.25
+    owner = _session_on_rank(
+        mgr,
+        "s",
+        lambda o: [12 if r == o else (0 if r == (o + 1) % 4 else 4) for r in range(4)],
+    )
+    emptiest = (owner + 1) % 4
+    (rank,) = _route(mgr, [_FakeSeq("s-1", dp_session_id="s")])
+    assert rank == emptiest
+    assert mgr._dp_route_counters["affinity_spill_total"] == 1
+    # The session now lives there.
+    mgr._rank_reqs = [5, 5, 5, 5]
+    assert _route(mgr, [_FakeSeq("s-2", dp_session_id="s")]) == [emptiest]
+
+
+def test_a_session_stays_while_its_rank_is_within_the_margin():
+    mgr = _make_mgr(4, session_affinity=True)
+    mgr._session_migrate_margin = 0.25
+    # Over the mean, but by less than the margin.
+    owner = _session_on_rank(mgr, "s", lambda o: [6 if r == o else 5 for r in range(4)])
+    assert _route(mgr, [_FakeSeq("s-1", dp_session_id="s")]) == [owner]
+    assert mgr._dp_route_counters["affinity_spill_total"] == 0
+
+
+def test_a_session_stays_when_no_rank_is_much_emptier():
+    mgr = _make_mgr(4, session_affinity=True)
+    mgr._session_migrate_margin = 0.25
+    # The owner is past the margin, but no rank is that far below the mean.
+    owner = _session_on_rank(
+        mgr, "s", lambda o: [20 if r == o else 10 for r in range(4)]
+    )
+    assert _route(mgr, [_FakeSeq("s-1", dp_session_id="s")]) == [owner]
+
+
+def test_without_a_shared_pool_a_crowded_session_stays():
+    mgr = _make_mgr(4, session_affinity=True)
+    owner = _session_on_rank(
+        mgr, "s", lambda o: [40 if r == o else 0 for r in range(4)]
+    )
+    assert _route(mgr, [_FakeSeq("s-1", dp_session_id="s")]) == [owner]
+    assert mgr._dp_route_counters["affinity_spill_total"] == 0
