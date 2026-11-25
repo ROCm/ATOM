@@ -615,10 +615,10 @@ def stage_mix(c, task):
 # ---------------------------------------------------------------- gemv CTAs
 def gemv_loads(c, rg, chunks, paired: bool = False):
     """This wave's weight operands of rows 16 rg .. for its K chunks ``chunks``
-    (indices into wave, wave + 8, ..), ``gemv.chunk_operands``' each. ``rg``
-    past the last group loads the last group. ``paired`` (whole 128 B lines a
-    load) from ``gemv_groups`` only: the one-group path, at the VGPR edge,
-    spills with it."""
+    (indices into wave, wave + 8, ..), ``gemv.chunk_ops``' each. ``rg`` past
+    the last group loads the last group. ``paired`` (whole 128 B lines a load)
+    from ``gemv_groups`` only: the one-group path, at the VGPR edge, spills
+    with it."""
     lane, wave = c["lane"], c["wave"]
     if const_expr(c["w8"]):
         # the plane holds the last task's tile, past ``FUSED`` to ``NPROJ``:
@@ -630,7 +630,7 @@ def gemv_loads(c, rg, chunks, paired: bool = False):
         r_w = rsrc(c["args"]["w_in"], FUSED * HIDDEN * 2)
     row0 = fx.min(rg, GEMV_TASKS - 1) * ROWS
     return [
-        gemv.chunk_operands(
+        gemv.chunk_ops(
             r_w, row0, HIDDEN, (wave + WAVES * i) * KCH, lane, paired, w8=c["w8"]
         )
         for i in chunks

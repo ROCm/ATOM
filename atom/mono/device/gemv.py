@@ -94,7 +94,7 @@ def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, paired=False, w8=Fals
     """This wave's operands of weight rows ``row0`` .. + 16 (``ldk`` columns a
     row at ``w``: row-major bf16, or with ``w8`` the preshuffled E4M3 plane; K
     columns ``k0`` .. ``k0 + k``): a list a chunk (clamped into K: ``mfmas``
-    zeroes the extra), ``chunk_operands``' each."""
+    zeroes the extra), ``chunk_ops``' each."""
     per, n = chunks(k)
     ldk = k if ldk is None else ldk
     r_w = rsrc(w)
@@ -104,30 +104,24 @@ def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, paired=False, w8=Fals
         return k0 + fx.min(wave + WAVES * i, n - 1) * KCH
 
     return [
-        chunk_operands(r_w, row0, ldk, kcol(i), lane, paired, cm, w8)
-        for i in range(per)
+        chunk_ops(r_w, row0, ldk, kcol(i), lane, paired, cm, w8) for i in range(per)
     ]
 
 
-def chunk_operands(r_w, row0, ldk, kcol, lane, paired=False, cm=CM_NT, w8=False):
-    """A chunk's MFMA A operands: ``chunk_ops``', or (``w8``) those of a
-    preshuffled E4M3 plane, ``w8_chunk_ops``'."""
-    if w8:
-        return w8_chunk_ops(r_w, row0, ldk, kcol, lane, cm)
-    return chunk_ops(r_w, row0, ldk, kcol, lane, paired, cm)
-
-
-def chunk_ops(r_w, row0, ldk, kcol, lane, paired=False, cm=CM_NT):
+def chunk_ops(r_w, row0, ldk, kcol, lane, paired=False, cm=CM_NT, w8=False):
     """The four MFMA A operands of one 128-column chunk (columns ``kcol`` ..)
-    of weight rows ``row0`` .. + 16 (``ldk`` bf16 a row): slab q's lane holds
-    row lane % 16, 8 columns from 32 q + (lane / 16) 8.
+    of weight rows ``row0`` .. + 16 (``ldk`` columns a row: row-major bf16, or
+    with ``w8`` the preshuffled E4M3 plane, ``w8_chunk_ops``'): slab q's lane
+    holds row lane % 16, 8 columns from 32 q + (lane / 16) 8.
 
-    A load takes one slab of the 16 rows (64 B each, rows a row apart), or
+    A bf16 load takes one slab of the 16 rows (64 B each, rows a row apart), or
     with ``paired`` two slabs of 8 rows -- whole 128 B lines: lane r < 8 the
     even slab of row r, lane r >= 8 the odd slab of row r - 8, and a lane ^ 8
     swap and a select put the layout back, the same values. Coalescing sees a
     load's addresses, not its lane order. It holds the pair's registers a
     while: a build at the VGPR edge spills with it (K3 K1 at S <= 16)."""
+    if w8:
+        return w8_chunk_ops(r_w, row0, ldk, kcol, lane, cm)
     r16 = lane % ROWS
     k = kcol + (lane // ROWS) * 8
 

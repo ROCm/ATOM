@@ -127,11 +127,11 @@ def o_task_or(own, task):
 
 def o_loads(c, rg, paired=False):
     """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8 < 12),
-    ``gemv.chunk_operands``' each."""
+    ``gemv.chunk_ops``' each."""
     lane, wave = c["lane"], c["wave"]
     r_w = rsrc(c["args"]["w_o"])
     return [
-        gemv.chunk_operands(
+        gemv.chunk_ops(
             r_w,
             rg * ROWS,
             OK,
