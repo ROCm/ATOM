@@ -67,6 +67,9 @@ _NON_PAGE_ROLES: frozenset[str] = frozenset(
         "replay_buf_k",
         "replay_buf_u",
         "replay_buf_g",
+        # Layer-local flush scratch and cached ISA; neither is a PAGE image.
+        "replay_flush_arrivals",
+        "replay_flush_wait",
         # Not a plane but a verdict on the ones above: True marks this whole
         # entry as per-request recurrent state, addressed by request slot. It
         # is checked rather than merely skipped -- see `build_mp_transfer_tensors`.

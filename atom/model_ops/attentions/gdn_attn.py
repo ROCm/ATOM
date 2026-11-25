@@ -85,8 +85,9 @@ def slot_indexed_caches(runner, replayssm: bool) -> list[torch.Tensor]:
     """The `(layer, slot, ...)` caches that together hold one slot's state.
 
     `relocate_state_slots` moves exactly these, and `state_slot_regions`
-    describes exactly these; anything added to the pool belongs here so that
-    neither can be extended without the other.
+    describes exactly these. Persistent slot state added to the pool belongs
+    here so neither can be extended without the other. Per-launch scratch that
+    is zero between launches is excluded.
 
     Takes the runner rather than the builder so that both callers reach it the
     same way whether or not they are bound: the state tests drive those two
