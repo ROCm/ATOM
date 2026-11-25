@@ -1,0 +1,240 @@
+{
+  "lease": "Lc95627",
+  "node": "pit2-p03-g08",
+  "gpus": 8,
+  "harness_sha": "57eb0de1f80ff6810965eacf50ce9f36764df567",
+  "diagnostic_only": true,
+  "formal_sa_point": false,
+  "arms": {
+    "base": {
+      "arm": "base",
+      "send_duration_seconds": 900.001,
+      "accounting": {
+        "records_total": 3916,
+        "records_profiled": 3032,
+        "records_dropped_total": 884,
+        "records_warmup_dropped": 884,
+        "records_error_dropped": 780,
+        "error_categories": {
+          "InvalidInferenceResultError": 780
+        }
+      },
+      "by_phase": {
+        "warmup": {
+          "error": 780,
+          "valid": 104
+        },
+        "profiling": {
+          "valid": 3032
+        }
+      },
+      "profiling_errors": 0,
+      "interactivity_tok_s_user": 100.7732387383699,
+      "full_itl_p90_ms": 9.923269436603363,
+      "token_throughput_per_chip": 47578.804148209034,
+      "successful_record_duration_seconds": 927.888724094,
+      "source_hashes": {
+        "prefill": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395",
+        "decode": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395"
+      },
+      "native_send_failures": 0,
+      "final_request_gauges": {
+        "final-worker-0.prom": [
+          0.0,
+          0.0
+        ],
+        "final-worker-1.prom": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "kv_probe": {
+        "metric": "vllm:mooncake_bytes_transferred_sum",
+        "prefill_before": 0.0,
+        "prefill_after": 101376000.0,
+        "transferred_bytes_delta": 101376000.0,
+        "passed": true
+      },
+      "raw_records_sha256": "471cdb4a26118ee7f360b178a74ee3d65fbd5f39d9a14268c129b87e0f3e9f81",
+      "client_freeze_sha256": "286771817a9d892fffe64319804bb6991fabe372b2df46be3372ee794953b02a",
+      "phase_notices": [
+        "12:36:29.542 NOTICE   Phase profiling (profiling) started | phase_index=0 | profiling_index=0 | target: 900.0s duration (runner.py:600)",
+        "12:51:29.543 NOTICE   Phase profiling (profiling) sending complete | sent=3,034, completed=3,007, in_flight=27 | sessions: sent=93, completed=28 | timeout_triggered=True (runner.py:1047)",
+        "12:51:59.543 NOTICE   Phase profiling (profiling) complete | completed=3,032, cancelled=2, errors=0 | sessions: completed=28, cancelled=0 | elapsed=930.00s | grace_period_timeout=True (runner.py:1170)"
+      ]
+    },
+    "candidate": {
+      "arm": "candidate",
+      "send_duration_seconds": 900.002,
+      "accounting": {
+        "records_total": 3943,
+        "records_profiled": 3059,
+        "records_dropped_total": 884,
+        "records_warmup_dropped": 884,
+        "records_error_dropped": 776,
+        "error_categories": {
+          "InvalidInferenceResultError": 776
+        }
+      },
+      "by_phase": {
+        "warmup": {
+          "error": 776,
+          "valid": 108
+        },
+        "profiling": {
+          "valid": 3059
+        }
+      },
+      "profiling_errors": 0,
+      "interactivity_tok_s_user": 102.68188940598621,
+      "full_itl_p90_ms": 9.738815732598912,
+      "token_throughput_per_chip": 48042.462918919,
+      "successful_record_duration_seconds": 929.651310766,
+      "source_hashes": {
+        "prefill": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395",
+        "decode": "956a63345b18780475e12ab278193c6179b5afa57006dfaed24f225c579b2566"
+      },
+      "native_send_failures": 0,
+      "final_request_gauges": {
+        "final-worker-0.prom": [
+          0.0,
+          0.0
+        ],
+        "final-worker-1.prom": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "kv_probe": {
+        "metric": "vllm:mooncake_bytes_transferred_sum",
+        "prefill_before": 0.0,
+        "prefill_after": 101376000.0,
+        "transferred_bytes_delta": 101376000.0,
+        "passed": true
+      },
+      "raw_records_sha256": "0817bad7e9e45f9efc2362f08880c00b8ae39b5946d0c791cfbbad2f1a154676",
+      "client_freeze_sha256": "286771817a9d892fffe64319804bb6991fabe372b2df46be3372ee794953b02a",
+      "phase_notices": [
+        "13:23:05.436 NOTICE   Phase profiling (profiling) started | phase_index=0 | profiling_index=0 | target: 900.0s duration (runner.py:600)",
+        "13:38:05.438 NOTICE   Phase profiling (profiling) sending complete | sent=3,061, completed=3,031, in_flight=30 | sessions: sent=93, completed=29 | timeout_triggered=True (runner.py:1047)",
+        "13:38:35.436 NOTICE   Phase profiling (profiling) complete | completed=3,059, cancelled=2, errors=0 | sessions: completed=29, cancelled=0 | elapsed=930.00s | grace_period_timeout=True (runner.py:1170)"
+      ]
+    }
+  },
+  "interactivity_change_pct": 1.894005483510952,
+  "throughput_per_chip_change_pct": 0.9745069869046219,
+  "matched_keys": 3013,
+  "median_matched_candidate_base_full_itl_ratio": 0.9730125523263536,
+  "teardown": {
+    "controller": "needs_inspection",
+    "candidate_and_outer_exit_markers": "missing",
+    "outer_workload_rc_from_release_note": 125,
+    "storage_probe": "OSError122 Disk quota exceeded",
+    "gpool_release_verified_utc": "2026-11-25T13:39:41Z",
+    "owned_containers_absent": true,
+    "note": "The controller's second release returned1 because the lease had already been released. Original failed/missing states are preserved."
+  },
+  "limits": [
+    "One sequential same-node900s A/B pair; no confidence interval or repeated-order control yet.",
+    "All request and aggregate/server-metric JSON exports parsed completely. The teardown error and missing exit markers remain a run-quality caveat.",
+    "This does not replace the earlier full3600s SA-style baseline or establish task-level accuracy."
+  ],
+  "recovery": {
+    "status": "measurement_complete_teardown_failed",
+    "lease": "Lc95627",
+    "gpu_release_verified_utc": "2026-11-25T13:39:41Z",
+    "owned_containers_absent": true,
+    "source": "gpool release journal and scoped container audit",
+    "original_outer_workload_rc": 125,
+    "original_exit_markers": "missing; not reconstructed",
+    "cause": "Home storage quota exhausted at/after benchmark export; write probe returnedEDQUOT122",
+    "both_send_windows_complete": true,
+    "exports_parse_successfully": true,
+    "archive_sha256": "f5ab0098058357672eecb5d7e1770ebb3846a743fd64d8128bb777dd8821470e",
+    "completed_client_caches_removed": {
+      "paths_absent": {
+        "base": true,
+        "candidate": true
+      },
+      "previous_cleanup_alive": false,
+      "write_probe": "ok"
+    },
+    "note": "Original controller needs_inspection/release_exit_code1 are retained. That was a second release attempt after the successful outer release."
+  },
+  "export_integrity": {
+    "base": {
+      "source": {
+        "lockfile_sha256": "86354f5a25283aa2535ea97b2b6a937a7cc5860f6934d378ab91cd2d13db19b7",
+        "profile": "release",
+        "rust_toolchain": "1.100.0",
+        "lockfile": ".github/benchmark/pr5090-router-ab/router-Cargo.lock",
+        "source_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93"
+      },
+      "client_freeze_sha256": "286771817a9d892fffe64319804bb6991fabe372b2df46be3372ee794953b02a",
+      "exports": {
+        "profile_export_aiperf.json": {
+          "bytes": 46867,
+          "valid_json": true,
+          "sha256": "3ec98638358e0db0e7ce4e306bb00e8860f9f585b794ac2987265022dcb34ee2"
+        },
+        "profile_export_aiperf_timeslices.json": {
+          "bytes": 19993451,
+          "valid_json": true,
+          "sha256": "cb8549149ea05559261eb840c70bf6aabfda50fc667c870811c301bf7f76481e"
+        },
+        "server_metrics_export.json": {
+          "bytes": 176764734,
+          "valid_json": true,
+          "sha256": "dd9503273a696f04f98e992694dd4f8c52e065f12659e4dd0811204e2fb8e18a"
+        }
+      }
+    },
+    "candidate": {
+      "source": {
+        "lockfile_sha256": "86354f5a25283aa2535ea97b2b6a937a7cc5860f6934d378ab91cd2d13db19b7",
+        "profile": "release",
+        "rust_toolchain": "1.100.0",
+        "lockfile": ".github/benchmark/pr5090-router-ab/router-Cargo.lock",
+        "source_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93"
+      },
+      "client_freeze_sha256": "286771817a9d892fffe64319804bb6991fabe372b2df46be3372ee794953b02a",
+      "exports": {
+        "profile_export_aiperf.json": {
+          "bytes": 46942,
+          "valid_json": true,
+          "sha256": "bb00765591bc62e43b91d2dc9be4edcf2009ffdd2d507d8c3ad9c069b2827433"
+        },
+        "profile_export_aiperf_timeslices.json": {
+          "bytes": 20115025,
+          "valid_json": true,
+          "sha256": "da088f347b2097bc48636ebb3eb24f480c2ef95db150b9f163776b3b04be3613"
+        },
+        "server_metrics_export.json": {
+          "bytes": 179681258,
+          "valid_json": true,
+          "sha256": "c4f0669c55952b83abe466ef424404bb9bd58e20bc29efaf4c2fbc2f33d4a5b0"
+        }
+      }
+    }
+  },
+  "contract_difference_paths": [
+    ".pair_arm",
+    ".roles.decode.env.ATOMESH_EXPECTED_NATIVE_SHA",
+    ".roles.decode.container",
+    ".case_name"
+  ],
+  "router_binary_sha256": "83e61a456a4871ed05db02b33564e05f5f3414001c744550135af7ee1aa39723",
+  "router_binary_identical_between_arms": true
+}

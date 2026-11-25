@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -400,7 +401,8 @@ def benchmark(contract, args):
             "Slurm and container cleanup are verified separately after this client exits.\n"
         )
         return 0
-    shared = output.parent / "client-venv"
+    # Installed packages are disposable; only client-freeze belongs in /logs.
+    shared = Path(tempfile.mkdtemp(prefix="atomesh-client-venv-", dir="/tmp"))
     python = shared / "bin/python"
     constraints = []
     if lock := contract.get("client_constraints"):
