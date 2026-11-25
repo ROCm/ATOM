@@ -1,0 +1,20 @@
+{
+  "base_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "engine_sha256": "540428ce937a5be29726195730246f053f88d3ddfabaa2af33ad79c7a92198a8",
+  "original_connector_sha256": "56a614c7d4416cd921937354782431f9ccc7df11511adb910b2ddf044d1d8c09",
+  "instrumented_connector_sha256": "45e05e355bba98ec51783ba0fc0a5267f7ef3a60e427444c3df075eed0ce8997",
+  "probe_symbol_rva": "0x35f930",
+  "task_stride": 152,
+  "does_not_modify_native_engine": true,
+  "changes_deadline_or_concurrency": false,
+  "files": {
+    "atomesh_timeout_probe.py": "cdeb52d80405ec195bf5bc6e4af75a5543f1e1a9d11312dc88feb27e7a0d9398",
+    "Dockerfile": "f74beef600b64f2d90253799c5cc7652e86a5f192fabb339bfb7de23efb3eded",
+    "fixture.cpp": "04b94f6807d41f1686e1feee66704762618505d5d83c35dd6d1735629a76bb22",
+    "mooncake_timeout_probe.cpp": "c18715ca3976212169b1d9155637c7677380f4a255434d2b970ad494e5dab8d2",
+    "prepare_worker.py": "8ac03aa597d10cd8bd15e29ee6a530a7d542739279a78c2eb42071df01427cfa",
+    "README.md": "409fb15c3501911b323fbaa8cc7014a77c9d448d451061dea7a6f5dce04dc50e",
+    "test_connector_probe.py": "70a156d0c0c4a4116ef6b9e92f454fb9de8bd28a15e1213cc1c598f8c413d80f",
+    "test_probe.py": "0c279c0936fa81e23a71453b8afe16b61f4e36ec3931226bc77da96acbc7550c"
+  }
+}

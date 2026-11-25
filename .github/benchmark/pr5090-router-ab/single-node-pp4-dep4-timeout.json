@@ -1,0 +1,285 @@
+{
+  "source": {
+    "repo": "SemiAnalysisAI/InferenceX",
+    "pr": 5090,
+    "sha": "7785faa2c9b342ec632b03fc4a279f9248304f3a",
+    "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/minimaxm31flash/vllm/mi355x-fp4/agentx/disagg-mooncake-variants.yaml",
+    "variant": "override_c40",
+    "recipe_sha256": "fb1625c2b79748c4fb26c91dbdda5120f4e52f304dfd1f898b27e59bd0f796c2",
+    "recipe_blob": "082c20636e54a30769fcbeb4abde68738255ce43",
+    "setup_blob": "150c0bc947bf37c7a9d981e77d9d0426a3124da2",
+    "master_blob": "2b0978eb6d820cb95e0b7284587355e0ee4bb8bc",
+    "client_requirements_blob": "2d791859312637304d51430825582f4f1ee8a533"
+  },
+  "image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "model": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+  "roles": {
+    "prefill": {
+      "nodes": 1,
+      "workers": 1,
+      "gpus": 4,
+      "args": {
+        "served-model-name": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+        "tensor-parallel-size": 1,
+        "gpu-memory-utilization": 0.85,
+        "language-model-only": true,
+        "trust-remote-code": true,
+        "reasoning-parser": "minimax_m3",
+        "tool-call-parser": "minimax_m3",
+        "enable-auto-tool-choice": true,
+        "block-size": 128,
+        "kv-cache-dtype": "nvfp4",
+        "attention-config": "{\"indexer_kv_dtype\":\"nvfp4\",\"indexer_decode_cp\":true}",
+        "moe-backend": "aiter",
+        "disable-hybrid-kv-cache-manager": true,
+        "enable-prefix-caching": true,
+        "max-model-len": 1048576,
+        "speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"attention_backend\":\"TRITON_ATTN\",\"kv_cache_dtype\":\"fp8\",\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\"}",
+        "renderer-num-workers": 8,
+        "enable-prompt-tokens-details": true,
+        "disable-uvicorn-access-log": true,
+        "max-num-batched-tokens": 32768,
+        "dbo-prefill-token-threshold": 16384,
+        "dbo-decode-token-threshold": 32768,
+        "compilation-config": "{\"max_cudagraph_capture_size\":2048}",
+        "kv-transfer-config": "{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"rdma\",\"num_workers\":10}},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":1349000000000,\"lazy_offload\":false,\"cpu_lru_eviction\":true}}]}}",
+        "max-num-seqs": 80,
+        "pipeline-parallel-size": 4
+      },
+      "env": {
+        "VLLM_ROCM_USE_AITER": "1",
+        "VLLM_ROCM_USE_AITER_MOE": "1",
+        "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "0",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+        "DEBUG_HIP_DYNAMIC_QUEUES": "0",
+        "DEBUG_HIP_IGNORE_STREAM_PRIORITY": "0",
+        "HIP_FORCE_DEV_KERNARG": "1",
+        "NCCL_DMABUF_ENABLE": "0",
+        "HSA_ENABLE_IPC_MODE_LEGACY": "1",
+        "PYTHONHASHSEED": "0",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "AITER_LOG_LEVEL": "WARNING",
+        "VLLM_ENGINE_READY_TIMEOUT_S": "7200",
+        "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "1200",
+        "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "3600",
+        "MC_GID_INDEX": "@fabric.rdma-gid-index",
+        "MC_IB_TC": "@fabric.rdma-tc",
+        "MC_MAX_CONCURRENT_REG_MR": "1",
+        "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600",
+        "HF_HOME": "/hf_hub_cache",
+        "HF_HUB_CACHE": "/hf_hub_cache/hub",
+        "MC_MAX_MR_SIZE": "1073741824",
+        "ATOMESH_MOONCAKE_PROBE_DIR": "/logs/timeout-probe",
+        "LD_PRELOAD": "/opt/atomesh-timeout/libmooncake_timeout_probe.so",
+        "ATOMESH_EXPECTED_NATIVE_SHA": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395"
+      },
+      "gpu_ids": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    "decode": {
+      "nodes": 1,
+      "workers": 1,
+      "gpus": 4,
+      "args": {
+        "served-model-name": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+        "tensor-parallel-size": 1,
+        "gpu-memory-utilization": 0.85,
+        "language-model-only": true,
+        "trust-remote-code": true,
+        "reasoning-parser": "minimax_m3",
+        "tool-call-parser": "minimax_m3",
+        "enable-auto-tool-choice": true,
+        "block-size": 128,
+        "kv-cache-dtype": "nvfp4",
+        "attention-config": "{\"indexer_kv_dtype\":\"nvfp4\",\"indexer_decode_cp\":true}",
+        "moe-backend": "aiter",
+        "disable-hybrid-kv-cache-manager": true,
+        "enable-prefix-caching": true,
+        "max-model-len": 1048576,
+        "speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"attention_backend\":\"TRITON_ATTN\",\"kv_cache_dtype\":\"fp8\",\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\"}",
+        "renderer-num-workers": 8,
+        "enable-prompt-tokens-details": true,
+        "disable-uvicorn-access-log": true,
+        "max-num-batched-tokens": 8192,
+        "kv-transfer-config": "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"mooncake_protocol\":\"rdma\",\"num_workers\":10}}",
+        "max-num-seqs": 20,
+        "compilation-config": "{\"cudagraph_capture_sizes\":[8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160],\"max_cudagraph_capture_size\":160}",
+        "data-parallel-size": 4,
+        "enable-expert-parallel": true,
+        "all2all-backend": "allgather_reducescatter"
+      },
+      "env": {
+        "VLLM_ROCM_USE_AITER": "1",
+        "VLLM_ROCM_USE_AITER_MOE": "1",
+        "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "0",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+        "DEBUG_HIP_DYNAMIC_QUEUES": "0",
+        "DEBUG_HIP_IGNORE_STREAM_PRIORITY": "0",
+        "HIP_FORCE_DEV_KERNARG": "1",
+        "NCCL_DMABUF_ENABLE": "0",
+        "HSA_ENABLE_IPC_MODE_LEGACY": "1",
+        "PYTHONHASHSEED": "0",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "AITER_LOG_LEVEL": "WARNING",
+        "VLLM_ENGINE_READY_TIMEOUT_S": "7200",
+        "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "1200",
+        "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "3600",
+        "MC_GID_INDEX": "@fabric.rdma-gid-index",
+        "MC_IB_TC": "@fabric.rdma-tc",
+        "MC_MAX_CONCURRENT_REG_MR": "1",
+        "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600",
+        "HF_HOME": "/hf_hub_cache",
+        "HF_HUB_CACHE": "/hf_hub_cache/hub",
+        "MC_MAX_MR_SIZE": "268435456",
+        "ATOMESH_MOONCAKE_PROBE_DIR": "/logs/timeout-probe",
+        "LD_PRELOAD": "/opt/atomesh-timeout/libmooncake_timeout_probe.so",
+        "ATOMESH_EXPECTED_NATIVE_SHA": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395"
+      },
+      "gpu_ids": [
+        4,
+        5,
+        6,
+        7
+      ]
+    }
+  },
+  "environment": {
+    "NCCL_SOCKET_IFNAME": "@fabric.socket-ifname",
+    "GLOO_SOCKET_IFNAME": "@fabric.socket-ifname",
+    "NCCL_IB_HCA": "@fabric.rdma-devices",
+    "NCCL_IB_GID_INDEX": "@fabric.rdma-gid-index",
+    "MC_DISABLE_HIP": "1"
+  },
+  "benchmark_env": {
+    "AIPERF_REQUIRED_SERVER_METRIC_PREFIX": "vllm:"
+  },
+  "concurrency": 80,
+  "duration": 900,
+  "agentx_version": "1.0.14",
+  "dataset": "semianalysis_cc_traces_weka_062126",
+  "frontend": {
+    "type": "vllm-router",
+    "enable_multiple_frontends": false,
+    "args": {
+      "policy": "consistent_hash",
+      "prefill-policy": "consistent_hash",
+      "decode-policy": "consistent_hash"
+    }
+  },
+  "setup_script": "vllm-router.sh",
+  "router_images": {
+    "baseline": "vllm/vllm-router:v0.1.16@sha256:4c9c87a7a911fd7628cf38a4c2ab65107a797778d95fa2a4d63e19f91b732e7c",
+    "atomesh": "rocm/atom-dev:nightly_202611110332@sha256:19712185deac1eca8db5f21bc25ff2f9a3f44758bfd7cec8cc1c7889fbea097d"
+  },
+  "router_policy": {
+    "baseline": "consistent_hash",
+    "atomesh": "dp_sticky"
+  },
+  "deployment": {
+    "memlock": "unlimited soft and hard in both worker arms",
+    "slurm_time_limit": "02:00:00",
+    "workflow_timeout_minutes": 960,
+    "scheduler_admission": "All previous two-node A/B jobs must be absent before sbatch",
+    "startup_guard": "wait for RUNNING with the expected node count and allocation generation; publish failures to the submitter",
+    "pre_cleanup": "on current exclusive nodes, stop only owned containers for this exact case whose jobs are absent from the active queue; never stop-all",
+    "orchestration": "native srtctl SweepOrchestrator and DockerLauncher under an owned GPU-pool lease"
+  },
+  "functional_only": false,
+  "purpose": "Reproduce PP3 native write timeout with sender10; capture first stalled batch without changing native engine, timeout or sender concurrency.",
+  "layout": "single_node",
+  "case_name": "pr5090-pp4-dep4-sender10-timeout-probe",
+  "router_build": {
+    "lockfile_sha256": "86354f5a25283aa2535ea97b2b6a937a7cc5860f6934d378ab91cd2d13db19b7",
+    "profile": "release",
+    "rust_toolchain": "1.100.0",
+    "lockfile": ".github/benchmark/pr5090-router-ab/router-Cargo.lock",
+    "source_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93"
+  },
+  "compatibility_adjustments": {
+    "image_config_sha256": "34510473dcd22d5680412ad5cbbe8192dbcbdd4405267a74fbb2da0a369f6fda",
+    "disabled_prefill_flags": [
+      "enable-dbo",
+      "enable-batch-sharded-sampling"
+    ],
+    "reason": "The pinned worker image rejects DBO with PP>1 and explicit batch-sharded sampling with TP1",
+    "disabled_decode_flags": [
+      "enable-batch-sharded-sampling"
+    ],
+    "decode_note": "TP1 rejects batch-sharded sampling; EP uses the pinned image default allgather_reducescatter backend explicitly"
+  },
+  "srtctl_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+  "verify_pd": true,
+  "run_time_limit": "01:15:00",
+  "client_constraints": {
+    "path": ".github/benchmark/pr5090-router-ab/client-freeze-1p1d-20261123.txt",
+    "sha256": "286771817a9d892fffe64319804bb6991fabe372b2df46be3372ee794953b02a",
+    "paired_run": "Lb4c8c6"
+  },
+  "budget_rationale": "75 minutes total including derived diagnostic image build, unchanged pinned router/model startup, original C80 warmup, at most900s observation and cleanup; stop early after first failed-write evidence.",
+  "transport_adjustment": {
+    "reason": "The first full-run attempt failed before measurement because the local HIP IPC fast path returned invalid device context. De-prioritize HIP for buffers also registered with RDMA.",
+    "setting": "MC_DISABLE_HIP=1 on both roles",
+    "scope": "Match TP4 performance arms by de-prioritizing same-host HIP IPC. This differs from the earlier PP4/DEP4 functional run; rerun protocol and real-KV probes before the measurement window.",
+    "source": "kvcache-ai/Mooncake v0.3.14 multi_transport.cpp protocol_priority; flag confirmed in pinned image engine.so",
+    "engine_so_sha256": "540428ce937a5be29726195730246f053f88d3ddfabaa2af33ad79c7a92198a8"
+  },
+  "comparison_limits": [
+    "Timeout diagnosis only; no new SA performance point.",
+    "Matches failed Lb6034c P/DEP settings including P order0,1,3,2; instrumentation/image plus shorter900s observation are the declared changes.",
+    "Keep both Mooncake num_workers10 and native timeout settings unset; do not use sender1."
+  ],
+  "prefill_device_order": [
+    0,
+    1,
+    3,
+    2
+  ],
+  "concurrency_control": {
+    "client_concurrency": 80,
+    "decode_max_num_seqs_per_rank": 20,
+    "decode_dp_ranks": 4,
+    "decode_max_num_seqs_total": 80,
+    "num_speculative_tokens": 7,
+    "decode_cudagraph_capture_sizes": [
+      8,
+      16,
+      24,
+      32,
+      40,
+      48,
+      56,
+      64,
+      72,
+      80,
+      88,
+      96,
+      104,
+      112,
+      120,
+      128,
+      136,
+      144,
+      152,
+      160
+    ],
+    "decode_max_cudagraph_capture_size": 160,
+    "tp_c80_baseline": "Reuse existing SA submission result; do not run TP C80"
+  },
+  "diagnostic_only": true,
+  "formal_sa_point": false,
+  "timeout_probe": {
+    "context": ".github/benchmark/pr5090-router-ab/diagnostics/mooncake-timeout",
+    "reference_lease": "Lb6034c",
+    "native_engine_sha256": "540428ce937a5be29726195730246f053f88d3ddfabaa2af33ad79c7a92198a8",
+    "stop_after_failed_write_evidence": true,
+    "maximum_uncached_batches_per_process": 3
+  }
+}

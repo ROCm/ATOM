@@ -16,6 +16,7 @@ case "${case_name}" in
   pp4-dep4-c80-sender1) contract_file=single-node-pp4-dep4-c80-sender1-diagnostic.json; budget=60m ;;
   pp4-dep4-c80-profile) contract_file=single-node-pp4-dep4-c80-profile.json; budget=75m ;;
   pp4-dep4-mxfp8-pair) contract_file=single-node-pp4-dep4-mxfp8-pair.json; budget=150m ;;
+  pp4-dep4-timeout) contract_file=single-node-pp4-dep4-timeout.json; budget=75m ;;
   *) exit 2 ;;
 esac
 export REPO_ROOT="${3:?checkout path}"
@@ -93,7 +94,9 @@ exit 127
 EOF
 chmod +x "${RUN_DIR}/bin/nvcc"
 export ATOMESH_ROUTER_BUILD_TIMEOUT_SECONDS=1500
-if [[ "${case_name}" == pp4-dep4-mxfp8-pair ]]; then
+if [[ "${case_name}" == pp4-dep4-timeout ]]; then
+  timeout --kill-after=120s "${budget}" python3 .github/scripts/atomesh/pd_timeout_probe.py
+elif [[ "${case_name}" == pp4-dep4-mxfp8-pair ]]; then
   timeout --kill-after=120s "${budget}" python3 .github/scripts/atomesh/pd_mxfp8_pair.py
 else
   timeout --kill-after=120s "${budget}" bash .github/scripts/atomesh/pd_srt_functional.sh
