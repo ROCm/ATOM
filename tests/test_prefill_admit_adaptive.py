@@ -15,6 +15,8 @@ from atom.model_engine.prefill_delayer import (
     _DEC_HALF_LIFE,
     _DEC_MIN_N,
     _FIXED_SLOTS,
+    _MAX_HOLD_MS,
+    _MIN_TICKS,
     PrefillDelayer,
     _EwFit,
 )
@@ -146,11 +148,12 @@ def test_a_clamped_low():
 
 
 def test_cycle_capped_by_budget():
-    # huge A: EOQ would hold ~100+ ticks; cap = 600 ms / ~26 ms ~ 23 ticks
+    # huge A: EOQ would hold ~200 ticks; cap = _MAX_HOLD_MS / ~26 ms
     d, cyc = _run(400000, 20000, 20.0, 0.3)
     t0, _ = d._adapt_local_fits()
     cap = d._adapt_max_ticks(t0, True)
-    assert 18 <= cap <= 28, cap
+    budget = _MAX_HOLD_MS * 1000.0 / 26000.0
+    assert 0.85 * budget <= cap <= 1.15 * budget, (cap, budget)
     # + the vacuous ticks with an empty queue right after a FIRE
     assert cyc <= cap + 2, (cyc, cap)
     assert d._stat_fire_adaptcap > 0
@@ -159,23 +162,24 @@ def test_cycle_capped_by_budget():
 def test_min_ticks():
     # tiny A, big queue: EOQ wants to fire every tick -> held to MIN_TICKS
     _d, cyc = _run(1000, 20000, 20.0, 8.0)
-    assert cyc >= 3.5, cyc
+    assert cyc >= _MIN_TICKS - 1, cyc  # n-1 held ticks before the n-th decision
 
 
 def test_slower_prefill_not_shorter_and_bounded():
-    _, fast = _run(30000, 20000, 20.0, 2.0)
-    _, slow = _run(90000, 20000, 20.0, 2.0)
-    assert fast <= slow <= 26, (fast, slow)
+    d, fast = _run(30000, 20000, 20.0, 0.5)
+    _, slow = _run(90000, 20000, 20.0, 0.5)
+    cap = d._adapt_max_ticks(d._adapt_local_fits()[0], True)
+    assert fast <= slow <= cap + 2, (fast, slow, cap)
 
 
-@pytest.mark.parametrize("a_us,lam", [(15000, 2.0), (25000, 2.0)])
+@pytest.mark.parametrize("a_us,lam", [(40000, 0.5), (60000, 0.5)])
 def test_cycle_matches_eoq_with_fitted_costs(a_us, lam):
     # between the MIN_TICKS floor and the TTFT cap the cycle follows EOQ
     # with the (bounded) fitted T0 and A
     d, cyc = _run(a_us, 20000, c_us=20.0, lam=lam)
     t0, a = d._adapt_local_fits()
     k_eoq = math.sqrt(2 * a * 300 / (lam * t0))
-    assert 4 < k_eoq < d._adapt_max_ticks(t0, True)
+    assert _MIN_TICKS < k_eoq < d._adapt_max_ticks(t0, True)
     assert 0.7 * k_eoq < cyc < 1.4 * k_eoq, (cyc, k_eoq)
 
 
@@ -195,9 +199,10 @@ def test_cap_not_below_cold_start_cap():
     # a slow decode mean must not shorten the TTFT cap below the cold-start
     # cap: a shorter cap admits prefill more often, which slows decode more
     d = _adaptive()
-    slow_t0 = 0.75 * 4 * (600_000 / _COLD_MAX_TICKS)
+    budget_us = _MAX_HOLD_MS * 1000.0
+    slow_t0 = 0.75 * 4 * (budget_us / _COLD_MAX_TICKS)
     assert d._adapt_max_ticks(slow_t0, True) == _COLD_MAX_TICKS
-    fast_t0 = 0.75 * (600_000 / (2 * _COLD_MAX_TICKS))
+    fast_t0 = 0.75 * (budget_us / (2 * _COLD_MAX_TICKS))
     assert d._adapt_max_ticks(fast_t0, True) == 2 * _COLD_MAX_TICKS
 
 
