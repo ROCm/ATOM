@@ -582,7 +582,12 @@ the pools' `masters`, and the key rule's `namespace`, `chunk_tokens` and `world`
 with `min_load_tokens`, the threshold the engine resolved (`OFFLOAD_MIN_LOAD_TOKENS`
 when set, else the Store's own 512), and `chain_check`, the hex
 digest of the first chunk of tokens `0..chunk_tokens`, by which a router checks
-that it computes the same keys.
+that it computes the same keys. A server whose ranks keep their blocks in a
+shared UMBP L1 pool (`umbp_pool`) also reports `kv_pool`, the same for every
+rank: `backend`, the UMBP server's `address`, the share `group` as the pools
+derive it when the setting is empty, `share_ratio` and `fetch`. Ranks on one
+node that report one `address` and `group`, with `fetch` on, copy the prefix
+they miss from each other's pools: a router counts what a rank's group holds.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
