@@ -2235,6 +2235,25 @@ def _flydsl_prefill_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len)
     return index_score_prefill_nvfp4
 
 
+def _flydsl_decode_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len):
+    """aiter's FlyDSL decode scorer when ``ATOM_M3_DECODE_SCORE_FLYDSL`` asks for
+    it and it serves the call (aiter decides: gfx1250, the FP4 index cache, at
+    most 32 (index head, query row) pairs a request), else None. Imported
+    directly: the flag needs an aiter that has the scorer."""
+    if index_kv_scale is None or not envs.ATOM_M3_DECODE_SCORE_FLYDSL:
+        return None
+    from aiter.ops.flydsl.index_score_decode import (
+        index_score_decode_nvfp4,
+        index_score_decode_nvfp4_supported,
+    )
+
+    if not index_score_decode_nvfp4_supported(
+        idx_q, index_kv_cache, index_kv_scale, max_query_len
+    ):
+        return None
+    return index_score_decode_nvfp4
+
+
 @torch.no_grad()
 def minimax_m3_index_topk(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
@@ -2540,54 +2559,75 @@ def minimax_m3_index_topk_decode(
     # scaled WMMA (`nvfp4_scaled_dot`) -- no decode in registers, so none of the
     # FP8 crossover's reasons apply -- the same read as the indexer-CP scorer.
     fp4_scaled = is_fp4 and arch == "gfx1250"
-    if fp4_scaled or use_transposed_decode_score(arch, batch, max_block, max_query_len):
-        score_kernel = _decode_index_score_transposed_kernel
-        score_grid = (batch, num_score_chunks)
-    else:
-        # The tiled scorer puts the chunk on the fastest grid axis.
-        score_kernel = _decode_index_score_tiled_kernel
-        score_grid = (num_score_chunks, batch)
-    score_kernel[score_grid](
-        idx_q,
-        index_kv_cache,
-        iks,
-        score,
-        block_table,
-        seq_lens,
-        head_dim,
-        sm_scale,
-        triton.cdiv(max_block, num_score_chunks),
-        idx_q.stride(0),
-        idx_q.stride(1),
-        idx_q.stride(2),
-        index_kv_cache.stride(0),
-        index_kv_cache.stride(1),
-        index_kv_cache.stride(2),
-        iks.stride(0),
-        iks.stride(1),
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        block_table.stride(0),
-        NUM_IDX_HEADS=num_idx_heads,
-        MAX_Q=max_query_len,
-        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        num_warps=(
-            DECODE_SCORE_FP4_NUM_WARPS
-            if fp4_scaled
-            else decode_score_num_warps(arch, batch, max_block, max_query_len)
-        ),
-        IS_FP4=is_fp4,
-        **({"FP4_SCALED_DOT": True} if fp4_scaled else {}),
-        # FP4 at one stage: deeper pipelining only holds more tiles in
-        # registers (MI455X b64 / 300K q1, one warp: 99.7 us at one stage, slower
-        # at two; the even / odd decode built to 667 VGPRs at three).
-        num_stages=(
-            DECODE_SCORE_FP4_NUM_STAGES
-            if is_fp4 and arch == "gfx1250"
-            else DECODE_SCORE_NUM_STAGES
-        ),
+    flydsl_score = _flydsl_decode_scorer(
+        idx_q, index_kv_cache, index_kv_scale, max_query_len
     )
+    if flydsl_score is not None:
+        # aiter's FlyDSL scorer (ATOM_M3_DECODE_SCORE_FLYDSL): the same scores
+        # bit for bit -- the transposed scorer's scaled WMMA pair for every dot
+        # -- from four-wave workgroups that split the query once for their
+        # whole chunk of blocks (up to 64) and stream the pages through LDS.
+        flydsl_score(
+            idx_q,
+            index_kv_cache,
+            index_kv_scale,
+            score,
+            block_table,
+            seq_lens,
+            sm_scale,
+            max_query_len,
+        )
+    else:
+        if fp4_scaled or use_transposed_decode_score(
+            arch, batch, max_block, max_query_len
+        ):
+            score_kernel = _decode_index_score_transposed_kernel
+            score_grid = (batch, num_score_chunks)
+        else:
+            # The tiled scorer puts the chunk on the fastest grid axis.
+            score_kernel = _decode_index_score_tiled_kernel
+            score_grid = (num_score_chunks, batch)
+        score_kernel[score_grid](
+            idx_q,
+            index_kv_cache,
+            iks,
+            score,
+            block_table,
+            seq_lens,
+            head_dim,
+            sm_scale,
+            triton.cdiv(max_block, num_score_chunks),
+            idx_q.stride(0),
+            idx_q.stride(1),
+            idx_q.stride(2),
+            index_kv_cache.stride(0),
+            index_kv_cache.stride(1),
+            index_kv_cache.stride(2),
+            iks.stride(0),
+            iks.stride(1),
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            block_table.stride(0),
+            NUM_IDX_HEADS=num_idx_heads,
+            MAX_Q=max_query_len,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            num_warps=(
+                DECODE_SCORE_FP4_NUM_WARPS
+                if fp4_scaled
+                else decode_score_num_warps(arch, batch, max_block, max_query_len)
+            ),
+            IS_FP4=is_fp4,
+            **({"FP4_SCALED_DOT": True} if fp4_scaled else {}),
+            # FP4 at one stage: deeper pipelining only holds more tiles in
+            # registers (MI455X b64 / 300K q1, one warp: 99.7 us at one stage, slower
+            # at two; the even / odd decode built to 667 VGPRs at three).
+            num_stages=(
+                DECODE_SCORE_FP4_NUM_STAGES
+                if is_fp4 and arch == "gfx1250"
+                else DECODE_SCORE_NUM_STAGES
+            ),
+        )
 
     _launch_select(
         score,

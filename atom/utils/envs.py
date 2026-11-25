@@ -906,6 +906,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K": lambda: int(
         os.getenv("ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K", "1024")
     ),
+    # MiniMax-M3 decode index block scores over the FP4 index cache on gfx1250:
+    # aiter's FlyDSL scorer (`aiter.ops.flydsl.index_score_decode`) instead of
+    # the Triton `_decode_index_score_transposed_kernel`; the same scores bit for
+    # bit, so the same top-k. Opt-in for A/B.
+    "ATOM_M3_DECODE_SCORE_FLYDSL": lambda: _flag_env("ATOM_M3_DECODE_SCORE_FLYDSL"),
     # Debug: save rank 0's fresh MiniMax-M3 prefill top-k selections of the
     # first ATOM_M3_DUMP_PREFILL_TOPK_CHUNKS prefill forwards whose longest
     # cached prefix is at least ATOM_M3_DUMP_PREFILL_TOPK_MIN_PREFIX tokens to
