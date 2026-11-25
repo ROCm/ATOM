@@ -469,6 +469,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         return {}
 
     def allocate_per_req_cache(self, entries):
+        # The arena is allocated here rather than carved from the runner's
+        # paged buffer (`paged_pool_bytes` is zero), so this is where a pool a
+        # KV connector provides has to be taken from. ATOM's own pool keeps
+        # the cache's allocations as they are.
+        memory = self.model_runner._kv_pool_memory()
         self.cache = PagedAttentionCache(
             self.geometry,
             self.num_blocks,
@@ -477,11 +482,52 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             max_tokens=self.max_num_batched_tokens,
             workspace=self.score_workspace,
             prefill_window_staging=self._prefill_window_staging,
+            allocate_backing=memory.allocate if memory.single_allocation else None,
         )
         self.copies = StateCopies(
             self.cache, self.model_runner.state_runtime.checkpoint_spec, self.max_bs
         )
         return {}
+
+    def owned_pool_layout(self):
+        """`(arena, PAGE regions)` of the pool this builder allocated itself.
+
+        A PAGE unit is one scheduler block: its main page and its rows in every
+        index plane (`PagedAttentionCache.unit_regions`). The STATE slots after
+        the paged extent are not in any region -- a block's bytes are the PAGE
+        alone, which is all a prefix hit reuses under encoder bounded replay.
+        """
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
+        cache = self.cache
+        # `arena` is the one allocation a connector's memory handed out (the
+        # BF16 arena, or the slab the quantized source buffers are cut from);
+        # None when the pool is ATOM's own.
+        if cache is None or cache.arena is None:
+            return None
+        regions = [
+            KVTransferRegion(base, cache.num_pages * unit, unit)
+            for base, unit in cache.unit_regions()
+        ]
+        return cache.arena, regions
+
+    def copy_paged_blocks(self, copies):
+        """Every region of a PAGE unit (`unit_regions`: its main pages and its
+        rows in each index plane), from `copies[i][0]` to `copies[i][1]`: one
+        gather and one scatter per region."""
+        # Staged through pinned memory: a pageable host-to-device copy waits
+        # for the device, which here would stall the step's whole launch.
+        ids = torch.tensor(copies, dtype=torch.int64).t().contiguous()
+        if self.device != "cpu":
+            ids = ids.pin_memory()
+        ids = ids.to(self.device, non_blocking=True)
+        src, dst = ids[0], ids[1]
+        cache = self.cache
+        planes = [view for _, view in cache.page_regions] + [
+            plane for owned in cache.index_planes.values() for plane in owned
+        ]
+        for plane in planes:
+            plane.index_copy_(0, dst, plane.index_select(0, src))
 
     def state_entry_views(self, slot):
         return self.copies.entries(slot)

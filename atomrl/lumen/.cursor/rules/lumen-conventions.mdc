@@ -1,0 +1,25 @@
+---
+description: Lumen project coding conventions for docstrings and comments
+globs: atomrl/atomrl/lumen/**/*.py
+alwaysApply: false
+---
+
+# Lumen Coding Conventions
+
+## No TransformerEngine (TE) replacement language
+
+Lumen is a standalone project. Do NOT describe Lumen modules as "drop-in replacements" for TransformerEngine or reference TE classes in docstrings/comments.
+
+```python
+# BAD
+"""Drop-in replacement for TE's ``TEColumnParallelLinear``."""
+"""Mirrors ``TESpecProvider`` — returns Lumen classes instead of TE classes."""
+# Matches TE convention: ...
+
+# GOOD
+"""Column-parallel linear using Lumen GEMM."""
+"""Provides Lumen module classes for Megatron-Core layer specs."""
+# Formula: ...
+```
+
+Exceptions: actual code that references TE class names (e.g. `TEGroupedMLP` in imports or runtime logic) is fine — only remove TE references from documentation and comments.

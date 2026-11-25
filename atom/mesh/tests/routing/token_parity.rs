@@ -16,9 +16,7 @@ use crate::{
         prepare_pool::PreparePoolRuntime,
         steps::{create_tokenizer_workflow_data, LoadTokenizerStep, TokenizerConfigRequest},
     },
-    routers::prepare::{
-        chat_template::process_chat_messages, fast_tokenizer::FastTokenizer, thread_tokenizer,
-    },
+    routers::prepare::{fast_tokenizer::FastTokenizer, thread_tokenizer},
 };
 
 const BACKENDS: [&str; 2] = ["huggingface", "fastokens"];
@@ -194,7 +192,7 @@ async fn tokenize(
                 .tokens(&parsed, &metadata, ctx, true)
                 .map_err(|error| error.message);
             let prompt = match parsed.chat() {
-                Some(chat) => process_chat_messages(chat, &*entry.tokenizer).map(|p| p.text),
+                Some(chat) => routing.render_chat(&entry, chat),
                 None => Ok(metadata.text.clone()),
             };
             let encode = prompt.ok().filter(|_| tokens.is_ok()).map(|prompt| {
