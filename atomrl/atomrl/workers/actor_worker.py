@@ -1537,6 +1537,34 @@ class AtomActorWorker(BaseWorker):
             itemsize = torch.bfloat16.itemsize
         return itemsize * param.numel()
 
+    @staticmethod
+    def _largest_checkpoint_tensor_bytes(model_path: str) -> int:
+        """Bytes of the largest tensor in a safetensors checkpoint, from the headers.
+
+        An upper bound on any single tensor the weight sync sends: the rollout
+        receives the checkpoint's tensors under their HF names, and FP32 ones go
+        out as BF16.
+        """
+        import json
+        import struct
+
+        largest = 0
+        for path in sorted(Path(model_path).glob("*.safetensors")):
+            with open(path, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                header = json.loads(f.read(header_len))
+            for name, meta in header.items():
+                if name == "__metadata__":
+                    continue
+                start, end = meta["data_offsets"]
+                largest = max(largest, int(end) - int(start))
+        if largest == 0:
+            raise FileNotFoundError(
+                f"no safetensors tensors under {model_path!r}; cannot size the "
+                "weight-sync bucket for a lazily gathered model"
+            )
+        return largest
+
     def update_weights_ipc_send(
         self,
         bucket_size_mb: int = 512,
@@ -1666,10 +1694,17 @@ class AtomActorWorker(BaseWorker):
         # expert weight is 768 MiB, past the 512 MiB default. vLLM re-opens per
         # bucket and needs no such floor.
         min_bucket_bytes = 0
-        if is_atom:
+        if is_atom and hasattr(params, "__len__"):
             min_bucket_bytes = max(
                 (self._sent_nbytes(p, keep_fp32) for _, p in params),
                 default=0,
+            )
+        elif is_atom:
+            # The Megatron engines hand out a lazy generator whose every tensor
+            # comes out of a collective; it can be drained once, by the send
+            # below. Scanning it here first left nothing to send.
+            min_bucket_bytes = self._largest_checkpoint_tensor_bytes(
+                str(get_nested_config(self.config, "policy", "model_name", default=""))
             )
 
         # ATOM's receive loop needs the whole bucket for its largest tensor

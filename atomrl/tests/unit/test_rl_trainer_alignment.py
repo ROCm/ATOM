@@ -527,6 +527,58 @@ def test_response_position_metrics_take_the_common_width() -> None:
     assert got["rollout_corr/pos_0_127/tokens"] == 4.0
 
 
+@pytest.mark.parametrize("use_atom", [True, False], ids=["atom", "vllm"])
+def test_ipc_sync_frees_actor_cache_before_waking_the_rollout(use_atom) -> None:
+    # A colocated Megatron actor held its training peak in the allocator cache;
+    # ATOM's weight wake then found 238 MiB free and the sync failed with
+    # "update_weights_ipc failed ... HIP out of memory" on Qwen3-30B-A3B. vLLM
+    # on ROCm wakes its KV cache into the same free memory.
+    from atomrl.core.config import WeightSyncConfig
+
+    calls: list = []
+
+    class _Stop(Exception):
+        pass
+
+    class _Mgr:
+        num_replicas = 1
+
+        @property
+        def servers(self):
+            calls.append("send")
+            raise _Stop
+
+    stub = SimpleNamespace(
+        _ray_rollout_mgr=_Mgr(),
+        _actor_wg=SimpleNamespace(num_workers=1),
+        _rollout_wg=None,
+        _ray_use_atom=use_atom,
+        _ray_use_vllm=not use_atom,
+        _ray_vllm_engine=SimpleNamespace(
+            enable_sleep=True,
+            wake=lambda tags=None: calls.append(("wake", tuple(tags or ()))),
+        ),
+        _ipc_endpoints_match_actors=lambda mgr: True,
+        _release_actor_cached_memory=lambda: calls.append("free"),
+        global_step=0,
+        config=SimpleNamespace(
+            weight_sync=WeightSyncConfig(),
+            policy=SimpleNamespace(
+                generation=SimpleNamespace(
+                    vllm_cfg=SimpleNamespace(
+                        update_weights_bucket_megabytes=512, use_shm=False
+                    )
+                )
+            ),
+        ),
+    )
+
+    with pytest.raises(_Stop):
+        RLTrainer._sync_weights_ipc(stub)
+
+    assert calls == ["free", ("wake", ("weights",)), "send"]
+
+
 def test_ipc_sync_refuses_fp8_quantize_on_the_safetensors_fallback() -> None:
     """The fallback exports BF16 through disk and cannot honour fp8_quantize.
 

@@ -1147,6 +1147,12 @@ class RLTrainer:
 
         # 1) wake weight memory before loading (only when sleep is in use).
         if sleeping:
+            # Both engines wake into whatever the driver reports free -- ATOM its
+            # weights, vLLM on ROCm its KV cache (its sleep keeps the weights
+            # resident) -- and a Megatron actor keeps its training peak in the
+            # allocator cache (198 GiB reserved, 53 GiB live for Qwen3-30B-A3B at
+            # EP=8), which left too little for ATOM's weights.
+            self._release_actor_cached_memory()
             rollout_engine.wake(tags=["weights"])
         # 2) start receivers + senders concurrently, then join both.
         # Keyword, and only when it is on: `prequantized_fp8` exists on the vLLM
