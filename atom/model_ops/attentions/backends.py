@@ -39,6 +39,7 @@ from atom.model_ops.attentions.token_layout.batch_ids import (
     build_cu_seqlens,
     build_query_layout,
 )
+from atom.model_ops.attentions.token_layout.decode import mrope_decode_positions
 from atom.model_ops.attentions.token_layout.prefill import (
     PrefillBatch,
     prefill_positions,
@@ -1166,19 +1167,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         width = scheduled_tokens if running_tokens is None else running_tokens
         positions = self._mrope_cpu_view(width)
         positions[:, scheduled_tokens:] = 0
-        lengths = batch.num_scheduled_tokens[: len(context_lens)]
-        offset = 0
-        for req_id, context_len, length in zip(batch.req_ids, context_lens, lengths):
-            start = int(context_len) - int(length)
-            stop = int(context_len)
-            delta = batch.mrope_position_deltas.get(req_id)
-            if delta is None:
-                base = np.arange(start, stop, dtype=np.int64)
-            else:
-                base = np.arange(start + int(delta), stop + int(delta), dtype=np.int64)
-            positions[:, offset : offset + int(length)] = base[None, :]
-            offset += int(length)
-
+        mrope_decode_positions(
+            batch.req_ids,
+            context_lens,
+            batch.num_scheduled_tokens[: len(context_lens)],
+            batch.mrope_position_deltas,
+            positions,
+        )
         return self._stage_mrope(width, group)
 
     @h2d_producer("early", runner="model_runner")

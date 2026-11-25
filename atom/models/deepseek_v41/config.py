@@ -225,11 +225,17 @@ class DeepseekV41TextConfig(PretrainedConfig):
             )
 
     def validate_request(
-        self, *, num_draft_tokens, multimodal_data, enable_dp_attention=False
+        self,
+        *,
+        num_draft_tokens,
+        multimodal_data,
+        media_on_prefill_instance=False,
+        enable_dp_attention=False,
     ):
         if enable_dp_attention and multimodal_data:
             raise ValueError("DeepSeek-V4.1 DP attention supports text requests only")
-        if num_draft_tokens and multimodal_data:
+        # A decode leg whose prefill kept the image drafts over image KV too.
+        if num_draft_tokens and (multimodal_data or media_on_prefill_instance):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark currently supports text requests only"
             )
