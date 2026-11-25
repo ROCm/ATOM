@@ -460,9 +460,10 @@ def _hash_traced_files(files) -> str:
     content = []
     for filepath in files:
         content.append(filepath)
-        if filepath == "<string>" or filepath == "<frozen os>":
-            # This means the function was dynamically generated, with
-            # e.g. exec() or frozen os module. We can't actually check these.
+        if filepath.startswith("<"):
+            # Not a file: the function was dynamically generated (exec()'s
+            # "<string>") or lives in a frozen stdlib module ("<frozen os>",
+            # "<frozen genericpath>", ...). We can't actually check these.
             continue
         with open(filepath) as f:
             content.append(f.read())

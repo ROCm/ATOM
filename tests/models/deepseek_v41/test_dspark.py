@@ -5,6 +5,8 @@ Every import here is plain torch, so a CPU-only runner checks all of it. The
 one case that needed a Triton kernel is `test_draft_attention.py`.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -123,3 +125,124 @@ def test_the_input_tap_pays_the_post_the_block_ahead_of_it_still_owes():
     assert torch.equal(
         draft._target_layer_input((settled,), None), torch.ones(tokens, hidden)
     )
+
+
+@pytest.mark.parametrize("runs_bf16", [True, False])
+def test_project_context_projects_only_the_kv_rows_of_a_bf16_wqkv_a(runs_bf16):
+    """A BF16 `wqkv_a` projects only its KV rows; an FP8 one projects both
+    halves and drops the query."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    pytest.importorskip("aiter", reason="the draft attention builds AITER layers")
+    from atom.models.deepseek_v41.dspark import DraftAttention
+
+    attention = object.__new__(DraftAttention)
+    torch.nn.Module.__init__(attention)
+    hidden, kv = torch.randn(3, 8), torch.randn(3, 4)
+    attention.wqkv_a = SimpleNamespace(runs_bf16=runs_bf16)
+    attention._wkv_shard = Mock(return_value=kv)
+    attention.project_qkv = Mock(return_value=(torch.randn(3, 2), kv))
+    attention.kv_norm = lambda x: 2 * x
+    attention.context_keys = Mock(return_value="keys")
+    assert attention.project_context(hidden, "positions", "rope") == "keys"
+    assert attention._wkv_shard.call_count == int(runs_bf16)
+    assert attention.project_qkv.call_count == int(not runs_bf16)
+    assert torch.equal(attention.context_keys.call_args.args[0], 2 * kv)
+
+
+def test_a_bf16_main_proj_takes_the_joined_taps_unquantized():
+    """Where `main_proj` runs in BF16 (no group32 FP8 GEMM), the taps reach it
+    joined and unquantized."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    model_cls = _draft_model()
+    model = object.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    main_proj = Mock(runs_bf16=True, return_value="projected")
+    model.mtp = [SimpleNamespace(main_proj=main_proj)]
+    taps = [torch.randn(3, 4, dtype=torch.bfloat16) for _ in range(3)]
+    assert model._project_taps(taps) == "projected"
+    (x,), kwargs = main_proj.call_args
+    assert torch.equal(x, torch.cat(taps, dim=-1)[None]) and not kwargs
+
+
+def test_lossless_sampling_arms_with_block_verification():
+    """V4.1 samples its block through the bound `draft_sampling`, so lossless
+    sampling may arm, and verifies a sampled request's drafts as one block."""
+    cls = _draft_model()
+    assert cls.supports_lossless_draft and cls.lossless_block_verify
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize("greedy", [False, True])
+@pytest.mark.parametrize("bound", [False, True])
+def test_the_block_head_takes_the_sampled_block_only_when_bound(bound, greedy, sharded):
+    """The sampled block where `draft_sampling` is bound and the pass is not
+    the greedy capture; otherwise the greedy block, sharded or not."""
+    cls = _draft_model()
+    model = SimpleNamespace(
+        draft_sampling="bound" if bound else None,
+        _sharded_markov_sample=lambda: sharded,
+        _head_and_sample_q=lambda *a: "sampled",
+        _head_and_sample_sharded=lambda *a: "greedy-sharded",
+        _head_and_sample=lambda *a: "greedy",
+    )
+    got = cls.head_and_sample(model, ("normed", "hc"), "anchors", 5, greedy=greedy)
+    if bound and not greedy:
+        assert got == "sampled"
+    else:
+        assert got == ("greedy-sharded" if sharded else "greedy")
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_the_sampled_block_feeds_the_confidence_head_its_w1_rows(monkeypatch, sharded):
+    """The sampled op hands back ids only; the confidence head still reads
+    W1[x_{k-1}] of the anchor and the drafts before each position. Sharded,
+    the block keeps this rank's slice of the head and names its shard."""
+    cls = _draft_model()
+    from atom.models.deepseek_v41 import dspark as v41_dspark
+
+    B, T, V, r, dim = 2, 3, 16, 4, 8
+    markov = DSparkMarkovHead(V, r)
+    seen = {}
+
+    def sample_block(base_logits, anchors, sampling, shard=None):
+        seen["block"] = (tuple(base_logits.shape), sampling, shard)
+        return torch.tensor([[1, 2, 3], [4, 5, 6]])
+
+    def confidence(hidden, embeds):
+        seen["embeds"] = embeds
+        return torch.zeros(B, T)
+
+    monkeypatch.setattr(markov, "sample_block", sample_block)
+    group = SimpleNamespace(world_size=2)
+    monkeypatch.setattr(v41_dspark, "get_tp_group", lambda: group)
+    monkeypatch.setattr(
+        v41_dspark.tgemm, "mm", lambda x, w: torch.zeros(x.shape[0], w.shape[0])
+    )
+    head = SimpleNamespace(
+        get_logits=lambda x: torch.zeros(x.shape[0], V),
+        weight=torch.zeros(V // 2, dim),
+        vocab_start_idx=V // 2,
+    )
+    model = SimpleNamespace(
+        head=head,
+        mtp=[SimpleNamespace(markov_head=markov, confidence_head=confidence)],
+        draft_sampling="bound",
+        _sharded_markov_sample=lambda: sharded,
+    )
+    ids, _ = cls._head_and_sample_q(
+        model, torch.zeros(B * T, dim), torch.zeros(B, T, dim), torch.tensor([7, 8])
+    )
+    assert torch.equal(ids, torch.tensor([[1, 2, 3], [4, 5, 6]]))
+    shape, sampling, shard = seen["block"]
+    assert sampling == "bound"
+    if sharded:
+        assert shape == (B, T, V // 2)
+        assert (shard.start, shard.group) == (V // 2, group)
+    else:
+        assert shape == (B, T, V) and shard is None
+    prev = torch.tensor([[7, 1, 2], [8, 4, 5]])
+    assert torch.equal(seen["embeds"], markov.markov_w1(prev))

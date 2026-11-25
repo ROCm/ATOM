@@ -322,7 +322,7 @@ SPUR_NIGHTLY = "10 16 * * *"
 SPUR_MORIIO = "10 4 * * *"
 # atomesh-benchmark.yaml's model root for the Spur lane.
 SPUR_MODEL_ROOT = "/data/junyyang/models"
-MORIIO_MODELS = ("DeepSeek-V3", "Kimi-K2.5-MXFP4", "Kimi-K3-MXFP4")
+MORIIO_MODELS = ("DeepSeek-V3", "DeepSeek-V4-Pro", "Kimi-K2.5-MXFP4", "Kimi-K3-MXFP4")
 
 
 def is_moriio(cell: dict) -> bool:
@@ -348,7 +348,7 @@ class MoriIOScheduleTest(unittest.TestCase):
 
     @classmethod
     def matrix(cls, schedule: str) -> list[dict]:
-        """Run the workflow's matrix step as that schedule would."""
+        """Run the workflow's matrix step as the given schedule would."""
         cells, _ = run_matrix_step(
             cls.matrix_script,
             dict(
@@ -378,13 +378,15 @@ class MoriIOScheduleTest(unittest.TestCase):
 
     def test_the_moriio_cron_has_a_concurrency_group_of_its_own(self):
         group = self.workflow["concurrency"]["group"]
-        groups = {
-            schedule: github_expressions(group, "schedule", schedule)
-            for schedule in (SPUR_NIGHTLY, SPUR_MORIIO)
-        }
-        self.assertEqual(len(set(groups.values())), 2)
         prefix = "Atomesh Benchmark-refs/heads/main-"
-        self.assertEqual(groups[SPUR_NIGHTLY], prefix + "schedule-atomesh-cicd-mi350")
+        self.assertEqual(
+            github_expressions(group, "schedule", SPUR_NIGHTLY),
+            prefix + "schedule-atomesh-cicd-mi350",
+        )
+        self.assertEqual(
+            github_expressions(group, "schedule", SPUR_MORIIO),
+            prefix + "schedule-atomesh-cicd-mi350-moriio",
+        )
         self.assertEqual(
             github_expressions(group, "push"), prefix + "push-atomesh-cicd"
         )

@@ -1186,35 +1186,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._checkpoint_slot_base_cache = None
         self._checkpoint_staging_cache = None
 
-    def warmup_per_req_cache(self) -> None:
-        """Run one checkpoint copy now, so the first real one is only a copy.
-
-        `execute_paged_state_copies` is reachable only from `build()`, so
-        everything it builds lazily -- the copy plan, the slot views, the slot
-        base table, the tiling's upload, the pinned descriptor, and the Triton
-        JIT of `_copy_tiles_kernel` -- otherwise lands inside the batch of
-        whichever request first crosses a rung. Hundreds of milliseconds, once,
-        on one unlucky request.
-
-        Slot 0 into the pool's first units. Both are real addresses, which is
-        the point: a warmup on scratch would compile a kernel and fill nothing.
-        The bytes it writes are read by nobody -- a KV block is written before
-        it is read, and this runs before any block has been handed out.
-        """
-        if self.model_runner.state_runtime.checkpoint_spec is None:
-            return
-        plan = self._checkpoint_copy_plan()
-        if not plan.num_spans:
-            return
-        units = self.model_runner.state_runtime.checkpoint_spec.units_per_checkpoint
-        staging = self._checkpoint_staging()
-        plan.write_descriptor(
-            staging.rows(0)[: plan.num_spans],
-            self._checkpoint_slot_bases()[:1],
-            self._page_unit_bases([list(range(units))]),
-        )
-        launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
-
     def _checkpoint_descriptor_device(self) -> torch.device:
         return self._kv_planes()[0].device
 

@@ -4,12 +4,12 @@
 //! selected for that session. A new session goes to the worker holding the
 //! fewest live sessions (load breaks ties); requests without a session ID use
 //! minimum-load balancing. A stale mapping is replaced when its worker is no
-//! longer healthy, the session has been idle for too long, or a request of the
-//! session failed with a server error or got no response. A failure counts
-//! only for a request placed on the session's current binding, on the worker it
-//! was sent to after DP rank mapping. Under ATOM PD idx2idx rank mapping, a
-//! failed prefill also releases the decode binding, although the decode was
-//! never sent.
+//! longer healthy or a candidate (another DP rank under idx2idx), the session
+//! has been idle for too long, or a request of the session failed with a server
+//! error or got no response. A failure counts only for a request placed on the
+//! session's current binding, on the worker it was sent to after DP rank
+//! mapping. Under ATOM PD idx2idx rank mapping, a failed prefill also releases
+//! the decode binding, although the decode was never sent.
 
 use std::{
     collections::HashMap,
@@ -285,7 +285,8 @@ impl LoadBalancingPolicy for DpStickyPolicy {
             return;
         }
         let identity = Self::worker_identity(worker);
-        // Without a reassignment, only rank mapping can move a pinned session.
+        // Without a reassignment, only rank mapping can move a pinned session: a request
+        // placed on an earlier binding returned above.
         let reason = assignment
             .reassigned
             .take()

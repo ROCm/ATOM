@@ -54,6 +54,7 @@ CARD = """## ATOM PR #9999 — a card
 **One-sentence summary that the review body does not need.**
 
 Review: ⚠️ NEEDS WORK
+Coverage: 2 files / 66 added lines -- within one review pass
 Validation (advisory): nothing ran here.
 
 ⚠️ atom/model_ops/moe.py:23 imports `_FLYDSL_USE_HERD` — **Author must** pin it.
@@ -401,6 +402,66 @@ def test_summary_carries_the_verdict_and_validation_lines(report, monkeypatch):
     assert "Review: ⚠️ NEEDS WORK" in body
     assert "Validation (advisory): nothing ran here." in body
     assert f"{_publish.BOT} review pr=9999 head=deadbeef" in body
+
+
+def test_summary_carries_the_coverage_verdict(report, monkeypatch):
+    """The coverage line must reach the posted review, not just card.md.
+
+    The gate reads card.md; build_review assembles what is posted. A verdict gated in
+    one copy and dropped from the other is a gate that reports success either way.
+    """
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    body = _publish.review_payload("9999")["body"]
+    assert (
+        "Coverage: 2 files / 66 added lines" in body
+    ), "the coverage verdict is computed and gated but never published"
+    # Above the findings: a reader who stops at the index must already know whether it
+    # is the whole diff or a sample of it.
+    assert body.index("Coverage:") < body.index("finding(s) posted inline")
+    # Some findings anchor here and some do not. The 0-of-N line belongs only to the
+    # all-or-nothing case: without this, `elif loose:` degrading to `if loose:` emits
+    # both blocks at once and every test stays green.
+    assert "could be anchored" not in body
+
+
+def test_the_coverage_line_publishes_as_the_card_writes_it(report, monkeypatch):
+    """The publisher must match the line the gate accepts, not a stricter form.
+
+    The gate matches on `strip().lower()`, and SKILL.md asks the card to carry
+    rules.txt's `  coverage: ...` line verbatim. The publisher must accept the same.
+    """
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    for written in (
+        "  coverage: 2 files / 66 added lines -- within one review pass",
+        "coverage: 2 files / 66 added lines -- within one review pass",
+        "   Coverage: 2 files / 66 added lines -- within one review pass",
+    ):
+        card = CARD.replace(
+            "Coverage: 2 files / 66 added lines -- within one review pass", written
+        )
+        (report / "card.md").write_text(card, encoding="utf-8")
+        body = _publish.review_payload("9999")["body"]
+        assert "2 files / 66 added lines" in body, f"dropped: {written!r}"
+
+
+def test_a_review_that_anchors_nothing_says_so(report, monkeypatch):
+    """0 of N anchored must be stated, not inferred from an absent block.
+
+    The summary names the anchored count only when there is one, so a review whose
+    findings all failed to anchor carried no inline comments and no notice of it.
+    """
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    unanchorable = CARD.replace(
+        "⚠️ atom/model_ops/moe.py:23 imports `_FLYDSL_USE_HERD` — **Author must** pin it.",
+        "⚠️ The workflow's cleanup step cannot fire — **Author must** drop the flag.",
+    ).replace("🔴 moe.py:22 and helper.py:7 — one of these citations was flagged.", "")
+    (report / "card.md").write_text(unanchorable, encoding="utf-8")
+    body = _publish.review_payload("9999")["body"]
+    assert "finding(s) posted inline" not in body
+    assert "0 of 2 finding(s) could be anchored" in body, (
+        "a review with findings and no anchors must say so -- silence reads as a "
+        "review that simply had nothing to attach"
+    )
 
 
 def test_card_md_is_not_rewritten(report, monkeypatch):

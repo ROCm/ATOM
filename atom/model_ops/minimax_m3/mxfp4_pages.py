@@ -92,3 +92,6 @@ class Mxfp4KvLayout:
             pool.field_view("k", layer, torch.uint8, shape),
             pool.field_view("v", layer, torch.uint8, shape),
         )
+
+    def head_runs(self, field, num_kv_heads):
+        return None
