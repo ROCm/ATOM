@@ -300,6 +300,83 @@ def test_the_ragged_gemm2_takes_up_to_4096_blocks_of_128(block_m, blocks, w8, ra
     assert calls == [(ragged, 3) if ragged else ("v2", block_m)]
 
 
+def test_the_moe_presort_needs_the_w2_copy_and_the_shape(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    registered = []
+    fused = ModuleType("aiter.fused_moe")
+    fused.register_presorted_moe = registered.append
+    monkeypatch.setitem(sys.modules, "aiter.fused_moe", fused)
+    ops = SimpleNamespace(
+        moe_sort=lambda ids, w, local: {"ids": ids},
+        MOE_SORT_MAX_TOKENS=32768,
+        moe_g2_w8_serves=lambda m, topk: True,
+    )
+    monkeypatch.setattr(T, "_K", ops)
+    layer = SimpleNamespace(w2_g2_weight=0, global_num_experts=128)
+    ids, w = torch.zeros(8192, 4, dtype=torch.int32), torch.zeros(8192, 4)
+    assert T.moe_presort(layer, ids, w, None) == {"ids": ids} == registered[-1]
+    assert T.moe_presort(layer, torch.zeros(32769, 4), w, None) is None
+    assert T.moe_presort(layer, torch.zeros(8192, 8), w, None) is None
+    other = SimpleNamespace(w2_g2_weight=0, global_num_experts=256)
+    assert T.moe_presort(other, ids, w, None) is None
+    assert T.moe_presort(SimpleNamespace(global_num_experts=128), ids, w, None) is None
+    monkeypatch.setattr(T, "_K", SimpleNamespace(moe_g2_w8_serves=ops.moe_g2_w8_serves))
+    assert T.moe_presort(layer, ids, w, None) is None  # an aiter without moe_sort
+    assert len(registered) == 1
+
+
+@pytest.mark.parametrize("taken", [True, False])
+def test_the_presort_tile_list_runs_only_where_aiter_took_the_presort(taken):
+    """The GEMM2 runs on moe_sort's tile list when fused_moe sorted with the presort,
+    and as moe_g2_w8 (its own prepass) when aiter ignored it."""
+    import functools
+    import sys
+    from types import ModuleType
+
+    from aiter_stub import atom_without_aiter
+
+    class Unset(SimpleNamespace):
+        def __getattr__(self, name):
+            return None
+
+    calls, m = [], 3
+    presort = {"sorted_token_ids": torch.zeros(128, dtype=torch.int32)}
+    presort.update(g2_tiles=torch.zeros(4), g2_ctl=torch.zeros(9))
+    sorted_ids = presort["sorted_token_ids"] if taken else torch.zeros(128)
+    fused = ModuleType("aiter.fused_moe")
+    fused._mxfp4_a4w4_stage2_fw = lambda *args, **kwargs: None
+    kernel = "flydsl_moe2_layout_afp4_wfp4_bf16_t128_reduce_persist_sbm128"
+    fused.fused_moe_prepare_stage2 = lambda *args, **kwargs: SimpleNamespace(
+        _stage2=functools.partial(fused._mxfp4_a4w4_stage2_fw, kernelName2=kernel),
+        _args=(None, torch.empty(2, 8, 4), sorted_ids, None, None, None, 4),
+        _kwargs={"block_m": 128, "w2_scale": None, "sorted_weights": None},
+        a2=torch.empty(1),
+        a2_scale=torch.empty(1),
+    )
+    fused._flydsl_v2_stage2_wrapper = lambda **kw: calls.append(("v2", 0))
+    fused.fused_moe_run_stage2 = lambda inputs, out: calls.append(("summed", 0))
+    ops = ModuleType("aiter.ops.m3_tp1_prefill")
+    ops.moe_g2_p6 = lambda *args: calls.append(("p6", args[9]))
+    ops.moe_g2_w8 = lambda *args: calls.append(("w8", args[9]))
+    ops.moe_g2_w8_serves = lambda m, topk: True
+    ops.moe_g2_w8_tiles = lambda *args: calls.append(("tiles", args[9]))
+    layer = Unset(w13_weight=torch.empty(2, 16, 4), w2_g2_weight=None)
+    x, routes = torch.zeros(m, 8), torch.empty(m, 4, 8)
+    with atom_without_aiter() as load, pytest.MonkeyPatch.context() as mp:
+        moe = load("atom.model_ops.moe")
+        tp1 = load("atom.model_ops.minimax_m3.tp1_prefill")
+        mp.setattr(tp1, "moe_presort", lambda *a: presort)
+        mp.setitem(sys.modules, "aiter.fused_moe", fused)
+        mp.setitem(sys.modules, "aiter.ops.m3_tp1_prefill", ops)
+        mp.setattr(load("aiter.ops"), "m3_tp1_prefill", ops, raising=False)
+        x4 = torch.zeros(m, 4)
+        args = (layer, x, x4, x4, None, None, None, routes, True)
+        assert moe.Mxfp4MoEMethod.apply_tp1_routes(Unset(), *args)
+    assert calls == [("tiles" if taken else "w8", m)]
+
+
 @pytest.fixture(scope="module")
 def model():
     return gpu_stack_import("atom.models.minimax_m3.model")
@@ -627,6 +704,7 @@ def moe_layer():
         w13_bias=None,
         w2_bias=None,
         expert_mask=None,
+        global_num_experts=128,
         activation=ActivationType.Swiglu,
         swiglu_limit=7.0,
         apply_router_weight_on_input=False,
@@ -729,7 +807,8 @@ def test_ragged_gemm2_route_rows_equal_the_v2_gemm2(dev, moe_layer, m, monkeypat
 
         monkeypatch.setattr(K, name, run)
 
-    names = [name for name in ("moe_g2_p6", "moe_g2_w8") if hasattr(K, name)]
+    ragged = ("moe_g2_p6", "moe_g2_w8", "moe_g2_w8_tiles")
+    names = [name for name in ragged if hasattr(K, name)]
     for name in names:
         spy(name)
     lay.w2_g2_weight, lay.w2_g2_scale = K.relayout_w2(*moe_layer.w2_raw)
