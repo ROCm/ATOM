@@ -177,6 +177,13 @@ class PublicationOwner:
             configured.append(group)
         return configured
 
+    def _current_stream_unchecked(self):
+        if self.device.type != "cuda":
+            return None
+        if torch.cuda.current_device() != self.device.index:
+            raise PublicationError("publication on the wrong device")
+        return torch.cuda.current_stream(self.device)
+
     def _current_stream(self):
         if self.device.type != "cuda":
             return None
@@ -194,8 +201,9 @@ class PublicationOwner:
         if self.device.type == "cuda":
             if torch.cuda.current_device() != self.device.index:
                 raise PublicationError("publication on the wrong device")
-            if torch.cuda.is_current_stream_capturing():
-                raise PublicationError("publish metadata before actual graph capture")
+            # Not capturing: `begin` / `resume` checked it for this epoch, on
+            # this thread and stream. Per call it is a stream-capture query,
+            # tens of us each in a serving process, ~10 times a decode step.
             if self._get_current_stream is not None:
                 same_stream = (
                     self._get_current_stream(self.device.index)[0] == self._stream_id
@@ -209,7 +217,13 @@ class PublicationOwner:
         """Wait for source reuse BEFORE producer writes; start a new epoch."""
         if self._state not in ("idle", "sealed"):
             raise PublicationError(f"cannot begin: owner is {self._state}")
-        stream = self._current_stream()
+        # The capture check is a stream-capture query to the runtime (tens of
+        # us in a serving process): every epoch while the runner starts up and
+        # captures, then one epoch in 256.
+        if self.epoch < 64 or self.epoch % 256 == 0:
+            stream = self._current_stream()
+        else:
+            stream = self._current_stream_unchecked()
         if self.completion is not None:
             # The caller records constructor uploads/slot clones before first use.
             try:

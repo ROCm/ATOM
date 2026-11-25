@@ -40,6 +40,7 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.triton_fast_launch import FastLaunch
 from atom.utils.decorators import mark_trace
 
 NEW_SEQUENCE = -1
@@ -143,7 +144,8 @@ def fill_deferred_decode_ids(
         "a step with no draft ids must feed exactly one token per request, "
         f"got max_tokens_per_seq={max_tokens_per_seq}"
     )
-    _fill_deferred_decode_ids_kernel[(bs + tail,)](
+    _fill_launch(
+        (bs + tail,),
         out,
         cu,
         src,
@@ -192,3 +194,6 @@ def fill_deferred_decode_ids_reference(
                 f"draft ids"
             )
             out[start + 1 : end] = draft_token_ids[row, : end - start - 1]
+
+
+_fill_launch = FastLaunch(_fill_deferred_decode_ids_kernel)

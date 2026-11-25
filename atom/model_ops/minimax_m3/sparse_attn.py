@@ -1414,8 +1414,14 @@ def sparse_pa_per_row(
     plan_step_owner=None,
     plan_cache_owner=None,
     quantized_direct: bool = True,
+    max_context_length: int | None = None,
 ) -> None:
     """Run one sparse selection per row, on ASM where it pays and PA decode else.
+
+    ``max_context_length``: an upper bound on every row's length when the caller
+    has one (a sliding window). It lets the split heuristic size the partitions
+    to the rows instead of the legacy cap of 8, which at a few rows of a few
+    thousand keys leaves each CTA 512 keys and most CUs idle.
 
     A row is a decode sequence or a prefill query token -- both are a length-1
     "sequence" with its own 16-page block_table + context_len, so both halves
@@ -1479,7 +1485,9 @@ def sparse_pa_per_row(
 
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
-    max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
+    max_context_partition_num = get_recommended_splits(
+        num_seqs, num_kv_heads_view, max_context_length=max_context_length
+    )
     plan_workgroup_budget = None
     if (
         quantized_output is not None

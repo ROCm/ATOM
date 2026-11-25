@@ -217,7 +217,35 @@ class AsyncIOProc:
         runner_class = resolve_obj_by_qualname(runner_qualname)
         self.runners: list[object] = []
         self.runners = [runner_class(rank, *args, **kwargs)]
+        self._bind_early_output_sink()
         self.busy_loop()
+
+    def _bind_early_output_sink(self) -> None:
+        """Early output: give the runner of the rank that answers (the
+        one with a primary output address) a way to send a forward's output
+        before the forward returns.
+
+        Sent from the calling (main) thread on a PUSH socket of its own,
+        connected to the same PULL the output thread feeds: handing the object
+        to that thread instead leaves it waiting for the GIL, which the main
+        thread -- still running the forward -- drops only every switch
+        interval (5 ms). The manager reads both connections through its one
+        socket; at most one forward is outstanding, and nothing else is sent
+        before its output is read, so the order it sees is unchanged.
+        """
+        if self.io_addrs[1] is None:
+            return
+        ctx = zmq.Context()
+        socket = make_zmq_socket(ctx, self.io_addrs[1], zmq.PUSH, linger=4000)
+        self._early_output_ctx = ctx
+        self._early_output_socket = socket
+
+        def sink(obj) -> None:
+            socket.send(pickle.dumps(obj))
+
+        for runner in self.runners:
+            if hasattr(runner, "early_output_sink"):
+                runner.early_output_sink = sink
 
     def exit(self):
         if not getattr(self, "still_running", True):

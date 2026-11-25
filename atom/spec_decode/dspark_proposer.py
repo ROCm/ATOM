@@ -7,6 +7,7 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.model_ops.triton_fast_launch import FastLaunch
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
@@ -39,6 +40,10 @@ def _stage_anchors_kernel(
     tl.store(positions_out + i, tl.load(positions + row, mask=real, other=0))
 
 
+# Per-request ids and positions only.
+_stage_anchors_launch = FastLaunch(_stage_anchors_kernel, small_tensors=True)
+
+
 class DSparkProposer(Drafter):
     """DSpark block-parallel drafter (sibling of ``EagleProposer``).
 
@@ -62,6 +67,11 @@ class DSparkProposer(Drafter):
         self._verify_scheduler = (
             VerifyScheduler(runner) if self._confidence_schedule else None
         )
+        # The verify scheduler is the confidence head's only consumer: without
+        # it the head's launches (concat, GEMV, sigmoid, the output copy) are
+        # dead work in every draft pass. Set before any warmup or capture.
+        if hasattr(self.model, "emit_confidence"):
+            self.model.emit_confidence = self._confidence_schedule
         # The draft shares the target's block tables and its KV lives in the same
         # paged pool, so it inherits the pool's DCP sharding: the block pass must
         # address and size itself in LOCAL (per-rank) terms. 1 when -dcp is unset.
@@ -168,15 +178,22 @@ class DSparkProposer(Drafter):
             self.draft_tokens_per_seq,
         )
 
-    def _stage_anchors(self, running_bs, next_token_ids, positions, rows):
+    def _stage_anchors(self, running_bs, next_token_ids, positions, rows, defer=False):
         """Each request's anchor token and position, written straight into the
-        block's fixed inputs at the padded batch, so `stage` copies nothing."""
+        block's fixed inputs at the padded batch, so `stage` copies nothing.
+
+        ``defer``: leave the writes to the one-launch block metadata
+        (`_build_paged_block_metadata`), which stages them as it reads them."""
         ids = self.block.buffer("anchor_ids", running_bs)
         anchor_positions = self.block.buffer("anchor_positions", running_bs)
         scheduled_bs = next_token_ids.shape[0]
         vocab_max = int(self.model.vocab_size) - 1
-        if ids.is_cuda:
-            _stage_anchors_kernel[(running_bs,)](
+        self._deferred_anchors = None
+        if defer and ids.is_cuda:
+            self._deferred_anchors = (ids, next_token_ids, positions, rows, vocab_max)
+        elif ids.is_cuda:
+            _stage_anchors_launch(
+                (running_bs,),
                 ids,
                 anchor_positions,
                 next_token_ids,
@@ -193,6 +210,23 @@ class DSparkProposer(Drafter):
             anchor_positions[:scheduled_bs] = positions[rows[:scheduled_bs]]
         return self.block.stage(
             running_bs, {"anchor_ids": ids, "anchor_positions": anchor_positions}
+        )
+
+    _deferred_anchors = None
+
+    def _anchors_in_metadata(self, forward_context) -> bool:
+        """Whether this step's anchors are staged by the one-launch block
+        metadata rather than by their own launch: the paged block of a
+        non-MLA draft without DCP whose pool is bound (the same conditions
+        under which `_build_paged_block_metadata` takes that launch)."""
+        model = self.model
+        return (
+            self._with_draft
+            and not model.block_attention_is_mla
+            and self.dcp_world_size == 1
+            and getattr(model, "prepare_paged_block_fused", None) is not None
+            and getattr(model, "block_size", None) == self.runner.block_size
+            and self._bound_draft_k_cache(forward_context) is not None
         )
 
     def _block_positions(self, running_bs, anchor_positions):
@@ -634,15 +668,90 @@ class DSparkProposer(Drafter):
             return
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
-        # One block when every tap was relayed from earlier PP stages.
-        if len(aux_hidden_states) == 1:
-            main_hidden_all = aux_hidden_states[0]
-        else:
-            main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
-        with record_function(
-            f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
-        ):
+        rows = aux_hidden_states[0].shape[0]
+        with record_function(f"draft_kv[bs={scheduled_bs} tok={rows}]"):
+            if self._context_graph_run(forward_context, aux_hidden_states, positions):
+                return
+            # One block when every tap was relayed from earlier PP stages.
+            if len(aux_hidden_states) == 1:
+                main_hidden_all = aux_hidden_states[0]
+            else:
+                main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
             self.model.write_context_kv(main_hidden_all, positions)
+
+    # Decode steps' context K/V write as a CUDA graph a row count: it is a
+    # dozen launches issued from Python every step (the host's issue time is on
+    # the bs1 step's critical path), and its inputs can be put at fixed
+    # addresses: the aux taps (concatenated into a static buffer, which replaces
+    # the eager concat), the positions and the slot mapping (copied in).
+    _CONTEXT_GRAPH_MAX_ROWS = 64
+
+    def _context_graph_run(self, forward_context, aux, positions) -> bool:
+        model = self.model
+        if (
+            not getattr(model, "context_kv_graphable", False)
+            or not envs.ATOM_DRAFT_CUDAGRAPH
+        ):
+            return False
+        context = forward_context.context
+        rows = aux[0].shape[0]
+        if (
+            context.is_prefill
+            or context.is_dummy_run
+            or not 0 < rows <= self._CONTEXT_GRAPH_MAX_ROWS
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        slot_mapping = forward_context.attn_metadata.slot_mapping
+        if slot_mapping is None or slot_mapping.shape[0] < rows:
+            return False
+        st = getattr(self, "_ctx_static", None)
+        if st is None:
+            width = sum(a.shape[-1] for a in aux)
+            n = self._CONTEXT_GRAPH_MAX_ROWS
+            st = self._ctx_static = {
+                "aux": torch.empty(n, width, dtype=aux[0].dtype, device=aux[0].device),
+                "pos": torch.empty(n, dtype=positions.dtype, device=positions.device),
+                "slot": torch.empty(
+                    n, dtype=slot_mapping.dtype, device=slot_mapping.device
+                ),
+                "graphs": {},
+                "warm": set(),
+                "pool": None,
+            }
+        if (
+            st["aux"].shape[-1] != sum(a.shape[-1] for a in aux)
+            or st["pos"].dtype != positions.dtype
+            or st["slot"].dtype != slot_mapping.dtype
+        ):
+            return False
+        aux_st, pos_st, slot_st = st["aux"][:rows], st["pos"][:rows], st["slot"][:rows]
+        if len(aux) == 1:
+            aux_st.copy_(aux[0])
+        else:
+            torch.cat(aux, dim=-1, out=aux_st)
+        pos_st.copy_(positions[:rows])
+        slot_st.copy_(slot_mapping[:rows])
+        graph = st["graphs"].get(rows)
+        if graph is not None:
+            graph.replay()
+            return True
+        if rows not in st["warm"]:
+            # First call at this row count: eager, through the static buffers
+            # (pays the per-shape JIT outside any capture).
+            st["warm"].add(rows)
+            model.write_context_kv(aux_st, pos_st, slot_mapping=slot_st)
+            return True
+        graph = torch.cuda.CUDAGraph()
+        if st["pool"] is None:
+            st["pool"] = torch.cuda.graph_pool_handle()
+        with torch.cuda.graph(
+            graph, pool=st["pool"], capture_error_mode="thread_local"
+        ):
+            model.write_context_kv(aux_st, pos_st, slot_mapping=slot_st)
+        st["graphs"][rows] = graph
+        graph.replay()  # this step's write: capture records, it does not run
+        return True
 
     def propose(
         self,
@@ -706,7 +815,11 @@ class DSparkProposer(Drafter):
         # slice past the end truncates rather than raising, so the kernels got
         # a slot table shorter than their own grid and read past it.
         staged = self._stage_anchors(
-            running_bs, next_token_ids, target_positions, last_token_indices
+            running_bs,
+            next_token_ids,
+            target_positions,
+            last_token_indices,
+            defer=self._anchors_in_metadata(forward_context),
         )
 
         if self._with_draft:
@@ -823,13 +936,16 @@ class DSparkProposer(Drafter):
         attn_metadata.causal = False
 
         # Filled for the PADDED batch: the backbone runs the pad rows too, so
-        # they need positions to embed and rotate.
+        # they need positions to embed and rotate (here, or by the one-launch
+        # metadata below).
         block_positions = self._blk_positions[:running_bs]
-        torch.add(
-            anchor_positions.view(running_bs, 1),
-            self._blk_offsets.view(1, T),
-            out=block_positions,
-        )
+
+        def fill_block_positions():
+            torch.add(
+                anchor_positions.view(running_bs, 1),
+                self._blk_offsets.view(1, T),
+                out=block_positions,
+            )
 
         # q_out dtype for the draft's MLA decode, ahead of the dummy return
         # below because that pass needs it just as much: MLA allocates q_out
@@ -855,12 +971,62 @@ class DSparkProposer(Drafter):
             # that returns here while the pool IS bound leaves the block
             # writing its KV through the last real step's slots. See
             # `_bound_draft_k_cache`.
+            fill_block_positions()
             return
 
         block_tables = self.runner.forward_vars["block_tables"].gpu[:running_bs]
         slots = self._blk_slots[: running_bs * T].view(running_bs, T)  # stable
         # Each request's KV spans [0, anchor] (context) ++ the T block rows.
         ctx_lens = self._blk_ctx_lens[:running_bs]  # stable
+        allocated_pages = block_table_state(
+            self.runner.forward_vars["block_tables"]
+        ).lengths
+        deferred, self._deferred_anchors = self._deferred_anchors, None
+        fused = getattr(self.model, "prepare_paged_block_fused", None)
+        if (
+            fused is not None
+            and not self.model.block_attention_is_mla
+            and self.dcp_world_size == 1
+            and fused(
+                attn_metadata,
+                block_tables,
+                anchor_positions,
+                self._blk_offsets,
+                block_positions,
+                slots,
+                ctx_lens,
+                allocated_pages,
+                scheduled_bs,
+                pad_ctx_len=self._paged_pad_ctx_len,
+                block_size=block_size,
+                stage=deferred,
+            )
+        ):
+            # Positions, slots, context lengths and the model's page-16 rows in
+            # one launch; the MLA decode's `kv_indptr` / `kv_indices` are not
+            # read by a per-row MHA decode, so they are not built.
+            attn_metadata.slot_mapping = slots.view(-1)
+            attn_metadata.block_tables = block_tables
+            attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: running_bs + 1]
+            attn_metadata.context_lens = ctx_lens
+            attn_metadata.max_seqlen_q = T
+            attn_metadata.max_seqlen_k = max_seqlen_k
+            return
+        if deferred is not None:
+            # Declined after all: stage the anchors here.
+            ids, next_token_ids, positions, rows, vocab_max = deferred
+            _stage_anchors_launch(
+                (running_bs,),
+                ids,
+                anchor_positions,
+                next_token_ids,
+                positions,
+                rows,
+                scheduled_bs,
+                vocab_max,
+                num_warps=1,
+            )
+        fill_block_positions()
         global_lens = anchor_positions + (1 + T)
         if self.dcp_world_size > 1:
             # DCP shards KV token-wise round-robin: one block table entry covers

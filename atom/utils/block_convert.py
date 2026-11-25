@@ -179,6 +179,10 @@ def kv_indices_generate_kernel(
     tl.store(output_ptr + out_start + out_pos, expanded_vals, mask=store_mask)
 
 
+# `kv_indices_generate_triton`'s launcher, made on first use (`FastLaunch`).
+_kv_indices_launch = None
+
+
 def kv_indices_generate_triton(
     block_tables, kv_indices_convert, kv_indptr_convert, ratio, max_ctx_len
 ):
@@ -200,12 +204,18 @@ def kv_indices_generate_triton(
 
     grid = (triton.cdiv(max_num_blocks, blocks_per_tile), bs)
 
-    kv_indices_generate_kernel[grid](
+    global _kv_indices_launch
+    if _kv_indices_launch is None:
+        from atom.model_ops.triton_fast_launch import FastLaunch
+
+        _kv_indices_launch = FastLaunch(kv_indices_generate_kernel)
+    _kv_indices_launch(
+        grid,
         block_tables,
         kv_indices_convert,
         kv_indptr_convert,
-        n_cols,
-        ratio,
+        n_cols=n_cols,
+        ratio=ratio,
         BLOCKS_PER_TILE=blocks_per_tile,
         RATIO_PAD=ratio_pad,
     )

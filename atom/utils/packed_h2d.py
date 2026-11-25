@@ -5,6 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils import hip_copy
+
 
 @triton.jit
 def scatter_packed_bytes(arena, destinations, BLOCK: tl.constexpr):
@@ -80,8 +82,10 @@ class PackedCopy:
             if len(self.prefixes) == 4:
                 del self.prefixes[next(iter(self.prefixes))]
             self.prefixes[offset] = prefix
-        # Header and payload share this single asynchronous H2D.
-        prefix[1].copy_(prefix[0], non_blocking=True)
+        # Header and payload share this single asynchronous H2D: a plain
+        # memcpy, the arena is persistent (`hip_copy`).
+        if not hip_copy.copy_async(prefix[1], prefix[0], hip_copy.H2D):
+            prefix[1].copy_(prefix[0], non_blocking=True)
         grid = (len(self.members), (largest + 1023) // 1024, 1)
         if self.kernel is None:
             self.kernel = self.launch[grid](self.device, self.destinations, BLOCK=1024)

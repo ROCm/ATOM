@@ -1758,6 +1758,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # Inherited as True from the MHA builder, which made `EagleProposer` pass
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
+    # Reads the previous verdict's bonus counts on the host (state rollback).
+    shifts_spec_metadata_on_device = False
 
     def _uses_paged_checkpoints(self) -> bool:
         """PAGE image for the Qwen GDN/MHA family; fork otherwise.

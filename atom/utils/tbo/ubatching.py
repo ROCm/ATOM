@@ -169,7 +169,9 @@ def sync_dp_metadata(
     tbo_fields = 9 if tbo_on else 5
     dspark_on = max_seqlen_q is not None
     n_fields = tbo_fields + (1 if dspark_on else 0)
-    local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
+    # NumPy for the local row: a group of one (every TP-only decode step) needs
+    # no tensor, and per-element torch writes cost microseconds each.
+    local = np.zeros(n_fields, dtype=np.int32)
     local[0] = scheduled_tokens
     local[1] = scheduled_bs
     local[2] = 1 if is_prefill else 0
@@ -184,14 +186,17 @@ def sync_dp_metadata(
         local[tbo_fields + 0] = max_seqlen_q
 
     # A group of one is its own row, with nothing to exchange.
-    gathered = [local]
     if dp_size > 1:
         gathered = [
             torch.empty(n_fields, dtype=torch.int32, device="cpu")
             for _ in range(dp_size)
         ]
-        torch.distributed.all_gather(gathered, local, group=dp_group)
-    sync = torch.stack(gathered, dim=1).numpy()  # [n_fields, dp_size]
+        torch.distributed.all_gather(
+            gathered, torch.from_numpy(local), group=dp_group
+        )
+        sync = torch.stack(gathered, dim=1).numpy()  # [n_fields, dp_size]
+    else:
+        sync = local.reshape(n_fields, 1)
 
     scheduled_tokens_per_dp_rank = sync[0]
     np.copyto(running_tokens_per_dp_rank, scheduled_tokens_per_dp_rank)

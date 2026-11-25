@@ -240,6 +240,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     # EagleProposer fuses the per-draft-step position bump into
     # prepare_mtp_decode's kernel when this is set (block-paged MHA draft).
     fuse_mtp_decode_position_update = True
+    # A deferred speculative decode may build this builder's metadata before
+    # the previous verdict is in: `stage_decode` derives every length from
+    # `verify_ctx_lens` and `shift_spec_metadata_on_device` redoes exactly that
+    # on the device. A subclass that reads the verdict on the host otherwise
+    # sets it False.
+    shifts_spec_metadata_on_device = True
 
     def __init__(
         self,
@@ -1132,6 +1138,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         running_tokens: int,
         max_seqlen_q: int,
     ) -> None:
+        # Async verdict: the lengths were laid out at the reservation; take
+        # the previous verdict's rejected counts off on the device before
+        # anything below reads them.
+        self.shift_spec_metadata_on_device(
+            attn_metadata, batch.total_seqs_num_decode, running_bs, max_seqlen_q
+        )
         super().finish_decode(
             batch, attn_metadata, running_bs, running_tokens, max_seqlen_q
         )
@@ -1169,6 +1181,36 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
+
+    def shift_spec_metadata_on_device(
+        self, attn_metadata, scheduled_bs: int, running_bs: int, max_seqlen_q: int
+    ) -> None:
+        """Async verdict: when this step's verdict take is still owed
+        (`tokenIDProcessor._status_pending`), shift the uploaded decode
+        metadata by the previous step's rejected counts on the device."""
+        tp = self.model_runner.tokenID_processor
+        locs = tp._pending_locs if getattr(tp, "_status_pending", False) else None
+        # `stage_decode` shifts only a verify window (`max_seqlen_q > 1`).
+        if locs is None or len(locs.deferred_curr) == 0 or max_seqlen_q <= 1:
+            return
+        from atom.model_ops.spec_decode_shift import shift_decode_metadata
+
+        var = self.model_runner.forward_vars
+        shift_decode_metadata(
+            decode_src=tp.decode_src.gpu,
+            rejected=tp.prev_spec_counts_gpu[1],
+            cu_seqlens_q=var["cu_seqlens_q"].gpu,
+            block_tables=attn_metadata.block_tables,
+            context_lens=attn_metadata.context_lens,
+            positions=var["positions"].gpu,
+            slot_mapping=attn_metadata.slot_mapping,
+            kv_indptr=attn_metadata.kv_indptr,
+            bs=scheduled_bs,
+            running_bs=running_bs,
+            max_q=max_seqlen_q,
+            page_size=self.model_runner.block_size,
+            kv_block_size=self.block_size,
+        )
 
     def finish_ubatch(
         self,

@@ -65,6 +65,7 @@ from atom.model_ops.layernorm import (
     fused_allreduce_gemma_rms_norm_mxfp8_quant,
 )
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
+from atom.model_ops.embed_head import VocabParallelEmbedding, masked_embedding
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
@@ -159,6 +160,10 @@ def _draft_quant_config(config) -> QuantizationConfig:
             f"{spec.quant_dtype})."
         )
     return draft_qc
+
+
+# Pinned staging slots for the pages each request holds; see `_alloc_block_rows`.
+_ALLOC_RING = 4
 
 
 def _page16_table(
@@ -303,6 +308,8 @@ class M3DSparkAttention(nn.Module):
             rope_scaling=None,
         )
         self.kv = KVCacheBinding(layer_num)
+        # 0: every block row attends the whole context (see `_window_rows`).
+        self.sliding_window = int(getattr(config, "sliding_window", 0) or 0)
 
     def _bound_cache(self):
         """This layer's KV cache in the layout every access of it uses.
@@ -356,6 +363,13 @@ class M3DSparkAttention(nn.Module):
             return
         qkv = linear_out(self.qkv_proj(ctx_hidden))
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        self._norm_rope_write(k, k, v, 0, positions, slot_mapping, cache)
+
+    def write_context_kv_rows(self, k, v, positions, slot_mapping) -> None:
+        """``write_context_kv`` from K/V already projected (``ContextKV``)."""
+        cache = self._bound_cache()
+        if cache is None:
+            return
         self._norm_rope_write(k, k, v, 0, positions, slot_mapping, cache)
 
     def forward(
@@ -416,6 +430,16 @@ class M3DSparkAttention(nn.Module):
             output=out,
             k_scale=ks16,
             v_scale=vs16,
+            # Every layer of the pass reads the same rows and lengths: one plan
+            # refresh per pass (the target's decode layers do the same).
+            plan_step_owner=md,
+            # A row reads at most the window, the page-16 start rounding and
+            # the block: the splits follow that instead of the legacy cap.
+            max_context_length=(
+                self.sliding_window + ASM_PAGE_SIZE + int(md.max_seqlen_q)
+                if self.sliding_window
+                else None
+            ),
         )
         return out.view(rows, -1)
 
@@ -505,6 +529,95 @@ class M3DSparkDecoderLayer(nn.Module):
         )
         return self.mlp(hidden_states, x_scale=x_scale), residual
 
+    def forward_mono(self, positions, hidden_states, residual, normed, next_norm, next_mxfp8):
+        """``_forward_fused_ar`` as two launches around the production paged attention where they serve the
+        call (``dspark_draft_mono.py``): qkv + q/k norm + RoPE + K/V cache write, then o_proj -> all-reduce +
+        norm -> MLP -> all-reduce + ``next_norm`` (the next layer's input norm, its MXFP8 output with
+        ``next_mxfp8``, or the final norm). ``normed``: ``(x, x_scale, residual)`` when the previous layer's
+        launch already all-reduced and normed this layer's input.
+
+        Returns ``(hidden, residual, normed)``: ``normed`` is set when the launches ran (the next layer's input,
+        or the final normed hidden); otherwise ``hidden`` is the TP-partial MLP output, as
+        ``_forward_fused_ar`` returns it."""
+        from atom.model_ops import dspark_draft_mono as mono
+        from atom.model_ops.blockscale import quantize_fp8
+
+        x_scale = None
+        if normed is not None:
+            hidden_states, x_scale, residual = normed
+        elif residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, x_scale, residual = _ar_norm(
+                hidden_states, residual, self.input_layernorm, self.self_attn.qkv_proj
+            )
+        attn = self.self_attn
+        rows = hidden_states.shape[0]
+        cache = attn._bound_cache()
+        if mono.usable(self, rows, cache):
+            md = get_forward_context().attn_metadata
+            if x_scale is None:
+                # what the qkv projection does with a bf16 input
+                hidden_states, x_scale = quantize_fp8(hidden_states)
+            q = mono.pre_launch(attn, hidden_states, x_scale, positions, md.slot_mapping, cache)
+            if q is not None:
+                o = None
+                if mono.pa_usable(
+                    getattr(self, "dspark_window", 0),
+                    rows,
+                    getattr(md, "dspark_bt16_rows", None),
+                    getattr(md, "dspark_ctx_rows", None),
+                ):
+                    o = mono.pa_launch(
+                        q, cache, md.dspark_bt16_rows, md.dspark_ctx_rows, attn.scaling
+                    )
+                if o is None:
+                    o = attn._block_attention_paged(q.view(rows, -1), md, cache)
+                o = o.view(rows, -1)
+                if mono.POST_FUSES_OPROJ:
+                    out = mono.post_launch(
+                        o,
+                        attn.o_proj,
+                        self.mlp,
+                        residual,
+                        self.post_attention_layernorm,
+                        next_norm,
+                        next_mxfp8,
+                    )
+                    if out is not None:
+                        return None, out[2], out
+                hidden_states = linear_out(attn.o_proj(o))
+                hidden_states, x_scale, residual = _ar_norm(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm,
+                    self.mlp.gate_up_proj,
+                )
+                out = mono.mlp_launch(
+                    hidden_states, x_scale, self.mlp, residual, next_norm, next_mxfp8
+                )
+                if out is not None:
+                    return None, out[2], out
+                self.mlp.fuse_swiglu_mxfp8 = self._swiglu_mxfp8 and _draft_fuse_rows(
+                    hidden_states.shape[0]
+                )
+                return self.mlp(hidden_states, x_scale=x_scale), residual, None
+        hidden_states = attn(positions, hidden_states, x_scale=x_scale)
+        return self._mlp_half(hidden_states, residual)
+
+    def _mlp_half(self, hidden_states, residual):
+        hidden_states, x_scale, residual = _ar_norm(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm,
+            self.mlp.gate_up_proj,
+        )
+        self.mlp.fuse_swiglu_mxfp8 = self._swiglu_mxfp8 and _draft_fuse_rows(
+            hidden_states.shape[0]
+        )
+        return self.mlp(hidden_states, x_scale=x_scale), residual, None
+
 
 class MiniMaxM3DSpark(DSparkDraftModel):
     """Top-level standalone DSpark draft for MiniMax-M3.1 (GQA backbone +
@@ -541,14 +654,19 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         self.markov_rank = int(config.dspark_markov_rank)
         self.vocab_size = int(config.vocab_size)
 
-        # Replicated: the aux hidden states arrive replicated, and the
-        # checkpoint keeps this projection BF16 (an ignored layer).
-        self.fc = ReplicatedLinear(
+        # The checkpoint keeps this projection BF16 (an ignored layer). The aux
+        # hidden states arrive replicated; under ATOM_DSPARK_FUSED_AR each rank
+        # reduces its quarter of K and the context norm all-reduces the partial
+        # sums (`project_context`), so a rank reads a quarter of the weight.
+        self._fc_partial = _draft_fused_ar()
+        fc_kind = RowParallelLinear if self._fc_partial else ReplicatedLinear
+        self.fc = fc_kind(
             self.hidden_size * len(self.target_layer_ids),
             self.hidden_size,
             bias=False,
             quant_config=None,
             prefix="fc",
+            **({"reduce_results": False} if self._fc_partial else {}),
         )
         self.hidden_norm = GemmaRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.layers = nn.ModuleList(
@@ -567,11 +685,17 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         self.markov_head = DSparkMarkovHead(self.vocab_size, self.markov_rank)
         # 0 or absent: every block row attends the whole context.
         self.sliding_window = int(getattr(config, "sliding_window", 0) or 0)
+        for layer in self.layers:
+            # the block attention launch bounds a row's keys by the window (dspark_draft_mono.pa_usable)
+            layer.dspark_window = self.sliding_window
         self.confidence_head = (
             DSparkConfidenceHead(self.hidden_size, self.markov_rank, bias=True)
             if getattr(config, "enable_confidence_head", False)
             else None
         )
+        # Whether `head_and_sample` computes the confidence head; the proposer
+        # clears it when nothing consumes the confidence (no verify scheduler).
+        self.emit_confidence = True
 
         # Bound by share_with_target(); the checkpoint ships neither.
         self.embed_tokens = None
@@ -610,21 +734,115 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         the last one through the target's final norm instead (the NeMo recipe's
         post-norm feature) dropped GSM8K acceptance from 51% to 39%.
         """
-        return self.hidden_norm(linear_out(self.fc(aux_concat)))
+        if not self._fc_partial:
+            return self.hidden_norm(linear_out(self.fc(aux_concat)))
+        k, r = self.fc.input_size, self.fc.tp_rank
+        part = linear_out(self.fc(aux_concat[:, r * k : (r + 1) * k].contiguous()))
+        if _draft_fuse_rows(part.shape[0]):
+            hidden, _ = fused_allreduce_gemma_rms_norm(
+                part, torch.zeros_like(part), self.hidden_norm
+            )
+            return hidden
+        return self.hidden_norm(tensor_model_parallel_all_reduce(part))
 
     @property
     def context_layers(self):
         return self.layers
+
+    def _context_kv(self):
+        """Every layer's context K/V as one GEMM (dspark_context_kv.py), built
+        on first use from the processed weights; None (per-layer path) unless
+        the fused-QKV linears are preshuffled MXFP8 1x32."""
+        ckv = getattr(self, "_ckv", False)
+        if ckv is False:
+            ckv = None
+            lins = [layer.self_attn.qkv_proj for layer in self.layers]
+            if all(
+                getattr(lin, "native_a8_group_rows", None) == 1
+                and getattr(lin.weight, "is_shuffled", False)
+                for lin in lins
+            ):
+                from atom.model_ops.dspark_context_kv import ContextKV
+
+                a = self.layers[0].self_attn
+                ckv = ContextKV(lins, a.q_size, a.kv_size)
+            self._ckv = ckv
+        return ckv
+
+    def _context_kv_write(self):
+        """Every layer's context K/V into its cache in one launch
+        (dspark_context_kv.ContextKVWrite), built once the pool is bound; None
+        (a launch a layer) unless the layers' caches are one pool's alike,
+        equally spaced views."""
+        bound = self.layers[0].self_attn.kv.k_cache
+        key = bound.data_ptr() if bound.numel() else None
+        w = getattr(self, "_ckv_write", False)
+        if w is False or self._ckv_write_key != key:
+            from atom.model_ops.dspark_context_kv import ContextKVWrite
+
+            attns = [layer.self_attn for layer in self.layers]
+            caches = [a._bound_cache() for a in attns]
+            if any(c is None for c in caches):
+                return None  # the pool is not bound yet: decide later
+            # Rebuilt whenever the pool is (re)bound: it holds layer 0's views.
+            w = self._ckv_write = ContextKVWrite.build(attns, caches)
+            self._ckv_write_key = key
+        return w
+
+    # The proposer may capture `write_context_kv` (with an explicit slot
+    # mapping) in a CUDA graph for decode steps.
+    context_kv_graphable = True
+
+    def write_context_kv(self, aux_concat, positions, slot_mapping=None) -> None:
+        """The base's absorb, with every layer's K/V projected in one GEMM
+        (bit-identical per column to the per-layer fused-QKV GEMMs).
+        ``slot_mapping``: the rows' cache slots; None reads the target
+        forward's from the forward context."""
+        from atom.utils.forward_context import get_forward_context
+
+        if get_forward_context().context.is_dummy_run:
+            return
+        ctx_hidden = self.project_context(aux_concat)
+        ckv = self._context_kv()
+        kv = ckv(ctx_hidden) if ckv is not None else None
+        if slot_mapping is None:
+            slot_mapping = get_forward_context().attn_metadata.slot_mapping[
+                : ctx_hidden.shape[0]
+            ]
+        if kv is None:
+            for layer in self.layers:
+                layer.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
+            return
+        writer = self._context_kv_write()
+        if writer is not None:
+            writer(kv, positions, slot_mapping)
+            return
+        for i, layer in enumerate(self.layers):
+            a = layer.self_attn
+            o = i * 2 * a.kv_size
+            layer.self_attn.write_context_kv_rows(
+                kv[:, o : o + a.kv_size],
+                kv[:, o + a.kv_size : o + 2 * a.kv_size],
+                positions,
+                slot_mapping,
+            )
 
     def _alloc_block_rows(self, P: int, T: int, device) -> None:
         """The first call is the warmup, ahead of any capture: these addresses
         are the ones every recording bakes in."""
         max_bs = self.max_num_seqs
         self._alloc = torch.zeros(max_bs, dtype=torch.int32, device=device)
-        self._alloc_host = torch.zeros(max_bs, dtype=torch.int32, pin_memory=True)
-        # Recorded after each copy out of `_alloc_host`; a fresh event has
-        # nothing to wait for.
-        self._alloc_copied = torch.cuda.Event()
+        # Pinned staging, a ring of _ALLOC_RING: the host can run ahead of the
+        # device, so a slot is rewritten only once its copy has read it, and
+        # with a ring that copy is steps old -- the wait on its event returns
+        # at once rather than syncing on the step just issued.
+        self._alloc_host = torch.zeros(
+            _ALLOC_RING, max_bs, dtype=torch.int32, pin_memory=True
+        )
+        # Recorded after each copy out of a slot; a fresh event has nothing to
+        # wait for.
+        self._alloc_copied = [torch.cuda.Event() for _ in range(_ALLOC_RING)]
+        self._alloc_slot = 0
         # One row of slack past the last request: `_window_rows` reads every
         # row as a P-wide window of this buffer.
         self._bt16_flat = torch.zeros(
@@ -670,23 +888,9 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         is allocated): their draft rows simply miss a few of their own keys.
         """
         running_bs, T = block_positions.shape
-        P = PAGES_PER_SPARSE_BLOCK * block_tables.shape[1]
-        if self._bt16 is None or self._bt16.shape[1] != P:
-            self._alloc_block_rows(P, T, block_tables.device)
-
-        # Allocated tokens per request. At least one page: the warmup batch and
-        # the pad tail address page 0 by convention. The host can run a step
-        # ahead of the device, so the previous step's copy must have read the
-        # pinned buffer before it is rewritten.
-        self._alloc_copied.synchronize()
-        pages = self._alloc_host.numpy()[:running_bs]
-        n = min(len(allocated_pages), scheduled_bs)
-        pages[:n] = allocated_pages[:n]
-        pages[n:] = 1
-        pages.clip(min=1, out=pages)
-        alloc = self._alloc[:running_bs]
-        alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
-        self._alloc_copied.record()
+        alloc = self._stage_allocated_pages(
+            block_tables, T, allocated_pages, scheduled_bs, running_bs
+        )
         alloc.mul_(self.block_size)
 
         slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
@@ -711,8 +915,105 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             self._bt16_rows[:rows],
             self._ctx_rows[:rows],
         )
+        self._publish_paged_block(attn_metadata, rows)
+
+    def prepare_paged_block_fused(
+        self,
+        attn_metadata,
+        block_tables: torch.Tensor,  # [running_bs, W] page ids (page-128)
+        anchor_positions: torch.Tensor,  # [running_bs] int64
+        offsets: torch.Tensor,  # [T] int64, 1..T
+        block_positions: torch.Tensor,  # [running_bs, T] out
+        slots: torch.Tensor,  # [running_bs, T] out -- the block's KV write slots
+        ctx_lens: torch.Tensor,  # [running_bs] out, anchor + 1 + T
+        allocated_pages,  # [>= scheduled_bs] host, pages each request holds
+        scheduled_bs: int,
+        *,
+        pad_ctx_len: int,
+        block_size: int,
+        stage=None,
+    ) -> bool:
+        """The proposer's block positions, slots and context lengths (no DCP)
+        and `prepare_paged_block`, in ONE launch (`dspark_block_meta`): the
+        same numbers as those ~30 small launches. False when it does not
+        apply; the caller then builds them as before."""
+        if block_size != self.block_size or not block_tables.is_cuda:
+            return False
+        from atom.model_ops.dspark_block_meta import PACKED_MAX_ROWS, block_meta
+
+        running_bs, T = block_positions.shape
+        W = block_tables.shape[1]
+        if running_bs <= PACKED_MAX_ROWS and W < 1 << 16:
+            # A few requests: their page counts go in as kernel scalars, no
+            # staging copy (a count is at most W).
+            self._ensure_block_rows(block_tables, T)
+            n = min(len(allocated_pages), scheduled_bs)
+            alloc = [max(int(p), 1) for p in allocated_pages[:n]]
+            alloc += [1] * (running_bs - n)
+        else:
+            alloc = self._stage_allocated_pages(
+                block_tables, T, allocated_pages, scheduled_bs, running_bs
+            )
+        rows = running_bs * T
+        block_meta(
+            anchor_positions,
+            offsets,
+            block_tables,
+            alloc,
+            block_positions,
+            slots.view(-1),
+            ctx_lens,
+            self._ctx_eff[:running_bs],
+            self._bt16_flat,
+            self._bt16_rows[:rows],
+            self._ctx_rows[:rows],
+            block_size=block_size,
+            sub_pages=PAGES_PER_SPARSE_BLOCK,
+            window_page=ASM_PAGE_SIZE,
+            window=self.sliding_window,
+            scheduled_bs=scheduled_bs,
+            pad_ctx_len=pad_ctx_len,
+            stage=stage,
+        )
+        self._publish_paged_block(attn_metadata, rows)
+        return True
+
+    def _ensure_block_rows(self, block_tables, T) -> None:
+        P = PAGES_PER_SPARSE_BLOCK * block_tables.shape[1]
+        if self._bt16 is None or self._bt16.shape[1] != P:
+            self._alloc_block_rows(P, T, block_tables.device)
+
+    def _stage_allocated_pages(
+        self, block_tables, T, allocated_pages, scheduled_bs, running_bs
+    ) -> torch.Tensor:
+        """Pages each request holds, host -> ``self._alloc[:running_bs]``.
+
+        At least one page: the warmup batch and the pad tail address page 0 by
+        convention."""
+        self._ensure_block_rows(block_tables, T)
+        k = self._alloc_slot
+        self._alloc_slot = (k + 1) % _ALLOC_RING
+        self._alloc_copied[k].synchronize()
+        pages = self._alloc_host[k].numpy()[:running_bs]
+        n = min(len(allocated_pages), scheduled_bs)
+        pages[:n] = allocated_pages[:n]
+        pages[n:] = 1
+        pages.clip(min=1, out=pages)
+        alloc = self._alloc[:running_bs]
+        alloc.copy_(self._alloc_host[k, :running_bs], non_blocking=True)
+        self._alloc_copied[k].record()
+        return alloc
+
+    def _publish_paged_block(self, attn_metadata, rows) -> None:
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
+        if self.markov_head.fused_sample:
+            from atom.model_ops.dspark_markov_chain import poll_errors
+
+            poll_errors()
+        from atom.model_ops import dspark_draft_mono
+
+        dspark_draft_mono.poll_errors()
 
     def forward_spec(self, input_ids, positions, num_draft):
         return self.head_and_sample(
@@ -735,8 +1036,33 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         bs = input_ids.shape[0]
         draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
         draft_ids[:, 0] = input_ids
-        hidden = self.embed_tokens(draft_ids.view(-1))
-        residual = None
+        hidden, residual = self._embed_block(draft_ids.view(-1))
+        if _draft_fused_ar() and _draft_fuse_rows(hidden.shape[0]):
+            # Each layer as two launches around the paged attention where they serve (dspark_draft_mono.py).
+            from atom.models.minimax_m3.model import _linear_consumes_mxfp8
+
+            normed = None
+            n = len(self.layers)
+            for i, layer in enumerate(self.layers):
+                last = i + 1 == n
+                nxt = self.final_norm if last else self.layers[i + 1]
+                next_mxfp8 = (
+                    not last
+                    and envs.ATOM_MINIMAX_M3_GLUON_AR_MXFP8
+                    and _linear_consumes_mxfp8(nxt.self_attn.qkv_proj)
+                )
+                hidden, residual, normed = layer.forward_mono(
+                    positions,
+                    hidden,
+                    residual,
+                    normed,
+                    nxt if last else nxt.input_layernorm,
+                    next_mxfp8,
+                )
+            if normed is not None:
+                return normed[0]
+            hidden, _ = fused_allreduce_gemma_rms_norm(hidden, residual, self.final_norm)
+            return hidden
         for layer in self.layers:
             hidden, residual = layer(positions, hidden, residual)
         if _draft_fused_ar() and _draft_fuse_rows(hidden.shape[0]):
@@ -752,22 +1078,61 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             hidden, _ = self.final_norm(hidden, residual)
         return hidden
 
+    def _embed_block(self, ids: torch.Tensor):
+        """The block's embedding and the residual layer 0 starts from.
+
+        Under ATOM_DSPARK_FUSED_AR at a fused row count, the vocabulary-parallel
+        lookup stays TP-partial with a zero residual: layer 0's input norm then
+        all-reduces it with the norm and the MXFP8 quant in one launch, as every
+        later layer's input norm does, instead of the embedding's own all-reduce
+        and an unfused norm. Exactly one rank holds each row (the others add
+        zeros), so the reduced embedding is the same value either way."""
+        embed = self.embed_tokens
+        if (
+            _draft_fused_ar()
+            and _draft_fuse_rows(ids.shape[0])
+            and isinstance(embed, VocabParallelEmbedding)
+            and embed.tp_size > 1
+        ):
+            hidden = masked_embedding(
+                ids, embed.weight, embed.vocab_start_idx, embed.vocab_end_idx
+            )
+            return hidden, torch.zeros_like(hidden)
+        return embed(ids), None
+
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]
         base_logits = self.lm_head(hidden).view(bs, num_draft, -1)
         out_ids = anchor_ids.new_empty(bs, num_draft + 1)
         out_ids[:, 0] = anchor_ids
-        markov_embeds = []
-        for k in range(num_draft):
-            # Greedy: sampling temperature is the target verify's business.
-            markov_embeds.append(
-                self.markov_head.sample_next(
-                    out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
-                )
+        markov_stack = None
+        if self.markov_head.fused_sample:
+            # One request: all K steps in one launch, bit-identical to the
+            # two-stage fused path below (dspark_markov_chain.py); None where
+            # its guard does not hold.
+            from atom.model_ops.dspark_markov_chain import markov_chain_bs1
+
+            embeds = markov_chain_bs1(
+                base_logits,
+                out_ids,
+                self.markov_head.markov_w1.weight,
+                self.markov_head.markov_w2.weight,
             )
+            if embeds is not None:
+                markov_stack = embeds.unsqueeze(0)
+        if markov_stack is None:
+            markov_embeds = []
+            for k in range(num_draft):
+                # Greedy: sampling temperature is the target verify's business.
+                markov_embeds.append(
+                    self.markov_head.sample_next(
+                        out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
+                    )
+                )
+            markov_stack = torch.stack(markov_embeds, dim=1)
         confidence = None
-        if self.confidence_head is not None:
+        if self.confidence_head is not None and self.emit_confidence:
             confidence = self.confidence_head(
-                hidden.view(bs, num_draft, -1), torch.stack(markov_embeds, dim=1)
+                hidden.view(bs, num_draft, -1), markov_stack
             )
         return out_ids[:, 1:], confidence
