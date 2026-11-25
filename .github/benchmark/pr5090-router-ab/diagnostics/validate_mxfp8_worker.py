@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import sys
@@ -61,10 +62,13 @@ def main(phase):
         env=dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"),
     )
     (output / "pytest.log").write_text(test.stdout)
+    summaries = re.findall(
+        r"(?m)^.*\b(?:passed|failed|skipped)\b.*\bin [\d.]+s.*$", test.stdout
+    )
     result.update(
         pytest_command=command,
         pytest_rc=test.returncode,
-        pytest_summary=test.stdout.strip().splitlines()[-1],
+        pytest_summary=summaries[-1] if summaries else None,
     )
     save()
     print(test.stdout, flush=True)

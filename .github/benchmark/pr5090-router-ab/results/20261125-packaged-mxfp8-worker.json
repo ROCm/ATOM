@@ -1,0 +1,425 @@
+{
+  "kind": "Packaged worker GPU layer/selector validation and actual dispatcher microbenchmark; not end-to-end or SA performance",
+  "lease": "L74f477",
+  "node": "pit2-p03-g08",
+  "gpu": 0,
+  "harness_sha": "4bbcc62a3f70d131ba70babe459970c43b07a7ee",
+  "base_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "candidate_local_image_ref": "sha256:bb98b47e6add4b4922375478b35e55970a49f33155e742a9285a0ac152cceb94",
+  "local_image_not_published_to_registry": true,
+  "archive_sha256": "0da8835e357019868c7dd2efc0453f42f9ee52ed62148e39660fa27b6d16bd53",
+  "asset_hashes": {
+    "context/Dockerfile": "8a07b2904e1f9cb7fa05aef49cad7df89acab33048fa6c564f96e2ab78f94ac8",
+    "context/rocm_native.py": "956a63345b18780475e12ab278193c6179b5afa57006dfaed24f225c579b2566",
+    "manifest.json": "dd438f5aa05d4b360269969d7c54ad9324c69bd73d53be46ac82af638ca09ab5",
+    "run_worker.sh": "d6639cd7122c0f496b0c3366aefdb75421acf781be18cf50ac1a9a66b676dd25",
+    "tests/pytest.ini": "578fc1cd12d8d642df8eff41d71d5119626e9f88f21fafadba6b1092ac840a93",
+    "tests/test_rocm_mxfp8_linear.py": "9dde4c465c85d83f19b7f901bb77a30623a01b9ecaf22d068de878109ecf6ede",
+    "wheels/iniconfig-2.3.0-py3-none-any.whl": "f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12",
+    "wheels/packaging-25.0-py3-none-any.whl": "29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484",
+    "wheels/pluggy-1.6.0-py3-none-any.whl": "e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746",
+    "wheels/pygments-2.19.2-py3-none-any.whl": "86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b",
+    "wheels/pytest-9.0.2-py3-none-any.whl": "711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b"
+  },
+  "base": {
+    "phase": "base",
+    "module_sha256": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395",
+    "records": [
+      {
+        "m": 16,
+        "selected_config": [
+          16,
+          16,
+          1024,
+          2,
+          2
+        ],
+        "passes_us": [
+          21.53025008738041,
+          21.557750180363655
+        ],
+        "repeat_delta_percent": 0.1276461790399337,
+        "bitwise_equal_to_base": null,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 24,
+        "selected_config": [
+          16,
+          16,
+          1024,
+          2,
+          2
+        ],
+        "passes_us": [
+          27.772813104093075,
+          27.825312688946724
+        ],
+        "repeat_delta_percent": 0.18885379355798876,
+        "bitwise_equal_to_base": null,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 32,
+        "selected_config": [
+          16,
+          16,
+          1024,
+          2,
+          2
+        ],
+        "passes_us": [
+          28.647813014686108,
+          28.57781294733286
+        ],
+        "repeat_delta_percent": 0.2446458773546946,
+        "bitwise_equal_to_base": null,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 40,
+        "selected_config": [
+          16,
+          16,
+          1024,
+          2,
+          2
+        ],
+        "passes_us": [
+          34.92537513375282,
+          34.900374710559845
+        ],
+        "repeat_delta_percent": 0.07160803356561218,
+        "bitwise_equal_to_base": null,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 48,
+        "selected_config": [
+          16,
+          16,
+          1024,
+          2,
+          2
+        ],
+        "passes_us": [
+          35.79043596982956,
+          35.83793714642525
+        ],
+        "repeat_delta_percent": 0.13263229228616474,
+        "bitwise_equal_to_base": null,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 56,
+        "selected_config": [
+          16,
+          16,
+          1024,
+          2,
+          2
+        ],
+        "passes_us": [
+          43.2929378002882,
+          43.282998725771904
+        ],
+        "repeat_delta_percent": 0.02296036269455691,
+        "bitwise_equal_to_base": null,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 64,
+        "selected_config": [
+          16,
+          16,
+          1024,
+          2,
+          2
+        ],
+        "passes_us": [
+          44.20800134539604,
+          44.192999601364136
+        ],
+        "repeat_delta_percent": 0.03394021305469377,
+        "bitwise_equal_to_base": null,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 80,
+        "selected_config": [
+          64,
+          64,
+          512,
+          8,
+          2
+        ],
+        "passes_us": [
+          41.390374302864075,
+          41.45037569105625
+        ],
+        "repeat_delta_percent": 0.1448595967481712,
+        "bitwise_equal_to_base": null,
+        "graph_matches_eager": true
+      }
+    ],
+    "complete": true,
+    "pytest_command": [
+      "/tmp/mxfp8-validation/bin/python",
+      "-m",
+      "pytest",
+      "-q",
+      "--color=no",
+      "-c",
+      "/bench/assets/tests/pytest.ini",
+      "--confcutdir=/bench/assets/tests",
+      "/bench/assets/tests/test_rocm_mxfp8_linear.py",
+      "-k",
+      "tp1_qkv_decode_tiles and bf16",
+      "--maxfail=1"
+    ],
+    "pytest_rc": 1,
+    "pytest_summary": "sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute",
+    "baseline_outputs_sha256": "06b2844992b0bde05c98ebfe51f6d9d8254dd0cedaa0cf4bc0ea4628c2afb9e1"
+  },
+  "candidate": {
+    "phase": "candidate",
+    "module_sha256": "956a63345b18780475e12ab278193c6179b5afa57006dfaed24f225c579b2566",
+    "records": [
+      {
+        "m": 16,
+        "selected_config": [
+          16,
+          16,
+          1024,
+          2,
+          2
+        ],
+        "passes_us": [
+          21.835187450051308,
+          21.832749247550964
+        ],
+        "repeat_delta_percent": 0.011167014907197115,
+        "bitwise_equal_to_base": true,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 24,
+        "selected_config": [
+          64,
+          64,
+          512,
+          8,
+          2
+        ],
+        "passes_us": [
+          22.747749462723732,
+          22.765249013900757
+        ],
+        "repeat_delta_percent": 0.07689913546791528,
+        "bitwise_equal_to_base": true,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 32,
+        "selected_config": [
+          64,
+          64,
+          512,
+          8,
+          2
+        ],
+        "passes_us": [
+          22.84025028347969,
+          22.850249893963337
+        ],
+        "repeat_delta_percent": 0.0437710703310843,
+        "bitwise_equal_to_base": true,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 40,
+        "selected_config": [
+          64,
+          64,
+          512,
+          8,
+          2
+        ],
+        "passes_us": [
+          22.977749817073345,
+          22.96525053679943
+        ],
+        "repeat_delta_percent": 0.054412120138604345,
+        "bitwise_equal_to_base": true,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 48,
+        "selected_config": [
+          64,
+          64,
+          512,
+          8,
+          2
+        ],
+        "passes_us": [
+          23.090249858796597,
+          23.0102501809597
+        ],
+        "repeat_delta_percent": 0.34706642126616677,
+        "bitwise_equal_to_base": true,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 56,
+        "selected_config": [
+          64,
+          64,
+          512,
+          8,
+          2
+        ],
+        "passes_us": [
+          23.08525051921606,
+          23.085249587893486
+        ],
+        "repeat_delta_percent": 4.034275446247848e-06,
+        "bitwise_equal_to_base": true,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 64,
+        "selected_config": [
+          64,
+          64,
+          512,
+          8,
+          2
+        ],
+        "passes_us": [
+          23.210249841213226,
+          23.222750052809715
+        ],
+        "repeat_delta_percent": 0.05384192976985765,
+        "bitwise_equal_to_base": true,
+        "graph_matches_eager": true
+      },
+      {
+        "m": 80,
+        "selected_config": [
+          64,
+          64,
+          512,
+          8,
+          2
+        ],
+        "passes_us": [
+          41.80299863219261,
+          41.82537645101547
+        ],
+        "repeat_delta_percent": 0.05351728716621688,
+        "bitwise_equal_to_base": true,
+        "graph_matches_eager": true
+      }
+    ],
+    "complete": true,
+    "pytest_command": [
+      "/tmp/mxfp8-validation/bin/python",
+      "-m",
+      "pytest",
+      "-q",
+      "--color=no",
+      "-c",
+      "/bench/assets/tests/pytest.ini",
+      "--confcutdir=/bench/assets/tests",
+      "/bench/assets/tests/test_rocm_mxfp8_linear.py",
+      "-k",
+      "tp1_qkv_decode_tiles or (test_rocm_mxfp8_linear_matches_dequant_reference and 9856)"
+    ],
+    "pytest_rc": 0,
+    "pytest_summary": "sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute",
+    "baseline_outputs_sha256": "06b2844992b0bde05c98ebfe51f6d9d8254dd0cedaa0cf4bc0ea4628c2afb9e1"
+  },
+  "pytest_summaries_from_raw_logs": {
+    "base": "1 failed, 2 passed, 372 deselected, 16 warnings in 8.03s",
+    "candidate": "38 passed, 345 deselected, 16 warnings in 11.84s"
+  },
+  "pytest_summary_note": "The original result.json incorrectly used the final SWIG warning as its summary; the exact pytest summaries above are extracted from retained raw logs.",
+  "comparison": [
+    {
+      "m": 16,
+      "base_us": 21.544000133872032,
+      "candidate_us": 21.833968348801136,
+      "speedup": 0.9867193993186756,
+      "max_repeat_pct": 0.1276461790399337,
+      "bitwise": true
+    },
+    {
+      "m": 24,
+      "base_us": 27.7990628965199,
+      "candidate_us": 22.756499238312244,
+      "speedup": 1.2215878464169976,
+      "max_repeat_pct": 0.18885379355798876,
+      "bitwise": true
+    },
+    {
+      "m": 32,
+      "base_us": 28.612812981009483,
+      "candidate_us": 22.845250088721514,
+      "speedup": 1.2524622348142016,
+      "max_repeat_pct": 0.2446458773546946,
+      "bitwise": true
+    },
+    {
+      "m": 40,
+      "base_us": 34.912874922156334,
+      "candidate_us": 22.971500176936388,
+      "speedup": 1.519834344872661,
+      "max_repeat_pct": 0.07160803356561218,
+      "bitwise": true
+    },
+    {
+      "m": 48,
+      "base_us": 35.8141865581274,
+      "candidate_us": 23.05025001987815,
+      "speedup": 1.553743951898216,
+      "max_repeat_pct": 0.34706642126616677,
+      "bitwise": true
+    },
+    {
+      "m": 56,
+      "base_us": 43.28796826303005,
+      "candidate_us": 23.085250053554773,
+      "speedup": 1.8751353423769552,
+      "max_repeat_pct": 0.02296036269455691,
+      "bitwise": true
+    },
+    {
+      "m": 64,
+      "base_us": 44.20050047338009,
+      "candidate_us": 23.21649994701147,
+      "speedup": 1.9038399661560428,
+      "max_repeat_pct": 0.05384192976985765,
+      "bitwise": true
+    },
+    {
+      "m": 80,
+      "base_us": 41.42037499696016,
+      "candidate_us": 41.81418754160404,
+      "speedup": 0.9905818439195537,
+      "max_repeat_pct": 0.1448595967481712,
+      "bitwise": true
+    }
+  ],
+  "workload_rc": 0,
+  "release_rc": 0,
+  "containers_absent": true,
+  "bitwise_equal_cases": 8,
+  "cuda_graph_eager_parity_all": true,
+  "limits": [
+    "38 tests ran against the packaged image, with test dependencies in an ephemeral uv venv; no vLLM checkout overrode the installed worker module.",
+    "The same native entry point selected the new tile automatically; timing does not include a complete model or PD serving workload.",
+    "The original image still contains its original source. The derived image contains candidate module SHA956a6334; base module SHA8b37de12.",
+    "All sampling output comparisons were bitwise equal, but no task-level model accuracy evaluation or end-to-end C80 performance result is claimed."
+  ]
+}
