@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """An exact top-k for a small k, by counting: entry e of an LDS array is a
 signed 64-bit sort key (a 32-bit key high, the entry's id low: key, then id,
 descending), and an entry's rank is the count of entries that beat it -- no
@@ -37,6 +38,16 @@ def u32_lt(a, b):
 def u32_gt(a, b):
     """a > b as unsigned 32-bit keys held in Int32s (``u32_lt``)."""
     return u32_lt(b, a)
+
+
+def order_key(bits):
+    """u32 order key of fp32 bits, held in an Int32."""
+    return (bits < 0).select(~bits, bits | INT_MIN)
+
+
+def key_bits(key):
+    """The fp32 bits ``order_key`` came from."""
+    return (key < 0).select(key ^ INT_MIN, ~key)
 
 
 BATCH = 16  # entries every lane reads a round of ``count_beaten``

@@ -62,6 +62,8 @@ LM_EVAL_REQUEST_TIMEOUT=${LM_EVAL_REQUEST_TIMEOUT:-1800}
 LM_EVAL_USE_CHAT_COMPLETIONS=${LM_EVAL_USE_CHAT_COMPLETIONS:-0}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-65}
 LM_EVAL_GEN_KWARGS=${LM_EVAL_GEN_KWARGS:-}
+# Ceiling for the supervised lm_eval run; below the workflow step's 120 min.
+ACCURACY_MAX_MINUTES=${ACCURACY_MAX_MINUTES:-110}
 
 MODEL_NAME=${SGLANG_MODEL_NAME:-}
 MODEL_PATH=${SGLANG_MODEL_PATH:-}
@@ -367,16 +369,20 @@ run_accuracy() {
     lm_eval_extra_args+=(--gen_kwargs "${LM_EVAL_GEN_KWARGS}")
   fi
 
-  lm_eval --model "${lm_eval_model}" \
-    --model_args "${lm_eval_model_args}" \
-    --tasks "${LM_EVAL_TASK}" \
-    --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
-    "${lm_eval_extra_args[@]}" \
-    --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
-  # Capture lm_eval exit code explicitly; tee always exits 0 so PIPESTATUS is needed.
-  lm_eval_exit="${PIPESTATUS[0]}"
+  # supervise_client.sh stops lm_eval as soon as the server hangs or faults
+  # (exit 1 / 2) rather than letting it retry until the step times out.
+  local lm_eval_exit=0
+  WAIT_SERVER_PID="$(cat "${SGLANG_PID_FILE}")" \
+    bash "$(dirname -- "${BASH_SOURCE[0]}")/supervise_client.sh" sglang \
+    "${ACCURACY_LOG_FILE}" "${ACCURACY_MAX_MINUTES}" -- \
+    lm_eval --model "${lm_eval_model}" \
+      --model_args "${lm_eval_model_args}" \
+      --tasks "${LM_EVAL_TASK}" \
+      --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+      "${lm_eval_extra_args[@]}" \
+      --output_path "${output_path}" || lm_eval_exit=$?
   if [[ "${lm_eval_exit}" -ne 0 ]]; then
-    echo "ERROR: lm_eval exited with code ${lm_eval_exit}"
+    echo "ERROR: lm_eval exited with code ${lm_eval_exit} (1 = server hang, 2 = server fault, 4 = ${ACCURACY_MAX_MINUTES} min elapsed when stopped by supervise_client.sh)"
     return "${lm_eval_exit}"
   fi
 

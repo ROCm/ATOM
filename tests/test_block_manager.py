@@ -744,7 +744,7 @@ class TestDecodeBlockHashing:
         for token in generated:
             seq.append_token(token)
             bm.may_append(seq)
-        bm.hash_decode_blocks(seq, seq.num_tokens)
+        bm.hash_decode_blocks(seq, seq.num_tokens, snapshot_step=0)
 
     def test_followup_turn_reuses_the_generated_blocks(self, seq_factory):
         bm = self._bm()
@@ -788,7 +788,7 @@ class TestDecodeBlockHashing:
             seq.append_token(token)
             bm.may_append(seq)
         # Commit only the first generated block; the rest is still in flight.
-        bm.hash_decode_blocks(seq, 12)
+        bm.hash_decode_blocks(seq, 12, snapshot_step=0)
         assert seq.num_hashed_tokens == 12
 
         followup = seq_factory(prompt + list(range(100, 112)))
@@ -806,7 +806,7 @@ class TestDecodeBlockHashing:
         for token in range(100, 106):
             seq.append_token(token)
             bm.may_append(seq)
-        bm.hash_decode_blocks(seq, seq.num_tokens)
+        bm.hash_decode_blocks(seq, seq.num_tokens, snapshot_step=0)
         assert seq.num_hashed_tokens == 16
 
     def test_deallocate_clears_the_watermark(self, seq_factory):
@@ -828,7 +828,7 @@ class TestDecodeBlockHashing:
         for token in range(100, 108):
             seq.append_token(token)
             bm.may_append(seq)
-        bm.hash_decode_blocks(seq, seq.num_tokens)
+        bm.hash_decode_blocks(seq, seq.num_tokens, snapshot_step=0)
         assert seq.num_hashed_tokens == 0
         assert not bm.kv.num_indexed
 

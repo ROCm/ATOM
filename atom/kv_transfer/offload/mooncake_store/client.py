@@ -32,6 +32,8 @@ import time
 from collections import Counter
 from typing import Any
 
+from atom.kv_transfer.offload.kv_store.client import CallRefused
+
 logger = logging.getLogger("atom")
 
 # Mooncake Store ErrorCode values (mooncake-store/include/types.h, v0.3.14).
@@ -129,14 +131,6 @@ class CallClock:
         return max(time.monotonic() - self._monotonic, time.time() - self._wall)
 
 
-class CallRefused(RuntimeError):
-    """This client refused a call before handing it to Mooncake.
-
-    Nothing was posted, so no transfer can reach the call's buffers or the
-    Store's memory.
-    """
-
-
 def _new_distributed_store() -> Any:
     """A fresh ``MooncakeDistributedStore``; imported here, never at load time."""
     from mooncake.store import MooncakeDistributedStore
@@ -164,7 +158,11 @@ def _new_marker_config(replicas: int) -> Any:
 
 
 class MooncakeStoreClient:
-    """One ``MooncakeDistributedStore`` set up as a pure, zero-copy client."""
+    """One ``MooncakeDistributedStore`` set up as a pure, zero-copy client.
+
+    Implements :class:`~atom.kv_transfer.offload.kv_store.client.KVStoreClient`
+    with Mooncake's own per-key codes, plus ``put_marker`` and ``remove``.
+    """
 
     def __init__(
         self,

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import logging
 from abc import ABC, abstractmethod
@@ -26,7 +27,10 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
-from atom.model_ops.attentions.pool_layout.paged_state_copy import DescriptorStaging
+from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+    DescriptorStaging,
+    launch_copy_descriptor,
+)
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
 from atom.model_ops.attentions.sparse_mla_head_groups import PERSISTENT_WORK_BUFFERS
@@ -195,6 +199,22 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         before it, alike on every TP rank."""
         return False
 
+    def settles_spec_status(self, batch: ScheduledBatch, max_seqlen_q: int) -> bool:
+        """True when this builder stages the step before the previous verify's
+        host-side status and restages what the status moves once it is taken
+        (`take_spec_status`): the wait then overlaps the staging and the rest
+        of the step's preparation. Asked once a step, before its input ids;
+        ignored when the step `consumes_device_verdict`."""
+        return False
+
+    def take_spec_status(self, processor) -> None:
+        """Take the previous verify's host-side status, owed by this step
+        (`tokenIDProcessor.take_deferred_spec_status`): where the runner ends
+        the step's preparation, before the target's launch, so everything
+        before it overlaps the wait. A builder that `settles_spec_status`
+        finishes the step there (its heads, and what reads them)."""
+        processor.take_deferred_spec_status()
+
     def close(self):
         """Release backend-owned host workers and mapped resources."""
         self.release_kv_pools()
@@ -353,6 +373,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return StateTransfer.none()
 
+    def state_transfer_slots(self) -> int:
+        """State slots past the live ones, kept for a P/D producer's pushes."""
+        return 0
+
     def checkpoint_image_bytes(self) -> int | None:
         """Bytes of an Active Slot a checkpoint image has to hold.
 
@@ -382,6 +406,21 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError(
             f"{type(self).__name__} owns per-request state but does not "
             "implement relocate_state_slots"
+        )
+
+    def owned_pool_layout(self):
+        """`(arena, PAGE regions)` of a paged pool this builder allocated
+        itself rather than carving from the runner's buffer, or None. A
+        backend that allocates its own arena (DeepSeek-V4.1) implements it, so
+        a pool-providing connector learns where its blocks are."""
+
+    def copy_paged_blocks(self, copies: Sequence[tuple[int, int]]) -> None:
+        """Copy whole paged blocks `(source, destination)` on the compute
+        stream, before the forward (a split pool demoting a private block into
+        its shared part). A backend whose pool can be split implements it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot copy paged blocks; "
+            "a share_ratio below 1 (umbp_pool connector) is not supported for this model"
         )
 
     def execute_paged_state_copies(
@@ -453,14 +492,27 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return staging
 
     def warmup_per_req_cache(self) -> None:
-        """Pay whatever the first checkpoint copy would pay, before serving.
+        """Warm checkpoint planning, staging and copying without changing bytes.
 
-        Called once by ModelRunner after `allocate_per_req_cache`'s pools are
-        installed, which is the earliest a backend can reach its own addresses.
-        Nothing else warms this path: `execute_paged_state_copies` runs only
-        from `build()`, so a backend that compiles a kernel or fills a cache
-        there does it inside a live request's batch. A no-op by default.
+        ModelRunner calls this after installing the per-request pools. Each
+        planned span copies onto itself, preserving both pages and initialized
+        state even when eager startup has no later capture reset.
         """
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            return
+        plan = self._checkpoint_copy_plan()
+        if not plan.num_spans:
+            return
+        staging = self._checkpoint_staging()
+        rows = staging.rows(0)[: plan.num_spans]
+        destinations = np.zeros(
+            (1, len(self._page_unit_stream_sizes(spec.units_per_checkpoint))),
+            dtype=np.int64,
+        )
+        plan.write_descriptor(rows, self._checkpoint_slot_bases()[:1], destinations)
+        rows[:, 1] = rows[:, 0]
+        launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
 
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
@@ -1651,6 +1703,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
+        if state_ops.block_copies:
+            self.copy_paged_blocks(state_ops.block_copies)
         if is_prefill:
             built = self.prepare_prefill(
                 batch, running_bs, running_tokens, ubatch_slices, pcp_groups

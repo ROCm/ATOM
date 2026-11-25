@@ -44,7 +44,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
     let shared = [1, 2].map(|port| {
         Arc::new(
             BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
-                .labels(std::collections::HashMap::from([(
+                .labels(HashMap::from([(
                     "mesh.responses_state".into(),
                     "shared".into(),
                 )]))
@@ -63,7 +63,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
 #[tokio::test]
 async fn capabilities_and_exact_token_routing_are_explicit() {
     let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
-        .labels(std::collections::HashMap::from([(
+        .labels(HashMap::from([(
             "mesh.apis".into(),
             "/v1/messages, /v1/chat/completions".into(),
         )]))
@@ -160,6 +160,169 @@ async fn chats_rendered_without_their_template_are_not_tokenized() {
         } else {
             assert!(result.unwrap().1.is_some());
         }
+    }
+}
+
+fn prefix_hash() -> crate::config::PolicyConfig {
+    crate::config::PolicyConfig::PrefixHash {
+        prefix_token_count: 4,
+        load_factor: 1.25,
+    }
+}
+
+/// A byte-level tokenizer twice: as HuggingFace loads it, and encoding with fastokens.
+fn huggingface_and_fastokens(
+    chat_template: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<dyn crate::tokenizer::traits::Tokenizer>,
+    Arc<dyn crate::tokenizer::traits::Tokenizer>,
+) {
+    use crate::routers::test_mocks::tokenizer::{byte_level_tokenizer_dir, BYTE_LEVEL_MERGES};
+    let config = json!({"chat_template": chat_template});
+    let dir = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, false, config);
+    let path = dir.path().join("tokenizer.json");
+    let hf = crate::tokenizer::factory::create_tokenizer(path.to_str().unwrap()).unwrap();
+    let fast = crate::routers::prepare::fast_tokenizer::FastTokenizer::new(hf.clone(), &path, 0);
+    (dir, hf, Arc::new(fast.unwrap()))
+}
+
+/// Models fastokens encodes tokenize up to a limit of their own, and render their
+/// chats with the HuggingFace template.
+#[tokio::test]
+async fn fastokens_models_tokenize_up_to_their_own_limit() {
+    let mut config = crate::config::RouterConfig {
+        policy: prefix_hash(),
+        ..Default::default()
+    };
+    config.prepare_pool.max_tokenize_bytes = Some(16);
+    config.fastokens.max_tokenize_bytes = Some(1024);
+    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, _pool.handle())
+        .await
+        .unwrap();
+    let template =
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}";
+    let (_dir, hf, fast) = huggingface_and_fastokens(template);
+    for (model, tokenizer) in [("hf", hf.clone()), ("fast", fast)] {
+        app.tokenizer_registry
+            .load(&TokenizerRegistry::generate_id(), model, model, || async {
+                Ok(tokenizer)
+            })
+            .await
+            .unwrap();
+    }
+    let long = "the weather ".repeat(100);
+    for prompt in ["the weather in 2026 is fine", &long] {
+        for (route, body, text) in [
+            (
+                "/v1/completions",
+                json!({"prompt": prompt}),
+                prompt.to_string(),
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"messages": [{"role": "user", "content": prompt}]}),
+                format!("<|im_start|>user\n{prompt}<|im_end|>\n"),
+            ),
+        ] {
+            for model in ["hf", "fast"] {
+                let mut body = body.clone();
+                body["model"] = json!(model);
+                let parsed =
+                    ParsedInference::parse(route, &serde_json::to_vec(&body).unwrap()).unwrap();
+                let routing = IngressRouting::new(&app);
+                let result = app
+                    .prepare_pool
+                    .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                        routing.prepare(&parsed, ctx)
+                    })
+                    .await
+                    .unwrap()
+                    .wait()
+                    .await
+                    .unwrap();
+                if model == "hf" || prompt.len() > 1024 {
+                    assert_eq!(
+                        result.unwrap_err().code,
+                        "tokenizer_input_too_large",
+                        "{route} {model}"
+                    );
+                } else {
+                    let tokens = result.unwrap().1.unwrap();
+                    assert_eq!(
+                        tokens,
+                        hf.encode(&text, false).unwrap().token_ids(),
+                        "{route}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A chat whose effort its model's template rejects and ATOM accepts
+/// tokenizes under the model's reasoning controls, with the effort ATOM takes.
+#[tokio::test]
+async fn chats_tokenize_with_the_effort_their_model_takes() {
+    let config = crate::config::RouterConfig {
+        policy: prefix_hash(),
+        ..Default::default()
+    };
+    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, _pool.handle())
+        .await
+        .unwrap();
+    // As V4.1's, the template rejects an effort it has no budget for.
+    let template = concat!(
+        "{%- if reasoning_effort is defined and reasoning_effort not in ['low', 'medium', 'high', 'max'] -%}",
+        "{{ raise_exception('Invalid reasoning effort') }}{%- endif -%}",
+        "{{ messages[0].content }}/{{ thinking_mode | default('-') }}/{{ reasoning_effort | default('-') }}",
+    );
+    let (_dir, hf, _) = huggingface_and_fastokens(template);
+    let id = TokenizerRegistry::generate_id();
+    let tokenizer = hf.clone();
+    app.tokenizer_registry
+        .load(&id, "m", "m", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    let v41 = Some(ChatControls::DeepseekV41);
+    for (controls, effort, want) in [
+        (None, "medium", Ok("hi/-/medium")),
+        (None, "minimal", Err("invalid_request")),
+        (v41, "minimal", Ok("hi/-/low")),
+        (v41, "medium", Ok("hi/-/high")),
+        (v41, "none", Ok("hi/chat/-")),
+        (v41, "ultra", Err("invalid_request")),
+    ] {
+        match controls {
+            Some(controls) => app.chat_controls.write().insert(id.clone(), controls),
+            None => app.chat_controls.write().remove(&id),
+        };
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let parsed =
+            ParsedInference::parse("/v1/chat/completions", &serde_json::to_vec(&body).unwrap())
+                .unwrap();
+        let routing = IngressRouting::new(&app);
+        let result = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let tokens = result
+            .map(|(_, tokens)| tokens.unwrap())
+            .map_err(|error| error.code);
+        let want = want.map(|prompt| hf.encode(prompt, false).unwrap().token_ids().to_vec());
+        assert_eq!(tokens, want, "{body}");
     }
 }
 fn json_headers() -> HeaderMap {
@@ -309,6 +472,77 @@ async fn lightweight_http_routing_needs_no_second_pool_submission() {
             assert_eq!(candidates[0].model_id(), "m");
         }
     }
+}
+
+/// The PD router's and ext-proc's planners select decode first under ATOM's idx2idx only.
+#[tokio::test]
+async fn idx2idx_planners_select_prefill_on_the_decode_rank() {
+    use crate::config::{AtomPdRankMappingPolicy, BackendType};
+    use crate::core::{
+        placement::{test_support::make_descriptor, PdPlanner, PlacementPlan},
+        DPAwareWorkerBuilder,
+    };
+    use crate::routers::http_pd_router::PDRouter;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let kv_transfer_info = Router::new().route(
+        "/kv_transfer_info",
+        get(|| async { axum::Json(json!({"tp_size": 1, "kv_role": "kv_producer"})) }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, kv_transfer_info).await });
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let descriptor = make_descriptor(Some("m"), None, None, None);
+    for (backend, decode_first) in [(BackendType::Atom, true), (BackendType::Sglang, false)] {
+        let config = crate::config::RouterConfig {
+            backend,
+            atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::Idx2Idx,
+            ..Default::default()
+        };
+        let app = Arc::new(
+            AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
+        let prefill = WorkerType::Prefill {
+            bootstrap_port: None,
+        };
+        let workers: Vec<Arc<dyn Worker>> = [
+            (base.as_str(), 0, prefill.clone()),
+            (base.as_str(), 1, prefill),
+            ("http://d", 1, WorkerType::Decode),
+        ]
+        .into_iter()
+        .map(|(url, rank, kind)| {
+            let builder = DPAwareWorkerBuilder::new_with_type(url, rank, 2, kind);
+            Arc::new(builder.model_id("m").build()) as Arc<dyn Worker>
+        })
+        .collect();
+        for worker in &workers {
+            app.worker_registry.register(worker.clone());
+        }
+        app.policy_registry
+            .set_prefill_policy(Arc::new(crate::policies::RoundRobinPolicy::new()));
+        let policies = Arc::new(PolicyRegistryAdapter::new(app.policy_registry.clone()));
+        let ingress = IngressRouting::new(&app).planner(workers, policies);
+        let router = PDRouter::new(&app).await.unwrap();
+
+        for planner in [&ingress as &dyn PdPlanner, router.planner.as_ref()] {
+            let mut ranks = HashSet::new();
+            for _ in 0..4 {
+                match planner.plan(&descriptor).await.unwrap() {
+                    PlacementPlan::Pair { prefill, .. } => ranks.insert(prefill.dp_rank()),
+                    other => panic!("expected Pair, got {other:?}"),
+                };
+            }
+            assert_eq!(
+                ranks == HashSet::from([Some(1)]),
+                decode_first,
+                "{backend:?}"
+            );
+        }
+    }
+    server.abort();
 }
 
 #[tokio::test]
@@ -633,7 +867,7 @@ impl crate::routers::RouterTrait for NativeIngressRouter {
     async fn route_chat(
         &self,
         _: Option<&HeaderMap>,
-        _: &crate::protocols::chat::ChatCompletionRequest,
+        _: &ChatCompletionRequest,
         _: Option<&str>,
     ) -> Response {
         Response::new(axum::body::Body::empty())
@@ -953,6 +1187,7 @@ async fn tokenize_endpoint_limits_the_total_prompt_bytes() {
     let pool = PreparePoolRuntime::new(default_pool()).unwrap();
     let mut config = crate::config::RouterConfig::default();
     config.prepare_pool.max_tokenize_bytes = Some(11);
+    config.fastokens.max_tokenize_bytes = Some(20);
     let context = Arc::new(
         AppContext::from_config(config, 5, pool.handle())
             .await
@@ -965,16 +1200,38 @@ async fn tokenize_endpoint_limits_the_total_prompt_bytes() {
         .load("limited", "m", "mock", || async { Ok(tokenizer) })
         .await
         .unwrap();
-    for (prompt, status) in [
-        (json!("hello world"), http::StatusCode::OK),
-        (json!(["hello", "world!"]), http::StatusCode::OK),
-        (json!("hello world!"), http::StatusCode::PAYLOAD_TOO_LARGE),
+    let (_dir, _, fast) = huggingface_and_fastokens("");
+    context
+        .tokenizer_registry
+        .load("fast", "fast", "fast", || async { Ok(fast) })
+        .await
+        .unwrap();
+    for (model, prompt, status) in [
+        ("m", json!("hello world"), http::StatusCode::OK),
+        ("m", json!(["hello", "world!"]), http::StatusCode::OK),
         (
+            "m",
+            json!("hello world!"),
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "m",
             json!(["hello", "world!!"]),
             http::StatusCode::PAYLOAD_TOO_LARGE,
         ),
+        // Models fastokens encodes have a limit of their own.
+        (
+            "fast",
+            json!(["hello world", "again!!!!"]),
+            http::StatusCode::OK,
+        ),
+        (
+            "fast",
+            json!("hello world, again!!!"),
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+        ),
     ] {
-        let request = json_request("/v1/tokenize", json!({"model": "m", "prompt": prompt}));
+        let request = json_request("/v1/tokenize", json!({"model": model, "prompt": prompt}));
         let response = crate::routers::comm::tokenize::tokenize(&context, request).await;
         assert_eq!(response.status(), status, "{prompt}");
         if status == http::StatusCode::PAYLOAD_TOO_LARGE {
@@ -992,11 +1249,15 @@ fn json_request(path: &str, body: serde_json::Value) -> Request {
         .unwrap()
 }
 
-async fn error_type(response: Response) -> serde_json::Value {
+async fn body_json(response: Response) -> serde_json::Value {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["type"].clone()
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn error_type(response: Response) -> serde_json::Value {
+    body_json(response).await["error"]["type"].clone()
 }
 
 #[tokio::test]

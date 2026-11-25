@@ -5,8 +5,9 @@
 //! worker picked for the session's first request: the healthy worker holding
 //! the fewest live sessions (load breaks ties). Requests without a session ID
 //! use minimum-load balancing. A stale mapping is replaced when its worker is
-//! no longer healthy, the session has been idle for too long, or a request of
-//! the session failed with a server error or got no response.
+//! no longer healthy or a candidate (another DP rank under idx2idx), the
+//! session has been idle for too long, or a request of the session failed with
+//! a server error or got no response.
 
 use std::sync::Arc;
 

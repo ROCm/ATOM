@@ -1,7 +1,7 @@
 use super::{
-    AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigResult, HealthCheckConfig,
-    MetricsConfig, PolicyConfig, PreparePoolConfig, RetryConfig, RouterConfig, RoutingMode,
-    SessionAffinityConfig, TokenizerCacheConfig,
+    AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigResult, FastokensConfig,
+    HealthCheckConfig, MetricsConfig, PolicyConfig, PreparePoolConfig, RetryConfig, RouterConfig,
+    RoutingMode, SessionAffinityConfig, TokenizerCacheConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -15,6 +15,11 @@ pub struct RouterConfigBuilder {
 impl RouterConfigBuilder {
     pub fn prepare_pool(mut self, config: PreparePoolConfig) -> Self {
         self.config.prepare_pool = config;
+        self
+    }
+
+    pub fn fastokens(mut self, config: FastokensConfig) -> Self {
+        self.config.fastokens = config;
         self
     }
 
@@ -371,6 +376,11 @@ impl RouterConfigBuilder {
 
     pub fn kv_events(mut self, enable: bool) -> Self {
         self.config.kv_events = enable;
+        self
+    }
+
+    pub fn mooncake_admin_port(mut self, port: u16) -> Self {
+        self.config.mooncake_admin_port = port;
         self
     }
 

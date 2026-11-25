@@ -1395,14 +1395,16 @@ def test_flydsl_prefill_layout_falls_back_unless_tokens_are_the_extends(
 
 
 def _flydsl_gate_env(monkeypatch, tp=4, arch=True):
-    """Flag on, `tp` ranks, `arch` for gfx942; returns the layer module."""
+    """Flag on, `tp` ranks, `arch` for a GPU aiter's FlyDSL QSA prefill runs
+    on; returns the layer module."""
     qsa_attention = pytest.importorskip(
         "atom.model_ops.qwen4_exp.qsa_attention", exc_type=ImportError
     )
     from aiter.dist import parallel_state
 
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
-    monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: arch)
+    widths = (1027, 2051, 3075, 4099) if arch else ()
+    monkeypatch.setattr(qsa_attention, "qsa_sparse_prefill_widths", lambda: widths)
     monkeypatch.setattr(
         parallel_state, "get_tensor_model_parallel_world_size", lambda: tp
     )
@@ -1427,7 +1429,7 @@ _FLASH_CONFIG = SimpleNamespace(
         ("1", True, torch.bfloat16, 4, 2048, 1, False),  # 24 q / 2 kv heads
         ("1", True, None, 4, 4096, 4, False),  # dtype unreadable: native
         ("0", True, torch.bfloat16, 4, 2048, 4, False),  # flag off
-        ("1", False, torch.bfloat16, 4, 2048, 4, False),  # not gfx942
+        ("1", False, torch.bfloat16, 4, 2048, 4, False),  # aiter: not this GPU
         ("1", True, torch.float8_e4m3fn, 4, 2048, 4, False),  # FP8 KV pool
         ("1", True, torch.bfloat16, 8, 2048, 4, False),  # compression ratio
         ("1", True, torch.bfloat16, 4, 1536, 4, False),  # budget the kernel lacks
@@ -1499,3 +1501,5 @@ def test_flydsl_prefill_layout_context_rows_on_device_tensors():
         for t in range(seq)
     ]
     assert slots.device == tables.device
+    # The layers pass it to aiter as the int32 slot table.
+    assert slots.dtype == torch.int32 and slots.is_contiguous()

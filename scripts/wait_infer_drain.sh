@@ -49,6 +49,21 @@
 #                                   pgrep miss must NOT be interpreted as a
 #                                   clean exit.)
 #
+# Overrides for engines other than native ATOM (vLLM / SGLang plugin servers,
+# via .github/scripts/supervise_client.sh); unset, the behaviour above holds:
+#   WAIT_SERVER_PID           track this server PID instead of pgrep'ing
+#                             SERVER_PATTERN; its stdout fd is the server log.
+#   WAIT_CLIENT_PID           the client is alive while this PID is (not a
+#                             zombie), instead of pgrep'ing CLIENT_PATTERN. Use
+#                             it when the client's command text also sits in a
+#                             wrapper's argv (e.g. `bash -lc "... lm_eval ..."`),
+#                             which would keep the pattern matching forever.
+#   WAIT_SERVER_EXIT_IS_FAULT 1: the server exiting while the client is still
+#                             running is a fault (exit 2), not a drain.
+#   WAIT_FAULT_PATTERN_EXTRA  extra ERE alternatives counted as a fault.
+#   WAIT_IDLE_NOISE_PATTERN_EXTRA extra ERE alternatives for server-log lines
+#                             that do not count as progress.
+#
 # Exit codes:
 #   0 — workload drained cleanly (server: client gone + no pending output;
 #                                 offline: process exited without fault)
@@ -73,6 +88,33 @@ CLIENT_PATTERN='lm_eval|curl.*v1/(completions|chat)|atom\.examples\.benchmark|at
 # Server- or offline-mode workload process. simple_inference and
 # atom.examples.benchmark also count — process-exit + no-fault = drain.
 SERVER_PATTERN='atom\.entrypoints|atom\.examples\.simple_inference'
+WAIT_SERVER_PID="${WAIT_SERVER_PID:-}"
+WAIT_CLIENT_PID="${WAIT_CLIENT_PID:-}"
+WAIT_SERVER_EXIT_IS_FAULT="${WAIT_SERVER_EXIT_IS_FAULT:-0}"
+
+# A PID counts as alive while it exists and is not a zombie: an exited child
+# stays a zombie until its parent reaps it, and kill -0 still succeeds on it.
+pid_alive() {
+    local pid=$1 stat
+    [ -n "$pid" ] && stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    [ "$(echo "${stat##*) }" | cut -d' ' -f1)" != "Z" ]
+}
+
+server_pid() {
+    if [ -n "$WAIT_SERVER_PID" ]; then
+        pid_alive "$WAIT_SERVER_PID" && echo "$WAIT_SERVER_PID"
+    else
+        pgrep -f "$SERVER_PATTERN" 2>/dev/null | head -1
+    fi
+}
+
+clients_alive() {
+    if [ -n "$WAIT_CLIENT_PID" ]; then
+        if pid_alive "$WAIT_CLIENT_PID"; then echo 1; else echo 0; fi
+    else
+        pgrep -af "$CLIENT_PATTERN" 2>/dev/null | grep -v grep | wc -l
+    fi
+}
 
 # Resolve the authoritative server/workload log by reading the workload
 # process's stdout fd. Re-run every poll because the workload PID can change
@@ -80,7 +122,7 @@ SERVER_PATTERN='atom\.entrypoints|atom\.examples\.simple_inference'
 # don't want a stale path. Returns empty string on failure.
 discover_server_log() {
     local pid log
-    pid=$(pgrep -f "$SERVER_PATTERN" 2>/dev/null | head -1)
+    pid=$(server_pid)
     [ -z "$pid" ] && return
     log=$(readlink "/proc/$pid/fd/1" 2>/dev/null)
     # Reject /dev/pts/, pipes, sockets, /dev/null — only real files count.
@@ -112,6 +154,7 @@ mtime_of() {
 }
 
 FAULT_PATTERN='stopped, reason|MEMORY_VIOLATION|ASSERT_TRAP|proc died unexpectedly|Memory access fault by GPU'
+[ -n "${WAIT_FAULT_PATTERN_EXTRA:-}" ] && FAULT_PATTERN="${FAULT_PATTERN}|${WAIT_FAULT_PATTERN_EXTRA}"
 
 # Server-log lines that must not count as progress. aiter prints this one from
 # a rank that is ALREADY blocked on the broadcast ring, so reading it as
@@ -119,6 +162,7 @@ FAULT_PATTERN='stopped, reason|MEMORY_VIOLATION|ASSERT_TRAP|proc died unexpected
 # STUCK_POLLS*POLL quiet window, so it resets the counter one poll before it can
 # fire and the hang only ever surfaces at MAX_MIN.
 IDLE_NOISE_PATTERN='No available shared memory broadcast block'
+[ -n "${WAIT_IDLE_NOISE_PATTERN_EXTRA:-}" ] && IDLE_NOISE_PATTERN="${IDLE_NOISE_PATTERN}|${WAIT_IDLE_NOISE_PATTERN_EXTRA}"
 
 prev_outputs=0
 prev_mtime=0
@@ -130,6 +174,9 @@ server_log=""
 # cleanup, cache prep, model load), NOT "workload finished". Without this
 # guard the script returns DRAINED in ~10s for any V4-Pro / large-model run.
 ever_seen=0
+# A given server PID is a server that is already up: it is never "still
+# starting", so its absence is an exit, not a launcher in pre-exec setup.
+[ -n "$WAIT_SERVER_PID" ] && ever_seen=1
 
 for ((i=1; i<=ITERS; i++)); do
     sleep "$POLL"
@@ -157,7 +204,7 @@ for ((i=1; i<=ITERS; i++)); do
 
     # Workload process alive? Only by process presence — no curl (HTTP can
     # false-negative under heavy load).
-    if pgrep -f "$SERVER_PATTERN" >/dev/null 2>&1; then
+    if [ -n "$(server_pid)" ]; then
         ever_seen=1
     else
         if [ "$ever_seen" -eq 0 ]; then
@@ -173,6 +220,11 @@ for ((i=1; i<=ITERS; i++)); do
         # Process was seen, now gone, no fault → clean drain. Covers both
         # stop_atom_server (server mode) and simple_inference finishing its
         # prompts (offline mode).
+        if [ "$WAIT_SERVER_EXIT_IS_FAULT" = "1" ] && [ "$(clients_alive)" -gt 0 ]; then
+            echo "[t=$((i*POLL))s] server exited while the client is still running — exiting 2"
+            [ -n "$server_log" ] && [ -r "$server_log" ] && tail -20 "$server_log"
+            exit 2
+        fi
         echo "[t=$((i*POLL))s] workload process exited cleanly — DRAINED"
         exit 0
     fi
@@ -199,7 +251,7 @@ for ((i=1; i<=ITERS; i++)); do
     delta_server_lines=$(( cur_server_lines - prev_server_lines ))
 
     # Client still running?
-    client_alive=$(pgrep -af "$CLIENT_PATTERN" 2>/dev/null | grep -v grep | wc -l)
+    client_alive=$(clients_alive)
 
     echo "[t=$((i*POLL))s] outputs=${cur_outputs} (+${delta_out}) mtime+${delta_mtime}s srv+${delta_server_lines}ln clients=${client_alive} stuck=${stuck}/${STUCK_POLLS}"
 
@@ -215,7 +267,9 @@ for ((i=1; i<=ITERS; i++)); do
     # Drained cleanly: client gone AND no new output this poll → done.
     # No need to wait STUCK_POLLS — once the client is gone no new requests
     # can arrive, so a single quiet poll is definitive.
-    if [ "$client_alive" -eq 0 ] && [ "$stuck" -ge 1 ]; then
+    # A client tracked by PID is done once it exits; the server's own logging
+    # after that (e.g. periodic stats) must not hold the drain open.
+    if [ "$client_alive" -eq 0 ] && { [ "$stuck" -ge 1 ] || [ -n "$WAIT_CLIENT_PID" ]; }; then
         echo "Engine DRAINED (client gone + no pending output)"
         exit 0
     fi
