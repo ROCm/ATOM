@@ -54,6 +54,14 @@ def _flag_env(name: str, default: str = "0") -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
+def _mori_v2_env() -> bool:
+    if is_set("ATOM_MORI_V2"):
+        return os.getenv("ATOM_MORI_V2") == "1"
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx1250"
+
+
 def _preload_mode() -> str:
     """ATOM_PRELOAD: "off", "server" (1: take the weights from a weight cache
     daemon) or "daemon" (be one)."""
@@ -416,8 +424,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # production mori v1 (mori.ops.EpDispatchCombineOp) for the EP+DP MoE
     # all2all. v1 is authored for gfx942/950 and does not run on gfx1250; v2 is
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
-    # active (dp_size>1 + expert-parallel + mori installed).
-    "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
+    # active (dp_size>1 + expert-parallel + mori installed). Unset: on for
+    # gfx1250, off elsewhere; 1 / 0 decides.
+    "ATOM_MORI_V2": _mori_v2_env,
     # --all2all-backend low-latency as vLLM runs it: mori's InterNodeV1LL, at
     # the launch geometry its handle was built with, when the EP group spans
     # nodes, and the IntraNode kernel within a node. Off keeps aiter's mapping,
