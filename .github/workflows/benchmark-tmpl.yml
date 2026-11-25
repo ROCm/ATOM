@@ -92,6 +92,21 @@ on:
         type: string
         required: false
         default: ""
+      plugin_poc_ref:
+        description: "Optional plugin_poc release tag or commit; empty serves no plugin"
+        type: string
+        required: false
+        default: ""
+      plugin_recipe:
+        description: "Recipe directory under plugin_poc's recipes/, e.g. dsv41/tp4-c8-mono"
+        type: string
+        required: false
+        default: ""
+      plugin_wheel_sha256:
+        description: "Optional sha256 of the release wheel; the wheel built from plugin_poc_ref must match it"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -150,6 +165,33 @@ jobs:
             exit 1
           fi
 
+      - name: Validate plugin_poc selection
+        if: ${{ inputs.plugin_poc_ref != '' }}
+        env:
+          PLUGIN_RECIPE: ${{ inputs.plugin_recipe }}
+          PLUGIN_POC_DEPLOY_KEY: ${{ secrets.PLUGIN_POC_DEPLOY_KEY }}
+        run: |
+          if [[ -z "$PLUGIN_RECIPE" ]]; then
+            echo "::error::plugin_poc_ref needs plugin_recipe"
+            exit 1
+          fi
+          # Secrets do not reach runs from forks; plugin runs are dispatched or scheduled ones.
+          if [[ -z "$PLUGIN_POC_DEPLOY_KEY" ]]; then
+            echo "::error::secret PLUGIN_POC_DEPLOY_KEY is not available to this run"
+            exit 1
+          fi
+
+      - name: Checkout plugin_poc
+        if: ${{ inputs.plugin_poc_ref != '' }}
+        uses: actions/checkout@v6
+        with:
+          repository: coderfeli/plugin_poc
+          ref: ${{ inputs.plugin_poc_ref }}
+          path: plugin_poc
+          ssh-key: ${{ secrets.PLUGIN_POC_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+
       - name: Start container + download model
         uses: ./.github/actions/atom-bench-container
         with:
@@ -196,6 +238,15 @@ jobs:
           CONTAINER_NAME: atom-benchmark
           AITER_GIT_REF: ${{ inputs.aiter_commit }}
         run: bash .github/scripts/install_aiter_from_ref.sh
+
+      - name: Build and install plugin_poc wheel
+        if: ${{ inputs.plugin_poc_ref != '' }}
+        env:
+          CONTAINER_NAME: atom-benchmark
+          PLUGIN_POC_PATH: plugin_poc
+          PLUGIN_RECIPE: ${{ inputs.plugin_recipe }}
+          EXPECTED_PLUGIN_WHEEL_SHA256: ${{ inputs.plugin_wheel_sha256 }}
+        run: bash .github/scripts/install_plugin_poc_wheel.sh
 
       - name: Verify checked-out ATOM code
         run: |
@@ -259,14 +310,14 @@ jobs:
           # them (argparse: invalid loads value). Mirrors atom-test.yaml.
           echo "ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
             ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
-            .github/scripts/atom_test.sh launch $model_path $ARGS $EXTRA_LAUNCH_ARGS" \
+            .github/scripts/atom_test.sh launch $model_path $ARGS $EXTRA_LAUNCH_ARGS ${PLUGIN_LAUNCH_ARGS:-}" \
             | docker exec -i atom-benchmark bash -l
 
           echo "========== Running benchmark =========="
           docker exec \
             -e ENABLE_TORCH_PROFILER="${{ inputs.enable_profiler && '1' || '0' }}" \
             -e RESULT_FILENAME="${{ env.RESULT_FILENAME }}" \
-            -e SERVER_ARGS="$ARGS $EXTRA_LAUNCH_ARGS" \
+            -e SERVER_ARGS="$ARGS $EXTRA_LAUNCH_ARGS ${PLUGIN_LAUNCH_ARGS:-}" \
             -e BENCH_EXTRA_ARGS -e BENCH_KIND \
             -e GPU_NAME -e ROCM_VERSION \
             -e DOCKER_IMAGE -e ATOM_IMAGE_DIGEST \

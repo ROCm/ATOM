@@ -53,6 +53,18 @@ on:
         description: "Advanced: AITER revision override — empty keeps the image version"
         type: string
         default: ""
+      plugin_poc_ref:
+        description: "Advanced: plugin_poc release tag or commit — empty serves no plugin"
+        type: string
+        default: ""
+      plugin_recipe:
+        description: "Advanced: recipe under plugin_poc's recipes/, e.g. dsv41/tp4-c8-mono (needs plugin_poc_ref)"
+        type: string
+        default: ""
+      plugin_wheel_sha256:
+        description: "Advanced: sha256 of the release wheel — the wheel built from plugin_poc_ref must match"
+        type: string
+        default: ""
       enable_profiler:
         description: "Advanced: collect graph-capture traces and a 30-second replay profile"
         type: boolean
@@ -149,5 +161,8 @@ jobs:
       atom_commit: ${{ needs.build-matrix.outputs.checkout_sha }}
       aiter_commit: ${{ inputs.aiter_commit || '' }}
       aiter_wheel_artifact_id: ${{ needs.build-matrix.outputs.aiter_wheel_artifact_id }}
+      plugin_poc_ref: ${{ inputs.plugin_poc_ref || '' }}
+      plugin_recipe: ${{ inputs.plugin_recipe || '' }}
+      plugin_wheel_sha256: ${{ inputs.plugin_wheel_sha256 || '' }}
       enable_profiler: ${{ inputs.enable_profiler || false }}
       enable_rtl: ${{ inputs.enable_rtl || false }}
