@@ -1,0 +1,21 @@
+{
+  "base_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "module_path": "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mxfp8/rocm_native.py",
+  "base_module_sha256": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395",
+  "candidate_module_sha256": "956a63345b18780475e12ab278193c6179b5afa57006dfaed24f225c579b2566",
+  "vllm_patch_base": "08c497efa9a5213f2903670655f040977ba03fbd",
+  "benchmark_harness": "b9c3df7db2f89efb95b881578e909f2863e8dd14",
+  "status": "Built and GPU layer/selector validated on L74f477; end-to-end serving/model evaluation still pending.",
+  "scope": "Only the candidate selector is applied to the installed base module. No unrelated main-branch changes are copied.",
+  "validation": {
+    "lease": "L74f477",
+    "node": "pit2-p03-g08",
+    "gpu": 0,
+    "local_image_ref": "sha256:bb98b47e6add4b4922375478b35e55970a49f33155e742a9285a0ac152cceb94",
+    "harness_sha": "4bbcc62a3f70d131ba70babe459970c43b07a7ee",
+    "pytest": "38 passed, 345 deselected, 16 warnings in 11.84s",
+    "bitwise_equal_cases": 8,
+    "cuda_graph_eager_parity_all": true,
+    "release_rc": 0
+  }
+}

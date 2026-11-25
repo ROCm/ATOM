@@ -31,6 +31,16 @@ def prefill_remap_preamble(order):
     )
 
 
+def native_source_guard(module_path):
+    return (
+        '\nif [ -n "${ATOMESH_EXPECTED_NATIVE_SHA:-}" ]; then\n'
+        f"  actual=$(sha256sum {shlex.quote(module_path)} | cut -d' ' -f1)\n"
+        '  printf "[NATIVE-SOURCE] actual=%s expected=%s\\n" "$actual" "$ATOMESH_EXPECTED_NATIVE_SHA"\n'
+        '  [ "$actual" = "$ATOMESH_EXPECTED_NATIVE_SHA" ] || exit 1\n'
+        "fi\n"
+    )
+
+
 def configurations(
     contract, model_path, run_dir, experiment_dir, fabric, uid, router_image
 ):
@@ -247,6 +257,9 @@ def main():
         wrapper.write_text(
             "#!/usr/bin/env bash\nset -euo pipefail\n"
             + prefill_remap_preamble(contract["prefill_device_order"])
+            + native_source_guard(
+                "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mxfp8/rocm_native.py"
+            )
             + '\nexec /usr/local/bin/vllm "$@"\n'
         )
         wrapper.chmod(0o755)
