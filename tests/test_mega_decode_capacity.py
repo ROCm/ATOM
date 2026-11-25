@@ -440,10 +440,10 @@ def test_tbo_and_plugin_steps_take_no_route_hint(runtime, monkeypatch):
 
 
 def test_capture_hints_the_rows_as_eager_does(runtime):
-    # The route depends on the rows alone: a capture, the capture loop's warmup
-    # (in_hipgraph) and a captured draft pass's warmup hint what eager hints, so
-    # the warmup compiles exactly what the recording launches, large-input
-    # route included.
+    # The route depends on the rows alone: a capture and its warmup hint what
+    # eager hints whether or not in_hipgraph is set (a draft capture leaves it
+    # unset), so the warmup compiles exactly what the recording launches,
+    # large-input route included.
     runtime.run(_context(SMALL_M_MTPR + 1))
     runtime.forward_context.in_hipgraph = True
     runtime.run(_context(SMALL_M_MTPR))
