@@ -42,6 +42,9 @@ below.
 
 ## 2. Container
 
+Prebuilt image with section 3 already done: `rocm/fw-bringup:gfx1250-minimax-m3-20261125-lmcache` (set `IMAGE` to it
+below and skip section 3).
+
 ```bash
 IMAGE=rocm/atom-dev:ub24-dcgpu-rk-10.2.0-pyt2.14.0-rocmtri3.9-24d5394c-atomsrc-gfx1250-b1123
 MODEL_DIR=/path/to/MiniMax-M3.1-Flash-Quark-MXFP4      # with dspark/ inside
@@ -248,7 +251,8 @@ on the C4 server (forced 4.04); `ref step` is the client-side time of one decode
 
 ## 7. Expected numbers
 
-Measured on one 4 x MI455X node with exactly this recipe (base image + the two branches), November 2026.
+Measured with exactly this recipe (base image + the two branches), November 2026, on two 4 x MI455X nodes: one with
+1 TB of host RAM (accuracy, C4, C64 without LMCache) and one with 2 TB (C64 with LMCache at 384 GiB/rank).
 
 **Accuracy** (fresh server, real DSpark acceptance, `CONC=4`):
 
@@ -268,10 +272,13 @@ Measured on one 4 x MI455X node with exactly this recipe (base image + the two b
 |---|---:|---:|---:|---|---|---|---|
 | **C4, these branches** (LMCache off) | **10,460** | **874.4** | 923.7 | 1.1 / 1.1 ms | 0.24 / 0.98 s | 97.7% | 764 / 0 |
 | C4, vLLM on MI355X (InferenceX) | 10,322 | 581.4 | | | | | |
+| **C64, these branches** (LMCache on, 384 GiB/rank, 2 TB node) | **128,726** | **286.1** | 393.9 | 2.5 / 3.5 ms | 0.33 / 0.83 s | 97.3% (LMCache 1.3%) | 12,236 / 3 |
 | **C64, these branches** (LMCache off, 1 TB node) | **128,233** | **266.7** | 403.5 | 2.5 / 3.7 ms | 0.31 / 1.01 s | 95.8% | 12,209 / 1 |
 | C64, vLLM on MI355X (InferenceX) | 112,879 | 114.7 | | | | | |
 
 C4 with these branches: interactivity P90 **1.50x** vLLM on MI355X (874.4 vs 581.4), tok/s/chip 1.01x.
+C64 with these branches, LMCache on at 384 GiB/rank (2 TB node): interactivity P90 **2.49x** vLLM on MI355X (286.1 vs
+114.7), tok/s/chip 1.14x (128,726 vs 112,879).
 C64 with these branches, LMCache off (1 TB node): interactivity P90 **2.33x** vLLM on MI355X (266.7 vs 114.7),
 tok/s/chip 1.14x (128,233 vs 112,879). Not recommended, for reference: LMCache at 160 GiB/rank on the same node gave P90
 244.3 and 127,074 tok/s/chip (the tier stayed full and loaded nothing).
