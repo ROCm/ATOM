@@ -541,23 +541,46 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
+        if self.markov_head.fused_sample:
+            # Host side of the step, outside any recording: report a bounded
+            # wait of the one-launch Markov chain that gave up (rarely: a sync).
+            from atom.model_ops.dspark_markov_chain import poll_errors
+
+            poll_errors()
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]
         base_logits = self.lm_head(hidden).view(bs, num_draft, -1)
         out_ids = anchor_ids.new_empty(bs, num_draft + 1)
         out_ids[:, 0] = anchor_ids
-        markov_embeds = []
-        for k in range(num_draft):
-            # Greedy: sampling temperature is the target verify's business.
-            markov_embeds.append(
-                self.markov_head.sample_next(
-                    out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
-                )
+        markov_stack = None
+        if self.markov_head.fused_sample:
+            # One request: all K steps in one launch, bit-identical to the
+            # two-stage fused path below (dspark_markov_chain.py); None where
+            # its guard does not hold.
+            from atom.model_ops.dspark_markov_chain import markov_chain_bs1
+
+            embeds = markov_chain_bs1(
+                base_logits,
+                out_ids,
+                self.markov_head.markov_w1.weight,
+                self.markov_head.markov_w2.weight,
             )
+            if embeds is not None:
+                markov_stack = embeds.unsqueeze(0)
+        if markov_stack is None:
+            markov_embeds = []
+            for k in range(num_draft):
+                # Greedy: sampling temperature is the target verify's business.
+                markov_embeds.append(
+                    self.markov_head.sample_next(
+                        out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
+                    )
+                )
+            markov_stack = torch.stack(markov_embeds, dim=1)
         confidence = None
         if self.confidence_head is not None:
             confidence = self.confidence_head(
-                hidden.view(bs, num_draft, -1), torch.stack(markov_embeds, dim=1)
+                hidden.view(bs, num_draft, -1), markov_stack
             )
         return out_ids[:, 1:], confidence
