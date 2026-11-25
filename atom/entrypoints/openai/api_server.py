@@ -31,6 +31,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any
 
+import msgspec
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import (
@@ -1692,6 +1693,24 @@ async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
     return await _race_disconnect(_collect(), raw_request, request_id)
 
 
+class _DumpedJSONResponse(JSONResponse):
+    """A ``JSONResponse`` of a ``model_dump(mode="json")`` document, rendered
+    by msgspec rather than stdlib ``json``.
+
+    A P/D prefill response carries its prompt's ids, and stdlib ``json`` takes
+    about 3 ms to render 100k of them on the event loop. The body reads back as
+    the same document, with ``JSONResponse``'s headers. A float under 1e-4 or
+    of 1e16 and over in magnitude may be spelled otherwise (``1e-05`` as
+    ``0.00001``), the same number. A non-finite float, which stdlib ``json``
+    refuses, renders as ``null``, as the streamed frames (``sse.py``) do.
+    """
+
+    _encoder = msgspec.json.Encoder()
+
+    def render(self, content: Any) -> bytes:
+        return self._encoder.encode(content)
+
+
 async def setup_streaming_request_fanout(
     prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
@@ -2491,7 +2510,7 @@ async def _chat_completions(
                 )
         _log_request_model("response", request_id, resp)
         # Bypass FastAPI's recursive conversion of the token ID list.
-        return JSONResponse(content=resp.model_dump(mode="json"))
+        return _DumpedJSONResponse(content=resp.model_dump(mode="json"))
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
@@ -2789,7 +2808,7 @@ async def _completions(
                 request_id, model_name, final_output, echo=echo
             )
         _log_request_model("response", request_id, resp)
-        return JSONResponse(content=resp.model_dump(mode="json"))
+        return _DumpedJSONResponse(content=resp.model_dump(mode="json"))
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.

@@ -4,6 +4,7 @@
 """Test prefill prompt-ID responses and decode reuse without tokenizing."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -19,6 +20,7 @@ from atom.entrypoints.openai.protocol import (
     ChatMessage,
     CompletionRequest,
 )
+from atom.entrypoints.openai.sse import data_frame
 from atom.sampling_params import SamplingParams
 
 PROMPT_IDS = [101, 102, 103, 104]
@@ -270,6 +272,67 @@ class TestHttpResponseSerialization:
             # Existing multi-choice builders do not return KV transfer metadata.
             assert body["kv_transfer_params"] is None
         assert len(body["choices"]) == n
+
+    @pytest.mark.parametrize("endpoint", ["chat", "completion"])
+    def test_prefill_ids_are_not_rendered_by_stdlib_json(
+        self, monkeypatch, server, endpoint
+    ):
+        # Stdlib json renders 100k ids in about 3 ms on the event loop.
+        suffix = "chat/completions" if endpoint == "chat" else "completions"
+        payload = {"model": "m", "return_token_ids": True}
+        payload.update(
+            {"messages": [{"role": "user", "content": "hi"}]}
+            if endpoint == "chat"
+            else {"prompt": "hi"}
+        )
+        rendered, stdlib_render = [], JSONResponse.render
+
+        def render(self, content):
+            rendered.append(content)
+            return stdlib_render(self, content)
+
+        monkeypatch.setattr(JSONResponse, "render", render)
+
+        async def post():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=api_server.app),
+                base_url="http://test",
+            ) as client:
+                return await client.post(f"/v1/{suffix}", json=payload)
+
+        response = asyncio.run(post())
+        assert response.status_code == 200
+        assert response.json()["prompt_token_ids"] == PROMPT_IDS
+        assert rendered == []
+
+    def test_a_dumped_response_has_jsonresponse_s_headers_and_document(self):
+        doc = {
+            "text": '你好 🌍\n"q" \\ \x00\u2028',
+            "prompt_token_ids": list(range(4096)),
+            "usage": {"small": 1e-05, "big": 1e16, "seconds": 0.0001},
+            "nested": [None, True, {"k": []}],
+        }
+        plain = JSONResponse(doc)
+
+        response = api_server._DumpedJSONResponse(doc)
+
+        assert response.status_code == plain.status_code
+        assert response.media_type == plain.media_type
+        assert dict(response.raw_headers).keys() == dict(plain.raw_headers).keys()
+        assert int(dict(response.raw_headers)[b"content-length"]) == len(response.body)
+        # Only the floats under 1e-4 or of 1e16 and over are spelled otherwise.
+        assert response.body != plain.body
+        assert json.loads(response.body) == doc
+        doc["usage"] = {"seconds": 0.0001}
+        assert api_server._DumpedJSONResponse(doc).body == JSONResponse(doc).body
+
+    def test_a_non_finite_float_renders_as_null_as_a_stream_frame_does(self):
+        doc = {"logprob": float("-inf"), "nan": float("nan")}
+
+        body = api_server._DumpedJSONResponse(doc).body
+
+        assert json.loads(body) == {"logprob": None, "nan": None}
+        assert body.decode() == data_frame(doc).removeprefix("data: ").strip()
 
     @pytest.mark.parametrize("endpoint", ["chat", "completion"])
     def test_http_prefill_ids_can_be_reused_by_decode(self, server, endpoint):
