@@ -208,6 +208,14 @@ impl ConfigValidator {
             });
         }
 
+        if config.encode_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "encode_timeout_secs".to_string(),
+                value: config.encode_timeout_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
         if config.queue_size > 0 && config.queue_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "queue_timeout_secs".to_string(),

@@ -97,6 +97,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn encode_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.encode_timeout_secs = timeout;
+        self
+    }
+
     pub fn mode(mut self, mode: RoutingMode) -> Self {
         self.config.mode = mode;
         self

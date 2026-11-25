@@ -78,6 +78,9 @@ pub struct RouterConfig {
     /// Encode worker policy (falls back to `policy` when unset)
     #[serde(default)]
     pub encode_policy: Option<PolicyConfig>,
+    /// How long P waits for E before encoding the media itself
+    #[serde(default = "default_encode_timeout_secs")]
+    pub encode_timeout_secs: u64,
 
     pub policy: PolicyConfig,
     pub host: String,
@@ -506,6 +509,10 @@ fn default_mooncake_admin_port() -> u16 {
     9003
 }
 
+fn default_encode_timeout_secs() -> u64 {
+    30
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -545,6 +552,7 @@ impl Default for RouterConfig {
             atom_standalone: false,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
             encode_urls: vec![],
+            encode_timeout_secs: default_encode_timeout_secs(),
             encode_policy: None,
             model_path: None,
             tokenizer_path: None,
