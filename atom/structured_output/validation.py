@@ -19,7 +19,7 @@ logger = logging.getLogger("atom")
 
 
 def require_available():
-    """A 400 naming the extra, before any schema check imports llguidance or RE2."""
+    """A 400 naming the backend, before any schema check imports llguidance or RE2."""
     if not structured_output.available():
         raise ValueError(structured_output.UNAVAILABLE)
 
