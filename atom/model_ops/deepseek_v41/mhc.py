@@ -364,8 +364,8 @@ def _aiter_serves(hidden_size: int, hc_mult: int, dtype: torch.dtype, reduce: bo
 def post_reduce_supported(pending, residual) -> bool:
     """Where an owed post and the stream reduction after it run as one
     `aiter.mhc_post_reduce`: aiter takes the shape and dtype
-    (`mhc_post_reduce_supported`), and the operands are on the GPU and
-    contiguous."""
+    (`mhc_post_reduce_supported`), the residual is on the GPU, and both
+    operands are contiguous."""
     return (
         residual.is_cuda
         and residual.is_contiguous()

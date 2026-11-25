@@ -97,17 +97,29 @@ def _post_runs(residual):
     return mhc_post_supported(residual.shape[-1], residual.shape[-2], residual.dtype)
 
 
+def _reduce_runs(residual):
+    from aiter import mhc_post_reduce_supported
+
+    return mhc_post_reduce_supported(
+        residual.shape[-1], residual.shape[-2], residual.dtype
+    )
+
+
 def test_unsupported_shapes_keep_the_settle_path():
     mhc = _mhc()
-    # Hidden 768: mhc_post serves it (256-column tiles), the reduce does not.
-    residual, pending, post, comb, pre = _data(4, 768, 1, False)
-    assert _post_runs(residual)
-    assert not mhc.post_reduce_supported(pending, residual)
-    state = mhc.SinglePassHCState(residual, pre, pending, post, comb)
-    settled = mhc.expand_residual(pending, residual, post, comb)
-    assert torch.equal(state.stream_mean(), settled.mean(dim=-2))
-    assert torch.equal(state.collapse(), mhc.collapse_streams(settled, pre))
+    # A hidden size mhc_post serves and the reduce does not, as aiter says
+    # today; the fallback must give the settle path's bits.
+    for hidden in (256, 512, 768, 1024, 1536):
+        residual, pending, post, comb, pre = _data(4, hidden, 1, False)
+        if _post_runs(residual) and not _reduce_runs(residual):
+            assert not mhc.post_reduce_supported(pending, residual)
+            state = mhc.SinglePassHCState(residual, pre, pending, post, comb)
+            settled = mhc.expand_residual(pending, residual, post, comb)
+            assert torch.equal(state.stream_mean(), settled.mean(dim=-2))
+            assert torch.equal(state.collapse(), mhc.collapse_streams(settled, pre))
+            break
 
+    # Layouts the reduce never takes, whatever aiter serves.
     residual, pending, _, _, _ = _data(4, 2048, 1, False)
     assert not mhc.post_reduce_supported(pending, residual[:, :2])
     assert not mhc.post_reduce_supported(
@@ -117,25 +129,18 @@ def test_unsupported_shapes_keep_the_settle_path():
 
 
 def test_expand_residual_follows_aiters_query():
-    """`expand_residual` takes `mhc_post` exactly where aiter says it runs, and
-    the torch body elsewhere, without trapping on any of these shapes."""
+    """`expand_residual` returns the residual's shape and dtype on each of
+    these shapes and dtypes, whichever side of aiter's query they fall on,
+    and the reduce is offered only where aiter's query allows it."""
     mhc = _mhc()
-    for hidden in (256, 512, 768, 1024, 2048):
-        residual, pending, post, comb, _ = _data(3, hidden, 3, False)
-        # The torch body takes the post mix as [tokens, 4]; mhc_post views it.
-        settled = mhc.expand_residual(pending, residual, post.squeeze(-1), comb)
-        assert settled.shape == residual.shape and settled.dtype == residual.dtype
-    # Hidden 256 cannot hold two tiles; FP32 streams are not mhc_post's.
-    residual, pending, post, comb, _ = _data(3, 256, 4, False)
-    assert not _post_runs(residual)
-    residual, pending, post, comb, _ = _data(3, 2048, 2, False)
-    assert _post_runs(residual) and _post_runs(residual.half())
-    assert not _post_runs(residual.float())
-    assert not mhc.post_reduce_supported(pending.float(), residual.float())
-    torch_body = mhc.expand_residual(
-        pending.float(), residual.float(), post.squeeze(-1), comb
-    )
-    assert torch_body.dtype == torch.float32
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        for hidden in (256, 512, 768, 1024, 2048):
+            residual, pending, post, comb, _ = _data(3, hidden, 3, False, dtype)
+            # The torch body takes the post mix as [tokens, 4]; mhc_post views it.
+            settled = mhc.expand_residual(pending, residual, post.squeeze(-1), comb)
+            assert settled.shape == residual.shape and settled.dtype == dtype
+            if not _reduce_runs(residual):
+                assert not mhc.post_reduce_supported(pending, residual)
 
 
 def test_post_reduce_matches_in_fp16():
