@@ -18,26 +18,26 @@ numbers (C4 and C64, 1 hour).
 
 Both branches are the code we measured, unchanged:
 
-- **ATOM** = the MiniMax-M3.1 gfx1250 "1123 stack" (`61c8db8`: ROCm/ATOM main + the M3.1 PRs + the combo16 fusions)
-  plus one commit with the C4 decode work: async verdict and early output, one-launch draft metadata / sampler /
+- **ATOM** = the MiniMax-M3.1 gfx1250 stack `61c8db8` (ROCm/ATOM main + the M3.1 PRs + the combo16 fusions) plus
+  one commit with the C4 decode work: async verdict and early output, one-launch draft metadata / sampler /
   verify, draft KV inside the decode graph, Markov-chain resident kernel, stream-capture and H2D host trims, the LM
   head in its own graph, o_proj + post-attention all-reduce + residual + RMSNorm in one launch ("Stage O"), DSpark draft
   layers as two launches each.
-- **aiter** = the matching aiter "1123 stack" (`9c3f0ef`) plus one commit with the C4 kernels (Stage O kernels, 8-row
+- **aiter** = the matching aiter stack `9c3f0ef` plus one commit with the C4 kernels (Stage O kernels, 8-row
   router, QKV / o_proj tiles, GEMM1 wave-level route for <= 16 tokens, split-K GEMM1 plan for 8 tokens) and one commit
   that puts the routed-MoE tuning rows into `aiter/configs/model_configs/minimax_m3_gfx1250_tuned_grouped_fmoe.csv`, so
   aiter's default config lookup picks them (no `AITER_CONFIG_GROUPED_FMOE`, no file copy).
 
 The C4 pieces are on by default and gate themselves (gfx1250, TP4, a decode step of one request x 8 rows, ...); other
-shapes run the 1123 path. The 1123 stack's own fusions are opt-in flags of that stack and are set in the launch
-command below. Target numerics are bit-exact to the 1123 stack (greedy GSM8K responses identical).
+shapes take the stack's regular path. The stack's other fusions are opt-in flags and are set in the launch command
+below.
 
 ## 1. Host
 
 - amdgpu loaded with `sudo modprobe amdgpu gpu_recovery=0 halt_if_hws_hang=1` (how our nodes load it).
 - `sudo sysctl -w kernel.numa_balancing=0` for the benchmark runs.
 - About 230 GB of disk for the model, 60 GB for the image, ~25 GB for the container's build outputs.
-- For C64 with LMCache at the reference size (384 GiB per rank): about **1,690 GiB of available host memory**
+- For C64 with LMCache at the recommended size (384 GiB per rank): about **1,690 GiB of available host memory**
   (4 x 384 x 1.1 GiB). On a node with less RAM use a smaller tier (section 4); that
   changes the C64 numbers.
 
@@ -105,8 +105,8 @@ python3 -c 'import lmcache, lmcache.cuda_ops; from lmcache.v1.cache_engine impor
 cd -
 ```
 
-(pip then reports that grpcio-tools 1.85.3 wants protobuf >= 7.35; it is a build tool and the server does not use it.
-The 1123 bring-up image had the same protobuf 6.33.)
+(pip then reports that grpcio-tools 1.85.3 wants protobuf >= 7.35; it is a build tool and the server does not use
+it.)
 
 ### Benchmark clients (separate venv, so the server's packages do not move)
 
@@ -171,11 +171,11 @@ until curl -sf -m 5 http://127.0.0.1:8790/health > /dev/null; do sleep 30; done
   ATOM_PREFIX_CACHE_POLICY=slru ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5 LMCACHE_CACHE_POLICY=ATOM_SLRU
   LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3`
   and to the arguments `--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'`.
-  - `LMCACHE_MAX_LOCAL_CPU_SIZE` is GiB **per TP rank**: 384 is the size of the reference C64 LMCache-on run and needs
+  - `LMCACHE_MAX_LOCAL_CPU_SIZE` is GiB **per TP rank**: 384 is the recommended size and needs
     4 x 384 x 1.1 = ~1,690 GiB of `MemAvailable` before the start (a 2 TB node) (check `grep MemAvailable /proc/meminfo`).
   - With less RAM, set it to at most `MemAvailable_GiB / 4.4` (e.g. 160 on a 1 TB node). A smaller tier holds fewer
     evicted prefixes, so the C64 numbers move (expected numbers below say which size each run used).
-  - Without LMCache (C64 LMCache-off reference): leave out the LMCache env and `--kv-transfer-config`; `PYTHONHASHSEED`
+  - Without LMCache: leave out the LMCache env and `--kv-transfer-config`; `PYTHONHASHSEED`
     and the slru policy then do not matter.
 - The forced acceptance length 4.04 is InferenceX's golden DSpark acceptance for M3.1 at K = 7; the generated text is
   synthetic under it, so never measure accuracy with it.
@@ -248,7 +248,7 @@ Measured on one 4 x MI455X node with exactly this recipe (base image + the two b
 | Check | Result |
 |---|---|
 | gate.py (17 x 23, tool call) | PASS |
-| GSM8K 5-shot c1, first 250 | EM 0.960 (flexible) / 0.956 (strict); greedy responses byte-identical to the 1123 stack's on 250 / 250 |
+| GSM8K 5-shot c1, first 250 | 0.960 (flexible) / 0.956 (strict) |
 | Accepted length, c1 phase | 4.637 |
 | GSM8K 5-shot c16, all 1319 | 0.9522 (flexible) / 0.9500 (strict) |
 | Accepted length, c16 phase | 4.740 |
@@ -257,19 +257,13 @@ Measured on one 4 x MI455X node with exactly this recipe (base image + the two b
 
 **AgentX, 1 hour** (InferenceX AgentX replay, forced acceptance 4.04):
 
-Our node ("node A" below) is a different machine from the one the 1123 references were measured on ("node B", which
-measured ~6% below other nodes in earlier comparisons); compare across nodes with that in mind.
+| Run | tok/s/chip | Interactivity P90 (tok/s/user) | Median | ITL p50 / p90 | TTFT p50 / p90 | Prefix hit | Requests / failed |
+|---|---:|---:|---:|---|---|---|---|
+| **C4, these branches** (LMCache off) | **10,460** | **874.4** | 923.7 | 1.1 / 1.1 ms | 0.24 / 0.98 s | 97.7% | 764 / 0 |
+| C4, vLLM on MI355X (InferenceX) | 10,322 | 581.4 | | | | | |
+| C64, these branches (LMCache on) | (not measured yet) | | | | | | |
+| C64, vLLM on MI355X (InferenceX) | 112,879 | 114.7 | | | | | |
 
-| Run | Node | tok/s/chip | Interactivity P90 (tok/s/user) | Median | ITL p50 / p90 | TTFT p50 / p90 | Prefix hit | Requests / failed |
-|---|---|---:|---:|---:|---|---|---|---|
-| **C4, these branches** (LMCache off) | A | **10,460** | **874.4** | 923.7 | 1.1 / 1.1 ms | 0.24 / 0.98 s | 97.7% | 764 / 0 |
-| C4, 1123 stack (reference) | B | 10,390 | 763.5 | 804.0 | 1.2 / 1.3 ms | 0.26 / 1.42 s | 97.7% | 773 / 0 |
-| C4, vLLM on MI355X (InferenceX) | | 10,322 | 581.4 | | | | | |
-| C64, these branches, LMCache on, 160 GiB/rank | A | (run in progress; added on completion) | | | | | | |
-| C64, 1123 stack, LMCache on, 384 GiB/rank (reference) | B | 127,454 | 261.6 | 362.0 | 2.8 / 3.8 ms | 0.35 / 0.87 s | 97.2% | 12,172 / 1 |
-| C64, 1123 stack, LMCache off (reference) | B | 126,691 | 253.7 | 380.8 | 2.6 / 3.9 ms | 0.33 / 1.08 s | 95.8% | 12,158 / 3 |
-| C64, vLLM on MI355X (InferenceX) | | 112,879 | 114.7 | | | | | |
-
-C4 with these branches: P90 **1.50x** vLLM MI355X and +14.5% over the 1123 stack's reference (different node).
+C4 with these branches: interactivity P90 **1.50x** vLLM on MI355X (874.4 vs 581.4), tok/s/chip 1.01x.
 
 
