@@ -332,6 +332,7 @@ class EngineCore:
                 exchange_prefill_costs=self.scheduler.cost_balance,
                 cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
                 admit_policy=config.prefill_admit_policy,
+                sync_prefill=envs.ATOM_DP_PREFILL_SYNC,
             )
         )
 

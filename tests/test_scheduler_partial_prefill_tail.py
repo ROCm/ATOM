@@ -48,6 +48,7 @@ class _VetoDelayer:
 
     is_local = False
     max_queue_ms = None
+    sync_prefill = False
 
     def protects_decode(self, running_decode_batch: int) -> bool:
         return False
