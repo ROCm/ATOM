@@ -397,10 +397,11 @@ async fn a_regular_server_or_transport_error_releases_the_session_binding() {
         tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
         url
     }
-    let closed = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", listener.local_addr().unwrap())
-    };
+    // Bound but never listening: connects are refused, and the port stays
+    // taken for the whole test, so no engine below can be handed it.
+    let closed_socket = tokio::net::TcpSocket::new_v4().unwrap();
+    closed_socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let closed = format!("http://{}", closed_socket.local_addr().unwrap());
     for (bound, next) in [
         (
             engine(http::StatusCode::BAD_REQUEST).await,
