@@ -20,9 +20,9 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
@@ -1691,8 +1691,36 @@ class Indexer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Stubs — implementations land in tasks #5-#8
+# Attention execution
 # ---------------------------------------------------------------------------
+
+
+_NULL_SPAN = nullcontext()
+
+
+@contextmanager
+def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool):
+    """Select segment metadata and phase, restoring them on exit.
+
+    Other context fields describe the whole batch. Segment operations must
+    size their work from the supplied tensors and metadata."""
+    saved_md = fc.attn_metadata
+    saved_is_prefill = ctx.is_prefill
+    fc.attn_metadata = seg_md
+    ctx.is_prefill = is_prefill
+    try:
+        yield
+    finally:
+        fc.attn_metadata = saved_md
+        ctx.is_prefill = saved_is_prefill
+
+
+def _mixed_span(tag: str):
+    """Create a span only while profiling. Called inside the opaque attention op,
+    so the predicate is evaluated at runtime rather than captured by Dynamo."""
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(tag)
+    return _NULL_SPAN
 
 
 class DeepseekV4Attention(nn.Module):
@@ -1898,6 +1926,9 @@ class DeepseekV4Attention(nn.Module):
         )
         self.layer_name = prefix
         atom_config = get_current_atom_config()
+        if atom_config.enable_mixed_prefill_decode:
+            self.forward_impl_default = self.forward_impl
+            self.forward_impl = self._forward_impl_mixed
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
         # Frozen bool: when KV cache dtype is fp8, route writes/attention to the
         # native 2buff fp8 path (compute-only 2buff quant, op4 fp8 prefill, op5
@@ -2115,6 +2146,11 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         """TR_HYBRID order: compressor launch -> pre/proj+norm -> paged core
         (which joins the compressors) -> post, each a piece of its own."""
+        # No mixed form: a mixed batch runs only on the FULL path
+        # (`forward_impl`), and `Config._validate_mixed_prefill_decode` refuses
+        # TR_HYBRID with mixed at launch. Not checked here: this order is
+        # traced, and Dynamo would fold an `is_mixed` read against the warmup
+        # batch, so the check could never fire.
         torch.ops.aiter.v4_attn_compress_launch(x, self.layer_name)
 
         (
@@ -2337,20 +2373,96 @@ class DeepseekV4Attention(nn.Module):
             x, positions, run_indexer_proj=False
         )
         qkn = self._qk_norm_rope(q, kv_pre, positions)
-        o = self._sparse_attention(
-            qkn,
-            positions,
-            x=x,
-            qr=qr,
-            qr_scale=qr_scale,
-        )
+        o = self._sparse_attention(qkn, positions, x=x, qr=qr, qr_scale=qr_scale)
         return self._attn_post(o, positions)
+
+    def _forward_impl_mixed(self, x: torch.Tensor, positions: torch.Tensor):
+        fc = get_forward_context()
+        if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
+            return torch.zeros_like(x)
+        if not fc.attn_metadata.is_mixed:
+            return self.forward_impl_default(x, positions)
+        # Each half owns its compressor plan; the carrier has none.
+        q, kv_pre, qr, qr_scale, *_ = self._attn_pre(
+            x, positions, run_indexer_proj=False
+        )
+        o = self._attn_mixed(fc.attn_metadata, q, kv_pre, qr, qr_scale, x, positions)
+        return self._attn_post(o, positions)
+
+    def _attn_mixed(
+        self,
+        attn_md: "AttentionMetaData_DSV4",
+        q: torch.Tensor,
+        kv_pre: torch.Tensor,
+        qr: torch.Tensor,
+        qr_scale: torch.Tensor | None,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run QK-norm/RoPE once, then compressors and sparse attention per segment.
+
+        The carrier masks prefill SWA writes until attention has consumed the
+        preceding window. BF16 output reuses Q; FP8 uses a separate BF16 buffer."""
+        fc = get_forward_context()
+        ctx = fc.context
+        n_p = attn_md.num_prefill_tokens
+        n_d = x.size(0) - n_p
+        # q_norm scales can be column-major or padded/shuffled. Their apparent
+        # first dimension is not a token axis: project before splitting them.
+        idx_q_quant = idx_weights = idx_q_scale = None
+        if self.indexer is not None and not self.skip_topk:
+            idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
+                x, qr, positions, qr_scale
+            )
+        qkn = self._qk_norm_rope(q, kv_pre, positions, True)
+
+        # Each segment writes only its own rows, preserving the other query slice.
+        out = qkn.q_sa
+        if out is None:
+            out = torch.empty(
+                (n_p + n_d, self.n_local_heads, self.head_dim),
+                dtype=x.dtype,
+                device=x.device,
+            )
+
+        def _seg(lo: int, hi: int, seg_md, is_prefill: bool) -> None:
+            sl = slice(lo, hi)
+            tag = "prefill" if is_prefill else "decode"
+            with (
+                _segment_forward_context(
+                    fc,
+                    ctx,
+                    seg_md,
+                    is_prefill=is_prefill,
+                ),
+                _mixed_span(f"mixed_seg[{tag}] n={hi - lo}"),
+            ):
+                # Launch and join decide side streams by the same predicate
+                # (`_compressors_async`), so the join in `_sparse_attention`
+                # always matches what this launch did.
+                self._launch_compressors(x[sl])
+                self._sparse_attention(
+                    qkn.slice_tokens(sl),
+                    positions[sl],
+                    idx_q_quant=None if idx_q_quant is None else idx_q_quant[sl],
+                    idx_weights=None if idx_weights is None else idx_weights[sl],
+                    idx_q_scale=None if idx_q_scale is None else idx_q_scale[sl],
+                    x=x[sl],
+                    out=out[sl],
+                    decode=partial(sparse_attn_v4_paged_decode, out=out[sl]),
+                )
+
+        with _mixed_span(f"mixed[n_p={n_p} n_d={n_d}]"):
+            _seg(0, n_p, attn_md.prefill_attn_metadata, True)
+            _seg(n_p, n_p + n_d, attn_md.decode_attn_metadata, False)
+        return out.view(n_p + n_d, -1)
 
     def _qk_norm_rope(
         self,
         q: torch.Tensor,
         kv_pre: torch.Tensor,
         positions: torch.Tensor,
+        mixed: bool = False,
     ) -> "QKNormRopeOut":
         """The fused QK-norm/RoPE (+ decode SWA write). Single source.
 
@@ -2369,10 +2481,10 @@ class DeepseekV4Attention(nn.Module):
         # `_attn_pre` this sits UPSTREAM of that guard and needs its own.
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return _qkn_placeholder(self, q, q.shape[0], zeros=True)
-        attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
+        attn_md = fc.attn_metadata
         rd = self.rope_head_dim
         ratio = self.compress_ratio
-        is_decode = attn_md.state is AttnState.DECODE
+        is_decode = attn_md.state is AttnState.DECODE or mixed
         swa_dest_rows = (
             attn_md.swa_dest_rows[ratio]
             if (is_decode and attn_md.swa_dest_rows is not None)
@@ -2394,8 +2506,8 @@ class DeepseekV4Attention(nn.Module):
         #
         # Decode has no ordering hazard, so writing before the attention reads
         # the window is safe. Prefill does — chunked prefix reads must see the
-        # PRIOR chunk — so it passes `swa_*=None` and scatters its window tail
-        # after sparse_attn below.
+        # PRIOR chunk — so pure prefill passes `swa_*=None`; mixed masks its
+        # prefill rows. Both scatter the prefill window after sparse_attn.
         #
         # bf16 → qkn.q_sa / qkn.kv populated; fp8 2buff → qkn.q_packed / qkn.q_rope
         # / qkn.k_packed / qkn.k_rope populated (the 2buff layout nope-fp8 [.,512] +
@@ -2444,9 +2556,15 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor | None = None,  # FULL only: inline `forward_batched`
         qr: torch.Tensor | None = None,  # FULL only, same
         qr_scale: torch.Tensor | None = None,  # FULL only, same
+        out: torch.Tensor | None = None,
+        decode=sparse_attn_v4_paged_decode,
     ) -> torch.Tensor:
         """The TOKEN-shaped tail: indexer top-k, CSA pack, the paged attention, and
         prefill's SWA write.
+
+        ``out``, when given, is the ``[num_tokens, n_local_heads, head_dim]``
+        prefill destination. Mixed decode binds its destination to ``decode``
+        in `_attn_mixed`, keeping the ordinary decode kernel call unchanged.
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP8
@@ -2523,7 +2641,7 @@ class DeepseekV4Attention(nn.Module):
             # (unified_kv_rope set) → aiter ASM with pre-packed fp8 Q + the
             # 2buff fp8/bf16 pools read with no requant. The optional H=128
             # prefill-ASM decode route also consumes the shared empty CSR.
-            o = sparse_attn_v4_paged_decode(
+            o = decode(
                 qkn.q_sa,
                 self.unified_kv,
                 kv_indices,
@@ -2604,9 +2722,9 @@ class DeepseekV4Attention(nn.Module):
             # quant; bf16 → OPUS / Triton over q_sa and the bf16 extend kv_full.
             # Under PCP the extend K is the PCP all-gathered full sequence
             # (k_*_full for fp8, kv_full for bf16); off PCP it is this fwd's
-            # tensor unchanged. On bf16 the wrapper reuses out=qkn.q_sa as the
-            # attention output buffer (q_sa is not needed after this call →
-            # avoids an extra empty_like); fp8 ignores both q_sa and out.
+            # tensor unchanged. Without a caller's `out`, the output reuses
+            # q_sa (not needed after this call), which the fp8 path, whose
+            # q_sa is None, turns into a fresh allocation.
             o = sparse_attn_v4_paged_2src(
                 qkn.q_sa,
                 self.unified_kv,
@@ -2617,9 +2735,7 @@ class DeepseekV4Attention(nn.Module):
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
                 self.softmax_scale,
-                # Reuse q_sa as the attention output buffer; q_sa is not needed
-                # after this call and this avoids an extra empty_like allocation.
-                out=qkn.q_sa,
+                out=qkn.q_sa if out is None else out,
                 unified_kv_rope=self.unified_kv_rope,
                 q_packed=qkn.q_packed,
                 q_rope=qkn.q_rope,
