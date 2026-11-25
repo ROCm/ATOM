@@ -27,7 +27,7 @@ def _spin(load_all, pending):
     """Re-issue ``load_all`` until ``pending`` clears; a side-effecting op in the
     loop keeps the loads from being hoisted."""
     v = load_all()
-    if const_expr(POLL_ESCALATE > 0 and POLL_SLEEP_UNITS > 1):
+    if const_expr(POLL_SLEEP_UNITS > 1):
         # the first POLL_ESCALATE retries one unit, the later ones the full
         # backoff (``polling.POLL_ESCALATE``)
         n = fx.Int32(0)
