@@ -194,14 +194,21 @@ _ADAPT_FIXED = 4
 #        prefill step
 #   FIRE on the n-th decision since the last FIRE (n-1 held ticks) once
 #   regret >= A*B and n >= _MIN_TICKS, or once n >= the TTFT cap
-#   _MAX_HOLD_MS / mean decode step (600 ms ~ 24 at ~25 ms/tick), clamped to
+#   _MAX_HOLD_MS / mean decode step (2 s ~ 80 at ~25 ms/tick), clamped to
 #   [_COLD_MAX_TICKS, _TICKS_CAP].
-# Tuned on DSV4.1 DEP4 8k/1k; not meant to be tuned per deployment.
+# _MIN_TICKS and _MAX_HOLD_MS: each prefill pass stalls the decode batch of
+# every rank. With DP lockstep and many requests decoding per rank, admitting
+# prefill every few ticks makes those stalls frequent and the decode cadence
+# uneven. Holding at least _MIN_TICKS decisions spaces the passes out and lets
+# each gather a fuller batch, trading some TTFT for steadier decode; the TTFT
+# cap is long enough not to fire before that at usual decode step times.
+# Tuned on DSV4.1 DEP4 8k/1k and DEP8 agentic serving; not meant to be tuned
+# per deployment.
 _T0_FRAC = 0.75
 _A_MIN_FRAC = 0.3
 _A_MAX_FRAC = 1.5
-_MAX_HOLD_MS = 600.0
-_MIN_TICKS = 4
+_MAX_HOLD_MS = 2000.0
+_MIN_TICKS = 40
 _TICKS_CAP = 200
 # cap before the decode mean is known (cold start)
 _COLD_MAX_TICKS = 24
