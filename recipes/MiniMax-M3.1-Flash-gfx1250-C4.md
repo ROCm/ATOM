@@ -70,6 +70,11 @@ pip install --no-deps --no-build-isolation -e /opt/ATOM
 git clone --depth 1 -b $BRANCH https://github.com/ROCm/aiter.git /opt/aiter
 git -C /opt/aiter log -1 --format=%H         # c390792879a5af356226e09a5da0e0919cfc9d74
 git -C /opt/aiter submodule update --init --depth 1 3rdparty/composable_kernel
+# ROCm 10.2's clang defines __gfx125__ for gfx1250, which turns on CK's TDM block, where a misplaced brace in
+# amd_tdm_store breaks the module_sample / module_activation JIT builds (C64 needs them). One-line fix, the same as in
+# CK develop; no kernel code changes.
+CKP=/opt/ATOM/recipes/minimax-m31-gfx1250/ck_tdm_store_brace.patch
+git -C /opt/aiter/3rdparty/composable_kernel apply --check $CKP && git -C /opt/aiter/3rdparty/composable_kernel apply $CKP
 pip uninstall -y amd-aiter
 cd /opt/aiter && PREBUILD_KERNELS=0 pip install --no-deps --no-build-isolation -e . && cd -
 python3 -c 'import atom, aiter, flydsl; print(atom.__file__, aiter.__file__, flydsl.__version__)'
