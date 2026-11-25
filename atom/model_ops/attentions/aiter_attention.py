@@ -1087,6 +1087,50 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             positions = var["positions"].gpu[:running_tokens]
         return attn_metadata, positions
 
+    def consumes_device_verdict(self, batch: ScheduledBatch, max_seqlen_q: int) -> bool:
+        """A verify window (``max_seqlen_q`` > 1) on a step the runner allows
+        (`ModelRunner._device_verdict_eligible`), with this class's own decode
+        metadata: everything `stage_decode` derives from the verdict -- context
+        lengths, positions, slot mapping, ``kv_indptr`` -- `spec_decode_shift`
+        redoes on the device. A subclass with its own decode metadata (or
+        M-RoPE positions) keeps the host-side wait."""
+        cls = type(self)
+        return bool(
+            max_seqlen_q > 1
+            and getattr(self.model_runner, "device_verdict_eligible", False)
+            and cls.stage_decode is AiterAttentionMetadataBuilder.stage_decode
+            and cls.finish_decode is AiterAttentionMetadataBuilder.finish_decode
+            and not self.model_runner.use_mrope
+        )
+
+    def _shift_to_device_verdict(
+        self, attn_metadata, scheduled_bs: int, running_bs: int, max_seqlen_q: int
+    ) -> None:
+        """The previous verdict's rejected counts, taken off the uploaded
+        metadata on the device before anything below reads it."""
+        tp = self.model_runner.tokenID_processor
+        locs = tp._status_locs
+        if not tp.spec_status_owed or locs is None or len(locs.deferred_curr) == 0:
+            return
+        from atom.model_ops.spec_decode_shift import shift_decode_metadata
+
+        var = self.model_runner.forward_vars
+        shift_decode_metadata(
+            decode_src=tp.decode_src.gpu,
+            rejected=tp.prev_spec_counts_gpu[1],
+            cu_seqlens_q=var["cu_seqlens_q"].gpu,
+            block_tables=attn_metadata.block_tables,
+            context_lens=attn_metadata.context_lens,
+            positions=var["positions"].gpu,
+            slot_mapping=attn_metadata.slot_mapping,
+            kv_indptr=attn_metadata.kv_indptr,
+            bs=scheduled_bs,
+            running_bs=running_bs,
+            max_q=max_seqlen_q,
+            page_size=self.model_runner.block_size,
+            kv_block_size=self.block_size,
+        )
+
     def finish_decode(
         self,
         batch: ScheduledBatch,
@@ -1095,6 +1139,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         running_tokens: int,
         max_seqlen_q: int,
     ) -> None:
+        if getattr(self.model_runner, "spec_status_deferred", False):
+            # Device verdict (`consumes_device_verdict`): the lengths were laid
+            # out at the reservation.
+            self._shift_to_device_verdict(
+                attn_metadata, batch.total_seqs_num_decode, running_bs, max_seqlen_q
+            )
         super().finish_decode(
             batch, attn_metadata, running_bs, running_tokens, max_seqlen_q
         )

@@ -256,6 +256,11 @@ class TokenLocations(NamedTuple):
 
 
 class tokenIDProcessor:
+    # Early output / device verdict (see `clean`); class defaults too, for
+    # processors built without `__init__`.
+    _early_taken: tuple | None = None
+    prev_spec_counts_gpu: torch.Tensor | None = None
+
     def __init__(
         self,
         runner: "ModelRunner",
@@ -451,6 +456,14 @@ class tokenIDProcessor:
         # (`prepare_input_ids`' `defer_spec_status`), owed until
         # `take_deferred_spec_status`.
         self.spec_status_owed = False
+        # Early output: the previous step's (ids, logprobs, drafts), received
+        # by `take_deferred_output` and consumed by this step's
+        # `prepare_sampled_ids` / `prepare_draft_ids`.
+        self._early_taken = None
+        # The previous producing step's verdict counts on the device ([bonus,
+        # rejected] x its requests), which a builder that consumes the device
+        # verdict shifts the next step's metadata by.
+        self.prev_spec_counts_gpu = None
 
     def verify_ctx_lens(self, context_lens: np.ndarray) -> np.ndarray:
         """`batch.context_lens` moved back to the start of this verify window.
@@ -511,14 +524,33 @@ class tokenIDProcessor:
             )
             return ret, logprobs_map
 
-        token_ids = self.recv_async_output(self.token_ids_cpu)
-        logprobs = self.recv_logprobs()
+        early = self._early_taken
+        if early is None:
+            token_ids = self.recv_async_output(self.token_ids_cpu)
+            logprobs = self.recv_logprobs()
         self.send_to_cpu_async(
             sampled_token_ids,
             self.token_ids_cpu,
             sync_event,
             gpu_logprobs=sampled_logprobs,
         )
+        if early is not None:
+            # Early output: `take_deferred_output` already received the
+            # previous step's ids (and set `prev_req_ids`); only this step's
+            # copy above is left. Its drafts are still held for
+            # `prepare_draft_ids`.
+            token_id_dict, logprobs_map = early[0], early[1]
+        else:
+            token_id_dict, logprobs_map = self._unpack_prev_outputs(token_ids, logprobs)
+
+        self.prev_batch = batch
+        self.prev_token_ids = sampled_token_ids
+        self.prev_channel_states = channel_states
+        return token_id_dict, logprobs_map
+
+    def _unpack_prev_outputs(self, token_ids, logprobs):
+        """`prev_batch`'s received ids (and logprobs) keyed by its request ids;
+        sets `prev_req_ids`. Empty before the first sampled forward."""
         token_id_dict = {}
         logprobs_map = None
         self.prev_req_ids = None
@@ -539,15 +571,32 @@ class tokenIDProcessor:
                     token_id_dict,
                     self.prev_batch.return_logprobs,
                 )
-        else:
-            # first time, no previous tokens
-            token_ids = {}
-            logprobs_map = None
-
-        self.prev_batch = batch
-        self.prev_token_ids = sampled_token_ids
-        self.prev_channel_states = channel_states
         return token_id_dict, logprobs_map
+
+    def take_deferred_output(
+        self,
+    ) -> tuple[dict[int, tuple[int, ...]], dict | None, np.ndarray]:
+        """Early output: the receive halves of `prepare_sampled_ids` and
+        `prepare_draft_ids`, run as soon as this step's target graph is
+        launched rather than after its sampling and drafting.
+
+        Everything a deferred step reports belongs to the PREVIOUS step: its
+        ids and logprobs (one D2H, waited on before the entry is popped, as
+        `recv_async_output` always does), its drafts (the draft D2H queue's
+        oldest entry) and its verify counts (already taken). The same FIFO
+        entries are taken, in the same order, as the late path takes them;
+        only the moment moves. This step's own copies are still enqueued by
+        `prepare_sampled_ids` / `prepare_draft_ids`, unchanged.
+        """
+        assert self.is_deferred_out and self._early_taken is None
+        token_ids = self.recv_async_output(self.token_ids_cpu)
+        logprobs = self.recv_logprobs()
+        token_id_dict, logprobs_map = self._unpack_prev_outputs(token_ids, logprobs)
+        drafts = self.recv_draft_token_ids()
+        if self.prev_req_ids is None:
+            drafts = np.array([], dtype=np.int32)
+        self._early_taken = (token_id_dict, logprobs_map, drafts)
+        return self._early_taken
 
     def get_token_locations(self, batch: ScheduledBatch) -> TokenLocations:
         prev_req_ids = self.prev_batch.req_ids
@@ -814,6 +863,13 @@ class tokenIDProcessor:
         else:
             self.draft_token_ids = draft_token_ids
             self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
+            early = self._early_taken
+            if early is not None:
+                # Received by `take_deferred_output`; this step's drafts still
+                # go down below, behind the previous step's.
+                self._early_taken = None
+                self.send_draft_token_ids_to_cpu(draft_token_ids)
+                return early[2]
             token_ids = self.recv_draft_token_ids()
             self.send_draft_token_ids_to_cpu(draft_token_ids)
             ret = (
@@ -853,6 +909,13 @@ class ModelRunner:
     # past the target's launch (`prepare_model`).
     verify_head: VerifyHead | None = None
     spec_status_deferred = False
+    # Whether this step may take the previous verify's verdict on the device
+    # (`_device_verdict_eligible`); the builder decides
+    # (`AttentionMetadataBuilder.consumes_device_verdict`).
+    device_verdict_eligible = False
+    # Rank 0's channel to send a decode step's output before the step returns
+    # (`_early_output_step`); set by the worker process.
+    early_output_sink = None
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -879,6 +942,10 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        # Rank 0's channel to send a decode step's output before the step
+        # returns (`_early_output_step`); set by the worker process, None on
+        # the other ranks.
+        self.early_output_sink = None
         # Where the paged pool's bytes come from, resolved on first use
         # (`_kv_pool_memory`).
         self._kv_pool_memory_provider = None
@@ -2976,6 +3043,9 @@ class ModelRunner:
             spec_decode_indices = self.drafter.prepare_spec_decode_indices(
                 lens, cu[1:], token_group
             )
+        self.device_verdict_eligible = self._device_verdict_eligible(
+            batch, forward_mode
+        )
         # A step built without the previous verify's host-side status takes it
         # after the target's launch (`forward`): a prefill (its rows are new
         # requests', none the status counts), or a decode whose builder
@@ -3720,6 +3790,9 @@ class ModelRunner:
                 self.tokenID_processor.spec_status_queue.send(
                     spec_counts, ready=self.forward_done_event
                 )
+                # A builder that consumes the device verdict shifts the next
+                # step by these. Held, so the allocator keeps them.
+                self.tokenID_processor.prev_spec_counts_gpu = spec_counts
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 # A producer that skips propose keeps the bookkeeping above:
                 # its next step reads `prev_token_ids` like any other's.
@@ -3844,6 +3917,17 @@ class ModelRunner:
         # The status this step deferred (`prepare_model`), after the launch.
         if self.spec_status_deferred:
             self.tokenID_processor.take_deferred_spec_status()
+        early_published = False
+        if self._early_output_step(batch):
+            # Early output: what this step reports is the previous step's, and
+            # it is all in now. Rank 0 sends it while the GPU runs the target,
+            # so the engine core schedules the next step while this one
+            # samples and drafts. Every rank takes the same queue entries, so
+            # their D2H FIFOs stay in step.
+            early_output = self._deferred_output()
+            if self.early_output_sink is not None:
+                self.early_output_sink(early_output)
+                early_published = True
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
 
@@ -3913,10 +3997,94 @@ class ModelRunner:
             needs_independent_noise=needs_independent_noise,
         )
 
+        # Consumed by `prepare_draft_ids`; never carried into a next step.
+        self.tokenID_processor._early_taken = None
         reset_forward_context()
         self._record_forward_vars_event()
         self._record_kv_cache_ready(batch)
+        if early_published:
+            # The engine already has this step's output; a second one would be
+            # read as the answer to its next call.
+            return None
         return fwd_output
+
+    def _single_group(self) -> bool:
+        """One engine, one stage, no PCP / SP: the only deployment the early
+        output and the device verdict are written for. A DP group mirrors
+        dummy forwards, PP moves the drafter to the last stage, and PCP / SP
+        redo the draft inputs across ranks -- each keeps the original step."""
+        pc = self.config.parallel_config
+        return (
+            pc.data_parallel_size == 1
+            and self.config.pipeline_parallel_size == 1
+            and get_pcp_world_size() == 1
+            and not sp_is_enabled()
+        )
+
+    def _device_verdict_eligible(self, batch: ScheduledBatch, forward_mode) -> bool:
+        """The engine's side of taking the previous verdict on the device: a
+        pure decode that carries requests over from a previous sampled step of
+        this deferred block drafter's runner (DSpark: its proposer reads the
+        step's positions on the device only), replayed from a whole-forward
+        decode graph (whose grids do not read the host's lengths), no
+        micro-batches, one engine / stage / PCP group. The builder adds what
+        its metadata needs (`consumes_device_verdict`)."""
+        tp = self.tokenID_processor
+        return bool(
+            tp.is_deferred_out
+            and getattr(getattr(self, "drafter", None), "is_block_drafter", False)
+            and not batch.is_dummy_run
+            and batch.total_seqs_num_prefill == 0
+            and batch.total_seqs_num_decode > 0
+            and not getattr(batch, "structured_requests", None)
+            and forward_mode.use_cudagraph
+            and forward_mode.ubatch_slices is None
+            and not self._tr_hybrid_active()
+            and tp.prev_batch is not None
+            and tp.prev_spec_counts_gpu is not None
+            and self._single_group()
+        )
+
+    def _early_output_step(self, batch: ScheduledBatch) -> bool:
+        """This step sends its output early: a pure decode of a deferred-output
+        block drafter's runner (DSpark), nothing in it whose output this step
+        itself decides (token constraints' errors), no KV connector (it may act
+        on a finished request as soon as the engine sees it), one engine /
+        stage / PCP group."""
+        tp = self.tokenID_processor
+        return bool(
+            tp.is_deferred_out
+            and getattr(getattr(self, "drafter", None), "is_block_drafter", False)
+            and not batch.is_dummy_run
+            and batch.total_seqs_num_prefill == 0
+            and batch.total_seqs_num_decode > 0
+            and not getattr(batch, "structured_requests", None)
+            and get_kvconnector() is None
+            and self._single_group()
+        )
+
+    def _deferred_output(self) -> ScheduledBatchOutput:
+        """This decode step's `ScheduledBatchOutput`, built before its
+        sampling: exactly the fields `postprocess` reports on the deferred
+        drafter path, every one of them the previous step's."""
+        tp = self.tokenID_processor
+        token_id_dict, logprobs_map, draft_token_ids = tp.take_deferred_output()
+        verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
+        return ScheduledBatchOutput(
+            req_ids=list(token_id_dict),
+            token_ids=list(token_id_dict.values()),
+            draft_token_ids=draft_token_ids,
+            is_deferred_out=True,
+            num_rejected=tp.prev_rejected_num,
+            num_bonus=tp.prev_bonus_num,
+            logprobs=logprobs_map,
+            dspark_ell=(
+                verify_scheduler.ell_nonblocking()
+                if verify_scheduler is not None
+                else None
+            ),
+            constraint_errors=constraint_errors(self),
+        )
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
