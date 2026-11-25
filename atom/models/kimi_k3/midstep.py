@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """Kimi-K3 midstep KDA state checkpoints (``ATOM_K3_KDA_STATE_MIDSTEP``).
 
