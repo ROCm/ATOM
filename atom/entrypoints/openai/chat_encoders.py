@@ -229,7 +229,8 @@ def template_takes_mid_system(
         after_user = render([top, user, mark, prior, last])
         after_assistant = render([top, user, prior, mark, last])
         trailing = render([top, user, prior, last, mark])
-    except _PROBE_REFUSALS:
+    except (*_PROBE_REFUSALS, NotImplementedError):
+        # DeepSeek-V4's encoder refuses shapes it does not know this way.
         return False
     except Exception:  # answering False only folds more
         logger.warning(

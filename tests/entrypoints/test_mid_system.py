@@ -18,7 +18,7 @@ import json
 import pytest
 from jinja2 import TemplateError
 
-from atom.entrypoints.openai import api_server
+from atom.entrypoints.openai import api_server, chat_encoders
 from atom.entrypoints.openai.chat_encoders import template_takes_mid_system
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
@@ -112,6 +112,23 @@ class _Template:
 )
 def test_the_probe_tells_which_templates_take_it(behaviour, takes):
     assert template_takes_mid_system(_Template(behaviour), None) is takes
+
+
+@pytest.mark.parametrize(
+    "error, warns",
+    [(NotImplementedError("Unknown role: system"), False), (RuntimeError("bug"), True)],
+)
+def test_only_an_unexpected_failure_is_logged(monkeypatch, caplog, error, warns):
+    # DeepSeek-V4's encoder refuses an unknown shape with NotImplementedError:
+    # an answer, not a failure worth a traceback at every startup.
+    def render(_tok, _enc, messages, **_kw):
+        if any(m["role"] == "system" for m in messages[1:]):
+            raise error
+        return "".join(m["content"] for m in messages)
+
+    monkeypatch.setattr(chat_encoders, "apply_chat_template", render)
+    assert template_takes_mid_system(None, None) is False
+    assert ("WARNING" in [r.levelname for r in caplog.records]) is warns
 
 
 def _sys(text):
