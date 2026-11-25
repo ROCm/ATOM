@@ -14,11 +14,14 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
-    # Do not use paths here. The required gate must be published for every PR;
-    # ci-gate below keeps the old path filter behavior for expensive jobs.
+    # Do not use paths here. The required gate must be published for every PR.
+    # No GPU or Slurm job runs on a PR, so there ci-gate only decides whether
+    # load-config runs.
   pull_request_review:
     types: [submitted]
   schedule:
+    # Spur MI350X nightly at 00:10 Beijing time (16:10 UTC).
+    - cron: '10 16 * * *'
     # Spur MI350X MoRI IO accuracy at 12:10 Beijing time (04:10 UTC).
     - cron: '10 4 * * *'
   workflow_dispatch:
@@ -236,10 +239,9 @@ env:
   ATOMESH_PD_RANK_MAPPING_POLICY: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'idx2idx' || 'none' }}
   ATOMESH_LOG_ROOT: ${{ ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/${USER}/logs/ATOMESH_LOG/' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe' && '/home/junyyang/ATOMesh_ACTION_RUNNER/ATOMesh_LOG/' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' && '/shared_nfs/ATOMESH_CI/LOG/' || '/it-share/ATOMESH_LOG/') }}
   ATOMESH_MODEL_ROOT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/junyyang/models' || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && '/shared_nfs/huggingface_models/amd' || '/mnt/models') }}
-  # MI350: omit fabric-5 (foreign containers ignore Spur --exclusive and fill
-  # VRAM) and fabric-15 (unreachable). Candidate pool is fabric-6,7,13,14,16.
-  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != 'auto' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || '') }}
-  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != 'auto' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || '') }}
+  # MI350: candidate pool is fabric-5,6,7,8.
+  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != 'auto' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8' || '') }}
+  ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != 'auto' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8' || '') }}
 
 concurrency:
   # Keep manual benchmark dispatches independent so different cases on the same branch can run together.
@@ -249,7 +251,8 @@ concurrency:
   # ci:mesh, or ci:full to a PR without ci:mesh (check_label_event in the gate
   # script) -- so an unrelated label can never cancel running heavy CI. The
   # gate job's name repeats this test; keep both in sync with CI_GATE_LABELS.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || (github.event_name == 'schedule' && 'atomesh-cicd-mi350-moriio' || 'atomesh-cicd') }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:mesh' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:mesh'))) && format('-noop-{0}', github.run_id) || '' }}
+  # The MoRI IO schedule has a group of its own, or it would queue behind the multi-day nightly.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || (github.event_name == 'schedule' && (github.event.schedule == '10 4 * * *' && 'atomesh-cicd-mi350-moriio' || 'atomesh-cicd-mi350') || 'atomesh-cicd') }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:mesh' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:mesh'))) && format('-noop-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
 
 permissions:
@@ -407,10 +410,11 @@ jobs:
       - name: Build benchmark matrix
         id: matrix
         env:
-          SUITE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
+          SUITE: ${{ github.event_name == 'schedule' && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
+          EVENT_SCHEDULE: ${{ github.event_name == 'schedule' && github.event.schedule || '' }}
           ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
@@ -450,7 +454,7 @@ jobs:
             exit 0
           fi
 
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "10 4 * * *" ]]; then
             python3 .github/scripts/atomesh/pd_matrix.py \
               --suite accuracy \
               --kv-connector moriio \
@@ -1529,14 +1533,19 @@ jobs:
           echo "RDMA smoke summary written to ${summary_path}"
 
   run-model-benchmark:
+    # Not on pull requests: their merge checks are the ATOMesh unit tests and
+    # the accuracy runs. The latest push to main on this workflow's
+    # paths runs the smoke suite (DeepSeek-V4 1P1D over Mooncake), since a newer
+    # push cancels a run still pending. To run it on a PR branch, dispatch this
+    # workflow with suite=smoke and case_names=ds-v4-1p1d-tp8-smoke.
     name: ${{ matrix.group.name }}
     needs: [ci-gate, load-config]
     if: >-
       needs.load-config.outputs.has_matrix == 'true'
       && (
         github.event_name == 'schedule'
+        || github.event_name == 'push'
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
-        || (github.event.pull_request && !github.event.pull_request.head.repo.fork)
       )
     strategy:
       fail-fast: false
@@ -1836,7 +1845,7 @@ jobs:
             summarize-results=${{ needs.summarize-results.result }}
           required-results: |
             load-config=${{ needs.load-config.result }}
-            run-model-benchmark=${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark) || (github.event.pull_request && !github.event.pull_request.head.repo.fork)) && needs.run-model-benchmark.result || 'success' }}
+            run-model-benchmark=${{ (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)) && needs.run-model-benchmark.result || 'success' }}
 
   dashboard:
     concurrency:

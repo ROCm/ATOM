@@ -10,6 +10,7 @@ build in its disk cache is traced too.
 Usage: python -m atom.models.minimax_m3.mono.contract [S ...]
 """
 
+import itertools
 import sys
 
 from atom.models.minimax_m3.mono.config import TP, IndexHeads
@@ -23,14 +24,25 @@ from atom.mono.runtime.compile import check_traced
 
 
 def build_layer(
-    tokens: int, index_heads: int, fuse_k1: bool = True, index_topk: bool = True
+    tokens: int,
+    index_heads: int,
+    fuse_k1: bool = True,
+    index_topk: bool = True,
+    kv_nvfp4: bool = False,
+    index_nvfp4: bool = False,
+    attn_mxfp8: bool = False,
+    fused_shared: bool = False,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
-    or not (``fuse_k1``), selecting or reusing a selection (``index_topk``)."""
+    or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), NVFP4
+    K/V / index pages (``kv_nvfp4`` / ``index_nvfp4``), native MXFP8 qkv / o_proj
+    (``attn_mxfp8``), the shared expert fused into the routed tables
+    (``fused_shared``)."""
     heads = IndexHeads(index_heads, 0)
     return build_post_attn_kernel(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=fuse_k1, heads=heads,
-        index_topk=index_topk,
+        index_topk=index_topk, kv_nvfp4=kv_nvfp4, index_nvfp4=index_nvfp4,
+        attn_mxfp8=attn_mxfp8, fused_shared=fused_shared,
     )  # fmt: skip
 
 
@@ -40,13 +52,29 @@ def build_dense(tokens: int):
 
 
 def check_build(
-    tokens: int, index_heads: int, fuse_k1: bool = True, index_topk: bool = True
+    tokens: int,
+    index_heads: int,
+    fuse_k1: bool = True,
+    index_topk: bool = True,
+    kv_nvfp4: bool = False,
+    index_nvfp4: bool = False,
+    attn_mxfp8: bool = False,
+    fused_shared: bool = False,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
-        build_layer(tokens, index_heads, fuse_k1, index_topk),
+        build_layer(
+            tokens,
+            index_heads,
+            fuse_k1,
+            index_topk,
+            kv_nvfp4,
+            index_nvfp4,
+            attn_mxfp8,
+            fused_shared,
+        ),
         K4_ABI,
-        mailbox_regions(tokens, index_heads, fuse_k1, index_topk),
+        mailbox_regions(tokens, index_heads, fuse_k1, index_topk, fused_shared),
     )
 
 
@@ -57,8 +85,18 @@ def check_dense_build(tokens: int) -> None:
 
 if __name__ == "__main__":
     sizes = [int(a) for a in sys.argv[1:]] or list(range(1, 17))
+    both = (False, True)
     for s in sizes:
         for ih in (1, TP):
-            for it in (True, False):
-                check_build(s, ih, index_topk=it)
-                print(f"S={s} index heads={ih} index_topk={it}: contract holds")
+            # indexer context parallelism reads fp8 index caches only
+            nvfp4 = both if ih == 1 else (False,)
+            # every kind of build a runner makes, its selecting and reusing layers
+            for nv, am, fs, it in itertools.product(nvfp4, both, both, both):
+                check_build(
+                    s, ih, index_topk=it, kv_nvfp4=nv, index_nvfp4=nv,
+                    attn_mxfp8=am, fused_shared=fs,
+                )  # fmt: skip
+                print(
+                    f"S={s} index heads={ih} nvfp4={nv} attn_mxfp8={am} "
+                    f"fused_shared={fs} index_topk={it}: contract holds"
+                )

@@ -185,6 +185,12 @@ whichever knob was set, converts a rate into a length, and calls
 the per-position unconditional rates. Everything downstream reads only the
 resolved `synthetic_acceptance_rates`, so neither spelling survives past config.
 
+A request's sampling parameters do not apply under it: `LLMEngine` admits every
+request with temperature 0, top-k off and top-p 1. The drafts are accepted by
+the configured rates whatever the target would have drawn, so a sampled request
+would only change which correction token is emitted, and it would keep the step
+off a model's verify head (`VerifyHead.samples_step`).
+
 `rejection_sample` then dispatches `rejection_synthetic_sample_kernel` in place
 of the greedy kernel. The kernel walks positions in order and stops at the first
 rejection, so it needs `P(accept i | accepted through i-1)` rather than the

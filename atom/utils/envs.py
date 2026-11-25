@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 """Centralized environment variable definitions for ATOM.
 
@@ -51,6 +52,22 @@ def _flag_env(name: str, default: str = "0") -> bool:
     # the opposite of what the operator wrote. `VAR="off "` did the same.
     raw = os.getenv(name, default).strip().lower()
     return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def _preload_mode() -> str:
+    """ATOM_PRELOAD: "off", "server" (1: take the weights from a weight cache
+    daemon) or "daemon" (be one)."""
+    raw = os.getenv("ATOM_PRELOAD", "").strip().lower()
+    if raw == "daemon":
+        return "daemon"
+    if raw in ("", "0", "false", "no", "off"):  # as _flag_env reads a flag
+        return "off"
+    if raw in ("1", "true", "yes", "on"):
+        return "server"
+    raise ValueError(
+        "ATOM_PRELOAD must be on (1/true/yes/on), off (0/false/no/off) or "
+        f"daemon, not {raw!r}"
+    )
 
 
 def _profiler_detail_env(name: str) -> bool:
@@ -146,6 +163,15 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
     return value
 
 
+def _dp_sync_interval_env() -> int | None:
+    """None for a non-integer, so every DP rank can reject it together; 0 and
+    negative values mean 1."""
+    try:
+        return max(1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1")))
+    except ValueError:
+        return None
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
@@ -164,6 +190,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the decode side scatters them into the paged KV and returns the slot.
     # 0 = staged writes only.
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
+    # MiniMax PP/TP1 -> TP landing, independent of incremental chunk transfer.
+    "ATOM_PD_MINIMAX_LANDING": lambda: _flag_env("ATOM_PD_MINIMAX_LANDING", "0"),
     # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the
     # failure; a Mooncake prefill keeps a landing slot whose write failed out
@@ -207,6 +235,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
+    "ATOM_STORE_SAVE_BATCH_CHUNKS": lambda: _int_env("ATOM_STORE_SAVE_BATCH_CHUNKS", 0),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
@@ -346,9 +375,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # Qwen3.8-Flash-Next eager prefill on SGLang-ATOM: run QSA sparse attention
-    # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
-    # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel. On by
-    # default; 0 / false / off disables. Needs aiter with ROCm/aiter#6576.
+    # with aiter's FlyDSL kernel (BF16 D256, one KV head per rank) instead of
+    # qsa_sparse_paged_gqa, where aiter reports it runs
+    # (aiter.ops.qsa.qsa_sparse_prefill_widths()). Other steps keep the native
+    # kernel. On by default; 0 / false / off disables. qsa_attention imports
+    # aiter's queries at module level, so aiter with ROCm/aiter#8083 is needed
+    # whether the flag is on or off.
     "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
@@ -434,7 +466,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
-    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950/gfx1250 shapes, else Triton.
+    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950/gfx1250 shapes, mega_mhc's gfx942
+    # ASM seam for seams with a post where AITER supports it, else Triton.
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),
@@ -520,8 +553,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
     # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
-    # interior states instead of cutting prefill chunks onto them. PAGE path
-    # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
+    # interior states instead of cutting prefill chunks onto them, on both the
+    # PAGE and the fork-slot path; see `StateCache.publish_midstep`. Not
+    # Qwen3.8, whose PLE windows are checkpointed only where a forward ends.
     "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
     # Set to 0 to keep Qwen3.5's GDN input projection as two layers
     # (`in_proj_qkvz` + `in_proj_ba`) when the checkpoint quantizes them with
@@ -580,14 +614,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS": lambda: int(
         os.getenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", str(1 << 26))
     ),
-    # DCP sparse (DSA) prefill: when QREP is active, produce the whole DCP
-    # group's query heads locally, as decode does, instead of AllGather Q. The
+    # DCP sparse (DSA) prefill, "q" transport: when QREP is active, produce the
+    # whole DCP group's query heads locally, as decode does, instead of
+    # AllGather Q. A "kv" step attends only this rank's heads and ignores it. The
     # pynccl gather lands rank-major, so the dim=1 reshape after it also copies
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
-    # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
-    # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
+    # DCP sparse prefill transport. "q" gathers the group's query heads and
+    # merges partials by LSE; "kv" all-gathers the step's KV rows and attends
+    # this rank's own heads over the whole top-k, with no merge. "auto" takes
+    # "kv" while the step's context is under ~200K + k * its new tokens (k 52
+    # with >= 16 heads a rank, 40 with fewer) and its gathered KV fits the token cap, else "q";
+    # "kv" skips the first condition and warns when it cannot be taken. The cap
+    # counts gathered rows (each request padded to whole local blocks), >= 0.
+    "ATOM_DCP_SPARSE_PREFILL": lambda: os.getenv("ATOM_DCP_SPARSE_PREFILL", "auto"),
+    "ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS", str(1 << 20))
+    ),
+    # DCP sparse prefill, "q" transport: use the non-persistent fp8 gqa64 MLA
+    # kernel, which needs no work metadata; a "kv" step runs the dcp=1 kernel
+    # and its plan regardless. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
         os.getenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1") == "1"
     ),
@@ -660,9 +707,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
-    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
-    # Read and checked by atom/mono/polling.py at import, which needs no ATOM
-    # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
+    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 4; 16
+    # beside a KV transfer or offload connector, set by Config). Read and
+    # checked by atom/mono/polling.py at import, which needs no ATOM import; 1
+    # restores the pre-backoff polling (ROCm/ATOM#3369).
     "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
@@ -921,6 +969,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # like the other directory knobs.
     "ATOM_RTL_TRACE_DIR": lambda: _optional_path_env("ATOM_RTL_TRACE_DIR"),
     # --- Model Loading ---
+    # Weight cache (docs/environment_variables.md): off, server or daemon.
+    "ATOM_PRELOAD": _preload_mode,
+    # The launch's name, set by its API server for its own processes.
+    "ATOM_PRELOAD_LAUNCH": lambda: os.getenv("ATOM_PRELOAD_LAUNCH"),
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),
@@ -1066,6 +1118,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # DP > 1 (single- or multi-node; not read under PP): after a sync that saw
+    # unfinished work, run the cross-DP state all_reduce only every N engine
+    # rounds (1 = every round, at most 16; 0 and negative values mean 1).
+    # Utility commands, abort and shutdown are applied only on rounds that sync,
+    # and once the group drains every rank still runs up to N-1 dummy rounds
+    # before the next sync.
+    "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
     # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
@@ -1373,7 +1432,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
-    # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
+    # page-locked (`engram.host_memory.pin_rows`), not copied to HBM; the
     # GPU pulls only the rows a step names and dequantizes them there. On by default: the host gather gives the same rows
     # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
@@ -1385,21 +1444,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # where Qwen Mono serves the deployment (`atom/models/qwen38/mono/ple.py`),
     # which ignores it.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
-    # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
-    # into page-locked memory of exactly its size (hipHostMalloc on base pages,
-    # so a fragmented page cache costs no compaction), one copy_ below 512 MiB, else one thread per 128 MiB (at least 8) up to
-    # 16 and the CPUs this process may use, dropping the copied checkpoint
-    # pages from the process as it goes; 0 registers the checkpoint mapping in
-    # place (one thread, under the HIP runtime lock). Either way the shard is
-    # resident once. Copying needs the HIP runtime; elsewhere it registers in
-    # place regardless. Unset, DP attention (every rank holds the whole table)
-    # registers in place -- the shared checkpoint mapping, pinned once per node
-    # rather than copied once per rank -- and copies only if that is refused.
-    # `tools/engram/bench_uva_shard.py` measures both.
-    "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
-    # Optional override of the file that serializes shared in-place
-    # registration. Empty: host_memory names one from the checkpoint path.
-    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", ""),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.
@@ -1423,6 +1467,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # OFFLOAD_LOAD_WORKERS: its SLOT load path needs a serial load executor.
     "OFFLOAD_COPY_WORKERS": lambda: _int_env("OFFLOAD_COPY_WORKERS", 1),
     "OFFLOAD_LOAD_WORKERS": lambda: _int_env("OFFLOAD_LOAD_WORKERS", 1),
+    # Opt-in (default off). Mooncake Store only: renew a load's lease keys on
+    # the bounded renewal executor instead of blocking the scheduler thread.
+    "ATOM_STORE_ASYNC_RENEW": lambda: _flag_env("ATOM_STORE_ASYNC_RENEW"),
     # Running-plus-queued save bound. None means unset: the connector then
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
@@ -1527,8 +1574,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "lmcache.mp.mp_transfer_mode" takes precedence.
     "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
     # LMCache's own chunk size, as the connector configures LMCache with it.
-    # Read on the ATOM side only by `prefix_spread`, which predicts loads with
-    # it and checks it against an LMCache MP server's chunk at registration.
+    # Read on the ATOM side only by `prefix_spread` and `share_cache`, which
+    # predict loads with it and check it against an LMCache MP server's chunk
+    # at registration.
     "LMCACHE_CHUNK_SIZE": lambda: _int_env("LMCACHE_CHUNK_SIZE", 256),
 }
 

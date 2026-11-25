@@ -7,12 +7,12 @@
 //! (startup, worker connection, API) should use this workflow to ensure consistent
 //! behavior (validation, caching, deduplication).
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tracing::{error, info, warn};
 use wfaas::{
     BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
@@ -23,6 +23,12 @@ use super::workflow_data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
+    routers::prepare::{
+        chat_controls::ChatControls,
+        fast_tokenizer::{
+            tokenizer_json, with_fastokens, FastTokenizer, DOWNLOAD_FAILURE, STRICT_REFUSAL,
+        },
+    },
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
         chat_template::ChatTemplateParams,
@@ -43,7 +49,10 @@ pub struct TokenizerConfigRequest {
     pub source: String,
     /// Optional path to chat template file
     pub chat_template_path: Option<String>,
-    /// Optional cache configuration. If provided, wraps tokenizer with CachedTokenizer.
+    /// Optional cache configuration. If provided, wraps a tokenizer that encodes
+    /// with HuggingFace with CachedTokenizer; one that encodes with fastokens is
+    /// not wrapped, and has fastokens' segment cache instead, sized by
+    /// `--fastokens-segment-cache-mb`.
     #[serde(default)]
     pub cache_config: Option<TokenizerCacheConfig>,
     /// If true, the workflow fails when a tokenizer with the same name already exists.
@@ -70,7 +79,8 @@ pub struct TokenizerRemovalRequest {
 /// - Input validation (via registry.load())
 /// - Deduplication (returns success if already exists)
 /// - Loading from local path or HuggingFace
-/// - Optional caching layer wrapping
+/// - Encoding with fastokens, for the models `--fastokens-models` lists
+/// - Optional caching layer wrapping, for the tokenizers that encode with HuggingFace
 pub struct LoadTokenizerStep;
 
 #[async_trait]
@@ -88,15 +98,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             .clone();
 
         info!(
-            "Loading tokenizer '{}' (id: {}) from source: {}{}",
-            config.name,
-            config.id,
-            config.source,
-            if config.cache_config.is_some() {
-                " with caching"
-            } else {
-                ""
-            }
+            "Loading tokenizer '{}' (id: {}) from source: {}",
+            config.name, config.id, config.source
         );
 
         // Clone needed values before async move
@@ -106,6 +109,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let chat_template = config.chat_template_path.clone();
         let cache_config = config.cache_config.clone();
         let chats_without_template = app_context.chats_without_template.clone();
+        let chat_controls = app_context.chat_controls.clone();
+        let fastokens = app_context.router_config.fastokens.clone();
 
         // Load the tokenizer using the registry's load method
         // This handles: validation, deduplication, and loading
@@ -118,6 +123,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let chat_template = chat_template.clone();
                 let cache_cfg = cache_config.clone();
                 let chats_without_template = chats_without_template.clone();
+                let chat_controls = chat_controls.clone();
+                let fastokens = fastokens.clone();
                 async move {
                     // Load base tokenizer
                     let base_tokenizer = factory::create_tokenizer_async_with_chat_template(
@@ -126,14 +133,26 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                     )
                     .await
                     .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+                    let base_tokenizer =
+                        with_fastokens(base_tokenizer, &name, &source, &fastokens).await?;
+                    let controls = checkpoint_chat_controls(&name, &source).await?;
                     probe_chat_render(
                         &chats_without_template,
                         &id,
                         &name,
                         &source,
                         chat_template.as_deref(),
+                        controls.is_some(),
                     )
                     .await;
+                    if let Some(controls) = controls {
+                        chat_controls.write().insert(id.clone(), controls);
+                    }
+                    // fastokens has its own segment cache
+                    // (`--fastokens-segment-cache-mb`, 1 GiB by default).
+                    if base_tokenizer.as_any().is::<FastTokenizer>() {
+                        return Ok(base_tokenizer);
+                    }
 
                     // Wrap with caching layer if configured
                     let tokenizer: Arc<dyn Tokenizer> = match cache_cfg {
@@ -143,6 +162,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                                 l0_max_entries: cfg.l0_max_entries,
                                 enable_l1: cfg.enable_l1,
                                 l1_max_memory: cfg.l1_max_memory,
+                                ..CacheConfig::default()
                             };
                             Arc::new(CachedTokenizer::new(base_tokenizer, cache_config))
                         }
@@ -158,17 +178,22 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
             Ok(outcome) => {
                 let loaded_id = outcome.id();
 
-                // Get vocab size for logging
-                let vocab_size = app_context
-                    .tokenizer_registry
-                    .get_by_id(loaded_id)
-                    .map(|e| e.tokenizer.vocab_size());
+                // Get vocab size, and how it encodes, for logging
+                let loaded = app_context.tokenizer_registry.get_by_id(loaded_id);
+                let vocab_size = loaded.as_ref().map(|e| e.tokenizer.vocab_size());
+                let encoding = match loaded.as_ref().map(|e| e.tokenizer.as_any()) {
+                    Some(tokenizer) if tokenizer.is::<FastTokenizer>() => {
+                        ", encoding with fastokens"
+                    }
+                    Some(tokenizer) if tokenizer.is::<CachedTokenizer>() => ", with caching",
+                    _ => "",
+                };
 
                 match &outcome {
                     LoadOutcome::Loaded { id } => {
                         info!(
-                            "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}",
-                            name, id, vocab_size
+                            "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}{}",
+                            name, id, vocab_size, encoding
                         );
                     }
                     LoadOutcome::AlreadyExists { id } => {
@@ -205,24 +230,37 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         }
     }
 
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true // Network/IO errors are retryable
+    fn is_retryable(&self, error: &WorkflowError) -> bool {
+        // Network/IO errors are retryable, among them a `tokenizer.json` fastokens
+        // cannot download under `--fastokens-strict`; a `--fastokens-strict`
+        // refusal is what the probe found, and a retry would only probe again.
+        !matches!(
+            error,
+            WorkflowError::StepFailed { message, .. } if message.starts_with(STRICT_REFUSAL)
+        )
     }
 }
 
 /// Record `id` in `chats_without_template`, and warn, when llm-tokenizer renders
 /// `source`'s chats without the Jinja template. It has no accessor for that, so a
 /// copy is probed; mirroring its `config.json` check would also mean mirroring
-/// how it resolves sources.
+/// how it resolves sources. Chats rendered under the model's `controlled`
+/// reasoning controls are not recorded, as the controls give the encoder the
+/// effort and mode ATOM's takes; they are probed only to warn that
+/// `--chat-template` does not apply.
 async fn probe_chat_render(
     chats_without_template: &RwLock<HashSet<String>>,
     id: &str,
     name: &str,
     source: &str,
     chat_template: Option<&str>,
+    controlled: bool,
 ) {
     const UNPROBED: &str = "Cannot probe whether llm-tokenizer renders these chats without the \
                             Jinja template; HTTP routing tokenizes them as it renders them";
+    if controlled && chat_template.is_none() {
+        return;
+    }
     let mut copy = match factory::create_tokenizer_async_with_chat_template(source, None).await {
         Ok(copy) => copy,
         Err(error) => {
@@ -235,6 +273,14 @@ async fn probe_chat_render(
         return;
     };
     if !renders_without_template(copy) {
+        return;
+    }
+    if controlled {
+        warn!(
+            tokenizer = name,
+            "llm-tokenizer renders these chats with a built-in encoder, not the Jinja template, \
+             so --chat-template does not apply"
+        );
         return;
     }
     chats_without_template.write().insert(id.to_string());
@@ -252,10 +298,12 @@ async fn probe_chat_render(
 
 /// Whether `tokenizer` renders chats without its Jinja template, as llm-tokenizer
 /// does with the encoders it has built in for the architectures in `config.json`
-/// (DeepSeek V3.2 and V4 in 1.4.2). Such a render ignores `--chat-template`, and
-/// its defaults are not ATOM's: DeepSeek renders chat mode unless `thinking` is
-/// true, where ATOM's encoder renders thinking mode. Replaces the template, so
-/// probe a copy.
+/// (in 2.0.0 DeepSeek V3.2 and V4.1, and V4 without a template of its own).
+/// Such a render ignores `--chat-template`, and its defaults are not ATOM's:
+/// DeepSeek V3.2 and V4 render chat mode unless `thinking` is true, where
+/// ATOM's encoder renders thinking mode, and V4.1's port takes `thinking: true`
+/// over `reasoning_effort: "none"`, where ATOM's renders chat mode. Replaces the
+/// template, so probe a copy.
 fn renders_without_template(tokenizer: &mut dyn Tokenizer) -> bool {
     const PROBE: &str = "probe";
     tokenizer.set_chat_template(PROBE.to_string()).is_ok()
@@ -265,6 +313,38 @@ fn renders_without_template(tokenizer: &mut dyn Tokenizer) -> bool {
                 ChatTemplateParams::default(),
             )
             .is_ok_and(|text| text != PROBE)
+}
+
+/// The reasoning controls ATOM renders `source`'s chats under, by the
+/// `model_type` in the `config.json` beside its `tokenizer.json`, if the
+/// checkpoint has its own. A HuggingFace model ID's tokenizer that cannot be
+/// downloaded fails the registration, to be retried, rather than leave the
+/// model's chats rendered without them.
+async fn checkpoint_chat_controls(
+    name: &str,
+    source: &str,
+) -> Result<Option<ChatControls>, String> {
+    match tokenizer_json(source).await {
+        Ok(tokenizer) => Ok(controls_beside(name, &tokenizer).await),
+        Err(reason) if reason.starts_with(DOWNLOAD_FAILURE) => Err(reason),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The reasoning controls for the `model_type` in the `config.json` beside
+/// `tokenizer`, if there is one.
+async fn controls_beside(name: &str, tokenizer: &Path) -> Option<ChatControls> {
+    let config = tokio::fs::read(tokenizer.with_file_name("config.json"))
+        .await
+        .ok()?;
+    let config: Value = serde_json::from_slice(&config).ok()?;
+    let model_type = config.get("model_type")?.as_str()?;
+    let controls = ChatControls::of_model_type(model_type)?;
+    info!(
+        tokenizer = name,
+        model_type, "HTTP routing takes the effort of these chats as ATOM does for the model"
+    );
+    Some(controls)
 }
 
 // ============================================================================
@@ -277,10 +357,12 @@ fn renders_without_template(tokenizer: &mut dyn Tokenizer) -> bool {
 /// - Input validation (empty name/source)
 /// - Deduplication (returns success if already exists)
 /// - Loading from local path or HuggingFace
-/// - Optional caching layer wrapping
+/// - Encoding with fastokens, for the models `--fastokens-models` lists
+/// - Optional caching layer wrapping, for the tokenizers that encode with HuggingFace
 ///
 /// Configuration:
-/// - 3 retries with 2s backoff (for network issues)
+/// - 3 retries with 2s backoff (for network issues), none after a
+///   `--fastokens-strict` refusal
 /// - 5 minute timeout (HuggingFace downloads can be slow)
 pub fn create_tokenizer_registration_workflow() -> WorkflowDefinition<TokenizerWorkflowData> {
     WorkflowDefinition::new("tokenizer_registration", "Tokenizer Registration").add_step(
@@ -312,13 +394,21 @@ pub fn create_tokenizer_workflow_data(
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
+        config::{FastokensConfig, RouterConfig},
         routers::{
             comm::tokenize::remove_tokenizer,
-            test_mocks::{app_context::app_context, tokenizer::hf_tokenizer_path},
+            test_mocks::{
+                app_context::{app_context, app_context_with_router_config},
+                tokenizer::{
+                    byte_level_tokenizer_dir, hf_tokenizer, hf_tokenizer_path, EnvVar,
+                    BYTE_LEVEL_MERGES,
+                },
+            },
         },
         tokenizer::{registry::TokenizerRegistry, HuggingFaceTokenizer},
     };
@@ -335,13 +425,17 @@ mod tests {
         dir
     }
 
-    /// llm-tokenizer picks its DeepSeek V3.2 and V4 encoders from `config.json`,
-    /// and they ignore the template.
+    /// llm-tokenizer picks its DeepSeek V3.2, V4 and V4.1 encoders from
+    /// `config.json`, and they ignore the template.
     #[test]
     fn test_deepseek_renders_without_template() {
         let mut jinja = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
         assert!(!renders_without_template(&mut jinja));
-        for architecture in ["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM"] {
+        for architecture in [
+            "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "DeepseekV41ForCausalLM",
+        ] {
             let dir = tokenizer_dir(architecture);
             let path = dir.path().join("tokenizer.json");
             let mut deepseek = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
@@ -381,6 +475,187 @@ mod tests {
         assert!(!marked(&jinja));
         remove_tokenizer(&context, &deepseek).await;
         assert!(!marked(&deepseek));
+    }
+
+    /// A tokenizer registers with the reasoning controls ATOM keeps for the
+    /// `model_type` in the `config.json` beside it, from its directory or its
+    /// `tokenizer.json`, and removing it drops them. HTTP routing tokenizes
+    /// its chats, which llm-tokenizer renders with its V4.1 encoder, also under
+    /// a `--chat-template`, which that encoder ignores.
+    #[tokio::test]
+    async fn test_registration_finds_the_checkpoint_chat_controls() {
+        let checkpoint = |model_type: &str| {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::copy(hf_tokenizer_path(), dir.path().join("tokenizer.json")).unwrap();
+            std::fs::write(
+                dir.path().join("config.json"),
+                json!({"model_type": model_type}).to_string(),
+            )
+            .unwrap();
+            dir
+        };
+        let v41 = checkpoint("deepseek_v41");
+        let v41_file = v41.path().join("tokenizer.json");
+        let template = v41.path().join("template.jinja");
+        std::fs::write(&template, "{{ messages }}").unwrap();
+        let llama = checkpoint("llama");
+        let bare = tempfile::TempDir::new().unwrap();
+        std::fs::copy(hf_tokenizer_path(), bare.path().join("tokenizer.json")).unwrap();
+        let context = app_context();
+        let mut ids = Vec::new();
+        for (source, chat_template, controls) in [
+            (v41.path(), None, Some(ChatControls::DeepseekV41)),
+            (v41_file.as_path(), None, Some(ChatControls::DeepseekV41)),
+            (v41.path(), Some(&template), Some(ChatControls::DeepseekV41)),
+            (llama.path(), None, None),
+            (bare.path(), None, None),
+        ] {
+            let id = TokenizerRegistry::generate_id();
+            let config = TokenizerConfigRequest {
+                id: id.clone(),
+                name: id.clone(),
+                source: source.to_str().unwrap().to_string(),
+                chat_template_path: chat_template.map(|path| path.to_str().unwrap().to_string()),
+                cache_config: None,
+                fail_on_duplicate: false,
+            };
+            let mut workflow = WorkflowContext::new(
+                WorkflowInstanceId::new(),
+                create_tokenizer_workflow_data(config, context.clone()),
+            );
+            LoadTokenizerStep.execute(&mut workflow).await.unwrap();
+            let found = context.chat_controls.read().get(&id).copied();
+            assert_eq!(found, controls, "{}", source.display());
+            let marked = context.chats_without_template.read().contains(&id);
+            assert!(!marked, "{}", source.display());
+            ids.push(id);
+        }
+        remove_tokenizer(&context, &ids[0]).await;
+        assert!(!context.chat_controls.read().contains_key(&ids[0]));
+    }
+
+    /// A model `--fastokens-models` lists encodes with fastokens, which leaves the
+    /// tokenizer cache out; one fastokens cannot load keeps HuggingFace, or fails
+    /// to register under `--fastokens-strict`, with no retries.
+    #[tokio::test]
+    async fn test_registration_encodes_listed_models_with_fastokens() {
+        async fn register(
+            context: &Arc<AppContext>,
+            source: &str,
+        ) -> Result<Arc<dyn Tokenizer>, WorkflowError> {
+            let id = TokenizerRegistry::generate_id();
+            let config = TokenizerConfigRequest {
+                id: id.clone(),
+                name: id.clone(),
+                source: source.to_string(),
+                chat_template_path: None,
+                cache_config: Some(TokenizerCacheConfig {
+                    enable_l0: true,
+                    l0_max_entries: 16,
+                    enable_l1: false,
+                    l1_max_memory: 0,
+                }),
+                fail_on_duplicate: true,
+            };
+            let mut workflow = WorkflowContext::new(
+                WorkflowInstanceId::new(),
+                create_tokenizer_workflow_data(config, context.clone()),
+            );
+            LoadTokenizerStep.execute(&mut workflow).await?;
+            Ok(context.tokenizer_registry.get_by_id(&id).unwrap().tokenizer)
+        }
+
+        let byte_level = byte_level_tokenizer_dir(BYTE_LEVEL_MERGES, true, json!({}));
+        let byte_level = byte_level.path().to_str().unwrap();
+        let mut config = RouterConfig::default();
+        let context = app_context_with_router_config(config.clone());
+        let unlisted = register(&context, byte_level).await.unwrap();
+        assert!(unlisted.as_any().is::<CachedTokenizer>());
+
+        config.fastokens.models = vec![byte_level.to_string()];
+        let context = app_context_with_router_config(config.clone());
+        let fast = register(&context, byte_level).await.unwrap();
+        assert!(fast.as_any().is::<FastTokenizer>());
+        assert_eq!(
+            fast.encode("the weather", true).unwrap().token_ids(),
+            unlisted.encode("the weather", true).unwrap().token_ids()
+        );
+
+        // The fixture's `Whitespace` pre-tokenizer is not one fastokens has.
+        config.fastokens.models = vec!["*".to_string()];
+        let context = app_context_with_router_config(config.clone());
+        let kept = register(&context, hf_tokenizer_path()).await.unwrap();
+        assert!(kept.as_any().is::<CachedTokenizer>());
+        config.fastokens.strict = true;
+        let context = app_context_with_router_config(config);
+        let error = register(&context, hf_tokenizer_path()).await.err().unwrap();
+        assert!(
+            error.to_string().contains("fastokens cannot encode"),
+            "{error}"
+        );
+        assert!(!LoadTokenizerStep.is_retryable(&error));
+        let broken = tempfile::TempDir::new().unwrap();
+        let broken = broken.path().join("tokenizer.json");
+        std::fs::write(&broken, "{}").unwrap();
+        let error = register(&context, broken.to_str().unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(LoadTokenizerStep.is_retryable(&error), "{error}");
+        assert!(context.tokenizer_registry.list().is_empty());
+    }
+
+    /// A `tokenizer.json` fastokens cannot download is no refusal: under
+    /// `--fastokens-strict` the registration fails and is retried, and without
+    /// it the model keeps HuggingFace.
+    #[tokio::test]
+    #[serial]
+    async fn test_fastokens_download_failures_are_retried() {
+        let _endpoint = EnvVar::set("HF_ENDPOINT", "http://127.0.0.1:1");
+        let hf = hf_tokenizer();
+        let mut config = FastokensConfig {
+            models: vec!["*".to_string()],
+            strict: true,
+            ..Default::default()
+        };
+        let error = with_fastokens(hf.clone(), "model", "org/model", &config)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("cannot download"), "{error}");
+        let error = WorkflowError::StepFailed {
+            step_id: StepId::new("load_tokenizer"),
+            message: error,
+        };
+        assert!(LoadTokenizerStep.is_retryable(&error), "{error}");
+
+        config.strict = false;
+        let kept = with_fastokens(hf.clone(), "model", "org/model", &config)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&kept, &hf));
+    }
+
+    /// A HuggingFace model ID whose tokenizer cannot be downloaded fails the
+    /// lookup of its chat controls, and the registration is retried; a source
+    /// with no `tokenizer.json` has none.
+    #[tokio::test]
+    #[serial]
+    async fn test_chat_controls_download_failures_are_retried() {
+        let _endpoint = EnvVar::set("HF_ENDPOINT", "http://127.0.0.1:1");
+        let error = checkpoint_chat_controls("model", "org/model")
+            .await
+            .unwrap_err();
+        assert!(error.starts_with(DOWNLOAD_FAILURE), "{error}");
+        let error = WorkflowError::StepFailed {
+            step_id: StepId::new("load_tokenizer"),
+            message: error,
+        };
+        assert!(LoadTokenizerStep.is_retryable(&error), "{error}");
+
+        let empty = tempfile::TempDir::new().unwrap();
+        let empty = empty.path().to_str().unwrap();
+        assert_eq!(checkpoint_chat_controls("model", empty).await, Ok(None));
     }
 
     #[test]

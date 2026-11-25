@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """A rank's share of V4.1's widths: every constant a kernel derives from the
 deployment, in one place (a build key's ``tp`` and ``ep`` pick it).
 
 TP: attention split by heads, the routed experts along their intermediate width,
-over ``tp`` ranks. DP attention with expert parallel (``ep`` > 1): attention whole
-on each rank (``tp`` 1), the routed experts split by expert over ``ep`` ranks at
-their whole width. The shared expert, replicated there, is split along its
+over ``tp`` ranks. Expert parallel (``ep`` > 1): the routed experts split by
+expert over ``ep`` ranks at their whole width -- the attention's TP ranks
+(``tp`` = ``ep``), or DP attention's (``tp`` 1, attention whole on each rank).
+The shared expert (replicated under DP attention) is split along its
 intermediate width over every rank of the MoE (``ranks``) either way."""
 
 from dataclasses import dataclass
@@ -17,8 +19,30 @@ from atom.mono.plan.shard import Shard, Tiles, cdiv, padded
 HIDDEN = 5120
 HC = 4  # hyper-connection streams
 Q_RANK, KV_DIM = 1280, 512  # the q latent, the window row
-# a KV row in an FP8 pool (``kv_fp8``): E4M3 values, then an E8M0 scale a 32
+# a KV row in an FP8 pool (``kv_fp8``): its E4M3 values in the data plane, its
+# E8M0 scales (one a 32 columns) in the scale plane
 KV_FP8_ROW_BYTES = KV_DIM + KV_DIM // 32
+
+
+# ``kvrow``'s row kinds a step row: its window row, then (a compressing layer)
+# the compressed entry it completes
+KVROW_KINDS = 2
+
+
+def kvrow_bytes(rows: int, kv_fp8: bool) -> int:
+    """The layer kernel's ``kvrow`` for a step of ``rows`` rows, laid out as the
+    pool's planes: row j < rows the step's window row j, row rows + j the
+    compressed entry step row j completes (a compressing layer); BF16 rows,
+    or an FP8 pool's E4M3 rows and then, from ``kvrow_scale0``, their scale
+    rows."""
+    return KVROW_KINDS * rows * (KV_FP8_ROW_BYTES if kv_fp8 else 2 * KV_DIM)
+
+
+def kvrow_scale0(rows: int) -> int:
+    """An FP8 ``kvrow``'s scale plane (``kvrow_bytes``): its byte offset."""
+    return KVROW_KINDS * rows * KV_DIM
+
+
 Q_HEADS = 64  # attention query heads
 O_GROUPS = 8  # wo_a groups
 O_RANK = 1024  # wo_a output rows a group
@@ -49,22 +73,34 @@ HEAD_TILE = 16  # heads an attention MFMA takes (its N)
 @dataclass(frozen=True)
 class Dims:
     tp: int
-    # expert-parallel ranks: 1 under TP
+    # expert-parallel ranks, the routed experts split over them (ATOM's EP
+    # group: every TP and DP rank); 1 under TP
     ep: int = 1
+    # DP attention with the MoE TP over its ranks (``tp`` of them): the shared
+    # expert replicated, as under expert parallel at attention TP 1
+    dp_attention_tp: bool = False
 
     def __post_init__(self):
         shard = Shard(self.tp)
         shard.split(Q_HEADS, "query heads")
         shard.split(O_GROUPS, "wo_a groups")
-        shard.split(MOE_INTER, "routed intermediate")
-        Shard(self.ranks).split(SHARED_INTER, "shared intermediate")
-        if self.ep > 1 and self.tp != 1:
+        if self.ep > 1 and self.tp not in (1, self.ep):
             raise ValueError(f"expert parallel {self.ep} at attention TP {self.tp}")
+        Shard(self.ranks // self.ep).split(MOE_INTER, "routed intermediate")
+        Shard(self.ranks).split(SHARED_INTER, "shared intermediate")
+
+    @property
+    def dp_attention(self) -> bool:
+        """The MoE over DP attention's ranks, each rank's own rows (else over
+        the attention's TP ranks, every rank's rows the same): its TP over
+        them, or expert parallel at attention TP 1."""
+        return self.dp_attention_tp or (self.ep > 1 and self.tp == 1)
 
     @property
     def ranks(self) -> int:
-        """The MoE's ranks: its all-reduce's (or reduce-scatter's) group."""
-        return self.tp * self.ep
+        """The MoE's ranks: its all-reduce's (or reduce-scatter's) group --
+        the attention's TP ranks, or DP attention's."""
+        return max(self.tp, self.ep)
 
     @property
     def heads(self) -> int:
@@ -129,8 +165,9 @@ class Dims:
 
     @property
     def inter_real(self) -> int:
-        """A routed expert's real intermediate width on this rank."""
-        return MOE_INTER // self.tp
+        """A routed expert's real intermediate width on this rank: whole
+        under expert parallel."""
+        return MOE_INTER // (self.ranks // self.ep)
 
     @property
     def inter(self) -> int:
@@ -139,11 +176,11 @@ class Dims:
 
     @property
     def sh_inter(self) -> int:
-        """The shared expert's intermediate width on this rank: under TP its
-        share padded as the loader pads it (the rest zero weights); under
-        expert parallel its part of the replicated weight."""
+        """The shared expert's intermediate width on this rank: under TP
+        attention its share padded as the loader pads it (the rest zero
+        weights); under DP attention its part of the replicated weight."""
         share = SHARED_INTER // self.ranks
-        return padded(share, SHARED_PAD) if self.ep == 1 else share
+        return share if self.dp_attention else padded(share, SHARED_PAD)
 
     @property
     def shared_tasks(self) -> int:

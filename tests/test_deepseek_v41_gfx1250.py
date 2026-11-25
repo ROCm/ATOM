@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The gfx1250 DeepSeek-V4.1 single-launch decode step on the CPU (no GPU):
 - which deployments and which steps it takes (needs aiter, skipped without it);
 - its kernel's per-step arithmetic (kernels/index_plan.py, moe_plan.py) and counter / LDS layout (layout.py), run on
@@ -193,7 +194,9 @@ def test_mono_dispatch_routes_to_the_single_launch_when_enabled(monkeypatch):
 
     monkeypatch.setattr(dispatch, "install_single_step", install)
     cfg = atom_config()
-    assert mono_dispatch.install_mono_decode("m", cfg, "d") == "single"
+    assert mono_dispatch.install_mono_decode("m", cfg, "d", metadata_builder=None) == (
+        "single"
+    )
     assert seen["args"] == ("m", cfg, "d")
 
 

@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.config import _is_minimax_m3_config
+from atom.config import _is_minimax_m3_config, kv_cache_torch_dtype
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
@@ -437,8 +437,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         a second geometry sharing one block-id space, which is what sizing
         summed for it all along. Nothing here asks which model it is.
         """
-        from aiter import dtypes
-
         runner = self.model_runner
         # `INDEX_ROWS` is a row space, not a pool: the indexer keys ride the
         # first geometry's pool, since declaring them per pool would charge for
@@ -466,11 +464,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 head_dim=geometry.head_dim,
                 # An FP4 (MXFP4 / NVFP4) layout declares its own bytes (uint8 pages);
                 # the dtype is read only by the dtype-wide cache, which FP4 is not.
-                kv_dtype=(
-                    torch.uint8
-                    if geometry.layout is not None
-                    else dtypes.d_dtypes[runner.config.kv_cache_dtype]
-                ),
+                kv_dtype=kv_cache_torch_dtype(runner.config.kv_cache_dtype),
                 extra_fields=extra_fields,
                 layout=geometry.layout,
             )
@@ -487,7 +481,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         """
         if not self._has_sparse_attention:
             return None
-        from aiter import dtypes
 
         config = self.model_runner.config
         text_config = getattr(config.hf_config, "text_config", config.hf_config)
@@ -527,7 +520,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "index_cache_dtype must be 'bf16', 'fp8', 'fp4' or 'nvfp4', got "
                 f"{index_dtype!r}"
             )
-        dtype = dtypes.d_dtypes[index_dtype]
+        dtype = kv_cache_torch_dtype(index_dtype)
         return _IndexCacheSpec(
             rows,
             (entry_tokens * dim * dtype.itemsize,),
@@ -1125,18 +1118,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
-            # The FP4 scorer takes its batch off the rows of idx_q, which a DP step
-            # can make more or fewer than `running_bs * q`; `_sparse_decode` slices q /
-            # idx_q to this batch. The other index caches keep the padded batch.
-            index_bs = running_bs
-            if "" in self._index_scorers:  # an FP4 (MXFP4 / NVFP4) index cache
-                index_bs = min(running_bs, running_tokens // max_seqlen_q)
-                if index_bs < batch.total_seqs_num_decode:
-                    raise ValueError(
-                        f"FP4 index decode: {running_tokens} rows of {max_seqlen_q} "
-                        f"query tokens do not cover the {batch.total_seqs_num_decode} "
-                        "scheduled requests"
-                    )
+            # A DP or packed (DSpark token-bucket) step can hand this rank more or
+            # fewer rows than `running_bs * q` (`ForwardMode`): for every index cache
+            # the decode metadata is the requests the rows cover, and `_sparse_decode`
+            # slices q / idx_q to it.
+            index_bs = min(running_bs, running_tokens // max_seqlen_q)
+            if index_bs < batch.total_seqs_num_decode:
+                raise ValueError(
+                    f"sparse index decode: {running_tokens} rows of {max_seqlen_q} "
+                    f"query tokens do not cover the {batch.total_seqs_num_decode} "
+                    "scheduled requests"
+                )
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables[:index_bs],
                 attn_metadata.context_lens[:index_bs],

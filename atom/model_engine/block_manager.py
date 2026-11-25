@@ -178,13 +178,11 @@ def draft_kv_lookahead(
     `C - 1`, so it writes through `C + k - 1` and needs `k` positions past
     `len(seq)` -- one more than the serial count.
 
-    A position past the row's allocated blocks reads its block id from the
-    zeroed tail of the block table, so the write lands in physical block 0 --
-    another request's KV, or the units of a PAGE state checkpoint. For a
-    block drafter that is not hypothetical: a fully accepted step whose last
-    block position starts a new block writes the draft rows of physical
-    block 0, and a PAGE state checkpoint stored there is then restored
-    corrupted by every later request that hits its prefix.
+    A position past the row's allocated blocks resolves to physical block 0
+    through the zeroed block-table tail. PAGE-capable pools keep that block
+    reserved for padding; other pools may use it for live KV. Neither is a
+    valid destination for this row's draft writes, so its whole reach must
+    have allocated blocks even when a padding block is reserved.
     """
     k = max(0, int(num_speculative_tokens or 0))
     return k if block_drafter else max(0, k - 1)
@@ -300,6 +298,7 @@ class BlockManager:
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
+            reserve_null_block=state_runtime.checkpoint_spec is not None,
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -314,10 +313,30 @@ class BlockManager:
         # `state_slots_per_req` is what a live request asks for.
         pool_entries: dict = getattr(config, "pool_entries", None) or {}
         pool_per_req: dict = getattr(config, "pool_entries_per_req", None) or {}
-        # Total capacity, kept so callers can tell "all slots busy" (transient)
-        # from "no slots were ever created" (permanent).
+        # Slots live requests can take (transfer slots are carved off below), kept
+        # so callers can tell "all slots busy" from "no slots were ever created".
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        # A P/D producer's transfer slots, sized by the runner past the live ones:
+        # the top of the pool, where a finished request's state waits for its push.
+        self.num_state_transfer_slots = config.state_transfer_slots
+        if self.num_state_transfer_slots:
+            self.num_state_slots -= self.num_state_transfer_slots
+            logger.info(
+                "State pool: %d slots for live requests, %d P/D transfer slots",
+                self.num_state_slots,
+                self.num_state_transfer_slots,
+            )
+        self._free_transfer_slots: deque[int] = deque(
+            range(
+                self.num_state_slots,
+                self.num_state_slots + self.num_state_transfer_slots,
+            )
+        )
+        # Finished requests moved to a transfer slot, and those that kept
+        # their live slot because every transfer slot was taken.
+        self.transfer_slot_moves = 0
+        self.transfer_slots_full = 0
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -415,6 +434,9 @@ class BlockManager:
         self._state_checkpoint_cache: StateCheckpointCache = (
             self.paged_state_checkpoints or self.state
         )
+        if self.num_state_transfer_slots:
+            # `deallocate` then hands a transfer slot back to its own list.
+            self.state.release_many = self._release_live_or_transfer_slots
         # Where a readable backend can snapshot inside a forward; see
         # `midstep_target_ok`. Zero for a backend that cannot.
         self.midstep_grid = state_runtime.transfer.midstep_grid
@@ -764,7 +786,7 @@ class BlockManager:
         Under DCP a rank stores only its interleaved shard, so this is a factor
         of `dcp_world_size` below the global `ceil(seq_len / block_size)`. The
         pool is sized in these same per-rank units, so this is the only count
-        that may be compared against `kv.num_blocks` — whether to draw from the
+        that may be compared against `kv.num_usable_blocks` — whether to draw from the
         pool (`can_allocate`/`allocate`) or to reject a prompt as too large for
         it (`Scheduler._unschedulable_reason`).
         """
@@ -807,10 +829,11 @@ class BlockManager:
         frontend can predict that verdict and refuse an oversized prompt with an
         error while it is still answering the client, instead of leaving the
         scheduler to discover it once the client is already waiting. The API
-        server needs it published because `num_kvcache_blocks` is measured in
-        the engine subprocess and its own Config never learns the value.
+        server needs it published because the engine measures the physical
+        `num_kvcache_blocks`, while this limit uses `kv.num_usable_blocks`
+        after reserving padding; the frontend's Config knows neither value.
         """
-        capacity = self.kv.num_blocks
+        capacity = self.kv.num_usable_blocks
         # A prompt this long needs more than `capacity` blocks on some rank, so
         # it bounds the search from above: each rank holds at least
         # `1 / dcp_world_size` of it, i.e. over `capacity` blocks' worth.
@@ -1001,7 +1024,7 @@ class BlockManager:
         return {
             "used": used,
             "free": free,
-            "total": self.kv.num_blocks,
+            "total": self.kv.num_usable_blocks,
             "hashed": hashed,
             "retained": max(0, hashed - used),
             "evicted_total": self.total_evicted_blocks,
@@ -3790,6 +3813,41 @@ class BlockManager:
         seq.offload_joint.load_hash = -1
         seq.offload_joint.reset_joint()
 
+    def _release_live_or_transfer_slots(self, slots) -> None:
+        """Hand back live slots to the pool, transfer slots to their own list."""
+        for slot in slots or ():
+            if slot >= self.num_state_slots:
+                self._free_transfer_slots.append(slot)
+            elif slot >= 0:
+                self.state.release(slot)
+
+    def move_state_to_transfer_slot(self, seq: Sequence) -> tuple[int, int] | None:
+        """Re-home a finished P/D request's state in a transfer slot.
+
+        Returns ``(src, dst)``: the caller must copy slot ``src`` into ``dst``
+        before the next forward, which may reuse ``src``. None when every
+        transfer slot is taken: the request keeps its live slot.
+        """
+        if not self._free_transfer_slots:
+            self.transfer_slots_full += 1
+            return None
+        src = seq.state_slot
+        dst = self._free_transfer_slots.popleft()
+        self.state.release_many(seq.state_slots)
+        seq.state_slots = [dst]
+        self.transfer_slot_moves += 1
+        return src, dst
+
+    def transfer_slot_occupancy(self) -> dict[str, int]:
+        """Transfer slots in use and in total, and the moves made or missed."""
+        total = self.num_state_transfer_slots
+        return {
+            "transfer_slots_total": total,
+            "transfer_slots_used": total - len(self._free_transfer_slots),
+            "transfer_slot_moves": self.transfer_slot_moves,
+            "transfer_slots_full": self.transfer_slots_full,
+        }
+
     def can_append(
         self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
     ) -> bool:
@@ -3815,7 +3873,7 @@ class BlockManager:
         `lookahead` positions past that (`draft_kv_lookahead`). Checking that
         the pool has room (`can_append`) is not the same as allocating it: a
         position past the last allocated block reads block id 0 from the zeroed
-        block-table tail, and the write lands in whoever owns physical block 0.
+        block-table tail, overwriting the padding block or unrelated live KV.
         """
         # Note: in disaggregated (P/D) mode the scheduler skips the
         # `num_new_tokens` half on the first decode step after remote prefill,

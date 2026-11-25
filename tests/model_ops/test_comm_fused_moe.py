@@ -668,6 +668,7 @@ def test_dsv4_single_stream_dispatches_by_token_support(atom_modules, supported)
         supported,
     )
     moe.combine_outputs = MagicMock(return_value=combined_output)
+    moe.experts.combine_accepts_shared.return_value = False
 
     result = atom_modules.deepseek_v4.MoE.single_stream_moe_forward(moe, hidden_states)
 
@@ -788,6 +789,51 @@ def test_dsv4_dual_stream_hands_the_shared_output_to_the_combine(
         routed, None, prefix="model.layers.3.mlp.combine_outputs"
     )
     routed_stream.wait_stream.assert_not_called()
+
+
+def test_dsv4_single_stream_hands_the_shared_output_to_the_combine(
+    monkeypatch, atom_modules
+):
+    """Where the routed combine adds the shared output, the single-stream path
+    hands it down with an event recorded on its own stream, and does not add
+    it again."""
+    moe = _new_v4_moe(atom_modules)
+    hidden_states = torch.randn(4, 8)
+    routed = torch.randn_like(hidden_states)
+    shared = torch.randn_like(hidden_states)
+    ready = MagicMock(name="shared_ready")
+    monkeypatch.setattr(atom_modules.deepseek_v4.torch.cuda, "Event", lambda: ready)
+    moe.shared_experts = MagicMock(return_value=shared)
+    moe.experts = SimpleNamespace(combine_accepts_shared=lambda rows: rows == 4)
+    moe.routed_expert_forward = MagicMock(return_value=(routed, False))
+    combined = torch.randn_like(hidden_states)
+    moe.combine_outputs = MagicMock(return_value=combined)
+
+    result = atom_modules.deepseek_v4.MoE.single_stream_moe_forward(moe, hidden_states)
+
+    assert result is combined
+    moe.routed_expert_forward.assert_called_once_with(
+        hidden_states, shared_partial=shared, shared_ready=ready
+    )
+    ready.record.assert_called_once_with()
+    moe.combine_outputs.assert_called_once_with(
+        routed, None, prefix="model.layers.3.mlp.combine_outputs"
+    )
+
+
+def test_dsv4_single_stream_refuses_a_comm_fused_shared_in_combine(
+    monkeypatch, atom_modules
+):
+    moe = _new_v4_moe(atom_modules)
+    hidden_states = torch.randn(4, 8)
+    monkeypatch.setattr(
+        atom_modules.deepseek_v4.torch.cuda, "Event", lambda: MagicMock()
+    )
+    moe.shared_experts = MagicMock(return_value=torch.randn_like(hidden_states))
+    moe.experts = SimpleNamespace(combine_accepts_shared=lambda rows: True)
+    moe.routed_expert_forward = MagicMock(return_value=(hidden_states, True))
+    with pytest.raises(RuntimeError, match="shared-in-combine"):
+        atom_modules.deepseek_v4.MoE.single_stream_moe_forward(moe, hidden_states)
 
 
 def _fused_moe_for_shared_add(atom_modules, *, accepts):

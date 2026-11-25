@@ -12,11 +12,11 @@ from atom.model_ops.minimax_m3.index_topk import (
     DECODE_TOPK_NUM_WARPS,
     PAGES_PER_SPARSE_BLOCK,
     _alloc_emit,
+    _fp4_index_ops,
     _launch_select,
     _require_packable,
     flydsl_ops,
 )
-from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
 # A decode graph is captured for max_model_len, so a grid sized by the launch
 # width is mostly programs past every request. The grid is sized by the batch
@@ -211,7 +211,7 @@ def indexer_context_scores(
     return scores
 
 
-def indexer_context_scores_mxfp4(
+def indexer_context_scores_fp4(
     idx_q,
     index_cache,
     block_table,
@@ -221,7 +221,8 @@ def indexer_context_scores_mxfp4(
     sm_scale,
     index_scorer,
 ):
-    """`indexer_context_scores` over the MXFP4 index cache, by aiter's FlyDSL scorer.
+    """`indexer_context_scores` over the FP4 (MXFP4, or NVFP4 as ``index_scorer.nvfp4``
+    says) index cache, by aiter's FlyDSL scorer.
 
     ``index_scorer`` is the step's record of this rank's shard: the work map, the
     shard's block bound ``max_block`` it was built at, and the workspace the scores
@@ -232,7 +233,7 @@ def indexer_context_scores_mxfp4(
     """
     if index_scorer.work_map is None:
         raise ValueError(
-            "the MXFP4 index decode needs the step's index_scorer "
+            "the FP4 index decode needs the step's index_scorer "
             "(a work map and the score workspace)"
         )
     local = index_scorer.max_block
@@ -246,7 +247,25 @@ def indexer_context_scores_mxfp4(
     scores = index_scorer.scores.logits(heads * tokens, local).view(
         heads, tokens, local
     )
-    k_data, k_scale = page_views(index_cache)
+    views, _, score_decode = _fp4_index_ops(index_scorer)
+    k_data, k_scale = views(index_cache)
+    if index_scorer.nvfp4:
+        # the TP decode's NVFP4 scorer and K rounding (its default), on the shard
+        return score_decode(
+            idx_q,
+            k_data,
+            k_scale,
+            block_table,
+            seq_lens,
+            max_query_len,
+            heads,
+            sm_scale,
+            local,
+            work_map=index_scorer.work_map,
+            out=scores,
+            **index_scorer.shard,
+        )
+    # aiter's MXFP4 decode entry takes no shard; its general scorer does
     return flydsl_ops().minimax_m3_index_score_flydsl(
         idx_q,
         k_data,

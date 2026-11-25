@@ -271,7 +271,7 @@ def quantize_with_gathered_amax(
     return q
 
 
-def _attention_fp8_fake(
+def attention_fp8_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -288,7 +288,7 @@ def _attention_fp8_fake(
 # Config refuses spec decoding under SP, and prefill token graphs are recorded
 # only for a builder with `supports_token_graph` (DeepSeek-V4.1's, an attention
 # SP refuses); ModelRunner also refuses any such builder under SP.
-@mark_spliting_op(is_custom=True, gen_fake=_attention_fp8_fake, mutates_args=["scale"])
+@mark_spliting_op(is_custom=True, gen_fake=attention_fp8_fake, mutates_args=["scale"])
 def sp_attention_fp8(
     q: torch.Tensor,
     k: torch.Tensor,
