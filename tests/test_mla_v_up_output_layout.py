@@ -39,9 +39,22 @@ def projection():
     assert {node.name for node in methods} == names
     for method in methods:
         method.decorator_list = []
+    constants = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_DCP_BF16_PACKED_TAIL_MAX_ROWS"
+            for target in node.targets
+        )
+    ]
+    assert len(constants) == 1
     namespace = {"torch": torch}
     exec(  # noqa: S102 - execute only the checked-in production method bodies
-        compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"),
+        compile(
+            ast.Module(body=constants + methods, type_ignores=[]), str(path), "exec"
+        ),
         namespace,
     )
     attn = type("Projection", (), {name: namespace[name] for name in names})()

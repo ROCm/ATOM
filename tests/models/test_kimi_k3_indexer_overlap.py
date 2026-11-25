@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """A Kimi-K3 DSA layer's DCP prefill: the indexer runs its top-k all-gather and
 owner filter on the model's side stream while the q path runs, and the sparse
 MLA waits for them before its query gather. Graph capture, TBO and an indexer

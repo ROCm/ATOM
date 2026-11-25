@@ -435,15 +435,17 @@ The backends implement the same LSE-weighted sum, with floating-point
 differences from accumulation order. Packed `a2a`
 bit-preserves fp32 LSE in two 16-bit slots when its buffer is bf16/fp16.
 Head-major prefill instead sends LSE as plain fp32 in a separate all-to-all.
-It requires PBM, `ATOM_MLA_ABSORB_BF16=1`, and an `a2a` or `mailbox` backend
-(mailbox uses A2A for prefill). The default FP8 `W_V_dcp` keeps the packed
-layout and its single collective. FP4 and fused output quantization also
-keep the packed layout.
+It requires PBM, `ATOM_MLA_ABSORB_BF16=1`, an `a2a` or `mailbox` backend,
+and more than 32 prefill rows (mailbox uses A2A for prefill). Eligible BF16
+prefills of at most 32 rows retain the packed tail and its single collective.
+This keeps the measured small-prefill range off the extra LSE collective.
+The default FP8 `W_V_dcp`, FP4 and fused output quantization keep the packed
+layout at every row count.
 
 | Value | Pattern | Collectives |
 |-------|---------|-------------|
 | `auto` (default) | `mailbox` on gfx950 with DCP > 1 when decode TBO and plugin mode are off, `a2a` otherwise; the choice is logged at startup | |
-| `a2a` | packed output and LSE share one all-to-all; head-major prefill exchanges output and LSE separately, then combines locally | 1 packed / 2 head-major |
+| `a2a` | packed output and LSE share one all-to-all, including eligible BF16 prefills of at most 32 rows; head-major prefill above 32 rows exchanges output and LSE separately, then combines locally | 1 packed / 2 head-major |
 | `ag_rs` | AllGather LSE + local correct + ReduceScatter output | 2 |
 | `mailbox` | decode only: aiter's FlyDSL `dcp_lse_combine`, one launch that stores each owner's rows and LSEs into its IPC-mapped mailbox and combines them there | **0** (no collective launch) |
 

@@ -257,6 +257,9 @@ _MLA_MIN_HEADS = 16  # MLA decode query-head floor; see mla_dense_min_query_head
 # 5-7 the medians run +6.4% to -5.0%, slower at bs 1.
 _MLA_NARROW_QLEN = 8
 
+# Keep the measured small-prefill range on one packed collective.
+_DCP_BF16_PACKED_TAIL_MAX_ROWS = 32
+
 
 def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) -> int:
     """Query-head floor of every MLA layer's decode in native ATOM.
@@ -1568,7 +1571,7 @@ class MLAAttention(nn.Module):
         """Keep short BF16 projections on the one-collective packed tail."""
         merge_out = (
             self._dcp_project_merge_out
-            if o.shape[0] <= 32
+            if o.shape[0] <= _DCP_BF16_PACKED_TAIL_MAX_ROWS
             else self._dcp_project_merge_out_head_major
         )
         return merge_out(o, lse, merge_in_fp32=merge_in_fp32, owned_counts=owned_counts)

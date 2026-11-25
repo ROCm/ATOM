@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Point a DCP sparse prefill's per-forward MLA work plan at one layer's keys.
 
 The metadata builder plans the forward's query rows once, one whole row a work
