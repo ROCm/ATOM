@@ -1,0 +1,11 @@
+--- a/.github/scripts/atomesh/pd_slurm_job.sh
++++ b/.github/scripts/atomesh/pd_slurm_job.sh
+@@ -46,7 +46,7 @@
+ execution_phase_port_offset() {
+   if [[ "$1" == "eval" ]]; then
+     printf '%s\n' "${ATOMESH_RESTART_PORT_OFFSET}"
+   else
+-    printf '0\n'
++    printf '%s\n' "${ATOMESH_COMBINED_PORT_OFFSET:-0}"
+   fi
+ }

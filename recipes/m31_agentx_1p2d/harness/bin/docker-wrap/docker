@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# docker, except that "docker pull IMAGE" does nothing when IMAGE is already on this node.
+# The campaign image is a local tag (docker save / load) that no registry has, and the CI
+# launcher (pd_slurm_job.sh) pulls the cell's image before every container. Everything else
+# goes to the real docker unchanged.
+self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+real=""
+IFS=: read -r -a dirs <<< "${PATH}"
+for d in "${dirs[@]}"; do
+  [[ "${d}" == "${self_dir}" ]] && continue
+  if [[ -x "${d}/docker" ]]; then real="${d}/docker"; break; fi
+done
+[[ -n "${real}" ]] || { echo "docker-wrap: no docker on PATH" >&2; exit 127; }
+if [[ "${1:-}" == pull && $# -ge 2 ]]; then
+  image="${!#}"
+  if "${real}" image inspect "${image}" >/dev/null 2>&1; then
+    echo "[agx] ${image} is on $(hostname -s); not pulling"
+    exit 0
+  fi
+fi
+exec "${real}" "$@"

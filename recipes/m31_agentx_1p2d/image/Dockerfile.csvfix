@@ -1,0 +1,23 @@
+# Incremental campaign image: an earlier campaign image whose aiter checkout moves to FIX_SHA, allowed ONLY when every
+# file that differs is a tuned-config CSV under aiter/configs/ (read at runtime; no compiled module or codegen input
+# that the prebuild used changes; opus codegen reads only libtype=opus rows, checked below). Re-runs the FlyDSL AOT of
+# each changed table into the image cache and fails on any AOT failure. Context: fix.bundle (git bundle with FIX_SHA).
+ARG FROM_IMAGE=rocm/atom-dev:m31-agx-local-0d26c2a1
+FROM ${FROM_IMAGE}
+ARG FIX_SHA
+RUN --mount=type=bind,source=.,target=/tmp/ctx \
+    cd /app/aiter-test && git fetch -q /tmp/ctx/fix.bundle "+refs/heads/*:refs/remotes/agx/*" && \
+    changed="$(git diff --name-only HEAD "${FIX_SHA}")" && echo "changed vs $(cat AGX_AITER_COMMIT): ${changed}" && \
+    test -n "${changed}" && \
+    ! echo "${changed}" | grep -v -E '^aiter/configs/.*\.csv$' && \
+    ! git diff HEAD "${FIX_SHA}" -- aiter/configs | grep -E '^[-+][^-+].*,opus,' && \
+    git checkout -q -B m31-agentx "${FIX_SHA}" && git log -1 --format=%H > AGX_AITER_COMMIT && \
+    for f in ${changed}; do \
+      echo "AOT replay of ${f}"; \
+      AITER_AOT_IMPORT=1 GPU_ARCHS=gfx950 AITER_MAX_JOBS=32 FLYDSL_RUNTIME_CACHE_DIR=/app/aiter-test/aiter/jit/flydsl_cache \
+        python3 -m aiter.aot.flydsl.gemm --csv "${f}" > /tmp/aot_fix.log 2>&1 || { grep -E "\[FAIL\]|replay gfx950|BISECT" /tmp/aot_fix.log | cut -c1-240; exit 1; }; \
+      grep -E "replay gfx950|BISECT|Total time" /tmp/aot_fix.log | cut -c1-200; \
+    done && \
+    chmod -R a+rX /app/aiter-test/aiter/jit/flydsl_cache /app/aiter-test/aiter/jit/flydsl_aot
+ARG FROM_IMAGE
+LABEL com.amd.m31agx.aiter.commit="${FIX_SHA}" com.amd.m31agx.from="${FROM_IMAGE}"
