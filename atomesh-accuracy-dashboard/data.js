@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795548501457,
+  "lastUpdate": 1795621019589,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -5424,6 +5424,48 @@ window.BENCHMARK_DATA = {
             "value": 0.8992,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45434441460 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611241524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1585 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jiayyu@amd.com",
+            "name": "Jiayun",
+            "username": "jiayyu"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c158b04c2895a01efff5250721ab2c452f78e0a3",
+          "message": "feat(v4): mixed prefill/decode batching with DSpark (#2037)\n\n* Support mixed prefill/decode for DeepSeek V4 and DSpark\n\n* docs: fix scheduling quick reference table\n\n* docs(mixed): reconcile validation notes and review cleanup\n\n* test(mixed): run DSpark arithmetic and profile cleanup checks on CPU\n\n* fix(mixed): remove default-path overhead and exercise CPU contracts\n\n* fix(v4): preserve mixed indexer scales and decode scheduling budgets\n\n* fix(scheduler): reserve KV for short mixed prefill steps\n\n* test(mixed): exercise the constructed mixed input batch\n\n* fix(scheduler): reserve promoted remote decodes and restore default hot path\n\n* test(mixed): adapt warmup fixture to model setup refactor\n\n* fix(scheduler): recheck decode page capacity before continuing mixed prefill\n\n* fix(scheduler): settle mixed KV owners before prefill selection\n\n* fix(mixed): streamline host scheduling and unify profile bindings\n\n* fix(mixed): preserve request age and narrow lossless refusal\n\n* refactor(mixed): tighten runtime contracts and cover scheduling bounds\n\n* refactor(mixed): isolate metadata and preserve default scheduling paths\n\n* refactor(mixed): isolate default paths and share admission state\n\n* fix(dspark): guard optional separate-draft confidence scheduling\n\n* chore(mixed): complete new-file copyright headers\n\n* test(mixed): consolidate regression coverage\n\nMerge seven fragmented test files into their owning suites and share\nscheduler fixtures. Replace source-spelling checks with actual Config\nconstruction and optimized-Python refusal checks; exercise metrics and\ntracing through a real mixed batch. Preserve speculative rollback, KV\npressure, publication and profiling regressions.\n\nNo runtime, benchmark or workflow changes.\n\nValidation: Linux non-GPU 16700 passed; ROCm regression 271 passed; Black/Ruff/diff checks.\n\n* fix(mixed): share admission reservation and cover wiring\n\nRead the tick reservation from BlockManager for joint and lowered-hit\nadmission instead of copying it into each AdmissionProbe. Cover mixed\ndispatch binding, decode output slices, independent rejection counts,\nand direct/deferred joint admission in the existing regression suites.\nRemove the unused producer set and stale append-check names.\n\nValidation: Linux 16706 passed; ROCm 273 passed; mixed-on GSM8K 1256/1319; five targeted wiring mutants killed; Black/Ruff/diff checks.\n\n* fix(mixed): preserve preload accounting after main rebase\n\nApply the weight-cache daemon adjustment after taking the mixed profile\npeak, so the second non-PyTorch measurement does not undo main's\naccounting. Extend the existing memory-budget test for cached weights\nand adapt its builder to state-transfer slot initialization.\n\nValidation: Linux 17059 passed; ROCm 275 passed; mixed-on GSM8K 1256/1319; Black/Ruff/diff checks.\n\n* test(mixed): assert prefill token budget directly\n\nBind the selected limits once and compare its tokens explicitly in both\nmodes. The old conditional checked object truthiness in mixed mode.\n\nValidation: 151 related Linux tests passed; a zero-token negative control\nfails at the budget assertion; Black/Ruff/diff checks passed.",
+          "timestamp": "2026-11-25T21:55:38+08:00",
+          "tree_id": "17800b7d3673b2b627f4c51e56f1b039cca78156",
+          "url": "https://github.com/ROCm/ATOM/commit/c158b04c2895a01efff5250721ab2c452f78e0a3"
+        },
+        "date": 1795621018737,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45628567248 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611241524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9462 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8923,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45628567248 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611241524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1425 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b-1p1d accuracy (GSM8K)",
+            "value": 0.8961,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45628567248 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611241524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1342 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
