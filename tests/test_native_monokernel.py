@@ -861,6 +861,7 @@ def test_glm_default_page_size_accepted_and_segmented_refused(monkeypatch):
         enable_expert_parallel=False,
         enable_tbo=False,
         enable_tbo_decode=False,
+        enable_return_routed_experts=False,
         speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=4),
         kv_cache_dtype="fp8",
     )

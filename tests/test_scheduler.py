@@ -5111,7 +5111,7 @@ class TestRoutedExpertPatches:
         if preemption == "kv_change":
             assert scheduler.preempt_running() == 1
         else:
-            assert scheduler._preempt_one_running()
+            assert scheduler._preempt_one_running(seq)
         assert seq.status == SequenceStatus.WAITING
 
         # Another request's output step: the first chunk's rows, seq waiting.

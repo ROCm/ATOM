@@ -427,7 +427,7 @@ def test_route_capture_off_runs_none_of_its_step_hooks(monkeypatch, deferred):
 
     runner.postprocess(
         batch=_batch(2),
-        logits=torch.zeros(2, 8),
+        lm_head_output=mod.LmHeadOutput(None, torch.zeros(2, 8)),
         temperatures=torch.ones(2),
         top_ks=None,
         top_ps=None,
