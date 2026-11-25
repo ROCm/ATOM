@@ -383,7 +383,7 @@ def test_ids_preempted_in_a_pass_that_forwards_nothing_wait_for_a_forward(
     out = ScheduledBatchOutput([seq.id], [(20,)], None, None, None, False)
     sched.postprocess(list(active.values()), out, batch=batch)
 
-    monkeypatch.setattr(sched.block_manager, "can_append", lambda *args: False)
+    monkeypatch.setattr(sched.block_manager, "_has_page_units", lambda *args: False)
     result = sched.schedule()
     monkeypatch.undo()
     assert seq.id in sched._presence_preempted
