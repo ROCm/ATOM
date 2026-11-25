@@ -4,6 +4,9 @@
 import functools
 
 import torch
+
+# ATOM_MTP_ADVANCE_IN_SELECT (eagle_fused_glue): default off
+_ADVANCE_IN_SELECT = __import__("os").environ.get("ATOM_MTP_ADVANCE_IN_SELECT", "0") == "1"
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -523,10 +526,19 @@ class ParallelLMHead(VocabParallelEmbedding):
             if draft_rs is not None:
                 # The verify's sampler draws the draft, the draft presence
                 # penalty applied in its kernel (no separate vocab pass).
+                # ATOM_MTP_ADVANCE_IN_SELECT: the pass's advance in that kernel too
+                adv_kw = {}
+                if _ADVANCE_IN_SELECT:
+                    from atom.spec_decode.eagle_fused_glue import take_select_advance
+
+                    adv = take_select_advance()
+                    if adv is not None:
+                        adv.src_hidden = x
+                        adv_kw = {"advance": adv}
                 if stats is not None:
-                    draft_rs.sample_draft(logits, out, draft_presence, stats=stats)
+                    draft_rs.sample_draft(logits, out, draft_presence, stats=stats, **adv_kw)
                 else:
-                    draft_rs.sample_draft(logits, out, draft_presence)
+                    draft_rs.sample_draft(logits, out, draft_presence, **adv_kw)
                 # ATOM_MTP_DRAFT_FUSED_SELECT: recorded in the sampler's kernel
                 if draft_presence is not None and not getattr(
                     draft_rs, "recorded_presence", False

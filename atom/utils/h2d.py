@@ -369,7 +369,7 @@ class BufferPublication:
             # ATOM_PROLOGUE_PACKED_H2D: into the build's single upload (late_pack.flush)
             src, dst = self._source_view[:count], self._destination_view[:count]
             if src.is_contiguous() and dst.is_contiguous():
-                _late_pack.add(dst, src)
+                _late_pack.add(dst, src, self.name)
                 return
         if count == self.capacity:
             self._destination_view.copy_(self._source_view, non_blocking=True)

@@ -69,6 +69,7 @@ class PackedCopy:
                     late_pack.add(
                         binding.destination.reshape(-1).view(torch.uint8)[:length],
                         binding.source.reshape(-1).view(torch.uint8)[:length],
+                        getattr(binding, "name", "packed"),
                     )
             return False
         active = [i for i, count in enumerate(counts) if count]

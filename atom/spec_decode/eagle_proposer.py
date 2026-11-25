@@ -1537,7 +1537,10 @@ class EagleProposer(Drafter):
         epilogue (`verify_epilogue_targets`).
         """
         from atom.spec_decode.eagle_fused_glue import (
+            ADVANCE_IN_SELECT,
+            SelectAdvance,
             advance_draft_pass,
+            set_select_advance,
             stage_verify_step0,
             store_last_draft_pass,
         )
@@ -1607,7 +1610,41 @@ class EagleProposer(Drafter):
         step_positions = self.step.buffer("positions", running_bs)
         spec_rs = getattr(self, "spec_rs", None)
         fused_rs_store = envs.ATOM_MTP_FUSED_RS_STORE
+        # ATOM_MTP_ADVANCE_IN_SELECT: in the span graph's recording, each pass's
+        # advance / last-pass tail goes to its select kernel (eagle_fused_glue)
+        adv_in_select = (
+            ADVANCE_IN_SELECT
+            and eager_passes
+            and fused_rs_store
+            and spec_rs is not None
+            and step0_graphed
+        )
         for i in range(self.mtp_k):
+            sel_adv = None
+            if adv_in_select:
+                last = i == self.mtp_k - 1
+                sel_adv = SelectAdvance(
+                    mid=not last,
+                    builder=builder,
+                    draft_ids=draft_ids,
+                    draft_col=i,
+                    scheduled_bs=scheduled_bs,
+                    running_bs=running_bs,
+                    records=spec_rs.record_args(i, scheduled_bs, context),
+                )
+                if not last:
+                    sel_adv.dst_ids = step_ids
+                    sel_adv.dst_hidden = step_hidden
+                    sel_adv.dst_positions = step_positions
+                    sel_adv.num_slot_rows = 0 if context.is_dummy_run else scheduled_bs
+                    if i == 0:
+                        sel_adv.num_reject_tokens = num_reject_tokens
+                        sel_adv.positions_src = positions_src
+                        sel_adv.anchors = last_token_indices
+                    sel_adv.token_split = (
+                        self._draft_token_split() if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT else None
+                    )
+                set_select_advance(sel_adv)
             with record_function(
                 f"propose_eagle[{i}/{self.mtp_k} "
                 f"tok={num_tokens if i == 0 else scheduled_bs} "
@@ -1684,6 +1721,8 @@ class EagleProposer(Drafter):
                             positions=step_positions,
                             hidden_states=step_hidden,
                         )
+                set_select_advance(None)
+                folded = sel_adv is not None and sel_adv.consumed
                 records = None
                 if spec_rs is not None:
                     # ATOM_MTP_REJECTION_SAMPLING: this pass's q records, before
@@ -1695,7 +1734,9 @@ class EagleProposer(Drafter):
                         spec_rs.store_step(i, scheduled_bs, context)
 
                 if i == self.mtp_k - 1:
-                    if fused_rs_store:
+                    if folded:
+                        pass  # the select stored the draft ids and records
+                    elif fused_rs_store:
                         store_last_draft_pass(
                             out_ids, draft_ids, i, scheduled_bs, records=records
                         )
@@ -1742,6 +1783,7 @@ class EagleProposer(Drafter):
                         or self._draft_kv_indices()
                     ),
                     records=records,
+                    launch=not folded,
                 )
                 for k, v in workinfos.items():
                     attn_metadata.__dict__[k] = v

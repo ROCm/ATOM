@@ -115,6 +115,17 @@ def fused_topk_topp_applicable(
 _PHILOX_CALLS = [0]
 
 
+def gluon_select_eager(logits: torch.Tensor, top_k) -> bool:
+    """Whether `fused_topk_topp_sample` takes aiter's Gluon path for these logits."""
+    from aiter.ops.triton.fusions import topk_topp_sample as tts
+
+    return (
+        envs.ATOM_SAMPLER_GLUON_SELECT
+        and tts.topk_topp_sample_gluon_select_supported(logits, top_k)
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
 def fused_topk_topp_sample(
     logits: torch.Tensor,
     temperatures: torch.Tensor,

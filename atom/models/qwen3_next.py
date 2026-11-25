@@ -1142,14 +1142,26 @@ class Qwen3NextAttention(nn.Module):
         """`select_rows` (the MTP drafter, ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ):
         every row attends (and writes its KV), and only these rows go on to the
         output gate and o_proj: the output has `len(select_rows)` rows."""
+        # ATOM_FOLD_QKV_BF16_INPUT_NORM: the layer left its input norm to the bf16 fold below
+        input_norm = self.__dict__.pop("_pending_input_norm", None)
+        qkv = None
+        if input_norm is not None:
+            from atom.model_ops import fold_qkv_qknorm_bf16
+
+            qkv = fold_qkv_qknorm_bf16.try_fold_qkv_bf16(
+                self, positions, hidden_states, norm=input_norm
+            )
+            if qkv is None:
+                hidden_states = input_norm(hidden_states)
         # ATOM_FOLD_QKNORM_QKV: the Q/K norm, MRoPE and KV write in the qkv GEMM's epilogue (decode)
         from atom.model_ops.fold_qkv_qknorm import fold_enabled, try_fold_qkv
 
-        qkv = (
-            try_fold_qkv(self, positions, hidden_states, x_scale)
-            if fold_enabled()
-            else None
-        )
+        if qkv is None:
+            qkv = (
+                try_fold_qkv(self, positions, hidden_states, x_scale)
+                if fold_enabled()
+                else None
+            )
         if qkv is None and x_scale is None:
             # ATOM_FOLD_QKNORM_QKV_BF16: the same fold for a bf16 qkv_proj (the MTP drafter's)
             from atom.model_ops import fold_qkv_qknorm_bf16
@@ -1717,6 +1729,22 @@ class Qwen3NextDecoderLayer(nn.Module):
             routed, shared, gate, residual, norm.weight, norm.variance_epsilon
         )
 
+    def _input_norm_to_qkv_fold(self, hidden_states, select_rows) -> bool:
+        """ATOM_FOLD_QKV_BF16_INPUT_NORM: this full-attention layer's input GemmaRMSNorm (no residual: the
+        MTP drafter's) can go to the bf16 qkv fold's prologue: the post-norm fold does not need the normed rows,
+        and the attention forward normalizes them itself where the fold declines."""
+        from atom.model_ops import fold_qkv_qknorm_bf16
+
+        return (
+            fold_qkv_qknorm_bf16.INPUT_NORM
+            and self.layer_type == "full_attention"
+            and isinstance(self.input_layernorm, GemmaRMSNorm)
+            and hidden_states.dim() == 2
+            and hidden_states.shape[-1] == 2048
+            and not getattr(self, "fold_postnorm", False)
+            and self._fold_postnorm_proj(hidden_states, None, select_rows) is None
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1754,7 +1782,12 @@ class Qwen3NextDecoderLayer(nn.Module):
             x_scale = hidden_bf16 = None
             if residual is None:
                 residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
+                if self._input_norm_to_qkv_fold(hidden_states, select_rows):
+                    # ATOM_FOLD_QKV_BF16_INPUT_NORM: normed in the qkv fold's prologue
+                    # (in __dict__: nn.Module.__setattr__ would register the norm as a submodule)
+                    self.self_attn.__dict__["_pending_input_norm"] = self.input_layernorm
+                else:
+                    hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 

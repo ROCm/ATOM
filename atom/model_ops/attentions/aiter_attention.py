@@ -7,6 +7,10 @@ from typing import ClassVar, NamedTuple
 import aiter
 import numpy as np
 import torch
+
+# ATOM_SKIP_VERIFY_KV_INDICES=1 (default off; with ATOM_HOSTNEXT_FUSED_PROLOGUE): the verify's kv_indices are
+# not generated where no decode kernel reads them (as ATOM_MTP_SKIP_DRAFT_KV_INDICES does for the drafts)
+_SKIP_VERIFY_KV_INDICES = __import__("os").environ.get("ATOM_SKIP_VERIFY_KV_INDICES", "0") == "1"
 import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
@@ -1437,6 +1441,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     self.block_ratio,
                     max_seqlen_k,
                 )
+                if _SKIP_VERIFY_KV_INDICES:
+                    # ATOM_SKIP_VERIFY_KV_INDICES: only the persistent ASM decode (attention pages of
+                    # 256 / 1024) reads kv_indices; the paged / gluon / unified decodes read block_tables
+                    from atom.spec_decode.eagle_fused_glue import draft_reads_kv_indices
+
+                    if not draft_reads_kv_indices(self):
+                        early.kv = None
             else:
                 early_meta_fix(early, **fix_args)
         if early is None or not early.fused:
