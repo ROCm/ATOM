@@ -3213,10 +3213,12 @@ class MLAAttention(nn.Module):
                 envs.ATOM_DCP_PREFILL_QREP,
             )
             # NVFP4 with the fused K-up: q_nope stays un-absorbed and the
-            # NVFP4 decode quantizes it inside its own K-up GEMM.
+            # NVFP4 decode quantizes it inside its own K-up GEMM. Only that path
+            # passes `k_up`, so a stand-in without it serves every other one.
             kup_fused = kup_fusable(self) and not is_rocm_aiter_fp4bmm_enabled()
+            no_k_up = {"k_up": False} if kup_fused else {}
             q_nope, q_rope = self._q_proj_and_k_up_proj(
-                q, x_scale=q_scale, group=use_qrep, k_up=not kup_fused
+                q, x_scale=q_scale, group=use_qrep, **no_k_up
             )
             nvfp4_out = try_nvfp4_decode(
                 self,

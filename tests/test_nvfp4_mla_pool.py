@@ -11,6 +11,7 @@ from atom.model_ops.attentions.mla_kv_pool import (
     NVFP4_NOPE_BYTES,
     MlaKvPool,
 )
+from atom.model_ops.attentions.nvfp4_hp_ring import Nvfp4HpRing
 from atom.model_ops.attentions.nvfp4_mla import Nvfp4MlaCache
 
 LAYERS = 3
@@ -63,6 +64,13 @@ def test_nvfp4_planes_bind_as_contiguous_aligned_layers():
 def test_nvfp4_pool_needs_page64_blocks():
     with pytest.raises(ValueError, match="64 tokens"):
         _pool(True, block_size=16)
+
+
+def test_cache_rejects_a_tail_of_the_wrong_size():
+    ring = Nvfp4HpRing(3, LAYERS, DIM)
+    assert Nvfp4MlaCache(LAYERS, 4, 2, DIM, device="cpu", ring=ring).ring is ring
+    with pytest.raises(ValueError, match="tail"):
+        Nvfp4MlaCache(LAYERS, 4, 3, DIM, device="cpu", ring=ring)
 
 
 def test_cache_rejects_wrong_plane_shape():

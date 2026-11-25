@@ -83,6 +83,7 @@ def test_fused_rope_matches_the_separate_path(batch, seed):
     kv_a = randn(batch, 576 + 64, s=1.0)
     k_nope = kv_a[:, :512]
     k_rope = kv_a[:, 512:576].view(batch, 1, 64)
+    q_rope_in, k_rope_in = q_rope.clone(), k_rope.clone()
     positions = torch.randint(0, 160000, (batch,), generator=gen, device="cuda")
     pages = 4 * batch
     req = torch.arange(batch, dtype=torch.int32, device="cuda")
@@ -133,8 +134,7 @@ def test_fused_rope_matches_the_separate_path(batch, seed):
     assert torch.equal(nope, r_nope), "kv_nope differs"
     assert _fraction_equal(aux, r_aux) >= KV_AUX_MATCH, "kv_aux differs"
     # The inputs were not rotated in place.
-    assert torch.equal(q_rope, q_wide[..., 128:])
-    assert torch.equal(k_rope, kv_a[:, 512:576].view(batch, 1, 64))
+    assert torch.equal(q_rope, q_rope_in) and torch.equal(k_rope, k_rope_in)
 
     # One launch for Q and K, RoPE in the kernel, then with roped inputs.
     from atom.model_ops.attentions.nvfp4_q_triton import decode_prep
@@ -180,6 +180,7 @@ def test_fused_rope_matches_the_separate_path(batch, seed):
             _assert_rope_close(new[:, 512:], k_pe.reshape(batch, 64))
             assert _fraction_equal(one_q[1], want_q[1]) >= Q_AUX_MATCH, fused
             assert _fraction_equal(aux, r_aux) >= KV_AUX_MATCH, fused
+            assert torch.equal(q_rope, q_rope_in) and torch.equal(k_rope, k_rope_in)
         else:
             assert torch.equal(one_q[1], want_q[1]), fused
             assert torch.equal(ring.buf[:batch], r_ring[:batch]), fused

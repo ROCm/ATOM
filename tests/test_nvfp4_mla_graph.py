@@ -16,8 +16,11 @@ import pytest
 import torch
 
 pytest.importorskip("aiter.ops.mla_nvfp4")
-if not torch.cuda.is_available():
-    pytest.skip("needs a GPU", allow_module_level=True)
+if (
+    not torch.cuda.is_available()
+    or "gfx1250" not in torch.cuda.get_device_properties(0).gcnArchName
+):
+    pytest.skip("AITER's NVFP4 MLA decoder is gfx1250-only", allow_module_level=True)
 
 from aiter.mla import mla_decode_prepare_page_csr
 

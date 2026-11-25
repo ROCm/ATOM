@@ -432,9 +432,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Decode with the gfx1250 NVFP4 MLA attention of AITER (PR 8200). The FP4
     # pages replace the FP8 KV cache in the paged pool, with a BF16 tail of the
-    # open 16-token tile for each request. Requires 128 query heads per rank,
-    # block size 64, and no prefix caching, chunked prefill or MTP. Off by
-    # default, so the FP8 path is unchanged.
+    # open 16-token tile for each request. Requires 128 query heads per rank
+    # and block size 64; docs/environment_variables.md lists the features it
+    # refuses. Off by default, so the FP8 path is unchanged.
     "ATOM_MLA_NVFP4": lambda: os.getenv("ATOM_MLA_NVFP4", "0") == "1",
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.

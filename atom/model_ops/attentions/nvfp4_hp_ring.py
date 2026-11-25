@@ -4,9 +4,8 @@
 """BF16 tail for the open NVFP4 MLA tile.
 
 One ring per request per layer holds the original BF16 latent of the tile
-that is still accepting tokens. The ring is 16 tokens (one tile), plus an
-optional rewind for speculative tokens. It is not a page and does not grow
-with context length.
+that is still accepting tokens. The ring is 16 tokens, one tile. It is not a
+page and does not grow with context length.
 
 A tile with fewer than 16 tokens is still quantized into the FP4 cache, using
 only the valid rows. The ring keeps the BF16 originals so the next token
@@ -32,7 +31,6 @@ class Nvfp4HpRing:
         layers: int,
         head_dim: int,
         *,
-        rewind: int = 0,
         device: torch.device | str = "cpu",
     ):
         if num_reqs < 1 or layers < 1 or head_dim < 1:
@@ -40,13 +38,10 @@ class Nvfp4HpRing:
                 "NVFP4 HP ring needs a positive request, layer, and head count, "
                 f"got reqs={num_reqs} layers={layers} head_dim={head_dim}."
             )
-        if rewind < 0:
-            raise ValueError(f"NVFP4 HP rewind must be >= 0, got {rewind}.")
         self.num_reqs = num_reqs
         self.layers = layers
         self.head_dim = head_dim
-        self.rewind = rewind
-        self.ring_size = HP_BLOCK_SIZE + rewind
+        self.ring_size = HP_BLOCK_SIZE
         self.buf = torch.zeros(
             (num_reqs, layers, self.ring_size, head_dim),
             dtype=torch.bfloat16,
@@ -56,38 +51,6 @@ class Nvfp4HpRing:
     def nbytes(self) -> int:
         """Bytes of the whole ring. Page size does not enter this number."""
         return self.buf.numel() * self.buf.element_size()
-
-    def store_tail(
-        self, layer: int, req: int, start: int, values: torch.Tensor
-    ) -> None:
-        """Keep the BF16 rows of one tile, ``values`` shaped ``[valid, head_dim]``.
-
-        ``start`` is the absolute position of the first row and is a multiple
-        of 16. ``valid`` is 0..16. A full tile may be stored; the next token
-        begins a new tile and does not read these rows.
-        """
-        self._check_layer_req(layer, req)
-        if start < 0 or start % HP_BLOCK_SIZE != 0:
-            raise ValueError(
-                f"NVFP4 tail start must be a non-negative multiple of {HP_BLOCK_SIZE}, "
-                f"got {start}."
-            )
-        if values.ndim != 2 or values.shape[1] != self.head_dim:
-            raise ValueError(
-                f"NVFP4 tail must be [valid, {self.head_dim}], got {tuple(values.shape)}."
-            )
-        valid = values.shape[0]
-        if not 0 <= valid <= HP_BLOCK_SIZE:
-            raise ValueError(
-                f"NVFP4 tail holds at most {HP_BLOCK_SIZE} tokens, got {valid}."
-            )
-        if valid == 0:
-            return
-        positions = start + torch.arange(valid, device=self.buf.device)
-        slots = torch.remainder(positions, self.ring_size)
-        self.buf[req, layer, slots] = values.to(
-            device=self.buf.device, dtype=self.buf.dtype
-        )
 
     def append_tokens(
         self,
@@ -110,7 +73,7 @@ class Nvfp4HpRing:
         the host and so cannot run inside a CUDA graph capture.
         """
         self._check_page_size(page_size)
-        self._check_layer_req(layer, 0)
+        self._check_layer(layer)
         req_ids = req_ids.to(device=self.buf.device, dtype=torch.long)
         positions = positions.to(device=self.buf.device, dtype=torch.long)
         if req_ids.ndim != 1 or positions.shape != req_ids.shape:
@@ -155,11 +118,9 @@ class Nvfp4HpRing:
         ).to(torch.int32)
         return tiles, valid, page_ids, tile_ids
 
-    def _check_layer_req(self, layer: int, req: int) -> None:
+    def _check_layer(self, layer: int) -> None:
         if not 0 <= layer < self.layers:
             raise ValueError(f"layer {layer} outside 0..{self.layers - 1}.")
-        if not 0 <= req < self.num_reqs:
-            raise ValueError(f"req {req} outside 0..{self.num_reqs - 1}.")
 
     @staticmethod
     def _check_page_size(page_size: int) -> None:
@@ -168,27 +129,3 @@ class Nvfp4HpRing:
                 f"NVFP4 page_size must be a positive multiple of {HP_BLOCK_SIZE}, "
                 f"got {page_size}."
             )
-
-
-def tile_spans(num_tokens: int, page_size: int) -> list[tuple[int, int, int, int]]:
-    """Every 16-token group of a prompt, including a short final group.
-
-    Each item is ``(start, valid, page_id, tile_id)``. ``valid`` is 16 except
-    on the last group. The caller quantizes every group into the FP4 cache.
-    Only a short last group has to be copied into the ring.
-    """
-    Nvfp4HpRing._check_page_size(page_size)
-    if num_tokens < 0:
-        raise ValueError(f"num_tokens must be >= 0, got {num_tokens}.")
-    spans = []
-    for start in range(0, num_tokens, HP_BLOCK_SIZE):
-        valid = min(HP_BLOCK_SIZE, num_tokens - start)
-        spans.append(
-            (
-                start,
-                valid,
-                start // page_size,
-                (start % page_size) // HP_BLOCK_SIZE,
-            )
-        )
-    return spans

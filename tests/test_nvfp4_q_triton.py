@@ -7,6 +7,16 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+requires_gfx1250 = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx1250" not in torch.cuda.get_device_properties(0).gcnArchName,
+    reason="AITER's NVFP4 MLA producers are gfx1250-only",
+)
+# q_aux: the first 64 bytes of a row are RoPE and residual E2M1 codes, the
+# rest E4M3 scales and padding.
+Q_AUX_CODES = 64
+# kv_aux: each 2048-byte token16 tile starts with 1024 bytes of codes.
+KV_AUX_TILE, KV_AUX_CODES = 2048, 1024
 
 
 def _query(batch, seed, strided=False):
@@ -30,6 +40,7 @@ def _query(batch, seed, strided=False):
     return q, nope, rope
 
 
+@requires_gfx1250
 @pytest.mark.parametrize(
     "batch,seed,strided", [(1, 0, False), (3, 1, True), (77, 2, False), (512, 3, True)]
 )
@@ -166,6 +177,7 @@ def test_decode_prep_q_planes_writes_the_rope_part():
     assert all(torch.equal(a, b) for a, b in zip(outs[1], outs[0]))
 
 
+@requires_gfx1250
 @pytest.mark.parametrize("fused", [True, False])
 @pytest.mark.parametrize("batch,steps", [(24, 40), (300, 6)])
 def test_aiter_decode_prep_writes_the_same_bytes(batch, steps, fused):
@@ -173,8 +185,6 @@ def test_aiter_decode_prep_writes_the_same_bytes(batch, steps, fused):
     one, step after step from the same stale bytes: q_aux, the tail and both
     cache planes, over tile starts and edges, padding rows, K outliers and
     signed zeros, with the fused RoPE and with pre-roped input."""
-    if "gfx1250" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""):
-        pytest.skip("AITER's decode prep is gfx1250")
     from aiter.rotary_embedding import get_rope
 
     from atom.model_ops.attentions.nvfp4_q_triton import _aiter_decode_prep, decode_prep
@@ -259,22 +269,26 @@ def test_aiter_decode_prep_writes_the_same_bytes(batch, steps, fused):
         # The HIP RoPE is the RoPE kernel's bf16 instructions; the Triton one's
         # emulation can lose the sign of an exact zero (a code 0 for 8), so
         # codes may differ by a zero's sign and in nothing else.
-        assert _same_but_zero_sign(outs[0], outs[1]), (step, "q_aux")
+        assert _same_but_zero_sign(outs[0], outs[1], Q_AUX_CODES), (step, "q_aux")
         assert torch.equal(tri[0][..., :512], hip[0][..., :512]), (step, "tail")
         assert _same_bf16_but_zero_sign(tri[0][..., 512:], hip[0][..., 512:]), (
             step,
             "tail rope",
         )
         assert torch.equal(tri[1], hip[1]), (step, "kv_nope")
-        assert _same_but_zero_sign(tri[2], hip[2]), (step, "kv_aux")
+        assert _same_but_zero_sign(
+            tri[2].view(-1, KV_AUX_TILE), hip[2].view(-1, KV_AUX_TILE), KV_AUX_CODES
+        ), (step, "kv_aux")
         pos = torch.where(slots >= 0, pos + 1, pos)
 
 
-def _same_but_zero_sign(a, b):
-    """Byte planes equal except E2M1 nibbles 0 / 8 (+0 / -0) swapped."""
+def _same_but_zero_sign(a, b, codes):
+    """Aux planes equal byte for byte, except that in the first ``codes`` bytes
+    of each row, the E2M1 codes, nibbles 0 / 8 (+0 / -0) may swap."""
     lo_a, hi_a, lo_b, hi_b = a & 15, a >> 4, b & 15, b >> 4
     ok = lambda x, y: (x == y) | ((x | y) == 8) & ((x & 7) == 0) & ((y & 7) == 0)
-    return bool((ok(lo_a, lo_b) & ok(hi_a, hi_b)).all())
+    same_codes = (ok(lo_a, lo_b) & ok(hi_a, hi_b))[..., :codes].all()
+    return bool(same_codes) and torch.equal(a[..., codes:], b[..., codes:])
 
 
 def _same_bf16_but_zero_sign(a, b):

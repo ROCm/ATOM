@@ -9,6 +9,11 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+requires_gfx1250 = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx1250" not in torch.cuda.get_device_properties(0).gcnArchName,
+    reason="AITER's NVFP4 MLA producers are gfx1250-only",
+)
 
 DIM, REQS, LAYERS, PAGE = 576, 40, 3, 64
 
@@ -124,6 +129,7 @@ def _fused_vs_producer(seed, pages=600):
     return (ring.buf, nope, aux), (ref_ring, ref_nope, ref_aux)
 
 
+@requires_gfx1250
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_fused_write_matches_the_aiter_producer_byte_for_byte(seed):
     (r, n, a), (rr, rn, ra) = _fused_vs_producer(seed)
@@ -158,6 +164,7 @@ def test_fused_write_replays_in_a_graph():
     assert torch.equal(nope, eager[1]) and torch.equal(aux, eager[2])
 
 
+@requires_gfx1250
 def test_prefill_quantize_matches_the_producer_on_gathered_tiles():
     from atom.model_ops.attentions.nvfp4_ring_triton import prefill_quantize
 
@@ -205,6 +212,7 @@ def test_prefill_quantize_matches_the_producer_on_gathered_tiles():
     assert bad.numel() == 0, f"kv_aux differs at {bad[:8].tolist()}"
 
 
+@requires_gfx1250
 def test_split_prefill_publish_matches_the_concat_publish():
     """Pages and the BF16 tail of each request's short last tile, which the
     next decode token requantizes."""

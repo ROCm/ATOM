@@ -53,6 +53,7 @@ from atom.model_ops.attention_mla import (
     mla_dcp_sparse_prefill_num_heads,
     mla_kernel_num_heads,
 )
+from atom.model_ops.attentions.nvfp4_hp_ring import Nvfp4HpRing
 from atom.model_ops.attentions.nvfp4_mla import (
     NVFP4_HEADS,
     NVFP4_PAGE,
@@ -524,6 +525,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # The NVFP4 pages and the BF16 tail of each request's open tile. None
         # unless ATOM_MLA_NVFP4 is set; the FP8 pool does not allocate one.
         self.nvfp4_cache: Nvfp4MlaCache | None = None
+        # Its tail and the step's page CSR (`_allocate_nvfp4_buffers`).
+        self._nvfp4_ring: Nvfp4HpRing | None = None
+        self._nvfp4_csr: tuple[torch.Tensor, ...] | None = None
         # Each prefill batch's host-side sparse plan, by buffer prefix, from
         # `_stage_prefill_batch` to `_finish_prefill_batch`; None for a dense
         # one.
@@ -1010,6 +1014,35 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if config.enable_tbo:
             self._allocate_ubatch_buffers(max_seqlen_qo)
+        if envs.ATOM_MLA_NVFP4:
+            self._allocate_nvfp4_buffers()
+
+    def _allocate_nvfp4_buffers(self) -> None:
+        """The NVFP4 BF16 tail and the step's page CSR, before the memory
+        profile, so the KV budget counts them like the other workspaces.
+
+        Both scale with `max_bs`, not with the page count, and neither is a
+        view of the pool, so they stay allocated across a sleep.
+        """
+        self._check_nvfp4_supported()
+        runner = self.model_runner
+        layers = self._kv_pool_layers()
+        if not layers:
+            return
+        self._nvfp4_ring = Nvfp4HpRing(
+            self.max_bs + 1,
+            layers,
+            mla_kv_entry_dim(runner.config.hf_config),
+            device=runner.device,
+        )
+        # Fixed addresses, so a captured decode reads whatever
+        # `_build_nvfp4_csr` wrote this step.
+        i32 = {"dtype": torch.int32, "device": runner.device}
+        self._nvfp4_csr = (
+            torch.zeros(self.max_bs + 1, **i32),
+            torch.zeros(self.max_bs * self.block_table_cols, **i32),
+            torch.zeros(self.max_bs, **i32),
+        )
 
     def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
         # Ready together before `kv_indices_generate_triton`, the step's first
@@ -1504,6 +1537,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def release_kv_pools(self) -> None:
         if self.kv_pool is not None:
             self.kv_pool.release()
+        if self.nvfp4_cache is not None:
+            # The cache and every layer's `impl.nvfp4` hold views of the FP4
+            # planes; `allocate_kv_cache_tensors` builds a new cache on wake.
+            for module in self.pool_rows.get(MLA_ROWS, {}):
+                getattr(module, "impl", module).nvfp4 = None
+            self.nvfp4_cache = None
 
     def _module_kinds(self, module) -> tuple:
         """One row space: the MLA layers, target and shared draft alike."""
@@ -1571,7 +1610,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         Prefill attends to the forward's own K/V and never reads history, so a
         prefill over cached context (prefix hit, chunked prefill) has nothing to
-        read. The shader is one query, 128 heads, page 64.
+        read. The shader is one query, 128 heads, page 64. A request's tail row
+        is freed by `EngineCore._release_request_resources`, which the
+        pipeline-parallel and RapidServe engine loops do not reach, and KV
+        transfer has no layout for the FP4 planes or the tail.
         """
         runner = self.model_runner
         config = runner.config
@@ -1599,6 +1641,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # the NVFP4 tail rows and CSR are not built for.
         if config.enable_tbo or config.enable_tbo_decode:
             problems.append("two-batch overlap")
+        if config.pipeline_parallel_size > 1:
+            problems.append("pipeline parallelism")
+        if config.enable_rapidserve:
+            problems.append("RapidServe")
+        if config.kv_transfer_config:
+            problems.append("KV transfer")
         if problems:
             raise RuntimeError(
                 "ATOM_MLA_NVFP4 cannot run with: " + ", ".join(problems) + "."
@@ -1640,14 +1688,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 device=runner.device,
                 kv_nope=nope,
                 kv_aux=aux,
-            )
-            # The step's CSR (`_build_nvfp4_csr`): fixed addresses, so a
-            # captured decode reads whatever the builder wrote this step.
-            i32 = {"dtype": torch.int32, "device": runner.device}
-            self._nvfp4_csr = (
-                torch.zeros(self.max_bs + 1, **i32),
-                torch.zeros(self.max_bs * self.block_table_cols, **i32),
-                torch.zeros(self.max_bs, **i32),
+                ring=self._nvfp4_ring,
             )
             logger.info(
                 "NVFP4 MLA cache: %d layers x %d pages, %.1f GiB FP4 (paged pool, "
@@ -1772,9 +1813,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
         if self.kv_pool.nvfp4:
             # P/D transports and offload parse one packed latent region per
-            # layer; the FP4 planes are neither that layout nor transferable yet.
-            if runner.config.kv_transfer_config:
-                raise RuntimeError("ATOM_MLA_NVFP4 does not support KV transfer.")
+            # layer; the FP4 planes are not that layout, and
+            # `_check_nvfp4_supported` refuses KV transfer.
             return None
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 

@@ -151,6 +151,8 @@ def test_try_nvfp4_decode_with_the_fused_kup(use_aiter, monkeypatch):
     pytest.importorskip("aiter.ops.mla_nvfp4")
     from atom.model_ops.attentions import nvfp4_q_triton
 
+    if not _gfx1250():
+        pytest.skip("AITER's NVFP4 MLA decoder is gfx1250-only")
     if use_aiter:
         _skip_without_aiter_ops()
     from types import SimpleNamespace

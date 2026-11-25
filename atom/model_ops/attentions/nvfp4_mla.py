@@ -73,7 +73,8 @@ class Nvfp4MlaCache:
     """FP4 pages plus the BF16 tail, for every MLA layer.
 
     In the engine the pages are the paged pool's two planes, passed in as
-    ``kv_nope`` / ``kv_aux`` ``[layers, pages, bytes]``. Without them the
+    ``kv_nope`` / ``kv_aux`` ``[layers, pages, bytes]``, and ``ring`` is the
+    tail the metadata builder allocated before KV sizing. Without them the
     cache allocates its own, which is what the unit tests use.
     """
 
@@ -87,6 +88,7 @@ class Nvfp4MlaCache:
         device: torch.device | str,
         kv_nope: torch.Tensor | None = None,
         kv_aux: torch.Tensor | None = None,
+        ring: Nvfp4HpRing | None = None,
         fused: bool = True,
     ):
         if layers < 1 or pages < 1 or max_reqs < 1:
@@ -137,9 +139,18 @@ class Nvfp4MlaCache:
         # One row per live request, plus `pad_row`: padding rows of a batch
         # write their throwaway token there instead of into a request's tail.
         self.pad_row = max_reqs
-        self.ring = Nvfp4HpRing(
-            max_reqs + 1, layers, head_dim, rewind=0, device=self.device
-        )
+        if ring is None:
+            ring = Nvfp4HpRing(max_reqs + 1, layers, head_dim, device=self.device)
+        if (ring.num_reqs, ring.layers, ring.head_dim) != (
+            max_reqs + 1,
+            layers,
+            head_dim,
+        ):
+            raise ValueError(
+                f"NVFP4 tail must be {max_reqs + 1} rows x {layers} layers x "
+                f"{head_dim}, got {ring.num_reqs} x {ring.layers} x {ring.head_dim}."
+            )
+        self.ring = ring
         if self.fused:
             from atom.model_ops.attentions.nvfp4_q_triton import warm
 
