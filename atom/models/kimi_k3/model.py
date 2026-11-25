@@ -546,6 +546,7 @@ class KimiSparseMoeBlock(nn.Module):
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
             and not tbo_active
+            and self.experts.allows_concurrent_shared_stream
         )
         # The split op's single-stream target row-shards a large step's latent
         # tail, so a latent block with TP takes the op with dual-stream off too.

@@ -163,6 +163,15 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
     return value
 
 
+def _dp_sync_interval_env() -> int | None:
+    """None for a non-integer, so every DP rank can reject it together; 0 and
+    negative values mean 1."""
+    try:
+        return max(1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1")))
+    except ValueError:
+        return None
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
@@ -1109,6 +1118,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # DP > 1 (single- or multi-node; not read under PP): after a sync that saw
+    # unfinished work, run the cross-DP state all_reduce only every N engine
+    # rounds (1 = every round, at most 16; 0 and negative values mean 1).
+    # Utility commands, abort and shutdown are applied only on rounds that sync,
+    # and once the group drains every rank still runs up to N-1 dummy rounds
+    # before the next sync.
+    "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
     # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
@@ -1183,7 +1199,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
     # --- Structured output ---
     # Hold tool calls to the declared schemas when the tool parser declares a
-    # grammar for them (Kimi-K3) and the structured-output extra is installed.
+    # grammar for them (Kimi-K3) and the structured-output backend is available.
     "ATOM_TOOL_CALL_GRAMMAR": lambda: (
         os.getenv("ATOM_TOOL_CALL_GRAMMAR", "0").lower() == "1"
     ),

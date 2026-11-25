@@ -93,6 +93,8 @@ def ranks(monkeypatch):
 class _Stub(nn.Module):
     """Stands in for a sub-module class; the test sets `fn` after `__init__`."""
 
+    allows_concurrent_shared_stream = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
 
@@ -560,6 +562,26 @@ def test_constructor_limits_row_dispatch(
     stub_block_parts.enable_tbo = tbo
     block = kimi.KimiSparseMoeBlock(config, prefix="scope", alt_stream=object())
     assert block.row_shardable is eligible and block._use_dispatch_op is eligible
+
+
+@pytest.mark.parametrize("shared_stream_allowed", [True, False])
+@pytest.mark.parametrize("world", [1, WORLD])
+def test_shared_stream_refusal_preserves_row_dispatch(
+    monkeypatch, stub_block_parts, shared_stream_allowed, world
+):
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "32")
+    monkeypatch.setattr(_Stub, "allows_concurrent_shared_stream", shared_stream_allowed)
+    monkeypatch.setattr(kimi, "get_tensor_model_parallel_world_size", lambda: world)
+    block = _block(_weights(), 0, [])
+
+    assert block._use_dual_stream is shared_stream_allowed
+    assert block.row_shardable is (world > 1)
+    dispatch = shared_stream_allowed or world > 1
+    assert block._use_dispatch_op is dispatch
+    registered = stub_block_parts.compilation_config.static_forward_context
+    assert (block.prefix in registered) is dispatch
+    if dispatch:
+        assert registered[block.prefix] is block
 
 
 def test_mono_fallback_preserves_typed_forward_outputs():

@@ -22,6 +22,7 @@ from atom.entrypoints.openai.reasoning_controls import apply_reasoning_controls
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
     AnthropicMessagesRequest,
+    anthropic_context_length_message,
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
@@ -235,6 +236,52 @@ class TestAnthropicToOpenAIMessages:
         assert result[3]["role"] == "tool"
         assert result[4]["role"] == "assistant"
         assert result[5]["role"] == "user"
+
+    def test_a_mid_conversation_system_message_is_its_text(self):
+        # Claude Code sends reminders this way, as cache-marked blocks; str()
+        # put the block list's Python repr in the prompt.
+        reminder = "<system-reminder>todo list is empty</system-reminder>"
+        msgs = [
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(
+                role="system",
+                content=[
+                    {
+                        "type": "text",
+                        "text": reminder,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            ),
+            AnthropicMessage(role="system", content="plain"),
+        ]
+        result = anthropic_to_openai_messages(msgs)
+        assert result[1:] == [
+            {"role": "system", "content": reminder},
+            {"role": "system", "content": "plain"},
+        ]
+
+    def test_an_unknown_role_is_refused(self):
+        msgs = [AnthropicMessage(role="tool", content="x")]
+        with pytest.raises(ValueError, match='Unexpected role "tool"'):
+            anthropic_to_openai_messages(msgs)
+
+
+class TestContextLengthWording:
+    """Claude Code compacts on the first form and retries with a smaller
+    ``max_tokens`` on the second; it recognises neither in OpenAI's wording."""
+
+    def test_a_prompt_that_fills_the_context(self):
+        assert (
+            anthropic_context_length_message(33028, 1024, 32768)
+            == "prompt is too long: 33028 tokens > 32767 maximum"
+        )
+
+    def test_a_prompt_that_fits_without_its_output(self):
+        assert anthropic_context_length_message(28672, 32000, 32768) == (
+            "input length and `max_tokens` exceed context limit: 28672 + 32000 "
+            "> 32768, decrease input length or `max_tokens` and try again"
+        )
 
 
 # ============================================================================

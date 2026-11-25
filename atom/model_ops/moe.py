@@ -554,6 +554,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             else None
         )
 
+    def allows_concurrent_shared_stream(self, layer: torch.nn.Module) -> bool:
+        """Whether the model may run its shared experts on a side stream next to
+        this method's routed experts on ``layer``. Asked once, at model init."""
+        return True
+
     @abstractmethod
     def create_weights(
         self,
@@ -2703,12 +2708,58 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
     """MXFP4 MoE method backed by the fused FlyDSL MegaMoE pipeline."""
 
+    # Activation x weight format of the MegaMoEV2 instances.
+    mega_quant = "a8w4"
+
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(quant_config, moe)
         # Mega owns the weight layout and the complete routed-MoE execution.
         # Standard Triton weight/forward paths must not preempt it.
         self.use_triton = False
         self.use_triton_decode = False
+
+    def allows_concurrent_shared_stream(self, layer: torch.nn.Module) -> bool:
+        return self.shared_stream_allowed(
+            self.moe,
+            layer,
+            model_dim=self.hidden_size,
+            inter_dim=self.intermediate_size,
+        )
+
+    @classmethod
+    def shared_stream_allowed(
+        cls, moe: FusedMoEConfig, layer: torch.nn.Module, *, model_dim, inter_dim
+    ) -> bool:
+        """``allows_concurrent_shared_stream`` of the Mega method on ``layer``,
+        also for experts that switch to it when they quantize online.
+
+        MegaMoEV2's fused small- and large-input kernels keep every CTA
+        resident and wait on the peer ranks; a shared-expert kernel holding
+        CUs on one rank next to them deadlocks the group (EP4 V4.1-Flash hung
+        in decode-graph warm-up and serving). Its staged route does not wait
+        so, and a layout AITER does not fuse takes only that one. The layout
+        is the one ``MegaFusedExperts`` builds its instances for."""
+        from atom.model_ops.fused_moe.flydsl_mega_experts import (
+            mega_builds_fused_route,
+            mega_swiglu_limit,
+        )
+
+        return not mega_builds_fused_route(
+            world_size=moe.ep_size,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=moe.num_experts,
+            topk=moe.experts_per_token,
+            quant=cls.mega_quant,
+            swiglu_limit=mega_swiglu_limit(layer),
+        )
+
+    def create_weights(self, layer: torch.nn.Module, *args, **kwargs):
+        from atom.model_ops.fused_moe.flydsl_mega_experts import register_mega_layer
+
+        # The large-input route gives each layer id its own protocol slot.
+        register_mega_layer(layer)
+        super().create_weights(layer, *args, **kwargs)
 
     def _process_weight_layout_after_loading(self, layer) -> None:
         from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
@@ -2739,7 +2790,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             model_dim=self.hidden_size,
             inter_dim=self.intermediate_size,
             mtpr=self.moe.max_num_tokens,
-            quant="a8w4",
+            quant=self.mega_quant,
         )
         # MegaMoE quantizes the bf16 rows itself, inside its dispatch.
         self.routed_rows_wire = None
@@ -2768,13 +2819,17 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         return views
 
 
+def _mxfp4_moe_method_cls() -> type[Mxfp4MoEMethod]:
+    # Under SP, `mega` runs SP MegaMoE over the native weights instead.
+    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
+        return MegaMxfp4MoEMethod
+    return Mxfp4MoEMethod
+
+
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
-    # Under SP, `mega` runs SP MegaMoE over the native weights instead.
-    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
-        return MegaMxfp4MoEMethod(quant_config, moe)
-    return Mxfp4MoEMethod(quant_config, moe)
+    return _mxfp4_moe_method_cls()(quant_config, moe)
 
 
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm
@@ -4072,6 +4127,36 @@ class FusedMoE(torch.nn.Module):
     @property
     def num_fused_shared_experts(self) -> int:
         return self.expert_layout.num_fused_shared_experts
+
+    @property
+    def allows_concurrent_shared_stream(self) -> bool:
+        """Whether shared experts may run on a side stream next to these experts.
+
+        A model asks after it set the experts' ``swiglu_limit``, which decides
+        whether MegaMoE fuses them. Experts that quantize online into the Mega
+        method answer by it, not by the source method they hold until then."""
+        if self._online_quant_method_cls() is MegaMxfp4MoEMethod:
+            return MegaMxfp4MoEMethod.shared_stream_allowed(
+                self.moe_config,
+                self,
+                model_dim=self.hidden_size,
+                inter_dim=self.intermediate_size_per_partition,
+            )
+        return self.quant_method.allows_concurrent_shared_stream(self)
+
+    def _online_quant_method_cls(self) -> type | None:
+        """The MXFP4 method class ``_online_quant`` switches these experts to;
+        None when it keeps the method they hold."""
+        if not self.online_quant:
+            return None
+        online_quant_config = self.quant_config.get_layer_quant_config(
+            self.layer_name, use_online_quant=True
+        )
+        if online_quant_config.quant_dtype != dtypes.fp4x2 or should_skip_online_quant(
+            self.layer_quant_config.quant_type, self.params_dtype, online_quant_config
+        ):
+            return None
+        return _mxfp4_moe_method_cls()
 
     @property
     def shared_expert_weight(self) -> float:
