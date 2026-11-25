@@ -522,10 +522,11 @@ class UmbpL1Pool(KVBlockPool):
     def fetch_pending(self, owner: Hashable) -> bool:
         return owner in self._fetches
 
-    def poll_fetches(self) -> None:
+    def poll_fetches(self) -> list[tuple[Hashable, list[int]]]:
         """Index what finished copies brought in; release the rest."""
         if not self._fetches:
-            return
+            return []
+        finished = []
         done = [o for o, entry in self._fetches.items() if entry[0].done()]
         for owner in done:
             future, ids, hashes, tokens_of, started, generation = self._fetches.pop(
@@ -539,17 +540,18 @@ class UmbpL1Pool(KVBlockPool):
             # Content from before a clear is not indexed again.
             landed = len(slots) if generation == self._clear_generation else 0
             index = self._hash_to_block_id
-            published = 0
+            indexed = []
             for i, block_id in enumerate(ids):
                 h = hashes[i]
                 # Computed here meanwhile: keep that copy, drop this one.
                 if i < landed and h not in index:
                     self.publish(block_id, h, tokens_of(i))
-                    published += 1
+                    indexed.append(i)
                 self.free(block_id)
-            if published:
+            if indexed:
                 # A memoised walk stops at a miss it rereads; make it reread.
                 self.index_version += 1
+            finished.append((owner, indexed))
             elapsed = time.perf_counter() - started
             self.blocks_fetched += copied
             self.bytes_fetched += copied_bytes
@@ -564,6 +566,7 @@ class UmbpL1Pool(KVBlockPool):
                     copied_bytes / (1 << 20),
                     elapsed * 1e3,
                 )
+        return finished
 
     def _fetch_executor(self):
         if self._executor is None:
@@ -1153,8 +1156,8 @@ class UmbpBlockPool(KVBlockPool):
     def fetch_pending(self, owner: Hashable) -> bool:
         return self.umbp.fetch_pending(owner)
 
-    def poll_fetches(self) -> None:
-        self.umbp.poll_fetches()
+    def poll_fetches(self) -> list[tuple[Hashable, list[int]]]:
+        return self.umbp.poll_fetches()
 
     def flush(self) -> None:
         self.umbp.flush()
