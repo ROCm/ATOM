@@ -625,9 +625,7 @@ def test_replayssm_prefill_layer_dispatch_matches_triton(monkeypatch, keep):
     from atom.model_ops import attention_gdn as gdn
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
-    from atom.model_ops.fla_ops.replayssm import (
-        replayssm_buffer_shapes,
-    )
+    from atom.model_ops.fla_ops.replayssm import replayssm_buffer_shapes
     from atom.utils import envs
 
     lengths = (129, 1000)

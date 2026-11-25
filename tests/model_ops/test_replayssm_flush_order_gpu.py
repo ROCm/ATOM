@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """A flushing ReplaySSM step folds records [0, h) into the checkpoint and then
 writes its own k / g records over rows [0, T). Every V slice of a head replays

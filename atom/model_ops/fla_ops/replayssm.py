@@ -1652,22 +1652,16 @@ def replayssm_gated_delta_rule(
 
 
 @triton.jit
-def _kda_log_decay(x, b_A, LOWER_BOUND, USE_LOWER_BOUND):
-    """KDA's log-decay of ``x = a + dt_bias``, elementwise over any shape."""
-    if USE_LOWER_BOUND:
-        return LOWER_BOUND * tl.sigmoid(tl.exp(b_A) * x)
-    softplus_x = tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x)
-    return -tl.exp(b_A) * softplus_x
-
-
-@triton.jit
 def _kda_gate(A_log_ptr, a_ptr, dt_bias_ptr, mask_k, LOWER_BOUND, USE_LOWER_BOUND):
     """Per-K-channel log-decay, matching fused_sigmoid_gating's two branches."""
     x = tl.load(a_ptr, mask=mask_k, other=0.0).to(tl.float32) + tl.load(
         dt_bias_ptr, mask=mask_k, other=0.0
     ).to(tl.float32)
     b_A = tl.load(A_log_ptr).to(tl.float32)
-    return _kda_log_decay(x, b_A, LOWER_BOUND, USE_LOWER_BOUND)
+    if USE_LOWER_BOUND:
+        return LOWER_BOUND * tl.sigmoid(tl.exp(b_A) * x)
+    softplus_x = tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x)
+    return -tl.exp(b_A) * softplus_x
 
 
 @triton.jit(do_not_specialize=["N", "T_TOT", "T_MAX", "CAP"])
@@ -1779,10 +1773,10 @@ def _replayssm_kda_fwd_kernel(
         BH,
         True,
     )
-    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
     # KDA keeps the state transposed as [BV, BK], so the contraction is u^T @ k~.
     b_h = b_h * b_decay[None, :]
     b_h += _replay_dot(tl.trans(b_ru), b_kw, False, DOT_MODE)
+    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
 
     if do_flush:
         tl.store(p_ckpt_hv, b_h.to(p_ckpt_hv.dtype.element_ty), mask=mask_h)
