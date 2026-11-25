@@ -1,0 +1,16 @@
+name: Sandbox Review Relay
+
+# CI evaluator design sandbox (ci-sandbox/* only; not for main). Added to the
+# sandbox base after a PR is open, to see whether that PR's reviews run it.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "relay github_sha=${GITHUB_SHA} ref=${GITHUB_REF}"
