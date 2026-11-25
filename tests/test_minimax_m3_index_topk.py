@@ -772,16 +772,7 @@ def test_split_decode_selector_matches_packed(
     assert (packed[0] >= 0).any()
 
 
-# --- aiter's FlyDSL prefill block scorer
-
-
-def _flydsl_scorer(monkeypatch, supported=True):
-    calls = []
-    monkeypatch.setattr(
-        m, "index_score_prefill_nvfp4_supported", lambda q, p, s: supported
-    )
-    monkeypatch.setattr(m, "index_score_prefill_nvfp4", lambda *a: calls.append(a))
-    return calls
+# --- aiter's FlyDSL prefill block scorer on the FP4 index cache
 
 
 @pytest.mark.parametrize(
@@ -794,7 +785,10 @@ def _flydsl_scorer(monkeypatch, supported=True):
     ],
 )
 def test_flydsl_prefill_scorer_gate(monkeypatch, rows, fp4, supported, expected):
-    _flydsl_scorer(monkeypatch, supported)
+    monkeypatch.setattr(m, "index_score_prefill_nvfp4", lambda *a: None)
+    monkeypatch.setattr(
+        m, "index_score_prefill_nvfp4_supported", lambda q, p, s: supported
+    )
     scale = torch.zeros(1, 128, 8, dtype=torch.uint8) if fp4 else None
     scorer = m._flydsl_prefill_scorer(
         torch.zeros(1, 1, 128), torch.zeros(1, 128, 64), scale, rows
@@ -802,41 +796,27 @@ def test_flydsl_prefill_scorer_gate(monkeypatch, rows, fp4, supported, expected)
     assert (scorer is not None) == expected
 
 
-def test_flydsl_prefill_scorer_replaces_the_triton_score(monkeypatch):
-    """The FlyDSL scorer writes the score tensor the selection reads; the Triton
-    score kernel does not launch."""
-    calls = _flydsl_scorer(monkeypatch)
-    monkeypatch.setattr(m, "FLYDSL_PREFILL_SCORE_MIN_ROWS", 1)
-    monkeypatch.setattr(m, "_check_fp4_index", lambda *a: None)
-    monkeypatch.setattr(m, "_score_chunk_blocks", lambda *a: 4)
-    monkeypatch.setattr(m, "_alloc_emit", lambda *a: (None, None))
-    selected = []
-    monkeypatch.setattr(
-        m, "_launch_select", lambda score, *a, **kw: selected.append(score)
-    )
+@gpu
+def test_flydsl_prefill_scorer_matches_triton(monkeypatch):
+    from atom.model_ops.minimax_m3.index_fp4 import index_fp4_store
 
-    class _NoLaunch:
-        def __getitem__(self, grid):
-            raise AssertionError("the Triton score kernel ran")
-
-    monkeypatch.setattr(m, "_index_block_score_kernel", _NoLaunch())
-    rows = 8
-    m.minimax_m3_index_topk(
-        torch.zeros(rows, 1, 128, dtype=torch.bfloat16),
-        torch.zeros(4, 128, 64, dtype=torch.uint8),
-        torch.zeros(1, 4, dtype=torch.int32),
-        torch.tensor([0, rows], dtype=torch.int32),
-        torch.tensor([300], dtype=torch.int32),
-        torch.tensor([300 - rows], dtype=torch.int32),
-        max_query_len=rows,
-        max_seq_len=300,
-        topk=16,
-        init_blocks=1,
-        local_blocks=1,
-        num_kv_heads=1,
-        sm_scale=1.0,
-        index_kv_scale=torch.zeros(4, 128, 8, dtype=torch.uint8),
+    if m.get_gfx() != "gfx1250":
+        pytest.skip("gfx1250 only")
+    kw = _inputs([2560, 300], [8192, 1024], 4, "cuda")
+    bf16 = kw["index_kv_cache"]
+    pages = bf16.shape[0]
+    payload = torch.zeros(pages, SPARSE_BLOCK_SIZE, 64, dtype=torch.uint8).cuda()
+    scale = torch.zeros(pages, SPARSE_BLOCK_SIZE, 8, dtype=torch.uint8).cuda()
+    slots = torch.arange(pages * SPARSE_BLOCK_SIZE, device="cuda")
+    index_fp4_store(bf16.view(-1, HEAD_DIM), slots, payload, scale)
+    kw.update(index_kv_cache=payload, index_kv_scale=scale)
+    kw["block_table"] = torch.randperm(pages, dtype=torch.int32, device="cuda").view(
+        kw["block_table"].shape
     )
-    assert len(calls) == 1 and len(selected) == 1
-    assert calls[0][3] is selected[0]  # the score tensor
-    assert calls[0][-1] == 4  # chunk_blocks
+    assert m._flydsl_prefill_scorer(kw["idx_q"], payload, scale, 2560) is not None
+    flydsl = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    monkeypatch.setattr(m, "_flydsl_prefill_scorer", lambda *a: None)
+    triton_ = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    torch.cuda.synchronize()
+    for a, b in zip(flydsl, triton_):
+        assert torch.equal(a, b)
