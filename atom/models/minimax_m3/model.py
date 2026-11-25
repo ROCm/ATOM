@@ -166,10 +166,11 @@ def _linear_consumes_mxfp8(linear: nn.Module) -> bool:
     """Whether a linear consumes native E4M3 plus row-major group-32 E8M0."""
     quant_type = getattr(linear, "quant_type", None)
     quant_type_value = getattr(quant_type, "value", quant_type)
-    params_dtype = getattr(linear, "params_dtype", None)
     return (
         quant_type_value == QuantType.per_1x32.value
-        and params_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        # LinearBase sets native_a8_group_rows for native E4M3FN and W4A8 FP4
+        # weights, never FNUZ; the fused op writes E4M3FN for the FP8 ones.
+        and getattr(linear, "params_dtype", None) == torch.float8_e4m3fn
         and getattr(linear, "native_a8_group_rows", None) is not None
         and not getattr(linear, "runs_bf16", False)
     )

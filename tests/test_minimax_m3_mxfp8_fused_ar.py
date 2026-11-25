@@ -28,7 +28,7 @@ def _linear(**kw):
     "kw, eligible",
     [
         ({}, True),
-        ({"params_dtype": torch.float8_e4m3fnuz}, True),
+        ({"params_dtype": torch.float8_e4m3fnuz}, False),
         ({"quant": "per_Token"}, False),
         ({"params_dtype": torch.float4_e2m1fn_x2}, False),
         ({"native_a8_group_rows": None}, False),
