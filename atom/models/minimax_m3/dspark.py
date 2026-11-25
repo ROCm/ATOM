@@ -447,6 +447,66 @@ class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
         )
         return self.mlp(hidden_states, x_scale=x_scale), residual
 
+    def forward_launches(
+        self, positions, hidden_states, residual, normed, next_norm, next_mxfp8
+    ):
+        """``_forward_fused_ar`` as two launches around the paged attention
+        where they serve the call (``dspark_draft_mono``): qkv + q/k norm +
+        RoPE + K/V cache write, then (after the attention, o_proj and its
+        all-reduce + norm) gate_up -> SwiGLU-OAI -> down -> all-reduce +
+        ``next_norm`` (the next layer's input norm, MXFP8 with ``next_mxfp8``,
+        or the final norm). ``normed``: ``(x, x_scale, residual)`` when the
+        previous layer's launch already reduced and normed this layer's input.
+
+        Returns ``(hidden, residual, normed)``: ``normed`` is set when the MLP
+        launch ran (the next layer's input, or the final normed hidden);
+        otherwise ``hidden`` is the TP-partial MLP output, as
+        ``_forward_fused_ar`` returns it."""
+        from atom.model_ops import dspark_draft_mono as mono
+        from atom.model_ops.blockscale import quantize_fp8
+
+        x_scale = None
+        if normed is not None:
+            hidden_states, x_scale, residual = normed
+        elif residual is None:
+            # The embedding arrives reduced.
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, x_scale, residual = _ar_norm(
+                hidden_states, residual, self.input_layernorm, self.self_attn.qkv_proj
+            )
+        attn = self.self_attn
+        rows = hidden_states.shape[0]
+        cache = attn._bound_cache()
+        q = None
+        if mono.usable(self, rows, cache):
+            md = get_forward_context().attn_metadata
+            if x_scale is None:
+                # what the qkv projection does with a bf16 input
+                hidden_states, x_scale = quantize_fp8(hidden_states)
+            q = mono.pre_launch(
+                attn, hidden_states, x_scale, positions, md.slot_mapping, cache
+            )
+        if q is None:
+            hidden_states = attn(positions, hidden_states, x_scale=x_scale)
+        else:
+            o = attn._block_attention_paged(q.view(rows, -1), md, cache)
+            hidden_states = linear_out(attn.o_proj(o.view(rows, -1)))
+        hidden_states, x_scale, residual = _ar_norm(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm,
+            self.mlp.gate_up_proj,
+        )
+        if q is not None:
+            out = mono.mlp_launch(
+                hidden_states, x_scale, self.mlp, residual, next_norm, next_mxfp8
+            )
+            if out is not None:
+                return None, out[2], out
+        return self.mlp(hidden_states, x_scale=x_scale), residual, None
+
 
 class MiniMaxM3DSpark(DSparkDraftModel):
     """Top-level standalone DSpark draft for MiniMax-M3.1 (GQA backbone +
@@ -615,6 +675,40 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
+        if _draft_fused_ar():
+            # Host side of the step, outside any recording: report a bounded
+            # wait of the draft launches that gave up (rarely: a sync).
+            from atom.model_ops import dspark_draft_mono
+
+            dspark_draft_mono.poll_errors()
+
+    def block_backbone(self, input_ids, positions, num_draft):
+        """The default block pass; under the fused draft all-reduce each layer
+        runs as two launches where they serve (`forward_launches`)."""
+        if not _draft_fused_ar():
+            return super().block_backbone(input_ids, positions, num_draft)
+        bs = input_ids.shape[0]
+        draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
+        draft_ids[:, 0] = input_ids
+        hidden = self.embed_tokens(draft_ids.view(-1))
+        positions = self.rope_positions(positions)
+        residual = normed = None
+        n = len(self.layers)
+        for i, layer in enumerate(self.layers):
+            last = i + 1 == n
+            nxt = self.final_norm if last else self.layers[i + 1].input_layernorm
+            # the next layer's input as `_ar_norm` would give it
+            next_mxfp8 = (
+                not last
+                and fused_allreduce_gemma_rms_norm_mxfp8_supported()
+                and _linear_consumes_mxfp8(self.layers[i + 1].self_attn.qkv_proj)
+            )
+            hidden, residual, normed = layer.forward_launches(
+                positions, hidden, residual, normed, nxt, next_mxfp8
+            )
+        if normed is not None:
+            return normed[0]
+        return self.block_final_norm(hidden, residual)
 
     def block_final_norm(self, hidden, residual):
         """With the fused draft all-reduce the last layer's MLP output is
