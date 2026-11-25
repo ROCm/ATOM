@@ -229,7 +229,7 @@ mod epd_routing_tests {
     use http_body_util::BodyExt;
     use mesh::{
         config::BackendType,
-        core::{prepare_pool::PreparePoolRuntime, Job},
+        core::{prepare_pool::PreparePoolRuntime, BasicWorkerBuilder, ConnectionMode, Job},
         routers::RouterFactory,
     };
     use serde_json::Value;
@@ -253,7 +253,7 @@ mod epd_routing_tests {
         _prepare: PreparePoolRuntime,
     }
 
-    /// One P, one D and one E, with a one-second request timeout for E.
+    /// One P, one D and one E, with a one-second encode timeout.
     async fn start_epd(reply: EncodeReply) -> Epd {
         let prefill = start_atom_role(AtomRole::Prefill).await;
         let decode = start_atom_role(AtomRole::Decode).await;
@@ -264,7 +264,8 @@ mod epd_routing_tests {
             .round_robin_policy()
             .host("127.0.0.1")
             .max_payload_size(256 * 1024 * 1024)
-            .request_timeout_secs(1)
+            .request_timeout_secs(30)
+            .encode_timeout_secs(1)
             .worker_startup_timeout_secs(5)
             .worker_startup_check_interval_secs(1)
             .max_concurrent_requests(64)
@@ -412,6 +413,24 @@ mod epd_routing_tests {
             .get_by_url(&epd.encode.url)
             .expect("encode worker")
             .set_healthy(false);
+        let (prefill, _, _) = serve(&epd, chat(image_parts(), false)).await;
+        assert!(bodies(&epd.encode).is_empty());
+        assert!(prefill.get("ec_transfer_params").is_none(), "{prefill}");
+    }
+
+    #[tokio::test]
+    async fn image_chat_skips_a_grpc_encode_worker() {
+        let epd = start_epd(EncodeReply::Params).await;
+        let registry = &epd.app_context.worker_registry;
+        let http = registry
+            .remove_by_url(&epd.encode.url)
+            .expect("encode worker");
+        let grpc = BasicWorkerBuilder::new(epd.encode.url.clone())
+            .worker_type(http.worker_type().clone())
+            .model_id(http.model_id())
+            .connection_mode(ConnectionMode::Grpc { port: None })
+            .build();
+        registry.register(Arc::new(grpc));
         let (prefill, _, _) = serve(&epd, chat(image_parts(), false)).await;
         assert!(bodies(&epd.encode).is_empty());
         assert!(prefill.get("ec_transfer_params").is_none(), "{prefill}");
