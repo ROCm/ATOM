@@ -3,12 +3,14 @@
 import copy
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from pd_native_stacks import capture_stacks
 from pd_timeout_probe import failure_evidence, main, validate_probe
 
 
@@ -70,6 +72,15 @@ class TimeoutProbeTests(unittest.TestCase):
             (repo / ".sa-srt-runtime").mkdir()
             contract = copy.deepcopy(self.contract)
             contract["timeout_probe"]["context"] = "context"
+            if contract["timeout_probe"].get("capture_native_stacks"):
+                (context / "debugger").mkdir()
+                real_context = (
+                    Path(__file__).resolve().parents[2]
+                    / "benchmark/pr5090-router-ab/diagnostics/mooncake-timeout"
+                )
+                (context / "debugger/Dockerfile").write_bytes(
+                    (real_context / "debugger/Dockerfile").read_bytes()
+                )
             (repo / "contract.json").write_text(json.dumps(contract))
             manifest = {
                 "base_image": contract["image"],
@@ -81,8 +92,17 @@ class TimeoutProbeTests(unittest.TestCase):
 
             def command(argv, **kwargs):
                 if argv[:2] == ["docker", "build"]:
-                    (run / "worker-build/image-id.txt").write_text("sha256:" + "a" * 64)
+                    Path(argv[argv.index("--iidfile") + 1]).write_text(
+                        "sha256:" + "a" * 64
+                    )
                 return SimpleNamespace(returncode=0)
+
+            def output(argv, **kwargs):
+                if "--version" in argv:
+                    return "GNU gdb fixture\n"
+                return json.dumps(
+                    {"engine_sha256": "native", "connector_sha256": "python"}
+                )
 
             class Child:
                 returncode = None
@@ -99,6 +119,12 @@ class TimeoutProbeTests(unittest.TestCase):
                     return self.returncode
 
             child = Child()
+
+            def stacks(*args):
+                self.assertEqual(child.terminated, 0)
+                self.assertIsNone(child.returncode)
+                return {"frames_present": True, "sidecars_remaining": []}
+
             events = [
                 {
                     "event": "before_free_uncached_batch",
@@ -125,21 +151,57 @@ class TimeoutProbeTests(unittest.TestCase):
                 patch("pd_timeout_probe.subprocess.run", side_effect=command),
                 patch(
                     "pd_timeout_probe.subprocess.check_output",
-                    return_value=json.dumps(
-                        {"engine_sha256": "native", "connector_sha256": "python"}
-                    ),
+                    side_effect=output,
                 ),
                 patch("pd_timeout_probe.subprocess.Popen", return_value=child),
                 patch("pd_timeout_probe.records", return_value=events),
                 patch("pd_timeout_probe.signal.signal"),
+                patch("pd_timeout_probe.capture_stacks", side_effect=stacks) as capture,
             ):
                 self.assertEqual(main(), 86)
+                if contract["timeout_probe"].get("capture_native_stacks"):
+                    capture.assert_called_once()
             self.assertEqual(child.terminated, 1)
             self.assertEqual(child.returncode, 143)
             self.assertEqual(
                 json.loads((run / "timeout-probe-result.json").read_text())["status"],
                 "captured_failure_stopping",
             )
+
+    def test_debugger_timeout_cleans_sidecar_without_killing_worker(self):
+        target, sidecar = "a" * 64, "b" * 64
+        selected = [
+            {
+                "Id": target,
+                "Config": {
+                    "Image": "worker-image",
+                    "Labels": {"srtctl.step": "prefill_0_fixture"},
+                },
+            }
+        ]
+        removed = []
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["docker", "run"]:
+                raise subprocess.TimeoutExpired(argv, 25)
+            if argv[:3] == ["docker", "rm", "-f"]:
+                removed.append(argv[3])
+            return SimpleNamespace(returncode=0)
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch(
+                "pd_native_stacks.subprocess.check_output",
+                side_effect=[target, json.dumps(selected), sidecar, ""],
+            ),
+            patch("pd_native_stacks.subprocess.run", side_effect=run),
+        ):
+            result = capture_stacks(
+                "owned-job", 123, "worker-image", "debugger-image", Path(temp) / "out"
+            )
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(removed, [sidecar])
+        self.assertEqual(result["sidecars_remaining"], [])
 
 
 if __name__ == "__main__":

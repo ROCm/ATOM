@@ -45,3 +45,19 @@ Live evidence must include `hook_active` with `layout_compatible=true`, four P
 and four D registration records, the first native stalled batch, and the matching
 Python failed-write record. Missing fields or truncated task/slice samples must
 be disclosed. Keep original failed workload codes and verify GPU release.
+
+The first live capture (`Lf13536`) found 5,005 unfinished tasks before cleanup;
+the 128 sampled slices used RDMA and remained PENDING. A later 50,610-task
+snapshot was taken after termination began and is not independent root-cause
+evidence. Batches over 65,536 tasks exceed the native probe's read bound; the
+current `unsupported_batch_layout` marker alone does not establish corruption.
+
+The follow-up uses a separate, pinned-base Ubuntu debugger image. It shares only
+the exact owned prefill container's PID namespace, with no network or GPU devices.
+After the first correlated failure, before terminating P/D, it attaches to that
+recorded worker PID and captures native stacks for at most 25 seconds. The model
+worker's packages, native engine, sender count, and deadlines stay unchanged.
+GDB uses one symbol worker and loads only the engine and basic runtime symbols;
+it disables auto-load scripts and debuginfod. A capture-specific label scopes
+cleanup even if the Docker client times out. A debugger pause can affect events
+after attachment, so keep the original pre-attach snapshot and timestamps.

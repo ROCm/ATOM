@@ -1,5 +1,8 @@
 """Build the pinned diagnostic image and stop after the first native failure."""
 
+# Pool-host Python 3.10 has no datetime.UTC.
+# ruff: noqa: UP017
+
 import hashlib
 import json
 import os
@@ -9,6 +12,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+from pd_native_stacks import capture_stacks
 
 
 def validate_probe(contract):
@@ -113,6 +118,49 @@ def main():
     assert runtime["engine_sha256"] == manifest["engine_sha256"]
     assert runtime["connector_sha256"] == manifest["instrumented_connector_sha256"]
     runtime.update(image=image, manifest=manifest)
+    debugger_image = None
+    if contract["timeout_probe"].get("capture_native_stacks"):
+        debugger = context / "debugger"
+        assert (
+            hashlib.sha256((debugger / "Dockerfile").read_bytes()).hexdigest()
+            == contract["timeout_probe"]["debugger_dockerfile_sha256"]
+        )
+        subprocess.run(
+            [sys.executable, str(scripts / "pd_gpool_guard.py"), "debugger-build"],
+            check=True,
+        )
+        with (build / "debugger-build.log").open("w") as log:
+            subprocess.run(
+                [
+                    "docker",
+                    "build",
+                    "--iidfile",
+                    str(build / "debugger-image-id.txt"),
+                    str(debugger),
+                ],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=600,
+                check=True,
+            )
+        debugger_image = (build / "debugger-image-id.txt").read_text().strip()
+        runtime["debugger_image"] = debugger_image
+        runtime["debugger_version"] = subprocess.check_output(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network=none",
+                "--label",
+                "srtctl.job=" + os.environ["SRTCTL_JOB_ID"],
+                "--entrypoint",
+                "/usr/bin/gdb",
+                debugger_image,
+                "--version",
+            ],
+            text=True,
+            timeout=30,
+        ).splitlines()[0]
     (build / "runtime.json").write_text(json.dumps(runtime, indent=2) + "\n")
     for role in ("prefill", "decode"):
         contract["roles"][role]["container"] = image
@@ -149,12 +197,31 @@ def main():
                     "status": "captured_failure_stopping",
                     "evidence": evidence,
                     "native_seen": native_seen,
-                    "captured_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017 - GPU hosts run Python 3.10
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
                     "interpretation": "Diagnostic snapshot only; root cause not yet established.",
                 }
                 (root / "timeout-probe-result.json").write_text(
                     json.dumps(result, indent=2) + "\n"
                 )
+                if evidence and debugger_image:
+                    try:
+                        result["native_stacks"] = capture_stacks(
+                            os.environ["SRTCTL_JOB_ID"],
+                            evidence["connector"]["pid"],
+                            image,
+                            debugger_image,
+                            probe_dir / "gdb",
+                        )
+                    except (
+                        OSError,
+                        ValueError,
+                        RuntimeError,
+                        subprocess.SubprocessError,
+                    ) as error:
+                        result["native_stacks_error"] = repr(error)
+                    (root / "timeout-probe-result.json").write_text(
+                        json.dumps(result, indent=2) + "\n"
+                    )
                 process.terminate()
                 process.wait(timeout=90)
                 return 86  # Intentional failed-run capture, never a passing benchmark.

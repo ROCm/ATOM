@@ -1,0 +1,87 @@
+{
+  "lease": "Lf13536",
+  "node": "g48",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "harness_sha": "d1daeddd79204bcd5c572e0cd51573a8d324e584",
+  "purpose": "PP4 DEP4 native timeout diagnosis; no performance point",
+  "sender_workers": 10,
+  "async_sender_tasks": 20,
+  "native_timeout_changed": false,
+  "worker_image": "sha256:1fb2ec9c947042505ccfc959bbc7c73df8a9b8899454d9e7c1f6f81c4ee5d75a",
+  "native_engine_sha256": "540428ce937a5be29726195730246f053f88d3ddfabaa2af33ad79c7a92198a8",
+  "kv_probe": {
+    "metric": "vllm:mooncake_bytes_transferred_sum",
+    "prefill_before": 0.0,
+    "prefill_after": 101376000.0,
+    "transferred_bytes_delta": 101376000.0,
+    "passed": true
+  },
+  "first_failure": {
+    "pp_rank": 3,
+    "consumer_logical_device": "3",
+    "time_utc": "2026-11-25T17:18:36.369818+00:00",
+    "before_cleanup": true,
+    "descriptors": 5005,
+    "bytes": 271631360,
+    "native_deadline_s": 30.27163136,
+    "python_call_elapsed_s": 30.282556215301156,
+    "native_task_count": 5005,
+    "native_finished_task_count": 0,
+    "tasks_with_all_slices_done": 0,
+    "pending_tasks": 5005,
+    "counter_eligible": true,
+    "has_failure": false,
+    "active_completion_callbacks": 0,
+    "task_detail_sample_count": 128,
+    "sample_transport_counts": {
+      "_ZTVN8mooncake13RdmaTransportE": 128
+    },
+    "sample_slice_status_counts": {
+      "0": 128
+    },
+    "sample_pointer_relationships_valid": true,
+    "all_sources_within_connector_ranges": true,
+    "all_destinations_within_connector_ranges": true
+  },
+  "registration_records": 8,
+  "registration_lifecycle_changes_observed": false,
+  "later_native_snapshots_excluded_from_initial_cause": [
+    {
+      "task_count": 50610,
+      "time_utc": "2026-11-25T17:18:41.259862+00:00",
+      "after_cleanup_started": true
+    }
+  ],
+  "probe_bound_markers": 3,
+  "cleanup_started_utc": "2026-11-25T17:18:37+00:00",
+  "resource_cleanup": {
+    "pool_workload_rc": 86,
+    "pool_exit_rc": 86,
+    "gpool_release_rc": 0,
+    "meaning_of_86": "Captured native failure; intentionally stopped workload. Not a passing run.",
+    "srt_left_one_prefill_container": true,
+    "outer_pool_removed_it": true,
+    "initial_release_refused_until_vram_drained": true,
+    "gpool_release_utc": "2026-11-25T17:19:14Z",
+    "gpu_hours": 3.105
+  },
+  "archive_sha256": "fe35f6ed0829246f084229236b36e171d4ae9dee918075dff42cfc87dee2020d",
+  "interpretation": "The first live snapshot does not support already-completed tasks hidden behind a stale batch counter. Focus on RDMA posting/progress and queue state. Root cause and fix remain unproven.",
+  "limits": [
+    "Only the first snapshot precedes cleanup. Later retry errors, CQ diagnostics and the second native snapshot are not clean evidence of the initial cause.",
+    "128 slice samples are PENDING; do not infer the status or posting history of every other slice from the sample.",
+    "Logical connector ranges do not prove validity of the underlying native MR keys or hardware mappings.",
+    "Three larger batches exceeded the current probe read bound; unsupported_batch_layout alone is not evidence of corruption.",
+    "Python call duration includes the post-timeout snapshot overhead; native deadline is unchanged."
+  ],
+  "next": "Capture PP3 native thread stacks while P and D remain alive, before the first termination signal, preserving sender10 and default deadlines."
+}

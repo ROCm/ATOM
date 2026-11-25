@@ -193,7 +193,7 @@
     "orchestration": "native srtctl SweepOrchestrator and DockerLauncher under an owned GPU-pool lease"
   },
   "functional_only": false,
-  "purpose": "Reproduce PP3 native write timeout with sender10; capture first stalled batch without changing native engine, timeout or sender concurrency.",
+  "purpose": "Reproduce PP3 native write timeout with sender10; capture pending batch metadata and native PP3 stacks before stopping P/D. Original native engine and deadlines unchanged.",
   "layout": "single_node",
   "case_name": "pr5090-pp4-dep4-sender10-timeout-probe",
   "router_build": {
@@ -277,9 +277,11 @@
   "formal_sa_point": false,
   "timeout_probe": {
     "context": ".github/benchmark/pr5090-router-ab/diagnostics/mooncake-timeout",
-    "reference_lease": "Lb6034c",
+    "reference_lease": "Lf13536",
     "native_engine_sha256": "540428ce937a5be29726195730246f053f88d3ddfabaa2af33ad79c7a92198a8",
     "stop_after_failed_write_evidence": true,
-    "maximum_uncached_batches_per_process": 3
+    "maximum_uncached_batches_per_process": 3,
+    "capture_native_stacks": true,
+    "debugger_dockerfile_sha256": "cbb83b0dadd6bcc45a7e1a67e820c0157a3792754d4e7eaf1b5457a74f94553d"
   }
 }
