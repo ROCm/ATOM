@@ -10,18 +10,17 @@
 import warnings
 
 import torch
-
 import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices
-from .utils import check_shared_mem, input_guard
+from .utils import autotune, check_shared_mem, input_guard
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
     key=["B", "H", "BT", "IS_VARLEN", "REVERSE"],
 )
@@ -77,7 +76,7 @@ def chunk_local_cumsum_scalar_kernel(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({"BS": BS}, num_warps=num_warps)
         for BS in BS_LIST

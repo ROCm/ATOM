@@ -10,16 +10,17 @@
 import os
 
 import torch
-
 import triton
 import triton.language as tl
+
+from .utils import autotune
 
 BT_LIST = [8, 16, 32, 64, 128]
 
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
 
 
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]
     ],
@@ -48,7 +49,7 @@ def l2norm_fwd_kernel1(
     tl.store(y + cols, b_y, mask=mask)
 
 
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({"BT": BT}, num_warps=num_warps)
         for num_warps in [1, 2, 4, 8, 16]

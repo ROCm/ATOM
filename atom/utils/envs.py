@@ -846,6 +846,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_REPLICATE_VOCAB_EMBED": lambda: (
         os.getenv("ATOM_REPLICATE_VOCAB_EMBED", "1") == "1"
     ),
+    # Pin every autotuned FLA Triton kernel (GDN chunked prefill) to its first
+    # config, so its bits do not depend on which config won this process's
+    # timing. Off by default; read when atom.model_ops.fla_ops is imported.
+    "ATOM_FLA_PIN_AUTOTUNE": lambda: _flag_env("ATOM_FLA_PIN_AUTOTUNE", "0"),
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
     ),

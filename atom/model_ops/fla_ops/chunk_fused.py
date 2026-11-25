@@ -28,7 +28,6 @@ Correctness reference: vllm.model_executor.layers.fla.ops.chunk_gated_delta_rule
 from __future__ import annotations
 
 import torch
-
 import triton
 import triton.language as tl
 
@@ -37,7 +36,7 @@ from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
 from .op import exp
 from .solve_tril import solve_tril
-from .utils import use_cuda_graph
+from .utils import autotune, use_cuda_graph
 from .wy_fast import recompute_w_u_fwd
 
 # ---------------------------------------------------------------------------
@@ -65,7 +64,7 @@ NUM_WARPS = [2, 4]
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in NUM_WARPS

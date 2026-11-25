@@ -7,18 +7,16 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-# ruff: noqa: E501
-
 import torch
-
 import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices
+from .utils import autotune
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]

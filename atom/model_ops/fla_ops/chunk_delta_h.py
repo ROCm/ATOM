@@ -6,16 +6,14 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-# ruff: noqa: E501
 
 import torch
-
 import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp
-from .utils import use_cuda_graph
+from .utils import autotune, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
 
@@ -31,7 +29,7 @@ NUM_WARPS = [2, 4, 8, 16]
         "SNAPSHOT": lambda args: args["snap_idx"] is not None,
     }
 )
-@triton.autotune(
+@autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
