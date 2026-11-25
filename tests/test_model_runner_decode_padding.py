@@ -59,6 +59,8 @@ def test_runner_model_height_and_sampling_rows(
     group = SimpleNamespace(rank_in_group=sp_rank)
     monkeypatch.setattr(modules.parallel_state, "get_pcp_group", lambda: group)
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.use_mrope = mrope
     runner.sp_mega_moe = Mock()
     runner.config = SimpleNamespace(prefill_context_parallel_size=1)

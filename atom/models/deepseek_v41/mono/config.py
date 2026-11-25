@@ -4,11 +4,7 @@
 
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.mono.runtime.deployment import (
-    common_refusals,
-    first_refusal,
-    routed_experts_refusal,
-)
+from atom.mono.runtime.deployment import common_refusals, first_refusal
 from atom.utils import envs
 
 # the TP sizes the kernels are built for (``kernels.dims``); at TP8 on gfx950 the
@@ -47,7 +43,6 @@ def config_refusal(atom_config) -> str | None:
     checks += common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA) + [
         # the kernels read the native 32x32 FP8 dense weights
         (not hf.fp4ptpc, "an FP4PTPC checkpoint's per-channel FP8 linears"),
-        routed_experts_refusal(atom_config),
         (
             atom_config.kv_cache_dtype in ("bf16", "fp8"),
             f"kv cache {atom_config.kv_cache_dtype}",

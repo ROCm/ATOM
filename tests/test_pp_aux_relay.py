@@ -318,6 +318,8 @@ def test_pp_refuses_eagle3_whose_taps_it_cannot_relay(monkeypatch, pp_size):
         runner_mod, "get_pp_group", lambda: types.SimpleNamespace(world_size=pp_size)
     )
     runner = object.__new__(runner_mod.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.config = types.SimpleNamespace()
     drafter = object.__new__(EagleProposer)
     drafter._captures_aux = True  # as EagleProposer.arm_aux_capture leaves it
@@ -336,6 +338,8 @@ def test_pp_keeps_a_drafter_whose_taps_the_config_declares(monkeypatch):
         runner_mod, "get_pp_group", lambda: types.SimpleNamespace(world_size=4)
     )
     runner = object.__new__(runner_mod.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.config = types.SimpleNamespace()
     # DSpark's shape: the spec comes from the config, so every stage relays it.
     drafter = types.SimpleNamespace(

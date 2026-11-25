@@ -143,14 +143,12 @@ def test_herd_declines_gathered_rows(
 @pytest.mark.parametrize("replay", [False, True])
 def test_herd_is_off_under_routed_expert_replay(monkeypatch, decode_step, replay):
     """fused_moe drops one HERD candidate in the kernel, out of capture's sight:
-    under replay the layer routes and captures its top-k as a plain step."""
+    under replay the layer routes its top-k as a plain step, which a bind's
+    wrapper of `select_experts` captures."""
     monkeypatch.setattr(
         moe_mod,
         "get_current_atom_config",
         lambda: SimpleNamespace(eplb_enable=False, enable_return_routed_experts=replay),
-    )
-    monkeypatch.setattr(
-        moe_mod.routed_experts_capturer, "CAPTURE_ROUTED_EXPERTS", replay
     )
     monkeypatch.setattr(moe_mod, "_FLYDSL_USE_HERD", True)
     monkeypatch.setattr(moe_mod, "get_gfx", lambda: "gfx1250")
@@ -181,12 +179,6 @@ def test_herd_is_off_under_routed_expert_replay(monkeypatch, decode_step, replay
         "select_experts",
         staticmethod(lambda **kw: top_ks.append(kw["top_k"]) or ("weights", "ids")),
     )
-    captured = []
-    monkeypatch.setattr(
-        moe_mod,
-        "maybe_capture_routed_experts",
-        lambda layer, ids: captured.append(ids),
-    )
     layer = _layer(
         *HERD_PROFILES["deepseek_v4"],
         expert_layout=SimpleNamespace(num_routed=128, uses_all2all_fusion=False),
@@ -196,7 +188,6 @@ def test_herd_is_off_under_routed_expert_replay(monkeypatch, decode_step, replay
     method.select_experts(layer, "x", torch.empty(64, 8))
 
     assert top_ks == [layer.top_k if replay else layer.top_k + 1]
-    assert captured == (["ids"] if replay else [])
 
 
 def test_herd_stays_off_without_aiters_herd_route(monkeypatch):

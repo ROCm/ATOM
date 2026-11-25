@@ -168,6 +168,7 @@ def test_release_kv_cache_unbinds_the_routed_experts_capture(monkeypatch):
 
     capturer = RoutedExpertsCapturer(num_slots=4, num_layers=2, top_k=2, device="cpu")
     moe = nn.Module()
+    moe.quant_method = SimpleNamespace(select_experts=lambda *a: None)
     capturer.bind(moe, 1)
     runner = SimpleNamespace(
         kv_cache=torch.empty(1),
@@ -190,40 +191,41 @@ def test_wake_rebinds_a_new_routed_experts_capture(monkeypatch):
     """Wake's `allocate_kv_cache` binds a fresh capturer at the slept block
     count, and the MoE layer captures into it rather than the freed one.
 
-    The stub mirrors ``ModelRunner._bind_routed_experts_layers`` with plain
-    torch so this lifecycle check runs in CI without aiter. The real bind is
-    covered by ``test_only_tp_rank0_binds_the_capture_buffer``.
+    Runs the real ``ModelRunner._bind_routed_experts_layers``, imported
+    without aiter where it is not installed (``atom_without_aiter``).
     """
+    from aiter_stub import atom_without_aiter
+
     from atom.model_ops.fused_moe.routed_experts_capturer import (
         ROUTES_VIEW_ATTR,
         RoutedExpertsCapturer,
     )
 
+    with atom_without_aiter() as load:
+        mr = load("atom.model_engine.model_runner")
+
     moe = nn.Module()
-    runner = SimpleNamespace(
-        kv_cache=torch.empty(1),
-        config=SimpleNamespace(num_kvcache_blocks=7),
-        model=nn.Sequential(moe),
-        label="test",
-        rank=0,
-        block_size=2,
-        device="cpu",
-    )
+    moe.prefix = "model.layers.1.mlp.experts"
+    moe.top_k = 2
+    moe.quant_method = SimpleNamespace(select_experts=lambda *a: None)
+    monkeypatch.setattr(mr, "fused_moe_modules", lambda model: [moe])
+    runner = mr.ModelRunner.__new__(mr.ModelRunner)
+    runner.kv_cache = torch.empty(1)
+    runner.config = SimpleNamespace(num_kvcache_blocks=7)
+    runner.model = nn.Sequential(moe)
+    runner.label = "test"
+    runner.rank = 0
+    runner.block_size = 2
+    runner.device = "cpu"
+    runner._return_routed_experts = True
+    runner._routed_experts_geo = (2, 2)
+    runner._routed_experts_capturer = None
     runner._get_models_with_kv = lambda: [runner.model]
     allocated = []
 
     def allocate_kv_cache(num_blocks):
-        # Same steps as ``ModelRunner._bind_routed_experts_layers``; kept
-        # local so this file does not import ``model_runner`` (aiter).
         allocated.append(num_blocks)
-        capturer = RoutedExpertsCapturer(
-            num_slots=num_blocks * runner.block_size,
-            num_layers=2,
-            top_k=2,
-            device=runner.device,
-        )
-        capturer.bind(moe, 1)
-        runner._routed_experts_capturer = capturer
+        mr.ModelRunner._bind_routed_experts_layers(runner, num_blocks)
 
     runner.allocate_kv_cache = allocate_kv_cache
     monkeypatch.setattr(memory_manager, "set_kv_cache_data", lambda _value: None)

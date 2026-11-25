@@ -654,13 +654,13 @@ class Sequence:
         run. A finished request has ``num_tokens - 1`` rows, except:
 
         - one that finished from ``running`` (aborted, a structured-output or
-          logprob error) while a scheduled forward still owed it routes: it
-          holds the rows up to ``routed_owed_from``, as that forward's patch
-          never reaches it;
+          logprob error) while a scheduled forward still owed it routes, or
+          while still mid-prefill / mid-recompute after a preemption: it
+          holds the rows that arrived (short of ``num_tokens - 1``), since
+          the rest never ran or their patch has not landed;
         - one finished from ``waiting`` (``_finish_rejected_waiting``): it
-          keeps the rows it had, unchecked -- short if it was preempted before
-          they arrived (preemption clears the buffer, so that is 0 rows),
-          ``None`` if it was never scheduled.
+          keeps the rows it had, unchecked -- 0 after a preemption (which
+          clears the buffer), ``None`` if it was never scheduled.
         """
         buf = self._routed_expert_buf
         # Zero rows is still [0, layers, top_k]; only a request no patch ever
@@ -715,7 +715,7 @@ class Sequence:
         self._routed_expert_rows = max(have, end)
 
     def truncate_routed_experts(self, keep_rows: int) -> None:
-        """Drop trailing route rows after speculative reject / stop trim."""
+        """Drop trailing route rows (spec reject, stop trim, or preemption)."""
         keep = max(int(keep_rows), 0)
         if keep >= self._routed_expert_rows:
             return

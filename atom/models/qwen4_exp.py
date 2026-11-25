@@ -16,7 +16,6 @@ from torch import nn
 from atom.config import Config
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.fused_moe import routed_experts_capturer
 from atom.model_ops.fused_moe.routed_experts_capturer import (
     ROUTES_VIEW_ATTR,
     maybe_capture_routed_experts,
@@ -354,6 +353,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             pad_align=moe_pad_align(config.moe_intermediate_size, self.tp_size),
         )
         install_stacked_expert_loaders(self.experts)
+        self.experts.on_routes_bound = self._capture_single_token_routes
         self._single_token_ok: bool | None = None
 
     def _single_token_supported(self) -> bool:
@@ -423,10 +423,61 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             and ex.routed_scaling_factor == 1.0
             and n == self.n_routed_experts + 1
         ):
-            capturing = (
-                routed_experts_capturer.CAPTURE_ROUTED_EXPERTS
-                and getattr(ex, ROUTES_VIEW_ATTR, None) is not None
+            return moe_decode_single_token(
+                hidden_states,
+                None,
+                None,
+                *weights,
+                router_logits=logits,
+                top_k=ex.top_k,
             )
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=hidden_states,
+            router_logits=logits,
+            use_grouped_topk=ex.use_grouped_topk,
+            top_k=ex.top_k,
+            renormalize=ex.renormalize,
+            topk_group=ex.topk_group,
+            num_expert_group=ex.num_expert_group,
+            custom_routing_function=ex.custom_routing_function,
+            scoring_func=ex.scoring_func,
+            e_score_correction_bias=ex.e_score_correction_bias,
+            fused_shared_experts_scoring_func=ex.shared_expert_scoring_func,
+            num_routing_experts=ex.global_num_experts,
+            num_fused_shared_experts=ex.num_fused_shared_experts,
+            routed_scaling_factor=ex.routed_scaling_factor,
+        )
+        return moe_decode_single_token(hidden_states, topk_ids, topk_weights, *weights)
+
+    def _capture_single_token_routes(self) -> None:
+        """Called when `experts` is bound a routes view: from here the
+        single-token step captures its ids. Swapped in on the instance, so a
+        layer never bound runs `_single_token_experts` as is. The model is not
+        Dynamo-traced, and the swap lands before CUDA graph capture."""
+        self._single_token_experts = self._single_token_experts_capturing
+
+    def _single_token_experts_capturing(self, hidden_states, logits):
+        """`_single_token_experts` that records the routed ids. The in-kernel
+        routing returns them (`return_topk_ids`); the other route has them
+        between its routing and its experts."""
+        ex = self.experts
+        n = ex.w13_weight.shape[0]
+        weights = (
+            ex.w13_weight,
+            ex.w13_weight_scale.view(n, -1),
+            ex.w2_weight,
+            ex.w2_weight_scale.view(n, -1),
+        )
+        if (
+            ex.renormalize
+            and ex.scoring_func == "softmax"
+            and not ex.use_grouped_topk
+            and ex.custom_routing_function is None
+            and ex.e_score_correction_bias is None
+            and ex.routed_scaling_factor == 1.0
+            and n == self.n_routed_experts + 1
+        ):
+            capturing = getattr(ex, ROUTES_VIEW_ATTR, None) is not None
             out = moe_decode_single_token(
                 hidden_states,
                 None,
@@ -456,8 +507,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             num_fused_shared_experts=ex.num_fused_shared_experts,
             routed_scaling_factor=ex.routed_scaling_factor,
         )
-        if routed_experts_capturer.CAPTURE_ROUTED_EXPERTS:
-            maybe_capture_routed_experts(ex, topk_ids)
+        maybe_capture_routed_experts(ex, topk_ids)
         return moe_decode_single_token(hidden_states, topk_ids, topk_weights, *weights)
 
 

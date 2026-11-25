@@ -256,6 +256,10 @@ def test_pp_shared_indexer_uses_the_producer_buffer_width(monkeypatch):
     from atom.model_engine.model_runner import ModelRunner
 
     runner = object.__new__(ModelRunner)
+
+    runner._return_routed_experts = False
+
+    runner._routed_experts_capturer = None
     runner._pp_share_indexer_ready = False
     runner.has_mla_indexer = True
     runner.model = SimpleNamespace(start_layer=0, end_layer=2)

@@ -477,6 +477,7 @@ class TestSchedule:
             _counted_as_inflight_load=True,
         )
         sched = Scheduler.__new__(Scheduler)
+        sched._return_routed_experts = False
         sched._early_load = EarlyLoadState()
         sched._rejected = []
         sched._inflight_prefix_wait = {}
@@ -607,6 +608,7 @@ class TestSchedule:
 
         sched = Scheduler.__new__(Scheduler)
 
+        sched._return_routed_experts = False
         sched._early_load = EarlyLoadState()
         sched.waiting = deque()
         sched.running = deque()
@@ -1069,6 +1071,7 @@ class TestSchedule:
 
     def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
         sched = Scheduler.__new__(Scheduler)
+        sched._return_routed_experts = False
         sched._early_load = EarlyLoadState()
         fresh = SimpleNamespace(id=1, status=SequenceStatus.WAITING)
         ready = SimpleNamespace(id=2, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
@@ -1480,6 +1483,7 @@ class TestSchedule:
 
         sched = Scheduler.__new__(Scheduler)
 
+        sched._return_routed_experts = False
         sched._early_load = EarlyLoadState()
         sched.kv_connector = _Connector()
         sched.waiting = deque()
@@ -3489,6 +3493,8 @@ class TestStalledOffloadSaveReclaim:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
+
+        s._return_routed_experts = False
         s.deferred_free_blocks = {seq.id: seq for seq in deferred}
         s._abandoned_saves = 0
         s._next_save_reconcile_at = 0.0
@@ -3668,6 +3674,8 @@ class TestStalledOffloadSaveReclaim:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
+
+        s._return_routed_experts = False
         s.deferred_free_blocks = {
             1: SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 1e6)
         }
@@ -3707,6 +3715,8 @@ class TestStalledOffloadSaveReclaim:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
+
+        s._return_routed_experts = False
         s.kv_connector = None
         assert s._save_abandon_timeout_s() == 0.0
         s.kv_connector = _ConnectorNamespace()  # a connector without the offload face
@@ -3726,6 +3736,8 @@ class TestStateStorePendingCap:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
+
+        s._return_routed_experts = False
         s.kv_connector = connector
         return s
 
@@ -3999,6 +4011,14 @@ def test_coalescing_keeps_inflight_load_slot_reserved(seq_factory):
     assert inflight.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
 
 
+def _routed_output(routed_experts=None, **kwargs):
+    """A `ScheduledBatchOutput` carrying a routes patch, set the way the
+    runner sets it with R3 on: on every output, None when there is no patch."""
+    output = ScheduledBatchOutput(**kwargs)
+    output.routed_experts = routed_experts
+    return output
+
+
 class TestRoutedExpertPatches:
     @pytest.fixture
     def scheduler(self, scheduler):
@@ -4007,7 +4027,7 @@ class TestRoutedExpertPatches:
         return scheduler
 
     def _output(self, seq_id, tokens, routed=None):
-        return ScheduledBatchOutput(
+        return _routed_output(
             req_ids=[seq_id],
             token_ids=[tuple(tokens)],
             num_rejected=None,
@@ -4103,7 +4123,7 @@ class TestRoutedExpertPatches:
         )
         scheduler.postprocess(
             list(scheduler.running),
-            ScheduledBatchOutput(
+            _routed_output(
                 req_ids=[a.id, b.id],
                 token_ids=[(10,), (11,)],
                 num_rejected=None,
@@ -4176,7 +4196,6 @@ class TestRoutedExpertPatches:
         assert "routed_epochs" not in vars(batch)
         assert "routed_experts" not in vars(output)
         assert batch.routed_prefix_ranges is None
-        assert output.routed_experts is None
 
     def test_postprocess_overlap_then_trim_on_finish(self, scheduler, seq_factory):
         seq = seq_factory([1, 2, 3, 4])
@@ -4234,9 +4253,86 @@ class TestRoutedExpertPatches:
             list(scheduler.running),
             self._output(seq.id, [10], self._patch((seq.id, 0, rows))),
         )
+        # Production always removes from ``running`` before ``preempt()``.
+        scheduler.running.remove(seq)
         assert scheduler.preempt(seq)
         assert seq.routed_expert_rows == 0
         assert seq.routed_experts is None or seq.routed_experts.shape[0] == 0
+
+    def _preempted_mid_recompute(self, seq_factory):
+        """A request preempted after decoding, resumed by one recompute chunk
+        (its rows held on the device), then left partial: the next chunk is
+        held back, as the prefill delayer does."""
+        scheduler = self._chunked_r3_scheduler()
+        sp = SamplingParams(ignore_eos=True, max_tokens=100)
+        seq = seq_factory([1, 2, 3, 4], sampling_params=sp)
+        scheduler.add(seq)
+        batch, seqs = scheduler.schedule()
+        scheduler.postprocess(
+            list(seqs.values()),
+            self._output(
+                seq.id, [10], self._patch((seq.id, 0, np.zeros((4, 1, 2), np.int16)))
+            ),
+            batch=batch,
+        )
+        for token in range(11, 18):
+            batch, seqs = scheduler.schedule()
+            start = seq.routed_expert_rows
+            need = max(seq.num_tokens - 1 - start, 1)
+            scheduler.postprocess(
+                list(seqs.values()),
+                self._output(
+                    seq.id,
+                    [token],
+                    self._patch((seq.id, start, np.zeros((need, 1, 2), np.int16))),
+                ),
+                batch=batch,
+            )
+        scheduler.running.remove(seq)
+        assert scheduler.preempt(seq)
+        batch, seqs = scheduler.schedule()
+        scheduler.postprocess(
+            list(seqs.values()), self._tokenless(batch.req_ids), batch=batch
+        )
+        assert seq.is_partial_prefill
+        assert seq.routed_forwarded_end > seq.num_prompt_tokens
+        return scheduler, seq
+
+    def _held_rows(self, seq):
+        """The resumed chunk's held rows, as the next copy carries them."""
+        patch = self._patch(
+            (seq.id, 0, np.zeros((seq.routed_forwarded_end, 1, 2), np.int16))
+        )
+        return patch._replace(epochs=np.asarray([seq.routed_epoch], np.int64))
+
+    def test_abort_mid_recompute_after_preempt_does_not_raise(self, seq_factory):
+        """Aborted while the next recompute chunk is held back: the routes stop
+        at what was forwarded, short of ``num_tokens - 1``, without raising
+        into the engine loop."""
+        scheduler, seq = self._preempted_mid_recompute(seq_factory)
+        # A step without this request (its chunk held) carries the held rows.
+        scheduler.postprocess(
+            list(scheduler.running), self._routes_only(self._held_rows(seq))
+        )
+        seq.status = SequenceStatus.ABORTED
+        finished = scheduler.postprocess(
+            list(scheduler.running), self._routes_only(None)
+        )
+        assert finished == [seq]
+        assert seq.leave_reason == "aborted"
+        assert seq.routed_expert_rows == seq.routed_forwarded_end
+        assert seq.routed_expert_rows < seq.num_tokens - 1
+
+    def test_lost_recompute_rows_still_raise(self, seq_factory):
+        """The same abort with the held rows never delivered and nothing owed
+        is a lost patch, and still raises."""
+        scheduler, seq = self._preempted_mid_recompute(seq_factory)
+        scheduler.postprocess(list(scheduler.running), self._routes_only(None))
+        scheduler.postprocess(list(scheduler.running), self._routes_only(None))
+        assert seq.routed_owed_from is None
+        seq.status = SequenceStatus.ABORTED
+        with pytest.raises(RuntimeError, match="rows"):
+            scheduler.postprocess(list(scheduler.running), self._routes_only(None))
 
     @staticmethod
     def _chunked_r3_scheduler():
@@ -4245,7 +4341,7 @@ class TestRoutedExpertPatches:
         return Scheduler(
             MockConfig(
                 max_num_batched_tokens=6,
-                num_kvcache_blocks=100,
+                num_kvcache_blocks=200,
                 kv_cache_block_size=4,
                 enable_chunked_prefill=True,
                 enable_return_routed_experts=True,
@@ -4257,7 +4353,7 @@ class TestRoutedExpertPatches:
         """What a step's forward hands postprocess with no sampled ids: a pure
         middle chunk's (no patch: the runner holds its rows), or a step's that
         carries routes only."""
-        return ScheduledBatchOutput(
+        return _routed_output(
             req_ids=list(req_ids),
             token_ids=[],
             num_rejected=None,
@@ -4307,7 +4403,7 @@ class TestRoutedExpertPatches:
         seq.status = SequenceStatus.ABORTED
         finished = scheduler.postprocess(
             list(scheduler.running),
-            ScheduledBatchOutput(
+            _routed_output(
                 req_ids=[],
                 token_ids=[],
                 num_rejected=None,
@@ -4330,7 +4426,7 @@ class TestRoutedExpertPatches:
         seq.status = SequenceStatus.ABORTED
         finished = scheduler.postprocess(
             list(scheduler.running),
-            ScheduledBatchOutput(
+            _routed_output(
                 req_ids=[],
                 token_ids=[],
                 num_rejected=None,
@@ -4347,7 +4443,7 @@ class TestRoutedExpertPatches:
     @staticmethod
     def _routes_only(patch):
         """A deferred step's late output: routes, no sampled row for the seq."""
-        return ScheduledBatchOutput(
+        return _routed_output(
             req_ids=[],
             token_ids=[],
             num_rejected=None,
@@ -4569,7 +4665,7 @@ class TestRoutedExpertPatches:
         # device for the next step's copy.
         scheduler.postprocess(
             list(scheduler.running),
-            ScheduledBatchOutput(
+            _routed_output(
                 req_ids=[long.id],
                 token_ids=[],
                 num_rejected=None,
@@ -4594,7 +4690,7 @@ class TestRoutedExpertPatches:
         chunk = np.ones((forwarded, 1, 2), np.int16)
 
         def short_output(token, *segments):
-            return ScheduledBatchOutput(
+            return _routed_output(
                 req_ids=[short.id],
                 token_ids=[(token,)],
                 num_rejected=None,
@@ -4639,7 +4735,7 @@ class TestRoutedExpertPatches:
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
         batch, _ = scheduler.schedule()
-        out = ScheduledBatchOutput(
+        out = _routed_output(
             req_ids=[],
             token_ids=[],
             num_rejected=None,

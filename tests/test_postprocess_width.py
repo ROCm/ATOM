@@ -73,6 +73,8 @@ def _batch(seqs, mask=None):
 def _runner(seen):
     """A ModelRunner carrying only what the no-spec branch of postprocess reads."""
     runner = object.__new__(mod.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.rank = 0
     runner._served = None
     runner.structured_output = None
@@ -511,6 +513,8 @@ def test_channel_constraint_preserves_raw_logprobs(monkeypatch, speculative, ena
 def test_a_context_only_producer_leaves_dp_draft_lockstep(context_kv_only):
     """No DP peer is owed the collectives of a propose nobody runs."""
     runner = object.__new__(mod.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.drafter = types.SimpleNamespace(context_kv_only=context_kv_only)
     runner.tokenID_processor = types.SimpleNamespace(is_pipeline_parallel=False)
     runner.config = types.SimpleNamespace(

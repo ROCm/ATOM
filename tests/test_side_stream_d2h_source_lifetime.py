@@ -92,6 +92,7 @@ def _forward_done():
 
 def _processor():
     proc = object.__new__(tokenIDProcessor)
+    proc.return_routed_experts = False
     proc.async_copy_stream = _copy_stream()
     proc._output_request_capacity = BS
     proc.num_spec_tokens = NUM_SPEC

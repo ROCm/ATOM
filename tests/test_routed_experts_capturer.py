@@ -56,11 +56,17 @@ def _forward(slots):
         fc.reset_forward_context()
 
 
+def _quant_method():
+    """The part of a quant method a bind wraps."""
+    return SimpleNamespace(select_experts=lambda layer, x, logits: (x, logits))
+
+
 def _capture(capturer, layer_id, ids, slots, top_k=None):
     """What a FusedMoE bound to ``layer_id`` does in a forward over ``slots``."""
     layer = SimpleNamespace(
         prefix=f"model.layers.{layer_id}.mlp.experts",
         top_k=capturer.top_k if top_k is None else top_k,
+        quant_method=_quant_method(),
     )
     capturer.bind(layer, layer_id)
     with _forward(slots):
@@ -130,11 +136,11 @@ def test_supported_topologies_pass():
 
 
 def _import_runner():
-    return pytest.importorskip(
-        "atom.model_engine.model_runner",
-        reason="model_runner imports aiter at module load",
-        exc_type=ImportError,
-    )
+    """`model_runner`, imported without aiter where it is not installed."""
+    from aiter_stub import atom_without_aiter
+
+    with atom_without_aiter() as load:
+        return load("atom.model_engine.model_runner")
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -143,10 +149,16 @@ def test_only_tp_rank0_binds_the_capture_buffer(rank, monkeypatch):
     MoE layers get a view and the other ranks' hook stays a no-op."""
     mr = _import_runner()
     moes = [
-        SimpleNamespace(prefix=f"model.layers.{i}.mlp.experts", top_k=2) for i in (0, 2)
+        SimpleNamespace(
+            prefix=f"model.layers.{i}.mlp.experts",
+            top_k=2,
+            quant_method=_quant_method(),
+        )
+        for i in (0, 2)
     ]
     monkeypatch.setattr(mr, "fused_moe_modules", lambda model: moes)
     runner = mr.ModelRunner.__new__(mr.ModelRunner)
+    runner._routed_experts_capturer = None
     runner.model = object()
     runner._return_routed_experts = True
     runner._routed_experts_geo = (3, 2)
@@ -172,9 +184,14 @@ def test_kv_cross_check_expects_only_the_rows_a_rank_allocates(rank, monkeypatch
     """Every rank is charged the capture rows but only rank 0 allocates them,
     so the other ranks' cross-check must not expect them."""
     mr = _import_runner()
-    moes = [SimpleNamespace(prefix="model.layers.0.mlp.experts", top_k=2)]
+    moes = [
+        SimpleNamespace(
+            prefix="model.layers.0.mlp.experts", top_k=2, quant_method=_quant_method()
+        )
+    ]
     monkeypatch.setattr(mr, "fused_moe_modules", lambda model: moes)
     runner = mr.ModelRunner.__new__(mr.ModelRunner)
+    runner._routed_experts_capturer = None
     runner.model = object()
     runner._return_routed_experts = True
     runner._routed_experts_geo = (3, 2)
@@ -334,49 +351,34 @@ def test_gather_step_tags_every_segment_with_its_requests_epoch():
     assert untagged.epochs is None
 
 
-@pytest.mark.parametrize("capture", [True, False])
-def test_select_logical_captures_its_routing(monkeypatch, capture):
-    """`_select_logical` captures the ids it returns: FusedMoE and the
-    comm-fused path both route there (HERD, the exception, is off under
-    replay: `test_flydsl_herd_routing.py`). With capture off the hook is
-    never entered."""
-    moe = pytest.importorskip(
-        "atom.model_ops.moe",
-        reason="moe imports aiter at module load",
-        exc_type=ImportError,
-    )
-    topk_weights = torch.rand(2, 2)
-    topk_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
-    monkeypatch.setattr(
-        moe.FusedMoE,
-        "select_experts",
-        staticmethod(lambda **_: (topk_weights, topk_ids)),
-    )
-    captured = []
-    monkeypatch.setattr(
-        moe,
-        "maybe_capture_routed_experts",
-        lambda layer, ids: captured.append((layer, ids)),
-    )
+def test_bind_captures_the_ids_select_experts_returns():
+    """A bound layer's `select_experts` records the ids it returns; one never
+    bound is the class's method untouched. A second bind (a wake) does not
+    wrap again."""
+    device = _device()
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=2, top_k=2, device=device)
+    topk_weights = torch.rand(1, 2, device=device)
+    topk_ids = torch.tensor([[5, 6]], dtype=torch.int32, device=device)
+
+    def select(layer, x, router_logits):
+        return topk_weights, topk_ids
+
+    unbound = SimpleNamespace(select_experts=select)
     layer = SimpleNamespace(
-        use_grouped_topk=False,
+        prefix="model.layers.1.mlp.experts",
         top_k=2,
-        renormalize=True,
-        topk_group=None,
-        num_expert_group=None,
-        custom_routing_function=None,
-        scoring_func="softmax",
-        e_score_correction_bias=None,
-        shared_expert_scoring_func=None,
-        routed_scaling_factor=1.0,
+        quant_method=SimpleNamespace(select_experts=select),
     )
+    capturer.bind(layer, 1)
+    wrapped = layer.quant_method.select_experts
+    capturer.bind(layer, 1)
 
-    monkeypatch.setattr(cap_mod, "CAPTURE_ROUTED_EXPERTS", capture)
-
-    out = moe._select_logical(layer, torch.zeros(2, 4), torch.zeros(2, 8), 8, 0)
-
+    assert layer.quant_method.select_experts is wrapped
+    assert unbound.select_experts is select
+    with _forward(torch.tensor([3], device=device)):
+        out = wrapped(layer, None, None)
     assert out == (topk_weights, topk_ids)
-    assert captured == ([(layer, topk_ids)] if capture else [])
+    assert capturer.buffer[3, 1].tolist() == [5, 6]
 
 
 def test_maybe_capture_skips_an_unbound_layer():
@@ -388,7 +390,9 @@ def test_maybe_capture_skips_an_unbound_layer():
 def test_moe_hook_writes_its_layer_at_this_forwards_slots():
     device = _device()
     capturer = RoutedExpertsCapturer(num_slots=8, num_layers=2, top_k=2, device=device)
-    layer = SimpleNamespace(prefix="model.layers.1.mlp.experts", top_k=2)
+    layer = SimpleNamespace(
+        prefix="model.layers.1.mlp.experts", top_k=2, quant_method=_quant_method()
+    )
     capturer.bind(layer, 1)
     with _forward(torch.tensor([3], device=device)):
         maybe_capture_routed_experts(
@@ -912,13 +916,11 @@ def test_qwen4_exp_single_token_moe_captures_its_routes(
 ):
     """Both batch-1 MoE branches capture the ids their kernel ran: the
     in-kernel routing's own ids, or `select_experts`'."""
-    q4 = pytest.importorskip(
-        "atom.models.qwen4_exp",
-        reason="qwen4_exp imports aiter at module load",
-        exc_type=ImportError,
-    )
+    from aiter_stub import atom_without_aiter
 
-    monkeypatch.setattr(cap_mod, "CAPTURE_ROUTED_EXPERTS", True)
+    with atom_without_aiter() as load:
+        q4 = load("atom.models.qwen4_exp")
+
     capturer = RoutedExpertsCapturer(num_slots=8, num_layers=2, top_k=2, device="cpu")
     kernel_ids = torch.tensor([[3, 1, 4]], dtype=torch.int32)
     selected_ids = torch.tensor([[2, 0, 4]], dtype=torch.int32)
@@ -952,12 +954,16 @@ def test_qwen4_exp_single_token_moe_captures_its_routes(
         global_num_experts=n,
         num_fused_shared_experts=1,
     )
-    if capturing:
-        capturer.bind(experts, 1)
     block = q4.Qwen4ExpSparseMoeBlock.__new__(q4.Qwen4ExpSparseMoeBlock)
     torch.nn.Module.__init__(block)
     block.experts = experts
     block.n_routed_experts = n - 1
+    experts.on_routes_bound = block._capture_single_token_routes
+    experts.quant_method = _quant_method()
+    if capturing:
+        capturer.bind(experts, 1)
+    # Unbound, the block runs the class's method, with no capture in it.
+    assert ("_single_token_experts" in vars(block)) is capturing
     x = torch.zeros((1, 2))
     with _forward(torch.tensor([6])):
         assert block._single_token_experts(x, torch.zeros((1, n))) is x

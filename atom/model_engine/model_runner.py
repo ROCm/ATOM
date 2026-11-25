@@ -130,7 +130,6 @@ from atom.model_ops.fused_moe.routed_experts_capturer import (
     current_slot_mapping,
     fused_moe_modules,
     merge_routed_patches,
-    set_routed_expert_capture,
 )
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RELAXED_TOP_N, RejectionSampler
@@ -247,10 +246,6 @@ class TokenLocations(NamedTuple):
 
 
 class tokenIDProcessor:
-    # R3-off default. `__init__` assigns from the runner; the class value
-    # covers `__new__`-built doubles that never hit `__init__`.
-    return_routed_experts = False
-
     def __init__(
         self,
         runner: "ModelRunner",
@@ -879,11 +874,6 @@ class ModelRunner:
     # the target's launch (`prepare_model`).
     compute_head: Callable | None = None
     spec_status_deferred = False
-    # R3-off defaults. `__init__` assigns from config; the class values cover
-    # `__new__`-built test doubles that never hit `__init__`.
-    _return_routed_experts = False
-    # Bound by `allocate_kv_cache` on TP rank 0 with replay on.
-    _routed_experts_capturer: RoutedExpertsCapturer | None = None
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -891,6 +881,9 @@ class ModelRunner:
         self.structured_compile_executor = None
         self.structured_compilations = OrderedDict()
         self._return_routed_experts = bool(config.enable_return_routed_experts)
+        # Bound by `allocate_kv_cache` on TP rank 0 with replay on; None here
+        # so every rank (and R3-off) has an instance value before that bind.
+        self._routed_experts_capturer = None
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
@@ -898,7 +891,6 @@ class ModelRunner:
         from atom.utils.graph_marker import set_graph_marker_enabled
 
         set_graph_marker_enabled(self.mark_trace)
-        set_routed_expert_capture(self._return_routed_experts)
         set_current_atom_config(config)
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size
@@ -3880,7 +3872,7 @@ class ModelRunner:
         if verify_scheduler is not None:
             dspark_ell = verify_scheduler.ell_nonblocking()
 
-        return ScheduledBatchOutput(
+        output = ScheduledBatchOutput(
             req_ids=req_ids_out,
             token_ids=token_ids_out,
             draft_token_ids=draft_token_ids,
@@ -3890,8 +3882,10 @@ class ModelRunner:
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
             constraint_errors=constraint_errors(self),
-            routed_experts=routed_experts,
         )
+        if self._return_routed_experts:
+            output.routed_experts = routed_experts
+        return output
 
     def _kv_after_forward(self) -> None:
         """Let the KV connector act behind this step's enqueued KV writes.
@@ -4020,13 +4014,16 @@ class ModelRunner:
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
             self._record_kv_cache_ready(batch)
-            return ScheduledBatchOutput(
+            output = ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
                 num_rejected=None,
                 num_bonus=None,
                 draft_token_ids=None,
             )
+            if self._return_routed_experts:
+                output.routed_experts = None
+            return output
 
         fwd_output = self.postprocess(
             batch,

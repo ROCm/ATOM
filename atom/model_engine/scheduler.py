@@ -628,11 +628,6 @@ class ScheduledBatchOutput:
     pinned-memory allocator work on the next result's serialization path.
     """
 
-    # This step's MoE routes in batch token order, a `RoutedExpertsPatch`. A
-    # class default, assigned on the instance only when a patch exists, so
-    # with R3 off it is not pickled.
-    routed_experts = None
-
     def __init__(
         self,
         req_ids: list[int],
@@ -645,7 +640,6 @@ class ScheduledBatchOutput:
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
         constraint_errors: dict[int, str] | None = None,
-        routed_experts=None,
     ):
         self.req_ids = req_ids
         self.constraint_errors = constraint_errors or {}
@@ -661,8 +655,6 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
-        if routed_experts is not None:
-            self.routed_experts = routed_experts
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
@@ -705,9 +697,6 @@ class Scheduler:
     # on to keep what was running (see `preempt_running`).
     can_recompute_prompts = True
     pd_admission: PdAdmissionController | None = None
-    # R3-off default. `__init__` assigns from config; the class value covers
-    # `__new__`-built test doubles that never hit `__init__`.
-    _return_routed_experts = False
 
     def __init__(
         self,
@@ -4745,10 +4734,10 @@ class Scheduler:
         if self._return_routed_experts:
             # Every position is asked for again on resume: a prefix hit reads
             # its rows from the blocks the request now uses (after a weight
-            # sync, a newer forward's KV), and the recompute overwrites the
-            # rest. Drop the rows held too: an early finish before the
-            # recompute ends would otherwise return old-weight routes past
-            # what the new forward has rewritten.
+            # sync, a newer forward's KV), and recompute fills the rest. Drop
+            # the rows held too: an early finish before the recompute ends
+            # would otherwise return old-weight routes past what the new
+            # forward has rewritten.
             seq.routed_forwarded_end = 0
             seq.truncate_routed_experts(0)
             # The in-flight and held patches are dropped, even ones that
@@ -4985,6 +4974,8 @@ class Scheduler:
                     seq.multimodal_cache_ready = True
         return_routes = self._return_routed_experts
         if return_routes:
+            # The runner sets it on every output when R3 is on: a
+            # `RoutedExpertsPatch`, or None when the step has no routes.
             routed = fwd_output.routed_experts
             if routed is not None:
                 # A dummy prefill's output carries the previous step's routes
@@ -5619,13 +5610,16 @@ class Scheduler:
         if self._return_routed_experts:
             # Routes cover every position but the last token's, which never ran.
             keep = int(num_tokens) - 1
-            # Rows lost are measured against what was forwarded. An abort
-            # between prefill chunks leaves the prompt's tail never run, so
-            # only positions before `routed_forwarded_end` are expected; it is
-            # advanced by prefill steps alone, so it bounds nothing past the
-            # prompt.
+            # A mid-prompt or mid-recompute abort leaves a tail that never ran,
+            # so it is bounded by what was forwarded, not `keep`. A recompute
+            # after preemption is partial with `routed_forwarded_end` past the
+            # prompt, so the prompt bound alone misses it. `routed_forwarded_end
+            # < keep` alone would hide a lost decode patch after the last chunk.
             expected = keep
-            if seq.routed_forwarded_end < seq.num_prompt_tokens:
+            if (
+                seq.is_partial_prefill
+                or seq.routed_forwarded_end < seq.num_prompt_tokens
+            ):
                 expected = min(keep, seq.routed_forwarded_end)
             # An early finish (abort, structured-output or logprob error) can
             # land while a scheduled forward still owes the request routes; it

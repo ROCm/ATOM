@@ -398,6 +398,7 @@ def cpu_processor(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", mock.Mock)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: mock.MagicMock())
     processor = object.__new__(runner_module.tokenIDProcessor)
+    processor.return_routed_experts = False
     processor.async_copy_stream = mock.Mock()
     processor._output_request_capacity = 4
     processor.num_spec_tokens = 2

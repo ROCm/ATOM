@@ -41,7 +41,6 @@ from atom.model_ops.eplb import (
     eplb_append_shared_map_and_record_fused,
     eplb_map_and_record_fused,
 )
-from atom.model_ops.fused_moe import routed_experts_capturer
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -68,9 +67,6 @@ from atom.model_ops.fused_moe.modular_kernel import (
 from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
     use_mori_low_latency,
-)
-from atom.model_ops.fused_moe.routed_experts_capturer import (
-    maybe_capture_routed_experts,
 )
 from atom.model_ops.fused_moe.routed_rows import (
     RoutedRowsWire,
@@ -515,11 +511,8 @@ def _select_logical(
     num_fused_shared_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The layer's routing over `num_routing_experts` logical experts,
-    `num_fused_shared_experts` shared columns widened in, captured for
-    routed-expert replay. Every `select_experts` routes here except
-    `Mxfp4MoEMethod`'s HERD step, which replay turns off, and Qwen4-Exp's
-    single-token experts, which capture their own ids."""
-    topk = FusedMoE.select_experts(
+    `num_fused_shared_experts` shared columns widened in."""
+    return FusedMoE.select_experts(
         hidden_states=x,
         router_logits=router_logits,
         use_grouped_topk=layer.use_grouped_topk,
@@ -535,9 +528,6 @@ def _select_logical(
         fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         routed_scaling_factor=layer.routed_scaling_factor,
     )
-    if routed_experts_capturer.CAPTURE_ROUTED_EXPERTS:
-        maybe_capture_routed_experts(layer, topk[1])
-    return topk
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):

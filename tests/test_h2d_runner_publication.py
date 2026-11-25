@@ -27,6 +27,10 @@ def runner_with_buffers(monkeypatch, pp_size=1, speculative=False, builder_cls=N
         builder_cls = Qwen4ExpMetadataBuilder
 
     runner = ModelRunner.__new__(ModelRunner)
+
+    runner._return_routed_experts = False
+
+    runner._routed_experts_capturer = None
     runner.device = torch.device("cuda", 0)
     runner.config = SimpleNamespace(
         pipeline_parallel_size=pp_size,

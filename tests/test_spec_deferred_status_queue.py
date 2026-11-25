@@ -67,6 +67,7 @@ def _batch_with_ids(req_ids: list[int]) -> ScheduledBatch:
 
 def _locations(prev: ScheduledBatch, cur: ScheduledBatch):
     processor = object.__new__(tokenIDProcessor)
+    processor.return_routed_experts = False
     processor.prev_batch = prev
     return tokenIDProcessor.get_token_locations(processor, cur)
 
@@ -98,6 +99,7 @@ def test_a_real_batch_still_carries_over_from_a_real_batch():
 
 def _processor() -> tokenIDProcessor:
     processor = object.__new__(tokenIDProcessor)
+    processor.return_routed_experts = False
     processor.runner = SimpleNamespace(h2d_groups={"input_ids": _input_ids_group()})
     processor.input_ids = SimpleNamespace(
         np=np.zeros(8, dtype=np.int32),
@@ -280,6 +282,8 @@ def test_a_dp_dummy_runs_at_the_schedulers_query_width(is_pd_producer, expected_
     `mtp_k`; a q=mtp_k+1 dummy beside them hands the uniform decode collectives
     two different `running_tokens`."""
     runner = ModelRunner.__new__(ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.drafter = SimpleNamespace(mtp_k=3)
     runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
     runner.block_size = 16
@@ -299,6 +303,8 @@ def test_a_dp_dummy_runs_at_the_schedulers_query_width(is_pd_producer, expected_
 
 def _graph_runner(*, is_pd_producer: bool, drafter: bool = True) -> ModelRunner:
     runner = ModelRunner.__new__(ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
     if drafter:
         runner.drafter = SimpleNamespace(mtp_k=3)
@@ -349,6 +355,8 @@ def test_only_a_drafting_decode_verifies(
     """Both the spec-decode metadata and its packed indices follow this
     predicate, so a producer step neither scores nor publishes drafts."""
     runner = ModelRunner.__new__(ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
     if drafter:
         runner.drafter = SimpleNamespace(mtp_k=3)
@@ -388,6 +396,7 @@ def _deferred_processor(cu_seqlens_q: np.ndarray, new_curr: list[int]):
     """A deferred-output processor whose next decode admits `new_curr`."""
     bs = len(cu_seqlens_q) - 1
     processor = object.__new__(tokenIDProcessor)
+    processor.return_routed_experts = False
     processor.input_ids = SimpleNamespace(
         np=np.zeros(16, dtype=np.int32),
         gpu=np.zeros(16, dtype=np.int32),
@@ -485,6 +494,8 @@ def test_a_producer_dp_dummy_stages_without_a_draft_table():
     it reads no draft table: that raised AttributeError on every idle DPA rank
     when the dummy still fabricated a request."""
     runner = ModelRunner.__new__(ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.drafter = SimpleNamespace(mtp_k=3)
     runner.tokenID_processor = SimpleNamespace(is_pd_producer=True)
     runner.block_size = 16

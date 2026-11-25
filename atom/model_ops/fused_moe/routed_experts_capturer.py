@@ -30,16 +30,6 @@ UNCAPTURED = -1
 # The GPU capture buffer's element type; the KV pool budget is sized from it.
 CAPTURE_DTYPE = torch.int32
 
-# Whether this process captures routes: set once from the config before the
-# model is built (`set_routed_expert_capture`) and never flipped after, so a
-# compiled graph's guard on it holds. Routing reads it before entering the hook.
-CAPTURE_ROUTED_EXPERTS = False
-
-
-def set_routed_expert_capture(enabled: bool) -> None:
-    global CAPTURE_ROUTED_EXPERTS
-    CAPTURE_ROUTED_EXPERTS = bool(enabled)
-
 
 class RoutedExpertsPatch(NamedTuple):
     """One step's routes for every request it forwarded.
@@ -219,6 +209,11 @@ class RoutedExpertsCapturer:
                 f"buffer's {self.num_layers} layers"
             )
         setattr(layer, ROUTES_VIEW_ATTR, self.buffer[:, layer_idx])
+        _capture_on_select(layer.quant_method)
+        # A layer that routes outside `select_experts` captures there itself.
+        on_bound = getattr(layer, "on_routes_bound", None)
+        if on_bound is not None:
+            on_bound()
 
     def gather_step(
         self,
@@ -276,6 +271,26 @@ class RoutedExpertsCapturer:
         offsets = np.zeros(len(lens) + 1, dtype=np.int64)
         np.cumsum(lens, out=offsets[1:])
         return RoutedExpertsPatch(req_ids, starts, offsets, rows, epochs)
+
+
+def _capture_on_select(quant_method: Any) -> None:
+    """Make ``quant_method.select_experts`` record its ids as it returns them.
+
+    Installed on the bound layers' own method object, so a layer with replay
+    off routes through the class's `select_experts` with nothing added. A
+    second bind (a wake) finds the wrapper already there.
+    """
+    select = quant_method.select_experts
+    if getattr(select, "captures_routes", False):
+        return
+
+    def select_and_capture(layer, x, router_logits):
+        topk = select(layer, x, router_logits)
+        maybe_capture_routed_experts(layer, topk[1])
+        return topk
+
+    select_and_capture.captures_routes = True
+    quant_method.select_experts = select_and_capture
 
 
 def maybe_capture_routed_experts(layer: Any, topk_ids: torch.Tensor) -> None:

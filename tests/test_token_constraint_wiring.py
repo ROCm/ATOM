@@ -66,6 +66,8 @@ CHANNEL = {"required_channel": object()}
 def test_release_reaches_the_grammar_through_the_runner():
     grammar = mock.Mock()
     runner = object.__new__(mod.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.structured_output = grammar
     mod.ModelRunner.release_constraints(runner, [3, 4])
     grammar.release.assert_called_once_with([3, 4])
@@ -129,6 +131,8 @@ def test_forward_without_a_grammar_prepares_nothing(rule):
 
 def _bypass_runner(monkeypatch):
     runner = object.__new__(mod.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.rejection_sampler = object()
     spec = SimpleNamespace(num_spec_steps=1, num_draft_tokens_np=np.array([1, 1]))
     monkeypatch.setattr(
@@ -154,6 +158,8 @@ def test_head_ids_serve_only_unconstrained_verifies(monkeypatch, rule, served):
 
 def _postprocess_runner(ids, grammar):
     runner = object.__new__(mod.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner._served = None
     runner.structured_output = grammar
     runner.sampler = lambda logits, *a, **k: logits.argmax(-1)

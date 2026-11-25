@@ -45,6 +45,8 @@ class _Model:
 def _runner(runner_module, model):
     """A runner with ``model`` installed, its head output resolved as ``ModelRunner.__init__`` resolves it."""
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.model = model
     runner.compute_head = getattr(model, "compute_head", None)
     runner.rejection_sampler = SimpleNamespace(synthetic_acceptance_rates=None)
@@ -338,6 +340,7 @@ def test_no_builder_consumes_the_device_verdict_by_default():
 def _processor(runner_module):
     """A token processor as ``prepare_input_ids`` sees it, a prefill batch's (``_stage_input_ids`` stubbed)."""
     processor = object.__new__(runner_module.tokenIDProcessor)
+    processor.return_routed_experts = False
     processor.runner = SimpleNamespace(h2d_groups=None)  # (no publication registry)
     processor.batch_info = SimpleNamespace(np=np.zeros(3, dtype=np.int32))
     processor.draft_tokens_per_seq = 0

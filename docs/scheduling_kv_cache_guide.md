@@ -267,14 +267,14 @@ With `enable_return_routed_experts`, each request accumulates its MoE routes
 - **Merge.** `postprocess` applies each segment to its request by id.
   Overlap overwrites; a segment starting past the rows held raises. Rows for a
   request that has left `running` are dropped: a finished request's extra row
-  is past its routes, and a preempted request rewinds `routed_forwarded_end`
-  to 0 and asks for every position again (a prefix hit from the blocks it
-  resumes on, which may hold a newer forward's KV after a weight sync; the rest
-  by recompute). Each preemption also bumps the request's
-  `routed_epoch`, and every segment carries the epoch it was scheduled under,
-  so a segment from before the preemption that arrives after the request
-  resumes (held middle-chunk rows, or an output still in flight) is dropped
-  too. Rejected speculative rows are trimmed each step.
+  is past its routes, and a preempted request clears its held rows, rewinds
+  `routed_forwarded_end` to 0, and asks for every position again (a prefix hit
+  from the blocks it resumes on, which may hold a newer forward's KV after a
+  weight sync; the rest by recompute). Each preemption also bumps the
+  request's `routed_epoch`, and every segment carries the epoch it was
+  scheduled under, so a segment from before the preemption that arrives after
+  the request resumes (held middle-chunk rows, or an output still in flight)
+  is dropped too. Rejected speculative rows are trimmed each step.
 - **Finish.** The routes are trimmed to `num_tokens - 1` rows and frozen.
   After each output `postprocess` records `routed_owed_from`, the first
   position a scheduled forward still owes routes for: the just-scheduled
@@ -282,11 +282,12 @@ With `enable_return_routed_experts`, each request accumulates its MoE routes
   (`routed_held_from` until a copy takes them). A request finishing early (abort,
   structured-output or logprob error) may return fewer rows when the missing
   ones are owed; fewer rows with nothing owed before `num_tokens - 1` raises.
-  Mid-prefill the bound is `routed_forwarded_end` instead: an abort between
-  chunks returns the forwarded rows, since the prompt's tail never ran.
-  These checks cover a running request only. A request finished from
-  `waiting` (`_finish_rejected_waiting`: an abort or "unschedulable", possibly
-  after a preemption) returns the rows it holds unchecked, which can be short.
+  Mid-prefill, including a mid-recompute after preemption (where
+  `routed_forwarded_end` may already sit past the prompt), bounds the check
+  by `routed_forwarded_end` rather than `num_tokens - 1`: the tail never ran. These checks cover a running
+  request only. A request finished from `waiting` (`_finish_rejected_waiting`:
+  an abort or "unschedulable", possibly after a preemption) returns the rows
+  it holds unchecked — 0 after a preemption, which clears the buffer.
 
 ## Block manager
 

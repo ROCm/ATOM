@@ -30,6 +30,10 @@ def v41_runner(monkeypatch, pp_size):
     from tests.attentions.deepseek_v41.helpers import metadata_buffers
 
     runner = ModelRunner.__new__(ModelRunner)
+
+    runner._return_routed_experts = False
+
+    runner._routed_experts_capturer = None
     runner.device = torch.device("cuda", 0)
     runner.config = SimpleNamespace(pipeline_parallel_size=pp_size, enable_tbo=False)
     runner.enforce_eager = True
@@ -158,6 +162,10 @@ def test_v4_tbo_plan_allocations_follow_actual_runner_slots(monkeypatch):
     )
 
     runner = ModelRunner.__new__(ModelRunner)
+
+    runner._return_routed_experts = False
+
+    runner._routed_experts_capturer = None
     runner.device = torch.device("cuda", 0)
     runner.config = SimpleNamespace(
         pipeline_parallel_size=2,

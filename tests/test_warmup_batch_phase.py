@@ -13,6 +13,8 @@ from atom.model_engine import model_runner as runner_module
 @pytest.mark.parametrize("max_model_len,warmup_tokens", [(4096, 16384), (8192, 4096)])
 def test_warmup_batch_is_a_prefill(monkeypatch, max_model_len, warmup_tokens):
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.config = SimpleNamespace(
         max_model_len=max_model_len,
         max_num_seqs=256,
@@ -53,6 +55,8 @@ def test_every_stage_warms_up_on_the_rows_the_last_stage_does(monkeypatch):
     rows = []
     for drafter in (None, SimpleNamespace(is_block_drafter=True)):
         runner = object.__new__(runner_module.ModelRunner)
+        runner._return_routed_experts = False
+        runner._routed_experts_capturer = None
         runner.config = SimpleNamespace(
             max_model_len=5000,
             max_num_seqs=8,
