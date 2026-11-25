@@ -1,0 +1,191 @@
+{
+  "pinned_version": "agentx-harness1.0.14",
+  "source_sha256": {
+    "timing/phase/credit_counter.py": "fe0197bde6d107427164c9f6937c61384a3c77800c36ebda399800f1e8c0c900",
+    "timing/phase/progress_tracker.py": "9e5d676bfe8dab3a7d5254c018585d88ff0a2ca108d7dd7cfcced591d4bf8bbd",
+    "credit/callback_handler.py": "2114eb180ce47821c7047a4fcab219ef6010b97c9972633d73230e6090e2a9f3",
+    "timing/branch_orchestrator.py": "9a88cc8a42e75b044e5925fdd41becb54ecc9fe092efbb955c2cee53060dca6e",
+    "timing/phase/runner.py": "82469e54d38578adb27ce2fc3c15c32f27e403a8e9babcd0cc8f61685e0c639a"
+  },
+  "python_version": "3.12.13 (main, May 10 2026, 19:35:37) [MSC v.1944 64 bit (AMD64)]",
+  "platform": "win32",
+  "unchanged_classes_and_methods": {
+    "CreditCounter": "entire class",
+    "PhaseProgressTracker": "entire class",
+    "PhaseCallbackContext": "entire class",
+    "CreditCallbackHandler": "entire class",
+    "BranchOrchestrator": [
+      "_maybe_suspend_parent",
+      "_notify_drain",
+      "_pop_future_join",
+      "get_branch_ids",
+      "has_pending_branch_work",
+      "intercept",
+      "set_drain_observer"
+    ],
+    "PhaseRunner": [
+      "_wait_for_event_with_timeout",
+      "_wait_for_returning_complete"
+    ]
+  },
+  "repetitions_per_case": 10,
+  "cpu_only": true,
+  "gpu_experiments": 0,
+  "results": [
+    {
+      "case": "no_future_join",
+      "acknowledgement_snapshots": [
+        {
+          "cancelled": 5,
+          "in_flight": 0,
+          "event_set": true
+        }
+      ],
+      "timeout_snapshots": [],
+      "final_cancelled": 5,
+      "final_in_flight": 0,
+      "cancel_drain_timed_out": false
+    },
+    {
+      "case": "future_join_async_ack",
+      "acknowledgement_snapshots": [
+        {
+          "cancelled": 5,
+          "in_flight": 0,
+          "event_set": false
+        }
+      ],
+      "timeout_snapshots": [
+        {
+          "in_flight": 0,
+          "cancelled": 5,
+          "branch_pending": true
+        }
+      ],
+      "final_cancelled": 5,
+      "final_in_flight": 0,
+      "cancel_drain_timed_out": true
+    },
+    {
+      "case": "future_join_drains_after_ack",
+      "acknowledgement_snapshots": [
+        {
+          "cancelled": 5,
+          "in_flight": 0,
+          "event_set": false
+        }
+      ],
+      "timeout_snapshots": [],
+      "final_cancelled": 5,
+      "final_in_flight": 0,
+      "cancel_drain_timed_out": false
+    },
+    {
+      "case": "future_join_sync_ack",
+      "acknowledgement_snapshots": [
+        {
+          "cancelled": 5,
+          "in_flight": 0,
+          "event_set": false
+        }
+      ],
+      "timeout_snapshots": [],
+      "final_cancelled": 5,
+      "final_in_flight": 0,
+      "cancel_drain_timed_out": false
+    },
+    {
+      "case": "one_ack_really_missing",
+      "acknowledgement_snapshots": [
+        {
+          "cancelled": 4,
+          "in_flight": 1,
+          "event_set": false
+        }
+      ],
+      "timeout_snapshots": [
+        {
+          "in_flight": 1,
+          "cancelled": 4,
+          "branch_pending": false
+        }
+      ],
+      "final_cancelled": 4,
+      "final_in_flight": 1,
+      "cancel_drain_timed_out": true
+    }
+  ],
+  "limits": "Uses real counting, callbacks, DAG predicate/intercept and phase-drain methods. Starts from an observed future-join state; no HTTP/IPC, no reconstruction of the full DAG creation history. Drain timeout shortened from10s to50ms only for the local test.",
+  "wheel_sha256": "43707f5377ef8095d9afec60aab1ecc8782aa878d022e528332a0b793d56ceaf",
+  "upstream_comparison": {
+    "master_sha": "18015a2d77a6077bee9750c6929a889d52c7df54",
+    "methods": [
+      {
+        "file": "timing/phase/runner.py",
+        "method": "_wait_for_returning_complete",
+        "same_ast_as_pinned": true,
+        "master_file_sha256": "82469e54d38578adb27ce2fc3c15c32f27e403a8e9babcd0cc8f61685e0c639a"
+      },
+      {
+        "file": "credit/callback_handler.py",
+        "method": "_signal_all_credits_returned_if_ready",
+        "same_ast_as_pinned": true,
+        "master_file_sha256": "2114eb180ce47821c7047a4fcab219ef6010b97c9972633d73230e6090e2a9f3"
+      },
+      {
+        "file": "timing/branch_orchestrator.py",
+        "method": "has_pending_branch_work",
+        "same_ast_as_pinned": true,
+        "master_file_sha256": "9a88cc8a42e75b044e5925fdd41becb54ecc9fe092efbb955c2cee53060dca6e"
+      },
+      {
+        "file": "timing/branch_orchestrator.py",
+        "method": "expire_replay_deadlines",
+        "same_ast_as_pinned": true,
+        "master_file_sha256": "9a88cc8a42e75b044e5925fdd41becb54ecc9fe092efbb955c2cee53060dca6e"
+      }
+    ],
+    "scope": "Read-only source comparison, no source or client upgrade."
+  },
+  "live_evidence": {
+    "pp_dep": {
+      "lease": "L9b107b",
+      "cancel_requested_at_utc": "2026-11-25T02:25:12.963Z",
+      "cancel_drain_timeout_at_utc": "2026-11-25T02:25:22.964Z",
+      "sent": 12966,
+      "completed": 12961,
+      "cancelled": 5,
+      "future_joins": 1,
+      "active_joins": 0,
+      "tracked_children": 0,
+      "future_join_parent_correlation_id": "2c5b7ffd-0856-4b5e-8ef2-2e28c3d1bdb5",
+      "trace": "578354185933aedcdc6c17fbfbfcfb48876b",
+      "last_exported_parent_turn": 27,
+      "gated_turn": 74
+    },
+    "sa_tp": {
+      "run_id": 45233004275,
+      "artifact_id": 14869788616,
+      "sent": 15250,
+      "completed": 15250,
+      "cancelled": 0,
+      "future_joins": 1,
+      "active_joins": 0,
+      "tracked_children": 0,
+      "future_join_parent_correlation_id": "d3b52389-7555-4ceb-b7ad-3963d8edf437",
+      "trace": "578354185933aedcdc6c17fbfbfcfb48876b",
+      "last_exported_parent_turn": 29,
+      "gated_turn": 74,
+      "cancel_drain_skipped_because_need_zero": true
+    },
+    "credit_counting": "Cancelled count increments on actual credit returns; freeze_completed_counts copies it without synthesizing missing cancellations."
+  },
+  "interpretation": "The client can time out on its DAG-gated completion event after all five cancellation returns have been counted. The live runs show the same future-join gate. Origin and appropriate teardown of the future-join state still require full lifecycle validation.",
+  "software_changed_in_gpu_experiment": false,
+  "new_pull_request": null,
+  "pp3_transport_root_cause": "Still unconfirmed; this cancellation-state finding concerns a different timeout.",
+  "log_sha256": {
+    "pp_dep_log": "7fea64b65072d8f639e232cfc9aff9566ae8e0861c1a5104b56b6f5af2e55c4f",
+    "sa_log": "efc525e94f2510966aede18ebc1ff6ea5364911a44ea4302f3579104d0631d6f"
+  }
+}
