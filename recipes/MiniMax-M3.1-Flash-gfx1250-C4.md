@@ -268,9 +268,11 @@ Measured on one 4 x MI455X node with exactly this recipe (base image + the two b
 |---|---:|---:|---:|---|---|---|---|
 | **C4, these branches** (LMCache off) | **10,460** | **874.4** | 923.7 | 1.1 / 1.1 ms | 0.24 / 0.98 s | 97.7% | 764 / 0 |
 | C4, vLLM on MI355X (InferenceX) | 10,322 | 581.4 | | | | | |
-| C64, these branches (LMCache on) | (not measured yet) | | | | | | |
+| **C64, these branches** (LMCache on, 160 GiB/rank, 1 TB node) | **127,074** | **244.3** | 376.0 | 2.7 / 4.1 ms | 0.34 / 1.06 s | 96.0% | 12,154 / 3 |
 | C64, vLLM on MI355X (InferenceX) | 112,879 | 114.7 | | | | | |
 
 C4 with these branches: interactivity P90 **1.50x** vLLM on MI355X (874.4 vs 581.4), tok/s/chip 1.01x.
+C64 with these branches (LMCache 160 GiB/rank): interactivity P90 **2.13x** vLLM on MI355X (244.3 vs 114.7), tok/s/chip
+1.13x (127,074 vs 112,879).
 
 
