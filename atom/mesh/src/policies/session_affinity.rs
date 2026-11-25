@@ -1086,21 +1086,36 @@ mod tests {
             route(&policy, &workers, &headers).await,
             (Some(0), "random")
         );
-        policy.on_dispatch("regular", Some(&headers), &workers[0], policy.binding("session-1"));
+        policy.on_dispatch(
+            "regular",
+            Some(&headers),
+            &workers[0],
+            policy.binding("session-1"),
+        );
 
         workers[1].set_healthy(true);
         assert_eq!(
             route(&policy, &workers, &headers).await,
             (Some(0), AFFINITY_HIT)
         );
-        policy.on_dispatch("regular", Some(&headers), &workers[0], policy.binding("session-1"));
+        policy.on_dispatch(
+            "regular",
+            Some(&headers),
+            &workers[0],
+            policy.binding("session-1"),
+        );
 
         workers[0].set_healthy(false);
         assert_eq!(
             route(&policy, &workers, &headers).await,
             (Some(1), "random")
         );
-        policy.on_dispatch("regular", Some(&headers), &workers[1], policy.binding("session-1"));
+        policy.on_dispatch(
+            "regular",
+            Some(&headers),
+            &workers[1],
+            policy.binding("session-1"),
+        );
 
         assert_eq!(
             affinity_samples(&handle.render()),
