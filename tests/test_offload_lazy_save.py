@@ -567,6 +567,14 @@ def test_two_demotions_in_flight_and_one_more_per_freed_slot(lmcache, two_slots)
     assert third.block_ids == cold[4:6]
 
 
+@pytest.mark.parametrize("pp", [1, 4])
+def test_demotion_slots_scale_with_the_pipeline_stages(lmcache, pp):
+    # A demotion reports once every stage stored it, a round trip that grows
+    # with the stages: the slots grow with them.
+    sched, _, _ = _lazy(lmcache, 600, pp=pp)
+    assert sched._max_demotions == lazy_save._MAX_DEMOTIONS_IN_FLIGHT * pp
+
+
 def test_a_slot_back_is_used_at_once_though_its_blocks_stay_held(lmcache, two_slots):
     sched, pool, tier, cold, filler = _cold(lmcache, 8, vacant=4, blocks=600)
     first, _second = sched.build_connector_meta().requests

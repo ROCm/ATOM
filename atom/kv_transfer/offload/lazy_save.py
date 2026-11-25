@@ -205,7 +205,17 @@ class LazySaveSchedulerMixin:
         # 1.8x the blocks on the M3.1 C192 trace): twice the slots. With four,
         # a 1/8-scale replay of that trace lost 3.4x the blocks it lost dirty
         # with eight.
-        self._max_demotions = _MAX_DEMOTIONS_IN_FLIGHT * (2 if self._exclusive else 1)
+        # Under PP a demotion reports only once every stage stored it: each
+        # stage takes its metadata in dispatch order, one stage-step behind the
+        # last, and its report rides that stage's next forward to the head. The
+        # round trip grows with the stage count, so the slots do too, or the
+        # demotion rate falls below the prefill's (M3.1 PP4 C192: 94% of HBM
+        # dirty within three minutes, then ~45K unsaved blocks evicted a
+        # minute). The free-list budget in `_demote` still bounds the pins.
+        pp = max(1, int(getattr(self._config, "pipeline_parallel_size", 1) or 1))
+        self._max_demotions = (
+            _MAX_DEMOTIONS_IN_FLIGHT * (2 if self._exclusive else 1) * pp
+        )
 
     def bind_save_abandoned(self, report) -> None:
         """Take the PP head's observer of abandoned saves, called with the
