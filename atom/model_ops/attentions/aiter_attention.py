@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.config import _is_minimax_m3_config
+from atom.config import _is_minimax_m3_config, kv_cache_torch_dtype
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
@@ -438,8 +438,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         a second geometry sharing one block-id space, which is what sizing
         summed for it all along. Nothing here asks which model it is.
         """
-        from aiter import dtypes
-
         runner = self.model_runner
         # `INDEX_ROWS` is a row space, not a pool: the indexer keys ride the
         # first geometry's pool, since declaring them per pool would charge for
@@ -467,11 +465,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 head_dim=geometry.head_dim,
                 # An FP4 (MXFP4 / NVFP4) layout declares its own bytes (uint8 pages);
                 # the dtype is read only by the dtype-wide cache, which FP4 is not.
-                kv_dtype=(
-                    torch.uint8
-                    if geometry.layout is not None
-                    else dtypes.d_dtypes[runner.config.kv_cache_dtype]
-                ),
+                kv_dtype=kv_cache_torch_dtype(runner.config.kv_cache_dtype),
                 extra_fields=extra_fields,
                 layout=geometry.layout,
             )
@@ -488,7 +482,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         """
         if not self._has_sparse_attention:
             return None
-        from aiter import dtypes
 
         config = self.model_runner.config
         text_config = getattr(config.hf_config, "text_config", config.hf_config)
@@ -528,7 +521,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "index_cache_dtype must be 'bf16', 'fp8', 'fp4' or 'nvfp4', got "
                 f"{index_dtype!r}"
             )
-        dtype = dtypes.d_dtypes[index_dtype]
+        dtype = kv_cache_torch_dtype(index_dtype)
         return _IndexCacheSpec(
             rows,
             (entry_tokens * dim * dtype.itemsize,),

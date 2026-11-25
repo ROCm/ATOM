@@ -1582,7 +1582,7 @@ class Scheduler:
         BlockManager bookkeeping; cheap (no traversal of seq tables).
         """
         bm = self.block_manager
-        total = bm.kv.num_blocks
+        total = bm.kv.num_usable_blocks
         if total <= 0:
             return 0.0
         return bm.kv.num_used / total
@@ -2155,7 +2155,7 @@ class Scheduler:
                 f"{self.max_num_batched_tokens}. {remedy}"
             )
         bm = self.block_manager
-        total_blocks = bm.kv.num_blocks
+        total_blocks = bm.kv.num_usable_blocks
         # `num_pool_blocks`, not `seq.num_blocks`: the latter counts global
         # blocks, while the pool is sized and drawn per-rank. Under dcp>1 the
         # two differ by `dcp_world_size`.
@@ -4155,8 +4155,8 @@ class Scheduler:
         """Refuse a batch whose draft round would write past a row's blocks.
 
         A position past the last allocated block reads block id 0 from the
-        zeroed block-table tail, and the KV write lands in physical block 0 --
-        silently, in whatever request or state checkpoint owns it. Every path
+        zeroed block-table tail, overwriting reserved padding or unrelated
+        live KV at physical block 0. Every path
         that schedules a forward has to have allocated through
         `len(seq) + draft_lookahead` (`may_append(..., lookahead=)`); this is
         where one that did not fails loudly. Remote-prefill rows are skipped:
@@ -4442,7 +4442,7 @@ class Scheduler:
             or not self.kv_connector.supports_early_load
         ):
             return 0
-        total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
+        total_blocks = int(bm.kv.num_usable_blocks) if bm is not None else 0
         state.maybe_log(total_blocks)
         state.tick += 1
         if state.entries:
