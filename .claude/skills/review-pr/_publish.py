@@ -429,9 +429,17 @@ def first_clause(finding, cite=""):
 
 
 def _line_starting(card, prefix):
+    """The first card line beginning with `prefix`, indented or not, any case.
+
+    The gate (`triage._check_coverage_line`) matches on `strip().lower()`, and SKILL.md
+    asks the card to carry rules.txt's `  coverage: ...` line verbatim. Both ends accept
+    the same line.
+    """
+    want = prefix.lower()
     for ln in card.split("\n"):
-        if ln.startswith(prefix):
-            return ln
+        st = ln.strip()
+        if st.lower().startswith(want):
+            return st
     return ""
 
 
@@ -477,7 +485,9 @@ def build_review(pr, card, diff_text, flagged, sha):
     what = _line_starting(card, "**")
     if what:
         parts.append(what)
-    for pref in ("Review:", "Validation"):
+    # Coverage sits above the findings: it says whether they are all of them. The gate
+    # reads card.md; this builds the body that is posted, so both have to carry it.
+    for pref in ("Review:", "Coverage:", "Validation"):
         l = _line_starting(card, pref)
         if l:
             parts.append(l)
@@ -490,6 +500,14 @@ def build_review(pr, card, diff_text, flagged, sha):
         parts.append(
             f"**{len(index)} finding(s) posted inline, on the lines they are about:**\n"
             + "\n".join(index)
+        )
+    elif loose:
+        # With findings but no anchors, say so: otherwise the review carries no inline
+        # comments and nothing telling the reader any were expected.
+        parts.append(
+            f"**0 of {len(loose)} finding(s) could be anchored to a line in this diff** "
+            "— each is stated in full above. A finding anchors when it cites a "
+            "`path:line` inside this diff's hunks."
         )
     ind = _line_starting(card, "_Independent refutation:")
     if ind:

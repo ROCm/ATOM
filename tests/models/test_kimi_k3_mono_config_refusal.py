@@ -129,6 +129,17 @@ def test_decode_context_parallelism_is_served(servable):
     assert config_refusal(atom_config) is None
 
 
+@pytest.mark.parametrize("connector", ["lmcache_mp", "lmcache_offload", "multi"])
+def test_lmcache_mp_can_run_beside_k3_and_shared_dsa_mono(servable, connector):
+    from atom.mono.dsa_indexer.dispatch import config_refusal as dsa_refusal
+
+    atom_config = _atom_config()
+    atom_config.kv_transfer_config = {"kv_connector": connector}
+    expected = None if connector == "lmcache_mp" else f"KV connector {connector}"
+    assert config_refusal(atom_config) == expected
+    assert dsa_refusal(atom_config) == expected
+
+
 def test_other_mono_models_still_refuse_decode_context_parallelism(servable):
     from atom.models.kimi_k3.mono.config import SUPPORTED_TP, Dims
 
@@ -230,3 +241,31 @@ def test_both_k3_drafts_are_served(servable, arch):
         draft_model_hf_config=SimpleNamespace(architectures=[arch]),
     )
     assert config_refusal(atom_config) is None
+
+
+def test_installer_keeps_a_model_without_a_layer_stack_on_native(monkeypatch, caplog):
+    import logging
+    import sys
+
+    from torch import nn
+
+    from atom.models.kimi_k3.mono import dispatch
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("a model without a layer stack must not prepare or route indexers")
+
+    monkeypatch.setattr(dispatch, "config_refusal", lambda config: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.mono.dsa_indexer.bind",
+        SimpleNamespace(
+            indexer_modules=unexpected,
+            prepare_weights=unexpected,
+            routing_refusal=unexpected,
+        ),
+    )
+    model = nn.Module()
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert dispatch.install_mono_decode(model, _atom_config(), None) is model
+    assert "model has no layer stack" in caplog.text
+    assert "armed" not in caplog.text

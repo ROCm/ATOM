@@ -524,8 +524,10 @@ def _replayssm_materialize_kernel(
     stride_bufg_pos: tl.constexpr,
     stride_bufg_hv: tl.constexpr,
     DOT_MODE: tl.constexpr,
+    IS_KDA: tl.constexpr,
 ):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    # Rows on axis 0: layers x sequences x heads outgrows axis 1's limit.
+    i_nh, i_v = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     if i_n >= N:
         return
@@ -549,10 +551,14 @@ def _replayssm_materialize_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     mask_k = o_k < K
     mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
 
-    p_src = ckpt + src * stride_ckpt_slot + i_hv * K * V
-    b_s0 = tl.load(p_src + o_k[:, None] * V + o_v[None, :], mask=mask_h, other=0.0).to(
+    mask_h = mask_k[:, None] & mask_v[None, :]
+    # A [K, V] tile either way; KDA keeps the state transposed as [V, K].
+    if IS_KDA:
+        off = i_hv * K * V + o_k[:, None] + o_v[None, :] * K
+    else:
+        off = i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+    b_s0 = tl.load(ckpt + src * stride_ckpt_slot + off, mask=mask_h, other=0.0).to(
         tl.float32
     )
     b_kw, b_ru, b_decay = _replay_tiles_kmajor(
@@ -579,15 +585,11 @@ def _replayssm_materialize_kernel(
         V,
         BK,
         BH,
-        False,
+        IS_KDA,
     )
     b_h = b_s0 * b_decay[:, None] + _replay_dot(b_kw, b_ru, True, DOT_MODE)
-    p_dst = ckpt + dst * stride_ckpt_slot + i_hv * K * V
-    tl.store(
-        p_dst + o_k[:, None] * V + o_v[None, :],
-        b_h.to(p_dst.dtype.element_ty),
-        mask=mask_h,
-    )
+    p_dst = ckpt + dst * stride_ckpt_slot + off
+    tl.store(p_dst, b_h.to(p_dst.dtype.element_ty), mask=mask_h)
 
 
 def replayssm_materialize(
@@ -602,7 +604,8 @@ def replayssm_materialize(
     max_query_len: int,
 ) -> None:
     """Write the state after verify step ``step_idx[i]`` of ``slot_idx[i]``
-    into checkpoint slot ``dst_idx[i]`` (GDN, scalar gate).
+    into checkpoint slot ``dst_idx[i]``. GDN (scalar gate, ``[HV, K, V]``) or
+    KDA (per-channel gate, a 4-D ``buf_g``, transposed ``[HV, V, K]``).
 
     Call after the verify forward and before :func:`replayssm_commit` for that
     step: the rebuild re-derives the forward's append offset from the cursor
@@ -611,7 +614,8 @@ def replayssm_materialize(
     round-trip.  The source slot's checkpoint and records are only read.
 
     Args:
-        ckpt: ``[num_slots, HV, K, V]`` contiguous checkpoint pool
+        ckpt: ``[num_slots, HV, K, V]`` (KDA ``[num_slots, HV, V, K]``)
+            contiguous checkpoint pool
         buf_k / buf_u / buf_g: this layer's record buffers
         write_pos: ``[num_slots]`` int32 cursor, not yet advanced for this step
         slot_idx: ``[N]`` live slot of each sequence
@@ -624,9 +628,10 @@ def replayssm_materialize(
         return
     if not ckpt.is_contiguous():
         raise ValueError("replayssm_materialize requires a contiguous checkpoint")
-    if buf_g.ndim != 3:
-        raise ValueError("replayssm_materialize supports the scalar-gate GDN ring")
-    _, HV, K, V = ckpt.shape
+    is_kda = buf_g.ndim == 4
+    # The records name the head dims; the checkpoint's axis order is layout.
+    HV, K, V = ckpt.shape[1], buf_k.shape[-1], buf_u.shape[-1]
+    assert ckpt[0, 0].numel() == K * V, "checkpoint and records disagree on K, V"
     cap = buf_k.shape[2]
     assert flush_threshold_ok(cap, max_query_len)
     BK = triton.next_power_of_2(K)
@@ -636,7 +641,7 @@ def replayssm_materialize(
     # The forward's replay tile: `base + step + 1` never exceeds
     # `cap - max_query_len` (see the flush policy above).
     BH = max(16, triton.next_power_of_2(cap - max_query_len))
-    _replayssm_materialize_kernel[(NV, n * HV)](
+    _replayssm_materialize_kernel[(n * HV, NV)](
         ckpt=ckpt,
         buf_k=buf_k,
         buf_u=buf_u,
@@ -665,6 +670,7 @@ def replayssm_materialize(
         stride_bufg_pos=buf_g.stride(2),
         stride_bufg_hv=buf_g.stride(1),
         DOT_MODE=_replay_dot_mode(buf_u.dtype),
+        IS_KDA=is_kda,
         num_warps=1,
         num_stages=3,
     )
@@ -1733,8 +1739,8 @@ def _replayssm_kda_fwd_kernel(
     p_k = k + (bos * H + i_h) * K + o_k
     p_v = v + (bos * HV + i_hv) * V + o_v
     p_o = o + (bos * HV + i_hv) * V + o_v
-    p_a = a + (bos * HV + i_hv) * K + o_k
-    p_b = b + bos * HV + i_hv
+    p_a = a + bos * stride_a_token + i_hv * K + o_k
+    p_b = b + bos * stride_b_token + i_hv
     p_A_log = A_log + i_hv
     p_dt_bias = dt_bias + i_hv * K + o_k
 
@@ -1851,7 +1857,12 @@ def replayssm_sigmoid_gating_delta_rule(
     # short buffer pads rather than shrinks.
     BH = max(16, triton.next_power_of_2(cap - max_query_len))
 
-    q, k, v, a, b = (x.contiguous() for x in (q, k, v, a, b))
+    q, k, v = (x.contiguous() for x in (q, k, v))
+    # Column views need no copy when each token's head/channel row is dense.
+    if a.stride(-1) != 1 or a.stride(-2) != K:
+        a = a.contiguous()
+    if b.stride(-1) != 1:
+        b = b.contiguous()
     out = q.new_empty(1, T_tot, HV, V) if o is None else o.unsqueeze(0)
 
     _replayssm_kda_fwd_kernel[(NV, N * HV)](

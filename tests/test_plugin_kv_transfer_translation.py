@@ -2,8 +2,8 @@
 """What the plugin reports as vLLM's KV transport, to every model.
 
 This translation is not V4.1's. The ATOM `Config` it fills is built for every
-plugin model, and several gates read the field as a plain truth value:
-`qwen4_exp_attn` refuses outright when it is non-empty, `EngineCore` sets
+plugin model. `qwen4_exp_attn` checks a configured value against its offload
+rules, `EngineCore` sets
 `kv_transfer_enabled` from it, and `simulated_tp` rejects on it. So "no
 transport" has to translate to something falsy, which is what the function's
 docstring promises.
@@ -64,7 +64,8 @@ def test_a_config_naming_no_connector_is_off():
     """The regression: vLLM builds the object before deciding what goes in it.
 
     Its defaults alone used to come back as a truthy dict, which every reader
-    takes as "a transport is configured" -- and `qwen4_exp_attn` refuses on it.
+    takes as "a transport is configured"; `qwen4_exp_attn` checks it against its
+    offload rules.
     """
     translated = _translate()(_vllm_config(_PydanticDataclassLike()))
     assert translated == {}

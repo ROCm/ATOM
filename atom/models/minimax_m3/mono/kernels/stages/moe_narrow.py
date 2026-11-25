@@ -9,19 +9,24 @@ from atom.models.minimax_m3.mono.config import INTER, MOE_SLOTS, TOP_K
 from atom.models.minimax_m3.mono.kernels.stages.shared import XN_SLICE
 from atom.models.minimax_m3.mono.layout import (
     DN_ROWS,
+    MID4N_WORDS,
+    MIDSC4N_WORDS,
     N_DN,
     N_ROUTER,
     SCORE_COPIES,
     SH_TASKS,
+    XN4_ROW,
+    XN4_WORDS,
     XN8_ROW,
     XSC_ROW,
     shared_after_routing,
 )
-from atom.mono.device.mx import FP4, mfma_scaled
+from atom.mono.device.mx import FP4, FP8, fp4_pack2, fp4_scale, mfma_scaled
 from atom.mono.device.ops import (
     bf2_f32,
     bf16_pair,
     bf16_round,
+    butterfly,
     fp8_pack4,
     row_sum,
     traced,
@@ -33,9 +38,14 @@ from atom.mono.plan.trace import enter_stage
 @traced
 def moe_narrow_defs(k4ctx):
     """The functions of the per-(token, slot) MoE (S <= 4)."""
+    FUSED = k4ctx["fused_shared"]
+    MID16_WORDS = k4ctx["MID16_WORDS"]
+    MID4_LDS = k4ctx["MID4_LDS"]
+    MIDSC4_LDS = k4ctx["MIDSC4_LDS"]
+    X4S_LDS = k4ctx["X4S_LDS"]
+    X4_LDS = k4ctx["X4_LDS"]
     BASE = k4ctx["BASE"]
     CPT = k4ctx["CPT"]
-    MID16_WORDS = k4ctx["MID16_WORDS"]
     MID8_LDS = k4ctx["MID8_LDS"]
     MID8_WORDS = k4ctx["MID8_WORDS"]
     MIDSC_LDS = k4ctx["MIDSC_LDS"]
@@ -51,6 +61,7 @@ def moe_narrow_defs(k4ctx):
     g4 = k4ctx["g4"]
     l16 = k4ctx["l16"]
     lane = k4ctx["lane"]
+    lds_b4 = k4ctx["lds_b4"]
     lds_b8 = k4ctx["lds_b8"]
     lds_i32 = k4ctx["lds_i32"]
     mb_poll = k4ctx["mb_poll"]
@@ -121,6 +132,52 @@ def moe_narrow_defs(k4ctx):
             else:
                 stage_xn(tok, mb_poll(xn_specs(tok)))
 
+        def fetch_xn4(tok=None):
+            """Token tok's (default: every token's) MXFP4 xn words and codes -> xs (after the
+            MXFP8 rows). Wave 0 first polls the last word of each router task's slice (as
+            ``fetch_xn``), then every thread takes words tid and tid + THREADS (the second only
+            below XN4_WORDS) and its code word."""
+            gate_tok = fx.min(lane // N_ROUTER, tokens - 1) if tok is None else tok
+            if wave == 0:
+                mb_poll(
+                    [
+                        (
+                            mr("xn4"),
+                            gate_tok * XN4_WORDS
+                            + (lane % N_ROUTER + 1) * (XN_SLICE // 8)
+                            - 1,
+                            1,
+                        )
+                    ]
+                )
+            gpu.barrier()
+
+            def stage_row(kk, row):
+                got = mb_poll(
+                    [
+                        (
+                            mr("xn4"),
+                            kk * XN4_WORDS + fx.min(tid + i * THREADS, XN4_WORDS - 1),
+                            1,
+                        )
+                        for i in range(2)
+                    ]
+                    + [(mr("xs4"), kk * XSC_WORDS + fx.min(tid, XSC_WORDS - 1), 1)]
+                )
+                fx.ptr_store(got[0][0], xs + (X4_LDS + row * XN4_ROW + tid))
+                if tid + THREADS < XN4_WORDS:
+                    fx.ptr_store(
+                        got[1][0], xs + (X4_LDS + row * XN4_ROW + tid + THREADS)
+                    )
+                if tid < XSC_WORDS:
+                    fx.ptr_store(got[2][0], xs + (X4S_LDS + row * XSC_ROW + tid))
+
+            if const_expr(tok is None):
+                for k in range_constexpr(tokens):
+                    stage_row(k, k)
+            else:
+                stage_row(tok, 0)
+
         sh_late = shared_after_routing(tokens)
         if const_expr(sh_late):
             sh_j = fx.min(start("shared"), SH_TASKS - 1)
@@ -135,9 +192,14 @@ def moe_narrow_defs(k4ctx):
             sh_compute(sh_j0, sh_w0[0], sh_w0[1])
         if ug_task_id(0)[1] | has_dn:
             # xn lands before the logits: stage it while waiting (a shared-expert
-            # CTA has it already); a CTA's routed tasks are one token's
-            if start("shared") >= SH_TASKS:
-                fetch_xn(bid // CPT if CPT is not None else None)
+            # CTA has its MXFP8 rows already); the routed tasks read the MXFP4 xn
+            # (``fused_shared``: the MXFP8 one), a CTA's being one token's
+            if const_expr(FUSED):
+                if start("shared") >= SH_TASKS:
+                    fetch_xn(bid // CPT if CPT is not None else None)
+            else:
+                if ug_task_id(0)[1]:
+                    fetch_xn4(bid // CPT if CPT is not None else None)
             # wave k polls token k's router logits and routes it right away
             mine = bid % SCORE_COPIES
             for k in range_constexpr(tokens):
@@ -207,8 +269,50 @@ def moe_narrow_defs(k4ctx):
         """Every token's route-weighted down GEMV of row group ``t`` -> push bf16
         partial rows -> rank-ordered sum -> ar_out."""
 
+        def stage_mids_quant(k):
+            """Token k's mid row -> the routed slots' MXFP4 words + codes (lanes < MID4N_WORDS), the shared
+            slot's MXFP8 words + codes (the next MID8_WORDS // 2 - MID4N_WORDS lanes). Each lane polls 8
+            consecutive elements of the row (a quarter of a 32-block) and quantizes them in registers: no bf16
+            copy in LDS (the mids are bf16-rounded at publish).
+            """
+            got = mb_poll(
+                [
+                    (
+                        mr("mid"),
+                        k * MOE_SLOTS * INTER
+                        + fx.min(tid * 8 + 2 * i, MOE_SLOTS * INTER - 2),
+                        2,
+                    )
+                    for i in range(4)
+                ]
+            )
+            f = [got[i][j].bitcast(fx.Float32) for i in range(4) for j in range(2)]
+            if tid < MID4N_WORDS:
+                amax4 = fx.max(f[0], -f[0])
+                for v in f[1:]:
+                    amax4 = fx.max(amax4, fx.max(v, -v))
+                e4, sc4 = fp4_scale(butterfly(amax4, (1, 2), fx.max))
+                word4 = fx.Int32(0)
+                for h in range_constexpr(4):
+                    word4 = fp4_pack2(word4, f[2 * h], f[2 * h + 1], sc4, h)
+                fx.ptr_store(word4, xs + (MID4_LDS + k * MID4N_WORDS + tid))
+                if tid % 4 == 0:
+                    fx.ptr_store(e4, xs + (MIDSC4_LDS + k * MIDSC4N_WORDS + tid // 4))
+            if (tid >= MID4N_WORDS) & (tid < MID8_WORDS // 2):
+                sc, inv = mx8_scale(f, (1, 2))
+                qv = [mx8_q(v, inv) for v in f]
+                fx.ptr_store(
+                    fp8_pack4(*qv[:4]), xs + (MID8_LDS + k * MID8_WORDS + tid * 2)
+                )
+                fx.ptr_store(
+                    fp8_pack4(*qv[4:]),
+                    xs + (MID8_LDS + k * MID8_WORDS + tid * 2 + 1),
+                )
+                if tid % 4 == 0:
+                    fx.ptr_store(sc, xs + (MIDSC_LDS + k * MIDSC_WORDS + tid // 4))
+
         def stage_mids(k):
-            """Token k's mid rows (every slot) -> xs, as bf16 pairs."""
+            """``fused_shared``: token k's mid rows (every slot) -> xs, as bf16 pairs."""
             mids = mb_poll(
                 [
                     (
@@ -231,14 +335,8 @@ def moe_narrow_defs(k4ctx):
                         xs + (k * (MOE_SLOTS * INTER // 2) + e // 2),
                     )
 
-        # every token's mid in one go: they land together (S = 4: -1.1 us)
-        for k in range_constexpr(tokens):
-            stage_mids(k)
-        stamp(10)
-        gpu.barrier()
-        # then MXFP8 in a pass of its own: quantizing inside stage_mids (after
-        # each poll) cost S = 1 / 4 1.75 / 6 us, though the arithmetic is tiny
-        for k in range_constexpr(tokens):
+        def quant_mids8(k):
+            """``fused_shared``: token k's staged mid rows -> MXFP8 words + scales."""
             if tid < MID8_WORDS // 2:  # 8 elements a lane, 4 lanes a 32-block
                 w = fx.Vector(
                     fx.ptr_load(xs + (k * MID16_WORDS + tid * 4), result_type=v4f)
@@ -255,7 +353,21 @@ def moe_narrow_defs(k4ctx):
                 )
                 if tid % 4 == 0:
                     fx.ptr_store(sc, xs + (MIDSC_LDS + k * MIDSC_WORDS + tid // 4))
+
+        # every token's mid in one go: they land together (S = 4: -1.1 us)
+        for k in range_constexpr(tokens):
+            if const_expr(FUSED):
+                stage_mids(k)
+            else:
+                stage_mids_quant(k)
+        stamp(10)
         gpu.barrier()
+        if const_expr(FUSED):
+            # then MXFP8 in a pass of its own: quantizing inside stage_mids (after
+            # each poll) cost S = 1 / 4 1.75 / 6 us, though the arithmetic is tiny
+            for k in range_constexpr(tokens):
+                quant_mids8(k)
+            gpu.barrier()
         # the shared expert once, B column l % 16 = token l % 16's mid -> opart
         # (free once the split is done); each token's reduce adds its column
         col_tok = fx.min(l16, tokens - 1)
@@ -274,7 +386,7 @@ def moe_narrow_defs(k4ctx):
                     + g4
                 ),
                 c=fx.Vector.filled(4, 0.0, fx.Float32),
-                a_fmt=FP4,
+                a_fmt=FP4 if FUSED else FP8,
             )
             sh = [sh[j4] + cu[j4] * wgt for j4 in range(4)]
         fx.ptr_store(
@@ -286,19 +398,49 @@ def moe_narrow_defs(k4ctx):
             # token k + 2's weights go out before token k's GEMV
             if const_expr(k + 2 < tokens):
                 dn_units[k + 2] = down_load(k + 2, t, has_dn)
-            acc = [fx.Float32(0.0) for _ in range(4)]
-            for wv, sc, sl, kc, wgt in dn_units.pop(k):
-                cu = mfma_scaled(
-                    a=wv,
-                    sa=sc,
-                    b=lds_b8(MID8_LDS + k * MID8_WORDS + (sl * INTER + kc * 128) // 4),
-                    sb=lds_i32(
-                        MIDSC_LDS + k * MIDSC_WORDS + (sl * INTER + kc * 128) // 32 + g4
-                    ),
-                    c=fx.Vector.filled(4, 0.0, fx.Float32),
-                    a_fmt=FP4,
-                )
-                acc = [acc[j4] + cu[j4] * wgt for j4 in range(4)]
+            if const_expr(FUSED):
+                # a8w4, each unit's MFMA route-weighted into the f32 sum
+                acc = [fx.Float32(0.0) for _ in range(4)]
+                for wv, sc, sl, kc, wgt in dn_units.pop(k):
+                    cu = mfma_scaled(
+                        a=wv,
+                        sa=sc,
+                        b=lds_b8(
+                            MID8_LDS + k * MID8_WORDS + (sl * INTER + kc * 128) // 4
+                        ),
+                        sb=lds_i32(
+                            MIDSC_LDS
+                            + k * MIDSC_WORDS
+                            + (sl * INTER + kc * 128) // 32
+                            + g4
+                        ),
+                        c=fx.Vector.filled(4, 0.0, fx.Float32),
+                        a_fmt=FP4,
+                    )
+                    acc = [acc[j4] + cu[j4] * wgt for j4 in range(4)]
+            else:
+                # the wave's slot: 6 chunks, one fp4 x fp4 MFMA each, in one
+                # accumulator, then production's bf16(acc * topk weight)
+                cslot = fx.Vector.filled(4, 0.0, fx.Float32)
+                for wv, sc, sl, kc, wgt in dn_units.pop(k):
+                    cslot = mfma_scaled(
+                        a=wv,
+                        sa=sc,
+                        b=lds_b4(
+                            MID4_LDS + k * MID4N_WORDS + sl * (INTER // 8) + kc * 16
+                        ),
+                        sb=lds_i32(
+                            MIDSC4_LDS
+                            + k * MIDSC4N_WORDS
+                            + sl * (INTER // 32)
+                            + kc * 4
+                            + g4
+                        ),
+                        c=cslot,
+                        a_fmt=FP4,
+                        b_fmt=FP4,
+                    )
+                acc = [bf16_round(cslot[j4] * wgt) for j4 in range(4)]
             fx.ptr_store(
                 fx.Vector.from_elements(acc, fx.Float32),
                 opart + ((k + 1) * WAVES * 64 + wave * 64 + lane) * 4,
@@ -309,9 +451,15 @@ def moe_narrow_defs(k4ctx):
             grp = (tid % DN_ROWS) // 16
             rr = tid % 16
             waves = [grp * 4 + w for w in range(4)]
-            tot = row_sum(opart + (k + 1) * WAVES * 64 * 4, rr, 0, waves) + row_sum(
-                opart, rr, k, waves
-            )
+            routed = row_sum(opart + (k + 1) * WAVES * 64 * 4, rr, 0, waves)
+            shared = row_sum(opart, rr, k, waves)
+            if const_expr(FUSED):
+                # one fused MoE: the shared expert a slot of the f32 sum
+                tot = routed + shared
+            else:
+                # production: the routed sum rounded to bf16, the shared expert's
+                # down output rounded to bf16, added in bf16
+                tot = bf16_round(routed) + bf16_round(shared)
             fx.ptr_store(bf16_round(tot), misc + tid)
         gpu.barrier()
         ffn_finish(t)
