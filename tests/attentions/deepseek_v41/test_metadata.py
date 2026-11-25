@@ -568,11 +568,100 @@ def test_prefill_attention_graph_fixes_only_prefill_request_capacity(
             addresses = tuple(p.data_ptr() for p in (*planes, *current))
             pointers = addresses if pointers is None else pointers
             assert addresses == pointers
+            assert step.swa_cached_until.shape == (capacity,)
+            assert step.swa_replay_start.shape == (capacity,)
+            assert step.swa_cached_until.count_nonzero() == 0
+            assert step.swa_cached_until.data_ptr() == (
+                builder.model_runner.forward_vars[
+                    "v41_prefill_cached_until"
+                ].gpu.data_ptr()
+            )
         elif is_prefill:
             # Eager prefill also stages its window, at the live request width.
             assert step.prefill_window_staging is not None
         else:
             assert step.prefill_window_staging is None
+
+
+@pytest.mark.parametrize("publication", ["unbound", "direct", "packed"])
+def test_prefill_replay_boundaries_publish_before_layers(monkeypatch, publication):
+    """Resumed/empty transitions reuse addresses, with no layer-local upload."""
+    from atom.utils.h2d import PublicationOwner
+
+    device = "cuda" if publication == "packed" else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required for packed metadata publication")
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    buffers = builder._prefill_replay_buffers(4, device)
+    builder.model_runner = SimpleNamespace(forward_vars=buffers)
+    geo = V41PoolGeometry(1, (), 32, 4, 512, 32, kv_dtype="fp8", layer_ratios=(0,))
+    cache = PagedAttentionCache(geo, 4, 4, device, max_tokens=8)
+    owner = group = None
+    if publication != "unbound":
+        owner = PublicationOwner(
+            device, torch.cuda.Event() if device == "cuda" else None
+        )
+        group = owner.group(
+            "step_metadata", [owner.bind(buf, name) for name, buf in buffers.items()]
+        )
+        if publication == "packed":
+            assert group.use_packed() == "packed"
+    copies = []
+    for name, buf in buffers.items():
+        original = buf.copy_to_gpu
+
+        def copy(*args, _name=name, _copy=original, **kwargs):
+            copies.append(_name)
+            return _copy(*args, **kwargs)
+
+        monkeypatch.setattr(buf, "copy_to_gpu", copy)
+
+    def unexpected_upload(*args, **kwargs):
+        raise AssertionError("The already-staged boundaries must not be uploaded again")
+
+    monkeypatch.setattr(cache, "publish_replay_layout", unexpected_upload)
+    pointers = None
+    for floors, cached in (
+        ([0, 0], [0, 0]),
+        ([16], [33]),
+        ([], []),
+        ([0, 16], [0, 34]),
+    ):
+        if owner is not None:
+            owner.begin()
+        copies.clear()
+        layout = builder._stage_prefill_replay_layout(
+            np.asarray(floors, np.int32),
+            np.asarray(cached, np.int32),
+            4,
+            publication_group=group,
+        )
+        assert len(copies) == (2 if group is None else 0)
+        requests = tuple(
+            PagedRequest(i, 32, 2 * i, 2, i, (0, 1)) for i in range(len(floors))
+        )
+        step = begin_step(
+            cache,
+            requests,
+            is_prefill=True,
+            running_bs=4,
+            running_tokens=8,
+            floors=np.asarray(floors, np.int32),
+            cached_until=np.asarray(cached, np.int32),
+            replay_layout=layout,
+        )
+        if group is not None:
+            group.publish()
+            owner.finish()
+        if device == "cuda":
+            torch.cuda.synchronize()
+        actual = (step.swa_replay_start, step.swa_cached_until)
+        assert [p.tolist() for p in actual] == [
+            values + [0] * (4 - len(values)) for values in (floors, cached)
+        ]
+        addresses = tuple(p.data_ptr() for p in actual)
+        pointers = addresses if pointers is None else pointers
+        assert addresses == pointers
 
 
 def test_startup_dummy_keeps_private_scratch_before_pool_allocation():

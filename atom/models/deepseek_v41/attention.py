@@ -616,14 +616,8 @@ class Attention(nn.Module):
         return a8w4, query_fp8, kv, window_kv
 
     @eager_region(live=_live_step)
-    def _prefill_indices_live(self, prefix, extend, cached_until, cache, step, *, a8w4):
-        """Publish the live CSR and ring boundary into graph-owned buffers."""
-        if step.request_cached_until.any():
-            # Resumed boundaries cover the live requests, not the graph's
-            # fixed capacity. Zero-length padding requests never read the tail.
-            cached_until[: step.swa_cached_until.numel()].copy_(step.swa_cached_until)
-        else:
-            cached_until.zero_()
+    def _prefill_indices_live(self, prefix, extend, cache, step, *, a8w4):
+        """Publish live CSR; ring boundaries were published before preparation."""
         if not step.requests:
             # Idle DP ranks have no scorer result. Publish empty lists through
             # zero indptrs; the captured MLA must not read stale indices.
@@ -637,14 +631,12 @@ class Attention(nn.Module):
         cache._index_group(self.spec, step, first, 1, a8w4=a8w4, out=(prefix, extend))
 
     def _attend_prefill_graph(self, query, cache, step, prepared):
-        """Capture quantized MLA and ring commit; CSR publication remains live."""
+        """Capture quantized MLA; fused preparation already committed its ring."""
         a8w4, query_fp8, kv, window_kv = prepared
         buffers, fill = cache.prefill_graph_buffers(self.spec, step, a8w4=a8w4)
-        prefix, prefix_ptr, extend, extend_ptr, cached_until = buffers
+        prefix, prefix_ptr, extend, extend_ptr = buffers
         if fill:
-            self._prefill_indices_live(
-                prefix, extend, cached_until, cache, step, a8w4=a8w4
-            )
+            self._prefill_indices_live(prefix, extend, cache, step, a8w4=a8w4)
         kwargs = {"pool_scale_dtype": torch.float8_e4m3fn} if a8w4 else {}
         output = sparse_attn_v41_paged_2src(
             tuple(part.flatten(0, 1) for part in query_fp8),
@@ -659,9 +651,10 @@ class Attention(nn.Module):
             out=query.flatten(0, 1),
             **kwargs,
         )
-        cache.write_prefill_window_graph(
-            self.spec.layer_id, window_kv, step, cached_until
-        )
+        if window_kv is not None:
+            cache.write_prefill_window_graph(
+                self.spec.layer_id, window_kv, step, step.swa_cached_until
+            )
         return output
 
     @eager_region(live=_live_rows)

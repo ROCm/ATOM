@@ -238,6 +238,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 or configured_a8w4_attention(model_runner.config, self.device)
             )
         )
+        if self._prefill_attention_graph:
+            model_runner.forward_vars.update(
+                self._prefill_replay_buffers(self.max_bs, self.device)
+            )
         self._prefill_window_staging = (
             torch.empty(
                 (self.max_bs * self.geometry.ring_slots + self.max_num_batched_tokens)
@@ -406,6 +410,37 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             key_rope.copy_to_gpu()
             buffers[names["key_rope"]] = key_rope
         return buffers
+
+    @staticmethod
+    def _prefill_replay_buffers(max_bs, device):
+        """Fixed replay boundaries, published with the step before any layer."""
+        return {
+            name: CpuGpuBuffer(
+                max_bs,
+                dtype=torch.int32,
+                device=device,
+                pin_memory=torch.device(device).type != "cpu",
+                publication_group="v41_step",
+            )
+            for name in ("v41_prefill_floor", "v41_prefill_cached_until")
+        }
+
+    def _stage_prefill_replay_layout(
+        self, floors, cached_until, running_bs, *, publication_group=None
+    ):
+        """Pad both boundaries at stable addresses through one step publication."""
+        return tuple(
+            self._stage(
+                name,
+                np.empty(0, np.int32) if values is None else values,
+                running_bs,
+                publication_group=publication_group,
+            )
+            for name, values in (
+                ("v41_prefill_floor", floors),
+                ("v41_prefill_cached_until", cached_until),
+            )
+        )
 
     @staticmethod
     def _engram_rows_buffer(max_num_batched_tokens, device):
@@ -882,6 +917,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             start_histories=histories,
             publication_group=group,
             query_prefix_ready=True,
+            replay_layout=(
+                self._stage_prefill_replay_layout(
+                    floors, cached_until, attention_bs, publication_group=group
+                )
+                if prefill_graph
+                else None
+            ),
         )
         step.prefill_attention_graph = prefill_graph
         step.request_resumes = resumes

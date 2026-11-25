@@ -74,8 +74,8 @@ class BatchStep:
     # its candidates bound
     candidate_blocks: dict[int, object] = field(default_factory=dict)
     # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
-    # launch wrote for the whole run. Graph entries also hold the shared
-    # cached-until buffer consumed by each layer's captured ring commit.
+    # launch wrote for the whole run. Ring boundaries are step metadata,
+    # published before the fused prefill producer runs.
     group_indices: dict[int | tuple[int, str], tuple[torch.Tensor, ...]] = field(
         default_factory=dict
     )

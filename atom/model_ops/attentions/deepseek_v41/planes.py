@@ -54,16 +54,8 @@ def _stage_window(
     )
 
 
-def prefill_window(history, step, ring):
-    """One SWA source: this batch's rings followed by space for current KV.
-
-    The producer writes current KV directly to the tail views. The persistent
-    rings remain unchanged until attention completes and write_window commits.
-    Plane and tail offsets follow the published request width. Native
-    quantized-attention token graphs pad that width to a fixed capacity;
-    other callers keep preparation beside their live CSR build.
-    """
-    dim = history[0].shape[-1]
+def prefill_window_views(step, dim, ring):
+    """Views of reserved history/current KV, without copying persistent history."""
     batches = step.cu_seqlens_q.numel() - 1
     rows = batches * ring
     size = (rows + step.running_tokens) * (dim + dim // 32)
@@ -73,8 +65,20 @@ def prefill_window(history, step, ring):
     if source.numel() < size:
         raise ValueError("Prefill window staging is smaller than the live step")
     planes = split_source(source[:size], dim)
+    return planes, tuple(plane[rows:] for plane in planes)
+
+
+def prefill_window(history, step, ring):
+    """Snapshot SWA history for a producer that commits after attention.
+
+    Native quantized token graphs use the same views but fuse this snapshot
+    with RoPE and ring commit. Other paths keep the snapshot and commit apart.
+    """
+    dim = history[0].shape[-1]
+    batches = step.cu_seqlens_q.numel() - 1
+    planes, current = prefill_window_views(step, dim, ring)
     if batches:
-        if source.is_cuda:
+        if planes[0].is_cuda:
             _stage_window[(triton.cdiv(ring, 16), batches)](
                 *history, *planes, step.slots, step.cu_seqlens_q, ring, dim
             )
@@ -89,7 +93,7 @@ def prefill_window(history, step, ring):
                     dst[batch * ring : (batch + 1) * ring].copy_(
                         old[slot * ring : (slot + 1) * ring]
                     )
-    return planes, tuple(plane[rows:] for plane in planes)
+    return planes, current
 
 
 @triton.jit(do_not_specialize=["NSLOTS"])

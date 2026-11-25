@@ -332,6 +332,9 @@ def test_native_token_graph_replays_different_request_counts(
 ):
     from types import MethodType
 
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
     from atom.models.deepseek_v41.attention import Attention, _live_step
     from atom.utils import forward_context
     from atom.utils.region_graph import TokenGraph, eager_region
@@ -390,6 +393,11 @@ def test_native_token_graph_replays_different_request_counts(
     tables = torch.zeros(4, 4, dtype=torch.int32, device="cuda")
     ctx = SimpleNamespace(in_hipgraph=False, main_stream=torch.cuda.current_stream())
     monkeypatch.setattr(forward_context, "_forward_context", ctx)
+    replay_builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    replay_builder.model_runner = SimpleNamespace(
+        forward_vars=replay_builder._prefill_replay_buffers(4, "cuda")
+    )
+    boundary_pointers = None
 
     def prepare(
         requests,
@@ -400,6 +408,7 @@ def test_native_token_graph_replays_different_request_counts(
         cached_until=0,
         live_tokens=width,
     ):
+        nonlocal boundary_pointers
         length = (live_tokens - (2 if padded else 0)) // requests if requests else 0
         live = length * requests
         order = (0, 3, 1, 4) if reverse else (4, 1, 3, 0)
@@ -437,10 +446,25 @@ def test_native_token_graph_replays_different_request_counts(
             request_floors=np.where(cached > 0, ring // 2, 0).astype(np.int32),
             request_cached_until=cached,
         )
-        # Use the production publisher: resumed boundaries have fresh storage
-        # at the live request count, even when graph metadata has padded slots.
-        cache.publish_replay_layout(step, batches)
-        if cached.any():
+        # Production graph publication precedes the fused producer. The same
+        # pointers must survive ordinary/resumed/empty batch transitions.
+        if graph_layout:
+            step.swa_replay_start, step.swa_cached_until = (
+                replay_builder._stage_prefill_replay_layout(
+                    step.request_floors, step.request_cached_until, batches
+                )
+            )
+            pointers = tuple(
+                p.data_ptr() for p in (step.swa_replay_start, step.swa_cached_until)
+            )
+            if boundary_pointers is None:
+                boundary_pointers = pointers
+            assert pointers == boundary_pointers
+            assert step.swa_cached_until.numel() == batches
+            assert step.swa_cached_until[requests:].count_nonzero() == 0
+        else:
+            cache.publish_replay_layout(step, batches)
+        if cached.any() and not graph_layout:
             assert step.swa_cached_until.numel() == requests
             assert step.swa_replay_start.numel() == requests
         cache._reserve_prefill_window(step)
@@ -539,6 +563,16 @@ def test_native_token_graph_replays_different_request_counts(
         return result
 
     monkeypatch.setattr(cache, "rope_quant_window", track_preparation)
+    from atom.model_ops.attentions.deepseek_v41 import cache as cache_module
+
+    fused_calls = []
+    fused_prepare = cache_module.prefill_rope_window
+
+    def track_fused(*args, **kwargs):
+        fused_calls.append(torch.cuda.is_current_stream_capturing())
+        return fused_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(cache_module, "prefill_rope_window", track_fused)
     commit_calls = []
     commit_window = cache.write_window
 
@@ -593,6 +627,7 @@ def test_native_token_graph_replays_different_request_counts(
     preparation_calls.clear()
     attention_calls.clear()
     graph_commit_calls.clear()
+    fused_calls.clear()
     graph = TokenGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -615,8 +650,10 @@ def test_native_token_graph_replays_different_request_counts(
         assert preparation_calls == expected_capture * group_size
         if capture_attention:
             assert attention_calls == [True] * group_size
-            assert [c[1] for c in graph_commit_calls] == [True] * group_size
-            assert len({c[2] for c in graph_commit_calls}) == 1
+            assert fused_calls == [True] * group_size
+            assert graph_commit_calls == []
+        else:
+            assert fused_calls == []
         # Capture can write only 64 tokens/request; this same bucket must
         # later commit all 128 ring rows of a single 256-token request.
         for requests, padded, reverse, cached_until, live_tokens in (
