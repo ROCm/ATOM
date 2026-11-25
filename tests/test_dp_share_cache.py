@@ -2,7 +2,9 @@
 # Unit tests for `--dp-load-balance share_cache` (atom/model_engine/dp_routing/share_cache.py)
 # and its CoreManager bookkeeping (rank-reported prefill backlog).
 
+import math
 import os
+import random
 from collections import deque
 from threading import Lock
 from types import SimpleNamespace
@@ -15,8 +17,7 @@ from atom.model_engine.dp_routing.share_cache import (
     LockstepCostPlacement,
     ShareCacheRouter,
     SharedWorkPlacement,
-    _smooth_max,
-    _smooth_max_rise,
+    _smooth_max_rises,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_STRATEGIES, CoreManager
 
@@ -570,26 +571,125 @@ def test_sibling_successor_debt_uses_contiguous_confirmed_prefix():
 # The placement rule: the lockstep step time a request adds to the DP group.
 
 
+def _rise(values, rank, add, temp):
+    adds = [0] * len(values)
+    adds[rank] = add
+    return _smooth_max_rises(values, adds, temp)[rank]
+
+
+def _reference_smooth_max(values, temp):
+    top = max(values)
+    return top + temp * math.log(sum(math.exp((v - top) / temp) for v in values))
+
+
+def _reference_rise(values, rank, add, temp):
+    """The rise as the difference of two full smooth maxima (the O(n) per
+    rank form the one-pass version replaces)."""
+    if add <= 0:
+        return 0.0
+    grown = list(values)
+    grown[rank] += add
+    return _reference_smooth_max(grown, temp) - _reference_smooth_max(values, temp)
+
+
+def _reference_scores(backlog, reqs, costs, loads):
+    p = LockstepCostPlacement
+    sharing = max(1, sum(reqs))
+    return [
+        p.PF_MS_PER_TOKEN * _reference_rise(backlog, r, costs[r], p.TOKEN_TEMP)
+        + p.DECODE_MS_PER_LANE
+        * p.DECODE_STEPS
+        * _reference_rise(reqs, r, 1, p.LANE_TEMP)
+        + p.LOAD_MS_PER_TOKEN * loads[r] / sharing
+        for r in range(len(backlog))
+    ]
+
+
 def test_smooth_max_rise_tracks_the_max():
     import pytest
 
     v = [10.0, 10.0, 30.0, 10.0]
-    assert _smooth_max(v, 2.0) == pytest.approx(30.0, abs=1e-3)
     # The busiest rank: the max rises by the whole increment.
-    assert _smooth_max_rise(v, 2, 1, 2.0) == pytest.approx(1.0, abs=1e-3)
+    assert _rise(v, 2, 1, 2.0) == pytest.approx(1.0, abs=1e-3)
     # Far below the max: almost nothing.
-    assert _smooth_max_rise(v, 0, 1, 2.0) < 1e-3
+    assert _rise(v, 0, 1, 2.0) < 1e-3
     # Monotone in the rank's own value, never above the increment, zero for zero.
-    rises = [_smooth_max_rise([w, 20.0, 20.0], 0, 1, 2.0) for w in range(10, 25)]
+    rises = [_rise([w, 20.0, 20.0], 0, 1, 2.0) for w in range(10, 25)]
     assert rises == sorted(rises) and all(0 < x <= 1 for x in rises)
-    assert _smooth_max_rise(v, 1, 0, 2.0) == 0.0
+    assert _rise(v, 1, 0, 2.0) == 0.0
     # Large token increments and values stay finite.
-    assert _smooth_max_rise([0, 3_000_000], 0, 2_000_000, 4096.0) == pytest.approx(
-        0.0, abs=1e-6
-    )
-    assert _smooth_max_rise([0, 0], 0, 2_000_000, 4096.0) == pytest.approx(
+    assert _rise([0, 3_000_000], 0, 2_000_000, 4096.0) == pytest.approx(0.0, abs=1e-6)
+    assert _rise([0, 0], 0, 2_000_000, 4096.0) == pytest.approx(
         2_000_000 - 4096.0 * 0.6931, rel=1e-3
     )
+
+
+def test_one_pass_rises_match_the_full_smooth_max_difference():
+    import pytest
+
+    rng = random.Random(7)
+    for _ in range(2000):
+        n = rng.choice((1, 2, 3, 8, 16, 64))
+        temp = rng.choice((2.0, 4096.0))
+        scale = rng.choice((1, 10, 1_000, 100_000, 5_000_000))
+        values = [rng.randint(0, scale) for _ in range(n)]
+        adds = [rng.choice((0, rng.randint(1, scale))) for _ in range(n)]
+        got = _smooth_max_rises(values, adds, temp)
+        for r in range(n):
+            want = _reference_rise(values, r, adds[r], temp)
+            # The reference subtracts two values near max(values), so it is
+            # itself only good to a few ulps of the max.
+            tol = 1e-9 * max(1.0, abs(max(values)) + adds[r])
+            assert got[r] == pytest.approx(want, abs=tol), (values, adds, r)
+            assert 0.0 <= got[r] <= adds[r] + 1e-9
+
+
+def test_one_pass_rises_stay_finite_and_ordered_at_extremes():
+    import pytest
+
+    # Backlogs and increments far past exp() range, and ranks whose weight
+    # underflows to zero next to the busiest.
+    big = [0, 1e9, 1e9 - 5e6, 3e9]
+    rises = _smooth_max_rises(big, [4e9] * 4, 4096.0)
+    assert all(math.isfinite(x) for x in rises)
+    # Growing the busiest rank raises the max by the whole increment; the
+    # others only by how far they climb past it.
+    assert rises[3] == pytest.approx(4e9, rel=1e-12)
+    assert rises[0] == pytest.approx(4e9 - 3e9, rel=1e-9)
+    assert rises[1] == pytest.approx(5e9 - 3e9, rel=1e-9)
+    assert rises[0] < rises[2] < rises[1] < rises[3]
+    # A rank far below that grows by a lot but stays below: no rise.
+    assert _smooth_max_rises([0, 1e12], [1e9, 0], 4096.0)[0] == 0.0
+    # A single rank: the rise is the increment.
+    assert _smooth_max_rises([7e8], [2e9], 4096.0) == [2e9]
+
+
+def test_one_pass_placement_chooses_as_the_full_smooth_max_did():
+    """Same choice as the two-smooth-max form, except where that form could
+    not tell the ranks apart: it subtracts two numbers near the max, so ranks
+    far below the busiest all score its rounding error (~1e-12 ms) and the
+    tie-break picked among them. The one-pass form still ranks those."""
+    rng = random.Random(11)
+    differ = 0
+    for trial in range(3000):
+        n = rng.choice((2, 4, 8, 16, 64))
+        backlog = [rng.choice((0, rng.randint(0, 400_000))) for _ in range(n)]
+        reqs = [rng.randint(0, 64) for _ in range(n)]
+        cost = rng.randint(1, 200_000)
+        hit = rng.randrange(n)
+        costs = [cost] * n
+        costs[hit] = rng.randint(0, cost)
+        loads = [rng.choice((0, rng.randint(0, cost))) for _ in range(n)]
+        owner = rng.choice((None, hit))
+        placement = LockstepCostPlacement()
+        placement.cursor = trial
+        got = placement(backlog, reqs, costs, owner, loads)
+        ref = _reference_scores(backlog, reqs, costs, loads)
+        want = min(range(n), key=lambda r: (ref[r], r != owner, (r - trial) % n))
+        if got != want:
+            differ += 1
+            assert abs(ref[got] - ref[want]) < 1e-9, (backlog, reqs, costs, loads)
+    assert differ < 3000 // 20
 
 
 def _place(backlog, reqs, costs, owner=None, loads=None):

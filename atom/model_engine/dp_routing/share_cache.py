@@ -11,23 +11,43 @@ from typing import ClassVar
 from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
 
 
-def _smooth_max(values, temp: float) -> float:
-    """temp * log(sum(exp(v / temp))): max(values) plus at most temp*log(n)."""
-    top = max(values)
-    return top + temp * math.log(sum(math.exp((v - top) / temp) for v in values))
-
-
-def _smooth_max_rise(values, rank: int, add: float, temp: float) -> float:
-    """How much `_smooth_max(values)` rises when `values[rank]` grows by `add`.
+def _smooth_max_rises(values, adds, temp: float) -> list[float]:
+    """For each rank r, how much smooth-max(values) rises when values[r] grows
+    by adds[r]; smooth-max(v) = temp * log(sum(exp(v / temp))), the max of v
+    plus at most temp*log(n).
 
     Close to the rise of the plain max for the busiest rank, and small but not
     zero for a rank just under it: the chance that it becomes the busiest while
-    the request lives there."""
-    if add <= 0:
-        return 0.0
-    grown = list(values)
-    grown[rank] += add
-    return _smooth_max(grown, temp) - _smooth_max(values, temp)
+    the request lives there.
+
+    One pass for all ranks: with p_r = exp(v_r / temp) / sum(exp(v / temp)),
+    the rise is temp * log(1 + p_r * expm1(add / temp)). Sums are shifted by the
+    max, and a large add is taken in log space, so big backlogs or increments
+    neither overflow nor lose the rise to cancellation."""
+    top = max(values)
+    weights = [math.exp((v - top) / temp) for v in values]
+    total = sum(weights)
+    log_total = math.log(total)
+    rises = []
+    for value, weight, add in zip(values, weights, adds):
+        if add <= 0:
+            rises.append(0.0)
+            continue
+        grow = add / temp
+        share = weight / total
+        if grow <= 32.0:
+            rises.append(temp * math.log1p(share * math.expm1(grow)))
+            continue
+        # log(1 - p + p * e^grow) = log(e^stay + e^moved)
+        moved = (value - top) / temp - log_total + grow
+        rest = total - weight
+        if rest <= 0:
+            rises.append(add)
+            continue
+        stay = math.log(rest) - log_total
+        high, low = (moved, stay) if moved >= stay else (stay, moved)
+        rises.append(temp * (high + math.log1p(math.exp(low - high))))
+    return rises
 
 
 class LockstepCostPlacement:
@@ -75,12 +95,13 @@ class LockstepCostPlacement:
     def scores(self, backlog, requests, costs, loads):
         decode_ms = self.DECODE_MS_PER_LANE * self.DECODE_STEPS
         sharing = max(1, sum(requests))
+        prefill = _smooth_max_rises(backlog, costs, self.TOKEN_TEMP)
+        decode = _smooth_max_rises(requests, [1] * len(requests), self.LANE_TEMP)
         return [
-            self.PF_MS_PER_TOKEN
-            * _smooth_max_rise(backlog, rank, costs[rank], self.TOKEN_TEMP)
-            + decode_ms * _smooth_max_rise(requests, rank, 1, self.LANE_TEMP)
-            + self.LOAD_MS_PER_TOKEN * loads[rank] / sharing
-            for rank in range(len(backlog))
+            self.PF_MS_PER_TOKEN * pf
+            + decode_ms * dc
+            + self.LOAD_MS_PER_TOKEN * load / sharing
+            for pf, dc, load in zip(prefill, decode, loads)
         ]
 
     def __call__(self, backlog, requests, costs, owner, loads):
