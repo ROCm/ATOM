@@ -610,18 +610,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_SP_MIN_UBATCH_TOKENS": lambda: int(
         os.getenv("ATOM_M3_SP_MIN_UBATCH_TOKENS", "8192")
     ),
-    # SP prefill hand-offs over aiter's XGMI pull collectives (aiter
-    # PullCollective) instead of RCCL: "rccl" (default), "pull" (the hand-offs
-    # whose producer writes into the pull buffer: the MXFP8 attention-output
-    # all-to-all and the reduce-scatter of the MoE partial, no stage copy) or
-    # "pull_all" (also the all-gathers and any other input, which copy first and
-    # measured 1.07-1.09x RCCL). A hand-off that does not fit (a TBO micro-batch,
-    # more than ATOM_M3_SP_PULL_MAX_TOKENS tokens, an unsupported dtype or size,
-    # aiter without the module) uses RCCL.
-    "ATOM_M3_SP_COMM": lambda: os.getenv("ATOM_M3_SP_COMM", "rccl"),
-    "ATOM_M3_SP_PULL_MAX_TOKENS": lambda: int(
-        os.getenv("ATOM_M3_SP_PULL_MAX_TOKENS", "16384")
-    ),
     # SP MoE layers: gather MXFP4 codes + routing and run the FlyDSL MXFP4 prefill
     # chain (0: gather bf16 rows and call the layer). _CHECK: log each layer's
     # cosine against the regular MoE once (debug; an extra bf16 gather).

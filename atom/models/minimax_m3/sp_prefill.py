@@ -72,141 +72,6 @@ class _Coll:
         self.comm.group_end()
 
 
-class _PullColl:
-    """The same hand-offs as `_Coll` over aiter's pull collectives (XGMI reads of
-    peer buffers). Anything that does not fit the pull buffer or its size rules
-    goes to ``fallback`` (the RCCL `_Coll`), so a call never fails because of it.
-    The MXFP8 attention-output all-to-all is zero copy: the quant writes into the
-    pull buffer and one kernel unpacks it into the o_proj layout."""
-
-    def __init__(self, pull, fallback: "_Coll", world: int, staged: bool = False):
-        self.pull = pull
-        self.fallback = fallback
-        self.world = world
-        # all-gather, reduce-scatter and the plain all-to-all copy their inputs
-        # into the pull buffer first; that copy costs more than the pull saves
-        # (measured: 1.07-1.09x RCCL), so they stay on RCCL unless asked for.
-        self.staged = staged
-
-    def _fields(self, ins, scale: int = 1):
-        """Byte (offset, size) of each input staged back to back, or None."""
-        plan, off = [], 0
-        for x in ins:
-            nbytes = x.numel() * x.element_size()
-            if nbytes % (8 * scale) or not x.is_contiguous():
-                return None
-            plan.append((off, nbytes))
-            off += nbytes
-        return plan if off <= self.pull.max_bytes else None
-
-    def _stage(self, ins, plan):
-        self.pull.acquire()
-        for x, (off, nbytes) in zip(ins, plan):
-            self.pull.buffer(x.shape, x.dtype, off).copy_(x)
-
-    def all_gather(self, outs: list[torch.Tensor], ins: list[torch.Tensor]) -> None:
-        plan = self._fields(ins) if self.staged else None
-        if plan is None:
-            return self.fallback.all_gather(outs, ins)
-        self._stage(ins, plan)
-        self.pull.all_gather([(o, n, _u8(out)) for (o, n), out in zip(plan, outs)])
-
-    def all_to_all(self, outs: list[torch.Tensor], ins: list[torch.Tensor]) -> None:
-        plan = self._fields(ins, self.world) if self.staged else None
-        if plan is None:
-            return self.fallback.all_to_all(outs, ins)
-        self._stage(ins, plan)
-        self.pull.all_to_all([(o, n, _u8(out)) for (o, n), out in zip(plan, outs)])
-
-    def reduce_scatter(self, out: torch.Tensor, x: torch.Tensor) -> None:
-        if (
-            x.dtype == torch.bfloat16
-            and x.is_contiguous()
-            and x.numel() % self.world == 0
-            and x.numel() * 2 <= self.pull.max_bytes
-            and x.data_ptr() == self.pull.buffer(x.shape, x.dtype).data_ptr()
-        ):
-            # already in the pull buffer (_pull_rs_buffer): pull straight from it
-            return self.pull.reduce_scatter(out, x.numel())
-        if (
-            not self.staged
-            or x.dtype != torch.bfloat16
-            or not x.is_contiguous()
-            or x.numel() * 2 > self.pull.max_bytes
-            or x.numel() % self.world
-        ):
-            return self.fallback.reduce_scatter(out, x)
-        self.pull.acquire()
-        self.pull.buffer(x.shape, x.dtype).copy_(x)
-        self.pull.reduce_scatter(out, x.numel())
-
-    def can_a2a_mxfp8(self, padded: int, d: int) -> bool:
-        return padded * (d + d // 32) <= self.pull.max_bytes and d % 256 == 0
-
-    def a2a_mxfp8(self, quant, x: torch.Tensor, rows: int):
-        """``quant(x, out=(codes, scales))`` into the pull buffer, then the unpack
-        all-to-all: (x_q [rows, w*d], x_s [rows, w*d/32]) for o_proj_full."""
-        padded, d = x.shape
-        codes = self.pull.buffer((padded, d), _FP8)
-        scales = self.pull.buffer(
-            (padded, d // 32), torch.float8_e8m0fnu, byte_offset=padded * d
-        )
-        self.pull.acquire()
-        quant(x, out=(codes, scales))
-        out_q = torch.empty((rows, self.world * d), dtype=_FP8, device=x.device)
-        out_s = torch.empty(
-            (rows, self.world * d // 32), dtype=torch.float8_e8m0fnu, device=x.device
-        )
-        self.pull.all_to_all_mxfp8(_u8(out_q), _u8(out_s), rows, d)
-        return out_q, out_s
-
-
-_pull_state: dict = {}
-
-
-def _pull():
-    """The process's `PullCollective` over the TP group, or None (not wanted, not
-    available, or the group is not one it handles). Built on first use."""
-    if envs.ATOM_M3_SP_COMM not in ("pull", "pull_all"):
-        return None
-    if "pull" in _pull_state:
-        return _pull_state["pull"]
-    pull = None
-    try:
-        from aiter.ops.triton.comms.pull_collective import PullCollective
-
-        tp = _tp()
-        if tp.world_size in (2, 4):
-            hidden = 6144
-            max_bytes = envs.ATOM_M3_SP_PULL_MAX_TOKENS * hidden * 2
-            pull = PullCollective(
-                tp.cpu_group,
-                max_bytes,
-                torch.device("cuda", torch.cuda.current_device()),
-            )
-    except Exception as exc:  # noqa: BLE001 aiter without the module, no IPC, ...
-        logger.warning("SP pull collectives off, using RCCL: %r", exc)
-    logger.info("MiniMax-M3 SP hand-offs: %s", "pull" if pull else "RCCL")
-    _pull_state["pull"] = pull
-    return pull
-
-
-def _pull_rs_buffer(sp: "SeqShard", hidden: int):
-    """The FFN partial's output buffer: the pull buffer itself, so the reduce-scatter
-    pulls from it without a stage copy; None (plain tensor, RCCL) where pull is off,
-    TBO runs, or the partial does not fit."""
-    from atom.utils.tbo.ubatching import tbo_active
-
-    pull = _pull()
-    if pull is None or tbo_active():
-        return None
-    n = sp.padded * hidden
-    if n * 2 > pull.max_bytes or n % sp.world:
-        return None
-    pull.acquire()
-    return pull.buffer((sp.padded, hidden), torch.bfloat16)
-
-
 def _tp():
     from aiter.dist.parallel_state import get_tp_group
 
@@ -231,11 +96,7 @@ def _run_phase(fn):
         comm = tbo_get_ubatch_tp_comm(tbo_current_ubatch_id())
         return tbo_on_comm(lambda: fn(_Coll(comm, tbo_get_comm_stream(), world)))
     comm = _tp().device_communicator.pynccl_comm
-    coll = _Coll(comm, torch.cuda.current_stream(), world)
-    pull = _pull()
-    if pull is None:
-        return fn(coll)
-    return fn(_PullColl(pull, coll, world, staged=envs.ATOM_M3_SP_COMM == "pull_all"))
+    return fn(_Coll(comm, torch.cuda.current_stream(), world))
 
 
 @dataclass(frozen=True)
@@ -522,18 +383,43 @@ def _input_phase(sp: SeqShard, layer, embeddings: torch.Tensor):
     return codes, scales, residual
 
 
+def _a2a_mxfp8_registered(attn_output: torch.Tensor, sp: SeqShard, d: int):
+    """(x_q ``[rows, w * d]``, x_s ``[rows, w * d / 32]``) from the TP group's
+    all-to-all with the quant writing straight into its registered buffer, or None
+    when the group has no such buffer (older aiter, no custom all-reduce, a size
+    or width it does not take)."""
+    from atom.model_ops.blockscale import quantize_fp8
+
+    tp = _tp()
+    buffer = getattr(tp, "all_to_all_buffer", None)
+    scale_off = (sp.padded * d + 15) // 16 * 16
+    if buffer is None or d % 512:
+        return None
+    try:
+        codes = buffer((sp.padded, d), _FP8)
+        scales = buffer((sp.padded, d // 32), torch.float8_e8m0fnu, scale_off)
+    except ValueError:  # does not fit the registered pool
+        return None
+    if codes is None:
+        return None
+    quantize_fp8(sp.pad(attn_output), out=(codes, scales))
+    return tp.all_to_all(codes, 0, -1, scales=scales, registered=True)
+
+
 def _o_proj_all_to_all(attn, attn_output: torch.Tensor, sp: SeqShard, coll):
     """This rank's heads of every token -> the whole o_proj of this rank's rows,
     through an all-to-all of the MXFP8 codes + scales."""
     from atom.models.minimax_m3.sp_layout import a2a_unpack
+    from atom.utils.tbo.ubatching import tbo_active
 
     d = attn_output.shape[1]
     w, rows = sp.world, sp.rows
-    if isinstance(coll, _PullColl) and coll.can_a2a_mxfp8(sp.padded, d):
-        from atom.model_ops.blockscale import quantize_fp8
-
-        x_q, x_s = coll.a2a_mxfp8(quantize_fp8, sp.pad(attn_output), rows)
-        return attn.o_proj_full(x_q, x_scale=x_s)
+    if not tbo_active():
+        # aiter's general all-to-all: the quant writes the codes and scales into
+        # the registered buffer and one kernel unpacks them into the o_proj layout
+        got = _a2a_mxfp8_registered(attn_output, sp, d)
+        if got is not None:
+            return attn.o_proj_full(got[0], x_scale=got[1])
     send_q, send_s = _quant(sp.pad(attn_output))
     recv_q = torch.empty_like(send_q)
     recv_s = torch.empty_like(send_s)
@@ -787,11 +673,7 @@ def _moe_chain(sp: SeqShard, moe, inp: FfnInput) -> torch.Tensor:
         for n in _CHAIN_WARM_UP_TOKENS:
             if n <= sp.padded and n != t:
                 chain(n, None, scale=scale, add=dummy)
-    out = _pull_rs_buffer(sp, w2.shape[1])
-    if out is None:
-        out = torch.empty(
-            (sp.padded, w2.shape[1]), dtype=torch.bfloat16, device=q.device
-        )
+    out = torch.empty((sp.padded, w2.shape[1]), dtype=torch.bfloat16, device=q.device)
     # The routed scale and the shared expert's output ride on the chain's final
     # reduce (``reduce * scale + shared``) rather than two passes over ``out``.
     finish = None
