@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 """Centralized environment variable definitions for ATOM.
 
@@ -51,6 +52,22 @@ def _flag_env(name: str, default: str = "0") -> bool:
     # the opposite of what the operator wrote. `VAR="off "` did the same.
     raw = os.getenv(name, default).strip().lower()
     return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def _preload_mode() -> str:
+    """ATOM_PRELOAD: "off", "server" (1: take the weights from a weight cache
+    daemon) or "daemon" (be one)."""
+    raw = os.getenv("ATOM_PRELOAD", "").strip().lower()
+    if raw == "daemon":
+        return "daemon"
+    if raw in ("", "0", "false", "no", "off"):  # as _flag_env reads a flag
+        return "off"
+    if raw in ("1", "true", "yes", "on"):
+        return "server"
+    raise ValueError(
+        "ATOM_PRELOAD must be on (1/true/yes/on), off (0/false/no/off) or "
+        f"daemon, not {raw!r}"
+    )
 
 
 def _profiler_detail_env(name: str) -> bool:
@@ -144,6 +161,15 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
     if not allow_zero and value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+def _dp_sync_interval_env() -> int | None:
+    """None for a non-integer, so every DP rank can reject it together; 0 and
+    negative values mean 1."""
+    try:
+        return max(1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1")))
+    except ValueError:
+        return None
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -681,9 +707,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
-    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
-    # Read and checked by atom/mono/polling.py at import, which needs no ATOM
-    # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
+    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 4; 16
+    # beside a KV transfer or offload connector, set by Config). Read and
+    # checked by atom/mono/polling.py at import, which needs no ATOM import; 1
+    # restores the pre-backoff polling (ROCm/ATOM#3369).
     "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
@@ -942,6 +969,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # like the other directory knobs.
     "ATOM_RTL_TRACE_DIR": lambda: _optional_path_env("ATOM_RTL_TRACE_DIR"),
     # --- Model Loading ---
+    # Weight cache (docs/environment_variables.md): off, server or daemon.
+    "ATOM_PRELOAD": _preload_mode,
+    # The launch's name, set by its API server for its own processes.
+    "ATOM_PRELOAD_LAUNCH": lambda: os.getenv("ATOM_PRELOAD_LAUNCH"),
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),
@@ -1087,6 +1118,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # DP > 1 (single- or multi-node; not read under PP): after a sync that saw
+    # unfinished work, run the cross-DP state all_reduce only every N engine
+    # rounds (1 = every round, at most 16; 0 and negative values mean 1).
+    # Utility commands, abort and shutdown are applied only on rounds that sync,
+    # and once the group drains every rank still runs up to N-1 dummy rounds
+    # before the next sync.
+    "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
     # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
@@ -1155,7 +1193,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
     # --- Structured output ---
     # Hold tool calls to the declared schemas when the tool parser declares a
-    # grammar for them (Kimi-K3) and the structured-output extra is installed.
+    # grammar for them (Kimi-K3) and the structured-output backend is available.
     "ATOM_TOOL_CALL_GRAMMAR": lambda: (
         os.getenv("ATOM_TOOL_CALL_GRAMMAR", "0").lower() == "1"
     ),
@@ -1394,7 +1432,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
-    # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
+    # page-locked (`engram.host_memory.pin_rows`), not copied to HBM; the
     # GPU pulls only the rows a step names and dequantizes them there. On by default: the host gather gives the same rows
     # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
@@ -1406,21 +1444,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # where Qwen Mono serves the deployment (`atom/models/qwen38/mono/ple.py`),
     # which ignores it.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
-    # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
-    # into page-locked memory of exactly its size (hipHostMalloc on base pages,
-    # so a fragmented page cache costs no compaction), one copy_ below 512 MiB, else one thread per 128 MiB (at least 8) up to
-    # 16 and the CPUs this process may use, dropping the copied checkpoint
-    # pages from the process as it goes; 0 registers the checkpoint mapping in
-    # place (one thread, under the HIP runtime lock). Either way the shard is
-    # resident once. Copying needs the HIP runtime; elsewhere it registers in
-    # place regardless. Unset, DP attention (every rank holds the whole table)
-    # registers in place -- the shared checkpoint mapping, pinned once per node
-    # rather than copied once per rank -- and copies only if that is refused.
-    # `tools/engram/bench_uva_shard.py` measures both.
-    "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
-    # Optional override of the file that serializes shared in-place
-    # registration. Empty: host_memory names one from the checkpoint path.
-    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", ""),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.

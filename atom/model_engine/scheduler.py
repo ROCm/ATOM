@@ -35,6 +35,7 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
+from atom.kv_transfer.disaggregation.types import produced_no_handoff
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -361,12 +362,13 @@ class ScheduledBatch:
         self.mrope_positions_by_req = {
             seq.id: seq.mrope_positions
             for seq in seqs.values()
-            if getattr(seq, "mrope_positions", None) is not None
+            if seq.mrope_positions is not None
         }
+        # A decode leg has no positions, only the delta its prefill handed it.
         self.mrope_position_deltas = {
-            seq.id: getattr(seq, "mrope_position_delta", 0)
+            seq.id: seq.mrope_position_delta
             for seq in seqs.values()
-            if getattr(seq, "mrope_positions", None) is not None
+            if seq.mrope_positions is not None or seq.mrope_position_delta
         }
 
         # num_cached_tokens for chunked prefill support
@@ -686,7 +688,8 @@ class Scheduler:
     _ENGINE_LABEL = ""
     _METRICS_ROLE = ""
     # A preempted sequence recomputes its prompt here, which a KV change relies
-    # on to keep what was running (see `preempt_running`).
+    # on to keep what was running (see `preempt_running`); an image decode leg
+    # whose media its prefill kept cannot, and is finished instead.
     can_recompute_prompts = True
     pd_admission: PdAdmissionController | None = None
 
@@ -729,10 +732,16 @@ class Scheduler:
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
         self.stop_token_ids = config.stop_token_ids
+        # Built before the block manager: a connector may provide its pool.
+        from atom.utils.forward_context import get_kvconnector
+
+        self.kv_connector = get_kvconnector("scheduler", config)
         self.block_manager = BlockManager(
             config,
             state_runtime=state_runtime,
+            kv_connector=self.kv_connector,
         )
+        self.stages_state_on_finish = self.block_manager.num_state_transfer_slots > 0
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
@@ -892,9 +901,6 @@ class Scheduler:
         # that must file at retire lands here; see `_finalize_prefill_chunk`.
         self._checkpoint_holds: dict[int, int] = {}
 
-        from atom.utils.forward_context import get_kvconnector
-
-        self.kv_connector = get_kvconnector("scheduler", config)
         if self._connector_flag("cancels_undispatched_loads"):
             # Only such a connector changes the abort path; any other keeps
             # the class's `_finish_rejected_waiting` as is.
@@ -940,6 +946,11 @@ class Scheduler:
             throughput_log_interval_steps=config.throughput_log_interval_steps,
             cache_hit_rate_window=config.cache_hit_rate_window,
             pool_pressure=self.block_manager.pool_pressure,
+            transfer_slot_occupancy=(
+                self.block_manager.transfer_slot_occupancy
+                if self.stages_state_on_finish
+                else None
+            ),
         )
         if config.enable_prefix_caching:
             self.engine_stats.block_manager = self.block_manager
@@ -1519,6 +1530,14 @@ class Scheduler:
             if seq.status == SequenceStatus.ABORTED:
                 examined += 1
                 continue
+            if self.block_manager.shared_prefix_pending(seq):
+                # Phase 2 parks it among the prefix waiters until its prefix
+                # lands from another rank's pool. Asking starts that copy, as
+                # a walk below would, so the probe reports what Phase 2 does.
+                lookup_skips -= 1
+                if lookup_skips < 0:
+                    break
+                continue
             if self._head_waits_on_tier_lookup(seq):
                 # Phase 2 skips it until its lookup answers (`prefix_waiters`),
                 # so reporting it prefillable would make the delayer count a
@@ -1892,6 +1911,18 @@ class Scheduler:
         if callable(callback):
             callback(str(seq.id))
 
+    def _stage_state_for_send(self, seq: Sequence) -> None:
+        """Move a finished P/D request's state to a transfer slot, if one is free.
+
+        Its live slots go back to admission now; the runner copies the state
+        before the next forward, and the connector pushes it from the transfer slot.
+        """
+        if produced_no_handoff(seq):
+            return
+        moved = self.block_manager.move_state_to_transfer_slot(seq)
+        if moved is not None:
+            self.kv_connector.stage_state_for_send(seq, *moved)
+
     def _connector_send_finished(self, req_id) -> None:
         """Drop the connector's send claim on a request's source blocks.
 
@@ -2233,11 +2264,17 @@ class Scheduler:
         as long as it fires, and nothing would fail — the log would just go
         quiet, which is indistinguishable from an idle engine.
         """
+        # Prefixes other pools copied in since the last pass become hits now,
+        # before any walk of this one.
+        self.block_manager.kv.poll_fetches()
         result = self._schedule()
         if self.pd_admission is not None and result is not None:
             batch, seqs = result
             if not batch.is_dummy_run:
                 self.pd_admission.scheduled(seqs.values())
+        # Here for the same reason as the tick: what this pass decided about
+        # blocks reaches the pool's backend once, whichever return was taken.
+        self.block_manager.kv.flush()
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
 
@@ -2486,6 +2523,12 @@ class Scheduler:
                 early_waiting += 1
                 continue
 
+            # Its prefix is still being copied in from another rank's pool:
+            # admitting it now would recompute what is about to land.
+            if self.block_manager.shared_prefix_pending(seq):
+                prefix_waiters.append(seq)
+                continue
+
             admission_ready = getattr(self.kv_connector, "admission_ready", None)
             if callable(admission_ready) and not admission_ready(seq):
                 # D may reserve a later request first. Unready P requests own no
@@ -2525,6 +2568,17 @@ class Scheduler:
 
             if remote_ready_for_decode:
                 self._schedule_first_decode_after_remote_kv(seq)
+                continue
+
+            # Without a load, every way on from here prefills locally: no
+            # connector, a failed receive, a requeue after its receive was
+            # queued, a preempted decode, an offload tier's resume on an
+            # instance with no P/D connector.
+            if (
+                seq.kv_transfer_params is not None
+                and not needs_remote_load
+                and self._refuse_prefill_without_media(seq)
+            ):
                 continue
 
             if offload_resume:
@@ -2761,6 +2815,12 @@ class Scheduler:
                     break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 self._inflight_prefix_wait.pop(seq.id, None)
+                continue
+            # A load an offload tier declines after `allocate` prefills
+            # locally too.
+            if seq.kv_transfer_params is not None and (
+                self._refuse_prefill_without_media(seq)
+            ):
                 continue
 
             if seq.offload_joint.boundary_tokens:
@@ -3603,6 +3663,17 @@ class Scheduler:
             seq.num_cached_tokens
         )
         return needs_remote_load
+
+    def _refuse_prefill_without_media(self, seq: Sequence) -> bool:
+        """Finish `seq` instead of prefilling it locally when it is a decode
+        leg whose media its prefill kept: its image placeholders would run as
+        text. True when it was finished."""
+        if not seq.media_on_prefill_instance:
+            return False
+        self._finish_rejected_waiting(
+            seq, reason="unschedulable: image decode leg has no media"
+        )
+        return True
 
     def _schedule_first_decode_after_remote_kv(self, seq: Sequence) -> None:
         """P/D path: a remote prefill completed, so schedule first decode."""
@@ -4643,7 +4714,9 @@ class Scheduler:
     def preempt_running(self) -> int:
         """Preempt every running sequence ahead of a KV change; return how many.
 
-        Each recomputes its prompt and tokens once scheduled again. Raises,
+        Each recomputes its prompt and tokens once scheduled again, except an
+        image decode leg whose media its prefill kept: that one is finished
+        when it is next admitted, as it has nothing to recompute from. Raises,
         preempting none, while one's blocks are still in use: remote KV loading
         for a parked request, a KV connector holding the sequence, or its token
         in flight through the pipeline. ``preempt()`` refuses nothing else, so
@@ -5473,6 +5546,12 @@ class Scheduler:
         self.engine_stats.update_throughput(
             num_generation_tokens=num_new_generation_tokens
         )
+        # Blocks this pass filled and released become visible to the pool's
+        # backend (and through it to other engine ranks) here.
+        # Demoted blocks became readable on this batch's device; publish them
+        # now that the forward carrying their copies was issued.
+        self.block_manager.kv.settle()
+        self.block_manager.kv.flush()
         return finished_seqs
 
     def _mark_finished(self, seq, reason, num_tokens):
@@ -5482,6 +5561,9 @@ class Scheduler:
         # without sampled output and requests without a stream queue.
         seq.leave_reason = reason
         if self.kv_connector is not None:
+            if self.stages_state_on_finish:
+                # Before `request_finished`, which advertises the slot.
+                self._stage_state_for_send(seq)
             callback = getattr(self.kv_connector, "request_finished", None)
             if callable(callback):
                 callback(seq)

@@ -189,9 +189,10 @@ class DSparkProposer(Drafter):
         it does all_gather the vocab shard; ``capture_epilogue`` says whether
         that one collective is captured with the rest.
 
-        Its ids are what `DraftGraph.run` copies out of the pool: deferred
-        output feeds them back as the next step's `input_ids`, so they are the
-        one thing here that outlives the pass.
+        Its ids are what `DraftGraph.run` copies out of the pool where the
+        recording allocated them (a mono head writes its own buffers, none):
+        deferred output feeds them back as the next step's `input_ids`, so
+        they are the one thing here that outlives the pass.
 
         It must be WARMED regardless: the head has its own per-shape flydsl
         builder, and leaving it out of the warm is exactly how

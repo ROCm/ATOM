@@ -44,7 +44,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
     let shared = [1, 2].map(|port| {
         Arc::new(
             BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
-                .labels(std::collections::HashMap::from([(
+                .labels(HashMap::from([(
                     "mesh.responses_state".into(),
                     "shared".into(),
                 )]))
@@ -63,7 +63,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
 #[tokio::test]
 async fn capabilities_and_exact_token_routing_are_explicit() {
     let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
-        .labels(std::collections::HashMap::from([(
+        .labels(HashMap::from([(
             "mesh.apis".into(),
             "/v1/messages, /v1/chat/completions".into(),
         )]))
@@ -260,6 +260,71 @@ async fn fastokens_models_tokenize_up_to_their_own_limit() {
         }
     }
 }
+
+/// A chat whose effort its model's template rejects and ATOM accepts
+/// tokenizes under the model's reasoning controls, with the effort ATOM takes.
+#[tokio::test]
+async fn chats_tokenize_with_the_effort_their_model_takes() {
+    let config = crate::config::RouterConfig {
+        policy: prefix_hash(),
+        ..Default::default()
+    };
+    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, _pool.handle())
+        .await
+        .unwrap();
+    // As V4.1's, the template rejects an effort it has no budget for.
+    let template = concat!(
+        "{%- if reasoning_effort is defined and reasoning_effort not in ['low', 'medium', 'high', 'max'] -%}",
+        "{{ raise_exception('Invalid reasoning effort') }}{%- endif -%}",
+        "{{ messages[0].content }}/{{ thinking_mode | default('-') }}/{{ reasoning_effort | default('-') }}",
+    );
+    let (_dir, hf, _) = huggingface_and_fastokens(template);
+    let id = TokenizerRegistry::generate_id();
+    let tokenizer = hf.clone();
+    app.tokenizer_registry
+        .load(&id, "m", "m", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    let v41 = Some(ChatControls::DeepseekV41);
+    for (controls, effort, want) in [
+        (None, "medium", Ok("hi/-/medium")),
+        (None, "minimal", Err("invalid_request")),
+        (v41, "minimal", Ok("hi/-/low")),
+        (v41, "medium", Ok("hi/-/high")),
+        (v41, "none", Ok("hi/chat/-")),
+        (v41, "ultra", Err("invalid_request")),
+    ] {
+        match controls {
+            Some(controls) => app.chat_controls.write().insert(id.clone(), controls),
+            None => app.chat_controls.write().remove(&id),
+        };
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let parsed =
+            ParsedInference::parse("/v1/chat/completions", &serde_json::to_vec(&body).unwrap())
+                .unwrap();
+        let routing = IngressRouting::new(&app);
+        let result = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let tokens = result
+            .map(|(_, tokens)| tokens.unwrap())
+            .map_err(|error| error.code);
+        let want = want.map(|prompt| hf.encode(prompt, false).unwrap().token_ids().to_vec());
+        assert_eq!(tokens, want, "{body}");
+    }
+}
 fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -407,6 +472,77 @@ async fn lightweight_http_routing_needs_no_second_pool_submission() {
             assert_eq!(candidates[0].model_id(), "m");
         }
     }
+}
+
+/// The PD router's and ext-proc's planners select decode first under ATOM's idx2idx only.
+#[tokio::test]
+async fn idx2idx_planners_select_prefill_on_the_decode_rank() {
+    use crate::config::{AtomPdRankMappingPolicy, BackendType};
+    use crate::core::{
+        placement::{test_support::make_descriptor, PdPlanner, PlacementPlan},
+        DPAwareWorkerBuilder,
+    };
+    use crate::routers::http_pd_router::PDRouter;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let kv_transfer_info = Router::new().route(
+        "/kv_transfer_info",
+        get(|| async { axum::Json(json!({"tp_size": 1, "kv_role": "kv_producer"})) }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, kv_transfer_info).await });
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let descriptor = make_descriptor(Some("m"), None, None, None);
+    for (backend, decode_first) in [(BackendType::Atom, true), (BackendType::Sglang, false)] {
+        let config = crate::config::RouterConfig {
+            backend,
+            atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::Idx2Idx,
+            ..Default::default()
+        };
+        let app = Arc::new(
+            AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
+        let prefill = WorkerType::Prefill {
+            bootstrap_port: None,
+        };
+        let workers: Vec<Arc<dyn Worker>> = [
+            (base.as_str(), 0, prefill.clone()),
+            (base.as_str(), 1, prefill),
+            ("http://d", 1, WorkerType::Decode),
+        ]
+        .into_iter()
+        .map(|(url, rank, kind)| {
+            let builder = DPAwareWorkerBuilder::new_with_type(url, rank, 2, kind);
+            Arc::new(builder.model_id("m").build()) as Arc<dyn Worker>
+        })
+        .collect();
+        for worker in &workers {
+            app.worker_registry.register(worker.clone());
+        }
+        app.policy_registry
+            .set_prefill_policy(Arc::new(crate::policies::RoundRobinPolicy::new()));
+        let policies = Arc::new(PolicyRegistryAdapter::new(app.policy_registry.clone()));
+        let ingress = IngressRouting::new(&app).planner(workers, policies);
+        let router = PDRouter::new(&app).await.unwrap();
+
+        for planner in [&ingress as &dyn PdPlanner, router.planner.as_ref()] {
+            let mut ranks = HashSet::new();
+            for _ in 0..4 {
+                match planner.plan(&descriptor).await.unwrap() {
+                    PlacementPlan::Pair { prefill, .. } => ranks.insert(prefill.dp_rank()),
+                    other => panic!("expected Pair, got {other:?}"),
+                };
+            }
+            assert_eq!(
+                ranks == HashSet::from([Some(1)]),
+                decode_first,
+                "{backend:?}"
+            );
+        }
+    }
+    server.abort();
 }
 
 #[tokio::test]
@@ -661,7 +797,7 @@ impl crate::routers::RouterTrait for NativeIngressRouter {
     async fn route_chat(
         &self,
         _: Option<&HeaderMap>,
-        _: &crate::protocols::chat::ChatCompletionRequest,
+        _: &ChatCompletionRequest,
         _: Option<&str>,
     ) -> Response {
         Response::new(axum::body::Body::empty())

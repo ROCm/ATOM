@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2026 ATOM Project Contributors
 
 """
 DeepSeek-V4 model for ATOM (PR1: skeleton + tiny-config eager forward).
@@ -3657,6 +3658,9 @@ class ParallelHead(ParallelLMHead):
     bf16-on-disk weight has the same effective precision as the reference's
     fp32 path while halving VRAM and using the faster a16w16 kernel.
     """
+
+    # its logits are the mHC reduction and norm, then the projection
+    logits_are_head = False
 
     def __init__(
         self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6

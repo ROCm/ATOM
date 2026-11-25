@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -24,7 +24,8 @@ use crate::{
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{
-        atom_standalone::AtomStandaloneRuntime, prepare::fast_tokenizer::TokenizeLimits,
+        atom_bridge::AtomBridgeRuntime,
+        prepare::{chat_controls::ChatControls, fast_tokenizer::TokenizeLimits},
         router_manager::RouterManager,
     },
     tokenizer::registry::TokenizerRegistry,
@@ -55,6 +56,10 @@ pub struct AppContext {
     /// their Jinja template, found as each registers. HTTP routing does not
     /// tokenize those chats.
     pub chats_without_template: Arc<RwLock<HashSet<String>>>,
+    /// The reasoning controls ATOM renders a tokenizer's chats under, by
+    /// registry id, for the checkpoints that have their own; HTTP routing
+    /// takes the effort of those chats as ATOM does.
+    pub(crate) chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
     /// `router_config`'s tokenization byte limits.
     pub(crate) tokenize_limits: TokenizeLimits,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -72,7 +77,9 @@ pub struct AppContext {
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
-    pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    /// ATOM standalone (`USE_ATOMESH_ENTRYPOINTS=1`): the OpenAI API served by
+    /// Rust down to LLMEngine.
+    pub atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
     /// Set with `kv_events` in the router config.
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     /// Set with `kv_events` in the router config.
@@ -104,7 +111,7 @@ pub struct AppContextBuilder {
     load_monitor: Option<Arc<LoadMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
-    atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
 }
 
 impl AppContext {
@@ -145,7 +152,7 @@ impl AppContextBuilder {
             load_monitor: None,
             worker_job_queue: None,
             workflow_engines: None,
-            atom_standalone_runtime: None,
+            atom_bridge_runtime: None,
         }
     }
 
@@ -239,8 +246,8 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn atom_standalone_runtime(mut self, runtime: Option<Arc<AtomStandaloneRuntime>>) -> Self {
-        self.atom_standalone_runtime = runtime;
+    pub fn atom_bridge_runtime(mut self, runtime: Option<Arc<AtomBridgeRuntime>>) -> Self {
+        self.atom_bridge_runtime = runtime;
         self
     }
 
@@ -305,6 +312,7 @@ impl AppContextBuilder {
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
             chats_without_template: Default::default(),
+            chat_controls: Default::default(),
             tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
@@ -329,7 +337,7 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError("workflow_engines"))?,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
-            atom_standalone_runtime: self.atom_standalone_runtime,
+            atom_bridge_runtime: self.atom_bridge_runtime,
             kv_event_monitor,
             kv_storage,
         })
@@ -392,7 +400,9 @@ impl AppContextBuilder {
     /// Create reasoning parser factory for gRPC mode
     fn with_reasoning_parser_factory(mut self) -> Self {
         // Initialize reasoning parser factory
-        self.reasoning_parser_factory = Some(ReasoningParserFactory::new());
+        let factory = ReasoningParserFactory::new();
+        crate::reasoning::register(&factory);
+        self.reasoning_parser_factory = Some(factory);
         self
     }
 

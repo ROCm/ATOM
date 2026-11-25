@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import logging
 from abc import ABC, abstractmethod
@@ -38,6 +39,7 @@ from atom.model_ops.attentions.token_layout.batch_ids import (
     build_cu_seqlens,
     build_query_layout,
 )
+from atom.model_ops.attentions.token_layout.decode import mrope_decode_positions
 from atom.model_ops.attentions.token_layout.prefill import (
     PrefillBatch,
     prefill_positions,
@@ -198,6 +200,22 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         before it, alike on every TP rank."""
         return False
 
+    def settles_spec_status(self, batch: ScheduledBatch, max_seqlen_q: int) -> bool:
+        """True when this builder stages the step before the previous verify's
+        host-side status and restages what the status moves once it is taken
+        (`take_spec_status`): the wait then overlaps the staging and the rest
+        of the step's preparation. Asked once a step, before its input ids;
+        ignored when the step `consumes_device_verdict`."""
+        return False
+
+    def take_spec_status(self, processor) -> None:
+        """Take the previous verify's host-side status, owed by this step
+        (`tokenIDProcessor.take_deferred_spec_status`): where the runner ends
+        the step's preparation, before the target's launch, so everything
+        before it overlaps the wait. A builder that `settles_spec_status`
+        finishes the step there (its heads, and what reads them)."""
+        processor.take_deferred_spec_status()
+
     def close(self):
         """Release backend-owned host workers and mapped resources."""
         self.release_kv_pools()
@@ -356,6 +374,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return StateTransfer.none()
 
+    def state_transfer_slots(self) -> int:
+        """State slots past the live ones, kept for a P/D producer's pushes."""
+        return 0
+
     def checkpoint_image_bytes(self) -> int | None:
         """Bytes of an Active Slot a checkpoint image has to hold.
 
@@ -385,6 +407,21 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError(
             f"{type(self).__name__} owns per-request state but does not "
             "implement relocate_state_slots"
+        )
+
+    def owned_pool_layout(self):
+        """`(arena, PAGE regions)` of a paged pool this builder allocated
+        itself rather than carving from the runner's buffer, or None. A
+        backend that allocates its own arena (DeepSeek-V4.1) implements it, so
+        a pool-providing connector learns where its blocks are."""
+
+    def copy_paged_blocks(self, copies: Sequence[tuple[int, int]]) -> None:
+        """Copy whole paged blocks `(source, destination)` on the compute
+        stream, before the forward (a split pool demoting a private block into
+        its shared part). A backend whose pool can be split implements it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot copy paged blocks; "
+            "a share_ratio below 1 (umbp_pool connector) is not supported for this model"
         )
 
     def execute_paged_state_copies(
@@ -1130,19 +1167,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         width = scheduled_tokens if running_tokens is None else running_tokens
         positions = self._mrope_cpu_view(width)
         positions[:, scheduled_tokens:] = 0
-        lengths = batch.num_scheduled_tokens[: len(context_lens)]
-        offset = 0
-        for req_id, context_len, length in zip(batch.req_ids, context_lens, lengths):
-            start = int(context_len) - int(length)
-            stop = int(context_len)
-            delta = batch.mrope_position_deltas.get(req_id)
-            if delta is None:
-                base = np.arange(start, stop, dtype=np.int64)
-            else:
-                base = np.arange(start + int(delta), stop + int(delta), dtype=np.int64)
-            positions[:, offset : offset + int(length)] = base[None, :]
-            offset += int(length)
-
+        mrope_decode_positions(
+            batch.req_ids,
+            context_lens,
+            batch.num_scheduled_tokens[: len(context_lens)],
+            batch.mrope_position_deltas,
+            positions,
+        )
         return self._stage_mrope(width, group)
 
     @h2d_producer("early", runner="model_runner")
@@ -1667,6 +1698,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
+        if state_ops.block_copies:
+            self.copy_paged_blocks(state_ops.block_copies)
         if is_prefill:
             built = self.prepare_prefill(
                 batch, running_bs, running_tokens, ubatch_slices, pcp_groups

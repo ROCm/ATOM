@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Quantized draft attention, cache state, and replay against independent oracles."""
 
 from types import SimpleNamespace
@@ -79,11 +81,6 @@ def test_runtime_setting_reaches_draft_constructor(monkeypatch, dtype):
         dspark, "build_attention_topology", lambda *a: [SimpleNamespace(layer_id=40)]
     )
     monkeypatch.setattr(dspark, "DraftBlock", lambda *a, **kw: nn.Identity())
-    # This test isolates config propagation with weightless draft stages.
-    # The real norm/weight binding is covered by test_dspark_context_norm_quant.
-    monkeypatch.setattr(
-        dspark.DeepseekV41DSpark, "_build_main_norm_quant", lambda self: None
-    )
     monkeypatch.setattr(dspark, "RotaryEmbedding", lambda *a, **kw: nn.Identity())
     assert dspark.DeepseekV41DSpark(config).draft_kv_dtype == dtype
 
