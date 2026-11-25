@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -149,7 +149,7 @@ def main():
                     "status": "captured_failure_stopping",
                     "evidence": evidence,
                     "native_seen": native_seen,
-                    "captured_at": datetime.now(UTC).isoformat(),
+                    "captured_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017 - GPU hosts run Python 3.10
                     "interpretation": "Diagnostic snapshot only; root cause not yet established.",
                 }
                 (root / "timeout-probe-result.json").write_text(
