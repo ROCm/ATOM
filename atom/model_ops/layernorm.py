@@ -1152,9 +1152,17 @@ def fused_allreduce_gemma_rms_norm_mxfp8_quant(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     norm: GemmaRMSNorm,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return Gemma-normalized E4M3 values, E8M0 scales, and the residual."""
+    emit_bf16: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """Return Gemma-normalized E4M3 values, E8M0 scales, and the residual.
+
+    ``emit_bf16`` (TP 1 only) also returns the normalized row as ``norm`` writes
+    it: (E4M3, E8M0 scale, normalized row, residual)."""
     if get_tensor_model_parallel_world_size() > 1:
+        assert not emit_bf16, "emit_bf16 is the TP 1 norm's"
         if tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant is None:
             raise RuntimeError(
                 "ATOM_MINIMAX_M3_GLUON_AR_MXFP8 requires an aiter exposing "
@@ -1171,10 +1179,45 @@ def fused_allreduce_gemma_rms_norm_mxfp8_quant(
         )
         return out_fp8, scale_out, residual_out
 
-    from atom.model_ops.blockscale import quantize_fp8
+    if not envs.ATOM_M3_TP1_NORM_MXFP8:
+        assert not emit_bf16, "emit_bf16 needs ATOM_M3_TP1_NORM_MXFP8"
+        from atom.model_ops.blockscale import quantize_fp8
 
-    normed, residual_out = norm(hidden_states, residual)
-    out_fp8, scale_out = quantize_fp8(normed)
+        normed, residual_out = norm(hidden_states, residual)
+        out_fp8, scale_out = quantize_fp8(normed)
+        return out_fp8, scale_out, residual_out
+
+    # TP 1: residual add + the norm `norm` runs + its group-32 MXFP8 quant
+    # (quantize_fp8) in one launch of the same aiter kernel, bit for bit the two.
+    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+
+    from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
+
+    shape = hidden_states.shape
+    x = hidden_states.view(-1, shape[-1])
+    out_fp8 = torch.empty(x.shape, dtype=FP8_DTYPE, device=x.device)
+    scale_out = torch.empty(
+        (x.shape[0], shape[-1] // 32), dtype=torch.float8_e8m0fnu, device=x.device
+    )
+    residual_out = torch.empty_like(x)
+    normed = torch.empty_like(x) if emit_bf16 else None
+    fused_qk_rmsnorm_group_quant(
+        out_fp8,
+        scale_out,
+        x,
+        norm.weight.data,
+        norm.variance_epsilon,
+        q_out_unquantized=normed,
+        q_res_out=residual_out,
+        q_residual=residual.view(-1, shape[-1]),
+        group_size=32,
+        gemma_norm=True,
+    )
+    out_fp8 = out_fp8.view(shape)
+    scale_out = scale_out.view(*shape[:-1], shape[-1] // 32)
+    residual_out = residual_out.view(shape)
+    if emit_bf16:
+        return out_fp8, scale_out, normed.view(shape), residual_out
     return out_fp8, scale_out, residual_out
 
 

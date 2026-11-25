@@ -230,6 +230,56 @@ def test_serial_forward_preserves_routed_then_shared_order() -> None:
     assert log == ["routed", "shared"]
 
 
+def test_serial_forward_feeds_the_shared_mlp_its_given_mxfp8_rows() -> None:
+    """With the post-attention norm's MXFP8 rows given, the shared MLP takes
+    them (and their scales) instead of quantizing the bf16 rows itself."""
+    hidden = MagicMock()
+    hidden.shape = (2, 64)
+    flat = MagicMock()
+    hidden.view.return_value = flat
+    routed = MagicMock()
+    shared_x, shared_x_scale = object(), object()
+    moe = SimpleNamespace(shared_input_from_moe_quant=False)
+    moe.routed_expert_forward = MagicMock(return_value=routed)
+    moe.shared_experts = MagicMock()
+
+    m3_model.MiniMaxM3MoE.single_stream_moe_forward(
+        moe, hidden, (shared_x, shared_x_scale)
+    )
+
+    moe.routed_expert_forward.assert_called_once_with(flat)
+    moe.shared_experts.assert_called_once_with(shared_x, x_scale=shared_x_scale)
+
+
+def test_dual_stream_feeds_the_shared_mlp_its_given_mxfp8_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On the alt stream too, the shared MLP takes the given MXFP8 rows."""
+    log: list[str] = []
+    main, alt = _Stream("main", log), _Stream("alt", log)
+
+    @contextmanager
+    def use_stream(stream: _Stream):
+        yield
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    hidden = MagicMock()
+    hidden.shape = (2, 64)
+    hidden.view.return_value = MagicMock()
+    routed = MagicMock()
+    shared_x, shared_x_scale = object(), object()
+    moe = SimpleNamespace(alt_stream=alt)
+    moe.shared_experts = MagicMock()
+    moe.routed_expert_forward = MagicMock(return_value=routed)
+
+    m3_model.MiniMaxM3MoE.dual_stream_moe_forward(
+        moe, hidden, (shared_x, shared_x_scale)
+    )
+
+    moe.shared_experts.assert_called_once_with(shared_x, x_scale=shared_x_scale)
+
+
 def test_moe_registers_dual_stream_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -434,7 +484,7 @@ def test_declined_shared_fold_adds_the_shared_mlp_then_skips_the_fold(
     # The same token count later goes to the stream path (here: no alt stream).
     m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
     assert len(fold.calls) == 1
-    moe.single_stream_moe_forward.assert_called_once_with(hidden)
+    moe.single_stream_moe_forward.assert_called_once_with(hidden, None)
 
 
 @pytest.mark.parametrize("fused", [False, True])

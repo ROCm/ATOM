@@ -32,6 +32,7 @@ def _gpu_stack_import(name):
 layernorm = _gpu_stack_import("atom.model_ops.layernorm")
 minimax_m3 = _gpu_stack_import("atom.models.minimax_m3.model")
 blockscale = _gpu_stack_import("atom.model_ops.blockscale")
+quantization = _gpu_stack_import("atom.model_ops.blockscale_kernels.quantization")
 
 
 @pytest.mark.parametrize(
@@ -135,26 +136,94 @@ def test_tp_helper_names_the_required_aiter_api(monkeypatch):
         )
 
 
-def test_single_rank_helper_norms_then_quantizes(monkeypatch):
-    monkeypatch.setattr(
-        layernorm,
-        "get_tensor_model_parallel_world_size",
-        lambda: 1,
-    )
+def test_single_rank_helper_norms_then_quantizes_by_default(monkeypatch):
+    """TP 1 without ATOM_M3_TP1_NORM_MXFP8: the norm, then quantize_fp8."""
+    monkeypatch.delenv("ATOM_M3_TP1_NORM_MXFP8", raising=False)
+    monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 1)
     normed, residual_out = object(), object()
     norm = Mock(return_value=(normed, residual_out))
     values, scales = object(), object()
     quantize = Mock(return_value=(values, scales))
     monkeypatch.setattr(blockscale, "quantize_fp8", quantize)
 
-    hidden_states = object()
-    residual = object()
+    hidden_states, residual = object(), object()
     result = layernorm.fused_allreduce_gemma_rms_norm_mxfp8_quant(
-        hidden_states,
-        residual,
-        norm,
+        hidden_states, residual, norm
     )
 
     assert result == (values, scales, residual_out)
     norm.assert_called_once_with(hidden_states, residual)
     quantize.assert_called_once_with(normed)
+
+
+@pytest.mark.parametrize("emit_bf16", [False, True])
+def test_single_rank_helper_is_one_aiter_mxfp8_norm(monkeypatch, emit_bf16):
+    """TP 1 with ATOM_M3_TP1_NORM_MXFP8: residual add + the Gemma norm + its
+    group-32 MXFP8 quant in one aiter launch (fp8 values + E8M0 scales), the
+    bf16 row only when asked."""
+    import aiter.ops.fused_qk_rmsnorm_group_quant as fqk
+
+    monkeypatch.setenv("ATOM_M3_TP1_NORM_MXFP8", "1")
+    monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 1)
+    fused = Mock()
+    monkeypatch.setattr(fqk, "fused_qk_rmsnorm_group_quant", fused)
+    hidden_states = torch.randn(2, 3, 64, dtype=torch.bfloat16)
+    residual = torch.randn_like(hidden_states)
+    norm = SimpleNamespace(
+        weight=torch.nn.Parameter(torch.zeros(64)), variance_epsilon=1e-6
+    )
+
+    result = layernorm.fused_allreduce_gemma_rms_norm_mxfp8_quant(
+        hidden_states, residual, norm, emit_bf16=emit_bf16
+    )
+
+    (values, scales, x, weight, eps), kwargs = fused.call_args
+    assert fused.call_count == 1 and eps == 1e-6
+    assert weight.data_ptr() == norm.weight.data_ptr()
+    assert x.shape == (6, 64) and x.data_ptr() == hidden_states.data_ptr()
+    assert values.dtype == quantization.FP8_DTYPE and values.shape == (6, 64)
+    assert scales.dtype == torch.float8_e8m0fnu and scales.shape == (6, 2)
+    assert kwargs["q_residual"].data_ptr() == residual.data_ptr()
+    assert kwargs["group_size"] == 32 and kwargs["gemma_norm"] is True
+    assert (kwargs["q_out_unquantized"] is not None) == emit_bf16
+    assert len(result) == (4 if emit_bf16 else 3)
+    assert result[0].shape == (2, 3, 64) and result[1].shape == (2, 3, 2)
+    assert result[-1].data_ptr() == kwargs["q_res_out"].data_ptr()
+    if emit_bf16:
+        assert result[2].data_ptr() == kwargs["q_out_unquantized"].data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("rows", [1, 255, 256, 4096, 32768])
+def test_single_rank_helper_bytes_are_norm_then_quantize_fp8(monkeypatch, rows):
+    """M3.1's hidden 6144 at decode and prefill row counts (255/256 straddle the
+    gfx1250 switch to the interleaved launch): the one-launch MXFP8 norm writes
+    the bytes of the norm followed by quantize_fp8, and the same bf16 row."""
+    monkeypatch.setenv("ATOM_M3_TP1_NORM_MXFP8", "1")
+    monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 1)
+    torch.manual_seed(rows)
+    # bf16 like the model's weights (aiter wants the weight in the input dtype)
+    norm = layernorm.GemmaRMSNorm(6144, eps=1e-6).to("cuda", torch.bfloat16)
+    norm.weight.data.normal_(0.0, 0.1)
+    x = torch.randn(rows, 6144, dtype=torch.bfloat16, device="cuda") * 3
+    residual = torch.randn_like(x)
+
+    normed, residual_ref = norm.forward_cuda(x, residual)
+    values_ref, scales_ref = blockscale.quantize_fp8(normed)
+    values, scales, row, residual_out = (
+        layernorm.fused_allreduce_gemma_rms_norm_mxfp8_quant(
+            x, residual, norm, emit_bf16=True
+        )
+    )
+
+    assert torch.equal(values.view(torch.uint8), values_ref.view(torch.uint8))
+    assert torch.equal(scales.view(torch.uint8), scales_ref.view(torch.uint8))
+    assert torch.equal(row.view(torch.int16), normed.view(torch.int16))
+    assert torch.equal(residual_out.view(torch.int16), residual_ref.view(torch.int16))
+    # the launch without the bf16 row (input norm, dense MLP) writes the same
+    values2, scales2, residual_out2 = (
+        layernorm.fused_allreduce_gemma_rms_norm_mxfp8_quant(x, residual, norm)
+    )
+    assert torch.equal(values2.view(torch.uint8), values.view(torch.uint8))
+    assert torch.equal(scales2.view(torch.uint8), scales.view(torch.uint8))
+    assert torch.equal(residual_out2.view(torch.int16), residual_out.view(torch.int16))

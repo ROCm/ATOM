@@ -24,7 +24,7 @@ from transformers import PretrainedConfig
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.indexer_cp import indexer_cp_enabled
-from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.base_attention import (
     Attention,
@@ -382,6 +382,17 @@ direct_register_custom_op(
     # The decode GEMM reads row-major E4M3 rows and contiguous E8M0 scales.
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
+
+
+def _shared_mlp(
+    shared_experts: nn.Module,
+    hidden_states: torch.Tensor,
+    shared_in: tuple[torch.Tensor, torch.Tensor] | None,
+) -> torch.Tensor:
+    """The shared MLP of `hidden_states`, from its MXFP8 rows when given."""
+    if shared_in is None:
+        return shared_experts(hidden_states)
+    return shared_experts(shared_in[0], x_scale=shared_in[1])
 
 
 def _linear_consumes_mxfp8(linear: nn.Module) -> bool:
@@ -931,7 +942,23 @@ class MiniMaxM3MoE(nn.Module):
         """Run the routed E128/top-4 branch and keep its TP-partial output."""
         return self._scale_routed(self._route_and_experts(hidden_states))
 
-    def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def takes_shared_mxfp8_input(self) -> bool:
+        """Whether `forward` can take the shared expert's MXFP8 input from the
+        caller (`shared_x`, `shared_x_scale`): a separate shared MLP whose gate_up
+        is a native MXFP8 linear, not fed by the routed quant or folded into the
+        routed launches."""
+        return (
+            self.shared_experts is not None
+            and not self.shared_input_from_moe_quant
+            and not self._shared_fold
+            and _linear_consumes_mxfp8(self.shared_experts.gate_up_proj)
+        )
+
+    def single_stream_moe_forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_in: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         if self.shared_input_from_moe_quant:
@@ -955,16 +982,22 @@ class MiniMaxM3MoE(nn.Module):
             return routed_output.view(orig_shape)
         if getattr(self, "_glue_epilogue", None) is not None and self._use_dual_stream:
             # Reached only from the dual-stream op (eager), see `_glue_epilogue`.
-            shared_output = self.shared_experts(hidden_states)
+            shared_output = _shared_mlp(self.shared_experts, hidden_states, shared_in)
             return self._routed_plus_shared(hidden_states, shared_output).view(
                 orig_shape
             )
         routed_output = self.routed_expert_forward(hidden_states)
         if self.shared_experts is not None:
-            routed_output = routed_output + self.shared_experts(hidden_states)
+            routed_output = routed_output + _shared_mlp(
+                self.shared_experts, hidden_states, shared_in
+            )
         return routed_output.view(orig_shape)
 
-    def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def dual_stream_moe_forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_in: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         """Overlap the independent shared MLP with the routed MoE branch (or,
         with the shared fold, run it inside the routed MoE's launches)."""
         orig_shape = hidden_states.shape
@@ -975,7 +1008,9 @@ class MiniMaxM3MoE(nn.Module):
         ):
             return self._shared_fold_forward(hidden_states).view(orig_shape)
         if self.alt_stream is None:
-            return self.single_stream_moe_forward(hidden_states).view(orig_shape)
+            return self.single_stream_moe_forward(hidden_states, shared_in).view(
+                orig_shape
+            )
         current_stream = torch.cuda.current_stream()
         alt_stream = self.alt_stream
 
@@ -993,7 +1028,9 @@ class MiniMaxM3MoE(nn.Module):
             def launch_shared() -> torch.Tensor:
                 alt_stream.wait_event(fork)
                 with torch.cuda.stream(alt_stream):
-                    launched.append(self.shared_experts(hidden_states))
+                    launched.append(
+                        _shared_mlp(self.shared_experts, hidden_states, shared_in)
+                    )
                 return launched[0]
 
             output = self._routed_plus_shared(
@@ -1007,7 +1044,7 @@ class MiniMaxM3MoE(nn.Module):
 
         alt_stream.wait_stream(current_stream)
         with torch.cuda.stream(alt_stream):
-            shared_output = self.shared_experts(hidden_states)
+            shared_output = _shared_mlp(self.shared_experts, hidden_states, shared_in)
 
         if getattr(self, "_glue_epilogue", None) is not None:
             # The join moves to right before the gather-reduce that adds it.
@@ -1030,10 +1067,23 @@ class MiniMaxM3MoE(nn.Module):
         shared_output.record_stream(current_stream)
         return (routed_output + shared_output).view(orig_shape)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_x: torch.Tensor | None = None,
+        shared_x_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """`shared_x`, `shared_x_scale`: the shared expert's MXFP8 input, the
+        quant of `hidden_states` its gate_up would make (see
+        `takes_shared_mxfp8_input`)."""
         if self._use_dual_stream:
+            if shared_x is not None:
+                return torch.ops.aiter.minimax_m3_moe_shared_in(
+                    hidden_states, shared_x, shared_x_scale, self.prefix
+                )
             return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
-        return self.single_stream_moe_forward(hidden_states)
+        shared_in = None if shared_x is None else (shared_x, shared_x_scale)
+        return self.single_stream_moe_forward(hidden_states, shared_in)
 
     # ---- ATOM_M3_SP_MOE_FRONT: the MoE front on the sequence-parallel owner rows ----
     def _sp_front_quant_ok(self) -> bool:
@@ -1213,6 +1263,41 @@ direct_register_custom_op(
     op_func=minimax_m3_sp_moe_front,
     mutates_args=(),
     fake_impl=_minimax_m3_sp_moe_front_fake,
+)
+
+
+def minimax_m3_moe_shared_in(
+    hidden_states: torch.Tensor,
+    shared_x: torch.Tensor,
+    shared_x_scale: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """`maybe_dual_stream_forward` of the MoE `layer_name` with the shared
+    expert's MXFP8 input given (`MiniMaxM3MoE.forward`'s `shared_x`)."""
+    moe = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    shared_in = (shared_x, shared_x_scale)
+    if _module_dispatch_ops._dual_stream_is_active(moe, hidden_states.shape[0]):
+        return moe.dual_stream_moe_forward(hidden_states, shared_in)
+    return moe.single_stream_moe_forward(hidden_states, shared_in)
+
+
+def _minimax_m3_moe_shared_in_fake(
+    hidden_states: torch.Tensor,
+    shared_x: torch.Tensor,
+    shared_x_scale: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_moe_shared_in",
+    op_func=minimax_m3_moe_shared_in,
+    mutates_args=(),
+    fake_impl=_minimax_m3_moe_shared_in_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
 
@@ -1685,6 +1770,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             and not self.is_moe_layer
             and _linear_consumes_mxfp8(self.mlp.gate_up_proj)
         )
+        # TP 1: the MoE's post-attention norm also writes the shared expert's
+        # MXFP8 input (its gate_up's own quant of the same row, bit for bit).
+        post_attention_norm_shared_mxfp8 = (
+            enable_mxfp8_fused_ar
+            and envs.ATOM_M3_TP1_NORM_MXFP8
+            and self.is_moe_layer
+            and get_tensor_model_parallel_world_size() == 1
+            and self.block_sparse_moe.takes_shared_mxfp8_input()
+        )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -1745,6 +1839,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 )
             )
             hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        elif post_attention_norm_shared_mxfp8:
+            shared_x, shared_x_scale, hidden_states, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8_quant(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm,
+                    emit_bf16=True,
+                )
+            )
+            hidden_states = ffn(
+                hidden_states, shared_x=shared_x, shared_x_scale=shared_x_scale
+            )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.post_attention_layernorm

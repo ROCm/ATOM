@@ -989,11 +989,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # MiniMax-M3 only: feed eligible native group-32 FP8 QKV and dense-MLP
     # linears directly from aiter's fused TP4 all-reduce + Gemma RMSNorm +
-    # MXFP8 quantizer. Off by default until the model-level path is enabled
-    # deliberately; unsupported linears keep the existing BF16/per-token path.
+    # MXFP8 quantizer; at TP 1 from aiter's fused_qk_rmsnorm_group_quant MXFP8
+    # mode, which also feeds a MoE layer's separate shared expert. Off by
+    # default until the model-level path is enabled deliberately; unsupported
+    # linears keep the existing BF16/per-token path.
     "ATOM_MINIMAX_M3_GLUON_AR_MXFP8": lambda: _flag_env(
         "ATOM_MINIMAX_M3_GLUON_AR_MXFP8"
     ),
+    # MiniMax-M3 at TP 1 under ATOM_MINIMAX_M3_GLUON_AR_MXFP8: the norm writes
+    # the native MXFP8 input in the same aiter fused_qk_rmsnorm_group_quant
+    # launch (also a MoE layer's separate shared expert) instead of norm +
+    # quantize_fp8. Same bytes. Opt-in for A/B.
+    "ATOM_M3_TP1_NORM_MXFP8": lambda: _flag_env("ATOM_M3_TP1_NORM_MXFP8"),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
     # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
