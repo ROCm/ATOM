@@ -614,6 +614,9 @@ class ReqMeta:
     # PD incremental: blocks already in decode's prefix cache; both sides
     # skip block_ids[:num_computed_blocks]. 0 = full transfer.
     num_computed_blocks: int = 0
+    # ATOM_MORIIO_VERIFY: the positions among those blocks that decode's prefix
+    # cache did not publish from a push (`Block.received`).
+    verify_held_not_received: list[int] = field(default_factory=list)
     # How many producer blocks correspond to one destination block. 1 when
     # producer and consumer share a DCP world, consumer dcp_size when the
     # producer is unsharded.
@@ -719,6 +722,9 @@ class ConnectorMetadata:
             local_slot_index=kv_transfer_params.get("local_slot_index", -1),
             remote_slot_index=kv_transfer_params.get("remote_slot_index", -1),
             num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
+            verify_held_not_received=kv_transfer_params.get(
+                "verify_held_not_received", []
+            ),
             src_block_skip_factor=kv_transfer_params.get("src_block_skip_factor", 1),
             chunked_transfer=kv_transfer_params.get("chunked_transfer", False),
             num_prompt_tokens=kv_transfer_params.get("num_prompt_tokens", 0),
