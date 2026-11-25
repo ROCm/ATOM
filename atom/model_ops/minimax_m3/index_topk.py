@@ -1150,6 +1150,7 @@ def _prefill_merge_topk_kernel(
     MERGE_SIZE: tl.constexpr,
     pages_per_block: tl.constexpr,
     block_page_stride: tl.constexpr,
+    CHUNK_BLOCKS: tl.constexpr,  # blocks a list covers, 0: every list is written
 ):
     pid_q = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -1160,6 +1161,9 @@ def _prefill_merge_topk_kernel(
         return
     prefix_len = tl.load(row_prefix + pid_b)
     valid_blocks = (prefix_len + pid_q + SPARSE_BLOCK) // SPARSE_BLOCK
+    if CHUNK_BLOCKS > 0:
+        # The fused scorer writes the lists of the chunks a row reaches.
+        num_partial = (valid_blocks + CHUNK_BLOCKS - 1) // CHUNK_BLOCKS * BLOCK_SIZE_T
 
     cols = tl.arange(0, MERGE_SIZE)
     keys = tl.load(
@@ -1220,9 +1224,8 @@ def _launch_parallel_prefill_selector(
     batch = row_starts.shape[0] - 1
     num_groups = triton.cdiv(max_block, PREFILL_TOPK_MAX_BLOCK_SIZE_K)
     block_size_t = triton.next_power_of_2(topk)
-    sparse_bt, sparse_ctx, stride_bt_b, stride_sbt_n = emit_args
     if pages_per_block == PAGES_PER_SPARSE_BLOCK:
-        partial_keys = sparse_bt.view(torch.int64).view(num_idx_heads, total_q, -1)
+        partial_keys = emit_args[0].view(torch.int64).view(num_idx_heads, total_q, -1)
     else:
         partial_keys = torch.empty(
             (num_idx_heads, total_q, num_groups * block_size_t),
@@ -1246,7 +1249,39 @@ def _launch_parallel_prefill_selector(
         num_warps=1,
     )
 
-    num_partial = num_groups * block_size_t
+    _launch_prefill_merge(
+        partial_keys[:, :, : num_groups * block_size_t],
+        topk_idx,
+        row_starts,
+        row_prefix,
+        block_table,
+        emit_args,
+        rows_per_req,
+        topk,
+        block_page_stride,
+        pages_per_block,
+    )
+
+
+def _launch_prefill_merge(
+    partial_keys,
+    topk_idx,
+    row_starts,
+    row_prefix,
+    block_table,
+    emit_args,
+    rows_per_req,
+    topk,
+    block_page_stride,
+    pages_per_block,
+    chunk_blocks=0,
+):
+    """Each row's top-k of its lists of ``_pack_score_key`` keys
+    ``[heads, total_q, lists * 16]``, and the emission. ``chunk_blocks``: a
+    list covers that many blocks and only the lists a row reaches are read."""
+    num_idx_heads, _, num_partial = partial_keys.shape
+    batch = row_starts.shape[0] - 1
+    sparse_bt, sparse_ctx, stride_bt_b, stride_sbt_n = emit_args
     _prefill_merge_topk_kernel[(rows_per_req, batch, num_idx_heads)](
         partial_keys,
         topk_idx,
@@ -1263,10 +1298,11 @@ def _launch_parallel_prefill_selector(
         stride_sbt_n,
         NUM_KV_HEADS=num_idx_heads,
         SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
-        BLOCK_SIZE_T=block_size_t,
+        BLOCK_SIZE_T=triton.next_power_of_2(topk),
         MERGE_SIZE=triton.next_power_of_2(num_partial),
         pages_per_block=pages_per_block,
         block_page_stride=block_page_stride,
+        CHUNK_BLOCKS=chunk_blocks,
         num_warps=1,
     )
 
@@ -2192,17 +2228,19 @@ def _decode_index_score_transposed_kernel(
 # ---------------------------------------------------------------------------
 @functools.cache
 def _flydsl_prefill_score_opts(spec: str) -> tuple[tuple[str, int], ...]:
-    """``ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS`` ("key=int,...") as the launch
-    keywords handed to aiter's prefill scorer (its tile: ``block_q``, ``waves``,
-    ``ring``, ``lds_scores``). Empty: aiter's defaults. aiter validates them;
-    none it accepts changes a score."""
+    """``ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS`` or
+    ``ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS`` ("key=int,...") as the launch
+    keywords handed to aiter's prefill scorer or its fused scorer + top-16 (the
+    tile: ``block_q``, ``waves``, ``ring``; ``lds_scores`` or ``chunk_blocks``).
+    Empty: aiter's defaults. aiter validates them; none it accepts changes a
+    score or the selection."""
     opts = []
     for item in filter(None, (x.strip() for x in spec.split(","))):
         key, sep, value = item.partition("=")
         if not sep:
             raise ValueError(
-                "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS must be 'key=int,...', "
-                f"got {spec!r}"
+                "ATOM_M3_INDEX_{SCORE,TOPK}_FLYDSL_PREFILL_OPTS must be "
+                f"'key=int,...', got {spec!r}"
             )
         opts.append((key.strip(), int(value)))
     return tuple(opts)
@@ -2233,6 +2271,39 @@ def _flydsl_prefill_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len)
     if opts:
         return functools.partial(index_score_prefill_nvfp4, **dict(opts))
     return index_score_prefill_nvfp4
+
+
+def _flydsl_prefill_topk(
+    idx_q, index_kv_cache, index_kv_scale, max_query_len, topk, max_block, emit
+):
+    """(aiter's fused prefill scorer + top-16, its chunk) when
+    ``ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL`` asks for it and it serves the call
+    (aiter decides: gfx1250, the FP4 index cache, top-16), else None. The row
+    bound is the FlyDSL scorer's -- the same loop -- and the merge that takes
+    its keys always emits. Imported directly: the flag needs an aiter that has
+    the op."""
+    if (
+        index_kv_scale is None
+        or not emit
+        or not envs.ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL
+        or max_query_len < envs.ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS
+    ):
+        return None
+    from aiter.ops.flydsl.index_score_prefill import (
+        TOPK_CHUNK_BLOCKS,
+        index_topk_prefill_nvfp4,
+        index_topk_prefill_nvfp4_supported,
+    )
+
+    if not index_topk_prefill_nvfp4_supported(
+        idx_q, index_kv_cache, index_kv_scale, topk, max_block
+    ):
+        return None
+    opts = {
+        "chunk_blocks": TOPK_CHUNK_BLOCKS,
+        **dict(_flydsl_prefill_score_opts(envs.ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS)),
+    }
+    return functools.partial(index_topk_prefill_nvfp4, **opts), opts["chunk_blocks"]
 
 
 def _flydsl_decode_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len):
@@ -2350,6 +2421,64 @@ def minimax_m3_index_topk(
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
 
+    topk_idx = torch.empty(
+        (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
+    )
+    emit_out, emit_args = _alloc_emit(
+        total_q,
+        num_idx_heads,
+        topk,
+        block_table,
+        emit_sparse_block_table,
+        idx_q.device,
+        emit_pages_per_block,
+    )
+    fused = _flydsl_prefill_topk(
+        idx_q,
+        index_kv_cache,
+        index_kv_scale,
+        max_query_len,
+        topk,
+        max_block,
+        emit_sparse_block_table,
+    )
+    if fused is not None:
+        # aiter's fused scorer + top-16 (ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL): the
+        # FlyDSL scorer's scores never reach memory. Each of its workgroups
+        # hands on a row's 16 best blocks of its chunk as `_pack_score_key`
+        # keys, and the merge below picks the row's 16 and emits: the same
+        # keys, top-k and emission as the selectors', so the same outputs.
+        _check_fp4_index(index_kv_cache, index_kv_scale, head_dim)
+        index_topk, chunk_blocks = fused
+        keys = index_topk(
+            idx_q,
+            index_kv_cache,
+            index_kv_scale,
+            block_table if score_block_table is None else score_block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            sm_scale,
+            max_query_len,
+            max_block,
+            init_blocks,
+            local_blocks,
+        )
+        _launch_prefill_merge(
+            keys,
+            topk_idx,
+            cu_seqlens_q,
+            prefix_lens,
+            block_table,
+            emit_args,
+            max_query_len,
+            topk,
+            block_page_stride,
+            emit_pages_per_block,
+            chunk_blocks,
+        )
+        return (topk_idx, *emit_out)
+
     score = prefill_score_buffer(
         num_idx_heads, total_q, max_block, idx_q.device, score_reserve
     )
@@ -2445,18 +2574,6 @@ def minimax_m3_index_topk(
             num_stages=score_num_stages,
         )
 
-    topk_idx = torch.empty(
-        (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
-    )
-    emit_out, emit_args = _alloc_emit(
-        total_q,
-        num_idx_heads,
-        topk,
-        block_table,
-        emit_sparse_block_table,
-        idx_q.device,
-        emit_pages_per_block,
-    )
     _launch_select(
         score,
         topk_idx,

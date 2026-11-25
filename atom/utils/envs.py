@@ -901,6 +901,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS": lambda: os.getenv(
         "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS", ""
     ),
+    # MiniMax-M3 prefill indexer over the FP4 index cache on gfx1250: aiter's
+    # fused FlyDSL scorer + top-16 (`index_topk_prefill_nvfp4`) instead of a
+    # scorer and a selector, the scores never written; the same selection.
+    # Opt-in for A/B. _OPTS: its launch keywords, "key=int,..." (chunk_blocks,
+    # block_q, waves, ring); aiter validates them.
+    "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL": lambda: _flag_env(
+        "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL"
+    ),
+    "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS": lambda: os.getenv(
+        "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS", ""
+    ),
     # MiniMax-M3 prefill index top-k: the widest tile (blocks, a power of two)
     # the Triton packed selector sorts at once. Same selection at any value.
     "ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K": lambda: int(
