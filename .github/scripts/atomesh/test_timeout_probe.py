@@ -203,6 +203,19 @@ class TimeoutProbeTests(unittest.TestCase):
         self.assertEqual(removed, [sidecar])
         self.assertEqual(result["sidecars_remaining"], [])
 
+    def test_long_failed_write_still_triggers_stacks_without_native_metadata(self):
+        failure = {
+            "event": "failed_native_write",
+            "pid": 10,
+            "tid": 20,
+            "duration_s": 31,
+        }
+        evidence = failure_evidence([failure])
+        self.assertEqual(evidence["native"]["event"], "native_state_unavailable")
+        self.assertEqual(evidence["connector"], failure)
+        failure["duration_s"] = 0.01
+        self.assertIsNone(failure_evidence([failure]))
+
 
 if __name__ == "__main__":
     unittest.main()

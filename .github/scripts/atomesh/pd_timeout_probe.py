@@ -53,6 +53,18 @@ def failure_evidence(events):
                 "native_call_start_monotonic_ns"
             ] <= n["monotonic_ns"] <= f["monotonic_ns"]:
                 return {"native": n, "connector": f}
+    # Very large batches exceed the bounded native reader; still capture their
+    # live thread stacks rather than waiting through more doomed requests.
+    for f in failures:
+        if f.get("duration_s", 0) >= 30:
+            return {
+                "native": {
+                    "event": "native_state_unavailable",
+                    "pid": f["pid"],
+                    "tid": f["tid"],
+                },
+                "connector": f,
+            }
     return None
 
 
