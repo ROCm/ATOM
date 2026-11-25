@@ -20,8 +20,11 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     runs-on: atom-mi355-8gpu.predownload
     timeout-minutes: 120
+    # Keep this group separate from the example matrix below. The unit job and
+    # the matrix start together, and a group holds at most one running and one
+    # pending job, so a shared group makes one of them cancel the other.
     concurrency:
-      group: atomrl-dapo-atom-mi355-8gpu.predownload
+      group: atomrl-dapo-unit-atom-mi355-8gpu.predownload
       cancel-in-progress: false
     permissions:
       contents: read
@@ -116,7 +119,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     concurrency:
-      group: atomrl-dapo-${{ matrix.runner }}
+      group: atomrl-dapo-examples-${{ matrix.runner }}
       cancel-in-progress: false
     permissions:
       contents: read
