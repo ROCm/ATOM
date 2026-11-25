@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
-"""MiniMax-M3 FP8 sparse prefill on aiter's token-tiled kernel (gfx950, TP1): one CTA
-serves 12 consecutive tokens of one request and one KV head, reading shared blocks once.
+"""MiniMax-M3 FP8 sparse prefill on aiter's token-tiled kernel (gfx950, TP1): a tile of
+12 consecutive tokens of one request and one KV head reads the blocks they share once.
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ logger = logging.getLogger("atom")
 _KV_HEADS, _HEADS_PER_KV, _HEAD_DIM, _TOPK = 4, 16, 128, 16
 # fewer rows leave most CUs idle (0.5-0.97x of ASM in situ)
 _MIN_ROWS = 1536
-# deep layers share fewer blocks a tile past this context and lose to ASM
-_MAX_SEQ_LEN = 32768
+# past it, deep layers of code-like prompts share fewer blocks a tile and lose to ASM
+_MAX_SEQ_LEN = 65_536
 
 
 @functools.cache
