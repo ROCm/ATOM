@@ -110,6 +110,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
             runner,
             SimpleNamespace(
                 total_seqs_num=bs,
+                temperatures=np.ones(bs, np.float32),
                 return_logprobs=[False] * bs,
                 any_logprobs=False,
                 required_channel=None,
@@ -187,6 +188,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
             runner,
             SimpleNamespace(
                 total_seqs_num=bs,
+                temperatures=np.ones(bs, np.float32),
                 return_logprobs=[False] * bs,
                 any_logprobs=False,
                 required_channel=None,

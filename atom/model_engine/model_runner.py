@@ -840,6 +840,21 @@ def _profile_runner_stage(method):
     return wrapped
 
 
+def _any_greedy(batch: ScheduledBatch, all_greedy: bool) -> bool:
+    """Whether any scheduled request samples greedily, read on the CPU.
+
+    The sampler's greedy-row correction (an argmax over the vocabulary and a
+    select) only changes greedy rows; with none in the batch it is skipped.
+    Read off the batch's requested temperatures (``prepare_sample`` clamps a
+    copy of them) with the sampler's own threshold, so a request the sampler
+    treats as greedy always counts.
+    """
+    if all_greedy:
+        return True
+    temperatures = batch.temperatures[: batch.total_seqs_num]
+    return bool((temperatures <= SAMPLER_EPS).any())
+
+
 class ModelRunner:
     # The verify head (`_bind_verify_head`), None where the logits are the
     # head output; whether this step deferred the previous verify's status
@@ -3431,21 +3446,6 @@ class ModelRunner:
                 return LmHeadOutput(verified, None)
         return LmHeadOutput(None, self.compute_logits(hidden_states))
 
-    @staticmethod
-    def _any_greedy(batch: ScheduledBatch, all_greedy: bool) -> bool:
-        """Whether any scheduled request samples greedily, read on the CPU.
-
-        The sampler's greedy-row correction (an argmax over the vocabulary and
-        a select) only changes greedy rows; with none in the batch it is
-        skipped. Read off the batch's requested temperatures (``prepare_sample``
-        clamps a copy of them) with the sampler's own threshold, so a request
-        the sampler treats as greedy always counts.
-        """
-        if all_greedy:
-            return True
-        temperatures = batch.temperatures[: batch.total_seqs_num]
-        return bool((temperatures <= SAMPLER_EPS).any())
-
     @_profile_runner_stage
     def postprocess(
         self,
@@ -3462,7 +3462,7 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         verified, logits = lm_head_output
-        any_greedy = self._any_greedy(batch, all_greedy)
+        any_greedy = _any_greedy(batch, all_greedy)
         # Keep probability payloads available on every participating rank.
         need_logprobs = batch.any_logprobs
         logprob_snapshot = None
@@ -5300,7 +5300,7 @@ class RapidServeModelRunner(ModelRunner):
                 top_ks,
                 top_ps,
                 all_greedy,
-                any_greedy=self._any_greedy(batch, all_greedy),
+                any_greedy=_any_greedy(batch, all_greedy),
             )
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()
