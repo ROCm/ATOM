@@ -460,6 +460,22 @@ and catches it; set it when chasing a corruption that does not reproduce.
 | **ATOM_PREFIX_FAST_WALK** | bool | true | Look the prompt's chain up with C-speed `map` rounds (the first block alone, then 16, 64, ... blocks, so a cold prompt costs one lookup), compare tokens on the last hit block only (all blocks if that one differs), and let `allocate` claim the blocks `can_allocate` found instead of walking the prompt again; any block that changed in between sends it back to the block-by-block walk. `0` walks block by block with a token compare per block. |
 | **ATOM_PREFIX_WALK_MEMO** | bool | true | Reuse a waiting request's prefix walk across the probes that run every scheduler tick: the delayer's head check and probe, and the DP chunk-cost estimate (`BlockManager.can_allocate_memoized`). It walks again when a hash the walk read is evicted, remapped to another block or revoked by a republish of its block, the hash at its first miss is published, `clear_cache` runs, more than 8192 such changes happened since its last check, or the request's token count or seed changed. The fit, state gates and replay are re-asked on every tick, so the answer equals the exact probe; admission still probes exactly. `0` re-walks every tick. |
 
+## KV pool backend
+
+No variables. The paged KV pool is the engine's own unless a KV connector
+provides it (`KVConnectorBase.kv_pool_memory`,
+`KVConnectorSchedulerBase.make_block_pool`). The `umbp_pool` connector hands it to
+a MORI-UMBP standalone server so DP ranks share cached prefixes; it is set up
+through `--kv-transfer-config` like any connector, e.g.
+`{"kv_connector": "umbp_pool", "kv_connector_extra_config": {"address":
+"unix:///tmp/umbp-l1/server.sock", "share_ratio": 0.5}}`. Below a share ratio
+of 1, `placement` (`private`, `shared` or `write_through`) says where fresh
+content goes and what moves between the private part and UMBP's. Its settings
+are documented in `atom/kv_transfer/pool/umbp/settings.py`. It serves
+DeepSeek-V4.1 under data-parallel attention (one runner per engine rank) and
+needs a MORI build whose UMBP L1 client copies into held slots (`Fetch` with
+`dst_slots`); startup refuses other models and tensor-parallel attention.
+
 ## State checkpoints
 
 For models carrying per-request recurrent state (GDN: Qwen3-Next / Qwen3.5;
