@@ -853,6 +853,18 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
     ):
+        if inputs_embeds is None and not self._mono.enabled:
+            # ATOM_EMBED_NORM0_MX32 (default off): layer 0's embedding + norm + quant
+            # from one launch, handed down as the model's inputs_embeds (same bytes)
+            from atom.model_ops import embed_norm_mx32
+
+            model = self.language_model.model
+            if embed_norm_mx32.enabled() and hasattr(model, "_embed_norm0_mx32"):
+                fused = model._embed_norm0_mx32(input_ids)
+                if fused is not None:
+                    return self.language_model(
+                        input_ids, positions, intermediate_tensors, fused
+                    )
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         if self._mono.supports(
@@ -1028,6 +1040,18 @@ class _Qwen3_5MultimodalBase(nn.Module):
     ):
         # Keep the compiled language model on the inputs_embeds path so vision
         # embeddings are not dropped after text-only warmup.
+        if inputs_embeds is None and not self._mono.enabled:
+            # ATOM_EMBED_NORM0_MX32 (default off): text-only rows: layer 0's embedding +
+            # norm + quant from one launch, handed down as inputs_embeds (same bytes)
+            from atom.model_ops import embed_norm_mx32
+
+            model = self.language_model.model
+            if embed_norm_mx32.enabled() and hasattr(model, "_embed_norm0_mx32"):
+                fused = model._embed_norm0_mx32(input_ids)
+                if fused is not None:
+                    return self.language_model(
+                        input_ids, positions, intermediate_tensors, fused
+                    )
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         if self._mono.supports(

@@ -33,6 +33,11 @@ _HOSTFAST_PRESENCE = os.environ.get("ATOM_HOSTFAST_PRESENCE", "0") == "1"
 # verify's host hand-off, so the GPU is never 8 penalized steps behind the host
 # and a slot's previous upload has long completed when it comes round again.
 _PINNED_RING = 8
+# ATOM_HOSTNEXT_POST_GRAPH (with ATOM_HOSTFAST_PRESENCE): a decode step's rows
+# go to one fixed device buffer instead of a fresh allocation, so the recorded
+# post-verify graph (`post_verify_graph`) reads them at the addresses it was
+# recorded with. The same bytes uploaded on the same stream.
+_FIXED_ROWS = _HOSTFAST_PRESENCE and os.environ.get("ATOM_HOSTNEXT_POST_GRAPH", "0") == "1"
 
 
 @triton.jit
@@ -72,6 +77,66 @@ def _apply_presence_penalty_kernel(
     x = tl.load(ptrs, mask=inb).to(tl.float32)
     x = x - tl.where(present, p, 0.0)
     tl.store(ptrs, x.to(logits_ptr.dtype.element_ty), mask=inb)
+
+
+# ATOM_PRESENCE_FUSED_ANCHORS=1 (default off): the anchors' marks (index_select of the
+# anchors + _mark_tokens_kernel, two launches) folded into the penalty launch. A row's
+# `present` also takes its request's anchor (input id `start`), which the unfused chain
+# marked into the mask before this kernel read it; and the programs of rows r < num_seqs
+# set request r's anchor byte in its slot's mask (their column block's share), as the mark
+# kernel did. Same logits, same mask afterwards.
+_FUSED_ANCHORS = os.environ.get("ATOM_PRESENCE_FUSED_ANCHORS", "0") == "1"
+
+
+@triton.jit
+def _apply_presence_penalty_anchors_kernel(
+    logits_ptr,
+    logits_stride,
+    input_ids_ptr,
+    row_seq_ptr,
+    row_pos_ptr,
+    seq_start_ptr,
+    slot_ptr,
+    penalty_ptr,
+    mask_ptr,
+    mask_stride,
+    vocab_start,
+    vocab_local,
+    num_seqs,
+    vocab,
+    MAX_EXTRA: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    inb = cols < vocab_local
+    s = tl.load(row_seq_ptr + row)
+    p = tl.load(penalty_ptr + s)
+    slot = tl.load(slot_ptr + s).to(tl.int64)
+    pos = tl.load(row_pos_ptr + row)
+    start = tl.load(seq_start_ptr + s)
+    present = (
+        tl.load(mask_ptr + slot * mask_stride + vocab_start + cols, mask=inb, other=0)
+        != 0
+    )
+    # the request's anchor (marked before the penalty in the unfused chain)
+    anchor = tl.load(input_ids_ptr + start)
+    present = present | (((cols + vocab_start) == anchor) & (anchor >= 0) & (anchor < vocab))
+    # the drafts this row's context already holds: input ids start + 1 .. start + pos
+    for k in tl.static_range(1, MAX_EXTRA + 1):
+        tok = tl.load(input_ids_ptr + start + k, mask=k <= pos, other=-1)
+        present = present | ((cols + vocab_start) == tok)
+    ptrs = logits_ptr + row.to(tl.int64) * logits_stride + cols
+    x = tl.load(ptrs, mask=inb).to(tl.float32)
+    x = x - tl.where(present, p, 0.0)
+    tl.store(ptrs, x.to(logits_ptr.dtype.element_ty), mask=inb)
+    # request `row`'s anchor byte, by the program whose global column block holds it
+    if row < num_seqs:
+        a = tl.load(input_ids_ptr + tl.load(seq_start_ptr + row))
+        a_slot = tl.load(slot_ptr + row).to(tl.int64)
+        lo = vocab_start + tl.program_id(1) * BLOCK
+        mine = (a >= lo) & (a < lo + BLOCK) & (a >= 0) & (a < vocab)
+        tl.store(mask_ptr + a_slot * mask_stride + a, tl.full([], 1, tl.uint8), mask=mine)
 
 
 @triton.jit
@@ -219,8 +284,42 @@ class PresencePenaltyStep:
     def apply(self, logits: torch.Tensor, vocab_start: int = 0) -> torch.Tensor:
         """Subtract the penalties in place from `logits` `[rows, V_local]`, the
         vocab slice starting at `vocab_start` (a TP shard's or the whole vocab)."""
-        self._mark_anchors()
         rows = min(self.num_rows, logits.shape[0])
+        nseq = self.seq_start.numel()
+        if (
+            _FUSED_ANCHORS
+            and not self._anchors_marked
+            and rows >= nseq
+            and rows > 0
+            and vocab_start == 0
+            and logits.shape[1] == self.state.mask.shape[1]
+        ):
+            # the anchors' marks in the penalty launch (rows r < nseq mark request r's)
+            self._anchors_marked = True
+            assert logits.stride(1) == 1
+            block = 4096
+            _apply_presence_penalty_anchors_kernel[
+                (rows, triton.cdiv(logits.shape[1], block))
+            ](
+                logits,
+                logits.stride(0),
+                self.input_ids,
+                self.row_seq,
+                self.row_pos,
+                self.seq_start,
+                self.slots,
+                self.penalties,
+                self.state.mask,
+                self.state.mask.stride(0),
+                vocab_start,
+                logits.shape[1],
+                nseq,
+                self.state.mask.shape[1],
+                MAX_EXTRA=self.state.max_extra,
+                BLOCK=block,
+            )
+            return logits
+        self._mark_anchors()
         if rows == 0:
             return logits
         assert logits.stride(1) == 1
@@ -277,6 +376,11 @@ class PresencePenaltyState:
         self._free = list(range(self.num_slots - 1, -1, -1))
         self._pin_ring: list | None = None
         self._pin_next = 0
+        self._fixed_rows: torch.Tensor | None = None
+        # _FIXED_ROWS: the last decode step's rows, reused while the batch and
+        # the slots are unchanged (`begin_step`)
+        self._slot_calls = 0
+        self._last_rows = None
 
     def _pinned_staging(self, n: int):
         """The next pinned int32 host buffer of the ring (and its numpy view),
@@ -299,6 +403,7 @@ class PresencePenaltyState:
         """Each request's slot, allocating (and clearing) those not yet seen;
         recycles the least recently scheduled request outside this batch."""
         in_batch = set(req_ids)
+        self._slot_calls += 1
         slots = np.empty(len(req_ids), dtype=np.int32)
         fresh = []
         for i, rid in enumerate(req_ids):
@@ -329,6 +434,23 @@ class PresencePenaltyState:
         pens = getattr(batch, "presence_penalties", None)
         if pens is None or batch.is_dummy_run or not np.any(pens != 0):
             return None
+        if _FIXED_ROWS and batch.total_tokens_num_prefill == 0:
+            # The same requests, query lengths and penalties as the last decode
+            # step, and no slot handed out since: the same rows, already in the
+            # fixed buffer, and the slots' order already this batch's.
+            last = self._last_rows
+            key = (
+                tuple(batch.req_ids),
+                np.asarray(batch.num_scheduled_tokens).tobytes(),
+                np.asarray(pens, dtype=np.float32).tobytes(),
+            )
+            if (
+                last is not None
+                and last[0] == key
+                and last[1] == self._slot_calls
+                and last[2] is self._fixed_rows
+            ):
+                return PresencePenaltyStep(self, *last[3], input_ids)
         slots = self._slots_for(batch.req_ids)
         if batch.total_tokens_num_prefill > 0:
             return None
@@ -356,7 +478,16 @@ class PresencePenaltyState:
             for p in parts:
                 host_np[o : o + len(p)] = p
                 o += len(p)
-            dev = host[:total].to(self.device, non_blocking=True)
+            if _FIXED_ROWS:
+                fixed = self._fixed_rows
+                if fixed is None or fixed.numel() < host.numel():
+                    fixed = self._fixed_rows = torch.empty(
+                        host.numel(), dtype=torch.int32, device=self.device
+                    )
+                dev = fixed[:total]
+                dev.copy_(host[:total], non_blocking=True)
+            else:
+                dev = host[:total].to(self.device, non_blocking=True)
         else:
             host = torch.from_numpy(
                 np.concatenate(
@@ -371,12 +502,13 @@ class PresencePenaltyState:
             ).pin_memory()
             dev = host.to(self.device, non_blocking=True)
         bs, n = len(q), len(row_seq)
-        return PresencePenaltyStep(
-            self,
+        views = (
             dev[:bs],
             dev[bs : 2 * bs].view(torch.float32),
             dev[2 * bs : 3 * bs],
             dev[3 * bs : 3 * bs + n],
             dev[3 * bs + n :],
-            input_ids,
         )
+        if _FIXED_ROWS and _HOSTFAST_PRESENCE:
+            self._last_rows = (key, self._slot_calls, self._fixed_rows, views)
+        return PresencePenaltyStep(self, *views, input_ids)

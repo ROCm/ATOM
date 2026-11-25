@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
+from atom.utils import late_pack
 import torch
 import triton
 import triton.language as tl
@@ -1532,11 +1533,17 @@ class GDNStateMixin(PoolRowsMixin):
             n = num_bonus.shape[0]
             np.add(num_bonus, 1, out=host[:n])
             host[n:] = 1
-            self.num_accepted_tokens.copy_(ring[i], non_blocking=True)
+            if late_pack.active() and self.num_accepted_tokens.is_contiguous():
+                late_pack.add(self.num_accepted_tokens, ring[i])
+            else:
+                self.num_accepted_tokens.copy_(ring[i], non_blocking=True)
         else:
             host = np.ones(self.num_accepted_tokens.shape, dtype=np.int32)
             host[: num_bonus.shape[0]] = num_bonus + 1
-            self.num_accepted_tokens.copy_(torch.from_numpy(host), non_blocking=True)
+            if late_pack.active() and self.num_accepted_tokens.is_contiguous():
+                late_pack.add(self.num_accepted_tokens, torch.from_numpy(host))
+            else:
+                self.num_accepted_tokens.copy_(torch.from_numpy(host), non_blocking=True)
         early = getattr(self.model_runner.tokenID_processor, "early_fix", None)
         if early is not None:
             # ATOM_HOSTNEXT_EARLY_META: the carried-over rows' bonus counts
@@ -2919,9 +2926,29 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         running_tokens: int,
         max_seqlen_q: int,
     ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_decode(
-            batch, running_bs, running_tokens, max_seqlen_q
+        # ATOM_PROLOGUE_PACKED_H2D: with the fused prologue nothing on the GPU reads this
+        # build's uploads before `early_prologue`: collect them into one upload + scatter
+        early = getattr(self.model_runner.tokenID_processor, "early_fix", None)
+        packing = (
+            late_pack.enabled()
+            and early is not None
+            and early.fused
+            and not batch.is_dummy_run
+            and max_seqlen_q > 1
+            and self.use_spec_decode
+            and envs.ATOM_GDN_FUSED_DECODE_PAD
+            and not late_pack.active()
         )
+        if packing:
+            late_pack.begin(self.num_accepted_tokens.device)
+        try:
+            attn_metadata, positions = super().prepare_decode(
+                batch, running_bs, running_tokens, max_seqlen_q
+            )
+        except BaseException:
+            if packing and late_pack.active():
+                late_pack.flush()
+            raise
         # publish_cu_seqlens_q already filled and uploaded the padded prefix
         # before prepare_input_ids. Reuse it without rewriting a borrowed source.
         attn_metadata.cu_seqlens_q = self.model_runner.forward_vars["cu_seqlens_q"].gpu[
@@ -2929,9 +2956,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         ]
 
         # The common decode builder already filled the block-table source.
-        self._attach_gdn_decode_metadata(
-            batch, attn_metadata, prepare_block_tables=False
-        )
+        try:
+            self._attach_gdn_decode_metadata(
+                batch, attn_metadata, prepare_block_tables=False
+            )
+        finally:
+            if packing and late_pack.active():
+                late_pack.flush()
         if self._fused_prologue():
             from atom.model_ops.attentions.early_meta import early_prologue
 

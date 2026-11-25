@@ -180,5 +180,33 @@ class HostHandoffRing:
         self._busy[index] = True
         return HostSlot(self, index, seq, shape)
 
+    def claim_cached(self, shape: tuple) -> HostSlot:
+        """`claim` with the slot's views made once per (slot, shape) and kept
+        (ATOM_HOSTNEXT_POST_GRAPH): the same memory, a few us less a claim."""
+        seq = self._seq % 0x7FFFFFFE + 1
+        index = seq % self.num_slots
+        if self._busy[index]:
+            raise RuntimeError(f"host hand-off slot {index} claimed before its receive")
+        cache = self.__dict__.setdefault("_views", {})
+        views = cache.get((index, shape))
+        if views is None:
+            if shape[0] * shape[1] > self.capacity:
+                raise ValueError(
+                    f"host hand-off shape {tuple(shape)} exceeds {self.capacity}"
+                )
+            slot = HostSlot(self, index, seq, shape)
+            cache[(index, shape)] = (slot.view, slot.array_view, slot.flag)
+        else:
+            slot = HostSlot.__new__(HostSlot)
+            slot.ring = self
+            slot.index = index
+            slot.seq = seq
+            slot.view, slot.array_view, slot.flag = views
+            slot.copy_done = slot
+            slot.source = None
+        self._seq = seq
+        self._busy[index] = True
+        return slot
+
     def _release(self, slot: HostSlot) -> None:
         self._busy[slot.index] = False
