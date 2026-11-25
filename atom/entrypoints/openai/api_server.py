@@ -2348,9 +2348,15 @@ async def _chat_completions(
         is_multimodal = _has_multimodal_content(messages)
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
-        if assistant_prefix is not None and (
-            is_multimodal or request.get_prompt_token_ids() is not None
-        ):
+        pretokenized = request.get_prompt_token_ids()
+        # ATOM_PROMPT_IDS_B64: the caller sent these ids itself, and the PD
+        # router forwards that same field to decode. Echoing them as a JSON
+        # list would have the router carry a second copy into decode's
+        # kv_transfer_params, which decode then has to parse and compare.
+        echo_ids = bool(request.return_token_ids) and not (
+            request.prompt_ids_from_b64() and not is_multimodal
+        )
+        if assistant_prefix is not None and (is_multimodal or pretokenized is not None):
             # Only rendered text can be continued.
             raise ValueError(
                 "an assistant prefix cannot be combined with image input or "
@@ -2490,7 +2496,7 @@ async def _chat_completions(
                     request_id,
                     multimodal_data=multimodal_data,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2516,7 +2522,7 @@ async def _chat_completions(
                     multimodal_data,
                     sampling_params,
                     request_id,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2543,7 +2549,7 @@ async def _chat_completions(
                     sampling_params,
                     request_id,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2569,7 +2575,7 @@ async def _chat_completions(
                     sampling_params,
                     request_id,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
