@@ -52,19 +52,42 @@ def _check_quant_input(x, group):
     return x.contiguous()
 
 
-def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
-    """E4M3, group32 E8M0 ceil scales; optionally return QAT values in x.dtype."""
+def quantize_fp8(
+    x: torch.Tensor,
+    *,
+    dequantize: bool = False,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
+):
+    """E4M3, group32 E8M0 ceil scales; optionally return QAT values in x.dtype.
+
+    ``out`` is a preallocated ``(codes, scales)`` pair of the result's shapes and
+    dtypes (not with ``dequantize``), e.g. views of a communication buffer.
+    """
     x = _check_quant_input(x, 32)
-    output = torch.empty_like(x, dtype=x.dtype if dequantize else FP8_DTYPE)
-    scales = (
-        None
-        if dequantize
-        else torch.empty(
-            (*x.shape[:-1], x.shape[-1] // 32),
-            device=x.device,
-            dtype=torch.float8_e8m0fnu,
+    if out is not None:
+        if dequantize:
+            raise ValueError("out is not supported with dequantize")
+        output, scales = out
+        if (
+            output.shape != x.shape
+            or output.dtype != FP8_DTYPE
+            or scales.shape != (*x.shape[:-1], x.shape[-1] // 32)
+            or scales.dtype != torch.float8_e8m0fnu
+            or not output.is_contiguous()
+            or not scales.is_contiguous()
+        ):
+            raise ValueError("out does not match the quantized shapes and dtypes")
+    else:
+        output = torch.empty_like(x, dtype=x.dtype if dequantize else FP8_DTYPE)
+        scales = (
+            None
+            if dequantize
+            else torch.empty(
+                (*x.shape[:-1], x.shape[-1] // 32),
+                device=x.device,
+                dtype=torch.float8_e8m0fnu,
+            )
         )
-    )
     if x.numel():
         quantize_fp8_kernel[(triton.cdiv(x.numel(), 1024),)](
             x,

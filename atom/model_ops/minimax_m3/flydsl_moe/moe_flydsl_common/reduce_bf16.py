@@ -2,12 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project (ported to ATOM)
 """Top-k sum of gemm2's routing-weighted bf16 partials ``[n_tokens * topk, H]`` ->
 ``[n_tokens, H]`` bf16, fp32 accumulate (aiter ``moe_reduction_kernel``'s math).
-One wave per (token, 512-column chunk), non-temporal loads."""
+One wave per (token, 512-column chunk), non-temporal loads.
+
+``fused=True`` also applies the routed scaling factor and adds a shared-expert
+output ``[add_rows, H]`` onto rows ``add_row0 ..`` in the same pass
+(``y = sum * scale + add``, one bf16 rounding), instead of two more elementwise
+passes over ``[n_tokens, H]``. Rows outside the add range read as zero from the
+bounds-checked buffer load."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops
-from flydsl.expr import range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from atom.model_ops.minimax_m3.flydsl_moe.moe_flydsl_common.epilogue import _bf16x2
@@ -23,7 +29,7 @@ _CHUNK = 512  # bf16 columns per (wave, dwordx4)
 _NT = 2  # non-temporal cache policy
 
 
-def compile_moe_reduce_bf16(*, H: int, topk: int):
+def compile_moe_reduce_bf16(*, H: int, topk: int, fused: bool = False):
     CPW = CHUNKS_PER_WAVE
     WPC = WAVES_PER_CTA
     assert H % (_CHUNK * CPW) == 0
@@ -32,11 +38,19 @@ def compile_moe_reduce_bf16(*, H: int, topk: int):
     CHUNK_DW = _CHUNK // 2
     LD = _NT
     ST = 0  # default-policy stores
-    name = f"m3_reduce_bf16_h{H}_k{topk}"
+    name = f"m3_reduce_bf16_h{H}_k{topk}" + ("_scale_add" if fused else "")
 
     # addresses, not tensors: every argument arrives preloaded in SGPRs
     @flyc.kernel(name=name, known_block_size=[64 * WPC, 1, 1])
-    def kernel_reduce_bf16(n_tokens: fx.Int32, arg_out: fx.Int64, arg_y: fx.Int64):
+    def kernel_reduce_bf16(
+        n_tokens: fx.Int32,
+        arg_out: fx.Int64,
+        arg_y: fx.Int64,
+        arg_add: fx.Int64,
+        add_row0: fx.Int32,
+        add_rows: fx.Int32,
+        scale_bits: fx.Int32,
+    ):
         lane = fx.thread_idx.x % 64
         gw = fx.block_idx.x * WPC + fx.thread_idx.x // 64
         tok = gw // SEGS
@@ -47,6 +61,10 @@ def compile_moe_reduce_bf16(*, H: int, topk: int):
         y_rsrc = buffer_ops.create_buffer_resource_from_addr(
             arg_y, num_records_bytes=n_tokens * (H * 2)
         )
+        add_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            arg_add, num_records_bytes=add_rows * (H * 2)
+        )
+        scale = _as_f32(scale_bits)
         if tok < n_tokens:
             col_dw = seg * (CHUNK_DW * CPW) + lane * 4
             row_dw = tok * (topk * ROW_DW) + col_dw
@@ -74,6 +92,25 @@ def compile_moe_reduce_bf16(*, H: int, topk: int):
                         acc[j][2 * d + 1] = acc[j][2 * d + 1] + _as_f32(
                             dw & fx.Int32(-65536)
                         )
+            if const_expr(fused):
+                # rows outside [add_row0, add_row0 + add_rows) are out of range
+                # of the resource (negative offsets wrap): the load returns 0
+                add_dw = (tok - add_row0) * ROW_DW + col_dw
+                for j in range_constexpr(CPW):
+                    sh = Vec(
+                        buffer_ops.buffer_load(
+                            add_rsrc,
+                            add_dw + j * CHUNK_DW,
+                            vec_width=4,
+                            dtype=fx.Int32,
+                        )
+                    )
+                    for d in range_constexpr(4):
+                        dw = fx.Int32(sh[d])
+                        acc[j][2 * d] = acc[j][2 * d] * scale + _as_f32(dw << 16)
+                        acc[j][2 * d + 1] = acc[j][2 * d + 1] * scale + _as_f32(
+                            dw & fx.Int32(-65536)
+                        )
             y_dw = tok * ROW_DW + col_dw
             for j in range_constexpr(CPW):
                 packed = Vec.from_elements(
@@ -86,12 +123,25 @@ def compile_moe_reduce_bf16(*, H: int, topk: int):
 
     @flyc.jit
     def launch_reduce_bf16(
-        OUT: fx.Tensor, Y: fx.Tensor, n_tokens: fx.Int32, stream: fx.Stream
+        OUT: fx.Tensor,
+        Y: fx.Tensor,
+        ADD: fx.Tensor,
+        n_tokens: fx.Int32,
+        add_row0: fx.Int32,
+        add_rows: fx.Int32,
+        scale_bits: fx.Int32,
+        stream: fx.Stream,
     ):
         grid = (n_tokens * SEGS + (WPC - 1)) // WPC
-        kernel_reduce_bf16(n_tokens, _tensor_addr(OUT), _tensor_addr(Y)).launch(
-            grid=(grid, 1, 1), block=(64 * WPC, 1, 1), stream=stream
-        )
+        kernel_reduce_bf16(
+            n_tokens,
+            _tensor_addr(OUT),
+            _tensor_addr(Y),
+            _tensor_addr(ADD),
+            add_row0,
+            add_rows,
+            scale_bits,
+        ).launch(grid=(grid, 1, 1), block=(64 * WPC, 1, 1), stream=stream)
 
     launch_reduce_bf16.kernel_name = name
     launch_reduce_bf16.compile_hints = PRELOAD_HINTS

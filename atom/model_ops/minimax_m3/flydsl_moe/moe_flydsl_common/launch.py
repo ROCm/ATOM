@@ -10,7 +10,9 @@ from atom.model_ops.minimax_m3.flydsl_moe.moe_flydsl_common.reduce_bf16 import (
     compile_moe_reduce_bf16,
 )
 from atom.model_ops.minimax_m3.flydsl_moe.moe_flydsl_common.sort import compile_moe_sort
-from atom.model_ops.minimax_m3.flydsl_moe.moe_flydsl_common.tile_map import compile_tile_map
+from atom.model_ops.minimax_m3.flydsl_moe.moe_flydsl_common.tile_map import (
+    compile_tile_map,
+)
 
 
 def _u8_flat(t: torch.Tensor) -> torch.Tensor:
@@ -28,5 +30,5 @@ def _get_tile_map(intermediate_size: int, block_m: int):
 
 
 @functools.cache
-def _get_reduce_bf16(hidden_size: int, topk: int):
-    return compile_moe_reduce_bf16(H=hidden_size, topk=topk)
+def _get_reduce_bf16(hidden_size: int, topk: int, fused: bool = False):
+    return compile_moe_reduce_bf16(H=hidden_size, topk=topk, fused=fused)
