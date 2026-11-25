@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lumen — AITER-Powered Model Training Optimization for AMD GPUs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --amd-red: #ed1c24;
+  --amd-red-dark: #c41922;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f8f9fb;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f5f6f8;
+  --text-primary: #1a1a2e;
+  --text-secondary: #5c6370;
+  --text-muted: #8b95a5;
+  --accent: #ed1c24;
+  --accent-soft: rgba(237, 28, 36, 0.08);
+  --green: #2da44e;
+  --blue: #0969da;
+  --yellow: #bf8700;
+  --purple: #8250df;
+  --border: #d0d7de;
+  --border-light: #e8ecf0;
+  --radius: 12px;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.08);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: 'Inter', -apple-system, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre { font-family: 'JetBrains Mono', monospace; }
+.container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+/* NAV */
+nav {
+  position: sticky; top: 0; z-index: 100;
+  background: rgba(255,255,255,0.92);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border-light);
+  padding: 14px 0;
+}
+nav .container {
+  display: flex; align-items: center; justify-content: space-between;
+}
+nav .logo {
+  font-size: 22px; font-weight: 800; color: var(--text-primary);
+  letter-spacing: -0.5px;
+}
+nav .logo span { color: var(--accent); }
+nav .links { display: flex; gap: 28px; }
+nav .links a {
+  color: var(--text-secondary); font-size: 14px; font-weight: 500;
+  transition: color 0.2s;
+}
+nav .links a:hover { color: var(--text-primary); text-decoration: none; }
+
+/* HERO */
+.hero {
+  padding: 80px 0 64px;
+  text-align: center;
+  background: linear-gradient(180deg, #fff 0%, var(--bg-secondary) 100%);
+}
+.hero h1 {
+  font-size: 48px; font-weight: 800; letter-spacing: -1.5px;
+  line-height: 1.15; margin-bottom: 20px; color: var(--text-primary);
+}
+.hero h1 .highlight { color: var(--accent); }
+.hero .subtitle {
+  font-size: 18px; color: var(--text-secondary);
+  max-width: 680px; margin: 0 auto 32px;
+}
+.hero .badges { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-bottom: 36px; }
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg-primary); border: 1px solid var(--border);
+  border-radius: 20px; padding: 6px 14px;
+  font-size: 13px; font-weight: 500; color: var(--text-secondary);
+  box-shadow: var(--shadow-sm);
+}
+.badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+.badge .dot.red { background: var(--accent); }
+.badge .dot.green { background: var(--green); }
+.badge .dot.blue { background: var(--blue); }
+.badge .dot.yellow { background: var(--yellow); }
+.btn-group { display: flex; gap: 12px; justify-content: center; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 11px 22px; border-radius: 8px;
+  font-size: 14px; font-weight: 600;
+  transition: all 0.2s; cursor: pointer; border: none;
+}
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--amd-red-dark); text-decoration: none; color: #fff; }
+.btn-secondary {
+  background: var(--bg-primary); color: var(--text-primary);
+  border: 1px solid var(--border);
+}
+.btn-secondary:hover { background: var(--bg-secondary); text-decoration: none; }
+
+/* FEATURES */
+.features { padding: 72px 0; background: var(--bg-primary); }
+.section-title {
+  font-size: 32px; font-weight: 700; text-align: center;
+  margin-bottom: 10px; letter-spacing: -0.5px; color: var(--text-primary);
+}
+.section-sub {
+  font-size: 15px; color: var(--text-secondary); text-align: center;
+  margin-bottom: 40px; max-width: 560px; margin-left: auto; margin-right: auto;
+}
+.feature-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+.feature-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  padding: 24px;
+  transition: all 0.2s;
+  box-shadow: var(--shadow-sm);
+}
+.feature-card:hover {
+  box-shadow: var(--shadow-md);
+  border-color: var(--border);
+  transform: translateY(-2px);
+}
+.feature-card .icon {
+  width: 36px; height: 36px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; margin-bottom: 14px;
+}
+.feature-card h3 { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+.feature-card p { font-size: 13px; color: var(--text-secondary); line-height: 1.55; }
+
+/* ARCH DIAGRAM */
+.arch-section { padding: 72px 0; background: var(--bg-secondary); }
+.arch-wrapper {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-light);
+  border-radius: 16px;
+  padding: 40px 28px;
+  overflow-x: auto;
+  box-shadow: var(--shadow-sm);
+}
+.arch-svg { width: 100%; max-width: 960px; margin: 0 auto; display: block; }
+
+/* CODE EXAMPLE */
+.code-section { padding: 72px 0; background: var(--bg-primary); }
+.code-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.code-block {
+  background: #f6f8fa;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.code-header {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-light);
+  font-size: 13px; font-weight: 600; color: var(--text-secondary);
+  display: flex; align-items: center; gap: 8px;
+  background: #fff;
+}
+.code-header .lang-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--blue); }
+.code-block pre {
+  padding: 16px 18px;
+  font-size: 13px; line-height: 1.6;
+  overflow-x: auto; color: #24292f;
+}
+.kw { color: #cf222e; }
+.str { color: #0a3069; }
+.fn { color: #8250df; }
+.cm { color: #6e7781; }
+.num { color: #0550ae; }
+
+/* OP TABLE */
+.ops-section { padding: 72px 0; background: var(--bg-secondary); }
+.ops-table {
+  width: 100%; border-collapse: collapse;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+.ops-table thead { background: #f6f8fa; }
+.ops-table th {
+  text-align: left; padding: 12px 20px;
+  font-size: 12px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-light);
+}
+.ops-table td {
+  padding: 10px 20px; font-size: 14px;
+  border-bottom: 1px solid var(--border-light);
+  color: var(--text-secondary);
+}
+.ops-table td:first-child { color: var(--text-primary); font-weight: 500; }
+.ops-table tr:last-child td { border-bottom: none; }
+.ops-table tr:hover td { background: #f6f8fa; }
+.tag {
+  display: inline-block; padding: 2px 8px; border-radius: 4px;
+  font-size: 11px; font-weight: 600;
+}
+.tag-green { background: rgba(45,164,78,0.1); color: var(--green); }
+.tag-blue { background: rgba(9,105,218,0.1); color: var(--blue); }
+.tag-purple { background: rgba(130,80,223,0.1); color: var(--purple); }
+
+/* RL SECTION */
+.rl-section { padding: 72px 0; background: var(--bg-primary); }
+.rl-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.rl-card {
+  background: var(--bg-card); border: 1px solid var(--border-light);
+  border-radius: var(--radius); padding: 24px;
+  box-shadow: var(--shadow-sm);
+}
+.rl-card.full-width { grid-column: 1 / -1; }
+.rl-card h3 { font-size: 17px; font-weight: 600; margin-bottom: 10px; }
+.rl-card h4 { font-size: 15px; font-weight: 600; margin: 18px 0 8px; color: var(--text-primary); }
+.rl-card p { font-size: 13px; color: var(--text-secondary); margin-bottom: 14px; }
+.rl-card table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.rl-card th, .rl-card td { text-align: left; padding: 7px 0; border-bottom: 1px solid var(--border-light); }
+.rl-card th { color: var(--text-secondary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+.rl-card td { color: var(--text-primary); }
+.rl-card ul { padding-left: 18px; margin: 0 0 14px; }
+.rl-card li { font-size: 13px; color: var(--text-secondary); line-height: 1.7; margin-bottom: 4px; }
+.rl-card li strong { color: var(--text-primary); }
+.rl-card .rl-env { font-size: 12px; color: var(--text-muted); margin-bottom: 16px; }
+.rl-card pre {
+  background: #f6f8fa; border: 1px solid var(--border-light); border-radius: 8px;
+  padding: 12px 14px; font-size: 12px; line-height: 1.5; overflow-x: auto;
+  color: #24292f; margin: 8px 0 14px;
+}
+.rl-tables-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 768px) { .rl-tables-row { grid-template-columns: 1fr; } }
+
+/* FOOTER */
+footer {
+  border-top: 1px solid var(--border-light);
+  padding: 36px 0;
+  text-align: center;
+  font-size: 14px; color: var(--text-secondary);
+  background: var(--bg-secondary);
+}
+footer a { color: var(--text-secondary); }
+footer a:hover { color: var(--text-primary); }
+
+@media (max-width: 768px) {
+  .hero h1 { font-size: 32px; }
+  .feature-grid { grid-template-columns: 1fr; }
+  .code-grid { grid-template-columns: 1fr; }
+  .rl-grid { grid-template-columns: 1fr; }
+  nav .links { display: none; }
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="container">
+    <div class="logo"><span>Lumen</span></div>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#quickstart">Quick Start</a>
+      <a href="#ops">Operators</a>
+      <a href="docs/index.html">Docs</a>
+      <a href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="container">
+    <h1>
+      <span class="highlight">Lumen</span>: AITER-Powered<br>
+      Training Optimization for AMD GPUs
+    </h1>
+    <p class="subtitle">
+      Light Unified Model Engine for AITER — optimized training kernels and model-level integrations for quantized training
+    </p>
+    <div class="badges">
+      <span class="badge"><span class="dot red"></span>FP8 E4M3 / E5M2 / MXFP8</span>
+      <span class="badge"><span class="dot green"></span>AITER Kernels</span>
+      <span class="badge"><span class="dot blue"></span>MORI Communication</span>
+      <span class="badge"><span class="dot yellow"></span>MI300X / MI355X</span>
+    </div>
+    <div class="btn-group">
+      <a class="btn btn-primary" href="#quickstart">Get Started</a>
+      <a class="btn btn-secondary" href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen">GitHub</a>
+    </div>
+  </div>
+</section>
+
+<section class="features" id="features">
+  <div class="container">
+    <h2 class="section-title">Key Features</h2>
+    <p class="section-sub">AITER-optimized training kernels and model-level integrations for quantized pretraining, fine-tuning, and post-training</p>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="icon" style="background:var(--accent-soft); color:var(--accent);">&#9889;</div>
+        <h3>Unified Model Optimization</h3>
+        <p><code>LumenConfig.enable(model)</code> coordinates quantization, AITER kernel patches, model patches, and distributed optimizations without changing the public training loop.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon" style="background:rgba(9,105,218,0.08); color:var(--blue);">&#9881;</div>
+        <h3>Unified QuantConfig</h3>
+        <p>A single configuration object governs format (E4M3, E5M2, MXFP8, Hybrid), scaling strategy (Dynamic, Delayed, Blockwise), and all precision knobs.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon" style="background:rgba(45,164,78,0.08); color:var(--green);">&#9650;</div>
+        <h3>Up to 2x Peak FLOPS</h3>
+        <p>FP8 on MI300X achieves ~2,615 TFLOPS vs ~1,307 TFLOPS for BF16. End-to-end training speedup of 1.4-1.7x depending on workload.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon" style="background:rgba(130,80,223,0.08); color:var(--purple);">&#9850;</div>
+        <h3>AITER Kernels</h3>
+        <p>AITER-optimized training kernels with an ASM -> CK -> Triton fallback chain. Covers attention, GEMM, normalization, RoPE, MoE, MLP, cross-entropy, and quantization.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon" style="background:rgba(191,135,0,0.08); color:var(--yellow);">&#9783;</div>
+        <h3>MORI Communication</h3>
+        <p>Native RDMA + GPU communication with FP8 all-gather (~2x bandwidth saving) and compute-communication overlap (AG/fwd, RS/bwd).</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon" style="background:rgba(0,0,0,0.04); color:var(--text-secondary);">&#9879;</div>
+        <h3>Backend-Agnostic</h3>
+        <p>Same quantization semantics across FSDP, FSDP2, and Megatron-LM backends. Supports SFT, pre-training, and RL workloads (GRPO, PPO, DAPO) with SGLang or vLLM rollout.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="arch-section" id="architecture">
+  <div class="container">
+    <h2 class="section-title">Architecture</h2>
+    <p class="section-sub">Lumen integrates AITER-optimized kernels at the model level and owns the quantized training lifecycle</p>
+    <div class="arch-wrapper">
+      <svg class="arch-svg" viewBox="0 0 960 620" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6" fill="#999"/>
+          </marker>
+          <style>
+            .arch-svg text { font-family: 'Inter', -apple-system, sans-serif; }
+          </style>
+        </defs>
+
+        <!-- Layer 1: Workloads -->
+        <rect x="30" y="10" width="900" height="56" rx="10" fill="#f3e8f5" stroke="#9c27b0" stroke-width="1.5"/>
+        <text x="480" y="33" text-anchor="middle" fill="#7b1fa2" font-size="11" font-weight="600" letter-spacing="1">WORKLOADS</text>
+        <text x="255" y="52" text-anchor="middle" fill="#333" font-size="14" font-weight="600">SFT</text>
+        <text x="705" y="52" text-anchor="middle" fill="#333" font-size="14" font-weight="600">Pretrain</text>
+
+        <path d="M480 66 L480 82" stroke="#999" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <!-- Layer 2: Training Backend -->
+        <rect x="30" y="82" width="290" height="56" rx="10" fill="#e3f2fd" stroke="#1976d2" stroke-width="1.5"/>
+        <text x="175" y="104" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600">MEGATRON-LM</text>
+        <text x="175" y="124" text-anchor="middle" fill="#555" font-size="12">TP / PP / EP / DP</text>
+
+        <rect x="335" y="82" width="290" height="56" rx="10" fill="#e3f2fd" stroke="#1976d2" stroke-width="1.5"/>
+        <text x="480" y="104" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600">FSDP / FSDP2</text>
+        <text x="480" y="124" text-anchor="middle" fill="#555" font-size="12">Full Shard + HF Accelerate</text>
+
+        <rect x="640" y="82" width="290" height="56" rx="10" fill="#e3f2fd" stroke="#1976d2" stroke-width="1.5"/>
+        <text x="785" y="104" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600">DEEPSPEED</text>
+        <text x="785" y="124" text-anchor="middle" fill="#555" font-size="12">ZeRO / Offload / Distributed Training</text>
+
+        <path d="M480 138 L480 156" stroke="#999" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <!-- Layer 3: Lumen Training Optimization (RED) -->
+        <rect x="30" y="156" width="900" height="56" rx="10" fill="#fde8e8" stroke="#d32f2f" stroke-width="2"/>
+        <text x="480" y="178" text-anchor="middle" fill="#c62828" font-size="14" font-weight="700">lumencfg.enable</text>
+        <text x="480" y="198" text-anchor="middle" fill="#333" font-size="12" font-weight="600">Quantization · AITER Kernel Patches · Model Patches · Distributed Optimizations</text>
+
+        <path d="M480 212 L480 230" stroke="#999" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <!-- Layer 4: Scaling + Distributed -->
+        <rect x="30" y="230" width="440" height="80" rx="10" fill="#fff8f0" stroke="#bbb" stroke-width="1"/>
+        <text x="250" y="252" text-anchor="middle" fill="#c62828" font-size="11" font-weight="600" letter-spacing="0.5">SCALING MANAGER</text>
+        <text x="250" y="272" text-anchor="middle" fill="#555" font-size="12">Per-tensor / Block / MXFP8 scaling</text>
+        <text x="250" y="289" text-anchor="middle" fill="#555" font-size="12">Amax history · Delayed scaling · AMD FNUZ</text>
+
+        <rect x="490" y="230" width="440" height="80" rx="10" fill="#f0f4ff" stroke="#bbb" stroke-width="1"/>
+        <text x="710" y="252" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600" letter-spacing="0.5">DISTRIBUTED MANAGEMENT</text>
+        <text x="710" y="272" text-anchor="middle" fill="#555" font-size="12">FP8 param &amp; grad buffers · FP8 all-gather</text>
+        <text x="710" y="289" text-anchor="middle" fill="#555" font-size="12">AG↔fwd overlap · RS↔bwd overlap</text>
+
+        <path d="M480 310 L480 330" stroke="#999" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <!-- Layer 5: Operators -->
+        <rect x="30" y="330" width="175" height="72" rx="8" fill="#fff5f5" stroke="#ddd" stroke-width="1"/>
+        <text x="118" y="354" text-anchor="middle" fill="#c62828" font-size="11" font-weight="600">ATTENTION</text>
+        <text x="118" y="370" text-anchor="middle" fill="#666" font-size="10">MHA / MLA / GQA</text>
+        <text x="118" y="384" text-anchor="middle" fill="#666" font-size="10">FP8 · MXFP8 · CP</text>
+
+        <rect x="215" y="330" width="175" height="72" rx="8" fill="#f0f4ff" stroke="#ddd" stroke-width="1"/>
+        <text x="303" y="354" text-anchor="middle" fill="#1565c0" font-size="11" font-weight="600">QUANTIZED LINEAR</text>
+        <text x="303" y="370" text-anchor="middle" fill="#666" font-size="10">Fused quant→GEMM→dequant</text>
+        <text x="303" y="384" text-anchor="middle" fill="#666" font-size="10">7 scaling modes</text>
+
+        <rect x="400" y="330" width="175" height="72" rx="8" fill="#f0fff0" stroke="#ddd" stroke-width="1"/>
+        <text x="488" y="354" text-anchor="middle" fill="#2e7d32" font-size="11" font-weight="600">FUSED MLP</text>
+        <text x="488" y="370" text-anchor="middle" fill="#666" font-size="10">Gated &amp; ungated fusion</text>
+        <text x="488" y="384" text-anchor="middle" fill="#666" font-size="10">FP8 activation store</text>
+
+        <rect x="585" y="330" width="175" height="72" rx="8" fill="#fffde7" stroke="#ddd" stroke-width="1"/>
+        <text x="673" y="354" text-anchor="middle" fill="#e65100" font-size="11" font-weight="600">MOE ROUTING</text>
+        <text x="673" y="370" text-anchor="middle" fill="#666" font-size="10">Fused top-k · Permute</text>
+        <text x="673" y="384" text-anchor="middle" fill="#666" font-size="10">Grouped GEMM · All FP8</text>
+
+        <rect x="770" y="330" width="160" height="72" rx="8" fill="#f3e8f5" stroke="#ddd" stroke-width="1"/>
+        <text x="850" y="354" text-anchor="middle" fill="#6a1b9a" font-size="11" font-weight="600">NORM · ROPE · CE</text>
+        <text x="850" y="370" text-anchor="middle" fill="#666" font-size="10">RMSNorm · LayerNorm</text>
+        <text x="850" y="384" text-anchor="middle" fill="#666" font-size="10">Cross-Entropy · Quant</text>
+
+        <path d="M480 402 L480 424" stroke="#999" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <!-- Layer 6: Providers -->
+        <rect x="30" y="424" width="900" height="80" rx="10" fill="#e8f5e9" stroke="#388e3c" stroke-width="1.5"/>
+        <text x="480" y="446" text-anchor="middle" fill="#2e7d32" font-size="11" font-weight="700" letter-spacing="0.5">AITER — TRAINING KERNEL PROVIDER</text>
+        <text x="480" y="466" text-anchor="middle" fill="#555" font-size="12">ASM · Triton · hipBLASLt · DeepGEMM</text>
+        <text x="480" y="483" text-anchor="middle" fill="#555" font-size="12">Attention · GEMM · MoE · Norm · Quantization</text>
+
+        <path d="M480 504 L480 526" stroke="#999" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <!-- Layer 7: Hardware -->
+        <rect x="30" y="526" width="900" height="56" rx="10" fill="#fde8e8" stroke="#d32f2f" stroke-width="1.5"/>
+        <text x="480" y="548" text-anchor="middle" fill="#c62828" font-size="11" font-weight="600" letter-spacing="1">HARDWARE</text>
+        <text x="480" y="568" text-anchor="middle" fill="#333" font-size="15" font-weight="700">AMD Instinct MI300X / MI355X / MI45X</text>
+      </svg>
+    </div>
+  </div>
+</section>
+
+<section class="code-section" id="quickstart">
+  <div class="container">
+    <h2 class="section-title">Quick Start</h2>
+    <p class="section-sub">Enable the AITER-powered model training optimization stack with one configuration</p>
+    <div class="code-grid">
+      <div class="code-block">
+        <div class="code-header"><span class="lang-dot"></span> Install</div>
+<pre><span class="cm"># User install</span>
+git clone https://github.com/ROCm/ATOM.git
+cd ATOM
+git checkout main
+pip install torch triton amd-aiter
+LUMEN_BUILD_EXTENSIONS=1 pip install --no-build-isolation --no-deps -e .
+
+<span class="cm"># Developer install</span>
+pip install torch triton amd-aiter pytest pytest-xdist torchao
+LUMEN_BUILD_EXTENSIONS=1 pip install --no-build-isolation --no-deps -e .</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-header"><span class="lang-dot" style="background:var(--yellow)"></span> Unified Training Optimization</div>
+<pre><span class="kw">from</span> atomrl.lumen <span class="kw">import</span> LumenConfig
+
+lumencfg = <span class="fn">LumenConfig</span>(
+    format=<span class="str">"fp8_e4m3"</span>,
+    scaling=<span class="str">"delayed"</span>,
+    fp8_attn=<span class="str">"dpa"</span>,
+    lumen_norm=<span class="num">True</span>,
+    lumen_linear=<span class="num">True</span>,
+    fused_mlp=<span class="num">True</span>,
+    fp8_param_gather=<span class="num">False</span>, <span class="cm"># enable with a distributed DP group</span>
+)
+lumencfg.<span class="fn">enable</span>(model)
+
+<span class="cm"># Training loop unchanged</span>
+output = <span class="fn">model</span>(input_ids)
+loss.backward()
+optimizer.step()</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-header"><span class="lang-dot" style="background:var(--green)"></span> Optimization Scope</div>
+<pre><span class="cm"># Quantization</span>    FP8 / MXFP8 / MXFP4
+<span class="cm"># AITER kernels</span>   Attention / GEMM / MoE / Norm
+<span class="cm"># Model patches</span>   Linear / MLP / RoPE / checkpoint
+<span class="cm"># Distributed</span>     FP8 gather / overlap / backend adapters</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="ops-section" id="ops">
+  <div class="container">
+    <h2 class="section-title">Operator Coverage</h2>
+    <p class="section-sub">~30 dispatch probes with ASM -> CK -> Triton fallback</p>
+    <table class="ops-table">
+      <thead>
+        <tr><th>Operator</th><th>Source</th><th>Backend Priority</th><th>FP8 Support</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Attention</td><td><code>ops/attention/</code></td><td>CK (csrc) -> Triton</td>
+          <td><span class="tag tag-green">BF16 / FP8 / MXFP8 / blockwise2d</span></td>
+        </tr>
+        <tr>
+          <td>Quantized Linear</td><td><code>ops/quantize/linear.py</code></td><td>hipBLASLt -> CK -> Triton</td>
+          <td><span class="tag tag-green">7 scaling modes</span></td>
+        </tr>
+        <tr>
+          <td>Grouped GEMM</td><td><code>ops/gemm/grouped_gemm.py</code></td><td>Triton (fused MoE) -> sequential</td>
+          <td><span class="tag tag-green">BF16 + all FP8 modes</span></td>
+        </tr>
+        <tr>
+          <td>Fused MLP</td><td><code>ops/mlp/fused_mlp.py</code></td><td>Triton (fused) -> decomposed GEMM</td>
+          <td><span class="tag tag-blue">FP8 activation store</span></td>
+        </tr>
+        <tr>
+          <td>MoE Routing</td><td><code>ops/moe/</code></td><td>ASM (gating) -> HIP (permute) -> Triton</td>
+          <td><span class="tag tag-green">BF16 + all FP8</span></td>
+        </tr>
+        <tr>
+          <td>Normalization</td><td><code>ops/normalization/</code></td><td>ASM -> CK -> Triton</td>
+          <td><span class="tag tag-blue">Fused norm+quant</span></td>
+        </tr>
+        <tr>
+          <td>Quantize Ops</td><td><code>ops/quantize/ops.py</code></td><td>C++ -> Triton (blockwise, MXFP8)</td>
+          <td><span class="tag tag-green">Core FP8</span></td>
+        </tr>
+        <tr>
+          <td>RoPE</td><td><code>ops/rope.py</code></td><td>Triton only</td>
+          <td><span class="tag tag-purple">SBHD / THD / 2D / 3D</span></td>
+        </tr>
+        <tr>
+          <td>Cross-Entropy</td><td><code>ops/cross_entropy.py</code></td><td>Triton + optional SDMA</td>
+          <td><span class="tag tag-purple">Vocab-parallel</span></td>
+        </tr>
+        <tr>
+          <td>SDMA</td><td><code>ops/sdma.py</code></td><td>mori.ccl</td>
+          <td><span class="tag tag-purple">float32</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p><strong>Lumen</strong> — MIT License — &copy; 2026 AMD</p>
+    <p style="margin-top:8px">
+      <a href="https://github.com/ROCm/ATOM/tree/main/atomrl/lumen">GitHub</a> &middot;
+      <a href="https://github.com/ROCm/aiter">AITER</a> &middot;
+      <a href="https://github.com/ROCm/mori">MORI</a> &middot;
+      <a href="https://rocm.docs.amd.com/">ROCm Docs</a>
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

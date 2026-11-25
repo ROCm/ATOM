@@ -61,9 +61,15 @@ def lossless_unsupported_reason(drafter) -> str | None:
             "native fallback filters differently."
         )
     head = drafter.model.markov_head
-    unsupported = markov_weights_unsupported(
-        head.markov_w1.weight, head.markov_w2.weight
-    )
+    weights = [head.markov_w1.weight, head.markov_w2.weight]
+    if weights[0].is_meta:
+        # Built ahead of its weights, which then land on the drafter's device:
+        # ask about weights like them there.
+        weights = [
+            torch.empty(0, *w.shape[1:], dtype=w.dtype, device=drafter.device)
+            for w in weights
+        ]
+    unsupported = markov_weights_unsupported(*weights)
     if unsupported is not None:
         # Checked once here so the sampled op never has to fail mid-serve.
         return f"cannot run the fused sampled draft ({unsupported})."

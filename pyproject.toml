@@ -36,7 +36,7 @@ fallback_version = "0.1.0"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["atom*"]
+include = ["atom", "atom.*"]
 
 [tool.setuptools]
 include-package-data = true

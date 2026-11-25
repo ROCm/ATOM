@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Qwen-Image FlowGRPO on verl-omni (README.md). Long runs only: the setup alone
+# takes about 30 minutes and 90 steps about 3.5 hours on 8x MI350X.
+
+images:
+  vllm-omni:
+    ref: vllm/vllm-openai-rocm:v0.27.0
+    atomrl_mount: /opt/atomrl/ATOM/atomrl
+    run_args: ["--entrypoint", "", "--init", "--ulimit", "stack=67108864"]
+
+defaults:
+  image: vllm-omni
+  tier: long
+  status: unvalidated
+  log_mode: stdout
+  notes: >-
+    Judged by exit code only; compare.py prints validation reward and phase
+    timings against the official verl-omni run at the end of the log. Needs
+    about 1.5 TB of host memory and 1 TB free under the data root.
+  env:
+    WORK: "{data_root}/flowgrpo"
+    HF_HOME: "{data_root}/flowgrpo/hf_home"
+  smoke:
+    steps: 90
+    timeout_min: 480
+    stall_min: 60
+    checks: {metrics: [], last_step: false, forbid: [], weight_sync_buckets: false}
+  full:
+    steps: 300
+    timeout_min: 1440
+    stall_min: 60
+    checks: {metrics: [], last_step: false, forbid: [], weight_sync_buckets: false}
+
+examples:
+  - id: flowgrpo-qwen-image-baseline
+    title: "Qwen-Image FlowGRPO, verl-omni official recipe (VeOmni training, vLLM-Omni rollout)"
+    command: >-
+      mkdir -p $WORK && bash {ex_dir}/setup_env.sh &&
+      RUN_NAME={id} bash {ex_dir}/run_flowgrpo.sh trainer.total_training_steps={steps} &&
+      python3 {ex_dir}/compare.py $WORK/runs/{id}
+
+  - id: flowgrpo-qwen-image-lumen
+    title: "Qwen-Image FlowGRPO with the Lumen actor patches"
+    command: >-
+      mkdir -p $WORK && bash {ex_dir}/setup_env.sh &&
+      RUN_NAME={id} LUMEN=1 bash {ex_dir}/run_flowgrpo.sh trainer.total_training_steps={steps} &&
+      python3 {ex_dir}/compare.py $WORK/runs/{id}

@@ -79,7 +79,9 @@ reasoning-parser = "=1.0.0"
 openai-protocol = { version = "=1.0.0", features = ["axum"] }
 num-traits = "0.2"
 rustpython-parser = "0.4.0"
-llm-tokenizer = "=1.4.2"
+llm-tokenizer = "=2.0.0"
+# Without `hf-hub`, with which fastokens fetches models itself: mesh gives it the `tokenizer.json` it loaded.
+fastokens = { version = "=0.3.6", default-features = false }
 wfaas = "=1.0.0"
 data-connector = "=1.0.0"
 openmetrics-parser = "0.4.4"

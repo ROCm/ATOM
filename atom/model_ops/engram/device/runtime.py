@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Engram's device-side runtime: the UVA lookup, and the inputs a forward gets.
 
 `EngramUva` is the half of `host.EngramHost` that reaches Triton -- hashing
@@ -15,7 +17,7 @@ import torch
 
 from atom.model_ops.engram.device.hashing import EngramHashTables, engram_row_indices
 from atom.model_ops.engram.device.staging import EngramStaging
-from atom.model_ops.engram.device.uva import uva_gather_into
+from atom.model_ops.engram.device.uva import UvaGather
 from atom.model_ops.engram.host import EngramHost, EngramPrefetcher, EngramRequest
 from atom.utils import CpuGpuBuffer, envs
 
@@ -37,12 +39,24 @@ class EngramUva:
         self.hash_tables = EngramHashTables.from_mapping(
             host.prefetcher._hash_mapping, host.device
         )
-        # One buffer for every layer: a layer's rows are consumed by its own
-        # gather before the next layer is hashed.
+        # every layer's hashed row ids, [layer, row, heads]: the overlap hashes
+        # and looks up every layer in one launch each; `stage` takes a layer
+        # at a time through the first plane, consumed by its own gather before
+        # the next layer is hashed
         self.row_ids = torch.empty(
-            host.max_num_tokens, num_hash_heads, dtype=torch.int64, device=host.device
+            len(host.layer_ids),
+            host.max_num_tokens,
+            num_hash_heads,
+            dtype=torch.int64,
+            device=host.device,
         )
         self._ids_staging = None
+        # a layer's gather (`stage`, a layer at a time); the overlap's is
+        # every layer's in one launch (`EngramStaging.gather`)
+        self.gathers = {
+            layer: UvaGather([host.prefetcher._tables[layer]], host.device)
+            for layer in host.layer_ids
+        }
         self.overlap = EngramStaging(self) if envs.ATOM_ENGRAM_OVERLAP else None
 
     def _rows_from_host(self, requests, rows):
@@ -81,7 +95,7 @@ class EngramUva:
                 batch.cu_seqlens,
                 batch.history,
                 batch.history_index,
-                self.row_ids[:rows],
+                self.row_ids[0, :rows],
             )
 
         return hashed
@@ -112,10 +126,9 @@ class EngramUva:
                 dtype=buffer.gpu.dtype,
                 device=host.device,
             )
-            uva_gather_into(
-                table,
-                ids,
-                flat.view(rows, host.local_heads, table.head_dim),
+            self.gathers[layer](
+                ids[None],
+                flat.view(1, rows, host.local_heads, table.head_dim),
                 head_start=host.head_start,
                 local_heads=host.local_heads,
                 total_heads=host.total_heads,
