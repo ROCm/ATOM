@@ -469,6 +469,7 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
             "ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-wait-c64"
         ),
         "umbp_kv_events_opt": STORE.replace("-mcstore-", "-umbp-kvev-opt-"),
+        "umbp_pool_opt": STORE.replace("-mcstore-", "-umbp-opt-"),
         "umbp_2p1d_kv_events_opt": (
             "ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-opt-c64"
         ),
@@ -562,6 +563,7 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
                     "2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-WAIT"
                 ),
                 "umbp_kv_events_opt": "8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-OPT",
+                "umbp_pool_opt": "8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-OPT",
                 "umbp_2p1d_kv_events_opt": "2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-OPT",
             },
         )
@@ -645,7 +647,7 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
                     self.assertEqual(pool["kv_connector"], "umbp_pool")
                     extra = pool["kv_connector_extra_config"]
                     self.assertEqual(extra["namespace"], f"p{port}")
-                    waits = suite in self.WAIT or suite in self.OPT
+                    waits = suite in (*self.WAIT, *self.OPT, "umbp_pool_opt")
                     self.assertEqual(extra.get("fetch_wait_ms"), 50 if waits else None)
                     # Where the launcher's server listens unless the case moves it.
                     self.assertIn(
@@ -653,7 +655,7 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
                     )
 
     def test_cells_launch_the_recipe_router_or_route_by_the_events(self):
-        for suite in ("umbp_pool", "umbp_2p1d"):
+        for suite in ("umbp_pool", "umbp_2p1d", "umbp_pool_opt"):
             with self.subTest(suite=suite):
                 self.assertEqual(
                     self.submitted_router_args(self.cells[suite]),
@@ -816,6 +818,24 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
                     prefill["extra_args"],
                     wait_prefill["extra_args"] + " --gpu-memory-utilization 0.95",
                 )
+
+    def test_the_opt_cells_routers_run_over_the_same_engines(self):
+        recipe, events = self.cells["umbp_pool_opt"], self.cells["umbp_kv_events_opt"]
+        self.assertEqual(
+            {key for key in events if recipe[key] != events[key]},
+            {"id", "suite", "name", "display_topology", "service"},
+        )
+        self.assertEqual(
+            {
+                key
+                for key in events["service"]
+                if recipe["service"][key] != events["service"][key]
+            },
+            {"router"},
+        )
+        self.assertEqual(
+            recipe["service"]["router"], self.cells["umbp_pool"]["service"]["router"]
+        )
 
     def test_only_the_cells_of_one_node_take_mooncake_off_hip_ipc(self):
         # A prefill worker's two devices cannot open the memory of the third

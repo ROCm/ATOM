@@ -2757,6 +2757,16 @@ models:
           env:
             prefill: *dsv41_umbp_wait_env_prefill
 
+      # The recipe's router over the same engines as umbp_kv_events_opt: the
+      # baseline of that cell's routing.
+      umbp_pool_opt:
+        - <<: *dsv41_8p16d_umbp
+          name: ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-umbp-opt-c1228
+          display_topology: 8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-OPT
+          prefill: *dsv41_p2ep2_prefill_hbm95
+          env:
+            prefill: *dsv41_umbp_wait_env_prefill
+
       umbp_smoke:
         # One prefill and one decode worker of those cells on a single node,
         # five minutes at c16: whether the server, the pool and the routing by
