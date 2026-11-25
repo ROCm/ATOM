@@ -60,6 +60,7 @@ from atom.model_ops.fused_moe.expert_layout import (
     expert_shard_view,
     physical_expert_id,
 )
+from atom.model_ops.fused_moe.fused_route import FusedRoute
 from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEModularKernel,
     FusedMoEPrepareAndFinalize,
@@ -3624,6 +3625,9 @@ class FusedMoE(torch.nn.Module):
 
     # Set in __init__ for a shared expert staged into its fused slot.
     shared_expert_staging: SharedExpertStaging | None = None
+    # Set by a model whose routing `FusedRoute` implements: the placed routes
+    # in one launch where no gather comes between routing and placement.
+    fused_route: FusedRoute | None = None
 
     def __init__(
         self,
@@ -5603,6 +5607,25 @@ class FusedMoE(torch.nn.Module):
             False,
         )
 
+    def _route(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        may_place: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """`(topk_weights, topk_ids, placed)`: the logical routes
+        (`select_experts`), or, where `may_place` (no gather moves the rows
+        before the experts) and the layer's `fused_route` takes the step, the
+        placed ones in its one launch."""
+        if may_place and self.fused_route is not None:
+            routes = self.fused_route(router_logits)
+            if routes is not None:
+                return *routes, True
+        topk_weights, topk_ids = self.quant_method.select_experts(
+            self, hidden_states, router_logits
+        )
+        return topk_weights, topk_ids, False
+
     def _run_experts(
         self,
         hidden_states: torch.Tensor,
@@ -5612,10 +5635,12 @@ class FusedMoE(torch.nn.Module):
         gathered: bool = False,
         shared_add: torch.Tensor | None = None,
         shared_ready: torch.cuda.Event | None = None,
+        placed: bool = False,
     ) -> torch.Tensor:
         """The experts on the routed rows (`x_scale`: they are in the method's
         `routed_rows_wire` already), still on logical experts: placed on the
-        physical ones (`place_experts`) after every gather. `gathered`: a DP
+        physical ones (`place_experts`) after every gather (`placed`: they
+        are already, by `fused_route`, and nothing gathers them). `gathered`: a DP
         gather made them the group's. Where ATOM_PCP_MOE_MERGE or SP folds the
         PCP group into the expert sharding, every PCP rank runs them over the
         same rows: a split pass (every SP pass) gathers its rows rank-major
@@ -5650,9 +5675,12 @@ class FusedMoE(torch.nn.Module):
             hidden_states, topk_weights, topk_ids, *scale = tbo_on_comm(gather)
             x_scale = scale[0] if scale else None
         gathered = gathered or split
-        topk_weights, topk_ids = self.quant_method.place_experts(
-            self, topk_weights, topk_ids, gathered
-        )
+        if placed:
+            assert not gathered, "placed routes cannot be gathered"
+        else:
+            topk_weights, topk_ids = self.quant_method.place_experts(
+                self, topk_weights, topk_ids, gathered
+            )
         # Only Mxfp4MoEMethod takes a shared output (combine_accepts_shared).
         shared_kwargs = (
             {}
@@ -5710,9 +5738,12 @@ class FusedMoE(torch.nn.Module):
         )
         # Routed on the rank that owns the rows, before any gather: each rank's
         # routing masks its own pad rows, and the gather then moves top-k
-        # weights and ids rather than router logits.
-        topk_weights, topk_ids = self.quant_method.select_experts(
-            self, hidden_states, router_logits
+        # weights and ids rather than router logits. With no gather at all, a
+        # `fused_route` places them here too.
+        topk_weights, topk_ids, placed = self._route(
+            hidden_states,
+            router_logits,
+            not use_dp_gather_scatter and not self.moe_parallel_config.pcp_merge,
         )
         x_scale = None
         if use_dp_gather_scatter:
@@ -5753,6 +5784,7 @@ class FusedMoE(torch.nn.Module):
             use_dp_gather_scatter,
             shared_add=shared_add,
             shared_ready=shared_ready,
+            placed=placed,
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
@@ -5807,10 +5839,12 @@ class FusedMoE(torch.nn.Module):
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
         # forward_impl_graph. Dropped again below.
-        topk_weights, topk_ids = self.quant_method.select_experts(
-            self, hidden_states, router_logits
-        )
         dp_repeat = self.moe_parallel_config.dp_logical_ratio
+        topk_weights, topk_ids, placed = self._route(
+            hidden_states,
+            router_logits,
+            dp_repeat == 1 and not self.moe_parallel_config.pcp_merge,
+        )
         local_rows = hidden_states.shape[0]
         if dp_repeat > 1:
             hidden_states, topk_weights, topk_ids = (
@@ -5827,6 +5861,7 @@ class FusedMoE(torch.nn.Module):
             gathered=dp_repeat > 1,
             shared_add=shared_add,
             shared_ready=shared_ready,
+            placed=placed,
         )
 
         if dp_repeat > 1:
