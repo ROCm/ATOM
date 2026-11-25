@@ -1,35 +1,44 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MLA landing for Mooncake P/D with a DCP decode (``ATOM_PD_MLA_LANDING``, default on).
+"""KV landing for Mooncake P/D: decode-side receive slots, credits and scatter.
 
-A DCP decode rank owns every ``dcp_size``-th token of a prefill block, so its
-MLA rows cannot be written as whole blocks. The staged path
-(``_execute_staged_mla_regions``) sends one RDMA descriptor per destination
-page, which caps a NIC at about 10 GB/s with fragmented decode block tables.
-Landing sends a rank's rows packed in rank order instead: one descriptor per
-slot of a decode-side GPU landing pool, which the decode rank then scatters
-into its paged KV cache.
+A decode rank that owns only part of each prefill block cannot take its KV as
+whole blocks. The staged path (``MooncakeConnector._execute_staged_transfer``
+without a landing offer) writes the staging slot straight to the destination
+pages, one RDMA descriptor per run of adjacent pages within a memory region
+(``TransferPlan.direct_descriptors``). A fragmented decode block table leaves
+few adjacent pages, which caps a NIC at about 10 GB/s. Landing sends
+a rank's units packed in rank order instead: one descriptor per slot of a
+decode-side GPU landing pool, which the decode rank then scatters into its
+paged KV cache. A unit is what ``transfer_plan`` packs; unit ``j`` of a request
+belongs at unit ``j % units_per_page`` of destination page
+``dst_block_ids[j // units_per_page]``. MLA rows to a DCP decode
+(``ATOM_PD_MLA_LANDING``, default on) are token rows, ``units_per_page`` the
+block size.
 
 Protocol, per decode rank (every rank has its own pool and connector):
 
 1. On first contact the rank gives a prefill stage endpoint a partition of
-   ``pool_slots // pp_size`` slots (``pp_size`` is the prefill's), first
+   ``max(1, pool_slots // pp_size)`` slots (``pp_size`` is the prefill's), first
    come, first served, and takes it back only from a stage that reports it
-   cannot land (no MLA staging pool: a DCP prefill, ``ATOM_PD_MLA_STAGING=0``
+   cannot land (no KV staging pool: a DCP prefill, ``ATOM_PD_MLA_STAGING=0``
    or a build without landing); such an endpoint is not offered slots
    again. With several landing prefill instances per decode rank, a later
    one may get fewer slots, or none and keep the staged path. The rank
-   advertises the stage's partition in every ``write_request``
-   (``mla_landing = {epoch, base, slot_bytes, slots}``).
+   advertises the stage's partition in every ``write_request`` under the
+   ``mla_landing`` key, kept for wire compatibility
+   (``{epoch, base, slot_bytes, slots}``; no ``layout`` means token rows).
 2. The stage keeps the partition as credits (``LandingCredits``), shared by
-   all its requests to that rank. A send worker takes a credit, gathers rows
+   all its requests to that rank. A send worker takes a credit, gathers units
    into its staging slot, writes the slot to ``base + slot * slot_bytes`` and
    sends ``MSG_LANDING_READY`` (request, nonce, stage, seq, slot, items). With
-   no credit within ``MLA_LANDING_CREDIT_WAIT_S`` it sends the rest
-   of the transfer through the staged path. Write-done then lists the slot of
-   every READY it sent (``landed_slots``), so a lost READY is detected and its
-   slot still returned; a stage that cannot land sends ``None`` instead.
+   no credit within ``LANDING_CREDIT_WAIT_S`` it sends the rest of the
+   transfer through the staged path. Write-done then lists the slot of every
+   READY it sent (``landed_slots``), so a lost READY is detected and its slot
+   still returned; a stage that cannot land sends ``None`` instead. A slot
+   whose write may still land is quarantined on the stage for
+   ``ATOM_PD_FAILED_WRITE_HOLD_S`` instead of being reused.
 3. The rank (``LandingReceiver``) scatters READY slots on its own stream and
    returns their credits (``MSG_LANDING_CREDIT``) once the scatter finished.
 4. A request completes when every stage's write-done arrived, every landed
@@ -76,11 +85,9 @@ from atom.kv_transfer.disaggregation.landing_scatter import (
     landing_segments,
     scatter_segments,
     segment_table,
-    segment_table_capacity,
 )
-from atom.kv_transfer.disaggregation.pd_producer import plain_mla_model
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
-from atom.utils import envs, get_hf_text_config
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -88,16 +95,16 @@ MSG_LANDING_READY = b"landing_ready"
 MSG_LANDING_CREDIT = b"landing_credit"
 
 # Prefill: a transfer needing fewer landing slots than this keeps the staged
-# per-page path; the scatter round trip would not pay off.
-MLA_LANDING_MIN_SLOTS = 2
+# path; the scatter round trip would not pay off.
+LANDING_MIN_SLOTS = 2
 # Prefill: how long a send worker waits for a free landing slot before it
-# sends the rest of the transfer through the staged per-page path.
-MLA_LANDING_CREDIT_WAIT_S = 0.010
+# sends the rest of the transfer through the staged path.
+LANDING_CREDIT_WAIT_S = 0.010
 # Decode: one rank's landing pool, held back from the KV budget and handed
 # out to prefill stages first come, first served (``advertise``).
-MLA_LANDING_SLOT_BYTES = 8 << 20
-MLA_LANDING_POOL_BYTES = 256 << 20
-MLA_LANDING_POOL_SLOTS = MLA_LANDING_POOL_BYTES // MLA_LANDING_SLOT_BYTES
+LANDING_SLOT_BYTES = 8 << 20
+LANDING_POOL_BYTES = 256 << 20
+LANDING_POOL_SLOTS = LANDING_POOL_BYTES // LANDING_SLOT_BYTES
 
 _STATS_INTERVAL_S = 30.0
 # A request still waiting on a stage this long is logged once.
@@ -230,52 +237,6 @@ class LandingCredits:
 # ---------------------------------------------------------------------------
 
 
-def mla_landing_configured(config) -> bool:
-    """Whether a Mooncake connector with ``config`` gets an MLA landing pool.
-
-    ``config`` holds one Mooncake connector's ``kv_transfer_config`` (see
-    ``KVConnectorFactory.kv_budget_reserve_bytes``). Only a ``kv_consumer``
-    running DCP on a plain MLA model (``plain_mla_model``) lands. The reserve
-    and the allocation in ``register_kv_caches`` both ask this, so no pool
-    goes unreserved.
-    """
-
-    return bool(
-        envs.ATOM_PD_MLA_LANDING
-        and getattr(config, "decode_context_parallel_size", 1) > 1
-        and config.kv_transfer_config.get("kv_role") == "kv_consumer"
-        and plain_mla_model(config)
-    )
-
-
-def mla_landing_table_segments(config) -> int:
-    """Segments a landing rank's scatter table holds, from ``config`` alone.
-
-    One per destination page of a full pool, plus 64 item splits per slot.
-    An MLA row takes at least ``kv_lora_rank`` bytes, so a page takes at
-    least ``block_size * kv_lora_rank``. A batch needing more segments is
-    copied in several chunks.
-    """
-
-    kv_lora_rank = get_hf_text_config(config.hf_config).kv_lora_rank
-    page_bytes = config.kv_cache_block_size * kv_lora_rank
-    pages_per_slot = MLA_LANDING_SLOT_BYTES // page_bytes
-    return segment_table_capacity(MLA_LANDING_POOL_SLOTS * (pages_per_slot + 64))
-
-
-def mla_landing_reserve_bytes(config) -> int:
-    """HBM to hold back from the KV budget for this rank's MLA landing.
-
-    The pool plus the scatter's int64 ``[3, segments]`` device table, both
-    allocated in ``register_kv_caches`` after the KV cache is sized.
-    """
-
-    if not mla_landing_configured(config):
-        return 0
-    table_bytes = 3 * 8 * mla_landing_table_segments(config)
-    return MLA_LANDING_POOL_SLOTS * MLA_LANDING_SLOT_BYTES + table_bytes
-
-
 @dataclass
 class _StageTransfer:
     """One prefill stage's transfer of one request to this rank."""
@@ -360,38 +321,39 @@ class LandingReceiver:
         device: int | None,
         pool_slots: int,
         slot_bytes: int,
-        block_size: int,
+        units_per_page: int,
         consumer_key: str,
         region_bases: list[int],
         region_block_bytes: list[int],
-        mla_regions: list[int],
+        region_indices: list[int],
         send: Callable[[str, list], None],
         finish: Callable[[str, bool], None],
         table_segments: int,
     ) -> None:
-        if not mla_regions:
-            raise ValueError("MLA landing needs at least one MLA region")
+        if not region_indices:
+            raise ValueError("KV landing needs at least one region")
         # None keeps everything on the CPU (unit tests replace _copy_segments).
         self.device = (
             torch.device("cpu") if device is None else torch.device("cuda", device)
         )
         self.slot_bytes = slot_bytes
-        self.block_size = block_size
+        # Transfer units per KV page: block_size for token rows, 1 for whole PAGEs.
+        self.units_per_page = units_per_page
         self.consumer_key = consumer_key
         self.epoch = int.from_bytes(os.urandom(7), "big")
         self._send = send
         self._finish = finish
         self._region_bases = np.asarray(region_bases, dtype=np.int64)
         self._region_block_bytes = np.asarray(region_block_bytes, dtype=np.int64)
-        self._is_mla = np.zeros(len(region_bases), dtype=bool)
-        self._is_mla[mla_regions] = True
-        for c in mla_regions:
-            if region_block_bytes[c] % (4 * block_size) or region_bases[c] % 4:
+        self._region_enabled = np.zeros(len(region_bases), dtype=bool)
+        self._region_enabled[region_indices] = True
+        for c in region_indices:
+            if region_block_bytes[c] % (4 * units_per_page) or region_bases[c] % 4:
                 raise ValueError(
-                    f"MLA landing needs 4-byte aligned rows; region {c} has "
+                    f"KV landing needs 4-byte aligned units; region {c} has "
                     f"{region_block_bytes[c]} bytes per block at {region_bases[c]:#x}"
                 )
-        self._dst_origin = int(self._region_bases[mla_regions].min())
+        self._dst_origin = int(self._region_bases[region_indices].min())
         self.pool = torch.empty(
             (pool_slots, slot_bytes), dtype=torch.uint8, device=self.device
         )
@@ -431,7 +393,7 @@ class LandingReceiver:
             base_addr=self.pool.data_ptr(),
             total_bytes=self.pool.numel(),
             unit_bytes=self.slot_bytes,
-            semantic_role="mla.landing",
+            semantic_role="kv.landing",
         )
 
     def start(self) -> None:
@@ -456,7 +418,7 @@ class LandingReceiver:
             )
         self._stream.synchronize()
         self._thread = threading.Thread(
-            target=self._run, daemon=True, name="mooncake-mla-landing"
+            target=self._run, daemon=True, name="mooncake-landing"
         )
         self._thread.start()
 
@@ -466,7 +428,7 @@ class LandingReceiver:
         """The ``mla_landing`` field for a write request to ``stage_addr``.
 
         The first request to a stage endpoint assigns it a partition of
-        ``pool_slots // num_stages`` slots; None once the pool is spent, for
+        ``max(1, pool_slots // num_stages)`` slots; None once the pool is spent, for
         an endpoint that cannot land, or when landing is disabled (a scatter
         error).
         """
@@ -482,7 +444,7 @@ class LandingReceiver:
                         self._warned_spent = True
                         logger.warning(
                             "[PD-LANDING] pool spent: stage %s and later new "
-                            "stage endpoints use staged per-page writes",
+                            "stage endpoints use staged writes",
                             stage_addr,
                         )
                     return None
@@ -739,8 +701,8 @@ class LandingReceiver:
         if reclaimed:
             logger.warning(
                 "[PD-LANDING] stage %s cannot land (a DCP prefill, "
-                "ATOM_PD_MLA_STAGING=0 or a build without landing); its %d "
-                "slots go back to the pool and it keeps staged per-page writes",
+                "staging disabled or a build without landing); its %d "
+                "slots go back to the pool and it keeps staged writes",
                 stage.stage_addr,
                 reclaimed,
             )
@@ -925,13 +887,13 @@ class LandingReceiver:
         for task, request in live:
             items = np.asarray(task.items, dtype=np.int64).reshape(-1, 4)
             region, row_start, row_count, offset = items.T
-            rows = request.dst_block_ids.size * self.block_size
+            rows = request.dst_block_ids.size * self.units_per_page
             # Upper bounds subtract from local sizes rather than add READY
             # values: such a sum can wrap past int64 and pass.
             if (
                 (region < 0).any()
-                or (region >= self._is_mla.size).any()
-                or not self._is_mla[region].all()
+                or (region >= self._region_enabled.size).any()
+                or not self._region_enabled[region].all()
                 or (row_start < 0).any()
                 or (row_count <= 0).any()
                 or (row_count > rows - row_start).any()
@@ -939,7 +901,7 @@ class LandingReceiver:
                 or (offset < 0).any()
                 or (offset % 4).any()
                 or (
-                    row_count * self._region_block_bytes[region] // self.block_size
+                    row_count * self._region_block_bytes[region] // self.units_per_page
                     > self.slot_bytes - offset
                 ).any()
             ):
@@ -959,12 +921,14 @@ class LandingReceiver:
                     self._region_bases[region],
                     self._region_block_bytes[region],
                     request.dst_block_ids,
-                    self.block_size,
+                    self.units_per_page,
                     self._dst_origin,
                 )
             )
             landed_bytes += int(
-                (row_count * self._region_block_bytes[region] // self.block_size).sum()
+                (
+                    row_count * self._region_block_bytes[region] // self.units_per_page
+                ).sum()
             )
         start = time.monotonic()
         if parts:

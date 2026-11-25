@@ -199,6 +199,7 @@ def test_qwen4_exp_rtp_gdn_policy_requires_vk_decode_state(
         num_spec_decodes=spec_decodes,
         non_spec_query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
         flydsl_prefill_metadata=None,
+        replayssm=False,
     )
     state = torch.empty((4, 2, 128, 128), dtype=torch.float32)
     if vk_layout:
@@ -228,6 +229,47 @@ def test_qwen4_exp_rtp_gdn_policy_requires_vk_decode_state(
     assert (metadata.flydsl_prefill_metadata is not None) is prefill_enabled
 
 
+@pytest.mark.parametrize("replayssm", [False, True])
+def test_qwen4_exp_rtp_gdn_prefill_stays_on_triton_under_replayssm(
+    monkeypatch, replayssm
+):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    layer = SimpleNamespace(
+        allow_aiter_flydsl=True,
+        dt_bias=torch.empty((), dtype=torch.bfloat16),
+    )
+    metadata = SimpleNamespace(
+        num_prefills=2,
+        num_prefill_tokens=5,
+        num_spec_decodes=0,
+        non_spec_query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+        flydsl_prefill_metadata=None,
+        replayssm=replayssm,
+    )
+    calls = []
+
+    def select(**kwargs):
+        calls.append(kwargs)
+        return GDNFlyDSLPolicy(prefill=True, decode=False)
+
+    monkeypatch.setattr(qwen4_exp_context, "select_policy", select)
+    monkeypatch.setattr(
+        qwen4_exp_context,
+        "build_prefill_metadata",
+        lambda lengths, cu: (tuple(lengths), cu),
+    )
+    RTPQwen4ExpContext._configure_gdn_backends(
+        metadata,
+        {3: layer},
+        {"layer_3": SimpleNamespace(v_cache=torch.empty((4, 2, 128, 128)))},
+        SimpleNamespace(input_lengths=torch.tensor([2, 3], dtype=torch.int32)),
+    )
+    assert calls[0]["replayssm"] is replayssm
+    assert layer.gdn_flydsl_policy.prefill is (not replayssm)
+    assert (metadata.flydsl_prefill_metadata is None) is replayssm
+
+
 def test_qwen4_exp_rtp_gdn_decode_does_not_build_prefill_schedule(monkeypatch):
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
@@ -235,7 +277,12 @@ def test_qwen4_exp_rtp_gdn_decode_does_not_build_prefill_schedule(monkeypatch):
         allow_aiter_flydsl=True,
         dt_bias=torch.empty((), dtype=torch.bfloat16),
     )
-    metadata = SimpleNamespace(num_prefills=0, flydsl_prefill_metadata=None)
+    metadata = SimpleNamespace(
+        num_prefills=0,
+        num_spec_decodes=0,
+        flydsl_prefill_metadata=None,
+        replayssm=False,
+    )
     monkeypatch.setattr(
         qwen4_exp_context,
         "select_policy",
@@ -263,7 +310,7 @@ def test_qwen4_exp_rtp_gdn_decode_supports_non_128_head_dimensions(monkeypatch):
         allow_aiter_flydsl=True,
         dt_bias=torch.empty((), dtype=torch.bfloat16),
     )
-    metadata = SimpleNamespace(num_prefills=0, num_spec_decodes=0)
+    metadata = SimpleNamespace(num_prefills=0, num_spec_decodes=0, replayssm=False)
     monkeypatch.setattr(
         qwen4_exp_context,
         "select_policy",

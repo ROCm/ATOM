@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Sparse decode's builder/consumer contract; CPU stubs stop at GPU operations."""
 
 from __future__ import annotations

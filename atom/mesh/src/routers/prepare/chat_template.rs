@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
+use super::fast_tokenizer::FastTokenizer;
 use crate::{
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
@@ -27,27 +28,21 @@ pub struct ProcessedMessages {
 
 /// Process chat messages and apply the HuggingFace chat template.
 ///
-/// Requires a HuggingFace tokenizer (directly or via `CachedTokenizer`); other
-/// tokenizer kinds return an error because the gRPC path expects a chat-template
-/// rendered prompt.
+/// Requires a HuggingFace tokenizer (directly or via `CachedTokenizer` or
+/// `FastTokenizer`); other tokenizer kinds return an error because the gRPC path
+/// expects a chat-template rendered prompt.
 pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
-    let hf_tokenizer = tokenizer
-        .as_any()
-        .downcast_ref::<HuggingFaceTokenizer>()
-        .or_else(|| {
-            tokenizer
-                .as_any()
-                .downcast_ref::<CachedTokenizer>()
-                .and_then(|cached| {
-                    cached
-                        .inner()
-                        .as_any()
-                        .downcast_ref::<HuggingFaceTokenizer>()
-                })
-        });
+    let any = tokenizer.as_any();
+    let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
+        let inner = match any.downcast_ref::<CachedTokenizer>() {
+            Some(cached) => cached.inner().as_any(),
+            None => any.downcast_ref::<FastTokenizer>()?.inner().as_any(),
+        };
+        inner.downcast_ref::<HuggingFaceTokenizer>()
+    });
 
     let Some(hf_tokenizer) = hf_tokenizer else {
         return Err(

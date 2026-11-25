@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """CPU byte contracts for the production DCP FP4 metadata and staging path."""
 
 import ast
@@ -9,6 +11,24 @@ import numpy as np
 import pytest
 import torch
 
+from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+from atom.model_ops.indexer.layout import fp4_scale_byte
+from atom.model_ops.sparse_indexer_fp4 import fp4_index_scale_rows
+
+
+def _pool(layout, block=64):
+    return MlaKvPool(
+        layers=1,
+        block_size=block,
+        entry_dim=576,
+        kv_dtype=torch.bfloat16,
+        index_layers=1,
+        index_rows_per_block=block,
+        index_head_dim=128,
+        index_fp4=True,
+        index_layout=layout,
+    )
+
 
 @pytest.fixture
 def staging():
@@ -18,15 +38,13 @@ def staging():
         "np": np,
         "MFMA": "mfma",
         "PRESHUFFLE": "preshuffle",
-        "FP4_KV_BLOCK_SIZE": 64,
-        "_MFMA_M": 16,
+        "fp4_scale_byte": fp4_scale_byte,
+        "fp4_index_scale_rows": fp4_index_scale_rows,
         "upload_numpy": lambda values, device: torch.from_numpy(values.copy()).to(
             device
         ),
     }
     for filename, names in (
-        ("indexer/layout.py", {"fp4_scale_byte"}),
-        ("sparse_indexer_fp4.py", {"fp4_index_scale_rows"}),
         (
             "attentions/aiter_mla.py",
             {"_build_dcp_indexer_fp4_prefill_meta", "_build_dcp_indexer_prefill_meta"},
@@ -76,6 +94,14 @@ def test_builder_and_staging_preserve_bytes_across_batches(
         cache = cache.unsqueeze(1)
         scale_cache = torch.empty(12, 1, 4, 64, dtype=torch.uint8)
         scale_cache[:, 0, :, swizzle] = scales[0].transpose(1, 2)
+    pool = _pool(layout)
+    pool.allocate(12, "cpu")
+    allocated_cache = pool.layer("index", 0)
+    allocated_scale = pool.layer("index_scale", 0)
+    assert allocated_cache.dtype == allocated_scale.dtype == torch.uint8
+    allocated_cache.copy_(cache)
+    allocated_scale.copy_(scale_cache)
+    cache, scale_cache = allocated_cache, allocated_scale
     builder = SimpleNamespace(
         model_runner=SimpleNamespace(block_size=64), device="cpu", block_table_cols=4
     )
@@ -200,3 +226,66 @@ def test_prefill_builder_passes_the_active_layout(staging, layout):
         builder, SimpleNamespace(), 1, "prefill_"
     )
     assert seen[0][-1] == layout
+
+
+@pytest.mark.parametrize("backend", ["aiter_mla", "kimi_mla_gdn_attn"])
+def test_native_bindings_keep_mfma_allocator_byte_types(backend):
+    from atom.config import KVCacheTensor
+
+    path = Path(__file__).parents[1] / "atom/model_ops/attentions" / f"{backend}.py"
+    bind = next(
+        node
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name == "build_kv_cache_tensor"
+    )
+    namespace = {"MLA_ROWS": "mla"}
+    exec(  # noqa: S102 -- runs production binding without GPU backend imports
+        compile(ast.Module(body=[bind], type_ignores=[]), str(path), "exec"), namespace
+    )
+    pool = _pool("mfma")
+    pool.allocate(3, "cpu")
+    module = torch.nn.Module()
+    module.layer_num, module.use_mla, module.base_attention = 5, True, object()
+    module.indexer = SimpleNamespace(
+        _indexer_fp4=True, k_cache=SimpleNamespace(kv_cache=[None])
+    )
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            config=SimpleNamespace(max_model_len=192),
+            has_mla_indexer=True,
+            index_cache_layer_map={5: 0},
+        ),
+        pool_rows={"mla": {module: 0}},
+        _module_kinds=lambda _: ("mla",),
+        _indexer_fp4=True,
+        kv_pool=pool,
+    )
+    record = namespace["build_kv_cache_tensor"](builder, module)
+    assert isinstance(record, KVCacheTensor)
+    cache = module.indexer.k_cache
+    for field, bound, published in (
+        ("index", cache.kv_cache[0], record.index_cache),
+        ("index_scale", cache.kv_cache_scale, record.index_scale),
+    ):
+        allocated = pool.layer(field, 0)
+        assert bound.dtype == published.dtype == torch.uint8
+        assert bound.data_ptr() == published.data_ptr() == allocated.data_ptr()
+        assert bound.shape == published.shape == allocated.shape
+        assert bound.is_contiguous()
+
+
+@pytest.mark.parametrize("page", [0, 1, 2, 7, 1024, 33554431])
+def test_mfma_scale_offsets_are_page_local(page):
+    rows, chunks = torch.arange(64)[:, None], torch.arange(4)
+    offsets = fp4_scale_byte(page * 64 + rows, chunks)
+    assert torch.equal(offsets, page * 256 + fp4_scale_byte(rows, chunks))
+    assert torch.equal(offsets.flatten().sort().values, torch.arange(256) + page * 256)
+
+
+@pytest.mark.parametrize("layout", ["mfma", "preshuffle"])
+@pytest.mark.parametrize("block", [16, 32, 128, 256])
+def test_fp4_pool_and_dcp_lut_reject_non64_blocks(layout, block):
+    with pytest.raises(ValueError, match="requires --block-size 64"):
+        _pool(layout, block)
+    with pytest.raises(ValueError, match="64-row blocks"):
+        fp4_index_scale_rows(torch.arange(block), block)

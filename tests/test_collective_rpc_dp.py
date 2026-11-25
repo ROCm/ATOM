@@ -42,6 +42,7 @@ def _mgr(engine_count=2, tp=1, cls=CoreManager):
     mgr._weight_sync_context = threading.local()
     mgr._weight_sync_dispatch_token = object()
     mgr._rpc_ranks_per_engine = tp
+    mgr._weight_syncs_unavailable = {}
     mgr.sent = []
     mgr.broadcast_utility_command = lambda cmd, **kw: mgr.sent.append((cmd, kw))
     # What reaches one rank at a time, as a failed sync's cleanup does.
@@ -657,6 +658,37 @@ def test_a_complete_weight_sync_finishes_only_after_every_dp_engine_succeeds():
     assert mgr.sent[1][1]["timeout"] == engine_budget(30.0)
     # The engines commit only the update this names.
     assert mgr.sent[1][1]["completed_request_id"] == mgr.sent[0][1]["request_id"]
+
+
+def test_a_weight_stream_is_finished_like_any_other_sync():
+    mgr = _mgr(1)
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "receive_weights_rdma", "result": 435}]
+    )
+
+    mgr.broadcast_utility_command_sync(
+        "receive_weights_rdma", timeout=5, group_name="g", version=1
+    )
+
+    assert [cmd for cmd, _ in mgr.sent] == [
+        "receive_weights_rdma",
+        "finish_weight_sync",
+    ]
+
+
+def test_a_weight_stream_that_outlasts_its_caller_is_unknown_not_discarded():
+    """The engine still waits for its runners to decide the stream; a discard
+    reached it once they had written it, and fenced it over a version the
+    caller had been told failed."""
+    mgr = _mgr(1)
+    mgr.broadcast_utility_command = _answering(mgr, [], ranks=[])
+
+    with pytest.raises(TimeoutError, match="unknown"):
+        mgr.broadcast_utility_command_sync(
+            "receive_weights_rdma", timeout=0.2, group_name="g", version=1
+        )
+
+    assert _discarded(mgr) == []
 
 
 def test_a_nonfinal_bucket_stays_fenced_for_the_rest_of_its_sync():

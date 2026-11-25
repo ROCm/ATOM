@@ -573,3 +573,52 @@ def test_draft_qsa_covers_the_graph_bucket_without_a_request_limit(monkeypatch):
     bridge._ensure_draft_qsa(torch.device("cpu"), block_size=64, ctx_len=8192)
     assert seen["max_bs"] == 64
     assert seen["max_tokens"] == 64 * 5
+
+
+@pytest.mark.parametrize(
+    "mode, native_qsa, built",
+    [
+        # Target prefill and, on the draft runner, the draft prefill.
+        ("EXTEND", True, []),
+        ("MIXED", True, []),
+        ("TARGET_VERIFY", True, []),
+        ("DRAFT_EXTEND_V2", True, []),
+        ("DECODE", True, ["decode", "fixup"]),
+        ("EXTEND", False, ["extend", "fixup"]),
+    ],
+    ids=["extend", "mixed", "verify", "draft-extend-v2", "decode", "not-qsa"],
+)
+def test_native_qsa_extend_builds_no_flashinfer_tables(
+    monkeypatch, mode, native_qsa, built
+):
+    """QSA reads none of the MHA tables; building them costs a host sync."""
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
+        ATOMAttnBackendForSgl,
+    )
+
+    calls = []
+    for name, tag in (
+        ("_init_forward_metadata_decode", "decode"),
+        ("_init_forward_metadata_extend", "extend"),
+        ("_fixup_page_table", "fixup"),
+    ):
+        monkeypatch.setattr(
+            ATOMAttnBackendForSgl,
+            name,
+            lambda self, forward_batch, tag=tag: calls.append(tag),
+        )
+    backend = ATOMAttnBackendForSgl.__new__(ATOMAttnBackendForSgl)
+    backend._atom_native_qsa = native_qsa
+    backend.use_mla = False
+    backend.forward_metadata = None
+
+    backend.init_forward_metadata(
+        SimpleNamespace(forward_mode=ForwardMode[mode], batch_size=2, spec_info=None)
+    )
+
+    assert calls == built
+    if not built:
+        assert backend.forward_metadata.kv_indices is None
+        assert backend.forward_metadata.kv_indptr is None

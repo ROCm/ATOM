@@ -70,6 +70,14 @@ def mla_dcp_decode_call(
     }
 
 
+def mla_cache_dtype(kv_cache_dtype: str):
+    """Concrete native MLA query/cache dtype for its normalized API selector."""
+    import torch
+    from aiter import dtypes
+
+    return dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
+
+
 def dcp_persistent_supported(
     num_heads: int, kv_cache_dtype: str, dcp_world_size: int
 ) -> bool:
@@ -82,11 +90,9 @@ def dcp_persistent_supported(
     depends on the dtype and selected head plan. Cache the result once per
     ``__init__``; it is not for the forward pass.
     """
-    import torch
-    from aiter import dtypes
     from aiter.ops.attention import MlaBackend, get_mla_decode_shape_support
 
-    dtype = dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
+    dtype = mla_cache_dtype(kv_cache_dtype)
     support = get_mla_decode_shape_support(
         num_heads,
         1,

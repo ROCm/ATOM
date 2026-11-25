@@ -68,6 +68,7 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
         dtype_q=dtype,
         dtype_kv=dtype,
         index_topk_out=topk,
+        _sparse_prefill_kv_granularity=topk,
         model_runner=SimpleNamespace(forward_vars=work_buffers("sparse_prefill_")),
     )
     AiterMLAMetadataBuilder._sparse_prefill_work_plan(builder, meta, "", heads, last)
@@ -110,6 +111,7 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
         "scale": scale,
         "dcp_sparse_prefill_num_heads": heads,
         "dcp_sparse_prefill_persistent": True,
+        "dcp_sparse_prefill_plan_native": reuse,
         "sparse_dcp_metadata_rebuild": True,
         "dcp_persistent_supported": True,
         "dcp_sparse_prefill_nonps": False,
@@ -237,6 +239,7 @@ def test_patch_stops_at_the_plans_last_item(cache_dtype, rows, heads):
         dtype_q=dtype,
         dtype_kv=dtype,
         index_topk_out=topk,
+        _sparse_prefill_kv_granularity=topk,
         model_runner=SimpleNamespace(forward_vars=work),
     )
     last = torch.ones(rows, dtype=torch.int32, device="cuda")

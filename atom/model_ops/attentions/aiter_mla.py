@@ -5,6 +5,7 @@ import functools
 import inspect
 import logging
 from dataclasses import dataclass
+from types import MappingProxyType
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from aiter.ops.attention import (
     get_mla_decode_shape_support,
 )
 
+from atom.config import kv_cache_torch_dtype
 from atom.distributed.dcp_utils import (
     NONPS_MAX_Q_ROWS,
     get_dcp_rank,
@@ -48,12 +50,12 @@ from atom.kv_transfer.disaggregation.pd_producer import mooncake_pd_producer_con
 from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
-    _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
     mla_dcp_kernel_num_heads,
     mla_dcp_persistent_width,
     mla_dcp_sparse_prefill_num_heads,
+    mla_dense_min_query_heads,
     mla_kernel_num_heads,
 )
 from atom.model_ops.attentions.selection_pack import (
@@ -537,9 +539,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
         # Must equal `MLAAttention.padded_num_heads`: that pads the query, this
-        # sizes the kernel's work descriptors for it.
+        # sizes the kernel's work descriptors for it. Both take the floor from
+        # the one model-level `mla_dense_min_query_heads`.
         self.padded_num_attention_heads = mla_kernel_num_heads(
-            max(self.num_attention_heads, _MLA_MIN_HEADS)
+            self.num_attention_heads,
+            mla_dense_min_query_heads(
+                config, self.num_attention_heads, get_dcp_world_size()
+            ),
         )
         self.is_sparse = model_runner.has_mla_indexer
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
@@ -567,11 +573,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self._fp4_launches = Fp4LaunchStorages(
             self.device, self.max_num_batched_tokens, self.max_bs
         )
-        self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
+        self.dtype_kv = kv_cache_torch_dtype(config.kv_cache_dtype)
         self.dtype_q = self.dtype_kv
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        self._sparse_prefill_kv_granularity = (
+            triton.next_power_of_2(self.index_topk_out)
+            if self.is_sparse and self.dcp_world_size > 1
+            else max(self.block_size, 16)
+        )
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self.indexes_by_token_table = indexes_by_token_table(
             self.is_sparse, self.dcp_world_size, self.index_kpool
@@ -608,6 +619,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and dcp_persistent
             and self.block_size == 1
         )
+        self._sparse_prefill_work_view_cache = {}
+        self._dcp_sparse_prefill_mode = self._resolve_dcp_sparse_prefill_mode(
+            config.kv_cache_dtype
+        )
+        self._dcp_sparse_prefill_kv_fallback_warned = False
+        self._warm_dcp_sparse_prefill_kv()
         if self.dcp_world_size > 1 and dcp_persistent:
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
                 self.num_attention_heads,
@@ -646,12 +663,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 config.max_num_batched_tokens,
                 NONPS_MAX_Q_ROWS,
             )
-        # Decode and sparse prefill round the gathered head count with different
-        # width tables, so the two can disagree. Their work/reduce buffers are
-        # separate, so size each for its own consumer.
+        # Decode and a "q" sparse prefill round the gathered head count with
+        # different width tables, so the two can disagree. Their work/reduce
+        # buffers are separate, so size each for its own consumer.
         self.sparse_prefill_num_heads = self.padded_num_attention_heads
         if self.sparse_dcp_metadata_rebuild:
-            self.sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
+            self.sparse_prefill_num_heads, _ = mla_dcp_sparse_prefill_num_heads(
                 self.num_attention_heads,
                 self.dcp_world_size,
                 dtype_q=self.dtype_q,
@@ -826,15 +843,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 (spp_ri_size, spp_ri_type),
                 (spp_rfm_size, spp_rfm_type),
                 (spp_rpm_size, spp_rpm_type),
-            ) = get_mla_metadata_info_v1(
-                self.max_num_batched_tokens,
-                1,  # sparse prefill treats each query token as q_len=1
-                self.sparse_prefill_num_heads,
-                self.dtype_q,
-                self.dtype_kv,
-                is_sparse=True,
-                fast_mode=True,
-            )
+            ) = self._sparse_prefill_work_info(self.max_num_batched_tokens)
             mla_metadata["sparse_prefill_work_meta_data"] = torch.empty(
                 spp_wmd_size, dtype=spp_wmd_type, device=self.device
             )
@@ -1052,15 +1061,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # A decode's per request, a prefill's per token.
             shapes["sparse_kv_indptr"] = (tokens + 1,)
             shapes["cu_seqlen_ks"] = (tokens,)
-            work = get_mla_metadata_info_v1(
-                tokens,
-                1,  # sparse prefill treats each query token as q_len=1
-                self.sparse_prefill_num_heads,
-                self.dtype_q,
-                self.dtype_kv,
-                is_sparse=True,
-                fast_mode=True,
-            )
+            work = self._sparse_prefill_work_info(tokens)
             for name, (size, _) in zip(PERSISTENT_WORK_BUFFERS, work):
                 shapes[f"sparse_prefill_{name}"] = size
         return shapes
@@ -1638,7 +1639,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             layers=self._kv_pool_layers(),
             block_size=runner.block_size,
             entry_dim=mla_kv_entry_dim(hf_config),
-            kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
+            kv_dtype=kv_cache_torch_dtype(runner.config.kv_cache_dtype),
             **indexer,
         )
 
@@ -2084,6 +2085,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         request's row of `dcp_indexer_fp4_block_tables` pages its keys as its
         own block table does and the scorer's columns are the request's own.
 
+        `layout` selects PRESHUFFLE page/row/scale-row indices or MFMA int64
+        page/row indices and full-plane offsets for each row's four scale bytes.
+        Both read and stage metadata are shared by all indexer layers.
+
         The read formula must track `cp_gather_indexer_k_quant_cache`, the FP8
         plane's gather, which the FP4 planes have no equivalent of. Its padded
         indices stay inside the sequence's own blocks, so the staging read
@@ -2100,8 +2105,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         stage = np.repeat(first_page[:bs] * block - g_cu[:bs], g_lens) + np.arange(
             int(g_cu[bs]), dtype=np.int64
         )
-        # Page / row / e8m0 row of both slot lists, built once per forward, not
-        # per layer: one upload, one launch.
+        # Upload both slot lists together; derive the layout-specific metadata
+        # once per forward, rather than rebuilding it in every layer.
         slots = upload_numpy(
             np.concatenate([read, stage]).astype(np.int32), self.device
         )
@@ -2338,26 +2343,85 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ]
         attn_metadata.dcp_owned_counts = self._dcp_owned_counts_gpu[first_token:]
 
+    def _sparse_prefill_work_widths(self):
+        """Head widths a sparse prefill plans with. A DCP "kv" step plans with
+        this rank's padded heads, which can need more tiles a token than the
+        gathered width (48 vs 128)."""
+        widths = [self.sparse_prefill_num_heads]
+        if (
+            self._dcp_sparse_prefill_mode != "q"
+            and self.padded_num_attention_heads != self.sparse_prefill_num_heads
+        ):
+            widths.append(self.padded_num_attention_heads)
+        return widths
+
+    def _sparse_prefill_work_info(self, tokens, heads=None):
+        """Sizes of the sparse prefill work buffers for ``tokens`` query rows:
+        for a ``heads`` plan, or by default the max over every width."""
+        infos = [
+            get_mla_metadata_info_v1(
+                tokens,
+                1,  # sparse prefill treats each query token as q_len=1
+                width,
+                self.dtype_q,
+                self.dtype_kv,
+                is_sparse=True,
+                fast_mode=True,
+            )
+            for width in ([heads] if heads else self._sparse_prefill_work_widths())
+        ]
+        if len(infos) == 1:
+            return infos[0]
+        return tuple(
+            (
+                (tuple(map(max, a, b)) if isinstance(a, (tuple, list)) else max(a, b)),
+                dtype,
+            )
+            for (a, dtype), (b, _) in zip(*infos)
+        )
+
+    def _sparse_prefill_work_views(self, prefix, heads):
+        """The ``prefix`` work buffers as a ``heads`` plan alone would size
+        them. aiter sizes its reduce grid and fp32 partials by the buffers it
+        is given, so a step must not see the max over both widths. Built once
+        per (prefix, heads) and shared by every step, hence read-only."""
+        cached = self._sparse_prefill_work_view_cache.get((prefix, heads))
+        if cached is not None:
+            return cached
+        var = self.model_runner.forward_vars
+        work = {
+            name: var[f"{prefix}sparse_prefill_{name}"]
+            for name in PERSISTENT_WORK_BUFFERS
+        }
+        if len(self._sparse_prefill_work_widths()) > 1:
+            tokens = self._ubatch_tokens() if prefix else self.max_num_batched_tokens
+            sizes = self._sparse_prefill_work_info(tokens, heads)
+            for name, (size, _) in zip(PERSISTENT_WORK_BUFFERS, sizes):
+                rows = size[0] if isinstance(size, (tuple, list)) else size
+                if rows < work[name].shape[0]:
+                    work[name] = work[name][:rows]
+        work = MappingProxyType(work)
+        self._sparse_prefill_work_view_cache[(prefix, heads)] = work
+        return work
+
     def _sparse_prefill_work_plan(
         self,
         attn_metadata: AttentionMetaData,
         prefix: str,
         num_heads: int,
         last_page_lens: torch.Tensor,
+        local_heads: bool = False,
     ) -> None:
         """The persistent sparse prefill's work plan over ``attn_metadata``'s
         query rows, into the ``prefix`` set's buffers; none for the
-        non-persistent DCP sparse prefill, which reads no plan.
+        non-persistent "q" prefill, which reads no plan. ``local_heads`` selects
+        a "kv" prefill's dcp=1 plan and ordinary split granularity.
 
-        Native DCP plans hold one work item a row: each owning layer points
+        Native "q" plans hold one work item a row: each owning layer points
         it at its own keys. Folded plans are rebuilt by each owning layer."""
-        if self.dcp_sparse_prefill_nonps:
+        if self.dcp_sparse_prefill_nonps and not local_heads:
             return
-        var = self.model_runner.forward_vars
-        work = {
-            name: var[f"{prefix}sparse_prefill_{name}"]
-            for name in PERSISTENT_WORK_BUFFERS
-        }
+        work = self._sparse_prefill_work_views(prefix, num_heads)
         get_mla_metadata_v1(
             attn_metadata.sparse_cu_seqlens_q,
             attn_metadata.sparse_kv_indptr,
@@ -2374,11 +2438,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             page_size=self.block_size,
             dtype_q=self.dtype_q,
             dtype_kv=self.dtype_kv,
-            # No row selects more than index_topk_out keys.
+            # Only "q" plans are patched to each layer's rank-local ranges.
             kv_granularity=(
-                triton.next_power_of_2(self.index_topk_out)
-                if self.dcp_world_size > 1
-                else max(self.block_size, 16)
+                max(self.block_size, 16)
+                if local_heads
+                else self._sparse_prefill_kv_granularity
             ),
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
@@ -2387,6 +2451,113 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         for name, buffer in work.items():
             setattr(attn_metadata, f"sparse_prefill_{name}", buffer)
+
+    def _warm_dcp_sparse_prefill_kv(self):
+        """Compile the "kv" index kernel at init: dummy runs build no plan, so
+        the first live "kv" step would JIT it."""
+        if self._dcp_sparse_prefill_mode == "q":
+            return
+        from atom.model_ops.dcp_ops import warm_dcp_sparse_prefill_kv_index
+
+        warm_dcp_sparse_prefill_kv_index(
+            self.dcp_world_size,
+            self.cp_kv_cache_interleave_size,
+            self.index_topk,
+            self.device,
+        )
+
+    def _resolve_dcp_sparse_prefill_mode(self, kv_cache_dtype):
+        """ATOM_DCP_SPARSE_PREFILL as this builder can run it. The "kv"
+        transport's conditions are `dcp_sparse_prefill_kv_blocker`'s."""
+        from atom.model_ops.dcp_ops import (
+            dcp_sparse_prefill_kv_blocker,
+            dcp_sparse_prefill_kv_context_bound,
+            dcp_sparse_prefill_kv_max_tokens_env,
+            dcp_sparse_prefill_mode_env,
+        )
+
+        if not self.is_sparse or self.dcp_world_size <= 1:
+            return "q"
+        mode = dcp_sparse_prefill_mode_env()
+        blocker = dcp_sparse_prefill_kv_blocker(kv_cache_dtype, self.block_size)
+        if blocker is not None and mode != "q":
+            log = logger.warning if mode == "kv" else logger.info
+            log("DCP sparse prefill: %s takes the q transport (%s)", mode, blocker)
+            return "q"
+        if mode != "q":
+            self._dcp_sparse_prefill_kv_max_tokens = (
+                dcp_sparse_prefill_kv_max_tokens_env()
+            )
+            self._dcp_sparse_prefill_kv_context_bound = functools.partial(
+                dcp_sparse_prefill_kv_context_bound, self.num_attention_heads
+            )
+        logger.info("DCP sparse prefill transport: %s", mode)
+        return mode
+
+    def _dcp_sparse_prefill_kv_plan(self, batch, total_kv, num_tokens):
+        """This step's DCP sparse prefill transport: the "kv" layout, or None
+        for "q". Reads the batch and its staged ``total_kv`` and ``num_tokens``
+        (the micro-batch's under TBO), identical on every DCP rank."""
+        mode = self._dcp_sparse_prefill_mode
+        if batch.is_dummy_run:
+            return None
+        # "auto"'s context bound first: it settles a long-prefix step as "q"
+        # before any of the plan's numpy work.
+        if mode == "auto" and total_kv > self._dcp_sparse_prefill_kv_context_bound(
+            num_tokens
+        ):
+            return None
+        from atom.model_ops.dcp_ops import (
+            dcp_sparse_prefill_kv_plan,
+            dcp_sparse_prefill_kv_rows,
+        )
+
+        plan = dcp_sparse_prefill_kv_plan(
+            batch.context_lens,
+            batch.block_tables,
+            self.dcp_world_size,
+            self.model_runner.block_size,
+            self._dcp_sparse_prefill_kv_max_tokens,
+            self.device,
+        )
+        if (
+            plan is None
+            and mode == "kv"
+            and not self._dcp_sparse_prefill_kv_fallback_warned
+            and dcp_sparse_prefill_kv_rows(
+                batch.context_lens, self.dcp_world_size, self.model_runner.block_size
+            )
+            * self.dcp_world_size
+            > self._dcp_sparse_prefill_kv_max_tokens
+        ):
+            self._dcp_sparse_prefill_kv_fallback_warned = True
+            logger.warning(
+                "DCP sparse prefill: a step over ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS"
+                "=%d takes the q transport (warned once)",
+                self._dcp_sparse_prefill_kv_max_tokens,
+            )
+        return plan
+
+    def _dcp_sparse_prefill_step(self, batch, attn_metadata, prefix, num_tokens):
+        """Pick this step's DCP sparse prefill transport and build its work
+        plan. The "kv" prefill attends this rank's own heads over the global
+        top-k, as without DCP, so it takes the dcp=1 plan."""
+        kv_plan = self._dcp_sparse_prefill_kv_plan(
+            batch, attn_metadata.total_kv, num_tokens
+        )
+        attn_metadata.dcp_sparse_prefill_kv = kv_plan
+        heads = (
+            self.padded_num_attention_heads
+            if kv_plan is not None
+            else self.sparse_prefill_num_heads
+        )
+        self._sparse_prefill_work_plan(
+            attn_metadata,
+            prefix,
+            heads,
+            attn_metadata.sparse_kv_last_page_lens,
+            local_heads=kv_plan is not None,
+        )
 
     def _finish_prefill_batch(self, batch, attn_metadata, prefix=""):
         super()._finish_prefill_batch(batch, attn_metadata, prefix)
@@ -2399,12 +2570,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 gathers = self._dcp_pass_gathers(attn_metadata, bs, prefix, passes)
             elif self.dcp_world_size > 1:
                 self._build_dcp_indexer_prefill_meta(attn_metadata, bs, prefix)
-            self._sparse_prefill_work_plan(
-                attn_metadata,
-                prefix,
-                self.sparse_prefill_num_heads,
-                attn_metadata.sparse_kv_last_page_lens,
-            )
+            if self._dcp_sparse_prefill_mode == "q":
+                self._sparse_prefill_work_plan(
+                    attn_metadata,
+                    prefix,
+                    self.sparse_prefill_num_heads,
+                    attn_metadata.sparse_kv_last_page_lens,
+                )
+            else:
+                self._dcp_sparse_prefill_step(
+                    batch, attn_metadata, prefix, len(staged.sparse_counts)
+                )
             if staged.pcp_split:
                 self._apply_pcp_reindex(
                     attn_metadata, batch.scheduled_tokens, staged.sparse_counts, prefix
@@ -2675,13 +2851,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         same contiguous local packing used by the Phase-1 slot_mapping writes.
         """
         from atom.model_ops.dcp_ops import (
+            dcp_padded_local_lens,
             dcp_reorg_row_indices,
             get_dcp_local_seq_lens,
         )
 
         dcp = self.dcp_world_size
         bsz = self.model_runner.block_size
-        vbs = bsz * dcp  # virtual (global) block size
 
         bs = batch.scheduled_bs
         cached_lens = batch.cached_lens.astype(np.int64)
@@ -2701,10 +2877,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )  # [bs, dcp]
 
         # Number of local blocks per seq is identical on every rank
-        # (= ceil(global_len / vbs)), so the padded local length is uniform and
-        # the AllGather block is uniform across ranks.
-        num_local_blocks = cdiv(cached_lens, vbs)  # [bs]
-        padded_local_len = num_local_blocks * bsz  # [bs]
+        # (= ceil(global_len / (bsz * dcp))), so the padded local length is
+        # uniform and the AllGather block is uniform across ranks.
+        padded_local_len = dcp_padded_local_lens(cached_lens, dcp, bsz)  # [bs]
         max_padded_local = int(padded_local_len.max(initial=0))
 
         # Local per-seq chunk budget (in local tokens), block-aligned so each

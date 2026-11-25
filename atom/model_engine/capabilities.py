@@ -30,6 +30,12 @@ from dataclasses import dataclass, field
 # that pins a version can refuse to negotiate rather than fail mid-collective.
 COLLECTIVE_RPC_PROTOCOL_VERSION = 1
 
+# The weight syncs a runner may be unable to take, as keys of a capability
+# report's ``unavailable``: a reload in place (direct, SHM, IPC), and a stream
+# over the trainer's RDMA group.
+WEIGHT_RELOAD_FEATURE = "weight_reload"
+RDMA_WEIGHT_RECEIVE_FEATURE = "rdma_weight_receive"
+
 
 def pcp_group_size_of(config) -> int:
     """Ranks in AITER's PCP process group, which Ulysses SP runs over too.

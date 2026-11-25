@@ -46,26 +46,6 @@ FP8_DTYPE = dtypes.fp8
 FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
 FP4_GROUP = 32
 _FMT_BF16, _FMT_FP8, _FMT_FP4 = 0, 1, 2
-QSA_CACHE_FORMATS = ("bf16", "fp8", "fp4")
-
-
-def qsa_cache_formats(atom_config) -> tuple[str, str]:
-    """`(K/V format, compressed index-key format)` this engine serves.
-
-    The raw index keys stay BF16 whatever is asked: they are mean-pooled
-    before normalization, and a group can straddle a prefill chunk.
-    An unset index dtype follows the KV cache's, as `Config` resolves it.
-    """
-    kv = getattr(atom_config, "kv_cache_dtype", "bf16") or "bf16"
-    kv = "bf16" if kv in ("auto", "bfloat16") else kv
-    index = getattr(atom_config, "index_cache_dtype", None) or kv
-    index = "bf16" if index in ("auto", "bfloat16") else index
-    if kv not in ("bf16", "fp8") or index not in QSA_CACHE_FORMATS:
-        raise ValueError(
-            f"Qwen QSA serves bf16/fp8 KV and bf16/fp8/fp4 index caches, got "
-            f"kv_cache_dtype={kv!r} index_cache_dtype={index!r}"
-        )
-    return kv, index
 
 
 def qsa_cache_row_layout(fmt: str, head_dim: int):
@@ -2022,7 +2002,7 @@ def qsa_expand_block_indices(
     return out
 
 
-def _selection_widths(
+def qsa_selection_widths(
     compressed_k_cache: torch.Tensor,
     page_table: torch.Tensor,
     token_topk: int,
@@ -2079,7 +2059,7 @@ def qsa_select_paged_groups(
     may select a row range and assemble the rows elsewhere; the widths depend
     only on the batch-wide `page_table` and `max_seq_len`.
     """
-    columns, block_topk, output_width = _selection_widths(
+    columns, block_topk, output_width = qsa_selection_widths(
         compressed_k_cache, page_table, token_topk, compress_ratio, max_seq_len
     )
     rows = q.shape[0]
@@ -2138,9 +2118,9 @@ def qsa_select_paged_tokens(
     compressed_k_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score, select and expand in one call: `[tokens, width]` token ids
-    (see `_selection_widths` for the width)."""
+    (see `qsa_selection_widths` for the width)."""
     rows = q.shape[0]
-    _, _, output_width = _selection_widths(
+    _, _, output_width = qsa_selection_widths(
         compressed_k_cache, page_table, token_topk, compress_ratio, max_seq_len
     )
     if out is None:

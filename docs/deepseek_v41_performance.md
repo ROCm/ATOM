@@ -25,8 +25,11 @@ the BF16 RoPE table and quantizes it to MXFP8 (1x32) in one launch, and
 `batched_gemm_a8w8_mxscale_bpreshuffle` runs the grouped GEMM. Delayed mHC
 uses AITER stages.
 
-On AITER builds without the native group32 interface, the compatibility FP8
-GEMM keeps two pipeline stages, including its four-way packed-K layout.
+Native group32 FP8 linears need an AITER build with
+[ROCm/aiter#8086](https://github.com/ROCm/aiter/pull/8086); an older one fails
+at model build. `native_quant_linear` still carries a compatibility FP8 GEMM
+for a build without the native group32 interface, which no linear reaches. It
+keeps two pipeline stages, including its four-way packed-K layout.
 Triton 3.7's async LDS load can lose the neutral scale for masked K/N tails,
 including the TP2 shared-expert down projection at K=1152. The packed kernel
 loads weight scales from bounded addresses and explicitly selects E8M0 code

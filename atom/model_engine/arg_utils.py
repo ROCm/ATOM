@@ -182,6 +182,7 @@ class EngineArgs:
     draft_model: str | None = None
     spec_decode_acceptance_rate: float | None = None
     spec_decode_acceptance_length: float | None = None
+    spec_decode_kv_cache_dtype: str | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
     disagg_prefill_max_num_seqs: int | None = None
@@ -346,23 +347,25 @@ class EngineArgs:
         )
         parser.add_argument(
             "--kv_cache_dtype",
-            choices=["bf16", "fp8", "fp4"],
+            choices=["bf16", "fp8", "fp4", "nvfp4"],
             type=str,
             default="bf16",
             help="KV cache type. Default is 'bf16'. 'fp4' is MiniMax-M3.1's MXFP4 K/V "
-            "or DeepSeek-V4.1's own FP4 KV; other models refuse it. M3's conditions "
-            "are in the configuration guide.",
+            "or DeepSeek-V4.1's own FP4 KV; 'nvfp4' is MiniMax-M3.1's NVFP4 K/V "
+            "(needs --index-cache-dtype nvfp4); other models refuse them. M3's "
+            "conditions are in the configuration guide.",
         )
         parser.add_argument(
             "--index-cache-dtype",
             "--index_cache_dtype",
-            choices=["bf16", "fp8", "fp4"],
+            choices=["bf16", "fp8", "fp4", "nvfp4"],
             type=str,
             default=None,
             help="Index cache type. Native single-node DeepSeek-V4 defaults to "
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
             "default to --kv_cache_dtype. 'fp4' is MiniMax-M3's MXFP4 index "
-            "cache or another model's own FP4 layout; see the configuration guide.",
+            "cache or another model's own FP4 layout; 'nvfp4' is MiniMax-M3's NVFP4 index "
+            "cache (e2m1 + e4m3 per 16); see the configuration guide.",
         )
         parser.add_argument(
             "--index-cache-layout",
@@ -511,6 +514,21 @@ class EngineArgs:
             "--method eagle3; optional for --method dspark (needed for the "
             "DFlash-backbone drafts such as Kimi-K3-DSpark, omitted for "
             "V4-Pro-DSpark which ships inside the target checkpoint).",
+        )
+        parser.add_argument(
+            "--spec-decode-kv-cache-dtype",
+            type=str,
+            default=None,
+            choices=["bf16", "fp8"],
+            help="KV dtype of the speculative draft's pages "
+            "(SpeculativeConfig.kv_cache_dtype). A draft with a KV pool of its own "
+            "(an MHA draft: MiniMax-M3.1's DSpark, an MHA EAGLE3 draft) takes "
+            "either; omitted, --kv_cache_dtype's (bf16 under an fp4 / nvfp4 target). A draft in the target's pool "
+            "always has --kv_cache_dtype, and a different value here is an error. "
+            "A DeepSeek-V4.1 DSpark draft is not set by this flag (refused): use "
+            '--dspark-config \'{"draft_kv_dtype":"fp8"}\', a different setting '
+            "(how the draft reads the target's pool, not its own pages). "
+            "Needs --method and --num-speculative-tokens > 0.",
         )
         parser.add_argument(
             "--spec-decode-acceptance-length",
@@ -876,8 +894,9 @@ class EngineArgs:
                 "kv_lora_rank/v_head_dim.\n"
                 "  \"comm_backend\" (str, auto): 'auto' = 'mailbox' on gfx950 "
                 "with DCP > 1 unless decode TBO or plugin mode, else 'a2a'; "
-                "'a2a' = one "
-                "all-to-all; 'ag_rs' = AllGather LSE + ReduceScatter output; "
+                "'a2a' = one packed all-to-all or separate output/LSE "
+                "all-to-alls for head-major prefill; 'ag_rs' = AllGather LSE "
+                "+ ReduceScatter output; "
                 "'mailbox' = aiter's FlyDSL mailbox combine for decode (a2a "
                 "elsewhere).\n"
                 "The last three default to the NEW behaviour (and the middle "
@@ -945,6 +964,9 @@ class EngineArgs:
         kwargs = {
             f.name: getattr(self, f.name) for f in fields(self) if f.name != "model"
         }
+        # Let Config resolve ATOM_TORCH_PROFILER_DIR when no path was supplied.
+        if self.torch_profiler_dir is None:
+            kwargs.pop("torch_profiler_dir")
 
         # Handle special transformations
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
@@ -974,6 +996,7 @@ class EngineArgs:
                 method=method,
                 model=draft_model or self.model,
                 num_speculative_tokens=num_spec_tokens,
+                kv_cache_dtype=kwargs.pop("spec_decode_kv_cache_dtype"),
                 synthetic_acceptance_rate=synthetic_acceptance_rate,
                 synthetic_acceptance_length=synthetic_acceptance_length,
             )
@@ -983,6 +1006,11 @@ class EngineArgs:
             kwargs.pop("draft_model")
             kwargs.pop("spec_decode_acceptance_rate")
             kwargs.pop("spec_decode_acceptance_length")
+            if kwargs.pop("spec_decode_kv_cache_dtype") is not None:
+                raise ValueError(
+                    "--spec-decode-kv-cache-dtype needs --method and "
+                    "--num-speculative-tokens > 0."
+                )
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode

@@ -47,7 +47,9 @@ _RESOURCE_KEYS = {
     "sgpr_spill": b".sgpr_spill_count",
 }
 _OPTIONAL = ("vgpr_spill", "sgpr_spill", "agpr")
-_BIN = re.compile(r'bin\s*=\s*"')
+# the opening quote of the gpu.object's ELF string: after ``bin =``, or after
+# its kernel metadata where FlyDSL records it, bare
+_BIN = re.compile(r'"(?=\\7FELF)')
 
 
 class ResourceError(Exception):
@@ -332,7 +334,8 @@ def gate(
 
 
 def _code_object(module_text: str) -> bytes:
-    """The gpu.binary's ELF from the module text (``bin = "..."``, MLIR-escaped)."""
+    """The gpu.binary's ELF from the module text (its object's string,
+    MLIR-escaped)."""
     m = _BIN.search(module_text)
     if m is None:
         raise RuntimeError("no gpu.binary in the compiled module")
