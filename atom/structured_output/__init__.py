@@ -45,9 +45,9 @@ class StructuredRequest:
 LLGUIDANCE_VERSION = "1.9.1"
 
 UNAVAILABLE = (
-    f"structured output needs llguidance=={LLGUIDANCE_VERSION} and google-re2, "
-    "which ATOM installs; this environment is missing one or has another llguidance "
-    "(the vLLM image pins <1.8)"
+    f"structured output needs llguidance=={LLGUIDANCE_VERSION}, google-re2 and "
+    "jsonschema, which ATOM installs; this environment is missing one or has "
+    "another llguidance (the vLLM image pins <1.8)"
 )
 
 

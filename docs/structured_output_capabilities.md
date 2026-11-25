@@ -5,7 +5,7 @@ llguidance and RE2, which the base install includes. This is separate from the
 SGLang plugin's structured-output implementation.
 
 The backend needs exactly the llguidance release ATOM pins (1.9.1), plus
-`google-re2`. Without them (ATOM installed with `--no-deps`), or with another
+`google-re2` and `jsonschema`. Without them (ATOM installed with `--no-deps`), or with another
 llguidance release (the vLLM plugin image pins `<1.8`), structured output is
 off: requests that ask for it get a 400 naming what it needs,
 `ATOM_TOOL_CALL_GRAMMAR=1` leaves tool calls unconstrained, and `/v1/models`
