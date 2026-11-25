@@ -282,3 +282,16 @@ def test_installer_keeps_a_model_without_a_layer_stack_on_native(monkeypatch, ca
         assert dispatch.install_mono_decode(model, _atom_config(), None) is model
     assert "model has no layer stack" in caplog.text
     assert "armed" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("ssm", "refused"), [("fp32", False), ("fp16", False), ("bf16", True)]
+)
+def test_the_recurrent_state_dtype_gate(servable, monkeypatch, ssm, refused):
+    # K1 reads the pool in place as fp32 or fp16; a bf16 one would be
+    # reinterpreted rather than converted
+    monkeypatch.setattr(k3_config.envs, "ATOM_GDN_SSM_DTYPE", ssm)
+    reason = config_refusal(_atom_config())
+    assert (reason is not None) is refused
+    if refused:
+        assert f"ATOM_GDN_SSM_DTYPE={ssm}" in reason

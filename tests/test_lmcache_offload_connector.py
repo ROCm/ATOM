@@ -35,6 +35,7 @@ except ModuleNotFoundError:
 
 from conftest import MockConfig, with_min_load
 
+from atom.config import KVCacheTensor
 from atom.kv_transfer.disaggregation import (
     ConnectorCompletion,
     KVConnectorOutput,
@@ -644,7 +645,8 @@ def test_dense_backend_registers_dense_kv_byte_codec(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     connector = _dense_registration_connector()
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.zeros((3, 8), dtype=torch.uint8),
             v_cache=None,
             k_scale=None,
@@ -1009,7 +1011,8 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
             k_scale=None,
@@ -1050,7 +1053,8 @@ def test_dense_codec_rejects_per_request_state_by_default():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             k_scale=None,
@@ -1104,7 +1108,8 @@ def _fp4_index_kv_caches(torch, num_blocks, *, with_scale=True):
         + 3
     ).reshape(num_blocks, _FP4_K_TILES, _FP4_NTPW, _FP4_ROWS)
     return {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=kv,
             v_cache=None,
             k_scale=None,
@@ -1132,7 +1137,8 @@ def test_dense_codec_moves_the_fp4_index_scale_plane():
     num_blocks = 4
     original = _fp4_index_kv_caches(torch, num_blocks)
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=original["l0"].k_cache.clone(),
             v_cache=None,
             k_scale=None,
@@ -1220,6 +1226,112 @@ def test_dense_codec_fp8_indexer_layout_is_unchanged():
     )
 
 
+def test_dense_codec_keeps_qsa_side_caches_and_ignores_absent_ones():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    blocks = 4
+    k = torch.zeros(blocks, 8, dtype=torch.bfloat16)
+    v = torch.zeros(blocks, 8, dtype=torch.bfloat16)
+    raw = torch.zeros(blocks, 4, dtype=torch.bfloat16)
+    comp = torch.zeros(blocks, 2, dtype=torch.bfloat16)
+    qsa = KVCacheTensor(
+        layer_num=0,
+        k_cache=k,
+        v_cache=v,
+    )
+    qsa.extra_planes = (("index_raw", raw), ("index_compressed", comp))
+    plain = KVCacheTensor(layer_num=1, k_cache=k, v_cache=v)
+    qsa_codec = DenseKVByteCodec({"qsa": qsa}, num_blocks=blocks)
+    plain_codec = DenseKVByteCodec({"mha": plain}, num_blocks=blocks)
+    assert qsa_codec.bytes_per_block == (8 + 8 + 4 + 2) * 2
+    assert plain_codec.bytes_per_block == (8 + 8) * 2
+
+
+def _block_planes(blocks, *widths):
+    import torch
+
+    return [torch.zeros(blocks, width, dtype=torch.uint8) for width in widths]
+
+
+def test_mp_page_layout_publishes_qsa_side_planes_by_name():
+    """The vLLM MP publisher names each extra plane after its field, whichever
+    of them a layer's formats leave out, and a layer with none publishes only
+    its KV."""
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
+
+    blocks = 4
+    k, v, raw, comp, scale, latent = _block_planes(blocks, 8, 8, 4, 2, 1, 8)
+    # No `rope_positions`: the layout has no image input.
+    qsa = KVCacheTensor(
+        layer_num=0,
+        k_cache=k,
+        v_cache=v,
+    )
+    qsa.extra_planes = (
+        ("index_raw", raw),
+        ("index_compressed", comp),
+        ("index_compressed_scale", scale),
+    )
+    mla = KVCacheTensor(layer_num=1, k_cache=latent)
+    pages = build_mp_transfer_tensors([qsa, mla], num_blocks=blocks).pages
+    assert [page.region.semantic_role for page in pages] == [
+        "L0000.k_cache",
+        "L0000.v_cache",
+        "L0000.index_raw",
+        "L0000.index_compressed",
+        "L0000.index_compressed_scale",
+        "L0001.k_cache",
+    ]
+
+
+def test_every_qsa_side_plane_is_published_under_its_own_name():
+    """LMCache keys a layer's MP regions by these roles: each QSA side plane
+    publishes under its own name."""
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
+
+    names = (
+        "index_raw",
+        "index_compressed",
+        "rope_positions",
+        "index_compressed_scale",
+    )
+    blocks = 4
+    k, v, *sides = _block_planes(blocks, 8, 8, 4, 2, 3, 1)
+    tensor = KVCacheTensor(layer_num=0, k_cache=k, v_cache=v)
+    tensor.extra_planes = tuple(zip(names, sides))
+    pages = build_mp_transfer_tensors([tensor], num_blocks=blocks).pages
+    assert [page.region.semantic_role for page in pages] == [
+        "L0000.k_cache",
+        "L0000.v_cache",
+        *(f"L0000.{name}" for name in names),
+    ]
+
+
+def test_mp_page_layout_refuses_an_extra_plane_it_cannot_name():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
+
+    k, other = _block_planes(4, 8, 2)
+    tensor = KVCacheTensor(layer_num=0, k_cache=k)
+    tensor.extra_planes = (("other", other),)
+    with pytest.raises(ValueError, match="other"):
+        build_mp_transfer_tensors([tensor], num_blocks=4)
+
+
 def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
     import torch
 
@@ -1227,7 +1339,8 @@ def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             k_scale=None,
@@ -1631,7 +1744,8 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     # one metadata upload and launch each group by index.
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
     original = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
             k_scale=None,
@@ -1639,7 +1753,8 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         )
     }
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=original["l0"].k_cache.clone(),
             v_cache=original["l0"].v_cache.clone(),
             k_scale=None,
@@ -1756,7 +1871,8 @@ def test_lmcache_connector_requires_fused_chunk_major_staging():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
             k_scale=None,
@@ -1787,7 +1903,8 @@ def test_lmcache_connector_rejects_oversized_memory_obj():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
             k_scale=None,
@@ -1817,7 +1934,8 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
 
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "3")
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
             v_cache=torch.arange(2 * 3, dtype=torch.uint8).reshape(2, 3),
             k_scale=None,
@@ -1837,7 +1955,8 @@ def _tiny_staging_codec():
     import torch
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
             v_cache=torch.arange(2 * 3, dtype=torch.uint8).reshape(2, 3),
             k_scale=None,
@@ -1932,7 +2051,8 @@ def test_codec_chunk_major_device_buffer_layout():
         pytest.skip("real torch is unavailable")
 
     original = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
             k_scale=None,
@@ -1940,7 +2060,8 @@ def test_codec_chunk_major_device_buffer_layout():
         )
     }
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=original["l0"].k_cache.clone(),
             v_cache=original["l0"].v_cache.clone(),
             k_scale=None,
@@ -1983,13 +2104,15 @@ def test_codec_chunk_major_handles_tail_and_sparse_blocks():
         pytest.skip("real torch is unavailable")
 
     original = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=(torch.arange(6 * 4, dtype=torch.uint8).reshape(6, 4) + 31),
             k_scale=(torch.arange(6, dtype=torch.uint8).reshape(6, 1) + 101),
             v_scale=None,
         ),
-        "l1": SimpleNamespace(
+        "l1": KVCacheTensor(
+            layer_num=1,
             k_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 151),
             v_cache=(torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2) + 201),
             k_scale=None,
@@ -1997,7 +2120,8 @@ def test_codec_chunk_major_handles_tail_and_sparse_blocks():
         ),
     }
     kv_caches = {
-        name: SimpleNamespace(
+        name: KVCacheTensor(
+            layer_num=layer.layer_num,
             k_cache=layer.k_cache.clone(),
             v_cache=layer.v_cache.clone(),
             k_scale=layer.k_scale.clone() if layer.k_scale is not None else None,
@@ -2038,7 +2162,8 @@ def test_codec_chunk_major_rejects_duplicate_block_ids():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             k_scale=None,
@@ -2059,7 +2184,8 @@ def test_dense_prepared_ids_preserve_per_pipeline_group_validation():
         pytest.skip("real torch is unavailable")
 
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             k_scale=None,
@@ -5457,7 +5583,8 @@ def test_codec_mla_token_major_block_accounting():
     # MLA: single latent k_cache, token-major (num_blocks*block_size, 1, latent),
     # no V / scale tensors.
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=torch.arange(
                 num_blocks * block_size * latent, dtype=torch.uint8
             ).reshape(num_blocks * block_size, 1, latent),
@@ -5477,7 +5604,8 @@ def test_codec_mla_token_major_block_accounting():
     with pytest.raises(ValueError):
         DenseKVByteCodec(
             {
-                "l0": SimpleNamespace(
+                "l0": KVCacheTensor(
+                    layer_num=0,
                     k_cache=torch.arange(7, dtype=torch.uint8),
                     v_cache=None,
                     k_scale=None,
@@ -5500,8 +5628,12 @@ def test_codec_mla_round_trip_byte_identical():
         num_blocks * block_size, 1, latent
     )
     kv_caches = {
-        "l0": SimpleNamespace(
-            k_cache=original.clone(), v_cache=None, k_scale=None, v_scale=None
+        "l0": KVCacheTensor(
+            layer_num=0,
+            k_cache=original.clone(),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
         )
     }
     codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
@@ -5539,7 +5671,8 @@ def test_codec_dsa_includes_index_cache_segment():
         num_blocks * block_size * index_dim, dtype=torch.uint8
     ).reshape(num_blocks, block_size, index_dim)
     kv_caches = {
-        "l0": SimpleNamespace(
+        "l0": KVCacheTensor(
+            layer_num=0,
             k_cache=k_cache.clone(),
             v_cache=None,
             k_scale=None,
@@ -5633,7 +5766,8 @@ def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
     # which shares the pool and is registered identically.
     layers = {f"layer_{i}": _make_layer(i) for i in range(3)}
     kv_caches = {
-        name: SimpleNamespace(
+        name: KVCacheTensor(
+            layer_num=int(name.removeprefix("layer_")),
             k_cache=k.clone(),
             v_cache=None,
             k_scale=None,

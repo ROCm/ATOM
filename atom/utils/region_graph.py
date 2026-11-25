@@ -183,10 +183,18 @@ class _Recorder:
         self.begin()
         delivered = self._deliver(result, args, kwargs)
         bound = inspect.signature(fn).bind(*args, **kwargs)
+        # A replay reads what ``live`` returns afresh, so the recording keeps
+        # none of it: a step it held would keep that bucket's step-sized
+        # tables alive, one set per bucket beside the shared pool.
+        taken_live = () if live is None else live().keys()
         self._steps.append(
             _EagerStep(
                 fn,
-                {k: _weak(v) for k, v in bound.arguments.items()},
+                {
+                    k: _weak(v)
+                    for k, v in bound.arguments.items()
+                    if k not in taken_live
+                },
                 live,
                 stream,
                 None if delivered is None else weak_ref_tensor(delivered),
@@ -330,6 +338,26 @@ def _record_whole(fn: Callable, *args, pool=None, **kwargs) -> tuple[_Segments, 
     return _Segments([_SegmentReplay(graph)], weak), output
 
 
+def allocated_by(value: Any, pool) -> Any:
+    """Which of ``value``'s tensors lie in memory ``pool`` holds, in
+    ``value``'s structure (a tuple of them, or one; anything else False):
+    ``torch.cuda.memory_snapshot``'s segments of that pool."""
+    spans = [
+        (seg["address"], seg["address"] + seg["total_size"])
+        for seg in torch.cuda.memory_snapshot()
+        if seg["segment_pool_id"] == pool
+    ]
+
+    def mark(v):
+        if isinstance(v, torch.Tensor):
+            return any(lo <= v.data_ptr() < hi for lo, hi in spans)
+        if isinstance(v, tuple):
+            return tuple(mark(x) for x in v)
+        return False
+
+    return mark(value)
+
+
 def graph_pool():
     """The one pool every `TokenGraph` and `ReqGraph` records into."""
     if TokenGraph._pool is None:
@@ -361,7 +389,8 @@ class TokenGraph:
     `ReqGraph`'s included. Recordings never overlap -- one module's run in
     stream order, a module's output consumed before the next one replays --
     the same as two replays of one bucket, so the pool is the largest
-    recording's, not their sum.
+    recording's, not their sum. Outside it, a module holds its input buffers
+    and no bucket's step: what a region takes live is never kept.
     """
 
     _pool = None
@@ -385,6 +414,10 @@ class TokenGraph:
         self._rows: dict[tuple, int] = {}
         # Argument position or name -> the buffer every bucket's input slices.
         self._buffers: dict[int | str, torch.Tensor] = {}
+        # (phase or None, bucket) -> the pool its recording allocated in, and
+        # which of its output's tensors that was (`allocated`)
+        self._recorded_in: dict[tuple, Any] = {}
+        self._allocated: dict[tuple, Any] = {}
         # The pools this records into, each retired when this goes.
         self._pools: set = set()
         type(self)._live.add(self)
@@ -435,10 +468,25 @@ class TokenGraph:
         self._buckets.clear()
         self._captured.clear()
         self._rows.clear()
+        self._recorded_in.clear()
+        self._allocated.clear()
         TokenGraph._sizes.clear()
         TokenGraph._pool = None
         self._buffers.clear()
         return dropped
+
+    def allocated(self, key, value, phase: str | None = None):
+        """Which of ``value``'s tensors -- ``key``'s recorded output, as a
+        replay hands it back -- its recording allocated in the pool, in
+        ``value``'s structure: storage the pool may re-issue to a later
+        recording, which a caller keeping the output past the next replay
+        must copy. A tensor outside it (a buffer the forward owns) is not.
+        Worked out once a recording (``allocated_by``)."""
+        got = self._allocated.get((phase, key))
+        if got is None:
+            pool = self._recorded_in[(phase, key)]
+            got = self._allocated[(phase, key)] = allocated_by(value, pool)
+        return got
 
     @staticmethod
     def key(args, kwargs) -> tuple:
@@ -473,6 +521,8 @@ class TokenGraph:
         drain_nccl_works()
         segments, output = self._record(forward, *inputs, pool=pool, **kw)
         self._buckets[(phase, key)] = (segments, inputs, kw)
+        self._recorded_in[(phase, key)] = pool
+        self._allocated.pop((phase, key), None)
         self._captured[(phase, key)] = {_phase()}
         context = getattr(forward_context.get_forward_context(), "context", None)
         if getattr(context, "step_rows", 0):

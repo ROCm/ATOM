@@ -61,6 +61,34 @@ PAGED_COPY_RUNTIME = StateRuntime(
 )
 
 
+def test_mixed_batch_carries_current_state_maintenance():
+    from atom.model_engine.sequence import SequenceStatus
+
+    sched = make_scheduler(
+        paged_copy_config(num_kvcache_blocks=40, enable_mixed_prefill_decode=True),
+        state_runtime=PAGED_COPY_RUNTIME,
+    )
+    decode = stateful_seq(list(range(BLOCK)))
+    assert sched.block_manager.allocate(decode, 0)
+    decode.num_cached_tokens = BLOCK
+    decode.append_token(42)
+    decode.type = SequenceType.DECODE
+    decode.status = SequenceStatus.RUNNING
+    sched.running.append(decode)
+    sched.add(stateful_seq([21] * BLOCK))
+    checkpoints = sched.block_manager.paged_state_checkpoints
+    operation = checkpoints.store.begin_store(33, src_slot=decode.state_slots[0])
+    assert operation is not None
+    checkpoints.store.complete_inflight()
+    assert checkpoints.begin_restore(33, dst_slot=decode.state_slots[0])
+
+    batch, _ = sched.schedule()
+    assert batch.is_mixed
+    restores = batch.state_maintenance_ops.checkpoint_restores
+    assert len(restores) == 1 and restores[0].dst_slot == decode.state_slots[0]
+    assert not sched.block_manager.take_state_maintenance_ops().checkpoint_restores
+
+
 def ckpt_config(**overrides):
     defaults = {
         "kv_cache_block_size": BLOCK,
@@ -5150,3 +5178,120 @@ def test_the_scheduler_applies_touch_verdicts(offload_clock):
     s.deferred_free_blocks = {}
     s._update_from_kv_xfer_finished(KVConnectorOutput())
     assert not idx.could_serve(7)
+
+
+# ── a fresh allocation starts from nothing restored ────────────────────────
+
+
+class _OffloadConnector:
+    """The scheduler-side connector, reduced to the offload flag and the
+    hooks admission and the park call."""
+
+    is_offload = True
+    supports_early_load = False
+
+    def update_state_after_alloc(self, seq):
+        pass
+
+    def build_connector_meta(self):
+        return None
+
+    def get_finished(self):
+        return set(), set()
+
+    def enqueue_state_loads(self, loads):
+        return True
+
+    def lookup_pending(self, seq):
+        return False
+
+    def lookup_would_defer(self, seq):
+        return False
+
+    def get_num_new_matched_tokens(self, seq):
+        return 0, False
+
+    def can_detach_lookup(self, seq):
+        return False
+
+    def cancel_preadmission(self, seq):
+        pass
+
+    def cancel_pending_load(self, seq):
+        pass
+
+
+def _state_only_park(stale):
+    """A request admitted onto a state-only tier load at rung r, carrying the
+    fields `stale` left over from an earlier restore. HBM still holds the KV
+    below r; only the state image is a tier load. -> (scheduler, seq, r)"""
+    sched = make_scheduler(
+        ckpt_config(num_kvcache_blocks=160, pool_entries={"state": 8}),
+        state_runtime=PAGED_COPY_RUNTIME,
+    )
+    sched.kv_connector = _OffloadConnector()
+    bm = sched.block_manager
+    first = stateful_seq(list(range(24)))
+    assert bm.allocate(first, bm.can_allocate(first))
+    bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+    h = boundary_hash(bm, first)
+    r = bm.checkpoint_limit(first)
+    bm.take_state_maintenance_ops()
+    bm.complete_previous_state_batch()
+    bm.deallocate(first)
+    # The image left HBM; the tier still advertises it.
+    bm.paged_state_checkpoints.unindex(h)
+    index = StateOffloadIndex(verified_for_s=5.0)
+    index.note_stored(h)
+    bm.state_offload = index
+    bm.paged_state_checkpoints.attach_offload(index)
+
+    seq = stateful_seq(list(range(48)))
+    for name, value in stale.items():
+        setattr(seq, name, value)
+    sched.add(seq)
+    sched.schedule()
+    assert seq.status.name == "WAITING_FOR_REMOTE_KVS"
+    assert seq.offload_joint.load_hash == h, "a state-only tier load"
+    return sched, seq, r
+
+
+def test_a_state_only_repark_after_a_restore_is_not_woken_past_its_rung():
+    # Restored 44 tokens, preempted, its HBM prefix evicted below that, now
+    # re-parked on a state-only tier load at the lower rung r. No connector
+    # plans a KV load for it, so nothing rewrites `offload_loaded_tokens`.
+    sched, seq, r = _state_only_park(
+        {
+            "offload_loaded": True,
+            "offload_loaded_tokens": 44,
+            "offload_load_start_tokens": 16,
+        }
+    )
+    assert 0 < r < 44
+    # Parked with nothing of the earlier restore left: a connector that does
+    # plan a load sets both, and one that does not must not inherit them.
+    assert seq.offload_loaded_tokens == 0
+    assert seq.offload_load_start_tokens is None
+    assert not seq.offload_loaded
+
+    sched.finished_recving_kv_req_ids.append(seq.id)
+    sched._resolve_offload_load(seq)
+
+    assert seq.num_cached_tokens == r, "rows r..44 were never filled"
+
+
+def test_an_abort_after_a_failed_load_and_repark_waits_for_the_new_load():
+    # A failed load leaves `offload_load_failed` set (and an empty table); the
+    # request re-parks on a state-only load and is aborted while it is in
+    # flight. It must wait for that load, not be cleaned up at once.
+    sched, seq, _r = _state_only_park({"offload_load_failed": True})
+    free = sched.block_manager.kv.num_free
+
+    assert sched.abort_request(seq.id)
+    assert seq.id in sched.deferred_free_blocks
+    assert sched.block_manager.kv.num_free == free, "the load is still writing"
+
+    sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_loading=[seq.id]))
+    assert seq.id not in sched.deferred_free_blocks
+    assert seq.id not in sched.finished_recving_kv_req_ids
+    assert sched._num_parked_remote_kv == 0

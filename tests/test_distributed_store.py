@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 """Rendezvous ports stay owned from allocation through worker shutdown."""
 
+import ast
 import copy
 import errno
 import multiprocessing
 import socket
 import time
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +17,41 @@ import torch.distributed as dist
 
 from atom.config import KVEventsConfig, ParallelConfig
 from atom.model_engine.engine_core_mgr import CoreManager
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "atom/model_engine/model_setup.py",
+        "atom/rollout/model_runner_ext.py",
+    ],
+)
+def test_distributed_initializers_forward_custom_all_reduce_policy(
+    relative_path,
+) -> None:
+    source = (Path(__file__).parents[1] / relative_path).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "init_pp_aware_dist_env"
+    ]
+
+    assert calls, relative_path
+    for call in calls:
+        policy = next(
+            (
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg == "disable_custom_all_reduce"
+            ),
+            None,
+        )
+        assert isinstance(policy, ast.Attribute), relative_path
+        assert isinstance(policy.value, ast.Name) and policy.value.id == "config"
+        assert policy.attr == "disable_custom_all_reduce"
 
 
 @pytest.fixture
@@ -198,6 +235,7 @@ def _model_runner_worker(pc, layout, global_rank):
         decode_context_parallel_size=dcp,
         is_multinode_tp=False,
         tp_rank_start=0,
+        disable_custom_all_reduce=False,
         master_addr="127.0.0.1",
         port=0,
     )

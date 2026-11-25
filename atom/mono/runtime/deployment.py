@@ -80,6 +80,15 @@ def dp_attention_ranks(atom_config) -> int:
     return dp if dpa and dp > 1 else 0
 
 
+def peer_memory_refusals(atom_config) -> list[tuple[bool, str]]:
+    """``(holds, why not)`` of any launch that maps its TP group's peer
+    buffers (HIP IPC): a model's mono kernels and the shared mono LM head
+    alike. HIP IPC cannot reach a GPU on another node."""
+    return [
+        (not atom_config.is_multinode_tp, "TP group spans nodes (HIP IPC peer memory)")
+    ]
+
+
 def routed_experts_refusal(atom_config) -> tuple[bool, str]:
     """``(holds, why not)`` for a mono model whose kernels route experts
     in-kernel: they never write the routed-expert capture, so it would
@@ -151,9 +160,7 @@ def common_refusals(
             "decode CP",
         ),
         (pcp_group_size_of(atom_config) == 1, "prefill CP or Ulysses SP"),
-        # Mono's peer buffers are HIP IPC mappings, which cannot reach a GPU on
-        # another node.
-        (not atom_config.is_multinode_tp, "TP group spans nodes (HIP IPC peer memory)"),
+        *peer_memory_refusals(atom_config),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (

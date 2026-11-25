@@ -110,6 +110,8 @@ class MoRIIOConnector(KVConnectorBase):
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
+        # Sets `state_transfer_slots` (the runner, after sizing the pools).
+        self._config = config
         self.transfer_mode = self._transfer_mode_from(kv_transfer_config)
         if (
             self.transfer_mode == "write"
@@ -195,6 +197,11 @@ class MoRIIOConnector(KVConnectorBase):
         self._state_tensors: dict[str, tuple[bytes, int, Any]] = {}
         self._num_state_slots = 0
         self._built_state_sessions: dict[str, list[tuple[Any, int]]] = {}
+        # Producer: slots from here up are transfer slots, and each staged
+        # transfer's event after the copy that filled its slot.
+        self._first_transfer_slot = 0
+        self._has_transfer_slots = False
+        self._staged_sources: dict[TransferId, Any] = {}
 
         # Session cache: remote_engine_id -> list[session]
         self._built_sessions: defaultdict[str, list] = defaultdict(list)
@@ -361,6 +368,7 @@ class MoRIIOConnector(KVConnectorBase):
             self.blocks_per_chunk,
         )
         if self._state_tensors:
+            self._locate_transfer_slots()
             if not self.is_producer and self.transfer_mode == "read":
                 raise NotImplementedError(
                     "moriio read mode moves block-addressed KV only, and this "
@@ -661,6 +669,45 @@ class MoRIIOConnector(KVConnectorBase):
                 meta,
             )
             self._initiate_background_handshake(req_id, remote_engine_id, meta)
+
+    def _locate_transfer_slots(self) -> None:
+        """A producer's transfer slots are the top `state_transfer_slots` of its
+        state pool; a push from one waits for its copy (`note_state_stages`)."""
+        transfer_slots = self._config.state_transfer_slots
+        self._first_transfer_slot = self._num_state_slots - transfer_slots
+        self._has_transfer_slots = transfer_slots > 0
+        if self._has_transfer_slots:
+            # Main's `get_finished` otherwise; the runner calls it by name.
+            self.get_finished = self._get_finished_forgetting_stages
+
+    def _get_finished_forgetting_stages(self) -> KVConnectorOutput:
+        """`get_finished`, then forget the staged copy of every send it released:
+        a push that finished, or a consumer that failed before asking."""
+        output = type(self).get_finished(self)
+        for transfer_id in output.finished_sending:
+            self._staged_sources.pop(int(transfer_id), None)
+        return output
+
+    def note_state_stages(self, stages: dict) -> None:
+        """Mark the transfers whose state the runner just copied to a transfer slot.
+
+        The copies were enqueued on this stream before this call; a push reads
+        the slot only once the event recorded after them has fired.
+        """
+        import torch
+
+        landed = torch.cuda.Event()
+        landed.record()
+        for transfer_id in stages:
+            self._staged_sources[int(transfer_id)] = landed
+
+    def _state_source_ready(self, request: dict[str, Any]) -> bool:
+        """Whether the push may read its state slot: a live slot at once, a
+        transfer slot once the copy that filled it has landed."""
+        if int(request.get("src_slot_index", -1)) < self._first_transfer_slot:
+            return True
+        landed = self._staged_sources.get(int(request["transfer_id"]))
+        return landed is not None and landed.query()
 
     def _issue_ready_reads(self) -> None:
         """Issue the reads whose handshake finished; fail those that cannot start."""
@@ -1532,6 +1579,17 @@ class MoRIIOConnector(KVConnectorBase):
             if not ready:
                 self._finish_write(request, ok=False)
                 continue
+            if self._has_transfer_slots and not self._state_source_ready(request):
+                if time.monotonic() - queued_at > self._handshake_timeout_s:
+                    logger.error(
+                        "transfer %s: its state never reached transfer slot %s",
+                        request["transfer_id"],
+                        request.get("src_slot_index"),
+                    )
+                    self._finish_write(request, ok=False)
+                else:
+                    waiting.append((request, queued_at))
+                continue
             try:
                 statuses = self._write_blocks(request, self._write_engine_id(request))
             except Exception:
@@ -2121,6 +2179,17 @@ class MoRIIOConnector(KVConnectorBase):
 # ===================================================================
 
 
+class MoRIIOConnectorMetadata(ConnectorMetadata):
+    """A step's snapshot; a producer's state copies (`state_stages`) ride along."""
+
+    WORK_FIELDS = ConnectorMetadata.WORK_FIELDS + ("state_stages",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Transfer id -> (live slot, transfer slot), copied by the runner this step.
+        self.state_stages: dict[TransferId, tuple[int, int]] = {}
+
+
 class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side KV connector that tracks transfer lifecycle.
 
@@ -2155,6 +2224,11 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         # Source-block ownership -- see `MooncakeConnectorScheduler` for why
         # the claim is taken in `request_finished` rather than at alloc.
         self._awaiting_send: set[str] = set()
+        # Producer: state copies into transfer slots, until the next metadata.
+        self._state_stages: dict[TransferId, tuple[int, int]] = {}
+        self._has_transfer_slots = config.state_transfer_slots > 0
+        if self._has_transfer_slots:
+            self.build_connector_meta = self._build_staging_connector_meta
 
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -2169,8 +2243,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         """
         params = seq.kv_transfer_params or {}
 
-        if params.get("do_remote_prefill") and not hasattr(seq, "kv_async_tagged"):
-            seq.kv_async_tagged = True
+        # Every time until `update_state_after_alloc` queues the receive: the
+        # scheduler can hold a request back after a yes (a full running set).
+        if params.get("do_remote_prefill"):
             return len(seq.prompt_token_ids), True
 
         return 0, False
@@ -2180,6 +2255,8 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
 
         The returned object is passed to the worker-side connector
         for RDMA operations.  The internal pending queue is cleared.
+        A producer with state transfer slots builds through
+        `_build_staging_connector_meta` instead (bound in `__init__`).
         """
         meta = ConnectorMetadata()
         meta.request_id_to_transfer_id = self.request_id_to_transfer_id
@@ -2199,6 +2276,21 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             list(self._reqs_need_recv.keys()),
         )
         self._reqs_need_recv.clear()
+        return meta
+
+    def _build_staging_connector_meta(self) -> ConnectorMetadata:
+        """A producer's snapshot with its state copies into transfer slots, less
+        those of sends already released. A producer receives nothing."""
+        meta = MoRIIOConnectorMetadata()
+        meta.request_id_to_transfer_id = self.request_id_to_transfer_id
+        if self._state_stages:
+            stages, self._state_stages = self._state_stages, {}
+            kept = {}
+            for tid, pair in stages.items():
+                # A send released before its copy: the release hands the slot back.
+                if str(tid) in self._awaiting_send:
+                    kept[tid] = pair
+            meta.state_stages = kept
         return meta
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
@@ -2284,6 +2376,14 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
 
     def should_defer_free(self, seq: Sequence) -> bool:
         return str(seq.id) in self._awaiting_send
+
+    def stage_state_for_send(self, seq: Sequence, src_slot: int, dst_slot: int):
+        """Have the worker copy ``seq``'s state into its transfer slot.
+
+        The scheduler already re-pointed ``seq`` at ``dst_slot``, which
+        `request_finished` advertises; the push reads it once the copy landed.
+        """
+        self._state_stages[seq.id] = (int(src_slot), int(dst_slot))
 
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))

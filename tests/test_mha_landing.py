@@ -243,7 +243,7 @@ class Harness:
             for s, d in zip(src, dst):
                 want = gpu[s, 0]
                 if runs is not None:
-                    want = want.reshape(runs[0], runs[1], -1)[:, self.rank]
+                    want = want.reshape(len(runs[1]), runs[0], -1)[:, self.rank]
                 assert torch.equal(
                     got[d, 0].reshape(-1), want.reshape(-1)
                 ), page.unit_spec

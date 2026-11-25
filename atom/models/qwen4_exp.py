@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 import fnmatch
 import re
 from typing import Any, ClassVar
@@ -1282,6 +1285,8 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             org_num_embeddings=config.vocab_size,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
+        # with extra output dims the logits mix the hc streams first
+        self.lm_head.logits_are_head = not self.extra_output_dims
         if getattr(config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
         self.embed_tokens = self.model.embed_tokens

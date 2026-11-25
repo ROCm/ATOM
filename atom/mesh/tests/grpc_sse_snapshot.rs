@@ -61,6 +61,7 @@ fn chat_ctx() -> ResponseContext {
         reasoning_parser_factory: None,
         configured_tool_parser: None,
         configured_reasoning_parser: None,
+        prompt_opener: None,
     }
 }
 
@@ -84,6 +85,7 @@ fn generate_ctx() -> ResponseContext {
         reasoning_parser_factory: None,
         configured_tool_parser: None,
         configured_reasoning_parser: None,
+        prompt_opener: None,
     }
 }
 
@@ -92,6 +94,7 @@ fn meta() -> WorkerMeta {
         request_id: REQUEST_ID.to_string(),
         weight_version: None,
         cached_tokens: 0,
+        timing: None,
     }
 }
 

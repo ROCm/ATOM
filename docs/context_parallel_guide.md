@@ -296,7 +296,7 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 | `-dcp N` / `--decode-context-parallel-size N` | `1` | Enable DCP with size `N`. `world = tp`; requires `tp % N == 0` |
 | `--dcp-config '{...}'` | see below | JSON dict of the four DCP knobs (`interleave_size`, `enable_query_replication`, `enable_project_before_merge`, `comm_backend`). Unknown keys raise. See [`--dcp-config`](#--dcp-config-the-four-dcp-knobs) |
 | `--kv-cache-dtype fp8` | `auto` | Supported with DCP (per-tensor scale). `auto`/`bf16` also fine |
-| `--enable_prefix_caching` | off | Supported with DCP |
+| `--enable_prefix_caching` | on; `--no-enable_prefix_caching` disables it | Supported with DCP |
 | `--enable_chunked_prefill` / `--no-enable_chunked_prefill` | on | Chunked prefill is supported with DCP; on by default |
 
 | Goal (8 GPUs) | Command |
@@ -369,6 +369,9 @@ dense MLA's `cprr` kernel running on a QREP-produced `q_out` — the combination
 the removed `speculative_config` gate used to block.
 
 **Sparse (DSA) prefill** can use QREP too, opt-in via `ATOM_DCP_PREFILL_QREP=1`.
+It applies to the `q` transport only: a step that takes the `kv` transport
+(`ATOM_DCP_SPARSE_PREFILL`, `auto` by default) all-gathers KV rows instead and
+attends this rank's own heads, so it neither gathers nor replicates q.
 Past `index_topk` context (2048 for GLM-5.2) prefill runs the absorbed MLA
 kernel and, like decode, AllGathers Q over the DCP group; through pynccl that
 gather lands rank-major, so `all_gather(dim=1)` also copies the whole gathered q
@@ -421,8 +424,10 @@ instead of `kv_lora_rank`. The payload ratio is `kv_lora_rank / v_head_dim`:
 | DeepSeek-R1 / V3.2 | 4x |
 | GLM-5.2 (`v_head_dim=256`) | 2x |
 
-Covers both decode and sparse prefill. Costs a DCP-group-wide copy of `W_V`
-(gathered at load time). Auto-disabled for fp4 and for `-dcp 1`.
+Covers decode and the `q` transport of sparse prefill; a `kv` sparse prefill
+step (`ATOM_DCP_SPARSE_PREFILL`) has no merge, so PBM does not apply to it.
+Costs a DCP-group-wide copy of `W_V` (gathered at load time). Auto-disabled
+for fp4 and for `-dcp 1`.
 
 ### `comm_backend`
 
@@ -599,7 +604,18 @@ hit it.
 DeepSeek-R1 never needed this: 128 heads at `-tp 8` is 16 per rank, and the dcp8
 gather lands on 128 exactly.
 
+At dcp1 nothing is gathered, and K3's 12 heads a rank can dispatch as 12
+instead of 16; "Decode query-head width" in the model ops guide lists when.
+Under DCP the per-rank floor stays 16; only the gathered width matters.
+
 ### Sparse DCP persistent attention and gqa=64
+
+This section is about DCP decode and the `q` transport of sparse prefill, which
+attend the group's gathered query heads. With fp8 KV the default
+`ATOM_DCP_SPARSE_PREFILL=auto` sends most sparse prefill steps to the `kv`
+transport instead: it all-gathers the step's KV and attends this rank's own
+heads, padded as without DCP, on the dcp=1 work plan with no merge, so none of
+the gathered-width handling below applies to those steps.
 
 With an **fp8 Q and an fp8 KV cache**, aiter serves gqa=64 only from the
 **persistent** decode kernel and aborts the process otherwise (`asm_mla.cu`:
@@ -627,10 +643,11 @@ metadata rebuild, and page size. A bf16-KV sparse DCP prefill that satisfies
 those reaches gqa=64 directly the same as fp8 does; only a prefill that fails
 one of those (e.g. gfx942, or DCP≤1) still pads to 128.
 
-**GLM-5.2 is the model that benefits**: 64 query heads at `-tp 8` is 8 per
-rank, so `-dcp 8` gathers exactly 64 and now dispatches the native persistent
-gqa64 kernel instead of padding to 128. `-tp 4 -dcp 4` has the same gathered
-width and uses the same persistent gqa64 path.
+**GLM-5.2 is the model that benefits** (decode, and `q` sparse prefill steps):
+64 query heads at `-tp 8` is 8 per rank, so `-dcp 8` gathers exactly 64 and
+now dispatches the native persistent gqa64 kernel instead of padding to 128.
+`-tp 4 -dcp 4` has the same gathered width and uses the same persistent gqa64
+path.
 
 **Validated** (native ATOM, MI355 gfx950, GLM-5.2-MXFP4, fp8 KV, no
 speculative decode): both `-tp 8 -dcp 8` and `-tp 4 -dcp 4` complete CUDA graph
@@ -748,7 +765,7 @@ MLA rows; see the [recipe](../recipes/DSpark.md)).
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
-| gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) rebuild persistent metadata, where aiter runs DCP decode persistent (validated on gfx950), per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
+| gathered head width 64 | Native sparse / DSA prefill on the `q` transport (bf16 KV, or fp8 KV with `ATOM_DCP_SPARSE_PREFILL=q` or a step `auto` keeps on `q`) and q_len=1 decode (fp8 KV) rebuild persistent metadata, where aiter runs DCP decode persistent (validated on gfx950), per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group) |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |

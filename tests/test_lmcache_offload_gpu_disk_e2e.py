@@ -8,10 +8,10 @@ import math
 import time
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
+from atom.config import KVCacheTensor
 from atom.kv_transfer.disaggregation.types import KVTransferRegion, SaveOperationId
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
@@ -82,14 +82,15 @@ def _make_aiter_kv_caches(
     *,
     num_blocks: int,
     block_size: int,
-) -> dict[str, SimpleNamespace]:
+) -> dict[str, KVCacheTensor]:
     num_heads = 2
     head_dim = 16
     pack = 16
-    caches: dict[str, SimpleNamespace] = {}
+    caches: dict[str, KVCacheTensor] = {}
     for layer_id in range(2):
         base = layer_id * 47
-        caches[f"layer-{layer_id}"] = SimpleNamespace(
+        caches[f"layer-{layer_id}"] = KVCacheTensor(
+            layer_num=layer_id,
             # AITER x-packed K: (blocks, heads, head_dim/x, block_size, x).
             k_cache=_uint8_payload(
                 (num_blocks, num_heads, head_dim // pack, block_size, pack),
@@ -119,7 +120,7 @@ def _make_aiter_kv_caches(
 
 
 def _clone_segments(
-    kv_caches: dict[str, SimpleNamespace],
+    kv_caches: dict[str, KVCacheTensor],
 ) -> dict[str, dict[str, torch.Tensor]]:
     return {
         layer_name: {

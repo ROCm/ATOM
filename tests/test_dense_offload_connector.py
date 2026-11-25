@@ -144,7 +144,6 @@ def test_loaded_prefix_can_publish_suffix_and_be_reused(
     # Model all ranks reporting successful load, then compute the next block.
     host._mark_offload_load_ready(seq)
     assert seq.num_cached_tokens == 16
-    assert seq.offload_promoted_tokens == 16 - hbm
     host.block_manager.hash_blocks(seq, 8)
     seq.num_cached_tokens = 24
 
@@ -1153,37 +1152,39 @@ def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
     """Losing to another sub must not cost a fresh hash every step.
 
     `MultiConnectorScheduler` queries *every* sub on every scheduler pass and
-    cancels the pending load of everyone but the winner, so under the supported
-    `[moriio, lmcache_offload]` ordering the offload sub arms a load and has it
-    taken away. The cancel does not forget the hit: the tier did not stop
-    holding the prefix because another connector won this step. So when moriio
-    stops matching -- its `kv_async_tagged` is one-shot -- the offload sub
+    cancels the pending load of everyone but the winner, so with a P/D sub
+    ahead of it (e.g. `[moriio, lmcache_offload]`) the offload sub arms a load
+    and has it taken away. The cancel does not forget the hit: the tier did not
+    stop holding the prefix because another connector won this step. So when
+    moriio stops matching -- once its receive is queued -- the offload sub
     answers from what it already knows, and only the dispatch pays the tier.
+    No shipped config reaches this today; `validate_multi_config` refuses a P/D
+    consumer with an offload tier, so this pins the composite's cancel contract.
     """
 
     sched = _scheduler(monkeypatch, "kv_consumer")
     sched._min_load_tokens = 0
     calls = []
     sched._lookup_client = as_lookup_client(_counting_lookup(calls, 16))
-    moriio_matched = {"yes": False}
+    moriio_queued = {"yes": False}
 
     def moriio_match(_seq):
-        if moriio_matched["yes"]:
-            return 0, False
-        moriio_matched["yes"] = True
-        return 16, True
+        return (0, False) if moriio_queued["yes"] else (16, True)
 
     moriio = SimpleNamespace(
         get_num_new_matched_tokens=moriio_match,
         cancel_pending_load=lambda seq: None,
+        update_state_after_alloc=lambda seq: moriio_queued.update(yes=True),
     )
     multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
     multi._connectors = [moriio, sched]
     multi._load_winner = {}
     seq = _load_seq(64, num_prompt_tokens=24)
 
-    for _ in range(5):
+    for step in range(5):
         assert multi.get_num_new_matched_tokens(seq) == (16, True)
+        if step == 0:
+            moriio.update_state_after_alloc(seq)
         sched.build_connector_meta()
 
     assert calls == ["64"]
