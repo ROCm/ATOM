@@ -89,53 +89,6 @@ def _small_k_selector():
     return topk_per_row_small_k, topk_per_row_small_k_supported
 
 
-@functools.cache
-def _flydsl_prefill_topk():
-    """aiter's FlyDSL prefill top-16 (ids of ragged fp32 score rows), or None when the
-    installed aiter does not have it. Imported on first use, like `_small_k_selector`,
-    but optional: the Triton / small-k selectors serve without it."""
-    try:
-        from aiter.ops.flydsl import minimax_m3_index_topk_prefill_flydsl
-    except (ImportError, AttributeError):
-        return None
-    return minimax_m3_index_topk_prefill_flydsl
-
-
-# The kernel's block-id tie-break has 13 index bits: at most 8192 blocks a row (1M tokens).
-_FLYDSL_PREFILL_TOPK_MAX_BLOCKS = 8192
-
-
-def _flydsl_prefill_topk_serves(
-    score, topk_idx, n_valid_column_per_row, topk, decode_max_q, emit
-):
-    """Whether the FlyDSL prefill selector takes this call: a prefill (ragged rows) with
-    published bounds, on the shapes the kernel contract covers. With the block-table
-    emission on, the selection is one more launch than the fused Triton selector's, so
-    the row has to be as wide as for aiter's selector (`_AITER_MIN_WIDTH_WITH_EMIT`).
-    Everything else keeps the selectors below, unchanged."""
-    if (
-        decode_max_q != 0
-        or n_valid_column_per_row is None
-        or topk != 16
-        or not envs.ATOM_M3_PREFILL_TOPK_FLYDSL
-        or get_gfx_runtime() != "gfx950"
-    ):
-        return False
-    heads, rows, width = score.shape
-    return (
-        score.dtype == torch.float32
-        and score.stride(2) == 1
-        and topk_idx.dtype == torch.int32
-        and topk_idx.stride(2) == 1
-        and n_valid_column_per_row.dtype == torch.int32
-        and n_valid_column_per_row.is_contiguous()
-        and n_valid_column_per_row.numel() >= heads * rows
-        and width <= _FLYDSL_PREFILL_TOPK_MAX_BLOCKS
-        and (not emit or width >= _AITER_MIN_WIDTH_WITH_EMIT)
-        and _flydsl_prefill_topk() is not None
-    )
-
-
 DECODE_SCORE_NUM_STAGES = 3
 _FP8_DTYPES = tuple(
     dtype
@@ -917,6 +870,21 @@ def _aiter_selector_wins(
     return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
 
 
+def _prefill_narrow_rows_to_aiter(arch, emit, topk, decode_max_q):
+    """`ATOM_M3_PREFILL_TOPK_FLYDSL`: hand the prefill rows narrower than `_AITER_MIN_WIDTH`
+    to `topk_per_row_small_k` too. On gfx950 an aiter that carries its one-wave k=16 build
+    beats the Triton selector from a few dozen blocks up (aiter#8581); an older one does
+    not, which is why the flag stays off by default. Rows it cannot serve (width under k)
+    decline in `_select_with_aiter` and keep the selectors below."""
+    return (
+        envs.ATOM_M3_PREFILL_TOPK_FLYDSL
+        and arch == "gfx950"
+        and decode_max_q == 0
+        and topk == 16
+        and not emit
+    )
+
+
 @triton.jit
 def _prefill_partial_topk_kernel(
     score_ptr,
@@ -1237,43 +1205,16 @@ def _launch_select(
     )
     arch = get_gfx_runtime()
     compute_units = _compute_units(device_index)
-    # Prefill with published bounds: aiter's FlyDSL top-16, which is faster than both
-    # selectors below at every prefill width (same ids as the Triton one, ties included).
-    if _flydsl_prefill_topk_serves(
-        score, topk_idx, n_valid_column_per_row, topk, decode_max_q, emit
-    ):
-        _flydsl_prefill_topk()(
-            score,
-            n_valid_column_per_row,
-            topk_idx,
-            score.shape[2] * SPARSE_BLOCK_SIZE,
-            init_blocks,
-            local_blocks,
+    take_aiter = n_valid_column_per_row is not None and (
+        _aiter_selector_wins(
+            score.shape[2],
+            emit,
+            arch=arch,
+            selector_rows=score.shape[0] * score.shape[1],
+            compute_units=compute_units,
+            decode_max_q=decode_max_q,
         )
-        if emit:
-            _launch_sparse_block_table_emit(
-                topk_idx,
-                row_starts=row_starts,
-                row_prefix=row_prefix,
-                batch=batch,
-                topk=topk,
-                block_table=block_table,
-                emit_args=emit_args,
-                num_idx_heads=num_idx_heads,
-                rows_per_req=rows_per_req,
-                decode_max_q=decode_max_q,
-                block_page_stride=block_page_stride,
-                pages_per_block=pages_per_block,
-            )
-        return
-
-    take_aiter = n_valid_column_per_row is not None and _aiter_selector_wins(
-        score.shape[2],
-        emit,
-        arch=arch,
-        selector_rows=score.shape[0] * score.shape[1],
-        compute_units=compute_units,
-        decode_max_q=decode_max_q,
+        or _prefill_narrow_rows_to_aiter(arch, emit, topk, decode_max_q)
     )
     if take_aiter and _select_with_aiter(
         score, topk_idx, n_valid_column_per_row, topk, init_blocks, local_blocks

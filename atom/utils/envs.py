@@ -662,12 +662,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
-    # MiniMax-M3 prefill index selector: aiter's FlyDSL top-16 over the scorer's
-    # fp32 rows (gfx950, one wave per row, 2-4x faster than the Triton selector and
-    # 1.3-2.8x faster than topk_per_row_small_k at 32K-180K contexts). Same ids as the
-    # Triton selector, ties included. Opt-in (default 0 until the GSM8K gate is
-    # clean: one flag-on run scored 0.5 pt below the flag-off run); needs an aiter that has
-    # the op. 0 keeps the previous Triton / topk_per_row_small_k selection.
+    # MiniMax-M3 prefill rows under 1024 blocks: 1 sends them to aiter's
+    # topk_per_row_small_k like the wider rows (gfx950, k=16; an aiter whose small_k has
+    # the one-wave build is 2-4x faster than the Triton selector there). Opt-in (default 0
+    # until the GSM8K gate is clean: one flag-on run scored 0.5 pt below the flag-off run).
+    # Wider rows take aiter regardless. 0 keeps the Triton selector for the narrow rows.
     "ATOM_M3_PREFILL_TOPK_FLYDSL": lambda: (
         os.getenv("ATOM_M3_PREFILL_TOPK_FLYDSL", "0") == "1"
     ),

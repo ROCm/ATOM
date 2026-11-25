@@ -1010,52 +1010,31 @@ def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
     assert all(torch.equal(a, b) for a, b in zip(tuned, previous))
 
 
-class TestFlydslPrefillTopkGate:
-    """`_flydsl_prefill_topk_serves`: aiter's FlyDSL prefill top-16 takes only a prefill with
-    published bounds on the kernel's contract; everything else keeps the old selectors.
-    """
+class TestPrefillNarrowRowsGate:
+    """`_prefill_narrow_rows_to_aiter`: the flag hands the prefill rows under `_AITER_MIN_WIDTH`
+    to aiter's `topk_per_row_small_k`, on gfx950 at k=16 without the emission launch."""
 
     @pytest.fixture
-    def served(self, monkeypatch):
-        monkeypatch.setattr(m, "get_gfx_runtime", lambda: "gfx950")
+    def gate(self, monkeypatch):
         monkeypatch.setattr(m.envs, "ATOM_M3_PREFILL_TOPK_FLYDSL", True, raising=False)
-        monkeypatch.setattr(m, "_flydsl_prefill_topk", lambda: object())
 
-        def call(width=900, rows=64, decode_max_q=0, emit=False, nvalid="ok", **over):
-            score = torch.zeros(1, rows, width)
-            idx = torch.zeros(1, rows, TOPK, dtype=torch.int32)
-            nv = torch.zeros(rows, dtype=torch.int32) if nvalid == "ok" else nvalid
-            kw = {"topk": TOPK, "decode_max_q": decode_max_q, "emit": emit}
-            kw.update(over)
-            return m._flydsl_prefill_topk_serves(score, idx, nv, **kw)
+        def call(arch="gfx950", emit=False, topk=TOPK, decode_max_q=0):
+            return m._prefill_narrow_rows_to_aiter(arch, emit, topk, decode_max_q)
 
         return call
 
-    def test_a_prefill_with_bounds_is_served(self, served):
-        assert served()
-        assert served(width=m._FLYDSL_PREFILL_TOPK_MAX_BLOCKS)
+    def test_a_prefill_without_emission_is_taken(self, gate):
+        assert gate()
 
-    def test_declines_what_the_contract_does_not_cover(self, served):
-        assert not served(nvalid=None)  # no published bounds: Triton derives them
-        assert not served(decode_max_q=1)  # decode keeps its selectors
-        assert not served(topk=8)
-        assert not served(width=m._FLYDSL_PREFILL_TOPK_MAX_BLOCKS + 1)
-        assert not served(nvalid=torch.zeros(3, dtype=torch.int32))  # short bounds
-        assert not served(nvalid=torch.zeros(64, dtype=torch.int64))
+    def test_declines_what_the_one_wave_build_does_not_cover(self, gate):
+        assert not gate(decode_max_q=1)  # decode keeps its selectors
+        assert not gate(topk=8)
+        assert not gate(arch="gfx942")
+        assert not gate(emit=True)  # one more launch than the fused Triton selector
 
-    def test_emission_needs_the_row_wide_enough_for_the_extra_launch(self, served):
-        assert not served(emit=True, width=m._AITER_MIN_WIDTH_WITH_EMIT - 1)
-        assert served(emit=True, width=m._AITER_MIN_WIDTH_WITH_EMIT)
-
-    def test_kill_switch_and_arch_and_missing_aiter_op(self, served, monkeypatch):
+    def test_off_by_default(self, gate, monkeypatch):
         monkeypatch.setattr(m.envs, "ATOM_M3_PREFILL_TOPK_FLYDSL", False)
-        assert not served()
-        monkeypatch.setattr(m.envs, "ATOM_M3_PREFILL_TOPK_FLYDSL", True)
-        monkeypatch.setattr(m, "get_gfx_runtime", lambda: "gfx942")
-        assert not served()
-        monkeypatch.setattr(m, "get_gfx_runtime", lambda: "gfx950")
-        monkeypatch.setattr(m, "_flydsl_prefill_topk", lambda: None)
-        assert not served()
+        assert not gate()
 
 
 def _select_definition(score, nvalid, init, local):
@@ -1081,13 +1060,14 @@ def _select_definition(score, nvalid, init, local):
     "qlens,prefixes,heads",
     [([2048], [30000], 1), ([700, 300], [90000, 5000], 1), ([1024], [160000], 2)],
 )
-def test_flydsl_prefill_topk_matches_the_definition(
+def test_prefill_selection_through_aiter_matches_the_definition(
     monkeypatch, qlens, prefixes, heads, quantum
 ):
-    """Through `_launch_select`, ragged batches, init / local forced: ids equal the
-    definition exactly (the kernel is the one `_flydsl_prefill_topk` returns)."""
-    if m.get_gfx_runtime() != "gfx950" or m._flydsl_prefill_topk() is None:
-        pytest.skip("needs gfx950 and an aiter with the FlyDSL prefill top-16")
+    """Through `_launch_select` with the flag on, ragged batches, init / local forced: ids
+    equal the definition exactly (aiter's one-wave k=16 build)."""
+    if m.get_gfx_runtime() != "gfx950":
+        pytest.skip("needs gfx950 and an aiter whose small_k has the one-wave build")
+    monkeypatch.setattr(m.envs, "ATOM_M3_PREFILL_TOPK_FLYDSL", True, raising=False)
     dev = "cuda"
     kw = _inputs(qlens, prefixes, heads, dev)
     total_q = sum(qlens)
@@ -1103,9 +1083,9 @@ def test_flydsl_prefill_topk_matches_the_definition(
         cu, pre, batch=len(qlens), total_q=total_q, num_idx_heads=heads, decode_max_q=0
     )
     calls = []
-    real = m._flydsl_prefill_topk()
+    real = m._select_with_aiter
     monkeypatch.setattr(
-        m, "_flydsl_prefill_topk", lambda: lambda *a: (calls.append(1), real(*a))[1]
+        m, "_select_with_aiter", lambda *a: (calls.append(1), real(*a))[1]
     )
     topk_idx = torch.empty((heads, total_q, TOPK), dtype=torch.int32, device=dev)
     _, emit_args = m._alloc_emit(total_q, heads, TOPK, kw["block_table"], False, dev, 8)
