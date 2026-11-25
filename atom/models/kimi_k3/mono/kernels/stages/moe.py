@@ -7,13 +7,14 @@
 """K2b ``moe``: one Kimi-K3 latent-MoE layer, from the MoE input row x to the
 layer's output, every TP reduction inside the kernel.
 
-Stages ``layer.build`` places in K2's launch, up to ``MAX_ROWS``
-rows: the MFMA's B operand holds 16 token rows, so past 16 the GEMVs after
-lnorm and the final reduce run a token group at a time (``group_view``). The original path (vLLM ROCm) replicates the
-router and the latent down projection on every rank; here each rank computes
-its eighth and the rows are all-gathered over the peer buffer.
+Stages ``layer.build`` places in K2's launch, up to ``MAX_ROWS`` rows: the
+MFMA's B operand holds 16 token rows, so past 16 the GEMVs after lnorm and the
+final reduce run a token group at a time (``group_view``). The original path
+(vLLM ROCm) replicates the router and the latent down projection on every
+rank; here each rank computes its eighth and the rows are all-gathered over
+the peer buffer.
 
-    early (one task each, x the row K2a's AttnRes stage publishes; weights first):
+    early (one task each, x the row K2a's AttnRes publishes; weights first):
       router  (7 x 16 rows of this rank's 112 experts): fp32 logits -> every
               rank's RLOG
       latent  (28 x 16 rows of this rank's 448): bf16, quantized once a

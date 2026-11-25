@@ -10,10 +10,10 @@ and the MLP AttnRes seam.
 
 Stages ``layer.build`` places in K2's launch (its CTA map: ``layer``):
 
-    gemv              o_proj (448 x 16 rows, K = 1536 local): GEMV (``w8``: FP8) of the
-                      core rows (plain loads: the previous launch wrote them) ->
-                      bf16 partial -> pushed to its owner rank's AR region (system
-                      scope, this rank's slot)
+    gemv              o_proj (448 x 16 rows, K = 1536 local): GEMV (``w8``: FP8)
+                      of the core rows (plain loads: the previous launch wrote
+                      them) -> bf16 partial -> pushed to its owner rank's AR
+                      region (system scope, this rank's slot)
     attn              per 128 columns: the 8 ranks' partials summed in rank
                       order (fp32 -> bf16: the custom all-reduce's result) ->
                       LDS delta; then K1's AttnRes stages with the MLP's weights:
