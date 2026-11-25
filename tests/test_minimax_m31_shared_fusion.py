@@ -17,9 +17,7 @@ dtypes = aiter.dtypes
 
 moe_mod = importlib.import_module("atom.model_ops.moe")
 quant_spec = importlib.import_module("atom.quant_spec")
-staging_mod = importlib.import_module(
-    "atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4"
-)
+staging_mod = importlib.import_module("atom.model_ops.fused_moe.shared_expert_staging")
 FusedMoE = moe_mod.FusedMoE
 LayerQuantConfig = quant_spec.LayerQuantConfig
 
@@ -36,22 +34,26 @@ def _param(*shape, dtype=torch.float32):
     return nn.Parameter(torch.zeros(*shape, dtype=dtype), requires_grad=False)
 
 
-def _fused_mxfp4_layer():
+def _fused_mxfp4_layer(ptpc=False, tp_size=1, tp_rank=0):
     """An MXFP4 FusedMoE with one fused shared slot, buffers as the target
-    lays them out (w13 halves padded), its shared expert staged in MXFP8."""
+    lays them out (w13 halves padded), its shared expert staged in MXFP8
+    (per-channel FP8 with ``ptpc``)."""
     layer = object.__new__(FusedMoE)
     nn.Module.__init__(layer)
+    layer.quant_method = None
+    layer._stream_online_quant = False
     layer.has_bias = False
     layer.prefix = layer.layer_name = "model.layers.3.block_sparse_moe.experts"
     layer.layer_quant_config = _spec(dtypes.fp4x2)
     layer.moe_parallel_config = SimpleNamespace(
-        tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, dp_rank=0, use_ep=False
+        tp_size=tp_size, tp_rank=tp_rank, ep_size=1, ep_rank=0, dp_rank=0, use_ep=False
     )
     layer.expert_map = None
     layer.expert_layout = SimpleNamespace(
         routed_physical_per_rank=ROUTED,
         num_fused_shared_experts=SHARED,
         shared_is_routed=False,
+        uses_all2all_fusion=False,
     )
     layer.local_num_experts = ROUTED + SHARED
     e, half = ROUTED + SHARED, I_LOCAL + PAD
@@ -61,8 +63,8 @@ def _fused_mxfp4_layer():
     layer.w13_weight_scale = _param(e, 2 * half, H // 32)
     layer.w2_weight = _param(e, H, I_LOCAL // 2)
     layer.w2_weight_scale = _param(e, H, I_LOCAL // 32)
-    layer.shared_mxfp8_into_mxfp4 = staging_mod.Mxfp8SharedIntoMxfp4(
-        layer, None, H, I_LOCAL
+    layer.shared_expert_staging = staging_mod.SharedExpertStaging(
+        layer, None, H, I_LOCAL, ptpc=ptpc
     )
     return layer
 
@@ -113,7 +115,7 @@ def test_shared_slot_loads_into_mxfp8_staging_not_mxfp4_buffers():
     w, s = _shared_checkpoint()
     _load_shared(layer, w, s)
 
-    staged = layer.shared_mxfp8_into_mxfp4.staged
+    staged = layer.shared_expert_staging.staged
     assert torch.equal(
         staged["w13_weight"][0, :I_LOCAL].view(torch.uint8), w["w1"].view(torch.uint8)
     )
@@ -134,7 +136,7 @@ def test_missing_shared_tensor_is_reported():
     w, s = _shared_checkpoint()
     _load_shared(layer, w, s, skip={("scale", "w3")})
     with pytest.raises(RuntimeError, match="w13_weight_scale"):
-        layer.shared_mxfp8_into_mxfp4.fuse(layer)
+        layer.shared_expert_staging.fuse(layer)
 
 
 def test_shared_expert_requantized_into_the_mxfp4_slot(monkeypatch):
@@ -143,7 +145,7 @@ def test_shared_expert_requantized_into_the_mxfp4_slot(monkeypatch):
     layer = _fused_mxfp4_layer()
     w, s = _shared_checkpoint()
     _load_shared(layer, w, s)
-    staged = {k: v.clone() for k, v in layer.shared_mxfp8_into_mxfp4.staged.items()}
+    staged = {k: v.clone() for k, v in layer.shared_expert_staging.staged.items()}
 
     seen = []
 
@@ -156,9 +158,9 @@ def test_shared_expert_requantized_into_the_mxfp4_slot(monkeypatch):
         )
 
     monkeypatch.setattr(staging_mod, "quant_weight_online", fake_quant)
-    layer.shared_mxfp8_into_mxfp4.fuse(layer)
+    layer.shared_expert_staging.fuse(layer)
 
-    assert layer.shared_mxfp8_into_mxfp4.staged is None
+    assert layer.shared_expert_staging.staged is None
     deq = staging_mod.dequant_mxfp8
     w1 = deq(staged["w13_weight"][0, :I_LOCAL], staged["w13_weight_scale"][0, :I_LOCAL])
     w3 = deq(staged["w13_weight"][0, I_LOCAL:], staged["w13_weight_scale"][0, I_LOCAL:])
@@ -186,7 +188,7 @@ def test_reloading_the_fused_shared_expert_is_refused(monkeypatch):
         "quant_weight_online",
         lambda x, **_: (x[:, : x.shape[1] // 2].float(), torch.ones(x.shape[0], 1)),
     )
-    layer.shared_mxfp8_into_mxfp4.fuse(layer)
+    layer.shared_expert_staging.fuse(layer)
     before = layer.w13_weight.data.clone()
 
     with pytest.raises(NotImplementedError, match="reloading"):
@@ -199,7 +201,7 @@ def test_refuses_eplb_routed_shared_expert():
     layer = _fused_mxfp4_layer()
     layer.expert_layout.shared_is_routed = True
     with pytest.raises(NotImplementedError, match="EPLB"):
-        staging_mod.Mxfp8SharedIntoMxfp4(layer, None, H, I_LOCAL)
+        staging_mod.SharedExpertStaging(layer, None, H, I_LOCAL)
 
 
 def test_refuses_online_requant_of_the_routed_experts(monkeypatch):
@@ -207,4 +209,4 @@ def test_refuses_online_requant_of_the_routed_experts(monkeypatch):
     layer = _fused_mxfp4_layer()
     monkeypatch.setattr(staging_mod, "will_online_requant", lambda *_: True)
     with pytest.raises(NotImplementedError, match="online_quant_config"):
-        staging_mod.Mxfp8SharedIntoMxfp4(layer, None, H, I_LOCAL)
+        staging_mod.SharedExpertStaging(layer, None, H, I_LOCAL)

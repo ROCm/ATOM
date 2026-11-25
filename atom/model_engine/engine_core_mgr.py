@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import asyncio
+import copy
 import hashlib
 import logging
 import multiprocessing
@@ -24,7 +25,7 @@ import zmq.asyncio
 from atom.config import Config
 from atom.distributed.kv_events import offset_endpoint
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-from atom.model_engine.capabilities import pcp_group_size_of
+from atom.model_engine.capabilities import WEIGHT_RELOAD_FEATURE, pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
@@ -57,6 +58,7 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
     PAUSE_GENERATION_CMD,
+    RECEIVE_WEIGHTS_RDMA_CMD,
     WEIGHT_UPDATE_UTILITY_CMDS,
     completes_weight_sync,
     kv_change,
@@ -185,14 +187,18 @@ def kv_event_sources(config) -> dict[str, dict[str, Any]]:
     """Where each engine on this node publishes KV events (`/kv_event_sources`),
     keyed by the global DP rank its publisher binds for: the endpoint after the
     per-rank offset (a wildcard host stays a wildcard), the topic, the tokens
-    per hashed block, and the replay endpoint, offset alike, when replay is on.
-    Empty with events off or the null publisher."""
+    per hashed block, the replay endpoint, offset alike, when replay is on, and
+    the Mooncake Store the ranks offload to, if any. Empty with events off or
+    the null publisher."""
     events = config.kv_events_config
     if not events.enable or events.publisher == "null":
         return {}
+    from atom.kv_transfer.offload.report import offload_report
+
     block_size = hash_block_size_for(
         config.kv_cache_block_size, config.decode_context_parallel_size
     )
+    offload = offload_report(config)
     sources = {}
     for rank, _ in iter_dp_rank_assignments(config):
         source = {
@@ -202,6 +208,8 @@ def kv_event_sources(config) -> dict[str, dict[str, Any]]:
         }
         if events.replay_endpoint:
             source["replay_endpoint"] = offset_endpoint(events.replay_endpoint, rank)
+        if offload is not None:
+            source["offload"] = offload
         sources[str(rank)] = source
     return sources
 
@@ -244,6 +252,45 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
     return visible
 
 
+def layout_engines(config: Config) -> list[tuple[int, int]]:
+    """The (global_dp_rank, local_dp_rank) of every DP rank whose engines this
+    node runs. Under DP attention every TP rank becomes a DP rank of its own,
+    and ``config`` is rewritten to say so."""
+    pc = config.parallel_config
+    multinode = pc.is_multinode_dp
+    rank_assignments = iter_dp_rank_assignments(config)
+    if not config.enable_dp_attention:
+        assert not (
+            config.pipeline_parallel_size > 1 and pc.data_parallel_size > 1
+        ), "Pipeline parallel combined with data parallel is not supported yet."
+        return rank_assignments
+    assert (
+        config.pipeline_parallel_size == 1
+    ), "Pipeline parallel + DP-attention is not supported yet"
+    # One engine per assignment this node owns; on a single node that is
+    # the whole tp x dp grid. --fake-eplb may shrink it to the visible
+    # device count, taking the first N assignments.
+    count = _resolve_dp_engine_count(config, len(rank_assignments))
+    logger.info(f"Enable dp attention, using {count} data parallel ranks")
+    pc.data_parallel_size *= config.tensor_parallel_size
+    pc.data_parallel_size_local = count
+    if multinode:
+        pc.data_parallel_rank *= config.tensor_parallel_size
+    config.tensor_parallel_size = 1
+    return rank_assignments[:count]
+
+
+def engine_config(
+    config: Config, dp_rank: int, local_dp_rank: int, pp_rank: int = 0
+) -> Config:
+    """The Config of one EngineCore: one DP rank's (PP stage's) copy."""
+    rank_config = copy.deepcopy(config)
+    rank_config.parallel_config.data_parallel_rank = dp_rank
+    rank_config.parallel_config.data_parallel_rank_local = local_dp_rank
+    rank_config.parallel_config.pipeline_parallel_rank = pp_rank
+    return rank_config
+
+
 def _add_frame(seqs: list[Sequence]) -> bytes:
     """An ADD request for an engine that admits `seqs` with a BlockManager:
     their shipped prompt chains, if any, ride third (`take_shipped_chains`)."""
@@ -262,6 +309,8 @@ class CoreManager:
     # No prefix router, and so no backlog ledger, unless __init__ builds one.
     _prefix_router = None
     _backlog = None
+    # No session moves unless a pool-sharing connector sets a margin.
+    _session_migrate_margin = None
     _bp_offline_batch = False
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
@@ -334,6 +383,9 @@ class CoreManager:
         # ranks: a DP rank sizes its pool from its own free memory, so a prompt
         # is only safe to admit if it fits wherever the router sends it.
         self.max_pool_tokens: int | None = None
+        # What some engine's runners cannot take, by feature, as each said at
+        # startup.
+        self._weight_syncs_unavailable: dict[str, str] = {}
         self.engine_core_processes = []
         self._distributed_stores = []
         self.input_sockets = []
@@ -388,6 +440,10 @@ class CoreManager:
         # reported prefill backlog, tracked by the ledger). Created only when
         # this manager actually routes between eligible DP ranks.
         self._prefix_router = self._build_prefix_router(config)
+        sharing = KVConnectorFactory.pool_sharing(config)
+        self._session_migrate_margin = (
+            sharing.get("session_migrate_margin") if sharing else None
+        )
         # The ledger holds each rank's reported prefill backlog and the charges
         # it does not cover yet (`EngineCoreRequestType.PREFILL_BACKLOG`).
         self._backlog = (
@@ -528,28 +584,8 @@ class CoreManager:
                 "two mappings have not been reconciled across nodes."
             )
 
-        rank_assignments = iter_dp_rank_assignments(config)
-        if config.enable_dp_attention:
-            assert pp_size == 1, "Pipeline parallel + DP-attention is not supported yet"
-            # One engine per assignment this node owns; on a single node that is
-            # the whole tp x dp grid. --fake-eplb may shrink it to the visible
-            # device count, taking the first N assignments.
-            local_engine_count = _resolve_dp_engine_count(config, len(rank_assignments))
-            logger.info(
-                f"Enable dp attention, using {local_engine_count} data parallel ranks"
-            )
-            # Under DP-attention every TP rank becomes its own DP rank.
-            config.parallel_config.data_parallel_size *= config.tensor_parallel_size
-            config.parallel_config.data_parallel_size_local = local_engine_count
-            if multinode:
-                config.parallel_config.data_parallel_rank *= config.tensor_parallel_size
-            config.tensor_parallel_size = 1
-        else:
-            dp_size = config.parallel_config.data_parallel_size
-            assert not (
-                pp_size > 1 and dp_size > 1
-            ), "Pipeline parallel combined with data parallel is not supported yet."
-            local_engine_count = len(rank_assignments) * pp_size
+        rank_assignments = layout_engines(config)
+        local_engine_count = len(rank_assignments) * pp_size
 
         global_engine_count = (
             config.parallel_config.data_parallel_size * pp_size
@@ -608,13 +644,7 @@ class CoreManager:
                     f"pp={pp_rank}) of {self.local_engine_count}"
                 )
 
-                # Create config for this (dp, pp) stage
-                import copy
-
-                rank_config = copy.deepcopy(config)
-                rank_config.parallel_config.data_parallel_rank = dp_rank
-                rank_config.parallel_config.data_parallel_rank_local = local_dp_rank
-                rank_config.parallel_config.pipeline_parallel_rank = pp_rank
+                rank_config = engine_config(config, dp_rank, local_dp_rank, pp_rank)
                 if self.pp_size > 1:
                     rank_config.parallel_config.pp_meta_addrs = self.pp_meta_addrs
                     rank_config.parallel_config.pp_token_addr = self.pp_token_addr
@@ -649,10 +679,11 @@ class CoreManager:
 
             try:
                 # No visible-device mask is published here. Device placement is
-                # owned by ModelRunner._setup_device_and_distributed, which
-                # selects an ABSOLUTE cuda:{local_dp_rank*tp_size+rank}. Masking
-                # the child as well would renumber its devices and compound the
-                # two offsets -- see set_device_control_env_var's docstring.
+                # owned by ModelRunner._setup_device_and_distributed (by default
+                # init_model_env in model_setup.py; the rollout runner overrides
+                # it), which selects an ABSOLUTE cuda:{local_dp_rank*tp_size+rank}.
+                # Masking the child as well would renumber its devices and compound
+                # the two offsets -- see set_device_control_env_var's docstring.
                 for info, local_dp_rank in zip(processes_info, local_dp_ranks):
                     dp_rank = info["dp_rank"]
                     logger.info(
@@ -763,9 +794,12 @@ class CoreManager:
         self._asyncio_mode = config.asyncio_mode
 
     def _record_ready_payload(self, data) -> None:
-        """Fold one rank's READY facts into the manager's view of capacity."""
+        """Fold one rank's READY facts into the manager's view of capacity,
+        and of the weight syncs some engine cannot take."""
         if not data:
             return
+        for feature, reason in data.get("weight_syncs_unavailable", {}).items():
+            self._weight_syncs_unavailable.setdefault(feature, reason)
         reported = data.get("max_pool_tokens")
         if reported is None:
             return
@@ -1049,7 +1083,7 @@ class CoreManager:
                     with self.ctx.socket(zmq.PAIR) as shutdown_sender:
                         shutdown_sender.connect(shutdown_path)
                         shutdown_sender.send(b"")
-                except Exception as e:
+                except (OSError, zmq.ZMQError) as e:
                     logger.debug(f"{self.label}: Error sending shutdown signal: {e}")
 
         for thread in self.output_threads:
@@ -1182,8 +1216,8 @@ class CoreManager:
         """The `prefix_spread` or `share_cache` router, or None.
 
         None for another strategy, and when there is nothing to route: one
-        DP rank, pipeline parallelism (requests enter at stage 0), and, for
-        `share_cache`, RapidServe. The strategy has no effect there, so its
+        DP rank, pipeline parallelism (requests enter at stage 0), and
+        RapidServe. The strategy has no effect there, so its
         requirements are not enforced.
         """
         strategy = self._dp_lb_strategy
@@ -1210,6 +1244,17 @@ class CoreManager:
                 "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
             )
         tier = KVConnectorFactory.offload_tier(config)
+        if not tier.loads:
+            # No offload tier, but a pool the ranks share: a request placed
+            # away from its prefix copies it from another rank's pool instead
+            # of recomputing it.
+            sharing = KVConnectorFactory.pool_sharing(config)
+            if sharing and sharing.get("loads"):
+                from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+                tier = OffloadTierProfile(
+                    loads=True, min_load_tokens=0, load_chunk_tokens=1
+                )
         if strategy == "prefix_spread":
             return PrefixSpreadRouter(
                 envs.ATOM_DP_PREFIX_IDLE_TOKENS, tier, config.max_num_seqs
@@ -1708,6 +1753,10 @@ class CoreManager:
                 )
         elif self._dp_session_affinity_enabled:
             if not isinstance(policy, SessionPolicy):
+                # Moving a session is worth it only where its history moves
+                # along: the ranks share their pools, and a margin was set.
+                margin = self._session_migrate_margin
+                migrate = margin is not None
                 policy = SessionPolicy(
                     self._select_dp_rank_locked,
                     self._select_new_session_rank_locked,
@@ -1715,6 +1764,8 @@ class CoreManager:
                     self._dp_session_prompt_tokens,
                     self._routable_engine_count,
                     self._record_ignored_parent,
+                    rank_reqs=(lambda: self._rank_reqs) if migrate else None,
+                    margin=margin if migrate else 0.1,
                 )
         elif policy is None or type(policy) is not LoadPolicy:
             policy = LoadPolicy(self._select_dp_rank_locked)
@@ -2209,11 +2260,21 @@ class CoreManager:
             if not outer:
                 ctx.sync_id = uuid.uuid4().hex
                 ctx.failure = None
+                ctx.abort_sent = False
             ctx.active = True
             try:
                 yield
             finally:
                 ctx.active = outer
+
+    def claim_weight_sync_abort(self) -> bool:
+        """Return true once for the outer weight-sync session's abort."""
+        with self._weight_sync_lock:
+            ctx = self._weight_sync_context
+            if not getattr(ctx, "active", False) or getattr(ctx, "abort_sent", False):
+                return False
+            ctx.abort_sent = True
+            return True
 
     def _discard_failed_weight_sync(self, failed_cmd: str) -> None:
         """Fence every engine this reaches and drop the failed sync's scratch.
@@ -2277,11 +2338,31 @@ class CoreManager:
                 f"broadcast_utility_command instead."
             )
         if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+            self._refuse_what_an_engine_cannot_take(cmd, owns_sync)
             # Re-entrant, so the weight_sync_session() a bucket belongs to
             # takes it again rather than waiting on itself.
             with self._weight_sync_lock:
                 return self._sync_weight_update(cmd, timeout, owns_sync, kwargs)
         return self._broadcast_and_wait(cmd, timeout, **kwargs)
+
+    def _refuse_what_an_engine_cannot_take(self, cmd: str, in_session: bool) -> None:
+        """Refuse a reload some engine's runners cannot take, before any
+        engine runs it: each engine refuses only what its own cannot, so under
+        PP the head would have written by the time a later stage refused.
+
+        Not a weight stream: its trainer is already broadcasting, so each
+        engine takes it in and refuses it there.
+        """
+        reason = self._weight_syncs_unavailable.get(WEIGHT_RELOAD_FEATURE)
+        if cmd == RECEIVE_WEIGHTS_RDMA_CMD or reason is None:
+            return
+        if in_session:
+            ctx = self._weight_sync_context
+            ctx.failure = ctx.failure or f"{cmd}: refused: {reason}"
+        raise RuntimeError(
+            f"{self.label}: utility command {cmd!r} refused before any engine "
+            f"ran it: {reason}"
+        )
 
     def _sync_weight_update(
         self, cmd: str, timeout: float, in_session: bool, kwargs: dict
@@ -2375,6 +2456,15 @@ class CoreManager:
 
         responses = [by_dp_rank[dp_rank] for dp_rank in sorted(by_dp_rank)]
         missing = sorted(set(sent) - set(by_dp_rank))
+        if missing and cmd == RECEIVE_WEIGHTS_RDMA_CMD:
+            # Still being received: an engine waits for its runners to decide
+            # the stream, and a discard would fence it over what they wrote.
+            raise TimeoutError(
+                f"{self.label}: DP rank(s) {missing} did not answer {cmd!r} "
+                f"within {timeout}s, so whether they wrote the stream is "
+                f"unknown; they stay fenced until a later sync rewrites every "
+                f"parameter"
+            )
         if missing:
             if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                 self._discard_failed_weight_sync(cmd)
@@ -2779,5 +2869,5 @@ class DisaggCoreManager(CoreManager):
             try:
                 self._cu_shm.close()
                 self._cu_shm.unlink()
-            except Exception:
-                pass
+            except (BufferError, FileNotFoundError, OSError) as error:
+                logger.debug("Could not release CU shared memory: %s", error)

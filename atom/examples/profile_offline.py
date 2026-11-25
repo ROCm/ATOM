@@ -3,11 +3,15 @@
 
 import argparse
 import random
+
 from transformers import AutoTokenizer
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
+
+DEFAULT_PROFILER_DIR = "./profiler_traces"
 
 parser = FlexibleArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -44,12 +48,13 @@ parser.add_argument(
 def main():
     args = parser.parse_args()
 
-    # Set default torch_profiler_dir to current directory if not provided
-    if args.torch_profiler_dir is None:
-        args.torch_profiler_dir = "./profiler_traces"
-        print(
-            "Warning: --torch-profiler-dir not specified, using default: ./profiler_traces"
-        )
+    # Flag, then the environment, then this example's own directory, the order
+    # the engine uses. An empty flag counts as unset only here; EngineArgs
+    # forwards "" to Config, which aborts on os.makedirs("").
+    args.torch_profiler_dir = (
+        args.torch_profiler_dir or envs.ATOM_TORCH_PROFILER_DIR or DEFAULT_PROFILER_DIR
+    )
+    print(f"Writing profiler traces to {args.torch_profiler_dir}")
 
     print("\nInitializing LLM engine...")
     engine_args = EngineArgs.from_cli_args(args)

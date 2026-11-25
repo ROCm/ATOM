@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from enum import Enum
 from itertools import groupby
+from typing import Literal
 
 from transformers import PretrainedConfig
 
@@ -44,23 +45,40 @@ class LayerAttentionSpec:
         return None if self.produces_candidates else self.candidate_owner
 
 
-def validate_native_quantization(config):
-    """Reject a checkpoint whose quantization is not the one V4.1 reads.
+FP4PTPC_METHOD = "w8a8_fp8"
+# FP4PTPC runs only with every FP4 routed expert converted to per-channel FP8:
+# the backbone's per-channel FP8 shared expert then takes their fused slot.
+FP4PTPC_RECIPE = (
+    "DeepSeek-V4.1 FP4PTPC needs its routed experts converted to per-channel "
+    'FP8: --online_quant_config \'{"layer_quant_config": {"*.ffn.experts*": '
+    '"ptpc_fp8"}}\''
+)
 
-    There is no second format to select between, so this returns nothing: the
-    five shapes below are the only ones the kernels accept, and a checkpoint
-    that declares anything else has no reader to fall back to.
+
+def quantization_format(config) -> Literal["native", "fp4ptpc"]:
+    """The checkpoint's format, "native" or "fp4ptpc"; ValueError for any
+    other, which V4.1 has no reader for.
+
+    Native: FP8 32x32 dense linears and FP4 routed experts, both scaled by
+    e8m0. FP4PTPC (`w8a8_fp8`): the native checkpoint with the linears
+    `layers.converted_linear_config` covers stored as per-channel FP8 (an F32
+    `[N, 1]` `weight_scale`); its routed experts, `wo_a`, engram tables and
+    draft stay native.
     """
-    if config.get("quant_method") != "fp8":
-        raise ValueError("DeepSeek-V4.1 requires the native FP8 checkpoint format")
-    if config.get("weight_block_size") not in ([32, 32], (32, 32)):
+    method = config.get("quant_method")
+    if method not in ("fp8", FP4PTPC_METHOD):
+        raise ValueError(
+            "DeepSeek-V4.1 requires the native FP8 checkpoint format or FP4PTPC"
+        )
+    if method == "fp8" and config.get("weight_block_size") not in ([32, 32], (32, 32)):
         raise ValueError("DeepSeek-V4.1 weight_block_size must be [32, 32]")
     if config.get("scale_fmt") != "ue8m0":
-        raise ValueError("DeepSeek-V4.1 dense scales must be ue8m0")
+        raise ValueError("DeepSeek-V4.1 native scales must be ue8m0")
     if config.get("activation_scheme") != "dynamic":
-        raise ValueError("DeepSeek-V4.1 requires dynamic per-32 FP8 activations")
+        raise ValueError("DeepSeek-V4.1 requires dynamic FP8 activations")
     if config.get("expert_dtype") != "fp4":
         raise ValueError("DeepSeek-V4.1 routed experts must use native fp4 weights")
+    return "fp4ptpc" if method == FP4PTPC_METHOD else "native"
 
 
 def _layer_ids(config, field, stop):
@@ -180,6 +198,8 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # __post_init__ hook and simply reassigns the same value in super().
         if "max_position_embeddings" in kwargs:
             self.max_position_embeddings = kwargs["max_position_embeddings"]
+        # Whether the checkpoint is FP4PTPC (`normalize_hf_config`).
+        kwargs.setdefault("fp4ptpc", False)
         super().__init__(**kwargs)
         # transformers >= 5.13 folds rope_theta into rope_parameters when
         # rope_scaling is present and drops the top-level attribute the model
@@ -248,7 +268,21 @@ def normalize_hf_config(raw: dict) -> DeepseekV41TextConfig:
     ):
         if field in raw:
             text.setdefault(field, deepcopy(raw[field]))
-    validate_native_quantization(text["quantization_config"])
+    fp4ptpc = quantization_format(text["quantization_config"]) == "fp4ptpc"
+    if fp4ptpc:
+        # Outside the converted linears this is the native checkpoint, and two
+        # readers need to see it as one: `QuantizationConfig` enables online
+        # quant (the routed experts' FP4 -> FP8) only for methods it knows,
+        # and V4's routed-expert detection would take `w8a8_fp8` for FP8
+        # experts. `fp4ptpc` marks the converted linears
+        # (`layers.converted_linear_config`) and, as a text-config field, keys
+        # the compile cache.
+        text["quantization_config"] = {
+            **text["quantization_config"],
+            "quant_method": "fp8",
+            "weight_block_size": [32, 32],
+        }
+    text["fp4ptpc"] = fp4ptpc
     text.pop("model_type")
     config = DeepseekV41TextConfig(**text)
     required_positive = (
@@ -302,6 +336,8 @@ def normalize_hf_config(raw: dict) -> DeepseekV41TextConfig:
 
     # The full model config is data, not a fallback AutoConfig lookup. The
     # installed Transformers version need not know this new architecture.
+    # Its root keeps the checkpoint's own quantization_config (`w8a8_fp8` for
+    # FP4PTPC); the text config the model is built from reads it as native.
     root_data = deepcopy(raw)
     root_data["text_config"] = DeepseekV41TextConfig(**deepcopy(text))
     root_data["vision_config"] = DeepseekV41VisionConfig(**vision)
@@ -386,13 +422,15 @@ def validate_runtime_config(config):
             # restores PAGE bytes and rebuilds the state by replay. MoRI-IO and
             # in-process offload read SLOT codecs this runtime does not publish.
             # P/D with CPU offload composes one Mooncake leg and one offload tier.
+            # A shared UMBP L1 pool (`umbp_pool`) moves PAGEs and replays STATE,
+            # like the Store; it provides the pool, so it stands alone.
             (
-                "KV transfer other than lmcache_mp, mooncake_store or mooncake "
-                "(multi: mooncake plus one offload tier)"
+                "KV transfer other than lmcache_mp, mooncake_store, mooncake or "
+                "umbp_pool (multi: mooncake plus one offload tier)"
             ),
             names is None
             or any(
-                name not in ("lmcache_mp", "mooncake", "mooncake_store")
+                name not in ("lmcache_mp", "mooncake", "mooncake_store", "umbp_pool")
                 for name in names
             )
             or (
@@ -422,8 +460,29 @@ def validate_runtime_config(config):
             "mooncake_store" in (names or ())
             and not config.enable_encoder_swa_bounded_replay,
         ),
+        (
+            # Another rank's blocks carry PAGE only, like the Store's: a hit on
+            # one rebuilds its state by replay.
+            "a shared UMBP L1 pool without encoder SWA bounded replay",
+            "umbp_pool" in (names or ())
+            and not config.enable_encoder_swa_bounded_replay,
+        ),
         ("RapidServe", config.enable_rapidserve),
-        ("online quantization", config.online_quant_config is not None),
+        (
+            # Validated only as FP4PTPC's routed-expert conversion.
+            "online quantization of the native checkpoint",
+            config.online_quant_config is not None and not config.hf_config.fp4ptpc,
+        ),
+        (
+            # Run only tensor parallel, its shared expert in the routed
+            # experts' fused slot.
+            "FP4PTPC with expert or data parallel",
+            config.hf_config.fp4ptpc
+            and (
+                config.enable_expert_parallel
+                or config.parallel_config.data_parallel_size != 1
+            ),
+        ),
         ("EPLB", config.eplb_enable),
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group

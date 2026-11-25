@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """One tensor-parallel group across nodes (atom/model_engine/tp_multinode.py)."""
 
+import sys
 import time
 from datetime import timedelta
 from types import SimpleNamespace
@@ -243,6 +244,79 @@ def test_config_checks_the_tp_slices(monkeypatch):
     monkeypatch.setattr(Config, "_check_multinode_tp", reached)
     with pytest.raises(Reached):
         Config(model="unused", tensor_parallel_size=8)
+
+
+def _vllm_parallel_config(tp):
+    """What vLLM's own ParallelConfig carries that ATOM reads: none of the
+    cross-node TP fields, which exist only on ATOM's ParallelConfig."""
+    return SimpleNamespace(
+        rank=0,
+        tensor_parallel_size=tp,
+        data_parallel_size=1,
+        data_parallel_size_local=1,
+        data_parallel_rank=0,
+        data_parallel_rank_local=None,
+        data_parallel_master_ip="127.0.0.1",
+        data_parallel_master_port=29500,
+        decode_context_parallel_size=1,
+        enable_expert_parallel=False,
+        enable_dbo=False,
+    )
+
+
+def test_a_plugin_run_is_one_whole_tp_group():
+    config = _config(None, 0)
+    config.parallel_config = _vllm_parallel_config(8)
+    config.plugin_config = SimpleNamespace(is_vllm=True)
+    config._check_multinode_tp()
+    assert (config.tp_size_local, config.tp_rank_start) == (8, 0)
+    assert not config.is_multinode_tp
+
+
+def test_the_vllm_plugin_builds_a_config_without_the_cross_node_tp_fields(
+    monkeypatch,
+):
+    from pathlib import Path
+
+    from atom import config as config_module
+    from atom.plugin import config as plugin_config
+
+    fixture = Path(__file__).parent / "models/deepseek_v41/fixtures"
+    # Only the quantization parser needs AITER, and only the V4.1 bridge needs
+    # vLLM itself; the translation and Config.__post_init__ run as they are.
+    monkeypatch.setattr(
+        config_module,
+        "QuantizationConfig",
+        lambda *a, **k: SimpleNamespace(exclude_layers=[]),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.plugin.vllm.deepseek_v41_bridge",
+        SimpleNamespace(
+            is_deepseek_v41_vllm_config=lambda _config: False,
+            v41_kv_cache_dtype=None,
+        ),
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model=str(fixture), max_model_len=4096, trust_remote_code=False
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096, max_num_seqs=8),
+        cache_config=SimpleNamespace(
+            gpu_memory_utilization=0.5,
+            block_size=256,
+            num_gpu_blocks=1024,
+            cache_dtype="bf16",
+            enable_prefix_caching=False,
+        ),
+        parallel_config=_vllm_parallel_config(4),
+        compilation_config=SimpleNamespace(mode=0),
+        quant_config=None,
+    )
+    config = plugin_config._generate_atom_config_from_vllm_config(vllm_config)
+    assert config.parallel_config is vllm_config.parallel_config
+    assert (config.tp_size_local, config.tp_rank_start) == (4, 0)
+    assert not config.is_multinode_tp
 
 
 @pytest.fixture

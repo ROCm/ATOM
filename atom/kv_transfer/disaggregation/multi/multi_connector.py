@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
@@ -69,6 +69,9 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     connector_metadata_has_work,
 )
+
+if TYPE_CHECKING:
+    from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
 
 logger = logging.getLogger("atom")
 
@@ -285,6 +288,17 @@ class MultiConnector(KVConnectorBase):
         # resolve, not raise `AttributeError`.
         self._state_tier = None
 
+    def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory | None:
+        """The pool memory of whichever sub provides the pool (at most one)."""
+        provided = [
+            memory
+            for connector in self._connectors
+            if (memory := connector.kv_pool_memory(config, rank)) is not None
+        ]
+        if len(provided) > 1:
+            raise ValueError("at most one sub-connector may provide the KV pool")
+        return provided[0] if provided else None
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -443,6 +457,20 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         tier = self._prefetch_tier()
         return 0 if tier is None else int(tier.held_tier_hit(seq))
 
+    def make_block_pool(
+        self, config: Any, num_blocks: int, **kwargs: Any
+    ) -> KVBlockPool | None:
+        """The block pool of whichever sub provides the pool (at most one)."""
+        provided = [
+            pool
+            for connector in self._connectors
+            if (pool := connector.make_block_pool(config, num_blocks, **kwargs))
+            is not None
+        ]
+        if len(provided) > 1:
+            raise ValueError("at most one sub-connector may provide the KV pool")
+        return provided[0] if provided else None
+
     def bind_block_manager(self, block_manager: Any) -> None:
         """Bind native checkpoint owners before any request can be admitted."""
         for connector in self._connectors:
@@ -528,32 +556,39 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # Opt into the scheduler's offload suffix-prefill path if any sub is the
         # offload backend (Scheduler._is_offload_connector reads this).
         self.is_offload = any(c.is_offload for c in self._connectors)
+        self.cancels_undispatched_loads = any(
+            c.cancels_undispatched_loads for c in self._connectors
+        )
         self.enable_chunked_transfer = any(
             getattr(c, "enable_chunked_transfer", False) and c.is_producer
             for c in self._connectors
         )
         # The sub that won `get_num_new_matched_tokens` for each in-flight
         # request, keyed by `seq.id`. The load-side decisions
-        # (`should_park_for_load_after_alloc` and the two chunk/partial-prefill
-        # siblings) belong to whichever sub armed the load, not to whichever sub
-        # hosts the state tier -- see `_load_owner` (review round 5, finding 1).
+        # (`should_park_for_load_after_alloc`, the two chunk/partial-prefill
+        # siblings, `cancel_undispatched_load` and `pd_receive_block_offset`)
+        # belong to whichever sub armed the load, not to whichever sub hosts the
+        # state tier -- see `_load_owner` (review round 5, finding 1).
         self._load_winner: dict = {}
 
     def _load_owner(self, seq: Any):
         """The sub that armed this request's KV load, or None.
 
         Recorded at `get_num_new_matched_tokens` time (first-hit-wins, losers
-        cancelled). The three load-side questions below --
+        cancelled). The load-side questions --
         `should_park_for_load_after_alloc`, `adjust_prefill_chunk_after_alloc`,
         `should_park_partial_prefill_for_load` -- ask "is there a load in flight
-        for this sequence, and must the forward wait for it?" That answer is the
-        winner's alone. Routing them through `_state_tier_sub()` instead (an
-        earlier fix) named the tier sub even when a *different* sub won the load
-        -- e.g. moriio winning ahead of `kimi_k3` under `[moriio, kimi_k3]`: the
-        tier sub armed nothing, its `_load_specs.get(sid)` was None, so it
+        for this sequence, and must the forward wait for it?", and
+        `cancel_undispatched_load` asks whether that load can be dropped before
+        any worker owns it. Those answers are the winner's alone. Routing
+        them through `_state_tier_sub()` instead (an earlier fix) named the
+        tier sub even when a *different* sub won the load -- e.g. moriio
+        winning ahead of `kimi_k3` under `[moriio, kimi_k3]`: the tier sub
+        armed nothing, its `_load_specs.get(sid)` was None, so it
         answered "don't park" and the prefill ran over moriio's in-flight KV.
-        The tier sub still owns the state-face forwarders; only these three
-        load-side questions follow the load's owner.
+        The tier sub still owns the state-face forwarders; these four
+        questions and `pd_receive_block_offset` (which reads `_load_winner`
+        directly) follow the load's owner.
         """
         return self._load_winner.get(getattr(seq, "id", None))
 
@@ -603,7 +638,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         Record the winner under `seq.id`: the load-side decisions
         (`should_park_for_load_after_alloc` and siblings) belong to it, not to
         the tier sub (finding 1). Cleared by `request_finished` /
-        `cancel_pending_load`.
+        `cancel_pending_load` / `cancel_undispatched_load`.
         """
         result = (0, False)
         winner = None
@@ -652,6 +687,15 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         self._load_winner.pop(seq.id, None)
         for c in self._connectors:
             c.cancel_pending_load(seq)
+
+    def cancel_undispatched_load(self, seq: Any) -> bool:
+        # Only the winning load owner can prove that no worker has started.
+        # An offload loser cannot authorize releasing a P/D owner's blocks.
+        owner = self._load_owner(seq)
+        if owner is None or not owner.cancel_undispatched_load(seq):
+            return False
+        self._load_winner.pop(seq.id, None)
+        return True
 
     def build_connector_meta(self) -> MultiConnectorMetadata:
         return MultiConnectorMetadata(

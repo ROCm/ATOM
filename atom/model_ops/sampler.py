@@ -5,6 +5,7 @@ import warnings
 
 import torch
 from aiter import mixed_sample_outer_exponential, topk_select
+from aiter.ops.triton.fusions.fused_mixed_sample import fused_mixed_sample
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
@@ -169,7 +170,7 @@ class Sampler(nn.Module):
             Sampled token IDs (num_tokens,)
         """
         # Resolve the engine-wide opt-in once: every consumer below (the
-        # temperature and filtered paths, and any fused path added later)
+        # shared-row and per-row temperature paths, and the filtered path)
         # reads this value instead of each ORing the policy for itself.
         needs_independent_noise = (
             needs_independent_noise or self.always_independent_noise
@@ -185,9 +186,9 @@ class Sampler(nn.Module):
 
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
-            sampled = self._temperature_sample(
-                logits, temperatures, needs_independent_noise=needs_independent_noise
-            )
+            if needs_independent_noise:
+                return self._independent_noise_sample(logits, temperatures)
+            sampled = self._temperature_sample(logits, temperatures)
             return _apply_greedy_tokens(logits, temperatures, sampled)
 
         # Apply top-k/top-p filtering
@@ -215,40 +216,55 @@ class Sampler(nn.Module):
         self,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        needs_independent_noise: bool = False,
     ) -> torch.Tensor:
-        """Temperature-based Gumbel-max sampling.
+        """Temperature-based Gumbel-max sampling on one shared noise row.
 
-        ``needs_independent_noise`` is the effective value ``forward``
-        resolved from the per-call request and the sampler-wide option. When
-        it is True the per-row exponential noise tensor is freshly drawn with
-        shape ``(num_tokens, vocab_size)`` so that fan-out siblings produced
-        by ``SamplingParams.n > 1`` diverge instead of collapsing onto the
-        same token when they share logits; the opt-in
-        (``always_independent_noise``) arrives through this same argument, so
-        a caller that reaches this method directly gets exactly what it
-        passes. Otherwise one fresh ``(1, vocab_size)`` row is drawn and
-        broadcast with stride 0, so every row of that call uses the same
-        noise.
+        One fresh ``(1, vocab_size)`` row is drawn and broadcast with stride
+        0, so every row of the call uses the same noise. Batches that need
+        independent noise take ``_independent_noise_sample`` instead.
 
-        Both branches materialize the noise in torch and score it with AITER's
+        The noise is materialized in torch and scored with AITER's
         ``mixed_sample_outer_exponential``. AITER's in-kernel ``mixed_sample``
         is not used here, see #2928.
         """
         num_tokens, vocab_size = logits.shape
         sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
-        if needs_independent_noise:
-            exponential = torch.empty(
-                (num_tokens, vocab_size), dtype=torch.float, device=logits.device
-            ).exponential_(1)
-        else:
-            exponential = get_per_token_exponential(vocab_size, logits.device).expand(
-                num_tokens, vocab_size
-            )
+        exponential = get_per_token_exponential(vocab_size, logits.device).expand(
+            num_tokens, vocab_size
+        )
         mixed_sample_outer_exponential(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
         return sampled_tokens
+
+    def _independent_noise_sample(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+    ) -> torch.Tensor:
+        """Temperature-based Gumbel-max sampling on a fresh noise row per token,
+        greedy rows included.
+
+        ``forward`` takes this path for an unfiltered batch whose resolved
+        ``needs_independent_noise`` is set: fan-out siblings
+        (``SamplingParams.n > 1``), which would otherwise collapse onto one
+        token when they share logits, the speculative bonus token and
+        verification rows of a non-greedy batch, and every batch under
+        ``always_independent_noise`` that is not all greedy.
+
+        The noise is one ``(num_tokens, vocab_size)`` ``exponential_`` draw.
+        AITER's ``fused_mixed_sample`` runs the race of
+        ``mixed_sample_outer_exponential`` on it and the greedy override of
+        ``_apply_greedy_tokens`` (rows at or below ``SAMPLER_EPS`` take the
+        lowest-id argmax) in one aiter call.
+        """
+        num_tokens, vocab_size = logits.shape
+        exponential = torch.empty(
+            (num_tokens, vocab_size), dtype=torch.float, device=logits.device
+        ).exponential_(1)
+        return fused_mixed_sample(
+            logits, exponential, temperatures, eps=self.eps, greedy_eps=SAMPLER_EPS
+        )
 
     def _topk_topp_sample(
         self,

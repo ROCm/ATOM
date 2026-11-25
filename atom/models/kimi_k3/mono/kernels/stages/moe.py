@@ -60,7 +60,14 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
     TG,
 )
 from atom.mono.device import gemv, queue, route
-from atom.mono.device.mx import FP4, UNIT_SCALE, fp4_tile_load, mfma_scaled, scale_index
+from atom.mono.device.mx import (
+    FP4,
+    UNIT_SCALE,
+    fp4_pack2,
+    fp4_tile_load,
+    mfma_scaled,
+    scale_index,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     bf2_f32,
@@ -167,19 +174,22 @@ TAGS = 258  # mailbox tags a step: a launch's ``layer`` + 1 (K2's 129 .. 256)
 # (``run_sdown``). Their own buffer: the scratch every launch shares holds
 # other kernels' words at any offset, and a count must start from zero.
 QUEUES = ("ug", "sdown")
-QUEUE_BYTES = -(-len(QUEUES) * TAGS * 4 // 16) * 16  # step zeroing's 16 B stores
+# a queue's words, a tag each: one region a queue, so a launch's words sit in
+# separate cache lines, not one its CTAs' atomics on both contend for
+QUEUE_REGION = TAGS * 4
+QUEUE_BYTES = -(-len(QUEUES) * QUEUE_REGION // 16) * 16  # step zeroing's 16 B stores
 
 
 def queue_offset(layer: int) -> int:
-    """The byte offset of the launch ``layer``'s words in the queue buffer
-    (``queue.tag_offset``): the launch is handed the queue there, so its
-    kernel adds constants only."""
-    return queue.tag_offset(layer, len(QUEUES))
+    """The byte offset of the launch ``layer``'s word in the first queue's
+    region (``queue.tag_offset``): the launch is handed the queue there, so
+    its kernel adds constants only (queue i's ``i * QUEUE_REGION`` on)."""
+    return queue.tag_offset(layer)
 
 
 def queue_word(c, name):
     """Queue ``name``'s word of this launch (``queue_offset``)."""
-    return queue.word(c["queue"] + fx.Int64(QUEUES.index(name) * 4))
+    return queue.word(c["queue"] + fx.Int64(QUEUES.index(name) * QUEUE_REGION))
 
 
 def max_u(s: int) -> int:
@@ -399,20 +409,6 @@ def e8m0_roundup(amax):
     wi = (amax * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
     b = fx.Int32(fx.Uint32(wi + fx.Int32(0x7FFFFF)) >> fx.Uint32(23)) & 0xFF
     return fx.min(b, fx.Int32(254))
-
-
-def pk_fp4_f32(old, a, b, scale, j):
-    """Two f32 / scale -> E2M1 nibbles into byte j of ``old`` (RNE, saturating)."""
-    return fx.Int32(
-        rocdl.cvt_scalef32_pk_fp4_f32(
-            T.i32,
-            as_ir_value(fx.Int32(old)),
-            as_ir_value(fx.Float32(a)),
-            as_ir_value(fx.Float32(b)),
-            as_ir_value(fx.Float32(scale)),
-            j,
-        )
-    )
 
 
 def pk_fp4_bf16(old, word, scale, j):
@@ -1091,7 +1087,7 @@ def ug_tile(c, task, ops, first, count):
         for j in range_constexpr(4):
             x0 = fx.ptr_load(c["av"] + (tt * 32 + col * 8 + 2 * j))
             x1 = fx.ptr_load(c["av"] + (tt * 32 + col * 8 + 2 * j + 1))
-            pk = pk_fp4_f32(pk, x0, x1, scale, j)
+            pk = fp4_pack2(pk, x0, x1, scale, j)
         row = first + tt
         st_dev(pk, c["inter"], row * INTER_WORDS + g * 4 + col)
         if col == 0:

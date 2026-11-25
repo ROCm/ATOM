@@ -11,11 +11,15 @@ Chat, tool and reasoning-effort protocol integration is complete, and native
 image requests support chunked prefill and request-owned embedding lifetime.
 
 The reference revision is `dba1be0a40aa45a94ad051997016db3960a90277`, AITER is
-pinned to `2039d2b96cd547ebc52f8d55f5f29ec1b8290796`, and Engram builds on
+pinned to `a53213dc474521a52ace1cecc079b70e3a0afafb` (it was
+`2039d2b96cd547ebc52f8d55f5f29ec1b8290796` until the
+[gfx942 (MI308X)](#gfx942-mi308x) section; the other sections' numbers predate
+the change), and Engram builds on
 ROCm/ATOM PR #2185. The primary deployment scope is TP4 with whole-expert EP
 on MI355X GPUs. For measured TP2/TP4 no-EP, level-3 FULL AgentX performance,
 see the [AgentX benchmark recipe](DeepSeek-V4.1-Flash-Agentic.md), using
-fixed acceptance length 3.51. For MI455X, see [gfx1250 (MI455X)](#gfx1250-mi455x).
+fixed acceptance length 3.51. For MI455X, see [gfx1250 (MI455X)](#gfx1250-mi455x);
+for MI308X, [gfx942 (MI308X)](#gfx942-mi308x).
 
 | Capability | Status |
 |---|---|
@@ -211,6 +215,51 @@ local-completions`, `num_concurrent=32`):
 
 The DEP4 gap to TP4 has not been investigated; its fp4 dispatch / combine wire
 is the first suspect.
+
+## gfx942 (MI308X)
+
+V4.1 runs on gfx942 at TP4 (`--level 0`, BF16 KV, FP8 index), with or without
+DSpark, from the FP4PTPC checkpoint (`quant_method: w8a8_fp8`): the native
+checkpoint with its dense linears stored as per-channel FP8.
+
+- **Routed experts.** FP4 in the checkpoint, converted to per-channel FP8 at
+  load by the `--online_quant_config` below. It is required: the model
+  refuses to build unless every routed expert is converted, the draft's
+  included, and the backbone's per-channel FP8 shared expert runs in their
+  fused slot. Expert parallel and data parallel are refused. As with any
+  online quant config, the comm-fused MoE backend is off.
+- **BF16 fallback.** AITER has no group32 FP8 GEMM on gfx942, so the linears
+  the checkpoint keeps native 32x32 (`wo_a` and DSpark's draft) are
+  dequantized to BF16 at load. At TP4 that costs 0.31 GiB more per GPU for
+  `wo_a`, and with DSpark another 0.21 GiB for the draft.
+- **AITER.** Needs [#8086](https://github.com/ROCm/aiter/pull/8086) (the
+  group32 GEMM query) and [#8178](https://github.com/ROCm/aiter/pull/8178)
+  (the clamped per-channel FP8 MoE at this checkpoint's 576-wide TP4
+  intermediate). The pin above has both.
+
+TP4 (add `--method dspark --num-speculative-tokens 5` for DSpark):
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=4 \
+AITER_REUSE_IDENTICAL_COMM_GROUPS=1 HF_HUB_OFFLINE=1 \
+python3 -m atom.entrypoints.openai_server \
+  --model <FP4PTPC checkpoint> --trust-remote-code \
+  --server-port 8000 -tp 4 \
+  --kv_cache_dtype bf16 --index-cache-dtype fp8 \
+  --gpu-memory-utilization 0.85 \
+  --max-num-batched-tokens 8192 --attn-prefill-chunk-size 8192 \
+  --block-size 16 --level 0 --max-num-seqs 64 \
+  --cudagraph-capture-sizes '[1,2,4,8,16,32,48,64]' \
+  --online_quant_config '{"layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"}}'
+```
+
+Validation on MI308X, GSM8K 3-shot on the full test set (`lm_eval
+local-completions`, `num_concurrent=32`):
+
+| Launch | GSM8K |
+|---|---|
+| TP4 | 0.925 |
+| TP4 + DSpark (5 speculative tokens) | 0.927; acceptance about 56% on these prompts |
 
 ## Fused decode (mono)
 

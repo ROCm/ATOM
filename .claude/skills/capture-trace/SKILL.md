@@ -131,14 +131,17 @@ For counts and aggregate time per kernel:
 zcat "$TRACE_DIR"/rank_0/*.gz | python3 -c "
 import json, sys
 events = json.load(sys.stdin)['traceEvents']
-def stat(kw):
-    m = [e for e in events if kw in e.get('name','') and 'dur' in e]
+def stat(kw, cats=None):
+    m = [e for e in events if kw in e.get('name','') and 'dur' in e
+         and (cats is None or e.get('cat') in cats)]
     if m: print(f'{kw}: count={len(m)} total_us={sum(e[\"dur\"] for e in m)}')
 stat('aiter::topk_softplus')
-stat('aiter::moe_forward')
+stat('aiter::moe_forward', cats=('cpu_op', 'user_annotation'))
 # ...
 "
 ```
+
+Host-side MoE time per `FusedMoE` layer call is `aiter::moe_forward`, counted over **both** categories. `FusedMoE.forward` records `aiter::moe_forward`, and `rocm_aiter_fused_moe` (called by the FP8 MoE methods) runs nested inside it as its own `aiter::rocm_aiter_fused_moe` event. Both are called through the caller `direct_register_custom_op` returns, which skips the `torch.ops` dispatch in eager mode: an eager call records a `user_annotation` of the op's name (only while the profiler runs), a dispatched call (torch.compile, FakeTensorMode/make_fx) a `cpu_op`. Filtering on `cpu_op` alone silently drops eager prefill. Leave out `gpu_user_annotation`: it is the GPU-side copy of the same annotation and would double-count.
 
 For a UI view, drop the `.gz` (decompressed `.json`) into <https://ui.perfetto.dev> or `chrome://tracing`.
 

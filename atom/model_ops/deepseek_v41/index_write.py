@@ -21,6 +21,7 @@ OPUS on gfx950 groups 64 rows physically; table IDs still name 8-row pages.
 import torch
 import triton
 import triton.language as tl
+from aiter import dtypes
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
 from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
@@ -128,7 +129,8 @@ def write_index_rows(
     # `view`, not `reshape`: a plane that could not be seen flat would come
     # back as a copy, and the kernel would fill the copy.
     flat = plane.view(-1)
-    fp8 = torch.float8_e4m3fn
+    # The scorers read the plane as `dtypes.fp8`, FNUZ on gfx942.
+    fp8 = dtypes.fp8
     _write_index_kernel[(count,)](
         keys,
         flat.view(fp8),
