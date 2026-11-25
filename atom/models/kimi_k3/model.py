@@ -447,6 +447,7 @@ class KimiSparseMoeBlock(nn.Module):
         # provides its own overlap, so the two are mutually exclusive.
         self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
         self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
+        self._row_shard_min_tokens = envs.ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS
         tbo_active = get_current_atom_config().enable_tbo
         self._use_dual_stream = (
             self.shared_experts is not None
@@ -605,8 +606,8 @@ class KimiSparseMoeBlock(nn.Module):
 
         return (
             self.tp_size > 1
-            and num_tokens > envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-            and num_tokens >= envs.ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS
+            and num_tokens > self._dual_stream_token_threshold
+            and num_tokens >= self._row_shard_min_tokens
             and not torch.cuda.is_current_stream_capturing()
             and not tbo_active()
         )

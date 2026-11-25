@@ -535,10 +535,24 @@ def test_row_gate_intersects_floor_and_strict_stream_threshold(
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, value)
-    assert (
-        kimi.KimiSparseMoeBlock.takes_row_tail(SimpleNamespace(tp_size=WORLD), tokens)
-        is expected
-    )
+    block = _block(_weights(), 0, [])
+    assert block.takes_row_tail(tokens) is expected
+
+
+@pytest.mark.parametrize("threshold,floor,first_row_tail", [(8, 4, 9), (4, 8, 8)])
+def test_row_gate_caches_environment_at_construction(
+    ranks, monkeypatch, threshold, floor, first_row_tail
+):
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", str(threshold))
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", str(floor))
+    block = _block(_weights(), 0, [])
+
+    def unexpected_env_read(name):
+        pytest.fail(f"row gate read environment after construction: {name}")
+
+    monkeypatch.setattr(kimi.envs, "__getattr__", unexpected_env_read)
+    assert not block.takes_row_tail(first_row_tail - 1)
+    assert block.takes_row_tail(first_row_tail)
 
 
 @pytest.mark.parametrize(
