@@ -210,7 +210,7 @@ impl Pipeline {
         };
         let guards = make_load_guards(&mut placement, resp_ctx.headers.as_ref());
         let stream = match self.engine.dispatch(&placement, &mut payload).await {
-            Ok(s) => s,
+            Ok(s) => s.with_prefill_charge(guards[0].prefill_charge()),
             Err(e) => return self.record_chat_err(&model, start, engine_err_to_response(e)),
         };
 
@@ -266,7 +266,7 @@ impl Pipeline {
         };
         let guards = make_load_guards(&mut placement, resp_ctx.headers.as_ref());
         let stream = match self.engine.dispatch(&placement, &mut payload).await {
-            Ok(s) => s,
+            Ok(s) => s.with_prefill_charge(guards[0].prefill_charge()),
             Err(e) => {
                 return self.record_generate_err(
                     &model_for_metric,
@@ -311,12 +311,13 @@ impl Pipeline {
 
         let (mut payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
         let mut placement = self.plan_for(&payload, &resp_ctx).await?;
-        let _guards = make_load_guards(&mut placement, resp_ctx.headers.as_ref());
+        let guards = make_load_guards(&mut placement, resp_ctx.headers.as_ref());
         let stream = self
             .engine
             .dispatch(&placement, &mut payload)
             .await
-            .map_err(engine_err_to_response)?;
+            .map_err(engine_err_to_response)?
+            .with_prefill_charge(guards[0].prefill_charge());
 
         render::chat_aggregator::process_typed(stream, resp_ctx).await
     }
@@ -375,8 +376,12 @@ impl Pipeline {
 
 fn make_load_guards(plan: &mut PlacementPlan, headers: Option<&HeaderMap>) -> Vec<WorkerLoadGuard> {
     match plan {
-        PlacementPlan::Single { worker, .. } => {
-            vec![WorkerLoadGuard::new(worker.clone(), headers)]
+        PlacementPlan::Single {
+            worker,
+            prefill_tokens,
+            ..
+        } => {
+            vec![WorkerLoadGuard::new(worker.clone(), headers).with_prefill_tokens(*prefill_tokens)]
         }
         PlacementPlan::Pair {
             prefill,

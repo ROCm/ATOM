@@ -1137,7 +1137,7 @@ enum DecodeCharge {
 /// immediately but the stream continues in the background.
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
-    prefill_tokens: usize,
+    prefill: Arc<PrefillCharge>,
     decode_charge: DecodeCharge,
     owns_load: bool,
 }
@@ -1146,8 +1146,8 @@ impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, _headers: Option<&http::HeaderMap>) -> Self {
         worker.increment_load();
         Self {
+            prefill: PrefillCharge::new(worker.clone(), 0),
             worker,
-            prefill_tokens: 0,
             decode_charge: DecodeCharge::None,
             owns_load: true,
         }
@@ -1157,8 +1157,8 @@ impl WorkerLoadGuard {
     pub fn adopt(reservation: LoadReservation) -> Self {
         let (worker, tokens) = reservation.defuse();
         Self {
+            prefill: PrefillCharge::new(worker.clone(), 0),
             worker,
-            prefill_tokens: 0,
             decode_charge: match tokens {
                 Some(tokens) => DecodeCharge::Tokens(tokens),
                 None => DecodeCharge::Untokenized,
@@ -1170,19 +1170,48 @@ impl WorkerLoadGuard {
     /// Also charge `tokens` of prefill to the worker until the guard drops or
     /// [`Self::release_prefill`] runs. Call once, on a new guard.
     pub fn with_prefill_tokens(mut self, tokens: usize) -> Self {
-        debug_assert_eq!(self.prefill_tokens, 0, "prefill already charged");
+        debug_assert_eq!(
+            self.prefill.tokens.load(Ordering::Relaxed),
+            0,
+            "prefill already charged"
+        );
         if tokens > 0 {
             self.worker.charge_prefill_tokens(tokens);
-            self.prefill_tokens = tokens;
+            self.prefill = PrefillCharge::new(self.worker.clone(), tokens);
         }
         self
     }
 
     /// Release the prefill charge while the request keeps counting as load.
     pub fn release_prefill(&mut self) {
-        if self.prefill_tokens > 0 {
-            self.worker.release_prefill_tokens(self.prefill_tokens);
-            self.prefill_tokens = 0;
+        self.prefill.release();
+    }
+
+    /// The prefill charge, for a release point that outlives this borrow.
+    pub fn prefill_charge(&self) -> Arc<PrefillCharge> {
+        self.prefill.clone()
+    }
+}
+
+/// Prefill tokens charged to one worker. Several release points may race
+/// (first chunk, guard drop); only the first releases the tokens.
+pub struct PrefillCharge {
+    worker: Arc<dyn Worker>,
+    tokens: AtomicUsize,
+}
+
+impl PrefillCharge {
+    fn new(worker: Arc<dyn Worker>, tokens: usize) -> Arc<Self> {
+        Arc::new(Self {
+            worker,
+            tokens: AtomicUsize::new(tokens),
+        })
+    }
+
+    pub fn release(&self) {
+        let tokens = self.tokens.swap(0, Ordering::AcqRel);
+        if tokens > 0 {
+            self.worker.release_prefill_tokens(tokens);
         }
     }
 }
@@ -2131,5 +2160,20 @@ mod tests {
         assert_eq!((worker.load(), worker.decode_kv_tokens()), (1, 8));
         drop(guard);
         assert_eq!((worker.load(), worker.decode_kv_tokens()), (0, 0));
+    }
+
+    #[test]
+    fn prefill_charge_releases_once_across_release_points() {
+        let worker = decode_worker();
+        let mut guard = WorkerLoadGuard::new(worker.clone(), None).with_prefill_tokens(7);
+        let charge = guard.prefill_charge();
+        assert_eq!(worker.prefill_tokens(), 7);
+        charge.release();
+        assert_eq!(worker.prefill_tokens(), 0);
+        // A second request's charge would be under-counted by a double release.
+        let _other = WorkerLoadGuard::new(worker.clone(), None).with_prefill_tokens(5);
+        guard.release_prefill();
+        drop(guard);
+        assert_eq!(worker.prefill_tokens(), 5);
     }
 }

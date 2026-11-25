@@ -268,6 +268,38 @@ async fn buffers_request_and_preserves_bytes_and_stream_lifetime() {
 }
 
 #[tokio::test]
+async fn streaming_prefill_charge_is_released_at_first_response_body() {
+    // Without a tokenizer, `agentic` estimates the prompt from its text.
+    let fixture = Fixture::new(RouterConfig {
+        policy: mesh::config::PolicyConfig::Agentic {
+            request_token_equivalent: 512,
+            eviction_interval_secs: 120,
+            max_tree_size: 1 << 20,
+        },
+        ..Default::default()
+    })
+    .await;
+    let mut stream = fixture.open().await;
+    stream.routed().await;
+    assert!(fixture.worker.prefill_tokens() > 0);
+    assert_eq!(fixture.worker.load(), 1);
+    stream.response_headers(false).await;
+    assert!(fixture.worker.prefill_tokens() > 0);
+    stream
+        .response_body(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            false,
+        )
+        .await;
+    assert_eq!(fixture.worker.prefill_tokens(), 0);
+    assert_eq!(fixture.worker.load(), 1);
+    stream.response_body(b"data: [DONE]\n\n", true).await;
+    fixture.unloaded().await;
+    assert_eq!(fixture.worker.prefill_tokens(), 0);
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn trailers_finish_request_and_response_without_body_eos() {
     let fixture = Fixture::new(RouterConfig::default()).await;
     let mut stream = fixture.open().await;

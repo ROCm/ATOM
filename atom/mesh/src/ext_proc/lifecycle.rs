@@ -63,6 +63,9 @@ impl RequestLifecycle {
     }
 
     pub fn body(&mut self, bytes: &[u8]) {
+        if let Some(decision) = &mut self.worker {
+            decision.target.release_prefill();
+        }
         if let Some(observation) = &mut self.observation {
             observation.streaming = self.streaming;
             observation.body(bytes);
