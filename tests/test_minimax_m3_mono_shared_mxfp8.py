@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The unfused MXFP8 shared expert's weight addressing: ``preshuffle.w8_offset`` as
-``fp8_tile_load`` calls it, against aiter's (16, 16) preshuffle of a random fp8-sized
-matrix (CPU, no kernel)."""
+"""The unfused MXFP8 shared expert's weight addressing: ``mxfp8_tile_dword`` against
+aiter's (16, 16) preshuffle of a random fp8-sized matrix (CPU, no kernel)."""
 
 import pytest
 import torch
@@ -10,7 +9,7 @@ import torch
 pytest.importorskip("aiter")
 from aiter.ops.shuffle import shuffle_weight
 
-from atom.mono.plan.preshuffle import W8_QSTEP, w8_offset
+from atom.models.minimax_m3.mono.layout import mxfp8_tile_dword
 
 
 @pytest.mark.parametrize("rows,cols", [(64, 256), (48, 768)])
@@ -20,10 +19,7 @@ def test_tile_dword_addresses_the_operand_pieces(rows, cols):
     for row in range(rows):
         for kc in range(cols // 128):
             for g in range(4):
-                dw = (
-                    w8_offset(row - row % 16, row % 16, 16 * g, cols) // 4
-                    + 4 * W8_QSTEP * kc
-                )
+                dw = mxfp8_tile_dword(row, cols, kc, g)
                 for half, k0 in enumerate((16 * g, 64 + 16 * g)):
                     at = (dw + 256 * half) * 4
                     want = w[row, kc * 128 + k0 : kc * 128 + k0 + 16]

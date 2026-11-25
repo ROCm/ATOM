@@ -2,13 +2,12 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Addresses in an E4M3 plane in AITER's (16, 16) preshuffle,
 ``[N/16][K/32][2][16 rows][16 B]``: ATOM's per-token FP8 linears as the
-production GEMM holds them, which ``gemv``'s ``w8`` loads read in place, and
-MiniMax-M3's MXFP8 shared expert (``fp8_tile_load``).
+production GEMM holds them, which ``gemv``'s ``w8`` loads read in place.
 
 As ``arith``: a kernel calls these on its traced operands, a CPU test on ints,
-so the test checks what the kernel runs. Wherever a load's result is used, the
-operands are non-negative, and there Python's and the device's ``%`` agree. No
-FlyDSL import.
+so the test checks what the kernel runs. Only non-negative operands reach ``//``
+and ``%``, where Python's floor and the device's truncation agree. No FlyDSL
+import.
 """
 
 ROWS = 16

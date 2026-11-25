@@ -38,6 +38,7 @@ from atom.models.minimax_m3.mono.layout import (
     XN4_ROW,
     XN8_ROW,
     XSC_ROW,
+    mxfp8_tile_dword,
 )
 from atom.mono.device.mx import (
     FP4,
@@ -54,7 +55,6 @@ from atom.mono.device.ops import (
     traced,
     uniform,
 )
-from atom.mono.plan.preshuffle import W8_QSTEP, w8_offset
 
 
 @traced
@@ -201,9 +201,7 @@ def moe_common_defs(k4ctx):
         16-k halves apart), row ``row`` at 128-k chunk ``kc``: k 16 g .. + 16 and
         64 + 16 g .. + 16 (g = lane // 16), the f8f6f4 MFMA's operand layout (the B
         operand's, ``lds_b8``). Each 16 B piece of the 64 lanes is 1 KB contiguous."""
-        # kc stays outside w8_offset: folded into its column, it changes K4's SGPR
-        # spill count in 113 of the 384 builds without fused_shared
-        dw = w8_offset(row - row % 16, row % 16, 16 * g4, cols) // 4 + 4 * W8_QSTEP * kc
+        dw = mxfp8_tile_dword(row, cols, kc, g4)
         halves = [
             fx.Vector(
                 bo.buffer_load(
