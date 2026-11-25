@@ -67,7 +67,7 @@ On TP, the interval and coalescer are enabled together.
 This applies to the standard scheduler, including connector-based P/D roles.
 RapidServe's dedicated `PrefillScheduler`/`DecodeScheduler` do not use the delayer.
 
-After each executed prefill, the decode interval runs before all coalescing
+After each executed prefill-only forward, the decode interval runs before all coalescing
 bounds. Once it expires, fill, queue age, KV pressure, partial-prefill, no-decode
 and stall bounds decide when to release; with DP, a group where some rank has no
 prefill also waits for alignment, and stall and the cost gate release it only
@@ -103,7 +103,7 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_PREFILL_DELAYER** | bool | true | Master switch for the prefill coalescer. |
-| **ATOM_PREFILL_DELAYER_TARGET_FILL** | float | 0.9 | Release once accumulated pending tokens reach `target_fill × max_num_batched_tokens` (averaged across prefillable ranks). In (0, 1]; higher = fewer, larger prefills at some TTFT cost. Clamped to (0, 1]. |
+| **ATOM_PREFILL_DELAYER_TARGET_FILL** | float | 0.9 | Release once accumulated pending tokens reach `target_fill × prefill_budget` (averaged across prefillable ranks). Each rank's prefill budget excludes tokens reserved for decode when mixed prefill/decode is enabled. In (0, 1]; higher = fewer, larger prefills at some TTFT cost. Clamped to (0, 1]. |
 | **ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS** | int | 200 | Max consecutive scheduler ticks a held prefill waits before force-release. Values `< 1` clamped to 1. |
 | **ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS** | int | 100 | Tighter bound for a held mid-chunked-prefill (it holds allocated KV). Values `< 1` clamped to 1. |
 | **ATOM_PREFILL_DELAYER_STALL_TICKS** | int | 10 | After this many consecutive ticks in which the group's work does not change, release an underfilled or unaligned prefill. A tick counts only if pending tokens did not grow, no rank turned prefillable or non-prefillable, and no request arrived on any rank: pending-token probes are capped per rank, so a flat sum alone does not mean decoding peers stopped receiving work. An unaligned group is released this way only when some rank without prefill cannot align before `TTFT_MAX_TICKS`: it runs no decode, or none of its decodes reaches `max_tokens` in time (a completion frees the slot its next request takes). By default an unaligned group (some rank has no prefill and no waiting work it cannot admit) waits for its peers until this stall bound, the cost gate (`COST_GATE`, under the same condition), or a TTFT, partial, KV or no-decode bound fires (`MAX_QUEUE_MS` is off by default). Values `< 1` clamped to 1. |
@@ -111,7 +111,7 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK** | float | 0.9 | At/above this KV usage a prefillable rank force-releases the group (it can't accumulate a bigger batch). A rank whose waiting head cannot be admitted (no KV for it, or its remote KV still loading) does not trigger it; it counts as aligned instead, since waiting cannot make its head admittable, and runs a dummy prefill beside its peers. |
 | **ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK** | float\|"" | "" (None) | If set, a prefillable rank below this KV usage force-releases (GPU starving). |
 | **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | After decode protection, release coalescing when the oldest schedulable waiting prefill reaches this age since arrival. Empty disables the age guard. Checkpoint dependency waits use `TTFT_MAX_TICKS`. This is not a hard TTFT limit. |
-| **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill. Ignored with `--prefill-admit-policy adaptive`. On DP=1, PP=1, a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. |
+| **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill-only forward; a mixed forward also advances decode and does not re-arm the interval. Ignored with `--prefill-admit-policy adaptive`. On DP=1, PP=1, a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. |
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 

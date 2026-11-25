@@ -257,6 +257,9 @@ class BlockManager:
         # round writes. Set by the scheduler, which knows whether this engine
         # drafts; admission charges for it and `may_append` allocates it.
         self.draft_lookahead = 0
+        # Admission protects the mixed tick's decodes. The scheduler updates
+        # this after P/D promotion and clears it before selecting decodes.
+        self.reserved_decode_blocks = 0
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
@@ -685,24 +688,22 @@ class BlockManager:
 
         The raise is unreachable through `Scheduler` and the checkpoint cache
         cannot make it reachable: a READY unpinned checkpoint counts as
-        available, and both callers sit behind a pin-aware check in the same
-        pass. `allocate` protects the checkpoint it is about to pin -- the
-        joint boundary when that image is in HBM, otherwise the HBM-hit
-        checkpoint -- and sees the pin taken before the fresh blocks.
-        `may_append` runs only in a pass that scheduled no prefill
-        (`scheduler.py`, `if num_seqs_prefill > 0` returns first), so every
-        pin was already released at the top of that pass -- except for the
-        draft lookahead an admission allocates right after its `allocate`.
-        `can_allocate` charged those blocks (`draft_lookahead_blocks`) against
-        the HBM-hit checkpoint; when a joint needs more, `_fit_joint` charges
-        that same demand plus the private tail against the checkpoint
-        `allocate` will pin. Under contention the reachable outcome is a
-        refused admission, not this.
-
-        That second half rests on prefill and decode never sharing a pass. If
-        the mixed batch that `scheduler.py` has a TODO for lands, `may_append`
-        starts running alongside this pass's pins and the argument has to be
-        redone.
+        available, and each caller sits right behind a pin-aware check that
+        counts the same set. `allocate` protects the checkpoint it is about to
+        pin -- the joint boundary when that image is in HBM, otherwise the
+        HBM-hit checkpoint -- and sees the pin taken before the fresh blocks,
+        and the draft lookahead an admission allocates right after its
+        `allocate` included: `can_allocate` charged those blocks
+        (`draft_lookahead_blocks`) against the HBM-hit checkpoint, and when a
+        joint needs more, `_fit_joint` charges that same demand plus the private
+        tail against the checkpoint `allocate` will pin. `may_append` follows
+        `_has_page_units(append_blocks_needed(...))`. Both ask about the same
+        eligible set (`_is_evictable`:
+        READY, unpinned): pins this pass's prefill admissions took -- a mixed
+        step's -- are outside it for both, and nothing is consumed between the
+        two (the scheduler's decode loop may preempt in between, which only
+        frees). Under contention the reachable outcome is a refused admission
+        or a skipped decode, not this.
         """
         if not self._ensure_page_units(1):
             raise AssertionError("No PAGE unit available for a fresh KV block")
@@ -1264,11 +1265,20 @@ class BlockManager:
         avoiding a second hash pass.
         """
         if probe is None:
-            return self._evaluate(seq, self._admission_walk, record, block_hashes)
+            return self._evaluate(
+                seq,
+                self._admission_walk,
+                record,
+                block_hashes,
+            )
         assert block_hashes is None, "the probe carries its own chain"
         probe.num_new_blocks = None
         probe.num_cached_blocks = self._evaluate(
-            seq, self._admission_walk, record, probe.block_hashes, probe
+            seq,
+            self._admission_walk,
+            record,
+            probe.block_hashes,
+            probe,
         )
         return probe.num_cached_blocks
 
@@ -1292,11 +1302,12 @@ class BlockManager:
             block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
+        reserved = self.reserved_decode_blocks
         if not self.enable_prefix_caching:
             num_new_blocks = self.num_pool_blocks(
                 len(seq)
             ) + self.draft_lookahead_blocks(len(seq))
-            if not self._has_page_units(num_new_blocks):
+            if not self._has_page_units(num_new_blocks + reserved):
                 return -1
             if probe is not None:
                 probe.num_new_blocks = num_new_blocks
@@ -1358,7 +1369,7 @@ class BlockManager:
             protected_hash=protected_hash,
         )
         self._record_checkpoint_end(seq)
-        if not self._has_page_units(num_new_blocks, protected_hash):
+        if not self._has_page_units(num_new_blocks + reserved, protected_hash):
             return -1
         # `record_allocation` re-checks a joint against this demand instead of
         # walking the hit again.
@@ -1369,7 +1380,8 @@ class BlockManager:
         # budget checks; refused probes avoid the extra LMCache hash walk.
         if record:
             self.record_allocation(
-                seq, AdmissionProbe(num_cached_blocks, block_hashes, num_new_blocks)
+                seq,
+                AdmissionProbe(num_cached_blocks, block_hashes, num_new_blocks),
             )
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
@@ -1433,7 +1445,9 @@ class BlockManager:
         if not decision.state_from_hbm and extra == 0:
             return decision
         protected = decision.boundary_hash if decision.state_from_hbm else None
-        if self._has_page_units(num_new_blocks + extra, protected):
+        if self._has_page_units(
+            num_new_blocks + extra + self.reserved_decode_blocks, protected
+        ):
             return decision
         reason = (
             "partial_chunk_no_room"
@@ -1800,7 +1814,7 @@ class BlockManager:
                 in_use += 1
         demand = probe.num_new_blocks + in_use
         protected = chain[lowered - 1] if lowered else None
-        if not self._has_page_units(demand, protected):
+        if not self._has_page_units(demand + self.reserved_decode_blocks, protected):
             return False
         probe.num_cached_blocks = lowered
         probe.num_new_blocks = demand
@@ -3938,30 +3952,25 @@ class BlockManager:
             "transfer_slots_full": self.transfer_slots_full,
         }
 
-    def can_append(
+    def append_blocks_needed(
         self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
-    ) -> bool:
-        """Whether the pool can back what `may_append` takes for this step.
-
-        Sized on `len(seq) + max(num_new_tokens, lookahead)`. A decode step's
-        `num_new_tokens` (`1 + mtp_k`) already exceeds its draft lookahead
-        (`mtp_k - 1`), so the lookahead never raises the bar there; it is
-        passed so the check states what it covers.
-        """
+    ) -> int:
+        """Free pages needed by the decode admission check, before allocating."""
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
         ebs = self._effective_block_size()
         reach = seq_len + max(num_new_tokens, lookahead)
         needed_blocks = (reach + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        return self._has_page_units(new_blocks_needed)
+        return new_blocks_needed
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0):
         """Allocate every block this step's KV writes land in.
 
         The target writes up to `len(seq) - 1`; the draft round writes
         `lookahead` positions past that (`draft_kv_lookahead`). Checking that
-        the pool has room (`can_append`) is not the same as allocating it: a
+        the pool has room (`_has_page_units(append_blocks_needed(...))`) is not
+        the same as allocating it: a
         position past the last allocated block reads block id 0 from the zeroed
         block-table tail, overwriting the padding block or unrelated live KV.
         """

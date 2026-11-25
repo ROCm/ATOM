@@ -521,7 +521,8 @@ class TestPagedMidstep:
 
 class TestPagedAnchorFallback:
     @pytest.mark.parametrize("advance", [False, True])
-    def test_shared_pool_exhaustion_keeps_all_anchors(self, advance):
+    @pytest.mark.parametrize("mixed", [False, True])
+    def test_shared_pool_exhaustion_keeps_all_anchors(self, advance, mixed):
         runtime = StateRuntime(
             transfer=StateTransfer.copy(
                 PAGED_COPY_SPEC.layout_id,
@@ -537,6 +538,7 @@ class TestPagedAnchorFallback:
                 max_num_batched_tokens=512,
                 pool_entries={"state": 10},
                 state_checkpoint_interval_tokens=-1,
+                enable_mixed_prefill_decode=mixed,
             ),
             state_runtime=runtime,
         )
