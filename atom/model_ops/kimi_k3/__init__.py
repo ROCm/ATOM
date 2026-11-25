@@ -4,7 +4,9 @@
 """Fused model operations for Kimi-K3."""
 
 from atom.model_ops.kimi_k3.activations import (
+    onorm_fits,
     rmsnorm_gated,
+    rmsnorm_gated_e8m0_col_major,
     situ_and_mul,
     situ_and_mul_maybe_quant,
     situ_and_mul_quant,
@@ -16,7 +18,9 @@ from atom.model_ops.kimi_k3.quant import strided_per_token_quant
 __all__ = [
     "apply_attn_res",
     "gather_kda_initial_state",
+    "onorm_fits",
     "rmsnorm_gated",
+    "rmsnorm_gated_e8m0_col_major",
     "situ_and_mul",
     "situ_and_mul_maybe_quant",
     "situ_and_mul_quant",

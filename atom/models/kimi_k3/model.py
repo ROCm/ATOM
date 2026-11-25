@@ -32,6 +32,7 @@ from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
+    ONormE8M0,
     fused_sigmoid_gating_delta_rule_update,
 )
 from atom.model_ops.fla_ops.replayssm import (
@@ -219,10 +220,12 @@ class KimiRMSNormGated(nn.Module):
         quant_type: QuantType | None = None,
         quant_dtype: torch.dtype | None = None,
         weight_dtype: torch.dtype | None = None,
+        e8m0_scale: bool = False,
     ):
         super().__init__()
         self.weight = atom_parameter(torch.ones(hidden_size, dtype=weight_dtype))
         self.variance_epsilon = eps
+        self.e8m0_scale = e8m0_scale
         # When ``quant_type`` names a fusable per-token scheme, the per-head
         # sigmoid-gated norm also emits (quantized, scale) so the consuming
         # o_proj skips its standalone quant; otherwise it returns a bf16 tensor.
@@ -240,6 +243,7 @@ class KimiRMSNormGated(nn.Module):
             quant_type=self.quant_type,
             quant_dtype=self.quant_dtype,
             is_prefill=is_prefill,
+            e8m0_scale=self.e8m0_scale,
         )
 
 
@@ -874,13 +878,13 @@ class KimiFullAttention(nn.Module):
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
         # Fuse sigmoid(g_proj) * attn_out + activation quant into one triton kernel
         # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
-        # (ptpc_fp8) or per-1x128 block.
+        # (ptpc_fp8) or per-1x128 block (FP32 or E8M0 scales).
         o_type, o_dtype = effective_layer_quant(quant_config, f"{prefix}.o_proj")
-        self.fuse_sigmoid_mul_quant = (
-            o_dtype == dtypes.fp8
-            and o_type in (QuantType.per_Token, QuantType.per_1x128)
-            and not _is_e8m0_blockscale(quant_config, o_type)
+        self.fuse_sigmoid_mul_quant = o_dtype == dtypes.fp8 and o_type in (
+            QuantType.per_Token,
+            QuantType.per_1x128,
         )
+        self.o_proj_e8m0_scale = _is_e8m0_blockscale(quant_config, o_type)
         # .value, like qknorm_quant_type_value above: comparing the pybind11
         # QuantType inside forward() graph-breaks Dynamo.
         self.o_proj_quant_type_value = (
@@ -955,6 +959,7 @@ class KimiFullAttention(nn.Module):
             gate,
             quant=self.fuse_sigmoid_mul_quant,
             quant_type_value=self.o_proj_quant_type_value,
+            e8m0_scale=self.o_proj_e8m0_scale,
         )
         return attn_out, attn_scale
 
@@ -1132,15 +1137,20 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
-        # rmsnorm_gated fuses only per-token FP8; otherwise o_proj quantizes itself.
+        # rmsnorm_gated fuses per-token FP8, and E8M0 per-1x128 FP8 when a head is
+        # one 128-wide group; otherwise o_proj quantizes itself.
         o_type, o_dtype = effective_layer_quant(quant_config, f"{prefix}.o_proj")
-        o_norm_fuses_quant = o_type == QuantType.per_Token and o_dtype == dtypes.fp8
+        o_e8m0 = _is_e8m0_blockscale(quant_config, o_type) and self.head_dim == 128
+        o_norm_fuses_quant = o_dtype == dtypes.fp8 and (
+            o_type == QuantType.per_Token or o_e8m0
+        )
         self.o_norm = KimiRMSNormGated(
             self.head_dim,
             eps=config.rms_norm_eps,
             quant_type=o_type if o_norm_fuses_quant else None,
             quant_dtype=o_dtype if o_norm_fuses_quant else None,
             weight_dtype=control_dtype,
+            e8m0_scale=o_e8m0,
         )
         self.o_proj = RowParallelLinear(
             self.proj_size,
@@ -1275,6 +1285,31 @@ class KimiKDAAttention(nn.Module):
             state_v_first=True,
         )
 
+    def _decode_onorm(
+        self, out_gate: torch.Tensor, ssm_state: torch.Tensor, num_seqs: int
+    ) -> ONormE8M0 | None:
+        """``onorm`` for fused_sigmoid_gating_delta_rule_update at one token per
+        request: the decode recurrence then emits o_proj's E8M0 FP8 input
+        (``self.o_norm`` on its BF16 output, see the kernel for the rounding).
+        None where o_norm would not take the gfx1250 Gluon kernel, for a
+        non-fp32 state, or where fusing is slower (``onorm_fits``)."""
+        from atom.model_ops.kimi_k3 import onorm_fits, rmsnorm_gated_e8m0_col_major
+
+        if ssm_state.dtype != torch.float32 or not onorm_fits(
+            num_seqs, self.num_local_heads
+        ):
+            return None
+        norm = self.o_norm
+        col_major = rmsnorm_gated_e8m0_col_major(
+            norm.quant_type, norm.quant_dtype, norm.e8m0_scale
+        )
+        if col_major is None:
+            return None
+        gate = rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
+        return ONormE8M0(
+            norm.weight, gate, norm.variance_epsilon, norm.quant_dtype, col_major
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
         # per-token quant; carry the scale through the opaque splitting custom op
@@ -1313,6 +1348,8 @@ class KimiKDAAttention(nn.Module):
             conv_state = conv_state.transpose(-1, -2)
 
         num_actual_tokens = kda_metadata.num_actual_tokens
+        # o_proj's input when the decode recurrence fused o_norm, else None.
+        normed = None
         hidden_states = hidden_states[:num_actual_tokens]
         if hidden_states_scale is not None:
             hidden_states_scale = hidden_states_scale[:num_actual_tokens]
@@ -1486,7 +1523,10 @@ class KimiKDAAttention(nn.Module):
                     fork_slots=kda_metadata.replayssm_fork_slots,
                 )
             else:
-                fused_sigmoid_gating_delta_rule_update(
+                onorm = self._decode_onorm(
+                    out_gate, ssm_state, kda_metadata.num_decodes
+                )
+                o, _ = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
                     a=gate,
                     b=beta,
@@ -1503,7 +1543,10 @@ class KimiKDAAttention(nn.Module):
                     use_qk_l2norm_in_kernel=True,
                     is_kda=True,
                     lower_bound=self._kda_gate_lower_bound,
+                    onorm=onorm,
                 )
+                if onorm is not None:
+                    normed = o
         elif kda_metadata.num_spec_decodes > 0:
             # Speculative-decode pass
             spec_state_indices = kda_metadata.spec_state_indices_tensor
@@ -1595,11 +1638,12 @@ class KimiKDAAttention(nn.Module):
         else:
             out.zero_()
 
-        normed = self.o_norm(
-            out,
-            rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim),
-            is_prefill=kda_metadata.num_prefills > 0,
-        )
+        if normed is None:
+            normed = self.o_norm(
+                out,
+                rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim),
+                is_prefill=kda_metadata.num_prefills > 0,
+            )
         # A fused per-token quant makes o_norm return (quantized, scale); feed it
         # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
         if isinstance(normed, tuple):

@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from aiter import QuantType, dtypes, get_hip_quant
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.utils.decorators import mark_trace
@@ -301,6 +304,61 @@ def situ_and_mul_maybe_quant(
     return situ_and_mul(x, beta, linear_beta), None
 
 
+@functools.cache
+def _onorm_gluon_module():
+    """The gfx1250 Gluon o_norm + E8M0 quant kernel module, or None elsewhere."""
+    try:
+        from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+        if get_arch() != "gfx1250":
+            return None
+        from atom.model_ops.kimi_k3 import rmsnorm_gated_gluon
+    except ImportError:
+        return None
+    return rmsnorm_gated_gluon
+
+
+def _rmsnorm_gated_e8m0_plan(
+    quant_type: QuantType | None,
+    quant_dtype: torch.dtype | None,
+    e8m0_scale: bool,
+    is_prefill: bool,
+):
+    """For the per-1x128 E8M0 scheme, ``(Gluon o_norm module or None, col_major)``
+    as ``rmsnorm_gated`` runs it; None for any other scheme."""
+    if not (
+        quant_type == QuantType.per_1x128 and quant_dtype == dtypes.fp8 and e8m0_scale
+    ):
+        return None
+    from atom.utils import envs
+
+    gluon = None if is_prefill else _onorm_gluon_module()
+    return gluon, envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+
+
+def rmsnorm_gated_e8m0_col_major(
+    quant_type: QuantType | None, quant_dtype: torch.dtype | None, e8m0_scale: bool
+) -> bool | None:
+    """The scale layout (col_major) ``rmsnorm_gated`` gives the gfx1250 Gluon
+    E8M0 o_norm for this scheme at decode, or None when it does not take it."""
+    plan = _rmsnorm_gated_e8m0_plan(quant_type, quant_dtype, e8m0_scale, False)
+    if plan is None or plan[0] is None:
+        return None
+    return plan[1]
+
+
+# The fused decode recurrence + o_norm runs one 4-wave workgroup per (request,
+# head), with BV = V. Past this many workgroups per CU it is slower than the
+# BV = 32 recurrence followed by the separate o_norm.
+_ONORM_MAX_WGS_PER_CU = 3
+
+
+def onorm_fits(num_seqs: int, num_heads: int) -> bool:
+    """Whether the decode recurrence with ``onorm`` (one token per request) is
+    faster than the recurrence plus a separate o_norm at this size."""
+    return num_seqs * num_heads <= _ONORM_MAX_WGS_PER_CU * get_cu_num()
+
+
 @mark_trace
 def rmsnorm_gated(
     x: torch.Tensor,
@@ -310,6 +368,7 @@ def rmsnorm_gated(
     quant_type: QuantType | None = None,
     quant_dtype: torch.dtype | None = None,
     is_prefill: bool = False,
+    e8m0_scale: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """rmsnorm(x) over last dim * weight * sigmoid(gate).
 
@@ -317,8 +376,10 @@ def rmsnorm_gated(
     output is also quantized and the function returns
     ``(fp8 [t, heads*H], scale [t, 1])`` ready for the consuming GEMM's
     ``x_scale=`` path. With no quant (``None``/``QuantType.No``) it returns the
-    bf16 tensor shaped like ``x``. Per-token FP8 is the only fused scheme today
-    (the consuming o_proj's a8w8 scheme); any other requested scheme asserts.
+    bf16 tensor shaped like ``x``. Per-token FP8 is the only fused scheme
+    besides ``e8m0_scale`` (per-1x128 FP8, one group per 128-wide head:
+    ``(fp8 [t, heads*H], E8M0 scale [t, heads])``, bit-identical to
+    ``per_1x128_e8m0_quant`` of the bf16 output); any other scheme asserts.
 
     ``gate`` may be strided (e.g. a column slice of a fused GEMM output): the
     kernel reads it via (outer, head) strides so no contiguous copy is needed.
@@ -327,6 +388,24 @@ def rmsnorm_gated(
     """
     if quant_type == QuantType.per_Token and quant_dtype == dtypes.fp8:
         return _rmsnorm_gated_per_token_quant(x, weight, gate, eps, quant_dtype)
+    e8m0_plan = _rmsnorm_gated_e8m0_plan(
+        quant_type, quant_dtype, e8m0_scale, is_prefill
+    )
+    if e8m0_plan is not None:
+        assert x.ndim == 3 and gate.ndim == 3 and x.shape[-1] == 128, (
+            x.shape,
+            gate.shape,
+        )
+        gluon, col_major = e8m0_plan
+        if gluon is not None:
+            return gluon.rmsnorm_gated_e8m0(
+                x, weight, gate, eps, quant_dtype, col_major
+            )
+        # Prefill (the multirow kernel) and other archs quantize separately.
+        from atom.model_ops.linear import per_1x128_e8m0_quant
+
+        y = rmsnorm_gated(x, weight, gate, eps, is_prefill=is_prefill)
+        return per_1x128_e8m0_quant(y.view(x.shape[0], -1), quant_dtype, col_major)
     # Only the no-quant (bf16) path remains. Any other requested scheme is
     # unsupported here -- fail loud rather than silently feed bf16 activations to
     # a GEMM that expects quantized input.
