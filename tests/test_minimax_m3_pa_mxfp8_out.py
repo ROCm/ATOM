@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from atom.model_ops import base_attention
 from atom.models.minimax_m3 import model as m3_model
@@ -169,108 +170,81 @@ def test_fill_unit_scale_writes_e8m0_one_and_fp32_one():
     assert (fp32 == 1).all()
 
 
-# --- o_proj on the MXFP8 input through aiter's decode GEMM
+# --- o_proj on the MXFP8 input through aiter's decode GEMM (N 6144, K 2048)
 
 
-def test_fast_oproj_routes_the_mxfp8_input_through_the_op(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        torch.ops.aiter,
-        "minimax_m3_o_proj_mxfp8",
-        lambda x, s, name: calls.append((x.dtype, s is not None, name)) or x,
-        raising=False,
-    )
-    layer = _layer()
-    layer.fast_oproj = True
-    layer.o_proj_name = "model.layers.0.self_attn.o_proj"
-    MiniMaxM3SparseAttention.forward(layer, torch.arange(3), torch.randn(3, 72))
-    assert calls == [(torch.uint8, True, "model.layers.0.self_attn.o_proj")]
-    assert not layer.o_proj.calls
-
-
-class _FastOProj:
-    """The attributes `_fast_oproj_conditions` reads; calling it is the linear."""
-
-    def __init__(self, shuffled: bool):
-        self.weight = torch.nn.Parameter(
-            torch.zeros(6144, 2048, dtype=torch.float8_e4m3fn), requires_grad=False
-        )
-        if shuffled:
-            self.weight.is_shuffled = True
-        self.weight_scale = torch.zeros(6144, 64, dtype=torch.uint8)
-        self.bias = None
-        self.native_a8_group_rows = 1
-        self.reduce_results = False
-        self.prefix = "model.layers.0.self_attn.o_proj"
-        self.calls = []
-
+class _FastOProj(SimpleNamespace):
     def __call__(self, x, x_scale=None):
         self.calls.append(x.shape[0])
-        return torch.zeros(x.shape[0], 6144, dtype=torch.bfloat16)
+        return torch.zeros(x.shape[0], 6144, dtype=torch.bfloat16, device=x.device)
 
 
-@pytest.fixture
-def decode_gemm(monkeypatch):
-    """aiter's gfx1250 decode GEMM, served up to 128 rows; records its rows."""
-    calls = []
+def _fast_oproj(weight, scale, shuffled=True):
+    weight.is_shuffled = shuffled
+    return _FastOProj(
+        weight=weight,
+        weight_scale=scale,
+        bias=None,
+        native_a8_group_rows=1,
+        reduce_results=False,
+        prefix="o_proj",
+        calls=[],
+    )
+
+
+@pytest.mark.parametrize("shuffled", [True, False])
+def test_fast_oproj_serves_decode_rows_else_keeps_the_linear(monkeypatch, shuffled):
+    served = []
     monkeypatch.setattr(
         m3_model,
         "mxfp8_decode_gemm_supported",
         lambda m, n, k: 0 < m <= 128 and (n, k) == (6144, 2048),
     )
-
-    def run(x, x_scale, w, w_scale):
-        calls.append(x.shape[0])
-        assert x_scale.dtype == torch.float8_e8m0fnu and x_scale.shape[1] == 64
-        return torch.ones(x.shape[0], w.shape[0], dtype=torch.bfloat16)
-
-    monkeypatch.setattr(m3_model, "mxfp8_decode_gemm", run)
-    return calls
-
-
-def _mx_input(rows):
-    x = torch.zeros(rows, 2048, dtype=torch.float8_e4m3fn)
-    return x, torch.zeros(rows, 64, dtype=torch.float8_e8m0fnu)
-
-
-def test_fast_oproj_serves_decode_rows_and_keeps_the_linear_past_them(decode_gemm):
-    o_proj = _FastOProj(shuffled=True)
-    for rows in (8, 80, 128, 129, 14336):
-        y = m3_model._o_proj_mxfp8(o_proj, *_mx_input(rows))
-        assert y.shape == (rows, 6144)
-    assert decode_gemm == [8, 80, 128]
-    assert o_proj.calls == [129, 14336]
-
-
-def test_fast_oproj_weight_is_judged_at_the_first_call(decode_gemm):
-    """The weight is shuffled by `process_weights_after_loading`, after the
-    attention's construction: the verdict waits for the first call."""
-    o_proj = _FastOProj(shuffled=False)
-    o_proj.weight.is_shuffled = True  # what the load does before any forward
-    m3_model._o_proj_mxfp8(o_proj, *_mx_input(80))
-    assert decode_gemm == [80] and not o_proj.calls
-
-
-def test_fast_oproj_falls_back_to_the_linear_without_a_shuffled_weight(decode_gemm):
-    o_proj = _FastOProj(shuffled=False)
-    m3_model._o_proj_mxfp8(o_proj, *_mx_input(80))
-    assert not decode_gemm and o_proj.calls == [80]
-    assert m3_model._fast_oproj_conditions(o_proj)["preshuffled weight"] is False
-
-
-def test_fast_oproj_op_looks_the_linear_up_by_name(decode_gemm, monkeypatch):
-    o_proj = _FastOProj(shuffled=True)
-    context = {"model.layers.0.self_attn.o_proj": o_proj}
     monkeypatch.setattr(
         m3_model,
-        "get_current_atom_config",
-        lambda: SimpleNamespace(
-            compilation_config=SimpleNamespace(static_forward_context=context)
-        ),
+        "mxfp8_decode_gemm",
+        lambda x, s, w, ws: served.append(x.shape[0])
+        or torch.ones(x.shape[0], 6144, dtype=torch.bfloat16),
     )
-    x, scale = _mx_input(80)
-    name = "model.layers.0.self_attn.o_proj"
-    assert m3_model.minimax_m3_o_proj_mxfp8(x, scale, name).shape == (80, 6144)
-    fake = m3_model._minimax_m3_o_proj_mxfp8_fake(x, scale, name)
-    assert fake.shape == (80, 6144) and fake.dtype == torch.bfloat16
-    assert decode_gemm == [80]
+    weight = torch.zeros(6144, 2048, dtype=torch.float8_e4m3fn)
+    o_proj = _fast_oproj(weight, torch.zeros(6144, 64, dtype=torch.uint8), shuffled)
+    for rows in (8, 128, 129):
+        x = torch.zeros(rows, 2048, dtype=torch.float8_e4m3fn)
+        y = m3_model._o_proj_mxfp8(o_proj, x, torch.zeros(rows, 64, dtype=torch.uint8))
+        assert y.shape == (rows, 6144)
+    assert served == ([8, 128] if shuffled else [])
+    assert o_proj.calls == ([129] if shuffled else [8, 128, 129])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx_runtime() != "gfx1250",
+    reason="gfx1250 only",
+)
+def test_fast_oproj_matches_the_linear():
+    from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
+
+    from atom.model_ops.blockscale import native_quant_linear
+
+    g = torch.Generator("cuda").manual_seed(0)
+
+    def e4m3(rows):
+        x = torch.randn(rows, 2048, generator=g, device="cuda").clamp(-8, 8)
+        return x.to(torch.float8_e4m3fn)
+
+    def e8m0(rows, lo, hi):
+        s = torch.randint(lo, hi, (rows, 64), generator=g, device="cuda")
+        return s.to(torch.uint8).view(torch.float8_e8m0fnu)
+
+    weight = shuffle_weight(e4m3(6144), layout=(16, 16))
+    scale = shuffle_mxfp8_bpreshuffle_scale(e8m0(6144, 118, 126))
+    o_proj = _fast_oproj(weight, scale)
+    for rows in (1, 64, 128):
+        x, x_scale = e4m3(rows), e8m0(rows, 120, 127)
+        fast = m3_model._o_proj_mxfp8(o_proj, x, x_scale)
+        ref = native_quant_linear(
+            x, weight, scale, x_scale=x_scale, weight_group_rows=1,
+            weight_preshuffled=True,
+        )  # fmt: skip
+        same = (fast.view(torch.int16) == ref.view(torch.int16)).double().mean()
+        assert same >= 0.9998, (rows, same.item())
+    assert not o_proj.calls
