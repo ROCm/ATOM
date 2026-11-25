@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Model execution must retain the step's padded height until sampling."""
 
 from types import SimpleNamespace
@@ -177,7 +179,8 @@ def test_runner_model_height_and_sampling_rows(
         monkeypatch.setattr(sp_wrapper, "get_forward_context", lambda: ctx)
 
     runner.model = Model() if sp_rank is None else sp_wrapper.SPModelWrapper(Model())
-    logits, hidden = runner.run_model(ids[:scheduled])
+    hidden = runner.run_model(ids[:scheduled])
+    logits = runner.compute_logits(hidden)
     # MegaMoE epochs advance on graph replays as well as eager steps, by this
     # rank's share of the step's padded rows.
     world = 1 if sp_rank is None else 4

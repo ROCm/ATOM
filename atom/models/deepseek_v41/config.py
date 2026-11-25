@@ -225,11 +225,17 @@ class DeepseekV41TextConfig(PretrainedConfig):
             )
 
     def validate_request(
-        self, *, num_draft_tokens, multimodal_data, enable_dp_attention=False
+        self,
+        *,
+        num_draft_tokens,
+        multimodal_data,
+        media_on_prefill_instance=False,
+        enable_dp_attention=False,
     ):
         if enable_dp_attention and multimodal_data:
             raise ValueError("DeepSeek-V4.1 DP attention supports text requests only")
-        if num_draft_tokens and multimodal_data:
+        # A decode leg whose prefill kept the image drafts over image KV too.
+        if num_draft_tokens and (multimodal_data or media_on_prefill_instance):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark currently supports text requests only"
             )
@@ -422,13 +428,15 @@ def validate_runtime_config(config):
             # restores PAGE bytes and rebuilds the state by replay. MoRI-IO and
             # in-process offload read SLOT codecs this runtime does not publish.
             # P/D with CPU offload composes one Mooncake leg and one offload tier.
+            # A shared UMBP L1 pool (`umbp_pool`) moves PAGEs and replays STATE,
+            # like the Store; it provides the pool, so it stands alone.
             (
-                "KV transfer other than lmcache_mp, mooncake_store or mooncake "
-                "(multi: mooncake plus one offload tier)"
+                "KV transfer other than lmcache_mp, mooncake_store, mooncake or "
+                "umbp_pool (multi: mooncake plus one offload tier)"
             ),
             names is None
             or any(
-                name not in ("lmcache_mp", "mooncake", "mooncake_store")
+                name not in ("lmcache_mp", "mooncake", "mooncake_store", "umbp_pool")
                 for name in names
             )
             or (
@@ -456,6 +464,13 @@ def validate_runtime_config(config):
             # copies state instead and the Store's PAGE-only load is unsound.
             "Mooncake Store without encoder SWA bounded replay",
             "mooncake_store" in (names or ())
+            and not config.enable_encoder_swa_bounded_replay,
+        ),
+        (
+            # Another rank's blocks carry PAGE only, like the Store's: a hit on
+            # one rebuilds its state by replay.
+            "a shared UMBP L1 pool without encoder SWA bounded replay",
+            "umbp_pool" in (names or ())
             and not config.enable_encoder_swa_bounded_replay,
         ),
         ("RapidServe", config.enable_rapidserve),

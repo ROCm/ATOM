@@ -24,6 +24,9 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `SiluAndMul` | `activation.py` | `aiter.silu_and_mul` | SiLU gated activation |
 | `VocabParallelEmbedding` | `embed_head.py` | `F.embedding` + TP all-reduce | Vocab embedding |
 | `ParallelLMHead` | `embed_head.py` | `tgemm.mm` + `tensor_model_parallel_all_gather` | LM output head |
+| `shared_peer_embedding` | `peer_embedding.py` | Triton `_peer_embedding_kernel` (HIP IPC) | A vocab-parallel embedding read from each row's owner rank's shard in one launch (a DSpark draft shares its target's) |
+| `VerifyHead`, `ShardedPicks`, `ArgmaxVerifyHead`, `argmax_lm_head` | `verify_head.py`, `lm_head_argmax.py` | `tgemm.mm` + Triton `_lm_head_argmax_pack_kernel` | What `ModelRunner` asks of a verify head after the forward (`VerifyHead`: `sample_token_ids`, `samples_step`), a vocab-sharded head's picks (`ShardedPicks`), and a drafted model's Triton verify head (`ArgmaxVerifyHead`, behind the shared mono LM head launch `atom/mono/lm_head` where that serves): each row's id over the vocab shards (greedy, or a temperature row's Gumbel-max draw) and the verify on them, in place of the logits' gather, the sampler and the rejection sampler |
+| `IdVerifiers`, `IdVerifier`, `VerifyOutput`, `HeadDraw` | `verify_ids.py` | Triton `_verify_ids_kernel` | A verify's output ids and spec status from a head's ids (exact match, or forced acceptance), at fixed addresses per width; the step's draw parameters |
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.fusions.fused_mixed_sample.fused_mixed_sample`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
@@ -200,6 +203,14 @@ class MLAModules:
    - Decode: `mla_decode_fwd` (ASM persistent MLA kernel).
    - Prefill (sparse): `mla_prefill_fwd`.
 3. V up-projection + O projection via batched BMM (`_v_up_proj_and_o_proj`).
+
+**Decode query-head width.** A rank with fewer query heads than the decode dispatches pads its query with zero heads (`padded_num_heads`, dropped again after the kernel). `mla_dense_min_query_heads` is the one model-level floor: `MLAAttention` pads to it and `AiterMLAMetadataBuilder` plans the step's single `work_*` plan for it. It is 16, or 12 on a rank with exactly 12 heads (Kimi-K3 at `-tp 8`, which then decodes unpadded) when all of these hold:
+
+- ATOM measured 12 heads faster: an fp8 KV cache at an 8-token verify (`_MLA_NARROW_QLEN`; Kimi-K3's interactive band, DSpark 7). The MI355X numbers are in the comment on `_MLA_NARROW_QLEN` in `atom/model_ops/attention_mla.py`.
+- The decode is the one the builder plans for: native ATOM (not the vLLM, SGLang or RTP-LLM plugins, whose builders plan the decode themselves), no indexer (`has_mla_indexer`; every layer of such a model, dense or sparse, keeps 16), no DCP, neither the Triton MLA decode (`ATOM_USE_TRITON_MLA`) nor the shuffled KV layout (`ATOM_MLA_KV_SHUFFLED`), and persistent by `mla_decode_is_persistent`, the predicate `MLAAttention.decode_is_persistent` uses (so page size 1).
+- ATOM asks `aiter.ops.attention.get_mla_decode_shape_support` about that decode, described as `_forward_decode` calls `mla_decode_fwd`, and it answers native and supported at 12 heads.
+
+Anything else keeps 16, including a bf16 KV cache (not measured), decoding without speculation, any other verify width, and any other head count on a rank (fewer than 12 heads still pad to 16).
 
 **Batched GEMM backends for MLA projections:**
 
