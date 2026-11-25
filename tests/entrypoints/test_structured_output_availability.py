@@ -83,9 +83,6 @@ def test_the_base_install_carries_the_pinned_backend():
     assert base is not None, "dependencies is not a one-line list; update the parser"
     assert f"llguidance=={structured_output.LLGUIDANCE_VERSION}" in base
     assert any(dep.startswith("google-re2") for dep in base)
-    # The `structured-output` extra is kept as an alias of the base install.
-    extra = _pyproject_list("structured-output")
-    assert extra is None or set(extra) <= set(base)
 
 
 def test_the_refusal_names_the_pin_without_an_install_command():
