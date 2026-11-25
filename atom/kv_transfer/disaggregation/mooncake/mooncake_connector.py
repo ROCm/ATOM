@@ -104,6 +104,7 @@ from atom.kv_transfer.disaggregation.types import (
     pair_units,
     produced_no_handoff,
 )
+from atom.kv_transfer.rdma_nic import gpu_pci_bdf, rail_rdma_device
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
 from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
@@ -252,8 +253,11 @@ def _ib_device_exists(device_name: str) -> bool:
 
 
 def _auto_select_ib_device(phys_idx: int) -> str:
-    # Older environments expose paired HCAs as rdmaN. Spur MI350 fabric exposes
-    # them as ionic_N, so try ionic_N only when rdmaN is not present.
+    """The HCA numbered like a physical GPU index, by name alone.
+
+    Older environments expose paired HCAs as rdmaN. Spur MI350 fabric exposes
+    them as ionic_N, so try ionic_N only when rdmaN is not present.
+    """
     rdma_device = f"rdma{phys_idx}"
     if _ib_device_exists(rdma_device):
         return rdma_device
@@ -261,6 +265,47 @@ def _auto_select_ib_device(phys_idx: int) -> str:
     if _ib_device_exists(ionic_device):
         return ionic_device
     return rdma_device
+
+
+def _primary_ib_device(phys_idx: int, gpu_ordinal: int | None) -> str:
+    """This rank's own HCA: the one on its GPU's PCIe switch, else by name.
+
+    HIP numbers GPUs in KFD order, which need not follow the HCA numbering: on
+    pit2-p03-g08 HIP GPU 0 shares its switch with rdma3, not rdma0 (#3833).
+    The ACTIVE HCA sharing the deepest sysfs PCI path with the GPU of torch
+    ordinal ``gpu_ordinal`` is the one the Mooncake Store client uses too
+    (``rail_rdma_device``). Where sysfs cannot tell -- no GPU or HCA in it, no
+    ACTIVE HCA under the GPU's host bridge, a tie -- or no ordinal is given,
+    the HCA is ``_auto_select_ib_device(phys_idx)``'s, as before.
+    """
+    if gpu_ordinal is None:
+        return _auto_select_ib_device(phys_idx)
+    try:
+        bdf = gpu_pci_bdf(gpu_ordinal)
+        device = rail_rdma_device(bdf, ib_root=_IB_SYSFS_ROOT)
+    except Exception as exc:  # noqa: BLE001 - the name serves as before
+        # The PCI tree only improves on the name: whatever stops the lookup
+        # (no sysfs in a container, a torch without PCI properties) must not
+        # stop a rank that starts on the name.
+        device = _auto_select_ib_device(phys_idx)
+        logger.info(
+            "Mooncake HCA for physical GPU %d: %s by name; the PCI tree of "
+            "GPU ordinal %d did not name one (%s)",
+            phys_idx,
+            device,
+            gpu_ordinal,
+            exc,
+        )
+        return device
+    logger.info(
+        "Mooncake HCA for physical GPU %d: %s, the ACTIVE HCA closest to its "
+        "PCI address %s (GPU ordinal %d)",
+        phys_idx,
+        device,
+        bdf,
+        gpu_ordinal,
+    )
+    return device
 
 
 def _parse_ib_devices(configured_devices: str) -> list[str]:
@@ -277,10 +322,16 @@ def _select_ib_devices(
     configured_devices: str,
     phys_idx: int | None,
     *,
+    gpu_ordinal: int | None = None,
     enable_alternate_hca: bool = False,
     hca_count: int = 8,
 ) -> list[str]:
-    """Resolve the HCAs on which Mooncake registers this rank's GPU memory."""
+    """Resolve the HCAs on which Mooncake registers this rank's GPU memory.
+
+    Configured devices win. Otherwise the first is the GPU's own HCA
+    (``_primary_ib_device``; ``gpu_ordinal`` is its torch ordinal, for the PCI
+    lookup), and alternate HCAs follow by name.
+    """
     if protocol.strip().lower() == "tcp":
         return []
     if configured_devices:
@@ -288,7 +339,7 @@ def _select_ib_devices(
     if phys_idx is None:
         raise ValueError("physical GPU index is required for RDMA device selection")
 
-    primary = _auto_select_ib_device(phys_idx)
+    primary = _primary_ib_device(phys_idx, gpu_ordinal)
     devices = [primary]
     if enable_alternate_hca:
         if hca_count <= 0:
@@ -1139,11 +1190,12 @@ class MooncakeConnector(KVConnectorBase):
         # Determine which RDMA device this TP rank should use. TCP is
         # intentionally initialized with an empty device filter so Mooncake
         # cannot activate an available HCA as an alternate path.
-        # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
-        # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
-        # By default, register only with the local NIC. Alternate-HCA mode
-        # registers a single engine on multiple NICs. On rail-isolated fabrics,
-        # matched-rail mode instead selects a single-HCA engine per request.
+        # The local NIC is the one on the GPU's PCIe switch in sysfs; failing
+        # that, NIC N for physical GPU N, named ionic_N on Spur MI350 and rdmaN
+        # on older setups (_primary_ib_device). By default, register only with
+        # the local NIC. Alternate-HCA mode registers a single engine on
+        # multiple NICs. On rail-isolated fabrics, matched-rail mode instead
+        # selects a single-HCA engine per request.
         _configure_mooncake_transport(self.protocol)
         configured_ib_device = kv_transfer_config.get(
             "ib_device", ""
@@ -1153,6 +1205,7 @@ class MooncakeConnector(KVConnectorBase):
         )
         hca_count = int(kv_transfer_config.get("ib_hca_count", 8))
         phys_idx: int | None = None
+        visible_idx: int | None = None
         if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
             visible_idx = torch.cuda.current_device()
             # ROCR first, for the reason in numa_utils._physical_index: it
@@ -1172,6 +1225,7 @@ class MooncakeConnector(KVConnectorBase):
             self.protocol,
             configured_ib_device,
             phys_idx,
+            gpu_ordinal=visible_idx,
             enable_alternate_hca=enable_alternate_hca,
             hca_count=hca_count,
         )

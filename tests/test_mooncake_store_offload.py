@@ -33,6 +33,7 @@ import torch
 from conftest import MockConfig, with_min_load
 
 from atom.config import KVCacheTensor
+from atom.kv_transfer import rdma_nic
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
@@ -1321,13 +1322,10 @@ def test_rail_rdma_device_refuses_two_equally_close_nics(tmp_path):
 def node(tmp_path, monkeypatch):
     pci, ib = _make_node(tmp_path)
     monkeypatch.setattr(nic, "_IB_SYSFS_ROOT", ib)
-    monkeypatch.setattr(nic, "_PCI_SYSFS_ROOT", pci)
+    # The lookup reads these when it runs.
+    monkeypatch.setattr(rdma_nic, "IB_SYSFS_ROOT", ib)
+    monkeypatch.setattr(rdma_nic, "PCI_SYSFS_ROOT", pci)
     monkeypatch.setattr(nic, "gpu_pci_bdf", lambda index: f"0000:{GPU_BDF[index]}:00.0")
-    real = nic.rail_rdma_device
-    # Keyword defaults were bound at import; rebind to the fake tree.
-    monkeypatch.setattr(
-        nic, "rail_rdma_device", lambda bdf: real(bdf, ib_root=ib, pci_root=pci)
-    )
     return ib
 
 
@@ -1339,6 +1337,12 @@ def test_requester_device_defaults_to_the_topology(node):
         "rdma2",
         "rdma1",
     ]
+
+
+def test_requester_device_names_the_override_when_the_topology_cannot_tell(node):
+    (node / "rdma3/ports/1/state").write_text("1: DOWN\n")
+    with pytest.raises(ValueError, match="cannot tell.*mooncake_store.rdma_devices"):
+        nic.requester_rdma_device(0, _nic_cfg())
 
 
 def test_requester_device_override_is_indexed_by_gpu_ordinal(node):

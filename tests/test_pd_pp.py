@@ -512,6 +512,14 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
     monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
     monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    pci_lookups = []
+
+    def no_pci_tree(ordinal):
+        pci_lookups.append(ordinal)
+        raise ValueError("no PCI tree in this test")
+
+    # So the HCA falls back to its name, rdma<physical GPU>.
+    monkeypatch.setattr(mc, "gpu_pci_bdf", no_pci_tree)
     monkeypatch.setattr(
         mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=8)
     )
@@ -568,6 +576,8 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
     engine.initialize.assert_called_once_with(
         host_ip, "P2PHANDSHAKE", protocol, expected_device
     )
+    # The PCI lookup reads the rank's torch ordinal, not its physical index.
+    assert pci_lookups == ([0] if protocol == "rdma" and not configured_device else [])
     assert conn.engine_id == f"{host_ip}:16578"
     assert conn.request_address == f"{host_ip}:8000"
     assert conn.ib_devices == (expected_device.split(",") if expected_device else [])
@@ -635,6 +645,7 @@ def _one_row_staging_consumer(monkeypatch, send):
     monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: None)
     monkeypatch.setattr(mc.torch.cuda, "set_device", lambda *a: None)
     monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    monkeypatch.setattr(mc, "gpu_pci_bdf", MagicMock(side_effect=ValueError("no PCI")))
     monkeypatch.setattr(
         mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
     )
@@ -998,6 +1009,159 @@ def test_mooncake_rdma_requires_gpu_index_without_explicit_device():
     )
     with pytest.raises(ValueError, match="physical GPU index"):
         mc._select_ib_device("rdma", "", None)
+
+
+# ---------------------------------------------------------------------------
+# The HCA a rank registers on, from its GPU's PCI tree (#3833)
+# ---------------------------------------------------------------------------
+
+# pit2-p03-g08 (MI355X), as its sysfs reads: rdmaN and one GPU behind each PCIe
+# switch, under host bridge pci0000:<top>0 with top = _G08_TOP[N]. HIP numbers
+# the GPUs in KFD order, so HIP GPU i is the one on bus _G08_GPU_BUS[i].
+_G08_TOP = ["0", "1", "6", "7", "8", "9", "e", "f"]
+_G08_GPU_BUS = ["75", "05", "65", "15", "f5", "85", "e5", "95"]
+# The HCA on each HIP GPU's switch; before #3833 HIP GPU i took rdma<i>.
+_G08_RAIL = [3, 0, 2, 1, 7, 4, 6, 5]
+
+
+def _plant_hca(ib, name, pci_node, state="4: ACTIVE"):
+    port = ib / name / "ports/1"
+    port.mkdir(parents=True)
+    (port / "state").write_text(state + "\n")
+    (ib / name / "device").symlink_to(pci_node)
+
+
+def _g08_sysfs(root, names="rdma{}"):
+    """Plant pit2-p03-g08's GPUs and HCAs (named ``names.format(N)``) under root."""
+    pci = root / "sys/bus/pci/devices"
+    ib = root / "sys/class/infiniband"
+    pci.mkdir(parents=True)
+    ib.mkdir(parents=True)
+    for n, top in enumerate(_G08_TOP):
+        # Root port 01.1, then the switch's upstream port: GPU N and rdmaN
+        # part below it, on downstream ports 00.0 and 01.0.
+        switch = root / "sys/devices" / f"pci0000:{top}0/0000:{top}0:01.1"
+        switch = switch / f"0000:{top}1:00.0"
+        gpu = switch / f"0000:{top}2:00.0/0000:{top}3:00.0/0000:{top}4:00.0"
+        gpu = gpu / f"0000:{top}5:00.0"
+        nic = switch / f"0000:{top}2:01.0/0000:{top}6:00.0/0000:{top}7:01.0"
+        nic = nic / f"0000:{top}9:00.0"
+        for node in (gpu, nic):
+            node.mkdir(parents=True)
+            (pci / node.name).symlink_to(node)
+        _plant_hca(ib, names.format(n), nic)
+    return pci, ib
+
+
+@pytest.fixture
+def g08(tmp_path, monkeypatch):
+    """The connector reading a planted pit2-p03-g08 sysfs, GPUs unmasked."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.kv_transfer import rdma_nic
+
+    def plant(names="rdma{}"):
+        pci, ib = _g08_sysfs(tmp_path, names)
+        monkeypatch.setattr(mc, "_IB_SYSFS_ROOT", ib)
+        monkeypatch.setattr(rdma_nic, "PCI_SYSFS_ROOT", pci)
+        return pci, ib
+
+    monkeypatch.setattr(
+        mc, "gpu_pci_bdf", lambda ordinal: f"0000:{_G08_GPU_BUS[ordinal]}:00.0"
+    )
+    return mc, plant
+
+
+def test_mooncake_rdma_takes_each_gpus_hca_from_its_pci_switch(g08, caplog):
+    mc, plant = g08
+    plant()
+    with caplog.at_level(logging.INFO, logger="atom"):
+        picked = [mc._select_ib_devices("rdma", "", i, gpu_ordinal=i) for i in range(8)]
+    assert picked == [[f"rdma{n}"] for n in _G08_RAIL]
+    assert (
+        "physical GPU 0: rdma3, the ACTIVE HCA closest to its PCI address "
+        "0000:75:00.0 (GPU ordinal 0)" in caplog.text
+    )
+
+
+def test_mooncake_rdma_pci_lookup_reads_the_visible_gpu(g08, monkeypatch):
+    # HIP_VISIBLE_DEVICES=4,5,6,7: torch ordinal j is physical GPU 4 + j.
+    mc, plant = g08
+    plant()
+    monkeypatch.setattr(
+        mc, "gpu_pci_bdf", lambda ordinal: f"0000:{_G08_GPU_BUS[4 + ordinal]}:00.0"
+    )
+    picked = [mc._select_ib_devices("rdma", "", 4 + j, gpu_ordinal=j) for j in range(4)]
+    assert picked == [[f"rdma{n}"] for n in _G08_RAIL[4:]]
+
+
+def test_mooncake_rdma_configured_hca_wins_over_the_pci_tree(g08, monkeypatch):
+    mc, plant = g08
+    plant()
+    lookup = MagicMock(side_effect=AssertionError("must not look up"))
+    monkeypatch.setattr(mc, "gpu_pci_bdf", lookup)
+    assert mc._select_ib_devices("rdma", " rdma0 ", None, gpu_ordinal=0) == ["rdma0"]
+    assert mc._select_ib_devices("tcp", "", None, gpu_ordinal=0) == []
+    lookup.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "unresolved",
+    ["no-infiniband", "gpu-not-in-sysfs", "nic-down", "tie", "no-pci-properties"],
+)
+def test_mooncake_rdma_falls_back_to_the_hca_name_when_pci_cannot_tell(
+    g08, monkeypatch, caplog, unresolved
+):
+    mc, plant = g08
+    pci, ib = plant()
+    if unresolved == "no-infiniband":  # a container without the class
+        monkeypatch.setattr(mc, "_IB_SYSFS_ROOT", ib / "not-mounted")
+    elif unresolved == "gpu-not-in-sysfs":
+        (pci / "0000:75:00.0").unlink()
+    elif unresolved == "nic-down":  # and no other ACTIVE HCA on its host bridge
+        (ib / "rdma3/ports/1/state").write_text("1: DOWN\n")
+    elif unresolved == "tie":
+        _plant_hca(ib, "rdma8", (ib / "rdma3/device").resolve())
+    else:  # a torch whose device properties carry no PCI address
+        lookup = MagicMock(side_effect=AttributeError("pci_domain_id"))
+        monkeypatch.setattr(mc, "gpu_pci_bdf", lookup)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert mc._select_ib_devices("rdma", "", 0, gpu_ordinal=0) == ["rdma0"]
+    assert "physical GPU 0: rdma0 by name" in caplog.text
+
+
+def test_mooncake_rdma_spur_ionic_hcas_by_pci_then_by_index(g08):
+    mc, plant = g08
+    pci, _ = plant(names="ionic_{}")
+    picked = [mc._select_ib_devices("rdma", "", i, gpu_ordinal=i) for i in range(8)]
+    assert picked == [[f"ionic_{n}"] for n in _G08_RAIL]
+    # Without a PCI match, ionic_N for physical GPU N, as rdmaN is absent.
+    (pci / "0000:75:00.0").unlink()
+    assert mc._select_ib_devices("rdma", "", 0, gpu_ordinal=0) == ["ionic_0"]
+
+
+@pytest.mark.parametrize("names", ["rdma{}", "ionic_{}"])
+def test_mooncake_matched_rails_auto_start_from_the_pci_primary(g08, names):
+    # A decode rank advertises its primary, and a producer writes through its
+    # own rail engine of that name: the rail family is the same as before.
+    mc, plant = g08
+    plant(names)
+    for i, n in enumerate(_G08_RAIL):
+        primary = mc._select_ib_devices("rdma", "", i, gpu_ordinal=i)
+        assert primary == [names.format(n)]
+        assert mc._resolve_matched_rails("rdma", primary, "auto") == [
+            names.format(rail) for rail in range(8)
+        ]
+
+
+def test_mooncake_rdma_alternate_hcas_follow_the_pci_primary(g08):
+    mc, plant = g08
+    plant()
+    devices = mc._select_ib_devices(
+        "rdma", "", 0, gpu_ordinal=0, enable_alternate_hca=True, hca_count=8
+    )
+    assert devices == ["rdma3"] + [f"rdma{n}" for n in (0, 1, 2, 4, 5, 6, 7)]
 
 
 # ---------------------------------------------------------------------------

@@ -109,7 +109,13 @@ All remaining commands are run **inside the container**.
 
 ## RDMA rails and HCA registration
 
-By default, each Mooncake worker registers GPU memory on its GPU-local HCA.
+By default, each Mooncake worker registers GPU memory on its GPU-local HCA:
+the ACTIVE HCA sharing the deepest sysfs PCI path with its GPU, behind the same
+PCIe switch on a rail-optimized node, which is also the HCA the Mooncake Store
+client uses. HIP numbers GPUs in KFD order, so it need not be `rdma<GPU index>`.
+Where sysfs cannot tell (a container without `/sys/class/infiniband`, no ACTIVE
+HCA under the GPU's host bridge, or a tie), the HCA is chosen by name instead:
+`rdmaN`, then `ionic_N`, for physical GPU N. Startup logs which and why.
 Keep this default when the producer and consumer use matching, mutually
 reachable rails, as in a two-node deployment with same-index GPU rank mapping.
 
@@ -138,8 +144,8 @@ GPU memory and does not need this setting.
   `ib_hca_count - 1`, skipping missing devices and duplicates.
 - `ib_hca_count` defaults to `8` and must be positive when automatic alternate
   HCA selection is enabled. It is an index range to scan, not a guarantee that
-  eight HCAs will be selected. Automatic selection checks `rdmaN`, then
-  `ionic_N`, for each physical GPU/HCA index; GPU masking is resolved through
+  eight HCAs will be selected. Alternate HCAs are found by name, `rdmaN`, then
+  `ionic_N`, for each index; GPU masking is resolved through
   `HIP_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES`.
 - An explicit `ib_device` in the connector config, or
   `ATOM_MOONCAKE_IB_DEVICE` in the environment, overrides automatic selection.
