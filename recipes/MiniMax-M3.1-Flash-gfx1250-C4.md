@@ -37,8 +37,8 @@ below.
 - amdgpu loaded with `sudo modprobe amdgpu gpu_recovery=0 halt_if_hws_hang=1` (how our nodes load it).
 - `sudo sysctl -w kernel.numa_balancing=0` for the benchmark runs.
 - About 230 GB of disk for the model, 60 GB for the image, ~25 GB for the container's build outputs.
-- For C64 with LMCache at 384 GiB per rank: about **1,690 GiB of available host memory** (4 x 384 x 1.1 GiB; a ~2 TB
-  node). On a ~1 TB node use 160 GiB per rank (~704 GiB available; section 4).
+- C64 with LMCache (384 GiB per rank) needs about **1,690 GiB of available host memory** (4 x 384 x 1.1 GiB; a ~2 TB
+  node). On a ~1 TB node run C64 **without LMCache** (section 4).
 
 ## 2. Container
 
@@ -172,20 +172,18 @@ until curl -sf -m 5 http://127.0.0.1:8790/health > /dev/null; do sleep 30; done
 - **Accuracy runs** (section 5): drop `--spec-decode-acceptance-length 4.04` (real DSpark acceptance), `CONC=4`.
 - **AgentX C4**: as above (`CONC=4`, delayer 20000, forced acceptance 4.04, LMCache off).
 - **AgentX C64**: `CONC=64` (max-num-seqs 128), `ATOM_PREFILL_DECODE_INTERVAL=8` instead of 20000, forced acceptance
-  4.04, and the LMCache CPU tier: add to the env
-  `PYTHONHASHSEED=0 LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=384 LMCACHE_CHUNK_SIZE=256
-  ATOM_PREFIX_CACHE_POLICY=slru ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5 LMCACHE_CACHE_POLICY=ATOM_SLRU
-  LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3`
-  and to the arguments `--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'`.
-  - `LMCACHE_MAX_LOCAL_CPU_SIZE` is GiB **per TP rank**; 384 needs 4 x 384 x 1.1 = ~1,690 GiB of `MemAvailable` before
-    the start (`grep MemAvailable /proc/meminfo`), i.e. a ~2 TB node.
-  - On a ~1 TB node use `LMCACHE_MAX_LOCAL_CPU_SIZE=160` (needs ~704 GiB available): the value used for the C64
-    numbers in section 7, on a 1 TB node. A different tier size holds a different amount of evicted prefixes, so the
-    C64 numbers can move with it.
-  - Once the tier is full, LMCache logs "Failed to allocate memory block ... no memory is available" for saves it cannot
-    place (a burst during the AgentX warm-up, then about 10-15K lines a minute at C64). This is expected.
-  - Without LMCache: leave out the LMCache env and `--kv-transfer-config`; `PYTHONHASHSEED`
-    and the slru policy then do not matter.
+  4.04.
+  - **On a node with ~2 TB of RAM**, add the LMCache CPU tier: add to the env
+    `PYTHONHASHSEED=0 LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=384 LMCACHE_CHUNK_SIZE=256
+    ATOM_PREFIX_CACHE_POLICY=slru ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5 LMCACHE_CACHE_POLICY=ATOM_SLRU
+    LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3`
+    and to the arguments `--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'`.
+    `LMCACHE_MAX_LOCAL_CPU_SIZE` is GiB **per TP rank**; 384 needs 4 x 384 x 1.1 = ~1,690 GiB of `MemAvailable` before
+    the start (`grep MemAvailable /proc/meminfo`). Once the tier is full, LMCache logs "Failed to allocate memory block
+    ... no memory is available" for saves it cannot place; this is expected.
+  - **On a node with ~1 TB of RAM, run C64 without LMCache**: leave out the LMCache env and `--kv-transfer-config`. A
+    smaller tier does not help there: at 160 GiB/rank it stayed full from the warm-up on and loaded 0 tokens in the hour,
+    and C64 P90 was 244.3 against 266.7 with LMCache off on the same node.
 - The forced acceptance length 4.04 is InferenceX's golden DSpark acceptance for M3.1 at K = 7; the generated text is
   synthetic under it, so never measure accuracy with it.
 - Stop the server with `pkill -INT -f atom.entrypoints.openai_server` and wait until no `ATOM::` process is left.
@@ -271,12 +269,11 @@ Measured on one 4 x MI455X node with exactly this recipe (base image + the two b
 | **C4, these branches** (LMCache off) | **10,460** | **874.4** | 923.7 | 1.1 / 1.1 ms | 0.24 / 0.98 s | 97.7% | 764 / 0 |
 | C4, vLLM on MI355X (InferenceX) | 10,322 | 581.4 | | | | | |
 | **C64, these branches** (LMCache off, 1 TB node) | **128,233** | **266.7** | 403.5 | 2.5 / 3.7 ms | 0.31 / 1.01 s | 95.8% | 12,209 / 1 |
-| C64, these branches (LMCache on, 160 GiB/rank, 1 TB node; tier full from the warm-up on, 0 tokens loaded) | 127,074 | 244.3 | 376.0 | 2.7 / 4.1 ms | 0.34 / 1.06 s | 96.0% | 12,154 / 3 |
 | C64, vLLM on MI355X (InferenceX) | 112,879 | 114.7 | | | | | |
 
 C4 with these branches: interactivity P90 **1.50x** vLLM on MI355X (874.4 vs 581.4), tok/s/chip 1.01x.
-C64 with these branches, LMCache off: interactivity P90 **2.33x** vLLM on MI355X (266.7 vs 114.7), tok/s/chip 1.14x
-(128,233 vs 112,879). With LMCache at 160 GiB/rank on the same 1 TB node: 2.13x / 1.13x (the tier stayed full and
-served no loads, so its saves only cost time).
+C64 with these branches, LMCache off (1 TB node): interactivity P90 **2.33x** vLLM on MI355X (266.7 vs 114.7),
+tok/s/chip 1.14x (128,233 vs 112,879). Not recommended, for reference: LMCache at 160 GiB/rank on the same node gave P90
+244.3 and 127,074 tok/s/chip (the tier stayed full and loaded nothing).
 
 
