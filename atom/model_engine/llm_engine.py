@@ -21,6 +21,7 @@ from atom.sampling_params import RequiredChannel, SamplingParams
 from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     WorkerGrammarPreflight,
+    require_available,
     validate_execution_options,
 )
 from atom.utils import envs
@@ -134,6 +135,7 @@ class LLMEngine:
     def prepare_structured_request(self, params, kv_transfer=None, multimodal=False):
         if not is_structured(params):
             return
+        require_available()
         validate_execution_options(
             self.config,
             params,
