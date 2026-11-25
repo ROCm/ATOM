@@ -897,6 +897,7 @@ wait_http() {
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
     exit_if_mooncake_store_died
+    exit_if_umbp_pool_server_died
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
@@ -929,6 +930,7 @@ wait_router_closed() {
     if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; then
       miss_count=0
       exit_if_mooncake_store_died
+      exit_if_umbp_pool_server_died
       if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
         set +e
         wait "${server_pid}"
@@ -2035,6 +2037,176 @@ start_mooncake_store_decode_owners() {
   echo "[wait][OK] mooncake-store decode owners mounted on ${NODE0_ADDR}'s pools ${mooncake_pool_devices[*]:-shared}"
 }
 
+# UMBP_POOL=1 (prefill role env) has the prefill ranks of a node share their
+# paged KV through ATOM's umbp_pool connector, in place of a Mooncake Store:
+# the case's PREFILL_KV_TRANSFER_CONFIG names that connector beside the P/D
+# one (multi), and the launcher runs the UMBP standalone server it reaches,
+# one per node, from before the node's first prefill worker until its workers
+# have exited. Its settings, all in the prefill role env:
+#  - UMBP_POOL_SERVER (default /opt/umbp-l1/umbp_standalone_server): the
+#    server's binary.
+#  - UMBP_POOL_ADDRESS (default unix:///tmp/umbp-l1/server.sock): where it
+#    listens, which the connector's "address" names too. A unix socket: the
+#    server is up once its socket file is there.
+#  - UMBP_POOL_SERVER_ENV: more NAME=VALUE words for the server's environment,
+#    separated by blanks.
+#  - UMBP_POOL_START_TIMEOUT (default 120 s) bounds the wait for that socket.
+# The server opens a rank's pool on the device the rank runs on, so it sees
+# all of the node's GPUs, whatever its workers see, and each prefill worker
+# gets ATOM_UMBP_DEVICE_ORDINALS: the server's ordinals of the devices in the
+# worker's HIP_VISIBLE_DEVICES. Two engine processes that give the server one
+# pool namespace destroy each other's pools, so the case's connector config
+# names one per prefill worker ("p${HANDSHAKE_PORT}"). The pool and a Store
+# exclude each other: a worker given both refuses to start.
+umbp_pool_server_started=0
+umbp_pool_server_pid=""
+umbp_pool_server_log=""
+# Exit status of a server that exited by itself, once collected.
+umbp_pool_server_exit_rc=""
+# That status when it is non-zero and the server was yet to be stopped.
+umbp_pool_server_failed_rc=""
+
+# The prefill role env asks for it; the validation reads the same variable
+# before any role env is applied.
+umbp_pool_requested() {
+  [[ "${ATOMESH_PREFILL_ENV_UMBP_POOL:-${UMBP_POOL:-0}}" == "1" ]]
+}
+
+# Refuses a prefill setting the server cannot start with. Needs the prefill
+# role env applied.
+check_umbp_pool_settings() {
+  if mooncake_store_requested; then
+    echo "[umbp-pool][FAIL] UMBP_POOL=1 with MOONCAKE_STORE=1: the prefill ranks share their KV through the pool or through a Store, and a worker given both (ATOM_KV_OFFLOAD=mooncake_store beside the umbp_pool connector) refuses to start; set MOONCAKE_STORE to 0 in the case" >&2
+    exit 2
+  fi
+  local server="${UMBP_POOL_SERVER:-/opt/umbp-l1/umbp_standalone_server}"
+  if [[ ! -f "${server}" || ! -x "${server}" ]]; then
+    echo "[umbp-pool][FAIL] UMBP_POOL_SERVER=${server} is not an executable file: UMBP_POOL=1 needs an image that carries the UMBP standalone server" >&2
+    exit 2
+  fi
+  local address="${UMBP_POOL_ADDRESS:-unix:///tmp/umbp-l1/server.sock}"
+  if [[ "${address}" != unix:///?* ]]; then
+    echo "[umbp-pool][FAIL] UMBP_POOL_ADDRESS=${address} is not unix://<absolute path>: the launcher waits for the server's socket file" >&2
+    exit 2
+  fi
+  # Bash arithmetic adds it to the clock: 2m would abort the wait, and a
+  # leading zero is read in decimal only with a base.
+  local timeout="${UMBP_POOL_START_TIMEOUT:-120}"
+  if [[ ! "${timeout}" =~ ^[0-9]{1,9}$ ]] || (( 10#${timeout} == 0 )); then
+    echo "[umbp-pool][FAIL] UMBP_POOL_START_TIMEOUT=${timeout} is not a positive integer number of seconds" >&2
+    exit 2
+  fi
+  # env would run a word without '=' as its command, in place of the server.
+  local -a words=()
+  local word
+  read -r -a words <<< "${UMBP_POOL_SERVER_ENV:-}"
+  for word in "${words[@]}"; do
+    if [[ ! "${word}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      echo "[umbp-pool][FAIL] UMBP_POOL_SERVER_ENV word '${word}' is not NAME=VALUE" >&2
+      exit 2
+    fi
+  done
+}
+
+# Runs before this node starts anything, on the prefill settings as the
+# prefill start will see them: the role env is applied in a subshell, so none
+# of it stays in this shell.
+validate_umbp_pool_settings() {
+  umbp_pool_requested || return 0
+  if [[ "${AGGREGATED:-0}" == "1" ]]; then
+    # The prefill start brings the server up, and an aggregated cell has none.
+    echo "[umbp-pool][FAIL] UMBP_POOL needs a P/D prefill; an aggregated cell starts none" >&2
+    exit 2
+  fi
+  (
+    apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+    check_umbp_pool_settings
+  )
+}
+
+# Whether the server has exited by itself; collects its exit status then.
+umbp_pool_server_exited() {
+  [[ -n "${umbp_pool_server_pid}" ]] || return 1
+  process_is_running "${umbp_pool_server_pid}" && return 1
+  set +e
+  wait "${umbp_pool_server_pid}"
+  umbp_pool_server_exit_rc=$?
+  set -e
+  umbp_pool_server_pid=""
+  return 0
+}
+
+# Without the server nothing moves a block between the ranks' pools, and the
+# workers' calls to it fail: the cell would measure ranks that share nothing.
+exit_if_umbp_pool_server_died() {
+  umbp_pool_server_exited || return 0
+  local rc="${umbp_pool_server_exit_rc}"
+  [[ "${rc}" -eq 0 ]] && rc=1
+  tail -n 40 "${umbp_pool_server_log}" >&2 || true
+  echo "[umbp-pool][FAIL] the UMBP server exited unexpectedly rc=${umbp_pool_server_exit_rc}, see ${umbp_pool_server_log}" >&2
+  exit "${rc}"
+}
+
+# Stops the server. Returns non-zero when it had exited non-zero by itself
+# before that, with the end of its log.
+stop_umbp_pool_server() {
+  if umbp_pool_server_exited; then
+    if [[ "${umbp_pool_server_exit_rc}" -ne 0 ]]; then
+      tail -n 40 "${umbp_pool_server_log}" >&2 || true
+      echo "[umbp-pool][FAIL] the UMBP server exited by itself rc=${umbp_pool_server_exit_rc} before it was stopped, see ${umbp_pool_server_log}" >&2
+      umbp_pool_server_failed_rc="${umbp_pool_server_exit_rc}"
+    else
+      echo "[umbp-pool] server had exited by itself rc=0, log ${umbp_pool_server_log}"
+    fi
+  elif [[ -n "${umbp_pool_server_pid}" ]]; then
+    terminate_process_group "${umbp_pool_server_pid}"
+    umbp_pool_server_pid=""
+    echo "[umbp-pool] server stopped, log ${umbp_pool_server_log}"
+  fi
+  [[ -z "${umbp_pool_server_failed_rc}" ]]
+}
+
+# Starts this node's server at its first prefill worker, which waits for the
+# server's socket; the node's later prefill workers share the server.
+start_umbp_pool_server() {
+  umbp_pool_requested || return 0
+  [[ "${umbp_pool_server_started}" == "0" ]] || return 0
+  check_umbp_pool_settings
+  local server="${UMBP_POOL_SERVER:-/opt/umbp-l1/umbp_standalone_server}"
+  local address="${UMBP_POOL_ADDRESS:-unix:///tmp/umbp-l1/server.sock}"
+  local socket="${address#unix://}"
+  local timeout=$(( 10#${UMBP_POOL_START_TIMEOUT:-120} ))
+  local -a extra_env=()
+  read -r -a extra_env <<< "${UMBP_POOL_SERVER_ENV:-}"
+  mkdir -p -- "$(dirname -- "${socket}")"
+  # A socket file an earlier server left behind would pass for this one's.
+  rm -f -- "${socket}"
+  umbp_pool_server_log="${RUNTIME_LOG_DIR}/umbp-server-rank-${NODE_RANK}.log"
+  # Without this worker's HIP_VISIBLE_DEVICES: the server opens the pool of
+  # every prefill rank of the node, each on that rank's device.
+  local -a cmd=(
+    env -u HIP_VISIBLE_DEVICES MORI_UMBP_LOG_LEVEL=info "${extra_env[@]}"
+    setsid "${server}" "${address}"
+  )
+  dump_launch_info "UMBP_SERVER" "${cmd[@]}"
+  "${cmd[@]}" >"${umbp_pool_server_log}" 2>&1 &
+  umbp_pool_server_pid=$!
+  echo "[wait] umbp-pool server socket ${socket} timeout=${timeout}s"
+  local deadline=$(( $(date +%s) + timeout ))
+  until [[ -S "${socket}" ]] && process_is_running "${umbp_pool_server_pid}"; do
+    exit_if_umbp_pool_server_died
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      tail -n 40 "${umbp_pool_server_log}" >&2 || true
+      echo "[wait][FAIL] umbp-pool server has no socket ${socket} after ${timeout}s, see ${umbp_pool_server_log}" >&2
+      stop_umbp_pool_server || true
+      exit 1
+    fi
+    sleep 1
+  done
+  umbp_pool_server_started=1
+  echo "[wait][OK] umbp-pool server pid=${umbp_pool_server_pid} address=${address} log=${umbp_pool_server_log}"
+}
+
 cleanup_processes() {
   local rc=$?
   local pid
@@ -2047,6 +2219,10 @@ cleanup_processes() {
   # Last: the workers read and write the Store until they exit.
   if ! stop_mooncake_store && [[ "${rc}" -eq 0 ]]; then
     rc="${mooncake_store_failed_rc}"
+  fi
+  # Likewise: the workers detach from the UMBP server as they exit.
+  if ! stop_umbp_pool_server && [[ "${rc}" -eq 0 ]]; then
+    rc="${umbp_pool_server_failed_rc}"
   fi
   return "${rc}"
 }
@@ -2103,10 +2279,17 @@ start_prefill() {
   fi
   reset_lmcache_disk
   start_mooncake_store
+  start_umbp_pool_server
   # On the env command line, not exported: decode starts from this same shell.
   local -a prefill_offload_env=()
   if mooncake_store_running; then
     prefill_offload_env=("${mooncake_store_prefill_env[@]}")
+  fi
+  # This worker counts the devices it sees from 0, and the node's UMBP server
+  # sees them all: the worker's visible devices are the server's ordinals.
+  local -a prefill_umbp_env=()
+  if umbp_pool_requested; then
+    prefill_umbp_env=("ATOM_UMBP_DEVICE_ORDINALS=${HIP_VISIBLE_DEVICES}")
   fi
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
@@ -2143,8 +2326,8 @@ start_prefill() {
     "${prefill_profiler_args[@]}"
     ${PREFILL_SERVER_ARGS}
   )
-  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_kv_events_env[@]}" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_kv_events_env[@]}" "${prefill_cmd[@]}"
+  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_umbp_env[@]}" "${prefill_kv_events_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_umbp_env[@]}" "${prefill_kv_events_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -2351,6 +2534,11 @@ start_router() {
     fi
     if [[ -n "${ROUTER_KV_STORAGE_LOAD_COST:-}" ]]; then
       router_kv_events_args+=(--kv-storage-load-cost "${ROUTER_KV_STORAGE_LOAD_COST}")
+    fi
+    # What a token a rank copies in from its share group (the ranks of one
+    # UMBP pool) counts for; the router's own default without the case's.
+    if [[ -n "${ROUTER_KV_SHARE_WEIGHT:-}" ]]; then
+      router_kv_events_args+=(--kv-share-weight "${ROUTER_KV_SHARE_WEIGHT}")
     fi
   fi
   local -a router_cmd=(
@@ -3061,13 +3249,14 @@ run_benchmark_and_eval() {
   fi
 }
 
+validate_umbp_pool_settings
 validate_mooncake_store_settings
 write_metadata
 
 # Every branch installs its EXIT trap before its first start (the pids expand
 # at exit): start_prefill and start_decode start the Store's masters and owners
-# before their server, so a start that fails stops what it and the starts
-# before it left running.
+# before their server, and start_prefill the UMBP server, so a start that fails
+# stops what it and the starts before it left running.
 if [[ "${AGGREGATED}" == "1" ]]; then
   if (( NODE_RANK >= DECODE_NODES_PER_WORKER )); then
     echo "[server] rank=${NODE_RANK} idle: the aggregated server spans ${DECODE_NODES_PER_WORKER} node(s)"

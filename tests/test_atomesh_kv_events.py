@@ -87,6 +87,8 @@ apply_role_env() { :; }
 reset_lmcache_disk() { :; }
 start_mooncake_store() { :; }
 mooncake_store_running() { false; }
+start_umbp_pool_server() { :; }
+umbp_pool_requested() { false; }
 build_server_cache_env() { :; }
 kv_transfer_config() { echo '{}'; }
 build_torch_profiler_args() { :; }
@@ -446,6 +448,224 @@ class DeepSeekV41ShareCacheCellsTest(unittest.TestCase):
         service = dict(cell["service"], router=router)
         args = self.submitted_router_args(dict(cell, service=service))
         self.assertEqual(args[args.index("--kv-storage-load-cost") + 1], "65536")
+
+
+class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
+    """The share-cache cells with a UMBP pool in the Store's place: both routers
+    on three nodes, and the cache-aware one's smoke on a single node."""
+
+    STORE = DeepSeekV41ShareCacheCellsTest.BASELINE
+    NAMES = {
+        "umbp_pool": STORE.replace("-mcstore-", "-umbp-"),
+        "umbp_kv_events": STORE.replace("-mcstore-", "-umbp-kvev-"),
+        "umbp_smoke": "ds-v41-flash-1p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-c16",
+    }
+    # Each pool cell and the Store cell it is.
+    STORE_SUITE = {"umbp_pool": "mooncake_store", "umbp_kv_events": "kv_events"}
+    run_script = KvEventsCellsTest.run_script
+    router_args = KvEventsCellsTest.router_args
+    submitted_exports = DeepSeekV41ShareCacheCellsTest.submitted_exports
+    submitted_router_args = DeepSeekV41ShareCacheCellsTest.submitted_router_args
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = (
+            dict(os.environ)
+            | MATRIX_ENV
+            | {
+                "ATOMESH_1P1D_NODES": "pit2-p03-g27",
+                "ATOMESH_2P1D_NODES": "pit2-p03-g27,pit2-p03-g48,pit2-p03-g53",
+            }
+        )
+        cls.router_script = router_script()
+        cls.suites = {}
+        with tempfile.TemporaryDirectory() as directory:
+            for suite in (*cls.NAMES, *cls.STORE_SUITE.values()):
+                output = Path(directory) / f"{suite}.json"
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(SCRIPTS / "pd_matrix.py"),
+                        "--suite",
+                        suite,
+                        "--model",
+                        "DeepSeek-V4.1-Flash-1017",
+                        "--output",
+                        str(output),
+                    ],
+                    cwd=ROOT,
+                    env=cls.env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                cls.suites[suite] = json.loads(output.read_text())["include"]
+        cls.cells = {suite: cells[0] for suite, cells in cls.suites.items()}
+
+    def prefill_exports(self, suite):
+        return {
+            key: value
+            for key, value in self.submitted_exports(self.cells[suite]).items()
+            if key.startswith("ATOMESH_PREFILL_ENV_")
+        }
+
+    def test_each_suite_holds_its_one_cell(self):
+        self.assertEqual(
+            {suite: [cell["name"] for cell in self.suites[suite]] for suite in self.NAMES},
+            {suite: [name] for suite, name in self.NAMES.items()},
+        )
+        self.assertEqual(
+            {suite: self.cells[suite]["display_topology"] for suite in self.NAMES},
+            {
+                "umbp_pool": "8P16D-P2EP2-D4NOEP-DSPARK5-UMBP",
+                "umbp_kv_events": "8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV",
+                "umbp_smoke": "1P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV",
+            },
+        )
+
+    def test_the_three_node_cells_are_the_store_cells_with_the_pool_in_its_place(self):
+        for suite, store_suite in self.STORE_SUITE.items():
+            with self.subTest(suite=suite):
+                cell, store = self.cells[suite], self.cells[store_suite]
+                changed = {key for key in store if cell[key] != store[key]}
+                self.assertEqual(
+                    changed - {"service"},
+                    {"id", "suite", "name", "display_topology", "env"},
+                )
+                # The Store cell's router, less what it counts the Store's hits at.
+                router = dict(store["service"]["router"])
+                router.pop("kv_storage_weight", None)
+                self.assertEqual(cell["service"], dict(store["service"], router=router))
+                self.assertEqual(
+                    {role for role in store["env"] if cell["env"][role] != store["env"][role]},
+                    {"prefill"},
+                )
+                prefill, store_prefill = cell["env"]["prefill"], store["env"]["prefill"]
+                self.assertEqual(
+                    {
+                        key
+                        for key in prefill.keys() | store_prefill.keys()
+                        if prefill.get(key) != store_prefill.get(key)
+                    },
+                    {"MOONCAKE_STORE", "UMBP_POOL", "PREFILL_KV_TRANSFER_CONFIG"},
+                )
+
+    def test_the_launcher_reads_the_pool_on_and_the_store_off(self):
+        script = shell_functions("mooncake_store_requested", "umbp_pool_requested") + """
+if mooncake_store_requested; then echo "ARG:store"; fi
+if umbp_pool_requested; then echo "ARG:pool"; fi
+"""
+        for suite in self.cells:
+            with self.subTest(suite=suite):
+                self.assertEqual(
+                    self.run_script(script, **self.prefill_exports(suite)),
+                    ["pool" if suite in self.NAMES else "store"],
+                )
+
+    def test_each_prefill_worker_names_a_pool_of_its_own_beside_the_p_d_connector(
+        self,
+    ):
+        source = (SCRIPTS / "pd_server_atom.sh").read_text()
+        script = shell_functions("apply_prefixed_env", "kv_transfer_config") + """
+apply_prefixed_env "ATOMESH_PREFILL_ENV_" 10.0.0.1
+printf 'ARG:%s\\n' "${PREFILL_KV_TRANSFER_CONFIG}"
+printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONFIG}" 10.0.0.1 "${HANDSHAKE_PORT}")"
+"""
+        for suite in self.NAMES:
+            # packed_nodes exports each worker's handshake port, 6301 + its first GPU.
+            for port in (6301, 6303, 6305, 6307):
+                with self.subTest(suite=suite, port=port):
+                    substituted, passed = self.run_script(
+                        script, HANDSHAKE_PORT=str(port), **self.prefill_exports(suite)
+                    )
+                    # The launcher hands the case's JSON to the worker as it is.
+                    self.assertEqual(passed, substituted)
+                    config = json.loads(passed)
+                    self.assertEqual(config["kv_connector"], "multi")
+                    p_d, pool = config["connectors"]
+                    self.assertEqual(
+                        p_d,
+                        {
+                            "kv_role": "kv_producer",
+                            "kv_connector": "mooncake",
+                            "proxy_ip": "10.0.0.1",
+                            "handshake_port": port,
+                            "protocol": "rdma",
+                        },
+                    )
+                    self.assertEqual(pool["kv_connector"], "umbp_pool")
+                    extra = pool["kv_connector_extra_config"]
+                    self.assertEqual(extra["namespace"], f"p{port}")
+                    # Where the launcher's server listens unless the case moves it.
+                    self.assertIn(
+                        f'"${{UMBP_POOL_ADDRESS:-{extra["address"]}}}"', source
+                    )
+
+    def test_cells_launch_the_recipe_router_or_route_by_the_events(self):
+        self.assertEqual(
+            self.submitted_router_args(self.cells["umbp_pool"]),
+            self.submitted_router_args(self.cells["mooncake_store"]),
+        )
+        # The Store cell's flow without the Store's hits: the router counts what
+        # a rank's pool group holds at its own --kv-share-weight.
+        store = self.submitted_router_args(self.cells["kv_events"])
+        weight = store.index("--kv-storage-weight")
+        for suite in ("umbp_kv_events", "umbp_smoke"):
+            with self.subTest(suite=suite):
+                args = self.submitted_router_args(self.cells[suite])
+                self.assertEqual(args, store[:weight] + store[weight + 2 :])
+                self.assertEqual(args[args.index("--prefill-policy") + 1], "agentic")
+                self.assertEqual(args[args.index("--decode-policy") + 1], "least_load")
+                self.assertIn("--kv-events", args)
+                self.assertNotIn("--kv-share-weight", args)
+
+    def test_a_cells_share_weight_reaches_the_router_with_the_events(self):
+        for suite, events in (("umbp_kv_events", True), ("umbp_pool", False)):
+            with self.subTest(suite=suite):
+                cell = self.cells[suite]
+                self.assertEqual(
+                    self.submitted_exports(cell)["ROUTER_KV_SHARE_WEIGHT"], ""
+                )
+                router = dict(cell["service"]["router"], kv_share_weight=0.5)
+                service = dict(cell["service"], router=router)
+                args = self.submitted_router_args(dict(cell, service=service))
+                if events:
+                    self.assertEqual(args[args.index("--kv-share-weight") + 1], "0.5")
+                else:
+                    self.assertNotIn("--kv-share-weight", args)
+        for suite in self.STORE_SUITE.values():
+            with self.subTest(suite=suite):
+                self.assertNotIn(
+                    "--kv-share-weight", self.submitted_router_args(self.cells[suite])
+                )
+
+    def test_the_smoke_is_one_prefill_and_one_decode_worker_on_one_node(self):
+        smoke, cell = self.cells["umbp_smoke"], self.cells["umbp_kv_events"]
+        self.assertEqual(
+            (smoke["topology"], smoke["pd_worker_layout"], smoke["nodes"]),
+            ("1p1d_dpa", "single_node", ["pit2-p03-g27"]),
+        )
+        self.assertEqual(smoke["num_nodes"], 1)
+        self.assertEqual(smoke["concurrency"], [16])
+        self.assertEqual(
+            smoke["benchmark"], dict(cell["benchmark"], benchmark_duration=300)
+        )
+        self.assertEqual(smoke["service"]["router"], cell["service"]["router"])
+        # single_node starts each role on the devices its role env names: as
+        # many as its TP, and none of the other role's.
+        devices = {"prefill": "0,1", "decode": "4,5,6,7"}
+        for role, tp in (("prefill", 2), ("decode", 4)):
+            with self.subTest(role=role):
+                self.assertEqual(
+                    smoke["service"][role], dict(cell["service"][role], workers=1)
+                )
+                self.assertEqual(smoke["service"][role]["tp"], tp)
+                self.assertEqual(len(devices[role].split(",")), tp)
+                self.assertEqual(
+                    smoke["env"][role],
+                    dict(cell["env"][role], HIP_VISIBLE_DEVICES=devices[role]),
+                )
 
 
 if __name__ == "__main__":

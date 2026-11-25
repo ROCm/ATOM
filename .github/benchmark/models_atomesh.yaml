@@ -2647,21 +2647,21 @@ models:
             balance_abs_threshold: 0
             balance_rel_threshold: 1.0
             extra_args: "--request-timeout-secs 1800 --prepare-queue-timeout-ms 5000 --prepare-timeout-ms 15000"
-          prefill:
+          prefill: &dsv41_p2ep2_prefill
             workers: 4
             tp: 2
             cudagraph: "[1,2,4,8,16,24,32,40,48,64]"
             cudagraph_mode: FULL
             compilation_level: 3
             extra_args: "--enable-dp-attention --enable-expert-parallel --dp-load-balance share_cache --attn-prefill-chunk-size 65536"
-          decode:
+          decode: &dsv41_d4noep_decode
             workers: 4
             tp: 4
             cudagraph: "[1,2,4,8,16,24,32,48,64,96,128]"
             cudagraph_mode: FULL
             compilation_level: 3
             extra_args: "--enable-dp-attention --dp-load-balance least_requests --attn-prefill-chunk-size 16384 --gpu-memory-utilization 0.75"
-          benchmark:
+          benchmark: &dsv41_share_cache_aiperf
             <<: *agentic_1m_aiperf
             apply_chat_template: false
             benchmark_duration: 900
@@ -2688,3 +2688,70 @@ models:
             # scores its hits alike and agentic places by load alone.
             kv_storage_weight: 0.87
             extra_args: "--request-timeout-secs 1800 --prepare-timeout-ms 15000"
+
+      # The share-cache cells with the prefill ranks' KV shared through a UMBP
+      # pool in place of the Store: ATOM's umbp_pool connector, beside the
+      # Mooncake P/D one, keeps each rank's paged KV in a pool of the node's
+      # UMBP standalone server, from which a rank copies the prefix it lacks
+      # out of another rank's. The launcher starts that server before the
+      # node's prefill workers (pd_server_atom.sh: UMBP_POOL) and no Store, whose
+      # MOONCAKE_STORE_* settings of the model stay in the env unread. Each
+      # prefill worker names a pool namespace of its own, by its handshake
+      # port: two engine processes with one namespace destroy each other's
+      # pools. Dispatch-only, on images that carry the server.
+      umbp_pool:
+        # The recipe's router, as the mooncake_store cell.
+        - &dsv41_8p16d_umbp
+          <<: *dsv41_8p16d_mcstore
+          name: ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-umbp-c1228
+          display_topology: 8P16D-P2EP2-D4NOEP-DSPARK5-UMBP
+          env:
+            prefill: &dsv41_umbp_env_prefill
+              MOONCAKE_STORE: "0"
+              UMBP_POOL: "1"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"umbp_pool","kv_connector_extra_config":{"address":"unix:///tmp/umbp-l1/server.sock","namespace":"p${HANDSHAKE_PORT}"}}]}
+
+      umbp_kv_events:
+        # The kv_events cell's router: the prefill's KV events say what each
+        # rank holds and what the ranks of its pool do, which the router counts
+        # at its own kv_share_weight. No Store, so no kv_storage_weight.
+        - &dsv41_8p16d_umbp_kvev
+          <<: *dsv41_8p16d_umbp
+          name: ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-c1228
+          display_topology: 8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV
+          router:
+            policy: cache_aware
+            prefill_policy: agentic
+            decode_policy: least_load
+            kv_events: true
+            extra_args: "--request-timeout-secs 1800 --prepare-timeout-ms 15000"
+
+      umbp_smoke:
+        # One prefill and one decode worker of those cells on a single node,
+        # five minutes at c16: whether the server, the pool and the routing by
+        # events work at all, before the three-node cells. single_node gives
+        # each role the devices its role env names: the prefill's two, and the
+        # decode's four on the node's other half, as a decode worker has there.
+        - <<: *dsv41_8p16d_umbp_kvev
+          name: ds-v41-flash-1p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-c16
+          display_topology: 1P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV
+          topology: 1p1d_dpa
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          concurrency: [16]
+          prefill:
+            <<: *dsv41_p2ep2_prefill
+            workers: 1
+          decode:
+            <<: *dsv41_d4noep_decode
+            workers: 1
+          env:
+            prefill:
+              <<: *dsv41_umbp_env_prefill
+              HIP_VISIBLE_DEVICES: "0,1"
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+          benchmark:
+            <<: *dsv41_share_cache_aiperf
+            benchmark_duration: 300
