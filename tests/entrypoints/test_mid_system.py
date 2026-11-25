@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """System messages inside the conversation, for templates that cannot take them.
 
@@ -12,8 +13,10 @@ those messages into user turns.
 """
 
 import asyncio
+import json
 
 import pytest
+from jinja2 import TemplateError
 
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.chat_encoders import template_takes_mid_system
@@ -251,3 +254,91 @@ def test_messages_folds_only_for_a_template_that_cannot_take_it(
         else [("system", "top"), ("user", "a\n\nnote")]
     )
     assert rendered[0] == expected
+
+
+def _recording(seen, refuse):
+    def render(_tok, _enc, messages, **_kw):
+        seen.append([(m.role, m.content) for m in messages])
+        if refuse([m.role for m in messages]):
+            raise TemplateError("System message must be at the beginning.")
+        return "<rendered prompt>"
+
+    return render
+
+
+def _system_after_the_start(roles):
+    start = next((i for i, r in enumerate(roles) if r != "system"), len(roles))
+    return "system" in roles[start:]
+
+
+def _messages(*messages, system="top"):
+    request = AnthropicMessagesRequest(
+        model="m", max_tokens=16, system=system, messages=list(messages)
+    )
+    return asyncio.run(api_server.anthropic_messages(request, None))
+
+
+def _error(reply):
+    return json.loads(reply.body)["error"]["message"]
+
+
+LEAD = [("system", "top"), ("system", "lead")]
+
+
+def test_a_leading_run_is_kept_when_a_reminder_is_refused(rendered, monkeypatch):
+    monkeypatch.setattr(api_server, "mid_system_supported", True)
+    monkeypatch.setattr(
+        api_server, "apply_chat_template", _recording(rendered, _system_after_the_start)
+    )
+    reply = _messages(
+        AnthropicMessage(role="system", content="lead"),
+        AnthropicMessage(role="user", content="a"),
+        AnthropicMessage(role="system", content="r"),
+    )
+    # The 400 Claude Code answers by folding the reminder.
+    assert reply.status_code == 400
+    assert _error(reply).startswith('Unexpected role "system"')
+    assert rendered[-1] == LEAD + [("user", "a")]
+
+
+def test_a_leading_run_is_not_folded(rendered, monkeypatch):
+    monkeypatch.setattr(api_server, "mid_system_supported", False)
+    _messages(
+        AnthropicMessage(role="system", content="lead"),
+        AnthropicMessage(role="user", content="a"),
+        AnthropicMessage(role="system", content="r"),
+    )
+    assert rendered[0] == LEAD + [("user", "a\n\nr")]
+
+
+def test_a_template_that_takes_one_system_message_is_not_blamed_on_a_mid_one(
+    rendered, monkeypatch
+):
+    # Nothing follows the user turn, so folding could not help: the original
+    # error stands rather than the 400 Claude Code would resend on.
+    monkeypatch.setattr(api_server, "mid_system_supported", True)
+    monkeypatch.setattr(
+        api_server,
+        "apply_chat_template",
+        _recording(rendered, lambda roles: "system" in roles[1:]),
+    )
+    reply = _messages(
+        AnthropicMessage(role="system", content="lead"),
+        AnthropicMessage(role="user", content="a"),
+    )
+    assert reply.status_code == 500
+    assert "Unexpected role" not in _error(reply)
+
+
+def test_only_system_messages_are_not_blamed_on_a_mid_one(rendered, monkeypatch):
+    # Nothing is mid-conversation, so the original error stands even for an
+    # encoder that renders an empty conversation.
+    monkeypatch.setattr(api_server, "mid_system_supported", True)
+    monkeypatch.setattr(
+        api_server,
+        "apply_chat_template",
+        _recording(rendered, lambda roles: bool(roles)),
+    )
+    reply = _messages(AnthropicMessage(role="system", content="x"))
+    assert reply.status_code == 500
+    assert "Unexpected role" not in _error(reply)

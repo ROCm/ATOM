@@ -1415,7 +1415,9 @@ def _renders_without_mid_system(
     the conversation (after the first non-system one) are dropped: run only
     after it refused them, to tell a template that wants its system messages
     first from one that failed for another reason."""
-    first = next((i for i, m in enumerate(messages) if m.role != "system"), 0)
+    first = next(
+        (i for i, m in enumerate(messages) if m.role != "system"), len(messages)
+    )
     kept = [m for i, m in enumerate(messages) if i < first or m.role != "system"]
     if len(kept) == len(messages):
         return False
@@ -3935,9 +3937,9 @@ def _setup_reasoning_and_tools(args) -> None:
     global model_starts_in_reasoning, reasoning_toggle, reasoning_dialect
     global mid_system_supported
     _template_source = chat_template_source(tokenizer, custom_message_encoder)
+    _plain_probe = render_probe_prompt(tokenizer, custom_message_encoder, tools=False)
     reasoning_dialect, _dialect_stated = resolve_dialect(
-        _template_source,
-        render_probe_prompt(tokenizer, custom_message_encoder, tools=False) or "",
+        _template_source, _plain_probe or ""
     )
     logger.info(
         "Reasoning channel: %s%s",
@@ -3963,9 +3965,7 @@ def _setup_reasoning_and_tools(args) -> None:
         )
 
     mid_system_supported = template_takes_mid_system(tokenizer, custom_message_encoder)
-    if not mid_system_supported and render_probe_prompt(
-        tokenizer, custom_message_encoder, tools=False
-    ):
+    if not mid_system_supported and _plain_probe:
         logger.info(
             "The chat template cannot take a system message inside the "
             "conversation; /v1/messages moves those into user turns."
