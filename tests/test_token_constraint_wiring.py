@@ -205,7 +205,9 @@ def _rapid_runner(monkeypatch, logits):
     runner.run_model = lambda ids, batch: logits
     # the head: the hidden states are the logits
     runner.model = SimpleNamespace(compute_logits=lambda hidden: hidden)
-    runner.sampler = lambda lg, temperatures, top_ks, top_ps, greedy: lg.argmax(-1)
+    runner.sampler = lambda lg, temperatures, top_ks, top_ps, greedy, any_greedy=True: (
+        lg.argmax(-1)
+    )
     monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
     monkeypatch.setattr(mod, "reset_forward_context", lambda: None)
     return runner
