@@ -37,8 +37,8 @@ below.
 - amdgpu loaded with `sudo modprobe amdgpu gpu_recovery=0 halt_if_hws_hang=1` (how our nodes load it).
 - `sudo sysctl -w kernel.numa_balancing=0` for the benchmark runs.
 - About 230 GB of disk for the model, 60 GB for the image, ~25 GB for the container's build outputs.
-- For C64 with LMCache (160 GiB per rank): about **704 GiB of available host memory** (4 x 160 x 1.1 GiB; a 1 TB node is
-  enough). Optional on ~2 TB nodes: 384 GiB per rank (section 4).
+- For C64 with LMCache at 384 GiB per rank: about **1,690 GiB of available host memory** (4 x 384 x 1.1 GiB; a ~2 TB
+  node). On a ~1 TB node use 160 GiB per rank (~704 GiB available; section 4).
 
 ## 2. Container
 
@@ -171,15 +171,15 @@ until curl -sf -m 5 http://127.0.0.1:8790/health > /dev/null; do sleep 30; done
 - **AgentX C4**: as above (`CONC=4`, delayer 20000, forced acceptance 4.04, LMCache off).
 - **AgentX C64**: `CONC=64` (max-num-seqs 128), `ATOM_PREFILL_DECODE_INTERVAL=8` instead of 20000, forced acceptance
   4.04, and the LMCache CPU tier: add to the env
-  `PYTHONHASHSEED=0 LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=160 LMCACHE_CHUNK_SIZE=256
+  `PYTHONHASHSEED=0 LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=384 LMCACHE_CHUNK_SIZE=256
   ATOM_PREFIX_CACHE_POLICY=slru ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5 LMCACHE_CACHE_POLICY=ATOM_SLRU
   LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3`
   and to the arguments `--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'`.
-  - `LMCACHE_MAX_LOCAL_CPU_SIZE` is GiB **per TP rank**; 160 is what the C64 numbers below were measured with and needs
-    4 x 160 x 1.1 = ~704 GiB of `MemAvailable` before the start (`grep MemAvailable /proc/meminfo`), so a 1 TB node
-    is enough.
-  - Optional, on nodes with ~2 TB of RAM: 384 (needs ~1,690 GiB available). A different tier size holds a different
-    amount of evicted prefixes, so the C64 numbers can move.
+  - `LMCACHE_MAX_LOCAL_CPU_SIZE` is GiB **per TP rank**; 384 needs 4 x 384 x 1.1 = ~1,690 GiB of `MemAvailable` before
+    the start (`grep MemAvailable /proc/meminfo`), i.e. a ~2 TB node.
+  - On a ~1 TB node use `LMCACHE_MAX_LOCAL_CPU_SIZE=160` (needs ~704 GiB available): the value used for the C64
+    numbers in section 7, on a 1 TB node. A different tier size holds a different amount of evicted prefixes, so the
+    C64 numbers can move with it.
   - Once the tier is full, LMCache logs "Failed to allocate memory block ... no memory is available" for saves it cannot
     place (a burst during the AgentX warm-up, then about 10-15K lines a minute at C64). This is expected.
   - Without LMCache: leave out the LMCache env and `--kv-transfer-config`; `PYTHONHASHSEED`
