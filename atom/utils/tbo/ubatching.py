@@ -168,35 +168,44 @@ def sync_dp_metadata(
     """
     tbo_fields = 9 if tbo_on else 5
     dspark_on = max_seqlen_q is not None
-    n_fields = tbo_fields + (1 if dspark_on else 0)
-    local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
-    local[0] = scheduled_tokens
-    local[1] = scheduled_bs
-    local[2] = 1 if is_prefill else 0
-    local[3] = 1 if needs_eager else 0
-    local[4] = final_requests
+    # Packed from one list and gathered into the rows of one buffer: a
+    # tensor element write, a tensor per rank and a stack each cost the host
+    # microseconds on every step.
+    fields = [
+        scheduled_tokens,
+        scheduled_bs,
+        1 if is_prefill else 0,
+        1 if needs_eager else 0,
+        final_requests,
+    ]
     if tbo_on:
-        local[5] = 1 if local_meets_min_tokens else 0
-        local[6] = 1 if local_can_split else 0
-        local[7] = local_ub_tokens[0]
-        local[8] = local_ub_tokens[1]
+        fields += [
+            1 if local_meets_min_tokens else 0,
+            1 if local_can_split else 0,
+            local_ub_tokens[0],
+            local_ub_tokens[1],
+        ]
     if dspark_on:
-        local[tbo_fields + 0] = max_seqlen_q
+        fields.append(max_seqlen_q)
+    # On the host whatever the default device: the runner calls this under
+    # CUDA, and Gloo and `.numpy()` both need CPU tensors.
+    local = torch.tensor(fields, dtype=torch.int32, device="cpu")
 
     # A group of one is its own row, with nothing to exchange.
-    gathered = [local]
+    gathered = local[None]
     if dp_size > 1:
-        gathered = [
-            torch.empty(n_fields, dtype=torch.int32, device="cpu")
-            for _ in range(dp_size)
-        ]
-        torch.distributed.all_gather(gathered, local, group=dp_group)
-    sync = torch.stack(gathered, dim=1).numpy()  # [n_fields, dp_size]
+        gathered = torch.empty((dp_size, len(fields)), dtype=torch.int32, device="cpu")
+        torch.distributed.all_gather(list(gathered.unbind(0)), local, group=dp_group)
+    sync = np.ascontiguousarray(gathered.numpy().T)  # [n_fields, dp_size]
 
     scheduled_tokens_per_dp_rank = sync[0]
     np.copyto(running_tokens_per_dp_rank, scheduled_tokens_per_dp_rank)
-    idle = scheduled_tokens_per_dp_rank == 0
-    if idle.any() and not idle.all():
+    # Reduced as Python lists: over dp_size values, each NumPy reduction's
+    # call overhead outweighs the reduction itself.
+    rows = sync.tolist()
+    num_idle = rows[0].count(0)
+    if 0 < num_idle < len(rows[0]):
+        idle = scheduled_tokens_per_dp_rank == 0
         # A rank with no request runs the group's phase and, on a ragged step,
         # the fewest running tokens a TBO prefill can split (1 + 1), never more
         # than the group's smallest nonzero count. It neither turns TBO on nor
@@ -212,8 +221,9 @@ def sync_dp_metadata(
             if prefill:
                 _, can_split, ub0, ub1 = prefill_tbo_vote(running_tokens)
                 sync[6][idle], sync[7][idle], sync[8][idle] = can_split, ub0, ub1
-    max_bs_across_dp = int(sync[1].max())
-    any_rank_needs_eager = bool(sync[3].any())
+        rows = sync.tolist()
+    max_bs_across_dp = max(rows[1])
+    any_rank_needs_eager = any(rows[3])
     tbo_collective_active = False
     ub_tokens_across_dp: tuple[tuple[int, ...], ...] | None = None
     if tbo_on:
@@ -224,23 +234,23 @@ def sync_dp_metadata(
         # split too (`cut_prefill_ubatches` has no min-token bar of its own)
         # to stay aligned. A decoding rank votes neither, so a step
         # some rank decodes never splits here.
-        tbo_collective_active = bool(sync[5].any()) and bool(sync[6].all())
+        tbo_collective_active = any(rows[5]) and all(rows[6])
         if tbo_collective_active:
-            ub_tokens_across_dp = (tuple(sync[7].tolist()), tuple(sync[8].tolist()))
+            ub_tokens_across_dp = (tuple(rows[7]), tuple(rows[8]))
 
     max_seqlen_q_across_dp: int | None = None
     if dspark_on:
-        max_seqlen_q_across_dp = int(sync[tbo_fields + 0].max())
+        max_seqlen_q_across_dp = max(rows[tbo_fields + 0])
 
     return DPSyncResult(
         scheduled_tokens_per_dp_rank=scheduled_tokens_per_dp_rank,
         max_bs_across_dp=max_bs_across_dp,
-        prefill_across_dp=tuple(bool(p) for p in sync[2].tolist()),
+        prefill_across_dp=tuple(map(bool, rows[2])),
         any_rank_needs_eager=any_rank_needs_eager,
         tbo_collective_active=tbo_collective_active,
         ub_tokens_across_dp=ub_tokens_across_dp,
         max_seqlen_q_across_dp=max_seqlen_q_across_dp,
-        max_final_requests_across_dp=int(sync[4].max()),
+        max_final_requests_across_dp=max(rows[4]),
     )
 
 

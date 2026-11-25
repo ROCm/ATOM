@@ -1309,9 +1309,10 @@ class DPEngineCoreProc(EngineCore):
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
-            global_has_unfinished = state_tensor[0].item() == 1
-            global_shutdown = state_tensor[1].item() == 1
-            global_held = state_tensor[2].item() == 1
+            # One read of all three flags: a `.item()` each costs more.
+            global_has_unfinished, global_shutdown, global_held = (
+                flag == 1 for flag in state_tensor.tolist()
+            )
             return global_has_unfinished, global_shutdown, global_held
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
