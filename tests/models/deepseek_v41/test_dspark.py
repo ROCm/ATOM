@@ -23,12 +23,16 @@ def _rope():
     return RotaryEmbedding
 
 
-def _draft_model():
+def _draft_module():
     """The draft model builds ATOM layers, which reach AITER."""
     pytest.importorskip("aiter", reason="the draft model builds AITER-backed layers")
-    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+    from atom.models.deepseek_v41 import dspark
 
-    return DeepseekV41DSpark
+    return dspark
+
+
+def _draft_model():
+    return _draft_module().DeepseekV41DSpark
 
 
 def _draft_sharing(embed, noise_token_id=2):
@@ -90,8 +94,7 @@ def test_noise_row_is_not_bound_under_graph_capture(monkeypatch):
 
 
 def test_sharded_noise_row_reads_the_owner_shard(monkeypatch):
-    from atom.models.deepseek_v41 import dspark
-
+    dspark = _draft_module()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     tp = SimpleNamespace(cpu_group=object(), device_group=object())
     monkeypatch.setattr(dspark, "get_tp_group", lambda: tp)
@@ -115,8 +118,8 @@ def test_sharded_noise_row_reads_the_owner_shard(monkeypatch):
 
 @pytest.mark.parametrize("refusal", ["unmapped", "fp32"])
 def test_sharded_noise_row_falls_back_to_nccl(monkeypatch, refusal):
-    from atom.models.deepseek_v41 import dspark
-    from atom.mono.runtime.consensus import MonoUnsupported
+    dspark = _draft_module()
+    MonoUnsupported = dspark.MonoUnsupported
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     tp = SimpleNamespace(cpu_group=object(), device_group=object())
