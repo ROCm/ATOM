@@ -284,6 +284,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SESSION_AFFINITY": lambda: (
         os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
     ),
+    # DP engine loop: a rank votes "unfinished" only when a scheduling pass
+    # could produce a batch (`Scheduler.has_forward_work`). Finished requests
+    # awaiting their KV send (`deferred_free_blocks`), tier loads and lookups
+    # in flight then leave the group idle-polling instead of running DP dummy
+    # forwards back to back, which a new arrival had to wait out. Off by
+    # default; ignored with the prefill delayer on.
+    "ATOM_DP_IDLE_WHEN_BLOCKED": lambda: _flag_env("ATOM_DP_IDLE_WHEN_BLOCKED"),
     # --- DP prefill cost balancing (DP attention with more than one rank) ---
     # Under DP attention every rank prefills in the same lockstep step and the
     # step lasts as long as the slowest rank. With the same token budget, a rank

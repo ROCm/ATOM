@@ -474,7 +474,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         prompt tokens is cheaper than either blocking the scheduler thread on
         it (every DP rank waits in lockstep) or admitting the request without
         it (a recompute). Bounded by `OFFLOAD_LOOKUP_DEFER_S` from the first
-        call here, which only Phase 2 makes; past it admission goes ahead with
+        call here, which Phase 2 makes, or `Scheduler.has_forward_work` when
+        its DP vote (`ATOM_DP_IDLE_WHEN_BLOCKED`) first sees `seq` blocked, at
+        the time the first pass would have; past it admission goes ahead with
         whatever answer the lookup holds.
         """
         sid = str(seq.id)

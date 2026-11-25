@@ -62,6 +62,11 @@ logger = logging.getLogger("atom")
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
 # idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
+# ATOM_DP_IDLE_WHEN_BLOCKED: how long a DP loop whose only work is blocked on a
+# tier lookup or load sleeps before it votes again. A sleep rather than
+# `yield_gil`: the lookup and load threads it waits on share this process's
+# GIL, and a loop spinning on it slows them down.
+BLOCKED_IDLE_SLEEP_S = 0.0005
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
 
@@ -1124,6 +1129,29 @@ class DPEngineCoreProc(EngineCore):
         self._init_prefill_delayer(config, self.dp_group)
         # `share_cache` routing reads each rank's own prefill backlog.
         self._report_backlog = config.dp_load_balance == "share_cache"
+        self._idle_when_blocked = self._resolve_idle_when_blocked()
+
+    def _resolve_idle_when_blocked(self) -> bool:
+        """`ATOM_DP_IDLE_WHEN_BLOCKED`: whether this rank reports work to its DP
+        group only when a pass could produce a batch (`has_forward_work`).
+        Off with a prefill delayer, whose cadence counts passes."""
+        if not envs.ATOM_DP_IDLE_WHEN_BLOCKED:
+            return False
+        if getattr(self.scheduler, "has_forward_work", None) is None:
+            logger.warning(
+                "%s: ATOM_DP_IDLE_WHEN_BLOCKED ignored: %s has no has_forward_work",
+                self.label,
+                type(self.scheduler).__name__,
+            )
+            return False
+        if getattr(self.scheduler, "prefill_delayer", None) is not None:
+            logger.warning(
+                "%s: ATOM_DP_IDLE_WHEN_BLOCKED ignored with the prefill delayer on",
+                self.label,
+            )
+            return False
+        logger.info("%s: ATOM_DP_IDLE_WHEN_BLOCKED on", self.label)
+        return True
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -1155,6 +1183,9 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
+        # Set once the group agreed to shut down: ATOM_DP_IDLE_WHEN_BLOCKED's
+        # narrower vote no longer applies (see the exit below), on every rank.
+        draining = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
@@ -1181,13 +1212,38 @@ class DPEngineCoreProc(EngineCore):
                     or self._weight_sync_fenced
                     or self._generation_paused
                 )
-                local_unfinished = not self.scheduler.is_finished() and not local_held
+                # This rank's vote. By default any unfinished state,
+                # `deferred_free_blocks` included, so a group whose only work
+                # is waiting runs DP dummy forwards back to back. With
+                # ATOM_DP_IDLE_WHEN_BLOCKED only what a pass could forward
+                # (`has_forward_work`); the idle drain below advances the rest.
+                idle_when_blocked = (
+                    getattr(self, "_idle_when_blocked", False) and not draining
+                )
+                # Held first: a held rank runs no pass, so it must not send
+                # lookups or start their defer windows (`has_forward_work`).
+                local_unfinished = not local_held and (
+                    self.scheduler.has_forward_work()
+                    if idle_when_blocked
+                    else not self.scheduler.is_finished()
+                )
 
                 # MAX-reduced: one held rank holds every rank of the group, so
                 # their forwards stay paired.
                 if sync_now:
+                    sync_kwargs = {}
+                    if idle_when_blocked:
+                        # Work this narrower vote hides (blocked requests, deferred
+                        # frees), reduced with the vote; see the exit below.
+                        sync_kwargs["local_hidden"] = (
+                            not local_unfinished
+                            and not local_held
+                            and not self.scheduler.is_finished()
+                        )
                     global_has_unfinished, global_shutdown, global_held = (
-                        self._sync_dp_state(local_unfinished, shutdown, local_held)
+                        self._sync_dp_state(
+                            local_unfinished, shutdown, local_held, **sync_kwargs
+                        )
                     )
                     if gate is not None:
                         gate.synced(global_has_unfinished, global_shutdown, global_held)
@@ -1201,6 +1257,14 @@ class DPEngineCoreProc(EngineCore):
                     )
 
                 if global_shutdown and not global_has_unfinished:
+                    if getattr(self, "_dp_group_hidden_work", False):
+                        # Some rank's blocked request or deferred free voted
+                        # "no work": every rank votes as with the flag off from
+                        # here, so they settle before the exit as they do off.
+                        # A reduced value, so all ranks switch on this pass
+                        # whatever their own setting.
+                        draining = True
+                        continue
                     logger.info(
                         f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
                     )
@@ -1219,11 +1283,16 @@ class DPEngineCoreProc(EngineCore):
                     self.scheduler.engine_stats.note_idle(now)
                     if self.scheduler.prefill_delayer is not None:
                         self.scheduler.prefill_delayer.notify_idle()
-                    if self.has_pending_kv_work():
+                    blocked = idle_when_blocked and bool(self.scheduler.waiting)
+                    if self.has_pending_kv_work() or blocked:
                         # Local RPCs only. Anything that reaches schedule()
                         # would run the delayer's cross-DP all_reduce off
                         # lockstep, so the idle drain must stay off that path.
+                        # A request blocked on its tier load is waiting too:
+                        # the poll is what settles it.
                         self._advance_idle_kv_transfer()
+                    if blocked:
+                        time.sleep(BLOCKED_IDLE_SLEEP_S)
                     continue
 
                 self.scheduler.engine_stats.note_busy(now)
@@ -1292,7 +1361,13 @@ class DPEngineCoreProc(EngineCore):
         local_has_unfinished: bool,
         local_shutdown: bool = False,
         local_held: bool = False,
+        local_hidden: bool = False,
     ) -> tuple[bool, bool, bool]:
+        """MAX-reduce this rank's flags over the DP group. `local_hidden`
+        (ATOM_DP_IDLE_WHEN_BLOCKED: unfinished work the vote left out) is
+        reduced too, into `_dp_group_hidden_work`; every rank sends it, so the
+        collective is the same whatever each rank's setting."""
+        self._dp_group_hidden_work = local_hidden
         if self._shutting_down:
             return local_has_unfinished, True, local_held
 
@@ -1302,6 +1377,7 @@ class DPEngineCoreProc(EngineCore):
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
                     1 if local_held else 0,
+                    1 if local_hidden else 0,
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -1312,6 +1388,7 @@ class DPEngineCoreProc(EngineCore):
             global_has_unfinished = state_tensor[0].item() == 1
             global_shutdown = state_tensor[1].item() == 1
             global_held = state_tensor[2].item() == 1
+            self._dp_group_hidden_work = state_tensor[3].item() == 1
             return global_has_unfinished, global_shutdown, global_held
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")

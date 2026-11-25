@@ -1852,7 +1852,8 @@ class Scheduler:
     def _head_waits_on_tier_lookup(self, seq: Sequence) -> bool:
         """Whether Phase 2 would skip `seq` for its in-flight tier lookup
         (`prefix_waiters`): same conditions, same order of the cheap checks. A
-        probe: it never starts the lookup's defer window, which is Phase 2's."""
+        probe: it never starts the lookup's defer window, which Phase 2 starts
+        (or `has_forward_work`, at the first vote that sees `seq` blocked)."""
         if (
             self.kv_connector is None
             or self._is_offload_prefill_resume(seq)
@@ -2078,6 +2079,78 @@ class Scheduler:
             and not self._rejected
             and not self.deferred_free_blocks
         )
+
+    def has_forward_work(self) -> bool:
+        """Whether a scheduling pass on this rank may produce a batch now.
+
+        `is_finished` with three kinds of waiting taken out, none of which a
+        forward advances (`ATOM_DP_IDLE_WHEN_BLOCKED`):
+        - `deferred_free_blocks`: finished requests whose KV a peer (D) or the
+          tier still reads; the idle drain polls them;
+        - a waiting request whose remote/tier load is in flight
+          (`_still_loading`; once it lands or fails, a pass takes it);
+        - a waiting request Phase 2 would pass over for its in-flight tier
+          lookup (`_head_waits_on_tier_lookup`), for at most
+          `OFFLOAD_LOOKUP_DEFER_S` from when it was first seen here.
+        Sends this rank's waiting lookups first (`prefetch_lookups`, as
+        `_schedule` does), so a fresh request blocks on its lookup instead of
+        costing a pass, and starts the connector's defer window when it first
+        sees a request blocked (`lookup_pending`, where the first pass would
+        have started it), so the two bounds run together, not back to back.
+        Local: no collective. A wrong True costs what the pass cost before (a
+        dummy forward); False only while every waiting request is blocked on
+        something that completes without a forward.
+        """
+        blocked_since = self._forward_blocked_since
+        if len(blocked_since) > len(self.waiting):
+            # Entries of requests that left `waiting` while the vote returned
+            # early (runnable work) are dropped here, so the map never holds
+            # more entries than `waiting` has requests.
+            waiting_ids = {seq.id for seq in self.waiting}
+            for sid in [sid for sid in blocked_since if sid not in waiting_ids]:
+                del blocked_since[sid]
+        if self.running or self._rejected:
+            return True
+        if not self.waiting:
+            return False
+        conn = self.kv_connector
+        if conn is not None:
+            prefetch = getattr(conn, "prefetch_lookups", None)
+            if prefetch is not None:
+                prefetch(
+                    itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
+                )
+        now = time.monotonic()
+        live = set()
+        for seq in self.waiting:
+            if seq.status == SequenceStatus.ABORTED:
+                return True  # reclaimed by a pass
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                if self._still_loading(seq):
+                    continue
+                return True  # landed or failed: a pass resumes or recomputes it
+            if self._unschedulable_reason(seq) is None and (
+                self._head_waits_on_tier_lookup(seq)
+            ):
+                first = blocked_since.get(seq.id)
+                if first is None:
+                    first = blocked_since[seq.id] = now
+                    conn.lookup_pending(seq)
+                live.add(seq.id)
+                if now - first <= envs.OFFLOAD_LOOKUP_DEFER_S:
+                    continue
+            return True
+        for sid in list(blocked_since):
+            if sid not in live:
+                del blocked_since[sid]
+        return False
+
+    @property
+    def _forward_blocked_since(self) -> dict:
+        """seq id -> when `has_forward_work` first saw it blocked on a lookup.
+        Created on first use, so a scheduler built without `__init__` (tests,
+        subclasses) has it too."""
+        return self.__dict__.setdefault("_forward_blocked_since_by_id", {})
 
     def add(self, seq: Sequence):
         tracing.enqueue(seq)
