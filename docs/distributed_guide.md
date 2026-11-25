@@ -205,7 +205,7 @@ The strategy is selected with `--dp-load-balance` (`Config.dp_load_balance`):
 | `round_robin` | none | Load-agnostic rotation (`cursor % n`). |
 | `least_requests` **(default)** | in-flight request count, then prompt-token load | `argmin((num_in_flight_reqs, in_flight_prompt_tokens))` — request count is primary; ties broken by the lighter prompt-token load, then the rotation cursor. |
 | `least_tokens` | combined token load per rank | `argmin(sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs)`. |
-| `share_cache` | prefill each rank reports it has left, plus this request's own work | `argmin(rank_backlog + (prompt - shared_prefix_hit) + ATOM_DP_LB_REQ_EQUIV * num_reqs)`. Needs an offload tier every rank shares (`mooncake_store`, `lmcache_mp`). |
+| `share_cache` | prefill each rank reports it has left, in-flight requests, this request's own work and tier load | The lockstep step time the request adds: rise of the smooth max of `rank_backlog` by `prompt - shared_prefix_hit`, rise of the smooth max of `num_reqs` by one, plus its own tier load (see below). Needs an offload tier every rank shares (`mooncake_store`, `lmcache_mp`). |
 | `prefix_spread` | prompt-prefix location, queued prefill per rank | Keep a request on the rank holding its prefix unless that rank has over `2 x ATOM_DP_PREFIX_IDLE_TOKENS` queued prefill and another has under `ATOM_DP_PREFIX_IDLE_TOKENS`; then move it there (it loads the prefix from the offload tier). New prefixes: `least_tokens`. See below. |
 
 `least_requests` (the default) keeps the number of in-flight requests even
@@ -224,7 +224,7 @@ All strategies break ties with a round-robin cursor.
 `share_cache` is for deployments whose offload tier is shared by every DP
 rank (one Mooncake Store, one LMCache MP server). Any rank can then load a
 prefix another rank computed, so a request's prefill work does not depend on
-where it lands and the router balances purely by work:
+where it lands and the router places it by the lockstep step time it adds:
 
 - **Request cost**: the common compressed prefix index in
   `atom/model_engine/dp_routing/prefix_spread.py` retains exact complete-block
@@ -250,6 +250,17 @@ where it lands and the router balances purely by work:
   flight; if the load fails, the credit reverts to the HBM hit. A request not
   yet allocated counts the router's estimate. The CoreManager adds the
   charges of requests sent after the rank's last report.
+- **Placement** (`LockstepCostPlacement` in `dp_routing/share_cache.py`): DP
+  ranks step together, so a step lasts as long as its busiest rank. Each rank
+  is scored in milliseconds of group step time: the rise of the smooth max of
+  the ranks' prefill backlogs when the request's cost there is added, the rise
+  of the smooth max of in-flight requests by one times the decode steps a
+  request lives, and the request's own tier load spread over the in-flight
+  requests. Both balance terms follow the busiest rank: a placement that does
+  not raise it costs almost nothing, so ranks well below it are not pulled
+  level with each other, and a request stays on the rank holding its prefix
+  in HBM unless that rank is near the busiest. Ties go to the prefix owner,
+  then round-robin. `ATOM_DP_LB_REQ_EQUIV` does not apply.
 
 With a Mooncake Store, `share_cache` likewise refuses distinct per-NIC
 `mooncake_store.pools` pairs (see the `prefix_spread` section below); aliases

@@ -11,7 +11,12 @@ from test_dp_load_balance import _note_charged
 
 from atom.kv_transfer.offload.tier import OffloadTierProfile
 from atom.model_engine.dp_routing.backlog import BacklogLedger
-from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
+from atom.model_engine.dp_routing.share_cache import (
+    LockstepCostPlacement,
+    ShareCacheRouter,
+    _smooth_max,
+    _smooth_max_rise,
+)
 from atom.model_engine.engine_core_mgr import DP_LB_STRATEGIES, CoreManager
 
 HBS = 16
@@ -51,18 +56,20 @@ def test_strategy_is_registered():
 
 
 def test_cold_prompt_goes_to_least_backlog():
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     route, cost = _route(router, _seq(1, PREFIX), [9_000, 0], [0, 0])
     assert route.rank == 1 and route.decision == "share_cache_cold_total"
     assert cost == len(PREFIX)
 
 
 def test_prefix_in_tier_is_credited_on_any_rank():
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq(1, PREFIX), backlog, reqs)
     router.prefill_complete(1)
-    backlog[first.rank] += 100_000  # the producer's rank is busy now
+    # The producer's rank is busy now: a deep backlog and a wide decode batch.
+    backlog[first.rank] += 100_000
+    reqs[first.rank] += 32
     route, cost = _route(
         router, _seq(2, PREFIX + list(range(10**6, 10**6 + 2_000))), backlog, reqs
     )
@@ -72,23 +79,30 @@ def test_prefix_in_tier_is_credited_on_any_rank():
 
 
 def test_prefix_still_prefilling_is_credited_only_on_its_rank():
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq(1, PREFIX), backlog, reqs)
     other = 1 - first.rank
     seq = _seq(2, PREFIX + list(range(10**6, 10**6 + 2_000)))
     hit = 40_000
+    seen = []
+    inner = router.placement
+
+    def spy(backlog, reqs, costs, owner, loads):
+        seen.append((list(costs), list(loads), owner))
+        return inner(backlog, reqs, costs, owner, loads)
+
+    router.placement = spy
     # The other rank pays the whole prompt; the producer's rank only the rest.
-    route = router.select(seq, list(backlog), list(reqs), None, None)
-    expected = min(
-        (backlog[first.rank] + 42_000 - hit + 512 * reqs[first.rank], first.rank),
-        (backlog[other] + 42_000 + 512 * reqs[other], other),
-    )[1]
-    assert route.rank == expected
+    # Neither loads anything: the tier does not hold the prefix yet.
+    router.select(seq, list(backlog), list(reqs), None, None)
+    costs, loads, owner = seen[-1]
+    assert costs[first.rank] == 42_000 - hit and costs[other] == 42_000
+    assert loads == [0, 0] and owner == first.rank
 
 
 def test_unprefilled_producer_drops_its_entries():
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     _route(router, _seq(1, PREFIX), backlog, reqs)
     router.release(1)  # aborted before its prefill completed
@@ -193,7 +207,7 @@ def test_a_newcomer_does_not_take_a_prefix_from_an_owner_still_prefilling_it():
     """A prefills a system prompt on rank 0; B, same prompt, is placed on rank 1.
     A finishes, so the prefix is in the tier. B aborts before its first token:
     that must not make the prefix cold."""
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
     backlog[first.rank] = 10_000_000  # B goes to the other rank for backlog
@@ -208,7 +222,7 @@ def test_a_newcomer_does_not_take_a_prefix_from_an_owner_still_prefilling_it():
 
 
 def test_the_newcomer_carries_the_entry_if_the_owner_leaves_unprefilled():
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
     backlog[first.rank] = 10_000_000
@@ -265,7 +279,7 @@ def test_a_promoted_backup_that_also_aborts_takes_the_entry_with_it():
     """A owns a cold prefix and B is its backup. A aborts, B is promoted; B then
     aborts before completing: nothing may keep crediting a prefix neither
     computed."""
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
     backlog[first.rank] = 10_000_000
@@ -281,11 +295,11 @@ def test_a_rank_that_did_not_find_the_prefix_drops_the_stale_entries():
     """The tier lost the prefix (failed save, eviction): the rank reports how
     much it reused, the entries past that are dropped, and the request that
     computes them becomes their producer."""
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     _route(router, _seq(1, PREFIX), backlog, reqs)
     router.prefill_complete(1)
-    _route_result, cost = _route(router, _seq(2, PREFIX + [7] * 2_000), backlog, reqs)
+    second, cost = _route(router, _seq(2, PREFIX + [7] * 2_000), backlog, reqs)
     assert cost < 42_000  # placed on the prefix the index lists
     # Its rank found only 8192 tokens.
     assert router.note_reuse(2, 8192)
@@ -295,14 +309,15 @@ def test_a_rank_that_did_not_find_the_prefix_drops_the_stale_entries():
     assert router.prefilling(2)
     # Once seq 2 completes, the whole prefix counts as loadable again.
     router.prefill_complete(2)
-    _, cost3 = _route(router, _seq(3, PREFIX), backlog, reqs)
-    assert cost3 == 0
+    reqs[1 - second.rank] += 32  # keep seq 3 on seq 2's rank
+    third, cost3 = _route(router, _seq(3, PREFIX), backlog, reqs)
+    assert third.rank == second.rank and cost3 == 0
     # A report at the estimate (one hash block of replay below it) drops nothing.
     assert not router.note_reuse(3, 40_000 - HBS)
 
 
 def test_reuse_reports_leave_entries_of_a_producer_still_prefilling():
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq(1, PREFIX), backlog, reqs)
     backlog[1 - first.rank] = 10**9  # keep the second on the producer's rank
@@ -313,7 +328,7 @@ def test_reuse_reports_leave_entries_of_a_producer_still_prefilling():
 
 
 def test_a_released_placement_forgets_its_reuse_report():
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     _route(router, _seq(1, PREFIX), backlog, reqs)
     router.prefill_complete(1)
@@ -325,7 +340,7 @@ def test_a_released_placement_forgets_its_reuse_report():
 
 def test_the_manager_counts_stale_placements_from_rank_reports():
     mgr = _bare_mgr()
-    mgr._prefix_router = ShareCacheRouter(_store_tier(512), 512)
+    mgr._prefix_router = ShareCacheRouter(_store_tier(512))
     mgr._dp_route_counters = dict.fromkeys(ShareCacheRouter.DECISIONS, 0)
     backlog, reqs = [0, 0], [0, 0]
     _route(mgr._prefix_router, _seq(1, PREFIX), backlog, reqs)
@@ -373,7 +388,9 @@ def test_share_cache_refuses_a_store_split_into_per_nic_pools():
         )
         return mgr._build_prefix_router(config)
 
-    assert isinstance(build(one, 2), ShareCacheRouter)
+    router = build(one, 2)
+    assert isinstance(router, ShareCacheRouter)
+    assert isinstance(router.placement, LockstepCostPlacement)
     assert build(two, 1) is None  # one rank: nothing to share
     # A producer-only Store does not load, so no rank could reuse the tier.
     with pytest.raises(ValueError, match="shares and loads from"):
@@ -387,7 +404,7 @@ def test_share_cache_refuses_a_store_split_into_per_nic_pools():
 def test_a_same_rank_reuser_carries_the_prefix_if_its_producer_aborts():
     """B reuses, on A's rank, a prefix A is still prefilling. A aborts and B
     computes the prefix: it must stay in the index."""
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
     backlog[1 - first.rank] = 10_000_000  # B stays on A's rank
@@ -402,7 +419,7 @@ def test_a_same_rank_reuser_carries_the_prefix_if_its_producer_aborts():
 def test_every_backup_of_a_prefix_is_kept():
     """A owns a prefix; B, then C, compute it beside A. B completes, then A and
     C abort: B computed it, so it stays credited."""
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
     backlog[first.rank] = 10_000_000
@@ -414,7 +431,7 @@ def test_every_backup_of_a_prefix_is_kept():
     placed = router.select(_seq("D", PREFIX + [9] * 2_000), [0, 0], [0, 0], None, None)
     assert router.charge("D", placed.credit) > 0
     # And with A and B gone unprefilled, C (completing) still carries it.
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
     backlog[first.rank] = 10_000_000
@@ -470,7 +487,7 @@ def test_reuse_reports_are_queued_ahead_of_the_step_outputs():
 def test_a_reuse_report_before_the_first_output_reassigns_the_prefix():
     """Report first (the queue order), then the first output: the request that
     recomputed the prefix owns it and, once complete, it is credited again."""
-    router = ShareCacheRouter(_store_tier(512), 512)
+    router = ShareCacheRouter(_store_tier(512))
     backlog, reqs = [0, 0], [0, 0]
     _route(router, _seq(1, PREFIX), backlog, reqs)
     router.prefill_complete(1)
@@ -482,7 +499,7 @@ def test_a_reuse_report_before_the_first_output_reassigns_the_prefix():
 
 
 def test_reuse_correction_cancel_does_not_credit_a_sibling_past_missing_trunk():
-    router = ShareCacheRouter(_store_tier(16), 16)
+    router = ShareCacheRouter(_store_tier(16))
     trunk = list(range(512))
     left = trunk + [700] * 512
     right = trunk + [800] * 512
@@ -505,18 +522,19 @@ def test_reuse_correction_cancel_does_not_credit_a_sibling_past_missing_trunk():
 
 
 def test_missing_trunk_clamp_preserves_other_rank_and_active_producer():
-    router = ShareCacheRouter(_store_tier(16), 16)
+    router = ShareCacheRouter(_store_tier(16))
     trunk = list(range(512))
     left = trunk + [700] * 512
     right = trunk + [800] * 512
-    for sid, tokens, backlog in (
-        (1, left, [0, 10**9]),
-        (2, right, [0, 10**9]),
-        (3, right, [10**9, 0]),
-    ):
-        _route(router, _seq(sid, tokens), backlog, [0, 0])
+    # A deep backlog and a wide decode batch keep each request off a rank.
+    for sid, tokens, away in ((1, left, 1), (2, right, 1), (3, right, 0)):
+        backlog, reqs = [0, 0], [0, 0]
+        backlog[away], reqs[away] = 10**9, 64
+        route, _ = _route(router, _seq(sid, tokens), backlog, reqs)
+        assert route.rank == 1 - away
         router.prefill_complete(sid)
-    _route(router, _seq(4, left), [0, 10**9], [0, 0])
+    route, _ = _route(router, _seq(4, left), [0, 10**9], [0, 64])
+    assert route.rank == 0
     assert router.note_reuse(4, 0)
     path = router._path(_seq(5, right).prompt_hash_chain)
     hits, _ = router._rank_hits(2, path, all_pending=True)
@@ -528,7 +546,7 @@ def test_missing_trunk_clamp_preserves_other_rank_and_active_producer():
 
 
 def test_sibling_successor_debt_uses_contiguous_confirmed_prefix():
-    router = ShareCacheRouter(_store_tier(16), 16)
+    router = ShareCacheRouter(_store_tier(16))
     trunk = list(range(512))
     left = trunk + [700] * 512
     right = trunk + [800] * 512
@@ -546,3 +564,130 @@ def test_sibling_successor_debt_uses_contiguous_confirmed_prefix():
     router.prefill_complete(4)
     path = router._path(_seq(5, right).prompt_hash_chain)
     assert router._rank_hits(2, path)[0][0] == 1024
+
+
+# The placement rule: the lockstep step time a request adds to the DP group.
+
+
+def test_smooth_max_rise_tracks_the_max():
+    import pytest
+
+    v = [10.0, 10.0, 30.0, 10.0]
+    assert _smooth_max(v, 2.0) == pytest.approx(30.0, abs=1e-3)
+    # The busiest rank: the max rises by the whole increment.
+    assert _smooth_max_rise(v, 2, 1, 2.0) == pytest.approx(1.0, abs=1e-3)
+    # Far below the max: almost nothing.
+    assert _smooth_max_rise(v, 0, 1, 2.0) < 1e-3
+    # Monotone in the rank's own value, never above the increment, zero for zero.
+    rises = [_smooth_max_rise([w, 20.0, 20.0], 0, 1, 2.0) for w in range(10, 25)]
+    assert rises == sorted(rises) and all(0 < x <= 1 for x in rises)
+    assert _smooth_max_rise(v, 1, 0, 2.0) == 0.0
+    # Large token increments and values stay finite.
+    assert _smooth_max_rise([0, 3_000_000], 0, 2_000_000, 4096.0) == pytest.approx(
+        0.0, abs=1e-6
+    )
+    assert _smooth_max_rise([0, 0], 0, 2_000_000, 4096.0) == pytest.approx(
+        2_000_000 - 4096.0 * 0.6931, rel=1e-3
+    )
+
+
+def _place(backlog, reqs, costs, owner=None, loads=None):
+    return LockstepCostPlacement()(
+        backlog, reqs, costs, owner, loads or [0] * len(backlog)
+    )
+
+
+def test_a_burst_spreads_over_decode_width_not_prefill_tokens():
+    """Every rank has a deep backlog except the one that took no cold prompt
+    this round. Balancing backlog plus a small per-request charge sends the
+    whole round there; charging the lockstep cost spreads it by decode width."""
+    n = 8
+    backlog = [60_000] * n
+    backlog[3] = 0  # nothing cold landed here this round
+    reqs = [15] * n
+
+    def by_backlog(backlog, reqs, costs, owner, loads):
+        return min(range(n), key=lambda r: backlog[r] + costs[r] + 512 * reqs[r])
+
+    picks = {}
+    for name, choose in (
+        ("backlog", by_backlog),
+        ("lockstep", LockstepCostPlacement()),
+    ):
+        b, r, count = list(backlog), list(reqs), [0] * n
+        for _ in range(16):  # one prefill cycle's arrivals, 2k uncached tokens each
+            rank = choose(b, r, [2_000] * n, None, [0] * n)
+            b[rank] += 2_000
+            r[rank] += 1
+            count[rank] += 1
+        picks[name] = count
+    assert picks["backlog"][3] == 16
+    assert max(picks["lockstep"]) <= 3
+
+
+def test_prefill_term_avoids_a_rank_with_a_huge_backlog():
+    backlog = [300_000, 10_000, 10_000, 10_000]
+    reqs = [10, 11, 11, 11]
+    assert _place(backlog, reqs, [8_000] * 4) != 0
+
+
+def test_decode_term_avoids_the_widest_rank():
+    backlog = [20_000] * 4
+    reqs = [30, 20, 20, 20]
+    assert _place(backlog, reqs, [2_000] * 4) != 0
+
+
+def test_affinity_keeps_the_owner_unless_it_is_near_the_widest():
+    n = 8
+    backlog = [40_000] * n
+    backlog[2] = 40_200  # without the load term the owner would lose a little
+    reqs = [26, 30, 26, 26, 26, 26, 26, 26]
+    loads = [90_000] * n
+    assert _place(backlog, reqs, [3_000] * n, owner=2, loads=loads) != 2
+    loads[2] = 0  # rank 2 holds the conversation in HBM: stay
+    assert _place(backlog, reqs, [3_000] * n, owner=2, loads=loads) == 2
+    # Owner is the widest by a margin: leave it anyway.
+    reqs = [20, 20, 30, 20, 20, 20, 20, 20]
+    assert _place(backlog, reqs, [3_000] * n, owner=2, loads=loads) != 2
+
+
+def test_ties_go_to_the_owner_then_round_robin():
+    p = LockstepCostPlacement()
+    z = [0] * 4
+    assert p(z, z, z, 2, z) == 2
+    assert {p(z, z, z, None, z) for _ in range(4)} == {0, 1, 2, 3}
+
+
+def test_router_passes_tier_loads_to_the_placement():
+    """End to end through the prefix index: the rank that produced a prefix
+    loads nothing, every other rank loads it from the tier, and the request
+    stays on the producer while that rank is not the widest."""
+    router = ShareCacheRouter(_store_tier(512))
+    seen = []
+    inner = router.placement
+
+    def spy(backlog, reqs, costs, owner, loads):
+        seen.append(list(loads))
+        return inner(backlog, reqs, costs, owner, loads)
+
+    router.placement = spy
+    first, _ = _route(router, _seq(1, PREFIX), [0, 0], [0, 0])
+    router.prefill_complete(1)
+    route, _ = _route(
+        router,
+        _seq(2, PREFIX + list(range(10**6, 10**6 + 2_000))),
+        [50_000, 50_000],
+        [10, 10],
+    )
+    assert seen[-1][first.rank] == 0 and seen[-1][1 - first.rank] > 0
+    assert route.rank == first.rank
+    # The producer is now much wider: the request moves and loads from the tier.
+    reqs = [10, 10]
+    reqs[first.rank] = 25
+    route, _ = _route(
+        router,
+        _seq(3, PREFIX + list(range(2 * 10**6, 2 * 10**6 + 2_000))),
+        [50_000, 50_000],
+        reqs,
+    )
+    assert route.rank != first.rank

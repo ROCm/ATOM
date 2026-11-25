@@ -228,7 +228,7 @@ class PrefixSpreadRouter:
         seq: Any,
         rank_tokens: list[int],
         rank_reqs: list[int],
-        choose: Callable[[list[int], list[int], list[int], int | None], int],
+        choose: Callable[[list[int], list[int], list[int], int | None, list[int]], int],
         decisions: tuple[str, str, str],
     ) -> Route:
         """Use a work placement rule with the common prefix/producer index.
@@ -248,7 +248,9 @@ class PrefixSpreadRouter:
             for rank in range(len(rank_tokens))
         ]
         costs = [max(0, seq.num_prompt_tokens - hit) for hit, _loaded in credits]
-        rank = choose(rank_tokens, rank_reqs, costs, owner)
+        # Tier tokens each rank would load.
+        loads = [loaded for _hit, loaded in credits]
+        rank = choose(rank_tokens, rank_reqs, costs, owner, loads)
         hit, loaded = credits[rank]
         self._record(
             chain,

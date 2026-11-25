@@ -1267,7 +1267,7 @@ class CoreManager:
                 f"rank shares and loads from ({', '.join(shared)}, kv_role "
                 f"offload or kv_both); the KV connectors are {names!r}"
             )
-        return ShareCacheRouter(tier, self._dp_lb_req_equiv)
+        return ShareCacheRouter(tier)
 
     @property
     def _routable_engine_count(self) -> int:
