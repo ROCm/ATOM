@@ -40,6 +40,9 @@ SCORE_BLOCK_SIZE_Q = _prefill_policy.SCORE_BLOCK_SIZE_Q
 _prefill_score_config = _prefill_policy.prefill_score_config
 _parallel_prefill_selector_wins = _prefill_policy.parallel_prefill_selector_wins
 PREFILL_TOPK_MIN_BLOCK_SIZE_K = _prefill_policy.PREFILL_TOPK_MIN_BLOCK_SIZE_K
+GFX950_PREFILL_TOPK_MIN_BLOCK_SIZE_K = (
+    _prefill_policy.GFX950_PREFILL_TOPK_MIN_BLOCK_SIZE_K
+)
 PREFILL_TOPK_MAX_BLOCK_SIZE_K = _prefill_policy.PREFILL_TOPK_MAX_BLOCK_SIZE_K
 PREFILL_TOPK_NUM_WARPS = _prefill_policy.PREFILL_TOPK_NUM_WARPS
 
@@ -719,8 +722,8 @@ def _score_tile_keys(
 # one place it gives something up: at exactly 128 blocks a 64-wide tile wins
 # 12%, because that shape is a first chunk whose rows span 1..128 blocks and the
 # narrow tile lets the short majority finish in one pass. The floor stays
-# because the next shape down (68 blocks) prefers 128 over 64 by 10%, so
-# lowering it is not a one-line change; it is worth ~0.1ms of a prefill step.
+# because the next shape down (68 blocks) prefers 128 over 64 by 10%; gfx950
+# floors it at 16 (seven variants), where a <= 64-block row sorts up to 1.2x faster.
 #
 # Decode cannot derive it, because it is captured: the wrapper's Python runs
 # once, at capture, and capture is handed max_seqlen_k = max_model_len so the
@@ -1294,12 +1297,16 @@ def _launch_select(
     )
 
 
-def _prefill_topk_block_size_k(max_block: int) -> int:
-    """Widest tile the row can use, so the merge chain is as short as it gets."""
-    return min(
-        PREFILL_TOPK_MAX_BLOCK_SIZE_K,
-        max(PREFILL_TOPK_MIN_BLOCK_SIZE_K, triton.next_power_of_2(max(1, max_block))),
+def _prefill_topk_block_size_k(max_block: int, topk: int, arch: str) -> int:
+    """Widest tile the row can use, so the merge chain is as short as it gets; never
+    narrower than the top-k it keeps."""
+    floor = (
+        GFX950_PREFILL_TOPK_MIN_BLOCK_SIZE_K
+        if arch == "gfx950"
+        else PREFILL_TOPK_MIN_BLOCK_SIZE_K
     )
+    width = triton.next_power_of_2(max(1, topk, max_block))
+    return min(PREFILL_TOPK_MAX_BLOCK_SIZE_K, max(floor, width))
 
 
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
@@ -1696,7 +1703,7 @@ def minimax_m3_index_topk(
         num_idx_heads,
         rows_per_req=max_query_len,
         decode_max_q=0,
-        block_size_k=_prefill_topk_block_size_k(max_block),
+        block_size_k=_prefill_topk_block_size_k(max_block, topk, get_gfx_runtime()),
         num_warps=PREFILL_TOPK_NUM_WARPS,
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,

@@ -31,6 +31,7 @@ from atom.model_ops.minimax_m3 import index_topk as m
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_SCORE_MIN_BLOCKS,
     DECODE_SCORE_TARGET_GRID,
+    GFX950_PREFILL_TOPK_MIN_BLOCK_SIZE_K,
     PREFILL_TOPK_MAX_BLOCK_SIZE_K,
     PREFILL_TOPK_MIN_BLOCK_SIZE_K,
     SPARSE_BLOCK_SIZE,
@@ -43,7 +44,8 @@ TOPK = 16
 
 
 class TestPrefillTileWidth:
-    """clamp(next_pow2(max_block), MIN, MAX), and the two ends of the clamp."""
+    """clamp(next_pow2(max_block), MIN, MAX) (MIN 16 on gfx950), and the two ends of
+    the clamp."""
 
     @pytest.mark.parametrize(
         "max_block,want",
@@ -59,18 +61,36 @@ class TestPrefillTileWidth:
         ],
     )
     def test_width(self, max_block, want):
-        assert _prefill_topk_block_size_k(max_block) == want
+        assert _prefill_topk_block_size_k(max_block, TOPK, "gfx942") == want
 
-    def test_width_is_a_power_of_two(self):
+    @pytest.mark.parametrize(
+        "max_block,want",
+        [
+            (1, GFX950_PREFILL_TOPK_MIN_BLOCK_SIZE_K),
+            (16, 16),
+            (17, 32),
+            (33, 64),
+            (64, 64),  # one 64-wide tile: 1.16x the 128 floor at 8192 tokens
+            (65, 128),
+            (2048, PREFILL_TOPK_MAX_BLOCK_SIZE_K),
+        ],
+    )
+    def test_gfx950_width(self, max_block, want):
+        assert _prefill_topk_block_size_k(max_block, TOPK, "gfx950") == want
+
+    @pytest.mark.parametrize("arch", ["gfx942", "gfx950", "gfx1250"])
+    def test_width_is_a_power_of_two(self, arch):
         # The selector tiles with tl.arange and folds with tl.topk; both need it.
         for mb in range(1, 2000):
-            w = _prefill_topk_block_size_k(mb)
+            w = _prefill_topk_block_size_k(mb, TOPK, arch)
             assert w & (w - 1) == 0
 
-    def test_width_never_below_the_topk_it_must_hold(self):
+    @pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+    @pytest.mark.parametrize("topk", [TOPK, 32, 256])
+    def test_width_never_below_the_topk_it_must_hold(self, arch, topk):
         # tl.static_assert(BLOCK_SIZE_K >= BLOCK_SIZE_T) in the kernel.
         for mb in (1, 2, 15, 16, 17, 4096):
-            assert _prefill_topk_block_size_k(mb) >= TOPK
+            assert _prefill_topk_block_size_k(mb, topk, arch) >= topk
 
 
 class TestDecodeScoreChunks:
@@ -855,7 +875,7 @@ def test_page128_prefill_emit_uses_aiter_or_fallback_without_parallel_workspace(
             1,
             rows_per_req=rows,
             decode_max_q=0,
-            block_size_k=m._prefill_topk_block_size_k(width),
+            block_size_k=m._prefill_topk_block_size_k(width, TOPK, m.get_gfx_runtime()),
             num_warps=m.PREFILL_TOPK_NUM_WARPS,
             emit=True,
             block_page_stride=1,
