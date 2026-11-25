@@ -66,6 +66,11 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange_many,
     pcp_is_enabled,
 )
+from atom.model_ops.attentions.nvfp4_mla import (
+    kup_fusable,
+    publish_prefill_kv,
+    try_nvfp4_decode,
+)
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     PERSISTENT_WORK_BUFFERS,
 )
@@ -764,6 +769,8 @@ class MLAAttention(nn.Module):
         super().__init__()
         self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
         self._flydsl_fp8_mha_ok: bool | None = None
+        self.nvfp4 = None
+        self.nvfp4_layer = 0
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -1793,8 +1800,15 @@ class MLAAttention(nn.Module):
         # Convert from (B, N, V) to (B, N * V)
         return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
 
+    def _k_up_weight(self, group=False):
+        if self.qrep_enabled and group:
+            return self.W_K_qrep, self.W_K_qrep_scale
+        return self.W_K, self.W_K_scale
+
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
-    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
+    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False, k_up=True):
+        # k_up=False returns the un-absorbed q_nope (B, N, P) for a caller that
+        # fuses the K-up itself (NVFP4, `kup_fusable`).
         # QREP: q_proj emits the full DCP-group head set. group=True (decode)
         # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
         # group=False (prefill / non-QREP) takes only this rank's heads.
@@ -1809,14 +1823,13 @@ class MLAAttention(nn.Module):
             n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
             q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        if not k_up:
+            return q_nope, q_pe
 
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
 
-        if self.qrep_enabled and group:
-            W_K, W_K_scale = self.W_K_qrep, self.W_K_qrep_scale
-        else:
-            W_K, W_K_scale = self.W_K, self.W_K_scale
+        W_K, W_K_scale = self._k_up_weight(group)
 
         if is_rocm_aiter_fp4bmm_enabled():
             # FP4 BMM: (N, B, P) x (N, P, L) -> (N, B, L)
@@ -3318,8 +3331,17 @@ class MLAAttention(nn.Module):
             )
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
             self.rotary_emb(positions, prefill_q_pe, k_rope)
+            # k_rope is post-RoPE from here. Under NVFP4 the FP4 pages are the
+            # only cache and get this latent; prefill attention runs on the
+            # forward's own K/V below, so nothing reads an FP8 copy.
+            publish_prefill_kv(self, k_nope, k_rope, positions, attn_metadata)
+            if self.nvfp4 is not None and attn_metadata.has_cached:
+                raise RuntimeError(
+                    "NVFP4 MLA prefill cannot read cached context; the history "
+                    "is only in FP4 pages."
+                )
 
-            if kv_cache.numel() > 0:
+            if self.nvfp4 is None and kv_cache.numel() > 0:
                 if self.kv_shuffled:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_cat_and_cache_mla(
@@ -3389,9 +3411,26 @@ class MLAAttention(nn.Module):
                 and self.dcp_prefill_qrep
                 and attn_metadata.dcp_sparse_prefill_kv is None,
             )
+            # NVFP4 with the fused K-up: q_nope stays un-absorbed and the
+            # NVFP4 decode quantizes it inside its own K-up GEMM. Only that path
+            # passes `k_up`, so a stand-in without it serves every other one.
+            kup_fused = kup_fusable(self) and not is_rocm_aiter_fp4bmm_enabled()
+            no_k_up = {"k_up": False} if kup_fused else {}
             q_nope, q_rope = self._q_proj_and_k_up_proj(
-                q, x_scale=q_scale, group=use_qrep
+                q, x_scale=q_scale, group=use_qrep, **no_k_up
             )
+            nvfp4_out = try_nvfp4_decode(
+                self,
+                q_nope,
+                q_rope,
+                k_nope,
+                k_rope,
+                positions,
+                attn_metadata,
+                w_k=self._k_up_weight(use_qrep)[0] if kup_fused else None,
+            )
+            if nvfp4_out is not None:
+                return nvfp4_out
 
             # ---- Prefill Context Parallel --------------------------------
             # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But

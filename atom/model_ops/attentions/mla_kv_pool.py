@@ -34,6 +34,12 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
 from atom.model_ops.indexer.layout import PRESHUFFLE
 from atom.model_ops.sparse_indexer_fp4 import fp4_index_block_shapes
 
+# One NVFP4 MLA page (64 tokens) in AITER's native layout: C codes and the
+# RoPE / residual / scale aux plane. A scheduler block is one page.
+NVFP4_PAGE_TOKENS = 64
+NVFP4_NOPE_BYTES = 16384
+NVFP4_AUX_BYTES = 8192
+
 
 class MlaKvPool:
     """`layers` MLA layers' worth of paged KV, sized and addressed.
@@ -60,13 +66,27 @@ class MlaKvPool:
         index_head_dim: int = 0,
         index_fp4: bool = False,
         index_layout: str = PRESHUFFLE,
+        nvfp4: bool = False,
     ):
         self.layers = layers
         self.block_size = block_size
         self.entry_dim = entry_dim
-        self.cache_fields = [
-            EntryField("kv", layers, (block_size, entry_dim), kv_dtype)
-        ]
+        self.nvfp4 = nvfp4
+        if nvfp4:
+            if block_size != NVFP4_PAGE_TOKENS:
+                raise ValueError(
+                    f"NVFP4 MLA pages hold {NVFP4_PAGE_TOKENS} tokens; the "
+                    f"scheduler block size is {block_size}."
+                )
+            # Two planes per layer instead of the packed latent row.
+            self.cache_fields = [
+                EntryField("kv_nope", layers, (NVFP4_NOPE_BYTES,), torch.uint8),
+                EntryField("kv_aux", layers, (NVFP4_AUX_BYTES,), torch.uint8),
+            ]
+        else:
+            self.cache_fields = [
+                EntryField("kv", layers, (block_size, entry_dim), kv_dtype)
+            ]
         self.index_fields: list[EntryField] = []
         if index_layers and index_fp4:
             data_shape, scale_shape = fp4_index_block_shapes(
@@ -126,6 +146,10 @@ class MlaKvPool:
         reshape is a view.
         """
         return self._views[name][layer]
+
+    def field(self, name: str) -> torch.Tensor:
+        """Every layer of a field, `[layers, blocks, *shape]`."""
+        return self._views[name]
 
     def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
         """One `(role, tensor)` per (field, layer), in declared field order.
