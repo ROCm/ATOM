@@ -464,9 +464,23 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
         "umbp_2p1d_kv_events": (
             "ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-c64"
         ),
+        "umbp_kv_events_wait": STORE.replace("-mcstore-", "-umbp-kvev-wait-"),
+        "umbp_2p1d_kv_events_wait": (
+            "ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-wait-c64"
+        ),
     }
     # The cells whose prefill and decode share their one node.
-    ONE_NODE = ("umbp_smoke", "umbp_2p1d", "umbp_2p1d_kv_events")
+    ONE_NODE = (
+        "umbp_smoke",
+        "umbp_2p1d",
+        "umbp_2p1d_kv_events",
+        "umbp_2p1d_kv_events_wait",
+    )
+    # Each cell whose pass waits for the copy it starts, and the cell it is.
+    WAIT = {
+        "umbp_kv_events_wait": "umbp_kv_events",
+        "umbp_2p1d_kv_events_wait": "umbp_2p1d_kv_events",
+    }
     # Each pool cell and the Store cell it is.
     STORE_SUITE = {"umbp_pool": "mooncake_store", "umbp_kv_events": "kv_events"}
     run_script = KvEventsCellsTest.run_script
@@ -533,6 +547,10 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
                 "umbp_smoke": "1P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV",
                 "umbp_2p1d": "2P1D-P2EP2-D4NOEP-DSPARK5-UMBP",
                 "umbp_2p1d_kv_events": "2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV",
+                "umbp_kv_events_wait": "8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-WAIT",
+                "umbp_2p1d_kv_events_wait": (
+                    "2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-WAIT"
+                ),
             },
         )
 
@@ -615,6 +633,9 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
                     self.assertEqual(pool["kv_connector"], "umbp_pool")
                     extra = pool["kv_connector_extra_config"]
                     self.assertEqual(extra["namespace"], f"p{port}")
+                    self.assertEqual(
+                        extra.get("fetch_wait_ms"), 50 if suite in self.WAIT else None
+                    )
                     # Where the launcher's server listens unless the case moves it.
                     self.assertIn(
                         f'"${{UMBP_POOL_ADDRESS:-{extra["address"]}}}"', source
@@ -631,7 +652,12 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
         # a rank's pool group holds at its own --kv-share-weight.
         store = self.submitted_router_args(self.cells["kv_events"])
         weight = store.index("--kv-storage-weight")
-        for suite in ("umbp_kv_events", "umbp_smoke", "umbp_2p1d_kv_events"):
+        for suite in (
+            "umbp_kv_events",
+            "umbp_smoke",
+            "umbp_2p1d_kv_events",
+            *self.WAIT,
+        ):
             with self.subTest(suite=suite):
                 args = self.submitted_router_args(self.cells[suite])
                 self.assertEqual(args, store[:weight] + store[weight + 2 :])
@@ -720,6 +746,40 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
                     self.assertEqual(
                         packed["env"][role], dict(cell["env"][role], MC_DISABLE_HIP="1")
                     )
+
+    def test_a_wait_cell_is_its_cell_with_the_wait_in_the_pools_settings(self):
+        for suite, base_suite in self.WAIT.items():
+            with self.subTest(suite=suite):
+                cell, base = self.cells[suite], self.cells[base_suite]
+                self.assertEqual(
+                    {key for key in base if cell[key] != base[key]},
+                    {"id", "suite", "name", "display_topology", "env"},
+                )
+                self.assertEqual(
+                    {
+                        role
+                        for role in base["env"]
+                        if cell["env"][role] != base["env"][role]
+                    },
+                    {"prefill"},
+                )
+                prefill, base_prefill = cell["env"]["prefill"], base["env"]["prefill"]
+                self.assertEqual(
+                    {key for key in base_prefill if prefill[key] != base_prefill[key]},
+                    {"PREFILL_KV_TRANSFER_CONFIG"},
+                )
+                # Substituted as the launcher does: the port is a bare number.
+                config, base_config = (
+                    json.loads(
+                        env["PREFILL_KV_TRANSFER_CONFIG"].replace(
+                            "${HANDSHAKE_PORT}", "6301"
+                        )
+                    )
+                    for env in (prefill, base_prefill)
+                )
+                pool = base_config["connectors"][1]["kv_connector_extra_config"]
+                pool["fetch_wait_ms"] = 50
+                self.assertEqual(config, base_config)
 
     def test_only_the_cells_of_one_node_take_mooncake_off_hip_ipc(self):
         # A prefill worker's two devices cannot open the memory of the third

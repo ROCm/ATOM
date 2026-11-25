@@ -2727,6 +2727,20 @@ models:
             kv_events: true
             extra_args: "--request-timeout-secs 1800 --prepare-timeout-ms 15000"
 
+      # The cache-aware cell with the pass that starts a copy from another
+      # rank's pool waiting up to 50 ms for it (the connector's fetch_wait_ms):
+      # the UMBP server copies a prefix in a few milliseconds, and without the
+      # wait the rank indexes it a pass, which is a forward, later.
+      umbp_kv_events_wait:
+        - <<: *dsv41_8p16d_umbp_kvev
+          name: ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-wait-c1228
+          display_topology: 8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-WAIT
+          env:
+            prefill: &dsv41_umbp_wait_env_prefill
+              <<: *dsv41_umbp_env_prefill
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"umbp_pool","kv_connector_extra_config":{"address":"unix:///tmp/umbp-l1/server.sock","namespace":"p${HANDSHAKE_PORT}","fetch_wait_ms":50}}]}
+
       umbp_smoke:
         # One prefill and one decode worker of those cells on a single node,
         # five minutes at c16: whether the server, the pool and the routing by
@@ -2791,7 +2805,17 @@ models:
           benchmark: *dsv41_one_node_aiperf
 
       umbp_2p1d_kv_events:
-        - <<: *dsv41_2p1d_umbp
+        - &dsv41_2p1d_umbp_kvev
+          <<: *dsv41_2p1d_umbp
           name: ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-c64
           display_topology: 2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV
           router: *dsv41_umbp_kvev_router
+
+      # That cell with umbp_kv_events_wait's 50 ms wait for a copy.
+      umbp_2p1d_kv_events_wait:
+        - <<: *dsv41_2p1d_umbp_kvev
+          name: ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-wait-c64
+          display_topology: 2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-WAIT
+          env:
+            common: *dsv41_one_node_env_common
+            prefill: *dsv41_umbp_wait_env_prefill
