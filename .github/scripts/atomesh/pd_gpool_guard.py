@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-GPOOL = "/share_nfs/yajizhan/gpu-pool/bin/gpool"
+GPOOL = os.environ.get("ATOMESH_GPOOL_CLI", "/share_nfs/yajizhan/gpu-pool/bin/gpool")
 
 
 def validate_lease(status, lease_id, hostname, username, mine):

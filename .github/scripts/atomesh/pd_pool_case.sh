@@ -24,7 +24,7 @@ export JOB_ID="gpool-${GPOOL_LEASE}-${case_name}"
 export SRTCTL_JOB_ID="${JOB_ID}-sa-functional"
 unset SLURM_JOB_ID SPUR_JOB_ID SPUR_TASK_OFFSET SPUR_PEER_NODES
 mkdir -p "${RUN_DIR}/bin" "${RUN_DIR}/logs"
-gpool=/share_nfs/yajizhan/gpu-pool/bin/gpool
+gpool="${ATOMESH_GPOOL_CLI:-/share_nfs/yajizhan/gpu-pool/bin/gpool}"
 finish_pool_test() {
   local rc=$? cleanup_rc=0 release_rc=0 log_rc=0 id attempt ids='' output=''
   trap - EXIT INT TERM HUP
