@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Slot-indexed MoE route capture: scatter, gather, CUDA-graph pad slots."""
 
 from contextlib import contextmanager

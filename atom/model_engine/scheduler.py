@@ -5483,7 +5483,11 @@ class Scheduler:
                 continue
             seq.apply_routed_expert_patch(start, rows[offsets[j] : offsets[j + 1]])
 
-    def _record_routes_owed(self, batch: ScheduledBatch | None) -> None:
+    def _record_routes_owed(
+        self,
+        batch: ScheduledBatch | None,
+        running_by_id: dict[int, Sequence],
+    ) -> None:
         """Set each running request's ``routed_owed_from`` after this output.
 
         ``batch`` was scheduled before the forward whose output this is, and
@@ -5507,9 +5511,8 @@ class Scheduler:
         ).tolist()
         for i, lo, _hi in batch.routed_prefix_ranges or ():
             firsts[i] = min(firsts[i], int(lo))
-        by_id = {seq.id: seq for seq in self.running}
         for req_id, first in zip(batch.req_ids, firsts):
-            seq = by_id.get(req_id)
+            seq = running_by_id.get(req_id)
             if seq is None:
                 continue
             # A speculative decode's `first` assumes the previous step's drafts
@@ -5570,7 +5573,7 @@ class Scheduler:
                     ),
                     routed,
                 )
-            self._record_routes_owed(batch)
+            self._record_routes_owed(batch, running_by_id)
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
         prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
         # `seqs` is the batch just run (empty for a DP dummy); `batch` may be None.

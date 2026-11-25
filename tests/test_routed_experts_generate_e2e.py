@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """GPU e2e: native LLM.generate() routed-expert capture.
 
 Covers tensor-parallel, CUDA-graph decode, a prefix-cache hit, concurrent

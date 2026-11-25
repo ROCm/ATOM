@@ -4586,6 +4586,11 @@ class TestMixedSpecDecodeReserve:
         assert batch.total_tokens_num == 16
 
 
+def _record_owed(scheduler, batch):
+    """`_record_routes_owed` as `postprocess` calls it, with the running index."""
+    scheduler._record_routes_owed(batch, {seq.id: seq for seq in scheduler.running})
+
+
 def _routed_output(routed_experts=None, **kwargs):
     """A `ScheduledBatchOutput` carrying a routes patch, set the way the
     runner sets it with R3 on: on every output, None when there is no patch."""
@@ -5344,17 +5349,17 @@ class TestRoutedExpertPatches:
 
         first = chunk(0, 4, False)
         assert not first.produces_output()
-        scheduler._record_routes_owed(first)
+        _record_owed(scheduler, first)
         assert (seq.routed_owed_from, seq.routed_held_from) == (0, 0)
         # A second middle chunk: chunk 0's routes are still on the device.
-        scheduler._record_routes_owed(chunk(4, 3, False))
+        _record_owed(scheduler, chunk(4, 3, False))
         assert (seq.routed_owed_from, seq.routed_held_from) == (0, 0)
         # The final chunk's copy takes both held chunks with its own rows, so
         # all three stay owed until the next output.
-        scheduler._record_routes_owed(chunk(7, 3, True))
+        _record_owed(scheduler, chunk(7, 3, True))
         assert (seq.routed_owed_from, seq.routed_held_from) == (0, None)
         # A DP dummy step's output carries that copy.
-        scheduler._record_routes_owed(None)
+        _record_owed(scheduler, None)
         assert seq.routed_owed_from is None
 
     def test_held_routes_stay_owed_past_a_step_that_leaves_them_out(
@@ -5376,7 +5381,7 @@ class TestRoutedExpertPatches:
             num_cached_tokens=[0],
             is_final_chunk=[False],
         )
-        scheduler._record_routes_owed(middle)
+        _record_owed(scheduler, middle)
         decode_other = ScheduledBatch(
             seqs={other.id: other},
             num_scheduled_tokens=[1],
@@ -5384,15 +5389,15 @@ class TestRoutedExpertPatches:
             total_seqs_num=1,
             num_cached_tokens=[2],
         )
-        scheduler._record_routes_owed(decode_other)
+        _record_owed(scheduler, decode_other)
         assert (seq.routed_owed_from, seq.routed_held_from) == (0, None)
-        scheduler._record_routes_owed(decode_other)
+        _record_owed(scheduler, decode_other)
         assert seq.routed_owed_from is None
 
-        scheduler._record_routes_owed(middle)
-        scheduler._record_routes_owed(None)
+        _record_owed(scheduler, middle)
+        _record_owed(scheduler, None)
         assert (seq.routed_owed_from, seq.routed_held_from) == (0, None)
-        scheduler._record_routes_owed(None)
+        _record_owed(scheduler, None)
         assert seq.routed_owed_from is None
 
     def test_preempt_clears_owed_routes(self, scheduler, seq_factory):
