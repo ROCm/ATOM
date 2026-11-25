@@ -17,7 +17,7 @@ from atom.models.deepseek_v41.weights import (
     checkpoint_schema,
 )
 
-from .reference import FIXTURES
+from .reference import FIXTURES, fp4ptpc_config
 
 
 @pytest.fixture(scope="module")
@@ -54,11 +54,68 @@ def test_source_schema_and_explicit_owner_slices(schema):
         build_weight_manifest(schema, tp_size=16)
 
 
-def test_published_headers_match_generated_schema(schema):
-    directory = os.environ.get("ATOM_DSV41_REFERENCE")
+def test_fp4ptpc_schema_converts_exactly_the_published_linears(schema):
+    """The published conversion: every native 32x32 FP8 linear except the
+    manifest's keep rules (`mtp.`, `.wo_a`; the engram tables are 1x32), 290
+    of them, each with an F32 per-row scale instead of its e8m0 blocks."""
+    ptpc = checkpoint_schema(fp4ptpc_config())
+    converted = {
+        n.removesuffix(".weight_scale") for n in ptpc if n.endswith(".weight_scale")
+    }
+    native_32x32 = {
+        n.removesuffix(".scale")
+        for n, spec in schema.items()
+        if n.endswith(".scale") and spec.block == (32, 32)
+    }
+    kept = {n for n in native_32x32 if n.startswith("mtp.") or n.endswith(".wo_a")}
+    assert len(converted) == 290
+    assert converted == native_32x32 - kept
+    assert len(ptpc) == len(schema)
+    for name in (
+        "layers.0.attn.wq_a",
+        "layers.0.attn.wkv",
+        "layers.0.attn.wq_b",
+        "layers.0.attn.wo_b",
+        "layers.2.attn.indexer.wq_b",
+        "layers.0.ffn.shared_experts.w2",
+        "layers.1.engram.wkv",
+    ):
+        weight, scale = ptpc[name + ".weight"], ptpc[name + ".weight_scale"]
+        assert weight.dtype == "F8_E4M3" and weight.block is None
+        assert scale.dtype == "F32" and scale.shape == (weight.shape[0], 1)
+        assert name + ".scale" not in ptpc
+    for name in (
+        "layers.0.attn.wo_a.scale",
+        "layers.0.ffn.experts.0.w1.scale",
+        "layers.1.engram.embed.scale",
+        "mtp.0.attn.wq_a.scale",
+        "mtp.0.ffn.shared_experts.w1.scale",
+        "mtp.0.main_proj.scale",
+    ):
+        assert ptpc[name].dtype == "F8_E8M0"
+    entries = {
+        e.source.name: e for e in build_weight_manifest(ptpc, tp_rank=3, tp_size=4)
+    }
+    column = entries["layers.0.attn.wq_b.weight_scale"]
+    assert (column.shape, column.start) == ((8192, 1), 3 * 8192)
+    # A row-parallel weight splits K; its per-row scale is every rank's whole.
+    row = entries["layers.0.attn.wo_b.weight_scale"]
+    assert (row.axis, row.shape, row.action) == (None, (5120, 1), "load")
+    assert row.target == "layers.0.attn.wo_b.weight_scale"
+
+
+@pytest.mark.parametrize(
+    "variable", ["ATOM_DSV41_REFERENCE", "ATOM_DSV41_FP4PTPC_REFERENCE"]
+)
+def test_published_headers_match_generated_schema(variable):
+    """A checkpoint directory's headers against the schema its own config
+    (and so its own format) generates."""
+    directory = os.environ.get(variable)
     if not directory:
-        pytest.skip("Set ATOM_DSV41_REFERENCE for complete checkpoint validation")
-    with CheckpointReader(directory, schema) as reader:
+        pytest.skip(f"Set {variable} for complete checkpoint validation")
+    config = get_hf_config(directory)
+    assert config.fp4ptpc == (variable == "ATOM_DSV41_FP4PTPC_REFERENCE")
+    with CheckpointReader(directory, checkpoint_schema(config)) as reader:
         assert len(reader.weight_map) == 96085
         assert not reader._handles  # Header validation never maps table payloads.
 

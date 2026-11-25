@@ -33,7 +33,6 @@ DRAFT_K2 = k2.LayerPostBuild(tokens=10, experts=128, topk=3, tp=4, ug_groups=1)
 def traces():
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("ARCH", "gfx950")
-        patch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
         return {
             "target_k1": trace(k1.build_attn_pre(TARGET_K1), k1.ABI),
             "target_k2": trace(k2.build_layer_post(TARGET_K2), k2.ABI),
@@ -56,7 +55,6 @@ def test_the_draft_holds(traces):
 @pytest.mark.parametrize("tok_par", [False, True], ids=["replicated", "token_parallel"])
 def test_fp4_index_layout_contract(monkeypatch, index_mfma, tok_par):
     monkeypatch.setenv("ARCH", "gfx950")
-    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
     key = k2.LayerPostBuild(
         tokens=12,
         index_bound_max=65536,

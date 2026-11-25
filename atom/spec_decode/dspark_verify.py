@@ -11,7 +11,28 @@ _MAX_ELL_INFLIGHT = 4
 
 # Steps back the adopted ell comes from. >= 2 so its copy has landed (the wait is
 # free), < _MAX_ELL_INFLIGHT so record_ell cannot reuse the slot being read.
+# >= 2 also keeps probability-ratio verification lossless; see
+# `require_ell_from_older_drafts`.
 _ELL_GENERATION = 2
+
+
+def require_ell_from_older_drafts() -> None:
+    """Refuse probability-ratio verification unless ell comes from older drafts.
+
+    The ratio test (``ATOM_SPEC_LOSSLESS_SAMPLING``) is lossless only if each
+    verified draft token x_k is distributed as q_k. With confidence-scheduled
+    verification, the verify length of a block is the ell adopted
+    ``_ELL_GENERATION`` steps back, i.e. computed from the confidence of drafts
+    at least two steps older than the block being verified, so it does not
+    depend on the samples it selects. An ell taken from the draft being
+    verified would pick positions by their sampled values and bias the output.
+    """
+    if _ELL_GENERATION < 2:
+        raise RuntimeError(
+            "probability-ratio verification needs the verify length adopted "
+            f"from drafts at least two steps old (_ELL_GENERATION >= 2, got "
+            f"{_ELL_GENERATION}); otherwise it depends on the verified samples"
+        )
 
 
 class VerifyScheduler:

@@ -30,6 +30,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from atom.config import KVCacheTensor
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     LoadOperationId,
@@ -42,6 +43,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_STORE_CHANNEL,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+from atom.kv_transfer.offload.kv_store import worker as store_worker_mod
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -49,7 +51,6 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
 )
 from atom.kv_transfer.offload.mooncake_store import keys
-from atom.kv_transfer.offload.mooncake_store import worker as worker_mod
 from atom.kv_transfer.offload.mooncake_store.worker import (
     MooncakeStoreOffloadConnector,
 )
@@ -130,7 +131,8 @@ def _config():
 def _kv_caches(device):
     """Two GLM-5.2-like layers: 576-byte MLA rows and 144-byte indexer rows."""
     return {
-        f"layer_{layer}": SimpleNamespace(
+        f"layer_{layer}": KVCacheTensor(
+            layer_num=layer,
             k_cache=torch.randint(
                 0, 256, (NUM_BLOCKS * BLOCK, 1, 576), dtype=torch.uint8, device=device
             ),
@@ -163,7 +165,9 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
     if _RDMA_DEVICE:
         monkeypatch.setenv("MC_NUM_QP_PER_EP", "1")
     monkeypatch.setattr(
-        worker_mod, "_tp_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0)
+        store_worker_mod,
+        "_tp_group",
+        lambda: SimpleNamespace(world_size=1, rank_in_group=0),
     )
     device = torch.device("cuda", torch.cuda.current_device())
     kv_caches = _kv_caches(device)
@@ -230,7 +234,8 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
             assert isinstance(worker._codec, DSV4PageSlotCodec)
         for cache in all_caches.values():
             for tensor in vars(cache).values():
-                tensor.reshape(NUM_BLOCKS, -1)[DESTINATION[0] :].zero_()
+                if isinstance(tensor, torch.Tensor) and tensor.numel():
+                    tensor.reshape(NUM_BLOCKS, -1)[DESTINATION[0] :].zero_()
         torch.cuda.synchronize(device)
 
         tokens = torch.randint(0, 150_000, (PROMPT,)).tolist()
@@ -294,10 +299,11 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
         torch.cuda.synchronize(device)
         for name, cache in all_caches.items():
             for field, tensor in vars(cache).items():
-                blocks = tensor.reshape(NUM_BLOCKS, -1)
-                assert torch.equal(
-                    blocks[DESTINATION], blocks[SOURCE]
-                ), f"{name}.{field} differs after the Store round trip"
+                if isinstance(tensor, torch.Tensor) and tensor.numel():
+                    blocks = tensor.reshape(NUM_BLOCKS, -1)
+                    assert torch.equal(
+                        blocks[DESTINATION], blocks[SOURCE]
+                    ), f"{name}.{field} differs after the Store round trip"
         assert worker._pool.quarantined("save") == 0
         assert worker._pool.quarantined("load") == 0
     finally:

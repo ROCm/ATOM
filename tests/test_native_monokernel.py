@@ -468,6 +468,7 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
         ):
             setattr(value, attribute, {})
         value._refused, value._announced = set(), set()
+        value._attention = module.AttentionWeight.FP8_PTPC
         value._cur_pos = None
         value._fused_indexer_on = False
         value._indexer_cp = False
@@ -565,6 +566,9 @@ def test_glm_q6_sparse_rows_are_intra_request_causal():
 
 def test_glm_tp4_symmetric_and_split_schedule_contracts():
     cfg, samples = glm5_tp_config(4), 12
+    assert glm_layout.uv_by_head(4, 1)
+    assert not glm_layout.uv_by_head(3, 1)
+    assert not glm_layout.uv_by_head(4, 4)
     scratch, symmetric = glm_layout.layout(
         samples, cfg.local_heads, 4, 2048, inter=cfg.inter
     )
@@ -573,12 +577,18 @@ def test_glm_tp4_symmetric_and_split_schedule_contracts():
     assert symmetric["_part_stride"] == part and symmetric["_bytes"] == 4 * part
     stages = dict(
         glm_layout.stage_tasks(
-            samples, cfg.local_heads, 2048, expert_mxfp4=True, inter=cfg.inter
+            samples,
+            cfg.local_heads,
+            2048,
+            expert_mxfp4=True,
+            inter=cfg.inter,
+            uv_by_head=glm_layout.uv_by_head(samples, 1),
         )
     )
     assert stages["split"] == samples * 2 * (
         2048 // glm_layout.sparse_keys_per_task(samples, cfg.local_heads)
     )
+    assert stages["uv"] == samples * cfg.local_heads * 2
     assert stages["ug"] >= samples * 9 * (cfg.inter // glm_layout.UG_TILE)
     assert [glm_layout.down_prefetch_batch(s, True) for s in (4, 5, 6, 8, 12)] == [
         9,

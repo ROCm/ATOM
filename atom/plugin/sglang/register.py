@@ -250,6 +250,13 @@ def register_plugin() -> None:
     _install_loader_quant_patch()
     _register_tc_piecewise_attention_split_ops()
     _install_decode_graph_forward_context_patch()
+    # Before SGLang resolves its server args: whether a DeepSeek-V4.1 launch
+    # ATOM serves keeps SGLang's radix cache on.
+    from atom.plugin.sglang.deepseek_v41_radix import (
+        register_v41_radix_launch_policy,
+    )
+
+    register_v41_radix_launch_policy()
     apply_prefill_compile_only_patch()
     apply_triton_kernel_retention_patch()
     apply_xgrammar_hip_bitmask_patch()
@@ -266,8 +273,9 @@ def register_plugin() -> None:
     # 0.5.20 recognizes Flash. This call only installs MTP draft-arch and
     # HC hidden-width adapters that upstream still does not provide.
     apply_qwen4_exp_recognition_patch()
-    # EP decode asm MoE and HIP topk=1 Triton tree/verify. Plugin-only;
-    # keeps Ling's Flash MTP adapter off atom/model_ops and eagle3_llama.
+    # HIP topk=1 Triton tree/verify and the gfx950 BF16 hipBLASLt bypass.
+    # Plugin-only; keeps Ling's Flash MTP adapter off atom/model_ops and
+    # eagle3_llama.
     apply_qwen4_exp_rocm_patch()
     _keep_atom_full_attn_for_native_qwen4_exp()
     install_sglang_replayssm_commit()
