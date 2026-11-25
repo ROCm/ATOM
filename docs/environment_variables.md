@@ -375,7 +375,7 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_TOOL_CALL_GRAMMAR** | bool | 0 (false) | `1`: on a chat request that declares tools and sets no `response_format`, hold each tool call to its tool's schema when the tool parser declares a grammar for its format (Kimi-K3: a call cannot close before its required arguments). Needs the `atom[structured-output]` extra. Where it cannot apply -- extra not installed, P/D, relaxed MTP, custom stop strings, speculative logprobs, a schema that fails the structured-output safety checks, or a grammar that fails to prepare -- the output stays unconstrained. Off by default: every constrained request computes a CPU token mask per decode position. |
+| **ATOM_TOOL_CALL_GRAMMAR** | bool | 0 (false) | `1`: on a chat request that declares tools and sets no `response_format`, hold each tool call to its tool's schema when the tool parser declares a grammar for its format (Kimi-K3: a call cannot close before its required arguments). Needs ATOM's structured-output backend (llguidance and RE2, in the base install). Where it cannot apply -- backend unavailable (e.g. the vLLM image's older llguidance), P/D, relaxed MTP, custom stop strings, speculative logprobs, a schema that fails the structured-output safety checks, or a grammar that fails to prepare -- the output stays unconstrained. Off by default: every constrained request computes a CPU token mask per decode position. |
 
 ## API image input
 

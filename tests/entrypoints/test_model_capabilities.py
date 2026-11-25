@@ -8,7 +8,7 @@ from atom.entrypoints.openai.model_capabilities import deployment_metadata
 
 @pytest.fixture(autouse=True)
 def _no_structured_output(monkeypatch):
-    """The other cases describe a deployment without the optional extra,
+    """The other cases describe a deployment without the structured-output backend,
     whatever this environment has installed."""
     monkeypatch.setattr(structured_output, "available", lambda: False)
 

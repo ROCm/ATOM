@@ -1189,17 +1189,17 @@ PATTERN_PARAMETERS = {
         ),
     ],
 )
-def test_without_the_backend_a_pattern_is_a_400_naming_the_extra(
+def test_without_the_backend_a_pattern_is_a_400_naming_it(
     engine, monkeypatch, handler, kwargs
 ):
-    """`pattern` is checked with RE2, which comes with the extra."""
+    """`pattern` is checked with RE2, part of the structured-output backend."""
     monkeypatch.setattr(structured_output, "available", lambda: False)
     monkeypatch.setitem(sys.modules, "re2", None)
     _template(monkeypatch, engine, "<A>")
     with pytest.raises(HTTPException) as exc:
         _chat(handler, [USER], **kwargs)
     assert exc.value.status_code == 400
-    assert "atom[structured-output]" in exc.value.detail
+    assert exc.value.detail == structured_output.UNAVAILABLE
     assert not engine.prompts
 
 
