@@ -1,0 +1,628 @@
+{
+  "lease": "L341ede",
+  "node": "pit2-p03-g53",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "harness_sha": "39d4e1abbad1e6ee369e6109e995e29e7113b5a0",
+  "kind": "diagnostic only; profiler overhead; not a new SA performance point",
+  "duration_seconds": 900.002,
+  "exit_codes": {
+    "pool-workload.rc": 0,
+    "pool-exit.rc": 0,
+    "gpool-release.rc": 0
+  },
+  "capture_complete": true,
+  "trace_files": 16,
+  "archive_sha256": "cfc87d469e98d8571438ceb68b85ac6fbe354c4224c2d9e126f1284694b3f32b",
+  "record_accounting": {
+    "warmup": {
+      "records": 884,
+      "errors": 832,
+      "valid": 52
+    },
+    "profiling": {
+      "records": 2991,
+      "valid": 2991
+    }
+  },
+  "drain_cancelled": 5,
+  "final_running_waiting_gauges": "zero on P and all four D ranks",
+  "kv_probe_bytes": 101376000,
+  "native_pp_send_failures": 0,
+  "windows": [
+    {
+      "window": 1,
+      "decode_rank_step_samples": 512,
+      "kernel_sum_ms_all_ranks": 12633.894488999795,
+      "kernel_categories": {
+        "moe_expert_gemm": {
+          "share_of_kernel_sum_pct": 32.306823763280654,
+          "sum_ms_per_rank_step": 7.971894583984358
+        },
+        "other_gemm_linear": {
+          "share_of_kernel_sum_pct": 22.074556776045455,
+          "sum_ms_per_rank_step": 5.447023851562379
+        },
+        "rccl_collective": {
+          "share_of_kernel_sum_pct": 16.47768458738174,
+          "sum_ms_per_rank_step": 4.065963447265606
+        },
+        "other_kernels": {
+          "share_of_kernel_sum_pct": 13.9138901352265,
+          "sum_ms_per_rank_step": 3.433332419921615
+        },
+        "sparse_attention_index_kv": {
+          "share_of_kernel_sum_pct": 9.863450079348016,
+          "sum_ms_per_rank_step": 2.43386303906249
+        },
+        "moe_routing_sorting": {
+          "share_of_kernel_sum_pct": 5.14698135690615,
+          "sum_ms_per_rank_step": 1.2700472539062753
+        },
+        "copy": {
+          "share_of_kernel_sum_pct": 0.21661330181147365,
+          "sum_ms_per_rank_step": 0.05345057812500051
+        }
+      },
+      "per_rank": [
+        {
+          "dp": 0,
+          "kernel_sum_ms": 3159.9826869999456,
+          "gpu_active_span_ms": 3195.359876953125,
+          "kernel_union_ms": 3115.9674228515623,
+          "kernel_union_span_percent": 97.51538301916509,
+          "kernel_overlap_ms": 44.01526414838293,
+          "gpu_execute_annotation_shapes": {
+            "execute_context_0(0)_generation_2(16)": {
+              "count": 8,
+              "mean_ms": 20.704865844726562,
+              "median_ms": 20.72994384765625
+            },
+            "execute_context_0(0)_generation_3(24)": {
+              "count": 89,
+              "mean_ms": 21.839119722173454,
+              "median_ms": 22.1150673828125
+            },
+            "execute_context_0(0)_generation_4(32)": {
+              "count": 31,
+              "mean_ms": 22.199619644657258,
+              "median_ms": 22.1625791015625
+            }
+          }
+        },
+        {
+          "dp": 1,
+          "kernel_sum_ms": 3157.183754999954,
+          "gpu_active_span_ms": 3195.4491376953124,
+          "kernel_union_ms": 3114.1215615234373,
+          "kernel_union_span_percent": 97.4548937358292,
+          "kernel_overlap_ms": 43.062193476516754,
+          "gpu_execute_annotation_shapes": {
+            "execute_context_0(0)_generation_3(24)": {
+              "count": 72,
+              "mean_ms": 21.575361043294272,
+              "median_ms": 22.056086914062497
+            },
+            "execute_context_0(0)_generation_4(32)": {
+              "count": 55,
+              "mean_ms": 22.252742436079544,
+              "median_ms": 22.18784375
+            },
+            "execute_context_1(8)_generation_3(24)": {
+              "count": 1,
+              "mean_ms": 22.1422275390625,
+              "median_ms": 22.1422275390625
+            }
+          }
+        },
+        {
+          "dp": 2,
+          "kernel_sum_ms": 3158.8092359999473,
+          "gpu_active_span_ms": 3195.4146142578124,
+          "kernel_union_ms": 3116.8342958984376,
+          "kernel_union_span_percent": 97.54084124142285,
+          "kernel_overlap_ms": 41.974940101509915,
+          "gpu_execute_annotation_shapes": {
+            "execute_context_0(0)_generation_2(16)": {
+              "count": 6,
+              "mean_ms": 22.240236653645834,
+              "median_ms": 22.25980078125
+            },
+            "execute_context_0(0)_generation_3(24)": {
+              "count": 71,
+              "mean_ms": 21.58082285706426,
+              "median_ms": 22.138904296875
+            },
+            "execute_context_0(0)_generation_4(32)": {
+              "count": 49,
+              "mean_ms": 22.215720603475766,
+              "median_ms": 22.108107421875
+            },
+            "execute_context_1(8)_generation_2(16)": {
+              "count": 1,
+              "mean_ms": 22.3274296875,
+              "median_ms": 22.3274296875
+            },
+            "execute_context_1(8)_generation_3(24)": {
+              "count": 1,
+              "mean_ms": 22.08810546875,
+              "median_ms": 22.08810546875
+            }
+          }
+        },
+        {
+          "dp": 3,
+          "kernel_sum_ms": 3157.9188109999473,
+          "gpu_active_span_ms": 3195.345271484375,
+          "kernel_union_ms": 3115.4077431640626,
+          "kernel_union_span_percent": 97.49831327982974,
+          "kernel_overlap_ms": 42.51106783588463,
+          "gpu_execute_annotation_shapes": {
+            "execute_context_0(0)_generation_2(16)": {
+              "count": 11,
+              "mean_ms": 21.120370738636364,
+              "median_ms": 20.843853515625
+            },
+            "execute_context_0(0)_generation_3(24)": {
+              "count": 71,
+              "mean_ms": 21.73309071027729,
+              "median_ms": 22.096947265625
+            },
+            "execute_context_0(0)_generation_4(32)": {
+              "count": 45,
+              "mean_ms": 22.209652690972224,
+              "median_ms": 22.209068359375
+            },
+            "execute_context_1(8)_generation_3(24)": {
+              "count": 1,
+              "mean_ms": 26.7911630859375,
+              "median_ms": 26.7911630859375
+            }
+          }
+        }
+      ],
+      "mean_gpu_execute_annotation_span_ms": 21.869614429473877
+    },
+    {
+      "window": 2,
+      "decode_rank_step_samples": 512,
+      "kernel_sum_ms_all_ranks": 16251.902502999688,
+      "kernel_categories": {
+        "moe_expert_gemm": {
+          "share_of_kernel_sum_pct": 28.008134100975834,
+          "sum_ms_per_rank_step": 8.890341107421877
+        },
+        "other_gemm_linear": {
+          "share_of_kernel_sum_pct": 24.95604562143587,
+          "sum_ms_per_rank_step": 7.921547271484141
+        },
+        "rccl_collective": {
+          "share_of_kernel_sum_pct": 17.11706989065752,
+          "sum_ms_per_rank_step": 5.433299824218702
+        },
+        "sparse_attention_index_kv": {
+          "share_of_kernel_sum_pct": 14.123722084699283,
+          "sum_ms_per_rank_step": 4.483151451171802
+        },
+        "other_kernels": {
+          "share_of_kernel_sum_pct": 10.624940758050547,
+          "sum_ms_per_rank_step": 3.3725683847653336
+        },
+        "moe_routing_sorting": {
+          "share_of_kernel_sum_pct": 4.99810195052605,
+          "sum_ms_per_rank_step": 1.586497375000038
+        },
+        "copy": {
+          "share_of_kernel_sum_pct": 0.1719855936549042,
+          "sum_ms_per_rank_step": 0.05459166210937549
+        }
+      },
+      "per_rank": [
+        {
+          "dp": 0,
+          "kernel_sum_ms": 4064.3635779999445,
+          "gpu_active_span_ms": 4083.7857392578126,
+          "kernel_union_ms": 4005.0519619140623,
+          "kernel_union_span_percent": 98.07203946605534,
+          "kernel_overlap_ms": 59.31161608588183,
+          "gpu_execute_annotation_shapes": {
+            "execute_context_0(0)_generation_10(80)": {
+              "count": 11,
+              "mean_ms": 29.488818892045455,
+              "median_ms": 29.5395537109375
+            },
+            "execute_context_0(0)_generation_6(48)": {
+              "count": 45,
+              "mean_ms": 28.17447571614583,
+              "median_ms": 28.2126591796875
+            },
+            "execute_context_0(0)_generation_7(56)": {
+              "count": 31,
+              "mean_ms": 28.24834982988911,
+              "median_ms": 27.8944697265625
+            },
+            "execute_context_0(0)_generation_8(64)": {
+              "count": 30,
+              "mean_ms": 28.56953154296875,
+              "median_ms": 28.611181640625
+            },
+            "execute_context_0(0)_generation_9(72)": {
+              "count": 5,
+              "mean_ms": 28.3614603515625,
+              "median_ms": 28.356060546875
+            },
+            "execute_context_1(8)_generation_6(48)": {
+              "count": 2,
+              "mean_ms": 28.80234521484375,
+              "median_ms": 28.80234521484375
+            },
+            "execute_context_1(8)_generation_7(56)": {
+              "count": 1,
+              "mean_ms": 28.660263671875,
+              "median_ms": 28.660263671875
+            },
+            "execute_context_1(8)_generation_8(64)": {
+              "count": 2,
+              "mean_ms": 28.52754150390625,
+              "median_ms": 28.52754150390625
+            },
+            "execute_context_1(8)_generation_9(72)": {
+              "count": 1,
+              "mean_ms": 29.000068359375,
+              "median_ms": 29.000068359375
+            }
+          }
+        },
+        {
+          "dp": 1,
+          "kernel_sum_ms": 4063.560921999907,
+          "gpu_active_span_ms": 4083.4374482421877,
+          "kernel_union_ms": 4004.1166337890627,
+          "kernel_union_span_percent": 98.05749897094003,
+          "kernel_overlap_ms": 59.44428821084462,
+          "gpu_execute_annotation_shapes": {
+            "execute_context_0(0)_generation_6(48)": {
+              "count": 11,
+              "mean_ms": 28.771970348011365,
+              "median_ms": 28.76191015625
+            },
+            "execute_context_0(0)_generation_7(56)": {
+              "count": 45,
+              "mean_ms": 28.54437016059028,
+              "median_ms": 28.5009814453125
+            },
+            "execute_context_0(0)_generation_8(64)": {
+              "count": 40,
+              "mean_ms": 28.321150244140625,
+              "median_ms": 27.96947314453125
+            },
+            "execute_context_0(0)_generation_9(72)": {
+              "count": 30,
+              "mean_ms": 28.592601660156248,
+              "median_ms": 28.523341796875002
+            },
+            "execute_context_1(8)_generation_6(48)": {
+              "count": 1,
+              "mean_ms": 28.76610546875,
+              "median_ms": 28.76610546875
+            },
+            "execute_context_2(16)_generation_7(56)": {
+              "count": 1,
+              "mean_ms": 29.2826708984375,
+              "median_ms": 29.2826708984375
+            }
+          }
+        },
+        {
+          "dp": 2,
+          "kernel_sum_ms": 4064.003718999934,
+          "gpu_active_span_ms": 4083.7509609375,
+          "kernel_union_ms": 4006.2003125,
+          "kernel_union_span_percent": 98.10099466937874,
+          "kernel_overlap_ms": 57.803406499933914,
+          "gpu_execute_annotation_shapes": {
+            "execute_context_0(0)_generation_5(40)": {
+              "count": 73,
+              "mean_ms": 28.231976896939212,
+              "median_ms": 28.3025390625
+            },
+            "execute_context_0(0)_generation_7(56)": {
+              "count": 15,
+              "mean_ms": 28.179749674479165,
+              "median_ms": 28.1358974609375
+            },
+            "execute_context_0(0)_generation_9(72)": {
+              "count": 38,
+              "mean_ms": 28.838630833675985,
+              "median_ms": 28.592814453125
+            },
+            "execute_context_2(16)_generation_5(40)": {
+              "count": 1,
+              "mean_ms": 28.47990234375,
+              "median_ms": 28.47990234375
+            },
+            "execute_context_2(16)_generation_7(56)": {
+              "count": 1,
+              "mean_ms": 28.856666015625,
+              "median_ms": 28.856666015625
+            }
+          }
+        },
+        {
+          "dp": 3,
+          "kernel_sum_ms": 4059.9742839999035,
+          "gpu_active_span_ms": 4083.616005859375,
+          "kernel_union_ms": 4005.4144541015626,
+          "kernel_union_span_percent": 98.08499252511488,
+          "kernel_overlap_ms": 54.55982989834109,
+          "gpu_execute_annotation_shapes": {
+            "execute_context_0(0)_generation_7(56)": {
+              "count": 44,
+              "mean_ms": 28.62868614612926,
+              "median_ms": 28.45092578125
+            },
+            "execute_context_0(0)_generation_8(64)": {
+              "count": 82,
+              "mean_ms": 28.553864376905487,
+              "median_ms": 28.70240380859375
+            },
+            "execute_context_1(8)_generation_7(56)": {
+              "count": 2,
+              "mean_ms": 28.522062499999997,
+              "median_ms": 28.522062499999997
+            }
+          }
+        }
+      ],
+      "mean_gpu_execute_annotation_span_ms": 28.483906393051146
+    }
+  ],
+  "trace_inventory": [
+    {
+      "file": "logs/torch-traces/window-1/decode/dp0_pp0_tp0_dcp0_ep0_rank0.1795585733051874945.pt.trace.json.gz",
+      "sha256": "6bc7ea952ac41a7b59da3541eeaa5b4040848aaa3e74bb056409ecb66efba8ce",
+      "gpu_steps": 128,
+      "parallel_ranks": {
+        "dp": 0,
+        "pp": 0,
+        "tp": 0,
+        "ep": 0,
+        "rank": 0
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-1/decode/dp1_pp0_tp0_dcp0_ep1_rank0.1795585733060474695.pt.trace.json.gz",
+      "sha256": "546f98e65d7ae1f40ad982d5d16517a652417414dd592302b3a85e2f6d2ad618",
+      "gpu_steps": 128,
+      "parallel_ranks": {
+        "dp": 1,
+        "pp": 0,
+        "tp": 0,
+        "ep": 1,
+        "rank": 0
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-1/decode/dp2_pp0_tp0_dcp0_ep2_rank0.1795585733051861095.pt.trace.json.gz",
+      "sha256": "67b1b5643401e01653a1f42f973e0b128bf351e1ad0dd2af68ad71cd64f44974",
+      "gpu_steps": 128,
+      "parallel_ranks": {
+        "dp": 2,
+        "pp": 0,
+        "tp": 0,
+        "ep": 2,
+        "rank": 0
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-1/decode/dp3_pp0_tp0_dcp0_ep3_rank0.1795585733066212229.pt.trace.json.gz",
+      "sha256": "05143d5f827d6499ec8489963dc5d71fa8bb1932472ec605e9bb1c8403d764af",
+      "gpu_steps": 128,
+      "parallel_ranks": {
+        "dp": 3,
+        "pp": 0,
+        "tp": 0,
+        "ep": 3,
+        "rank": 0
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-1/prefill/dp0_pp0_tp0_dcp0_ep0_rank0.1795585731087713415.pt.trace.json.gz",
+      "sha256": "d40d877e08943cc0affb51ea684005c9102eb3ee17193c479e0f7d16217da7f1",
+      "gpu_steps": 5,
+      "parallel_ranks": {
+        "dp": 0,
+        "pp": 0,
+        "tp": 0,
+        "ep": 0,
+        "rank": 0
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-1/prefill/dp0_pp1_tp0_dcp0_ep0_rank1.1795585732452460058.pt.trace.json.gz",
+      "sha256": "72ee2962310f3c53978b61648330cdf76257d9bccc2c8beb322b647e8ec68a30",
+      "gpu_steps": 5,
+      "parallel_ranks": {
+        "dp": 0,
+        "pp": 1,
+        "tp": 0,
+        "ep": 0,
+        "rank": 1
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-1/prefill/dp0_pp2_tp0_dcp0_ep0_rank2.1795585732488683060.pt.trace.json.gz",
+      "sha256": "5081d62e8c4fceb24771e59a89f7a883fc0bf8bab9ba99d82c7343953a060c05",
+      "gpu_steps": 5,
+      "parallel_ranks": {
+        "dp": 0,
+        "pp": 2,
+        "tp": 0,
+        "ep": 0,
+        "rank": 2
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-1/prefill/dp0_pp3_tp0_dcp0_ep0_rank3.1795585732531364609.pt.trace.json.gz",
+      "sha256": "a28a5ccce98ae90b06d6dd7c0e135506e3a80b3c999a3d0508d3135abc7bb06e",
+      "gpu_steps": 5,
+      "parallel_ranks": {
+        "dp": 0,
+        "pp": 3,
+        "tp": 0,
+        "ep": 0,
+        "rank": 3
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-2/decode/dp0_pp0_tp0_dcp0_ep0_rank0.1795586213965892894.pt.trace.json.gz",
+      "sha256": "735c9d92008309c20930d41209d46a26b16763a552137598fe9c661706e77919",
+      "gpu_steps": 128,
+      "parallel_ranks": {
+        "dp": 0,
+        "pp": 0,
+        "tp": 0,
+        "ep": 0,
+        "rank": 0
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-2/decode/dp1_pp0_tp0_dcp0_ep1_rank0.1795586213948252278.pt.trace.json.gz",
+      "sha256": "482bec5cb2a00968b907f5156324e8506ea9d2f76b609f4812a2feee893066cb",
+      "gpu_steps": 128,
+      "parallel_ranks": {
+        "dp": 1,
+        "pp": 0,
+        "tp": 0,
+        "ep": 1,
+        "rank": 0
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-2/decode/dp2_pp0_tp0_dcp0_ep2_rank0.1795586213960005342.pt.trace.json.gz",
+      "sha256": "f0ded455739d1c2cddd0e0a418a7b83110c72e938e05484333f0092b022cf439",
+      "gpu_steps": 128,
+      "parallel_ranks": {
+        "dp": 2,
+        "pp": 0,
+        "tp": 0,
+        "ep": 2,
+        "rank": 0
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-2/decode/dp3_pp0_tp0_dcp0_ep3_rank0.1795586213981611872.pt.trace.json.gz",
+      "sha256": "631e5783587b99b14afd707eb5472c70c1b2130cd0dd3439f108a2499c1ecc44",
+      "gpu_steps": 128,
+      "parallel_ranks": {
+        "dp": 3,
+        "pp": 0,
+        "tp": 0,
+        "ep": 3,
+        "rank": 0
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-2/prefill/dp0_pp0_tp0_dcp0_ep0_rank0.1795586209576323584.pt.trace.json.gz",
+      "sha256": "8fc7766eb587c097fabd7142e7ef4457b1479ac4e7c6bf9619d94715ff19eb6c",
+      "gpu_steps": 1,
+      "parallel_ranks": {
+        "dp": 0,
+        "pp": 0,
+        "tp": 0,
+        "ep": 0,
+        "rank": 0
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-2/prefill/dp0_pp1_tp0_dcp0_ep0_rank1.1795586209576937550.pt.trace.json.gz",
+      "sha256": "3df1e203d00e3f52b36fa0ae680064a38c6fc44bb78070438709649ff5751170",
+      "gpu_steps": 1,
+      "parallel_ranks": {
+        "dp": 0,
+        "pp": 1,
+        "tp": 0,
+        "ep": 0,
+        "rank": 1
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-2/prefill/dp0_pp2_tp0_dcp0_ep0_rank2.1795586209577341321.pt.trace.json.gz",
+      "sha256": "e3a47425ca5efa1552de7cc3295d879bc418aca2efd1913a3e2a327215b51722",
+      "gpu_steps": 1,
+      "parallel_ranks": {
+        "dp": 0,
+        "pp": 2,
+        "tp": 0,
+        "ep": 0,
+        "rank": 2
+      }
+    },
+    {
+      "file": "logs/torch-traces/window-2/prefill/dp0_pp3_tp0_dcp0_ep0_rank3.1795586209578746621.pt.trace.json.gz",
+      "sha256": "b6b37aa300c2041b9f754f0556e4f3682ab28c9db4a82e85d7c75a5149a062a2",
+      "gpu_steps": 1,
+      "parallel_ranks": {
+        "dp": 0,
+        "pp": 3,
+        "tp": 0,
+        "ep": 0,
+        "rank": 3
+      }
+    }
+  ],
+  "limits": [
+    "Kernel category shares use summed kernel durations, not additive wall-time fractions. Union time and overlap are reported separately.",
+    "GPU step spans combine all GPU annotations sharing one external id; graph labels record capture shape, not necessarily actual active requests.",
+    "Profiling changes timing; no matched TP GPU trace was rerun, so this identifies PP/DEP hotspots but does not prove the entire TP gap is caused by one kernel."
+  ],
+  "confirmed_kernel_route_difference": {
+    "image_digest": "sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+    "layer_digest": "sha256:57f0d7b4b182410593fb1b707860544bf53f1252cd16d0a164bb2979ed4811d2",
+    "source_path": "usr/local/lib/python3.12/dist-packages/vllm/models/minimax_m3/amd/akr_moe.py",
+    "source_sha256": "784cf248ab2d6f2f6a79ad7d3e03ab67e4fc04c12691d1cb91f1220c24669d0d",
+    "guard": "    if (\n        mc.ep_size > 1\n        or mc.dp_size > 1\n        or mc.is_sequence_parallel\n        or getattr(mc, \"pcp_size\", 1) > 1\n    ):\n        return \"needs plain TP (no EP, DP, SP or PCP)\"\n",
+    "logs": {
+      "tp40": {
+        "sha256": "7c41943fd3b0a52ff660b5bbcaa6268a163ebe2f8b37c11e4e384da05d34a741",
+        "lines": [
+          "(Worker_TP0 pid=1699) INFO 11-23 20:48:09 [akr_moe.py:33] amd_kernels moe: MoE blocks run on amd_kernels mxfp4_moe"
+        ]
+      },
+      "dep_profile": {
+        "sha256": "54c7bcf7496c09ef2b2ba77f9702c996caf53adaa25ff878bc6e6d15b4622dcb",
+        "lines": [
+          "(Worker_DP1_EP1 pid=3328) WARNING 11-25 05:24:28 [akr_moe.py:28] amd_kernels moe off for language_model.model.layers.3.block_sparse_moe: needs plain TP (no EP, DP, SP or PCP)",
+          "(Worker_DP2_EP2 pid=3362) WARNING 11-25 05:24:28 [akr_moe.py:28] amd_kernels moe off for language_model.model.layers.3.block_sparse_moe: needs plain TP (no EP, DP, SP or PCP)"
+        ]
+      }
+    },
+    "package_required_geometry": {
+      "hidden_size": 6144,
+      "intermediate_size_per_rank": 768,
+      "experts_per_rank": 128,
+      "top_k": 4
+    },
+    "dep4_geometry_from_model_and_sharding": {
+      "hidden_size": 6144,
+      "intermediate_size_per_rank": 3072,
+      "experts_per_rank": 32,
+      "top_k": 4
+    },
+    "implication": "Same worker image selects different MoE implementations in TP and DEP. The amd_kernels whole-block route explicitly rejects DEP; stock AITER is used. Removing the guard is invalid because weights and routing geometry also differ.",
+    "remaining": "The quantitative gain from adding a DEP fast path is not measured; no TP rerun or candidate worker change occurred."
+  },
+  "next_actions": [
+    "Evaluate an EP-compatible optimized MoE path with E32/I3072 weight geometry and correct expert mapping; preserve shared-expert handling and collectives.",
+    "Check TP1 dense MXFP8 shape coverage and the generic linear hotspot; select a candidate only after operator-level correctness/timing validation.",
+    "Retain P sender1 for this profile only; sender10 native PP timeout remains an independent unresolved issue."
+  ]
+}
