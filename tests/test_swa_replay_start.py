@@ -135,6 +135,7 @@ def test_a_backed_off_chunk_has_to_pass_where_it_resumed():
     scheduler = SimpleNamespace(
         long_prefill_token_threshold=128,
         max_num_batched_tokens=16384,
+        _step_budget=0,  # no ATOM_PREFILL_STEP_TOKENS
         block_manager=SimpleNamespace(block_size=128),
         _tick_cost_limit=math.inf,  # no DP prefill cost balancing
         _dynamic_chunk_limit=lambda history_len, kind: None,

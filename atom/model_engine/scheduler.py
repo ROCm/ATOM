@@ -80,6 +80,23 @@ logger = logging.getLogger("atom")
 _DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
 
 
+def adaptive_prefill_step(config) -> int:
+    """`ATOM_PREFILL_STEP_TOKENS` on the chunk grid for a chunked-prefill P/D
+    producer under PP, when below `max_num_batched_tokens`; else 0 (off)."""
+    tokens = envs.ATOM_PREFILL_STEP_TOKENS
+    if not tokens or not config.enable_chunked_prefill:
+        return 0
+    if getattr(config, "pipeline_parallel_size", 1) <= 1:
+        return 0
+    from atom.kv_transfer.disaggregation.pd_producer import pd_producer_configured
+
+    if not pd_producer_configured(config):
+        return 0
+    align = chunk_alignment(config.kv_cache_block_size)
+    step = max(tokens - tokens % align, align)
+    return step if step < config.max_num_batched_tokens else 0
+
+
 def defers_output(config, family=None) -> bool:
     """Whether each step's sampled ids reach the host a step late, read on
     device by the next forward. The scheduler and the runner's
@@ -847,6 +864,20 @@ class Scheduler:
         # Whether the latest first-chunk sizing drew a sweep arm, so that
         # admitting that request moves the sweep on (see _commit_calibration_arm).
         self._calibration_arm_drawn = False
+        # ATOM_PREFILL_STEP_TOKENS: this tick's prefill budget (0: the full budget)
+        # and the prefill tokens of the head's batches in flight.
+        self._small_step = adaptive_prefill_step(config)
+        self._step_budget = 0
+        self._pp_inflight_prefill_tokens = 0
+        if self._small_step:
+            logger.info(
+                "Prefill steps of %d tokens, %d while prefill in flight and queued "
+                "fills %d steps of %d and no longer prompt is mid-prefill",
+                self._small_step,
+                self.max_num_batched_tokens,
+                config.pipeline_parallel_size + 2,
+                self.max_num_batched_tokens,
+            )
         # Per-step prefill census (`_record_prefill_supply`); dynamic sizing
         # needs at most one prefill source over the whole window.
         self._recent_prefill_supply: deque[int] = deque(
@@ -1340,7 +1371,7 @@ class Scheduler:
         tick: the batch budget, and under cost balancing the cost left to the
         step's target (largest k with `_chunk_cost(start, k)` <= what is left),
         but never below the balancing floor of `_balance_min_tokens`."""
-        cap_room = self.max_num_batched_tokens - batched_tokens
+        cap_room = (self._step_budget or self.max_num_batched_tokens) - batched_tokens
         if self._tick_cost_limit == math.inf:
             return max(cap_room, 0)
         left = self._tick_cost_limit - self._tick_cost
@@ -1631,9 +1662,9 @@ class Scheduler:
                     seq.dp_est_cached_tokens, max(0, int(credit))
                 )
 
-    def _waiting_new_token_count(self) -> int:
+    def _waiting_new_token_count(self, cap: int | None = None) -> int:
         """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
-        saturated at `max_num_batched_tokens`.
+        saturated at `cap` (`max_num_batched_tokens` by default).
 
         Feeds PrefillDelayer's coalescer fill signal (accumulate a full prefill
         batch before releasing, instead of firing many tiny fragments). The cap
@@ -1655,7 +1686,7 @@ class Scheduler:
         an un-admitted seq has not been probed against the prefix cache yet, so
         this is an upper bound on new tokens for cache-hit prompts.
         """
-        cap = self.max_num_batched_tokens
+        cap = cap or self.max_num_batched_tokens
         total = 0
         for seq in self._waiting_prefills():
             num_new_tokens = self.pending_prefill_tokens(seq)
@@ -1669,9 +1700,9 @@ class Scheduler:
                 return cap
         return total
 
-    def _partial_prefill_remaining_tokens(self) -> int:
+    def _partial_prefill_remaining_tokens(self, cap: int | None = None) -> int:
         """Sum of remaining (not-yet-computed) tokens across mid-chunked-prefill
-        seqs in `running`, saturated at `max_num_batched_tokens`.
+        seqs in `running`, saturated at `cap` (`max_num_batched_tokens` by default).
 
         Folded into the coalescer's pending-token signal so a small partial tail
         chunk does not force its own tiny prefill forward — it accumulates with
@@ -1689,7 +1720,7 @@ class Scheduler:
         """
         if self._partial_prefill_count == 0:
             return 0
-        cap = self.max_num_batched_tokens
+        cap = cap or self.max_num_batched_tokens
         total = 0
         seen = 0
         for seq in self.running:
@@ -2248,6 +2279,7 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
+        self._step_budget = self._prefill_step_budget()
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
@@ -2421,7 +2453,7 @@ class Scheduler:
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
-            and num_batched_tokens < self.max_num_batched_tokens
+            and num_batched_tokens < (self._step_budget or self.max_num_batched_tokens)
             and self._tick_cost < self._tick_cost_limit
         ):
             if len(prefix_waiters) > early_waiting:
@@ -2567,6 +2599,9 @@ class Scheduler:
                     seq, seq.num_cached_tokens, hit=replayed
                 )
                 num_new_tokens = seq.num_tokens - start
+                if self._small_step and self._requires_atomic_prefill(seq):
+                    # A whole prefill cannot be cut to the small step.
+                    self._step_budget = self.max_num_batched_tokens
                 budget_remaining = self._prefill_room(num_batched_tokens, start)
                 chunk = self._prefill_chunk_for_budget(
                     num_new_tokens,
@@ -2673,6 +2708,12 @@ class Scheduler:
                 prefix_waiters.append(seq)
                 continue
             atomic_prefill = self._requires_atomic_prefill(seq)
+            if self._small_step and num_new_tokens > self.max_num_batched_tokens:
+                # A long prompt's chunks ride small steps (`_prefill_step_budget`).
+                self._step_budget = min(self._step_budget, self._small_step)
+            elif self._small_step and atomic_prefill:
+                # A whole prefill cannot be cut to the small step.
+                self._step_budget = self.max_num_batched_tokens
             budget_remaining = self._prefill_room(num_batched_tokens, start)
             # `start` comes from the hit `can_allocate` offered, before
             # `allocate` may disown the boundary. The worker fits
@@ -3708,6 +3749,25 @@ class Scheduler:
         return self.enable_dynamic_chunking and (
             self._calibrating or self.dynamic_chunk_predictor is not None
         )
+
+    def _prefill_step_budget(self) -> int:
+        """ATOM_PREFILL_STEP_TOKENS: the small step while a prompt longer than
+        `max_num_batched_tokens` is mid-prefill or a request decodes, or while
+        the prefill in flight and queued cannot fill `pp_size + 2` full steps;
+        the full `max_num_batched_tokens` otherwise; 0 when it is off."""
+        if not self._small_step:
+            return 0
+        full = self.max_num_batched_tokens
+        for seq in self.running:
+            if seq.num_completion_tokens or (
+                seq.is_partial_prefill and seq.num_prompt_tokens > full
+            ):
+                return self._small_step
+        need = (self.config.pipeline_parallel_size + 2) * full
+        supply = self._pp_inflight_prefill_tokens
+        supply += self._waiting_new_token_count(need)
+        supply += self._partial_prefill_remaining_tokens(need)
+        return full if supply >= need else self._small_step
 
     def _record_prefill_supply(self) -> None:
         """Sample this step's prefill sources into the sole-prefill window.
@@ -4787,6 +4847,8 @@ class Scheduler:
         """
         for req_id in self._pp_inflight_req_ids(batch):
             self._pp_inflight_token_block.add(req_id)
+        if self._small_step:
+            self._pp_inflight_prefill_tokens += batch.total_tokens_num_prefill
 
     def release_pp_inflight(self, batch: ScheduledBatch) -> None:
         """Head: release seqs blocked by mark_pp_inflight after postprocess.
@@ -4797,6 +4859,8 @@ class Scheduler:
         """
         for req_id in self._pp_inflight_req_ids(batch):
             self._pp_inflight_token_block.discard(req_id)
+        if self._small_step:
+            self._pp_inflight_prefill_tokens -= batch.total_tokens_num_prefill
 
     def _batch_seq_lookup(self, seqs: Iterable[Sequence] | None) -> dict[int, Sequence]:
         """Look up batch seqs directly; falls back to ``running`` if None."""
