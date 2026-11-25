@@ -1220,7 +1220,7 @@ class EngineUtilityHandler:
                 result |= {
                     "kv_blocks_used": kv_pool.num_used,
                     "kv_blocks_free": kv_pool.num_free,
-                    "kv_blocks_total": kv_pool.num_blocks,
+                    "kv_blocks_total": kv_pool.num_usable_blocks,
                     "kv_blocks_indexed": kv_pool.num_indexed,
                     "kv_blocks_evictable": reusable,
                     "kv_blocks_vacant": kv_pool.num_free - reusable,

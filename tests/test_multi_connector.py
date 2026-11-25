@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
 from atom.kv_transfer.disaggregation.multi import multi_connector as mc_module
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnector,
@@ -35,6 +36,8 @@ from atom.kv_transfer.disaggregation.types import (
 
 class FakeSchedSub:
     """Scheduler-side sub-connector mock."""
+
+    cancels_undispatched_loads = False
 
     def lookup_pending(self, seq):
         return False
@@ -130,6 +133,9 @@ class FakeSchedSub:
         self.cancelled.append(seq)
         self.pending_load = False
 
+    def cancel_undispatched_load(self, seq):
+        return False
+
     def cancel_preadmission(self, seq):
         # The base default: the pending load's cancellation, for a sub that has one.
         if self._offload:
@@ -198,6 +204,7 @@ class DestructiveSub:
     """
 
     is_offload = True
+    cancels_undispatched_loads = False
 
     def __init__(self, *, owned_load, owned_channel):
         self._owned_load = owned_load
@@ -247,6 +254,9 @@ def _sched(connectors):
     obj._connectors = connectors
     obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
     obj.is_offload = any(getattr(c, "is_offload", False) for c in connectors)
+    obj.cancels_undispatched_loads = any(
+        getattr(c, "cancels_undispatched_loads", False) for c in connectors
+    )
     obj._load_winner = {}
     return obj
 
@@ -257,6 +267,81 @@ def _worker(connectors):
     obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
     obj._state_tier = None
     return obj
+
+
+@pytest.mark.parametrize("pd_wins", [False, True])
+def test_cancel_undispatched_load_uses_only_the_winning_owner(pd_wins):
+    seq = SimpleNamespace(id=17)
+    pd = FakeSchedSub(match=(32, True) if pd_wins else (0, False))
+    offload = FakeSchedSub(match=(64, True), is_offload=True, offload_methods=True)
+    scheduler = _sched([pd, offload])
+    scheduler.get_num_new_matched_tokens(seq)
+    offload.cancelled.clear()
+
+    def cancel(request):
+        offload.cancel_pending_load(request)
+        return True
+
+    offload.cancel_undispatched_load = cancel
+    assert scheduler.cancel_undispatched_load(seq) is not pd_wins
+    if pd_wins:
+        assert scheduler._load_winner[seq.id] is pd
+        assert offload.cancelled == []
+    else:
+        assert seq.id not in scheduler._load_winner
+        assert offload.cancelled == [seq]
+
+
+class _InheritingPDSched(KVConnectorSchedulerBase):
+    """A P/D-style scheduler connector that keeps every base default."""
+
+    is_producer = False
+
+    def __init__(self, match):
+        self._match = match
+
+    def get_num_new_matched_tokens(self, seq):
+        return self._match
+
+
+_InheritingPDSched.__abstractmethods__ = frozenset()
+
+
+def test_base_cancel_undispatched_load_defaults_to_false():
+    assert KVConnectorSchedulerBase.cancels_undispatched_loads is False
+    pd = _InheritingPDSched((32, True))
+    assert pd.cancels_undispatched_loads is False
+    assert pd.cancel_undispatched_load(SimpleNamespace(id=1)) is False
+
+
+def test_real_constructor_propagates_cancels_undispatched_loads(monkeypatch):
+    def build(flag):
+        offload = FakeSchedSub(is_offload=True, offload_methods=True)
+        offload.cancels_undispatched_loads = flag
+        monkeypatch.setattr(
+            mc_module,
+            "_build_subconnectors",
+            lambda config, role: [_InheritingPDSched((0, False)), offload],
+        )
+        return mc_module.MultiConnectorScheduler(SimpleNamespace())
+
+    assert build(True).cancels_undispatched_loads is True
+    assert build(False).cancels_undispatched_loads is False
+
+
+def test_pd_winner_inheriting_the_base_default_is_never_cancelled(monkeypatch):
+    seq = SimpleNamespace(id=18)
+    pd = _InheritingPDSched((32, True))
+    offload = FakeSchedSub(match=(64, True), is_offload=True, offload_methods=True)
+    offload.cancel_undispatched_load = lambda request: True
+    monkeypatch.setattr(
+        mc_module, "_build_subconnectors", lambda config, role: [pd, offload]
+    )
+    scheduler = mc_module.MultiConnectorScheduler(SimpleNamespace())
+    assert scheduler.get_num_new_matched_tokens(seq) == (32, True)
+    assert scheduler._load_winner[seq.id] is pd
+    assert scheduler.cancel_undispatched_load(seq) is False
+    assert scheduler._load_winner[seq.id] is pd
 
 
 def _save_meta(*req_ids):

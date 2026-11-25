@@ -1,0 +1,10 @@
+# The build context is the ATOM repository root (see build_image.sh), so the
+# context-wide atomrl/.dockerignore does not apply; BuildKit reads this file
+# because it sits next to the Dockerfile.
+.git
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+atomrl/_site
