@@ -6,6 +6,7 @@ one case that needed a Triton kernel is `test_draft_attention.py`.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -28,6 +29,43 @@ def _draft_model():
     from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 
     return DeepseekV41DSpark
+
+
+@pytest.mark.parametrize("draft_dtype", ["auto", "fp8"])
+def test_serving_prepares_noise_embedding_before_drafting(monkeypatch, draft_dtype):
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    model = _draft_model()
+    draft = model.__new__(model)
+    torch.nn.Module.__init__(draft)
+    draft.config = SimpleNamespace(dspark_noise_token_id=2)
+    draft.draft_kv_dtype = draft_dtype
+    proposer = SimpleNamespace(model=draft, context_kv_only=True)
+
+    embed = torch.nn.Embedding.from_pretrained(torch.full((4, 8), 3.0), freeze=False)
+    forward = Mock(wraps=embed.forward)
+    monkeypatch.setattr(embed, "forward", forward)
+    target = SimpleNamespace(embed=embed, head=torch.nn.Identity())
+    draft.share_with_target(target)
+    DSparkProposer.prepare_for_serving(proposer)
+    forward.assert_not_called()
+    with pytest.raises(RuntimeError, match="Prepare the V4.1 DSpark noise embedding"):
+        draft._noise_embedding()
+    forward.assert_not_called()
+
+    proposer.context_kv_only = False
+    DSparkProposer.prepare_for_serving(proposer)
+    DSparkProposer.prepare_for_serving(proposer)
+    row = draft._noise_embedding()
+    torch.testing.assert_close(row, torch.full((8,), 3.0))
+    assert not row.requires_grad
+    assert draft._noise_embedding() is row
+    forward.assert_called_once()
+
+    target.embed = torch.nn.Embedding.from_pretrained(torch.full((4, 8), 5.0))
+    draft.share_with_target(target)
+    DSparkProposer.prepare_for_serving(proposer)
+    torch.testing.assert_close(draft._noise_embedding(), torch.full((8,), 5.0))
 
 
 def test_block_mask_keeps_all_draft_rows_and_only_the_visible_window():

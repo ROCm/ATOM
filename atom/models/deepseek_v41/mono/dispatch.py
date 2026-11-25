@@ -186,12 +186,6 @@ class MonoDraftModel(nn.Module):
     def __init__(self, draft: nn.Module, dp_ranks: int = 0) -> None:
         super().__init__()
         self.model = draft
-        if draft.draft_kv_dtype != "fp8":
-            # Peer embedding can bypass the native lookup during model warmup.
-            # Resolve the row before graph warmup can cache a zero all-reduce
-            # placeholder for the native draft buckets.
-            with torch.no_grad():
-                draft._noise_embedding()
         self._max_requests = (
             min(MAX_REQUESTS, MAX_MOE_ROWS // (dp_ranks * draft.block_size))
             if dp_ranks

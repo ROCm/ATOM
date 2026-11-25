@@ -281,6 +281,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
             args.qk_rope_head_dim, capacity + self.block_size, base=args.rope_theta
         )
         self.embed = self.head = None
+        self._noise_row: torch.Tensor | None = None
 
     @property
     def model(self):
@@ -309,6 +310,20 @@ class DeepseekV41DSpark(DSparkDraftModel):
 
     def share_with_target(self, target_base, loaded=None):
         self.embed, self.head = target_base.embed, target_base.head
+        self._noise_row = None
+
+    @torch.no_grad()
+    def prepare_for_serving(self) -> None:
+        """Cache the fixed noise row before collective graph warmup."""
+        if self._noise_row is not None:
+            return
+        ids = torch.full(
+            (1,),
+            self.config.dspark_noise_token_id,
+            dtype=torch.long,
+            device=self.embed.weight.device,
+        )
+        self._noise_row = self.embed(ids).flatten()
 
     def target_aux_capture_spec(self, layer_ids, hidden_size, _target_layers=None):
         # Published taps (37, 38, 39) have no Engram. A block pre-hook at an
@@ -587,26 +602,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
             self._context_ids = ids
         return ids
 
-    def _noise_embedding(self):
-        """The noise token's embedding row, embedded once and kept.
-
-        Every draft column past the anchor carries `dspark_noise_token_id`, and
-        the embedding is a TP all-reduce: embedding it per step per column put
-        `width` identical rows through the collective for no reason. The table
-        is fixed once the checkpoint is loaded, so the row is too -- resolved on
-        the first drafting step rather than at construction, which is when the
-        shared target embedding has actually been attached.
-        """
-        row = self.__dict__.get("_noise_row")
+    def _noise_embedding(self) -> torch.Tensor:
+        row = self._noise_row
         if row is None:
-            ids = torch.full(
-                (1,),
-                self.config.dspark_noise_token_id,
-                dtype=torch.long,
-                device=self.embed.weight.device,
+            raise RuntimeError(
+                "Prepare the V4.1 DSpark noise embedding before drafting"
             )
-            row = self.embed(ids).flatten()
-            self._noise_row = row
         return row
 
     def block_backbone(self, input_ids, positions, num_draft):

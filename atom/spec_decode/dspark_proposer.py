@@ -83,6 +83,10 @@ class DSparkProposer(Drafter):
         if self._with_draft:
             self._init_draft_block_buffers()
 
+    def prepare_for_serving(self) -> None:
+        if not self.context_kv_only:
+            self.model.prepare_for_serving()
+
     def _arm_lossless_draft(self) -> DSparkLossless | None:
         """Allocates only; the runner binds the draft model (`bind_target`)
         before any warmup or capture, since ``block``'s sampler branches on

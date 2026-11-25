@@ -702,6 +702,10 @@ class Drafter(abc.ABC):
     def load_model(self, target_model: nn.Module) -> None:
         self.attach_to_target(target_model, self.load_weights())
 
+    def prepare_for_serving(self) -> None:
+        """Prepare decode state after attaching materialized target weights."""
+        return
+
     def load_weights(self) -> set[str]:
         """Load the draft's own weights into ``self.model``; what it loaded."""
         # Three drafter flavors cover three of the four combinations:

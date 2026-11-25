@@ -991,6 +991,9 @@ class ModelRunner:
 
         if self.config.speculative_config and get_pp_group().is_last_rank:
             self.drafter = self._build_and_load_drafter()
+            # RapidServe decode receives its target weights by IPC later.
+            if not config.disagg_is_decode:
+                self.drafter.prepare_for_serving()
             self.rejection_sampler = RejectionSampler(
                 synthetic_acceptance_rates=(
                     self.config.speculative_config.synthetic_acceptance_rates
@@ -5109,6 +5112,8 @@ class RapidServeModelRunner(ModelRunner):
             handles = pickle.load(f)
         os.remove(path)
         import_model_weights(self.model, handles)
+        if self.config.speculative_config and get_pp_group().is_last_rank:
+            self.drafter.prepare_for_serving()
         gc.collect()
         torch.cuda.empty_cache()
         # Surface any tensor prefill didn't export (would crash later in forward).

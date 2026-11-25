@@ -337,13 +337,8 @@ def test_the_draft_is_routed_by_its_request_count(
     _context(monkeypatch, prefill=prefill)
     draft = _Draft()
     draft.draft_kv_dtype = draft_dtype
-    draft._noise_embedding = Mock()
     routed = routed and draft_dtype != "fp8"
     model = dispatch.MonoDraftModel(draft)
-    if draft_dtype == "fp8":
-        draft._noise_embedding.assert_not_called()
-    else:
-        draft._noise_embedding.assert_called_once_with()
     runner = _DraftRunner()
     model._mono = SimpleNamespace(
         runner=runner, ready=lambda rows: runner.rows.append(rows) or True
