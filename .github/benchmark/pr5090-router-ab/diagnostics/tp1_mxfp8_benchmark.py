@@ -113,7 +113,7 @@ def benchmark(output):
                 call(index)
         passes = []
         for _ in range(2):
-            for _ in range(5):
+            for _ in range(PLAN.get("warmup_graph_replays", 5)):
                 graph.replay()
             events = [
                 (
@@ -224,6 +224,7 @@ if __name__ == "__main__":
             M=[16, 24, 32, 40, 48, 56, 64, 80],
             configs=[[64, 64, 512, 8, 2]],
             confirmation_abba=True,
+            warmup_graph_replays=1000,
         )
     validate_plan()
     if args.plan:
