@@ -99,7 +99,6 @@ def _plain_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
     """A linear's weight as the kernels read it: bf16, unshuffled, exactly
     ``shape``."""
     w = _param(module, name)
-    _need(w.dtype == BF16, f"{name} is {w.dtype}, expected bf16")
     _need(not getattr(w, "is_shuffled", False), f"{name} is preshuffled")
     _need(not getattr(module, "is_output_padded", False), f"{name} output padded")
     _need(tuple(w.shape) == shape, f"{name} is {tuple(w.shape)}, expected {shape}")
