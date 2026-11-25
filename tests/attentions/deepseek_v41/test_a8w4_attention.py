@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -387,7 +388,6 @@ def test_native_token_graph_replays_different_request_counts(
     cu = torch.empty(5, dtype=torch.int32, device="cuda")
     slots = torch.empty(4, dtype=torch.int32, device="cuda")
     tables = torch.zeros(4, 4, dtype=torch.int32, device="cuda")
-    floor = torch.zeros(4, dtype=torch.int32, device="cuda")
     ctx = SimpleNamespace(in_hipgraph=False, main_stream=torch.cuda.current_stream())
     monkeypatch.setattr(forward_context, "_forward_context", ctx)
 
@@ -419,10 +419,7 @@ def test_native_token_graph_replays_different_request_counts(
             torch.tensor(list(order[:requests]) + [-1] * (4 - requests), device="cuda")
         )
         batches = 4 if graph_layout else requests
-        # Use fresh storage on resumed steps: both CSR and ring commit must
-        # resolve these live, rather than retaining capture's zero buffers.
-        replay_floor = torch.full_like(floor, ring // 2) if cached_until else floor
-        cached = torch.full_like(floor, cached_until) if cached_until else floor
+        cached = np.broadcast_to(np.asarray(cached_until, dtype=np.int32), (requests,))
         step = BatchStep(
             tuple(
                 RequestSpan(b, ring, b * length, length, order[b])
@@ -437,12 +434,15 @@ def test_native_token_graph_replays_different_request_counts(
             max_q_len=length,
             is_prefill=True,
             prefill_attention_graph=graph_layout,
-            swa_replay_start=replay_floor[:batches],
-            swa_cached_until=cached[:batches],
-            request_cached_until=torch.full(
-                (requests,), cached_until, dtype=torch.int32
-            ).numpy(),
+            request_floors=np.where(cached > 0, ring // 2, 0).astype(np.int32),
+            request_cached_until=cached,
         )
+        # Use the production publisher: resumed boundaries have fresh storage
+        # at the live request count, even when graph metadata has padded slots.
+        cache.publish_replay_layout(step, batches)
+        if cached.any():
+            assert step.swa_cached_until.numel() == requests
+            assert step.swa_replay_start.numel() == requests
         cache._reserve_prefill_window(step)
         step.begin_forward()
         ctx.attn_metadata = SimpleNamespace(cache=cache, step=step, queries=None)
@@ -625,6 +625,8 @@ def test_native_token_graph_replays_different_request_counts(
             (0, False, False, 0, width),
             (4, True, True, 0, width),
             (2, True, False, ring + 17, width),
+            (3, True, True, (ring + 17, 0, ring + 33), width),
+            (2, True, False, 0, width),
             (1, False, True, ring + width, width),
             (1, False, False, 0, 16),
             (1, False, True, 0, width),
@@ -662,7 +664,7 @@ def test_native_token_graph_replays_different_request_counts(
                 assert attention_calls == []
             planes = ring_planes()
             committed = tuple(p.clone() for p in planes)
-            if not requests or cached_until >= ring + width:
+            if not requests or np.all(step.request_cached_until >= ring + width):
                 for actual, saved in zip(committed, history):
                     torch.testing.assert_close(actual, saved, rtol=0, atol=0)
             prepare(

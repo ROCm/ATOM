@@ -619,7 +619,9 @@ class Attention(nn.Module):
     def _prefill_indices_live(self, prefix, extend, cached_until, cache, step, *, a8w4):
         """Publish the live CSR and ring boundary into graph-owned buffers."""
         if step.request_cached_until.any():
-            cached_until.copy_(step.swa_cached_until)
+            # Resumed boundaries cover the live requests, not the graph's
+            # fixed capacity. Zero-length padding requests never read the tail.
+            cached_until[: step.swa_cached_until.numel()].copy_(step.swa_cached_until)
         else:
             cached_until.zero_()
         if not step.requests:
