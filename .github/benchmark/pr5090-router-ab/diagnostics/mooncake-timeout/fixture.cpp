@@ -27,22 +27,25 @@ template<class T, size_t N> void put(std::array<unsigned char,N>& a,size_t i,T v
 }
 extern "C" int run_case(int kind) {
     std::array<unsigned char,96> batch{};
-    std::array<unsigned char,304> tasks{};
+    std::array<unsigned char,152*160> tasks{};
+    const size_t task_count = kind == 3 ? 160 : 2;
+    const size_t task_bytes = 152 * task_count;
     std::array<unsigned char,72> request{};
     std::array<unsigned char,120> slice{};
     uint64_t slice_ptr = reinterpret_cast<uint64_t>(slice.data());
     uint64_t id = reinterpret_cast<uint64_t>(batch.data());
-    put(batch,0,id); put(batch,8,uint64_t{2});
+    put(batch,0,id); put(batch,8,uint64_t{task_count});
     put(batch,16,reinterpret_cast<uint64_t>(tasks.data()));
-    put(batch,24,reinterpret_cast<uint64_t>(tasks.data()+tasks.size()));
-    put(batch,32,reinterpret_cast<uint64_t>(tasks.data()+tasks.size()));
+    put(batch,24,reinterpret_cast<uint64_t>(tasks.data()+task_bytes));
+    put(batch,32,reinterpret_cast<uint64_t>(tasks.data()+task_bytes));
     batch[0x50]=1;
     if(kind==0) { batch[0x3a]=1; put(batch,0x48,uint64_t{2}); }
-    for(size_t i=0;i<2;i++) {
+    for(size_t i=0;i<task_count;i++) {
+        const bool pending = (kind==1 && i==1) || (kind==3 && i>=140);
         put(tasks,i*152,uint64_t{4});
-        put(tasks,i*152+8,uint64_t{(kind==1 && i==1)?3u:4u});
-        tasks[i*152+24]=(kind==1 && i==1)?0:1;
-        put(tasks,i*152+32,(uint64_t{1}<<63)+((kind==1 && i==1)?3:4));
+        put(tasks,i*152+8,uint64_t{pending?3u:4u});
+        tasks[i*152+24]=pending?0:1;
+        put(tasks,i*152+32,(uint64_t{1}<<63)+(pending?3:4));
         put(tasks,i*152+40,uint64_t{1024});
         put(tasks,i*152+56,uint64_t{1024});
         put(tasks,i*152+64,id);

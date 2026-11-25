@@ -102,6 +102,7 @@ static void snapshot(uint64_t id) {
     std::ostringstream out, task_details;
     size_t readable = 0, all_slices_done = 0, unpublished_done = 0;
     size_t pending = 0, failed = 0, omitted = 0, detailed = 0;
+    size_t completed_controls = 0;
     bool first = true;
     for (size_t i = 0; i < count; ++i) {
         unsigned char task[kTaskSize]{};
@@ -115,10 +116,14 @@ static void snapshot(uint64_t id) {
         unpublished_done += complete && !task[24];
         pending += !complete;
         failed += failures != 0;
-        // Include completed tasks if the batch counter disagrees, as well as
-        // every unfinished/failed task. Bound output without hiding totals.
-        if (complete && !failures && finished == count) continue;
-        if (detailed++ >= 128) { ++omitted; continue; }
+        // Completed prefixes must not consume the whole sample before a stuck
+        // tail. Keep a few controls so pure completion-counter mismatches are
+        // still visible, and use the remaining budget for unfinished tasks.
+        const bool control = complete && !failures;
+        if (control && (finished == count || completed_controls >= 8)) { ++omitted; continue; }
+        if (detailed >= 128) { ++omitted; continue; }
+        ++detailed;
+        completed_controls += control;
         if (!first) task_details << ',';
         first = false;
         task_details << "{\"task\":" << i << ",\"slices\":" << slices
@@ -178,6 +183,7 @@ static void snapshot(uint64_t id) {
         << ",\"done_unpublished_tasks\":" << unpublished_done
         << ",\"pending_tasks\":" << pending << ",\"failed_tasks\":" << failed
         << ",\"omitted_task_details\":" << omitted
+        << ",\"completed_controls_sampled\":" << completed_controls
         << ",\"non_atomic_snapshot\":true,\"tasks\":[" << task_details.str() << "]}";
     write_event(out.str());
 }

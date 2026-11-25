@@ -61,3 +61,26 @@ GDB uses one symbol worker and loads only the engine and basic runtime symbols;
 it disables auto-load scripts and debuginfod. A capture-specific label scopes
 cleanup even if the Docker client times out. A debugger pause can affect events
 after attachment, so keep the original pre-attach snapshot and timestamps.
+
+Validate native symbol loading, not merely the presence of Python/libc frames:
+build the debugger image, then run `debugger/test_native_symbols.py IMAGE` on a
+Linux CPU host with Docker and g++. It loads a real C++ `engine.so` fixture and
+requires a named `mooncake::WorkerPool::performPostSend` frame, mappings,
+registers, successful detach, and sidecar cleanup. The earlier compound
+`sharedlibrary` filter did not load the native engine; the separate library
+filters avoid that failure. Raw PCs from that capture can be recovered only
+within the explicitly documented bounds, not treated as a complete backtrace.
+
+Task details now retain at most eight completed controls and prioritize unfinished
+tasks. The older first-128 sampling hid the unfinished tail behind a completed
+prefix in `Lcffeae`; its aggregate completion counts remain usable. A native CPU
+fixture with 140 completed tasks followed by 20 pending ones reproduces that
+sampling failure and verifies the corrected sample without changing batch bytes.
+
+The debugger also records the engine mapping and registers. Its optional queue
+decoder reads only at two PCs whose instructions and layout were checked against
+the exact engine hash: the full-queue metadata loop and the incoming-queue mutex
+call return. It reports queue length/cursor or mutex owner plus worker counters.
+It does not call functions in the inferior or change its memory. An absent sample
+at those PCs is not evidence that the queue is empty; a CPU layout fixture checks
+the decoder, while the next live capture must still establish the actual values.

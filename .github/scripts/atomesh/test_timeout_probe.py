@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from pd_gdb_snapshot import decode_frame
 from pd_native_stacks import capture_stacks
 from pd_timeout_probe import failure_evidence, main, validate_probe
 
@@ -215,6 +216,36 @@ class TimeoutProbeTests(unittest.TestCase):
         self.assertEqual(evidence["connector"], failure)
         failure["duration_s"] = 0.01
         self.assertIsNone(failure_evidence([failure]))
+
+    def test_pinned_pc_decoder_reads_queue_and_mutex_without_modifying_memory(self):
+        import struct
+
+        memory = bytearray(0x7000)
+
+        def put(address, value, kind="Q"):
+            struct.pack_into("<" + kind, memory, address, value)
+
+        pool, stack, node, lock = 0x2000, 0x1000, 0x3000, 0x5000
+        put(pool + 12, 2, "i")
+        put(pool + 0x150, 1000)
+        put(pool + 0x158, 700)
+        put(stack + 8, node)
+        put(node + 0x28, 0x4000)
+        put(node + 0x30, 0x4400)
+        put(stack + 0x28, lock)
+        put(lock + 8, 35735, "i")
+        put(lock, 2, "i")
+        before = bytes(memory)
+        regs = {"r14": pool, "rsp": stack, "rax": 0x4200, "rsi": 0x4400}
+        read = lambda address, size: bytes(memory[address : address + size])
+        data = decode_frame(0x3C41E3, regs, read)
+        self.assertEqual((data["queued_slices"], data["remaining_slices"]), (128, 64))
+        self.assertEqual((data["submitted"], data["processed"]), (1000, 700))
+        self.assertEqual(decode_frame(0x3C2B9C, regs, read)["owner_tid"], 35735)
+        self.assertIsNone(decode_frame(0x1234, regs, read))
+        with self.assertRaises(ValueError):
+            decode_frame(0x3C41E3, regs | {"rsi": 0x4401}, read)
+        self.assertEqual(bytes(memory), before)
 
 
 if __name__ == "__main__":

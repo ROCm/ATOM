@@ -69,6 +69,9 @@ def capture_stacks(job_id, pid, worker_image, debugger_image, output):
         "seccomp=unconfined",
         "--memory=2g",
         "--pids-limit=64",
+        "-v",
+        str(Path(__file__).with_name("pd_gdb_snapshot.py").resolve())
+        + ":/capture-queue.py:ro",
         "-e",
         "DEBUGINFOD_URLS=",
         "--entrypoint",
@@ -93,11 +96,23 @@ def capture_stacks(job_id, pid, worker_image, debugger_image, output):
         "-ex",
         f"attach {pid}",
         "-ex",
-        r"sharedlibrary engine\.so|libstdc\+\+|libc\.so|libpthread",
+        "sharedlibrary /engine[.]so",
+        "-ex",
+        "sharedlibrary libstdc",
+        "-ex",
+        "sharedlibrary libc[.]so",
+        "-ex",
+        "info sharedlibrary",
+        "-ex",
+        f"python print(''.join(x for x in open('/proc/{pid}/maps') if '/engine.so' in x or 'libc.so' in x or 'libstdc' in x))",
         "-ex",
         "info threads",
         "-ex",
         "thread apply all bt 24",
+        "-ex",
+        "thread apply all info registers rip rsp rax rbx rcx rdx rsi rdi rbp r12 r13 r14 r15",
+        "-ex",
+        "source /capture-queue.py",
         "-ex",
         "detach",
     ]
@@ -161,5 +176,6 @@ def capture_stacks(job_id, pid, worker_image, debugger_image, output):
             result["stack_bytes"] = len(data)
             result["stack_sha256"] = hashlib.sha256(data).hexdigest()
             result["frames_present"] = b"#0 " in data or b"#0\t" in data
+            result["mooncake_symbols_present"] = b"mooncake::WorkerPool" in data
         (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result

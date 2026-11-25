@@ -1,0 +1,72 @@
+{
+  "lease": "Lcffeae",
+  "node": "g53",
+  "gpus": 8,
+  "harness_sha": "1de72bd10606dbde3c7cd9490aba9e1f8e7c8529",
+  "sender_workers": 10,
+  "async_sender_tasks": 20,
+  "native_deadline_changed": false,
+  "first_failure": {
+    "pp_rank": 3,
+    "descriptors": 47565,
+    "bytes": 6479262720,
+    "duration_seconds": 36.50681440252811,
+    "finished_counter_at_snapshot_start": 40720,
+    "fully_done_tasks_seen_during_scan": 40729,
+    "unfinished_tasks_seen_during_scan": 6836,
+    "non_atomic_snapshot": true,
+    "head_task_samples": 128,
+    "all_sampled_head_tasks_completed": true,
+    "unfinished_tail_transport_not_observed": true
+  },
+  "gdb": {
+    "before_pd_cleanup": true,
+    "start_utc": "2026-11-25T19:03:10.260931+00:00",
+    "finish_utc": "2026-11-25T19:03:10.955224+00:00",
+    "pd_cleanup_utc": "2026-11-25 19:03:11Z",
+    "return_code": 0,
+    "native_symbols_loaded": false,
+    "deep_native_backtrace_reliable": false,
+    "stack_bytes": 140649,
+    "stack_sha256": "68383f0d9b787e2b901746255df6d7f14246aefffc82e28b03575b420c369249",
+    "sidecar_removed": true
+  },
+  "pc_recovery": {
+    "method": "Unique clock_gettime PLT return with page offset0x14a identifies load bias; independently corroborated by epoll_wait, pthread_cond_clockwait, mutex-call return sites in exact ELF540428ce.",
+    "reliable_scope": "Top PCs and the first engine return address from a C-runtime frame only. Not the later unsymbolized backtrace.",
+    "locations": [
+      {
+        "rva": "0x3c41e3",
+        "function": "WorkerPool::performPostSend+0x16b3",
+        "operation": "Iterates queued slices to assign endpoint and completion token before bounded posting."
+      },
+      {
+        "rva": "0x3c2b9c",
+        "function": "WorkerPool::performPostSend+0x6c",
+        "operation": "Waits for the incoming worker queue mutex."
+      }
+    ],
+    "root_cause_proven": false,
+    "initial_clock_return_rva": "0x14514a",
+    "additional_sender_pc_rva": "0x2ebbf7",
+    "additional_sender_interpretation": "Buffer/metadata-selection loop; exact source attribution remains to be verified."
+  },
+  "cleanup": {
+    "pool_workload_rc": 86,
+    "pool_exit_rc": 86,
+    "release_rc": 0,
+    "srt_left_two_worker_containers": true,
+    "outer_pool_removed_both": true,
+    "initial_release_waited_for_vram": true,
+    "release_utc": "2026-11-25T19:03:48Z",
+    "gpu_hours": 3.08
+  },
+  "archive_sha256": "304ab7e27c0daa270fb25ce853008b2d4bc10a24571f46211ada77787ecd38c1",
+  "next": "Prioritize unfinished task samples; fix native symbol loading; capture module mappings, registers, and instruction-gated queue size/mutex-owner metadata before cleanup, with sender10 and unchanged deadlines.",
+  "limits": [
+    "The nine-task counter difference can arise while the non-atomic snapshot is being read; it is not proof of a stale counter.",
+    "A single PC sample does not quantify time spent or prove that the observed queue loop caused the deadline failure.",
+    "The old head-only sample cannot identify transport or KV-region membership of the unfinished tail.",
+    "No new performance point or confirmed fix."
+  ]
+}

@@ -15,10 +15,11 @@ def child():
     lib = ctypes.CDLL(str(Path(__file__).with_name("fixture.so")))
     lib.run_case.argtypes = [ctypes.c_int]
     assert lib.run_case(1) == 0  # A real unfinished slice.
+    assert lib.run_case(3) == 0  # Completed prefix must not hide pending tail.
     assert lib.run_case(2) == 0  # All slices done, batch counter disagrees.
     with ThreadPoolExecutor(max_workers=10) as workers:
         assert list(workers.map(lib.run_case, [0] * 100)) == [0] * 100
-    assert lib.calls() == lib.callbacks() == 102
+    assert lib.calls() == lib.callbacks() == 103
     paths = list(Path(os.environ["ATOMESH_MOONCAKE_PROBE_DIR"]).glob("*.jsonl"))
     assert len(paths) == 1
     events = [json.loads(line) for line in paths[0].read_text().splitlines()]
@@ -28,8 +29,12 @@ def child():
         assert len(events) == 1  # Foreign ELF layout is not inspected.
     else:
         assert active["layout_compatible"] is True
-        assert len(events) == 3  # Successes produce no snapshots.
-        waiting, stale = events[1:]
+        assert len(events) == 4  # Successes produce no snapshots.
+        waiting, tail, stale = events[1:]
+        assert tail["pending_tasks"] == 20
+        assert sum(t["task"] >= 140 for t in tail["tasks"]) == 20
+        assert sum(t["task"] < 140 for t in tail["tasks"]) <= 8
+        assert len(tail["tasks"]) + tail["omitted_task_details"] == 160
         assert waiting["pending_tasks"] == 1
         assert waiting["all_slices_done_tasks"] == 1
         assert waiting["tasks"][1]["slice_sample"][0]["task_matches"]
