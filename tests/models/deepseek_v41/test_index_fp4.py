@@ -466,3 +466,93 @@ def test_mfma_candidates_cross_groups_and_replay(per_page):
     table.copy_(move.argsort()[table.long()].int())
     graph.replay()
     check(selected)
+
+
+@pytest.mark.parametrize("capacity", [1 << 16, 640])
+def test_fp4_packed_candidate_source_takes_its_top_k_inside_its_picks(capacity):
+    """A candidate-source layer keeping more blocks than its top-k takes that
+    top-k over its picks (`top_k_within_candidates`): the same rows as the
+    plane's whole-row top-k, and the same picks."""
+
+    from atom.model_ops.deepseek_v41 import paged_scoring as scoring
+    from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+
+    torch.manual_seed(7)
+    pages, per_page = 8, 128
+    _, _, units = _pool(pages, per_page)
+    for t in (units.values, units.scales):
+        t.copy_(torch.randint(0, 256, t.shape, dtype=torch.uint8, device="cuda"))
+    units.scales.clamp_(120, 132)
+    tables = torch.tensor(
+        [[2, 0, 3, 1], [5, 7, 4, 6]], dtype=torch.int32, device="cuda"
+    )
+    seen = [300, 301, 302, 511, 512, 0, 0]
+    starts = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+    visible = torch.tensor(seen, dtype=torch.int32, device="cuda")
+    rows = visible.numel()
+    query = scoring.quantize_query_fp4(
+        torch.randn(rows, HEADS, DIM, device="cuda").bfloat16(), _rope(),
+        torch.randint(0, 1 << 16, (rows,), device="cuda"),
+    )  # fmt: skip
+    weights = torch.rand(rows, HEADS, device="cuda").bfloat16()
+    ragged = Fp4MqaRaggedMetadata(starts, 3, tables, per_page // PAGE)
+    workspace = _packed_workspace(capacity)
+    packed = _plan_step(workspace, seen)
+
+    def score(packed):
+        return scoring.score_topk_quantized(
+            query, weights, units, None, visible, topk=24,
+            weight_scale=(HEADS * DIM) ** -0.5, ragged=ragged, block_size=PAGE,
+            candidate_count=32, workspace=workspace if packed else None,
+            packed=packed,
+        )  # fmt: skip
+
+    want, got = score(None), score(packed)
+    assert torch.equal(got[0], want[0])
+    assert torch.equal(got[1], want[1])
+
+
+@pytest.mark.parametrize("levels", [0, 3])
+def test_top_k_within_candidates_selects_what_the_whole_row_does(levels):
+    """Packed rows of mixed lengths (a padding row included); with `levels`,
+    scores on a few values so the k-th score ties across blocks."""
+    from aiter.ops.topk import top_k_per_row_decode
+
+    from atom.model_ops.deepseek_v41.indexer import (
+        pick_candidate_blocks_packed,
+        top_k_within_candidates,
+    )
+
+    torch.manual_seed(11)
+    seen = [1, 7, 8, 9, 300, 1000, 4095, 4096, 0]
+    k, keep, block = 64, 128, PAGE
+    width = max(seen)
+    row_blocks = [-(-s // block) for s in seen]
+
+    def offsets(sizes):
+        return torch.tensor(
+            [sum(sizes[:i]) for i in range(len(sizes))],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+    starts, block_starts = offsets(seen), offsets(row_blocks)
+    ends = torch.tensor(seen, dtype=torch.int32, device="cuda")
+    logits = torch.randn(sum(seen), device="cuda")
+    if levels:
+        logits = torch.round(logits * levels) / levels
+    maxima = torch.empty(sum(row_blocks), device="cuda")
+    rows = len(seen)
+    chosen = torch.empty(rows, keep, dtype=torch.int32, device="cuda")
+    pick_candidate_blocks_packed(
+        logits, starts, maxima, block_starts, ends, block, chosen,
+        -(-width // block) * block,
+    )  # fmt: skip
+    got = torch.empty(rows, k, dtype=torch.int32, device="cuda")
+    top_k_within_candidates(logits, starts, ends, chosen, block, got, k)
+    want = torch.empty_like(got)
+    top_k_per_row_decode(
+        logits, 1, ends, want, rows, 0, 1, k=k, stable=True,
+        row_starts=starts, plane_width=width,
+    )  # fmt: skip
+    assert torch.equal(got, want)

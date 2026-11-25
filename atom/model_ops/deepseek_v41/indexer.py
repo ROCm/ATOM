@@ -308,3 +308,105 @@ def _block_maxima(logits, visible, maxima, block_size, blocks, tile, packed=None
         PACKED=packed is not None,
     )
     return ends
+
+
+# Rows a band may have for `top_k_within_candidates`: its compacted plane is
+# `rows x candidate blocks x block` floats, allocated per band.
+CANDIDATE_TOPK_MAX_ROWS = 1024
+
+
+@triton.jit
+def _gather_candidates_kernel(
+    logits,
+    starts,
+    ends,
+    candidates,
+    plane,
+    lengths,
+    candidate_stride,
+    plane_stride,
+    count,
+    BLOCK: tl.constexpr,
+    CHUNK: tl.constexpr,
+    COUNT: tl.constexpr,
+):
+    """Row r's chosen blocks, side by side in `plane` row r; their length.
+
+    Candidates are ascending with a `-1` tail and the newest visible block,
+    the only partly filled one, is last when kept, so the compacted row is
+    every kept block whole but the last, which runs to the row's end.
+    """
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    slots = chunk * CHUNK + tl.arange(0, CHUNK)
+    blocks = tl.load(
+        candidates + row * candidate_stride + slots, slots < count, other=-1
+    )
+    end = tl.load(ends + row)
+    start = tl.load(starts + row).to(tl.int64)
+    columns = blocks[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+    kept = (blocks[:, None] >= 0) & (columns < end)
+    scores = tl.load(logits + start + columns, kept, other=float("-inf"))
+    out = slots[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+    tl.store(
+        plane + row.to(tl.int64) * plane_stride + out,
+        scores,
+        (slots < count)[:, None],
+    )
+    if chunk == 0:
+        every = tl.arange(0, COUNT)
+        ids = tl.load(
+            candidates + row * candidate_stride + every, every < count, other=-1
+        )
+        valid = tl.sum((ids >= 0).to(tl.int32), axis=0)
+        last = tl.max(ids, axis=0)
+        tail = tl.minimum(end - last * BLOCK, BLOCK)
+        tl.store(lengths + row, tl.where(valid > 0, (valid - 1) * BLOCK + tail, 0))
+
+
+def top_k_within_candidates(logits, starts, ends, candidates, block_size, out, k):
+    """Each packed row's top-k (`out`, ascending compressed-row ids, `-1`
+    padded) taken over the candidate blocks the row just picked off the same
+    logits, rather than over its whole row.
+
+    The same selection: every one of a row's top-k scores lies in a block
+    whose best score is at least the k-th, and fewer than `k` blocks can
+    have a best score above it. The row keeps its newest block and its best
+    others by that score, more than `k` blocks in all, so the kept blocks
+    hold every top-k score. Ties at the k-th score resolve alike too: the
+    block pick and the top-k both keep the smallest index first, so the
+    blocks holding the earliest tied scores are kept. Kept blocks are
+    ascending, so a compacted column order is the row's, and the stable
+    top-k orders its output as it would on the whole row.
+
+    `logits` is the flat packed buffer (row r at `starts[r]`, visible to
+    `ends[r]`), `candidates` the rows' `pick_candidate_blocks_packed` output.
+    """
+    from .candidate_table import lift_candidate_selection
+
+    rows, count = candidates.shape
+    assert count > k, "the kept blocks need not hold the whole top-k"
+    plane = torch.empty(
+        rows, count * block_size, dtype=torch.float32, device=logits.device
+    )
+    lengths = torch.empty(rows, dtype=torch.int32, device=logits.device)
+    if rows:
+        chunk = 64
+        _gather_candidates_kernel[(rows, triton.cdiv(count, chunk))](
+            logits,
+            starts,
+            ends,
+            candidates,
+            plane,
+            lengths,
+            candidates.stride(0),
+            plane.stride(0),
+            count,
+            BLOCK=block_size,
+            CHUNK=chunk,
+            COUNT=triton.next_power_of_2(count),
+        )
+    top_k_per_row_decode(
+        plane, 1, lengths, out, rows, plane.stride(0), 1, k=k, stable=True
+    )
+    lift_candidate_selection(out, candidates, rows_per_block=block_size)
