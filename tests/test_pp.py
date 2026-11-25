@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 import types
-from collections import deque
+from collections import deque, namedtuple
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
@@ -40,6 +40,8 @@ for _fn in (
 ):
     if not hasattr(_ps_stub, _fn):
         setattr(_ps_stub, _fn, MagicMock())
+if not hasattr(_ps_stub, "TensorMetadata"):
+    _ps_stub.TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 sys.modules["aiter.dist.parallel_state"] = _ps_stub
 
 _comm_stub = sys.modules.get("aiter.ops.communication") or types.ModuleType(
@@ -216,10 +218,21 @@ def test_make_layers_places_real_and_missing(monkeypatch, pp_rank, pp_size):
 # ---------------------------------------------------------------------------
 
 
+ROW_BOUND = 8
+
+
+@pytest.fixture(autouse=True)
+def _resident_buffers(monkeypatch):
+    """A row bound for the resident PP buffers, and none left from a test."""
+    monkeypatch.setattr(pp_comm, "_row_bound", lambda: ROW_BOUND)
+    monkeypatch.setattr(pp_comm, "_RESIDENT", {})
+
+
 def _fake_pp_group(monkeypatch, rank_in_group=0, world_size=2):
     grp = MagicMock()
     grp.rank_in_group = rank_in_group
     grp.world_size = world_size
+    grp.ranks = list(range(world_size))
     sent = {}
 
     def send_tensor_dict(tensors, dst, all_gather_group=None):
@@ -296,17 +309,65 @@ def test_send_tolerates_missing_residual(monkeypatch):
     assert set(sent["tensors"].keys()) == {"hidden_states"}
 
 
+def _serve_recv(monkeypatch, grp, payload):
+    """The previous stage sends ``payload``: its metadata through recv_object,
+    then each tensor through torch.distributed.recv. Returns the recv log."""
+    meta = pp_comm.TensorMetadata
+    grp.recv_object.return_value = [
+        (k, meta(v.device.type, v.dtype, v.size())) for k, v in payload.items()
+    ]
+    order, log = iter(list(payload.values())), []
+
+    def recv(tensor, src, group):
+        log.append((tensor, src, group))
+        tensor.copy_(next(order))
+
+    monkeypatch.setattr(pp_comm.torch.distributed, "recv", recv)
+    return log
+
+
 def test_recv_wraps_from_group_relative_prev(monkeypatch):
     grp, _ = _fake_pp_group(monkeypatch, rank_in_group=1, world_size=2)
     payload = {"hidden_states": torch.ones(2, 2), "residual": torch.zeros(2, 2)}
-    grp.recv_tensor_dict.return_value = payload
+    log = _serve_recv(monkeypatch, grp, payload)
 
     out = pp_comm.recv_intermediate_tensors()
 
-    grp.recv_tensor_dict.assert_called_once_with(src=0, all_gather_group=None)
+    grp.recv_object.assert_called_once_with(src=0)
+    assert [(src, group) for _, src, group in log] == [(0, grp.cpu_group)] * 2
     assert isinstance(out, IntermediateTensors)
     assert torch.equal(out["hidden_states"], torch.ones(2, 2))
     assert torch.equal(out["residual"], torch.zeros(2, 2))
+
+
+def test_recv_lands_in_resident_buffers_unless_fresh(monkeypatch):
+    # Every step's payload lands in the same row-bound buffer per key, so the
+    # allocator never sees the chunk's row count; a key the caller keeps past
+    # the step gets a tensor of its own.
+    grp, _ = _fake_pp_group(monkeypatch, rank_in_group=1, world_size=2)
+    ptrs = []
+    for rows in (5, 8, 3):
+        payload = {
+            "hidden_states": torch.full((rows, 4), float(rows)),
+            pp_comm.PP_AUX_KEY: torch.ones(rows, 6),
+        }
+        _serve_recv(monkeypatch, grp, payload)
+        out = pp_comm.recv_intermediate_tensors(fresh=(pp_comm.PP_AUX_KEY,))
+        hidden = out["hidden_states"]
+        assert hidden.shape == (rows, 4) and torch.equal(
+            hidden, payload["hidden_states"]
+        )
+        assert hidden.untyped_storage().nbytes() == ROW_BOUND * 4 * 4
+        assert out[pp_comm.PP_AUX_KEY].untyped_storage().nbytes() == rows * 6 * 4
+        ptrs.append(hidden.untyped_storage().data_ptr())
+    assert len(set(ptrs)) == 1
+
+
+def test_recv_past_the_bound_grows_the_buffer(monkeypatch):
+    grp, _ = _fake_pp_group(monkeypatch, rank_in_group=1, world_size=2)
+    _serve_recv(monkeypatch, grp, {"hidden_states": torch.ones(ROW_BOUND + 2, 4)})
+    out = pp_comm.recv_intermediate_tensors()
+    assert out["hidden_states"].shape == (ROW_BOUND + 2, 4)
 
 
 def test_roundtrip_preserves_proxy_tensors(monkeypatch):
@@ -315,7 +376,7 @@ def test_roundtrip_preserves_proxy_tensors(monkeypatch):
         {"hidden_states": torch.randn(4, 8), "residual": torch.randn(4, 8)}
     )
     pp_comm.send_intermediate_tensors(it)
-    grp.recv_tensor_dict.return_value = sent["tensors"]
+    _serve_recv(monkeypatch, grp, sent["tensors"])
 
     got = pp_comm.recv_intermediate_tensors()
     for k in ("hidden_states", "residual"):
@@ -461,6 +522,31 @@ def test_async_send_hands_owned_tensors_over_uncloned(monkeypatch):
     )
     assert sent[2] is not hidden and torch.equal(sent[2], hidden)
     assert sent[3] is aux
+
+
+def test_async_send_copies_into_one_resident_buffer_per_key(monkeypatch):
+    # The send in flight lives through the next step's forward; at the chunk's
+    # row count it would pin a block of a new size every step.
+    _fake_async_pp_group(monkeypatch, rank_in_group=0, world_size=2)
+    monkeypatch.setattr(pp_comm.envs, "ATOM_PP_SEND_ALLGATHER", False)
+    sent = []
+    monkeypatch.setattr(
+        pp_comm.torch.distributed,
+        "isend",
+        lambda buf, dst, group: sent.append(buf) or MagicMock(),
+    )
+    ptrs = set()
+    for rows in (6, 2, 8):
+        sent.clear()
+        hidden, aux = torch.randn(rows, 4), torch.randn(rows, 6)
+        pp_comm.async_send_intermediate_tensors(
+            IntermediateTensors({"hidden_states": hidden, pp_comm.PP_AUX_KEY: aux})
+        )
+        assert torch.equal(sent[2], hidden) and torch.equal(sent[3], aux)
+        assert sent[2].untyped_storage().nbytes() == ROW_BOUND * 4 * 4
+        assert sent[3].untyped_storage().nbytes() == ROW_BOUND * 6 * 4
+        ptrs.add((sent[2].data_ptr(), sent[3].data_ptr()))
+    assert len(ptrs) == 1
 
 
 # ---------------------------------------------------------------------------

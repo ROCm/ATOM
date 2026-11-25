@@ -132,7 +132,7 @@ class PPAuxRelay:
             self._check_received(received)
             if not self.own_ids:
                 return received[:num_tokens]
-        # Hand the step's buffer over: the send path owns it from here.
+        # Hand the step's buffer over: the send copies it into its resident buffer.
         send, self._send = self._send, None
         assert (
             send is not None and send.shape[0] == num_tokens
