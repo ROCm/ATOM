@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """The presence-penalty kernels (`triton_presence_penalty.py`) against the
 plain rule (`presence_penalty_reference.expected_logits`), step by step."""

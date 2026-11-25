@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """References for the presence penalty (`atom/model_ops/presence_penalty.py`).
 

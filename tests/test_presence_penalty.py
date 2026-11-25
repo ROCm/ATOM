@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """The presence penalty without a GPU: request admission, the host bookkeeping
 and staging of `presence_penalty.py`, and the rule at the token-constraint
