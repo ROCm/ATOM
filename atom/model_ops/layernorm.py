@@ -1240,8 +1240,12 @@ class GemmaRMSNorm(nn.Module):
         residual: torch.Tensor,
         rows: torch.Tensor | None = None,
         write_residual: bool = True,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """`self(routed + sigmoid(gate) * shared, residual)` in one launch.
+
+        `out` (ATOM_FINAL_NORM_INTO_OUTPUT, a final norm only): rows the fused
+        gather + tail kernel writes the normed rows into; other routes ignore it.
 
         `write_residual=False` (a final norm, whose new residual nobody reads)
         returns the normed rows alone, and only rows `rows` when given
@@ -1255,7 +1259,13 @@ class GemmaRMSNorm(nn.Module):
             moe, residual, self.weight, rows
         ):
             return moe_gather_tail_rmsnorm(
-                moe, residual, self.weight, self.variance_epsilon, rows, write_residual
+                moe,
+                residual,
+                self.weight,
+                self.variance_epsilon,
+                rows,
+                write_residual,
+                out=out if (rows is None and not write_residual) else None,
             )
         moe = resolve_gathered(moe)
         if self.fused_allreduce:

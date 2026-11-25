@@ -1681,6 +1681,11 @@ class Qwen3NextDecoderLayer(nn.Module):
         `(x_fp8, x_scale, residual)` -- or None where it does not apply (then the norm runs in
         bf16 and the Linear quantizes: the same bytes). A deferred gather (`GatheredRouted`,
         ATOM_MOE_GATHER_TAIL_NORM) goes to the gather + tail kernel's 1x32 epilogue."""
+        from atom.model_ops.embed_norm_mx32 import EmbedNormMx32
+
+        if isinstance(hidden_states, EmbedNormMx32):
+            # ATOM_EMBED_NORM0_MX32: layer 0's embedding + norm + quant ran as one launch
+            return tuple(hidden_states)
         if residual is None or not isinstance(hidden_states, MoEGatedSum):
             return None
         if not mxfp8_1x32.fused_act_quant():
@@ -1909,6 +1914,53 @@ class Qwen3NextModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _embed_first(self, input_ids: torch.Tensor):
+        """Layer 0's input: the embedding rows, or (ATOM_EMBED_NORM0_MX32=1, default off) the
+        embedding + layer 0's input norm + its 1x32 MXFP8 quant from one launch
+        (embed_norm_mx32.EmbedNormMx32, taken by layer 0's `_input_norm_mx32`). Same bytes."""
+        from atom.model_ops import embed_norm_mx32
+
+        if embed_norm_mx32.enabled():
+            fused = self._embed_norm0_mx32(input_ids)
+            if fused is not None:
+                return fused
+        return self.get_input_embeddings(input_ids)
+
+    def _embed_norm0_mx32(self, input_ids: torch.Tensor):
+        from atom.model_ops import embed_norm_mx32
+        from atom.model_ops.layernorm import gluon_gemma_rmsnorm
+
+        embed = self.embed_tokens
+        if (
+            self.start_layer != 0
+            or not isinstance(embed, VocabParallelEmbedding)
+            or embed.tp_size != 1
+            or not mxfp8_1x32.fused_act_quant()
+            or gluon_gemma_rmsnorm() is None
+        ):
+            return None
+        layer = self.layers[0]
+        norm = layer.input_layernorm
+        if (
+            not isinstance(norm, GemmaRMSNorm)
+            or norm.use_fused_quant
+            or norm.fused_allreduce
+        ):
+            return None
+        if layer.layer_type == "linear_attention":
+            if not getattr(layer.linear_attn, "takes_mx32_input", False):
+                return None
+            proj = getattr(layer.linear_attn, "in_proj_qkvzba", None)
+        elif layer.layer_type == "full_attention":
+            proj = getattr(layer.self_attn, "qkv_proj", None)
+        else:
+            return None
+        if not mxfp8_1x32.takes_mx32(proj):
+            return None
+        return embed_norm_mx32.embed_norm_mx32(
+            input_ids, embed.weight, norm.weight.data, norm.variance_epsilon
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1920,7 +1972,7 @@ class Qwen3NextModel(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
+                hidden_states = self._embed_first(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -1939,8 +1991,18 @@ class Qwen3NextModel(nn.Module):
         if isinstance(hidden_states, MoEGatedSum):
             # The last MoE block's gated add folded into the final norm, which
             # skips the residual store nobody reads.
+            from atom.model_ops import model_out_buffer
+
             return self.norm.forward_moe_tail(
-                hidden_states, residual, write_residual=False
+                hidden_states,
+                residual,
+                write_residual=False,
+                out=model_out_buffer.take(
+                    residual.shape[0],
+                    residual.shape[1],
+                    residual.dtype,
+                    residual.device,
+                ),
             )
         hidden_states, _ = self.norm(hidden_states, residual)
 

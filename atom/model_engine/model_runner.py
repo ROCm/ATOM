@@ -15,6 +15,7 @@ from typing import Any, ClassVar, NamedTuple
 import numpy as np
 import torch
 import torch.profiler as torch_profiler
+
 import tqdm
 from aiter import destroy_dist_env, init_dist_env
 from aiter.dist.parallel_state import (
@@ -138,6 +139,11 @@ _EARLY_META = os.environ.get("ATOM_HOSTNEXT_EARLY_META", "0") == "1"
 # ATOM_HOSTNEXT_FUSED_PROLOGUE=1 (with EARLY_META): the early fix and the GDN
 # pre-verify kernels as one launch at the end of the build (`early_meta`).
 _FUSED_PROLOGUE = _EARLY_META and os.environ.get("ATOM_HOSTNEXT_FUSED_PROLOGUE", "0") == "1"
+# ATOM_HOSTNEXT_POST_GRAPH=1: a graphed speculative verify's presence penalty,
+# rejection-sampling verify and fused epilogue replayed as one recorded graph
+# per step shape (`model_ops.post_verify_graph`); the same bits as the eager
+# chain, which runs wherever the recording does not apply.
+_POST_GRAPH = os.environ.get("ATOM_HOSTNEXT_POST_GRAPH", "0") == "1"
 
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
@@ -3459,7 +3465,14 @@ class ModelRunner:
                 if logits is not None:
                     logits = logits[:scheduled_tokens]
                     if self._presence_step is not None:
-                        self._presence_step.apply(logits)
+                        if (
+                            _POST_GRAPH
+                            and forward_context.spec_decode_metadata is not None
+                        ):
+                            # postprocess applies it, recorded or not
+                            self._pg_pending_apply = logits
+                        else:
+                            self._presence_step.apply(logits)
                 else:
                     logits = self._compute_logits(hidden_states, greedy_ids, topk_cands)
 
@@ -3950,6 +3963,281 @@ class ModelRunner:
             )
         return out, verdict, nxt, host
 
+    def _post_graph_verify(
+        self,
+        batch: ScheduledBatch,
+        metadata,
+        logits,
+        temperatures: torch.Tensor,
+        top_ks,
+        top_ps,
+        all_greedy: bool,
+        hidden_states: torch.Tensor,
+    ):
+        """ATOM_HOSTNEXT_POST_GRAPH: ``(sampled tokens, verdict, next anchor ids,
+        host slots)`` of a graphed verify from one replayed recording of the
+        presence penalty (left by `run_model`), `_sample_verify_and_bonus`'s
+        rejection-sampling verify and `_fused_verify_epilogue` with the host
+        hand-off; None where the eager chain runs (the penalty still pending)."""
+        mods = self.__dict__.get("_pg_static")
+        if mods is None:
+            mods = self._pg_static = self._post_graph_static()
+        if not mods:
+            return None
+        pvg, tts, sampler_mod, VerifyHandoff, verify_epilogue, max_bs = mods
+        rs = self._spec_rs
+        drafter = self.drafter
+        proc = self.tokenID_processor
+        step = self._presence_step
+        if (
+            not isinstance(logits, torch.Tensor)
+            or all_greedy
+            or batch.is_dummy_run
+            or batch.next_token_ids is not None
+            or proc._handoff_rings is None
+            or not metadata.target_logits_indices.numel()
+            or any(batch.return_logprobs)
+            or self.rejection_sampler.synthetic_acceptance_rates is not None
+            or (step is not None and not self._pg_fixed_rows)
+            or not rs.applies(logits, top_ks, top_ps)
+        ):
+            return None
+        context = get_forward_context().context
+        if not context.forward_mode.use_cudagraph:
+            return None
+        bs = batch.total_seqs_num
+        S = metadata.num_spec_steps
+        if not 1 <= bs <= max_bs or metadata.cu_num_draft_tokens.numel() != bs:
+            return None
+
+        ids = proc.input_ids.gpu[1 : batch.total_tokens_num + 1]
+        stage, draft_presence = drafter.verify_epilogue_targets(
+            ids, context.positions, hidden_states
+        )
+        if stage is not None and stage["running_bs"] > max_bs:
+            stage = None
+        top_k = int(top_ks)
+        # the eager sampler's choice (`fused_topk_topp_sample`, not capturing)
+        gkey = (top_k, logits.shape[1], logits.dtype)
+        gluon = self._pg_gluon.get(gkey)
+        if gluon is None:
+            gluon = self._pg_gluon[gkey] = bool(
+                envs.ATOM_SAMPLER_GLUON_SELECT
+                and tts.topk_topp_sample_gluon_select_supported(logits, top_k)
+            )
+        seed = torch.cuda.initial_seed() & 0xFFFFFFFFFFFFFFFF if gluon else None
+        num_draft = metadata.num_draft_tokens_np
+        uniform = bool(
+            len(num_draft) == bs
+            and (num_draft == S).all()
+            and batch.total_tokens_num == bs * (S + 1)
+        )
+        per_req_topp = isinstance(top_ps, torch.Tensor)
+        key = (
+            bs,
+            metadata.target_logits_indices.numel(),
+            S,
+            top_k,
+            ("tensor", top_ps.numel()) if per_req_topp else top_ps,
+            uniform,
+            None if stage is None else stage["running_bs"],
+            step is not None,
+            draft_presence is not None,
+            context.scheduled_bs,
+            seed,
+        )
+        rings = proc._handoff_rings
+        # Where the recording reads and writes, besides buffers made once with
+        # their owners (the sampler's records, the draft penalty's, the presence
+        # mask) and shapes the key fixes.
+        sig = (
+            rings,
+            logits.data_ptr(),
+            temperatures.data_ptr(),
+            top_ps.data_ptr() if per_req_topp else 0,
+            metadata.cu_num_draft_tokens.data_ptr(),
+            metadata.target_logits_indices.data_ptr(),
+            metadata.bonus_logits_indices.data_ptr(),
+            metadata.input_ids.data_ptr(),
+            0 if step is None else step.slots.data_ptr(),
+            0 if step is None else step.row_pos.data_ptr(),
+            0 if step is None else step.input_ids.data_ptr(),
+            0 if stage is None else stage["positions"].data_ptr(),
+            0 if stage is None else stage["hidden_states"].data_ptr(),
+            0 if stage is None else stage["staged"]["input_ids"].data_ptr(),
+        )
+        pg = self._post_graphs
+        ent, record_now = pg.lookup(key, sig)
+        if ent is None and not record_now:
+            return None
+        host = (
+            rings[0].claim_cached((bs, S + 1)),
+            rings[1].claim_cached((2, bs)),
+        )
+        tok_slot, status_slot = host
+        philox = 0
+        if seed is not None:
+            sampler_mod._PHILOX_CALLS[0] += 1
+            philox = sampler_mod._PHILOX_CALLS[0]
+        pg.upload(
+            (
+                philox,
+                tok_slot.index * tok_slot.ring.capacity,
+                tok_slot.index * tok_slot.ring.flags.shape[1],
+                tok_slot.seq,
+                status_slot.index * status_slot.ring.capacity,
+                status_slot.index * status_slot.ring.flags.shape[1],
+                status_slot.seq,
+            )
+        )
+        if pvg.POST_GRAPH_CHECK:
+            snap = self._post_graph_snapshot(logits, step, stage, draft_presence, ids)
+
+        def body():
+            if step is not None:
+                step.apply(logits)
+            target, bonus = pvg.rs_verify_recordable(
+                rs, logits, metadata, temperatures, top_k, top_ps, seed, pg.scal
+            )
+            return verify_epilogue(
+                target,
+                bonus.reshape(-1),
+                metadata,
+                max_bs=max_bs,
+                presence_step=step,
+                draft_presence=draft_presence,
+                draft_presence_bs=context.scheduled_bs,
+                stage=stage,
+                host_dev=(tok_slot.ring, status_slot.ring, pg.scal),
+                uniform=uniform,
+            )
+
+        if ent is None:
+            ent = pg.record(key, sig, body)
+        ent["graph"].replay()
+        pg.stats["replay"] += 1
+        out, verdict, nxt = ent["outs"]
+        if pvg.POST_GRAPH_CHECK:
+            self._post_graph_check(
+                pg, snap, (out, verdict, nxt), logits, step, stage, draft_presence,
+                ids, rs, metadata, temperatures, top_k, top_ps, seed, max_bs,
+                context.scheduled_bs, uniform,
+            )
+        if step is not None:
+            step._anchors_marked = True
+        if stage is not None or draft_presence is not None:
+            drafter.verify_handoff = VerifyHandoff(
+                stage["staged"] if stage is not None else None,
+                draft_presence is not None,
+            )
+        return out, verdict, nxt, host
+
+    def _post_graph_static(self):
+        """The deployment half of `_post_graph_verify`'s conditions, decided once:
+        its modules and the epilogue's batch bound, or () where it never applies."""
+        from aiter.ops.triton.fusions import topk_topp_sample as tts
+
+        from atom.model_ops import post_verify_graph as pvg
+        from atom.model_ops import presence_penalty as pp
+        from atom.model_ops import sampler as sampler_mod
+        from atom.model_ops.verify_epilogue import VerifyHandoff, verify_epilogue
+
+        if (
+            getattr(self, "_spec_rs", None) is None
+            or getattr(self, "drafter", None) is None
+            or pvg._philox_uniform is None
+            or not envs.ATOM_SPEC_FUSED_VERIFY_SAMPLE
+            or not envs.ATOM_MTP_FUSED_VERIFY_EPILOGUE
+            or not envs.ATOM_MTP_VERIFY_HOST_HANDOFF
+            or not self.tokenID_processor.is_deferred_out
+            or get_pcp_world_size() > 1
+            or get_tp_group().world_size > 1
+        ):
+            logger.info("ATOM_HOSTNEXT_POST_GRAPH: not applicable to this deployment")
+            return ()
+        self._pg_gluon = {}
+        # without the fixed presence rows, only steps without a penalty
+        self._pg_fixed_rows = pp._FIXED_ROWS
+        self._post_graphs = pvg.PostVerifyGraphs(self.device)
+        return (
+            pvg,
+            tts,
+            sampler_mod,
+            VerifyHandoff,
+            verify_epilogue,
+            self._verify_epilogue_max_bs(),
+        )
+
+    def _post_graph_snapshot(self, logits, step, stage, draft_presence, ids):
+        """ATOM_HOSTNEXT_POST_GRAPH_CHECK: what the chain reads and writes."""
+        state = {"logits": logits, "ids": self.tokenID_processor.input_ids.gpu}
+        if step is not None:
+            state["mask"] = step.state.mask
+        if stage is not None:
+            for k, v in stage["staged"].items():
+                state["staged_" + k] = v
+        if draft_presence is not None:
+            dp = draft_presence
+            for k in ("slots", "penalties", "pos", "ctx"):
+                state["dp_" + k] = getattr(dp, k)
+        torch.cuda.synchronize()
+        return (
+            {k: (v, v.clone()) for k, v in state.items()},
+            torch.cuda.get_rng_state(),
+        )
+
+    def _post_graph_check(
+        self, pg, snap, outs, logits, step, stage, draft_presence, ids, rs, metadata,
+        temperatures, top_k, top_ps, seed, max_bs, scheduled_bs, uniform,
+    ):
+        """Run the eager chain from the snapshot and compare with the replay's
+        results; the eager chain's state is left (equal when the check passes)."""
+        from atom.model_ops import sampler as sampler_mod
+        from atom.model_ops.verify_epilogue import verify_epilogue
+
+        torch.cuda.synchronize()
+        bufs, rng = snap
+        got = {k: v.clone() for k, (v, _) in bufs.items()}
+        got_outs = [t.clone() for t in outs]
+        rng_after = torch.cuda.get_rng_state()
+        for v, saved in bufs.values():
+            v.copy_(saved)
+        torch.cuda.set_rng_state(rng)
+        if seed is not None:
+            sampler_mod._PHILOX_CALLS[0] -= 1
+        if step is not None:
+            step._anchors_marked = False
+            step.apply(logits)
+        target, bonus = rs.verify(logits, metadata, temperatures, top_k, top_ps)
+        ref_outs = verify_epilogue(
+            target,
+            bonus.reshape(-1),
+            metadata,
+            max_bs=max_bs,
+            presence_step=step,
+            draft_presence=draft_presence,
+            draft_presence_bs=scheduled_bs,
+            stage=stage,
+            host=None,
+            uniform=uniform,
+        )
+        torch.cuda.synchronize()
+        bad = [k for k, (v, _) in bufs.items() if not torch.equal(v, got[k])]
+        bad += [
+            n for n, a, b in zip(("out", "verdict", "next"), got_outs, ref_outs)
+            if not torch.equal(a, b)
+        ]
+        if not torch.equal(rng_after, torch.cuda.get_rng_state()):
+            bad.append("rng")
+        if bad:
+            pg.stats["check_bad"] += 1
+            if pg.stats["check_bad"] <= 5:
+                logger.error("ATOM_HOSTNEXT_POST_GRAPH_CHECK: mismatch in %s", bad)
+        else:
+            pg.stats["check_ok"] += 1
+        for o, r in zip(outs, ref_outs):
+            o.copy_(r)
+
     _glue_sampler = None
 
     def _glue_step_sample(self, cands, metadata, temperatures, top_k, top_ps):
@@ -4021,11 +4309,23 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        # ATOM_HOSTNEXT_POST_GRAPH: run_model left the presence penalty to here
+        pending_apply = (
+            self.__dict__.pop("_pg_pending_apply", None) if _POST_GRAPH else None
+        )
+        if pending_apply is not None and spec_decode_metadata is None:
+            self._presence_step.apply(pending_apply)
+            pending_apply = None
         spec_rs = getattr(self, "_spec_rs", None)
         if spec_rs is not None:
             # This step's requests: their draft records for the verify below and
             # the draft passes after it, and the passes' sampling parameters.
-            spec_rs.stage_step(batch.req_ids[:bs], temperatures, top_ps)
+            spec_rs.stage_step(
+                batch.req_ids[:bs],
+                temperatures,
+                top_ps,
+                temps_host=getattr(batch, "temperatures", None),
+            )
         # Set when the sampled tokens are already identical on every TP rank.
         tokens_tp_synced = False
         # ATOM_GLUE_STEP_SAMPLE's kernel or the fused verify epilogue
@@ -4070,7 +4370,25 @@ class ModelRunner:
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            if isinstance(logits, GatheredCandidates):
+            if _POST_GRAPH:
+                post = self._post_graph_verify(
+                    batch,
+                    spec_decode_metadata,
+                    logits,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                    all_greedy,
+                    hidden_states,
+                )
+                if post is not None:
+                    sampled_tokens, verdict, glue_next, handoff_slots = post
+                    glue = post[:3]
+                elif pending_apply is not None:
+                    self._presence_step.apply(pending_apply)
+            if glue is not None:
+                pass
+            elif isinstance(logits, GatheredCandidates):
                 if isinstance(top_ks, int) and top_ks <= logits.k:
                     # Sampler, rejection, presence marks and next anchors in one
                     # kernel, identical on every TP rank (ATOM_GLUE_STEP_SAMPLE).
@@ -4392,6 +4710,10 @@ class ModelRunner:
             if step_key is not None:
                 timeline.mark(step_key, "draft_kv_launched")
         if pp_non_last or self._is_pure_middle_chunk(batch):
+            if _POST_GRAPH:
+                pending_apply = self.__dict__.pop("_pg_pending_apply", None)
+                if pending_apply is not None:
+                    self._presence_step.apply(pending_apply)
             # This return skips `postprocess`, hence propose() and the DP
             # collectives it carries. Run it for those and drop the ids.
             if will_align_draft:
@@ -5001,9 +5323,12 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:running_tokens]
                     )
-                    model_output = self.model(
-                        input_ids[:running_tokens], model_positions
-                    )
+                    from atom.model_ops import model_out_buffer
+
+                    with model_out_buffer.target(outputs[:running_tokens]):
+                        model_output = self.model(
+                            input_ids[:running_tokens], model_positions
+                        )
                     outputs[:running_tokens] = model_output
                     if logits_in_graph:
                         self.model.compute_logits(outputs[:running_tokens])
@@ -5034,7 +5359,10 @@ class ModelRunner:
                         # The drafter's aux capture hook runs inside the
                         # forward and writes its own buffers (in-graph).
                         def full_forward(n=running_tokens, pos=model_positions):
-                            outputs[:n] = self.model(input_ids[:n], pos)
+                            # ATOM_FINAL_NORM_INTO_OUTPUT: the final norm may write
+                            # outputs[:n] itself (then this assignment copies nothing)
+                            with model_out_buffer.target(outputs[:n]):
+                                outputs[:n] = self.model(input_ids[:n], pos)
                             if logits_in_graph:
                                 return self.model.compute_logits(outputs[:n])
                             return None

@@ -13,6 +13,7 @@ import threading
 from contextlib import contextmanager
 from functools import wraps
 
+from atom.utils import late_pack as _late_pack
 import torch
 
 # Graph captures in progress. _check_active runs on every publication and reads
@@ -364,6 +365,12 @@ class BufferPublication:
         return _count(count, self.capacity, self.name)
 
     def _copy(self, count):
+        if _late_pack.active():
+            # ATOM_PROLOGUE_PACKED_H2D: into the build's single upload (late_pack.flush)
+            src, dst = self._source_view[:count], self._destination_view[:count]
+            if src.is_contiguous() and dst.is_contiguous():
+                _late_pack.add(dst, src)
+                return
         if count == self.capacity:
             self._destination_view.copy_(self._source_view, non_blocking=True)
         elif count:

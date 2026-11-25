@@ -62,6 +62,15 @@ _FUSED_SELECT = os.environ.get("ATOM_MTP_DRAFT_FUSED_SELECT", "0") == "1"
 # epilogue (aiter gemm_a8w8_lmhead_stats) and advances the draw counter: no
 # stats kernel. Z and p differ in their last bits (summation order).
 _LMHEAD_STATS = os.environ.get("ATOM_MTP_DRAFT_LMHEAD_STATS", "0") == "1"
+# ATOM_HOSTNEXT_POST_GRAPH: stage_step skips the slot lookup and upload when the
+# step's requests are the last step's (only stage_step hands out slots).
+_REUSE_SLOTS = os.environ.get("ATOM_HOSTNEXT_POST_GRAPH", "0") == "1"
+# ATOM_SPEC_RS_STAGE_CACHE=1 (default off): stage_step skips its two small uploads when
+# they would rewrite the same bytes -- the slot upload when the step's requests are the
+# last step's (as above), the temperature copy when the step's host temperatures and
+# batch size are the last step's (only stage_step writes row_temp / step_slots). Two
+# ~2.5 us copies a steady decode step; the same values in the buffers.
+_STAGE_CACHE = os.environ.get("ATOM_SPEC_RS_STAGE_CACHE", "0") == "1"
 
 
 def _kb(k: int) -> int:
@@ -202,6 +211,7 @@ class SpecRejectionSampling:
             for _ in range(_PINNED_RING)
         ]
         self._pin_next = 0
+        self._last_slots = None
         self._slot_of: OrderedDict = OrderedDict()
         self._free = list(range(self.num_slots - 1, -1, -1))
         self._presence = None
@@ -228,7 +238,7 @@ class SpecRejectionSampling:
             slots[i] = slot
         return slots
 
-    def stage_step(self, req_ids, temperatures, top_ps) -> None:
+    def stage_step(self, req_ids, temperatures, top_ps, temps_host=None) -> None:
         """This step's requests (batch order): their record slots, for the
         verify below and the draft passes after it, and the draft passes'
         sampling parameters (each draft row is the step's request of that
@@ -237,11 +247,22 @@ class SpecRejectionSampling:
         self.active_bs = bs
         if bs == 0:
             return
-        host = self._pinned[self._pin_next]
-        self._pin_next = (self._pin_next + 1) % _PINNED_RING
-        host[:bs].copy_(torch.from_numpy(self._slots_for(list(req_ids[:bs]))))
-        self.step_slots[:bs].copy_(host[:bs], non_blocking=True)
-        self.row_temp[:bs].copy_(temperatures[:bs])
+        if _REUSE_SLOTS or _STAGE_CACHE:
+            # ATOM_HOSTNEXT_POST_GRAPH: the same requests as the last step and no
+            # slot handed out since: step_slots already holds them, in order.
+            key = tuple(req_ids[:bs])
+            if key != getattr(self, "_last_slots", None):
+                self._last_slots = key
+                self._stage_slots(key, bs)
+        else:
+            self._stage_slots(req_ids, bs)
+        tkey = None
+        if _STAGE_CACHE and temps_host is not None:
+            # the bytes the copy below would write come from these host values
+            tkey = (bs, np.ascontiguousarray(temps_host[:bs]).tobytes())
+        if tkey is None or tkey != getattr(self, "_last_temps", None):
+            self.row_temp[:bs].copy_(temperatures[:bs])
+            self._last_temps = tkey
         if isinstance(top_ps, torch.Tensor) and top_ps.numel() > 1:
             self.row_topp[:bs].copy_(top_ps[:bs])
             self._topp_scalar = None
@@ -250,6 +271,12 @@ class SpecRejectionSampling:
             if tp != self._topp_scalar:
                 self.row_topp.fill_(tp)
                 self._topp_scalar = tp
+
+    def _stage_slots(self, req_ids, bs: int) -> None:
+        host = self._pinned[self._pin_next]
+        self._pin_next = (self._pin_next + 1) % _PINNED_RING
+        host[:bs].copy_(torch.from_numpy(self._slots_for(list(req_ids[:bs]))))
+        self.step_slots[:bs].copy_(host[:bs], non_blocking=True)
 
     def record_args(self, i: int, scheduled_bs: int, context=None):
         """`store_step`'s copies as arguments for a fused launch

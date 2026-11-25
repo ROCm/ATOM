@@ -39,12 +39,34 @@ program (an atomic arrival count, no waiting), once every row is written.
 
 from typing import NamedTuple
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 # Hidden-state rows a copy program moves.
 _COPY_ROWS = 2
+
+# ATOM_PERSISTENT_VERDICT=1 (default off): the verdict [3, bs] goes to one fixed buffer a batch
+# size instead of a fresh allocation, so the drafter's span graph (ATOM_MTP_DRAFT_SPAN_GRAPH),
+# recorded on these rows, reads them in place: its two per-step copies of the rejected counts
+# and anchors are skipped (eagle_proposer._span_graph_propose copies only when the addresses
+# differ). Every reader of a step's verdict (the span graph, the next step's early fix) runs
+# on the stream before the next same-size verify epilogue rewrites it. Same values.
+_PERSIST_VERDICT = os.environ.get("ATOM_PERSISTENT_VERDICT", "0") == "1"
+_VERDICTS: dict = {}
+
+
+def persistent_verdict(t: torch.Tensor) -> bool:
+    """Whether `t` lies in one of the fixed verdict buffers."""
+    if not _VERDICTS:
+        return False
+    p = t.data_ptr()
+    for v in _VERDICTS.values():
+        if v.data_ptr() <= p < v.data_ptr() + v.numel() * v.element_size():
+            return True
+    return False
 
 
 class VerifyHandoff(NamedTuple):
@@ -93,6 +115,7 @@ class VerifyHandoff(NamedTuple):
         "host_status_ptr",
         "tok_flag_ptr",
         "status_flag_ptr",
+        "host_scal_ptr",
     ],
 )
 def _verify_epilogue_kernel(
@@ -141,6 +164,10 @@ def _verify_epilogue_kernel(
     status_flag_ptr,
     tok_seq,
     status_seq,
+    # HOST_DEV (ATOM_HOSTNEXT_POST_GRAPH): int64 [tok data offset, tok flag
+    # offset, tok seq, status data offset, status flag offset, status seq] at
+    # host_scal_ptr + 1, from the ring bases above (a recorded launch)
+    host_scal_ptr,
     num_spec_steps,
     scheduled_bs,
     running_bs,
@@ -158,6 +185,7 @@ def _verify_epilogue_kernel(
     Q_P2: tl.constexpr,
     H: tl.constexpr,
     COPY_ROWS: tl.constexpr,
+    HOST_DEV: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     if pid == 0:
@@ -190,13 +218,28 @@ def _verify_epilogue_kernel(
         tl.store(out_ptr + flat, tok, mask=in_row)
         rejected_count = num_spec_steps - accepted
         if HOST:
+            if HOST_DEV:
+                # the claimed slots and sequence numbers from the device
+                h_tok = host_tok_ptr + tl.load(host_scal_ptr + 1)
+                f_tok = tok_flag_ptr + tl.load(host_scal_ptr + 2)
+                q_tok = tl.load(host_scal_ptr + 3).to(tl.int32)
+                h_st = host_status_ptr + tl.load(host_scal_ptr + 4)
+                f_st = status_flag_ptr + tl.load(host_scal_ptr + 5)
+                q_st = tl.load(host_scal_ptr + 6).to(tl.int32)
+            else:
+                h_tok = host_tok_ptr
+                f_tok = tok_flag_ptr
+                q_tok = tok_seq
+                h_st = host_status_ptr
+                f_st = status_flag_ptr
+                q_st = status_seq
             # first, so the host waits for as little as possible
-            tl.store(host_tok_ptr + flat, tok, mask=in_row)
-            tl.store(host_status_ptr + b, accepted, mask=real)
-            tl.store(host_status_ptr + scheduled_bs + b, rejected_count, mask=real)
+            tl.store(h_tok + flat, tok, mask=in_row)
+            tl.store(h_st + b, accepted, mask=real)
+            tl.store(h_st + scheduled_bs + b, rejected_count, mask=real)
             tl.debug_barrier()
-            tl.atomic_xchg(tok_flag_ptr, tok_seq, sem="release", scope="sys")
-            tl.atomic_xchg(status_flag_ptr, status_seq, sem="release", scope="sys")
+            tl.atomic_xchg(f_tok, q_tok, sem="release", scope="sys")
+            tl.atomic_xchg(f_st, q_st, sem="release", scope="sys")
         if UNIFORM:
             anchor = b * (num_spec_steps + 1) + accepted
         else:
@@ -300,6 +343,7 @@ def verify_epilogue(
     stage: dict | None = None,
     host=None,
     uniform: bool = False,
+    host_dev=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(output ids [bs, S + 1], verdict [3, bs], next anchor ids [bs])``, all
     int32, as `rejection_sample` (sampled target ids), ``presence_step.mark``
@@ -316,7 +360,9 @@ def verify_epilogue(
     `output_transfer.HostSlot` (the output rows', the ``[accepted, rejected]``
     status's) the kernel fills and flags. ``uniform``: every request verifies
     ``S`` drafts on its own ``S + 1`` rows, in order (the metadata's indices
-    are then not read).
+    are then not read). ``host_dev`` (ATOM_HOSTNEXT_POST_GRAPH, in place of
+    ``host``): ``(token ring, status ring, scalars)``, the slots and sequence
+    numbers read from the int64 device ``scalars`` (a recorded launch).
     """
     cu = metadata.cu_num_draft_tokens
     bs = cu.numel()
@@ -330,6 +376,12 @@ def verify_epilogue(
     buf = torch.empty(bs * (S + 5), dtype=torch.int32, device=dev)
     out = buf[: bs * (S + 1)].view(bs, S + 1)
     verdict = buf[bs * (S + 1) : bs * (S + 4)].view(3, bs)
+    if _PERSIST_VERDICT:
+        verdict = _VERDICTS.get((bs, dev))
+        if verdict is None:
+            verdict = _VERDICTS[(bs, dev)] = torch.empty(
+                (3, bs), dtype=torch.int32, device=dev
+            )
     nxt = buf[bs * (S + 4) :]
 
     unused = cu  # the pointer passed for what a variant does not read
@@ -406,7 +458,19 @@ def verify_epilogue(
         q, rbs, num_tokens, h = 1, bs, 0, 16
         staging = (unused,) * 3 + (0,) + (unused,) * 3 + (0, unused)
 
-    if host is not None:
+    host_scal = unused
+    if host_dev is not None:
+        assert host is None
+        tok_ring, status_ring, host_scal = host_dev
+        handoff = (
+            tok_ring.data,
+            status_ring.data,
+            tok_ring.flags,
+            status_ring.flags,
+            0,
+            0,
+        )
+    elif host is not None:
         tok_slot, status_slot = host
         assert (
             tok_slot.view.numel() == bs * (S + 1) and status_slot.view.numel() == 2 * bs
@@ -436,6 +500,7 @@ def verify_epilogue(
         *begin,
         *staging,
         *handoff,
+        host_scal,
         S,
         bs,
         rbs,
@@ -447,12 +512,13 @@ def verify_epilogue(
         BEGIN_STEP=begin_step,
         DP_BLOCK=dp_block,
         STAGE=stage is not None,
-        HOST=host is not None,
+        HOST=host is not None or host_dev is not None,
         UNIFORM=uniform,
         Q=q,
         Q_P2=triton.next_power_of_2(q),
         H=h,
         COPY_ROWS=_COPY_ROWS,
+        HOST_DEV=host_dev is not None,
         num_warps=1,
     )
     return out, verdict, nxt

@@ -58,6 +58,19 @@ class PackedCopy:
 
     def submit(self, counts):
         """Enqueue copies and return whether the packed arena is borrowed."""
+        from atom.utils import late_pack
+
+        if late_pack.active():
+            # ATOM_PROLOGUE_PACKED_H2D: the members join the build's single upload
+            # (their bytes are copied on the host now: nothing is borrowed)
+            for binding, count in zip(self.members, counts):
+                length = 0 if count is None else count * binding.bytes_per_count
+                if length:
+                    late_pack.add(
+                        binding.destination.reshape(-1).view(torch.uint8)[:length],
+                        binding.source.reshape(-1).view(torch.uint8)[:length],
+                    )
+            return False
         active = [i for i, count in enumerate(counts) if count]
         if len(active) == 1:
             # A single live member already takes one DMA; no packing/scatter.

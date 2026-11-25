@@ -1481,6 +1481,17 @@ class EagleProposer(Drafter):
             pool = self.__dict__["_span_pool"] = torch.cuda.graph_pool_handle()
         # the recording reads the verdict from buffers of its own (the verdict's tensors move between steps)
         reject, anchors = args[3].clone(), args[5].clone()
+        from atom.model_ops import verify_epilogue as _ve
+
+        if (
+            _ve.persistent_verdict(args[3])
+            and _ve.persistent_verdict(args[5])
+            and args[3].is_contiguous()
+            and args[5].is_contiguous()
+        ):
+            # ATOM_PERSISTENT_VERDICT: record on the fixed verdict rows themselves; a
+            # replay then copies nothing (src is dst)
+            reject, anchors = args[3], args[5]
         args = args[:3] + (reject, args[4], anchors)
         graph = torch.cuda.CUDAGraph()
         # as region_graph records: on the current stream, thread_local (the NCCL watchdog polls hipEventQuery)

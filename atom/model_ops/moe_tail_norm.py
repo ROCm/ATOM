@@ -855,6 +855,7 @@ def moe_gather_tail_rmsnorm(
     eps: float,
     rows: Tensor | None = None,
     write_residual: bool = True,
+    out: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """`moe_tail_rmsnorm` (write_residual) / `moe_tail_rmsnorm_rows` (not) of
     `MoEGatedSum(gather_reduce(moe.routed), shared, gate)` in one launch,
@@ -865,7 +866,9 @@ def moe_gather_tail_rmsnorm(
     tokens, hidden = shared.shape
     n_out = tokens if rows is None else rows.shape[0]
     assert rows is None or not write_residual, "a row subset has no new residual"
-    out = torch.empty((n_out, hidden), dtype=shared.dtype, device=shared.device)
+    if out is None or tuple(out.shape) != (n_out, hidden) or out.dtype != shared.dtype:
+        # (`out`: ATOM_FINAL_NORM_INTO_OUTPUT's caller-owned rows, model_out_buffer)
+        out = torch.empty((n_out, hidden), dtype=shared.dtype, device=shared.device)
     res_out = torch.empty_like(out) if write_residual else None
     if n_out == 0:
         return (out, res_out) if write_residual else out
