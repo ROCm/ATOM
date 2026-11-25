@@ -1,0 +1,415 @@
+{
+  "run": {
+    "case": "pp4-dep4-c80",
+    "lease_id": "L9b107b",
+    "node": "pit2-p03-g52",
+    "gpus": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "harness_sha": "1572129e5f313865e801e7ab519ee7c4f8a81700"
+  },
+  "metrics": {
+    "lease": "L9b107b",
+    "node": "pit2-p03-g52",
+    "chips": 8,
+    "harness_sha": "1572129e5f313865e801e7ab519ee7c4f8a81700",
+    "srt_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+    "router_sha": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+    "worker_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+    "concurrency": 80,
+    "requested_duration_s": 3600,
+    "send_duration_s": 3600.003,
+    "exit_codes": {
+      "pool-workload.rc": 0,
+      "pool-exit.rc": 0,
+      "gpool-release.rc": 0
+    },
+    "successful_profiling_records": 12955,
+    "accounting": {
+      "records_total": 13845,
+      "records_profiled": 12955,
+      "records_dropped_total": 890,
+      "records_warmup_dropped": 884,
+      "records_error_dropped": 801,
+      "error_categories": {
+        "InvalidInferenceResultError": 801
+      }
+    },
+    "interactivity_tok_s_user": 99.26787340123562,
+    "p90_full_response_itl_seconds": 0.010073752622442627,
+    "total_throughput_tok_s": 481463.7057619545,
+    "token_throughput_per_chip": 60182.96322024431,
+    "sa_record_duration_seconds": 3629.800514733,
+    "raw_record_sha256": "c481ee3b6f307c1f92798634a192b2bc552aeff2b160e6b924412db1cc9632eb",
+    "method_source_commit": "3234f996c34453191c80269b74c3d9f0b3a9bf65",
+    "method": "SA successful profiling records: 1/P90(full-response ITL), input+output token rate/all P+D chips, including cached input; no intermediate rounding",
+    "formal_sa_submission": false,
+    "limits": "Request-level metrics only. D-rank server counters and error details require separate review; no sum of per-rank percentiles."
+  },
+  "raw_record_counts": {
+    "warmup:error": 795,
+    "warmup:valid": 89,
+    "profiling:valid": 12955,
+    "profiling:error": 6
+  },
+  "profiling_errors": [
+    {
+      "trace": "3cb1c6dc71a21714587287306ebe52748568",
+      "turn": 0,
+      "source_kind": "weka_subagent",
+      "type": "InvalidInferenceResultError",
+      "input_tokens": 27817,
+      "same_trace_turn_kind_in_sa": true
+    },
+    {
+      "trace": "55a0906aeb5c8d3b40e7ddc4c61999d1eac4",
+      "turn": 24,
+      "source_kind": "weka_main",
+      "type": "InvalidInferenceResultError",
+      "input_tokens": 208995,
+      "same_trace_turn_kind_in_sa": true
+    },
+    {
+      "trace": "55a0906aeb5c8d3b40e7ddc4c61999d1eac4",
+      "turn": 26,
+      "source_kind": "weka_main",
+      "type": "InvalidInferenceResultError",
+      "input_tokens": 217769,
+      "same_trace_turn_kind_in_sa": true
+    },
+    {
+      "trace": "55a0906aeb5c8d3b40e7ddc4c61999d1eac4",
+      "turn": 29,
+      "source_kind": "weka_main",
+      "type": "InvalidInferenceResultError",
+      "input_tokens": 249644,
+      "same_trace_turn_kind_in_sa": true
+    },
+    {
+      "trace": "55a0906aeb5c8d3b40e7ddc4c61999d1eac4",
+      "turn": 1,
+      "source_kind": "weka_flat",
+      "type": "InvalidInferenceResultError",
+      "input_tokens": 260000,
+      "same_trace_turn_kind_in_sa": true
+    },
+    {
+      "trace": "002001296e8a8c38ad9d7cc436d691afc602",
+      "turn": 121,
+      "source_kind": "weka_main",
+      "type": "InvalidInferenceResultError",
+      "input_tokens": 381745,
+      "same_trace_turn_kind_in_sa": true
+    }
+  ],
+  "drain_cancelled_requests": 5,
+  "control_completed": 12961,
+  "control_reported_errors": 0,
+  "control_error_note": "Phase-control errors do not include every empty-content record rejected by the record processor; raw content errors are counted separately.",
+  "final_worker_metrics": {
+    "prefill": [
+      {
+        "metric": "vllm:mooncake_num_failed_transfers_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_recvs_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_kv_expired_reqs_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_running{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_waiting{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      }
+    ],
+    "decode": [
+      {
+        "metric": "vllm:mooncake_num_failed_transfers_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_transfers_total{engine=\"1\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_transfers_total{engine=\"2\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_transfers_total{engine=\"3\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_recvs_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_recvs_total{engine=\"1\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_recvs_total{engine=\"2\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_failed_recvs_total{engine=\"3\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_kv_expired_reqs_total{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_kv_expired_reqs_total{engine=\"1\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_kv_expired_reqs_total{engine=\"2\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:mooncake_num_kv_expired_reqs_total{engine=\"3\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_running{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_running{engine=\"1\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_running{engine=\"2\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_running{engine=\"3\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_waiting{engine=\"0\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_waiting{engine=\"1\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_waiting{engine=\"2\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      },
+      {
+        "metric": "vllm:num_requests_waiting{engine=\"3\",model_name=\"amd/MiniMax-M3.1-Flash-Quark-MXFP4\"}",
+        "value": 0.0
+      }
+    ]
+  },
+  "final_transfer_errors_and_request_gauges_zero": true,
+  "sa_reference": {
+    "run_id": 45233004275,
+    "raw_artifact_id": 14869788616,
+    "raw_sha256": "75510600f80942baf3c5a772cf067727657d8c0751b822fe3a2b937ea4d5d370",
+    "raw_counts": {
+      "warmup:error": 884,
+      "profiling:valid": 15243,
+      "profiling:error": 7
+    },
+    "profiling_errors": [
+      {
+        "trace": "3cb1c6dc71a21714587287306ebe52748568",
+        "turn": 0,
+        "source_kind": "weka_subagent",
+        "type": "InvalidInferenceResultError",
+        "input_tokens": 27831
+      },
+      {
+        "trace": "55a0906aeb5c8d3b40e7ddc4c61999d1eac4",
+        "turn": 24,
+        "source_kind": "weka_main",
+        "type": "InvalidInferenceResultError",
+        "input_tokens": 209010
+      },
+      {
+        "trace": "55a0906aeb5c8d3b40e7ddc4c61999d1eac4",
+        "turn": 26,
+        "source_kind": "weka_main",
+        "type": "InvalidInferenceResultError",
+        "input_tokens": 217784
+      },
+      {
+        "trace": "55a0906aeb5c8d3b40e7ddc4c61999d1eac4",
+        "turn": 29,
+        "source_kind": "weka_main",
+        "type": "InvalidInferenceResultError",
+        "input_tokens": 249659
+      },
+      {
+        "trace": "55a0906aeb5c8d3b40e7ddc4c61999d1eac4",
+        "turn": 1,
+        "source_kind": "weka_flat",
+        "type": "InvalidInferenceResultError",
+        "input_tokens": 260015
+      },
+      {
+        "trace": "002001296e8a8c38ad9d7cc436d691afc602",
+        "turn": 121,
+        "source_kind": "weka_main",
+        "type": "InvalidInferenceResultError",
+        "input_tokens": 381756
+      },
+      {
+        "trace": "3cb1c6dc71a21714587287306ebe52748568",
+        "turn": 2,
+        "source_kind": "weka_subagent",
+        "type": "InvalidInferenceResultError",
+        "input_tokens": 40521
+      }
+    ]
+  },
+  "sender_adjustment": {
+    "reference_lease": "Lb6034c",
+    "diagnostic_lease": "La786a5",
+    "parameter": "prefill Mooncake num_workers",
+    "previous": 10,
+    "current": 1,
+    "effective_sender_threads": [
+      10,
+      1
+    ],
+    "effective_async_sender_tasks": [
+      20,
+      2
+    ],
+    "admission": "Dispatch only after the 900s diagnostic completes without transfer failures and releases its GPU lease.",
+    "interpretation": "Candidate mitigation and performance measurement; the PP3 root cause is not established."
+  },
+  "comparison_limits": [
+    "Reuse the existing SA TP C80 result; no TP C80 experiment is authorized.",
+    "Record and disclose node/GPU-count, topology, software and workload differences from the SA result; no isolated router-gain claim.",
+    "C80 also changes decode max-num-seqs from 5 to 20 per DP rank and expands DSpark capture sizes to 160 tokens, as approved by the user.",
+    "P sender count is reduced from 10 to 1; this also reduces asynchronous sender tasks from 20 to 2. Do not attribute the observation to a single native concurrency mechanism."
+  ],
+  "phase_notices": [
+    "01:18:17.771 NOTICE   Phase warmup (warmup) started | target: 884 requests (runner.py:600)",
+    "01:24:38.644 NOTICE   Phase warmup (warmup) sending complete | sent=884, completed=865, in_flight=19 | sessions: sent=82, completed=25 (runner.py:1047)",
+    "01:24:42.850 NOTICE   Phase warmup (warmup) complete | completed=884, cancelled=0, errors=0 | sessions: completed=25, cancelled=0 | elapsed=385.08s (runner.py:1170)",
+    "01:24:42.963 NOTICE   Phase profiling (profiling) started | phase_index=0 | profiling_index=0 | target: 3600.0s duration (runner.py:600)",
+    "02:24:42.966 NOTICE   Phase profiling (profiling) sending complete | sent=12,966, completed=12,918, in_flight=48 | sessions: sent=146, completed=88 | timeout_triggered=True (runner.py:1047)",
+    "02:25:22.964 NOTICE   Phase profiling (profiling) complete | completed=12,961, cancelled=5, errors=0 | sessions: completed=88, cancelled=0 | elapsed=3640.00s | grace_period_timeout=True (runner.py:1170)",
+    "02:25:22.965 NOTICE   All requests have completed, please wait for the results to be processed (currently 12,961 of 12,961 records processed)... (records_manager.py:1227)",
+    "02:25:22.965 NOTICE   All credits completed (phase_orchestrator.py:252)"
+  ],
+  "warmup_note": "AgentX warmup uses max_tokens=1; retain its empty-content errors separately from profiling.",
+  "root_cause_status": "No transfer-failure observation is not proof of a unique cause or permanent fix.",
+  "archive_sha256": "cedd353b859f193f3f76ee7ba308bda87a774a39ba5b5c7df5551eda50aac5d5",
+  "cleanup_verification": {
+    "lease": "L9b107b",
+    "remaining_run_containers": [],
+    "controller_terminal": {
+      "pool-workload.rc": "0",
+      "pool-exit.rc": "0",
+      "gpool-release.rc": "0"
+    }
+  },
+  "srt_runtime": {
+    "source_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+    "installed_hashes": {
+      "core/docker.py": "ab4d438a37299e01735596862fc434ed432f3337ce412bf25e6f8f2254fda0ee",
+      "core/launcher.py": "d8023788365855558dc7226057e31dca514e3969171caad672ff9bbc9364146d",
+      "core/runtime.py": "89f1d051a53a89f1fb6d5ff2671a705af335f0487b57741accdd0baf2df74c02",
+      "core/schema.py": "ff91c29d5d607ddd6367f452bfe8a1f6f00b664f62ff96838673aeb7b38f9f1c",
+      "backends/vllm.py": "f2c69130d0fc9cabc214c7cbd2e1806fb1d737476f236c8c3bac68432ba0b9f5",
+      "frontends/atomesh.py": "f05637f3bbc2a455a012bee26d7e87fc6677a19c26e0b19b77a478944734c4e5",
+      "frontends/vllm_router.py": "2d4d1f13864decb890485de33a694b5a8ca934b9c4485dfd7efadd7d125a11c9"
+    },
+    "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]"
+  },
+  "router_runtime": {
+    "commit": "69ed5e77bcc93b9d51cb5cf1528badd0e703ed93",
+    "profile": "release",
+    "source_dirty": "false",
+    "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+    "binary_sha256": "7d187c071dfe908d2c09ecbe8470ce8c0001be67ceede191d434a5b5ee265a79",
+    "lockfile_sha256": "86354f5a25283aa2535ea97b2b6a937a7cc5860f6934d378ab91cd2d13db19b7",
+    "image_id": "sha256:156de9c2e42245318498ec5083953322bf306783c69ca2b7129b5dbc3d722daa",
+    "base_image": "rocm/atom-dev:nightly_202611110332@sha256:19712185deac1eca8db5f21bc25ff2f9a3f44758bfd7cec8cc1c7889fbea097d",
+    "runtime_verified": true
+  },
+  "rdma_observation": {
+    "first": "2026-11-25T00:50:21.054030+00:00",
+    "last": "2026-11-25T02:26:23.560935+00:00",
+    "samples": 127,
+    "error_counter_count": 200,
+    "nonzero_error_counter_deltas": {},
+    "scope": "Samples taken while this lease was active; host counters cannot rule out every per-QP failure."
+  },
+  "comparison": {
+    "vs_sa_tp_c80": {
+      "interactivity_tok_s_user": -69.34056514476164,
+      "token_throughput_per_chip": 20.403574495049593
+    },
+    "vs_pp_dep_c40": {
+      "interactivity_tok_s_user": -20.882629845361546,
+      "token_throughput_per_chip": 78.55042985733445
+    },
+    "content_error_rate_pct": 0.046292724326826636,
+    "sa_content_error_rate_pct": 0.04590163934426229
+  },
+  "agentx_submission_valid": true,
+  "metric_duration_coverage": [
+    {
+      "phase_name": "profiling",
+      "expected_duration_seconds": 3600.0,
+      "required_ratio": 0.95,
+      "ttft_ratio": 1.0,
+      "inter_token_latency_ratio": 1.0
+    }
+  ],
+  "raw_cancelled_profiling_records": 0,
+  "drain_cancellation_note": "Five requests were cancelled after30s grace; the client waited10s more for credit return and forced phase completion. They have no raw per-request exports. Final P/D request gauges were0 and all run containers/GPUs were released. The credit-return timeout remains an open teardown issue.",
+  "formal_sa_submission": false,
+  "metric_method_validation": {
+    "source_head": "3234f996c34453191c80269b74c3d9f0b3a9bf65",
+    "source_files_sha256": {
+      "artifacts.py": "733b9615196e84a12f5c497e64201c1cd912b8da954cc68200359b4e89214da1",
+      "request_metrics.py": "2e8fe91989732d641a41c066db02f7639968adf841a14cb82c44b80db8e000a4",
+      "common.py": "b4d029f00d7158f512af7b801763185e0789fcbd9e7aef19573865d99ce83c87"
+    },
+    "sa_reference_run": 45233004275,
+    "recomputed_raw_values": {
+      "interactivity_tok_s_user": 323.7759417176615,
+      "token_throughput_per_chip": 49984.36589299654
+    },
+    "matches_published_values_to_5_decimals": true,
+    "successful_records": 15243,
+    "gpu_rerun": false
+  },
+  "decode_external_kv_hits_by_rank": {
+    "0": 296679784,
+    "1": 292992869,
+    "2": 296586593,
+    "3": 292891531
+  },
+  "protocol_probe_transfer": {
+    "metric": "vllm:mooncake_bytes_transferred_sum",
+    "prefill_before": 0.0,
+    "prefill_after": 101376000.0,
+    "transferred_bytes_delta": 101376000.0,
+    "passed": true
+  }
+}
