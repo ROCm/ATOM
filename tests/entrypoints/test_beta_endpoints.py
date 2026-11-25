@@ -11,12 +11,14 @@ import asyncio
 import inspect
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
+from atom import structured_output
 from atom.entrypoints.openai import api_server, request_timing
 from atom.entrypoints.openai.api_compatibility import DEEPSEEK_API_COMPATIBILITY
 from atom.entrypoints.openai.chat_encoders import (
@@ -778,9 +780,10 @@ def test_zero_max_tokens_records_no_time_to_first_token(no_generation, stream, n
 
 
 def test_zero_max_tokens_still_needs_the_prompt_to_fit(no_generation):
-    with pytest.raises(HTTPException) as exc:
-        _beta_complete(prompt="x" * 65, echo=True, max_tokens=0)
-    assert exc.value.status_code == 400
+    request = BetaCompletionRequest(model="m", prompt="x" * 65, echo=True, max_tokens=0)
+    response = asyncio.run(api_server.beta_completions(request, None))
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["code"] == "context_length_exceeded"
 
 
 def test_v1_completions_still_need_a_token(engine):
@@ -1117,6 +1120,8 @@ def structured(engine, monkeypatch):
         seen.configured.append(kwargs["strict_schemas"])
 
     monkeypatch.setattr(api_server, "_configure_structured_output", configure)
+    # Setup is stubbed; the backend need not be installed.
+    monkeypatch.setattr(structured_output, "available", lambda: True)
     monkeypatch.setattr(
         api_server,
         "validate_tool_calls",
@@ -1145,6 +1150,57 @@ def test_strict_tools_are_a_beta_feature(structured, handler, tool_choice, stric
     assert structured.validated == (
         [(expected, frozenset({"weather"}))] if strict else []
     )
+
+
+PATTERN_PARAMETERS = {
+    "type": "object",
+    "properties": {"id": {"type": "string", "pattern": "^[a-z]+$"}},
+    "required": ["id"],
+    "additionalProperties": False,
+}
+
+
+@pytest.mark.parametrize(
+    "handler, kwargs",
+    [
+        (
+            api_server.chat_completions,
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "r", "schema": PATTERN_PARAMETERS},
+                }
+            },
+        ),
+        (
+            api_server.beta_chat_completions,
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "f",
+                            "strict": True,
+                            "parameters": PATTERN_PARAMETERS,
+                        },
+                    }
+                ]
+            },
+        ),
+    ],
+)
+def test_without_the_backend_a_pattern_is_a_400_naming_the_extra(
+    engine, monkeypatch, handler, kwargs
+):
+    """`pattern` is checked with RE2, which comes with the extra."""
+    monkeypatch.setattr(structured_output, "available", lambda: False)
+    monkeypatch.setitem(sys.modules, "re2", None)
+    _template(monkeypatch, engine, "<A>")
+    with pytest.raises(HTTPException) as exc:
+        _chat(handler, [USER], **kwargs)
+    assert exc.value.status_code == 400
+    assert "atom[structured-output]" in exc.value.detail
+    assert not engine.prompts
 
 
 def test_a_prefix_cannot_be_continued_under_strict_tools(structured, engine):

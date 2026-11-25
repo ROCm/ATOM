@@ -14,6 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 from atom.models.utils import IntermediateTensors
 from atom.plugin.sglang.runtime.context import bind_current_forward_batch
+from atom.plugin.sglang.runtime.model_arch import cached_model_arch_spec
 
 logger = logging.getLogger("atom.plugin.sglang.runtime.forward_context")
 
@@ -730,10 +731,7 @@ def _set_atom_forward_context(
             include_v2=True
         )
     )
-    from atom.plugin.sglang.runtime.model_arch import resolve_model_arch_spec
-
-    hf_config = getattr(atom_config, "hf_config", None)
-    model_arch, model_adapter = resolve_model_arch_spec(hf_config)
+    model_arch, model_adapter = cached_model_arch_spec(atom_config)
     attn_metadata = None
     if model_adapter.build_forward_metadata is not None:
         try:
