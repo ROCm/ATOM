@@ -35,6 +35,7 @@ hit ratio, reconciled with the cached tokens the engine reports.
 | Branch | Meaning |
 | --- | --- |
 | `hit`, `relocate`, `miss` | By the index: the selected worker holds the longest prefix; another worker holds a longer one but its queue outweighs the reuse; no candidate holds any. |
+| `shared` | By the index: the selected worker will copy part of what it is credited in from its UMBP share group (`--kv-share-weight`), whether or not another worker is credited more. |
 | `text_hit`, `text_relocate`, `text_miss` | The same, by the text tree. |
 | `unmatched` | Neither tokens nor text. |
 

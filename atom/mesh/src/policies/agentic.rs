@@ -48,8 +48,9 @@ pub struct Candidate {
     /// Index in the caller's worker list, preserved even after health filtering.
     pub worker_index: usize,
     /// Leading prompt tokens the worker's GPU KV cache is estimated to hold, with
-    /// those its engine will load from a store counted at the store's weight; a
-    /// load takes at least the store's load cost off the sum.
+    /// those its engine will copy in from its share group counted at the share
+    /// weight and those it will load from a store at the store's weight; a load
+    /// takes at least the store's load cost off the sum.
     /// `None` means unknown and receives no cache credit; `Some(0)` is a known
     /// miss. Both stay eligible.
     pub cached_tokens: Option<usize>,
@@ -299,65 +300,99 @@ impl LoadBalancingPolicy for AgenticPolicy {
             .zip(provider)
             .map(|(tokens, provider)| provider.match_workers(tokens, workers))
             .filter(|hits| healthy.iter().any(|&idx| hits[idx].is_some()));
-        // With a store, `held` is what each worker's engine reports cached once it has
-        // loaded from it. The hits count a load at the store's weight and at no less
-        // than its load cost, which ranks the workers; the one selected is estimated and
+        // In a share group, `pooled` is what each worker's device cache holds once its
+        // engine has copied in the prefix the other ranks of its group hold; with a store,
+        // `held` is what its engine then reports cached, loads included. The hits count a
+        // copy at the share weight, and a load at the store's weight and at no less than
+        // its load cost, which ranks the workers; the one selected is estimated and
         // charged by what it will hold.
-        let (index_hits, held) = match (index_hits, matchable.zip(provider)) {
-            (Some(device), Some((tokens, provider))) if provider.store_weight() > 0.0 => {
-                let weight = provider.store_weight();
-                let load_cost = provider.store_load_cost();
-                let cached = provider.cached_tokens(tokens, workers, &device).await;
-                // A store that does not answer (its lookup timed out, or its breaker
-                // is open) is taken to hold the longest prefix on a device, which the
-                // engine that computed it offloads: a device hit then weighs what it
-                // does while the store answers. It is not taken to hold the prompt, or
-                // a burst of cold prompts would be charged nothing and pile onto the
-                // few workers that seem free.
-                let known = device.iter().flatten().copied().max().unwrap_or(0);
-                let held: Vec<_> = device
-                    .iter()
-                    .zip(&cached)
-                    .map(|(&device, &cached)| Some(cached.unwrap_or(known).max(device?)))
-                    .collect();
-                let credited = device.iter().zip(&held).map(|(&device, &held)| {
-                    let (device, held) = (device?, held?);
-                    let weighed = device + (weight * f64::from(held - device)).round() as u32;
-                    // The engine admits a loaded prefix about as much later whatever its
-                    // size. Priced by its size alone, a load of a turn's few tokens is
-                    // nearly free, and the next turn leaves the worker that holds them
-                    // all for one that held the conversation earlier and has a slightly
-                    // shorter queue.
-                    let loads = held > device;
-                    Some(weighed.min(held.saturating_sub(if loads { load_cost } else { 0 })))
-                });
-                let credited = credited.collect::<Vec<_>>();
-                // Past that prefix a silent store is taken to hold what it held of such
-                // prompts while it answered, for the charge alone: every worker would
-                // load it alike. A conversation no device holds any longer is nearly all
-                // in the store. Charged whole, a burst of them weighs a hundred times
-                // what it computes, and once the store answers again the requests
-                // charged what they compute all go to the few workers charged least.
-                let prompt = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-                let silent = |(device, cached): (&Option<u32>, &Option<u32>)| {
-                    device.is_some() && cached.is_none()
-                };
-                if !device.iter().zip(&cached).any(silent) {
-                    let stored = cached.iter().flatten().copied().max().unwrap_or(0);
-                    let (gap, past) = (prompt.saturating_sub(known), stored.saturating_sub(known));
-                    self.store_share.learn(gap, past);
-                }
-                let reported = held.iter().zip(&cached).map(|(&held, cached)| {
-                    let held = held?;
-                    let past = match cached {
-                        Some(_) => 0,
-                        None => self.store_share.of(prompt.saturating_sub(held)),
-                    };
-                    Some(held + past)
-                });
-                (Some(credited), Some(reported.collect::<Vec<_>>()))
+        let shared = match (&index_hits, matchable.zip(provider)) {
+            (Some(device), Some((tokens, provider))) => {
+                provider.shared_tokens(tokens, workers, device)
             }
-            (hits, _) => (hits, None),
+            _ => None,
+        };
+        let copies = shared.is_some();
+        let (index_hits, held, copiers) = match (index_hits, matchable.zip(provider)) {
+            (Some(device), Some((tokens, provider))) if copies || provider.store_weight() > 0.0 => {
+                let (share_weight, weight) = (provider.share_weight(), provider.store_weight());
+                let pooled = shared.unwrap_or_else(|| device.clone());
+                let copied = |device: u32, pooled: u32| {
+                    (share_weight * f64::from(pooled.saturating_sub(device))).round() as u32
+                };
+                let copiers: Vec<bool> = device
+                    .iter()
+                    .zip(&pooled)
+                    .map(|(device, pooled)| pooled > device)
+                    .collect();
+                if weight <= 0.0 {
+                    let credited = device.iter().zip(&pooled).map(|(&device, &pooled)| {
+                        let (device, pooled) = (device?, pooled?);
+                        Some(device + copied(device, pooled))
+                    });
+                    let credited = credited.collect::<Vec<_>>();
+                    (Some(credited), Some(pooled), Some(copiers))
+                } else {
+                    let load_cost = provider.store_load_cost();
+                    let cached = provider.cached_tokens(tokens, workers, &pooled).await;
+                    // A store that does not answer (its lookup timed out, or its breaker
+                    // is open) is taken to hold the longest prefix on a device, which the
+                    // engine that computed it offloads: a device hit then weighs what it
+                    // does while the store answers. It is not taken to hold the prompt, or
+                    // a burst of cold prompts would be charged nothing and pile onto the
+                    // few workers that seem free.
+                    let known = pooled.iter().flatten().copied().max().unwrap_or(0);
+                    let held: Vec<_> = pooled
+                        .iter()
+                        .zip(&cached)
+                        .map(|(&pooled, &cached)| Some(cached.unwrap_or(known).max(pooled?)))
+                        .collect();
+                    let credited = (device.iter().zip(&pooled).zip(&held)).map(
+                        |((&device, &pooled), &held)| {
+                            let (device, pooled, held) = (device?, pooled?, held?);
+                            let weighed = device
+                                + copied(device, pooled)
+                                + (weight * f64::from(held - pooled)).round() as u32;
+                            // The engine admits a loaded prefix about as much later whatever
+                            // its size. Priced by its size alone, a load of a turn's few
+                            // tokens is nearly free, and the next turn leaves the worker that
+                            // holds them all for one that held the conversation earlier and
+                            // has a slightly shorter queue.
+                            let loads = held > pooled;
+                            let cost = if loads { load_cost } else { 0 };
+                            Some(weighed.min(held.saturating_sub(cost)))
+                        },
+                    );
+                    let credited = credited.collect::<Vec<_>>();
+                    // Past that prefix a silent store is taken to hold what it held of such
+                    // prompts while it answered, for the charge alone: every worker would
+                    // load it alike. A conversation no device holds any longer is nearly
+                    // all in the store. Charged whole, a burst of them weighs a hundred
+                    // times what it computes, and once the store answers again the requests
+                    // charged what they compute all go to the few workers charged least.
+                    let prompt = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+                    let silent = |(pooled, cached): (&Option<u32>, &Option<u32>)| {
+                        pooled.is_some() && cached.is_none()
+                    };
+                    if !pooled.iter().zip(&cached).any(silent) {
+                        let stored = cached.iter().flatten().copied().max().unwrap_or(0);
+                        let (gap, past) =
+                            (prompt.saturating_sub(known), stored.saturating_sub(known));
+                        self.store_share.learn(gap, past);
+                    }
+                    let reported = held.iter().zip(&cached).map(|(&held, cached)| {
+                        let held = held?;
+                        let past = match cached {
+                            Some(_) => 0,
+                            None => self.store_share.of(prompt.saturating_sub(held)),
+                        };
+                        Some(held + past)
+                    });
+                    let reported = reported.collect::<Vec<_>>();
+                    (Some(credited), Some(reported), Some(copiers))
+                }
+            }
+            (hits, _) => (hits, None, None),
         };
         let tree = text.map(|_| self.tree(workers[healthy[0]].as_ref()));
         let (source, hits) = match (index_hits, text.zip(tree.as_deref())) {
@@ -407,8 +442,11 @@ impl LoadBalancingPolicy for AgenticPolicy {
         let ratio =
             |tokens: usize| (prompt_tokens > 0).then(|| tokens as f64 / prompt_tokens as f64);
         let selected_known = hits[selection.worker_index].is_some();
+        // The selected worker copies part of what it will hold in from its share group.
+        let copies_in = copiers.is_some_and(|copiers| copiers[selection.worker_index]);
         let (branch, estimated_hit_ratio) = match source {
             Hits::Index if longest == 0 => ("miss", ratio(cached).filter(|_| selected_known)),
+            Hits::Index if copies_in => ("shared", ratio(cached)),
             Hits::Index if reused == longest => ("hit", ratio(cached)),
             Hits::Index => ("relocate", ratio(cached).filter(|_| selected_known)),
             Hits::Text if longest == 0 => ("text_miss", None),
@@ -657,6 +695,109 @@ mod tests {
 
         fn store_load_cost(&self) -> u32 {
             self.2
+        }
+    }
+
+    /// Each worker's device hit, what its device holds once its engine has copied in from
+    /// its share group, and what its engine reports cached once it has loaded from a
+    /// store as well; the weight of those copies and of those loads.
+    #[derive(Debug)]
+    struct Pooled(Vec<(u32, u32, u32)>, f64, f64);
+
+    #[async_trait]
+    impl PrefixMatchProvider for Pooled {
+        fn match_workers(&self, _tokens: &[u32], _: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
+            self.0.iter().map(|&(device, ..)| Some(device)).collect()
+        }
+
+        fn shared_tokens(
+            &self,
+            _: &[u32],
+            _: &[Arc<dyn Worker>],
+            device: &[Option<u32>],
+        ) -> Option<Vec<Option<u32>>> {
+            assert_eq!(device, self.match_workers(&[], &[]));
+            (self.1 > 0.0).then(|| self.0.iter().map(|&(_, pooled, _)| Some(pooled)).collect())
+        }
+
+        fn share_weight(&self) -> f64 {
+            self.1
+        }
+
+        async fn cached_tokens(
+            &self,
+            _: &[u32],
+            _: &[Arc<dyn Worker>],
+            device: &[Option<u32>],
+        ) -> Vec<Option<u32>> {
+            // The store is asked past what a device will hold, its copies included.
+            let asked = |&(device, pooled, _): &(u32, u32, u32)| {
+                Some(if self.1 > 0.0 { pooled } else { device })
+            };
+            assert_eq!(device, self.0.iter().map(asked).collect::<Vec<_>>());
+            self.0.iter().map(|&(.., cached)| Some(cached)).collect()
+        }
+
+        fn store_weight(&self) -> f64 {
+            self.2
+        }
+    }
+
+    #[tokio::test]
+    async fn tokens_a_worker_copies_in_from_its_share_group_count_at_the_share_weight() {
+        let workers = workers();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        // a's device holds 60 of the 100 tokens; b's 20, and its share group 80. The weight
+        // says which of them leads; b, once chosen, is estimated to report the 80 it will
+        // hold and charged the 20 it computes, whatever the weight.
+        for (weight, want) in [
+            (0.0, (Some(0), "hit", Some(0.6), Some(40))),
+            (0.5, (Some(0), "hit", Some(0.6), Some(40))),
+            (0.9, (Some(1), "shared", Some(0.8), Some(20))),
+            (1.0, (Some(1), "shared", Some(0.8), Some(20))),
+        ] {
+            let policy = agentic(512, None);
+            let pooled = Pooled(vec![(60, 60, 60), (20, 80, 80)], weight, 0.0);
+            policy.set_kv_events(Arc::new(pooled));
+            assert_eq!(
+                decide(&policy, &workers, &info).await,
+                want,
+                "weight {weight}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_is_asked_past_what_a_share_group_holds() {
+        let workers = workers();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        // a's device holds 40 of the 100 tokens. b's holds none, its share group 50, and
+        // its store the 40 after those: b's copies and loads count at their weights, and
+        // b, once chosen, is estimated to report 90 and charged the 10 it computes.
+        let b_leads = (Some(1), "shared", Some(0.9), Some(10));
+        for (share, store, want) in [
+            (0.9, 0.5, b_leads),
+            (0.9, 0.1, b_leads),
+            (0.5, 0.1, (Some(0), "hit", Some(0.4), Some(60))),
+            // Without share groups the store is asked past the device alone.
+            (0.0, 0.5, (Some(1), "hit", Some(0.9), Some(10))),
+        ] {
+            let policy = agentic(512, None);
+            let pooled = Pooled(vec![(40, 40, 40), (0, 50, 90)], share, store);
+            policy.set_kv_events(Arc::new(pooled));
+            assert_eq!(
+                decide(&policy, &workers, &info).await,
+                want,
+                "share weight {share}, store weight {store}"
+            );
         }
     }
 
