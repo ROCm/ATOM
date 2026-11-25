@@ -31,6 +31,12 @@ def validate_probe(contract):
             raise ValueError("Do not change the native timeout or status-polling path")
         if env.get("ATOMESH_MOONCAKE_PROBE_DIR") != "/logs/timeout-probe":
             raise ValueError("Expected task-scoped probe output")
+        if contract.get("mooncake_rebuild") and "LD_PRELOAD" in env:
+            raise ValueError("Never use the old ELF probe on a rebuilt engine")
+    if contract.get("mooncake_rebuild") and contract["timeout_probe"].get(
+        "capture_native_stacks"
+    ):
+        raise ValueError("Disable fixed-ELF stack decoding for rebuilt engines")
 
 
 def records(directory):
@@ -174,7 +180,8 @@ def main():
             timeout=30,
         ).splitlines()[0]
     (build / "runtime.json").write_text(json.dumps(runtime, indent=2) + "\n")
-    for role in ("prefill", "decode"):
+    roles = ("prefill",) if contract.get("mooncake_rebuild") else ("prefill", "decode")
+    for role in roles:
         contract["roles"][role]["container"] = image
     # Existing helper resolves contracts relative to REPO_ROOT.
     resolved = repo / ".sa-srt-runtime/timeout-probe-contract.json"
@@ -202,6 +209,16 @@ def main():
             if native_seen and first_native is None:
                 first_native = time.monotonic()
             evidence = failure_evidence(events)
+            if contract.get("mooncake_rebuild") and not evidence:
+                failed = next(
+                    (e for e in events if e.get("event") == "failed_native_write"),
+                    None,
+                )
+                if failed:
+                    evidence = {
+                        "native": {"event": "native_state_unavailable"},
+                        "connector": failed,
+                    }
             if evidence or (
                 first_native is not None and time.monotonic() - first_native > 30
             ):
@@ -253,18 +270,33 @@ def main():
                 {e["pid"] for e in events if e.get("event") == "register"}
             ),
             "evidence": failure_evidence(events),
+            "failed_native_writes": sum(
+                e.get("event") == "failed_native_write" for e in events
+            ),
             "root_cause": "unresolved",
         }
-        if process.returncode == 0 and (
-            result["hook_active"] < 4 or result["registered_workers"] != 8
-        ):
+        rebuilt = bool(contract.get("mooncake_rebuild"))
+        registrations = [e for e in events if e.get("event") == "register"]
+        incomplete = (
+            result["registered_workers"] != 4
+            or any(
+                e.get("sender_workers") != 10 or e.get("async_sender_tasks") != 20
+                for e in registrations
+            )
+            if rebuilt
+            else result["hook_active"] < 4 or result["registered_workers"] != 8
+        )
+        if process.returncode == 0 and incomplete:
             result["status"] = "instrumentation_incomplete"
+        if result["failed_native_writes"] and process.returncode == 0:
+            result["status"] = "native_failure_at_exit"
         (root / "timeout-probe-result.json").write_text(
             json.dumps(result, indent=2) + "\n"
         )
         return (
             2
-            if result["status"] == "instrumentation_incomplete"
+            if result["status"]
+            in ("instrumentation_incomplete", "native_failure_at_exit")
             else process.returncode
         )
     finally:

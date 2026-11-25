@@ -40,6 +40,18 @@ class TimeoutProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "native timeout"):
                 validate_probe(bad)
 
+    def test_rebuilt_engine_rejects_old_elf_instrumentation(self):
+        contract = copy.deepcopy(self.contract)
+        contract["mooncake_rebuild"] = {"arm": "base"}
+        with self.assertRaisesRegex(ValueError, "old ELF"):
+            validate_probe(contract)
+        for role in contract["roles"].values():
+            role["env"].pop("LD_PRELOAD")
+        with self.assertRaisesRegex(ValueError, "fixed-ELF"):
+            validate_probe(contract)
+        contract["timeout_probe"]["capture_native_stacks"] = False
+        validate_probe(contract)
+
     def test_only_correlate_same_process_and_native_thread(self):
         n = {
             "event": "before_free_uncached_batch",
@@ -64,6 +76,12 @@ class TimeoutProbeTests(unittest.TestCase):
         self.assertIsNone(failure_evidence([n, f]))
 
     def test_capture_stops_only_owned_child_and_preserves_failed_result(self):
+        self.check_capture()
+
+    def test_rebuilt_producer_leaves_decode_image_unchanged(self):
+        self.check_capture(rebuilt=True)
+
+    def check_capture(self, rebuilt=False):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             run = Path(tmp) / "run"
@@ -72,6 +90,11 @@ class TimeoutProbeTests(unittest.TestCase):
             run.mkdir()
             (repo / ".sa-srt-runtime").mkdir()
             contract = copy.deepcopy(self.contract)
+            if rebuilt:
+                contract["mooncake_rebuild"] = {"arm": "base"}
+                contract["timeout_probe"]["capture_native_stacks"] = False
+                for role in contract["roles"].values():
+                    role["env"].pop("LD_PRELOAD")
             contract["timeout_probe"]["context"] = "context"
             if contract["timeout_probe"].get("capture_native_stacks"):
                 (context / "debugger").mkdir()
@@ -141,6 +164,8 @@ class TimeoutProbeTests(unittest.TestCase):
                     "monotonic_ns": 30,
                 },
             ]
+            if rebuilt:
+                events = [dict(events[-1], duration_s=0.01)]
             env = {
                 "REPO_ROOT": str(repo),
                 "RUN_DIR": str(run),
@@ -162,6 +187,16 @@ class TimeoutProbeTests(unittest.TestCase):
                 self.assertEqual(main(), 86)
                 if contract["timeout_probe"].get("capture_native_stacks"):
                     capture.assert_called_once()
+                else:
+                    capture.assert_not_called()
+            resolved = json.loads(
+                (repo / ".sa-srt-runtime/timeout-probe-contract.json").read_text()
+            )
+            if rebuilt:
+                self.assertNotIn("container", resolved["roles"]["decode"])
+                self.assertEqual(
+                    resolved["roles"]["prefill"]["container"], "sha256:" + "a" * 64
+                )
             self.assertEqual(child.terminated, 1)
             self.assertEqual(child.returncode, 143)
             self.assertEqual(

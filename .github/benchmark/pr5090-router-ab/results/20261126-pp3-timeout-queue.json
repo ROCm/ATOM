@@ -1,0 +1,89 @@
+{
+  "lease": "L037f72",
+  "node": "g53",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "harness_sha": "8ae0a5c98106c5c4b7a348edd12b724e25c3a2f3",
+  "sender_workers": 10,
+  "async_sender_tasks": 20,
+  "native_timeout_variables": "unset",
+  "descriptor_count": 420,
+  "total_bytes": 22794240,
+  "duration_s": 30.027942644432187,
+  "native": {
+    "event": "before_free_uncached_batch",
+    "pid": 1705,
+    "tid": 35175,
+    "batch_id": 138636309857296,
+    "monotonic_ns": 6108681087971548,
+    "task_count": 420,
+    "finished_task_count": 0,
+    "counter_eligible": 1,
+    "has_failure": 0,
+    "active_completion_callbacks": 0,
+    "readable_tasks": 420,
+    "all_slices_done_tasks": 0,
+    "done_unpublished_tasks": 0,
+    "pending_tasks": 420,
+    "failed_tasks": 0,
+    "omitted_task_details": 292,
+    "completed_controls_sampled": 0,
+    "non_atomic_snapshot": true
+  },
+  "sample_count": 128,
+  "sample_transports": [
+    "_ZTVN8mooncake13RdmaTransportE"
+  ],
+  "sample_statuses": "See original task samples",
+  "gdb": {
+    "target_container": "eb800faea037098438a99107442c03deb2bf9405d9f2b48a9dc309a04d08606a",
+    "container_pid": 1705,
+    "worker_image": "sha256:72e75448e6d1f34b5c14c7c7fd6f13c197a89665bf915296b144bc710bf36979",
+    "debugger_image": "sha256:8475916e77c382fcd92db7074eb94af75aeb7ce7f445cead2f700cdff02f2980",
+    "started_at": "2026-11-25T20:10:59.080490+00:00",
+    "gdb_rc": 0,
+    "sidecars_remaining": [],
+    "finished_at": "2026-11-25T20:10:59.878868+00:00",
+    "stack_bytes": 401050,
+    "stack_sha256": "1b0326111e9721ab93aee088f6fb738b376d187402684107a67b37bd388f9ad6",
+    "frames_present": true,
+    "mooncake_symbols_present": true
+  },
+  "queue_samples": [
+    {
+      "base": "0x7ef91862b000",
+      "frames": [
+        {
+          "worker_pool": "0xaa65a4f0",
+          "rva": "0x3c41e3",
+          "workers": 2,
+          "submitted": 16407855,
+          "processed": 16099580,
+          "kind": "full_queue_metadata_sweep",
+          "queued_slices": 234683,
+          "remaining_slices": 34533,
+          "tid": 34969
+        }
+      ],
+      "errors": []
+    }
+  ],
+  "provider_stack_caveat": "Another worker sampled inside libionic pthread_spin_lock. Single PC is not evidence of a persistent provider lock.",
+  "candidate_pr": "https://github.com/kvcache-ai/Mooncake/pull/5840",
+  "candidate_head": "8babd5a9b3ecfe0df78379ca0f1f143a391edd44",
+  "conclusion": "Large queued-slice metadata sweep observed at the exact production loop changed by upstream PR5840; candidate causality and GPU fix validation remain pending.",
+  "exit_codes": {
+    "pool-workload.rc": 86,
+    "pool-exit.rc": 86,
+    "gpool-release.rc": 0
+  },
+  "archive_sha256": "9a74250b6e0b6e8f2180b4433dc7ed25b8d69f35894cc92262705ae92da6c8f5"
+}

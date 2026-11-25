@@ -1,0 +1,26 @@
+{
+  "base_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "base_source": "e1ea5d31bb5e46ff2df9f90e7c2fbaf52fcdee8c",
+  "candidate_pr": "https://github.com/kvcache-ai/Mooncake/pull/5840",
+  "candidate_head": "8babd5a9b3ecfe0df78379ca0f1f143a391edd44",
+  "production_patch_sha256": "3d6c2408c07e8059f6ac6ce554b9e2d1dcebfbfe5481a517bed5cae6d3c128b9",
+  "wheel_name": "mooncake_transfer_engine_rocm-0.3.14-cp312-cp312-manylinux_2_35_x86_64.whl",
+  "base_module_sha256": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395",
+  "verify_sha256": "8cdb08cd67151981e8596d21b6e536512c67951ff490f4ab6da99fd8aedab5a6",
+  "build_scope": "TE-only Release, HIP ON, HIP_DMABUF ON, MULTI_PROTOCOL ON, METRICS ON; CUDA/Store/etcd/Rust/EP/event-driven completion OFF in both arms",
+  "limitation": "The rebuilt unpatched baseline must reproduce the native timeout before attributing improvement to PR5840.",
+  "arms": {
+    "base": {
+      "wheel_sha256": "7d06ffc6f25cd70b23946486f15195da576abf9993a37b5884807b63ea0514b8",
+      "engine_sha256": "2833931581a1e3b0d676fd237185d3350ace814b6e2ba034bbf5ff0da726b16d",
+      "cpu_tests_passed": 10,
+      "python_import_passed": true
+    },
+    "patched": {
+      "wheel_sha256": "46864d35bb3fa85b2b37c6f6fb8f801277ce930f009ca543366df602bff63e96",
+      "engine_sha256": "3c8196c03d57a4cf10c83b5ec681f62a0851646f7b005939709e329df2c41511",
+      "cpu_tests_passed": 10,
+      "python_import_passed": true
+    }
+  }
+}
