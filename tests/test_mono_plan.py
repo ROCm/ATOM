@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The mono framework's trace-time hand-off contract: each breach is reported."""
+"""The mono framework's trace-time hand-off contract: each breach is reported.
+Also the (16, 16) FP8 preshuffle's addresses (``preshuffle``)."""
 
 import dataclasses
 
 import pytest
+import torch
 
-from atom.mono.plan import build_key
+from atom.mono.plan import build_key, preshuffle
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.check import ContractError, RegionDecl, check
 from atom.mono.plan.trace import Space, enter_stage, note, note_unnamed, recording
+from atom.mono.weights.layer import _unshuffle_linear_weight
 
 S, P = Space.SCRATCH, Space.PEER
 
@@ -143,3 +146,56 @@ def test_source_digest_refuses_a_missing_path(tmp_path, monkeypatch):
 
 def test_symbol_params_are_the_sym_fields():
     assert symbol_params(_Key(4, 1e-6, 2)) == {"s": 4}
+
+
+def preshuffled(rows, k):
+    """Random E4M3 bytes and their (16, 16) preshuffle, written out as AITER's
+    ``shuffle_weight`` permutes 1-byte elements: [N/16][K/32][2][16 rows][16 B]."""
+    plain = torch.randint(
+        0, 256, (rows, k), dtype=torch.uint8, generator=torch.Generator().manual_seed(0)
+    )
+    flat = plain.view(-1, rows // 16, 16, k // 32, 2, 16).permute(0, 1, 3, 4, 2, 5)
+    return plain, flat.reshape(-1)
+
+
+def test_the_written_out_preshuffle_is_aiters():
+    # the reference below, against the shuffle ATOM's FP8 linears apply
+    shuffle = pytest.importorskip("aiter.ops.shuffle")
+    for rows, k in ((48, 384), (256, 128)):
+        plain, flat = preshuffled(rows, k)
+        aiter = shuffle.shuffle_weight(plain.view(torch.float8_e4m3fn), layout=(16, 16))
+        assert torch.equal(aiter.view(torch.uint8).reshape(-1), flat)
+
+
+def test_mono_unshuffle_inverts_the_written_out_preshuffle():
+    # the same reference without AITER: mono's host-side unshuffle inverts it
+    for rows, k in ((48, 384), (256, 128)):
+        plain, flat = preshuffled(rows, k)
+        w = flat.view(rows, k)
+        w.is_shuffled = True
+        assert torch.equal(_unshuffle_linear_weight(w), plain)
+
+
+@pytest.mark.parametrize("rows, k", [(48, 384), (32, 128), (16, 7168)])
+def test_w8_offset_indexes_the_production_preshuffle(rows, k):
+    # every 8-element run, then a GEMV chunk's operands as gemv.w8_chunk_ops
+    # loads them: lane group g's 8 at kcol + 32 q + 8 g
+    plain, flat = preshuffled(rows, k)
+    for row in range(rows):
+        for col in range(0, k, 8):
+            at = preshuffle.w8_offset(row - row % 16, row % 16, col, k)
+            assert torch.equal(flat[at : at + 8], plain[row, col : col + 8])
+    for row0 in range(0, rows, 16):
+        for lane in range(64):
+            for kcol in range(0, k, 128):
+                dwords = preshuffle.w8_lane_dwords(row0, lane, kcol, k)
+                for q, at in enumerate(dwords):
+                    col = kcol + 32 * q + 8 * (lane // 16)
+                    want = plain[row0 + lane % 16, col : col + 8]
+                    assert torch.equal(flat[4 * at : 4 * at + 8], want)
+
+
+def test_gemv_indexes_through_w8_lane_dwords():
+    # what the test above checks is what gemv's FP8 loads call
+    gemv = pytest.importorskip("atom.mono.device.gemv", exc_type=ImportError)
+    assert gemv.w8_lane_dwords is preshuffle.w8_lane_dwords
