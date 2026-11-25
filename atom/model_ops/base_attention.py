@@ -496,6 +496,7 @@ def _flydsl_prepare_explicit_plan(
     existing_plan,
     plan_step_owner=None,
     plan_cache_owner=None,
+    plan_workgroup_budget=None,
 ):
     """Return the explicit plan aiter #5809 requires.
 
@@ -507,6 +508,8 @@ def _flydsl_prepare_explicit_plan(
     ``plan_cache_owner``: the object that owns plan/scratch storage. Omit it
     for process-lifetime storage (required by captured decode graphs); sparse
     prefill passes its ephemeral metadata so variable row counts are released.
+    ``plan_workgroup_budget``: overrides the budget (a caller that splits its
+    rows into clusters of its own, ``sparse_attn_nvfp4.fused_reduce_split``).
     Plans are window-free: the gate rejects sliding windows.
     """
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
@@ -521,6 +524,8 @@ def _flydsl_prepare_explicit_plan(
     else:
         max_partitions = shape.get("max_partitions")
     workgroup_budget = shape.get("workgroup_budget")
+    if plan_workgroup_budget is not None:
+        workgroup_budget = int(plan_workgroup_budget)
 
     if existing_plan is not None and flydsl_plan_matches(
         existing_plan, num_seqs, num_kv_heads
@@ -1077,6 +1082,71 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
+
+
+def fill_unit_scale(scale: torch.Tensor) -> None:
+    """Fill a quantized output's scales with 1.0: E8M0 MXFP8 scales (byte 127)
+    or FP32 descales."""
+    if scale.dtype == torch.float8_e8m0fnu:
+        scale.view(torch.uint8).fill_(127)
+    else:
+        scale.fill_(1.0)
+
+
+def unified_attention_with_output_quant_base_fake(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+    quantized_output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    return None
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=unified_attention_with_output_quant_base_fake,
+    mutates_args=["quantized_output", "output_scale"],
+)
+@eager_region()
+def unified_attention_with_output_quant_base(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+    quantized_output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    """Sparse-M3 attention writing o_proj's quantized input in place.
+
+    Caller-owned mutable buffers keep stable addresses for graph replay while
+    the eager region returns nothing; the generic attention op is unchanged.
+    """
+    if use_mla:
+        raise ValueError("quantized attention output is only defined for sparse MHA")
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    if not getattr(self.impl, "supports_output_quant", False):
+        raise RuntimeError(f"{layer_name} does not support quantized attention output")
+    self.impl.forward(
+        query=q,
+        key=k,
+        value=v,
+        position=positions,
+        q_scale=q_scale,
+        qkv=qkv,
+        quantized_output=quantized_output,
+        output_scale=output_scale,
+    )
 
 
 def linear_attention_with_output_base_fake(

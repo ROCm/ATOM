@@ -8,36 +8,286 @@ The cache is the NVFP4 layout of ``index_fp4`` per kv head:
 
 A row is a decode query row or a prefill query token. It attends the top-k
 128-blocks the indexer picked for it, addressed through its request's block
-table, up to its own causal length. ``nvfp4_kernels.decode`` does the
-attention; this module maps ATOM's batch onto its per-row (request, causal
-length) arguments.
+table, up to its own causal length. This module maps ATOM's batch onto its
+per-row (request, causal length) arguments.
+
+gfx950 runs the Gluon kernel of ``nvfp4_kernels.decode`` over the top-k ids.
+gfx1250 runs aiter's FlyDSL paged decode, the operator the FP8 sparse path
+runs there, with its NVFP4 K/V: like the FP8 path, every row (and kv head) is
+a length-1 sequence with its own compacted table of selected pages, and the
+plan's partitions merge in the kernel or the reducer. The top-k selectors emit
+that table in the launch that selects (``emit_pages_per_block`` =
+``NVFP4_PAGES_PER_BLOCK``); ``nvfp4_page_table`` builds it for the selectors
+that do not. aiter decides which shapes it serves.
 """
+
+import functools
+import inspect
 
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from atom.model_ops.minimax_m3.nvfp4_kernels.decode import (
-    can_use_nvfp4_decode,
-    flash_decode_nvfp4,
-)
 from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import Nvfp4Cache
 
 BLOCK = 128  # sparse block == cache page
 
 
+@functools.cache
+def _gluon_kernel() -> bool:
+    """gfx950 runs the Gluon kernel over top-k ids (``nvfp4_kernels.decode``,
+    CDNA4 MFMA and buffer loads); gfx1250 aiter's FlyDSL paged decode over
+    ``nvfp4_page_table``."""
+    return get_gfx_runtime() == "gfx950"
+
+
+def reads_page_table() -> bool:
+    """Whether the attention reads a page-128 table (gfx1250's paged decode),
+    which the selectors then emit, or only the top-k ids (gfx950's Gluon kernel)."""
+    return not _gluon_kernel()
+
+
 def check_nvfp4_sparse_attention(q, k_payload, k_scale, v_payload, v_scale, topk_idx):
-    """Raise unless the gfx950 kernel serves these shapes (16 q heads per kv head,
-    head dim 128, 128-token pages, 32-bit addressable caches). The shapes are
-    fixed per deployment, so one call per layer at its first forward is enough."""
+    """gfx950: raise unless the Gluon kernel serves these shapes (16 q heads per
+    kv head, head dim 128, 128-token pages). The shapes are fixed per deployment,
+    so one call per layer at its first forward is enough. gfx1250: nothing to
+    check here; aiter's paged decode refuses what it does not serve."""
+    if not _gluon_kernel():
+        return
+    from atom.model_ops.minimax_m3.nvfp4_kernels.decode import can_use_nvfp4_decode
+
     k = Nvfp4Cache(payload=k_payload, scales=k_scale)
     v = Nvfp4Cache(payload=v_payload, scales=v_scale)
     if not can_use_nvfp4_decode(q, k, v, topk_idx, BLOCK):
         raise ValueError(
-            "ATOM_M3_SPARSE_KV_NVFP4: the gfx950 NVFP4 attention kernel needs "
+            "ATOM_M3_SPARSE_KV_NVFP4: the NVFP4 attention kernel needs "
             f"16 q heads per kv head and head dim 128; got q {tuple(q.shape)}, "
             f"k payload {tuple(k_payload.shape)} (e.g. MiniMax-M3.1 at TP4)."
         )
+
+
+@triton.jit
+def _page_table_kernel(
+    topk_ptr,  # [Hkv, rows, topk] logical block ids, -1 padded
+    block_table_ptr,  # [reqs, max_blocks] physical page of each logical block
+    row_req_ptr,  # [rows]
+    row_seq_ptr,  # [rows] causal length
+    table_ptr,  # out [rows * Hkv, topk] page ids of the (page, kv head) view
+    ctx_ptr,  # out [rows * Hkv] tokens to attend
+    topk,
+    stride_t_h,
+    stride_t_n,
+    stride_bt,
+    NUM_KV_HEADS: tl.constexpr,
+    TOPK_P: tl.constexpr,
+    PAGE: tl.constexpr,  # tokens per block == cache page
+):
+    row = tl.program_id(0)
+    kvh = tl.program_id(1)
+    seq = tl.load(row_seq_ptr + row)
+    req = tl.load(row_req_ptr + row).to(tl.int64)
+    off = tl.arange(0, TOPK_P)
+    blk = tl.load(
+        topk_ptr + kvh * stride_t_h + row * stride_t_n + off,
+        mask=off < topk,
+        other=-1,
+    )
+    # The block holding the row's last token; blocks past it hold no visible
+    # token. A zero-length (padding) row selects nothing, whatever its list.
+    self_blk = (tl.maximum(seq, 1) - 1) // PAGE
+    valid = (blk >= 0) & (blk <= self_blk) & (seq > 0)
+    is_tail = valid & (blk == self_blk)
+    is_full = valid & (blk < self_blk)
+    n_full = tl.sum(is_full.to(tl.int32), axis=0)
+    has_tail = tl.sum(is_tail.to(tl.int32), axis=0) > 0
+    # Full blocks first in selection order, the partial tail block last: the
+    # paged decode masks a sequence's tokens past its length, which then fall
+    # in the tail block only.
+    slot = tl.where(is_full, tl.cumsum(is_full.to(tl.int32), axis=0) - 1, n_full)
+    slot = tl.where(valid, slot, -1)
+    page = tl.load(block_table_ptr + req * stride_bt + blk, mask=valid, other=0)
+    page = page * NUM_KV_HEADS + kvh
+    # Gather, not scatter: entry j is the page whose slot is j. Unused slots
+    # hold page 0 (never read), so every slot is written and the table needs no
+    # memset.
+    hit = slot[None, :] == off[:, None]
+    compact = tl.sum(tl.where(hit, page[None, :], 0), axis=1)
+    out_row = row * NUM_KV_HEADS + kvh
+    tl.store(table_ptr + out_row.to(tl.int64) * topk + off, compact, mask=off < topk)
+    ctx = n_full * PAGE + tl.where(has_tail, seq - self_blk * PAGE, 0)
+    tl.store(ctx_ptr + out_row, ctx)
+
+
+def nvfp4_page_table(
+    topk_idx: torch.Tensor,  # [Hkv, rows, topk] int32 block ids, -1 right-padded
+    block_table: torch.Tensor,  # [reqs, max_blocks] int32
+    row_req: torch.Tensor,  # [rows]
+    row_seq_len: torch.Tensor,  # [rows]
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """gfx1250: the paged decode's per-(row, kv head) compacted page table
+    ``[rows * Hkv, topk]`` and lengths ``[rows * Hkv]``, page ``p * Hkv + h`` of
+    the ``[pages * Hkv, 1, ...]`` cache view; the attention of every sparse layer
+    sharing the top-k reads it. gfx950 reads the top-k ids: (None, None)."""
+    if _gluon_kernel():
+        return None, None
+    num_kv_heads, rows, topk = topk_idx.shape
+    table = torch.empty(
+        rows * num_kv_heads, topk, dtype=torch.int32, device=topk_idx.device
+    )
+    ctx = torch.empty(rows * num_kv_heads, dtype=torch.int32, device=topk_idx.device)
+    if rows:
+        assert topk_idx.stride(-1) == 1 and block_table.stride(-1) == 1
+        _page_table_kernel[(rows, num_kv_heads)](
+            topk_idx,
+            block_table,
+            row_req,
+            row_seq_len,
+            table,
+            ctx,
+            topk,
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            block_table.stride(0),
+            NUM_KV_HEADS=num_kv_heads,
+            TOPK_P=triton.next_power_of_2(topk),
+            PAGE=BLOCK,
+        )
+    return table, ctx
+
+
+@functools.cache
+def _pa_decode_merges_partitions() -> bool:
+    """Whether aiter's FlyDSL paged decode can merge a row's partitions itself
+    (``page_groups`` / ``plan_free``, ROCm/aiter#8462)."""
+    from aiter.ops.flydsl.pa_decode import pa_decode
+
+    return "page_groups" in inspect.signature(pa_decode).parameters
+
+
+def fused_reduce_split(seqs: int, device) -> tuple[int, int | None, int, int]:
+    """(partitions, workgroup budget, page groups, rows a cluster) of decode rows
+    that merge their top-k window inside the paged attention: a cluster of P
+    CTAs a row while every row's cluster stays resident (gfx1250: 15 clusters a
+    16 CUs), else one CTA a row whose four wave groups merge in LDS."""
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
+    if seqs * 8 <= cus:
+        return 8, 8 * seqs, 1, 1
+    if seqs * 4 <= cus:
+        return 4, 4 * seqs, 2, 1
+    if seqs <= cus * 15 // 16:
+        return 4, 4 * seqs, 1, 1
+    return 1, None, 4, 1
+
+
+def _flydsl_attention(
+    q, k_payload, k_scale, v_payload, v_scale, table, ctx, sm_scale,
+    plan_step_owner, plan_cache_owner, quantized_output=None, output_scale=None,
+    rows_per_request=0,
+):  # fmt: skip
+    """aiter's FlyDSL paged decode over the NVFP4 cache, one length-1 sequence a
+    (row, kv head), planned and scratch-cached like the FP8 sparse path's.
+
+    ``quantized_output`` / ``output_scale``: o_proj's MXFP8 input (E4M3
+    ``[rows, heads * D]`` and E8M0 ``[rows, heads * D // 32]``), written by the
+    attention instead of the BF16 output with the BF16 call's split: aiter
+    writes it in every output mode, bit for bit the BF16 output quantized as
+    o_proj's ``quantize_fp8`` would.
+
+    ``rows_per_request``: decode rows a request (its query length), 0 for
+    prefill rows. Decode rows (a full top-k window each) merge their partitions
+    inside the paged attention where aiter can (``fused_reduce_split``), and a
+    request's rows dispatch on one XCD."""
+    from aiter.ops.flydsl.pa_decode import pa_decode
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    from atom.model_ops.base_attention import (
+        _flydsl_plan_scratch,
+        _flydsl_prepare_explicit_plan,
+    )
+
+    rows, num_q_heads, head_dim = q.shape
+    pages, num_kv_heads = k_payload.shape[:2]
+    group = num_q_heads // num_kv_heads
+    seqs = rows * num_kv_heads
+    output = torch.empty_like(q)
+    quant_args = {}
+    if quantized_output is not None:
+        quant_args = {
+            "quantized_output": quantized_output.view(seqs, group, head_dim),
+            "output_scale": output_scale,
+            # Nothing reads the BF16 output.
+            "store_output": False,
+        }
+    if seqs == 0:
+        return output
+    # (row, kv head) -> sequence, as the FP8 path collapses them; zero-copy
+    # (.view raises rather than copy, which would break the page encoding).
+    q_view = q.view(seqs, group, head_dim)
+    out_view = output.view(seqs, group, head_dim)
+    caches = [
+        t.view(pages * num_kv_heads, 1, *t.shape[2:])
+        for t in (k_payload, v_payload, k_scale, v_scale)
+    ]
+    k_view, v_view = caches[0], caches[1]
+    ks_view, vs_view = (t.view(torch.float8_e4m3fn) for t in caches[2:])
+    # The FP8 sparse path's split: a bounded top-k window per row.
+    partitions = get_recommended_splits(seqs, 1)
+    workgroup_budget = None
+    page_groups = None
+    cluster_rows = 1
+    if rows_per_request > 0 and _pa_decode_merges_partitions():
+        partitions, workgroup_budget, page_groups, cluster_rows = fused_reduce_split(
+            seqs, q.device
+        )
+    context_bound = table.shape[1] * BLOCK
+    plan = _flydsl_prepare_explicit_plan(
+        q=q_view,
+        k_cache=k_view,
+        context_lens=ctx,
+        num_seqs=seqs,
+        query_length=1,
+        plan_partition_cap=partitions,
+        context_bound=context_bound,
+        existing_plan=None,
+        plan_step_owner=plan_step_owner,
+        plan_cache_owner=plan_cache_owner,
+        plan_workgroup_budget=workgroup_budget,
+    )
+    exp_sums, max_logits, partials = _flydsl_plan_scratch(
+        plan, 1, group, head_dim, q.dtype, q.device, plan_cache_owner=plan_cache_owner
+    )
+    pa_decode(
+        out_view,
+        q_view,
+        k_view,
+        v_view,
+        ctx,
+        table,
+        sm_scale,
+        1,
+        key_scale=ks_view,
+        value_scale=vs_view,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=partials,
+        work_plan=plan,
+        max_context_length=context_bound,
+        **quant_args,
+        **(
+            {
+                "page_groups": page_groups,
+                # No plan lookups; a request's rows (which share most selected
+                # pages) dispatch on one XCD.
+                "plan_free": True,
+                "xcd_rows": rows_per_request * num_kv_heads,
+                "cluster_rows": cluster_rows,
+            }
+            if page_groups
+            else {}
+        ),
+    )
+    return output
 
 
 @torch.no_grad()
@@ -52,18 +302,59 @@ def nvfp4_sparse_attention(
     row_req: torch.Tensor,  # [rows] request index of each row
     row_seq_len: torch.Tensor,  # [rows] causal length each row attends to
     sm_scale: float,
+    page_table: tuple[torch.Tensor, torch.Tensor] | None = None,
+    plan_step_owner=None,
+    plan_cache_owner=None,
+    quantized_output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
+    rows_per_request: int = 0,
 ) -> torch.Tensor:
-    """O ``[rows, num_heads, D]`` of every row over its top-k blocks."""
-    return flash_decode_nvfp4(
+    """O ``[rows, num_heads, D]`` of every row over its top-k blocks.
+
+    ``page_table``: gfx1250, ``nvfp4_page_table`` of these arguments (or the
+    selector's NVFP4 emission) when the caller already built it (it is shared
+    by the sparse layers of a step); built here otherwise.
+    ``plan_step_owner`` / ``plan_cache_owner``: as for the FP8 sparse path's
+    ``sparse_pa_per_row``. ``quantized_output`` / ``output_scale`` (gfx1250):
+    o_proj's MXFP8 input, see ``_flydsl_attention``; the returned BF16 output
+    is then unspecified. ``rows_per_request`` (gfx1250): decode rows a request,
+    0 for prefill rows; see ``_flydsl_attention``.
+    """
+    if _gluon_kernel():
+        if quantized_output is not None:
+            raise NotImplementedError(
+                "the gfx950 NVFP4 attention writes its BF16 output only"
+            )
+        from atom.model_ops.minimax_m3.nvfp4_kernels.decode import flash_decode_nvfp4
+
+        return flash_decode_nvfp4(
+            q.contiguous(),
+            Nvfp4Cache(payload=k_payload, scales=k_scale),
+            Nvfp4Cache(payload=v_payload, scales=v_scale),
+            block_table,
+            row_seq_len,
+            row_req,
+            BLOCK,
+            topk_idx.contiguous(),
+            sm_scale,
+        )
+    if page_table is None or page_table[0] is None:
+        page_table = nvfp4_page_table(
+            topk_idx.contiguous(), block_table, row_req, row_seq_len
+        )
+    return _flydsl_attention(
         q.contiguous(),
-        Nvfp4Cache(payload=k_payload, scales=k_scale),
-        Nvfp4Cache(payload=v_payload, scales=v_scale),
-        block_table,
-        row_seq_len,
-        row_req,
-        BLOCK,
-        topk_idx.contiguous(),
+        k_payload,
+        k_scale,
+        v_payload,
+        v_scale,
+        *page_table,
         sm_scale,
+        plan_step_owner,
+        plan_cache_owner,
+        quantized_output,
+        output_scale,
+        rows_per_request,
     )
 
 
