@@ -280,10 +280,9 @@ def _flydsl_attention(
     ks_view, vs_view = (t.view(torch.float8_e4m3fn) for t in caches[2:])
     if (
         quantized_direct
-        # The BF16 output, or o_proj's MXFP8 input (E8M0 scales); the per-token
-        # FP32 FP8 output keeps the paged decode. The image's aiter pads the
-        # MXFP8 bucket for one kv head only (lifted by aiter m31-pa-mh-aiter).
-        and (quantized_output is None or (mxfp8 and num_kv_heads == 1))
+        # The BF16 output, or o_proj's MXFP8 input (E8M0 scales, any number of
+        # kv heads); the per-token FP32 FP8 output keeps the paged decode.
+        and (quantized_output is None or mxfp8)
         and envs.ATOM_M3_SPARSE_PREFILL_REUSE
         and rows >= envs.ATOM_M3_SPARSE_PREFILL_REUSE_MIN_ROWS
     ):

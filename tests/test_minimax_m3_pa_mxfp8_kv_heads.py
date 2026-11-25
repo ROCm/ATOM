@@ -174,14 +174,22 @@ def test_per_token_fp8_output_still_needs_one_kv_head(mods, monkeypatch):
 
 
 @pytest.mark.parametrize("kv_heads", [1, 4])
-def test_prefill_reuse_takes_the_mxfp8_output_for_one_kv_head(
+def test_prefill_reuse_takes_the_mxfp8_output_for_any_kv_heads(
     mods, monkeypatch, kv_heads
 ):
-    """The image's aiter pads the reuse kernel's MXFP8 bucket for one kv head
-    only; with more the prefill keeps the paged decode."""
+    """The reuse prefill writes o_proj's MXFP8 input for every kv head count
+    (aiter pads the bucket per (token, kv head)): its flattened views, the pad
+    counted in sequences, and the row-major bytes."""
     r = _call(
         mods, monkeypatch, rows=6, bucket=8, kv_heads=kv_heads, mxfp8=True, reuse=True
     )
-    assert bool(r.reuse_calls) == (kv_heads == 1)
-    codes, _ = _mxfp8(r.q.reshape(6, -1))
+    assert len(r.reuse_calls) == 1
+    kw = r.reuse_calls[0]
+    assert kw["kv_heads"] == kv_heads
+    assert kw["quantized_pad_rows"] == (8 - 6) * kv_heads
+    assert kw["quantized_output"].shape == (8 * kv_heads, GROUP, D)
+    assert kw["output_scale"].shape == (8 * kv_heads, GROUP * D // 32)
+    codes, scales = _mxfp8(r.q.reshape(6, -1))
     assert torch.equal(r.out[:6], codes)
+    assert torch.equal(r.scale.view(torch.uint8)[:6], scales)
+    assert (r.out[6:] == 0).all() and (r.scale.view(torch.uint8)[6:] == 127).all()
