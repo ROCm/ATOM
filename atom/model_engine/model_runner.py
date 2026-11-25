@@ -149,6 +149,7 @@ from atom.utils import (
     CpuGpuBuffer,
     envs,
     get_hf_text_config,
+    hip_copy,
     init_exit_handler,
     resolve_obj_by_qualname,
     worker_process_name,
@@ -256,6 +257,11 @@ class TokenLocations(NamedTuple):
 
 
 class tokenIDProcessor:
+    # `_ids_pinned_view`'s ring; a class default too, for processors built
+    # without `__init__` (they copy with `Tensor.to`).
+    _ids_pinned_ring: list | None = None
+    _ids_pinned_next = 0
+
     def __init__(
         self,
         runner: "ModelRunner",
@@ -315,6 +321,9 @@ class tokenIDProcessor:
         # at a fixed address (a drafter's own buffer) its next writer waits on
         # the copy's own event instead (`await_draft_ids_copy`).
         self.async_copy_stream = torch.cuda.Stream(runner.device)
+        # `send_to_cpu_async`'s pinned destinations (`_ids_pinned_view`).
+        self._ids_pinned_ring: list[torch.Tensor | None] = [None] * 8
+        self._ids_pinned_next = 0
         self.zero_spec_counts = torch.zeros(
             2 * self._output_request_capacity, dtype=torch.int32, device=device
         )
@@ -331,7 +340,11 @@ class tokenIDProcessor:
         copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
-            cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
+            cpu_tensor = self._ids_pinned_view(gpu_tensor, len(cpu_tensor_handle))
+            if cpu_tensor is None or not hip_copy.copy_async(
+                cpu_tensor, gpu_tensor, hip_copy.D2H, self.async_copy_stream
+            ):
+                cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             cpu_logprobs = (
                 gpu_logprobs.to("cpu", non_blocking=True)
                 if gpu_logprobs is not None
@@ -342,6 +355,29 @@ class tokenIDProcessor:
         # them until recv_async_output has waited on copy_done.
         cpu_tensor_handle.append((cpu_tensor, copy_done, (gpu_tensor, gpu_logprobs)))
         self.logprobs_cpu.append(cpu_logprobs)
+
+    def _ids_pinned_view(self, gpu_tensor: torch.Tensor, pending: int):
+        """A pinned destination for ``gpu_tensor`` from a ring of persistent
+        slots, or None (the caller copies with `Tensor.to`). An entry is
+        received, its copy waited on and its ids read out, one step later
+        (deferred output), so ``pending`` stays far inside the ring."""
+        ring = self._ids_pinned_ring
+        if (
+            ring is None
+            or pending >= len(ring) - 1
+            or not gpu_tensor.is_cuda
+            or not gpu_tensor.is_contiguous()
+        ):
+            return None
+        i = self._ids_pinned_next
+        self._ids_pinned_next = (i + 1) % len(ring)
+        n = gpu_tensor.numel()
+        buf = ring[i]
+        if buf is None or buf.numel() < n or buf.dtype != gpu_tensor.dtype:
+            buf = ring[i] = torch.empty(
+                max(n, 1024), dtype=gpu_tensor.dtype, device="cpu", pin_memory=True
+            )
+        return buf[:n].view(gpu_tensor.shape)
 
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
