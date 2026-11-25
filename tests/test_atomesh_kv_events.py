@@ -468,6 +468,10 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
         "umbp_2p1d_kv_events_wait": (
             "ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-wait-c64"
         ),
+        "umbp_kv_events_opt": STORE.replace("-mcstore-", "-umbp-kvev-opt-"),
+        "umbp_2p1d_kv_events_opt": (
+            "ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-opt-c64"
+        ),
     }
     # The cells whose prefill and decode share their one node.
     ONE_NODE = (
@@ -475,11 +479,17 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
         "umbp_2p1d",
         "umbp_2p1d_kv_events",
         "umbp_2p1d_kv_events_wait",
+        "umbp_2p1d_kv_events_opt",
     )
     # Each cell whose pass waits for the copy it starts, and the cell it is.
     WAIT = {
         "umbp_kv_events_wait": "umbp_kv_events",
         "umbp_2p1d_kv_events_wait": "umbp_2p1d_kv_events",
+    }
+    # Each wait cell with larger prefill pools, and the wait cell it is.
+    OPT = {
+        "umbp_kv_events_opt": "umbp_kv_events_wait",
+        "umbp_2p1d_kv_events_opt": "umbp_2p1d_kv_events_wait",
     }
     # Each pool cell and the Store cell it is.
     STORE_SUITE = {"umbp_pool": "mooncake_store", "umbp_kv_events": "kv_events"}
@@ -551,6 +561,8 @@ class DeepSeekV41UmbpPoolCellsTest(unittest.TestCase):
                 "umbp_2p1d_kv_events_wait": (
                     "2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-WAIT"
                 ),
+                "umbp_kv_events_opt": "8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-OPT",
+                "umbp_2p1d_kv_events_opt": "2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-OPT",
             },
         )
 
@@ -633,9 +645,8 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
                     self.assertEqual(pool["kv_connector"], "umbp_pool")
                     extra = pool["kv_connector_extra_config"]
                     self.assertEqual(extra["namespace"], f"p{port}")
-                    self.assertEqual(
-                        extra.get("fetch_wait_ms"), 50 if suite in self.WAIT else None
-                    )
+                    waits = suite in self.WAIT or suite in self.OPT
+                    self.assertEqual(extra.get("fetch_wait_ms"), 50 if waits else None)
                     # Where the launcher's server listens unless the case moves it.
                     self.assertIn(
                         f'"${{UMBP_POOL_ADDRESS:-{extra["address"]}}}"', source
@@ -657,6 +668,7 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
             "umbp_smoke",
             "umbp_2p1d_kv_events",
             *self.WAIT,
+            *self.OPT,
         ):
             with self.subTest(suite=suite):
                 args = self.submitted_router_args(self.cells[suite])
@@ -780,6 +792,30 @@ printf 'ARG:%s\\n' "$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONF
                 pool = base_config["connectors"][1]["kv_connector_extra_config"]
                 pool["fetch_wait_ms"] = 50
                 self.assertEqual(config, base_config)
+
+    def test_an_opt_cell_is_its_wait_cell_with_larger_prefill_pools(self):
+        for suite, wait_suite in self.OPT.items():
+            with self.subTest(suite=suite):
+                cell, wait = self.cells[suite], self.cells[wait_suite]
+                self.assertEqual(
+                    {key for key in wait if cell[key] != wait[key]},
+                    {"id", "suite", "name", "display_topology", "service"},
+                )
+                service, wait_service = cell["service"], wait["service"]
+                self.assertEqual(
+                    {key for key in wait_service if service[key] != wait_service[key]},
+                    {"prefill"},
+                )
+                prefill, wait_prefill = service["prefill"], wait_service["prefill"]
+                self.assertEqual(
+                    {key for key in wait_prefill if prefill[key] != wait_prefill[key]},
+                    {"extra_args"},
+                )
+                # After the recipe's 85% among the common arguments: the last wins.
+                self.assertEqual(
+                    prefill["extra_args"],
+                    wait_prefill["extra_args"] + " --gpu-memory-utilization 0.95",
+                )
 
     def test_only_the_cells_of_one_node_take_mooncake_off_hip_ipc(self):
         # A prefill worker's two devices cannot open the memory of the third

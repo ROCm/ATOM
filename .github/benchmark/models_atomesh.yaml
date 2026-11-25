@@ -2741,6 +2741,22 @@ models:
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"umbp_pool","kv_connector_extra_config":{"address":"unix:///tmp/umbp-l1/server.sock","namespace":"p${HANDSHAKE_PORT}","fetch_wait_ms":50}}]}
 
+      # The wait cell with the prefill workers' KV pools taken out of 95% of
+      # their GPUs instead of the recipe's 85%. A prefill rank's weights and
+      # workspace take 192 GB of its 288 GB, which leaves a pool of 32 GiB at
+      # 85% and of about 61 GiB at 95%: with no tier under the pool, that pool
+      # is all the prefix cache the eight prefill ranks have.
+      umbp_kv_events_opt:
+        - &dsv41_8p16d_umbp_kvev_opt
+          <<: *dsv41_8p16d_umbp_kvev
+          name: ds-v41-flash-8p16d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-opt-c1228
+          display_topology: 8P16D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-OPT
+          prefill: &dsv41_p2ep2_prefill_hbm95
+            <<: *dsv41_p2ep2_prefill
+            extra_args: "--enable-dp-attention --enable-expert-parallel --dp-load-balance share_cache --attn-prefill-chunk-size 65536 --gpu-memory-utilization 0.95"
+          env:
+            prefill: *dsv41_umbp_wait_env_prefill
+
       umbp_smoke:
         # One prefill and one decode worker of those cells on a single node,
         # five minutes at c16: whether the server, the pool and the routing by
@@ -2816,6 +2832,18 @@ models:
         - <<: *dsv41_2p1d_umbp_kvev
           name: ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-wait-c64
           display_topology: 2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-WAIT
+          env:
+            common: *dsv41_one_node_env_common
+            prefill: *dsv41_umbp_wait_env_prefill
+
+      # And with umbp_kv_events_opt's larger pools.
+      umbp_2p1d_kv_events_opt:
+        - <<: *dsv41_2p1d_umbp_kvev
+          name: ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-opt-c64
+          display_topology: 2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-OPT
+          prefill:
+            <<: *dsv41_p2ep2_prefill_hbm95
+            workers: 2
           env:
             common: *dsv41_one_node_env_common
             prefill: *dsv41_umbp_wait_env_prefill
