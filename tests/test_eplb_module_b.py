@@ -4,14 +4,12 @@
 import types
 
 import pytest
-from import_guard import skip_if_dependency_missing
+from aiter_stub import atom_without_aiter
 
 torch = pytest.importorskip("torch")
 
-try:
-    from atom.model_ops import eplb
-except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
-    skip_if_dependency_missing(_e, "requires full atom import env")
+with atom_without_aiter() as _load:
+    eplb = _load("atom.model_ops.eplb")
 
 
 class _FakeTPGroup:
@@ -56,19 +54,26 @@ def _step(mgr):
 def _spy_rebalance(mgr, fired):
     """Replace the runtime rebalance with a 0-yield spy that records each fire.
 
-    The scheduler drives `_execute_rebalance`, which yields-from
-    `_execute_runtime_rebalance`. Recording a fire without yielding mirrors the
-    real migration's synchronous, per-call behaviour and keeps the exact
-    call-count semantics these scheduler tests assert -- without needing real
-    `live_metadata` / EP MoE layers / weight movement.
+    The scheduler drives `_execute_rebalance`, which plans (`_plan`) and
+    yields-from `_execute_runtime_rebalance`. Recording a fire without yielding
+    mirrors the real migration's synchronous, per-call behaviour and keeps the
+    exact call-count semantics these scheduler tests assert -- without needing
+    real `live_metadata` / EP MoE layers / weight movement.
     """
 
-    def _fake():
+    def _fake(plan):
         fired.append(1)
         return
         yield  # pragma: no cover - marks this a generator (never reached)
 
+    mgr._plan = _planned
     mgr._execute_runtime_rebalance = _fake
+
+
+def _planned():
+    """A plan that moves a layer, for tests that fake the migration."""
+    one = torch.zeros(1, 1, dtype=torch.int32)
+    return eplb.PlacementPlan(one, one.unsqueeze(-1), one, [0])
 
 
 def test_manager_steps_with_dummy_and_triggers_by_interval(monkeypatch):
@@ -323,10 +328,11 @@ def test_execute_rebalance_uses_default_stream_no_explicit_wait(monkeypatch):
         rebalance_balancedness_agg="min",
     )
 
-    def _fake():
+    def _fake(plan):
         return
         yield  # pragma: no cover - marks this a generator
 
+    manager._plan = _planned
     manager._execute_runtime_rebalance = _fake
 
     waited = {"called": False}
@@ -356,11 +362,12 @@ def test_execute_rebalance_drains_runtime_generator():
     )
     steps = []
 
-    def _fake():
+    def _fake(plan):
         steps.append("chunk0")
         yield
         steps.append("chunk1")
 
+    manager._plan = _planned
     manager._execute_runtime_rebalance = _fake
 
     gen = manager._execute_rebalance()

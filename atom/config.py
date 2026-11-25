@@ -1806,6 +1806,9 @@ class EPLBConfig:
     #   "naive"  -> greedy replicate + balanced_packing (spread thinly)
     #   "biased" -> fully replicate top-K hottest experts to all GPUs
     #               (K = num_redundant // num_gpus, per-node in multi-node)
+    #   "swap"   -> no redundant experts, one node, dp_size == ep_size: expert
+    #               swaps across ranks from the live placement on the load
+    #               since the start, then frozen for good once none gains
     placement_policy: str = "naive"
 
     def __post_init__(self):
@@ -1838,7 +1841,11 @@ class EPLBConfig:
         assert self.placement_policy in {
             "naive",
             "biased",
-        }, "eplb.placement_policy must be one of {'naive','biased'}"
+            "swap",
+        }, "eplb.placement_policy must be one of {'naive','biased','swap'}"
+        assert (
+            self.placement_policy != "swap" or self.num_redundant_experts == 0
+        ), "eplb.placement_policy 'swap' needs num_redundant_experts == 0"
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "EPLBConfig":

@@ -334,7 +334,8 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     @property
     def eplb_layer_end(self) -> int | None:
         """EPLB balances on prefill load, and under replay only the layers
-        before the decoder run a prefill's every row: it places those."""
+        before the decoder run a prefill's every row: it places those
+        (placement_policy "swap" places every layer, on decode load too)."""
         return self.decoder_start if self.replay else None
 
     def set_aux_hidden_state_rows(self, layer_ids, buffers):
@@ -406,7 +407,8 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         (`decoder_runs`): attention sees no request and writes no cache, so
         the rows only feed the collectives. EPLB places no decoder layer
         (`eplb_layer_end`), so their routing reaches no expert-load
-        statistics."""
+        statistics; under placement_policy "swap", which places every layer,
+        it reaches the decoder layers' prefill counts."""
         forward = get_forward_context()
         metadata = forward.attn_metadata
         step, cache = metadata.step, metadata.cache
