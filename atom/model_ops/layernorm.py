@@ -19,6 +19,10 @@ from aiter.dist.communication_op import (
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.fused_qk_rmsnorm_group_quant import (
+    fused_qk_rmsnorm_group_quant,
+    fused_qk_rmsnorm_per_token_quant,
+)
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
@@ -1379,6 +1383,82 @@ class DualRMSNormMXFP8:
             q_scale = q_scale.view(*lead, -1)
             k_out = k_out.view(*lead, -1)
         return q_fp8, q_scale, k_out
+
+
+def _rows(x: torch.Tensor) -> torch.Tensor:
+    """`x` as unit-stride rows."""
+    x = x.reshape(-1, x.shape[-1])
+    return x if x.stride(-1) == 1 else x.contiguous()
+
+
+class DualRMSNormBF16:
+    """BF16 `DualRMSNormMXFP8`: both norms in one launch (AITER's
+    `fused_qk_rmsnorm_group_quant` without a quant), Q unquantized (scale
+    None), for where the Q GEMMs run in BF16."""
+
+    def __init__(self, q_norm: nn.Module, k_norm: nn.Module, prefix: str = "") -> None:
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        self.prefix = prefix
+
+    @mark_trace
+    def __call__(self, q: torch.Tensor, k: torch.Tensor):
+        lead = q.shape[:-1]
+        q2, k2 = _rows(q), _rows(k)
+        yk = torch.empty(k2.shape, dtype=k.dtype, device=k.device)
+        yq, sq = self._norm(q2, k2, yk)
+        sq = None if sq is None else sq.view(*lead, 1)
+        return yq.view(*lead, -1), sq, yk.view(*lead, -1)
+
+    def _norm(self, q2, k2, yk):
+        """The launch over rows, K into `yk`; returns Q and its scale."""
+        yq = torch.empty(q2.shape, dtype=q2.dtype, device=q2.device)
+        if q2.shape[0]:
+            fused_qk_rmsnorm_group_quant(
+                q=q2,
+                q_weight=self.q_norm.weight,
+                q_epsilon=self.q_norm.eps,
+                q_out_unquantized=yq,
+                k=k2,
+                k_weight=self.k_norm.weight,
+                k_epsilon=self.k_norm.eps,
+                k_out=yk,
+            )
+        return yq, None
+
+
+class DualRMSNormPerToken(DualRMSNormBF16):
+    """`DualRMSNormBF16` with Q quantized per token in the same launch (AITER's
+    `fused_qk_rmsnorm_per_token_quant`, one F32 scale a row), so per-channel
+    Q readers share one quantization."""
+
+    def __init__(
+        self,
+        q_norm: nn.Module,
+        k_norm: nn.Module,
+        prefix: str = "",
+        *,
+        quant_dtype: torch.dtype,
+    ) -> None:
+        super().__init__(q_norm, k_norm, prefix)
+        self.quant_dtype = quant_dtype
+
+    def _norm(self, q2, k2, yk):
+        yq = torch.empty(q2.shape, dtype=self.quant_dtype, device=q2.device)
+        sq = torch.empty((q2.shape[0], 1), dtype=torch.float32, device=q2.device)
+        if q2.shape[0]:
+            fused_qk_rmsnorm_per_token_quant(
+                yq,
+                sq,
+                q2,
+                self.q_norm.weight,
+                self.q_norm.eps,
+                k=k2,
+                k_weight=self.k_norm.weight,
+                k_epsilon=self.k_norm.eps,
+                k_out=yk,
+            )
+        return yq, sq
 
 
 # ---------------------------------------------------------------------------

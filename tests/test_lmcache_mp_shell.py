@@ -24,10 +24,12 @@ from atom.kv_transfer.offload.mp.connector import (
 def _config():
     return with_min_load(
         SimpleNamespace(
+            decode_context_parallel_size=1,
+            dcp_config=SimpleNamespace(interleave_size=1),
             kv_transfer_config={
                 "kv_connector": "lmcache_mp",
                 "kv_role": "offload",
-            }
+            },
         )
     )
 

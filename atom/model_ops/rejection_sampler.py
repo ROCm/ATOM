@@ -131,12 +131,14 @@ class RejectionSampler(nn.Module):
         vocab_size: int,
         logits_dtype: torch.dtype,
         device,
+        block: bool = False,
     ) -> None:
         """Arm the probability-ratio verify for up to ``max_bs`` requests of
         ``num_spec_steps`` drafts over ``vocab_size`` ids: allocate its scratch
         before the KV cache is sized, so the budget and the profiling run see
         it and no verify allocates, and compile every variant for
-        ``logits_dtype`` at the store's width (`warmup_ratio_verify`). No
+        ``logits_dtype`` at the store's width (`warmup_ratio_verify`). ``block``:
+        the verifies will take the block rule (`RatioVerifyInputs.block`). No
         warmup or capture forward verifies, so without this the first sampled
         verify would compile; one on logits of another dtype is refused
         (`forward`)."""
@@ -149,6 +151,7 @@ class RejectionSampler(nn.Module):
             store_width(vocab_size),
             logits_dtype,
             self._ratio_scratch,
+            block,
         )
         self._ratio_logits_dtype = logits_dtype
 
@@ -310,6 +313,10 @@ def rejection_sample(
         # Probability-ratio path: accept with `u * q < p` against the q the
         # draft actually drew from, instead of requiring equality with the
         # target's own draw. Same output distribution, higher acceptance.
+        # Its kernels read these through raw pointers at unit stride too: a
+        # strided view would verify, and emit, other rows' tokens.
+        assert cu_num_draft_tokens.is_contiguous()
+        assert bonus_logits_indices.is_contiguous()
         _ratio_sample(
             output_token_ids,
             verdict,

@@ -42,6 +42,7 @@ def _mgr(engine_count=2, tp=1, cls=CoreManager):
     mgr._weight_sync_context = threading.local()
     mgr._weight_sync_dispatch_token = object()
     mgr._rpc_ranks_per_engine = tp
+    mgr._weight_syncs_unavailable = {}
     mgr.sent = []
     mgr.broadcast_utility_command = lambda cmd, **kw: mgr.sent.append((cmd, kw))
     # What reaches one rank at a time, as a failed sync's cleanup does.
@@ -385,7 +386,7 @@ def test_the_id_is_released_so_it_can_be_reused_serially():
 
 
 def test_results_are_rpcresult_instances():
-    """The public API's return type, which LumenRL reads .ok/.value/.error off."""
+    """RpcResult is the public return contract for .ok/.value/.error."""
     mgr = _mgr(1)
 
     def broadcast_and_answer(cmd, **kw):
@@ -659,6 +660,37 @@ def test_a_complete_weight_sync_finishes_only_after_every_dp_engine_succeeds():
     assert mgr.sent[1][1]["completed_request_id"] == mgr.sent[0][1]["request_id"]
 
 
+def test_a_weight_stream_is_finished_like_any_other_sync():
+    mgr = _mgr(1)
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "receive_weights_rdma", "result": 435}]
+    )
+
+    mgr.broadcast_utility_command_sync(
+        "receive_weights_rdma", timeout=5, group_name="g", version=1
+    )
+
+    assert [cmd for cmd, _ in mgr.sent] == [
+        "receive_weights_rdma",
+        "finish_weight_sync",
+    ]
+
+
+def test_a_weight_stream_that_outlasts_its_caller_is_unknown_not_discarded():
+    """The engine still waits for its runners to decide the stream; a discard
+    reached it once they had written it, and fenced it over a version the
+    caller had been told failed."""
+    mgr = _mgr(1)
+    mgr.broadcast_utility_command = _answering(mgr, [], ranks=[])
+
+    with pytest.raises(TimeoutError, match="unknown"):
+        mgr.broadcast_utility_command_sync(
+            "receive_weights_rdma", timeout=0.2, group_name="g", version=1
+        )
+
+    assert _discarded(mgr) == []
+
+
 def test_a_nonfinal_bucket_stays_fenced_for_the_rest_of_its_sync():
     mgr = _mgr(2)
     mgr.broadcast_utility_command = _answering(
@@ -682,6 +714,18 @@ def test_a_raw_nonfinal_bucket_requires_an_owned_session():
     with pytest.raises(ValueError, match="weight_sync_session"):
         mgr.broadcast_utility_command_sync("update_weights_ipc", is_last=False)
     assert mgr.sent == []
+
+
+def test_weight_sync_abort_claim_is_once_per_outer_session():
+    mgr = _mgr(1)
+
+    with mgr.weight_sync_session():
+        assert mgr.claim_weight_sync_abort()
+        with mgr.weight_sync_session():
+            assert not mgr.claim_weight_sync_abort()
+
+    with mgr.weight_sync_session():
+        assert mgr.claim_weight_sync_abort()
 
 
 def test_overlapping_weight_sync_sessions_cannot_interleave_their_buckets():

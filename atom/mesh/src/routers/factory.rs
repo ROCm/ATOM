@@ -12,7 +12,7 @@ use crate::{
     app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
     core::ConnectionMode,
-    routers::atom_standalone::AtomStandaloneRouter,
+    routers::atom_bridge::AtomBridgeRouter,
 };
 
 /// Factory for creating router instances based on configuration
@@ -75,12 +75,10 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         let runtime = ctx
-            .atom_standalone_runtime
+            .atom_bridge_runtime
             .as_ref()
-            .ok_or_else(|| "ATOM standalone requires a Python-owned runtime".to_string())?;
-        let router = AtomStandaloneRouter::from_runtime(runtime);
-
-        Ok(Box::new(router))
+            .ok_or_else(|| "ATOM standalone requires the Python-owned token bridge".to_string())?;
+        Ok(Box::new(AtomBridgeRouter::new(ctx, Arc::clone(runtime))?))
     }
 
     /// Create a PD router with injected policy

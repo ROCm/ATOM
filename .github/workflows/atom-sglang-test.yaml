@@ -5,14 +5,18 @@ on:
     branches: [main]  # Triggers on PRs targeting `main`
     types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
     # Do not use paths-ignore here. The required gate must be published for
-    # every PR; ci-gate below keeps the old path-ignore behavior for expensive
-    # jobs.
+    # every PR; ci-gate below scopes the expensive jobs by path instead.
   pull_request_review:
     types: [submitted]
 
 concurrency:
-  # Non-approval reviews must not replace a pending approval run.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}
+  # Non-approval reviews must not replace a pending approval run. Every label
+  # event except the one that opens the gate -- adding ci:sglang, or ci:full
+  # to a PR without ci:sglang (check_label_event in the gate script) -- gets
+  # its own group too, so an unrelated label can never cancel running heavy
+  # CI. The gate job's name repeats this test; keep both in sync with
+  # CI_GATE_LABELS.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:sglang' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:sglang'))) && format('-noop-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -43,22 +47,24 @@ jobs:
         env:
           CI_GATE_WORKFLOW: atom-sglang-test.yaml
           CI_GATE_LABELS: ci:full,ci:sglang
+          # Approval alone does not start the sglang plugin CI: a PR runs it
+          # when it changes the plugin, its CI or its image, or carries
+          # ci:sglang / ci:full. Core-only changes are covered by the nightly.
+          CI_GATE_PATHS_INCLUDE: |
+            atom/plugin/**
+            .github/workflows/atom-sglang-test.yaml
+            .github/scripts/plugin_ci/**
+            .github/scripts/atom_sglang_test.sh
+            .github/workflows/docker-release.yaml
+            .github/benchmark/sglang_models_accuracy.json
+            docker/atom_release.dockerfile
+            docker/sglang_release.dockerfile
           CI_GATE_PATHS_IGNORE: |
             **/*.md
-            docs/**
-            .claude/**
             atom/plugin/vllm/**
-            atom/mesh/**
-            .github/benchmark/models_atomesh.yaml
-            .github/scripts/atomesh/**
-            .github/workflows/atomesh-*.yaml
-            .github/workflows/atom-review-bot*.yml
-            .github/scripts/atomesh_*.sh
-            .github/dashboard/atomesh_*.html
-            .github/workflows/atom-vllm-*.yaml
-            .github/benchmark/oot_models_accuracy.json
-            LICENSE
-            .gitignore
+            atom/plugin/rtpllm/**
+            .github/scripts/plugin_ci/run_vllm_ci.sh
+            .github/scripts/plugin_ci/vllm_slurm_job.sh
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash ./.github/scripts/check_heavy_ci_gate.sh
@@ -360,7 +366,7 @@ jobs:
           if-no-files-found: ignore
 
   atom-sglang-test-gate:
-    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.should_run == 'true') && 'ATOM SGLang Test Gate' || 'ATOM SGLang Test Gate not requested' }}
+    name: ${{ ((github.event_name != 'pull_request_review' && !(github.event.action == 'labeled' && !(github.event.label.name == 'ci:sglang' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:sglang'))))) || needs.ci-gate.outputs.should_run == 'true') && 'ATOM SGLang Test Gate' || 'ATOM SGLang Test Gate not requested' }}
     if: always()
     runs-on: ubuntu-latest
     permissions:

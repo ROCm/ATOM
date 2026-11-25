@@ -3,7 +3,8 @@
 //! The inner policy places a session's first request; for `dp_sticky` that is
 //! [`LeastSessionsPolicy`], which reads the live session counts the table
 //! passes in. Later requests stay on that worker until the idle TTL expires,
-//! the worker is unusable, or a request of the session fails. A failure counts
+//! the worker is unusable or not a candidate (another DP rank under idx2idx), or
+//! a request of the session fails. A failure counts
 //! only for a request placed on the session's current binding, on the worker it
 //! was sent to after DP rank mapping. Under ATOM PD idx2idx rank mapping, a
 //! failed prefill also releases the decode binding, although the decode was
@@ -262,7 +263,8 @@ impl SessionTable {
         if binding != Some(entry.binding) {
             return None;
         }
-        // Without a reassignment, only rank mapping can move a pinned session.
+        // Without a reassignment, only rank mapping can move a pinned session: a
+        // request placed on an earlier binding returned above.
         let reason = entry
             .reassigned
             .take()

@@ -1,6 +1,16 @@
 from types import SimpleNamespace as NS
 
+import pytest
+
+from atom import structured_output
 from atom.entrypoints.openai.model_capabilities import deployment_metadata
+
+
+@pytest.fixture(autouse=True)
+def _no_structured_output(monkeypatch):
+    """The other cases describe a deployment without the optional extra,
+    whatever this environment has installed."""
+    monkeypatch.setattr(structured_output, "available", lambda: False)
 
 
 def test_dspark_reports_runtime_context_and_text_only():
@@ -73,3 +83,12 @@ assert 'atom.entrypoints.openai.deepseek_v41_encoder' not in sys.modules
     subprocess.run(
         [sys.executable, "-c", code], check=True, capture_output=True, text=True
     )
+
+
+def test_structured_output_is_reported_only_when_available(monkeypatch):
+    assert "structured_output" not in deployment_metadata(None, None)
+    monkeypatch.setattr(structured_output, "available", lambda: True)
+    assert deployment_metadata(None, None)["structured_output"] == {
+        "backend": "llguidance",
+        "formats": ["json_object", "json_schema"],
+    }

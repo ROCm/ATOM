@@ -39,7 +39,7 @@ def config_refusal(atom_config) -> str | None:
     checks += common_refusals(
         atom_config, lambda *_: None, (1, 2, 4, 8), refuse_decode_cp=False
     )
-    checks += resident_grid_refusals(atom_config)
+    checks += resident_grid_refusals(atom_config, connectors=("lmcache_mp",))
     return first_refusal(checks)
 
 
@@ -123,6 +123,7 @@ def install_mono_decode(
         from atom.mono.dsa_indexer.bind import (
             IndexerHook,
             indexer_modules,
+            prepare_weights,
             routing_refusal,
         )
     except ImportError as error:
@@ -136,6 +137,7 @@ def install_mono_decode(
         logger.info("DSA indexer mono off: %s", why)
         return model
     logger.info("DSA indexer mono armed (TP%d)", atom_config.tensor_parallel_size)
+    prepare_weights(modules)
     # routed now, before the layer stack is first traced (its warmup): the
     # runner attaches to it once built
     return IndexerMonoModel(model, IndexerHook(modules), metadata_builder)

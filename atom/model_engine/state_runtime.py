@@ -10,6 +10,7 @@ from atom.model_engine.page_unit_checkpoint import (
     CheckpointStoreOp,
     PagedStateCheckpointSpec,
 )
+from atom.model_engine.state_cache import KEEP_NONE, KEEP_SETTLED, KEEP_SNAPSHOT
 
 FORK = "fork"
 COPY = "copy"
@@ -52,12 +53,19 @@ class StateTransfer:
     #: (`conv_kernel - 1`) is sliced out of the step's own conv input. 0 when
     #: not readable.
     midstep_min_offset: int = 0
+    #: What a decode boundary keeps; see `StateCache.decode_keep`. A snapshot
+    #: is built in a scratch slot the coordinator lends the store.
+    decode_keep: str = KEEP_SETTLED
 
     def __post_init__(self) -> None:
         if not isinstance(self.fork_tokens, int) or isinstance(self.fork_tokens, bool):
             raise TypeError("fork_tokens must be an integer")
         if not isinstance(self.readable_midstep, bool):
             raise TypeError("readable_midstep must be a bool")
+        if self.decode_keep not in (KEEP_SETTLED, KEEP_SNAPSHOT, KEEP_NONE):
+            raise ValueError(f"unknown decode keep {self.decode_keep!r}")
+        if self.decode_keep == KEEP_SNAPSHOT and self.kind != COPY:
+            raise ValueError("only a copy transfer builds decode snapshots")
         if self.kind in (NONE, REPLAY) and self.readable_midstep:
             raise ValueError(f"{self.kind} transfer has no state to read midstep")
         for name in ("midstep_grid", "midstep_min_offset"):
@@ -119,6 +127,7 @@ class StateTransfer:
         readable_midstep: bool = False,
         midstep_grid: int = 0,
         midstep_min_offset: int = 0,
+        decode_keep: str = KEEP_SETTLED,
     ) -> "StateTransfer":
         return cls(
             COPY,
@@ -126,6 +135,7 @@ class StateTransfer:
             readable_midstep=readable_midstep,
             midstep_grid=midstep_grid,
             midstep_min_offset=midstep_min_offset,
+            decode_keep=decode_keep,
         )
 
     def to_wire(self) -> dict[str, str | int | bool | None]:
@@ -136,6 +146,7 @@ class StateTransfer:
             "readable_midstep": self.readable_midstep,
             "midstep_grid": self.midstep_grid,
             "midstep_min_offset": self.midstep_min_offset,
+            "decode_keep": self.decode_keep,
         }
 
     @classmethod
@@ -149,6 +160,7 @@ class StateTransfer:
             "readable_midstep",
             "midstep_grid",
             "midstep_min_offset",
+            "decode_keep",
         }
         if set(wire) != expected:
             raise ValueError(
@@ -162,6 +174,7 @@ class StateTransfer:
             readable_midstep=wire["readable_midstep"],  # type: ignore[arg-type]
             midstep_grid=wire["midstep_grid"],  # type: ignore[arg-type]
             midstep_min_offset=wire["midstep_min_offset"],  # type: ignore[arg-type]
+            decode_keep=wire["decode_keep"],  # type: ignore[arg-type]
         )
 
     @property
@@ -253,11 +266,17 @@ class StateMaintenanceOps:
     relocations: tuple[tuple[int, int], ...] = ()
     checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
     checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
+    # (source, destination) paged blocks whose whole content is copied before
+    # the batch: a private block demoted into the shared part of a split pool.
+    block_copies: tuple[tuple[int, int], ...] = ()
 
     @property
     def empty(self) -> bool:
         return not (
-            self.relocations or self.checkpoint_stores or self.checkpoint_restores
+            self.relocations
+            or self.checkpoint_stores
+            or self.checkpoint_restores
+            or self.block_copies
         )
 
 

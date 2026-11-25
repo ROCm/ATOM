@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Real UVA lookup under warmup, capture, and changing graph replay inputs.
 
 Run pytest on one GPU, or torchrun --nproc-per-node=4 -m
@@ -24,7 +26,6 @@ from atom.model_ops.engram.device.hashing import (
     engram_cursor_rows_reference,
     engram_row_indices_reference,
     engram_snapshot,
-    engram_snapshot_indices,
 )
 from atom.model_ops.engram.device.staging import EngramStaging, EngramStep
 from atom.model_ops.engram.mapping import EngramConfig
@@ -68,24 +69,39 @@ def make_batch(mapping, lengths, seed):
 
 @pytest.mark.parametrize("config", [tiny_config(), EngramConfig.from_hf(V41_FLASH)])
 @pytest.mark.parametrize("lengths", [[1, 1], [1, 6, 3], [64]])
-def test_snapshot_keeps_old_history_and_padding(config, lengths):
+@pytest.mark.parametrize("in_launch", [False, True])
+def test_snapshot_keeps_old_history_and_padding(config, lengths, in_launch):
+    """One launch: the lookbacks and every layer's row ids from them, the
+    compressed ids read (``in_launch`` False) or made from the raw ids in it;
+    the rows are the reference's whatever the cursor does after."""
     mapping = build(config)
     tables = EngramHashTables.from_mapping(mapping, torch.device("cuda"))
     batch, tokens, histories, masks = make_batch(mapping, lengths, 7)
     count = sum(lengths)
+    compress = None
+    if in_launch:
+        expected_compressed = batch.compressed.clone()
+        batch.compressed.fill_(-7)
+        flat = torch.as_tensor(np.concatenate(tokens), dtype=torch.int32, device="cuda")
+        dead = torch.as_tensor(~np.concatenate(masks), device="cuda")
+        compress = (flat, dead)
     snapshot = torch.empty(count + 5, tables.ngram, dtype=torch.int64, device="cuda")
-    engram_snapshot(tables, batch, snapshot)
+    layers = list(config.layer_ids)
+    out = torch.empty(
+        len(layers), count + 5, tables.heads, dtype=torch.int64, device="cuda"
+    )
+    engram_snapshot(tables, batch, snapshot, compress=compress, rows=(layers, out))
+    if in_launch:
+        assert torch.equal(batch.compressed, expected_compressed)
     # Emulate prepare advancing the cursor, and release all temporary inputs.
     batch.history.fill_(31)
     batch.compressed.fill_(17)
-    for layer in config.layer_ids:
-        out = torch.empty(count + 5, tables.heads, dtype=torch.int64, device="cuda")
-        engram_snapshot_indices(tables, layer, snapshot, out)
+    for i, layer in enumerate(layers):
         expected = engram_row_indices_reference(
             mapping, layer, tokens, histories, masks
         )
-        np.testing.assert_array_equal(out[:count].cpu().numpy(), expected)
-        assert torch.all(out[count:] == -1)
+        np.testing.assert_array_equal(out[i, :count].cpu().numpy(), expected)
+        assert torch.all(out[i, count:] == -1)
 
 
 @pytest.mark.parametrize("config", [tiny_config(), EngramConfig.from_hf(V41_FLASH)])
@@ -116,10 +132,20 @@ def test_snapshot_stages_all_cursor_prefixes_without_mutating_history(
         device="cuda",
     )
     original = batch.history.clone()
+    layers = list(config.layer_ids)
+    out = torch.empty(
+        len(layers), count + 5, tables.heads, dtype=torch.int64, device="cuda"
+    )
 
     def prepare():
+        # the lookbacks, the candidates and every layer's rows: one launch
         engram_snapshot(
-            tables, batch, snapshot, cursor_positions=positions, cursor_out=candidates
+            tables,
+            batch,
+            snapshot,
+            cursor_positions=positions,
+            cursor_out=candidates,
+            rows=(layers, out),
         )
 
     prepare()
@@ -139,14 +165,12 @@ def test_snapshot_stages_all_cursor_prefixes_without_mutating_history(
     assert torch.all(candidates[len(lengths) :] == -99)
     assert torch.equal(batch.history, original)
     assert torch.all(snapshot[count:] == -2)
-    for layer in config.layer_ids:
-        out = torch.empty(count + 5, tables.heads, dtype=torch.int64, device="cuda")
-        engram_snapshot_indices(tables, layer, snapshot, out)
+    for i, layer in enumerate(layers):
         np.testing.assert_array_equal(
-            out[:count].cpu().numpy(),
+            out[i, :count].cpu().numpy(),
             engram_row_indices_reference(mapping, layer, tokens, histories, masks),
         )
-        assert torch.all(out[count:] == -1)
+        assert torch.all(out[i, count:] == -1)
 
 
 def make_staging(mapping, group=None, staging_cls=EngramStaging):
@@ -203,7 +227,11 @@ def make_staging(mapping, group=None, staging_cls=EngramStaging):
         host=host,
         hash_tables=EngramHashTables.from_mapping(mapping, device),
         row_ids=torch.empty(
-            32, config.num_hash_heads, dtype=torch.int64, device=device
+            len(config.layer_ids),
+            32,
+            config.num_hash_heads,
+            dtype=torch.int64,
+            device=device,
         ),
     )
     return staging_cls(uva), backing

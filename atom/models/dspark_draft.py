@@ -32,7 +32,7 @@ forward, ``DSparkGQADecoderLayer``.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import torch
 from torch import nn
@@ -84,6 +84,16 @@ class DraftSampling:
     #: [max_bs] fp32, the request's top-p, over the unfiltered q and
     #: intersected with top-k (aiter's rule); 1.0 is off.
     top_p: torch.Tensor
+
+
+class VocabShard(NamedTuple):
+    """This TP rank's slice of a sharded LM head: the base logits a sampler
+    is handed hold vocab ids ``start`` on only, and ``group`` (the TP group)
+    holds the rest. ``use_custom`` picks its custom all-gather."""
+
+    start: int
+    group: Any
+    use_custom: bool
 
 
 def linear_out(output):
@@ -229,6 +239,7 @@ class DSparkMarkovHead(nn.Module):
         base_logits: torch.Tensor,  # [B, T, V]
         anchor_ids: torch.Tensor,  # [B]
         sampling: "DraftSampling | None",
+        shard: VocabShard | None = None,
     ) -> torch.Tensor:
         """The block, left to right, each position from ``x_{k-1}`` into its
         own column of one ``[B, T + 1]`` block whose first column is the
@@ -242,18 +253,28 @@ class DSparkMarkovHead(nn.Module):
         Kimi-K3's loop: one for greedy and lossless, so the column convention
         and the noise counters cannot drift apart. V4, V4.1 and MiniMax-M3.1
         keep their own greedy loops, because their confidence head reads each
-        position's ``W1[x_{k-1}]``, which the sampled op does not produce.
-        Lossless, each row writes its q
-        straight into the row block its request owns (``sampling.q_row_base``),
-        which the accept kernel reads a step later. The branch on
-        ``sampling`` is python, so a recording holds one side; an armed
-        drafter records both (`DSparkProposer.block_greedy`).
+        position's ``W1[x_{k-1}]``, which the sampled op does not produce
+        (V4.1's sampled block takes this loop and gathers those rows after
+        it). Lossless, each row writes its q straight into the row block its
+        request owns (``sampling.q_row_base``), which the accept kernel reads a
+        step later. The branch on ``sampling`` is python, so a recording holds
+        one side; an armed drafter records both (`DSparkProposer.block_greedy`).
+
+        ``shard``: ``base_logits`` is this rank's ``[B, T, V / tp]`` slice of a
+        sharded LM head, which the sampled op keeps sharded
+        (`dspark_markov_sample_tp`); it draws and stores what it would from
+        the whole vocab. Lossless only: a greedy flavor that shards its head
+        runs its own loop.
         """
         bs, num_draft, vocab = base_logits.shape
+        if shard is not None:
+            assert sampling is not None, "only the sampled block keeps a shard"
+            vocab *= shard.group.world_size
         if sampling is not None:
             # Imported here for the reason `sample_next` gives.
             from atom.model_ops.spec_sampling.dspark_markov_sample import (
                 dspark_markov_sample,
+                dspark_markov_sample_tp,
             )
 
             # The noise counter stride is the buffer's max batch, not this
@@ -269,7 +290,7 @@ class DSparkMarkovHead(nn.Module):
                 # written twice.
                 self.sample_next(out_ids[:, k], base_logits[:, k], out_ids[:, k + 1])
                 continue
-            dspark_markov_sample(
+            args = (
                 base_logits[:, k],
                 out_ids[:, k],
                 self.markov_w1.weight,
@@ -285,6 +306,10 @@ class DSparkMarkovHead(nn.Module):
                 k * position_stride,
                 sampling.scratch,
             )
+            if shard is None:
+                dspark_markov_sample(*args)
+            else:
+                dspark_markov_sample_tp(*args, *shard)
         return out_ids[:, 1:]
 
 
@@ -321,16 +346,28 @@ class DSparkConfidenceHead(nn.Module):
         # probabilities). The checkpoint head is BF16 [1, hidden + rank]: the
         # GEMV takes it as is and accumulates and writes FP32, which is what
         # casting both operands to FP32 first would compute, minus the casts.
-        # aiter is imported here, not at module load: this module imports
-        # without it.
-        x = torch.cat([hidden_states, markov_embeds], dim=-1)
         weight, bias = self.proj.weight, self.proj.bias
+        if hidden_states.is_cuda:
+            # Triton is imported here, not at module load: this module imports
+            # without it.
+            from atom.model_ops.dspark_confidence import (
+                can_fuse_confidence,
+                fused_confidence,
+            )
+
+            if can_fuse_confidence(hidden_states, markov_embeds, weight, bias):
+                # FP32 accumulation in one launch, without the concatenated
+                # copy (its reduction order differs from the GEMM's).
+                return fused_confidence(hidden_states, markov_embeds, weight)
+        x = torch.cat([hidden_states, markov_embeds], dim=-1)
         if not x.is_cuda:
             logit = torch.nn.functional.linear(
                 x.float(), weight.float(), None if bias is None else bias.float()
             )
             return torch.sigmoid(logit).squeeze(-1)
 
+        # aiter is imported here, not at module load: this module imports
+        # without it.
         import aiter
         from aiter.tuned_gemm import tgemm
 
@@ -476,6 +513,12 @@ class DSparkDraftModel(nn.Module):
     #: real q? A class flag, not a probe: every flavor's head has the method.
     #: ``DSparkProposer`` binds sampling buffers only where it is set.
     supports_lossless_draft = False
+
+    #: Once lossless sampling arms, verify a sampled request's drafts as one
+    #: block (Sun et al. 2024; `ratio_verify`) rather than token by token: the
+    #: same output law, never fewer accepted drafts in expectation. A class
+    #: flag beside ``supports_lossless_draft``, set where it has been run.
+    lossless_block_verify: ClassVar[bool] = False
 
     #: The buffers the block sampler draws into, set once lossless speculative
     #: sampling arms (`DSparkLossless.bind_target`), before any warmup or

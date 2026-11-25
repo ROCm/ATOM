@@ -107,10 +107,10 @@ class DCPShardPlan:
     def landing_row_count(self) -> int:
         """Rows a landing slot sequence carries, unpadded.
 
-        Rows are the valid destination tokens in destination order. They are
-        a prefix (see ``staged_page_runs``), so they are the leading rows of
-        ``source_token_per_dst_token`` and row ``j`` lands at token
-        ``j % block_size`` of destination page ``j // block_size``. The
+        Rows are the valid destination tokens in destination order. A rank's
+        global positions grow with its local ones, so they are a prefix: the
+        leading rows of ``source_token_per_dst_token``, with row ``j`` at
+        token ``j % block_size`` of destination page ``j // block_size``. The
         decode side relies on exactly that mapping to scatter the rows
         (``landing_scatter.landing_segments``).
         """
@@ -124,8 +124,8 @@ class DCPShardPlan:
 
         Row ``p * block_size + t`` names the producer token (``block_id *
         block_size + token``) that lands at token ``t`` of destination page
-        ``p``. Tokens past the source end read token 0; ``staged_page_runs``
-        never sends them.
+        ``p``. Tokens past the source end read token 0; the transfer plan
+        sends only the leading ``landing_row_count`` rows.
         """
 
         run_start = self.src_block_id_per_run * self.block_size + self.src_token
@@ -134,57 +134,12 @@ class DCPShardPlan:
         valid_offsets = np.where(self.valid[:, None], offsets, 0)
         return (run_start[:, None] + valid_offsets).reshape(-1)
 
-    def staged_page_runs(
-        self,
-        dst_block_ids: Sequence[int],
-        staging_addr: int,
-        dst_base: int,
-        token_bytes: int,
-        dst_pages_per_mr: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Byte descriptors for pages staged page-major at ``staging_addr``.
-
-        The staging buffer holds ``dst_pages`` pages in destination token order
-        (see ``source_token_per_dst_token``). Each page sends only its valid
-        tokens, which the plan keeps as a page prefix because a rank's global
-        positions grow with its local ones, so the bytes written are exactly
-        those of ``token_runs``. Runs adjacent on both ends are merged, except
-        across a destination page that is a multiple of ``dst_pages_per_mr``:
-        the consumer registers its region as memory regions of that many
-        pages, and one RDMA op must stay inside one of them.
-        """
-
-        dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
-        if dst_ids.size != self.dst_pages:
-            raise ValueError(
-                f"DCP shard plan has {self.dst_pages} destination pages, got "
-                f"{dst_ids.size} block ids"
-            )
-        if self.valid.size and (self.valid[1:] > self.valid[:-1]).any():
-            raise ValueError("DCP shard plan valid tokens are not a prefix")
-        runs_per_page = self.block_size // self.interleave_size
-        valid_tokens = (
-            self.valid.reshape(self.dst_pages, runs_per_page).sum(axis=1)
-            * self.interleave_size
-        )
-        page_bytes = self.block_size * token_bytes
-        keep = valid_tokens > 0
-        src = staging_addr + np.flatnonzero(keep).astype(np.int64) * page_bytes
-        dst = dst_base + dst_ids[keep] * page_bytes
-        return coalesce_contiguous(
-            src,
-            dst,
-            valid_tokens[keep] * token_bytes,
-            dst_ids[keep] % dst_pages_per_mr == 0,
-        )
-
 
 def pack_slots(
     unit_bytes: Sequence[int],
     num_units: int,
     slot_bytes: int,
     align: int,
-    first_units: Sequence[int] | None = None,
 ) -> list[list[tuple[int, int, int, int]]]:
     """Pack every region's ``num_units`` units into fixed-size slots.
 
@@ -194,13 +149,10 @@ def pack_slots(
     ``region_pos`` indexes ``unit_bytes`` and the units occupy
     ``[slot_offset, slot_offset + (unit_stop - unit_start) * width)``. Every
     item but a region's last spans a multiple of ``align`` units.
-    ``first_units`` optionally starts each region at a later unit (its
-    earlier units were already sent).
 
-    The staged MLA path packs destination pages (``align`` 1). Landing packs
-    the ``DCPShardPlan.landing_row_count`` unpadded rows with ``align`` the
-    block size, so the rows a sender has not landed yet always start on
-    a destination page and can go out as whole pages.
+    ``TransferPlan.pack`` packs a request's units with ``align`` the units of
+    one destination page, so the rest of a transfer that runs out of landing
+    credits always starts on a page and can go out as staged direct writes.
     """
 
     slots: list[list[tuple[int, int, int, int]]] = []
@@ -212,7 +164,7 @@ def pack_slots(
                 f"Slot of {slot_bytes} bytes cannot hold {align} x "
                 f"{width}-byte units"
             )
-        unit = 0 if first_units is None else first_units[region_pos]
+        unit = 0
         while unit < num_units:
             capacity = (slot_bytes - used) // width
             if unit + capacity < num_units:
@@ -308,8 +260,8 @@ def kv_heads_of_rank(rank: int, tp: int, total_heads: int) -> tuple[int, int]:
 def consumer_head_slices(
     src_bytes: int,
     dst_bytes: int,
-    src_runs: tuple[int, int] | None,
-    dst_runs: tuple[int, int] | None,
+    src_runs: tuple[int, tuple[int, ...]] | None,
+    dst_runs: tuple[int, tuple[int, ...]] | None,
     rank: int,
     tp: int,
     label: str,
@@ -323,26 +275,20 @@ def consumer_head_slices(
                 f"{dst_runs} of {dst_bytes} B on consumer rank {rank}/{tp}"
             )
         return np.array([[0, 0, src_bytes]], dtype=np.int64)
-    (runs, heads), (dst_run_count, dst_heads) = src_runs, dst_runs
+    (heads, widths), (dst_heads, dst_widths) = src_runs, dst_runs
     first, count = kv_heads_of_rank(rank, tp, heads)
-    width = src_bytes // (runs * heads) if runs > 0 else 0
     if (
-        width <= 0
-        or (runs, count) != (dst_run_count, dst_heads)
-        or src_bytes != runs * heads * width
-        or dst_bytes != runs * count * width
+        not widths
+        or min(widths) <= 0
+        or (count, widths) != (dst_heads, dst_widths)
+        or src_bytes != heads * sum(widths)
+        or dst_bytes != count * sum(widths)
     ):
         raise ValueError(
-            f"{label}: {runs}x{heads} heads in {src_bytes} B here do not cut "
-            f"into {dst_run_count}x{dst_heads} in {dst_bytes} B on consumer "
-            f"rank {rank}/{tp}"
+            f"{label}: {heads} heads of runs {widths} B in {src_bytes} B here do "
+            f"not cut into {dst_heads} of runs {dst_widths} B in {dst_bytes} B on "
+            f"consumer rank {rank}/{tp}"
         )
-    run = np.arange(runs, dtype=np.int64)
-    return np.stack(
-        [
-            run * heads * width + first * width,
-            run * count * width,
-            np.full(runs, count * width, dtype=np.int64),
-        ],
-        axis=1,
-    )
+    w = np.asarray(widths, dtype=np.int64)
+    before = np.cumsum(w) - w
+    return np.stack([before * heads + first * w, before * count, count * w], axis=1)

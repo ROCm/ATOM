@@ -6,22 +6,26 @@ pre-mix carried from the PREVIOUS sublayer while the one computed here is
 carried to the next. HIP Mega-MHC and the Triton implementation cover that seam --
 the owed post, the gate projection, Sinkhorn, the collapse with the carried
 pre-mix and the sublayer's input RMSNorm. HIP uses one compute kernel on gfx950
-and gfx1250; Triton remains available through ATOM_DSV41_MHC_BACKEND=triton.
+and gfx1250. On gfx942, seams with a post pass the FP32 weight to mega_mhc,
+which runs AITER's ASM seam and RMSNorm wherever
+mhc_fused_post_pre_delayed_asm_supported holds (H=5120); seams without a post
+stay on Triton. ATOM_DSV41_MHC_BACKEND=triton forces Triton everywhere.
 
 The norm is the sublayer's own. Attention can request HIP's fused MXFP8
 output alongside BF16 for its other readers; FFN keeps the BF16 interface.
 Its consumers (wqkv_a's group32 GEMM, the bounded-replay row gather) read
 row-major (T, H/32) E8M0 scales. gfx950 writes those; gfx1250 writes its
-m32k4 GEMM A-scale layout unless asked for `scale_row_major`, so there the
-fused output needs an AITER with that option, else the GEMM quantizes.
+m32k4 GEMM A-scale layout unless asked for `scale_row_major`, which ATOM
+always requests there (a plain `mega_mhc` parameter on aiter main).
 """
 
-import inspect
 from functools import cache
 
 import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.mega_mhc import mega_mhc, mega_mhc_shuffle_fn
+from aiter.ops.mhc import mhc_fused_post_pre_delayed_asm_supported
 from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     mhc_fused_post_pre_delayed_rmsnorm,
 )
@@ -33,29 +37,27 @@ _HIP_ARCHS = ("gfx950", "gfx1250")
 
 
 @cache
-def _hip_ops():
-    try:
-        from aiter.ops.mega_mhc import mega_mhc, mega_mhc_shuffle_fn
-    except ImportError:
-        return None
-    return mega_mhc, mega_mhc_shuffle_fn
+def _row_major_scale_options():
+    """The mega_mhc options that give fused MXFP8 row-major (T, H/32) scales,
+    or None on other archs: gfx950 always writes them, gfx1250 through
+    `scale_row_major` (m32k4 otherwise)."""
+    arch = get_gfx_runtime()
+    if arch == "gfx950":
+        return {}
+    if arch == "gfx1250":
+        # scale_row_major is a plain mega_mhc parameter on aiter main.
+        return {"scale_row_major": True}
+    return None
 
 
 @cache
-def _row_major_scale_options():
-    """The mega_mhc options that give fused MXFP8 row-major (T, H/32) scales,
-    or None when this arch/AITER cannot: gfx950 always writes them, gfx1250
-    only through `scale_row_major` (m32k4 otherwise)."""
-    arch, ops = get_gfx_runtime(), _hip_ops()
-    if arch == "gfx950":
-        return {}
-    if (
-        arch == "gfx1250"
-        and ops is not None
-        and "scale_row_major" in inspect.signature(ops[0]).parameters
-    ):
-        return {"scale_row_major": True}
-    return None
+def use_asm_seam(hc_mult: int, hidden: int) -> bool:
+    """Whether a seam with a post passes the FP32 weight to mega_mhc for AITER's
+    gfx942 ASM seam: wherever AITER supports it, unless
+    ATOM_DSV41_MHC_BACKEND=triton."""
+    return envs.ATOM_DSV41_MHC_BACKEND != "triton" and (
+        mhc_fused_post_pre_delayed_asm_supported(hidden, hc_mult)
+    )
 
 
 def fuse_quant_supported() -> bool:
@@ -86,12 +88,7 @@ def pack_mhc_fn(fn):
                 "hc_mult=4 and H in {4096, 5120, 6144, 7168}"
             )
         return None
-    ops = _hip_ops()
-    if ops is None:
-        if backend == "hip":
-            raise RuntimeError("HIP Mega-MHC requires AITER mega_mhc_shuffle_fn")
-        return None
-    return ops[1](fn)
+    return mega_mhc_shuffle_fn(fn)
 
 
 def pre_delayed(
@@ -118,7 +115,8 @@ def pre_delayed(
     Returns `(residual, normed_input, next_pre_mix, post_mix, combination)`.
     `residual` is the caller's own tensor when no post was requested.
     `hc_fn` is a HIP BF16 hi/lo pack when `w_preshuffle_bf16=True`,
-    or the original FP32 weight for Triton otherwise.
+    or the original FP32 weight otherwise (Triton, or gfx942's ASM seam for
+    seams with a post, see `use_asm_seam`).
     With `fuse_quant`, `normed_input` is `(bf16, fp8, e8m0_scale)` with
     row-major scales; it needs the HIP backend and `fuse_quant_supported()`.
     """
@@ -211,15 +209,18 @@ def v41_mhc_pre_delayed(
         raise ValueError("Fused mHC quantization requires the HIP backend")
     if fuse_quant and not fuse_quant_supported():
         raise ValueError(
-            "Fused mHC quantization requires row-major scales: gfx950, or "
-            "gfx1250 with AITER mega_mhc(scale_row_major=)"
+            "Fused mHC quantization requires row-major scales: gfx950 or gfx1250"
         )
-    if w_preshuffle_bf16:
-        kernel = _hip_ops()[0]
-        options["w_preshuffle_bf16"] = True
+    # mega_mhc for a packed BF16 fn (HIP, gfx950/gfx1250), or for a raw FP32 fn
+    # on gfx942 where it runs AITER's ASM seam and RMSNorm. fuse_quant implies
+    # w_preshuffle_bf16, so the ASM branch always resolves to BF16.
+    if w_preshuffle_bf16 or (with_post and use_asm_seam(hc_mult, hidden)):
+        kernel = mega_mhc
         options["out_dtype"] = "mxfp8" if fuse_quant else "bf16"
-        if fuse_quant:
-            options.update(_row_major_scale_options())
+        if w_preshuffle_bf16:
+            options["w_preshuffle_bf16"] = True
+            if fuse_quant:
+                options.update(_row_major_scale_options())
     new_residual, post, comb, normed, pre = kernel(
         residual.view(rows, hc_mult, hidden),
         hc_fn,

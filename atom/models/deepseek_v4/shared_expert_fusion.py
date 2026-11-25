@@ -19,11 +19,14 @@ _FUSED_SCALE_NATIVE_MX = {"quant_block_size": 32, "scale_dtype_fmt": "ue8m0"}
 _FUSED_SCALE_BLOCKSCALE = {"transpose_scale": True}
 
 
-def fused_scale_kwargs(native_a8_group_rows: Any | None) -> dict:
-    """Scale kwargs for ``fused_clamp_act_mul`` given ``w2``'s activation layout."""
+def fused_scale_kwargs(
+    native_a8_group_rows: Any | None, blockscale: bool
+) -> dict | None:
+    """Scale kwargs for ``fused_clamp_act_mul`` given ``w2``'s activation layout;
+    None for a ``w2`` that reads neither layout (per-channel FP8)."""
     if native_a8_group_rows is not None:
         return _FUSED_SCALE_NATIVE_MX
-    return _FUSED_SCALE_BLOCKSCALE
+    return _FUSED_SCALE_BLOCKSCALE if blockscale else None
 
 
 @cache
