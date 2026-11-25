@@ -540,10 +540,6 @@ class DSparkDraftModel(nn.Module):
             int(config.vocab_size), int(config.dspark_markov_rank)
         )
 
-    def prepare_for_serving(self) -> None:
-        """Prepare fixed draft state after the target weights are available."""
-        return
-
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""
         return

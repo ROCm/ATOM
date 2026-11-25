@@ -31,41 +31,122 @@ def _draft_model():
     return DeepseekV41DSpark
 
 
-@pytest.mark.parametrize("draft_dtype", ["auto", "fp8"])
-def test_serving_prepares_noise_embedding_before_drafting(monkeypatch, draft_dtype):
-    from atom.spec_decode.dspark_proposer import DSparkProposer
-
+def _draft_sharing(embed, noise_token_id=2):
     model = _draft_model()
     draft = model.__new__(model)
     torch.nn.Module.__init__(draft)
-    draft.config = SimpleNamespace(dspark_noise_token_id=2)
-    draft.draft_kv_dtype = draft_dtype
-    proposer = SimpleNamespace(model=draft, context_kv_only=True)
+    draft.config = SimpleNamespace(dspark_noise_token_id=noise_token_id)
+    draft.share_with_target(SimpleNamespace(embed=embed, head=torch.nn.Identity()))
+    return draft
 
-    embed = torch.nn.Embedding.from_pretrained(torch.full((4, 8), 3.0), freeze=False)
+
+def _sharded_embedding(fill, dtype):
+    """A rank's `VocabParallelEmbedding` (rows 2 and 3 of 4 over TP 2) whose
+    module forward -- the custom all-reduce -- must never run."""
+    from atom.model_ops.embed_head import VocabParallelEmbedding
+
+    embed = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+    torch.nn.Module.__init__(embed)
+    embed.tp_rank, embed.tp_size = 1, 2
+    embed.vocab_start_idx, embed.vocab_end_idx = 2, 4
+    embed.weight = torch.nn.Parameter(
+        torch.full((2, 8), fill, dtype=dtype), requires_grad=False
+    )
+    embed.forward = Mock(side_effect=AssertionError("custom all-reduce"))
+    return embed
+
+
+def test_noise_row_binds_once_and_rebinds_with_a_new_target(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    embed = torch.nn.Embedding.from_pretrained(torch.full((4, 8), 3.0))
     forward = Mock(wraps=embed.forward)
     monkeypatch.setattr(embed, "forward", forward)
-    target = SimpleNamespace(embed=embed, head=torch.nn.Identity())
-    draft.share_with_target(target)
-    DSparkProposer.prepare_for_serving(proposer)
-    forward.assert_not_called()
-    with pytest.raises(RuntimeError, match="Prepare the V4.1 DSpark noise embedding"):
-        draft._noise_embedding()
-    forward.assert_not_called()
+    draft = _draft_sharing(embed)
 
-    proposer.context_kv_only = False
-    DSparkProposer.prepare_for_serving(proposer)
-    DSparkProposer.prepare_for_serving(proposer)
     row = draft._noise_embedding()
     torch.testing.assert_close(row, torch.full((8,), 3.0))
     assert not row.requires_grad
     assert draft._noise_embedding() is row
     forward.assert_called_once()
+    assert draft._embed_peer is None
 
-    target.embed = torch.nn.Embedding.from_pretrained(torch.full((4, 8), 5.0))
-    draft.share_with_target(target)
-    DSparkProposer.prepare_for_serving(proposer)
+    draft.share_with_target(
+        SimpleNamespace(
+            embed=torch.nn.Embedding.from_pretrained(torch.full((4, 8), 5.0)),
+            head=torch.nn.Identity(),
+        )
+    )
     torch.testing.assert_close(draft._noise_embedding(), torch.full((8,), 5.0))
+
+
+def test_noise_row_is_not_bound_under_graph_capture(monkeypatch):
+    capturing = [True]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    draft = _draft_sharing(torch.nn.Embedding.from_pretrained(torch.ones(4, 8)))
+    with pytest.raises(RuntimeError, match="not under graph capture"):
+        draft._noise_embedding()
+    capturing[0] = False
+    torch.testing.assert_close(draft._noise_embedding(), torch.ones(8))
+
+
+def test_sharded_noise_row_reads_the_owner_shard(monkeypatch):
+    from atom.models.deepseek_v41 import dspark
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    tp = SimpleNamespace(cpu_group=object(), device_group=object())
+    monkeypatch.setattr(dspark, "get_tp_group", lambda: tp)
+    embed = _sharded_embedding(4.0, torch.bfloat16)
+
+    def read(ids, out):
+        assert ids.tolist() == [3]
+        return out.fill_(7.0)
+
+    peer = Mock(side_effect=read)
+    bind = Mock(return_value=peer)
+    monkeypatch.setattr(dspark, "shared_peer_embedding", bind)
+    draft = _draft_sharing(embed, noise_token_id=3)
+
+    torch.testing.assert_close(
+        draft._noise_embedding(), torch.full((8,), 7.0, dtype=torch.bfloat16)
+    )
+    bind.assert_called_once_with(embed, tp.cpu_group)
+    assert draft._embed_peer is peer
+
+
+@pytest.mark.parametrize("refusal", ["unmapped", "fp32"])
+def test_sharded_noise_row_falls_back_to_nccl(monkeypatch, refusal):
+    from atom.models.deepseek_v41 import dspark
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    tp = SimpleNamespace(cpu_group=object(), device_group=object())
+    monkeypatch.setattr(dspark, "get_tp_group", lambda: tp)
+    monkeypatch.setattr(
+        dspark,
+        "shared_peer_embedding",
+        Mock(side_effect=MonoUnsupported("no IPC")),
+    )
+    dtype = torch.float32 if refusal == "fp32" else torch.bfloat16
+    embed = _sharded_embedding(4.0, dtype)
+
+    def lookup(ids, weight, start, end):
+        assert (start, end) == (2, 4)
+        return weight[ids - start].clone()
+
+    reduced = []
+    monkeypatch.setattr(dspark, "masked_embedding", lookup)
+    monkeypatch.setattr(
+        dspark.dist, "all_reduce", lambda t, group: reduced.append(group)
+    )
+    draft = _draft_sharing(embed, noise_token_id=3)
+
+    torch.testing.assert_close(
+        draft._noise_embedding(), torch.full((8,), 4.0, dtype=dtype)
+    )
+    assert reduced == [tp.device_group]
+    assert draft._embed_peer is None
+    if refusal == "fp32":
+        dspark.shared_peer_embedding.assert_not_called()
 
 
 def test_block_mask_keeps_all_draft_rows_and_only_the_visible_window():
