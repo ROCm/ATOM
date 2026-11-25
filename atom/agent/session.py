@@ -174,7 +174,7 @@ class ChatSession:
             # machine may have changed since).
             self.messages += [m for m in history if m.get("role") != "system"]
             self._note = (
-                "atom-chat resumed this conversation after a restart. Deployments "
+                "atom resumed this conversation after a restart. Deployments "
                 "may have changed since; re-check with deployment_status before "
                 "relying on earlier results."
             )
@@ -199,7 +199,7 @@ class ChatSession:
         carries a note; otherwise it keeps believing it runs on the old one.
         """
         self.brain = brain
-        self._note = f"atom-chat switched this conversation to {brain.describe()}."
+        self._note = f"atom switched this conversation to {brain.describe()}."
         if self.log:
             self.log.meta(brain=brain.describe())
 
@@ -256,7 +256,7 @@ class ChatSession:
                     f"brain {failed.describe()} failed ({e}); continuing on {nxt.describe()}"
                 )
                 self.brain = nxt
-                self._note = f"atom-chat moved this conversation to {nxt.describe()}."
+                self._note = f"atom moved this conversation to {nxt.describe()}."
                 if self.log:
                     self.log.meta(brain=nxt.describe(), fallback_from=failed.describe())
 

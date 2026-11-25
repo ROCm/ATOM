@@ -655,9 +655,7 @@ def run_scenario(sc: Scenario, make_brain, out_dir: Path, base: AgentConfig) -> 
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
-        prog="atom-chat-evals", description=__doc__.split("\n")[0]
-    )
+    p = argparse.ArgumentParser(prog="atom-evals", description=__doc__.split("\n")[0])
     p.add_argument("--brain-url", required=True)
     p.add_argument("--brain-model")
     p.add_argument("--brain-api", choices=["openai", "anthropic"], default="openai")
@@ -666,7 +664,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--small-model", default=SMALL_MODEL)
     p.add_argument("--image")
-    p.add_argument("--out", default=f"atom-chat-evals-{time.strftime('%Y%m%d-%H%M%S')}")
+    p.add_argument("--out", default=f"atom-evals-{time.strftime('%Y%m%d-%H%M%S')}")
     args = p.parse_args(argv)
 
     def make_brain():

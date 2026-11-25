@@ -22,8 +22,10 @@ tracing = ["opentelemetry-api>=1.40,<2", "opentelemetry-sdk>=1.40,<2", "opentele
 diffusion = ["av", "pillow", "torchaudio"]
 
 [project.scripts]
-# Conversational deployment agent (stdlib only; see docs/atom_chat_guide.md).
-atom-chat = "atom.agent.cli:main"
+# `atom`: the conversational deployment agent (stdlib only; see
+# docs/atom_chat_guide.md). Hosts without an ATOM install: the Debian package
+# amd-atom (scripts/build_deb.sh) or scripts/install_atom_command.sh.
+atom = "atom.agent.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/ROCm/ATOM"

@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""``atom-chat``: talk to ATOM to deploy models.
+"""``atom``: talk to ATOM to deploy models.
 
-atom-chat                           # chat; finds a brain or offers to start one
-atom-chat --brain-url http://host:8000/v1
-atom-chat --bootstrap /models/DeepSeek-V4.1-Flash --bootstrap-gpus 0,1,2,3
-atom-chat -p "serve Qwen3-8B on one free GPU" --yes   # one-shot, scriptable
-atom-chat --guided                  # step-by-step wizard, no LLM needed
-atom-chat status | stop d1 | mcp
+atom                           # chat; finds a brain or offers to start one
+atom --brain-url http://host:8000/v1
+atom --bootstrap /models/DeepSeek-V4.1-Flash --bootstrap-gpus 0,1,2,3
+atom -p "serve Qwen3-8B on one free GPU" --yes   # one-shot, scriptable
+atom --guided                  # step-by-step wizard, no LLM needed
+atom status | stop d1 | mcp
 """
 
 from __future__ import annotations
@@ -443,7 +443,7 @@ def guided(ctx: ToolContext, term: Terminal) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="atom-chat",
+        prog="atom",
         description="Chat with ATOM to deploy and operate LLM servers on AMD GPUs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -582,9 +582,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.resume:
         sid = SessionLog.resolve(cfg.state_dir, args.resume)
         if sid is None:
-            sys.exit(
-                f"no unique session matches {args.resume!r} (see `atom-chat sessions`)"
-            )
+            sys.exit(f"no unique session matches {args.resume!r} (see `atom sessions`)")
         _, history = SessionLog.load(cfg.state_dir, sid)
         log = SessionLog(cfg.state_dir, sid)
     else:
@@ -609,7 +607,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "stop":
         if not args.target:
-            sys.exit("usage: atom-chat stop <deployment-id>")
+            sys.exit("usage: atom stop <deployment-id>")
         print(
             json.dumps(
                 ToolBox(ctx).call("stop_server", {"deployment": args.target}), indent=1

@@ -9,9 +9,9 @@ One agent, three audiences:
 
 | Audience | Wants | Front-end |
 |---|---|---|
-| Customers deploying on AMD GPUs | A correct, fast deployment the first time; no surprises on shared machines | `atom-chat` (REPL, one-shot, guided), later web/API |
-| ATOM / AITER engineers | Their workflows (benchmark, trace, debug, kernel tuning) run end to end | `atom-chat --profile developer`, or Claude Code + MCP |
-| Other agents (Claude Code, Hermes, Codex) | ATOM operations as tools | `atom-chat mcp` |
+| Customers deploying on AMD GPUs | A correct, fast deployment the first time; no surprises on shared machines | `atom` (REPL, one-shot, guided), later web/API |
+| ATOM / AITER engineers | Their workflows (benchmark, trace, debug, kernel tuning) run end to end | `atom --profile developer`, or Claude Code + MCP |
+| Other agents (Claude Code, Hermes, Codex) | ATOM operations as tools | `atom mcp` |
 
 "Robust" means these guarantees, each enforced in code rather than in a prompt:
 
@@ -35,7 +35,7 @@ choosing among options, reading failures and profiles, and explaining.
 ## 2. Architecture
 
 ```
- Front-ends     atom-chat REPL / -p / --guided     MCP server     (web, Slack)
+ Front-ends     atom REPL / -p / --guided     MCP server     (web, Slack)
                          │                              │
  Agent core     Session ── Brain adapters (OpenAI chat, Anthropic Messages)
                    │       Context manager (budget, summaries, resume)
@@ -200,7 +200,7 @@ what makes AMD deployments get better over time.
 |---|---|---|
 | 1. Robust core | Leases, runtime hardening, brain retries + Anthropic adapter, session persistence + audit log, permission modes, image-sourced knowledge/env validation, agent eval suite | Two agents on one box never collide; kill -9 of the agent loses nothing; eval suite green nightly on MI355X |
 | 2. Skills | Skill loader (catalog, load, files), `exec_in_runtime` + background jobs, customer/developer profiles; run-atom-workload, capture-trace, GSM8K guard working through skills | "benchmark it", "trace it", "check accuracy" work end to end via the repos' own skills |
-| 3. Swarm v1: `atom-chat tune` | Workload profile + SLA -> serving/algorithm search with scheduler, ledger, accuracy guard, noise-aware selection, Pareto report | Beats the recipe default on a held-out workload by more than the measured noise band, reproducibly |
+| 3. Swarm v1: `atom tune` | Workload profile + SLA -> serving/algorithm search with scheduler, ledger, accuracy guard, noise-aware selection, Pareto report | Beats the recipe default on a held-out workload by more than the measured noise band, reproducibly |
 | 4. Swarm v2 | Profiler + AITER kernel-tuning lane, experience database, upstream recipe proposals, multi-node/PD | Tuned-config overlays produced and validated automatically |
 
 ### Phase 1 status (2026-11-12): done
@@ -264,7 +264,7 @@ Borrowed ideas:
 
 - A separate coordinator instead of "one agent, delegate when appropriate":
   in DeepSeek's test a single session with a neutral prompt never delegated
-  (0/5 runs). `atom-chat tune` is therefore its own orchestrator mode, not a
+  (0/5 runs). `atom tune` is therefore its own orchestrator mode, not a
   decision the chat loop makes.
 - Threads/subscriptions: a trial's events (failure, hang, completion) go to
   that trial's worker/diagnoser directly, not through the orchestrator.
@@ -281,4 +281,4 @@ and noise-aware selection matter more than the number of agents.
 
 Super-agent-style traffic (one router, many parallel worker sessions with
 heavy prefix reuse) is also the agentic serving workload ATOM optimizes for;
-it is a natural workload profile for `atom-chat tune`.
+it is a natural workload profile for `atom tune`.

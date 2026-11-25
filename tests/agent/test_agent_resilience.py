@@ -101,7 +101,7 @@ def test_session_falls_back_to_the_next_brain(server, cfg):
     # The model is told on its next turn.
     session.send("again")
     assert fake.REQUESTS[-1]["body"]["messages"][-1]["content"].startswith(
-        "[atom-chat moved"
+        "[atom moved"
     )
 
 
@@ -225,7 +225,7 @@ def test_session_log_round_trip_and_resume(cfg):
     )
     assert resumed.messages[0]["content"] == "new sys"
     resumed.send("q2")
-    assert resumed.messages[-2]["content"].startswith("[atom-chat resumed")
+    assert resumed.messages[-2]["content"].startswith("[atom resumed")
 
 
 def test_failed_first_step_is_not_persisted(cfg):

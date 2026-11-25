@@ -163,9 +163,10 @@ matching recipe, starts the server, verifies it and explains failures,
 asking before anything that changes the machine. Its LLM can be ATOM itself.
 
 ```bash
-atom-chat                                   # or: python -m atom.agent
-atom-chat --bootstrap /models/DeepSeek-V4.1-Flash --bootstrap-gpus 0,1,2,3
-claude mcp add atom -- python -m atom.agent mcp   # same tools for Claude Code
+sudo apt install ./build/deb/amd-atom_*_all.deb   # Ubuntu: built by scripts/build_deb.sh
+atom                                   # opens the interactive session
+atom --bootstrap /models/DeepSeek-V4.1-Flash --bootstrap-gpus 0,1,2,3
+claude mcp add atom -- atom mcp        # same tools for Claude Code
 ```
 
 See the [ATOM Chat guide](docs/atom_chat_guide.md).

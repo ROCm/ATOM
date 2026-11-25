@@ -13,6 +13,6 @@ engine, so it runs on a bare host that drives ATOM through docker as well as
 inside an ATOM container. Its "brain" is any OpenAI-compatible endpoint with
 tool calling -- including an ATOM server, so ATOM can deploy ATOM.
 
-Entry points: ``python -m atom.agent`` / ``atom-chat`` (interactive chat),
-``atom-chat mcp`` (the same tools over MCP stdio for Claude Code, Hermes, ...).
+Entry points: ``python -m atom.agent`` / ``atom`` (interactive chat),
+``atom mcp`` (the same tools over MCP stdio for Claude Code, Hermes, ...).
 """

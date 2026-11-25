@@ -6,7 +6,7 @@
     claude mcp add atom -- python -m atom.agent mcp
 
 lets Claude Code (or Hermes, Cursor, ...) plan, launch, watch, diagnose and
-stop ATOM deployments with the same tools ``atom-chat`` uses. The MCP client
+stop ATOM deployments with the same tools ``atom`` uses. The MCP client
 owns approvals, so tools run when called; the annotations tell it which ones
 change the machine.
 """
@@ -109,7 +109,7 @@ def serve(
         session=f"mcp-{os.getpid()}",
         profile=profile,
     )
-    # switch_brain only means something inside atom-chat's own loop.
+    # switch_brain only means something inside atom's own loop.
     box = ToolBox(ctx, include_brain_switch=False)
     for line in stdin:
         line = line.strip()

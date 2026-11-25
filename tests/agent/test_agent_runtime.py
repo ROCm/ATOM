@@ -265,7 +265,7 @@ def test_slash_brain_switch_is_announced_to_the_model(cfg):
     second.describe = lambda: "m2 @ http://x/v1"
     session.switch_brain(second)
     session.send("which model?")
-    assert second.seen[0][-1]["content"].startswith("[atom-chat switched")
+    assert second.seen[0][-1]["content"].startswith("[atom switched")
     session.send("again")
     assert second.seen[1][-1]["content"] == "again"  # only announced once
 

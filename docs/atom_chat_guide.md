@@ -1,6 +1,6 @@
 # ATOM Chat: deploy by conversation
 
-`atom-chat` turns ATOM into a deployment agent you talk to. Describe what you
+`atom` turns ATOM into a deployment agent you talk to. Describe what you
 want served; the agent inspects the machine, picks the matching recipe from
 `recipes/`, adapts it to your GPUs, starts the server, watches it come up,
 verifies it (including tool calling) and explains failures with ATOM's own
@@ -69,30 +69,82 @@ debug guide's failure table. The agent makes that knowledge executable:
 
 ### ATOM deploys ATOM
 
-The brain can be ATOM itself. With no endpoint configured, `atom-chat` offers
+The brain can be ATOM itself. With no endpoint configured, `atom` offers
 to serve a tool-calling model already on disk (DeepSeek-V4/V4.1, GLM-5,
 Kimi-K2.5/K3, MiniMax-M2/M3, Qwen3.5/Next) and then uses it:
 
 ```bash
-atom-chat --bootstrap /models/DeepSeek-V4.1-Flash --bootstrap-gpus 0,1,2,3
+atom --bootstrap /models/DeepSeek-V4.1-Flash --bootstrap-gpus 0,1,2,3
 ```
 
 Once a new deployment is ready you can move the conversation onto it
 (`switch_brain` / `/brain d2`): the model you just deployed answers the next
 question, which also proves its tool calling works end to end.
 
-## Usage
+## Install
+
+The command is `atom`. The agent only needs Python 3.10+ (and docker to run
+ATOM), so there are three ways to get it:
+
+**Ubuntu / Debian, system-wide** -- the `amd-atom` package installs
+`/usr/bin/atom`:
 
 ```bash
-pip install -e .            # or run in place: python -m atom.agent
-atom-chat                   # finds a brain (env, a local ATOM server) or offers to start one
-atom-chat --brain-url http://gateway:8000/v1 --brain-model my-model
-atom-chat --brain-url http://127.0.0.1:8000 --brain-api anthropic   # ATOM's /v1/messages, or Anthropic's API
-atom-chat -p "serve /data/Llama-3.1-8B on one free GPU" --mode auto-safe   # one-shot, scriptable
-atom-chat --guided          # wizard without any LLM
-atom-chat --resume          # continue the last chat (or --resume <id>; see `atom-chat sessions`)
-atom-chat status            # deployments started by the agent
-atom-chat stop d2
+bash scripts/build_deb.sh                 # -> build/deb/amd-atom_<version>_all.deb
+sudo apt install ./build/deb/amd-atom_*_all.deb
+atom
+sudo apt remove amd-atom
+```
+
+The package is architecture-independent (~2 MB), depends only on `python3
+(>= 3.10)` and recommends docker; tested on Ubuntu 22.04 and 24.04. It
+declares `Conflicts: atom` because the discontinued Atom editor's package
+also installed `/usr/bin/atom`; apt refuses to replace it silently. The
+version comes from `git describe` (e.g. `0.1.6~rc0+git826.b832762c`).
+
+**One user, from a checkout** -- no root, nothing pip-installed (works where
+the system Python refuses `pip install`):
+
+```bash
+bash scripts/install_atom_command.sh       # puts `atom` in ~/.local/bin
+bash scripts/install_atom_command.sh --uninstall
+```
+
+**Inside an ATOM container or a venv** -- `pip install -e .` provides the
+same `atom` command.
+
+Both launchers run Python isolated (`-I`), so running `atom` inside some other
+ATOM checkout still runs the installed agent. `python -m atom.agent` works
+from a checkout without installing anything.
+
+## Usage
+
+Type `atom` to open the interactive session:
+
+```text
+$ atom
+ATOM Chat -- brain: /raid/models/DeepSeek-V4.1-Flash-1017 @ http://127.0.0.1:8001/v1 (local :8001)
+session s20261113-072053-eeda; mode ask; profile customer, 4 skills (...)
+Machine snapshot (host ...):
+- 8 x AMD Instinct MI355X (gfx950, 287 GiB each); free GPUs (HIP index): [4, 5, 6, 7]
+Describe what you want to serve. /help for commands, Ctrl-D to exit.
+
+you ▸
+```
+
+With no LLM running anywhere, `atom` first offers to serve one of the
+tool-capable checkpoints it finds on disk as its brain, to take a URL, or to
+run the guided wizard.
+
+```bash
+atom                   # finds a brain (env, a local ATOM server) or offers to start one
+atom --brain-url http://gateway:8000/v1 --brain-model my-model
+atom --brain-url http://127.0.0.1:8000 --brain-api anthropic   # ATOM's /v1/messages, or Anthropic's API
+atom -p "serve /data/Llama-3.1-8B on one free GPU" --mode auto-safe   # one-shot, scriptable
+atom --guided          # wizard without any LLM
+atom --resume          # continue the last chat (or --resume <id>; see `atom sessions`)
+atom status            # deployments started by the agent
+atom stop d2
 ```
 
 Brain discovery order: `--brain-url`, then `ATOM_CHAT_BASE_URL` (or
@@ -184,7 +236,7 @@ claude mcp add atom -- python -m atom.agent mcp
 Claude Code then gets `inspect_system`, `plan_deployment`, `launch_server`,
 `wait_until_ready`, `diagnose`, `smoke_test`, `benchmark`, ... with read-only
 / destructive annotations; the MCP client handles approvals
-(`atom-chat mcp --mode read-only` still refuses changes).
+(`atom mcp --mode read-only` still refuses changes).
 
 ## Robustness guarantees
 
