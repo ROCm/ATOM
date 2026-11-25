@@ -57,6 +57,7 @@ def score_topk(
     weight_scale: float = 1.0,
     stable: bool = False,
     on_band=None,
+    band_topk=None,
     out: torch.Tensor | None = None,
     request_local: bool = True,
 ) -> torch.Tensor:
@@ -72,7 +73,10 @@ def score_topk(
 
     `on_band(scores, span)`, when given, sees each band's logits before its
     top-k: a scorer that reads more than the top-k off them (a layer picking
-    its successors' candidate blocks) does it there. FP8 concat rows' keys
+    its successors' candidate blocks) does it there. `band_topk(scores,
+    span, out, row_starts, row_ends)`, when given, may take a packed band's
+    top-k itself (into `out`, the band's rows) and returns whether it did;
+    the plain per-row top-k runs otherwise. FP8 concat rows' keys
     are gathered here, packed ones pass by pass (`rows.passes`), every rank
     its share of each pass.
 
@@ -80,11 +84,13 @@ def score_topk(
     and `weights` into its slot and returns the gathered slots rank-major:
     slot r holds rows r, r + world, ..., so row i sits at
     `(i % world) * stride + i // world` (`csa_translate_pack` reads it
-    there). `out`, `on_band` and `request_local=False`, which assume rows in
-    order, do not apply."""
+    there). `out`, `on_band`, `band_topk` and `request_local=False`, which
+    assume rows in order, do not apply."""
     split = rows.split
     if split.stripe:
-        if not (out is None and on_band is None and request_local):
+        if not (
+            out is None and on_band is None and band_topk is None and request_local
+        ):
             raise ValueError(
                 "a striped split returns its rows rank-major, not in place"
             )
@@ -103,7 +109,16 @@ def score_topk(
         _score_concat(query, weights, cache, rows, topk, stable, mine, request_local)
     else:
         _score_paged(
-            query, weights, cache, rows, topk, weight_scale, stable, on_band, mine
+            query,
+            weights,
+            cache,
+            rows,
+            topk,
+            weight_scale,
+            stable,
+            on_band,
+            mine,
+            band_topk,
         )
     _gather_split(out, split)
     return out
@@ -149,7 +164,18 @@ def _all_gather_slot(buffer, stride, rank, world, group):
     )
 
 
-def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_band, out):
+def _score_paged(
+    query,
+    weights,
+    cache,
+    rows,
+    topk,
+    weight_scale,
+    stable,
+    on_band,
+    out,
+    band_topk=None,
+):
     """Paged rows, band by band into the plane, each band top-k'd at once."""
     workspace = rows.workspace
     # Without a workspace (rows cut to the logits budget alone), one band's
@@ -222,7 +248,9 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
                 k=topk,
                 stable=stable,
             )
-        else:
+        elif band_topk is None or not band_topk(
+            scores, span, out[span], offsets, rows.row_ends[span]
+        ):
             # Packed: a row's logits start at its offset; the top-k is told
             # the plane width the rows stand for, so it picks as that would.
             top_k_per_row_decode(
