@@ -417,6 +417,7 @@ def _dense_impl(prefix_k, prefix_v):
         rope_is_zero_pad=False,
         use_flydsl_fp8_prefill_attn=False,
         _flydsl_fp8_mha_ok=None,
+        _prefill_k_cat_arch=False,
         split_prefill_recording=True,
         _gather_cached_kv_b_proj=gather,
     )
