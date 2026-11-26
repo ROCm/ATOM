@@ -71,6 +71,7 @@ def _mooncake(is_producer=True):
         dcp_size=1,
         hash_block_size=16,
         pp_size=1,
+        _speculative=False,
     )
 
 

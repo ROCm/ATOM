@@ -11,6 +11,7 @@ KV cache data from producer (prefill) to consumer (decode) nodes.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import logging
 import math
 import os
@@ -489,9 +490,34 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.block_size = config.kv_cache_block_size
         self.dcp_size = config.decode_context_parallel_size
         self.hash_block_size = self.block_size * self.dcp_size
-        self.enable_chunked_transfer = kv_transfer_config.get(
-            "enable_chunked_transfer", False
+        # Early handoff (ATOM_PD_EARLY_HANDOFF) drives the same chunked
+        # machinery from P's own early answer; the router asks for it per
+        # request, only for a D that declared it can receive chunked transfer.
+        early_handoff = bool(self.is_producer and envs.ATOM_PD_EARLY_HANDOFF)
+        self.enable_chunked_transfer = (
+            kv_transfer_config.get("enable_chunked_transfer", False) or early_handoff
         )
+        # Whether an early request may allocate before D's write request
+        # (`_may_allocate_before_d`). Every use of the state below is behind it.
+        self._speculative = bool(
+            early_handoff and envs.ATOM_PD_EARLY_HANDOFF_SPECULATIVE
+        )
+        self._pool_pages = 0
+        if self._speculative:
+            # The engine sizes the pool before it builds the scheduler.
+            self._pool_pages = int(config.num_kvcache_blocks)
+            if self._pool_pages <= 0:
+                raise ValueError(
+                    "ATOM_PD_EARLY_HANDOFF_SPECULATIVE needs a sized KV pool "
+                    f"(num_kvcache_blocks={self._pool_pages})"
+                )
+        # Early sources allocated before D's report, str(request id) -> pages.
+        # Keyed like `_awaiting_send`: `send_finished` may name either form.
+        self._spec_pins: dict[str, int] = {}
+        # Max-heap of the registered, not yet allocated chunked requests
+        # (`_chunked_waiting`), as (-prompt pages, id); stale entries are
+        # dropped lazily when they reach the top.
+        self._waiting_pages: list[tuple[int, Any]] = []
         self._chunked_receiving: dict[ReqId, Sequence] = {}
         self._chunked_admission_timeout_s = float(
             kv_transfer_config.get("chunked_admission_timeout_s", 300)
@@ -676,8 +702,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             self._reqs_need_save[seq.id] = previous_save
         if not already_claimed:
             self._awaiting_send.discard(str(seq.id))
+            self._unpin(seq.id)
         if previous_waiting is not None:
             self._chunked_waiting[seq.id] = previous_waiting
+            self._note_waiting(seq)
         if was_ready:
             self._chunked_ready.add(seq.id)
 
@@ -693,9 +721,19 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                     seq.id in self._chunked_ready,
                 ),
             )
+        d_reported = seq.id in self._chunked_ready
         self._chunked_waiting.pop(seq.id, None)
         self._chunked_ready.discard(seq.id)
         params = seq.kv_transfer_params or {}
+        if (
+            self._speculative
+            and params.get("pd_early_handoff")
+            and not d_reported
+            and str(seq.id) not in self._awaiting_send
+        ):
+            # Allocated before D's report: its pages wait on D until D reaches
+            # P or the source is released.
+            self._spec_pins[str(seq.id)] = len(seq.block_table)
         if params.get("chunked_transfer") and (
             self.is_producer or params.get("do_remote_prefill")
         ):
@@ -791,6 +829,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             aborted = produced_no_handoff(seq)
             self._chunked_waiting.pop(seq.id, None)
             self._chunked_ready.discard(seq.id)
+            if aborted:
+                # Its cancellation is queued below. A finished source keeps
+                # its pin until D reaches P or the worker reports it safe.
+                self._unpin(seq.id)
             params["prefill_aborted"] = aborted
             if not aborted:
                 drafts = getattr(seq, "spec_token_ids", None)
@@ -891,6 +933,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
+        self._unpin(req_id)
 
     def abort_send(self, seq: Sequence) -> None:
         # request_finished queued cancellation; only the aggregated
@@ -919,10 +962,86 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 now + self._chunked_admission_timeout_s,
             )
             self._pending_chunked_admissions[seq.id] = params["transfer_id"]
+            self._note_waiting(seq)
         _, deadline = self._chunked_waiting[seq.id]
         if self._expire_chunked_admission(seq, deadline, now):
             return False
-        return seq.id in self._chunked_ready
+        if seq.id in self._chunked_ready:
+            return True
+        return bool(params.get("pd_early_handoff")) and self._may_allocate_before_d(seq)
+
+    # ---------------------------------------------- allocation before D's report
+    #
+    # An early request is registered like a gated one (the worker reports D's
+    # arrival, and a write request that arrives while P queues is not expired),
+    # but it may allocate its source before D reserved its pages, so P's
+    # prefill overlaps the router->D->P hop. Such a source waits on D. The
+    # danger is a cycle: P's pool full of sources waiting on D while D's pool
+    # holds reservations for requests P has no room for.
+    #
+    # Rule: allocate before D only if, afterwards, the pages pinned that way
+    # still leave room in P's pool for the largest other registered chunked
+    # request:  pinned + pages(seq) + max_{r registered, r != seq} pages(r)
+    # <= pool. Why that suffices: D learns of a request only from P's early
+    # answer, and P answers only after it dispatched the request to this rank,
+    # so every request D can hold pages for against this rank is already
+    # registered here (or allocated, and then it progresses). Sources D has
+    # reserved (and every non-P/D allocation) finish and free on their own, so
+    # P's pool eventually holds only pins, and the room above admits whatever
+    # D reserved. Past the rule the request waits for D (the gate), so P falls
+    # back to D's order exactly when D falls behind. Remaining gap: a larger
+    # request registered after the pins were taken, which D reserves ahead of
+    # a pinned one while every D page waits on P; the worker's lookup timeout
+    # (PREFILL_LOOKUP_TIMEOUT) then cancels the oldest pinned source and D
+    # aborts that request.
+
+    def _prompt_pages(self, seq: Sequence) -> int:
+        return -(-seq.num_prompt_tokens // (self.block_size * self.dcp_size))
+
+    def _note_waiting(self, seq: Sequence) -> None:
+        if not self._speculative:
+            return
+        heapq.heappush(self._waiting_pages, (-self._prompt_pages(seq), id(seq), seq.id))
+        # Keep the lazy heap bounded by the live set.
+        if len(self._waiting_pages) > 2 * len(self._chunked_waiting) + 64:
+            self._waiting_pages = [
+                (-self._prompt_pages(s), id(s), s.id)
+                for s, _ in self._chunked_waiting.values()
+            ]
+            heapq.heapify(self._waiting_pages)
+
+    def _largest_waiting_pages(self, exclude: Sequence) -> int:
+        """Prompt pages of the largest registered, unallocated chunked request
+        other than `exclude`."""
+        heap = self._waiting_pages
+        held = []
+        try:
+            while heap:
+                _, _, req_id = heap[0]
+                if req_id not in self._chunked_waiting:
+                    heapq.heappop(heap)
+                elif req_id == exclude.id:
+                    held.append(heapq.heappop(heap))
+                else:
+                    return -heap[0][0]
+            return 0
+        finally:
+            for entry in held:
+                heapq.heappush(heap, entry)
+
+    def _unpin(self, req_id) -> None:
+        if self._speculative:
+            self._spec_pins.pop(str(req_id), None)
+
+    def _may_allocate_before_d(self, seq: Sequence) -> bool:
+        if not self._speculative:
+            return False
+        need = (
+            sum(self._spec_pins.values())
+            + self._prompt_pages(seq)
+            + self._largest_waiting_pages(seq)
+        )
+        return need <= self._pool_pages
 
     def _expire_chunked_admission(
         self, seq: Sequence, deadline: float, now: float
@@ -948,6 +1067,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 output.finished_sending.add(completion.operation_id)
                 output.connector_completions.discard(completion)
             elif completion.channel == "pd_admission_ready":
+                # A source allocated before this report no longer waits on D
+                # (or, on failure, was already retired by the worker).
+                self._unpin(completion.operation_id)
                 pending = self._chunked_waiting.get(completion.operation_id)
                 if pending is not None:
                     seq, _ = pending
