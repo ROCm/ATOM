@@ -59,6 +59,24 @@ pub fn prepare_chat(
     prepare_chat_with(req, headers, model_id, components, None, false)
 }
 
+/// A chat's body as the client `sent` it (JSON bytes), for
+/// `prepare_chat_with`, where `model` renders with an encoder of its own
+/// (`chat_render`): the typed request drops or rewrites fields that encoder
+/// reads (`thinking`, a system message's `tools`, `tool_choice`). A chat
+/// whose model renders with a template is not parsed again.
+pub fn sent_chat_body(
+    sent: &[u8],
+    model: Option<&str>,
+    components: &AppContext,
+) -> Result<Option<Arc<serde_json::Map<String, serde_json::Value>>>, Response> {
+    if model.and_then(|m| components.chat_controls_of(m)).is_none() {
+        return Ok(None);
+    }
+    serde_json::from_slice(sent)
+        .map(|body| Some(Arc::new(body)))
+        .map_err(|e| error::bad_request("invalid_request", e.to_string()))
+}
+
 /// `prepare_chat`, rendering the prompt (`chat_render::render_chat`) with the
 /// chat's body as `sent` where the caller has it, and, with
 /// `reads_prompt_opener`, naming the opener the prompt ends on

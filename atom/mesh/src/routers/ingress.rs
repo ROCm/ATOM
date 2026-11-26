@@ -1,6 +1,6 @@
 //! Shared HTTP proxy contract. The routing view never replaces the original payload.
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, LazyLock},
     time::Instant,
 };
@@ -653,7 +653,6 @@ pub struct IngressRouting {
     policy_registry: Arc<PolicyRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,
-    chats_without_template: Arc<RwLock<HashSet<String>>>,
     chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
     pd: bool,
     tokenize_limits: TokenizeLimits,
@@ -670,7 +669,6 @@ impl IngressRouting {
             policy_registry: app.policy_registry.clone(),
             worker_registry: app.worker_registry.clone(),
             tokenizer_registry: app.tokenizer_registry.clone(),
-            chats_without_template: app.chats_without_template.clone(),
             chat_controls: app.chat_controls.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             tokenize_limits: app.tokenize_limits,
@@ -928,9 +926,6 @@ impl IngressRouting {
         ctx.check()?;
         let template_started = Instant::now();
         let prompt = if let Some(chat) = parsed.chat() {
-            if self.chats_without_template.read().contains(&entry.id) {
-                return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
-            }
             let mut prompt = self.render_chat(&entry, chat, body, routed)?;
             if let Some(front) = routed.and_then(|routed| routed.front.as_deref()) {
                 prompt.insert_str(0, front);

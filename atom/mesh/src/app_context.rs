@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -52,10 +52,6 @@ pub struct AppContext {
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub admission: Arc<crate::core::admission::AdmissionController>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
-    /// Registry ids of the tokenizers whose chats llm-tokenizer renders without
-    /// their Jinja template, found as each registers. HTTP routing does not
-    /// tokenize those chats.
-    pub chats_without_template: Arc<RwLock<HashSet<String>>>,
     /// The encoder ATOM renders a tokenizer's chats with, by registry id, for
     /// the checkpoints that have their own (`chat_render`).
     pub(crate) chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
@@ -313,7 +309,6 @@ impl AppContextBuilder {
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
-            chats_without_template: Default::default(),
             chat_controls: Default::default(),
             tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,

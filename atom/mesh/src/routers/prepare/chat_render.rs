@@ -49,17 +49,21 @@ pub(crate) enum ChatControls {
     DeepseekV4,
     /// ATOM's `deepseek_v41_encoder`.
     DeepseekV41,
-    /// `tokenization_kimi.py`, whose template is code.
+    /// `tokenization_kimi.py`, whose template is code: Kimi-K3's and
+    /// Kimi-K3.1's (llm-tokenizer picks the port of each from `config.json`).
     KimiK3,
 }
 
 impl ChatControls {
+    /// The controls of a checkpoint's `model_type`: V4.1's are also its text
+    /// and DSpark configs' (`selector.py`'s `_V41_TYPES`), K3's also K3.1's
+    /// (`config.py`'s `ARCH_ALIASES`).
     pub(crate) fn of_model_type(model_type: &str) -> Option<Self> {
         match model_type {
             "deepseek_v32" => Some(Self::DeepseekV32),
             "deepseek_v4" => Some(Self::DeepseekV4),
-            "deepseek_v41" => Some(Self::DeepseekV41),
-            "kimi_k3" => Some(Self::KimiK3),
+            "deepseek_v41" | "deepseek_v41_text" | "deepseek_v41_dspark" => Some(Self::DeepseekV41),
+            "kimi_k3" | "kimi_k31" => Some(Self::KimiK3),
             _ => None,
         }
     }
@@ -533,6 +537,29 @@ mod tests {
         }
     }
 
+    /// Every `model_type` ATOM serves with an encoder of its own has controls.
+    #[test]
+    fn model_types_of_each_encoder() {
+        for (model_types, controls) in [
+            (&["deepseek_v32"][..], ChatControls::DeepseekV32),
+            (&["deepseek_v4"], ChatControls::DeepseekV4),
+            (
+                &["deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"],
+                ChatControls::DeepseekV41,
+            ),
+            (&["kimi_k3", "kimi_k31"], ChatControls::KimiK3),
+        ] {
+            for model_type in model_types {
+                assert_eq!(
+                    ChatControls::of_model_type(model_type),
+                    Some(controls),
+                    "{model_type}"
+                );
+            }
+        }
+        assert_eq!(ChatControls::of_model_type("kimi_k25"), None);
+    }
+
     /// Messages reach each encoder as ATOM's adapter hands them over.
     #[test]
     fn messages_are_atoms() {
@@ -632,5 +659,54 @@ mod tests {
         assert!(
             !forced(json!({"reasoning_effort": "none"})).is_err_and(|e| e.contains("tool_choice"))
         );
+    }
+
+    /// The gRPC routers prepare a chat from its body as sent
+    /// (`sent_chat_body`), not from the typed request (`sent = None`), which
+    /// drops `thinking`: from that, a chat with thinking off would render in
+    /// thinking mode. A model rendered with a template does not read it.
+    #[tokio::test]
+    async fn grpc_chats_render_from_the_body_as_sent() {
+        use std::sync::Arc;
+
+        use crate::{
+            routers::{
+                prepare::{prepare_chat_with, sent_chat_body},
+                test_mocks::{
+                    app_context::app_context_with_tokenizer_registry, tokenizer::hf_tokenizer,
+                },
+            },
+            tokenizer::registry::TokenizerRegistry,
+        };
+
+        let registry = Arc::new(TokenizerRegistry::new());
+        let id = TokenizerRegistry::generate_id();
+        registry
+            .load(&id, "m", "hf-test", || async { Ok(hf_tokenizer()) })
+            .await
+            .unwrap();
+        let app = app_context_with_tokenizer_registry(registry);
+        let (chat, body) = chat(&json!({"thinking": {"type": "disabled"}}));
+        let sent = Value::Object(body).to_string().into_bytes();
+        assert_eq!(sent_chat_body(&sent, Some("m"), &app).unwrap(), None);
+
+        app.chat_controls
+            .write()
+            .insert(id, ChatControls::DeepseekV4);
+        let prompt = |sent: Option<&Map<String, Value>>| {
+            let (_, ctx) = prepare_chat_with(
+                Arc::new(chat.clone()),
+                None,
+                Some("m".to_string()),
+                &app,
+                sent,
+                false,
+            )
+            .unwrap();
+            ctx.original_text.unwrap()
+        };
+        let body = sent_chat_body(&sent, Some("m"), &app).unwrap().unwrap();
+        assert!(prompt(Some(&body)).ends_with("<｜Assistant｜></think>"));
+        assert!(prompt(None).ends_with("<｜Assistant｜><think>"));
     }
 }

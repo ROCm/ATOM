@@ -7,10 +7,9 @@
 //! (startup, worker connection, API) should use this workflow to ensure consistent
 //! behavior (validation, caching, deduplication).
 
-use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
@@ -108,7 +107,6 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let source = config.source.clone();
         let chat_template = config.chat_template_path.clone();
         let cache_config = config.cache_config.clone();
-        let chats_without_template = app_context.chats_without_template.clone();
         let chat_controls = app_context.chat_controls.clone();
         let fastokens = app_context.router_config.fastokens.clone();
 
@@ -122,7 +120,6 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let source = source.clone();
                 let chat_template = chat_template.clone();
                 let cache_cfg = cache_config.clone();
-                let chats_without_template = chats_without_template.clone();
                 let chat_controls = chat_controls.clone();
                 let fastokens = fastokens.clone();
                 async move {
@@ -136,15 +133,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                     let base_tokenizer =
                         with_fastokens(base_tokenizer, &name, &source, &fastokens).await?;
                     let controls = checkpoint_chat_controls(&name, &source).await?;
-                    probe_chat_render(
-                        &chats_without_template,
-                        &id,
-                        &name,
-                        &source,
-                        chat_template.as_deref(),
-                        controls.is_some(),
-                    )
-                    .await;
+                    probe_chat_render(&name, &source, chat_template.as_deref(), controls.is_some())
+                        .await?;
                     if let Some(controls) = controls {
                         chat_controls.write().insert(id.clone(), controls);
                     }
@@ -233,67 +223,66 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
     fn is_retryable(&self, error: &WorkflowError) -> bool {
         // Network/IO errors are retryable, among them a `tokenizer.json` fastokens
         // cannot download under `--fastokens-strict`; a `--fastokens-strict`
-        // refusal is what the probe found, and a retry would only probe again.
+        // refusal is what the probe found, and a retry would only probe again;
+        // so is a model whose chats would render without ATOM's controls.
         !matches!(
             error,
-            WorkflowError::StepFailed { message, .. } if message.starts_with(STRICT_REFUSAL)
+            WorkflowError::StepFailed { message, .. }
+                if message.starts_with(STRICT_REFUSAL) || message.starts_with(UNCONTROLLED_REFUSAL)
         )
     }
 }
 
-/// Record `id` in `chats_without_template`, and warn, when llm-tokenizer renders
-/// `source`'s chats without the Jinja template. It has no accessor for that, so a
-/// copy is probed; mirroring its `config.json` check would also mean mirroring
-/// how it resolves sources. Chats rendered under the model's `controlled`
-/// reasoning controls are not recorded, as the controls give the encoder the
-/// effort and mode ATOM's takes; they are probed only to warn that
-/// `--chat-template` does not apply.
+/// How the refusal of a model whose chats llm-tokenizer renders with a
+/// built-in encoder, with no `ChatControls` here, begins: ATOM renders them
+/// with its own controls, so the router would render them otherwise than the
+/// engine (for the gRPC and ATOM bridge routers, the tokens the engine runs).
+pub(crate) const UNCONTROLLED_REFUSAL: &str =
+    "llm-tokenizer renders the chats of this model with a built-in encoder, without ATOM's controls";
+
+/// Refuse `source` when llm-tokenizer renders its chats without the Jinja
+/// template and its `model_type` has no `ChatControls` (not `controlled`).
+/// llm-tokenizer has no accessor for that, so a copy is probed; mirroring its
+/// `config.json` check would also mean mirroring how it resolves sources. A
+/// `controlled` model is probed only to warn that `--chat-template` does not
+/// apply; one that cannot be probed is served, with a warning.
 async fn probe_chat_render(
-    chats_without_template: &RwLock<HashSet<String>>,
-    id: &str,
     name: &str,
     source: &str,
     chat_template: Option<&str>,
     controlled: bool,
-) {
+) -> Result<(), String> {
     const UNPROBED: &str = "Cannot probe whether llm-tokenizer renders these chats without the \
-                            Jinja template; HTTP routing tokenizes them as it renders them";
+                            Jinja template, as ATOM does not";
     if controlled && chat_template.is_none() {
-        return;
+        return Ok(());
     }
     let mut copy = match factory::create_tokenizer_async_with_chat_template(source, None).await {
         Ok(copy) => copy,
         Err(error) => {
             warn!(tokenizer = name, %error, "{UNPROBED}");
-            return;
+            return Ok(());
         }
     };
     let Some(copy) = Arc::get_mut(&mut copy) else {
         warn!(tokenizer = name, "{UNPROBED}: the loaded copy is shared");
-        return;
+        return Ok(());
     };
     if !renders_without_template(copy) {
-        return;
+        return Ok(());
     }
-    if controlled {
-        warn!(
-            tokenizer = name,
-            "llm-tokenizer renders these chats with a built-in encoder, not the Jinja template, \
-             so --chat-template does not apply"
-        );
-        return;
+    if !controlled {
+        return Err(format!(
+            "{UNCONTROLLED_REFUSAL} ({name}): its config.json's model_type is not one \
+             ChatControls::of_model_type knows"
+        ));
     }
-    chats_without_template.write().insert(id.to_string());
     warn!(
         tokenizer = name,
-        "llm-tokenizer renders these chats with a built-in encoder, not the Jinja template{}; \
-         its defaults are not ATOM's, so HTTP routing does not tokenize them",
-        if chat_template.is_some() {
-            ", so --chat-template does not apply"
-        } else {
-            ""
-        }
+        "llm-tokenizer renders these chats with a built-in encoder, not the Jinja template, \
+         so --chat-template does not apply"
     );
+    Ok(())
 }
 
 /// Whether `tokenizer` renders chats without its Jinja template, as llm-tokenizer
@@ -445,45 +434,39 @@ mod tests {
         }
     }
 
-    /// Registering a tokenizer whose `config.json` picks a built-in encoder marks
-    /// it, and removing it drops the mark.
+    /// A tokenizer whose `config.json` picks a built-in encoder of
+    /// llm-tokenizer's, with no `ChatControls` for its `model_type` (here none,
+    /// as only `architectures` names the model), is refused, and not retried.
     #[tokio::test]
-    async fn test_registration_marks_chats_rendered_without_template() {
+    async fn test_registration_refuses_chats_rendered_without_controls() {
         let context = app_context();
         let dir = tokenizer_dir("DeepseekV4ForCausalLM");
-        let deepseek = TokenizerRegistry::generate_id();
-        let jinja = TokenizerRegistry::generate_id();
-        for (id, source) in [
-            (&deepseek, dir.path().to_str().unwrap()),
-            (&jinja, hf_tokenizer_path()),
-        ] {
-            let config = TokenizerConfigRequest {
-                id: id.clone(),
-                name: id.clone(),
-                source: source.to_string(),
-                chat_template_path: None,
-                cache_config: None,
-                fail_on_duplicate: true,
-            };
-            let mut workflow = WorkflowContext::new(
-                WorkflowInstanceId::new(),
-                create_tokenizer_workflow_data(config, context.clone()),
-            );
-            LoadTokenizerStep.execute(&mut workflow).await.unwrap();
-        }
-
-        let marked = |id: &str| context.chats_without_template.read().contains(id);
-        assert!(marked(&deepseek));
-        assert!(!marked(&jinja));
-        remove_tokenizer(&context, &deepseek).await;
-        assert!(!marked(&deepseek));
+        let id = TokenizerRegistry::generate_id();
+        let config = TokenizerConfigRequest {
+            id: id.clone(),
+            name: id.clone(),
+            source: dir.path().to_str().unwrap().to_string(),
+            chat_template_path: None,
+            cache_config: None,
+            fail_on_duplicate: true,
+        };
+        let mut workflow = WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            create_tokenizer_workflow_data(config, context.clone()),
+        );
+        let error = LoadTokenizerStep.execute(&mut workflow).await.unwrap_err();
+        assert!(
+            matches!(&error, WorkflowError::StepFailed { message, .. } if message.starts_with(UNCONTROLLED_REFUSAL)),
+            "{error:?}"
+        );
+        assert!(!LoadTokenizerStep.is_retryable(&error));
+        assert!(context.tokenizer_registry.get_by_id(&id).is_none());
     }
 
     /// A tokenizer registers with the reasoning controls ATOM keeps for the
     /// `model_type` in the `config.json` beside it, from its directory or its
-    /// `tokenizer.json`, and removing it drops them. HTTP routing tokenizes
-    /// its chats, which llm-tokenizer renders with its V4.1 encoder, also under
-    /// a `--chat-template`, which that encoder ignores.
+    /// `tokenizer.json`, and removing it drops them. It registers also under a
+    /// `--chat-template`, which llm-tokenizer's V4.1 encoder ignores.
     #[tokio::test]
     async fn test_registration_finds_the_checkpoint_chat_controls() {
         let checkpoint = |model_type: &str| {
@@ -528,8 +511,6 @@ mod tests {
             LoadTokenizerStep.execute(&mut workflow).await.unwrap();
             let found = context.chat_controls.read().get(&id).copied();
             assert_eq!(found, controls, "{}", source.display());
-            let marked = context.chats_without_template.read().contains(&id);
-            assert!(!marked, "{}", source.display());
             ids.push(id);
         }
         remove_tokenizer(&context, &ids[0]).await;

@@ -1,6 +1,7 @@
 //! Whether requests tokenize as on ATOM, with each tokenizer backend: for
 //! routing (`IngressRouting::tokens`), and as the gRPC and ATOM bridge routers
-//! prepare a chat (`prepare::prepare_chat_with`, with the body as sent).
+//! prepare a chat (`prepare::prepare_chat_with`, with the body as sent, read
+//! as the gRPC routers read it: `prepare::sent_chat_body`).
 
 use std::{
     path::{Path, PathBuf},
@@ -18,7 +19,9 @@ use crate::{
         prepare_pool::PreparePoolRuntime,
         steps::{create_tokenizer_workflow_data, LoadTokenizerStep, TokenizerConfigRequest},
     },
-    routers::prepare::{fast_tokenizer::FastTokenizer, prepare_chat_with, thread_tokenizer},
+    routers::prepare::{
+        fast_tokenizer::FastTokenizer, prepare_chat_with, sent_chat_body, thread_tokenizer,
+    },
 };
 
 const BACKENDS: [&str; 2] = ["huggingface", "fastokens"];
@@ -192,13 +195,14 @@ async fn tokenize(
         Err(error) => return (Err(error.to_string()), None, Some(Err(error.to_string()))),
     };
     let prepared = parsed.chat().map(|chat| {
-        let sent = serde_json::from_slice(&sent).unwrap();
+        let body = sent_chat_body(&sent, Some(MODEL), app)
+            .map_err(|response| response.status().to_string())?;
         prepare_chat_with(
             Arc::new(chat.clone()),
             None,
             Some(MODEL.to_string()),
             app,
-            Some(&sent),
+            body.as_deref(),
             true,
         )
         .map(|(payload, _)| payload.token_ids)

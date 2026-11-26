@@ -32,6 +32,9 @@ pub mod token_handle;
 
 pub use factory::RouterFactory;
 
+/// A chat's body as the client sent it (`RouterTrait::sent_chat_body`).
+pub type SentChatBody = std::sync::Arc<serde_json::Map<String, serde_json::Value>>;
+
 /// Core trait for all router implementations
 ///
 /// This trait provides a unified interface for routing requests,
@@ -51,11 +54,22 @@ pub trait RouterTrait: Send + Sync + Debug {
         _app: &std::sync::Arc<crate::app_context::AppContext>,
     ) -> Response {
         use prepare::inference::ParsedInference;
+        let sent = match &request.parsed {
+            ParsedInference::Chat(_) => {
+                match self.sent_chat_body(&request.body, request.metadata.model.as_deref()) {
+                    Ok(sent) => sent,
+                    Err(response) => return response,
+                }
+            }
+            _ => None,
+        };
         let (uri, headers, parsed, metadata) = request.into_native_parts();
         let headers = Some(&headers);
         let model = metadata.model.as_deref();
         match parsed {
-            ParsedInference::Chat(body) => self.route_chat(headers, &body, model).await,
+            ParsedInference::Chat(body) => {
+                self.route_chat_as_sent(headers, &body, sent, model).await
+            }
             ParsedInference::Completion(body) => self.route_completion(headers, &body, model).await,
             ParsedInference::Generate(body) => self.route_generate(headers, &body, model).await,
             ParsedInference::Responses(body) => {
@@ -124,6 +138,29 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Generate endpoint not implemented",
         )
             .into_response()
+    }
+
+    /// A chat's body as the client `sent` it (JSON bytes), read before the
+    /// raw request is released, for a router whose prompt render reads fields
+    /// the typed request drops (`chat_render`); the others keep none.
+    fn sent_chat_body(
+        &self,
+        _sent: &[u8],
+        _model_id: Option<&str>,
+    ) -> Result<Option<SentChatBody>, Response> {
+        Ok(None)
+    }
+
+    /// Route a chat completion request, given also its body as sent where
+    /// `sent_chat_body` kept it. The others route the typed request.
+    async fn route_chat_as_sent(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        _sent: Option<SentChatBody>,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_chat(headers, body, model_id).await
     }
 
     /// Route a chat completion request
