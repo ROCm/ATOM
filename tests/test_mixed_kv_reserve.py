@@ -126,10 +126,13 @@ def test_profile_addresses_include_full_draft_lookahead(
         )
 
 
-@pytest.mark.parametrize("width", [1, 8])
-def test_pure_decode_profile_prepares_requested_width(
-    runner_module, monkeypatch, width
+@pytest.mark.parametrize("width,profile_query_width", [(1, 1), (8, 8), (8, None)])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_pure_decode_profile_preserves_full_k_through_postprocess(
+    runner_module, monkeypatch, width, profile_query_width, deferred
 ):
+    from atom.model_ops import rejection_sampler
+
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.config = SimpleNamespace(
         max_model_len=257,
@@ -145,7 +148,11 @@ def test_pure_decode_profile_prepares_requested_width(
         mtp_k=7,
         is_block_drafter=True,
         uses_confidence_schedule=True,
-        verify_scheduler=SimpleNamespace(ell_by_req={}),
+        verify_scheduler=SimpleNamespace(ell_by_req={}, ell_nonblocking=lambda: None),
+        context_kv_only=False,
+        compute_draft_kv=Mock(),
+        lossless=None,
+        runner=runner,
     )
     full, full_pages = _batch(runner, 0, 4, 8, long_context=True)
     batch, pages = _batch(runner, 0, 4, width, long_context=True)
@@ -170,24 +177,140 @@ def test_pure_decode_profile_prepares_requested_width(
     runner._producer_graph_shapes = lambda: None
     runner._cut_ubatches = lambda mode, batch: mode
     runner.prepare_sample = lambda batch, group: (None, None, None, True, False)
-    runner.h2d_groups = {"token_inputs": Mock()}
+    runner.h2d_groups = {"token_inputs": Mock(), "spec_decode": Mock()}
+    lengths = batch.num_scheduled_tokens
+    cu = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
     runner.attn_metadata_builder = Mock(
         step_needs_eager=Mock(return_value=False),
         consumes_device_verdict=Mock(return_value=False),
         settles_spec_status=Mock(return_value=False),
         query_lengths=Mock(return_value=batch.num_scheduled_tokens),
+        decode_spans=Mock(return_value=(4, lengths, cu)),
     )
-    runner.tokenID_processor = Mock()
-    runner.prepare_inputs = Mock()
+    runner.arange_np = np.arange(32, dtype=np.int32)
+    runner.forward_vars = {}
+    for name in (
+        "target_logits_indices",
+        "cu_num_draft_tokens",
+        "bonus_logits_indices",
+    ):
+        host = np.zeros(32, dtype=np.int32)
+        runner.forward_vars[name] = SimpleNamespace(np=host, gpu=torch.from_numpy(host))
+    runner.drafter.prepare_spec_decode_indices = lambda *args: (
+        runner_module.Drafter.prepare_spec_decode_indices(runner.drafter, *args)
+    )
+    context = SimpleNamespace(spec_decode_metadata=None)
 
-    # Real prepare_model, DSpark shrink and DP shape reduction: fresh IDs must
-    # reach the sharded head at the requested width, not both at K+1.
-    runner.prepare_model(batch)
+    def prepare_inputs(batch, ids, *, forward_mode, spec_decode_indices):
+        context.spec_decode_metadata = runner_module.Drafter.calc_spec_decode_metadata(
+            runner.drafter, ids, spec_decode_indices
+        )
+        context.context = SimpleNamespace(
+            forward_mode=forward_mode,
+            pcp_split=False,
+            positions=torch.arange(4 * width),
+        )
+
+    runner.prepare_inputs = Mock(side_effect=prepare_inputs)
+    runner.tokenID_processor = SimpleNamespace(
+        is_pd_producer=False,
+        is_pipeline_parallel=False,
+        is_deferred_out=deferred,
+        prev_batch=None,
+        prev_rejected_num=np.zeros(4, dtype=np.int32),
+        prev_bonus_num=np.zeros(4, dtype=np.int32),
+        spec_status_queue=Mock(),
+        input_ids=SimpleNamespace(gpu=torch.zeros(4 * width + 1, dtype=torch.int32)),
+        prepare_input_ids=Mock(return_value=torch.zeros(4 * width, dtype=torch.int32)),
+        prepare_sampled_ids=Mock(
+            side_effect=lambda batch, ids, *args, **kwargs: (
+                {rid: row[row >= 0].tolist() for rid, row in zip(batch.req_ids, ids)},
+                {},
+            )
+        ),
+    )
+    for name in (
+        "_advance_forward_vars",
+        "_gate_staging_reuse",
+        "_mark_staging_h2d_enqueued",
+        "_record_forward_vars_event",
+        "_record_kv_cache_ready",
+        "_kv_after_forward",
+    ):
+        setattr(runner, name, Mock())
+    monkeypatch.setattr(runner_module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(runner_module, "reset_forward_context", lambda: None)
+    for name in ("get_tp_group", "get_pp_group"):
+        monkeypatch.setattr(runner_module, name, lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(runner_module, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(runner_module, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(runner_module, "sp_is_enabled", lambda: False)
+    runner._served = runner.verify_head = runner.structured_output = None
+    runner.forward_done_event = Mock()
+    runner.run_model = lambda ids, batch: torch.zeros(len(ids), 2)
+    runner.model = SimpleNamespace(
+        compute_logits=lambda hidden: torch.zeros(len(hidden), 8)
+    )
+    runner.sampler = lambda **kwargs: torch.arange(4, dtype=torch.int32)
+    runner.rejection_sampler = rejection_sampler.RejectionSampler()
+    drafts = np.zeros((4, 7), dtype=np.int32)
+    runner.propose_draft_token_ids = Mock(return_value=drafts)
+
+    # Replace only GPU kernels: retain the real sampler's full-K allocation,
+    # metadata construction, postprocess reshape/gather, and draft dispatch.
+    class AcceptAll:
+        def __getitem__(self, grid):
+            def launch(
+                out,
+                status,
+                cu_drafts,
+                ids,
+                indices,
+                target,
+                bonus,
+                bonus_indices,
+                k,
+                **kwargs,
+            ):
+                counts = torch.diff(cu_drafts, prepend=cu_drafts.new_zeros(1))
+                out.fill_(-1)
+                for i, n in enumerate(counts.tolist()):
+                    out[i, :n] = 0
+                    out[i, n] = bonus[i]
+                status[0] = counts
+                status[1] = k - counts
+                status[2] = bonus_indices
+
+            return launch
+
+    monkeypatch.setattr(
+        rejection_sampler, "rejection_greedy_sample_kernel", AcceptAll()
+    )
+    monkeypatch.setattr(
+        rejection_sampler,
+        "topk_select",
+        lambda logits, *a, **k: (None, logits.argmax(-1)),
+    )
+    monkeypatch.setattr(rejection_sampler, "RELAXED_TOP_N", 1)
+    result = runner.forward(batch, profile_query_width=profile_query_width)
     mode = runner.prepare_inputs.call_args.kwargs["forward_mode"]
     assert not mode.is_prefill and mode.running_tokens_are_unified
     assert mode.max_seqlen_q == width
     assert mode.running_bs == 4 and mode.running_tokens == 4 * width
     assert runner.tokenID_processor.prepare_input_ids.call_args.args[1] == width
+    metadata = context.spec_decode_metadata
+    assert batch.num_spec_step == metadata.num_spec_steps == 7
+    assert metadata.num_draft_tokens_np.tolist() == [width - 1] * 4
+    sampled = runner.tokenID_processor.prepare_sampled_ids.call_args.args[1]
+    assert sampled.shape == (4, 8)
+    torch.testing.assert_close(
+        sampled[:, width - 1], torch.arange(4, dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        runner.propose_draft_token_ids.call_args.args[3],
+        torch.arange(4, dtype=torch.int32),
+    )
+    assert result.draft_token_ids is drafts
 
 
 @pytest.mark.parametrize("max_seqs", [512, 1024])
@@ -264,7 +387,8 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
             pool_open = False
             memory["allocated"] = 80
 
-    def forward(batch):
+    def forward(batch, *, profile_query_width=None):
+        assert profile_query_width == (batch.width if batch.prefill == 0 else None)
         assert runner.gpu_forward_metrics is None
         observed.append(memory["reserved"])
         shapes.append((batch.prefill, batch.decode, batch.width))
