@@ -141,38 +141,21 @@ def test_queue_includes_kv_wait_and_counts_first_forward_once(clock):
 def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     clock, monkeypatch
 ):
-    import pickle
-    from contextlib import nullcontext
-
     from aiter_stub import stubbed_aiter
+    from engine_wire_harness import run_input_thread
 
     with stubbed_aiter():
         from atom.model_engine import engine_core as core
+    from atom.model_engine.zmq_protocol.codec import encode_input
 
     seq = Sequence([1, 3, 4], block_size=4)
-    # A serialized timestamp from another engine must not replace local receipt.
+    # A timestamp from another engine must not replace local receipt.
     SchedulerMetrics.enqueue(seq, received_at=50.0)
-    frames = iter(
-        [
-            pickle.dumps((core.EngineCoreRequestType.ADD, [seq])),
-            pickle.dumps((core.EngineCoreRequestType.SHUTDOWN, None)),
-        ]
-    )
-    sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(frames))
-    monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
-    monkeypatch.setattr(
-        core.zmq,
-        "Poller",
-        lambda: SimpleNamespace(
-            register=lambda *a: None,
-            poll=lambda: [(sock, core.zmq.POLLIN)],
-        ),
-    )
-    engine = core.EngineCore.__new__(core.EngineCore)
-    engine._kv_progress_event = core.threading.Event()
-    engine.label = "metrics-test"
-    engine.input_queue = Queue()
-    engine.process_input_sockets("input", "control")
+    messages = [
+        encode_input(core.EngineCoreRequestType.ADD, [seq]),
+        encode_input(core.EngineCoreRequestType.SHUTDOWN),
+    ]
+    engine = run_input_thread(monkeypatch, core, messages)
     received = engine.input_queue.get_nowait()[0]
     assert received.queue_timing.received_at == 100.0
 

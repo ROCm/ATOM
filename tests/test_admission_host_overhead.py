@@ -6,16 +6,14 @@
 import array
 import importlib
 import pickle
-import queue
 import random
 import sys
-import threading
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 from aiter_stub import stubbed_aiter
 from conftest import MockConfig
+from engine_wire_harness import core_context, run_input_thread
 from test_dsv4_state_replay import _bm, _mp_bm, _mp_seq
 from test_state_checkpoint import (
     PAGED_COPY_RUNTIME,
@@ -34,6 +32,7 @@ from atom.model_engine.prefix_hash import (
     take_shipped_chains,
 )
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.zmq_protocol.codec import decode_input, encode_input
 from atom.sampling_params import SamplingParams
 
 BLOCK = 4
@@ -535,26 +534,26 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
     assert all(s.prompt_hash_chain is None for s in seqs)
     if manager == "DisaggCoreManager":
         (rank, frame), (prefill, prefill_frame) = frames
-        assert (rank, prefill, len(pickle.loads(prefill_frame))) == (1, 0, 2)
+        _, prefill_items = decode_input(prefill_frame)
+        assert (rank, prefill, len(prefill_items)) == (1, 0, 3)
+        assert all(item.prompt_hash_chain is None for item in prefill_items)
     else:
         [(rank, frame)] = frames
     core = _real("atom.model_engine.engine_core", monkeypatch)
-    feed = iter([frame, pickle.dumps((core.EngineCoreRequestType.SHUTDOWN, None))])
-    sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(feed))
-    monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
-    poller = SimpleNamespace(register=lambda *a: None, poll=lambda: [(sock, 1)])
-    monkeypatch.setattr(core.zmq, "Poller", lambda: poller)
-    engine = object.__new__(core.EngineCore)
-    engine._kv_progress_event = threading.Event()
-    engine.label, engine.input_queue = "test", queue.Queue()
-    engine.process_input_sockets("input", "control")
+    context = core_context(
+        kv_cache_block_size=BLOCK,
+        hf_config=SimpleNamespace(model_type="qwen3_5_moe_text"),
+    )
+    shutdown = encode_input(core.EngineCoreRequestType.SHUTDOWN)
+    engine = run_input_thread(monkeypatch, core, [frame, shutdown], context=context)
     want = reference_chain(tokens, BLOCK, -1, 10)
     got = engine.input_queue.get_nowait()
     assert [s.prompt_hash_chain.hashes.tolist() for s in got] == [want] * 3
 
 
 def test_a_pickled_seq_never_carries_a_chain():
-    """Neither to the engine (the ADD frame carries it) nor back."""
+    """Wherever a seq is still pickled (FrontendHub, runner, PP / disagg
+    channels) it leaves its chain behind; the ADD message carries it."""
     seq = shipped_seq(PROMPT)
     assert pickle.loads(pickle.dumps(seq)).prompt_hash_chain is None
     assert seq.prompt_hash_chain is not None

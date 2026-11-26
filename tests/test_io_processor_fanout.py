@@ -47,6 +47,7 @@ def _make_processor() -> InputOutputProcessor:
     proc.requests = {}
     proc.has_per_req_cache = False
     proc.num_speculative_tokens = 0
+    proc.uses_mrope = False
     return proc
 
 

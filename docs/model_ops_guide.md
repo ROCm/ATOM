@@ -518,7 +518,8 @@ state machine, llguidance keeps its packed vocabulary masks.
 
 A request carries at most one of the two: request admission
 (`InputOutputProcessor.preprocess_fanout`, which `LLMEngine.add_request`, the
-API server and atomesh call) rejects a JSON Schema or strict tool grammar
+API server and atomesh's TokenBridge call, and `admission.build_sequence` on
+the EngineCore for any client) rejects a JSON Schema or strict tool grammar
 together with a required channel. Accepted tokens advance channel and grammar
 state after verification and broadcasts. Grammar input copies still overlap
 target forward, and channel state uses the existing GPU carry when deferred

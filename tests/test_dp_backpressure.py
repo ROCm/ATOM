@@ -7,7 +7,6 @@ ends up processing MORE total requests than a slow one (the whole point of Fix A
 """
 
 import logging
-import pickle
 import queue
 import threading
 import time
@@ -20,19 +19,16 @@ import pytest
 from atom.config import KVEventsConfig
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.sequence import Sequence
+from atom.model_engine.zmq_protocol.codec import decode_input
 
 
-class Seq:
+class Seq(Sequence):
     _n = 0
 
     def __init__(self, prompt=10):
         Seq._n += 1
-        self.id = f"s{Seq._n}"
-        self.num_prompt_tokens = prompt
-        self.data_parallel_rank = None
-        self.dp_session_id = None
-        self.dp_parent_session_id = None
-        self.stream_callback = None
+        super().__init__([1] * prompt, 16, id=Seq._n)
 
 
 def make_mgr(n_ranks=4, depth=3, fail_ranks=None):
@@ -67,10 +63,10 @@ def make_mgr(n_ranks=4, depth=3, fail_ranks=None):
     def fake_send(dp_rank, payload):
         if dp_rank in mgr.fail_ranks:
             raise RuntimeError(f"send failed rank {dp_rank}")
-        _type, seqs = pickle.loads(payload)
+        _type, items = decode_input(payload)
         assert _type == EngineCoreRequestType.ADD
         with mgr._send_lock:
-            mgr.sent[dp_rank].extend(s.id for s in seqs)
+            mgr.sent[dp_rank].extend(item.seq_id for item in items)
 
     mgr._send_request = fake_send
     return mgr

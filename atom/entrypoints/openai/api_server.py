@@ -902,9 +902,26 @@ def _send_stream_chunk_tagged(
     )
 
 
-async def _submit_engine_requests(seqs):
+async def _submit_engine_requests(seqs, stream_request_id: str | None = None):
+    """Hand `seqs` to the engine. If that fails, nothing of theirs is left
+    behind: not their requests, sequence ids or callbacks, nor the stream
+    state of `stream_request_id`."""
+
+    def forget():
+        for seq in seqs:
+            engine.core_mgr.abort_request(seq.id)
+            engine.io_processor.requests.pop(seq.id, None)
+            _seq_id_to_request_id.pop(seq.id, None)
+        if stream_request_id is not None:
+            _stream_loops.pop(stream_request_id, None)
+            _request_start_times.pop(stream_request_id, None)
+
     if not any(is_structured(seq) for seq in seqs):
-        engine.core_mgr.add_request(seqs)
+        try:
+            engine.core_mgr.add_request(seqs)
+        except BaseException:
+            forget()
+            raise
         return
     # Admission RPCs must not block the API event loop. If the client cancels,
     # settle the in-flight submission before aborting so it cannot enqueue later.
@@ -917,10 +934,7 @@ async def _submit_engine_requests(seqs):
         try:
             await submission
         finally:
-            for seq in seqs:
-                engine.core_mgr.abort_request(seq.id)
-                engine.io_processor.requests.pop(seq.id, None)
-                _seq_id_to_request_id.pop(seq.id, None)
+            forget()
         raise
 
 
@@ -1594,7 +1608,7 @@ async def setup_streaming_request(
     # %-style, not an f-string: the arguments are formatted only if the
     # record is emitted, and this runs once per request with debug off.
     logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
-    await _submit_engine_requests([seq])
+    await _submit_engine_requests([seq], stream_request_id=request_id)
 
     return seq_id, stream_collector, seq.num_prompt_tokens
 
@@ -1816,7 +1830,7 @@ async def setup_streaming_request_fanout(
     logger.debug(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )
-    await _submit_engine_requests(seqs)
+    await _submit_engine_requests(seqs, stream_request_id=request_id)
     return seq_ids, shared_collector, seqs[0].num_prompt_tokens
 
 

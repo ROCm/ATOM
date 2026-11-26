@@ -196,8 +196,10 @@ def test_ipc_hbm_adoption_does_not_turn_content_into_residency():
 
 
 def test_the_record_stays_on_the_frontend():
-    """Only the chain rides the ADD frame."""
-    import pickle
+    """Only the chain rides the ADD message: its hashes, 8 bytes a block,
+    beside the prompt's 4 bytes a token."""
+    from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+    from atom.model_engine.zmq_protocol.codec import encode_input
 
     tokens = list(range(4000))
     record = pb.extend_block_hashes(tokens, 4)
@@ -205,7 +207,9 @@ def test_the_record_stays_on_the_frontend():
     ph.ship_prompt_hash_chain(seq, 4, block_hashes=record)
     chain = seq.prompt_hash_chain
     assert not any(isinstance(f, pb.PrefixBlockHashes) for f in chain)
-    assert len(pickle.dumps(chain)) < len(record.hashes) + 1024
+    frame = encode_input(EngineCoreRequestType.ADD, [seq])
+    payload = len(tokens) * 4 + len(chain.hashes) * 8
+    assert len(frame) < payload + 1024
 
 
 def test_a_record_of_another_geometry_is_ignored_and_the_chain_rehashed():

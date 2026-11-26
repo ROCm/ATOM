@@ -66,6 +66,11 @@ from atom.model_engine.engine_utility import (
 from atom.model_engine.prefix_hash import hash_block_size_for, take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.zmq_protocol.codec import (
+    decode_output,
+    encode_input,
+    encode_submit,
+)
 from atom.observability import tracing
 from atom.structured_output import is_structured
 from atom.utils import (
@@ -297,6 +302,22 @@ def _add_frame(seqs: list[Sequence]) -> bytes:
     chains = take_shipped_chains(seqs)
     frame = (EngineCoreRequestType.ADD, seqs) + ((chains,) if chains else ())
     return pickle.dumps(frame)
+
+
+def _submit_frame(seqs: list[Sequence]) -> bytes:
+    """ADD for an EngineCore (`_submit_frame_refusing`, its frame alone)."""
+    return _submit_frame_refusing(seqs)[0]
+
+
+def _submit_frame_refusing(seqs: list[Sequence]) -> tuple[bytes, set[int]]:
+    """ADD for an EngineCore, and the ids it carries refused
+    (`codec.encode_submit`). The seqs' shipped prompt chains go with it and
+    the frontend keeps no copy: a disaggregated prefill engine, sent the same
+    seqs after decode, so gets none."""
+    frame, refused = encode_submit(seqs)
+    for seq in seqs:
+        seq.prompt_hash_chain = None
+    return frame, refused
 
 
 class CoreManager:
@@ -830,7 +851,7 @@ class CoreManager:
                     continue
 
                 obj = socket.recv(copy=False)
-                request_type, data = pickle.loads(obj)
+                request_type, data = decode_output(obj)
 
                 if request_type == EngineCoreRequestType.READY:
                     logger.info(
@@ -873,7 +894,7 @@ class CoreManager:
 
                     obj = output_socket.recv(copy=False)
                     try:
-                        request_type, data = pickle.loads(obj)
+                        request_type, data = decode_output(obj)
                     except Exception:
                         # Every request on this DP rank waits on this thread,
                         # so one message it cannot decode must not end it.
@@ -938,6 +959,10 @@ class CoreManager:
                                     logger.debug(
                                         f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                     )
+                        # Ended here on params that did not load; their Core
+                        # still runs them.
+                        for seq_id in stream_outputs.cut_short:
+                            self.abort_request(seq_id)
                         # Batched stream dispatch: the per-seq callbacks only buffer
                         # their chunks into a thread-local; flush the whole step's
                         # buffer into the per-request stream collectors now (one
@@ -1127,7 +1152,7 @@ class CoreManager:
         logger.info(f"{self.label}: All EngineCores shut down")
 
     def _send_request(self, dp_rank: int, payload: bytes) -> None:
-        """Send one already-pickled request to an engine core. Hot path.
+        """Send one already-encoded request to an engine core. Hot path.
 
         Every ``input_sockets`` write goes through here and holds
         ``_input_send_lock``. Two caller classes share the socket: the request
@@ -1151,7 +1176,7 @@ class CoreManager:
             )
 
     def _send_control(self, dp_rank: int, payload: bytes, copy: bool = False) -> None:
-        """Send one already-pickled control message. Serialized, never hot.
+        """Send one already-encoded control message. Serialized, never hot.
 
         Writers here are the event loop (abort, the /debug/* endpoints) and the
         per-rank output threads (shutdown), so this does need a lock -- but none
@@ -1200,17 +1225,28 @@ class CoreManager:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
-        if self.pp_size > 1:
-            # Pipeline parallel (dp=1): requests enter only at stage 0, which
-            # drives the pipeline downstream.
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
-            self._send_request(0, _add_frame(seqs))
-        elif self._routable_engine_count == 1:
-            # Single routable engine, send all requests
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
-            self._send_request(0, _add_frame(seqs))
-        else:
-            self._dispatch_to_dp_ranks(seqs)
+        try:
+            if self.pp_size > 1:
+                # Pipeline parallel (dp=1): requests enter only at stage 0,
+                # which drives the pipeline downstream.
+                logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
+                self._send_request(0, _submit_frame(seqs))
+            elif self._routable_engine_count == 1:
+                # Single routable engine, send all requests
+                logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
+                self._send_request(0, _submit_frame(seqs))
+            else:
+                self._dispatch_to_dp_ranks(seqs)
+        except BaseException:
+            self._forget_unsubmitted(seqs)
+            raise
+
+    def _forget_unsubmitted(self, seqs: list) -> None:
+        """After an add failed partway, no callback is left registered for
+        `seqs`: their client has already failed. Those a rank took still run
+        there; the caller that failed decides whether to abort them."""
+        for seq in seqs:
+            self._seq_id_to_callback.pop(seq.id, None)
 
     def _build_prefix_router(self, config) -> PrefixSpreadRouter | None:
         """The `prefix_spread` or `share_cache` router, or None.
@@ -1375,7 +1411,7 @@ class CoreManager:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if not rank_seqs:
                     continue
-                frame = _add_frame(rank_seqs)
+                frame = _submit_frame(rank_seqs)
                 if self._backlog is None:
                     self._send_request(dp_rank, frame)
                     dispatched[dp_rank] = True
@@ -1484,9 +1520,7 @@ class CoreManager:
         send_error: Exception | None = None
         for dp_rank, rank_seqs in sends:
             try:
-                self._send_request(
-                    dp_rank, pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))
-                )
+                self._send_request(dp_rank, _submit_frame(rank_seqs))
                 added.append(f"rank{dp_rank}: {len(rank_seqs)} req")
             except Exception as exc:
                 logger.exception(
@@ -1698,7 +1732,7 @@ class CoreManager:
             try:
                 self._send_request(
                     rank,
-                    pickle.dumps((EngineCoreRequestType.DP_PREFIX_CREDIT, updates)),
+                    encode_input(EngineCoreRequestType.DP_PREFIX_CREDIT, updates),
                 )
             except Exception:
                 logger.exception(
@@ -2004,14 +2038,14 @@ class CoreManager:
                     f"{self.label}: Send utility command '{cmd}' to DP rank {rank}"
                 )
                 self._send_control(
-                    rank, pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))
+                    rank, encode_input(EngineCoreRequestType.UTILITY, {"cmd": cmd})
                 )
         else:
             logger.debug(
                 f"{self.label}: Send utility command '{cmd}' to DP rank {dp_rank}"
             )
             self._send_control(
-                dp_rank, pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))
+                dp_rank, encode_input(EngineCoreRequestType.UTILITY, {"cmd": cmd})
             )
 
     @contextmanager
@@ -2236,8 +2270,8 @@ class CoreManager:
     ):
         self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
         payload = {"cmd": cmd, **kwargs}
-        # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
-        serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
+        # Serialize once and reuse for all ranks (optimization: avoid repeated encodes)
+        serialized_payload = encode_input(EngineCoreRequestType.UTILITY, payload)
         for rank in range(len(self.control_sockets)) if _ranks is None else _ranks:
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
@@ -2283,11 +2317,9 @@ class CoreManager:
         the failure that matters, and a rank whose socket fails here must not
         keep its peers, which may hold the failed update, from hearing it.
         """
-        payload = pickle.dumps(
-            (
-                EngineCoreRequestType.UTILITY,
-                {"cmd": DISCARD_WEIGHT_SYNC_CMD, "failed_cmd": failed_cmd},
-            )
+        payload = encode_input(
+            EngineCoreRequestType.UTILITY,
+            {"cmd": DISCARD_WEIGHT_SYNC_CMD, "failed_cmd": failed_cmd},
         )
         for rank in range(len(self.control_sockets)):
             try:
@@ -2522,7 +2554,7 @@ class CoreManager:
             try:
                 if has_control_socket:
                     self._send_control(
-                        dp_rank, pickle.dumps((EngineCoreRequestType.SHUTDOWN, None))
+                        dp_rank, encode_input(EngineCoreRequestType.SHUTDOWN)
                     )
                     logger.debug(f"{self.label}: Sent shutdown to DP rank {dp_rank}")
                 else:
@@ -2821,7 +2853,7 @@ class DisaggCoreManager(CoreManager):
         sock = self.output_sockets[idx]
         while True:
             obj = sock.recv(copy=False)
-            request_type, data = pickle.loads(obj)
+            request_type, data = decode_output(obj)
             if request_type == EngineCoreRequestType.READY:
                 self._record_ready_payload(data)
                 return
@@ -2840,24 +2872,33 @@ class DisaggCoreManager(CoreManager):
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
 
-        # Send decode payload as-is. Decode admits and allocates the blocks
-        # (`DecodeScheduler.allocate_waiting`), so it alone gets the chains.
-        decode_payload = _add_frame(seqs)
-        self._send_request(1, decode_payload)
+        try:
+            # Send decode payload as-is. Decode admits and allocates the blocks
+            # (`DecodeScheduler.allocate_waiting`), so it alone gets the chains.
+            decode_payload, refused = _submit_frame_refusing(seqs)
+            self._send_request(1, decode_payload)
 
-        # For prefill: limit each sequence to 1 output token.  Prefill discards
-        # all sampled tokens (postprocess is a no-op), but setting max_tokens=1
-        # ensures the forward pass terminates after a single generate step and
-        # that num_scheduled_tokens correctly reflects only the prompt tokens.
-        import copy as _copy
+            # For prefill: limit each sequence to 1 output token.  Prefill
+            # discards all sampled tokens (postprocess is a no-op), but setting
+            # max_tokens=1 ensures the forward pass terminates after a single
+            # generate step and that num_scheduled_tokens correctly reflects
+            # only the prompt tokens. One decode was sent refused is not sent:
+            # it is rejected once, by decode.
+            import copy as _copy
 
-        prefill_seqs = []
-        for seq in seqs:
-            ps = _copy.copy(seq)
-            ps.max_tokens = 1
-            prefill_seqs.append(ps)
-        prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
-        self._send_request(0, prefill_payload)
+            prefill_seqs = []
+            for seq in seqs:
+                if seq.id in refused:
+                    continue
+                ps = _copy.copy(seq)
+                ps.max_tokens = 1
+                prefill_seqs.append(ps)
+            if prefill_seqs:
+                prefill_payload = encode_input(EngineCoreRequestType.ADD, prefill_seqs)
+                self._send_request(0, prefill_payload)
+        except BaseException:
+            self._forget_unsubmitted(seqs)
+            raise
 
     def _collective_rpc_unsupported(self) -> str | None:
         return "its two engines are the prefill and decode halves of one replica"

@@ -174,7 +174,8 @@ def test_every_serving_frontend_applies_the_gc_policy():
     This coverage has gone stale twice already: #1980 reached the API server
     but not the disaggregated EngineCores, whose `run_engine` does not call the
     base one; and the first version of this change reached those but not
-    atomesh, which builds its own engine and never runs the FastAPI lifespan.
+    the atomesh standalone launcher, which builds its own engine (the Rust
+    frontend serves it) and never runs the FastAPI lifespan.
     Both misses are silent -- the process simply keeps its 200ms pauses.
 
     So the rule is checked rather than the instances: a process that builds an

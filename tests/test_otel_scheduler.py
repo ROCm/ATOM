@@ -5,7 +5,6 @@
 # ruff: noqa: F811
 
 import asyncio
-import pickle
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -15,6 +14,7 @@ from test_otel_tracing import clock, execute, spans  # noqa: F401
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.zmq_protocol.codec import decode_input, prompt_token_ids
 from atom.observability import tracing
 from atom.sampling_params import SamplingParams
 
@@ -129,13 +129,13 @@ def test_core_manager_captures_context_after_executor_preprocess(spans):
         CoreManager.add_request(manager, [seq])
 
     execute(app)
-    _, seqs = pickle.loads(frames[0])
+    _, items = decode_input(frames[0])
     http = spans.get_finished_spans()[0]
     assert (
-        seqs[0]._atom_trace_carrier["traceparent"].split("-")[2]
+        items[0].trace.carrier["traceparent"].split("-")[2]
         == f"{http.context.span_id:016x}"
     )
-    assert seqs[0]._atom_trace_carrier["tracestate"] == "othervendor=x,nsdye=1"
+    assert items[0].trace.carrier["tracestate"] == "othervendor=x,nsdye=1"
 
 
 @pytest.mark.parametrize("already_bound", [False, True])
@@ -156,8 +156,10 @@ def test_same_node_pd_marks_http_and_skips_both_engine_carriers(
         DisaggCoreManager.add_request(manager, [seq])
         assert len(frames) == 2
         for frame in frames:
-            _, seqs, *_ = pickle.loads(frame)
-            for child_seq in seqs:
+            _, items = decode_input(frame)
+            for item in items:
+                assert item.trace is None
+                child_seq = Sequence(prompt_token_ids(item), block_size=4)
                 assert not hasattr(child_seq, "_atom_trace_carrier")
                 tracing.enqueue(child_seq)
                 tracing.forward(child_seq, is_decode=False)
@@ -363,6 +365,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
     monkeypatch.setattr(cls, "_init_data_parallel", lambda *a: None)
     monkeypatch.setattr(cls, "_post_model_load_hook", lambda *a: None)
     monkeypatch.setattr(engine_core.StateRuntime, "from_wire", lambda wire: None)
+    monkeypatch.setattr(engine_core, "AdmissionContext", lambda *a, **k: None)
 
     def call(name, *a, **k):
         events.append(name)
