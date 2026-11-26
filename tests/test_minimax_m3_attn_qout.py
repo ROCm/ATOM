@@ -1,4 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """ATOM_M3_ATTN_QOUT: ``SparseMHAPagedAttentionImpl._qout_buffers`` (when the NVFP4 decode attention writes
 o_proj's MXFP8 input itself) and ``attn_qout.aiter_supports`` (feature detection of aiter's ``quant_out``).
 """
@@ -76,3 +78,49 @@ def test_aiter_supports(monkeypatch):
     attn_qout.aiter_supports.cache_clear()
     assert attn_qout.aiter_supports() is False
     attn_qout.aiter_supports.cache_clear()
+
+
+def _qout_layer(monkeypatch, *, runs_bf16=False, mode=None):
+    """A MiniMaxM3SparseAttention stand-in that reaches ``_attn_qout`` with every other gate open."""
+    pytest.importorskip("aiter")
+    from atom.models.minimax_m3 import model as m3
+
+    monkeypatch.setattr(m3.envs, "ATOM_M3_ATTN_QOUT", True, raising=False)
+    monkeypatch.setattr(attn_qout, "aiter_supports", lambda: True)
+    cc = SimpleNamespace(cudagraph_mode=mode)
+    monkeypatch.setattr(
+        m3, "get_current_atom_config", lambda: SimpleNamespace(compilation_config=cc)
+    )
+    impl = SimpleNamespace(
+        kv_cache_dtype="nvfp4", indexer_cp_group=None, _qout_enabled=False
+    )
+    layer = SimpleNamespace(
+        o_proj=SimpleNamespace(native_a8_group_rows=4, runs_bf16=runs_bf16),
+        attn=SimpleNamespace(impl=impl),
+    )
+    return m3.MiniMaxM3SparseAttention._attn_qout(layer), impl
+
+
+def test_attn_qout_gate_open(monkeypatch):
+    ok, impl = _qout_layer(monkeypatch)
+    assert ok and impl._qout_enabled
+
+
+def test_attn_qout_refused_on_bf16_oproj(monkeypatch):
+    ok, impl = _qout_layer(monkeypatch, runs_bf16=True)
+    assert not ok and not impl._qout_enabled
+
+
+@pytest.mark.parametrize("name", ["TR_HYBRID", "FULL_AND_TR_HYBRID"])
+def test_attn_qout_refused_under_tr_hybrid(monkeypatch, name):
+    from atom.config import CUDAGraphMode
+
+    ok, impl = _qout_layer(monkeypatch, mode=CUDAGraphMode[name])
+    assert not ok and not impl._qout_enabled
+
+
+def test_attn_qout_allowed_under_full_graph(monkeypatch):
+    from atom.config import CUDAGraphMode
+
+    ok, _ = _qout_layer(monkeypatch, mode=CUDAGraphMode.FULL_DECODE_ONLY)
+    assert ok

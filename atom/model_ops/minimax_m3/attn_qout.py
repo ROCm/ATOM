@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """ATOM_M3_ATTN_QOUT: o_proj's MXFP8 input straight from the NVFP4 sparse decode attention.
 
 On pure-decode steps of 8..128 rows the attention (aiter ``sparse_pa_nvfp4_decode(quant_out=...)``) writes the

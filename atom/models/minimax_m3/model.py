@@ -17,7 +17,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
 
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
@@ -627,7 +627,8 @@ class MiniMaxM3SparseAttention(nn.Module):
 
     def _attn_qout(self) -> bool:
         """ATOM_M3_ATTN_QOUT: the attention writes o_proj's MXFP8 input (needs the aiter ``quant_out`` and a
-        native MXFP8 o_proj); decided once, at the first trace."""
+        native MXFP8 o_proj that does not run BF16, and no TR_HYBRID token graphs); decided once, at the first
+        trace."""
         ok = getattr(self, "_qout_ok", None)
         if ok is None:
             from atom.model_ops.minimax_m3 import attn_qout
@@ -636,12 +637,27 @@ class MiniMaxM3SparseAttention(nn.Module):
                 envs.ATOM_M3_ATTN_QOUT
                 and attn_qout.aiter_supports()
                 and getattr(self.o_proj, "native_a8_group_rows", None) is not None
+                # A BF16-fallback o_proj asserts ``x_scale is None``.
+                and not getattr(self.o_proj, "runs_bf16", False)
+                # TR_HYBRID replays the captured o_proj while attention re-runs as
+                # an eager region: the codes/scales handed over in Python would
+                # be stale at replay, so keep the ordinary BF16 hand-off there.
+                and not _uses_tr_hybrid_graph()
                 and self.attn.impl.kv_cache_dtype == "nvfp4"
                 and self.attn.impl.indexer_cp_group is None
             )
             if ok:
                 self.attn.impl._qout_enabled = True
         return ok
+
+
+def _uses_tr_hybrid_graph() -> bool:
+    """True when the running config records TR_HYBRID token graphs (absent config or mode: False)."""
+    try:
+        mode = get_current_atom_config().compilation_config.cudagraph_mode
+    except (AssertionError, AttributeError):
+        return False
+    return bool(mode) and mode.uses_tr_hybrid()
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
