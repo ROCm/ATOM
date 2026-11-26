@@ -505,10 +505,6 @@ def test_native_token_graph_replays_different_request_counts(
             first = torch.minimum(step.slots[0] * 4, (visible - 4).clamp_min(0))
             valid = (columns < visible) & (step.batch_ids[:, None] >= 0)
             step.selected[0] = torch.where(valid, first + columns, -1).contiguous()
-            assert torch.equal(
-                (step.selected[0] >= 0).sum(-1),
-                torch.where(step.batch_ids >= 0, visible[:, 0].clamp_max(4), 0),
-            )
 
     selection_calls = []
     owner = SimpleNamespace(
@@ -760,6 +756,16 @@ def test_native_token_graph_replays_different_request_counts(
             index_calls.clear()
             fused_calls.clear()
             got = graph.replay((fresh_q, fresh_kv)).clone()
+            # Validate after replay has been enqueued: a host-side assertion in
+            # the side-stream scorer could hide a missing graph dependency.
+            if ratio and requests:
+                visible = ((step.positions + 1) // ratio).clamp_max(4)
+                torch.testing.assert_close(
+                    (step.selected[0] >= 0).sum(-1),
+                    torch.where(step.batch_ids >= 0, visible, 0).to(torch.int64),
+                    rtol=0,
+                    atol=0,
+                )
             if live_fusion:
                 assert fused_calls == (
                     [False] * group_size
