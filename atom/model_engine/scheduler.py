@@ -3474,6 +3474,30 @@ class Scheduler:
                     " ".join(f"{k}={v}" for k, v in sorted(skips.items())),
                 )
 
+        # Admission has finished, so scratch cannot take a request's slot.
+        # Settle anchor cuts before totals, connector metadata and final flags.
+        if self.block_manager.plans_midstep:
+            for i, seq in enumerate(scheduled_seqs.values()):
+                start = seq.num_cached_tokens
+                end = start + int(num_scheduled_tokens[i])
+                planned_end = self.block_manager.plan_midstep(
+                    seq,
+                    start,
+                    end,
+                    cut_floor=(
+                        end
+                        if self._requires_atomic_prefill(seq)
+                        else _cut_floor(seq, start, start)
+                    ),
+                )
+                num_scheduled_tokens[i] = planned_end - start
+                if (
+                    self.advance_on_schedule
+                    and seq.midstep_anchor_pos == planned_end
+                    and not seq.midstep_reservations
+                ):
+                    self.block_manager.checkpoint_when_scheduled(seq, planned_end)
+
         total_tokens_num_prefill = sum(num_scheduled_tokens)
         if self._tick_cost_limit < math.inf:
             self._log_prefill_balance(total_tokens_num_prefill)
@@ -3703,8 +3727,8 @@ class Scheduler:
             self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
             connector_meta_output = self.kv_connector.build_connector_meta()
 
-        # Connector metadata describes already queued transfers. Reserve
-        # midstep checkpoints afterwards, before the batch snapshot.
+        # Admission already settled anchor cuts and checkpoint destinations
+        # before totals and connector metadata. Freeze the final row markers.
         is_final_chunk, next_token_ids = self._settle_prefill_chunks(
             prefill_seqs, prefill_tokens, prefill_cached
         )
@@ -4499,9 +4523,8 @@ class Scheduler:
         if target:
             chunk = target - start
         else:
-            # A readable class is never cut onto a rung; keep the next
-            # chunk's start on the block grid instead, or every snapshot
-            # position in it is off the grid too.
+            # Keep the next chunk on the block grid for interior snapshots.
+            # Post-admission planning handles PAGE anchors without scratch.
             chunk = bm.align_midstep_chunk(seq, start, chunk)
         on_rung = bool(target)
         # `cancel_state_fork` runs only when the first two hold, and returning
@@ -5392,8 +5415,8 @@ class Scheduler:
     ) -> tuple[list[bool], list[int] | None]:
         """Per-chunk bookkeeping every batch carrying prefill rows owes.
 
-        Both pure and mixed batches call this after admission and before
-        snapshotting final-chunk markers and checkpoint destinations.
+        Both pure and mixed batches call this after admission has settled
+        checkpoint cuts and before snapshotting final-chunk markers.
 
         All three lists are positionally aligned and cover the prefill rows
         only. The caller passes the leading prefill slice of a mixed batch;
@@ -5428,19 +5451,6 @@ class Scheduler:
                 next_token_ids.append(
                     -1 if end >= seq.num_tokens else int(seq.token_ids[end])
                 )
-
-        # Reserve midstep checkpoint destinations for the chunks just settled.
-        # Here rather than inside `_finalize_prefill_chunk` because a
-        # reservation takes a slot off the free list, and admission for this
-        # pass only finishes above — planning any earlier would let a
-        # checkpoint's destination compete with a request still to be let in.
-        # The batch the caller builds snapshots what this leaves on each seq,
-        # so this must run before that build.
-        for i, seq in enumerate(prefill_seqs):
-            start = num_cached_tokens[i]
-            self.block_manager.plan_midstep(
-                seq, start, start + int(num_scheduled_tokens[i])
-            )
 
         return is_final_chunk, next_token_ids
 

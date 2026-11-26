@@ -193,10 +193,10 @@ class CompilationConfig:
     - FULL_AND_TR_HYBRID.
 
     TR_HYBRID mode mixes token graphs and request graphs: the compiled forward
-    is recorded as a `TokenGraph` per token bucket, breaking only at the split
-    ops whose launches depend on host data (`eager_region`), which run between
-    its segments -- eagerly, or as a `ReqGraph` where the request bucket fixes
-    their launches.
+    is recorded as a `TokenGraph` per token bucket, breaking only where a split
+    op calls an `eager_region`, whose launches depend on host data: it runs
+    between the segments -- eagerly, or as a `ReqGraph` where the request
+    bucket fixes its launches.
 
     FULL mode: Capture full cudagraph for all batches. Can be good for small
     models or workloads with small prompts; not supported by many backends.
