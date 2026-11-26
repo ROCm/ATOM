@@ -591,11 +591,11 @@ def test_cap_sends_early_requests_past_it_through_the_gate(
     b = seq_factory(list(range(10)), kv_transfer_params=p_params("early-b"))
     assert p.admission_ready(a)  # 3 pages of 6: at the cap.
     _allocate(p, a, [0, 1, 2])
-    assert p._early_pins == {a.id: 3}
+    assert p._early_pins == {str(a.id): 3}
     assert p.admission_ready(b) is ready
     assert b.id in p._chunked_waiting  # Registered either way.
     _ack(p, a)  # D reached A: its source no longer waits on D.
-    assert a.id not in p._early_pins
+    assert str(a.id) not in p._early_pins
     assert p.admission_ready(b)
 
 
@@ -632,7 +632,7 @@ def test_undone_allocation_leaves_the_cap(monkeypatch, seq_factory):
 
     a.block_table = new_block_table([0, 1, 2])
     p.update_state_after_alloc(a)
-    assert a.id in p._early_pins
+    assert str(a.id) in p._early_pins
     p.cancel_preadmission(a)
     assert not p._early_pins and a.id in p._chunked_waiting
 
@@ -647,7 +647,7 @@ def test_reallocation_after_d_reached_p_takes_no_pin(monkeypatch, seq_factory):
     b = seq_factory(list(range(10)), kv_transfer_params=p_params("early-b"))
     assert p.admission_ready(a)
     _allocate(p, a, [0, 1, 2])
-    assert p._early_pins == {a.id: 3}
+    assert p._early_pins == {str(a.id): 3}
     _ack(p, a)
     assert not p._early_pins
     assert p.admission_ready(a)  # It holds its send claim: re-admitted.
@@ -685,7 +685,7 @@ def test_worker_lookup_timeout_releases_a_finished_pin(monkeypatch, seq_factory)
         )
     handoff = p.kv_connector.build_connector_meta().reqs_to_save[a.id]
     assert not handoff.prefill_aborted
-    assert p.kv_connector._early_pins == {a.id: 3}
+    assert p.kv_connector._early_pins == {str(a.id): 3}
     assert a.id in p.deferred_free_blocks
     assert not p.kv_connector.admission_ready(b)  # 3 + 3 pages > half of 6.
     p._update_from_kv_xfer_finished(
@@ -698,6 +698,21 @@ def test_worker_lookup_timeout_releases_a_finished_pin(monkeypatch, seq_factory)
     assert not p.kv_connector._early_pins
     assert not p.deferred_free_blocks and p.block_manager.kv.num_free == 6
     assert p.kv_connector.admission_ready(b)
+
+
+@pytest.mark.parametrize("as_str", [False, True])
+def test_send_finished_releases_the_pin(monkeypatch, seq_factory, as_str):
+    """`send_finished` is the release: by the time the scheduler frees the
+    blocks (`source_blocks_released`) the pin is already gone. It may name
+    the request either way, as for the send claim."""
+    p = make_scheduler_connector(monkeypatch, True, early=True, num_kvcache_blocks=6)
+    a = seq_factory(list(range(10)), kv_transfer_params=p_params("early-a"))
+    assert p.admission_ready(a)
+    _allocate(p, a, [0, 1, 2])
+    _finish_prefill(p, a)
+    assert p._early_pins == {str(a.id): 3} and p.should_defer_free(a)
+    p.send_finished(str(a.id) if as_str else a.id)
+    assert not p._early_pins and not p.should_defer_free(a)
 
 
 def test_aborted_early_request_leaves_the_cap(monkeypatch, seq_factory):
