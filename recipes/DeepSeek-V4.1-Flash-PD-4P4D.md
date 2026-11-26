@@ -518,6 +518,12 @@ What the tables show:
 
 ## 4P8D AgentX ladder (c1-c768, 3600 s)
 
+![DeepSeek-V4.1-Flash P/D on MI355X: token throughput per GPU vs P90 interactivity (AgentX, 3600 s)](DeepSeek-V4.1-Flash-PD-4P8D-AgentX-curve.png)
+
+The red solid line is this ladder (filled points are connected; hollow points are 1P1D / other P:D
+shapes kept for reference). Reference curves: B300 Dynamo vLLM FP4 and B200 / MI355X vLLM from public
+InferenceX data. x = 1000 / P90 ITL (tok/s/user); y = total tok/s divided by all GPUs in the deployment.
+
 This part is a two-node P/D deployment of DeepSeek-V4.1-Flash-1017 on 12x
 MI355X: one P instance (DEP4, 4 GPUs) on the P node and one D instance
 (8 GPUs) on the D node. It lists, for every point on the measured
