@@ -1,4 +1,4 @@
-﻿# DeepSeek V4.1-Flash 4P4D on one 8-GPU node (TTFT-optimized)
+# DeepSeek V4.1-Flash 4P4D on one 8-GPU node (TTFT-optimized)
 
 This recipe describes a single-node prefill/decode (P/D) split for
 DeepSeek-V4.1-Flash-1017 on 8x MI355X running the AgentX C256 workload. The
