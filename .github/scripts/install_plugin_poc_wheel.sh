@@ -53,27 +53,12 @@ fi
 python3 -m pip uninstall -y atom-plugin sp-qkv-provider >/dev/null 2>&1 || true
 python3 -m pip install --no-deps "$wheel"
 
-# Every FlyDSL-backed plugin declines on another FlyDSL than its backend.json pin, and the image's may differ.
-flydsl=$(python3 - "$copy" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-pins = {json.loads(p.read_text()).get("flydsl") for p in Path(sys.argv[1]).glob("ops/*/backend.json")} - {None}
-if len(pins) != 1:
-    raise SystemExit(f"::error::plugins pin FlyDSL {sorted(pins)}, expected one version")
-print(pins.pop())
-PY
-)
-# Uninstalling a FlyDSL can leave its dist-info (REQUESTED is not in RECORD) behind; importlib.metadata then
-# reads the version as None and every pinned plugin declines.
+# FlyDSL follows AITER (the image's, or what the AITER override installed with it); a plugin states only
+# the oldest FlyDSL it needs (backend.json "flydsl") and does not register below it, which the check below
+# refuses. Replacing a FlyDSL can leave its dist-info (REQUESTED is not in RECORD) behind; importlib.metadata
+# then reads the version as None and every FlyDSL-backed plugin declines.
 purelib=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
-drop_stale_flydsl() { for d in "$purelib"/flydsl-*.dist-info; do [ -f "$d/RECORD" ] || rm -rf "$d"; done; }
-drop_stale_flydsl
-if [ "$(python3 -c 'import importlib.metadata as m; print(m.version("flydsl"))' 2>/dev/null)" != "$flydsl" ]; then
-  python3 -m pip install --no-deps --force-reinstall "flydsl==${flydsl}"
-  drop_stale_flydsl
-fi
+for d in "$purelib"/flydsl-*.dist-info; do [ -f "$d/RECORD" ] || rm -rf "$d"; done
 echo "flydsl $(python3 -c 'import importlib.metadata as m; print(m.version("flydsl"))')"
 
 cd /workspace
