@@ -989,7 +989,12 @@ class InputOutputProcessor:
                 None if prefix_encoding is None else prefix_encoding.block_hashes
             )
             chains = self.token_prefix_chains
-            if token_prompt and chains is not None and envs.ATOM_FRONTEND_PREFIX_HASH:
+            if (
+                token_prompt
+                and chains is not None
+                and chains.enabled
+                and envs.ATOM_FRONTEND_PREFIX_HASH
+            ):
                 block_hashes = chains.block_hashes(seqs[0].token_ids)
             ship_prompt_hash_chain(
                 seqs[0], self.prefix_hash_block_size, block_hashes=block_hashes

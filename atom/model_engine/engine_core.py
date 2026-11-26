@@ -714,8 +714,8 @@ class EngineCore:
         self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
 
     def _wait_for_input(self) -> None:
-        """Sleep until the input thread queues work or `IDLE_WAIT_S` passes: a loop
-        that spun instead would hold the GIL that thread needs to queue it."""
+        """Sleep until the input thread queues work, a worker's KV output arrives, or
+        `IDLE_WAIT_S` passes: a spinning loop holds the GIL the input thread needs."""
         self._kv_progress_event.clear()  # before the reads: a later put sets it again
         if self.input_queue.empty() and self.utility_queue.empty():
             self._kv_progress_event.wait(IDLE_WAIT_S)
