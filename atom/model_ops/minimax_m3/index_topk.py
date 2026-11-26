@@ -2274,7 +2274,7 @@ def _flydsl_prefill_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len)
 
 
 def _flydsl_prefill_topk(
-    idx_q, index_kv_cache, index_kv_scale, max_query_len, topk, max_block, emit
+    idx_q, index_kv_cache, index_kv_scale, max_query_len, batch, topk, max_block, emit
 ):
     """(aiter's fused prefill scorer + top-16, its chunk) when
     ``ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL`` asks for it and it serves the call
@@ -2290,7 +2290,7 @@ def _flydsl_prefill_topk(
     ):
         return None
     from aiter.ops.flydsl.index_score_prefill import (
-        TOPK_CHUNK_BLOCKS,
+        index_topk_prefill_chunk_blocks,
         index_topk_prefill_nvfp4,
         index_topk_prefill_nvfp4_supported,
     )
@@ -2299,10 +2299,12 @@ def _flydsl_prefill_topk(
         idx_q, index_kv_cache, index_kv_scale, topk, max_block
     ):
         return None
-    opts = {
-        "chunk_blocks": TOPK_CHUNK_BLOCKS,
-        **dict(_flydsl_prefill_score_opts(envs.ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS)),
-    }
+    opts = dict(_flydsl_prefill_score_opts(envs.ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS))
+    if "chunk_blocks" not in opts:
+        # aiter's default for this grid, which the merge needs to know.
+        opts["chunk_blocks"] = index_topk_prefill_chunk_blocks(
+            idx_q, max_query_len, batch, max_block, **opts
+        )
     return functools.partial(index_topk_prefill_nvfp4, **opts), opts["chunk_blocks"]
 
 
@@ -2438,6 +2440,7 @@ def minimax_m3_index_topk(
         index_kv_cache,
         index_kv_scale,
         max_query_len,
+        batch,
         topk,
         max_block,
         emit_sparse_block_table,

@@ -52,7 +52,7 @@ def aiter_op(monkeypatch):
     """Stand-in for aiter's prefill index module: records each launch."""
     calls = types.SimpleNamespace(fused=[], scorer=[], serves=True)
     mod = types.ModuleType(AITER_OP)
-    mod.TOPK_CHUNK_BLOCKS = 256
+    mod.index_topk_prefill_chunk_blocks = lambda *a, **kw: 256
     mod.index_score_prefill_nvfp4_supported = lambda *a: True
     mod.index_score_prefill_nvfp4 = lambda *a, **kw: calls.scorer.append((a, kw))
     mod.index_topk_prefill_nvfp4_supported = lambda *a: calls.serves
