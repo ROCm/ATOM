@@ -10,8 +10,12 @@ import pytest
 
 pytest.importorskip("torch")
 
-from atom.model_engine.engine_core import EngineCore
-from atom.model_engine.model_runner import ModelRunner
+from aiter_stub import stubbed_aiter
+
+# `async_proc` binds `aiter.dist.shm_broadcast` at import, which a CPU runner
+# (no GPU AITER build) does not have.
+with stubbed_aiter():
+    from atom.model_engine.engine_core import EngineCore
 
 
 def _batch(prefill, decode, blocked=False, spec=0):
@@ -33,6 +37,11 @@ def test_forward_kind():
 
 
 def _blocked_step(batch, tokens):
+    # `ModelRunner` pulls in AITER's ops, GEMM and MoE modules at import: only
+    # a real AITER build (not a stub) can load it, so these tests skip on CPU.
+    pytest.importorskip("aiter.ops")
+    from atom.model_engine.model_runner import ModelRunner
+
     calls = []
     runner = SimpleNamespace(
         model=SimpleNamespace(
