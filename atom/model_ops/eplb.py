@@ -1621,12 +1621,24 @@ def _replica_spread(gathered: bool = False) -> tuple[int, int]:
     return _MANAGER.replica_spread
 
 
+def _eplb_layer_end(model: Any) -> int | None:
+    """The first layer EPLB leaves alone where the model declares one
+    (`eplb_layer_end`), else None: every EP MoE layer is placed."""
+    end = getattr(model, "eplb_layer_end", None)
+    return None if end is None else int(end)
+
+
 def collect_ep_moe_layers(model: Any) -> dict[int, Any]:
-    """Map checkpoint layer id -> EP MoE module that owns expert weights."""
+    """Map checkpoint layer id -> EP MoE module that owns expert weights, for
+    the layers before the model's `eplb_layer_end`. A layer past the placed
+    ones is never owned (`_eplb_owns_layer`): no remap, record or migration."""
+    end = _eplb_layer_end(model)
     layers: dict[int, Any] = {}
     for module in model.modules():
         layer_id = getattr(module, "layer_id", None)
         if isinstance(layer_id, bool) or not isinstance(layer_id, int):
+            continue
+        if end is not None and layer_id >= end:
             continue
         if not bool(getattr(module, "use_ep", False)):
             continue
@@ -1844,9 +1856,11 @@ class EPLBManager:
             self._p2p_batch_chunk_size = 32
 
         logger.info(
-            "EPLB runtime initialized: layers=%d num_logical=%d "
+            "EPLB runtime initialized: layers=%d (%d..%d) num_logical=%d "
             "num_physical=%d ep_size=%d ep_rank=%d",
             len(layers),
+            min(layers),
+            max(layers),
             num_logical,
             num_physical,
             ep_size,
@@ -2495,8 +2509,9 @@ def with_eplb_forward_monitor(fn):
 def _eplb_owns_layer(meta: Any, layer_id: Any) -> bool:
     """True when ``layer_id`` is one of the MoE layers EPLB places.
 
-    EPLB covers the target model's MoE layers only. Drafter/MTP MoE layers
-    (e.g. the DSpark drafter's layer 61 on DSV4-Pro) are never migrated, so
+    EPLB covers the target model's placed MoE layers only. Layers at or past
+    its ``eplb_layer_end``, and drafter/MTP MoE layers (e.g. the DSpark
+    drafter's layer 61 on DSV4-Pro), are never migrated, so
     their logical ids already are physical ids and their load is not tracked.
     Redundant slots do not change that: an EPLB-routed shared expert is a
     logical id and loads into physical slot e like the routed experts.

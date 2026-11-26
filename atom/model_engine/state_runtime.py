@@ -21,6 +21,11 @@ NONE = "none"
 REPLAY = "replay"
 
 
+def snapped_checkpoint_interval(interval: int, hash_block_size: int) -> int:
+    """Keep sentinels; positive intervals round down to a reachable hash boundary."""
+    return interval // hash_block_size * hash_block_size if interval > 0 else interval
+
+
 @dataclass(frozen=True)
 class StateTransfer:
     """How a backend transfers one request's state to another slot."""
@@ -33,20 +38,20 @@ class StateTransfer:
     #:
     #: A separate axis from `kind`, and it must stay one. `kind` answers how a
     #: slot is handed to *another request*; this answers where within one
-    #: forward a snapshot can be taken at all. GDN is `fork(1)` and — because
-    #: its chunk kernel's per-chunk intermediates are copied out —
-    #: midstep-readable; DeepSeek-V4 is `copy()` and is not, because its
-    #: compressor ring is not materialized at interior boundaries the way a
-    #: chunk kernel's `h` is. Deriving either from the other would silently
-    #: turn the prefill chunk cut off for a backend that still needs it.
+    #: forward a snapshot can be taken. GDN can copy chunk intermediates;
+    #: Kimi KDA can re-run a head ending at the target. Both can checkpoint
+    #: midstep with PAGE copies, while GDN also supports fork transfer.
+    #: DeepSeek-V4's compressor ring has no interior snapshot path. Deriving
+    #: readability from transfer kind would remove cuts it still needs.
     #:
     #: Default False, so every backend keeps today's behavior until it has
-    #: actually ported the copy-out.
+    #: implemented and enabled an interior snapshot path.
     readable_midstep: bool = False
     #: Token spacing of the interior states a readable backend exposes, counted
     #: from the *start of the forward*, not from position 0. GDN's chunk kernel
     #: materializes `h` every 64 tokens of the step, so a forward over
-    #: `(start, end]` can be read at `start + 64k` and nowhere else inside it.
+    #: `(start, end]` can be read at `start + 64k` inside it. Kimi's head
+    #: re-runs use grid 1 because the head can end at any token.
     #: 0 when not readable.
     midstep_grid: int = 0
     #: Tokens of this forward a snapshot needs behind it: GDN's conv window
@@ -266,11 +271,17 @@ class StateMaintenanceOps:
     relocations: tuple[tuple[int, int], ...] = ()
     checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
     checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
+    # (source, destination) paged blocks whose whole content is copied before
+    # the batch: a private block demoted into the shared part of a split pool.
+    block_copies: tuple[tuple[int, int], ...] = ()
 
     @property
     def empty(self) -> bool:
         return not (
-            self.relocations or self.checkpoint_stores or self.checkpoint_restores
+            self.relocations
+            or self.checkpoint_stores
+            or self.checkpoint_restores
+            or self.block_copies
         )
 
 
@@ -289,9 +300,9 @@ def midstep_target_ok(
 ) -> bool:
     """Whether a forward over `(start, end]` can snapshot the state at `pos`.
 
-    Interior positions must sit on the forward's own grid, `start + grid*k`:
-    that is where the chunk kernel left a state in `h`, and a position between
-    two of them reads the earlier one while being filed under the later hash.
+    Interior positions must sit on the backend's grid, `start + grid*k`.
+    GDN's chunk snapshots use grid 64; Kimi KDA's head re-runs use grid 1.
+    Filing an earlier grid position under a later hash would pair wrong state.
     `end` is always readable, from the runtime slot the forward leaves behind.
 
     `min_offset` tokens of this forward must precede `pos`, because the conv
@@ -306,7 +317,7 @@ def snap_midstep_position(pos: int, start: int, end: int, grid: int) -> int:
     """`pos` moved back onto the grid of a forward over `(start, end]`.
 
     `end` stays where it is: the runtime slot holds it exactly. Anything else
-    goes back to the last state the chunk kernel materialized at or before it,
+    goes back to the last interior position the backend can produce,
     which costs the next resume at most `grid - 1` tokens of recompute.
     """
     if pos == end:
@@ -358,4 +369,34 @@ def midstep_checkpoint_targets(
                     f"over ({start}, {end}] (grid {grid}, min offset {min_offset})"
                 )
             out.append((row, dst, pos - start, int(pos == end), runtime_slots[j]))
+    return out
+
+
+def midstep_rerun_rows(
+    targets: list[tuple[int, int, int, int, int]], num_scheduled_tokens
+) -> dict[str, list]:
+    """Small checkpoint descriptors and ranges for re-running interior heads."""
+    if not targets:
+        return {}
+    cu = [0]
+    for n in num_scheduled_tokens:
+        cu.append(cu[-1] + int(n))
+    rows, slots, offs, is_end, runtime = map(list, zip(*targets))
+    out = {
+        "rows": rows,
+        "slots": slots,
+        "offs": offs,
+        "is_end": is_end,
+        "runtime": runtime,
+        "h_rows": [0] * len(targets),
+    }
+    head_ranges, kda_rows, kda_cu = [], list(range(len(cu) - 1)), list(cu)
+    for i, (row, _slot, off, end, _runtime) in enumerate(targets):
+        if not end:
+            out["h_rows"][i] = len(head_ranges)
+            head_ranges.append((cu[row], off))
+            kda_rows.append(row)
+            kda_cu.append(kda_cu[-1] + off)
+    if head_ranges:
+        out.update(head_ranges=head_ranges, kda_rows=kda_rows, kda_cu=kda_cu)
     return out
