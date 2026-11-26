@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """DeepSeek-V4.1's hi routing (``hi_dispatch.HiDecodeModel``): the forward follows the builder's routing decision
 (``AttentionMetaData.served_by_round``). A step routed to the hook runs on the hi path and never creates ATOM's K1 / K2
 runner; another decode step creates it (once) and runs on it, and invalidates the hook's incremental import; a step
 routed to the hook whose forward the hi layers cannot run (``inputs_embeds``) raises instead of leaving Engram staging
 and the draft's context write on the hook's side while the forward takes ATOM's. A served forward expands ATOM's own
-embedding rows into the hi layers' input; its head output is the hook's in-graph verify (``compute_head``).
+embedding rows into the hi layers' input; its verify head is the hook's in-graph verify (``HiVerifyHead``).
 """
 
 import sys
@@ -43,7 +44,7 @@ def D():
 
 class _Hook:
     def __init__(self):
-        self.verified, self.invalidated = 0, []
+        self.invalidated = []
 
     def invalidate(self, step, dummy=False):
         self.invalidated.append(step)
@@ -88,7 +89,7 @@ def _model(D, monkeypatch, hook, served=()):
         return m(ids, None, inputs_embeds=emb)
 
     monkeypatch.setattr(
-        D, "step_supported", lambda ids, emb, dp: emb is None and ids.numel() <= 48
+        D, "step_supported", lambda rows, embeds, dp: not embeds and rows <= 48
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     return routed, made
@@ -125,24 +126,16 @@ def test_a_served_step_the_hi_layers_cannot_run_raises(D, monkeypatch):
     assert made == []
 
 
-def test_the_head_output_is_the_hooks_in_graph_verify(D, monkeypatch):
-    """``compute_head``: the hook's head output at the forward's rows (``HiLayers.head_output``); every forward
-    starts with no verify of its own (``verified``), so a forward that served none gives None (the logits).
-    """
+def test_the_verify_head_is_the_hooks_in_graph_verify(D, monkeypatch):
+    """``HiVerifyHead.sample_token_ids``: the hook's verify of the step the forward context lays out, at the
+    forward's rows (``HiLayers.token_ids``, which decides whether that step ran one)."""
     hook = _Hook()
-    hook.head_output = lambda rows: (
-        ("ids", "verdict", rows) if hook.verified == rows else None
-    )
-    m, _ = _model(D, monkeypatch, hook, served={6})
-    hook.verified = 6
-    m(torch.zeros(7, dtype=torch.int64))  # (ATOM's path: no verify of its own)
-    assert hook.verified == 0
-    model = D.HiDecodeModel.__new__(D.HiDecodeModel)
-    torch.nn.Module.__init__(model)
-    model._hi = hook
-    assert model.compute_head(torch.zeros(6, 4)) is None
-    hook.verified = 6
-    assert model.compute_head(torch.zeros(6, 4)) == ("ids", "verdict", 6)
+    hook.token_ids = lambda metadata, rows: (metadata, rows)
+    _model(D, monkeypatch, hook, served={6})
+    head = D.HiVerifyHead(hook)
+    metadata, rows = head.sample_token_ids(torch.zeros(6, 4))
+    assert metadata is D.get_forward_context().attn_metadata and rows == 6
+    assert head.samples and head.draws_top_p(6) and not head.ids_agree
 
 
 def test_a_served_forward_takes_atoms_embedding_rows(D, monkeypatch):
