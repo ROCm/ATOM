@@ -128,6 +128,7 @@ def _prefill_impl(**over):
     impl = _impl(
         use_flydsl_fp8_prefill_attn=True,
         _flydsl_fp8_mha_ok=None,
+        _prefill_k_cat_arch=False,
         num_heads=12,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,

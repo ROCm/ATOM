@@ -828,7 +828,8 @@ class MLAAttention(nn.Module):
         super().__init__()
         self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
         self._flydsl_fp8_mha_ok: bool | None = None
-        # Prefill K by `cat_prefill_k` on gfx1250 layers; main's torch.cat elsewhere.
+        # Prefill K by `cat_prefill_k` on gfx1250 layers; elsewhere each site keeps
+        # main's expression (`torch.cat`, or two copies at the vLLM plugin sites).
         self._prefill_k_cat_arch = kernel_arch()
         # Set by a model whose prefill token graph records up to the attention
         # core (`records_prefill_split`).
