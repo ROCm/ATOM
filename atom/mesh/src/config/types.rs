@@ -25,6 +25,25 @@ pub enum VllmKvConnector {
     #[default]
     Mooncake,
     MoriioRead,
+    MoriioWrite,
+}
+
+impl VllmKvConnector {
+    pub fn is_moriio(self) -> bool {
+        matches!(self, Self::MoriioRead | Self::MoriioWrite)
+    }
+}
+
+/// Exact native MoRI endpoints for one HTTP worker with a node-local DP pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VllmMoriioPeer {
+    pub url: String,
+    pub host: String,
+    pub handshake_port: u16,
+    pub notify_port: u16,
+    pub tp_size: usize,
+    pub dp_size: usize,
 }
 
 impl std::str::FromStr for VllmKvConnector {
@@ -34,6 +53,7 @@ impl std::str::FromStr for VllmKvConnector {
         match value {
             "mooncake" => Ok(Self::Mooncake),
             "moriio-read" => Ok(Self::MoriioRead),
+            "moriio-write" => Ok(Self::MoriioWrite),
             other => Err(format!("unsupported vLLM KV connector: {other}")),
         }
     }
@@ -86,6 +106,8 @@ pub struct RouterConfig {
     pub backend: BackendType,
     #[serde(default)]
     pub vllm_kv_connector: VllmKvConnector,
+    #[serde(default)]
+    pub vllm_moriio_peers: Vec<VllmMoriioPeer>,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
     #[serde(default)]
@@ -472,6 +494,7 @@ impl Default for RouterConfig {
             },
             backend: BackendType::Sglang,
             vllm_kv_connector: VllmKvConnector::Mooncake,
+            vllm_moriio_peers: Vec::new(),
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
             port: 3001,

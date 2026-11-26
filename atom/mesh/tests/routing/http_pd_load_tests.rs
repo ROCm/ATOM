@@ -207,7 +207,7 @@ fn dispatch_with_policy(
             }
             DispatchKind::Vllm => {
                 router
-                    .dispatch_vllm_mooncake_internal(
+                    .dispatch_vllm_push_internal(
                         headers.as_ref(),
                         json!({}),
                         json!({}),
@@ -336,10 +336,39 @@ fn dispatch_moriio(
     body: Value,
     route: &'static str,
 ) -> JoinHandle<Response> {
+    dispatch_moriio_mode(p, d, body, route, false)
+}
+
+fn dispatch_moriio_mode(
+    p: &IngressBackend,
+    d: &IngressBackend,
+    body: Value,
+    route: &'static str,
+    write: bool,
+) -> JoinHandle<Response> {
     let mut router = tests::create_test_pd_router();
     router.backend = BackendType::Vllm;
-    router.vllm_kv_connector = VllmKvConnector::MoriioRead;
-    router.adapter = Arc::new(VllmMoriioAdapter);
+    router.vllm_kv_connector = if write {
+        VllmKvConnector::MoriioWrite
+    } else {
+        VllmKvConnector::MoriioRead
+    };
+    router.adapter = if write {
+        let peer = |worker: &Arc<dyn Worker>, port, dp| crate::config::VllmMoriioPeer {
+            url: worker.base_url().into(),
+            host: "127.0.0.1".into(),
+            handshake_port: port,
+            notify_port: port + 100,
+            tp_size: 1,
+            dp_size: dp,
+        };
+        Arc::new(VllmMoriioWriteAdapter::new(vec![
+            peer(&p.worker, 6300, 1),
+            peer(&d.worker, 6400, 4),
+        ]))
+    } else {
+        Arc::new(VllmMoriioAdapter)
+    };
     let placement = router
         .reserve_pair(
             PlacementPlan::Pair {
@@ -1266,4 +1295,71 @@ async fn atom_chunked_decode_admission_rejection_cancels_pending_prefill() {
         assert_eq!(p.worker.load(), 0);
         assert_eq!(d.worker.load(), 0);
     }
+}
+
+#[tokio::test]
+async fn moriio_write_dispatches_decode_before_prefill_returns_without_read_metadata() {
+    for stream in [false, true] {
+        let mut p = IngressBackend::start(WorkerType::Prefill {
+            bootstrap_port: None,
+        })
+        .await;
+        let mut d = IngressBackend::start(WorkerType::Decode).await;
+        let task = dispatch_moriio_mode(
+            &p,
+            &d,
+            json!({"stream":stream,"max_tokens":64,"tools":[{"type":"function"}]}),
+            "/v1/chat/completions",
+            true,
+        );
+        let (prefill, p_reply) = p.next_request().await;
+        let (decode, d_reply) = d.next_request().await;
+        assert_eq!(prefill["kv_transfer_params"]["remote_dp_size"], 4);
+        assert_eq!(decode["kv_transfer_params"]["remote_dp_size"], 1);
+        assert_eq!(
+            decode["kv_transfer_params"]["remote_dp_rank_override"],
+            false
+        );
+        assert_eq!(prefill["request_id"], decode["request_id"]);
+        assert_eq!(decode["max_tokens"], 64);
+        assert!(decode["tools"].is_array());
+        p_reply
+            .send(axum::Json(json!({"choices":[]})).into_response())
+            .unwrap();
+        d_reply
+            .send(axum::Json(json!({"choices":[{"text":"ok"}]})).into_response())
+            .unwrap();
+        let response = result(task).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("ok"));
+        wait_load(&p.worker, 0).await;
+        wait_load(&d.worker, 0).await;
+    }
+}
+
+#[tokio::test]
+async fn moriio_write_prefill_failure_cancels_pending_decode_and_releases_load() {
+    let mut p = IngressBackend::start(WorkerType::Prefill {
+        bootstrap_port: None,
+    })
+    .await;
+    let mut d = IngressBackend::start(WorkerType::Decode).await;
+    let task = dispatch_moriio_mode(
+        &p,
+        &d,
+        json!({"stream":false}),
+        "/v1/chat/completions",
+        true,
+    );
+    let (_, p_reply) = p.next_request().await;
+    let (_, _d_reply) = d.next_request().await;
+    p_reply
+        .send((StatusCode::INTERNAL_SERVER_ERROR, "prefill failed").into_response())
+        .unwrap();
+    let response = result(task).await;
+    assert!(response.status().is_server_error());
+    drop(response);
+    wait_load(&p.worker, 0).await;
+    wait_load(&d.worker, 0).await;
 }

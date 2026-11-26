@@ -33,6 +33,7 @@ use crate::{
                 sglang::SglangAdapter,
                 vllm::{VllmAdapter, VllmPrefillInfo},
                 vllm_moriio::VllmMoriioAdapter,
+                vllm_moriio_write::VllmMoriioWriteAdapter,
                 BackendAdapter, PairCtx,
             },
             planner::DefaultPlanner,
@@ -390,6 +391,13 @@ impl PDRouter {
                 if ctx.router_config.vllm_kv_connector == VllmKvConnector::MoriioRead =>
             {
                 Arc::new(VllmMoriioAdapter)
+            }
+            BackendType::Vllm
+                if ctx.router_config.vllm_kv_connector == VllmKvConnector::MoriioWrite =>
+            {
+                Arc::new(VllmMoriioWriteAdapter::new(
+                    ctx.router_config.vllm_moriio_peers.clone(),
+                ))
             }
             BackendType::Vllm => {
                 let info =
@@ -826,10 +834,12 @@ impl PDRouter {
         };
         // MoRI parses legacy peer addresses embedded in request IDs before explicit
         // metadata. Own the worker ID so a caller cannot override the selected peer.
-        let mori_headers = (self.backend == BackendType::Vllm
-            && self.vllm_kv_connector == VllmKvConnector::MoriioRead)
-            .then(|| {
+        let mori_headers =
+            (self.backend == BackendType::Vllm && self.vllm_kv_connector.is_moriio()).then(|| {
                 let mut headers = headers.cloned().unwrap_or_default();
+                if self.vllm_kv_connector == VllmKvConnector::MoriioWrite {
+                    headers.remove("x-data-parallel-rank");
+                }
                 let id = self.adapter.correlation_id(&ctx).expect("MoRI transfer ID");
                 headers.insert(
                     "x-request-id",
@@ -872,9 +882,12 @@ impl PDRouter {
                 }
                 let correlation = self.adapter.correlation_id(&ctx);
                 if matches!(self.backend, BackendType::Vllm)
-                    && self.vllm_kv_connector == VllmKvConnector::Mooncake
+                    && matches!(
+                        self.vllm_kv_connector,
+                        VllmKvConnector::Mooncake | VllmKvConnector::MoriioWrite
+                    )
                 {
-                    self.dispatch_vllm_mooncake_internal(
+                    self.dispatch_vllm_push_internal(
                         headers,
                         body,
                         decode_body,
@@ -902,9 +915,9 @@ impl PDRouter {
         crate::core::AttachedBody::wrap_response(response, placement)
     }
 
-    /// Core vLLM Mooncake dispatch: fire P as background task, stream D response back to client.
+    /// Core vLLM push dispatch: fire P as background task, stream D response back to client.
     #[allow(clippy::too_many_arguments)]
-    async fn dispatch_vllm_mooncake_internal(
+    async fn dispatch_vllm_push_internal(
         &self,
         headers: Option<&HeaderMap>,
         prefill_request_json: Value,
@@ -2412,7 +2425,7 @@ mod tests {
                 )
                 .unwrap();
             let response = router
-                .dispatch_vllm_mooncake_internal(
+                .dispatch_vllm_push_internal(
                     None,
                     json!({}),
                     json!({"fail":fail}),
