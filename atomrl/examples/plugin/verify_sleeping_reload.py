@@ -7,11 +7,15 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import ray
 from atomrl.engine.inference.atom_ray_server import ATOMReplicaManager
 from atomrl.plugin._megatron_hooks import update_weight_post_write
+from atomrl.plugin.verl.register import ATOMRolloutAdapter
+from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
 
@@ -70,7 +74,25 @@ def main() -> None:
             raise RuntimeError(
                 "generation after sleeping weight reload returned no tokens"
             )
-        print("sleeping ATOM weight reload verification passed")
+
+        weights = {}
+        for checkpoint in sorted(Path(args.model).glob("*.safetensors")):
+            weights.update(load_file(checkpoint))
+        if not weights:
+            raise RuntimeError(f"no safetensors weights found under {args.model}")
+
+        adapter = ATOMRolloutAdapter.__new__(ATOMRolloutAdapter)
+        adapter._manager = manager
+        adapter._weight_version = 0
+        manager.sleep_all(level=2)
+        asyncio.run(adapter.update_weights(iter(weights.items())))
+
+        output = ray.get(manager.servers[0].generate.remote(prompt, sampling))
+        if not output["token_ids"]:
+            raise RuntimeError(
+                "generation after verl sleeping weight reload returned no tokens"
+            )
+        print("sleeping ATOM weight reload verification passed for hooks and verl")
     finally:
         manager.shutdown()
         ray.shutdown()

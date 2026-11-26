@@ -210,6 +210,15 @@ def test_framework_lifecycle_accepts_model_name_and_drops_unsupported_dtype(
     assert "dtype" not in manager.kwargs["engine_kwargs"]
 
 
+def test_slime_unlimited_concurrency_uses_atom_capacity():
+    lifecycle = importlib.import_module("atomrl.plugin._lifecycle")
+    kwargs = lifecycle.default_engine_kwargs(
+        SimpleNamespace(sglang_server_concurrency=0, max_num_seqs=64),
+        "slime",
+    )
+    assert kwargs["max_num_seqs"] == 64
+
+
 def test_lifecycle_cleans_up_when_create_or_injection_fails(monkeypatch):
     lifecycle = importlib.import_module("atomrl.plugin._lifecycle")
 
@@ -240,6 +249,23 @@ def test_lifecycle_cleans_up_when_create_or_injection_fails(monkeypatch):
             {},
         )
     assert _FakeManager.instances[-1].stopped
+
+
+def test_lifecycle_teardown_clears_manager_when_shutdown_fails():
+    lifecycle = importlib.import_module("atomrl.plugin._lifecycle")
+
+    class FailingShutdownManager(_FakeManager):
+        def shutdown(self):
+            self.stopped = True
+            raise RuntimeError("shutdown failed")
+
+    args = SimpleNamespace(_atomrl_atom_manager=FailingShutdownManager())
+    lifecycle.teardown_args_manager(args)
+    assert args._atomrl_atom_manager is None
+
+    adapter = SimpleNamespace(_manager=FailingShutdownManager())
+    lifecycle.teardown_adapter_manager(adapter)
+    assert adapter._manager is None
 
 
 @pytest.mark.parametrize("framework", ("vime", "miles", "slime"))
@@ -486,7 +512,11 @@ def test_verl_weight_sync_uses_scoped_checkpoint(monkeypatch):
         )
     )
 
-    assert adapter._manager.reloaded
+    assert adapter._manager.events == [
+        ("wake", ["weights"]),
+        ("reload", adapter._manager.reloaded[0]),
+        ("wake", ["kv_cache"]),
+    ]
     assert written_paths and not written_paths[0].parent.exists()
 
 

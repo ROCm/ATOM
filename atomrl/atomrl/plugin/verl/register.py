@@ -86,7 +86,9 @@ class ATOMRolloutAdapter:
             prefix=f"atomrl-verl-v{self._weight_version:06d}-"
         ) as weight_dir:
             save_file(state_dict, f"{weight_dir}/model.safetensors")
+            self._manager.wake_all(tags=["weights"])
             self._manager.reload_weights_from_path(weight_dir)
+            self._manager.wake_all(tags=["kv_cache"])
 
     async def release(self) -> None:
         if self._manager is not None:

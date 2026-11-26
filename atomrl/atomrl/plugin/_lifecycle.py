@@ -24,12 +24,14 @@ def default_engine_kwargs(args: Any, framework: str) -> dict[str, Any]:
     """Build public ATOM engine kwargs from a host framework's arguments."""
     kwargs: dict[str, Any] = {}
     if framework == "slime":
-        tp = getattr(args, "sglang_tp_size", None) or getattr(
-            args, "tensor_model_parallel_size", 1
-        )
-        max_seqs = getattr(args, "sglang_server_concurrency", None) or getattr(
-            args, "max_num_seqs", 256
-        )
+        tp = getattr(args, "sglang_tp_size", None)
+        if tp in (None, 0):
+            tp = getattr(args, "tensor_model_parallel_size", 1)
+        max_seqs = getattr(args, "sglang_server_concurrency", None)
+        if max_seqs in (None, 0):
+            # SGLang uses zero for unlimited concurrency. ATOM requires a
+            # finite positive capacity, so preserve its configured capacity.
+            max_seqs = getattr(args, "max_num_seqs", 256)
     else:
         tp = getattr(args, "tensor_model_parallel_size", 1)
         max_seqs = getattr(args, "max_num_seqs", 256)
@@ -114,8 +116,8 @@ def teardown_args_manager(args: Any) -> None:
     manager = getattr(args, "_atomrl_atom_manager", None)
     if manager is None:
         return
-    manager.shutdown()
     args._atomrl_atom_manager = None
+    _shutdown_best_effort(manager)
 
 
 def setup_adapter_manager(
@@ -148,5 +150,5 @@ def teardown_adapter_manager(adapter: Any) -> None:
     manager = getattr(adapter, "_manager", None)
     if manager is None:
         return
-    manager.shutdown()
     adapter._manager = None
+    _shutdown_best_effort(manager)
