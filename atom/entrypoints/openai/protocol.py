@@ -122,10 +122,10 @@ def resolve_prompt_token_ids(
     return ids
 
 
-#: P/D wire form of a pre-tokenized prompt: base64 of little-endian uint32,
-#: one JSON string instead of a JSON list of 100K+ ints. Read only with
-#: ATOM_PROMPT_IDS_B64=1 (ignored otherwise, like any unknown field). The
-#: same format as the exact-tokenizer front's ATOM_FRONT_IDS_B64.
+#: P/D wire form of a pre-tokenized prompt: one JSON string instead of a JSON
+#: list of 100K+ ints, the base64 of ``array("I", ids).tobytes()`` (uint32,
+#: little-endian). Read with ATOM_PROMPT_IDS_B64=1, the default; with "0" it
+#: is ignored, like any unknown field.
 PROMPT_TOKEN_IDS_B64 = "prompt_token_ids_b64"
 _INT32_MAX = 2**31 - 1
 assert array.array("i").itemsize == 4

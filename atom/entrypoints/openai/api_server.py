@@ -2278,14 +2278,17 @@ async def _chat_completions(
         is_multimodal = has_media and not (
             pretokenized is not None and leaves_media_on_prefill(kv_transfer_params)
         )
-        # ATOM_PROMPT_IDS_B64: the caller sent these ids itself, and the PD
-        # router forwards that same field to decode. Echoing them as a JSON
-        # list would have the router carry a second copy into decode's
-        # kv_transfer_params, which decode then has to parse and compare.
-        # A multimodal prefill still echoes: its ids have the image
-        # placeholders expanded, which the decode leg needs.
+        # ATOM_PROMPT_IDS_B64 on a P/D prefill leg: the caller sent these ids
+        # itself, and the PD router forwards that same field to decode.
+        # Echoing them as a JSON list would have the router carry a second
+        # copy into decode's kv_transfer_params, which decode then has to
+        # parse and compare. Any other request (a single server's
+        # `return_token_ids`) still echoes, and so does a multimodal prefill:
+        # its ids have the image placeholders expanded, which decode needs.
         echo_ids = bool(request.return_token_ids) and not (
-            request.prompt_ids_from_b64() and not has_media
+            request.prompt_ids_from_b64()
+            and not has_media
+            and bool((kv_transfer_params or {}).get("do_remote_decode"))
         )
         if assistant_prefix is not None and (is_multimodal or pretokenized is not None):
             # Only rendered text can be continued.

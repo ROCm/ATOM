@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """``prompt_token_ids_b64`` (ATOM_PROMPT_IDS_B64): the P/D decode-ingest fast path."""
 
@@ -26,7 +27,7 @@ MESSAGES = [{"role": "user", "content": "hi"}]
 
 
 def encode(ids):
-    """The exact-tokenizer front's `prompt_ids_codec.encode_ids`."""
+    """The wire format: base64 of `array("I", ids).tobytes()`, uint32 LE."""
     a = array.array("I", ids)
     if a.itemsize != 4:  # pragma: no cover - every supported host
         pytest.skip("array('I') is not 32-bit here")
@@ -160,7 +161,8 @@ class TestRequestModel:
             )
 
     def test_on_kv_carried_ids_are_checked_against_b64(self, b64_on):
-        # An unpatched P still echoes the ids; the router carries them to D.
+        # Ids the router carried to D in kv_transfer_params must agree with
+        # the b64 prompt on a text decode leg.
         ok = ChatCompletionRequest.model_validate(
             {
                 "messages": MESSAGES,
@@ -295,6 +297,26 @@ class TestHandler:
         assert isinstance(sent, array.array) and sent.tolist() == PROMPT_IDS
         assert kwargs["return_token_ids"] is False
         assert response.json()["prompt_token_ids"] is None
+
+    def test_single_server_request_still_echoes_b64_ids(self, server, b64_on):
+        # No do_remote_decode: not a P/D prefill leg, so return_token_ids is
+        # honoured even though the ids came as b64.
+        response = _post(
+            {
+                "model": "m",
+                "messages": MESSAGES,
+                PROMPT_TOKEN_IDS_B64: encode(PROMPT_IDS),
+                "return_token_ids": True,
+                "stream": False,
+                "max_tokens": 1,
+            }
+        )
+        assert response.status_code == 200, response.text
+        assert server.templates == 0
+        sent, kwargs = server.generate[0]
+        assert isinstance(sent, array.array) and sent.tolist() == PROMPT_IDS
+        assert kwargs["return_token_ids"] is True
+        assert response.json()["prompt_token_ids"] == PROMPT_IDS
 
     def test_off_renders_and_echoes_as_before(self, server, b64_off):
         response = _post(

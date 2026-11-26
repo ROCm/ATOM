@@ -1391,11 +1391,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FRONTEND_PREFIX_HASH": lambda: (
         os.getenv("ATOM_FRONTEND_PREFIX_HASH", "1") == "1"
     ),
-    # Read a chat request's `prompt_token_ids_b64` (base64 of uint32 LE, from
-    # the exact-tokenizer front's ATOM_FRONT_IDS_B64) instead of a JSON id
-    # list, and do not echo those ids back to the PD router (it already sends
-    # the same field to decode). A request without the field is unchanged.
-    # "0": the field is ignored.
+    # Read a chat request's `prompt_token_ids_b64` (base64 of
+    # `array("I", ids).tobytes()`, uint32 little-endian) instead of a JSON id
+    # list. A P/D prefill leg (`do_remote_decode`) whose ids came this way does
+    # not echo them to the PD router, which already sends the same field to
+    # decode; every other request keeps its `return_token_ids` echo. A request
+    # without the field is unchanged. Enable on P and D together (a mixed
+    # setup is not supported); both share this default. "0": the field is
+    # ignored.
     "ATOM_PROMPT_IDS_B64": lambda: os.getenv("ATOM_PROMPT_IDS_B64", "1") == "1",
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
