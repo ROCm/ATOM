@@ -22,8 +22,11 @@ are closed"); read the caveats first.
    interactivity does not at c32 and c64** (77% and 64-74%); the remaining gap is the decode step (+1.5 ms) at c32 and
    prefill/queueing at c64. This recipe is not yet the user's target of >= 85% on both.
 4. The GSM8K gate margin is thin (pooled 8 runs 0.9629 against a 0.9626 line, see "Accuracy gate").
-5. #3510/#3511 are cherry-picked onto public main (they sit on a 55-commit private branch); the recipe needs one
-   extra one-line fix and one env entry that are not in any PR yet (see "Commits needed from #3510/#3511").
+5. The measured trees carry #3510/#3511 as cherry-picks of the earlier 55-commit-branch commits (`2e833df17`,
+   `ad44f6d0f`), whose SP MoE chain imports a private `atom.model_ops.minimax_m3.flydsl_moe` package that public main
+   does not have. The PR heads are now single commits on main (#3510 `e7c63d7a9`, #3511 `7c403a3e5`) that import the
+   chain from aiter (`aiter.ops.flydsl.kernels.minimax_m3_moe_prefill`, ROCm/aiter#8699, draft) instead; the numbers
+   below were not repeated with those ported imports (see "Commits needed from #3510/#3511").
 6. The aiter side is the image's aiter plus the listed PRs; three of them (#8548 stack, #8555, #8584 now #8582) carry
    conflict resolutions that the stack builder did by hand (see "Divergences from the PR heads").
 7. aiperf reports `grace_timeout=True` at c64 for these arms and for the reference (in-flight requests at cutoff,
@@ -139,13 +142,15 @@ aiter (aiter main `c7d4f9fe1` as the base of the builds; open PRs as of 2026-11-
    these four and is the final decode-MoE interface (`fused_moe(shared_folded=True)`, tuned rows, `--decode-chain`
    tuner); the old #3787 head used the mega_moe_tp ops directly.
 2. `#8675` (small-M BF16 ring GEMM, policies `rg` for lm_head and `rk` for the DSpark draft fc, selected by `tgemm`
-   tuned rows; it replaces the closed #8554/#8573), `#8574` (pull all-reduce + Gemma RMSNorm).
+   tuned rows; only the `rk` rows are reached from ATOM today: the `rg` rows need a preshuffled lm_head weight passed
+   with `is_shuffled=True`, and `ParallelLMHead.local_logits` still passes the row-major weight, so the lm_head ring
+   needs a separate thin ATOM change that is not in any PR; it replaces the closed #8554/#8573), `#8574` (pull all-reduce + Gemma RMSNorm).
 3. `#8575` (sparse decode attention: all-wave merge, in-kernel index top-16, MXFP8 `quant_out`; it contains the closed
    #8577 and #8604).
 4. `#8472` (HIP `fused_qknorm_idxrqknorm`: DPP exchanges, xor-atomic V nibbles, hardware converts, NVFP4 insert, prefill
    variant; it contains the closed #8473, #8576 and #8580).
 5. `#8578 -> #8582` (o_proj_full 8-wave picks; persistent 4-wave GEMM, tuner backend and o_proj_full rows; #8582
-   contains the closed #8584, including the inference-tensor scale-cache-key fix), `#8599` (MXFP8 small-M config rows).
+   contains the closed #8584, including the inference-tensor scale-cache-key fix), (`#8599`, MXFP8 small-M config rows, is not in the measured trees and not in the recipe: see below).
 6. `#8581` (prefill top-16 selector inside `topk_per_row_small_k`; present, flag off).
 7. `#8607` (draft) for the QKV front chain: one op, 1-64 rows one launch and 65-128 rows split-K, reading plain
    row-major activation codes from `per_group_quant_hip`. The closed #8606 (shuffled quantizer), #8610 and #8611 are
@@ -153,7 +158,7 @@ aiter (aiter main `c7d4f9fe1` as the base of the builds; open PRs as of 2026-11-
 
 Not part of the recipe: #8587 (HIP general `all_to_all` / `all_to_all_buffer`, MXFP8 all-to-all; used by ATOM #3812
 only, c32 +0.1..0.6%, no flag), attention quant-out (ATOM #3806 with the `quant_out` of #8575: no gain), #8598 (merged,
-lm_head tuned rows) / #8599 (tuned CSV rows, kernel-level only).
+lm_head tuned rows) / #8599 (tuned CSV rows, kernel-level only; the 069 stack tree `stack069/aiter-F` has no #8599 merge, so no measured arm used its rows).
 
 ### PRs the builds used that are closed
 
@@ -164,7 +169,7 @@ kernel family:
 |---|---|---|
 | aiter #8473, #8576, #8580 | NVFP4 converts, FlyDSL NVFP4 insert, DPP / xor-atomic V in `fused_qknorm_idxrqknorm` | #8472 |
 | aiter #8551, #8552 | decode router GEMM split-K, 128-row n-blocks kernel | #8548 |
-| aiter #8554, #8573 | small-M BF16 ring GEMM (lm_head), DSpark fc ring | #8675 (ATOM needs no call site: ATOM #3776 and #3786 are closed, the rows are picked by `tgemm`) |
+| aiter #8554, #8573 | small-M BF16 ring GEMM (lm_head), DSpark fc ring | #8675 (draft fc: ATOM needs no call site, the `rk` rows are picked by `tgemm`; lm_head: the `rg` rows need a preshuffled weight and ATOM passes the row-major one, so the lm_head ring is not reached; ATOM #3776 and #3786 are closed) |
 | aiter #8577, #8604 | index top-16 in the attention, `quant_out` | #8575 |
 | aiter #8584 | 4-wave backend, o_proj_full rows | #8582 |
 | aiter #8606, #8610, #8611 | MXFP8 shuffled quantizer, split-3 GEMM, reduce + insert | #8607 (#8606 withdrawn) |
@@ -175,8 +180,9 @@ ATOM (main `d0dec1480`):
 2. `#3775` (scheduler policies), `#3783` (prefill token graphs), `#3784` (mono row cap), `#3785` (fused index select,
    needs aiter #8575), `#3789` (draft block batch ladder), `#3788` (prefill top-16; code present,
    `ATOM_M3_PREFILL_TOPK_FLYDSL=0`, needs aiter #8581). `#3776` (LM head ring) and `#3786` (draft fc ring) are closed:
-   the ring GEMMs are reached through aiter #8675's tuned rows, so `ATOM_LM_HEAD_RING` / `ATOM_DSPARK_FC_RING` exist
-   only in the measured trees, not in a live PR. Note the measured trees called the draft fc ring through `fc_taps`
+   the draft fc ring is reached through aiter #8675's `rk` tuned rows, while the lm_head ring (`rg`) is not reached
+   from ATOM until it keeps the lm_head weight shuffled with `is_shuffled=True`; `ATOM_LM_HEAD_RING` /
+   `ATOM_DSPARK_FC_RING` exist only in the measured trees, not in a live PR. Note the measured trees called the draft fc ring through `fc_taps`
    (#3786); #3723's `write_context_kv` calls `self.fc` directly and bypassed `fc_taps`, so the ring was not on that
    fused path there. Whether the tuned-row route covers that call is not measured.
 3. `#3787` (decode MoE chain; the measured head `a779e6967` needs aiter #8548-#8556; the rewrite onto aiter #8676
@@ -190,16 +196,22 @@ ATOM (main `d0dec1480`):
 
 ### Commits needed from #3510/#3511
 
-Public main does not have the 55-commit branch the two PRs are stacked on. The recipe uses exactly two commits of it:
-`2e833df17` (#3510, prefill DBO under pure TP; code only, not enabled) and `ad44f6d0f` (#3511, sequence-parallel
-prefill under pure TP), cherry-picked in that order onto main. Two things are needed on top of them and are in no PR
-yet:
+What the measured trees used: two cherry-picked commits of the 55-commit private branch, `2e833df17` (#3510, prefill
+DBO under pure TP; code only, not enabled) and `ad44f6d0f` (#3511, sequence-parallel prefill under pure TP), in that
+order, on a tree that also contains the private `atom/model_ops/minimax_m3/flydsl_moe` package that `ad44f6d0f`
+imports (public main has no such package: those two commits alone fail at the first eligible SP prefill).
 
-- **`moe.fhmoe` getattr fix**: `atom/models/minimax_m3/sp_prefill.py` `_expert_tables` reads `moe.fhmoe` but the FHMoE
-  integration commits are not on main, so the attribute does not exist. The one-line fix is
-  `if getattr(moe, "fhmoe", None) is not None:` (without it the SP warm-up crashes with an `AttributeError`).
-- **`ATOM_M3_INDEXER_CP_MIN_BATCH`**: the cherry-picked #3511 commit needs this entry in `atom/utils/envs.py` (it is
-  defined on the 55-commit base branch): `int(os.environ[...]) if "..." in os.environ else None`.
+What a public build should use instead: the current PR heads, #3510 `e7c63d7a9` then #3511 `7c403a3e5` (single commits
+on main). #3511 ports the imports to aiter's `minimax_m3_moe_prefill` package and needs **ROCm/aiter#8699** (draft; it
+is not in the aiter list above because no measured arm contained it). The dependent patches (#3805, #3807, #3811,
+#3812) are stacked on the old private base, so before reproducing the numbers they have to be re-applied on the new
+heads; that rebase and a re-measurement with the ported imports have not been done.
+
+- **`moe.fhmoe`**: `_expert_tables` in `sp_prefill.py` read `moe.fhmoe`, which main does not have (the FHMoE
+  integration commits are not on main). ATOM #3811 is the one-line `getattr(moe, "fhmoe", None)` fix, a published PR;
+  the measured trees had it as a local commit.
+- `ATOM_M3_INDEXER_CP_MIN_BATCH` needs no entry: nothing in main + #3510 + #3511 reads it (ATOM #3811's body corrects
+  the earlier note that said it did).
 - #3805's cherry-pick also drops two `fhmoe` context lines (the changed lines are identical to the PR head).
 
 ### Divergences from the PR heads (what the measured trees contain that a clean merge of the PR heads would not)
@@ -208,7 +220,7 @@ The FsW tree is main + the merges above. The following are not byte-identical me
 
 | Where | Divergence |
 |---|---|
-| ATOM #3510/#3511 | cherry-picks (not the PR commits); #3511 commit carries the extra envs entry above; local commit `db9e767b6` (getattr fix) is in no PR |
+| ATOM #3510/#3511 | cherry-picks of the old private-branch commits (not the current PR heads); local commit `db9e767b6` is the `moe.fhmoe` getattr fix, now ATOM #3811 |
 | ATOM #3805 | cherry-pick, `fhmoe` context lines dropped; changed lines identical to `6ec5724d5` |
 | ATOM #3807 | identical patch to `8633fa102` |
 | ATOM #3809/#3810 | net diff `3598884c3..03c20fecc` applied with a union resolution in the SP files; changed lines identical to the PR heads, `qkv_chain.py`/tests byte-identical |
@@ -233,7 +245,7 @@ ATOM PRs (ROCm/ATOM):
 | `ATOM_M3_PREFILL_TOKEN_GRAPH`, `ATOM_TOKEN_GRAPH_SIZES` | `1`, `256,512,1024` | #3783 (`ATOM_TOKEN_GRAPH_SIZES` is on main, default `256,512,1024,2048,3072`) |
 | `ATOM_MONO_MAX_ROWS` | `8` | #3784 |
 | `ATOM_DSPARK_BLOCK_BS_LADDER` | `1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64` | #3789 |
-| `ATOM_LM_HEAD_RING` | `1` (measured trees only) | ATOM #3776 is closed; aiter #8675 tuned rows (`rg`) replace it, no ATOM flag |
+| `ATOM_LM_HEAD_RING` | `1` (measured trees only) | ATOM #3776 is closed; aiter #8675 has `rg` rows but they need a preshuffled lm_head weight, which ATOM does not pass yet: no live replacement |
 | `ATOM_DSPARK_FC_RING` | `1` (measured trees only) | ATOM #3786 is closed; aiter #8675 tuned rows (`rk`) replace it, no ATOM flag |
 | `ATOM_M3_FUSED_INDEX_SELECT` | `1` | #3785 and aiter #8575 |
 | `ATOM_M3_DECODE_MOE` | `1` (c8-c32), `0` (c64) | old #3787 head and aiter #8548-#8556; the #3787 rewrite on aiter #8676 drops the flag |
