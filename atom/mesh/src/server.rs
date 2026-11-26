@@ -41,7 +41,7 @@ use crate::{
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
-        atom_standalone::AtomStandaloneRuntime,
+        atom_bridge::AtomBridgeRuntime,
         comm::{conversations, parse, tokenize},
         ingress::EndpointSpec,
         router_manager::RouterManager,
@@ -251,6 +251,13 @@ async fn kv_event_sources(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+async fn kv_storage_sources(State(state): State<Arc<AppState>>) -> Response {
+    match &state.context.kv_storage {
+        Some(storage) => Json(storage.status(&state.context.client).await).into_response(),
+        None => (StatusCode::NOT_FOUND, "KV events are off (--kv-events)").into_response(),
+    }
+}
+
 async fn get_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
@@ -356,7 +363,7 @@ pub struct ServerConfig {
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
     pub tls: Option<ServerTlsConfig>,
-    pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    pub atom_bridge_runtime: Option<Arc<AtomBridgeRuntime>>,
 }
 
 pub fn build_app(
@@ -412,6 +419,7 @@ pub fn build_app(
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
         .route("/kv_events/sources", get(kv_event_sources))
+        .route("/kv_storage/sources", get(kv_storage_sources))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
         // Tokenizer management endpoints
@@ -552,7 +560,7 @@ async fn serve_with_prepare_pool(
         )
         .await?
         .prepare_pool(prepare_pool)
-        .atom_standalone_runtime(config.atom_standalone_runtime.clone())
+        .atom_bridge_runtime(config.atom_bridge_runtime.clone())
         .build()
         .map_err(|e| e.to_string())?,
     );
@@ -598,9 +606,15 @@ async fn serve_with_prepare_pool(
             .get()
             .expect("JobQueue should be initialized");
 
+        // The Rust frontend prepares every request for the one served model,
+        // by that name.
+        let name = config
+            .atom_bridge_runtime
+            .as_ref()
+            .map_or_else(|| tokenizer_source.clone(), |r| r.served_model_name.clone());
         let tokenizer_config = TokenizerConfigRequest {
             id: TokenizerRegistry::generate_id(),
-            name: tokenizer_source.clone(),
+            name,
             source: tokenizer_source.clone(),
             chat_template_path: config.router_config.chat_template.clone(),
             cache_config: config.router_config.tokenizer_cache.to_option(),

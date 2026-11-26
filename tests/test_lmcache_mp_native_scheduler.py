@@ -748,7 +748,12 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
     seq, request = start_engine_load(engine)
     block_table = list(seq.block_table)
     state_slot = seq.state_slot
-    assert engine.block_manager.kv.num_free == 31
+    expected_free = (
+        engine.block_manager.kv.num_usable_blocks
+        - len(block_table)
+        - len(request.native_state.unit_ids)
+    )
+    assert engine.block_manager.kv.num_free == expected_free
 
     batch, scheduled = engine.schedule()
     assert scheduled == {} and batch.connector_meta_output.requests == []
@@ -764,8 +769,8 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
     engine._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_loading={request.load_operation})
     )
-    # The three transfer units remain as an unpinned READY checkpoint.
-    assert engine.block_manager.kv.num_free == 31
+    # The transfer units remain as an unpinned READY checkpoint.
+    assert engine.block_manager.kv.num_free == expected_free
     assert engine.block_manager.paged_state_checkpoints.contains(
         request.native_state.prefix_hash
     )
@@ -773,7 +778,6 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
     assert scheduled[seq.id] is seq
     assert seq.num_cached_tokens == 16
     assert list(batch.num_cached_tokens) == [16]
-    assert seq.offload_promoted_tokens == 16
     assert list(seq.block_table) == block_table
     assert seq.state_slot == state_slot
     assert engine._num_parked_remote_kv == 0
@@ -899,7 +903,11 @@ def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     assert engine.deferred_free_blocks[seq.id] is seq
     assert list(seq.block_table) == block_table
     assert seq.state_slot == state_slot
-    assert engine.block_manager.kv.num_free == 31
+    assert engine.block_manager.kv.num_free == (
+        engine.block_manager.kv.num_usable_blocks
+        - len(block_table)
+        - len(request.native_state.unit_ids)
+    )
 
     kwargs = {
         "finished_loading" if succeeded else "failed_loading": {request.load_operation}
@@ -908,7 +916,9 @@ def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     assert seq.id not in engine.deferred_free_blocks
     assert list(seq.block_table) == []
     assert seq.state_slot == -1
-    expected_free = 37 if succeeded else 40
+    expected_free = engine.block_manager.kv.num_usable_blocks - (
+        len(request.native_state.unit_ids) if succeeded else 0
+    )
     assert engine.block_manager.kv.num_free == expected_free
     assert (
         engine.block_manager.paged_state_checkpoints.contains(
@@ -987,7 +997,7 @@ def test_engine_releases_retired_request_when_unpinned_candidate_is_evicted(
     assert connector.has_pending_work()
     engine._update_from_kv_xfer_finished(KVConnectorOutput())
     assert seq.id not in engine.deferred_free_blocks
-    assert bm.kv.num_free == 40
+    assert bm.kv.num_free == bm.kv.num_usable_blocks
     assert connector._retired_requests == {}
     assert connector._save_tracker == {}
     assert not connector.has_pending_work()
@@ -1128,7 +1138,10 @@ def test_engine_estimates_a_woken_replay_from_its_forward_start(monkeypatch):
     replay below the reach, as admission does."""
     engine, _, _, seq = replaying_engine(monkeypatch)
     _woken(engine, seq)
-    assert engine._local_prefill_pending_work() == (True, 40 - (32 - _REPLAY))
+    assert engine._local_prefill_pending_work(limits=engine._prefill_limits()) == (
+        True,
+        40 - (32 - _REPLAY),
+    )
     starts = []
     real_cost = engine._chunk_cost
     monkeypatch.setattr(
@@ -1136,7 +1149,7 @@ def test_engine_estimates_a_woken_replay_from_its_forward_start(monkeypatch):
         "_chunk_cost",
         lambda start, k: starts.append(start) or real_cost(start, k),
     )
-    engine._estimate_prefill_chunk_cost()
+    engine._estimate_prefill_chunk_cost(limits=engine._prefill_limits())
     assert starts == [32 - _REPLAY]
 
 

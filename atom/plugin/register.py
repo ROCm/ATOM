@@ -52,6 +52,7 @@ _ATOM_SUPPORTED_MODELS = _LazyModelRegistry(
         "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGenerationTextOnly",
         "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGenerationTextOnly",
         "Qwen4ExpForConditionalGeneration": "atom.models.qwen4_exp:Qwen4ExpForConditionalGeneration",
+        "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.runtime:DeepseekV41RuntimeModel",
     }
 )
 
@@ -107,6 +108,9 @@ def _register_custom_attention_to_sglang() -> None:
     from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
         ATOMDeepseekV4BackendForSgl,
     )
+    from atom.plugin.sglang.attention_backend.deepseek_v41_backend import (
+        ATOMDeepseekV41BackendForSgl,
+    )
     from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
         ATOMAttnBackendForSgl,
     )
@@ -117,6 +121,7 @@ def _register_custom_attention_to_sglang() -> None:
     from atom.plugin.sglang.attention_backend.kimi_k3_backend import (
         ATOMKimiK3BackendForSgl,
     )
+    from atom.plugin.sglang.deepseek_v41_bridge import is_deepseek_v41_config
     from atom.plugin.sglang.kimi_k3_bridge import is_kimi_k3_config
     from atom.plugin.sglang.runtime import is_glm52_dsa_config
 
@@ -142,6 +147,10 @@ def _register_custom_attention_to_sglang() -> None:
     def create_atom_backend(runner):
         hf_config = runner.model_config.hf_config
         arches = getattr(hf_config, "architectures", None) or []
+        # Before the V4 check: SGLang renames V4.1 to DeepseekV4ForCausalLM.
+        if is_deepseek_v41_config(hf_config):
+            logger.info("Use ATOMDeepseekV41BackendForSgl (aiter backend choice)")
+            return ATOMDeepseekV41BackendForSgl(runner)
         if any("DeepseekV4" in str(arch) for arch in arches):
             logger.info(
                 "Use ATOMDeepseekV4BackendForSgl for DeepSeek-V4 through SGLang aiter backend choice"
@@ -158,6 +167,9 @@ def _register_custom_attention_to_sglang() -> None:
 
     @register_attention_backend("dsv4")
     def create_dsv4_backend(runner):
+        if is_deepseek_v41_config(runner.model_config.hf_config):
+            logger.info("Create ATOMDeepseekV41BackendForSgl (dsv4 backend choice)")
+            return ATOMDeepseekV41BackendForSgl(runner)
         logger.info(
             "Create ATOMDeepseekV4BackendForSgl through SGLang dsv4 backend choice"
         )
@@ -356,6 +368,10 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
     def _is_dsv4_or_glm52_runner(runner) -> bool:
         return _is_dsv4_runner(runner) or _is_glm52_runner(runner)
 
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        _is_v41_runner as _is_dsv41_runner,
+    )
+
     def _uses_glm52_generic_draft_frontend(runner) -> bool:
         model = getattr(runner, "model", None)
         return bool(getattr(model, "_atom_glm52_uses_generic_draft_frontend", False))
@@ -452,8 +468,22 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
         def can_run(self, forward_batch):
             try:
-                model_runner = getattr(self, "model_runner", None)
-                is_supported_model = _is_dsv4_or_glm52_runner(model_runner)
+                # Both model checks are decided once per graph runner (its
+                # model runner is fixed), not on every decode / verify step.
+                # DeepSeek-V4.1 shares V4's architecture name in SGLang but
+                # stages its own graphs (verify and DSpark draft block,
+                # `deepseek_v41_bridge`); the V4 verify-graph knobs below are
+                # not its.
+                verdict = self.__dict__.get("_atom_v4_graph_knobs")
+                if verdict is None:
+                    model_runner = getattr(self, "model_runner", None)
+                    verdict = (
+                        _is_dsv4_or_glm52_runner(model_runner)
+                        and not _is_dsv41_runner(model_runner),
+                        _is_glm52_runner(model_runner),
+                    )
+                    self._atom_v4_graph_knobs = verdict
+                is_supported_model, is_glm52 = verdict
                 mode = getattr(forward_batch, "forward_mode", None)
                 is_target_verify = bool(
                     getattr(mode, "is_target_verify", lambda: False)()
@@ -467,7 +497,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 # that replay on for every supported model; a 6-token prompt
                 # then faults inside the replayed kernel. Eager verify uses
                 # the live length. DeepSeek-V4 still follows the flag.
-                if _is_glm52_runner(model_runner) and is_target_verify:
+                if is_glm52 and is_target_verify:
                     return False
                 if (
                     is_supported_model

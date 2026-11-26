@@ -308,17 +308,31 @@ def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
 
 
 def _build_atom_speculative_config_from_sglang(server_args: Any, hf_config: Any):
-    """SGLang EAGLE/NEXTN → ATOM ``SpeculativeConfig``.
+    """SGLang speculative decoding → ATOM ``SpeculativeConfig``.
 
-    Native Qwen4Exp returns the unmixed HC bundle only when
-    ``atom_config.speculative_config is not None``. SGLang owns scheduling;
-    this object is that ABI flag plus the Native draft-token horizon
-    (``speculative_num_steps``, not SGLang's ``steps+1`` draft-token count).
+    DeepSeek-V4.1 (DSPARK only): native DSpark's config (method ``dspark``,
+    five drafts, the target checkpoint; `build_v41_dspark_speculative_config`),
+    which sizes the V4.1 pool for the drafts and builds the draft.
+
+    Qwen4Exp (EAGLE/NEXTN): native Qwen4Exp returns the unmixed HC bundle
+    only when ``atom_config.speculative_config is not None``. SGLang owns
+    scheduling; this object is that ABI flag plus the Native draft-token
+    horizon (``speculative_num_steps``, not SGLang's ``steps+1`` draft-token
+    count). Every other model: None.
     """
     algo = getattr(server_args, "speculative_algorithm", None)
     name = str(getattr(algo, "name", algo)).strip().upper()
     if name in {"", "NONE", "NULL", "FALSE"}:
         return None
+
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        build_v41_dspark_speculative_config,
+        is_deepseek_v41_config,
+    )
+
+    if is_deepseek_v41_config(hf_config):
+        # Native DSpark (`dspark`, five drafts, the target checkpoint).
+        return build_v41_dspark_speculative_config(server_args, hf_config)
 
     text = getattr(hf_config, "text_config", None) or hf_config
     if getattr(text, "model_type", None) not in {"qwen4_exp", "qwen4_exp_text"}:
@@ -388,8 +402,9 @@ def _vllm_kv_transfer_config(config: Any) -> dict:
     # defaults alone (`kv_load_failure_policy`, an empty extra-config) made
     # this return a truthy dict -- which every reader takes as "a transport is
     # configured". That is what this docstring has always promised not to do,
-    # and the readers are not all V4.1's: `qwen4_exp_attn` refuses outright on
-    # a truthy value, and `EngineCore` sets `kv_transfer_enabled` from one.
+    # and the readers are not all V4.1's: `qwen4_exp_attn` checks a truthy value
+    # against its offload rules (and refuses it under RapidServe), and
+    # `EngineCore` sets `kv_transfer_enabled` from one.
     if not translated.get("kv_connector"):
         return {}
     return translated
@@ -734,6 +749,19 @@ def _generate_atom_config_from_sglang_config(config: Any):
     atom_kv_cache_dtype = server_args.kv_cache_dtype
     if str(atom_kv_cache_dtype).startswith("fp8"):
         atom_kv_cache_dtype = "fp8"
+    atom_index_cache_dtype = atom_kv_cache_dtype
+
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        is_deepseek_v41_config,
+        sglang_v41_kv_cache_dtype,
+    )
+
+    if is_deepseek_v41_config(sgl_model_config.hf_config):
+        # ATOM owns the pool, in the format the operator named (the raw
+        # value: SGLang resolves "auto" in its own bags); the index plane is
+        # not the main pool's format (None: Config's FP8 default).
+        atom_kv_cache_dtype = sglang_v41_kv_cache_dtype(server_args.kv_cache_dtype)
+        atom_index_cache_dtype = None
 
     atom_speculative_config = _build_atom_speculative_config_from_sglang(
         server_args, sgl_model_config.hf_config
@@ -757,7 +785,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         enforce_eager=True,
         parallel_config=sgl_parallel_config,
         kv_cache_dtype=atom_kv_cache_dtype,
-        index_cache_dtype=atom_kv_cache_dtype,
+        index_cache_dtype=atom_index_cache_dtype,
         enable_prefix_caching=False,
         port=None,
         torch_profiler_dir=None,

@@ -48,6 +48,7 @@ fn canonical_chunks() -> Vec<Result<TokenChunk, EngineError>> {
                 request_id: "req-canonical".to_string(),
                 weight_version: None,
                 cached_tokens: 0,
+                timing: None,
             },
         }),
     ]

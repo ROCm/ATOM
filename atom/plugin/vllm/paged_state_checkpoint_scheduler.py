@@ -428,11 +428,10 @@ class SchedulerStateCheckpoints:
         """Before vLLM frees a request's blocks.
 
         A decode keep stored on the request's last step whose prefix hash was
-        not known yet is hashed now, as native keeps one on a request's last
-        step (a PAGE checkpoint's successor_room is 0); an abort whose closing
-        token never landed drops it, as native skips an aborted seq's hashing; a
-        preempted request (still RUNNING when ``_preempt_request`` frees it)
-        drops it, and like native forgets its last checkpoint position.
+        not known yet is hashed now; an abort whose closing token never landed
+        drops it, as native skips an aborted seq's hashing; a preempted request
+        (still RUNNING when ``_preempt_request`` frees it) drops it, and like
+        native forgets its last checkpoint position.
         """
         rid = request.request_id
         landed = self.landing.pop(rid, None)
@@ -621,9 +620,7 @@ class SchedulerStateCheckpoints:
 
     def _keep_decode(self, request, end: int) -> None:
         """A scheduled decode step on which native's unaimed rule keeps a state
-        checkpoint (native keeps it on the request's last step too: ``_checkpoint_room``
-        is 0 there and a PAGE checkpoint's ``successor_room`` is 0). Hashed as
-        soon as the block's prefix hash exists."""
+        checkpoint. Hashed as soon as the block's prefix hash exists."""
         rid = request.request_id
         idx = end // self.placement.block - 1
         for gid in self.state_checkpoint_gids:

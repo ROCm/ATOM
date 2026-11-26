@@ -464,7 +464,9 @@ _ledger_rc() {  # <rules.txt content, or MISSING> -> exit code of the ledger gat
   [ "$1" = MISSING ] || printf '%s\n' "$1" > "$d/rules.txt"
   : > "$d/verdicts.txt"
   python3 "$S/triage.py" ledger "$d/rules.txt" "$d/verdicts.txt" >/dev/null 2>&1
-  echo $?
+  rc=$?
+  rm -rf "$d"
+  echo $rc
 }
 t "a missing rules.txt is refused by the ledger gate, before this one" \
   "$(_ledger_rc MISSING)" "1"
@@ -584,6 +586,27 @@ _budget_pair() {  # <agent> <budget> -> rc of run_one's precondition
   ( ATOM_AGENT_TIMEOUT=$1 ATOM_RUN_BUDGET=$2 \
     timeout 20 bash "$S/run_one.sh" 0 x/y >/dev/null 2>&1; echo $? )
 }
+# The old gate here forbade any other workflow from using the review runner's label, to
+# prop up a box_busy() that counted only its own runs. That ban cost every review in a repo
+# the day one landed (aiter#8255). What has to hold instead is that watchdog watches the
+# label the job actually runs on -- checked on its own, because a watchdog whose behaviour
+# tests also fail would hide whether this gate still bites.
+_label_gate() {  # <RUNNER_LABEL to plant> -> does check_prompts refuse?
+  r=$(mktemp -d); d="$r/.claude/skills/review-pr"
+  mkdir -p "$d" "$r/.github/workflows"; cp -r "$S"/. "$d/" 2>/dev/null
+  cp "$S/../../../.github/workflows/"*.y*ml "$r/.github/workflows/" 2>/dev/null
+  python3 -c '
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1], "watchdog.py")
+p.write_text(re.sub(r"^RUNNER_LABEL = .[^\"]+.$", "RUNNER_LABEL = \"%s\"" % sys.argv[2],
+                    p.read_text(), count=1, flags=re.M))' "$d" "$1"
+  out=$(python3 "$d/check_prompts.py" 2>&1 | grep -c "is not the review job.s label")
+  rm -rf "$r"
+  printf '%s\n' "$out"
+}
+t "a watchdog watching the wrong label is refused" "$(_label_gate wrong-box)" "1"
+t "and the right one is not" "$(_label_gate atom-bot)" "0"
+
 t "a per-agent timeout that starves the refuter is refused" "$(_budget_pair 5400 7200)" "2"
 
 # A cross-family refuter must be reachable by doing what the comment says. The hook has

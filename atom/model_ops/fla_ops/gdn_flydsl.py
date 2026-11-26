@@ -1,7 +1,9 @@
-"""Optional AITER FlyDSL GDN for the standalone Qwen4Exp backend.
+"""AITER FlyDSL GDN kernels for Qwen3.8-Flash-Next, and the policy that picks them.
 
-ATOM exposes logical KV state views backed by VK storage. No per-token state
-packing, pool-wide transpose, or device-to-host synchronization is required.
+Used by native ATOM and the SGLang and RTP-LLM plugins. Decode updates the pool
+in place through a logical KV view of VK storage; prefill gathers its initial
+states into FP32 VK in one launch. No per-token state packing, pool-wide
+transpose, or device-to-host synchronization is required.
 """
 
 import functools
@@ -21,38 +23,49 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class GDNFlyDSLPolicy:
-    """Resolved at cache binding; decode and physical VK layout are inseparable."""
+    """Which GDN stages run FlyDSL for a layer; `decode` needs VK state storage.
+
+    Native ATOM and the SGLang plugin reuse a fixed policy for the bound state;
+    the RTP-LLM plugin resolves it on every forward.
+    """
 
     prefill: bool = False
     decode: bool = False
 
 
-def decode_device_supported(device):
-    return (
-        torch.version.hip is not None
-        and device.type == "cuda"
-        and torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-        == "gfx942"
-    )
+@functools.cache
+def _validated_on_gfx942():
+    # Measurement scope, not a kernel limit: aiter's FlyDSL GDN decode and
+    # prefill (`gdn_prepare_flydsl_supported`) also run on gfx950.
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx942"
 
 
 def select_policy(*, allowed, replayssm, lossy_decode, state, activation_dtype):
-    # ReplaySSM kernels address a contiguous KV pool. Do not reinterpret it as
-    # VK even when K == V makes the shape identical. Keep both stages original.
-    if not allowed or replayssm:
+    if not allowed:
         return GDNFlyDSLPolicy()
-    prefill_enabled = backend("prefill") != "triton"
-    decode_enabled = (
-        backend("decode") != "triton"
+    # Read both switches before any gate, so an invalid value always raises.
+    prefill_backend, decode_backend = backend("prefill"), backend("decode")
+    prefill_wanted = prefill_backend != "triton"
+    # ReplaySSM kernels address a contiguous KV pool. Do not reinterpret it as
+    # VK even when K == V makes the shape identical; keep decode original.
+    decode_wanted = (
+        not replayssm
+        and decode_backend != "triton"
         and not lossy_decode
         and state.ndim == 4
         and state.shape[-2:] == (128, 128)
         and state.dtype in (torch.bfloat16, torch.float32)
         and activation_dtype == torch.bfloat16
-        and decode_device_supported(state.device)
     )
-    if not (prefill_enabled or decode_enabled) or ops() is None:
+    # `_validated_on_gfx942` imports AITER, which needs HIP.
+    if not (prefill_wanted or decode_wanted) or ops() is None:
         return GDNFlyDSLPolicy()
+    # The ReplaySSM pool does not rule prefill out (prefill reads and writes the
+    # state as logical KV), but under ReplaySSM it runs only on gfx942.
+    prefill_enabled = prefill_wanted and (not replayssm or _validated_on_gfx942())
+    decode_enabled = decode_wanted and _validated_on_gfx942()
     return GDNFlyDSLPolicy(prefill_enabled, decode_enabled)
 
 
@@ -73,27 +86,23 @@ def backend(stage):
 def ops():
     if torch.version.hip is None:
         return None
-    try:
-        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
-        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            chunk_gated_delta_rule_fwd_h_flydsl_opt,
-            gdn_prepare_flydsl_supported,
-            gdn_prepare_fwd_flydsl,
-        )
-        from aiter.ops.prefill_batch_metadata import (
-            build_gated_delta_rule_prefill_metadata,
-        )
+    from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        chunk_gated_delta_rule_fwd_h_flydsl_opt,
+        gdn_prepare_flydsl_supported,
+        gdn_prepare_fwd_flydsl,
+    )
+    from aiter.ops.prefill_batch_metadata import (
+        build_gated_delta_rule_prefill_metadata,
+    )
 
-        return (
-            flydsl_gdr_decode,
-            gdn_prepare_fwd_flydsl,
-            chunk_gated_delta_rule_fwd_h_flydsl_opt,
-            build_gated_delta_rule_prefill_metadata,
-            gdn_prepare_flydsl_supported,
-        )
-    except (ImportError, AttributeError, RuntimeError, OSError) as error:
-        logger.warning("AITER FlyDSL GDN unavailable; keeping Triton: %s", error)
-        return None
+    return (
+        flydsl_gdr_decode,
+        gdn_prepare_fwd_flydsl,
+        chunk_gated_delta_rule_fwd_h_flydsl_opt,
+        build_gated_delta_rule_prefill_metadata,
+        gdn_prepare_flydsl_supported,
+    )
 
 
 def build_prefill_metadata(lengths, cu_seqlens):
@@ -300,34 +309,32 @@ def decode_supported(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
         and reads.is_contiguous()
         and writes.is_contiguous()
         and q.stride(-1) == k.stride(-1) == 1
-        and decode_device_supported(q.device)
+        and _validated_on_gfx942()
     )
 
 
 def decode(q, k, v, a, b, state, A_log, dt_bias, reads, writes, out=None):
     """Fused gating/normalization/recurrence, zero-copy logical KV state view.
 
-    `out`, a contiguous `[batch, hv, 128]` buffer, receives the result
-    directly when the kernel writes every row itself.
+    `out` receives the result directly when it is contiguous, has shape
+    `[batch, hv, 128]`, and has the same dtype as `q`. Otherwise the result
+    is returned in a newly allocated buffer.
     """
     if not decode_supported(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
         raise ValueError("Unsupported AITER FlyDSL decode inputs")
     _log_dispatch("decode (zero-copy VK state)")
     batch, hv = v.shape[1:3]
-    fn = ops()[0]
-    writes_all_rows = getattr(fn, "zeroes_invalid_output", False)
+    # The kernel writes every row, zeroing the negative-index padding rows.
     if (
         out is not None
-        and writes_all_rows
         and out.is_contiguous()
         and out.shape == (batch, hv, 128)
         and out.dtype == q.dtype
     ):
         output = out.view(batch, 1, hv, 128)
     else:
-        allocate = torch.empty if writes_all_rows else torch.zeros
-        output = allocate((batch, 1, hv, 128), device=q.device, dtype=q.dtype)
-    fn(
+        output = torch.empty((batch, 1, hv, 128), device=q.device, dtype=q.dtype)
+    ops()[0](
         query=q.transpose(0, 1),
         key=k.transpose(0, 1),
         value=v.transpose(0, 1),

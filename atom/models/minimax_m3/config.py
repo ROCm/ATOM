@@ -7,6 +7,31 @@ imports neither the model nor AITER until the architecture check needs it."""
 from atom.config import FP4_CACHE_DTYPES
 
 
+def nvfp4_pages_move(config) -> bool:
+    """Whether this config's NVFP4 KV and index pages move under every transport it
+    runs: each registered with ``moves_nvfp4_pages``."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    return config.kv_cache_dtype == "nvfp4" and (
+        KVConnectorFactory.topology_moves_nvfp4_pages(config)
+    )
+
+
+def draft_dtype_moves(config) -> bool:
+    """Whether an own-pool draft may keep a KV dtype other than the target's under this
+    config's transports: a DSpark draft beside an NVFP4 KV, every transport registered
+    with ``moves_own_dtype_draft``."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    spec = config.speculative_config
+    return (
+        config.kv_cache_dtype == "nvfp4"
+        and spec is not None
+        and spec.method == "dspark"
+        and KVConnectorFactory.topology_moves_own_dtype_draft(config)
+    )
+
+
 def _fp4_kv_refusal(config) -> str | None:
     """Why ``--kv-cache-dtype fp4|nvfp4`` cannot run this MiniMax-M3 here, or None.
 
@@ -20,8 +45,16 @@ def _fp4_kv_refusal(config) -> str | None:
         # aiter's FP4 writers and sparse PA only handle bf16; an fp16 model fails in its
         # first forward.
         return f"it needs a bfloat16 model, got {config.torch_dtype}"
-    if config.kv_transfer_config:
-        # Offload / P-D transfer moves pages by a layout that does not know this format.
+    if config.kv_transfer_config and not nvfp4_pages_move(config):
+        # Not verified: MXFP4 pages under any transport, NVFP4 pages under one
+        # not registered with moves_nvfp4_pages.
+        if config.kv_cache_dtype == "nvfp4":
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+            return (
+                "it runs with KV offload or --kv-transfer-config only under "
+                + ", ".join(KVConnectorFactory.nvfp4_page_connectors())
+            )
         return "it does not run with KV offload or --kv-transfer-config"
     if config.sequence_parallel_size > 1:
         # Ulysses leaves a top-k reusing layer's qkv without index columns; the fused
@@ -69,7 +102,8 @@ def validate_runtime_config(config):
     - an FP4 KV also: the same FP4 index cache (the default when omitted, an explicit other value is refused;
       MXFP4 and NVFP4 never pair),
       every attention layer an indexed sparse one (M3.1), a bf16 model, no sequence parallelism, no KV offload
-      or ``--kv-transfer-config``, and no speculative draft left with FP4 KV.
+      or ``--kv-transfer-config`` (an NVFP4 KV excepted where every transport, ``multi`` expanded, is
+      registered with ``moves_nvfp4_pages``), and no speculative draft left with FP4 KV.
     """
     from atom.config import is_plugin_mode
 

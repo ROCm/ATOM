@@ -28,10 +28,12 @@ from aiter.utility import fp4_utils
 from torch import nn
 
 from atom.config import QuantizationConfig, get_current_atom_config
+from atom.model_ops.blockscale import dequantize_fp8_weight
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
+    padded_partition_size,
     requantize_with_max_scale,
     shuffle_weights,
 )
@@ -160,6 +162,19 @@ def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
         )
 
 
+def native_group32_runs_bf16() -> bool:
+    """Whether native group32 FP8 linears run in BF16: AITER has no group32 GEMM
+    for a 32x32 weight in the layout `weight_is_stored_preshuffled` keeps."""
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_group32_supported
+
+    return not gemm_a8w8_blockscale_group32_supported(
+        "32x32",
+        bpreshuffle=weight_is_stored_preshuffled(
+            QuantType.per_1x32, dtypes.fp8, native_group_rows=32
+        ),
+    )
+
+
 def _is_per_1x32(quant_type) -> bool:
     # By value: plugin-mode QuantType members do not compare equal under `==`.
     return quant_type is not None and quant_type.value == QuantType.per_1x32.value
@@ -240,10 +255,6 @@ def _zero_pad_tail(param, dim: int, start: int, length: int) -> None:
     other tiles; re-shuffled, they would land in the pad."""
     if length > 0:
         param.data.narrow(dim, start, length).view(torch.uint8).zero_()
-
-
-def padded_partition_size(size: int, align: int | None) -> int:
-    return size if not align else (size + align - 1) // align * align
 
 
 def _zero_k_pad(layer: nn.Module, quant_config, prefix: str) -> None:
@@ -742,12 +753,13 @@ def weight_is_stored_preshuffled(
     forward.
 
     ``native_group_rows`` marks a native group32 weight, otherwise read as
-    checkpoint bytes. Native 32x32 weights are shuffled on gfx950 for AITER's
-    preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
-    always on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL
-    one. Native 1x32 weights are shuffled only when the existing
-    ``needs_preshuffled_weight`` override is set, as the M3.1 shape-gated
-    opt-in path does.
+    checkpoint bytes. Native 1x32 and 32x32 weights are shuffled alike: always
+    on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL one; on
+    gfx950 for AITER's preshuffled group32 GEMM under
+    ATOM_GROUP32_WEIGHT_PRESHUFFLE (on by default); and anywhere the
+    ``needs_preshuffled_weight`` override is set. A shuffled 1x32 weight's
+    scale takes the layout of aiter's ``shuffle_mxfp8_bpreshuffle_scale``; a
+    32x32 weight's scale stays row-major.
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -915,6 +927,7 @@ class LinearBase(nn.Module):
         self.params_dtype = params_dtype
         self.scale_dtype = _quant_scale_dtype(quant_type, quant_config)
         self.native_a8_group_rows = None
+        self.runs_bf16 = False
         source_block = layer_quant_config.weight_block_size
         native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
             (1, 32),
@@ -948,6 +961,10 @@ class LinearBase(nn.Module):
                     "Native group32 A8 requires dynamic activations and native weights"
                 )
             self.native_a8_group_rows = layer_quant_config.weight_block_size[0]
+            # No group32 FP8 GEMM here: dequantized to BF16 at load.
+            self.runs_bf16 = (
+                params_dtype == torch.float8_e4m3fn and native_group32_runs_bf16()
+            )
             if self.input_size % 32 or any(
                 size % self.native_a8_group_rows for size in self.output_partition_sizes
             ):
@@ -1221,6 +1238,11 @@ class LinearBase(nn.Module):
             self.quant_type, self.params_dtype, online_layer_quant_config
         ):
             return
+        if self.params_dtype == torch.float4_e2m1fn_x2:
+            # Only MoE experts convert from MXFP4.
+            raise ValueError(
+                f"{self.prefix}: an MXFP4 linear is not an online quantization source"
+            )
 
         assert online_quant_dtype in [
             dtypes.fp8,
@@ -1401,8 +1423,23 @@ class LinearBase(nn.Module):
         catch exactly that skipped along with the padding.
         """
         # A native group32 weight keeps its compact scales, and its bytes too
-        # unless it is one the preshuffled group32 GEMM reads.
+        # unless it is one the preshuffled group32 GEMM reads; with
+        # `runs_bf16` it becomes a BF16 weight without scales.
         if self.native_a8_group_rows is not None:
+            if self.runs_bf16:
+                # No group32 FP8 GEMM here: a BF16 weight, never shuffled.
+                if self.weight.numel() and self.weight.dtype == torch.float8_e4m3fn:
+                    self.weight = atom_parameter(
+                        dequantize_fp8_weight(
+                            self.weight.data,
+                            self.weight_scale.data,
+                            group_rows=self.native_a8_group_rows,
+                        )
+                    )
+                    # A fresh Parameter: weight_loader() reads this off it.
+                    self.weight.weight_loader_process = self.weight_loader_process
+                    self.weight_scale = None
+                return
             if self.weight.numel() and weight_is_stored_preshuffled(
                 self.quant_type,
                 self.params_dtype,
@@ -1412,6 +1449,13 @@ class LinearBase(nn.Module):
                 native_group_rows=self.native_a8_group_rows,
             ):
                 shuffle_weights(self.weight)
+                if self.native_a8_group_rows == 1:
+                    # Needs aiter with ROCm/aiter#8084.
+                    from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale
+
+                    self.weight_scale.data = shuffle_mxfp8_bpreshuffle_scale(
+                        self.weight_scale.data
+                    )
             return
         if self.weight.numel() == 0:
             return
@@ -1663,7 +1707,17 @@ class LinearBase(nn.Module):
             "Linear out= requested but this quant path does not support it "
             f"(quant_type={self.quant_type})."
         )
-        if self.native_a8_group_rows is not None:
+        # The per-token quant and the a8w8 GEMMs take rows: flatten the leading
+        # dims here and restore them on the way out.
+        lead = None
+        if x.dim() > 2 and self.quant_type.value == QuantType.per_Token.value:
+            lead, x = x.shape[:-1], x.flatten(0, -2)
+            if x_scale is not None:
+                x_scale = x_scale.flatten(0, -2)
+        if self.runs_bf16:
+            assert x_scale is None, "the BF16 fallback takes unquantized input"
+            y = tgemm.mm(x, self.weight, self.bias, otype=otype)
+        elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
 
             y = native_quant_linear(
@@ -1820,6 +1874,8 @@ class LinearBase(nn.Module):
             y = y[..., : self._output_size_before_padding]
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = tensor_model_parallel_all_reduce(y)
+        if lead is not None:
+            y = y.reshape(*lead, y.shape[-1])
         return y
 
     def make_row_view(self, start: int, length: int) -> "LinearBase":
@@ -1842,6 +1898,12 @@ class LinearBase(nn.Module):
                 "a shuffled weight may only be row-sliced on 16-row boundaries "
                 f"(shuffle block size); got start={start} length={length}"
             )
+            # Its 1x32 scale may be in 32-row tiles (n32k4 on gfx1250).
+            if self.native_a8_group_rows == 1 and (start % 32 or length % 32):
+                raise ValueError(
+                    "a shuffled native 1x32 weight may only be row-sliced on "
+                    f"32-row boundaries; got start={start} length={length}"
+                )
 
         view = copy.copy(self)
         # nn.Module bookkeeping is shared by the shallow copy; give the view its

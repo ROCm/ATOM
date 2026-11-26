@@ -51,6 +51,7 @@ def test_written_plane_scores_as_if_it_were_never_shuffled(tile):
     honestly. `tile` 8 and 16 shuffle in groups of different length, and 8 was
     unreachable before aiter admitted a page below the MFMA tile.
     """
+    from aiter import dtypes
     from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
     from atom.model_ops.deepseek_v41 import index_write
@@ -62,6 +63,8 @@ def test_written_plane_scores_as_if_it_were_never_shuffled(tile):
     plan = torch.zeros(rows, 4, dtype=torch.int32, device="cuda")
     plan[:, 2] = torch.arange(rows, device="cuda")
     keys = torch.randn(rows, dim, dtype=torch.bfloat16, device="cuda")
+    # Tiny negatives quantize to -0, which the e4m3fn bytes spell as FNUZ NaN.
+    keys[:, ::16] = -1e-6
     index_write.write_index_rows(
         keys,
         plane,
@@ -74,7 +77,7 @@ def test_written_plane_scores_as_if_it_were_never_shuffled(tile):
     )
 
     query = torch.randn(1, 1, heads, dim, dtype=torch.bfloat16, device="cuda")
-    q_fp8 = query.to(torch.float8_e4m3fn)
+    q_fp8 = query.to(dtypes.fp8)
     weights = torch.rand(1, heads, dtype=torch.float32, device="cuda")
     logits = torch.empty(1, rows, dtype=torch.float32, device="cuda")
     units = plane.view(-1, tile, dim + 4).shape[0]
@@ -92,8 +95,9 @@ def test_written_plane_scores_as_if_it_were_never_shuffled(tile):
 
     # The writer's own quantization, restated on the keys rather than read back
     # out of the plane: one fp32 scale per row, the row being the block.
-    scale = (keys.float().abs().amax(-1, keepdim=True).clamp_min(1e-4)) / 448.0
-    stored = (keys.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    fp8_max = torch.finfo(dtypes.fp8).max
+    scale = (keys.float().abs().amax(-1, keepdim=True).clamp_min(1e-4)) / fp8_max
+    stored = (keys.float() / scale).clamp(-fp8_max, fp8_max).to(dtypes.fp8)
     per_head = torch.einsum(
         "hd,rd->hr", q_fp8.reshape(heads, dim).float(), stored.float() * scale
     )
@@ -877,3 +881,83 @@ def test_scorer_runs_in_its_workspace_and_selects_the_same_rows():
     for got, want in zip(actual, expected):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     assert observed == [space.logits(1, 1).data_ptr()]
+
+
+@pytest.mark.parametrize(
+    "enabled,layout,rows,expected",
+    [
+        # Folds: the fuse flag, the gfx1250 FP4 NATURAL plane, 1..128 rows.
+        (True, "natural", 1, True),
+        (True, "natural", 48, True),
+        (True, "natural", 128, True),
+        # Falls back to the standalone GEMM, which is always correct.
+        (True, "natural", 129, False),  # above the 128-row gate
+        (True, "natural", 0, False),  # an empty step
+        (False, "natural", 48, False),  # fuse flag off
+        (True, "mfma", 48, False),  # gfx950 OPUS plane, no such kernel
+        (True, "preshuffle", 48, False),  # FlyDSL plane, no such kernel
+    ],
+)
+def test_indexer_project_fuses_only_the_natural_plane(
+    monkeypatch, enabled, layout, rows, expected
+):
+    """The gate that `Indexer.project` actually runs: the fuse flag, the
+    NATURAL plane and 1..128 rows. Other FP4 steps keep `quantize_query_fp4`
+    plus the standalone GEMM. CPU only — both launches are patched."""
+    from types import SimpleNamespace
+
+    from aiter_stub import atom_without_aiter
+    from torch import nn
+
+    with atom_without_aiter() as load:
+        attention = load("atom.models.deepseek_v41.attention")
+        layout_tags = load("atom.model_ops.indexer.layout")
+
+    assert {layout_tags.MFMA, layout_tags.NATURAL, layout_tags.PRESHUFFLE} == {
+        "mfma",
+        "natural",
+        "preshuffle",
+    }
+
+    branch = {}
+
+    def fused(*args):
+        branch["name"] = "fused"
+        return "fused"
+
+    def quant(*args, **kwargs):
+        branch["name"] = "quant"
+        branch["layout"] = kwargs["layout"]
+        return "quant"
+
+    monkeypatch.setattr(attention, "project_query_fp4", fused)
+    monkeypatch.setattr(attention, "quantize_query_fp4", quant)
+
+    indexer = attention.Indexer.__new__(attention.Indexer)
+    nn.Module.__init__(indexer)
+    indexer.heads, indexer.head_dim = 4, 8
+    indexer.fuse_weights_proj = enabled
+    indexer.spec = SimpleNamespace(kv_owner=0)
+    indexer.wq_b = lambda qr, x_scale=None: torch.zeros(
+        1, rows, indexer.heads * indexer.head_dim
+    )
+
+    class Weights:
+        weight = "proj"
+
+        def __call__(self, hidden):
+            return ("standalone",)
+
+    indexer.weights_proj = Weights()
+    cache = SimpleNamespace(
+        geometry=SimpleNamespace(index_fp4=True),
+        index_units={0: SimpleNamespace(layout=layout)},
+        rope_positions=lambda step: "positions",
+    )
+    got = indexer.project(torch.zeros(1, rows, 4), None, None, cache, None, "rope")
+    if expected:
+        assert branch == {"name": "fused"}
+        assert got == "fused"
+    else:
+        assert branch == {"name": "quant", "layout": layout}
+        assert got == ("quant", "standalone")

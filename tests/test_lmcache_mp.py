@@ -334,8 +334,8 @@ def test_parallel_strategy_collapses_fully_replicated_mla(monkeypatch):
 
 
 def test_auto_rank_collapse_is_off_for_a_draft_with_its_own_pool(monkeypatch):
-    """A DSpark draft whose backend owns a KV pool appends per-rank PAGE
-    regions, so a replicated MLA target no longer collapses."""
+    """A DSpark draft whose attention family is in `DRAFT_POOL_FAMILIES` appends
+    per-rank PAGE regions, so a replicated MLA target no longer collapses."""
     from atom.utils import selector
 
     owns_pool = {"value": True}
