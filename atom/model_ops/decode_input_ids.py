@@ -39,8 +39,8 @@ each request's own span keeps that unexpressible.
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
-from atom.model_ops.triton_fast_launch import FastLaunch
 from atom.utils.decorators import mark_trace
 
 NEW_SEQUENCE = -1
@@ -103,6 +103,11 @@ def _fill_deferred_decode_ids_kernel(
     tl.store(out_ptr + start + col, val, mask=live)
 
 
+# A launch whose key Triton compiled before skips its per-call dispatch: host
+# time on the decode step's critical path.
+_fill_launch = fast_launch(_fill_deferred_decode_ids_kernel, by_specialization=True)
+
+
 @mark_trace(prefix="decode_input_ids")
 def fill_deferred_decode_ids(
     out: torch.Tensor,
@@ -144,8 +149,7 @@ def fill_deferred_decode_ids(
         "a step with no draft ids must feed exactly one token per request, "
         f"got max_tokens_per_seq={max_tokens_per_seq}"
     )
-    _fill_launch(
-        (bs + tail,),
+    _fill_launch[(bs + tail,)](
         out,
         cu,
         src,
@@ -194,6 +198,3 @@ def fill_deferred_decode_ids_reference(
                 f"draft ids"
             )
             out[start + 1 : end] = draft_token_ids[row, : end - start - 1]
-
-
-_fill_launch = FastLaunch(_fill_deferred_decode_ids_kernel)

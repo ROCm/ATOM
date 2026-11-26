@@ -4,6 +4,7 @@
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
 
 @triton.jit
@@ -179,8 +180,8 @@ def kv_indices_generate_kernel(
     tl.store(output_ptr + out_start + out_pos, expanded_vals, mask=store_mask)
 
 
-# `kv_indices_generate_triton`'s launcher, made on first use (`FastLaunch`).
-_kv_indices_launch = None
+# A launch whose key Triton compiled before skips its per-call dispatch.
+_kv_indices_launch = fast_launch(kv_indices_generate_kernel, by_specialization=True)
 
 
 def kv_indices_generate_triton(
@@ -204,18 +205,12 @@ def kv_indices_generate_triton(
 
     grid = (triton.cdiv(max_num_blocks, blocks_per_tile), bs)
 
-    global _kv_indices_launch
-    if _kv_indices_launch is None:
-        from atom.model_ops.triton_fast_launch import FastLaunch
-
-        _kv_indices_launch = FastLaunch(kv_indices_generate_kernel)
-    _kv_indices_launch(
-        grid,
+    _kv_indices_launch[grid](
         block_tables,
         kv_indices_convert,
         kv_indptr_convert,
-        n_cols=n_cols,
-        ratio=ratio,
+        n_cols,
+        ratio,
         BLOCKS_PER_TILE=blocks_per_tile,
         RATIO_PAD=ratio_pad,
     )
