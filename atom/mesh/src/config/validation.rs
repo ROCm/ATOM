@@ -93,6 +93,26 @@ impl ConfigValidator {
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
             PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::DpSticky => {}
+            PolicyConfig::Agentic {
+                request_token_equivalent: _,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                if *eviction_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "eviction_interval_secs".to_string(),
+                        value: eviction_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+                if *max_tree_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "max_tree_size".to_string(),
+                        value: max_tree_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,
@@ -361,6 +381,16 @@ impl ConfigValidator {
                                     .to_string(),
                         });
                     }
+                }
+
+                // Decode has no prefill charge, so agentic would pin long sessions to it.
+                if let PolicyConfig::Agentic { .. } = config.mode.get_decode_policy(&config.policy)
+                {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason:
+                            "agentic places prefill only; set --decode-policy to another policy"
+                                .to_string(),
+                    });
                 }
             }
         }
@@ -659,6 +689,31 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_agentic_places_prefill_only() {
+        let agentic = PolicyConfig::Agentic {
+            request_token_equivalent: 512,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+        };
+        let pd = |main: PolicyConfig, prefill, decode| {
+            let mode = RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
+                decode_urls: vec!["http://decode1:8000".to_string()],
+                prefill_policy: prefill,
+                decode_policy: decode,
+            };
+            ConfigValidator::validate(&RouterConfig::new(mode, main))
+        };
+
+        assert!(pd(PolicyConfig::Random, Some(agentic.clone()), None).is_ok());
+        let dp_sticky = Some(PolicyConfig::DpSticky);
+        assert!(pd(agentic.clone(), None, dp_sticky).is_ok());
+        let error = pd(agentic.clone(), None, None).unwrap_err().to_string();
+        assert!(error.contains("agentic places prefill only"), "{error}");
+        assert!(pd(PolicyConfig::Random, None, Some(agentic)).is_err());
     }
 
     #[test]
