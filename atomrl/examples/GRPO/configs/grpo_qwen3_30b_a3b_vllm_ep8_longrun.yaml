@@ -109,6 +109,7 @@ policy:
       dtype: bfloat16
       enforce_eager: false
       enable_chunked_prefill: true
+      enable_prefix_caching: true        # vLLM 0.31 returns routed experts (R3) only with it; weight updates reset the cache
       max_num_batched_tokens: 16384
       max_num_seqs: 64
       quantization: ""

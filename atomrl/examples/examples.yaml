@@ -11,7 +11,7 @@ images:
   # and published. The checkout running the examples is mounted over the copy
   # of AtomRL inside, so code changes need no rebuild.
   release:
-    ref: rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119
+    ref: rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125
     atomrl_mount: /opt/atomrl/ATOM/atomrl
     atom_mount: /opt/atomrl/ATOM
     env: {RL_ROOT: /opt/atomrl}
@@ -21,14 +21,14 @@ images:
 
 examples:
   - id: unit-tests
-    title: "AtomRL unit tests (tests/unit, atomrl/tests), GPU tests included"
+    title: "AtomRL unit tests (tests/unit, tests/atomrl), GPU tests included"
     tier: t0
     status: validated
     gpus_per_node: 8
     log_mode: stdout
     command: >-
       cd {atomrl} && PYTHONPATH={atomrl}:$PYTHONPATH
-      python3 -m pytest tests/unit atomrl/tests -q -p no:cacheprovider -rfE
+      python3 -m pytest tests/unit tests/atomrl -q -p no:cacheprovider -rfE
     smoke:
       timeout_min: 120
       stall_min: 30

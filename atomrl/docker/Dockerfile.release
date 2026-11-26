@@ -6,7 +6,7 @@
 # source revisions fixed for reproducibility. The root ATOM Dockerfile is built
 # first as rocm/atom-dev:latest; this file does not modify it.
 
-ARG BASE_IMAGE=rocm/atom-dev:vllm-latest
+ARG BASE_IMAGE=rocm/atom-dev:vllm-v0.31.0-nightly_20261119
 FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-lc"]
@@ -16,9 +16,10 @@ ARG PYTORCH_ROCM_ARCH=gfx950
 ARG AITER_REPO=https://github.com/ROCm/aiter.git
 ARG AITER_SHA=c813348adc360f077c9bd040ee8de68bb7ade0f7
 ARG AITER_DIR=/app/aiter-test
-ARG MEGATRON_COMMIT=8dd45f5a51378ec1ee7937dee3c20d8626df4763
+ARG MEGATRON_CORE_VERSION=0.18.2
 ARG APEX_SHA=daed85255d51476425080e7e6203f0bee6d7e4cc
 ARG TE_SHA=6e541a10419a6e31bdc98b1516db04eb81a463b6
+ARG FLASH_ATTN_REF=v2.8.3
 ARG WITH_MEGATRON=1
 
 ENV RL_ROOT=/opt/atomrl \
@@ -71,10 +72,7 @@ RUN pip install --upgrade "setuptools>=77,<80" setuptools-scm && \
     LUMEN_BUILD_EXTENSIONS=1 pip install --no-build-isolation -e ./atomrl
 
 RUN if [ "${WITH_MEGATRON}" = "1" ]; then \
-      git clone --recursive https://github.com/ROCm/Megatron-LM.git /opt/atomrl/megatron_lm && \
-      cd /opt/atomrl/megatron_lm && git checkout "${MEGATRON_COMMIT}" && \
-      pip install -e . -U --force-reinstall --no-deps && \
-      cd megatron/core/datasets && make; \
+      pip install --no-deps "megatron-core==${MEGATRON_CORE_VERSION}"; \
     fi
 
 COPY atomrl/release/build_apex_te.sh /tmp/build_apex_te.sh
@@ -84,10 +82,14 @@ RUN if [ "${WITH_MEGATRON}" = "1" ]; then \
       bash /tmp/build_apex_te.sh; \
     fi
 
+COPY atomrl/release/build_flash_attn.sh /tmp/build_flash_attn.sh
+RUN FLASH_ATTN_REF="${FLASH_ATTN_REF}" PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" \
+    bash /tmp/build_flash_attn.sh
+
 COPY atomrl/release/patch_vllm_aiter_rmsnorm.py /opt/atomrl/patch_vllm_aiter_rmsnorm.py
 RUN python /opt/atomrl/patch_vllm_aiter_rmsnorm.py
 
-ENV PYTHONPATH=/opt/atomrl/megatron_lm:/opt/atomrl/ATOM:/app/aiter-test:/opt/atomrl/ATOM/atomrl:${PYTHONPATH:-} \
+ENV PYTHONPATH=/opt/atomrl/ATOM:/app/aiter-test:/opt/atomrl/ATOM/atomrl:${PYTHONPATH:-} \
     AITER_JIT_DIR=/opt/atomrl/aiter-jit
 
 RUN python -c "import torch; assert torch.version.hip is not None; print(torch.__version__, torch.version.hip)" && \
@@ -99,5 +101,10 @@ RUN python -c "import torch; assert torch.version.hip is not None; print(torch._
 RUN python -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent / 'lib')" \
       > /etc/ld.so.conf.d/torch.conf && ldconfig
 
+COPY --chmod=755 atomrl/release/entrypoint.sh /opt/atomrl/entrypoint.sh
+# Last, so a new commit only rebuilds this layer. run.sh records it per run.
+ARG ATOM_COMMIT=unknown
+ENV ATOM_COMMIT=${ATOM_COMMIT}
 WORKDIR /opt/atomrl/ATOM/atomrl
-CMD ["/bin/bash"]
+ENTRYPOINT ["/opt/atomrl/entrypoint.sh"]
+CMD ["sleep", "infinity"]

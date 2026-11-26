@@ -14,6 +14,7 @@ are reconstructed with a differentiable CP all-reduce.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import math
@@ -57,6 +58,20 @@ from atomrl.engine.training.model_registry import (
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("ATOMRL_LOGGING_LEVEL", "INFO"))
+
+
+def _te_attention_backend(ec) -> str | None:
+    """Megatron's attention_backend for TransformerEngine, None for its auto.
+
+    On ROCm, TE's auto takes flash_attn's backend whenever that package is
+    installed, which runs Qwen3-30B-A3B's packed causal attention at about half
+    the speed of TE's own fused attention (fwd + bwd 2.60 vs 1.33 ms per 8192
+    tokens on MI355X). ``te_attention_backend: auto`` restores TE's choice.
+    """
+    name = ec.get("te_attention_backend")
+    if name is None and torch.version.hip and importlib.util.find_spec("flash_attn"):
+        return "fused"
+    return None if name == "auto" else name
 
 
 def _mem_diag_on() -> bool:
@@ -470,6 +485,13 @@ class MegatronNativeEngine(MegatronBaseEngine):
             if self._r3_enabled:
                 moe_kwargs["moe_enable_routing_replay"] = True
 
+        attn_kwargs: dict = {}
+        te_backend = _te_attention_backend(ec)
+        if te_backend:
+            from megatron.core.transformer.enums import AttnBackend
+
+            attn_kwargs["attention_backend"] = AttnBackend[te_backend]
+
         recompute_kwargs: dict = {}
         rc_gran = ec.get("recompute_granularity") or None
         if rc_gran:
@@ -545,6 +567,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 ),
                 **moe_kwargs,
                 **recompute_kwargs,
+                **attn_kwargs,
             )
 
         if self._spec.build_layer_spec is not None:

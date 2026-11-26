@@ -358,6 +358,20 @@ def test_reload_verification_ignores_generated_scales_and_static_router_table():
     ) == ["model.layers.0.ffn.shared_experts.bias"]
 
 
+def test_reload_verification_counts_experts_reported_above_routed_experts():
+    # vLLM 0.31 keeps FusedMoE's buffers in a nested RoutedExperts, and its
+    # loader reports them under the FusedMoE's own name.
+    nested = "model.layers.0.mlp.experts.routed_experts.w13_weight"
+
+    assert (
+        rdma._missing_reloadable_names(
+            {nested}, {"model.layers.0.mlp.experts.w13_weight"}
+        )
+        == []
+    )
+    assert rdma._missing_reloadable_names({nested}, set()) == [nested]
+
+
 @pytest.mark.parametrize(
     ("name", "expected"),
     [

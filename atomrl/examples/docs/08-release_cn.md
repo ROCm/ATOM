@@ -15,7 +15,7 @@
 ```bash
 git clone https://github.com/ROCm/ATOM.git
 cd ATOM/atomrl
-docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119
+docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125
 export DATA_ROOT=/path/to/data
 bash examples/run.sh prepare 1        # 模型与数据，只需一次（§8.4.3）
 bash examples/run.sh 1                # 跑例子 1，并按 §8.5.1 自动判定
@@ -50,7 +50,7 @@ overlong 奖励缓冲、TIS rollout 修正。
 前几分钟：
 
 ```bash
-docker run --rm --entrypoint /bin/bash rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119 \
+docker run --rm --entrypoint /bin/bash rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125 \
   -lc 'echo $ATOM_COMMIT; ls /opt/atomrl/aiter-jit/*.so | wc -l'
 ```
 
@@ -71,7 +71,7 @@ release 构建从当前 checkout 复制 ATOM、AtomRL 与 Lumen。AITER 和 MORI
 | ATOM + AtomRL | 当前仓库 | 当前分支 | 你的 checkout |
 | Lumen | `atomrl/lumen` | 内置 | 当前 checkout |
 | AITER | `ROCm/aiter` | detached | `c813348adc36` |
-| MORI | `rocm/atom-dev:vllm-latest` | 已安装包 | `amd_mori_nightly 1.2.6.dev20261119` |
+| MORI | `rocm/atom-dev:vllm-v0.31.0-nightly_20261119` | 已安装包 | `amd_mori_nightly 1.2.6.dev20261119` |
 
 两个外部依赖都会先按 SHA checkout，再初始化其 submodule。Docker build 参数可以显式
 覆盖仓库或 SHA；默认值不会跟随可变的 `main` 或 `HEAD`。
@@ -99,11 +99,12 @@ AtomRL 原先在这里强制 `sleep_keeps_memory_resident=true`，该 pin 已于
 移除——它所防的那个故障已经不再复现。释放的代价是每步多一次图重捕获，约 1 秒（2–3%），
 不影响已发布的参考值。
 
-底座镜像是已发布的 `rocm/atom-dev:vllm-latest`，其中 PyTorch 为
+底座镜像是已发布的 `rocm/atom-dev:vllm-v0.31.0-nightly_20261119`，其中 PyTorch 为
 `2.10.0+rocm7.2.4`，vLLM 为
 `0.31.1.dev0+gdb9527a46.d20261119.rocm724`。验证过的附加版本为
-Megatron commit `8dd45f5a`、ROCm Apex `daed8525` 和 ROCm
-TransformerEngine `6e541a10`。
+NVIDIA megatron-core `0.18.2`、ROCm Apex `daed8525`、ROCm
+TransformerEngine `6e541a10` 和 flash-attention `2.8.3`（CK，对着镜像的 torch 编译）。261125 上 base 自带的 Apex 1.10.0 挡住了 `daed8525`，
+实际 import 的是前者（[VALIDATION](../../release/VALIDATION.md)）。
 完整清单见 [`release/versions.env`](../../release/versions.env)。
 
 容器启动时会打印这四棵源码树各自的 HEAD。验证软件栈：
@@ -257,7 +258,7 @@ rocm-smi --showmeminfo vram | grep -i used      # 宿主机上直接可用
 拉取：
 
 ```bash
-docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119
+docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125
 ```
 
 `run.sh` 默认用的就是它。也可以从本仓库自行构建同一个镜像，下面就是全部步骤：
@@ -411,7 +412,7 @@ docker run -d --name atomrl-ex-release \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
   -v "$PWD":/opt/atomrl/ATOM/atomrl \
-  rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119 sleep infinity
+  rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125 sleep infinity
 
 docker exec \
   -e RL_ROOT=/opt/atomrl \

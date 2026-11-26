@@ -250,6 +250,10 @@ class MegatronConfig:
     # Long-sequence memory: flash attention (O(L) vs local O(L^2)) + memory-efficient
     # chunked/fused token log-prob. Both default off (unchanged smoke behavior).
     attention_backend: str = "unfused"  # "flash" | "unfused"
+    # Megatron native: TransformerEngine's attention backend, as Megatron's
+    # attention_backend (auto | flash | fused | unfused). None: fused on ROCm
+    # when flash_attn is installed, else auto.
+    te_attention_backend: str | None = None
     use_packed_sequences: bool = (
         True  # varlen flash packing; disable for incompatible ROCm kernels
     )

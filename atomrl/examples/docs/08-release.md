@@ -17,7 +17,7 @@ nodes (example 8, see [chapter 7](07-disaggregated-rdma.md)).
 ```bash
 git clone https://github.com/ROCm/ATOM.git
 cd ATOM/atomrl
-docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119
+docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125
 export DATA_ROOT=/path/to/data
 bash examples/run.sh prepare 1        # models and data, once (§8.4.3)
 bash examples/run.sh 1                # run example 1 and judge it against §8.5.1
@@ -53,7 +53,7 @@ The image carries the kernels its build warms up already compiled; the others co
 on first use, in the first minutes of the first run in a fresh container:
 
 ```bash
-docker run --rm --entrypoint /bin/bash rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119 \
+docker run --rm --entrypoint /bin/bash rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125 \
   -lc 'echo $ATOM_COMMIT; ls /opt/atomrl/aiter-jit/*.so | wc -l'
 ```
 
@@ -77,7 +77,7 @@ current checkout commit. Every run prints both.
 | ATOM + AtomRL | current repository | current branch | your checkout |
 | Lumen | `atomrl/lumen` | in-tree | current checkout |
 | AITER | `ROCm/aiter` | detached | `c813348adc36` |
-| MORI | `rocm/atom-dev:vllm-latest` | installed package | `amd_mori_nightly 1.2.6.dev20261119` |
+| MORI | `rocm/atom-dev:vllm-v0.31.0-nightly_20261119` | installed package | `amd_mori_nightly 1.2.6.dev20261119` |
 
 Both external dependencies are checked out by SHA before their submodules are
 initialized. Docker build arguments may override the repositories or SHAs explicitly;
@@ -113,11 +113,13 @@ here; that pin was removed on 2026-09-16 after the failure it guarded against st
 reproducing. Releasing costs one graph recapture per step, about 1 s (2–3%), and does
 not move the published metrics.
 
-The base image is the published `rocm/atom-dev:vllm-latest`, with PyTorch
-`2.10.0+rocm7.2.4` and vLLM
+The base image is the published `rocm/atom-dev:vllm-v0.31.0-nightly_20261119`, with
+PyTorch `2.10.0+rocm7.2.4` and vLLM
 `0.31.1.dev0+gdb9527a46.d20261119.rocm724`. The validated additions are
-Megatron commit `8dd45f5a`, ROCm Apex `daed8525`, and ROCm
-TransformerEngine `6e541a10`.
+NVIDIA megatron-core `0.18.2`, ROCm Apex `daed8525`, ROCm
+TransformerEngine `6e541a10`, and flash-attention `2.8.3` (CK, built against the image's torch). On 261125 the base's own Apex 1.10.0 shadows the
+`daed8525` build, so that is the one imported
+([VALIDATION](../../release/VALIDATION.md)).
 The full list is in [`release/versions.env`](../../release/versions.env).
 
 The container prints the HEAD of all four source trees at startup. To verify the
@@ -283,7 +285,7 @@ to start if any card is above 2 GB and says so; `--force` skips the gate.
 Pull it:
 
 ```bash
-docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119
+docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125
 ```
 
 That is what `run.sh` uses. Or build the same image from this repository:
@@ -445,7 +447,7 @@ docker run -d --name atomrl-ex-release \
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --shm-size 64G \
   -v "$DATA_ROOT":"$DATA_ROOT" -e DATA_ROOT="$DATA_ROOT" \
   -v "$PWD":/opt/atomrl/ATOM/atomrl \
-  rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119 sleep infinity
+  rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125 sleep infinity
 
 docker exec \
   -e RL_ROOT=/opt/atomrl \

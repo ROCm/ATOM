@@ -398,6 +398,7 @@ class AtomActorWorker(BaseWorker):
                 ),
                 "moe_mori_kernel_type": meg_cfg.get("moe_mori_kernel_type"),
                 "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
+                "te_attention_backend": meg_cfg.get("te_attention_backend"),
                 # One key: the Megatron TransformerConfig field name, which is
                 # what all three engines read. ``r3_enabled`` was an alias.
                 "moe_enable_routing_replay": r3_enabled,

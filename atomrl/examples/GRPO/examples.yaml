@@ -51,6 +51,11 @@ examples:
     title: "Qwen3-30B-A3B GRPO, Megatron TP4/EP8 on one node, vLLM BF16 TP2x4 on the other, RDMA sync"
     tier: t2
     status: validated
+    env: &tp2_custom_ar
+      # TP2 custom all-reduce shares its buffers over IPC, which VMM-backed
+      # (expandable_segments) memory refuses on torch 2.10.0+rocm7.2.4.
+      PYTORCH_ALLOC_CONF: ""
+      PYTORCH_CUDA_ALLOC_CONF: ""
     smoke:
       config: configs/grpo_qwen3_30b_a3b_vllm_ep8_longrun.yaml
       overrides: &ex8
@@ -83,8 +88,12 @@ examples:
     status: validated
     needs: [rdma, atom_rdma]
     env:
+      <<: *tp2_custom_ar
       BACKEND: atom
       ATOM_FORCE_ATTN_TRITON: "1"
+      # AtomRL turns ATOM's custom all-reduce off for TP > 1, and AITER c813348a's
+      # all-gather then asserts in the lm_head gather instead of using NCCL.
+      ATOMRL_DISABLE_CUSTOM_AR: "0"
     smoke:
       # The vLLM two-node config with the rollout on ATOM. No R3 (ATOM is
       # fail-closed on it), so k3_kl runs about twice the vLLM example's.

@@ -9,7 +9,7 @@
 
 ```bash
 git clone https://github.com/ROCm/ATOM.git && cd ATOM/atomrl
-docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119   # release 镜像
+docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125   # release 镜像
 export DATA_ROOT=/path/to/data
 bash examples/run.sh prepare 1 6     # 模型与数据，只需一次
 bash examples/run.sh list            # 实时打印下面的清单
@@ -21,7 +21,7 @@ release 镜像固定了 ROCm、PyTorch、AITER、ATOM、Megatron 和 vLLM 的版
 
 ## 示例清单
 
-截至 2026-11-19，在上面的 release 镜像上。*validated*：在所列硬件上按参考值通过。*长跑*：全尺寸运行，
+截至 2026-11-26，在上面的 release 镜像上。*validated*：在所列硬件上按参考值通过。*长跑*：全尺寸运行，
 按需执行，尚无经 `run.sh` 记录的通过。
 
 <table>
@@ -42,77 +42,77 @@ release 镜像固定了 ROCm、PyTorch、AITER、ATOM、Megatron 和 vLLM 的版
       <td><code>dapo-qwen3-8b-vllm-bf16</code>（1）</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>3.8 分钟</td>
+      <td>3.1 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-8B，FSDP2 BF16，vLLM FP8 rollout</td>
       <td><code>dapo-qwen3-8b-vllm-fp8-rollout</code>（2）</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>2.6 分钟</td>
+      <td>2.8 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-8B，FSDP2 FP8，vLLM FP8 rollout</td>
       <td><code>dapo-qwen3-8b-vllm-fp8-e2e</code>（3）</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>4.0 分钟</td>
+      <td>3.5 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-8B，FSDP2 FP8，ATOM FP8 rollout</td>
       <td><code>dapo-qwen3-8b-atom-fp8</code>（4）</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>12.3 分钟</td>
+      <td>10.9 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-8B，FSDP2 BF16，ATOM BF16 rollout</td>
       <td><code>dapo-qwen3-8b-atom-bf16</code>（5）</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>7.4 分钟</td>
+      <td>8.0 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B，FSDP2 BF16，vLLM BF16</td>
       <td><code>dapo-qwen3moe-vllm-bf16</code>（6）</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>10.1 分钟</td>
+      <td>8.0 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B，Megatron EP=8，vLLM BF16</td>
       <td><code>dapo-qwen3moe-megatron-ep8</code>（7）</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>8.7 分钟</td>
+      <td>8.2 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B，FSDP2 BF16，ATOM BF16 rollout</td>
       <td><code>dapo-qwen3moe-atom-bf16</code>（9）</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>16.3 分钟</td>
+      <td>15.8 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B，fully async，4 + 4 卡</td>
       <td><code>dapo-qwen3moe-vllm-fully-async</code></td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>13.4 分钟</td>
+      <td>12.8 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B，两机 fully async，vLLM</td>
       <td><code>dapo-qwen3moe-fully-async-vllm-2node</code></td>
       <td>2×8 MI355X</td>
       <td>validated</td>
-      <td>17.0 分钟</td>
+      <td>15.0 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B，两机 fully async，ATOM</td>
       <td><code>dapo-qwen3moe-fully-async-atom-2node</code></td>
       <td>2×8 MI355X</td>
       <td>validated</td>
-      <td>26.9 分钟</td>
+      <td>22.4 分钟</td>
     </tr>
     <tr>
       <td rowspan="3"><a href="GRPO/README.md">GRPO</a></td>
@@ -120,14 +120,14 @@ release 镜像固定了 ROCm、PyTorch、AITER、ATOM、Megatron 和 vLLM 的版
       <td><code>grpo-qwen3moe-vllm-2node</code>（8）</td>
       <td>2×8 MI355X</td>
       <td>validated</td>
-      <td>25.0 分钟</td>
+      <td>20.5 分钟</td>
     </tr>
     <tr>
       <td>同上，ATOM rollout</td>
       <td><code>grpo-qwen3moe-atom-2node</code></td>
       <td>2×8 MI355X</td>
       <td>validated</td>
-      <td>25.2 分钟</td>
+      <td>28.4 分钟</td>
     </tr>
     <tr>
       <td>DeepSeek-V4-Flash，Megatron TP4/PP4/EP4，vLLM FP8</td>
@@ -157,7 +157,7 @@ release 镜像固定了 ROCm、PyTorch、AITER、ATOM、Megatron 和 vLLM 的版
       <td><code>sddd-eagle3-smoke-hf</code></td>
       <td>1 卡</td>
       <td>validated</td>
-      <td>0.9 分钟</td>
+      <td>0.8 分钟</td>
     </tr>
     <tr>
       <td>Kimi K2.5 Eagle3 第一、二阶段，ATOM MXFP4 teacher</td>
@@ -187,14 +187,14 @@ release 镜像固定了 ROCm、PyTorch、AITER、ATOM、Megatron 和 vLLM 的版
       <td><code>unit-tests</code></td>
       <td>1×8</td>
       <td>validated</td>
-      <td>6.2 分钟</td>
+      <td>5.0 分钟</td>
     </tr>
     <tr>
       <td>Qwen3-0.6B GRPO，单卡（<a href="../configs/"><code>../configs/</code></a>）</td>
       <td><code>quickstart-grpo-qwen3-0.6b</code></td>
       <td>1 卡</td>
       <td>validated</td>
-      <td>14.2 分钟</td>
+      <td>13.8 分钟</td>
     </tr>
   </tbody>
 </table>
