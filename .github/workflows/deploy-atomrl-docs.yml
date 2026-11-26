@@ -1,0 +1,78 @@
+name: Deploy AtomRL Documentation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/deploy-atomrl-docs.yml"
+      - "atomrl/atomrl-docs/**"
+      - "atomrl/lumen/lumen-docs/**"
+  workflow_dispatch:
+
+jobs:
+  deploy-docs:
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            atomrl/atomrl-docs/docs/requirements.txt
+            atomrl/lumen/lumen-docs/docs/requirements.txt
+
+      - name: Install documentation dependencies
+        run: |
+          python -m pip install \
+            -r atomrl/atomrl-docs/docs/requirements.txt \
+            -r atomrl/lumen/lumen-docs/docs/requirements.txt
+
+      - name: Build AtomRL documentation
+        run: |
+          sphinx-build -W --keep-going -b html \
+            atomrl/atomrl-docs/docs/source /tmp/atomrl-docs
+          test -f /tmp/atomrl-docs/index.html
+
+      - name: Build Lumen documentation
+        run: |
+          sphinx-build -W --keep-going -b html \
+            atomrl/lumen/lumen-docs/docs/source /tmp/lumen-docs
+          test -f /tmp/lumen-docs/index.html
+
+      - name: Publish documentation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          SOURCE_SHA=$(git rev-parse HEAD)
+
+          git fetch origin gh-pages
+          git checkout -B gh-pages origin/gh-pages
+
+          rm -rf atomrl lumen
+          mkdir -p atomrl lumen
+          cp -a /tmp/atomrl-docs/. atomrl/
+          cp -a /tmp/lumen-docs/. lumen/
+          touch .nojekyll
+
+          git add atomrl lumen .nojekyll
+          if git diff --cached --quiet; then
+            echo "Documentation is already up to date."
+          else
+            git commit -m "docs: deploy AtomRL and Lumen documentation"
+            git push origin HEAD:gh-pages
+          fi
+
+          git checkout "$SOURCE_SHA"

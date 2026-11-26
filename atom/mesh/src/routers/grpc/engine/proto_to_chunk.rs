@@ -42,6 +42,7 @@ pub(crate) fn proto_complete_to_chunk(complete: ProtoGenerateComplete) -> TokenC
         request_id: String::new(),
         weight_version: None,
         cached_tokens: complete.cached_tokens().max(0) as u32,
+        timing: None,
     };
     TokenChunk::Complete {
         token_ids: complete.output_ids().to_vec(),

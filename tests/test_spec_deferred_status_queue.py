@@ -1,25 +1,41 @@
+from __future__ import annotations
+
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import pytest
+from aiter_stub import atom_without_aiter
 
-# On the module, not on "aiter" -- see tests/test_dspark.py for why a name-only
-# guard passes on the non-GPU runner and then aborts collection.
-pytest.importorskip(
-    "atom.model_engine.model_runner",
-    reason="requires AITER to import model_runner",
-    exc_type=ImportError,
-)
 
-from atom.model_engine.model_runner import (
-    ModelRunner,
-    _kv_config_has_producer,
-    tokenIDProcessor,
-)
+@pytest.fixture(scope="module", autouse=True)
+def load_runner():
+    global ModelRunner, _kv_config_has_producer, tokenIDProcessor
+    with atom_without_aiter() as load:
+        module = load("atom.model_engine.model_runner")
+        ModelRunner = module.ModelRunner
+        _kv_config_has_producer = module._kv_config_has_producer
+        tokenIDProcessor = module.tokenIDProcessor
+        yield
+
+
 from atom.model_engine.scheduler import ScheduledBatch, defers_output
 from atom.spec_decode.status import SpecStatusQueue
 from atom.utils.selector import Family
+
+
+def test_postprocess_keeps_its_profiler_stage():
+    runner = SimpleNamespace(profiler=object())
+    with (
+        mock.patch("atom.model_engine.model_runner.record_function") as span,
+        mock.patch(
+            "atom.model_engine.model_runner.get_forward_context",
+            side_effect=RuntimeError("stop before sampling"),
+        ),
+        pytest.raises(RuntimeError, match="stop before sampling"),
+    ):
+        ModelRunner.postprocess(runner, None, None, None, None, None, False, None)
+    span.assert_called_once_with("ATOM::postprocess")
 
 
 def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
@@ -32,6 +48,7 @@ def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
     batch.total_seqs_num_prefill = len(is_final_chunk)
     batch.total_seqs_num_decode = 0
     batch.has_prefill = True
+    batch.is_mixed = False
     batch.is_final_chunk = is_final_chunk
     return batch
 
@@ -230,6 +247,7 @@ def _decode_batch(*, num_spec_step: int) -> ScheduledBatch:
     batch.total_seqs_num_prefill = 0
     batch.total_seqs_num_decode = 3
     batch.has_prefill = False
+    batch.is_mixed = False
     batch.num_spec_step = num_spec_step
     return batch
 
@@ -256,17 +274,31 @@ def test_a_non_deferred_decode_stages_the_scheduled_ids_as_they_are():
     group.publish.assert_called_once()
 
 
-def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts():
+@pytest.mark.parametrize("is_mixed", [False, True])
+def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts(is_mixed):
     """Nothing reaches it with drafts: PP verifies none locally and a producer
     never speculates. Staging them here would size rows by `max_seqlen_q`,
     which under DP is the group's maximum for a block drafter, not this
     batch's row width."""
     processor = _recurrent_producer_processor()
+    batch = _decode_batch(num_spec_step=3)
+    if is_mixed:
+        batch.scheduled_tokens = np.arange(5, dtype=np.int32)
+        batch.total_tokens_num = 5
+        batch.total_tokens_num_prefill = 1
+        batch.total_tokens_num_decode = 4
+        batch.total_seqs_num = 2
+        batch.total_seqs_num_prefill = 1
+        batch.total_seqs_num_decode = 1
+        batch.is_mixed = True
+        batch.num_rejected = np.zeros(2, dtype=np.int32)
+        batch.num_bonus = np.zeros(2, dtype=np.int32)
 
-    with pytest.raises(AssertionError, match="num_spec_step=3"):
+    assert batch.is_mixed is is_mixed
+    with pytest.raises(NotImplementedError, match="num_spec_step=3"):
         tokenIDProcessor.prepare_input_ids(
             processor,
-            _decode_batch(num_spec_step=3),
+            batch,
             4,
             processor.runner.h2d_groups["input_ids"],
         )
@@ -443,6 +475,7 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
 
     batch = SimpleNamespace(
         scheduled_tokens=np.arange(8, dtype=np.int32),
+        is_mixed=False,
         # Two q=4 rows, so the flat width is 8 and the request count is 2.
         total_tokens_num=8,
         total_tokens_num_prefill=0,

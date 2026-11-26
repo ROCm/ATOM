@@ -59,11 +59,18 @@ class MoE(V4MoE):
         *,
         quant_config,
         alt_stream: torch.cuda.Stream | None = None,
+        enable_eplb: bool = True,
     ):
         args = DeepseekV4Args.from_hf_config(config)
         args.quant_config = quant_config
         args.moe_fp8_activations = True
-        super().__init__(layer_id, args, prefix=prefix, alt_stream=alt_stream)
+        super().__init__(
+            layer_id,
+            args,
+            prefix=prefix,
+            alt_stream=alt_stream,
+            enable_eplb=enable_eplb,
+        )
         if config.fp4ptpc and not self._fuse_shared_into_routed:
             # Standalone, the per-channel FP8 shared expert has no GEMM at TP4.
             raise ValueError(f"{prefix}: {FP4PTPC_RECIPE}")

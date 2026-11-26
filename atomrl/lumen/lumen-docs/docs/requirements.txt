@@ -1,0 +1,6 @@
+sphinx>=7.0
+furo>=2024.0
+myst-parser>=3.0
+sphinx-copybutton>=0.5
+linkify-it-py>=2.0
+sphinxcontrib-mermaid>=1.0
