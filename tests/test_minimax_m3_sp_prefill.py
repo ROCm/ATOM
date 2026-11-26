@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """MiniMax-M3 sequence-parallel prefill (`atom/models/minimax_m3/sp_prefill.py`)
 on the CPU, AITER stubbed (`tests/aiter_stub.py`): when a step runs SP (pure TP,
 native MXFP8 linears, token thresholds every TBO micro-batch reads alike), when
