@@ -218,6 +218,11 @@ DEFAULT_PORT = 8000
 engine = None
 # `EncoderOnly` under --encoder-only, which builds no engine.
 encoder = None
+# --accept-ec-transfer-params: a chat request's `ec_transfer_params` names
+# where this prefill server reads its image embeddings. Off, they are dropped:
+# only a router that runs the encoder (ATOMesh) may set them.
+accept_ec_transfer_params = False
+_warned_ec_transfer_params = False
 tokenizer: AutoTokenizer | None = None
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
@@ -2335,8 +2340,12 @@ async def _chat_completions(
                     request_id, len(prompt_or_tokens), multimodal_data
                 )
             if request.ec_transfer_params is not None:
-                # The prefill encode reads these rows instead of running the tower.
-                multimodal_data["ec_transfer_params"] = request.ec_transfer_params
+                if accept_ec_transfer_params:
+                    # The prefill encode reads these rows instead of running
+                    # the tower.
+                    multimodal_data["ec_transfer_params"] = request.ec_transfer_params
+                else:
+                    _warn_ec_transfer_params_dropped()
         elif pretokenized is not None:
             # Reuse prefill IDs to skip template rendering and tokenization.
             prompt_or_tokens = pretokenized
@@ -2592,15 +2601,26 @@ async def _chat_completions(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _warn_ec_transfer_params_dropped() -> None:
+    global _warned_ec_transfer_params
+    if not _warned_ec_transfer_params:
+        _warned_ec_transfer_params = True
+        logger.warning(
+            "Dropping ec_transfer_params: start the server with "
+            "--accept-ec-transfer-params to read image embeddings from an "
+            "encoder server"
+        )
+
+
 async def _encoder_only_response(
     request_id: str, num_prompt_tokens: int, multimodal_data: dict[str, Any]
 ) -> JSONResponse:
     """No choices: where the prefill server reads the image embeddings."""
-    from atom.kv_transfer.disaggregation.mooncake.ec_transport import EcPoolFull
+    from atom.ec_transfer import EcStoreFull
 
     try:
         params = await encoder.encode(multimodal_data)
-    except EcPoolFull as e:
+    except EcStoreFull as e:
         # The router sends the request on without these, and prefill encodes.
         logger.warning("Embedding pool full for %s: %s", request_id, e)
         return JSONResponse(
@@ -3951,6 +3971,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--accept-ec-transfer-params",
+        action="store_true",
+        help=(
+            "Read a chat request's image embeddings from the encoder server its "
+            "ec_transfer_params name (E/P/D prefill). Set it only where clients "
+            "cannot reach this server except through a router that runs the "
+            "encoder and replaces any client-sent ec_transfer_params (ATOMesh); "
+            "without it they are dropped and this server encodes images itself."
+        ),
+    )
+    parser.add_argument(
         "--request-log",
         type=str,
         default=None,
@@ -4020,7 +4051,8 @@ def _setup_frontend(args) -> None:
     """Request log, tokenizer, chat template and model name: everything a
     front end needs before the engine exists (shared with front-end workers)."""
     global tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global custom_message_encoder, fim_format
+    global custom_message_encoder, fim_format, accept_ec_transfer_params
+    accept_ec_transfer_params = getattr(args, "accept_ec_transfer_params", False)
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")
         _request_logger.setLevel(logging.INFO)
