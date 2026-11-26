@@ -81,6 +81,8 @@ def test_minimax_m31_dspark_caps_the_rows_but_not_ctx_lens(host_staging):
     draft = MiniMaxM3DSpark.__new__(MiniMaxM3DSpark)
     draft.max_num_seqs, draft._bt16 = 4, None
     draft.sliding_window = 0
+    # the host check of the one-launch Markov chain is the head's business
+    draft.markov_head = types.SimpleNamespace(fused_sample=False)
     T = 3
     pos = torch.tensor([[126, 127, 128], [5, 6, 7], [1, 2, 3]])
     slots = torch.tensor([[10, 11, 12], [20, 21, 22], [-1, -1, -1]])
