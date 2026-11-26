@@ -42,6 +42,7 @@ from atom.model_ops.layernorm import (
     sp_allreduce_supported,
     sp_fused_allreduce_gemma_rms_norm,
     sp_fused_allreduce_gemma_rms_norm_mxfp8_quant,
+    tp1_norm_mxfp8_one_launch,
 )
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
@@ -1774,7 +1775,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # MXFP8 input (its gate_up's own quant of the same row, bit for bit).
         post_attention_norm_shared_mxfp8 = (
             enable_mxfp8_fused_ar
-            and envs.ATOM_M3_TP1_NORM_MXFP8
+            and tp1_norm_mxfp8_one_launch(
+                hidden_states.numel() // hidden_states.shape[-1]
+            )
             and self.is_moe_layer
             and get_tensor_model_parallel_world_size() == 1
             and self.block_sparse_moe.takes_shared_mxfp8_input()

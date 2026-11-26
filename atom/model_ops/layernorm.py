@@ -1148,6 +1148,14 @@ def fused_allreduce_gemma_rms_norm_quant(
     return out_fp8, scale_out, residual_out
 
 
+def tp1_norm_mxfp8_one_launch(rows: int) -> bool:
+    """Whether the TP 1 norm writes its MXFP8 output in the one aiter launch
+    (ATOM_M3_TP1_NORM_MXFP8, up to ATOM_M3_TP1_NORM_MXFP8_MAX_ROWS rows)."""
+    return bool(envs.ATOM_M3_TP1_NORM_MXFP8) and (
+        rows <= envs.ATOM_M3_TP1_NORM_MXFP8_MAX_ROWS
+    )
+
+
 def fused_allreduce_gemma_rms_norm_mxfp8_quant(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -1179,8 +1187,8 @@ def fused_allreduce_gemma_rms_norm_mxfp8_quant(
         )
         return out_fp8, scale_out, residual_out
 
-    if not envs.ATOM_M3_TP1_NORM_MXFP8:
-        assert not emit_bf16, "emit_bf16 needs ATOM_M3_TP1_NORM_MXFP8"
+    if not tp1_norm_mxfp8_one_launch(hidden_states.numel() // hidden_states.shape[-1]):
+        assert not emit_bf16, "emit_bf16 needs the one-launch TP 1 MXFP8 norm"
         from atom.model_ops.blockscale import quantize_fp8
 
         normed, residual_out = norm(hidden_states, residual)
