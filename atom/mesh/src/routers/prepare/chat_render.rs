@@ -151,9 +151,8 @@ impl ChatControls {
     /// K3's template takes them as `tools`.
     ///
     /// V3.2's and V4's tool-call arguments stay the JSON string sent, which
-    /// their checkpoints' encoders `json.loads`. ATOM decodes them first, so
-    /// its V3.2 encoder fails on them and its V4 encoder renders them as one
-    /// `arguments` parameter: here the router renders otherwise than ATOM.
+    /// their checkpoints' encoders `json.loads`, as ATOM's adapter for them
+    /// hands them over (`preserve_tool_call_arguments`).
     fn messages(self, sent: &Map<String, Value>) -> (Vec<Value>, Option<Vec<Value>>) {
         let v41 = self == Self::DeepseekV41;
         let messages = field(sent, "messages")
@@ -246,6 +245,7 @@ impl ChatControls {
                 drop_thinking,
             };
             deepseek_v32::encode_messages(&messages, mode, &params)
+                .map(|prompt| v32_tools_as_the_checkpoint_writes_them(&prompt))
         } else {
             let reasoning_effort = match kwargs.get("reasoning_effort").filter(|v| !v.is_null()) {
                 None => deepseek_v4::ReasoningEffort::Low,
@@ -262,6 +262,51 @@ impl ChatControls {
         };
         rendered.map_err(|e| format!("Failed to apply chat template: {e}"))
     }
+}
+
+/// The checkpoint's `encoding_dsv32.py` `TOOLS_SYSTEM_TEMPLATE` up to the tool
+/// schemas, as ATOM's server renders it (the checkpoint's own file): its
+/// paragraphs set apart by blank lines.
+const V32_TOOLS_HEAD: &str = "## Tools
+
+You have access to a set of tools you can use to answer the user's question.
+You can invoke functions by writing a \"<｜DSML｜function_calls>\" block like the following as part of your reply to the user:
+<｜DSML｜function_calls>
+<｜DSML｜invoke name=\"$FUNCTION_NAME\">
+<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>
+...
+</｜DSML｜invoke>
+<｜DSML｜invoke name=\"$FUNCTION_NAME2\">
+...
+</｜DSML｜invoke>
+</｜DSML｜function_calls>
+
+String and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The \"string\" attribute should be set to \"true\" for string type parameters and \"false\" for other types (numbers, booleans, arrays, objects).
+
+If the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:
+
+<｜DSML｜function_calls>
+...
+</｜DSML｜function_calls>
+
+<function_results>
+...
+</function_results>
+
+<think>...thinking about results</think>
+
+Here are the functions available in JSONSchema format:
+<functions>
+";
+
+/// `prompt`, from llm-tokenizer's V3.2 port, with its tools block as the
+/// checkpoint writes it. The port writes the block as the serving engines'
+/// copies of the encoder do, without the checkpoint's blank lines; the rest of
+/// the block (the tool schemas) is alike. The port's head is the checkpoint's
+/// with the blank lines dropped.
+fn v32_tools_as_the_checkpoint_writes_them(prompt: &str) -> String {
+    let ports_head = V32_TOOLS_HEAD.replace("\n\n", "\n");
+    prompt.replace(&ports_head, V32_TOOLS_HEAD)
 }
 
 /// The prompt `chat` renders to with `tokenizer`, and the channel opener it
@@ -663,6 +708,39 @@ mod tests {
         assert!(
             !forced(json!({"reasoning_effort": "none"})).is_err_and(|e| e.contains("tool_choice"))
         );
+    }
+
+    /// V3.2 with tools and a history tool call renders as DeepSeek-V3.2's
+    /// own encoder (the checkpoint's `encoding_dsv32.py`, which ATOM's server
+    /// loads) renders it: its tools block's blank lines included
+    /// (`tests/fixtures/chat_render/gen_deepseek_v32_tools.py`).
+    #[test]
+    fn v32_with_tools_renders_as_the_checkpoint() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/chat_render/deepseek_v32_tools.json"
+        )))
+        .unwrap();
+        let tokenizer = create_tokenizer(hf_tokenizer_path()).unwrap();
+        for (mode, expected) in fixture["prompts"].as_object().unwrap() {
+            let thinking = if mode == "thinking" {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let (chat, body) = chat(&json!({
+                "messages": fixture["messages"],
+                "thinking": {"type": thinking},
+            }));
+            let (text, _) = render_chat(
+                &chat,
+                Some(&body),
+                &*tokenizer,
+                Some(ChatControls::DeepseekV32),
+            )
+            .unwrap();
+            assert_eq!(&text, expected.as_str().unwrap(), "{mode}");
+        }
     }
 
     /// The gRPC routers prepare a chat from its body as sent
