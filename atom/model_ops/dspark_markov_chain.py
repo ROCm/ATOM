@@ -14,29 +14,33 @@ the workgroups exchange their (max, id) through tagged 64-bit slots and every
 workgroup reduces them itself.
 
 Numerics: bit-identical to ``dspark_markov_argmax`` -- per tile the same chain
-of eight ``v_wmma_f32_16x16x32_bf16`` its Triton stage 1 emits on gfx1250 (W2 in
-the first operand slot, the embedding row in the second, the same K split
-across lanes), ``fp32(base) + acc``, lowest id on ties. Checked op-level on the
-ids, the W1 rows and every biased logit of all K steps, eager and graph replay.
+of eight ``v_wmma_f32_16x16x32_bf16`` its Triton stage 1 emits on gfx1250 (the
+same operands, the same K split across lanes), ``fp32(base) + acc``, lowest id
+on ties.
 
 Served when (``usable``): gfx1250, ONE request (the block's rows are its K
 positions), bf16 logits / tables of rank 256, a vocabulary of whole 16-id
-tiles, K <= 8, and every CU free for one workgroup (the launch checks its tile
-split fits). Anything else keeps the two-stage path.
+tiles, K <= 8, and a tile split that fits the device (the launch checks it).
+Anything else keeps the two-stage path.
 
-The waits are bounded. A wait that gives up (a workgroup not resident, which a
-dedicated GPU does not hit) sets a bit in an error word and the step continues
-on what it has: the drafted ids are then wrong but only drafted -- verification
-rejects them. ``poll_errors`` reports such a word to the log.
+The exchange waits for every workgroup, which holds when the launch has the GPU
+to itself. Its waits are bounded so that a workgroup that never becomes
+resident (another process or a long kernel on a side stream holding CUs) cannot
+hang the step; such a wait sets a bit in an error word and that step's drafts
+are not to be trusted. ``check_errors``, called by the draft on the host every
+step, reads the word without waiting on the device and raises, rather than
+drafting on.
 """
 
 import ctypes
 import fcntl
+import glob
 import hashlib
 import logging
 import os
 import subprocess
 import tempfile
+from typing import NamedTuple
 
 import torch
 
@@ -48,11 +52,23 @@ _SRC = os.path.join(
 RANK = 256
 MAX_STEPS = 8
 LDS_TILES = 38
+# Return codes of `markov_chain_launch` for a tile split or LDS size this
+# device cannot hold: the one-launch path is never served on it.
+_DOES_NOT_FIT = (-3, -4)
 _lib = None
 _lib_failed = False
-_state: dict = {}  # device index -> (slots, err)
-_err_reported = 0
 _calls = 0
+
+
+class _DeviceState(NamedTuple):
+    slots: torch.Tensor  # [MAX_STEPS * ncta] int64 exchange slots
+    err: torch.Tensor  # [1] int32 error word, bit k: a wait of step k gave up
+    ncta: int
+    err_host: torch.Tensor  # pinned copy of `err`
+    err_copied: torch.cuda.Event  # recorded after each copy into `err_host`
+
+
+_state: dict[int, _DeviceState] = {}
 
 
 def _opus_include() -> "str | None":
@@ -74,9 +90,15 @@ def _load():
         inc = _opus_include()
         if inc is None:
             raise RuntimeError("aiter's opus.hpp not found")
+        rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+        # Linked against the HIP runtime file itself: a pip ROCm SDK's runtime
+        # directory ships only the versioned soname, which `-lamdhip64` misses.
+        runtimes = sorted(glob.glob(os.path.join(rocm, "lib", "libamdhip64.so*")))
+        if not runtimes:
+            raise RuntimeError(f"no libamdhip64 under {rocm}/lib")
         with open(_SRC, "rb") as f:
             src = f.read()
-        key = hashlib.sha1(src + inc.encode()).hexdigest()[:16]
+        key = hashlib.sha1(src + inc.encode() + runtimes[0].encode()).hexdigest()[:16]
         cache = os.path.join(
             os.path.expanduser("~"), ".cache", "atom", "dspark_markov_chain"
         )
@@ -85,9 +107,7 @@ def _load():
         with open(os.path.join(cache, ".lock"), "w") as lk:
             fcntl.flock(lk, fcntl.LOCK_EX)
             if not os.path.exists(so):
-                hipcc = os.path.join(
-                    os.environ.get("ROCM_PATH", "/opt/rocm"), "bin", "hipcc"
-                )
+                hipcc = os.path.join(rocm, "bin", "hipcc")
                 fd, tmp = tempfile.mkstemp(suffix=".so", dir=cache)
                 os.close(fd)
                 cmd = [
@@ -97,11 +117,12 @@ def _load():
                     "-std=c++17",
                     "-fPIC",
                     "-shared",
-                    "-DFILL_TDM=1",
                     f"-I{inc}",
                     _SRC,
                     "-o",
                     tmp,
+                    "-no-hip-rt",
+                    f"-Wl,{runtimes[0]}",
                 ]
                 r = subprocess.run(cmd, capture_output=True, text=True, check=False)
                 if r.returncode:
@@ -111,12 +132,12 @@ def _load():
         lib = ctypes.CDLL(so)
         lib.markov_chain_launch.restype = ctypes.c_int
         lib.markov_chain_launch.argtypes = (
-            [ctypes.c_int] * 4
+            [ctypes.c_int]
             + [ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_long]
             + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
-            + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-            + [ctypes.c_int] * 4
             + [ctypes.c_void_p, ctypes.c_void_p]
+            + [ctypes.c_int] * 4
+            + [ctypes.c_void_p]
         )
         _lib = lib
     except Exception as e:  # noqa: BLE001 -- any failure keeps the two-stage path
@@ -157,30 +178,28 @@ def usable(
 def markov_chain_bs1(base, ids, w1, w2) -> "torch.Tensor | None":
     """Drafted ids into ``ids[0, 1:]`` (``ids[0, 0]`` is the anchor) and the
     ``[K, 256]`` W1 rows of the K steps returned; None when not served."""
+    global _lib_failed
     if not usable(base, ids, w1, w2):
         return None
     dev = base.device
     st = _state.get(dev.index)
     if st is None:
         if torch.cuda.is_current_stream_capturing():
-            return (
-                None  # buffers must outlive the graph pool: allocate on an eager call
-            )
+            # The buffers must outlive the graph pool: allocated on an eager call.
+            return None
         ncta = torch.cuda.get_device_properties(dev).multi_processor_count
-        st = _state[dev.index] = (
-            torch.zeros(MAX_STEPS * ncta + MAX_STEPS, dtype=torch.int64, device=dev),
+        st = _state[dev.index] = _DeviceState(
+            torch.zeros(MAX_STEPS * ncta, dtype=torch.int64, device=dev),
             torch.zeros(1, dtype=torch.int32, device=dev),
             ncta,
+            torch.zeros(1, dtype=torch.int32, pin_memory=True),
+            torch.cuda.Event(),
         )
-    slots, err, ncta = st
     K = base.shape[1]
     embeds = torch.empty(K, RANK, dtype=w1.dtype, device=dev)
     b = base[0]
     rc = _lib.markov_chain_launch(
-        0,
-        0,
         int(ids.dtype == torch.int64),
-        0,
         b.data_ptr(),
         b.stride(0),
         ids.data_ptr(),
@@ -189,45 +208,44 @@ def markov_chain_bs1(base, ids, w1, w2) -> "torch.Tensor | None":
         w2.data_ptr(),
         embeds.data_ptr(),
         embeds.stride(0),
-        slots.data_ptr(),
-        err.data_ptr(),
-        None,
+        st.slots.data_ptr(),
+        st.err.data_ptr(),
         b.shape[1],
         K,
         LDS_TILES,
-        ncta,
+        st.ncta,
         torch.cuda.current_stream(dev).cuda_stream,
-        None,
     )
+    if rc in _DOES_NOT_FIT:
+        _lib_failed = True
+        logger.warning(
+            "DSpark Markov chain kernel declined (rc=%d): two-stage path", rc
+        )
+        return None
     if rc != 0:
-        if rc in (
-            -3,
-            -4,
-        ):  # tile split / LDS does not fit this device: never served here
-            global _lib_failed
-            _lib_failed = True
-            logger.warning(
-                "DSpark Markov chain kernel declined (rc=%d): two-stage path", rc
-            )
-            return None
         raise RuntimeError(f"DSpark Markov chain launch failed: rc={rc}")
     return embeds
 
 
-def poll_errors(every: int = 512) -> None:
-    """Report a bounded wait that gave up (read every ``every`` calls: a sync)."""
-    global _calls, _err_reported
+def check_errors(every: int = 512) -> None:
+    """Raise if a bounded wait of the one-launch chain gave up.
+
+    Host side, outside any recording. Every ``every`` calls it reads the
+    error word as copied the time before (through a pinned buffer and an
+    event, so it never waits on the device), then copies it again.
+    """
+    global _calls
     _calls += 1
-    if _calls % every or not _state:
+    if _calls % every:
         return
-    for slots, err, _ in _state.values():
-        v = int(err.item())
-        if v:
-            _err_reported += 1
-            err.zero_()
-            logger.error(
-                "DSpark Markov chain: a bounded wait gave up (step mask 0x%x, report %d); "
-                "drafts of that step were wrong, verification rejected them",
-                v,
-                _err_reported,
+    for st in _state.values():
+        if st.err_copied.query() and st.err_host.item():
+            raise RuntimeError(
+                "DSpark Markov chain: a workgroup of the one-launch chain was not "
+                f"resident (steps 0x{st.err_host.item():x} waited it out), so those "
+                "steps' drafts are not to be trusted. Something else holds CUs of "
+                "this GPU; set ATOM_DSPARK_FUSED_MARKOV_SAMPLE=0 to sample with "
+                "the two-stage path."
             )
+        st.err_host.copy_(st.err, non_blocking=True)
+        st.err_copied.record()

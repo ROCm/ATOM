@@ -542,11 +542,11 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
         if self.markov_head.fused_sample:
-            # Host side of the step, outside any recording: report a bounded
-            # wait of the one-launch Markov chain that gave up (rarely: a sync).
-            from atom.model_ops.dspark_markov_chain import poll_errors
+            # Host side of the step, outside any recording: raise if a bounded
+            # wait of the one-launch Markov chain gave up (no device wait).
+            from atom.model_ops.dspark_markov_chain import check_errors
 
-            poll_errors()
+            check_errors()
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]
