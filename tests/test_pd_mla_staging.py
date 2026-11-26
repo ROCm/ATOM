@@ -148,7 +148,7 @@ def test_staged_index_descriptors_stay_inside_one_destination_mr(monkeypatch):
     conn = object.__new__(mc.MooncakeConnector)
     conn._MAX_RDMA_CHUNK_BYTES = 2 * 64 + 10  # two 64-byte pages per MR
     conn._index_staging_slots = mc.SlotPool(1)
-    conn._send_worker_stream = _Stream
+    conn._thread_stream = _Stream
     conn._gather_sharded_index = lambda *_args: (10000, 5)
     conn._nic = _Nic()
     writes = []
@@ -265,7 +265,7 @@ def _producer(mc, regions, *, pool_size=0, slot_pages=0):
         )
         conn._kv_staging_slots = mc.SlotPool(pool_size)
         conn._stream = _Stream()
-        conn._send_worker_stream = lambda: conn._stream
+        conn._thread_stream = lambda: conn._stream
         conn._kv_source_views = {
             i: t.view(-1, TOKEN_BYTES) for i, t in enumerate(regions)
         }
@@ -524,7 +524,7 @@ def test_a_failed_index_gather_ends_before_its_slot_is_released(monkeypatch):
     events = []
     stream = _Stream()
     stream.synchronize = lambda: events.append("sync")
-    conn._send_worker_stream = lambda: stream
+    conn._thread_stream = lambda: stream
     conn._index_staging_slots = mc.SlotPool(1)
     conn._index_staging_slots.release = lambda _idx: events.append("release")
 
@@ -793,8 +793,8 @@ def test_staged_mla_gathers_on_the_gpu(dcp_rank):
     new = _producer(mc, regions, pool_size=1, slot_pages=2)
     new._kv_staging = new._kv_staging.to(device)
     new._cuda_device = device.index
-    new._send_worker_streams = threading.local()
-    del new._send_worker_stream  # the real per-worker stream
+    new._thread_streams = threading.local()
+    del new._thread_stream  # the real per-thread stream
     old._rdma_write = _DeviceNic(regions + dst_old).write
     nic = _DeviceNic(regions + dst_new + [new._kv_staging])
     new._rdma_write = nic.write

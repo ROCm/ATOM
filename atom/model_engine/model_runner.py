@@ -61,6 +61,10 @@ from atom.kv_transfer.disaggregation import (
 )
 from atom.kv_transfer.disaggregation.factory import warn_unsized_state_transfer_slots
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
+from atom.model_engine.compute_stream import (
+    enter_compute_stream,
+    new_compute_priority_stream,
+)
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.kv_cache_binding import kv_cache_bindings
@@ -1007,6 +1011,14 @@ class ModelRunner:
             # forward returns the final (concatenated) output. See arm_aux_capture.
 
         torch.set_default_device(self.device)
+        # Only now that every weight is loaded: the loader hands each
+        # `weight_loader` to a thread pool whose threads launch on the default
+        # stream, and a non-blocking stream is not ordered against it, so the
+        # init `zero_`s and `process_weights_after_loading` could race the
+        # copies. Draining is what `enter_compute_stream` does before it
+        # switches. Graph capture and the first forward are still below, and
+        # only the stream a graph is launched from matters.
+        self.compute_stream = enter_compute_stream(self.config, self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
         self._arm_lossless(config)
@@ -5081,8 +5093,10 @@ class RapidServeModelRunner(ModelRunner):
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Decode runs the model forward and its head on a dynamically selected
         # (optionally CU-masked) stream so they don't contend with prefill on
-        # the shared GPU; postprocess (sampling + async CPU copy) stays on the
-        # default stream. The stream pool is created by DecodeEngineCore via
+        # the shared GPU; postprocess (sampling + async CPU copy) stays on this
+        # thread's current stream, which is the High-priority compute stream
+        # when ATOM_HIGH_PRIORITY_COMPUTE_STREAM moved the thread onto it. The
+        # stream pool is created by DecodeEngineCore via
         # create_decode_stream_pool().
         stream = self._decode_streams[batch.cu_stream_fraction]
         self._done_event.record()
@@ -5107,7 +5121,9 @@ class RapidServeModelRunner(ModelRunner):
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
 
-        # postprocess (sampling + async CPU copy) always runs on default stream.
+        # postprocess (sampling + async CPU copy) runs on the runner thread's
+        # current stream: the default one, or the High-priority compute stream
+        # when ATOM_HIGH_PRIORITY_COMPUTE_STREAM moved this thread onto it.
         fwd_output = self.postprocess(
             batch,
             temperatures,
@@ -5372,6 +5388,17 @@ class RapidServeModelRunner(ModelRunner):
     # CU fractions for which we pre-create masked streams.
     _CU_POOL_FRACTIONS: ClassVar[list[float]] = [0.5]
 
+    def _new_pool_fallback_stream(self) -> torch.cuda.Stream:
+        """The full-CU stream a prefill or decode pool falls back to.
+
+        Both pools follow the runner's compute priority, so neither side of a
+        disaggregated rank outranks the other and the flag reaches prefill as
+        well as decode.
+        """
+        if self.compute_stream is None:
+            return torch.cuda.Stream(self.device)
+        return new_compute_priority_stream(self.device)
+
     def create_prefill_stream_pool(self) -> bool:
         """Create a pool of CUDA streams for disaggregated prefill.
 
@@ -5388,7 +5415,7 @@ class RapidServeModelRunner(ModelRunner):
                 mask = self._cu_mask_for_fraction(f, upper=False)
                 self._prefill_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
-        self._prefill_streams[None] = torch.cuda.Stream()
+        self._prefill_streams[None] = self._new_pool_fallback_stream()
         logger.info(
             f"Prefill stream pool created: fractions={list(self._prefill_streams.keys())}"
         )
@@ -5409,7 +5436,7 @@ class RapidServeModelRunner(ModelRunner):
                 mask = self._cu_mask_for_fraction(f, upper=True)
                 self._decode_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
-        self._decode_streams[None] = torch.cuda.Stream()
+        self._decode_streams[None] = self._new_pool_fallback_stream()
         self._model_fwd_event = torch.cuda.Event()
         self._done_event = torch.cuda.Event()
         logger.info(
@@ -5422,8 +5449,8 @@ class RapidServeModelRunner(ModelRunner):
         """Run a prefill forward pass on a dynamically selected CU-masked stream.
 
         Writes KV for all prompt tokens, samples the first generated token for
-        each sequence, then synchronizes before returning so decode's default
-        stream sees all KV writes.  Returns a list of sampled token IDs (one
+        each sequence, then synchronizes before returning so decode sees all KV
+        writes whatever stream it runs on.  Returns a list of sampled token IDs (one
         per sequence, in batch order) — these are included in PrefillDone so
         the decode process can append them before the first decode step,
         matching the num_tokens state that non-disagg postprocess would produce.
@@ -5458,7 +5485,8 @@ class RapidServeModelRunner(ModelRunner):
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()
-        # Synchronize so decode's default stream sees all KV writes.
+        # A host-side wait, so decode sees all KV writes whatever stream it
+        # runs on -- the default one, or the High-priority compute stream.
         stream.synchronize()
         self._record_kv_cache_ready(batch)
         reset_forward_context()

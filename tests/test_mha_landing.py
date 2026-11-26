@@ -148,7 +148,7 @@ class Harness:
             chunked_transfer=False,
         )
         self.stream = torch.cuda.Stream() if self.device.type == "cuda" else Stream()
-        c._send_worker_stream = lambda: self.stream
+        c._thread_stream = lambda: self.stream
         self.event = (
             torch.cuda.Event()
             if self.device.type == "cuda"

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # PD-disaggregation + pipeline-parallel unit tests (GPU-free).
 
+import contextlib
 import logging
 import os
 import subprocess
@@ -1208,10 +1209,12 @@ def _make_transfer_connector(prefill_data, captured):
     conn.done_sending = set()
     conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
     conn._execute_block_slot_transfer = (
-        lambda request, target, src, dst, data, req_id, *, engine=None: captured.append(
-            (request, target, src, dst, data, req_id, engine)
+        lambda request, target, src, dst, data, req_id, ready_event, *, engine=None: (
+            captured.append(
+                (request, target, src, dst, data, req_id, ready_event, engine)
+            )
+            or True
         )
-        or True
     )
     conn._send_write_done = lambda *_args, **_kwargs: None
     return conn
@@ -1251,7 +1254,22 @@ def test_tp_transfer_uses_final_source_slot_after_checkpoint_move():
     assert transferred["swa_block_ids"] == [7]
     # The slot path takes the engine `_execute_transfer` picked, so #2276's
     # matched-rail routing reaches it too.
-    assert captured[0][6] is conn.transfer_engine
+    assert captured[0][7] is conn.transfer_engine
+
+
+def test_tp_transfer_hands_the_slot_gather_its_prefill_ready_event():
+    """Staging the state slot gathers it on a send-worker stream, which only
+    this event orders against the forward that wrote it."""
+    captured = []
+    conn = _make_transfer_connector(
+        {"block_ids": [3], "slot_index": 3, "swa_block_ids": [3]}, captured
+    )
+    ready_event = object()
+    conn._kv_cache_ready_events["prefill-1"] = ready_event
+
+    conn._execute_transfer(_stateful_write_request())
+
+    assert captured[0][6] is ready_event
 
 
 @pytest.mark.parametrize("invalid_slot", [-1, None, "invalid"])
@@ -1375,6 +1393,124 @@ def test_failed_write_done_returns_the_staging_row_to_the_pool():
     assert not scattered, "a failed transfer must not scatter its staging row"
     assert "r1" not in conn._pending_recv_slots
     assert "r1" in conn.failed_recving
+
+
+def test_a_landed_state_slot_is_scattered_before_the_request_is_done(monkeypatch):
+    """The receive-side twin of the staged gather's ready event.
+
+    `_scatter_slot` is an async copy and nothing else makes decode's read of
+    the state slot wait for it, so the wait happens here, before the request
+    is published and before the staging row goes back for the next RDMA write
+    to overwrite. It runs on a private stream: with the flag off this thread's
+    current stream is the null stream the decode forward is enqueued on, and
+    waiting on that would hold every notification behind the in-flight decode
+    step.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    order = []
+    scatter_stream = SimpleNamespace(
+        synchronize=lambda: order.append("synchronize"),
+    )
+    devices = []
+    monkeypatch.setattr(
+        mc.torch.cuda,
+        "Stream",
+        lambda device: devices.append(device) or scatter_stream,
+    )
+
+    @contextlib.contextmanager
+    def as_current(stream):
+        assert stream is scatter_stream
+        order.append("enter")
+        yield
+
+    monkeypatch.setattr(mc.torch.cuda, "stream", as_current)
+
+    def _no_current_stream(*args, **kwargs):
+        raise AssertionError(
+            "waiting on the listener's current stream parks every "
+            "notification behind the decode forward"
+        )
+
+    monkeypatch.setattr(mc.torch.cuda, "current_stream", _no_current_stream)
+    conn = _make_connector(
+        _staging_slots=mc.SlotPool(),
+        _scatter_slot=lambda *args: order.append(("scatter", *args)),
+        _mla_landing=None,
+        _cuda_device=3,
+        _thread_streams=threading.local(),
+    )
+    release = conn._staging_slots.release
+    conn._staging_slots.release = lambda idx: (
+        order.append(("release", idx)),
+        release(idx),
+    )
+    conn._pending_recv_expected["r1"] = 1
+    conn._pending_recv.add("r1")
+    conn._pending_recv_slots["r1"] = (7, 3)
+
+    assert conn._record_write_done("r1", 0, 0, 0)
+
+    assert order == ["enter", ("scatter", 7, 3), "synchronize", ("release", 3)]
+    # The scatter stream belongs to the KV cache's device, which is not
+    # necessarily the listener thread's current one.
+    assert devices == [conn._cuda_device]
+    assert conn._staging_slots.free == [3]
+    assert "r1" in conn.done_recving
+
+
+@pytest.mark.parametrize("raiser", ["scatter", "synchronize"])
+def test_a_raised_scatter_returns_its_staging_row(monkeypatch, raiser):
+    """The twin of the gather side's failure arm.
+
+    The row is handed back however the scatter leaves, and it has to be quiet
+    first: a scatter that raised partway still has copies in flight. Losing
+    one row parks every later receive on the pool, which has no acquire
+    timeout. `synchronize` is where HIP surfaces an earlier fault, so it
+    raising is the likeliest way here, not the unlikeliest.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    order = []
+
+    def _sync():
+        order.append("synchronize")
+        if raiser == "synchronize":
+            raise RuntimeError("scatter blew up")
+
+    scatter_stream = SimpleNamespace(synchronize=_sync)
+    monkeypatch.setattr(mc.torch.cuda, "Stream", lambda device: scatter_stream)
+    monkeypatch.setattr(mc.torch.cuda, "stream", contextlib.nullcontext)
+
+    def _boom(*args):
+        order.append("scatter")
+        if raiser == "scatter":
+            raise RuntimeError("scatter blew up")
+
+    conn = _make_connector(
+        _staging_slots=mc.SlotPool(),
+        _scatter_slot=_boom,
+        _mla_landing=None,
+        _cuda_device=3,
+        _thread_streams=threading.local(),
+    )
+    release = conn._staging_slots.release
+    conn._staging_slots.release = lambda idx: (
+        order.append(("release", idx)),
+        release(idx),
+    )
+    conn._pending_recv_expected["r1"] = 1
+    conn._pending_recv.add("r1")
+    conn._pending_recv_slots["r1"] = (7, 3)
+
+    with pytest.raises(RuntimeError, match="scatter blew up"):
+        conn._record_write_done("r1", 0, 0, 0)
+
+    assert order == ["scatter", "synchronize", ("release", 3)]
+    assert conn._staging_slots.free == [3]
 
 
 def test_failed_write_done_without_a_staging_row_is_a_noop():
@@ -2151,6 +2287,7 @@ def _run_slot_transfer(mc, connector, request_data):
         [1, 2],
         {"slot_index": 5},
         "req-1",
+        None,
     )
 
 
@@ -2266,7 +2403,7 @@ def test_dcp_index_staging_waits_for_request_ready_event(monkeypatch):
     )
     connector._gather_sharded_index = MagicMock()
     staging_stream = MagicMock()
-    connector._send_worker_stream = MagicMock(return_value=staging_stream)
+    connector._thread_stream = MagicMock(return_value=staging_stream)
     connector._execute_staged_index_layer_chunk = MagicMock(return_value=True)
     connector._rdma_write = MagicMock(return_value=True)
     ready_event = object()
@@ -2330,7 +2467,7 @@ def test_dcp_index_staging_rejects_missing_request_ready_event():
     connector._index_staging_chunk_pages = 256
     connector._prepare_sharded_index = MagicMock(return_value=object())
     connector._gather_sharded_index = MagicMock()
-    connector._send_worker_stream = MagicMock()
+    connector._thread_stream = MagicMock()
     connector._rdma_write = MagicMock(return_value=True)
     request_data = {
         "consumer_base_addrs": [3_000_000, 4_000_000],
@@ -2379,6 +2516,47 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
 
     ready_event.record.assert_called_once_with(producer_stream)
     assert connector._kv_cache_ready_events == {11: ready_event, 12: ready_event}
+
+
+@pytest.mark.parametrize(
+    "staging,recorded",
+    [
+        ({"_staging_slot_bytes": 4}, True),
+        ({"_kv_staging": object()}, True),
+        ({}, False),
+    ],
+)
+def test_mooncake_records_a_ready_event_for_any_staged_path(
+    monkeypatch, staging, recorded
+):
+    """A backend that stages only the state slot needs the event too.
+
+    V4/V4.1 compressor state has no index or MLA staging, and the staged slot
+    gather fails closed without an event rather than reading a partial state.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector = object.__new__(mc.MooncakeConnector)
+    connector.is_producer = True
+    connector._index_staging_pool_size = 0
+    connector._kv_staging = None
+    connector._staging_slot_bytes = 0
+    connector._cuda_device = 3
+    connector._kv_cache_ready_events = {}
+    connector._kv_cache_ready_batches = deque()
+    connector._kv_ready_done_event = None
+    connector._kv_ready_expired = {}
+    connector._completed_prefills_lock = threading.Lock()
+    for name, value in staging.items():
+        setattr(connector, name, value)
+    ready_event = MagicMock()
+    monkeypatch.setattr(mc.torch.cuda, "Event", MagicMock(return_value=ready_event))
+    monkeypatch.setattr(mc.torch.cuda, "current_stream", MagicMock())
+
+    connector.record_kv_cache_ready([11])
+
+    assert connector._kv_cache_ready_events == ({11: ready_event} if recorded else {})
 
 
 def _ready_event_producer(mc, monkeypatch):
@@ -2751,7 +2929,7 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
     conn._index_staging_slots = MagicMock()
     conn._index_staging_slots.acquire.return_value = 3
     staging_stream = SimpleNamespace(synchronize=MagicMock())
-    conn._send_worker_stream = lambda: staging_stream
+    conn._thread_stream = lambda: staging_stream
     conn._gather_sharded_index = lambda *_args: (10000, 2)
     conn._rdma_write = MagicMock(return_value=True)
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())
