@@ -42,6 +42,7 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     chunked_topology_supported,
 )
 from atom.kv_transfer.disaggregation.gather import GatherLayout, gather_units
+from atom.kv_transfer.disaggregation.mooncake import send_process
 from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     DEFAULT_HANDSHAKE_PORT,
     producer_endpoint,
@@ -1096,6 +1097,9 @@ class MooncakeConnector(KVConnectorBase):
     # ``__init__`` aborted before the matched-rail block; both must fall back to
     # the single shared ``transfer_engine`` instead of raising AttributeError.
     _rail_pool: RailEnginePool | None = None
+    # The same for the send process (send_process.py): off unless __init__ says so.
+    _send_process_mode: bool = False
+    _send_process: send_process.StageLink | None = None
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -1127,6 +1131,10 @@ class MooncakeConnector(KVConnectorBase):
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.is_consumer = not self.is_producer
+        # The P->D send path runs in a process of its own (send_process.py).
+        self._send_process_mode = (
+            self.is_producer and send_process.send_process_enabled(config)
+        )
 
         # Networking config
         self.http_port = kv_transfer_config.get("http_port", 8000)
@@ -1213,31 +1221,13 @@ class MooncakeConnector(KVConnectorBase):
                 self.tp_rank,
             )
 
-        # The device filter independently selects the RDMA data path; the
-        # server name below is also advertised in consumer/notification metadata.
-        self.transfer_engine = TransferEngine()
-        ret = self.transfer_engine.initialize(
-            self.local_ip,
-            "P2PHANDSHAKE",
-            self.protocol,
-            ib_device,
-        )
-        if ret != 0:
-            raise RuntimeError(
-                f"Mooncake TransferEngine.initialize() failed (ret={ret}) "
-                f"on ip={self.local_ip}, protocol={self.protocol}, "
-                f"ib_device={ib_device}"
-            )
-        self.rpc_port = self.transfer_engine.get_rpc_port()
-        self.engine_id = f"{self.local_ip}:{self.rpc_port}"
-        logger.info(
-            "Mooncake TransferEngine initialized: ip=%s, protocol=%s, "
-            "ib_device=%s, rpc_port=%d",
-            self.local_ip,
-            self.protocol,
-            ib_device,
-            self.rpc_port,
-        )
+        if self._send_process_mode:
+            if matched_rails:
+                raise RuntimeError("ATOM_PD_SEND_PROCESS runs no matched rails")
+            # The send process starts the P->D engine; this process needs none.
+            self.transfer_engine, self.rpc_port, self.engine_id = None, 0, "pd-send"
+        else:
+            self._init_transfer_engine(ib_device)
 
         if matched_rails and self.is_producer:
             # _resolve_matched_rails requires exactly one primary HCA.
@@ -1407,11 +1397,8 @@ class MooncakeConnector(KVConnectorBase):
             send_worker_count(kv_transfer_config) if self.is_producer else 0
         )
         if self.is_producer:
-            self._send_executor = ThreadPoolExecutor(
-                max_workers=self._num_send_workers,
-                thread_name_prefix="mooncake-send-worker",
-                initializer=torch.cuda.set_device,
-                initargs=(self._cuda_device,),
+            self._send_executor = (
+                None if self._send_process_mode else self._make_send_executor()
             )
         else:
             # Consumer: write requests queue here and one daemon worker posts
@@ -1438,6 +1425,41 @@ class MooncakeConnector(KVConnectorBase):
         # --- Msgspec encoder/decoder for bootstrap metadata ---
         self._encoder = msgspec.msgpack.Encoder()
         self._decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
+
+    def _init_transfer_engine(self, ib_device: str) -> None:
+        # The device filter independently selects the RDMA data path; the
+        # server name below is also advertised in consumer/notification metadata.
+        self.transfer_engine = TransferEngine()
+        ret = self.transfer_engine.initialize(
+            self.local_ip,
+            "P2PHANDSHAKE",
+            self.protocol,
+            ib_device,
+        )
+        if ret != 0:
+            raise RuntimeError(
+                f"Mooncake TransferEngine.initialize() failed (ret={ret}) "
+                f"on ip={self.local_ip}, protocol={self.protocol}, "
+                f"ib_device={ib_device}"
+            )
+        self.rpc_port = self.transfer_engine.get_rpc_port()
+        self.engine_id = f"{self.local_ip}:{self.rpc_port}"
+        logger.info(
+            "Mooncake TransferEngine initialized: ip=%s, protocol=%s, "
+            "ib_device=%s, rpc_port=%d",
+            self.local_ip,
+            self.protocol,
+            ib_device,
+            self.rpc_port,
+        )
+
+    def _make_send_executor(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(
+            max_workers=self._num_send_workers,
+            thread_name_prefix="mooncake-send-worker",
+            initializer=torch.cuda.set_device,
+            initargs=(self._cuda_device,),
+        )
 
     # -----------------------------------------------------------------
     # KVConnectorBase: register_kv_caches
@@ -1478,11 +1500,16 @@ class MooncakeConnector(KVConnectorBase):
 
     @classmethod
     def kv_budget_reserve_bytes(cls, config) -> int:
-        """The KV staging pool (producer) and landing pool (consumer).
+        """The KV staging pool (producer), landing pool (consumer) and send process.
 
-        ``register_kv_caches`` allocates both after the KV cache is sized.
+        ``register_kv_caches`` allocates them after the KV cache is sized.
         """
-        return staging_reserve_bytes(config) + landing_reserve_bytes(config)
+        child = (
+            send_process.SEND_PROCESS_RESERVE_BYTES
+            if send_process.send_process_enabled(config)
+            else 0
+        )
+        return staging_reserve_bytes(config) + landing_reserve_bytes(config) + child
 
     def register_kv_caches(
         self,
@@ -1622,6 +1649,10 @@ class MooncakeConnector(KVConnectorBase):
         else:
             self._start_layer = 0
 
+        if self._send_process_mode:
+            self._start_send_process(tt)
+            return
+
         # Chunk all regions for RDMA memory registration
         reg_ptrs: list[int] = []
         reg_sizes: list[int] = []
@@ -1750,6 +1781,26 @@ class MooncakeConnector(KVConnectorBase):
         # gives up.
         self._await_listener()
 
+    def _start_send_process(self, tt) -> None:
+        """Hand this stage's P->D sends to its send process; staged pages only."""
+        views = dict(enumerate(tt.block_tensor_views))
+        if (
+            self._has_slot_regions
+            or tt.swa_block_regions
+            or tt.index_staging_region is not None
+            or not views
+            or len(views) != len(tt.block_regions)
+            or not all(
+                v.is_cuda and v.dtype == torch.uint8 and v.is_contiguous()
+                for v in views.values()
+            )
+        ):
+            raise RuntimeError(
+                "ATOM_PD_SEND_PROCESS sends staged PAGE regions only: no slot, "
+                "window or index staging regions"
+            )
+        self._send_process = send_process.start(self, views)
+
     def _build_kv_staging(self, tt) -> KVTransferRegion | None:
         """One bounded pool for every eligible byte-layout adapter on this P rank."""
         if not self._kv_staging_reserve or self._has_slot_regions:
@@ -1870,6 +1921,13 @@ class MooncakeConnector(KVConnectorBase):
 
     def record_kv_cache_ready(self, req_ids: list[ReqId]) -> None:
         """Record when this prefill batch's KV writes become visible to staging."""
+        if self._send_process is not None:
+            if req_ids:
+                # Its relay thread waits on it, then tells the send process.
+                event = torch.cuda.Event(blocking=True)
+                event.record(torch.cuda.current_stream(self._cuda_device))
+                self._send_process.ready(event, req_ids)
+            return
         if (
             not self.is_producer
             or (self._index_staging_pool_size == 0 and self._kv_staging is None)
@@ -1917,6 +1975,10 @@ class MooncakeConnector(KVConnectorBase):
     def _get_kv_cache_ready_event(self, req_id: ReqId) -> torch.cuda.Event | None:
         with self._completed_prefills_lock:
             return self._kv_cache_ready_events.get(req_id)
+
+    def _mark_done_sending(self, transfer_id: TransferId) -> None:
+        """Every write of ``transfer_id`` is done; caller holds ``_completion_lock``."""
+        self.done_sending.add(transfer_id)
 
     def _drop_completed_prefill(self, transfer_id: TransferId) -> None:
         """Forget a prefill no write reads again, with its KV ready event."""
@@ -1999,12 +2061,16 @@ class MooncakeConnector(KVConnectorBase):
                             )
                         self._completed_prefills_cv.notify_all()
                     continue
+                entry = {
+                    "block_ids": meta.local_block_ids,
+                    "swa_block_ids": meta.local_swa_block_ids,
+                    "slot_index": meta.local_slot_index,
+                }
+                if self._send_process is not None:
+                    self._send_process.saved({req_id: entry})
+                    continue
                 with self._completed_prefills_cv:
-                    self._completed_prefills[req_id] = {
-                        "block_ids": meta.local_block_ids,
-                        "swa_block_ids": meta.local_swa_block_ids,
-                        "slot_index": meta.local_slot_index,
-                    }
+                    self._completed_prefills[req_id] = entry
                     self._completed_prefills_cv.notify_all()
                 logger.debug(
                     "[PRODUCER] Cached %d prefill blocks (slot=%d) for req %s",
@@ -2368,6 +2434,8 @@ class MooncakeConnector(KVConnectorBase):
         batch the worker already took, are dropped rather than sent while this
         process goes away; none is posted after this returns."""
         if self.is_producer:
+            if self._send_process is not None:
+                self._send_process.close()
             return
         with self._write_cv:
             self._write_closed = True
@@ -2400,6 +2468,11 @@ class MooncakeConnector(KVConnectorBase):
             raise RuntimeError(
                 "Mooncake consumer could not post a write request"
             ) from self._write_request_error
+        if self._send_process is not None:
+            released = self._send_process.poll_done()  # raises once it is gone
+            if released:
+                with self._completion_lock:
+                    self.done_sending.update(released)
         if self._landing is not None:
             self._landing.sweep()
         self._expire_pending_recvs()
@@ -2632,7 +2705,7 @@ class MooncakeConnector(KVConnectorBase):
                 return
             self._release_count.pop(transfer_id, None)
             self._released_transfers.add(transfer_id)
-            self.done_sending.add(transfer_id)
+            self._mark_done_sending(transfer_id)
         self._drop_completed_prefill(transfer_id)
         logger.debug(
             "[PRODUCER] All %d decode ranks released transfer_id=%s; page freed",
@@ -2859,7 +2932,7 @@ class MooncakeConnector(KVConnectorBase):
                     )
                 else:
                     with self._completion_lock:
-                        self.done_sending.add(transfer_id)
+                        self._mark_done_sending(transfer_id)
                     self._drop_completed_prefill(transfer_id)
                     logger.debug(
                         "[PRODUCER] All %d consumers served for transfer_id=%s",

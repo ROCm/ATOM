@@ -1722,6 +1722,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # PP stage boundary over HIP IPC (`pp_ipc.py`) on a MiniMax-M3 P/D prefill
     # producer with one rank a stage on gfx950; 0 keeps NCCL everywhere.
     "ATOM_PP_IPC": lambda: os.getenv("ATOM_PP_IPC", "1") == "1",
+    # P->D sends of a MiniMax page-staging Mooncake producer from a process of
+    # their own per stage (`send_process.py`); 0 keeps them in the stage process.
+    "ATOM_PD_SEND_PROCESS": lambda: os.getenv("ATOM_PD_SEND_PROCESS", "0") == "1",
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (`engram.host_memory.pin_rows`), not copied to HBM; the
