@@ -9,6 +9,7 @@ from typing import Annotated, Any
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     NonNegativeInt,
@@ -47,13 +48,40 @@ PromptTokenIds = list[NonNegativeInt]
 _PROMPT_TOKEN_IDS_ADAPTER = TypeAdapter(PromptTokenIds)
 
 
+def check_media_handoff(
+    kv_transfer_params: dict[str, Any], max_model_len: int | None
+) -> None:
+    """Reject an image handoff key out of range.
+
+    `cache_seed` roots a 64-bit prefix hash chain; `mrope_position_delta`
+    moves decode positions, which must stay within the context.
+    """
+    if "cache_seed" in kv_transfer_params:
+        seed = kv_transfer_params["cache_seed"]
+        if type(seed) is not int or not 0 <= seed < 2**64:
+            raise ValueError(
+                "kv_transfer_params['cache_seed'] must be an integer in [0, 2**64)"
+            )
+    if "mrope_position_delta" in kv_transfer_params:
+        delta = kv_transfer_params["mrope_position_delta"]
+        if type(delta) is not int or (
+            max_model_len is not None and abs(delta) > max_model_len
+        ):
+            raise ValueError(
+                "kv_transfer_params['mrope_position_delta'] must be an integer "
+                f"no larger in magnitude than max_model_len ({max_model_len})"
+            )
+
+
 def resolve_prompt_token_ids(
     prompt_token_ids: PromptTokenIds | None,
     kv_transfer_params: dict[str, Any] | None,
 ) -> PromptTokenIds | None:
     """Resolve IDs from the top-level field or vLLM-compatible PD metadata.
 
-    Reject empty lists and conflicting IDs between the two locations.
+    On a chat decode leg whose prefill kept the image, these are the
+    prefill's ids, image placeholders expanded. Reject empty lists and
+    conflicting IDs between the two locations.
     """
     from_kv = (kv_transfer_params or {}).get("prompt_token_ids")
     if prompt_token_ids is None and from_kv is None:
@@ -79,6 +107,22 @@ def resolve_prompt_token_ids(
     return ids
 
 
+# The leave reasons that mean the model ended the output itself: its EOS, one
+# of the request's stop sequences, or one of the model's stop tokens
+# (`stop_<token_id>`), and `stop`, the same fact in OpenAI's words. Every other
+# reason -- `max_tokens`, `aborted`, `unschedulable: ...` -- cut it off.
+MODEL_STOP_REASONS = ("eos", "stop", "stop_sequence")
+STOP_TOKEN_REASON_PREFIX = "stop_"
+
+
+def ended_by_stop(finish_reason: str | None) -> bool:
+    """Did the model end its output itself, rather than being cut off?"""
+    return finish_reason is not None and (
+        finish_reason in MODEL_STOP_REASONS
+        or finish_reason.startswith(STOP_TOKEN_REASON_PREFIX)
+    )
+
+
 def openai_stop_reason(finish_reason: str | None) -> str | None:
     """The engine's leave reason as OpenAI spells it.
 
@@ -94,7 +138,9 @@ def openai_stop_reason(finish_reason: str | None) -> str | None:
     """
     if finish_reason is None:
         return None
-    if finish_reason in ("stop", "length", "tool_calls"):
+    if ended_by_stop(finish_reason):
+        return "stop"
+    if finish_reason in ("length", "tool_calls"):
         return finish_reason
     if finish_reason in ("max_tokens", "max_new_tokens"):
         return "length"
@@ -162,7 +208,9 @@ def _normalize_tool_call_arguments(tool_calls: Any) -> Any:
     OpenAI clients send tool-call arguments as a JSON *string*, but chat
     templates (Qwen3 qwen3_coder/qwen3_xml, Hermes, etc.) iterate
     ``tool_call.arguments.items()`` and require a mapping. Mirrors how vLLM and
-    SGLang deserialize arguments before applying the chat template.
+    SGLang deserialize arguments before applying the chat template. Skipped for
+    templates that take the string (Kimi-K3, DeepSeek-R1/V3); see
+    ``preserve_tool_call_arguments`` in ``api_server``.
     """
     if not isinstance(tool_calls, list):
         return tool_calls
@@ -205,11 +253,19 @@ class ChatMessage(BaseModel):
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
 
-    def to_template_dict(self, *, preserve_content: bool = False) -> dict[str, Any]:
+    def to_template_dict(
+        self,
+        *,
+        preserve_content: bool = False,
+        preserve_tool_call_arguments: bool = False,
+    ) -> dict[str, Any]:
         """Convert to dict for chat template, preserving tool-related fields.
 
         Returns a dict with role, content, and any extra fields (tool_calls,
         tool_call_id, name, reasoning_content, tools) that the chat template needs.
+        ``preserve_tool_call_arguments`` keeps ``function.arguments`` strings
+        as sent, for templates that take them as strings (Kimi-K3 renders them
+        verbatim, DeepSeek-R1/V3 concatenate them).
         """
         d: dict[str, Any] = {
             "role": self.role,
@@ -223,7 +279,7 @@ class ChatMessage(BaseModel):
             if key in extras:
                 d[key] = (
                     _normalize_tool_call_arguments(extras[key])
-                    if key == "tool_calls"
+                    if key == "tool_calls" and not preserve_tool_call_arguments
                     else extras[key]
                 )
         return d
@@ -245,6 +301,9 @@ class ChatCompletionRequest(BaseModel):
     stop: list[str] | None = None
     ignore_eos: bool | None = False
     stream: bool | None = False
+    stream_options: dict[str, Any] | None = None
+    logprobs: Annotated[bool, Field(strict=True)] | None = False
+    top_logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
     seed: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     # Tool calling
@@ -268,7 +327,8 @@ class ChatCompletionRequest(BaseModel):
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
-    # Pre-tokenized text prompt; messages are still required and validated.
+    # Pre-tokenized prompt (an image decode leg's has its prefill's image
+    # placeholders expanded); messages are still required and validated.
     prompt_token_ids: PromptTokenIds | None = None
     # Echo prompt IDs in non-streaming responses, including n > 1.
     return_token_ids: bool | None = None
@@ -351,6 +411,55 @@ class CompletionRequest(BaseModel):
         return DEFAULT_MAX_TOKENS
 
 
+def _one_or_many(value: Any) -> Any:
+    """A single stop string as a list of one."""
+    return [value] if isinstance(value, str) else value
+
+
+# DeepSeek's API takes one stop string or a list of them.
+OneOrManyStops = Annotated[list[str] | None, BeforeValidator(_one_or_many)]
+
+
+class BetaChatCompletionRequest(ChatCompletionRequest):
+    """``/beta/chat/completions``: Chat with DeepSeek's beta contract.
+
+    A final assistant message may carry ``prefix: true`` to be continued
+    (see ``prefix_completion``), and ``stop`` may be a single string.
+    """
+
+    stop: OneOrManyStops = None
+
+
+class BetaCompletionRequest(CompletionRequest):
+    """``/beta/completions``: completions with DeepSeek's FIM parameters.
+
+    ``/v1/completions`` does not declare these, so it ignores them, as it
+    always has.
+    """
+
+    stop: OneOrManyStops = None
+    # Text after the gap that fill-in-the-middle asks the model to fill.
+    suffix: str | None = None
+    # Only with `stream`: `include_usage` puts `usage` on every chunk.
+    stream_options: dict[str, Any] | None = None
+    # Return the prompt ahead of the completion; not with `suffix`.
+    echo: bool | None = False
+    # DeepSeek's range. Completions return no token probabilities yet, so
+    # a value is refused rather than dropped.
+    logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
+
+    def get_max_tokens(self) -> int:
+        """As for /v1, except that 0 is allowed: DeepSeek's completions take
+        ``max_tokens >= 0``, and 0 generates nothing (the ``echo`` alone).
+        """
+        limit = (
+            self.max_completion_tokens
+            if self.max_completion_tokens is not None
+            else self.max_tokens
+        )
+        return 0 if limit == 0 else super().get_max_tokens()
+
+
 # ============================================================================
 # Response Models
 # ============================================================================
@@ -394,6 +503,13 @@ class ModelCard(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "atom"
+    name: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    input_modalities: list[str] | None = None
+    output_modalities: list[str] | None = None
+    effort: dict[str, Any] | None = None
+    structured_output: dict[str, Any] | None = None
 
 
 class ModelList(BaseModel):

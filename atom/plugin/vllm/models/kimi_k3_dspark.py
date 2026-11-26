@@ -79,7 +79,8 @@ class KimiK3DSparkVllm(ATOMForCausalLM):
         self.draft_id_to_target_id = None
 
     def combine_hidden_states(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        return self.model.project_context(aux_concat)
+        # vLLM hands over the taps already joined.
+        return self.model.project_context((aux_concat,))
 
     def precompute_and_store_context_kv(
         self,

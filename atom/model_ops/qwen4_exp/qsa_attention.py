@@ -32,10 +32,17 @@ arithmetically once the group is behind the current chunk. That is what
 raw index keys so pooling can read them back.
 """
 
+import functools
+import logging
 from types import SimpleNamespace
 
 import aiter
 import torch
+from aiter.ops.qsa import (
+    qsa_sparse_prefill,
+    qsa_sparse_prefill_supports_selection,
+    qsa_sparse_prefill_widths,
+)
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
@@ -45,15 +52,216 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul
+from atom.model_ops.qwen4_exp.ops.gated import (
+    is_per_token_fp8_linear,
+    sigmoid_mul,
+    sigmoid_mul_quant,
+)
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
+    qsa_cache_row_layout,
     qsa_compress_groups,
+    qsa_expand_block_indices,
+    qsa_select_paged_groups,
     qsa_select_paged_tokens,
+    qsa_selection_widths,
     qsa_sparse_paged_gqa,
+    qsa_store_quantized_rows,
     qsa_store_rows,
 )
+from atom.model_ops.qwen4_exp.qsa_cache_rules import (
+    QSA_ROWS,
+    qsa_cache_formats,
+    qsa_row_space,
+)
+from atom.plugin.prepare import is_plugin_mode
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
+
+logger = logging.getLogger(__name__)
+
+
+def qsa_rank_heads(
+    num_attention_heads: int, num_key_value_heads: int, tp_size: int
+) -> tuple[int, int]:
+    """Per-rank (query heads, KV heads) under TP. With fewer KV heads than
+    ranks each rank keeps one replicated KV head."""
+    if num_attention_heads % tp_size:
+        raise ValueError(f"TP={tp_size} must divide {num_attention_heads} q heads")
+    if num_key_value_heads >= tp_size:
+        if num_key_value_heads % tp_size:
+            raise ValueError(f"TP={tp_size} must divide the KV heads")
+        return num_attention_heads // tp_size, num_key_value_heads // tp_size
+    if tp_size % num_key_value_heads:
+        raise ValueError("TP size must be a multiple of the KV head count")
+    return num_attention_heads // tp_size, 1
+
+
+def flydsl_fallback_reason(
+    compress_ratio: int,
+    token_topk: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    *,
+    kv_bf16: bool,
+) -> str | None:
+    """Why QSA layers with this indexer, per-rank head shape and KV format
+    cannot take the aiter FlyDSL attention, or None if they can. The kernel
+    expects min(v // 4, T) blocks for a row with v visible tokens (width
+    4T + 3); another budget or ratio selects a different number, so padding
+    its selection would give wrong output. The one authority for the layer's
+    fallback and the SGLang bridge's layout build; the per-call conditions
+    (host layout, selection byte span, graph capture, query dtype) stay with
+    the layer. `ATOM_QSA_FLYDSL_ATTN` is checked by the callers."""
+    if not kv_bf16:
+        return "the KV cache is not BF16"
+    widths = qsa_sparse_prefill_widths()
+    if not widths:
+        return "aiter's FlyDSL QSA prefill does not run on this GPU"
+    if compress_ratio != 4 or token_topk + 3 not in widths:
+        return f"indexer compress ratio {compress_ratio} / budget {token_topk}"
+    if num_kv_heads != 1 or num_heads not in (12, 6, 3) or head_dim != 256:
+        return (
+            f"per-rank head shape {num_heads} q / {num_kv_heads} kv heads "
+            f"x {head_dim} (needs 12, 6 or 3 q / 1 kv x 256)"
+        )
+    return None
+
+
+@functools.cache
+def log_flydsl_fallback(reason: str) -> None:
+    """Warn once per distinct reason, so a server with the FlyDSL QSA attention
+    enabled shows whether, and why, QSA attention stays on the native kernel."""
+    logger.warning(
+        "FlyDSL QSA prefill attention is enabled, but QSA attention uses the "
+        "native kernel: %s",
+        reason,
+    )
+
+
+@functools.cache
+def _log_flydsl_active() -> None:
+    logger.info("QSA attention runs eager prefill on the aiter FlyDSL kernel")
+
+
+def _flydsl_call_fallback_reason(query, width, qsa) -> str | None:
+    """Why this one laid-out prefill call cannot take the FlyDSL attention, or None."""
+    if width is None:
+        return f"selection wider than {qsa_sparse_prefill_widths()[-1]} columns"
+    if not qsa_sparse_prefill_supports_selection(query.shape[0], width):
+        return f"aiter does not take a {query.shape[0]} x {width} selection"
+    if torch.cuda.is_current_stream_capturing():
+        return "graph capture"
+    if query.dtype != torch.bfloat16:
+        return f"query dtype {query.dtype}"
+    if sum(qsa.host_lens[0]) != query.shape[0]:
+        return "host query lengths do not cover the query rows"
+    return None
+
+
+class _FlyDSLPrefill:
+    """One prefill forward's FlyDSL attention layout, for its QSA layers.
+
+    Every QSA layer of a forward has the same rows, selection width and host
+    lengths, so the first one makes the checks, the per-request prefix lengths
+    and the kernel-width selection buffer, and leaves them on the forward's
+    QSA metadata. `key` holds what the decision reads from the layer and the
+    query; a layer with another key makes its own. What it reads from `qsa`
+    (the host lengths, and the block table width and longest sequence that set
+    the selection width) is not in the key. That is safe because the layout
+    lives on one forward's metadata: the SGLang bridge builds a new
+    `Qwen4ExpQSAMetadata` every forward (`build_qsa_metadata` in
+    `qwen4_exp_bridge.py`), and a `for_tokens` that trims rows returns a copy
+    without the layout.
+    """
+
+    __slots__ = (
+        "indices",
+        "key",
+        "laid_out",
+        "prefix_lens",
+        "query_lens",
+        "reason",
+        "rows",
+        "width",
+    )
+
+    def __init__(self, key, layer, query, qsa) -> None:
+        ratio, topk, heads, kv_heads, head_dim, kv_bf16 = key[:6]
+        self.key = key
+        self.rows = query.shape[0]
+        self.laid_out = False
+        self.reason = self.width = self.query_lens = self.prefix_lens = None
+        self.indices = None
+        if not envs.ATOM_QSA_FLYDSL_ATTN:
+            return
+        # The prefixed path reads raw cache rows; the kernel takes BF16 only.
+        reason = flydsl_fallback_reason(
+            ratio, topk, heads, kv_heads, head_dim, kv_bf16=kv_bf16
+        )
+        if reason is None and qsa.host_lens is None:
+            # Not laid out for FlyDSL (target verify, warmup, ATOM's own
+            # runner); the SGLang bridge logs its own reasons for skipping.
+            return
+        self.laid_out = True
+        if reason is None:
+            selection_width = qsa_selection_widths(
+                layer.compressed_key_cache,
+                qsa.block_tables,
+                topk,
+                ratio,
+                qsa.max_seq_len,
+            )[2]
+            width = next(
+                (w for w in qsa_sparse_prefill_widths() if w >= selection_width),
+                None,
+            )
+            reason = _flydsl_call_fallback_reason(query, width, qsa)
+        self.reason = reason
+        if reason is None:
+            self.width = width
+            self.query_lens, seq_lens = qsa.host_lens
+            self.prefix_lens = tuple(s - q for q, s in zip(self.query_lens, seq_lens))
+
+    @property
+    def ready(self) -> bool:
+        """Laid out and supported: this forward's QSA layers run FlyDSL."""
+        return self.laid_out and self.reason is None
+
+    @classmethod
+    def of(cls, layer, query, qsa) -> "_FlyDSLPrefill":
+        """The forward's layout for `layer`, made by its first QSA layer and
+        kept on `qsa`."""
+        key = (
+            layer.indexer.compress_ratio,
+            layer.indexer.token_topk,
+            layer.num_heads,
+            layer.num_kv_heads,
+            layer.head_dim,
+            layer.k_scale_cache is None,
+            query.shape[0],
+            query.dtype,
+            layer.compressed_key_cache.shape[1],
+        )
+        plan = qsa.flydsl_prefill
+        if plan is None or plan.key != key:
+            plan = cls(key, layer, query, qsa)
+            qsa.flydsl_prefill = plan
+        return plan
+
+    def selection_out(self, device) -> torch.Tensor:
+        """`[rows, width]` int32, -1 past the selection. The selection writes its
+        leading columns; the kernel reads the whole buffer. The expansion drops
+        columns no row can reach (short contexts select every complete block,
+        then the tail, left-aligned), so the -1 tail keeps each row's layout.
+        Layers of the forward reuse it: each rewrites the same columns and
+        nothing writes the rest."""
+        if self.indices is None:
+            self.indices = torch.full(
+                (self.rows, self.width), -1, dtype=torch.int32, device=device
+            )
+        return self.indices
 
 
 def build_qwen4_exp_rope(config, head_size: int):
@@ -202,17 +410,9 @@ class Qwen4ExpAttention(nn.Module):
         self.layer_num = layer_num
         self.total_num_heads = int(config.num_attention_heads)
         self.total_num_kv_heads = int(config.num_key_value_heads)
-        if self.total_num_heads % tp_size:
-            raise ValueError(f"TP={tp_size} must divide {self.total_num_heads} q heads")
-        self.num_heads = self.total_num_heads // tp_size
-        if self.total_num_kv_heads >= tp_size:
-            if self.total_num_kv_heads % tp_size:
-                raise ValueError(f"TP={tp_size} must divide the KV heads")
-            self.num_kv_heads = self.total_num_kv_heads // tp_size
-        else:
-            if tp_size % self.total_num_kv_heads:
-                raise ValueError("TP size must be a multiple of the KV head count")
-            self.num_kv_heads = 1
+        self.num_heads, self.num_kv_heads = qsa_rank_heads(
+            self.total_num_heads, self.total_num_kv_heads, tp_size
+        )
         self.head_dim = int(config.head_dim)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -279,6 +479,24 @@ class Qwen4ExpAttention(nn.Module):
         # derived arithmetically, which is exact while all three mRoPE rows
         # hold the linear position (i.e. text).
         self.rope_position_cache: torch.Tensor | None = None
+        # Scale planes of the quantized caches; None while a cache is BF16.
+        self.k_scale_cache: torch.Tensor | None = None
+        self.v_scale_cache: torch.Tensor | None = None
+        self.compressed_key_scale: torch.Tensor | None = None
+        # Plugin hosts allocate and bind BF16 caches of their own.
+        self.kv_format = self.index_format = "bf16"
+        self.qsa_row_space = QSA_ROWS
+        if not is_plugin_mode():
+            formats = qsa_cache_formats(atom_config)
+            # The MTP draft layer sits past the target stack. It keeps BF16
+            # caches under quantized target caches, in a row space of its own:
+            # an FP8 draft KV costs ~3.5% of the real acceptance length, a BF16
+            # one none.
+            self.qsa_row_space = qsa_row_space(
+                formats, layer_num, int(config.num_hidden_layers)
+            )
+            if self.qsa_row_space == QSA_ROWS:
+                self.kv_format, self.index_format = formats
         self.profile_block_size = getattr(atom_config, "kv_cache_block_size", 64)
 
     def bind_caches(
@@ -288,20 +506,76 @@ class Qwen4ExpAttention(nn.Module):
         raw_key_cache: torch.Tensor,
         compressed_key_cache: torch.Tensor,
         rope_position_cache: torch.Tensor | None = None,
+        *,
+        k_scale_cache: torch.Tensor | None = None,
+        v_scale_cache: torch.Tensor | None = None,
+        compressed_key_scale: torch.Tensor | None = None,
     ) -> None:
         self.k_cache = k_cache
         self.v_cache = v_cache
         self.raw_key_cache = raw_key_cache
         self.compressed_key_cache = compressed_key_cache
         self.rope_position_cache = rope_position_cache
+        self.k_scale_cache = k_scale_cache
+        self.v_scale_cache = v_scale_cache
+        self.compressed_key_scale = compressed_key_scale
+
+    def _store_kv(self, key, value, slots) -> None:
+        if self.k_scale_cache is None:
+            aiter.reshape_and_cache_flash(
+                key,
+                value,
+                self.k_cache,
+                self.v_cache,
+                slots,
+                "auto",
+                self._unit_scale,
+                self._unit_scale,
+            )
+            return
+        qsa_store_quantized_rows(
+            self.k_cache,
+            self.k_scale_cache,
+            slots,
+            key,
+            self.v_cache,
+            self.v_scale_cache,
+            value,
+        )
+
+    def _attend(self, query, selected, block_tables, token_to_req, decode_reqs):
+        return qsa_sparse_paged_gqa(
+            query,
+            self.k_cache,
+            self.v_cache,
+            selected,
+            block_tables,
+            token_to_req,
+            softmax_scale=self.scaling,
+            num_decode_requests=decode_reqs,
+            k_scale=self.k_scale_cache,
+            v_scale=self.v_scale_cache,
+        )
 
     def _select_tokens(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         qsa,
+        rows=None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Update both index caches, then return the per-token selection."""
+        """Update both index caches, then return the per-token selection.
+
+        The indexer is replicated, so with `rows` (the caller's token sharding:
+        `start`, `chunk`, `num_tokens` and a row `gather`) each rank scores and
+        selects only its own query rows and the selected groups are
+        all-gathered before the (cheap) expansion. Every row's selection
+        depends only on its own query, so the result is the same.
+
+        `out`, a `[tokens, >= width]` int32 buffer, receives the selection in
+        its leading columns; the returned selection is then a view of it.
+        """
         index_q, raw_key = self.indexer.project_qk(hidden_states, positions)
         qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
         if self.rope_position_cache is not None:
@@ -323,28 +597,78 @@ class Qwen4ExpAttention(nn.Module):
             rope_position_offset=int(get_forward_context().context.is_draft),
         )
         normalized = self.indexer.normalize_compressed_keys(pooled, first_positions)
-        qsa_store_rows(
-            self.compressed_key_cache, qsa.compressed_slot_mapping, normalized
-        )
+        if self.compressed_key_scale is None:
+            qsa_store_rows(
+                self.compressed_key_cache, qsa.compressed_slot_mapping, normalized
+            )
+        else:
+            qsa_store_quantized_rows(
+                self.compressed_key_cache,
+                self.compressed_key_scale,
+                qsa.compressed_slot_mapping,
+                normalized,
+            )
 
-        return qsa_select_paged_tokens(
-            index_q,
+        allow_flydsl = get_forward_context().context.is_prefill
+        if rows is None:
+            return qsa_select_paged_tokens(
+                index_q,
+                self.compressed_key_cache,
+                qsa.block_tables,
+                qsa.token_to_req,
+                qsa.logical_positions,
+                qsa.seq_lens,
+                self.indexer.token_topk,
+                self.indexer.compress_ratio,
+                out=out,
+                max_seq_len=qsa.max_seq_len,
+                allow_flydsl=allow_flydsl,
+                compressed_k_scale=self.compressed_key_scale,
+            )
+        local = slice(rows.start, min(rows.start + rows.chunk, rows.num_tokens))
+        groups, width = qsa_select_paged_groups(
+            index_q[local],
             self.compressed_key_cache,
             qsa.block_tables,
-            qsa.token_to_req,
-            qsa.logical_positions,
+            qsa.token_to_req[local],
+            qsa.logical_positions[local],
             qsa.seq_lens,
             self.indexer.token_topk,
             self.indexer.compress_ratio,
             max_seq_len=qsa.max_seq_len,
-            allow_flydsl=get_forward_context().context.is_prefill,
+            allow_flydsl=allow_flydsl,
+            compressed_k_scale=self.compressed_key_scale,
+        )
+        if groups.shape[0] < rows.chunk:
+            groups = nn.functional.pad(groups, (0, 0, 0, rows.chunk - groups.shape[0]))
+        return qsa_expand_block_indices(
+            rows.gather(groups),
+            qsa.logical_positions,
+            qsa.seq_lens,
+            qsa.token_to_req,
+            self.indexer.compress_ratio,
+            self.indexer.token_topk,
+            None if out is None else out[:, :width],
+            output_width=width,
         )
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rows=None,
     ) -> torch.Tensor:
+        """`quantized` is an optional `(fp8, scale)` copy of `hidden_states`
+        that an FP8 `qkv_proj` takes instead of quantizing it again; the
+        indexer still reads the BF16 `hidden_states`. `rows`: the decoder's
+        token sharding, see `_select_tokens`."""
         num_tokens = hidden_states.shape[0]
-        qkv = self.qkv_proj(hidden_states)
+        qkv = (
+            self.qkv_proj(hidden_states)
+            if quantized is None
+            else self.qkv_proj(quantized[0], x_scale=quantized[1])
+        )
         gate, q, k, v = qkv.split(
             [self.q_size, self.q_size, self.kv_size, self.kv_size], -1
         )
@@ -365,34 +689,67 @@ class Qwen4ExpAttention(nn.Module):
             )
         else:
             qsa = qsa.for_tokens(num_tokens)
-            aiter.reshape_and_cache_flash(
-                key,
-                value,
-                self.k_cache,
-                self.v_cache,
-                qsa.slot_mapping,
-                "auto",
-                self._unit_scale,
-                self._unit_scale,
-            )
-            selected = self._select_tokens(hidden_states, positions, qsa)
-            attn_out = qsa_sparse_paged_gqa(
-                query,
-                self.k_cache,
-                self.v_cache,
-                selected,
-                qsa.block_tables,
-                qsa.token_to_req,
-                softmax_scale=self.scaling,
-                num_decode_requests=(
-                    None
-                    if forward_context.context.is_prefill
-                    else qsa.block_tables.shape[0]
-                ),
-            )
+            self._store_kv(key, value, qsa.slot_mapping)
+            plan = out = None
+            if forward_context.context.is_prefill:
+                plan = _FlyDSLPrefill.of(self, query, qsa)
+                if plan.ready:
+                    # FlyDSL reads the selection at its kernel width: select
+                    # straight into that buffer.
+                    out = plan.selection_out(query.device)
+            selected = self._select_tokens(hidden_states, positions, qsa, rows, out)
+            attn_out = None
+            if plan is not None:
+                attn_out = self._flydsl_attention(query, key, value, plan, qsa)
+            if attn_out is None:
+                attn_out = self._attend(
+                    query,
+                    selected,
+                    qsa.block_tables,
+                    qsa.token_to_req,
+                    (
+                        None
+                        if forward_context.context.is_prefill
+                        else qsa.block_tables.shape[0]
+                    ),
+                )
 
+        if is_per_token_fp8_linear(self.o_proj):
+            gated, gated_scale = sigmoid_mul_quant(
+                attn_out.reshape(num_tokens, -1), gate, self.o_proj.params_dtype
+            )
+            return self.o_proj(gated, x_scale=gated_scale)
         gated = sigmoid_mul(attn_out.reshape(num_tokens, -1), gate)
         return self.o_proj(gated)
+
+    def _flydsl_attention(self, query, key, value, plan, qsa):
+        """aiter FlyDSL sparse attention for an eager prefill, or None for the
+        native kernel. `plan` is the forward's layout; when it is ready the
+        selection was written into `plan.indices`. With the flag on, the first
+        FlyDSL call and each distinct fallback reason are logged once."""
+        if not plan.laid_out:
+            return None
+        if plan.reason is not None:
+            log_flydsl_fallback(plan.reason)
+            return None
+        _log_flydsl_active()
+        kv_slots = qsa.context_slots
+        if kv_slots is None:
+            k, v = key.contiguous(), value.contiguous()
+        else:
+            # With a prefix the kernel reads the context rows in place through
+            # the bridge's slot table.
+            k, v = self.k_cache.flatten(0, 1), self.v_cache.flatten(0, 1)
+        return qsa_sparse_prefill(
+            query.contiguous(),
+            k,
+            v,
+            plan.indices,
+            query_lens=plan.query_lens,
+            prefix_lens=plan.prefix_lens,
+            softmax_scale=self.scaling,
+            kv_slots=kv_slots,
+        )
 
     def _profile_attention(self, query, key, value, hidden_states, positions):
         """Exercise real indexer, cache and sparse workspaces before pool sizing.
@@ -424,34 +781,43 @@ class Qwen4ExpAttention(nn.Module):
             "compressed_key_cache",
             "rope_position_cache",
         )
+        scale_names = ("k_scale_cache", "v_scale_cache", "compressed_key_scale")
         saved = [getattr(self, name) for name in names]
+        saved_scales = {name: getattr(self, name) for name in scale_names}
+
+        def paged(rows, heads, fmt, head_dim):
+            dim, dtype, scale_tail, scale_dtype = qsa_cache_row_layout(fmt, head_dim)
+            values = torch.zeros((pages, rows, heads, dim), device=device, dtype=dtype)
+            if scale_tail is None:
+                return values, None
+            return values, torch.ones(
+                (pages, rows, heads, *scale_tail), device=device, dtype=scale_dtype
+            )
+
+        k_cache, k_scale = paged(
+            block, self.num_kv_heads, self.kv_format, self.head_dim
+        )
+        v_cache, v_scale = paged(
+            block, self.num_kv_heads, self.kv_format, self.head_dim
+        )
+        compressed, compressed_scale = paged(
+            block // ratio, 1, self.index_format, self.indexer.index_head_dim
+        )
         self.bind_caches(
-            query.new_zeros((pages, block, self.num_kv_heads, self.head_dim)),
-            query.new_zeros((pages, block, self.num_kv_heads, self.head_dim)),
+            k_cache,
+            v_cache,
             query.new_zeros((pages, block, 1, self.indexer.index_head_dim)),
-            query.new_zeros((pages, block // ratio, 1, self.indexer.index_head_dim)),
+            compressed,
             torch.zeros((pages, block, 1, 3), device=device, dtype=torch.int64),
+            k_scale_cache=k_scale,
+            v_scale_cache=v_scale,
+            compressed_key_scale=compressed_scale,
         )
         try:
-            aiter.reshape_and_cache_flash(
-                key,
-                value,
-                self.k_cache,
-                self.v_cache,
-                logical,
-                "auto",
-                self._unit_scale,
-                self._unit_scale,
-            )
+            self._store_kv(key, value, logical)
             selected = self._select_tokens(hidden_states, positions, metadata)
-            return qsa_sparse_paged_gqa(
-                query,
-                self.k_cache,
-                self.v_cache,
-                selected,
-                metadata.block_tables,
-                metadata.token_to_req,
-                softmax_scale=self.scaling,
+            return self._attend(
+                query, selected, metadata.block_tables, metadata.token_to_req, None
             )
         finally:
-            self.bind_caches(*saved)
+            self.bind_caches(*saved, **saved_scales)

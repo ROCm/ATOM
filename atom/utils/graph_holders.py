@@ -8,19 +8,14 @@ pool invalidates every graph that captured them -- see
 ``atom/rollout/memory_manager.py``, which does the releasing. Finding those
 graphs is the problem this module exists for.
 
-``runner.graphs`` is only the manual whole-forward store. Under PIECEWISE the
-graphs are one per compiled dense piece, each held by a ``CUDAGraphWrapper``
-that the compile backend installs with ``module.__dict__[target] = ...``
-(``atom/utils/backends.py``) on a submodule of a split ``fx.GraphModule`` that
-only Dynamo's cache holds. Both halves of that defeat a walk: there is no path
-from the runner to the graph module, and the ``__dict__`` assignment keeps the
-wrapper out of ``_modules`` even for someone who has one. So a holder no walk
-can reach registers itself here instead, and the releaser asks this module.
-
-Registration is the last resort, not the convention: a store the releaser can
-reach -- ``runner.graphs``, ``UBatchWrapper.tbo_graphs``,
-``Drafter.draft_graphs`` -- is walked there, where the reader can see what is
-being cleared.
+``runner.req_graph`` is the whole-forward store. A module's token graphs
+(``atom/utils/region_graph.py``) are held by the module itself, in its
+``__dict__``, wherever in the model it sits -- a draft model's, a compiled
+model's -- so no walk from the runner finds them all. So every `TokenGraph`
+registers itself here, a `ReqGraph` (``runner.req_graph``, each draft pass's)
+included, and the releaser asks this module last: it walks the stores it can
+reach first (``runner.req_graph``, ``Drafter.draft_graphs``), where the reader
+can see what is being cleared, and this registry drops whatever no walk found.
 
 Nothing here imports the compile stack, torch or aiter: the release path is
 exercised on CPU, and a registry is names and lifetimes only.
@@ -50,8 +45,7 @@ def release_registered_graphs() -> int:
 
     Process-wide, which is as narrow as a registry gets: the holders are
     reached by nothing else, so there is no runner to ask for its own. The
-    other graph stores in this process are already process-global for the same
-    reason (`atom/utils/cuda_graph.py`'s graph pools, `deepseek_v4.py`'s
-    attention-core capture runner), and a rollout worker holds one runner.
+    other graph store in this process is already process-global for the same
+    reason (`region_graph.graph_pool`), and a rollout worker holds one runner.
     """
     return sum(holder.release_graphs() for holder in list(_holders))

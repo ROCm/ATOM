@@ -4,9 +4,11 @@ mailbox cell a stage polls is one its producer writes this step. The functions
 under test are the ones the kernel calls (``mono/index_plan.py``)."""
 
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from atom.models.deepseek_v41.mono import index_plan as ip
 
@@ -24,7 +26,12 @@ def written_chunks(bound, chunks_fn=ip.chunks):
     return {ch for ch in range(chunks_fn(bound) + 1) if ip.chunk_written(bound, ch)}
 
 
-def polled_chunks(bound, seg_chunks=ip.seg_chunks):
+def whole_row_chunks(bound, s):
+    """The chunk flags segment s of an unsplit row polls (``stage_ilist``)."""
+    return ip.share_chunks(ip.scored(bound), bound, s)
+
+
+def polled_chunks(bound, seg_chunks=whole_row_chunks):
     return {
         ip.CHUNKS_PER_SEG * s + c
         for s in range(ip.segments(bound))
@@ -263,7 +270,9 @@ def walk_tasks(bounds, owners):
     row past them zero."""
     plan = np.full((CTAS, 4), -9, dtype=np.int32)
     ip.fill_walk_plan(
-        np.asarray(bounds, dtype=np.int32), np.asarray(owners, dtype=np.int32), plan
+        np.asarray(bounds, dtype=np.int32),
+        ip.walk_pieces(np.asarray(owners, dtype=np.int32)),
+        plan,
     )
     live = int(np.argmin(plan[:, 1] > 0)) if (plan[:, 1] == 0).any() else CTAS
     assert (plan[live:] == 0).all(), plan
@@ -313,3 +322,212 @@ def test_reindex_split_covers_each_tokens_chunks_once(tokens):
     covered = [ch for ch0, ch1 in ranges for ch in range(ch0, ch1)]
     assert covered == list(range(ip.REINDEX_CHUNKS))
     assert min(ch1 - ch0 for ch0, ch1 in ranges) >= 4
+
+
+def device_step(rng, rows, position_max):
+    """(owners, positions) of a decode step ``rows`` wide: requests of 1..9
+    adjacent rows (a run past WALK_ROWS splits) at random positions, then pad
+    rows (batch id -1, position 0)."""
+    owners, positions, request = [], [], 0
+    while len(owners) < rows - rng.randrange(0, 4):
+        length = min(rng.randrange(1, 10), rows - len(owners))
+        start = rng.randrange(0, position_max)
+        owners += [request] * length
+        positions += range(start, start + length)
+        request += 1
+    pad = rows - len(owners)
+    return owners + [-1] * pad, positions + [0] * pad
+
+
+@pytest.mark.parametrize("position_max", [ip.TOPK, 64 * ip.CHUNK, 1 << 20])
+def test_device_walk_plan_is_the_host_plan(position_max):
+    """``step_meta``'s plan, the one the FP4 score stage reads, is
+    ``fill_walk_plan``'s: every row, past the last task included."""
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
+
+    rng = random.Random(position_max)
+    ratios = (1, 2)
+    for rows in [1, 6, 7, 24, 47, 48] * 10:
+        owners, positions = device_step(rng, rows, position_max)
+        step = SimpleNamespace(
+            batch_ids=torch.tensor(owners, dtype=torch.int32, device="cuda"),
+            positions=torch.tensor(positions, dtype=torch.int64, device="cuda"),
+            slots=torch.zeros(rows, dtype=torch.int32, device="cuda"),
+            block_tables=torch.zeros(rows, 4, dtype=torch.int32, device="cuda"),
+        )
+        plans = {
+            r: torch.full((CTAS + rows, 4), -9, dtype=torch.int32, device="cuda")
+            for r in ratios
+        }
+        # a token-parallel step's rank plans its own rows (TP 4: rank 1's);
+        # another splits its long FULL rows over TP 8 (a random rank's share)
+        tok_par = rows % 4 == 0 and rng.random() < 0.5
+        lo, n = (rows // 4, rows // 4) if tok_par else (0, rows)
+        tp, rank = (1, 0) if tok_par else (8, rng.randrange(8))
+        write_step_meta(
+            step,
+            SimpleNamespace(window_size=128),
+            SimpleNamespace(slot_rows=256, ring_slots=134),
+            torch.empty(rows, dtype=torch.int32, device="cuda"),
+            torch.empty(rows, KMETA, dtype=torch.int32, device="cuda"),
+            plans,
+            (lo, n),
+            tp,
+            rank,
+        )
+        for ratio, plan in plans.items():
+            bounds = ((np.asarray(positions) + 1) // ratio)[lo : lo + n]
+            mine = np.asarray(owners, dtype=np.int32)[lo : lo + n]
+            shares = ip.row_shares(bounds, mine, tp, ratio, rank)
+            expected = np.full((CTAS + rows, 4), -9, dtype=np.int32)
+            ip.fill_walk_plan(bounds, ip.walk_pieces(mine), expected[:CTAS], shares[:2])
+            expected[:CTAS][expected[:CTAS, 1] > 0, 0] += lo
+            ip.fill_shares(shares, expected[CTAS + lo : CTAS + lo + n])
+            got = plan.cpu().numpy()[: CTAS + lo + n]
+            assert got.tolist() == expected[: CTAS + lo + n].tolist(), (
+                ratio,
+                owners,
+                positions,
+                tp,
+                rank,
+            )
+
+
+def long_requests(rng, rows_each=6, requests=4, bound_max=1 << 20):
+    """(bounds, owners): requests of ``rows_each`` rows, their bounds rising
+    by one a row, from short to past SPLIT_FROM."""
+    bounds, owners = [], []
+    for r in range(requests):
+        top = rng.randrange(ip.TOPK, bound_max)
+        bounds += range(top - rows_each + 1, top + 1)
+        owners += [r] * rows_each
+    return np.asarray(bounds), np.asarray(owners)
+
+
+@pytest.mark.parametrize("tp", [4, 8])
+def test_row_shares_partition_every_row(tp):
+    """A split row's shares are disjoint and cover its columns; a whole row's
+    every rank holds whole (``index_plan.row_shares``)."""
+    rng = random.Random(tp)
+    for _ in range(200):
+        bounds, owners = long_requests(rng)
+        ranks = [ip.row_shares(bounds, owners, tp, 2, r) for r in range(tp)]
+        for t, b in enumerate(bounds):
+            splits = {bool(ranks[r][2][t]) for r in range(tp)}
+            assert len(splits) == 1
+            if splits.pop():
+                cols = []
+                for r in range(tp):
+                    first, n = int(ranks[r][0][t]), int(ranks[r][1][t])
+                    assert first % ip.CHUNK == 0
+                    cols += range(first, first + n)
+                assert cols == list(range(b)), (t, b)
+            else:
+                assert all(
+                    (ranks[r][0][t], ranks[r][1][t]) == (0, b) for r in range(tp)
+                )
+    # the candidate producer (ratio 1) and a TP without whole quads stay whole
+    bounds, owners = np.asarray([1 << 19] * 6), np.asarray([0] * 6)
+    assert not ip.row_shares(bounds, owners, 8, 1, 3)[2].any()
+    assert not ip.row_shares(bounds, owners, 2, 2, 1)[2].any()
+
+
+@pytest.mark.parametrize("tp", [4, 8])
+def test_split_walk_tasks_write_each_share_once(tp):
+    """A rank's walk plan scores exactly its shares' written chunks."""
+    rng = random.Random(10 + tp)
+    for _ in range(50):
+        bounds, owners = long_requests(rng)
+        for rank in range(tp):
+            first, cols, _ = ip.row_shares(bounds, owners, tp, 2, rank)
+            plan = np.full((CTAS, 4), -9, dtype=np.int32)
+            ip.fill_walk_plan(bounds, ip.walk_pieces(owners), plan, (first, cols))
+            live = int(np.argmin(plan[:, 1] > 0)) if (plan[:, 1] == 0).any() else CTAS
+            tasks = [tuple(row) for row in plan[:live].tolist()]
+            rows = bounds.tolist()
+            expected = sorted(
+                (t, ch)
+                for t, b in enumerate(rows)
+                for ch in written_chunks(b)
+                if first[t] <= ch * ip.CHUNK < first[t] + cols[t]
+            )
+            assert sorted(walked_cells(rows, owners.tolist(), tasks)) == expected
+
+
+def stable_top(scores, cols, k):
+    """The top-k columns of ``scores`` at ``cols`` as the select takes them
+    (ties to the lower column), in column order, with their values."""
+    order = sorted(range(len(cols)), key=lambda i: (-scores[i], cols[i]))[:k]
+    return sorted((cols[i], scores[i]) for i in order)
+
+
+def test_merged_shares_select_the_unsplit_top_k():
+    """Each rank's top-k of its share, ranked together in rank order, is the
+    top-k of every column -- the same ids in the same order, ties included
+    (``index_score.stage_imerge``)."""
+    rng = np.random.default_rng(3)
+    for tp in (4, 8):
+        for _ in range(12):
+            bound = int(rng.integers(ip.SPLIT_FROM + 1, 1 << 19))
+            if not ip.row_shares([bound], [0], tp, 2, 0)[2][0]:
+                continue  # a split would add a level (``index_plan.split_gains``)
+            # few distinct values: ties everywhere
+            scores = rng.integers(0, 40, bound).astype(np.float32)
+            whole = stable_top(scores, list(range(bound)), ip.TOPK)
+            answers = []
+            for rank in range(tp):
+                first, n, _ = ip.row_shares([bound], [0], tp, 2, rank)
+                lo, hi = int(first[0]), int(first[0] + n[0])
+                answers += stable_top(scores[lo:hi], list(range(lo, hi)), ip.TOPK)
+            cols = [c for c, _ in answers]
+            merged = stable_top([v for _, v in answers], cols, ip.TOPK)
+            assert merged == whole
+
+
+EDGE_BLOCKS = (ip.TOPK_BLOCKS - 1) * ip.BLOCK_ROWS
+
+
+@pytest.mark.parametrize(
+    "bound", [*bounds(), *range(EDGE_BLOCKS - 9, EDGE_BLOCKS + 3 * ip.BLOCK_ROWS)]
+)
+def test_candidate_bound_is_the_candidate_blocks_rows(bound):
+    """A candidate producer's row ranks its candidate blocks' rows: every
+    column up to TOPK_BLOCKS blocks, else TOPK_BLOCKS - 1 whole blocks and the
+    newest one's visible rows; it compacts from TOPK_BLOCKS blocks on, the
+    same answer from its bound or its candidates' columns."""
+    blocks = ip.blocks(bound)
+    newest = bound - (blocks - 1) * ip.BLOCK_ROWS
+    want = bound if blocks <= ip.TOPK_BLOCKS else EDGE_BLOCKS + newest
+    cols = ip.candidate_bound(bound)
+    assert cols == want
+    assert ip.compacts(bound) == (blocks >= ip.TOPK_BLOCKS)
+    assert ip.compacts(cols) == ip.compacts(bound)
+
+
+def test_candidate_rows_select_the_whole_top_k():
+    """The top-TOPK of a row's columns is the top-TOPK of its top-TOPK_BLOCKS
+    blocks' rows (block maxima, the newest pinned; ties to the lower block
+    and the lower column), lifted back -- the same ids, ties included
+    (``index_score._compact``)."""
+    rng = np.random.default_rng(4)
+    for bound in (EDGE_BLOCKS + 1, ip.TOPK_BLOCKS * ip.BLOCK_ROWS + 3, 40000, 70001):
+        # few distinct values: ties everywhere
+        scores = rng.integers(0, 40, bound).astype(np.float32)
+        whole = stable_top(scores, list(range(bound)), ip.TOPK)
+        blocks = ip.blocks(bound)
+        maxima = [
+            scores[b * ip.BLOCK_ROWS : (b + 1) * ip.BLOCK_ROWS].max()
+            for b in range(blocks)
+        ]
+        maxima[-1] = np.inf
+        kept = [b for b, _ in stable_top(maxima, list(range(blocks)), ip.TOPK_BLOCKS)]
+        rows = [
+            c
+            for b in kept
+            for c in range(b * ip.BLOCK_ROWS, min((b + 1) * ip.BLOCK_ROWS, bound))
+        ]
+        assert len(rows) == ip.candidate_bound(bound)
+        compact = stable_top(scores[rows], list(range(len(rows))), ip.TOPK)
+        assert [(rows[i], v) for i, v in compact] == whole

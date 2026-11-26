@@ -50,6 +50,7 @@ from atom.model_ops.linear import (
 from atom.models.utils import maybe_prefix
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import token_graph
 
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
@@ -258,6 +259,7 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@token_graph
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -337,7 +339,7 @@ class Qwen3ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         if self.hf_config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,

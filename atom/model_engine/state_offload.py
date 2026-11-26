@@ -15,8 +15,22 @@ import logging
 import os
 from collections import OrderedDict
 from dataclasses import dataclass, replace
+from math import inf
+from time import monotonic
+
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+#: Seconds a confirmed image is trusted per GiB of LMCache pool: a quarter of
+#: the time the pool takes to turn over at 1 GiB/s of new stores.
+_TIER_VERIFIED_S_PER_GIB = 0.25
+#: Well above a touch round trip.
+_TIER_VERIFIED_MIN_S = 5.0
+_TIER_VERIFIED_MAX_S = 60.0
+
+#: A hash voted on every scheduling pass is touched at most this often.
+_TIER_TOUCH_INTERVAL_S = 0.5
 
 
 class StateOffloadIndex:
@@ -27,6 +41,10 @@ class StateOffloadIndex:
     means "was stored once", never "is still there". The false positive costs
     one lookup and a park/unpark, and is handled by the `failed_loading` path
     (`fail_load` -> `forget`).
+
+    With a `verified_for_s` window, every voted hit is also touched: the worker
+    refreshes the image in LMCache's LRU, as a KV lookup does for its chunks,
+    and reports whether it was still there (`apply_touch_verdict`).
     """
 
     def __init__(
@@ -35,6 +53,7 @@ class StateOffloadIndex:
         can_store: bool = True,
         can_load: bool = True,
         max_cpu_entries: int | None = None,
+        verified_for_s: float | None = None,
     ) -> None:
         # The two legs are separately granted. A `kv_producer` role saves and
         # never loads, a `kv_consumer` loads and never saves, and offering a
@@ -86,6 +105,26 @@ class StateOffloadIndex:
         # than indexed. Any non-zero value means the reclaim window is firing
         # on live transfers and is set too low.
         self.stores_untrusted = 0
+        # Off for indexes whose connector carries no touches (the vLLM plugin).
+        self.refresh_hits = verified_for_s is not None
+        self.verified_for_s = verified_for_s or 0.0
+        # Read once: `hold_admission` runs on the admission path. Not read
+        # without the refresh, which never holds.
+        self.defer_s = envs.OFFLOAD_LOOKUP_DEFER_S if self.refresh_hits else 0.0
+        self._touch_wanted: set[int] = set()
+        # hash -> monotonic of the last touch sent / the last evidence the
+        # image was resident.
+        self._touch_sent_at: dict[int, float] = {}
+        self._verified_at: dict[int, float] = {}
+        # hash -> monotonic of the first held admission; `defer_s` runs from
+        # here, so re-sent touches cannot extend a hold.
+        self._hold_started_at: dict[int, float] = {}
+        # Holds that ran out; admitted unheld until evidence arrives.
+        self._hold_expired: set[int] = set()
+        self.touches_sent = 0
+        self.touch_misses = 0
+        self.loads_deferred_for_verify = 0
+        self.verify_holds_expired = 0
 
     # ------------------------------- stores -------------------------------- #
     def note_stored(self, h: int) -> None:
@@ -101,15 +140,33 @@ class StateOffloadIndex:
         # re-stored prefix is treated as freshly used, then trim the cold end.
         self._hash_lru.pop(h, None)
         self._hash_lru[h] = None
+        self._mark_verified(h)
         while len(self._hash_lru) > self._hash_cap:
             old, _ = self._hash_lru.popitem(last=False)
             self.hashes.discard(old)
+            self._drop_touch_state(old)
             self.hashes_evicted += 1
 
     def forget(self, h: int) -> None:
         """Drop a hash whose load failed, so the next request does not retry."""
         self.hashes.discard(h)
         self._hash_lru.pop(h, None)
+        self._drop_touch_state(h)
+
+    def _drop_touch_state(self, h: int) -> None:
+        self._touch_wanted.discard(h)
+        self._touch_sent_at.pop(h, None)
+        self._verified_at.pop(h, None)
+        self._end_hold(h)
+
+    def _mark_verified(self, h: int) -> None:
+        if self.refresh_hits:
+            self._verified_at[h] = monotonic()
+        self._end_hold(h)
+
+    def _end_hold(self, h: int) -> None:
+        self._hold_started_at.pop(h, None)
+        self._hold_expired.discard(h)
 
     def could_serve(self, h: int) -> bool:
         """Whether a load for `h` could be offered at all: this tier can load
@@ -127,6 +184,108 @@ class StateOffloadIndex:
         boundary disowned and the HBM checkpoint forfeited to a full recompute.
         """
         return self.can_load and h in self.hashes
+
+    # ------------------------------- touches ------------------------------- #
+    def want_touch(self, h: int) -> None:
+        """The resumable scan counted `h` as a hit; under `refresh_hits`, queue
+        it for `take_touches`."""
+        if self.refresh_hits and h in self.hashes:
+            self._touch_wanted.add(h)
+
+    def take_touches(self) -> list[int]:
+        """Hashes to touch this step, drained; one touched within
+        `_TIER_TOUCH_INTERVAL_S` is skipped (a waiting request votes every pass).
+        """
+        if not self._touch_wanted:
+            return []
+        now = monotonic()
+        out = []
+        for h in self._touch_wanted:
+            if now - self._touch_sent_at.get(h, -inf) < _TIER_TOUCH_INTERVAL_S:
+                continue
+            self._touch_sent_at[h] = now
+            out.append(h)
+        self._touch_wanted.clear()
+        self.touches_sent += len(out)
+        return out
+
+    def apply_touch_verdict(self, h: int, resident: bool) -> None:
+        """A touch came back; gone drops `h` before a request parks on it."""
+        if h not in self.hashes:
+            return
+        if not resident:
+            # Stale: `h` was stored (again) after this touch looked.
+            if self._verified_at.get(h, -inf) > self._touch_sent_at.get(h, -inf):
+                return
+            self.touch_misses += 1
+            self.forget(h)
+            return
+        self._mark_verified(h)
+        # The touch made it LMCache's youngest image; keep the cap's order.
+        self._hash_lru.move_to_end(h)
+
+    def publish_touches(self, connector) -> None:
+        """Hand this pass's touches to `connector`. One that will not carry
+        them turns the refresh off for good, so no admission waits out
+        `defer_s` for a verdict that never comes."""
+        if not self.refresh_hits:
+            return
+        hashes = self.take_touches()
+        if not hashes:
+            return
+        enqueue = getattr(connector, "enqueue_state_touches", None)
+        if enqueue is not None and enqueue(hashes):
+            return
+        logger.warning(
+            "state offload: %s does not carry state touches; state images "
+            "will not be refreshed in LMCache's LRU, and an image LMCache "
+            "evicts is only noticed when a load misses.",
+            type(connector).__name__,
+        )
+        self.refresh_hits = False
+
+    def collect_touch_verdicts(self, connector) -> None:
+        """Apply the verdicts `connector` reached TP quorum on."""
+        take = getattr(connector, "take_state_touch_verdicts", None)
+        if take is None:
+            return
+        for h, resident in take().items():
+            self.apply_touch_verdict(h, resident)
+
+    def hold_admission(self, h: int) -> bool:
+        """Whether an admission restoring its state from `h` (-1: nothing
+        outside HBM) waits a pass for its touch verdict: `h` not confirmed
+        within `verified_for_s`. If the verdict is gone, `h` has left the index
+        and the retry plans a lower boundary instead of parking on a miss.
+        At most `defer_s` from the first hold.
+        """
+        defer_s = self.defer_s
+        # `could_serve`: a store-only role indexes stores it never loads.
+        if not self.refresh_hits or defer_s <= 0 or not self.could_serve(h):
+            return False
+        now = monotonic()
+        verified = self._verified_at.get(h)
+        if verified is not None and now - verified <= self.verified_for_s:
+            return False
+        if h in self._hold_expired:
+            return False
+        started = self._hold_started_at.setdefault(h, now)
+        if now - started > defer_s:
+            self._hold_expired.add(h)
+            self.verify_holds_expired += 1
+            if self.verify_holds_expired == 1:
+                logger.warning(
+                    "state offload: no touch verdict for a CPU state image "
+                    "within OFFLOAD_LOOKUP_DEFER_S=%.1fs; admitting without it. "
+                    "Touch verdicts are lost or late, e.g. a stalled step "
+                    "(counted as state_offload_verify_holds_expired).",
+                    defer_s,
+                )
+            return False
+        # Ask for a touch; `take_touches` throttles the resend.
+        self._touch_wanted.add(h)
+        self.loads_deferred_for_verify += 1
+        return True
 
     # -------------------------------- loads -------------------------------- #
     def request_load(self, req_id, h: int) -> bool:
@@ -169,6 +328,7 @@ class StateOffloadIndex:
             # order so the cap trims what the codec will trim.
             if h in self._hash_lru:
                 self._hash_lru.move_to_end(h)
+                self._mark_verified(h)
 
     def fail_load(self, req_id) -> None:
         """No bytes came back. Retract the claim as well as counting it.
@@ -220,13 +380,42 @@ class StateOffloadIndex:
             # far past `indexed` means the state budget is smaller than the
             # reusable working set.
             "hashes_evicted": self.hashes_evicted,
+            # Hit refresh. `touch_misses`: images a touch found gone, which
+            # left the index (one a load was already offered on also counts in
+            # `loads_failed`). `loads_deferred_for_verify`: admission passes
+            # held. `verify_holds_expired`: holds that got no verdict within
+            # `defer_s`; non-zero means verdicts are lost or late (e.g. a
+            # stalled step).
+            "touches_sent": self.touches_sent,
+            "touch_misses": self.touch_misses,
+            "loads_deferred_for_verify": self.loads_deferred_for_verify,
+            "verify_holds_expired": self.verify_holds_expired,
         }
+
+
+def tier_verified_for_s(pool_gib: float) -> float:
+    """How long an image counts as resident after the last store, load or
+    touch; either error costs a held pass or a missed load, not wrong output."""
+    window = pool_gib * _TIER_VERIFIED_S_PER_GIB
+    return min(max(window, _TIER_VERIFIED_MIN_S), _TIER_VERIFIED_MAX_S)
 
 
 #: Offload layouts whose worker half builds a `StateOffloadTier`. Not every
 #: `lmcache_offload` does: `dense` has no per-request state at all and `hybrid`
 #: (DSV4) keeps its own in the SLOT sidecar. `qwen` subclasses the K3 tier.
 _STATE_TIER_LAYOUTS = frozenset({"kimi_k3", "qwen"})
+
+#: Of those, the layouts that keep the tier under PP. Only K3's PAGE
+#: checkpoints span the stages (`paged_checkpoints_span_pipeline`); Qwen keeps
+#: fork checkpoints under PP, publishes no layout id, and its worker turns the
+#: tier off.
+_PP_STATE_TIER_LAYOUTS = frozenset({"kimi_k3"})
+
+
+def state_tier_spans_pipeline(layout: str) -> bool:
+    """Whether `layout` keeps its state tier under PP."""
+    return layout in _PP_STATE_TIER_LAYOUTS
+
 
 #: Roles from which the worker will save / load. Mirrors `_do_save` / `_do_load`
 #: in `OffloadWorkerMixin`; the state legs ride those same halves.
@@ -240,12 +429,13 @@ class StateTierCapability:
 
     Derived from configuration, not from the connector's public name. The name
     only says which connector class is constructed; whether that class builds a
-    `StateOffloadTier` depends on the layout it resolves, the pipeline depth,
-    and the role it was given. The engine used to install a `StateOffloadIndex`
-    for any `lmcache_offload`, so a K3 run under PP>1 -- or any `dense`/`hybrid`
-    run -- got an index against a worker that would never build the tier. That
-    mismatch is what left stores emitted with nowhere to go, and it is the
-    common root of the tier-none fallback paths.
+    `StateOffloadTier` depends on the layout it resolves, the pipeline depth
+    for a layout whose checkpoints do not span stages, and the role it was
+    given. The engine used to install a `StateOffloadIndex` for any
+    `lmcache_offload`, so any `dense`/`hybrid` run got an index against a
+    worker that would never build the tier. That mismatch is what left stores
+    emitted with nowhere to go, and it is the common root of the tier-none
+    fallback paths.
 
     `reason` is filled in whenever the tier is off, so the log names which check
     refused it rather than leaving the operator to guess.
@@ -329,9 +519,9 @@ def state_tier_capability(config) -> StateTierCapability:
 
     A capability descriptor rather than a name check, because the two are not
     the same question and the worker refuses on conditions the name cannot see
-    (no transfer config, a `multi` composite with no offload sub, `pp_size > 1`,
-    an unknown explicit override, a layout that offloads no state, or a `kv_role`
-    that neither saves nor loads). Config alone because this runs in the engine
+    (no transfer config, a `multi` composite with no offload sub, an unknown
+    explicit override, a layout that offloads no state, `pp_size > 1` for a
+    layout other than K3's, or a `kv_role` that neither saves nor loads). Config alone because this runs in the engine
     process at
     `BlockManager.__init__`, before any worker connector exists -- so it must
     agree with the worker by construction, which is why the layout comes from
@@ -365,18 +555,19 @@ def state_tier_capability(config) -> StateTierCapability:
     if name not in _STATE_TIER_BACKENDS:
         return replace(none, reason=f"connector {name!r} hosts no state tier")
 
-    # The worker refuses PP outright: `CacheEngineKey` has no PP component, so
-    # two stages at the same TP rank would overwrite each other's entries.
-    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
-    if pp_size > 1:
-        return replace(none, reason=f"pipeline_parallel_size={pp_size}")
-
     try:
         layout = select_offload_layout(layout_config)
     except ValueError as exc:  # an unknown explicit override
         return replace(none, reason=str(exc))
     if layout not in _STATE_TIER_LAYOUTS:
         return replace(none, reason=f"layout {layout!r} offloads no state")
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    if pp_size > 1 and not state_tier_spans_pipeline(layout):
+        return replace(
+            none,
+            reason=f"layout {layout!r} keeps no state tier at "
+            f"pipeline_parallel_size={pp_size}",
+        )
 
     role = cfg.get("kv_role", "offload")
     can_store = role in _SAVE_ROLES
@@ -390,10 +581,51 @@ def state_tier_cpu_bytes() -> int:
     """CPU bytes the state tier may keep per worker (`OFFLOAD_STATE_CPU_SIZE`,
     GiB, default 32), carved from the paged-KV LMCache pool it shares.
 
-    One reader for both halves: the worker's `StateByteCodec` evicts against
-    it and the engine's `StateOffloadIndex` mirrors the resulting entry bound.
+    Under PP this is the stages' average, not each stage's cap: the stages pool
+    it and every stage keeps the same number of images
+    (`state_tier_cpu_entries`), so a stage holds that count times its own image.
+    A stage whose image is larger than the average holds more than this, while
+    `scale_cpu_size_for_pp` gives it a pool by layer count, so
+    `LMCACHE_MAX_LOCAL_CPU_SIZE` has to fit the stage with the most state per
+    layer (stage 0 of Kimi-K3 at PP8).
     """
     return int(float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30))
+
+
+def _lmcache_engine_config(config):
+    """The LMCache config this engine's offload connector builds; raises when
+    LMCache or its config cannot be read."""
+    from atom.kv_transfer.offload.config import build_lmcache_config
+
+    kvcfg = getattr(config, "kv_transfer_config", None) or {}
+    # Under `multi` the lmcache.* keys (chunk_size, offload_layout) live on
+    # the offload SUB-connector, not the composite. Passing the raw
+    # composite here read a zero chunk grid. Unwrap the sub the same way
+    # `state_tier_capability` does, so the gate's chunk size and the tier
+    # the capability check builds stay consistent.
+    if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
+        sub, _why = _offload_subconfig(kvcfg)
+        if sub is not None:
+            kvcfg = sub
+    return build_lmcache_config(kvcfg)
+
+
+def state_tier_cpu_entries(spec, config) -> int:
+    """Checkpoint images each worker's state tier keeps.
+
+    One reader for both halves: the worker's `StateByteCodec` evicts against
+    it and the engine's `StateOffloadIndex` mirrors it.
+
+    Under PP the stages' budgets are pooled and split by image bytes, as
+    `scale_cpu_size_for_pp` splits the KV pool by layers, so every stage keeps
+    the same count. Split evenly, a stage with a smaller image would keep
+    images whose other parts the largest-image stage had already evicted, and
+    a load needs every stage's part. The total across stages is unchanged.
+    """
+    if not spec.pipeline_op_bytes:
+        return state_tier_cpu_bytes() // spec.image_bytes
+    stages = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    return state_tier_cpu_bytes() * stages // spec.pipeline_op_bytes
 
 
 def state_tier_chunk_tokens(config) -> int:
@@ -414,19 +646,7 @@ def state_tier_chunk_tokens(config) -> int:
     disable the joint KV load.
     """
     try:
-        from atom.kv_transfer.offload.config import build_lmcache_config
-
-        kvcfg = getattr(config, "kv_transfer_config", None) or {}
-        # Under `multi` the lmcache.* keys (chunk_size, offload_layout) live on
-        # the offload SUB-connector, not the composite. Passing the raw
-        # composite here read a zero chunk grid. Unwrap the sub the same way
-        # `state_tier_capability` does, so the gate's chunk size and the tier
-        # the capability check builds stay consistent.
-        if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
-            sub, _why = _offload_subconfig(kvcfg)
-            if sub is not None:
-                kvcfg = sub
-        return int(build_lmcache_config(kvcfg).chunk_size)
+        return int(_lmcache_engine_config(config).chunk_size)
     except Exception:
         # Blind on purpose: this runs at model load, the import reaches a
         # third-party package that may be absent entirely, and the only
@@ -438,6 +658,22 @@ def state_tier_chunk_tokens(config) -> int:
             exc_info=True,
         )
         return 0
+
+
+def state_tier_verified_for_s(config) -> float:
+    """`tier_verified_for_s` for one worker's LMCache CPU pool, the floor
+    when it cannot be read. Like `state_tier_chunk_tokens`, call it only when
+    a tier is hosted."""
+    try:
+        pool_gib = float(_lmcache_engine_config(config).max_local_cpu_size)
+    except Exception:  # noqa: BLE001 - `state_tier_chunk_tokens` logged why
+        logger.warning(
+            "state offload: LMCache's CPU pool size is unknown; a confirmed "
+            "state image is trusted for %.0f s",
+            _TIER_VERIFIED_MIN_S,
+        )
+        pool_gib = 0.0
+    return tier_verified_for_s(pool_gib)
 
 
 #: The connector backends whose worker half can build a `StateOffloadTier`.

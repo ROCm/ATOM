@@ -33,7 +33,6 @@ DRAFT_K2 = k2.LayerPostBuild(tokens=10, experts=128, topk=3, tp=4, ug_groups=1)
 def traces():
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("ARCH", "gfx950")
-        patch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
         return {
             "target_k1": trace(k1.build_attn_pre(TARGET_K1), k1.ABI),
             "target_k2": trace(k2.build_layer_post(TARGET_K2), k2.ABI),
@@ -50,6 +49,23 @@ def test_the_target_holds(traces):
 def test_the_draft_holds(traces):
     check(traces["draft_k1"], contract.k1_regions(DRAFT_K1))
     check(traces["draft_k2"], contract.k2_regions(DRAFT_K2))
+
+
+@pytest.mark.parametrize("index_mfma", [False, True], ids=["flydsl", "opus"])
+@pytest.mark.parametrize("tok_par", [False, True], ids=["replicated", "token_parallel"])
+def test_fp4_index_layout_contract(monkeypatch, index_mfma, tok_par):
+    monkeypatch.setenv("ARCH", "gfx950")
+    key = k2.LayerPostBuild(
+        tokens=12,
+        index_bound_max=65536,
+        tp=4,
+        index_fp4=True,
+        index_mfma=index_mfma,
+        kv_fp8=True,
+        tok_par=tok_par,
+    )
+    record = trace(k2.build_layer_post(key), k2.ABI)
+    check(record, contract.k2_regions(key))
 
 
 def _changed(decls, name, **change):

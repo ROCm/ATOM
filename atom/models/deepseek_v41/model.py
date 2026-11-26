@@ -11,7 +11,11 @@ from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
+from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
+    fuse_quant_supported,
+    pack_mhc_fn,
+    pre_delayed,
+)
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.engram.device.layer import EngramOp
@@ -29,7 +33,7 @@ from atom.utils.forward_context import get_forward_context
 
 from .attention import Attention
 from .config import build_attention_topology
-from .layers import native_quant_config
+from .layers import converted_linear_config, converted_linear_spec
 from .moe import MoE
 
 
@@ -84,6 +88,10 @@ class Block(nn.Module):
                     f"hc_{sublayer}_{suffix}",
                     atom_parameter(torch.empty(shape, dtype=torch.float32)),
                 )
+            self.register_buffer(f"hc_{sublayer}_fn_packed", None, persistent=False)
+        # Set with the packs: attention's fused MXFP8 norm output, where the
+        # HIP kernel can write row-major scales (`fuse_quant_supported`).
+        self.hc_fuse_quant = False
         self.engram = None
         if spec.layer_id in config.engram_layer_ids:
             width = (
@@ -97,11 +105,34 @@ class Block(nn.Module):
                 width,
                 hc,
                 config.rms_norm_eps,
-                quant_config=native_quant_config(),
+                quant_config=converted_linear_config(config),
             )
 
+    def process_weights_after_loading(self):
+        for sublayer in ("attn", "ffn"):
+            # Mono kernels still consume FP32 fn. Keep one read-only HIP pack
+            # per weight, shared by all token counts and execution streams.
+            setattr(
+                self,
+                f"hc_{sublayer}_fn_packed",
+                pack_mhc_fn(getattr(self, f"hc_{sublayer}_fn")),
+            )
+        # Only a native group32 `wqkv_a` reads MXFP8; a per-channel one
+        # quantizes its input per token.
+        self.hc_fuse_quant = (
+            self.hc_attn_fn_packed is not None
+            and fuse_quant_supported()
+            and self.attn.wqkv_a.native_a8_group_rows is not None
+            and not self.attn.wqkv_a.runs_bf16
+        )
+
     def attention_forward(self, normed, cache, step, rope):
-        """Run attention on its seam's normed BF16 input."""
+        """Keep BF16 for auxiliary readers and reuse the optional QKV quant."""
+        if isinstance(normed, tuple):
+            hidden, hidden_fp8, hidden_scale = normed
+            return self.attn(
+                hidden, hidden_scale, cache, step, rope, hidden_fp8=hidden_fp8
+            )
         return self.attn(normed, None, cache, step, rope)
 
     def engram_forward(self, residual, embeddings, image_mask):
@@ -121,15 +152,18 @@ class Block(nn.Module):
                 state,
                 residual=self.engram_forward(state.residual, embeddings, image_mask),
             )
+        hc_fn = self.hc_attn_fn_packed
         residual, normed, pre, post, comb = pre_delayed(
             state.residual,
             state.pre_mix,
-            self.hc_attn_fn,
+            hc_fn if hc_fn is not None else self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
             self.attn_norm.weight,
             **self.hc_options,
             norm_eps=self.attn_norm.eps,
+            w_preshuffle_bf16=hc_fn is not None,
+            fuse_quant=self.hc_fuse_quant,
             sublayer_output=state.pending,
             post_mix=state.post_mix,
             combination=state.combination,
@@ -137,17 +171,19 @@ class Block(nn.Module):
         return normed, residual, pre, post, comb
 
     def prepare_ffn(self, output, residual, pre, post, comb):
-        # The attention post folds into this seam: one kernel pair computes the
+        # The attention post folds into this seam: the delayed kernel computes the
         # new residual, the gates and the normed FFN input.
+        hc_fn = self.hc_ffn_fn_packed
         residual, normed, pre, post, comb = pre_delayed(
             residual,
             pre,
-            self.hc_ffn_fn,
+            hc_fn if hc_fn is not None else self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
             self.ffn_norm.weight,
             **self.hc_options,
             norm_eps=self.ffn_norm.eps,
+            w_preshuffle_bf16=hc_fn is not None,
             sublayer_output=output,
             post_mix=post,
             combination=comb,
@@ -227,9 +263,16 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         # One shared configuration owns all expert source/online quantization
         # rules. Native attention and Engram projections own their A8 layouts.
+        # Shared experts keep the converted spec; online patterns may convert
+        # the routed experts.
         self.moe_quant_config = make_v4_quant_config(
-            config, online_quant_config=online_quant_config
+            config,
+            online_quant_config=online_quant_config,
+            shared_expert_spec=converted_linear_spec(config),
+            online_routed_experts=True,
         )
+        # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
+        self.quant_config = self.moe_quant_config
         # A stream earns a hardware queue only where two branches are live at
         # once -- overlapping lifetimes, not independent data. One per model
         # rather than per layer, because layers do not overlap.

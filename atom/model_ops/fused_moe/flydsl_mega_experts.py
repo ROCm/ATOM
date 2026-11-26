@@ -19,6 +19,15 @@ MTPR also selects the p2p wire format, so the choice must use group-agreed
 metadata, never a rank's local request count. Set ATOM_MEGA_DECODE_FAST_PATH=0
 to retain the configured capacity for all forwards.
 
+``MegaMoEV2`` is built with ``routed=True`` and gets the DP-group max rows of
+each step (``_max_tokens_hint``), from which AITER (ROCm/aiter#7788 and later)
+picks the staged, small-input or large-input route on the layouts its fused
+kernels support. The large-input route holds one protocol slot per layer id
+up to the largest one of the Mega MoE layers built, target and draft
+(``_mega_layer_slots``), selected by the layer's ``layer_id``. When the main
+instance's small-input route covers the decode capacity, the decode instance is
+not built: the main instance already routes those steps to the same kernel.
+
 Weight prep uses aiter's own shuffles (``aiter.ops.shuffle``):
   w1/w1_scale: ``shuffle_weight_a16w4(., 16, gate_up=True)`` /
                ``shuffle_scale_a16w4(., E, gate_up=True)``  (g1u1 interleave)
@@ -28,7 +37,7 @@ Shuffled tensors stay expert-major + contiguous, so EPLB can migrate their
 expert-major views in place.
 
 Memory: MegaMoEV2 instances are shared across all MoE layers (process-level
-cache keyed by shape/quant/mtpr); both capacities are built in the same order
+cache keyed by shape/quant/mtpr); the capacities are built in the same order
 on all ranks before capture. Per-layer weights are swapped in before forward
 (``_s1_w1`` / ``_s1_w1_scale`` / ``w2`` / ``w2_scale`` are runtime pointer args,
 not baked into the kernel).
@@ -41,7 +50,6 @@ import os
 
 import torch
 
-from atom.model_ops.fused_moe.triton_zero_pad_rows import zero_pad_rows_
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
 
@@ -58,26 +66,154 @@ if _MEGA_DECODE_MTPR not in _MEGA_DECODE_MTPRS:
         f"got {_MEGA_DECODE_MTPR}"
     )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
+# Layer ids of the MoE layers built with the Mega method (register_mega_layer),
+# and the prefixes of those built without one.
+_MEGA_LAYER_IDS: set[int] = set()
+_MEGA_LAYERS_WITHOUT_ID: list[str] = []
 
 
 def _os_env(k):
     return os.environ.get(k, "<unset>")
 
 
-def _select_decode_mtpr(mtpr: int, context, *, tbo_active: bool) -> int:
+def _select_decode_mtpr(
+    mtpr: int, context, *, tbo_active: bool, pcp_merge: bool = False
+) -> int:
     """Select from already allocated capacities using the pass's shared shape.
 
     A decode rank can have a prefilling peer. Only ``running_tokens_are_unified``
     proves that every DP rank agreed on this shape. Do not gate on is_prefill or
-    is_dummy_run: a draft pass also runs on idle peers whose parent batch flags
-    can differ. TBO contexts keep the existing capacity. ``running_bs`` counts
-    requests and underestimates MTP verification rows.
+    on whether the rank has requests: a draft pass also runs on idle peers,
+    whose own batch differs. TBO contexts keep the existing capacity. ``running_bs`` counts
+    requests and underestimates MTP verification rows. Under ``pcp_merge`` the
+    rows are padded as the route hint pads them (``_max_tokens_hint``).
     """
     if context is None or not context.running_tokens_are_unified or tbo_active:
         return mtpr
-    if 0 < context.running_tokens <= _MEGA_DECODE_MTPR:
+    rows = _pcp_merged_rows(int(context.running_tokens), pcp_merge)
+    if 0 < rows <= _MEGA_DECODE_MTPR:
         return _MEGA_DECODE_MTPR
     return mtpr
+
+
+def _pcp_merged_rows(rows: int, pcp_merge: bool) -> int:
+    """The rows every PCP rank's experts may run: under PCP merge a split pass
+    gathers the PCP shards of the step's rows padded to a PCP multiple."""
+    if not pcp_merge or rows <= 0:
+        return rows
+    from atom.distributed.pcp_utils import pcp_pad_len
+
+    return pcp_pad_len(rows)
+
+
+def register_mega_layer(layer) -> None:
+    """Record the layer id of a MoE layer built with the Mega method.
+
+    The large-input route gives each layer id its own protocol slot. Target
+    layers are numbered ``[0, num_hidden_layers)``; the V4 MTP and DSpark draft
+    layers follow them (``num_hidden_layers + i``), as many as the draft model
+    builds (DSpark: the checkpoint's stages, not ``num_nextn_predict_layers``).
+    The draft model is built before the first forward builds an instance, which
+    refuses a layer without an id once it holds the large-input route
+    (``_check_layer_slots``).
+    """
+    if layer.layer_id is None:
+        _MEGA_LAYERS_WITHOUT_ID.append(layer.prefix)
+    else:
+        _MEGA_LAYER_IDS.add(int(layer.layer_id))
+
+
+def _mega_layer_slots() -> int:
+    """Large-input protocol slots of a shared operator: one per layer id up to
+    the largest one built (``register_mega_layer``)."""
+    return max(_MEGA_LAYER_IDS, default=0) + 1
+
+
+def _check_layer_slots(mega) -> None:
+    """Every layer of an instance holding the large-input route selects its
+    protocol slot by its layer_id. The other routes select none, so a layout
+    that never builds the large-input route (the DeepSeek-V3/R1 MTP block keeps
+    layer_id None) runs without one."""
+    if mega.large_m_available and _MEGA_LAYERS_WITHOUT_ID:
+        raise ValueError(
+            "MegaMoE's large-input route selects each MoE layer's protocol slot "
+            f"by its layer_id, and {_MEGA_LAYERS_WITHOUT_ID[0]!r} has none: its "
+            "model must pass FusedMoE(layer_id=...)"
+        )
+
+
+def mega_swiglu_limit(layer) -> float:
+    """The SwiGLU clamp a Mega instance for ``layer`` is built with; a model
+    without one sets none on its experts."""
+    return float(getattr(layer, "swiglu_limit", 0.0))
+
+
+def mega_builds_fused_route(
+    *,
+    world_size: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    quant: str,
+    swiglu_limit: float,
+) -> bool:
+    """Whether AITER's fused (small- and large-input) MegaMoEV2 kernels serve
+    this layout, by AITER's own query (``fused_layout_supported``).
+
+    With ``routed=True`` an instance on such a layout builds the small-input
+    route on 256-CU parts and the large-input route at the capacities AITER
+    lists for it; an instance on any other layout holds the staged route only.
+    The answer reads the layout and the arch, so it is the same on every rank
+    and for every capacity ``run_mega_moe`` builds, the decode one included.
+    """
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+        fused_layout_supported,
+    )
+
+    return fused_layout_supported(
+        arch=get_gfx_runtime(),
+        world_size=world_size,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        quant=quant,
+        swiglu_limit=float(swiglu_limit),
+    )
+
+
+def _max_tokens_hint(fc, *, pcp_merge: bool) -> int | None:
+    """This step's max rows over the DP group, identical on every EP rank.
+
+    None (the staged route) when no such count is known: plugin bridges, TBO
+    ubatches and missing metadata. The route depends on the rows alone, so a
+    graph capture takes the route its eager run takes (small-input up to its
+    capacity, large-input above it) and the eager warmup before a capture
+    compiles the kernels and allocates the workspaces the capture launches.
+
+    ``pcp_merge``: every PCP rank runs the experts over the same rows, which a
+    split pass gathers from the PCP shards of the step's rows padded to a PCP
+    multiple. The padded count bounds both such a pass and one that holds the
+    step's rows already, so every rank hints it whatever its own pass.
+    """
+    context = fc.context
+    if context is None or is_plugin_mode():
+        return None
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if tbo_active():  # a ubatch's counts need not be the group's
+        return None
+    if context.running_tokens_are_unified:
+        rows = int(context.running_tokens)  # padded, as a captured graph's bucket
+    elif context.running_tokens_across_dp:
+        rows = max(int(r) for r in context.running_tokens_across_dp)
+    else:
+        return None
+    if rows <= 0:
+        return None
+    return _pcp_merged_rows(rows, pcp_merge)
 
 
 def build_mega_weights(layer) -> None:
@@ -169,6 +305,8 @@ def get_or_build_mega_moe(
 
         # MegaMoEV2 auto-selects fixed-slot vs compact and its GEMM tiles from
         # (tokens, mtpr); no gemm2_tile / enable_fused / tune-table args anymore.
+        # The per-layer slots cost memory only on a capacity that builds the
+        # large-input route.
         with torch.inference_mode(False), torch.no_grad():
             m = MegaMoEV2(
                 rank=rank,
@@ -184,7 +322,10 @@ def get_or_build_mega_moe(
                 w2_scale=w2_scale,
                 max_tok_per_rank=mtpr,
                 swiglu_limit=swiglu_limit,
+                routed=True,
+                large_m_state_slots=_mega_layer_slots(),
             )
+        _check_layer_slots(m)
         _MEGA_CACHE[key] = m
         if rank == 0:
             logger.info(
@@ -224,14 +365,10 @@ def run_mega_moe(
     mtpr: int,
     swiglu_limit: float,
     quant: str = "a8w4",
-    mask_pad_rows: bool = False,
 ) -> torch.Tensor:
     """Replace EP experts with MegaMoEV2. x: [tokens, model_dim] bf16 (this rank's
     local tokens, pre-dispatch). topk_ids: global (physical) expert ids. Returns
-    [tokens, model_dim] bf16.
-
-    mask_pad_rows: return this pass's DP pad rows as zeros without dispatching
-    them (see _enable_mega_pad_row_mask)."""
+    [tokens, model_dim] bf16."""
     from aiter.dist.parallel_state import get_ep_group
 
     # Do NOT "simplify" this to get_ep_group().rank_in_group / .world_size.
@@ -269,6 +406,7 @@ def run_mega_moe(
     # Mega construction has symmetric allocations and barriers; lazily building
     # only the locally selected capacity could leave peers in different calls.
     mega = get_or_build_mega_moe(mtpr=mtpr, **build_args)
+    pcp_merge = layer.moe_parallel_config.pcp_merge
     use_decode_capacity = (
         envs.ATOM_MEGA_DECODE_FAST_PATH
         # Plugin bridges do not all publish native ForwardMode's group-agreed
@@ -277,6 +415,10 @@ def run_mega_moe(
         and mtpr > _MEGA_DECODE_MTPR
         and world == 8
         and experts == world * 48
+        # The small-input route of the configured capacity serves these steps
+        # with the kernel the decode capacity's own small-input route would.
+        # It is built from the layout alone, so every rank decides the same.
+        and mega.small_m_mtpr < _MEGA_DECODE_MTPR
     )
     if use_decode_capacity:
         from atom.utils.tbo.ubatching import tbo_active
@@ -284,12 +426,14 @@ def run_mega_moe(
         # Do not introduce symmetric workspace allocation from a TBO worker.
         # The first ordinary forward's warmup will allocate the small instance.
         use_decode_capacity = not tbo_active()
+    from atom.utils.forward_context import get_forward_context
+
     if use_decode_capacity:
         decode_mega = get_or_build_mega_moe(mtpr=_MEGA_DECODE_MTPR, **build_args)
-        from atom.utils.forward_context import get_forward_context
-
         context = get_forward_context().context
-        selected_mtpr = _select_decode_mtpr(mtpr, context, tbo_active=False)
+        selected_mtpr = _select_decode_mtpr(
+            mtpr, context, tbo_active=False, pcp_merge=pcp_merge
+        )
         if selected_mtpr != mtpr:
             # The local tensor is a bound check, not an independent protocol
             # selector. All peers must choose using the same context metadata.
@@ -316,47 +460,21 @@ def run_mega_moe(
                     selected_mtpr,
                 )
 
+    max_tokens = _max_tokens_hint(get_forward_context(), pcp_merge=pcp_merge)
+    if mega.large_m_available:
+        # The weights are bound above; select this layer's protocol slot.
+        mega.select_layer_state(layer.layer_id)
+
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
-    pad_rows = None
-    if mask_pad_rows:
-        from atom.utils.forward_context import step_pad_rows
-
-        pad_rows = step_pad_rows(run_tokens)
-    if pad_rows is not None:
-        # Whole rows: every top-k slot, the fused shared-expert slot included.
-        ids = torch.where(pad_rows, -1, ids)
-    # An aiter whose combine skips -1 slots returns the pad rows as zeros itself.
-    # The check is not free, so ask for it only on passes that mask rows.
-    combine_can_mask = getattr(mega, "supports_combine_mask", False)
-    forward_kwargs = (
-        {"mask_invalid_slots": pad_rows is not None} if combine_can_mask else {}
-    )
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
-        # construction (see the cache key above).
-        out = mega.forward(x.contiguous(), wts, ids, **forward_kwargs)
-    if pad_rows is not None and not combine_can_mask:
-        # Older aiter: combine sums every top-k slot, and a -1 slot holds whatever
-        # an earlier call left there (possibly non-finite). Zero those rows.
-        out = zero_pad_rows_(out, pad_rows)
+        # construction (see the cache key above). Routing sends a pad row's
+        # slots to -1, which combine must skip rather than sum stale data from.
+        out = mega.forward(
+            x.contiguous(), wts, ids, mask_invalid_slots=True, max_tokens=max_tokens
+        )
     return out
-
-
-def _enable_mega_pad_row_mask(mtpr: int) -> bool:
-    """Whether Mega masks DP pad rows (ATOM_MEGA_MASK_PAD_ROWS).
-
-    MegaMoEV2 never counts, sends or computes a top-k id < 0, so whole pad rows
-    routed to -1 cost nothing; only combine needs care (see run_mega_moe).
-    Allocates the device mask now, at layer init, before any graph capture
-    records its address. Plugin frontends never publish it.
-    """
-    if not envs.ATOM_MEGA_MASK_PAD_ROWS or is_plugin_mode():
-        return False
-    from atom.utils.forward_context import enable_pad_rows_device
-
-    enable_pad_rows_device(mtpr, torch.device("cuda"))
-    return True
 
 
 class MegaFusedExperts:
@@ -394,7 +512,6 @@ class MegaFusedExperts:
         self._inter_dim = inter_dim
         self._mtpr = mtpr
         self._quant = quant
-        self._mask_pad_rows = _enable_mega_pad_row_mask(mtpr)
 
     def __call__(
         self,
@@ -408,10 +525,13 @@ class MegaFusedExperts:
         activation=None,
         apply_router_weight_on_input: bool = False,
         expert_map: torch.Tensor | None = None,
+        x_scale: torch.Tensor | None = None,
         **_ignored,
     ) -> torch.Tensor:
         from aiter import ActivationType
 
+        # The method declares no routed-rows wire: MegaMoE quantizes bf16 rows.
+        assert x_scale is None, "MegaMoE takes bf16 rows, not pre-quantized ones"
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "mega does not support apply_router_weight_on_input=True"
@@ -446,7 +566,6 @@ class MegaFusedExperts:
             # run_mega_moe selects the small instance using this pass's padded
             # token count; request count alone is insufficient under MTP.
             mtpr=self._mtpr,
-            swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
+            swiglu_limit=mega_swiglu_limit(self._layer),
             quant=self._quant,
-            mask_pad_rows=self._mask_pad_rows,
         )

@@ -33,6 +33,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from atom.sampling_params import RequiredChannel
+
 # A tool name is an identifier, which is what the model was given.
 #
 # `\w` and not `[A-Za-z_]`: OpenAI's own grammar is `^[a-zA-Z0-9_-]{1,64}$`, so
@@ -350,6 +352,34 @@ class ToolCallParser(ABC):
     # Leniency about what to *parse* stays: once identified, a format should
     # read the malforms its own model emits. Only the claim must be single.
     DETECT_MARKERS: ClassVar[tuple[str, ...]] = ()
+
+    @classmethod
+    def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
+        """What a request that must call a tool holds the output to, in this
+        format's token ids; None leaves it unconstrained.
+
+        None for every format but Kimi-K3, whose answer either closes the
+        message or opens the tools channel at one token -- the place a model
+        told it MUST call a tool still sometimes ends instead.
+        """
+        return None
+
+    @classmethod
+    def tool_call_grammar(
+        cls, functions: list[dict], *, required: bool, starts_in_reasoning: bool
+    ) -> str | None:
+        """A Lark (llguidance) grammar for the rest of the assistant message
+        that holds this format's calls to ``functions``; None leaves the output
+        unconstrained.
+
+        ``functions`` are the function objects the request lets the model
+        call; ``required`` means it must call one; ``starts_in_reasoning``
+        says whether the prompt opened the reasoning channel. Applied to a chat
+        request that declares tools and no response format when
+        ATOM_TOOL_CALL_GRAMMAR=1 (`structured_output.validation.
+        configure_tool_call_grammar`). None for every format but Kimi-K3.
+        """
+        return None
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:

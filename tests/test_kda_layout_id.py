@@ -43,21 +43,36 @@ def builder(
     num_spec=0,
     pp=1,
     rapidserve=False,
+    replayssm=False,
+    kpool=1,
+    kpool_tail=None,
 ):
+    """`kpool` is the model's (GLM-5.3 pools indexer keys); `kpool_tail` says
+    whether this PP stage holds indexer layers, and with them the tail plane."""
     config = SimpleNamespace(
         pipeline_parallel_size=pp,
         enable_rapidserve=rapidserve,
     )
+    if kpool_tail is None:
+        kpool_tail = kpool > 1
+    tail = (256, 3) if kpool_tail else None
     stub = SimpleNamespace(
         model_runner=SimpleNamespace(config=config),
         num_state_layers=lambda: layers,
         num_spec=num_spec,
+        replayssm=replayssm,
         _state_shape_for_runner=lambda: (shape_k, shape_v),
         _state_dtypes=lambda: (dt_k, dt_v),
+        _kpool_size=lambda: kpool,
+        _kpool_tail_plane_shape=lambda: tail,
+        _checkpoint_plane_shapes=lambda: [(1, layers)] * 2 + [tail] * bool(tail),
     )
-    stub._uses_paged_checkpoints = Builder._uses_paged_checkpoints.__get__(
-        stub, type(stub)
-    )
+    for name in (
+        "_uses_paged_checkpoints",
+        "_decode_keep",
+        "_decode_image_is_conv_and_ssm",
+    ):
+        setattr(stub, name, getattr(Builder, name).__get__(stub, type(stub)))
     return stub
 
 
@@ -133,14 +148,17 @@ class TestEverythingThatMovesAByteMovesTheId:
 
 
 class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
-    """`get_num_blocks` raises on a copying transfer under PP or RapidServe.
+    """`get_num_blocks` raises on a copying transfer under RapidServe.
     Answering `copy` there would turn "K3 keeps no state cache" into "K3 does
     not start"."""
 
-    def test_pipeline_parallelism_falls_back_to_fork(self):
+    def test_pipeline_parallelism_copies(self):
+        """The stages agree on one unit geometry, so a checkpoint is a PAGE
+        image under PP too rather than a slot competing with admissions."""
         with tp_world(TP):
             transfer = Builder.state_transfer(builder(pp=2))
-        assert transfer.forks and not transfer.copies
+        assert transfer.copies and not transfer.forks
+        assert Builder.paged_checkpoints_span_pipeline
 
     def test_rapidserve_falls_back_to_fork(self):
         with tp_world(TP):
@@ -157,3 +175,35 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
         interior state to slice a checkpoint out of."""
         with tp_world(TP):
             assert not Builder.state_transfer(builder()).readable_midstep
+
+    @pytest.mark.parametrize(
+        "replayssm, num_spec, kpool, keep",
+        [
+            (True, 2, 1, "snapshot"),
+            (True, 0, 1, "snapshot"),
+            (False, 2, 1, "snapshot"),
+            (False, 0, 1, "settled"),
+            (True, 2, 4, "none"),
+            (False, 0, 4, "settled"),
+        ],
+    )
+    def test_a_decode_boundary_keeps_what_the_slot_can_give(
+        self, replayssm, num_spec, kpool, keep
+    ):
+        """Under MTP or ReplaySSM the slot is ahead of a decode boundary, and
+        the image is rebuilt only where it is conv and SSM alone."""
+        with tp_world(TP):
+            transfer = Builder.state_transfer(
+                builder(replayssm=replayssm, num_spec=num_spec, kpool=kpool)
+            )
+        assert transfer.decode_keep == keep
+
+    @pytest.mark.parametrize("kpool_tail", [True, False])
+    def test_every_pp_stage_of_a_kpool_model_keeps_none(self, kpool_tail):
+        """A stage with no indexer layer holds no tail plane, but the head
+        files and sizes scratch for every stage, so it answers as they do."""
+        with tp_world(TP):
+            transfer = Builder.state_transfer(
+                builder(replayssm=True, pp=2, kpool=4, kpool_tail=kpool_tail)
+            )
+        assert transfer.decode_keep == "none"

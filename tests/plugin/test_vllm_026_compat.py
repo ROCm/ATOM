@@ -108,3 +108,29 @@ def test_eagle3_type_proxy_is_valid_isinstance_guard():
     assert isinstance(NativeEagle3(), guard)
     assert isinstance(AtomModelBase(), guard)
     assert not isinstance(object(), guard)
+
+
+def test_the_profiling_mark_is_set_before_the_cache_is_built(monkeypatch):
+    """A proxy bound inside `initialize_kv_cache` must see this call's mode.
+
+    V4.1 binds from `register_kv_caches`, inside it: marked afterwards, V2's
+    profiling stub was bound as a serving pool and the real init that followed
+    read the stale profiling mark and declined to bind.
+    """
+    from atom.plugin.vllm import deepseek_v4_prefix_patch as patch
+    from atom.plugin.vllm import vllm_runtime
+
+    proxy = SimpleNamespace(_atom_v4_proxy_layer=True)
+    seen = []
+
+    class _Runner:
+        compilation_config = SimpleNamespace(static_forward_context={"p": proxy})
+
+        def initialize_kv_cache(self, kv_cache_config, is_profiling=False):
+            seen.append(proxy._atom_v4_profiling_kv_cache)
+
+    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", lambda: [_Runner])
+    patch.apply_vllm_v4_profile_cache_patch()
+    _Runner().initialize_kv_cache(None, is_profiling=True)
+    _Runner().initialize_kv_cache(None)
+    assert seen == [True, False]

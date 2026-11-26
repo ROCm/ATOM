@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Qwen3-30B-A3B GRPO long run — Megatron TP4/EP8 + ATOM BF16 rollout (MI308X)
+#
+# Aligned with LMSYS MILES RL:
+#   GRPO 32x8 sampling, 8k response cap, global batch 256, no KL, TP4/EP8
+#   https://www.lmsys.org/blog/2026-03-17-rocm-miles-rl-amd/#performance
+#
+# Training: Megatron-Core GPTModel (TP=4, EP=8, sequence-parallel,
+#   distributed optimizer, flash attention, chunked log-prob,
+#   torch RMSNorm — no apex/TE)
+#
+# Rollout: ATOM AsyncLLMEngine (BF16 weights + FP8 KV cache, TP=2 x 4 replicas,
+#   enforce_eager=false + compilation_config.level=3 + sleep_level=2)
+#
+# FP8 per_block_fp8 is NOT used (Qwen3-30B-A3B MoE intermediate=768 causes
+# garbled output with 128x128 block quantization). BF16 weights + FP8 KV cache.
+#
+# MILES reference performance (8xMI300X):
+#   Mean step 388.50s, AIME accuracy 0.665 -> 0.729
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B"
+  training_backend: megatron
+  generation_backend: atom
+  max_total_sequence_length: 9216        # 1024 prompt + 8192 response
+  max_response_length: 8192             # MILES: 8k response cap
+  train_global_batch_size: 256          # MILES: 32 prompts x 8 generations = 256
+  gen_batch_size: 64                    # over-sample prompts per round
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 32768           # MILES: --max-tokens-per-gpu 32768
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  adam_beta1: 0.9
+  adam_beta2: 0.98                        # MILES: --adam-beta2 0.98
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      tensor_model_parallel_size: 4
+      expert_model_parallel_size: 8      # 128 experts / 8 = 16 experts per GPU
+      expert_tensor_parallel_size: 1    # MILES: ETP=1 (MoE layers no TP, dense layers TP=4)
+      num_experts: 128
+      moe_grouped_gemm: false             # grouped_gemm (CUTLASS) unavailable on ROCm; use SequentialMLP
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
+      use_distributed_optimizer: true
+      sequence_parallel: true
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+      attention_backend: flash
+      log_probs_chunk_size: 1024
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    atom_cfg:
+      tensor_parallel_size: 2
+      kv_cache_dtype: fp8
+      transport: ray_http
+      expert_parallel_size: 1
+      engine_kwargs:
+        enforce_eager: false
+        compilation_config:
+          level: 3
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.60
+      max_model_len: 9216
+      dtype: bfloat16
+      enforce_eager: false
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 16384
+      max_num_seqs: 64
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: true
+      sleep_level: 2
+      update_weights_bucket_megabytes: 2048
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: grpo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  clip_ratio_high: 0.28                   # MILES: --eps-clip-high 0.28 (asymmetric clip)
+  grpo:
+    num_generations: 8
+    kl_coeff: 0.0
+    clip_ratio: 0.2
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+moe:
+  r3:
+    # ATOM + R3 is fail-closed; vLLM hard_assignment is the production path.
+    enabled: false
+    record_router_logits: false
+    replay_mode: hard_assignment
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-30b-a3b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-30b-a3b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 10
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/qwen3-30b-a3b-ep8/longrun"
+  save_steps: 50
+  save_total_limit: 5
+  resume: true
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: AtomRL
+    name: qwen3-30b-a3b-grpo-ep8-miles-aligned
+
+num_training_steps: 1000
+seed: 10086

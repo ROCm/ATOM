@@ -174,6 +174,7 @@ def _make_layer(num_experts, hidden, intermediate, seed=0):
     torch.manual_seed(seed)
     return SimpleNamespace(
         activation=moe_mod.ActivationType.Silu,
+        global_num_experts=num_experts,
         num_fused_shared_experts=0,
         w13_bias=None,
         w2_bias=None,
@@ -279,14 +280,14 @@ def test_triton_views_reproduce_the_triton_prep():
 
 @gfx1250_only
 def test_decode_prep_rejects_a_layout_the_two_kernels_do_not_share():
-    """GGUU (ATOM_MOE_GU_ITLV=0) gives FlyDSL and Triton genuinely different
+    """The separated (GGUU) layout gives FlyDSL and Triton genuinely different
     layouts, so sharing one copy must be refused rather than read as garbage."""
     method = _prep_method(
         use_triton=True, use_triton_decode=True, num_experts=3, intermediate=128
     )
     method.is_guinterleave = False
 
-    with pytest.raises(AssertionError, match="ATOM_MOE_GU_ITLV"):
+    with pytest.raises(AssertionError, match="interleaved=False"):
         method._process_weight_layout_after_loading(_make_layer(3, 256, 128))
 
 
@@ -333,7 +334,8 @@ def _apply_dispatch_probe(monkeypatch, *, use_triton_decode, is_prefill):
     method.hidden_pad = 0
     method.intermediate_pad = 0
     method.fused_experts = None
-    method.select_experts_with_record = lambda **_k: ("topk_weights", "topk_ids")
+    method.use_flydsl_herd = False
+    method.triton_identity_expert_map = "identity_map"
     method._triton_views_of_flydsl_weights = lambda _layer: (
         "w13_view",
         "w2_view",
@@ -384,6 +386,12 @@ def _apply_dispatch_probe(monkeypatch, *, use_triton_decode, is_prefill):
         swiglu_limit=0.0,
         num_fused_shared_experts=0,
         routed_scaling_factor=1.0,
+        top_k=4,
+        use_grouped_topk=False,
+        scoring_func="sqrtsoftplus",
+        e_score_correction_bias=None,
+        custom_routing_function=None,
+        shared_expert_scoring_func=None,
     )
     captured["flydsl_calls"] = flydsl_calls
     return method, layer, captured
@@ -397,9 +405,8 @@ def test_prefill_falls_through_to_flydsl(monkeypatch):
     result = method.apply(
         layer=layer,
         x="x",
-        router_logits="router_logits",
-        top_k=4,
-        renormalize=False,
+        topk_weights="topk_weights",
+        topk_ids="topk_ids",
         global_num_experts=16,
         expert_map=None,
         activation="silu",
@@ -420,22 +427,27 @@ def test_decode_takes_triton_over_a_view_of_the_flydsl_weights(monkeypatch):
     method, layer, captured = _apply_dispatch_probe(
         monkeypatch, use_triton_decode=True, is_prefill=False
     )
-    # Reach the fused-experts call without standing up aiter's real routing().
-    import aiter.ops.triton.moe.moe_routing.routing as routing_mod
+    # Reach the fused-experts call without standing up aiter's real sort.
+    import atom.model_ops.fused_moe_triton as triton_mod
 
     monkeypatch.setattr(
-        routing_mod,
-        "routing",
-        lambda *a, **k: (SimpleNamespace(n_expts_act=4), "gather", "scatter"),
+        triton_mod,
+        "routing_from_dispatched",
+        lambda *a, **k: (
+            SimpleNamespace(n_expts_act=4),
+            "gather",
+            "scatter",
+            "gate_valid",
+            None,
+        ),
     )
     monkeypatch.setattr(torch, "empty_like", lambda _x: "out", raising=False)
 
     result = method.apply(
         layer=layer,
         x="x",
-        router_logits=SimpleNamespace(shape=(2, 16)),
-        top_k=4,
-        renormalize=False,
+        topk_weights=torch.zeros(2, 4),
+        topk_ids=torch.zeros(2, 4, dtype=torch.int32),
         global_num_experts=16,
         expert_map=None,
         activation=moe_mod.ActivationType.Silu,

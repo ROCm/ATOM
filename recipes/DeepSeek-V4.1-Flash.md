@@ -1,16 +1,25 @@
 # DeepSeek-V4.1-Flash
 
 The native text backbone and the paged ModelRunner/Scheduler lifecycle are
-usable. The original V4 BF16 attention and inverse RoPE kernels are reused.
+usable. With `--kv_cache_dtype fp8`, AITER's `mla_sparse_prefill_v41`
+attends over contiguous MXFP8 data and scale planes. With FP4 KV,
+`ATOM_DSV41_A8W4_ATTN=auto` (the default) uses native A8W4 on supported
+gfx950 configurations, as selected by AITER's V4.1 capability API. Setting
+`ATOM_DSV41_A8W4_ATTN=off`, or using a query/backend that cannot run A8W4,
+selects the BF16 adapter. BF16 KV uses the original V4 BF16 attention.
 Chat, tool and reasoning-effort protocol integration is complete, and native
 image requests support chunked prefill and request-owned embedding lifetime.
 
 The reference revision is `dba1be0a40aa45a94ad051997016db3960a90277`, AITER is
-pinned to `2039d2b96cd547ebc52f8d55f5f29ec1b8290796`, and Engram builds on
+pinned to `a53213dc474521a52ace1cecc079b70e3a0afafb` (it was
+`2039d2b96cd547ebc52f8d55f5f29ec1b8290796` until the
+[gfx942 (MI308X)](#gfx942-mi308x) section; the other sections' numbers predate
+the change), and Engram builds on
 ROCm/ATOM PR #2185. The primary deployment scope is TP4 with whole-expert EP
 on MI355X GPUs. For measured TP2/TP4 no-EP, level-3 FULL AgentX performance,
 see the [AgentX benchmark recipe](DeepSeek-V4.1-Flash-Agentic.md), using
-fixed acceptance length 3.51.
+fixed acceptance length 3.51. For MI455X, see [gfx1250 (MI455X)](#gfx1250-mi455x);
+for MI308X, [gfx942 (MI308X)](#gfx942-mi308x).
 
 | Capability | Status |
 |---|---|
@@ -23,15 +32,17 @@ fixed acceptance length 3.51.
 | Vision and image requests | Implemented; [visual quality remains unstable](../docs/deepseek_v41_vision.md#current-limitations) in eager and FULL graph modes |
 | Multimodal chunking and embedding lifetime | Supported; output can vary with chunk size |
 | Packed cache, native quantized experts and graph execution | Implemented; see [memory and numerical limits](../docs/deepseek_v41_performance.md#memory-and-numerical-limits) |
+| FP8 (MXFP8) KV cache (`--kv_cache_dtype fp8`; BF16 and FP4 also accepted) | Complete on the original path and in mono; 1.84x the rows of the BF16 pool, GSM8K within the BF16 baseline's spread |
 | FP8 (default) or FP4 (`--index_cache_dtype fp4`) index plane, paged scorer, whole-forward target graph | Complete; a decode step is the draft's replay plus the target's, and prefill scores in the plane too |
 | DSpark speculation and accepted-prefix state commit | Fixed-width lifecycle supported at level 0; [quality and throughput acceptance remain incomplete](../docs/deepseek_v41_dspark.md#current-limitations) |
 | Candidate-only indexing, Engram residency and fusion | Partial: Engram UVA/overlap and fusions exist. Visibility-sized scratch, candidate-only Reindex and HBM residency remain |
 | Fused decode (mono) for DSpark verify steps of up to 12 rows and their draft backbone | On by default (`ATOM_MONO_ENABLE`) but currently refused: its MoE kernel still runs MXFP4 activations; see [Fused decode](#fused-decode-mono) |
 | Decoder SWA bounded replay (the decoder on each prompt's last window rows) | On by default (`--no-decoder-swa-bounded-replay`); see [the runtime guide](../docs/deepseek_v41_runtime.md#decoder-swa-bounded-replay) |
 | Encoder SWA bounded replay (no state checkpoints; a hit rebuilds one PAGE) | On by default (`--no-encoder-swa-bounded-replay`); see [the runtime guide](../docs/deepseek_v41_runtime.md#encoder-swa-bounded-replay) |
+| P/D disaggregation (Mooncake) | 1P1D TP2+TP2 validated with DSpark (gsm8k and AgentX c32); MoRI-IO not yet admitted. See [the PD guide](pd_disaggregation_guide.md#deepseek-v41-flash) |
 | TP4 with routed experts sharded across TP instead of whole-expert EP | Supported; relative throughput is workload-dependent |
 | TP2 no EP | GPU benchmark completed at level 3 FULL; see the [AgentX recipe](DeepSeek-V4.1-Flash-Agentic.md) for commands and measured points |
-| Other TP sizes | Configuration tests cover TP1/2/4/8 and dimension divisibility; this does not establish GPU or quality validation for TP1/8. TP8 does not start: AITER's FP8 blockscale GEMM runs no K = 288 (the shared expert's down projection) |
+| Other TP sizes | Configuration tests cover TP1/2/4/8 and dimension divisibility; this does not establish GPU or quality validation for TP1. TP8 starts on gfx950 through the shared expert's in-place K pad, 288 -> 320 (`fp8_group32_k_pad_align`; the pad goes away with ROCm/aiter#7967). GSM8K at TP8 (MI355X, 1,319 questions, 64 in flight, real acceptance): 0.9727 strict / 0.9719 flexible on ATOM's path |
 
 The full-layer path remains the numerical and performance baseline. CED and
 bounded replay are approximate modes with separate quality gates and cache
@@ -77,6 +88,179 @@ run under whole-expert EP or shard across TP, whichever the launch selects.
 V4.1 initializes the same distributed environment as every other model and has no
 collective policy of its own.
 
+## Shared Mooncake Store across data-parallel ranks
+
+A Mooncake Store shared by every DP rank lets a request run on any rank and load
+the prefix another rank computed, so requests need no session affinity. Start a
+Mooncake master (with its HTTP metadata server) and a DRAM owner on the host, then
+start the server with the Store as the offload tier and the `share_cache` router:
+
+```bash
+export ATOM_KV_OFFLOAD=mooncake_store
+export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{
+  "mooncake_store.master": "127.0.0.1:19861",
+  "mooncake_store.metadata": "http://127.0.0.1:19862/metadata",
+  "mooncake_store.protocol": "rdma",
+  "mooncake_store.rdma_devices": "<rdma device>",
+  "mooncake_store.local_hostname": "127.0.0.1"}'
+python -m atom.entrypoints.openai_server --model <V4.1 checkpoint> \
+  --enable_prefix_caching --enable-dp-attention -tp 4 \
+  --dp-load-balance share_cache
+```
+
+- `share_cache` needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`
+  (the default), and excludes `ATOM_DP_SESSION_AFFINITY=1`. It places a request on
+  the rank with the least prefill left, charging it only what it will compute.
+- The Store tier loads from 512 tokens (`OFFLOAD_MIN_LOAD_TOKENS`) and starts a load
+  as soon as the lookup answers (early tier load), without a flag.
+- Set `ATOM_PREFILL_DELAYER_TARGET_FILL=0.8` (default 0.9). At 0.9 a DP4 shared
+  Store had a median TTFT well above main's; at 0.8, against main with session
+  affinity (DP4, AgentX, 1800 s, same time, MI355X), 256 concurrency gave throughput
+  +5.2%, mean TTFT -50.9%, median -17.0%, ITL -1.6%; 512 gave +4.7%, -31.4%, -41.2%,
+  and ITL +2.8%.
+- Use one Store every DP rank reaches. `share_cache` refuses
+  `mooncake_store.pools` that name more than one (master, metadata) pair:
+  each worker reads its own NIC's pool, so a request placed on another rank
+  would miss every load. NIC aliases of one pair are accepted.
+- Give the owner enough DRAM for the prefixes you expect (768 GB held a 30-minute
+  agentic run at 256 concurrency), and watch `OFFLOAD-STORE-STATS`: repeated
+  `NO_AVAILABLE_HANDLE` failures mean the master dropped the owner's segment (raise
+  the master's `--client_ttl` if the owner can be starved of CPU while the engine
+  starts).
+- Prefill/decode disaggregation: on the prefill side set the same variables and
+  add the Mooncake transfer connector (`kv_role: kv_producer`) through
+  `--kv-transfer-config`; ATOM composes the two into one `multi` connector. The
+  decode side runs the Mooncake consumer only and does not use the Store.
+  `share_cache` accepts that composite on the prefill side.
+
+## gfx1250 (MI455X)
+
+V4.1 runs on gfx1250 at TP4 (`--level 0`, BF16 KV, FP8 index), with or without
+DSpark, and at DEP4 (EP + DP attention). On gfx1250 its FP8 linears, the grouped
+`wo_a` and the FP8 index scoring run on AITER's FlyDSL kernels:
+
+- FP8 linears and `wo_a`: the batched mxfp8_32 GEMM, which reads the 32x32
+  weight scale as stored. The 32x32 linears, including DSpark's `main_proj`
+  and Engram's `wkv`, are held preshuffled on gfx1250 as on gfx950. A K that
+  128 does not divide (the shared expert's down projection at TP4, K = 576)
+  runs as a ragged last k-tile.
+- FP8 index scoring: `flydsl_fp8_paged_mqa_logits`, over the same packed,
+  preshuffled 8-row-page cache.
+
+What differs from gfx950:
+
+- **The per-layer mono kernels are gfx950-only** (wave64, `permlane32`). On
+  gfx1250 the deployment check refuses them and logs `V4.1 mono decode off:
+  arch gfx1250`. gfx1250 has its own fused decode instead, the
+  [single-launch step](#gfx1250-single-launch-decode-step), switched like the
+  gfx950 mono decode (`ATOM_MONO_ENABLE`, on by default); with
+  `ATOM_MONO_ENABLE=0`, or a deployment it refuses, DSpark's draft passes and
+  verify steps take the original, unfused path.
+- **The router GEMV** (bf16 MFMA) is gfx950-only; gfx1250 uses the regular gate.
+- **FP4 index interface (hardware validation pending).** With
+  `--index-cache-dtype fp4`, gfx1250 uses natural query/cache rows with AITER's
+  H32 OPUS MQA API, including full-layer and candidate tables and packed logits.
+  Requires AITER [#7128](https://github.com/ROCm/aiter/pull/7128) and
+  [#6952](https://github.com/ROCm/aiter/pull/6952). gfx1250 correctness, model E2E
+  and performance remain unvalidated. On gfx950, FP4 defaults to the OPUS
+  scorer with MFMA cache layout; set `ATOM_V4_UNIFIED_MQA=flydsl` before
+  startup to use the FlyDSL scorer and its page-8 layout.
+- **`--level 0`.** A first `--level 3` start can stall while ranks compile and
+  autotune at different times.
+
+TP4 (add `--method dspark --num-speculative-tokens 5` for DSpark):
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=4 ATOM_DISABLE_MMAP=true \
+AITER_REUSE_IDENTICAL_COMM_GROUPS=1 HF_HUB_OFFLINE=1 \
+python3 -m atom.entrypoints.openai_server \
+  --model /models/deepseek-ai/DeepSeek-V4.1-Flash --trust-remote-code \
+  --server-port 8000 -tp 4 \
+  --kv_cache_dtype bf16 --index-cache-dtype fp8 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
+  --block-size 16 --level 0 --max-num-seqs 64 \
+  --cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]'
+```
+
+DEP4 (EP + DP attention, MegaMoE over mori v2):
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=4 ATOM_DISABLE_MMAP=true \
+AITER_REUSE_IDENTICAL_COMM_GROUPS=1 HF_HUB_OFFLINE=1 \
+MORI_GPU_ARCHS=gfx1250 FLYDSL_GPU_ARCH=gfx1250 \
+ATOM_MORI_V2=1 MEGA_DISPATCH_WIRE=fp4 ATOM_MEGA_COMBINE_WIRE=fp4 \
+ATOM_MOE_GU_ITLV=1 ATOM_DP_LM_HEAD_MODE=allgather MORI_SHMEM_HEAP_SIZE=16G \
+python3 -m atom.entrypoints.openai_server \
+  --model /models/deepseek-ai/DeepSeek-V4.1-Flash --trust-remote-code \
+  --server-port 8000 -tp 4 --enable-expert-parallel --enable-dp-attention \
+  --kv_cache_dtype bf16 --index-cache-dtype fp8 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
+  --block-size 16 --level 0 --max-num-seqs 512 \
+  --cudagraph-capture-sizes '[1,2,4,8,16,32,48,64,96,128,192,256,320,384,448,512]'
+```
+
+`--max-num-seqs` counts per DP rank. If the image's mori loads only
+`libamd_smi.so.<N>`, point `MORI_AMD_SMI_PATH` at it.
+
+Validation on MI455X, GSM8K 3-shot on the full test set (`lm_eval
+local-completions`, `num_concurrent=32`):
+
+| Launch | GSM8K |
+|---|---|
+| TP4 | 0.926 |
+| TP4 + DSpark (5 speculative tokens) | 0.926; acceptance about 50% on these prompts |
+| DEP4 | 0.916 |
+
+The DEP4 gap to TP4 has not been investigated; its fp4 dispatch / combine wire
+is the first suspect.
+
+## gfx942 (MI308X)
+
+V4.1 runs on gfx942 at TP4 (`--level 0`, BF16 KV, FP8 index), with or without
+DSpark, from the FP4PTPC checkpoint (`quant_method: w8a8_fp8`): the native
+checkpoint with its dense linears stored as per-channel FP8.
+
+- **Routed experts.** FP4 in the checkpoint, converted to per-channel FP8 at
+  load by the `--online_quant_config` below. It is required: the model
+  refuses to build unless every routed expert is converted, the draft's
+  included, and the backbone's per-channel FP8 shared expert runs in their
+  fused slot. Expert parallel and data parallel are refused. As with any
+  online quant config, the comm-fused MoE backend is off.
+- **BF16 fallback.** AITER has no group32 FP8 GEMM on gfx942, so the linears
+  the checkpoint keeps native 32x32 (`wo_a` and DSpark's draft) are
+  dequantized to BF16 at load. At TP4 that costs 0.31 GiB more per GPU for
+  `wo_a`, and with DSpark another 0.21 GiB for the draft.
+- **AITER.** Needs [#8086](https://github.com/ROCm/aiter/pull/8086) (the
+  group32 GEMM query) and [#8178](https://github.com/ROCm/aiter/pull/8178)
+  (the clamped per-channel FP8 MoE at this checkpoint's 576-wide TP4
+  intermediate). The pin above has both.
+
+TP4 (add `--method dspark --num-speculative-tokens 5` for DSpark):
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=4 \
+AITER_REUSE_IDENTICAL_COMM_GROUPS=1 HF_HUB_OFFLINE=1 \
+python3 -m atom.entrypoints.openai_server \
+  --model <FP4PTPC checkpoint> --trust-remote-code \
+  --server-port 8000 -tp 4 \
+  --kv_cache_dtype bf16 --index-cache-dtype fp8 \
+  --gpu-memory-utilization 0.85 \
+  --max-num-batched-tokens 8192 --attn-prefill-chunk-size 8192 \
+  --block-size 16 --level 0 --max-num-seqs 64 \
+  --cudagraph-capture-sizes '[1,2,4,8,16,32,48,64]' \
+  --online_quant_config '{"layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"}}'
+```
+
+Validation on MI308X, GSM8K 3-shot on the full test set (`lm_eval
+local-completions`, `num_concurrent=32`):
+
+| Launch | GSM8K |
+|---|---|
+| TP4 | 0.925 |
+| TP4 + DSpark (5 speculative tokens) | 0.927; acceptance about 56% on these prompts |
+
 ## Fused decode (mono)
 
 A DSpark verify step of up to 12 rows (two requests' verifies; it is routed by
@@ -121,9 +305,60 @@ The kernels are built for the TP size of the deployment (TP2, TP4 or TP8;
 instruction for instruction. At TP2 (2026-09-30, MI355X, `--level 0`,
 concurrency 2) the check mode holds as at TP4, and GSM8K 3-shot on the first
 200 questions is 0.940 / 0.945 (mono / original) with acceptance 49.5% /
-49.2%. At TP8 the kernels compile and fit, but the server does not start on
-the original path: the shared expert's down projection has K = 288 there, and
-AITER's gfx950 FP8 blockscale GEMM needs K to be a multiple of its K tile.
+49.2%. At TP8 the shared expert's down projection has K = 288, which AITER's
+gfx950 group-32 FP8 GEMM cannot step (it needs a multiple of 64): the loader
+pads the shared expert's pair in place to 320 (`fp8_group32_k_pad_align`,
+`kernels/dims.py`'s `SHARED_PAD`) until ROCm/aiter#7967. On MI355X at TP8 the
+mono decode runs with it (forced acceptance 3.51: 3.88 ms a decode step, TPOT
+p50 1.52 ms at c1 and c8), and GSM8K on all 1,319 questions at 64 in flight is
+0.9727 / 0.9719 (strict / flexible).
+
+## gfx1250 single-launch decode step
+
+On gfx1250, mono decode (`ATOM_MONO_ENABLE`, on by default) runs each DSpark
+decode step as one
+persistent FlyDSL kernel per TP rank, issued as two launches: the target
+launch covers the 40 target layers, the LM head, sampling and the block
+verification; the draft launch covers the draft context KV, the three draft
+stages, the draft head and the Markov drafts. Inside the kernel:
+
+- the compressor, Engram, the indexer (2-level selection, REINDEX) and the MoE;
+- temperature / top-p sampling with the probabilistic draft and block verify.
+
+It replaces the target forward, the sampler, the rejection sampler and the
+DSpark proposer of a served step
+(`atom/models/deepseek_v41/mono/gfx1250/`).
+
+- **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache, FP8
+  index cache, up to 8 requests (6 verify rows each), no DSpark confidence
+  schedule or ragged verify. Anything else is refused at load
+  (`V4.1 single-launch step off: <why>`).
+- **Memory.** The kernel reads the routed experts in place, as the
+  production MoE keeps them (no second copy). Its own buffers a rank: ~77 MB
+  scratch, ~28 MB peer receive and the shared experts' FP8 planes (~0.4 GB).
+- **Steps it does not serve** take the production path; it says why once per
+  kind in the log (`not served (...)`). These are:
+  - prefill;
+  - steps with structured output, logprobs or top-k;
+  - a block table or index bound past the kernel's (`tables.BCOLS`, `ILW`).
+- **Build.** Every width (6..48 rows) is built at startup, ~2.5 min cold.
+  The builds go to the FlyDSL disk cache; clear it after editing a kernel.
+- **Debug switches** (the mono ones, `atom/utils/envs.py`):
+  - `ATOM_MONO_TIMELINE=<prefix>`: per-step time split, averaged over 64
+    steps, logged and appended to `<prefix>_r<rank>.jsonl`;
+  - `ATOM_MONO_CHECK` (eager): the launch beside the production forward,
+    its head, selection, taps and drafts compared.
+
+Measured on MI455X (TP4, `--level 0`, same machine, original path as the
+reference):
+
+| | single launch | original |
+|---|---|---|
+| GSM8K (T = 1, 512 questions) | 453 | 455 |
+| GSM8K draft acceptance | 0.365 | 0.365 |
+| step time, 8 requests (short prompts) | 7.18 ms | 7.97 ms |
+| step time, 1 request | 5.44 ms | 6.75 ms |
+| TPOT, 8 requests, ~26.6k-token agentic prompts (2 runs) | 2.01 / 2.06 ms | 2.30 / 2.15 ms |
 
 ## Equal-score index selection
 

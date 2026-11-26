@@ -11,7 +11,6 @@ from import_guard import skip_if_dependency_missing
 torch = pytest.importorskip("torch")
 
 try:
-    import atom.config
     from atom.model_ops import eplb
 except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
     skip_if_dependency_missing(_e, "requires full atom import env")
@@ -48,7 +47,7 @@ def test_fused_map_passes_through_layer_past_placement(live_meta):
 
 def test_record_skips_layer_past_placement(live_meta, monkeypatch):
     monkeypatch.setattr(
-        atom.config,
+        eplb,
         "get_current_atom_config",
         lambda: SimpleNamespace(
             eplb_enable=True, eplb_config=SimpleNamespace(load_window_size=1)

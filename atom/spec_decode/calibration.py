@@ -13,7 +13,9 @@ import torch
 def calibration_identity(config, device):
     model = Path(config.model)
     files = ("config.json", "model.safetensors.index.json")
-    return {
+    spec = config.speculative_config
+    draft_dtype = spec.draft_kv_dtype if spec is not None else config.kv_cache_dtype
+    identity = {
         "model_files": {
             name: hashlib.sha256((model / name).read_bytes()).hexdigest()
             for name in files
@@ -27,6 +29,23 @@ def calibration_identity(config, device):
         "torch_version": torch.__version__,
         "hip_version": torch.version.hip,
     }
+    # Only when it is not the target's, so profiles from before it was a choice
+    # still match.
+    if draft_dtype != config.kv_cache_dtype:
+        identity["draft_kv_cache_dtype"] = draft_dtype
+    if config.hf_config.model_type == "deepseek_v41_text":
+        # Before this option existed, even FP8 windows were decoded to BF16.
+        # Omit that default so already measured profiles keep matching.
+        if config.dspark.draft_kv_dtype == "fp8":
+            identity["draft_attention_dtype"] = "fp8"
+        if config.kv_cache_dtype == "fp4":
+            from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
+                configured_a8w4_attention,
+            )
+
+            if configured_a8w4_attention(config, device):
+                identity["target_attention_dtype"] = "a8w4"
+    return identity
 
 
 def validate_calibration(profile, identity, *, width, max_batch):

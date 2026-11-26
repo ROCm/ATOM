@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 from atom.models.utils import IntermediateTensors
 from atom.plugin.sglang.runtime.context import bind_current_forward_batch
+from atom.plugin.sglang.runtime.model_arch import cached_model_arch_spec
 
 logger = logging.getLogger("atom.plugin.sglang.runtime.forward_context")
 
@@ -111,18 +114,32 @@ def _trim_hidden_states_for_output(hidden_states, num_tokens: int):
     return hidden_states
 
 
-def _resolve_num_tokens_across_dp(
+def _select_rows_for_output(hidden_states, rows: torch.Tensor):
+    """SGLang's ``rows`` of an output computed over widened inputs."""
+    if torch.is_tensor(hidden_states):
+        return hidden_states.index_select(0, rows)
+    if isinstance(hidden_states, tuple):
+        return tuple(
+            tensor.index_select(0, rows) if torch.is_tensor(tensor) else tensor
+            for tensor in hidden_states
+        )
+    raise TypeError(
+        "Cannot map a widened forward's output of type "
+        f"{type(hidden_states).__name__} back to SGLang's rows"
+    )
+
+
+def _resolve_running_tokens_per_dp_rank(
     atom_config: Any,
     forward_batch: ForwardBatch,
     num_tokens: int,
-) -> torch.Tensor:
-    """Resolve per-DP token counts for ATOM's CPU-side DPMetadata."""
+) -> np.ndarray:
+    """The rows every DP rank's forward runs, from SGLang's dp-attention
+    counts, for ATOM's CPU-side DPMetadata."""
 
     global_num_tokens_cpu = getattr(forward_batch, "global_num_tokens_cpu", None)
     if global_num_tokens_cpu is not None:
-        num_tokens_across_dp = torch.tensor(
-            global_num_tokens_cpu, dtype=torch.int32, device="cpu"
-        )
+        running_tokens_per_dp_rank = np.array(global_num_tokens_cpu, dtype=np.int32)
     else:
         dp_size = atom_config.parallel_config.data_parallel_size
         global_num_tokens_gpu = getattr(forward_batch, "global_num_tokens_gpu", None)
@@ -141,15 +158,13 @@ def _resolve_num_tokens_across_dp(
         # Static batches, such as CUDA graph capture batches, may only keep
         # global token counts on GPU. Avoid GPU-to-CPU reads here and mirror
         # their same-shape layout directly for ATOM's CPU DPMetadata.
-        num_tokens_across_dp = torch.full(
-            (dp_size,), num_tokens, dtype=torch.int32, device="cpu"
-        )
+        running_tokens_per_dp_rank = np.full(dp_size, num_tokens, dtype=np.int32)
 
     # SGLang reports idle ranks as 0 tokens, but ATOM materializes every idle
     # rank as one physical dummy token. Normalize the complete vector on every
     # rank so collectives and DPMetadata use identical sizes.
-    num_tokens_across_dp.clamp_min_(1)
-    return num_tokens_across_dp
+    np.maximum(running_tokens_per_dp_rank, 1, out=running_tokens_per_dp_rank)
+    return running_tokens_per_dp_rank
 
 
 def _resolve_running_tokens_are_unified(
@@ -279,18 +294,10 @@ def _slice_v4_graph_metadata_for_capture(
     indexer_meta = getattr(md, "indexer_meta", None)
     if isinstance(indexer_meta, dict):
         indexer_meta = dict(indexer_meta)
-        for key in (
-            "batch_id_per_q_token",
-            "seq_base_per_token_gpu",
-            "cu_starts_gpu",
-            "cu_ends_gpu",
-        ):
+        for key in ("cu_starts_gpu", "visible_gpu"):
             value = indexer_meta.get(key)
             if torch.is_tensor(value):
                 indexer_meta[key] = value[:num_tokens]
-        value = indexer_meta.get("n_committed_per_seq_gpu")
-        if torch.is_tensor(value):
-            indexer_meta["n_committed_per_seq_gpu"] = value[:bs]
         md.indexer_meta = indexer_meta
 
     return md
@@ -329,6 +336,7 @@ def _build_glm52_dsa_metadata(
         return None
 
     from atom.plugin.sglang.glm52_dsa_bridge import (
+        SHARED_SPARSE_INDICES_ATTR,
         build_atom_glm52_attention_metadata_from_sglang,
         get_draft_decode_sub_step,
         is_draft_decode_metadata,
@@ -425,6 +433,12 @@ def _build_glm52_dsa_metadata(
                         graph_cache
                     )
                 graph_cache[graph_cache_key] = attn_metadata
+    if attn_metadata is not None and token_to_kv_pool is not None:
+        # The selection the indexer writes and every sparse MLA layer reads:
+        # the buffer `bind_glm52_dsa_cache_views` binds onto the indexers.
+        attn_metadata.sparse_kv_indices = getattr(
+            token_to_kv_pool, SHARED_SPARSE_INDICES_ATTR, None
+        )
     return attn_metadata
 
 
@@ -699,7 +713,11 @@ def _build_kimi_k3_metadata(
             "reduce_partial_map",
             "num_kv_splits",
         ):
-            setattr(attn_metadata, name, getattr(forward_metadata, name, None))
+            value = getattr(forward_metadata, name, None)
+            if name == "work_meta_data" and not torch.is_tensor(value):
+                # SGLang's ForwardMetadata field is work_metadata.
+                value = getattr(forward_metadata, "work_metadata", None)
+            setattr(attn_metadata, name, value)
 
     linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
     attn_metadata.gdn_metadata = SGLangGDNForwardContext._build_gdn_metadata(
@@ -718,6 +736,7 @@ def _set_atom_forward_context(
 
     from atom.utils.forward_context import (
         Context,
+        DPMetadata,
         set_forward_context,
     )
 
@@ -728,10 +747,7 @@ def _set_atom_forward_context(
             include_v2=True
         )
     )
-    from atom.plugin.sglang.runtime.model_arch import resolve_model_arch_spec
-
-    hf_config = getattr(atom_config, "hf_config", None)
-    model_arch, model_adapter = resolve_model_arch_spec(hf_config)
+    model_arch, model_adapter = cached_model_arch_spec(atom_config)
     attn_metadata = None
     if model_adapter.build_forward_metadata is not None:
         try:
@@ -800,13 +816,15 @@ def _set_atom_forward_context(
     max_q = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
     enable_dp_attention = bool(atom_config.enable_dp_attention)
     if enable_dp_attention:
-        num_tokens_across_dp = _resolve_num_tokens_across_dp(
+        running_tokens_per_dp_rank = _resolve_running_tokens_per_dp_rank(
             atom_config, forward_batch, num_tokens
         )
         # Already TOKENS, and already the group max -- what MoE pads to.
-        running_tokens = int(torch.max(num_tokens_across_dp).item())
+        running_tokens = int(running_tokens_per_dp_rank.max())
     else:
-        num_tokens_across_dp = None
+        running_tokens_per_dp_rank = DPMetadata.gather_running_tokens(
+            atom_config.parallel_config, num_tokens
+        )
         running_tokens = num_tokens if is_prefill else batch_size * max_q
     # Sequences, per the field's contract -- the TBO split divides this into
     # per-ubatch request counts, so handing it a token count would make each
@@ -830,8 +848,7 @@ def _set_atom_forward_context(
         attn_metadata=attn_metadata,
         atom_config=atom_config,
         context=context,
-        num_tokens=num_tokens,
-        num_tokens_across_dp=num_tokens_across_dp,
+        running_tokens_per_dp_rank=running_tokens_per_dp_rank,
     )
 
 
@@ -858,13 +875,20 @@ class SGLangPluginRuntime:
     input_embeds: torch.Tensor | None = None
     set_forward_context: bool = True
     save_kv_cache: bool | None = None
+    # The adapter's `SGLangModelAdapterSpec.expand_forward_inputs`, passed by
+    # a wrapper whose model widens some forwards (None for every other one).
+    expand_forward_inputs: Callable[[Any, Any, Any, Any], Any] | None = None
     _original_forward_batch: ForwardBatch = field(init=False, repr=False)
     _is_dummy_run: bool = field(init=False, default=False)
     _exit_stack: ExitStack = field(init=False, repr=False)
+    # SGLang's rows of the ATOM model's output, when the adapter widened this
+    # forward's inputs (`SGLangModelAdapterSpec.expand_forward_inputs`).
+    _output_rows: torch.Tensor | None = field(init=False, default=None)
 
     def __enter__(self) -> SGLangPluginRuntime:  # noqa: PYI034
         self._original_forward_batch = self.forward_batch
         self._is_dummy_run = _is_dummy_forward(self.forward_batch)
+        self._output_rows = None
 
         if self._is_dummy_run:
             (
@@ -878,6 +902,8 @@ class SGLangPluginRuntime:
                 self.input_embeds,
                 self.forward_batch,
             )
+        elif self.expand_forward_inputs is not None:
+            self._expand_inputs()
 
         self._exit_stack = ExitStack()
         self._exit_stack.enter_context(bind_current_forward_batch(self.forward_batch))
@@ -894,9 +920,22 @@ class SGLangPluginRuntime:
     def __exit__(self, exc_type, exc, tb) -> None:
         self._exit_stack.close()
 
+    def _expand_inputs(self) -> None:
+        """Run the adapter's ``expand_forward_inputs``: rows ATOM executes
+        that SGLang's batch does not hold, derived from this forward only.
+        ``trim_output`` maps the output back to SGLang's rows."""
+        expanded = self.expand_forward_inputs(
+            self.forward_batch, self.input_ids, self.positions, self.input_embeds
+        )
+        if expanded is None:
+            return
+        self.input_ids, self.positions, self._output_rows = expanded
+
     def trim_output(self, hidden_states):
         """Map ATOM-visible outputs back to SGLang-visible token count."""
 
         if self._is_dummy_run:
             return _trim_hidden_states_for_output(hidden_states, 0)
+        if self._output_rows is not None:
+            return _select_rows_for_output(hidden_states, self._output_rows)
         return hidden_states

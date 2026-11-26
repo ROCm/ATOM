@@ -174,10 +174,11 @@ class TestWhatKeepsAnAccumulatingState:
             (V4, False),
             (MLA, False),
             (MHA, False),
-            # CSA2 is slot-addressed too, but its window write lands at
-            # `(slot, position)` and stores the token's own KV, so replaying a
-            # token rewrites the same row with the same bytes.
-            (CSA2, False),
+            # CSA2's window write alone would be idempotent, but its STATE
+            # slot also carries a cursor, compressor rings and Engram history
+            # that advance per token: a P/D producer that decodes T0 hands
+            # over a cursor one past the prompt, which the consumer rejects.
+            (CSA2, True),
         ],
     )
     def test_the_hybrids_and_pure_gdn_answer_together(self, family, expected):

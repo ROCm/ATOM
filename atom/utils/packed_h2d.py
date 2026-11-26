@@ -7,15 +7,42 @@ import triton.language as tl
 
 
 @triton.jit
-def scatter_packed_bytes(arena, destinations, BLOCK: tl.constexpr):
+def scatter_packed_words(arena, destinations, wide, WORDS: tl.constexpr):
+    """Scatter each packed member (header: int64 arena offset, byte count) to
+    its destination, WORDS * 8 bytes a program: as int64 words where the
+    member starts 16-byte aligned in the arena (packing pads every member to
+    that) and its destination is too (`wide`), byte by byte otherwise."""
     member = tl.program_id(0)
     header = arena.to(tl.pointer_type(tl.int64))
     start = tl.load(header + 2 * member)
     length = tl.load(header + 2 * member + 1)
-    destination = tl.load(destinations + member).to(tl.pointer_type(tl.uint8))
-    offset = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    values = tl.load(arena + start + offset, offset < length, other=0)
-    tl.store(destination + offset, values, offset < length)
+    address = tl.load(destinations + member)
+    span = WORDS * 8
+    base = tl.program_id(1).to(tl.int64) * span
+    if base < length:
+        if tl.load(wide + member) != 0:
+            words = length // 8
+            index = base // 8 + tl.arange(0, WORDS)
+            source = (arena + tl.multiple_of(start, 16)).to(tl.pointer_type(tl.int64))
+            target = tl.multiple_of(address, 16).to(tl.pointer_type(tl.int64))
+            tl.store(
+                target + index, tl.load(source + index, index < words), index < words
+            )
+            # The last program also moves the 0-7 tail bytes.
+            if base + span >= length:
+                tail = words * 8 + tl.arange(0, 8)
+                tl.store(
+                    address.to(tl.pointer_type(tl.uint8)) + tail,
+                    tl.load(arena + start + tail, tail < length),
+                    tail < length,
+                )
+        else:
+            offset = base + tl.arange(0, WORDS * 8)
+            tl.store(
+                address.to(tl.pointer_type(tl.uint8)) + offset,
+                tl.load(arena + start + offset, offset < length),
+                offset < length,
+            )
 
 
 class PackedCopy:
@@ -33,8 +60,9 @@ class PackedCopy:
         result = cls()
         result.members = members
         result.header_bytes = 16 * len(members)  # int64 (offset, byte count)
+        # Every member starts 16-byte aligned (`submit` pads), for the word copy.
         capacity = result.header_bytes + sum(
-            b.capacity * b.bytes_per_count for b in members
+            -(-(b.capacity * b.bytes_per_count) // 16) * 16 for b in members
         )
         result.host = torch.empty(
             capacity, dtype=torch.uint8, device="cpu", pin_memory=True
@@ -51,8 +79,14 @@ class PackedCopy:
             dtype=torch.int64,
             device=device,
         )
+        # Destinations the word copy may store to as int64 (16-byte aligned).
+        result.wide = torch.tensor(
+            [int(b.destination.data_ptr() % 16 == 0) for b in members],
+            dtype=torch.int32,
+            device=device,
+        )
         result.prefixes = {}
-        result.launch = scatter_packed_bytes
+        result.launch = scatter_packed_words
         result.kernel = None
         return result, None
 
@@ -72,7 +106,7 @@ class PackedCopy:
             self.header[2 * i + 1] = length
             if length:
                 self.payload[offset : offset + length] = self.sources[i][:length]
-                offset += length
+                offset += -(-length // 16) * 16
                 largest = max(largest, length)
         prefix = self.prefixes.get(offset)
         if prefix is None:
@@ -82,11 +116,14 @@ class PackedCopy:
             self.prefixes[offset] = prefix
         # Header and payload share this single asynchronous H2D.
         prefix[1].copy_(prefix[0], non_blocking=True)
-        grid = (len(self.members), (largest + 1023) // 1024, 1)
+        # 1024 words (8 KiB) a program.
+        grid = (len(self.members), (largest + 8191) // 8192, 1)
         if self.kernel is None:
-            self.kernel = self.launch[grid](self.device, self.destinations, BLOCK=1024)
+            self.kernel = self.launch[grid](
+                self.device, self.destinations, self.wide, WORDS=1024, num_warps=8
+            )
         else:
             # Both argument storages and their layouts are fixed for this
             # binding. Reuse its compiled kernel; counts and grid stay dynamic.
-            self.kernel[grid](self.device, self.destinations)
+            self.kernel[grid](self.device, self.destinations, self.wide)
         return True

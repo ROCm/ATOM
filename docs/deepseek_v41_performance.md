@@ -25,8 +25,11 @@ the BF16 RoPE table and quantizes it to MXFP8 (1x32) in one launch, and
 `batched_gemm_a8w8_mxscale_bpreshuffle` runs the grouped GEMM. Delayed mHC
 uses AITER stages.
 
-On AITER builds without the native group32 interface, the compatibility FP8
-GEMM keeps two pipeline stages, including its four-way packed-K layout.
+Native group32 FP8 linears need an AITER build with
+[ROCm/aiter#8086](https://github.com/ROCm/aiter/pull/8086); an older one fails
+at model build. `native_quant_linear` still carries a compatibility FP8 GEMM
+for a build without the native group32 interface, which no linear reaches. It
+keeps two pipeline stages, including its four-way packed-K layout.
 Triton 3.7's async LDS load can lose the neutral scale for masked K/N tails,
 including the TP2 shared-expert down projection at K=1152. The packed kernel
 loads weight scales from bounded addresses and explicitly selects E8M0 code
@@ -51,14 +54,27 @@ and buffer addresses remain fixed across steps. Padding tokens carry V4's
 
 ## Cache format and attention boundary
 
-The main pool accepts `kv_cache_dtype="bf16"` or `"fp4"`. The index plane is
-independent: `index_cache_dtype="fp8"` (default) or `"fp4"`.
+The main pool accepts `kv_cache_dtype="fp8"` (the deployed configuration),
+`"bf16"` or `"fp4"`. The index plane is independent: `index_cache_dtype="fp8"`
+(default) or `"fp4"`.
 
-| Region | BF16 main-pool configuration | FP4 main-pool configuration |
-|---|---|---|
-| Main KV, 512 dimensions | BF16 | E2M1 FP4 with E4M3 scales, group 16 |
-| SWA, 512 dimensions | BF16 | E4M3 FP8 with E8M0 scales, group 32 |
-| Index keys, 128 dimensions | E4M3 FP8 with a per-key power-of-two scale | Same FP8 index format |
+| Region | FP8 main-pool configuration | BF16 main-pool configuration | FP4 main-pool configuration |
+|---|---|---|---|
+| Main KV, 512 dimensions | MXFP8: separate E4M3 data and E8M0 scale planes, group 32 (512 + 16 B per logical row) | BF16 | Separate E2M1 FP4 data and E4M3 scale planes, group 16 (256 + 32 B per logical row) |
+| SWA, 512 dimensions | Same MXFP8 planes | BF16 | Separate E4M3 data and E8M0 scale planes, group 32 |
+| Index keys, 128 dimensions | Per `index_cache_dtype` | E4M3 FP8 with a per-key power-of-two scale | Same FP8 index format |
+
+Each quantized CSA source and each layer's SWA source exposes contiguous
+data and scale planes. The 528 B MXFP8 cost is a logical row's total across
+those planes, not an interleaved physical row stride. CSA and SWA have
+independent row spaces; prefill stages the batch's rings followed by current
+KV in the SWA source, while decode reads the persistent ring directly.
+
+The FP8 pool holds 1.84x the rows of the BF16 one. Its sources use int32 row
+indices, and attention reads the data and scale planes as they are stored:
+the query is quantized to the same MXFP8 format, and AITER's
+`mla_sparse_prefill_v41` (`fp8_attention.sparse_attn_v41_paged_2src`) attends
+over the pool and the window, prefill and decode alike.
 
 The index writer stores scales as FP32 in preshuffled tiles. Global owner
 regions share block IDs while keeping separate index planes. FP32 compressor
@@ -66,23 +82,33 @@ tails and committed Engram histories retain their precision and checkpoint
 semantics. `V41PoolGeometry` declares allocation sizes, alignment and image
 layout identity; memory planning and checkpoint copies use those declarations.
 
-`packed_rows.py` owns packed row encoding and decoding.
-`packed_attention.py` decodes selected history into bounded BF16 scratch and
+For FP4 KV, `ATOM_DSV41_A8W4_ATTN=auto` (the default) asks AITER whether
+the live query can use A8W4 over NVFP4 CSA and MXFP8 SWA planes. On supported
+gfx950 configurations this is the native path. `off`, or an ineligible
+query/backend, uses the BF16 adapter. AITER's public V4.1 capability API is
+required by this revision.
+
+On that adapter, `packed_rows.py` decodes selected plane rows, and
+`packed_attention.py` uses bounded BF16 scratch and
 passes ordinary int32 row indices to V4 attention. Prefill keeps the current
 chunk in BF16; decode preserves V4's batch size and split-K dispatch. Neither
 path materializes the entire historical main KV pool.
 
-On the BF16 pool, decode attention reads two sources
-(`sparse_attn_v4_paged_2src`): the selection from the pool, and the window
+On the BF16 pool (and on the FP8 pool through its MXFP8 twin above), decode
+attention reads two sources (`sparse_attn_v4_paged_2src`): the selection from
+the pool, and the window
 through the layer's own ring (`ring_view`), whose rows are one list shared by
 every layer. An index group's layers share one selection plane. The OPUS kernel
 splits each token's keys across blocks when the step has too few tokens to
 fill the GPU.
 
-Packed PAGE writes reuse V4's sentinel-aware `swa_scatter_rows`. A zero-copy
-view preserves gaps between PAGE fields, and compression-plan offsets select
-the destination rows. Padding rows are skipped on the device, including during
-graph replay.
+A compressed main row is written by the compressor's own kernel
+(`fused_compress_attn`) in the pool's row format: BF16, or on the FP8 / FP4
+pools (`quant_mode` "planar_fp8" / "planar_fp4") the row rounded to BF16 and
+quantized by `quantize_fp8` / `quantize_fp4`'s rule into separate data and
+scale planes. The
+kernel resolves each plan row's PAGE through the block table; padding rows are
+skipped on the device, including during graph replay.
 
 ## Graph ownership
 
@@ -99,7 +125,7 @@ occurs during input preparation, since replay does not execute Python.
 
 Startup capture uses the serving allocation and block 0 for synthetic
 requests. The runtime validator checks that capture preserves live cache pages.
-`PIECEWISE` is also accepted by the runtime; development and validation use
+`TR_HYBRID` is also accepted by the runtime; development and validation use
 level 0, and broader compiler support remains outside the supported scope.
 
 ## Memory and numerical limits

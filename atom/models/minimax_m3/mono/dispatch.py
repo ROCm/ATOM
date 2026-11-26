@@ -5,6 +5,9 @@
 The configuration is checked once; a step is then routed to mono only when it is
 a decode of 1..MAX_TOKENS tokens (a cudagraph's pad rows counted; a speculative
 verify's q tokens of a request count as q).
+The attention linears may be the checkpoint's native MXFP8 1x32 (no online quantization) or the ptpc-FP8
+requantization: ``weights.SparseMoeLayer`` decides per model, the runner builds the matching K1 / K4
+(``attn_mxfp8``), and a model mixing the two is refused there.
 Every per-step input is TP-uniform: the kernels all-reduce in-kernel, so ranks
 that disagreed would wait on each other forever (a per-rank flag such as
 ``is_dummy_run`` must never gate this).
@@ -34,13 +37,32 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
+def _uses_dspark(atom_config) -> bool:
+    use_dspark = getattr(
+        getattr(atom_config, "speculative_config", None), "use_dspark", None
+    )
+    return bool(use_dspark is not None and use_dspark())
+
+
+def _dspark_mode_supported(atom_config) -> bool:
+    if not _uses_dspark(atom_config):
+        return True
+    dspark = getattr(atom_config, "dspark", None)
+    return dspark is not None and not (dspark.confidence_schedule or dspark.ragged)
+
+
 def _config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use mono, or None."""
     checks = common_refusals(atom_config, Dims, SUPPORTED_TP) + [
-        (atom_config.kv_cache_dtype == "fp8", f"kv cache {atom_config.kv_cache_dtype}"),
+        # fp8 K/V + fp8 index, or NVFP4 K/V + NVFP4 index (single-buffer pages), not mixed
         (
-            (atom_config.index_cache_dtype or atom_config.kv_cache_dtype) == "fp8",
-            "index cache not fp8",
+            atom_config.kv_cache_dtype in ("fp8", "nvfp4"),
+            f"kv cache {atom_config.kv_cache_dtype}",
+        ),
+        (
+            (atom_config.index_cache_dtype or atom_config.kv_cache_dtype)
+            == atom_config.kv_cache_dtype,
+            f"index cache {atom_config.index_cache_dtype} with kv cache {atom_config.kv_cache_dtype}",
         ),
         (
             atom_config.kv_cache_block_size == 128,
@@ -49,6 +71,10 @@ def _config_refusal(atom_config) -> str | None:
         (
             atom_config.max_model_len <= MAX_CONTEXT,
             f"max_model_len {atom_config.max_model_len} > {MAX_CONTEXT}",
+        ),
+        (
+            _dspark_mode_supported(atom_config),
+            "DSpark confidence schedule / ragged",
         ),
     ]
     return first_refusal(checks)
@@ -59,9 +85,16 @@ class MonoDecode:
 
     def __init__(self, causal_lm, atom_config) -> None:
         self._lm = causal_lm
+        self._uses_dspark = _uses_dspark(atom_config)
+        self._drafter = None
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
-            lambda: MonoDecodeRunner(causal_lm), "MiniMax-M3 mono decode"
+            lambda: MonoDecodeRunner(
+                causal_lm,
+                drafter=self._drafter,
+                require_aux=self._uses_dspark,
+            ),
+            "MiniMax-M3 mono decode",
         )
         if not envs.ATOM_MONO_ENABLE:
             self._mono.enabled = False
@@ -71,6 +104,13 @@ class MonoDecode:
             logger.info("MiniMax-M3 mono decode off: %s", why)
             self._mono.enabled = False
 
+    def bind_drafter(self, drafter) -> None:
+        if not self._uses_dspark:
+            return
+        if self._mono.runner is not None:
+            raise RuntimeError("cannot bind a DSpark drafter after Mono starts")
+        self._drafter = drafter
+
     def supports(
         self,
         input_ids: torch.Tensor,
@@ -78,7 +118,7 @@ class MonoDecode:
         intermediate_tensors,
         inputs_embeds,
     ) -> bool:
-        if not self._mono.enabled:
+        if input_ids is None or not self._mono.enabled:
             return False
         n = input_ids.numel()  # a cudagraph's pad rows included
         if intermediate_tensors is not None or inputs_embeds is not None:
@@ -108,8 +148,8 @@ class MonoDecode:
         bt = decode.block_table
         if bt.dtype != torch.int32 or decode.seq_lens.dtype != torch.int32:
             return False
-        # a row per request (eager decode cuts the tables to the real batch while
-        # the ids stay padded) and rows bt.shape[1] apart
+        # a row per request, the batch's pad rows included (``row_live`` keeps
+        # them out), and rows bt.shape[1] apart
         if (
             bt.shape[0] < n // q
             or decode.seq_lens.shape[0] < n // q
@@ -141,3 +181,12 @@ class MonoDecode:
                 envs.ATOM_MONO_TRACE, sums,
             )  # fmt: skip
         return out
+
+
+def install_mono_decode(
+    model: torch.nn.Module, _atom_config, drafter, *, metadata_builder=None
+):
+    """Bind MiniMax's in-model Mono router after drafter hooks are armed."""
+    if drafter is not None:
+        model.bind_mono_drafter(drafter)
+    return model

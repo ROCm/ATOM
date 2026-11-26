@@ -161,6 +161,62 @@ class TestMidstepTargets:
         with pytest.raises(RuntimeError):
             midstep_checkpoint_targets([0, 1], [0, 0], [64, 64], [5], [[]], 16, 64, 3)
 
+    def test_interior_targets_get_one_snapshot_row_each(self):
+        """The snapshot plan an fp32 pool (Qwen4Exp) runs the chunk kernel with.
+
+        Rows of 200, 77 and 333 tokens chunk at offsets 0, 4 and 6. Each
+        interior target's boundary, `chunk_offsets[row] + off // 64`, names
+        its own snapshot row, which is also the row the writer reads for it;
+        end targets take no snapshot and are read from the runtime slot.
+        """
+        import torch
+
+        from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
+
+        targets = midstep_checkpoint_targets(
+            state_rows=[0, 1, 2],
+            num_cached_tokens=[0, 0, 0],
+            num_scheduled_tokens=[200, 77, 333],
+            runtime_slots=[0, 1, 2],
+            saves=[[(3, 64), (4, 128), (5, 200)], [(6, 64)], [(7, 192), (8, 333)]],
+            num_slots=16,
+            grid=64,
+            min_offset=3,
+        )
+        rows, _slots, offs, is_end, _runtime = (list(c) for c in zip(*targets))
+        chunk_offsets = torch.tensor([0, 4, 6, 12])
+        snap_idx, h_rows, n = interior_state_snapshots(
+            torch.tensor(rows),
+            torch.tensor(offs),
+            [not e for e in is_end],
+            chunk_offsets,
+            (200 + 77 + 333) // 64 + 3 + 1,
+            64,
+        )
+        assert n == 4
+        assert h_rows.tolist() == [0, 1, -1, 2, 3, -1]
+        expected = [-1] * snap_idx.numel()
+        for chunk, row in ((1, 0), (2, 1), (5, 2), (9, 3)):
+            expected[chunk] = row
+        assert snap_idx.tolist() == expected
+
+    def test_a_forward_with_only_end_targets_takes_no_snapshot(self):
+        import torch
+
+        from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
+
+        snap_idx, h_rows, n = interior_state_snapshots(
+            torch.tensor([0, 1]),
+            torch.tensor([200, 77]),
+            [False, False],
+            torch.tensor([0, 4, 6]),
+            8,
+            64,
+        )
+        assert n == 0
+        assert h_rows.tolist() == [-1, -1]
+        assert snap_idx.tolist() == [-1] * 8
+
     def test_scheduled_batch_carries_the_rows(self):
         stateless = stateful_seq(list(range(8)))
         stateless.has_per_req_cache = False

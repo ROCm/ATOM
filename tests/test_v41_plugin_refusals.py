@@ -26,17 +26,26 @@ from atom.plugin.vllm import deepseek_v41_state_reserve_patch as reserve_patch
 
 PLATFORM = Path(__file__).resolve().parents[1] / "atom/plugin/vllm/platform.py"
 _REFUSALS = ("_refuse_v41_multi_axis_parallelism", "_refuse_v41_kv_transfer")
+#: Pure helpers the refusals call. Extracted with them because the scope
+#: below is built from scratch, so a name the refusal resolves at call time
+#: is a NameError rather than a refusal unless it is carried along.
+_HELPERS = ("_v41_state_tier_configured",)
 
 
-def _refusals():
+def _refusals(*, checkpoints=True):
     tree = ast.parse(PLATFORM.read_text())
     functions = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in _REFUSALS
+        if isinstance(node, ast.FunctionDef) and node.name in _REFUSALS + _HELPERS
     ]
-    assert {node.name for node in functions} == set(_REFUSALS)
-    scope = {"logger": logging.getLogger("atom.test.refusals")}
+    assert {node.name for node in functions} == set(_REFUSALS + _HELPERS)
+    scope = {
+        "logger": logging.getLogger("atom.test.refusals"),
+        # Stubbed rather than extracted: the real one imports the checkpoint
+        # module, which reads vLLM's config.
+        "_v41_state_checkpoints_configured": lambda _config: checkpoints,
+    }
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module(body=functions, type_ignores=[]), str(PLATFORM), "exec"),
         scope,
@@ -110,7 +119,9 @@ def test_every_kv_connector_is_refused(connector):
         SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector=connector)),
         SimpleNamespace(kv_transfer_config={"kv_connector": connector}),
     ):
-        with pytest.raises(ValueError, match="does not support KV transfer") as raised:
+        with pytest.raises(
+            ValueError, match="KV transfer only through AtomLMCacheOffloadConnector"
+        ) as raised:
             refuse(config)
         assert connector in str(raised.value)
 
@@ -122,6 +133,44 @@ def test_running_without_a_connector_is_not_refused(transfer):
     refuse = _refusals()._refuse_v41_kv_transfer
     refuse(SimpleNamespace(kv_transfer_config=transfer))
     refuse(SimpleNamespace())
+
+
+def test_the_state_owning_connector_is_admitted():
+    """The one name on the allow-list, and the reason it is on it.
+
+    `AtomLMCacheOffloadConnector` writes and restores V4.1's STATE: it stores
+    a whole checkpoint at PAGE boundaries and caps every hit, local or
+    external, to a boundary it holds. Refusing it would make the feature this
+    connector exists for unreachable; admitting any other name would restore
+    PAGEs with somebody else's state, so the test pins the list to one.
+    """
+    refuse = _refusals()._refuse_v41_kv_transfer
+    for config in (
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="AtomLMCacheOffloadConnector"
+            )
+        ),
+        SimpleNamespace(
+            kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"}
+        ),
+    ):
+        refuse(config)
+
+
+def test_the_state_owning_connector_needs_its_checkpoints():
+    """Admitted by name, it still needs the checkpoints its state rides.
+
+    Without them it would start, store nothing, and stop the engine on its
+    first tier hit; the refusal moves that failure to startup.
+    """
+    refuse = _refusals(checkpoints=False)._refuse_v41_kv_transfer
+    with pytest.raises(ValueError, match="only with its state checkpoints live"):
+        refuse(
+            SimpleNamespace(
+                kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"}
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

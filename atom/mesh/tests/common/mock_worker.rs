@@ -50,6 +50,8 @@ pub enum HealthStatus {
 /// Mock worker server for testing
 pub struct MockWorker {
     config: Arc<RwLock<MockWorkerConfig>>,
+    kv_event_sources: Arc<RwLock<serde_json::Value>>,
+    dp_size: Arc<RwLock<Option<usize>>>,
     shutdown_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -58,9 +60,21 @@ impl MockWorker {
     pub fn new(config: MockWorkerConfig) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
+            kv_event_sources: Arc::new(RwLock::new(json!({}))),
+            dp_size: Arc::new(RwLock::new(None)),
             shutdown_handle: None,
             shutdown_tx: None,
         }
+    }
+
+    /// Where the worker's DP ranks publish KV events, served as ATOM serves them.
+    pub async fn set_kv_event_sources(&self, sources: serde_json::Value) {
+        *self.kv_event_sources.write().await = sources;
+    }
+
+    /// The DP size a DP-aware router discovers at `/server_info`, not served until set.
+    pub async fn set_dp_size(&self, dp_size: usize) {
+        *self.dp_size.write().await = Some(dp_size);
     }
 
     /// Start the mock worker server
@@ -71,7 +85,28 @@ impl MockWorker {
         let port = listener.local_addr()?.port();
         config.write().await.port = port;
 
+        let kv_event_sources = self.kv_event_sources.clone();
+        let dp_size = self.dp_size.clone();
         let app = Router::new()
+            .route(
+                "/kv_event_sources",
+                get(move || {
+                    let sources = kv_event_sources.clone();
+                    async move { Json(sources.read().await.clone()) }
+                }),
+            )
+            .route(
+                "/server_info",
+                get(move || {
+                    let dp_size = dp_size.clone();
+                    async move {
+                        match *dp_size.read().await {
+                            Some(dp_size) => Json(json!({"dp_size": dp_size})).into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }),
+            )
             .route("/health", get(health_handler))
             .route("/health_generate", get(health_generate_handler))
             .route("/get_server_info", get(server_info_handler))
@@ -412,6 +447,7 @@ async fn chat_completions_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config).await {
         return (
@@ -467,7 +503,7 @@ async fn chat_completions_handler(
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        Json(json!({
+        let response = Json(json!({
             "id": format!("chatcmpl-{}", Uuid::new_v4()),
             "object": "chat.completion",
             "created": timestamp,
@@ -485,8 +521,8 @@ async fn chat_completions_handler(
                 "completion_tokens": 5,
                 "total_tokens": 15
             }
-        }))
-        .into_response()
+        }));
+        ([("x-worker-id", worker_id)], response).into_response()
     }
 }
 
@@ -495,6 +531,7 @@ async fn completions_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config).await {
         return (
@@ -549,7 +586,7 @@ async fn completions_handler(
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        Json(json!({
+        let response = Json(json!({
             "id": format!("cmpl-{}", Uuid::new_v4()),
             "object": "text_completion",
             "created": timestamp,
@@ -565,8 +602,8 @@ async fn completions_handler(
                 "completion_tokens": 5,
                 "total_tokens": 15
             }
-        }))
-        .into_response()
+        }));
+        ([("x-worker-id", worker_id)], response).into_response()
     }
 }
 

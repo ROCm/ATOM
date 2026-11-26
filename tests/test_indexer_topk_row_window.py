@@ -3,7 +3,7 @@
 
 """`top_k_per_row_prefill` must honor each row's window, not just its end.
 
-The FP8 indexer prefill path (`Indexer._score_topk_prefill`) scores a
+The FP8 indexer prefill path (`concat_rows` scored by `score_topk`) scores a
 `[rows, total_committed]` logits matrix whose columns are the batch's
 sequences' compressed K *concatenated*. Row `t` of sequence `s` may only
 select columns `[seq_base[s], seq_base[s] + visible_end[t])`. Nothing masks

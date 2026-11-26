@@ -7,9 +7,11 @@ paper's §3.5 early-stop losslessness counterexample.
 """
 
 import numpy as np
+import pytest
 import torch
 import torch as _torch
 
+from atom.spec_decode import dspark_verify
 from atom.spec_decode.dspark_scheduler import (
     apply_q_bucket,
     build_sps_table,
@@ -537,6 +539,8 @@ def _fresh_scheduler():
     vs._ell_stage_ring = None
     vs._ell_stage_idx = 0
     vs._ell_slot_event = [None] * 4
+    vs._ell_slot_source = [None] * 4
+    vs._ell_oneoff_inflight = []
     vs._ell_last_slot = None
     return vs
 
@@ -596,6 +600,16 @@ def test_ell_map_is_remapped_by_req_id_not_position():
     assert [by_req[r] for r in ["C", "A", "B"]] == [1, 2, 5]
 
 
+def test_prob_verification_needs_ell_from_older_drafts(monkeypatch):
+    # The adopted ell is N-2's (above), so the verify length of a block never
+    # depends on the samples in it -- what keeps the probability-ratio
+    # verification lossless. A delay that reaches the verified draft is refused.
+    dspark_verify.require_ell_from_older_drafts()
+    monkeypatch.setattr(dspark_verify, "_ELL_GENERATION", 1)
+    with pytest.raises(RuntimeError, match="_ELL_GENERATION"):
+        dspark_verify.require_ell_from_older_drafts()
+
+
 def test_ell_setter_drops_inflight_copies():
     vs = _fresh_scheduler()
     vs._ell_pending = [_pending(True, [3], ["A"])]
@@ -627,11 +641,14 @@ def test_ell_stage_ring_allocates_on_cpu_under_a_gpu_default_device():
     vs = _fresh_scheduler()
     vs.runner = _StubRunner()
 
+    previous = _torch.get_default_device()
     _torch.set_default_device("cuda")
     try:
         slot = vs._ell_stage(4)
     finally:
-        _torch.set_default_device(None)
+        # `None` would leave torch's global device context empty for every
+        # later test that reads the default device.
+        _torch.set_default_device(previous)
 
     assert slot.device.type == "cpu"
     assert slot.is_pinned()
@@ -704,6 +721,111 @@ def test_ell_stage_never_reuses_a_slot_whose_copy_is_still_in_flight():
     assert vs._ell_last_slot == 0
     assert slot.data_ptr() == vs._ell_stage_ring[0].data_ptr()
     assert vs._ell_stage_idx == 1
+
+
+class _FakeCopyEvent(_FakeSlotEvent):
+    """The event `record_ell` creates for its copy; lands when the test says."""
+
+    def __init__(self):
+        super().__init__(landed=False)
+
+    def record(self, stream=None):
+        pass
+
+
+def _ell_copy_scheduler(monkeypatch):
+    """A scheduler whose record_ell runs on CPU, with its copy events exposed."""
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest import mock
+
+    events = []
+
+    def event():
+        events.append(_FakeCopyEvent())
+        return events[-1]
+
+    monkeypatch.setattr(_torch.cuda, "Event", event)
+    monkeypatch.setattr(_torch.cuda, "current_stream", mock.Mock)
+    monkeypatch.setattr(_torch.cuda, "stream", lambda stream: nullcontext())
+    # One-off buffers ask for pinned memory, which a CPU-only build cannot give.
+    zeros = _torch.zeros
+    monkeypatch.setattr(
+        _torch, "zeros", lambda *a, pin_memory=False, **kw: zeros(*a, **kw)
+    )
+    vs = _fresh_scheduler()
+    vs.runner = SimpleNamespace(
+        tokenID_processor=SimpleNamespace(async_copy_stream=mock.Mock()),
+        config=SimpleNamespace(max_num_seqs=8),
+    )
+    vs._ell_stage_ring = _torch.zeros(4, 8, dtype=_torch.int64)
+    return vs, events
+
+
+def _record(vs, value):
+    ell = _torch.full((2,), value, dtype=_torch.int64)
+    vs.set_last_ell(ell)
+    vs.record_ell(["A", "B"])
+    vs.set_last_ell(None)
+    return value
+
+
+def _held(vs):
+    """Values of the ell tensors still referenced, slots first."""
+    held = [int(t[0]) for t in vs._ell_slot_source if t is not None]
+    return held + [int(t[0]) for _, t in vs._ell_oneoff_inflight]
+
+
+def test_ell_source_outlives_its_pending_entry_until_the_slot_is_reused(monkeypatch):
+    """The copy reads ell on the shared side stream, after record_ell returns.
+
+    `_ell_pending` evicts entries whose copy may still be in flight, and the
+    setter clears it outright, so ell is held with its ring slot's event and
+    released only when `_ell_stage` hands that slot out again after the event.
+    """
+    vs, events = _ell_copy_scheduler(monkeypatch)
+    values = [_record(vs, v) for v in range(4)]
+    assert _held(vs) == values
+    assert vs._ell_slot_event == events
+
+    vs.ell_by_req = {}  # drops every pending entry, not the copies
+    assert vs._ell_pending == []
+    assert _held(vs) == values
+
+    # Slot 0 still busy: the next copy takes a one-off buffer and evicts
+    # nothing it does not own.
+    oneoff = _record(vs, 4)
+    assert vs._ell_last_slot is None
+    assert _held(vs) == values + [oneoff]
+    assert vs._ell_oneoff_inflight[0][0] is events[4]
+
+    # Slot 0's copy lands: reusing the slot releases its ell, and only that.
+    events[0].landed = True
+    newest = _record(vs, 5)
+    assert vs._ell_last_slot == 0
+    assert _held(vs) == [newest, *values[1:], oneoff]
+
+
+def test_oneoff_ell_is_held_until_its_own_copy_event_lands(monkeypatch):
+    vs, events = _ell_copy_scheduler(monkeypatch)
+    for v in range(4):
+        _record(vs, v)
+    first = _record(vs, 4)
+    second = _record(vs, 5)
+    assert [int(t[0]) for _, t in vs._ell_oneoff_inflight] == [first, second]
+    # The one-off copy reuses the event record_ell made for it.
+    assert [e for e, _ in vs._ell_oneoff_inflight] == events[4:6]
+    assert len(events) == 6
+
+    events[4].landed = True
+    third = _record(vs, 6)
+    assert [int(t[0]) for _, t in vs._ell_oneoff_inflight] == [second, third]
+    events[5].landed = events[6].landed = True
+    vs.set_last_ell(None)
+    vs.record_ell(["A"])  # no ell this step: nothing new, nothing released
+    assert len(vs._ell_oneoff_inflight) == 2
+    _record(vs, 7)  # lands in the one-off list too, after pruning
+    assert len(vs._ell_oneoff_inflight) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -838,7 +960,9 @@ def _decode_batch(width, num_spec_step):
     from types import SimpleNamespace
 
     return SimpleNamespace(
+        has_prefill=False,
         total_tokens_num_prefill=0,
+        total_seqs_num_prefill=0,
         total_seqs_num_decode=1,
         total_tokens_num_decode=width,
         total_tokens_num=width,
@@ -871,3 +995,122 @@ def test_q_bucket_still_shrinks_a_verifying_decode():
     assert apply_q_bucket(batch, runner.drafter, runner.config.dspark) == 2
     assert batch.num_scheduled_tokens.tolist() == [2]
     assert batch.total_tokens_num_decode == 2
+
+
+# ----------------------------------------------------------------------------
+# The verify length a block gets does not depend on that block's samples
+# ----------------------------------------------------------------------------
+
+
+class _LandedEvent:
+    """torch.cuda.Event stand-in for a copy that has already landed."""
+
+    def record(self, stream=None):
+        pass
+
+    def query(self):
+        return True
+
+    def synchronize(self):
+        pass
+
+
+def _stepping_scheduler(monkeypatch):
+    """A VerifyScheduler whose record_ell runs its real host path on CPU."""
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(_torch.cuda, "Event", _LandedEvent)
+    monkeypatch.setattr(_torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(_torch.cuda, "stream", lambda stream: nullcontext())
+    vs = _fresh_scheduler()
+    vs.runner = SimpleNamespace(
+        tokenID_processor=SimpleNamespace(
+            async_copy_stream=SimpleNamespace(wait_stream=lambda stream: None)
+        ),
+        config=SimpleNamespace(
+            max_num_seqs=8, parallel_config=SimpleNamespace(data_parallel_size=1)
+        ),
+    )
+    vs.sps_table = None
+    vs.sts_temperatures = None
+    vs._last_ell = None
+    vs._ell_stage = lambda n: _torch.zeros(n, dtype=_torch.int64)
+    return vs
+
+
+def _run_steps(vs, confidences, req_ids):
+    """One entry per step, in the runner's order: the {req_id: ell} read at
+    the top of the step (it sizes the verification of the block drafted the
+    step before), then that step's draft and its ell."""
+    sized = []
+    for confidence in confidences:
+        sized.append(dict(vs.ell_by_req))
+        vs.set_last_ell(vs.compute_ell(confidence))
+        vs.record_ell(req_ids)
+    return sized
+
+
+def test_verify_length_is_independent_of_the_block_being_verified(monkeypatch):
+    """ATOM_SPEC_LOSSLESS_SAMPLING verifies with the p/q ratio test, which is
+    lossless only if a block's own samples do not choose how much of it is
+    verified. Its confidence comes from the sampled tokens, so the ell it
+    yields may size the verification of a LATER block only.
+
+    Two runs differ only in block N's confidence (as two different samples
+    of block N would). The step that verifies block N must get the same
+    lengths in both; one step later the difference must show, or the two
+    confidences would not have told the runs apart."""
+    assert dspark_verify._ELL_GENERATION >= 2
+    req_ids = ["A", "B"]
+    earlier = [
+        _torch.tensor([[0.9, 0.8, 0.7], [0.6, 0.5, 0.4]]),
+        _torch.tensor([[0.95, 0.9, 0.85], [0.3, 0.2, 0.1]]),
+    ]
+    sure = _torch.full((2, 3), 0.99)
+    unsure = _torch.tensor([[0.99, 0.01, 0.01], [0.01, 0.01, 0.01]])
+    after = _torch.tensor([[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]])
+
+    runs = []
+    for block_n in (sure, unsure):
+        vs = _stepping_scheduler(monkeypatch)
+        # steps N-2, N-1, N draft; N+1 verifies block N and drafts; N+2 reads
+        runs.append(_run_steps(vs, [*earlier, block_n, after, after], req_ids))
+    a, b = runs
+    verifies_block_n = len(earlier) + 1
+    assert a[verifies_block_n] == b[verifies_block_n]
+    # sized from block N-1's draft, not from block N's
+    vs = _stepping_scheduler(monkeypatch)
+    ell_n_minus_1 = vs.compute_ell(earlier[-1]).tolist()
+    assert a[verifies_block_n] == dict(zip(req_ids, ell_n_minus_1))
+    # positive control: block N's confidence does size a later verification
+    assert a[verifies_block_n + 1] != b[verifies_block_n + 1]
+
+
+@pytest.mark.parametrize("prefill_length", [1, 3])
+def test_q_bucket_preserves_prefill_and_uses_decode_rows_bonus_counts(prefill_length):
+    runner = _q_bucket_runner()
+    runner.drafter.verify_scheduler.ell_by_req = {7: 1, 8: 0}
+    batch = _decode_batch(width=4, num_spec_step=3)
+    batch.req_ids = [90, 7, 8]
+    batch.total_seqs_num_prefill = 1
+    batch.total_seqs_num_decode = 2
+    batch.total_tokens_num_prefill = prefill_length
+    batch.total_tokens_num_decode = 8
+    batch.total_tokens_num = prefill_length + 8
+    batch.num_scheduled_tokens = np.array([prefill_length, 4, 4], dtype=np.int32)
+    batch.scheduled_tokens = np.arange(prefill_length + 8, dtype=np.int32)
+    batch.num_bonus = np.array([99, 0, 1])
+    batch.scheduled_spec_decode_tokens = np.arange(9).reshape(3, 3)
+    assert apply_q_bucket(batch, runner.drafter, runner.config.dspark) == 2
+    assert batch.num_scheduled_tokens.tolist() == [prefill_length, 2, 2]
+    assert batch.scheduled_tokens.tolist() == list(range(prefill_length + 2)) + [
+        prefill_length + 4,
+        prefill_length + 5,
+    ]
+    assert (batch.total_tokens_num_prefill, batch.total_tokens_num_decode) == (
+        prefill_length,
+        4,
+    )
+    assert batch.total_tokens_num == prefill_length + 4
+    assert batch.scheduled_spec_decode_tokens.tolist() == [[0], [3], [6]]

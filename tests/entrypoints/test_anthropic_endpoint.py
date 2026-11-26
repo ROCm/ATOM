@@ -17,10 +17,12 @@ import pytest
 
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import ChatMessage
-from atom.entrypoints.openai.reasoning import separate_reasoning
+from atom.entrypoints.openai.reasoning import ReasoningChannel
+from atom.entrypoints.openai.reasoning_controls import apply_reasoning_controls
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
     AnthropicMessagesRequest,
+    anthropic_context_length_message,
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
@@ -234,6 +236,52 @@ class TestAnthropicToOpenAIMessages:
         assert result[3]["role"] == "tool"
         assert result[4]["role"] == "assistant"
         assert result[5]["role"] == "user"
+
+    def test_a_mid_conversation_system_message_is_its_text(self):
+        # Claude Code sends reminders this way, as cache-marked blocks; str()
+        # put the block list's Python repr in the prompt.
+        reminder = "<system-reminder>todo list is empty</system-reminder>"
+        msgs = [
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(
+                role="system",
+                content=[
+                    {
+                        "type": "text",
+                        "text": reminder,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            ),
+            AnthropicMessage(role="system", content="plain"),
+        ]
+        result = anthropic_to_openai_messages(msgs)
+        assert result[1:] == [
+            {"role": "system", "content": reminder},
+            {"role": "system", "content": "plain"},
+        ]
+
+    def test_an_unknown_role_is_refused(self):
+        msgs = [AnthropicMessage(role="tool", content="x")]
+        with pytest.raises(ValueError, match='Unexpected role "tool"'):
+            anthropic_to_openai_messages(msgs)
+
+
+class TestContextLengthWording:
+    """Claude Code compacts on the first form and retries with a smaller
+    ``max_tokens`` on the second; it recognises neither in OpenAI's wording."""
+
+    def test_a_prompt_that_fills_the_context(self):
+        assert (
+            anthropic_context_length_message(33028, 1024, 32768)
+            == "prompt is too long: 33028 tokens > 32767 maximum"
+        )
+
+    def test_a_prompt_that_fits_without_its_output(self):
+        assert anthropic_context_length_message(28672, 32000, 32768) == (
+            "input length and `max_tokens` exceed context limit: 28672 + 32000 "
+            "> 32768, decrease input length or `max_tokens` and try again"
+        )
 
 
 # ============================================================================
@@ -542,7 +590,9 @@ class TestAnthropicMessagesRequest:
         assert len(req.tools) == 1
 
     @pytest.mark.parametrize("value", [-5, -1, 0])
-    def test_non_positive_max_tokens_returns_invalid_request(self, value):
+    def test_non_positive_max_tokens_returns_invalid_request(self, value, monkeypatch):
+        # Use a served model so the request reaches max_tokens validation.
+        monkeypatch.setattr(api_server, "model_name", "test")
         request = AnthropicMessagesRequest(
             model="test",
             messages=[AnthropicMessage(role="user", content="Hi")],
@@ -781,7 +831,9 @@ class TestSeparationIsUnconditional:
     )
 
     def test_no_call_is_fabricated_from_reasoning(self):
-        reasoning, body = separate_reasoning(self.RAW, starts_thinking=False)
+        reasoning, body = ReasoningChannel(starts_open=False).split(
+            self.RAW, stopped=True
+        )
         _, calls = parse_tool_calls(body, None, parser_cls=QwenXmlParser)
         names = [c.function["name"] for c in calls]
         assert names == ["get_weather"], f"fabricated {names}"
@@ -791,7 +843,7 @@ class TestSeparationIsUnconditional:
         """The cost of the answer this replaces: tying the parse to `thinking`
         meant no `tool_use` block for any request that did not opt in, which
         is most of them."""
-        _, body = separate_reasoning(self.RAW, starts_thinking=False)
+        _, body = ReasoningChannel(starts_open=False).split(self.RAW, stopped=True)
         _, calls = parse_tool_calls(body, None, parser_cls=QwenXmlParser)
         assert len(calls) == 1
 
@@ -949,26 +1001,25 @@ class TestAnEffortIsNotAnOptIn:
     def test_only_an_explicit_statement_resolves(self, req, expected):
         assert resolve_thinking(req)[0] is expected
 
-    def test_the_toggle_is_written_only_when_stated(self):
-        """Read off the syntax tree, not grepped: the guard has to be on the
-        resolved value, not on the toggle merely existing."""
-        tree = ast.parse(pathlib.Path(api_server.__file__).read_text())
-        writes = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Subscript)
-            and isinstance(n.ctx, ast.Store)
-            and getattr(n.value, "id", None) == "merged_kwargs"
-            and isinstance(n.slice, ast.Name)
-        ]
-        assert writes, "no name-keyed write to merged_kwargs; matcher is stale"
-        guarded = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.If)
-            and "_th_enabled is not None" in ast.unparse(n.test)
-        ]
-        assert guarded, "the toggle is written without asking whether it was stated"
+    @pytest.mark.parametrize("default", [False, True])
+    @pytest.mark.parametrize("effort", [None, "high", 37])
+    def test_the_toggle_is_written_only_when_stated(self, default, effort):
+        defaults = {"enable_thinking": default}
+        actual = apply_reasoning_controls(
+            defaults,
+            ("enable_thinking", False, True),
+            resolve_thinking(self.Req(reasoning_effort=effort)),
+        )
+        assert actual["enable_thinking"] is default
+        assert defaults == {"enable_thinking": default}
+        explicit = apply_reasoning_controls(
+            defaults,
+            ("enable_thinking", False, True),
+            resolve_thinking(
+                self.Req(thinking={"type": "disabled"}, reasoning_effort=effort)
+            ),
+        )
+        assert explicit["enable_thinking"] is False
 
 
 class TestTheEndpointAsksForTheOrder:

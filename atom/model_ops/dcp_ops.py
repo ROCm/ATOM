@@ -3,18 +3,26 @@
 
 """DCP (Decode Context Parallel) communication ops for ATOM.
 
-Two backends combine the per-rank partial attention outputs into the global
+Three backends combine the per-rank partial attention outputs into the global
 softmax, selected by ``DCPConfig.comm_backend``:
 
-  * ``ag_rs`` -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
-  * ``a2a``   -- one all-to-all carrying output+LSE, combine locally (1 call)
+  * ``ag_rs``   -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
+  * ``a2a``     -- one all-to-all carrying output+LSE, combine locally (1 call)
+  * ``mailbox`` -- small decode merges in aiter's FlyDSL mailbox combine, which
+    stores straight into the owners' IPC-mapped memory (no collective call);
+    everything else as ``a2a``
 
 They are mathematically equivalent but not bitwise identical; see the A2A
 section below for why one collective can replace two.
 
 Also here: the sparse indexer's DCP support -- the decode candidate exchange
-(fused into one aiter op) and the sparse-prefill owned-slot filter.
+(fused into one aiter op) and the sparse-prefill owned-slot filter, which the
+"q" prefill transport merges like decode -- and the "kv" prefill transport,
+which all-gathers the step's KV rows instead and needs no merge.
 """
+
+import logging
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -27,7 +35,11 @@ from atom.distributed.dcp_layout import (  # noqa: F401
     dcp_owner_rank,
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
+from atom.utils import envs, upload_numpy
 from atom.utils.forward_context import get_published_dcp_local_context_lens
+
+logger = logging.getLogger("atom")
 
 # Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
 # it without importing Triton. Re-exported here for existing attention callers.
@@ -94,6 +106,71 @@ def dcp_all_gather_query_heads(cp_group, q: torch.Tensor) -> torch.Tensor:
         return cp_group.all_gather(q, dim=1)
     gathered = dcp_all_gather(cp_group, q.reshape(tokens, -1), -1)
     return gathered.view(tokens, -1, head_dim)
+
+
+@triton.jit
+def _dcp_prefill_query_reorder_pad_kernel(
+    X,
+    Y,
+    tokens,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    WORLD: tl.constexpr,
+    PADDED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Y[token] = the token's rows of every rank's X, end to end, then zeros up
+    to PADDED heads; each program copies BLOCK contiguous elements of it."""
+    token = tl.program_id(0).to(tl.int64)
+    column = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    owner = (column // (HEADS * DIM)).to(tl.int64)
+    local = column % (HEADS * DIM)
+    value = tl.load(
+        X + owner * tokens * HEADS * DIM + token * HEADS * DIM + local,
+        mask=column < WORLD * HEADS * DIM,
+        other=0,
+    )
+    tl.store(Y + token * PADDED * DIM + column, value, mask=column < PADDED * DIM)
+
+
+def dcp_all_gather_prefill_query_heads(cp_group, q: torch.Tensor, padded_heads: int):
+    """Gather prefill Q and pad heads without an intermediate token-major copy.
+
+    BF16 Q is produced contiguous. Gather it on the first dimension, preserving
+    rank-major storage, then fuse rank-to-token reorder and zero padding. The
+    collective retains its existing size/topology fallback and synchronization.
+    Other layouts/dtypes keep the existing gather-plus-pad behavior.
+    """
+    tokens, heads, dim = q.shape
+    world = cp_group.world_size
+    real_heads = heads * world
+    assert padded_heads >= real_heads
+    if q.dtype != torch.bfloat16 or not q.is_contiguous() or tokens == 0:
+        gathered = cp_group.all_gather(q, dim=1)
+        return torch.nn.functional.pad(gathered, (0, 0, 0, padded_heads - real_heads))
+    if padded_heads == real_heads:
+        return dcp_all_gather_query_heads(cp_group, q)
+    gathered = dcp_all_gather(cp_group, q, 0)
+    out = torch.empty((tokens, padded_heads, dim), dtype=q.dtype, device=q.device)
+    # Reinterpret as integers to preserve every BF16 bit, including NaN payloads.
+    # One 16-byte access a lane across the program's waves: the copy runs as
+    # fully coalesced vector loads/stores over the flat [padded_heads * dim] row.
+    num_warps = 4
+    block = num_warps * 64 * (16 // out.element_size())
+    _dcp_prefill_query_reorder_pad_kernel[
+        (tokens, triton.cdiv(padded_heads * dim, block))
+    ](
+        gathered.view(torch.int16),
+        out.view(torch.int16),
+        tokens,
+        heads,
+        dim,
+        world,
+        padded_heads,
+        block,
+        num_warps=num_warps,
+    )
+    return out
 
 
 class CPTritonContext:
@@ -304,78 +381,71 @@ def _lse_pack_slots(dtype: torch.dtype) -> int:
 
 @triton.jit
 def _zero_nonfinite_rows_kernel(
-    out_ptr,  # [B, H, D]   attention output, written in place
-    lse_ptr,  # [B, H]      fp32 per-head LSE
+    out_ptr,
+    lse_ptr,
     out_stride_b,
     out_stride_h,
     lse_stride_b,
     lse_stride_h,
+    rows,
+    HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Zero the (token, head) rows whose LSE is not finite. One program per row.
+    """Zero the (token, head) rows whose LSE is not finite, ROW_BLOCK rows a
+    program.
 
-    Replaces five launches with one. The Python it stands in for --
-
-        o = torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0.0)
-
-    -- costs four kernels just to build the mask, because torch decomposes
-    isfinite into abs/ne/eq/mul, and a fifth to apply it. The mask is [B, H],
-    a few KB; at ~5.5 us per launch that chain is pure launch overhead.
-
-    The bigger win is the early return. A non-finite LSE means the row saw no
-    valid KV, which is an edge case -- nearly every row is finite. `where`
-    cannot know that: it reads and rewrites all of `o` regardless. Here a
-    finite row exits before touching `o` at all, so the common case costs one
-    scalar load per row instead of a full read-modify-write of [B, H, D].
+    Stands in for ``o = torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0)``,
+    which is five launches (isfinite decomposes into four) and a full
+    read-modify-write of ``o``. A non-finite LSE means the row saw no valid KV,
+    an edge case, so a tile whose rows are all finite exits after one LSE
+    load without touching ``o``.
     """
-    b = tl.program_id(axis=0).to(tl.int64)
-    h = tl.program_id(axis=1).to(tl.int64)
-
-    lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
-    # isfinite: NaN fails `lse == lse`, +-inf fails the abs bound. `&` rather
-    # than `and` to match the rest of this file and to keep the predicate a
-    # single elementwise op; `tl.abs` has no side effect, so nothing is lost by
-    # not short-circuiting.
-    if (lse == lse) & (tl.abs(lse) < float("inf")):  # noqa: PLR0124
+    # Inactive tail rows use a valid address even though their loads are masked.
+    row = tl.program_id(0) * ROW_BLOCK + tl.arange(0, ROW_BLOCK)
+    valid = row < rows
+    safe_row = tl.where(valid, row, 0).to(tl.int64)
+    b = safe_row // HEADS
+    h = safe_row % HEADS
+    lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h, mask=valid, other=0.0)
+    finite = (lse == lse) & (tl.abs(lse) < float("inf"))  # noqa: PLR0124
+    clear = valid & ~finite
+    if tl.sum(clear.to(tl.int32), axis=0) == 0:
         return
-
     base = out_ptr + b * out_stride_b + h * out_stride_h
-    for off in tl.range(0, HEAD_DIM, BLOCK):
-        idx = off + tl.arange(0, BLOCK)
-        keep = idx < HEAD_DIM
-        # BLOCK rounds HEAD_DIM up, so the tail lanes of the last block are out
-        # of range. The store mask already keeps them from writing; folding them
-        # onto 0 keeps the address itself inside the row too, as the two a2a
-        # kernels in this file do for their padding rank lanes.
+    for off in range(tl.cdiv(HEAD_DIM, BLOCK)):
+        col = off * BLOCK + tl.arange(0, BLOCK)
+        keep = col < HEAD_DIM
         tl.store(
-            base + tl.where(keep, idx, 0),
-            tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty),
-            mask=keep,
+            base[:, None] + tl.where(keep, col, 0)[None, :],
+            tl.full((ROW_BLOCK, BLOCK), 0, out_ptr.dtype.element_ty),
+            mask=clear[:, None] & keep[None, :],
         )
 
 
 def zero_nonfinite_rows(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
-    """In-place `out[~isfinite(lse)] = 0`, one kernel. See the kernel docstring."""
+    """Zero non-finite LSE rows in place, preserving finite output bits."""
     assert out.dim() == 3 and lse.dim() == 2, (out.shape, lse.shape)
     assert out.shape[:2] == lse.shape, (out.shape, lse.shape)
-    # The kernel indexes the head dim as `base + idx`, i.e. it assumes a unit
-    # stride there. Every caller passes a fresh `torch.empty` or the result of
-    # `.contiguous()`, but a violation would write the wrong memory silently,
-    # so it is checked rather than assumed.
     assert out.stride(2) == 1, f"head dim must be contiguous, got {out.stride()}"
     b, h, d = out.shape
     if b == 0 or h == 0:
         return out
-    _zero_nonfinite_rows_kernel[(b, h)](
+    row_block = 32
+    _zero_nonfinite_rows_kernel[(triton.cdiv(b * h, row_block),)](
         out,
         lse,
         out.stride(0),
         out.stride(1),
         lse.stride(0),
         lse.stride(1),
+        b * h,
+        HEADS=h,
         HEAD_DIM=d,
-        BLOCK=min(1024, triton.next_power_of_2(d)),
+        ROW_BLOCK=row_block,
+        BLOCK=min(128, triton.next_power_of_2(d)),
+        num_warps=4,
     )
     return out
 
@@ -394,29 +464,38 @@ def _dcp_a2a_pack_kernel(
     send_stride_b,
     send_stride_h,
     H_LOCAL: tl.constexpr,
+    H_ROUNDED: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     LSE_PACK: tl.constexpr,
     HAS_OWNED_COUNTS: tl.constexpr,
 ):
     """Scatter (output, lse) into the per-destination send buffer.
 
-    One program per (token, GLOBAL head). Head ``h`` belongs to destination rank
-    ``h // H_LOCAL`` -- the same contiguous split the ReduceScatter path uses, so
-    a rank ends up owning exactly the heads it owned before.
+    One program per (token, DESTINATION RANK), handling that destination's whole
+    H_LOCAL-head slice: one program per (token, head) leaves the kernel
+    launch-bound. Head ``h`` belongs to destination ``h // H_LOCAL`` -- the same
+    contiguous split the ReduceScatter path uses, so a rank ends up owning
+    exactly the heads it owned before. H_ROUNDED rounds H_LOCAL up to the power of
+    two ``tl.arange`` needs; the extra lanes alias lane 0 and are masked on
+    store.
     """
     b = tl.program_id(axis=0).to(tl.int64)
-    h = tl.program_id(axis=1).to(tl.int64)
+    dst = tl.program_id(axis=1).to(tl.int64)
 
-    dst = h // H_LOCAL
-    h_local = h % H_LOCAL
+    hb = tl.arange(0, H_ROUNDED)
+    h_valid = hb < H_LOCAL
+    # Padding lanes alias lane 0, so their loads read lane 0's (valid) data and
+    # no pointer is formed past this destination's slice; only stores are masked.
+    hb_safe = tl.where(h_valid, hb, 0).to(tl.int64)
+    h = dst * H_LOCAL + hb_safe
 
     d = tl.arange(0, HEAD_DIM)
-    src = tl.load(out_ptr + b * out_stride_b + h * out_stride_h + d)
+    src = tl.load(out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :])
 
     dst_base = (
-        send_ptr + dst * send_stride_n + b * send_stride_b + h_local * send_stride_h
+        send_ptr + dst * send_stride_n + b * send_stride_b + hb_safe * send_stride_h
     )
-    tl.store(dst_base + d, src)
+    tl.store(dst_base[:, None] + d[None, :], src, mask=h_valid[:, None])
 
     lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
     if HAS_OWNED_COUNTS:
@@ -425,7 +504,7 @@ def _dcp_a2a_pack_kernel(
         # payload; this adds no kernel launch to the decode path.
         lse = tl.where(tl.load(owned_counts_ptr + b) == 0, float("-inf"), lse)
     if LSE_PACK == 1:
-        tl.store(dst_base + HEAD_DIM, lse)
+        tl.store(dst_base + HEAD_DIM, lse, mask=h_valid)
     else:
         # Split the fp32 into two raw 16-bit halves. Nothing does arithmetic on
         # these slots -- the collective copies bits and the combine kernel puts
@@ -433,8 +512,8 @@ def _dcp_a2a_pack_kernel(
         bits = lse.to(tl.uint32, bitcast=True)
         hi = (bits >> 16).to(tl.uint16).to(dst_base.dtype.element_ty, bitcast=True)
         lo = (bits & 0xFFFF).to(tl.uint16).to(dst_base.dtype.element_ty, bitcast=True)
-        tl.store(dst_base + HEAD_DIM, hi)
-        tl.store(dst_base + HEAD_DIM + 1, lo)
+        tl.store(dst_base + HEAD_DIM, hi, mask=h_valid)
+        tl.store(dst_base + HEAD_DIM + 1, lo, mask=h_valid)
 
 
 @triton.jit
@@ -543,6 +622,7 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     N_RANKS,
     HEAD_DIM: tl.constexpr,
     H_LOCAL: tl.constexpr,
+    H_ROUNDED: tl.constexpr,
     LSE_PACK: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     FP8_MAX: tl.constexpr,
@@ -566,21 +646,27 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     b = tl.program_id(axis=0).to(tl.int64)
 
     n = tl.arange(0, N_ROUNDED)
-    h = tl.arange(0, H_LOCAL)
+    h = tl.arange(0, H_ROUNDED)
     d = tl.arange(0, HEAD_DIM)
     valid = n < N_RANKS
-    # The padding lanes are masked at every load, which is the documented Triton
+    # The N padding lanes are masked at every load, which is the documented Triton
     # contract. They are also folded onto lane 0 here so no pointer is ever
     # FORMED outside `recv` -- belt and braces, asked for in review, and free:
     # the select folds into the address arithmetic.
     n_safe = tl.where(valid, n, 0)
+    # H_LOCAL need not be a power of two (K3: 96/8 = 12). Padding heads alias
+    # head 0 instead: they compute head 0's values, which cannot change the row
+    # max, and are dropped by the store mask. The N axis cannot do the same,
+    # since an aliased rank would be summed twice.
+    h_valid = h < H_LOCAL
+    h_safe = tl.where(h_valid, h, 0)
 
     # [N, H] base of each (shard, head) record for this token.
     hbase = (
         recv_ptr
         + n_safe[:, None].to(tl.int64) * recv_stride_n
         + b * recv_stride_b
-        + h[None, :].to(tl.int64) * recv_stride_h
+        + h_safe[None, :].to(tl.int64) * recv_stride_h
     )
 
     if LSE_PACK == 1:
@@ -611,7 +697,7 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     factor_is_nan = factor != factor  # noqa: PLR0124
     factor = tl.where(factor_is_nan | (~valid[:, None]), 0.0, factor)
 
-    # [N, H, D]. Mask the padding lanes: N_ROUNDED rounds up to a power of two,
+    # [N, H, D]. Mask the N padding lanes: N_ROUNDED rounds up to a power of two,
     # so for a non-power-of-two group the high lanes address memory past `recv`.
     # Their factor is already 0, so this changes no result -- it stops the read.
     vals = tl.load(
@@ -643,8 +729,9 @@ def _dcp_a2a_unpack_combine_quant_kernel(
 
     q = tl.minimum(tl.maximum(acc * inv, -FP8_MAX), FP8_MAX)
     tl.store(
-        out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :],
+        out_ptr + b * out_stride_b + h_safe[:, None] * out_stride_h + d[None, :],
         q.to(out_ptr.dtype.element_ty),
+        mask=h_valid[:, None],
     )
 
 
@@ -696,6 +783,7 @@ def cp_lse_a2a(
         f"got H={h_total}, N={n_ranks}"
     )
     h_local = h_total // n_ranks
+    h_rounded = triton.next_power_of_2(h_local)
 
     dtype = cp_attn_out.dtype
     pack = _lse_pack_slots(dtype)
@@ -713,7 +801,7 @@ def cp_lse_a2a(
         owned_counts = cp_attn_lse
 
     send = torch.empty((n_ranks, b, h_local, head_dim + pack), dtype=dtype, device=dev)
-    _dcp_a2a_pack_kernel[(b, h_total)](
+    _dcp_a2a_pack_kernel[(b, n_ranks)](
         cp_attn_out,
         cp_attn_lse,
         owned_counts,
@@ -726,6 +814,7 @@ def cp_lse_a2a(
         send.stride(1),
         send.stride(2),
         H_LOCAL=h_local,
+        H_ROUNDED=h_rounded,
         HEAD_DIM=head_dim,
         LSE_PACK=pack,
         HAS_OWNED_COUNTS=has_owned_counts,
@@ -752,6 +841,7 @@ def cp_lse_a2a(
             n_ranks,
             HEAD_DIM=head_dim,
             H_LOCAL=h_local,
+            H_ROUNDED=h_rounded,
             LSE_PACK=pack,
             N_ROUNDED=triton.next_power_of_2(n_ranks),
             FP8_MAX=float(torch.finfo(quant_dtype).max),
@@ -791,6 +881,156 @@ def mask_empty_dcp_lse(
     return cp_attn_lse.masked_fill(owned_counts[:, None] == 0, float("-inf"))
 
 
+# ─────────────────────────────────────────── mailbox merge backend ──
+#
+# aiter's ``dcp_lse_combine`` (FlyDSL, aiter #6972 / #7943, in main from
+# 78a14ae5d): one launch in which every rank stores each owner's head rows and
+# LSEs straight into the owner's IPC-mapped, sentinel-filled mailbox, then
+# polls its own heads and combines them. It replaces pack -> all_to_all_single
+# -> combine. Decode only: its peer buffer is sized for the widest decode step,
+# capped at the widest merge under _MAILBOX_MAX_ELEMS, and its launch epoch
+# lives on each rank, so every rank must launch it the same number of times in
+# the same order -- which a DCP group's lock-step decode does, since every
+# condition below reads only shapes, dtype and capture state. Only
+# graph-captured steps take it: an eager call re-traces the FlyDSL kernel on
+# the host every time (~77 ms a call on Kimi-K3 DCP8), which a capture pays
+# once. Sparse MLA's empty rows (owned_counts == 0) are masked inside the
+# combine through its ``row_counts``.
+
+_MAILBOX_WORKSPACES: dict = {}
+# Mailbox merges taken, per workspace. A merge can only take the mailbox inside
+# a graph capture, so after capture this is every launch a replay makes.
+_MAILBOX_LAUNCHES: dict = {}
+# Largest merge (tokens x all heads x head dim) the mailbox takes. Measured on
+# MI355X in a CUDA graph against pack -> RCCL all-to-all -> combine: GLM-5.2
+# DCP4 (16 x 256) leads at every width up to 512 tokens (8.4e6); Kimi-K3 DCP8
+# (12 x 128) leads through 160 tokens (2.0e6), loses at 192, where the
+# combine's token tile steps from 4 to 8, and leads again from 384. 2^21 is
+# 128 tokens on GLM-5.2 and 170 on Kimi-K3.
+_MAILBOX_MAX_ELEMS = 1 << 21
+
+
+def _mailbox_key(cp_group, heads, dim):
+    return (id(cp_group), heads, dim)
+
+
+def dcp_mailbox_max_tokens(atom_config) -> int:
+    """The widest decode step: every sequence verifying all its draft tokens."""
+    spec = atom_config.speculative_config
+    drafts = (spec.num_speculative_tokens or 0) if spec is not None else 0
+    return atom_config.max_num_seqs * (1 + drafts)
+
+
+def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
+    """Create the shared mailbox workspace of (group, heads a rank, head dim).
+
+    Collective (it maps every rank's peer buffer): call it on every rank of
+    ``cp_group`` in the same order, before any CUDA graph is captured. Its
+    memory sits outside torch's allocator, so it must exist before the KV
+    cache is sized. Returns False on every rank, and the merge stays on
+    all-to-all, when the peer memory cannot be allocated or mapped. ``max_tokens`` is
+    capped at the widest merge under ``_MAILBOX_MAX_ELEMS``: wider ones take
+    all-to-all, so room for them would never be used.
+    """
+    key = _mailbox_key(cp_group, heads, dim)
+    if key in _MAILBOX_WORKSPACES:  # None: tried, and it fell back
+        return _MAILBOX_WORKSPACES[key] is not None
+    _MAILBOX_WORKSPACES[key] = None
+    # Same shapes on every rank, so every rank returns here alike.
+    max_tokens = min(
+        max_tokens, _MAILBOX_MAX_ELEMS // (cp_group.world_size * heads * dim)
+    )
+    if max_tokens < 1:
+        logger.warning(
+            "DCP mailbox: one token of %d heads x %d already exceeds %d elements; "
+            "merging with 'a2a'",
+            cp_group.world_size * heads,
+            dim,
+            _MAILBOX_MAX_ELEMS,
+        )
+        return False
+    try:
+        from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace
+    except ImportError as error:
+        raise ImportError(
+            "DCP comm_backend 'mailbox' needs aiter with the FlyDSL mailbox "
+            "combine (78a14ae5d or later) and FlyDSL >= 0.5.0. Set --dcp-config "
+            '\'{"comm_backend": "a2a"}\' to run without it.'
+        ) from error
+    device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        # aiter agrees on the allocation and on the IPC mapping across the
+        # group before raising, so every rank falls back alike.
+        ws = CombineWorkspace(cp_group, device, heads, dim, max_tokens)
+    except RuntimeError as error:
+        logger.warning("DCP mailbox peer memory: %s; merging with 'a2a'", error)
+        return False
+    _MAILBOX_WORKSPACES[key] = ws
+    logger.info(
+        "DCP mailbox merge ready: %d heads a rank x %d, up to %d decode tokens, "
+        "%.1f MiB of peer memory",
+        heads,
+        dim,
+        max_tokens,
+        ws.peers.bytes.numel() / (1 << 20),
+    )
+    return True
+
+
+def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype):
+    """The mailbox merge, or None when this call cannot take it."""
+    if cp_group.world_size == 1 or not torch.cuda.is_current_stream_capturing():
+        return None
+    tokens, heads, dim = cp_attn_out.shape
+    key = _mailbox_key(cp_group, heads // cp_group.world_size, dim)
+    ws = _MAILBOX_WORKSPACES.get(key)
+    if (
+        ws is None
+        or tokens == 0
+        or tokens > ws.max_tokens  # capped at _MAILBOX_MAX_ELEMS
+        or cp_attn_out.dtype != torch.bfloat16
+    ):
+        return None
+    from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine
+
+    _MAILBOX_LAUNCHES[key] = _MAILBOX_LAUNCHES.get(key, 0) + 1
+    # The combine takes exactly one int32 count per row, where the a2a path
+    # accepts any buffer at least `tokens` long.
+    out = dcp_lse_combine(
+        ws,
+        cp_attn_out,
+        cp_attn_lse.to(torch.float32).contiguous(),
+        base_e=True,
+        row_counts=None if owned_counts is None else owned_counts[:tokens],
+    )
+    # No quantizing combine here: hand back the bf16 rows unquantized, which
+    # the caller then quantizes as it would without the fused path.
+    return out if quant_dtype is None else (out, None)
+
+
+def check_dcp_mailbox_launches() -> None:
+    """Raise unless every rank of each mailbox group captured the same number
+    of mailbox merges. A launch pairs with the same launch on every peer, so a
+    rank that took one more would pair each later merge with the wrong call and
+    hang at the last one. Collective: call on every rank after graph capture."""
+    for key, ws in _MAILBOX_WORKSPACES.items():
+        if ws is None:
+            continue
+        n = _MAILBOX_LAUNCHES.get(key, 0)
+        t = torch.tensor([n, -n], dtype=torch.int64, device="cpu")
+        # aiter's workspace keeps the DCP group's CPU (gloo) group
+        torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MIN, group=ws.group
+        )
+        lo, hi = t[0].item(), -t[1].item()
+        if lo != hi:
+            raise RuntimeError(
+                f"DCP mailbox: ranks captured between {lo} and {hi} mailbox "
+                f"merges (this rank {n}); replay would pair them wrongly. Set "
+                '--dcp-config \'{"comm_backend": "a2a"}\' and report this.'
+            )
+
+
 def dcp_lse_merge(
     cp_attn_out,
     cp_attn_lse,
@@ -802,7 +1042,7 @@ def dcp_lse_merge(
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
-    Dispatches to one of the two backends above. Both compute the same weighted
+    Dispatches to one of the backends above. All compute the same weighted
     sum over KV shards and leave this rank owning the same head slice; they
     differ only in how many collectives it takes (see the A2A section above for
     why one all-to-all can replace AllGather-LSE + ReduceScatter). Equivalent
@@ -815,7 +1055,19 @@ def dcp_lse_merge(
 
     ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
     a2a backend does not use one.
+
+    ``backend="mailbox"`` takes aiter's mailbox combine in a graph capture
+    when its workspace was prepared (``prepare_dcp_mailbox``) and the call
+    fits it, else all-to-all. Every input to that choice is the same on every
+    rank of the group.
     """
+    if backend == "mailbox":
+        merged = _dcp_mailbox_merge(
+            cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype
+        )
+        if merged is not None:
+            return merged
+        backend = "a2a"
     if backend == "a2a":
         return cp_lse_a2a(
             cp_attn_out,
@@ -1013,21 +1265,19 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_
 
 
 def get_dcp_local_window_lens(
-    seq_lens, max_seqlen_q, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
+    positions, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
 ):
     """Per-DCP-rank local KV length of each query token's causal window.
 
-    Draft position ``j`` attends to global positions ``[0, seq_len -
-    max_seqlen_q + j]``; that extra position belongs to a single rank, so the
-    ranks' local lengths do not all advance with j. Returns a flat
-    ``[len(seq_lens) * max_seqlen_q]`` array in (sequence, draft position)
-    order. ``max_seqlen_q == 1`` reproduces ``get_dcp_local_seq_lens``.
+    The token at global position ``p`` attends to ``[0, p]``; a draft
+    position's extra key belongs to a single rank, so the ranks' local lengths
+    do not all advance with it. One entry per token of ``positions``; a step of
+    one token a sequence reproduces ``get_dcp_local_seq_lens``.
     """
-    windows = seq_lens[:, None] - max_seqlen_q + 1 + np.arange(max_seqlen_q)
     return get_dcp_local_seq_lens(
-        # Row 0 is the committed token count, which a scheduled decode row
-        # always has at least one of; the clip is for callers that do not.
-        windows.clip(min=0).ravel(),
+        # A scheduled decode token always sees itself; the clip is for callers
+        # that do not.
+        (positions + 1).clip(min=0),
         dcp_size,
         dcp_rank,
         cp_kv_cache_interleave_size,
@@ -1073,13 +1323,18 @@ def dcp_prefill_slot_mapping(
     return slot_mapping
 
 
-def dcp_local_logits_width(max_model_len: int, dcp_world_size: int) -> int:
+def dcp_local_logits_width(
+    max_model_len: int,
+    dcp_world_size: int,
+    cp_kv_cache_interleave_size: int = 1,
+) -> int:
     """Column count of one DCP rank's local indexer logits plane.
 
-    The FP4 metadata builder bakes this into a CUDAGraph-captured schedule while
-    the scorer allocates the plane, so the two have to read it off one formula.
+    Reserve the longest shard (rank zero). A partial interleave group can give
+    it more than ceil(max_model_len / world_size) tokens when S > 1.
     """
-    return -(-max_model_len // dcp_world_size)
+    full, tail = divmod(max_model_len, dcp_world_size * cp_kv_cache_interleave_size)
+    return full * cp_kv_cache_interleave_size + min(tail, cp_kv_cache_interleave_size)
 
 
 def dcp_local_context_lens(
@@ -1119,6 +1374,42 @@ def dcp_local_context_lens(
     base = full_chunks * S
     remainder = (g_ctx - base * W - dcp_rank * S).clamp(0, S)
     return (base + remainder).to(torch.int32)
+
+
+@triton.jit
+def _dcp_owns(pos, RANK: tl.constexpr, WORLD: tl.constexpr, INTERLEAVE: tl.constexpr):
+    """Whether this rank holds the KV of request positions `pos` (-1 = none)."""
+    return (pos >= 0) & ((pos // INTERLEAVE) % WORLD == RANK)
+
+
+@triton.jit
+def _owned_dcp_slots(
+    pos,
+    valid,
+    table_row,
+    bt_stride_col,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    """`(owned, slot)` of request positions `pos` on this rank, read through
+    the request's block-table row `table_row`. A table page holds PAGE of the
+    rank's tokens, i.e. a virtual page of PAGE * WORLD request positions:
+
+        slot = table[pos // (PAGE*W)] * PAGE + (vb // (W*S)) * S + vb % S,
+        vb   = pos % (PAGE*W)
+    """
+    owned = valid & _dcp_owns(pos, RANK, WORLD, INTERLEAVE)
+    virtual_page = PAGE * WORLD
+    within = pos % virtual_page
+    page = tl.load(table_row + (pos // virtual_page) * bt_stride_col, owned, other=0)
+    slot = (
+        page * PAGE
+        + (within // (WORLD * INTERLEAVE)) * INTERLEAVE
+        + within % INTERLEAVE
+    )
+    return owned, slot
 
 
 # ---------------------------------------------------------------------------
@@ -1162,6 +1453,7 @@ def dcp_decode_candidate_exchange_fused(
     q_scale: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
     weights_scale: float = 1.0,
+    cache_layout: str = PRESHUFFLE,
 ) -> None:
     """Score the local shard, exchange scores, emit this rank's owned KV slots.
 
@@ -1203,7 +1495,7 @@ def dcp_decode_candidate_exchange_fused(
         num_decode_tokens, 1, *padded_q_fp8_decode_tokens.shape[2:]
     )
     # One block-table row per query token; both aiter ops address it by row.
-    block_tables = attn_metadata.dcp_token_block_tables[:num_decode_tokens]
+    block_tables = attn_metadata.token_block_tables[:num_decode_tokens]
 
     local_ctx = dcp_local_context_lens(
         attn_metadata,
@@ -1212,7 +1504,9 @@ def dcp_decode_candidate_exchange_fused(
         cp_kv_cache_interleave_size,
         num_decode_tokens,
     )
-    l_max = dcp_local_logits_width(max_model_len, dcp_world_size)
+    l_max = dcp_local_logits_width(
+        max_model_len, dcp_world_size, cp_kv_cache_interleave_size
+    )
     local_logits = torch.empty(
         [num_decode_tokens, l_max], dtype=torch.float32, device="cuda"
     )
@@ -1227,6 +1521,24 @@ def dcp_decode_candidate_exchange_fused(
             l_max,
             KVBlockSize=runner_block_size,
             Preshuffle=True,
+        )
+    elif cache_layout == MFMA:
+        from atom.model_ops.dsa_fp4 import opus_logits
+
+        opus_logits(
+            q_rows.squeeze(1),
+            q_scale[:num_decode_tokens],
+            kv_cache,
+            kv_scale,
+            weights[:num_decode_tokens],
+            block_tables,
+            attn_metadata.sparse_cu_seqlens_q[: num_decode_tokens + 1],
+            local_ctx,
+            max_qlen=1,
+            max_seq_len=l_max,
+            block_size=runner_block_size,
+            weight_scale=weights_scale,
+            out=local_logits,
         )
     else:
         from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
@@ -1281,19 +1593,18 @@ def dcp_decode_candidate_exchange_fused(
         values=send,
     )
 
-    # Half the payload of the (score, gid) exchange. Still moved as int32 so no
-    # float canonicalization can touch the bits; bitcast back is free.
+    # Half the payload of the (score, gid) exchange, on the custom all-gather:
+    # a pure copy, so the score bits arrive untouched.
     n_cand = dcp_world_size * k_loc
     gathered_sc = (
-        get_dcp_group()
-        .all_gather(send.view(torch.int32), dim=0)
+        dcp_all_gather(get_dcp_group(), send, 0)
         .view(dcp_world_size, num_decode_tokens, k_loc)
         .permute(1, 0, 2)
         .reshape(num_decode_tokens, n_cand)
     )
 
     flydsl_dcp_topk_merge(
-        gathered_sc.view(torch.float32),
+        gathered_sc,
         local_idx,
         block_tables,
         out_kv_indices,
@@ -1321,8 +1632,7 @@ def dcp_decode_candidate_exchange_fused(
 def _count_owned_dcp_prefill_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
     batch_id_per_q_token,  # int32 [num_tokens]
-    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
-    cu_seqlens_k,  # int32 [num_req + 1] -- per-seq base of the flat KV axis
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- positions in the request
     out_counts,  # int32 [num_tokens]
     out_metadata_counts,  # int32 [num_tokens], max(out_counts, 1)
     DCP_RANK: tl.constexpr,
@@ -1338,9 +1648,8 @@ def _count_owned_dcp_prefill_kernel(
 
     Differs from the decode twin (`_count_owned_dcp_kernel`) in two ways:
     the row unit is a query token rather than a request (prefill has many query
-    tokens per request), and `topk_indices` holds a FLAT index into the
-    concatenated KV of all sequences, so the within-sequence position -- which
-    is what the round-robin owner is derived from -- is `indice - cu_seqlens_k[req]`.
+    tokens per request), and the round-robin owner is derived from each
+    candidate's position in its request, which `topk_indices` holds.
     """
     token_id = tl.program_id(0)
     # `-1` marks a CUDAGraph pad token (see token_layout/batch_ids.py): its row
@@ -1348,7 +1657,6 @@ def _count_owned_dcp_prefill_kernel(
     # counts this pass writes stop describing what that pass writes.
     req_id = tl.load(batch_id_per_q_token + token_id)
     valid_req = req_id >= 0
-    base = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
 
     count = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
@@ -1359,12 +1667,8 @@ def _count_owned_dcp_prefill_kernel(
             mask=col_valid,
             other=-1,
         )
-        pos = indice - base  # position within the sequence
         owned = (
-            col_valid
-            & valid_req
-            & (indice >= 0)
-            & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+            col_valid & valid_req & _dcp_owns(indice, DCP_RANK, DCP_WORLD, INTERLEAVE)
         )
         count += tl.sum(owned.to(tl.int32))
 
@@ -1377,8 +1681,7 @@ def _compact_filter_dcp_prefill_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
     out_kv_indptr,  # int32 [num_tokens + 1] -- COMPACTED offsets (cumsum of pass 1)
     batch_id_per_q_token,  # int32 [num_tokens]
-    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
-    cu_seqlens_k,  # int32 [num_req + 1]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- positions in the request
     block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
     out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
     DCP_RANK: tl.constexpr,
@@ -1393,13 +1696,8 @@ def _compact_filter_dcp_prefill_kernel(
     bt_stride1: tl.constexpr,
 ):
     """Pass 2 for sparse PREFILL: keep only this rank's owned candidates, map
-    them through the interleave-S (virtual-block) layout, and pack them to the
-    front of the token's region (S=1 -> the original round-robin):
-
-        vbs  = PAGE_SIZE * W
-        vb   = pos % vbs
-        slot = block_table[req, pos // vbs] * PAGE_SIZE
-               + (vb // (W*S)) * S + (vb % S)
+    them through the interleave-S (virtual-block) layout (`_owned_dcp_slots`),
+    and pack them to the front of the token's region.
 
     Same rationale as the decode twin: no `-1` holes (they break aiter's lse
     path) and compaction is order-preserving so the fp accumulation order is
@@ -1409,10 +1707,8 @@ def _compact_filter_dcp_prefill_kernel(
     # Pad-token guard, in lockstep with pass 1 (see the note there).
     req_id = tl.load(batch_id_per_q_token + token_id)
     valid_req = req_id >= 0
-    base = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
     out_kv_start = tl.load(out_kv_indptr + token_id)
 
-    vbs = PAGE_SIZE * DCP_WORLD
     written = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
         col_id = tile_start + tl.arange(0, BLOCK_N)
@@ -1426,25 +1722,16 @@ def _compact_filter_dcp_prefill_kernel(
             mask=col_valid,
             other=-1,
         )
-        pos = indice - base
-        idx_valid = (
-            col_valid
-            & valid_req
-            & (indice >= 0)
-            & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        idx_valid, slot = _owned_dcp_slots(
+            indice,
+            col_valid & valid_req,
+            block_table + req_id * bt_stride0,
+            bt_stride1,
+            DCP_RANK,
+            DCP_WORLD,
+            INTERLEAVE,
+            PAGE_SIZE,
         )
-
-        block_id = pos // vbs
-        vb = pos % vbs
-        inblock_offset = (vb // (DCP_WORLD * INTERLEAVE)) * INTERLEAVE + (
-            vb % INTERLEAVE
-        )
-        physical_block = tl.load(
-            block_table + req_id * bt_stride0 + block_id * bt_stride1,
-            mask=idx_valid,
-            other=0,
-        )
-        slot = physical_block * PAGE_SIZE + inblock_offset
 
         owned_i32 = idx_valid.to(tl.int32)
         dst = written + tl.cumsum(owned_i32, axis=0) - owned_i32
@@ -1460,11 +1747,23 @@ def _compact_filter_dcp_prefill_kernel(
     tl.store(out_kv_indices + out_kv_start, 0, mask=written == 0)
 
 
+@triton.jit
+def _scan_dcp_metadata_counts_kernel(Indptr, rows, BLOCK: tl.constexpr):
+    """Indptr[1:rows+1] = inclusive prefix sum of the counts stored there, and
+    Indptr[0] = 0: one program, BLOCK rows at a time with a running carry."""
+    carry = tl.zeros((), dtype=tl.int32)
+    for start in range(0, rows, BLOCK):
+        row = start + tl.arange(0, BLOCK)
+        counts = tl.load(Indptr + row + 1, row < rows, other=0)
+        tl.store(Indptr + row + 1, tl.cumsum(counts, axis=0) + carry, row < rows)
+        carry += tl.sum(counts, axis=0)
+    tl.store(Indptr, 0)
+
+
 def triton_filter_and_convert_dcp_index_prefill(
     dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] GLOBAL counts
     batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
-    topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] FLAT indices
-    cu_seqlens_k: torch.Tensor,  # int32 [num_req + 1]
+    topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] in-request
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
     dcp_rank: int,
     dcp_world_size: int,
@@ -1478,8 +1777,8 @@ def triton_filter_and_convert_dcp_index_prefill(
 ):
     """Filter a sparse-PREFILL top-k down to this rank's owned KV slots.
 
-    Prefill has one row per query token and its ``topk_indices`` are flat KV
-    indices rather than within-sequence positions. (The decode path no longer
+    Prefill has one row per query token, its ``topk_indices`` positions in
+    the token's request, as the shared scorer emits them. (The decode path no longer
     needs this at all -- the fused merge emits owned slots directly.) Two passes,
     in-place int32 cumsum, order-preserving compaction, and the same
     layer-scoped buffers are reused (they are sized ``max_num_batched_tokens``,
@@ -1487,10 +1786,9 @@ def triton_filter_and_convert_dcp_index_prefill(
     """
     assert topk_indices.dtype == torch.int32
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
-        f"BLOCK_N ({BLOCK_N})"
-    )
+    assert (
+        NUM_TOPK_TOKENS % BLOCK_N == 0
+    ), f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
     assert 0 <= dcp_rank < dcp_world_size
     assert out is not None, "sparse_kv_indices_buffer (out) is required"
 
@@ -1499,7 +1797,6 @@ def triton_filter_and_convert_dcp_index_prefill(
     dsa_kv_indptr_c = dsa_kv_indptr.contiguous()
     batch_id_per_q_token_c = batch_id_per_q_token.contiguous()
     topk_indices_c = topk_indices.contiguous()
-    cu_seqlens_k_c = cu_seqlens_k.contiguous()
     block_table_c = block_table.contiguous()
 
     ti_stride0, ti_stride1 = topk_indices_c.stride()
@@ -1512,7 +1809,6 @@ def triton_filter_and_convert_dcp_index_prefill(
         dsa_kv_indptr_c,
         batch_id_per_q_token_c,
         topk_indices_c,
-        cu_seqlens_k_c,
         counts,
         metadata_counts,
         dcp_rank,
@@ -1525,14 +1821,9 @@ def triton_filter_and_convert_dcp_index_prefill(
     )
 
     # The count kernel already wrote max(count, 1) into the destination tail,
-    # so this per-full-layer path needs neither an allocation nor another
-    # pointwise operator. Exact input/output overlap is supported by cumsum.
-    out_kv_indptr[:1].zero_()
-    torch.cumsum(
-        metadata_counts,
-        dim=0,
-        dtype=torch.int32,
-        out=metadata_counts,
+    # so the scan runs in place and needs no allocation.
+    _scan_dcp_metadata_counts_kernel[(1,)](
+        out_kv_indptr, num_tokens, BLOCK=2048, num_warps=8
     )
 
     _compact_filter_dcp_prefill_kernel[grid](
@@ -1540,7 +1831,6 @@ def triton_filter_and_convert_dcp_index_prefill(
         out_kv_indptr,
         batch_id_per_q_token_c,
         topk_indices_c,
-        cu_seqlens_k_c,
         block_table_c,
         out,
         dcp_rank,
@@ -1555,3 +1845,298 @@ def triton_filter_and_convert_dcp_index_prefill(
         bt_stride1,
     )
     return out
+
+
+# ───────────────────────────────── sparse prefill: transfer KV, not q ──
+#
+# The "q" sparse prefill gathers the group's query heads, attends this rank's
+# 1/dcp of the KV and merges the partials by LSE. The "kv" one all-gathers the
+# step's KV rows instead -- every prefill request's [0, context_len) from the
+# DCP-sharded fp8 cache, rank-major -- and attends this rank's own heads over
+# the whole top-k, as without DCP: no LSE, no merge. Each rank receives KV
+# rows (576 B a context token) instead of query heads and partial outputs
+# (tens of KB a new token).
+
+
+# "auto" takes "kv" while the step's context stays under
+# CONTEXT_BASE + context_per_new_token(heads a rank) * its new tokens: the
+# gather grows with the context, "q" with the new tokens. Fitted on
+# GLM-5.2-FP8 fp8 KV with a cached prefix + 64 / 1K / 16K new tokens,
+# 32K-960K on MI355X (gfx950): k in [48.5, 57) classifies all 18 tp4/dcp4
+# points (16 heads a rank), 40 all tp8/dcp8 ones (8 heads a rank); on MI300X
+# at tp8/dcp8 the bound is conservative. k follows the heads a rank attends,
+# which "kv" pays for: fewer heads, less attention for the gather to save. 16
+# or more heads a rank take 52, fewer take 40. A forced "kv" skips it; both
+# stay under the cap.
+DCP_SPARSE_PREFILL_KV_CONTEXT_BASE = 200 * 1024
+
+
+def dcp_sparse_prefill_kv_context_per_new_token(local_heads: int) -> int:
+    return 52 if local_heads >= 16 else 40
+
+
+def dcp_sparse_prefill_kv_context_bound(local_heads: int, num_tokens: int) -> int:
+    """The most context "auto" takes "kv" for, in a step of ``num_tokens``
+    new tokens."""
+    return (
+        DCP_SPARSE_PREFILL_KV_CONTEXT_BASE
+        + dcp_sparse_prefill_kv_context_per_new_token(local_heads) * num_tokens
+    )
+
+
+def dcp_sparse_prefill_mode_env() -> str:
+    mode = envs.ATOM_DCP_SPARSE_PREFILL
+    if mode not in ("auto", "q", "kv"):
+        raise ValueError(f"ATOM_DCP_SPARSE_PREFILL={mode!r}: auto, q or kv")
+    return mode
+
+
+def dcp_sparse_prefill_kv_max_tokens_env() -> int:
+    cap = envs.ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS
+    if cap < 0:
+        raise ValueError(f"ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS={cap}: must be >= 0")
+    return cap
+
+
+def dcp_sparse_prefill_kv_blocker(kv_cache_dtype: str, mla_page_size: int):
+    """Why a DCP sparse prefill cannot take "kv" here, or None. It gathers fp8
+    cache rows and runs the dcp=1 kernel at page size 1. Plugins keep "q", and
+    so does PCP: its reindex rewrites the token order and indptr the "kv"
+    layout reads."""
+    from atom.distributed.pcp_utils import pcp_is_enabled
+    from atom.plugin import is_plugin_mode
+
+    if not kv_cache_dtype.startswith("fp8"):
+        return "a non-fp8 KV cache"
+    if mla_page_size != 1:
+        return f"MLA page size {mla_page_size}"
+    if is_plugin_mode():
+        return "plugin mode"
+    if pcp_is_enabled():
+        return "PCP"
+    return None
+
+
+def dcp_sparse_prefill_kv_profile_rows(
+    mode: str,
+    num_tokens: int,
+    local_heads: int,
+    max_num_seqs: int,
+    block_size: int,
+    dcp_world_size: int,
+    kv_max_rows: int,
+) -> int:
+    """The most gathered rows a "kv" step of ``num_tokens`` new tokens can
+    take: the cap for a forced "kv"; for "auto", its context bound plus each
+    request's padding to whole local blocks."""
+    if mode == "kv":
+        return kv_max_rows
+    requests = min(num_tokens, max_num_seqs)
+    return min(
+        kv_max_rows,
+        dcp_sparse_prefill_kv_context_bound(local_heads, num_tokens)
+        + requests * block_size * dcp_world_size,
+    )
+
+
+def dcp_sparse_prefill_kv_scratch_bytes(
+    num_tokens: int,
+    local_heads: int,
+    padded_heads: int,
+    kv_lora_rank: int,
+    rope_dim: int,
+    kv_itemsize: int,
+    dcp_world_size: int,
+    kv_max_rows: int,
+) -> int:
+    """What a "kv" sparse prefill adds in one layer at ``kv_max_rows``, for the
+    memory profile, whose dummy run skips the attention: this rank's rows, the
+    gathered KV, the query padded to the kernel's heads (a copy, when it pads)
+    and the per-rank output. The "q" transport's own buffers are not profiled,
+    as before this transport existed."""
+    d = kv_lora_rank + rope_dim
+    local_rows = -(-kv_max_rows // dcp_world_size)
+    padded_q = num_tokens * padded_heads * d * kv_itemsize
+    return (
+        (kv_max_rows + local_rows) * d * kv_itemsize
+        + (padded_q if padded_heads > local_heads else 0)
+        + num_tokens * padded_heads * kv_lora_rank * 2
+    )
+
+
+@dataclass(frozen=True)
+class DcpSparsePrefillKV:
+    """This step's "kv" sparse prefill layout: rank ``r``'s rows of request
+    ``i`` land at ``r * rows_pad + shard_base[i] + local_index`` of the
+    gathered KV."""
+
+    slot_ids: torch.Tensor  # int32 [rows_pad], this rank's rows, padded per request
+    shard_base: torch.Tensor  # int32 [num_requests + 1], exclusive cumsum
+    rows_pad: int
+
+
+def dcp_padded_local_lens(
+    context_lens, dcp_world_size: int, block_size: int
+) -> np.ndarray:
+    """Each request's length on one DCP rank padded to whole local blocks: the
+    same on every rank, since every rank holds ceil(len / (block_size * dcp))
+    blocks of it."""
+    context_lens = np.asarray(context_lens, dtype=np.int64)
+    return -(-context_lens // (block_size * dcp_world_size)) * block_size
+
+
+def dcp_sparse_prefill_kv_rows(context_lens, dcp_world_size: int, block_size: int):
+    """Rows one rank contributes to a "kv" step."""
+    return int(dcp_padded_local_lens(context_lens, dcp_world_size, block_size).sum())
+
+
+def dcp_sparse_prefill_kv_plan(
+    context_lens: np.ndarray,
+    block_tables,
+    dcp_world_size: int,
+    block_size: int,
+    max_tokens: int,
+    device: torch.device,
+) -> DcpSparsePrefillKV | None:
+    """The "kv" layout for a prefill step, or None to keep the "q" path.
+
+    Every input is the step's batch, identical on every DCP rank, so every rank
+    returns the same choice and gathers the same row count. A request owns
+    ``cdiv(context_len, block_size * dcp)`` local blocks on every rank, so its
+    padded local length is the same everywhere; padding rows read allocated
+    slots and are never selected. Raises if a block table is shorter than its
+    context: those blocks already hold the step's KV.
+    """
+    context_lens = np.asarray(context_lens, dtype=np.int64)
+    if len(context_lens) == 0 or len(block_tables) < len(context_lens):
+        return None
+    padded = dcp_padded_local_lens(context_lens, dcp_world_size, block_size)
+    rows_pad = int(padded.sum())
+    if rows_pad == 0 or rows_pad * dcp_world_size > max_tokens:
+        return None
+    # Upload each request's local blocks, not its slots, and expand on GPU: 4 B
+    # a local block, so a plan at the default cap (2^20 rows) stays under the
+    # pageable-copy cliff (512 KiB) while dcp * block_size >= 8.
+    blocks = []
+    for i, n in enumerate(padded.tolist()):
+        block_ids = np.asarray(block_tables[i], dtype=np.int32)
+        if len(block_ids) * block_size < n:
+            raise ValueError(f"request {i}: {len(block_ids)} blocks for {n} local rows")
+        blocks.append(block_ids[: n // block_size])
+    shard_base = np.zeros(len(padded) + 1, dtype=np.int32)
+    np.cumsum(padded, out=shard_base[1:])
+    block_ids = upload_numpy(np.concatenate(blocks), device)
+    offsets = torch.arange(block_size, dtype=torch.int32, device=device)
+    return DcpSparsePrefillKV(
+        slot_ids=(block_ids[:, None] * block_size + offsets).view(-1),
+        shard_base=upload_numpy(shard_base, device),
+        rows_pad=rows_pad,
+    )
+
+
+def dcp_gather_sparse_prefill_kv(
+    cp_group, kv_cache: torch.Tensor, plan: DcpSparsePrefillKV
+) -> torch.Tensor:
+    """All-gather the step's KV rows: ``[dcp * rows_pad, 1, d]`` in the cache
+    dtype, rank-major. fp8 rows travel as bytes; the gather is a copy."""
+    local = dcp_gather_compressed_kv(kv_cache, plan.slot_ids)
+    return dcp_all_gather(cp_group, local, 0).unsqueeze(1)
+
+
+@triton.jit(do_not_specialize=["rows_pad", "out_numel"])
+def _dcp_sparse_prefill_kv_index_kernel(
+    dsa_kv_indptr,  # int32 [num_tokens + 1], GLOBAL per-token candidate counts
+    batch_id_per_q_token,  # int32 [num_tokens]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS], positions in the request
+    shard_base,  # int32 [num_requests + 1]
+    out_kv_indices,  # int32
+    rows_pad,
+    out_numel,
+    DCP_WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0: tl.int64,
+    ti_stride1: tl.constexpr,
+):
+    """Each candidate's row in the gathered KV, written where the dcp=1 prefill
+    writes its cache slot: the same positions and the same zero for an invalid
+    one (negative, or past the request's padded rows), so the attention reads
+    the same rows in the same order."""
+    token_id = tl.program_id(0)
+    col_id = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    kv_start = tl.load(dsa_kv_indptr + token_id)
+    kv_len = tl.load(dsa_kv_indptr + token_id + 1) - kv_start
+    indice = tl.load(topk_indices + token_id * ti_stride0 + col_id * ti_stride1)
+    base = tl.load(shard_base + req_id, mask=valid_req, other=0)
+    end = tl.load(shard_base + req_id + 1, mask=valid_req, other=0)
+    owner = (indice // INTERLEAVE) % DCP_WORLD
+    local = (indice // (INTERLEAVE * DCP_WORLD)) * INTERLEAVE + indice % INTERLEAVE
+    row = owner * rows_pad + base + local
+    out_offset = kv_start + col_id
+    store_mask = (col_id < kv_len) & (out_offset < out_numel)
+    valid = valid_req & store_mask & (indice >= 0) & (base + local < end)
+    tl.store(out_kv_indices + out_offset, tl.where(valid, row, 0), mask=store_mask)
+
+
+def triton_dcp_sparse_prefill_kv_index(
+    dsa_kv_indptr: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
+    topk_indices: torch.Tensor,
+    plan: DcpSparsePrefillKV,
+    dcp_world_size: int,
+    out: torch.Tensor,
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,
+    cp_kv_cache_interleave_size: int = 1,
+) -> torch.Tensor:
+    """Map a sparse-prefill top-k (positions in each token's request) to rows of
+    the gathered KV (``dcp_gather_sparse_prefill_kv``), at the global
+    ``dsa_kv_indptr`` offsets: no ownership filter, no compaction."""
+    assert topk_indices.dtype == torch.int32
+    assert topk_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0
+    num_tokens = min(
+        dsa_kv_indptr.shape[0] - 1,
+        batch_id_per_q_token.shape[0],
+        topk_indices.shape[0],
+    )
+    if num_tokens == 0:
+        return out
+    ti_stride0, ti_stride1 = topk_indices.stride()
+    _dcp_sparse_prefill_kv_index_kernel[(num_tokens, NUM_TOPK_TOKENS // BLOCK_N)](
+        dsa_kv_indptr,
+        batch_id_per_q_token,
+        topk_indices,
+        plan.shard_base,
+        out,
+        plan.rows_pad,
+        out.numel(),
+        dcp_world_size,
+        cp_kv_cache_interleave_size,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        ti_stride0,
+        ti_stride1,
+    )
+    return out
+
+
+def warm_dcp_sparse_prefill_kv_index(
+    dcp_world_size: int, interleave: int, num_topk_tokens: int, device
+) -> None:
+    """Compile the "kv" index kernel with one candidate-free token: dummy runs
+    build no plan, so the first live "kv" step would JIT it."""
+    zeros = torch.zeros(2, dtype=torch.int32, device=device)
+    triton_dcp_sparse_prefill_kv_index(
+        zeros,
+        zeros[:1],
+        torch.zeros(1, num_topk_tokens, dtype=torch.int32, device=device),
+        DcpSparsePrefillKV(slot_ids=zeros[:0], shard_base=zeros, rows_pad=0),
+        dcp_world_size,
+        zeros[:0],
+        NUM_TOPK_TOKENS=num_topk_tokens,
+        cp_kv_cache_interleave_size=interleave,
+    )

@@ -2,14 +2,18 @@
 # Tests for atom/utils/envs.py — lazy env var evaluation
 
 import logging
+from pathlib import Path
 
 import pytest
 
 # All ATOM_* env vars that could affect default-value tests
 _ATOM_ENV_VARS = [
+    "ATOM_ENABLE_OTEL_TRACE",
+    "ATOM_TRACE_VERSION",
     "ATOM_DP_RANK",
     "ATOM_DP_RANK_LOCAL",
     "ATOM_DP_SIZE",
+    "ATOM_DP_SYNC_INTERVAL",
     "ATOM_DP_MASTER_IP",
     "ATOM_DP_MASTER_PORT",
     "ATOM_DP_BASE_PORT",
@@ -21,11 +25,15 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION",
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION",
+    "ATOM_ENABLE_GLUON_FUSED_AR",
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
     "ATOM_USE_MODEL_SENSITIVE_RMSNORM",
     "ATOM_TORCH_PROFILER_DIR",
+    "ATOM_ONLINE_QUANT_INFO_DIR",
+    "ATOM_ENGRAM_CACHE_DIR",
+    "ATOM_RTL_TRACE_DIR",
     "ATOM_ENABLE_METRICS_DEVICE_TIMER",
     "ATOM_METRICS_UPDATE_INTERVAL_S",
     "ATOM_SHUTDOWN_TIMEOUT_S",
@@ -42,7 +50,6 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
-    "ATOM_MEGA_MASK_PAD_ROWS",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -64,6 +71,28 @@ def _get_envs():
     from atom.utils import envs
 
     return envs
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, 1),
+        ("1", 1),
+        ("16", 16),
+        ("0", 1),
+        ("-5", 1),
+        ("bad", None),
+        ("", None),
+        ("1.5", None),
+        ("99", 99),  # past 16: rejected by every rank together (startup)
+    ],
+)
+def test_dp_sync_interval_env(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("ATOM_DP_SYNC_INTERVAL", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DP_SYNC_INTERVAL", raw)
+    assert _get_envs().ATOM_DP_SYNC_INTERVAL == expected
 
 
 class TestEnvsDefaults:
@@ -99,11 +128,25 @@ class TestEnvsDefaults:
     def test_ds_input_rmsnorm_quant_fusion_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is True
 
+    def test_gluon_fused_ar_default_enabled(self):
+        assert _get_envs().ATOM_ENABLE_GLUON_FUSED_AR is True
+
     def test_model_sensitive_rmsnorm_default_disabled(self):
         assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is False
 
     def test_torch_profiler_dir_default(self):
         assert _get_envs().ATOM_TORCH_PROFILER_DIR is None
+
+    def test_online_quant_info_dir_default(self):
+        assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR is None
+
+    def test_engram_cache_dir_default(self):
+        assert _get_envs().ATOM_ENGRAM_CACHE_DIR == str(
+            Path.home() / ".cache" / "atom" / "engram"
+        )
+
+    def test_rtl_trace_dir_default(self):
+        assert _get_envs().ATOM_RTL_TRACE_DIR is None
 
     def test_metrics_device_timer_default_disabled(self):
         assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is False
@@ -150,9 +193,6 @@ class TestEnvsDefaults:
     def test_use_flydsl_fp8_prefill_attn_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
 
-    def test_mega_mask_pad_rows_default_enabled(self):
-        assert _get_envs().ATOM_MEGA_MASK_PAD_ROWS is True
-
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
             _ = _get_envs().ATOM_NONEXISTENT_VAR
@@ -187,6 +227,48 @@ class TestEnvsOverrides:
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
         assert _get_envs().ATOM_TORCH_PROFILER_DIR == "/tmp/prof"
+
+    def test_empty_torch_profiler_dir_reads_as_unset(self, monkeypatch):
+        # `VAR=` is how a launcher clears it inline. Handing "" to Config would
+        # abort startup on os.makedirs("") instead.
+        monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "")
+        assert _get_envs().ATOM_TORCH_PROFILER_DIR is None
+
+    def test_online_quant_info_dir_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ONLINE_QUANT_INFO_DIR", "/tmp/oq")
+        assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR == "/tmp/oq"
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_online_quant_info_dir_reads_only_its_own_variable(
+        self, monkeypatch, value
+    ):
+        # The knob reports its own variable and nothing else; the fallback to
+        # ATOM_TORCH_PROFILER_DIR lives at the loader's one call site
+        # (tests/test_online_quant_info_dir.py pins the effective directory).
+        if value is not None:
+            monkeypatch.setenv("ATOM_ONLINE_QUANT_INFO_DIR", value)
+        monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
+        assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR is None
+
+    def test_engram_cache_dir_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENGRAM_CACHE_DIR", "/tmp/engram")
+        assert _get_envs().ATOM_ENGRAM_CACHE_DIR == "/tmp/engram"
+
+    def test_empty_engram_cache_dir_reads_as_its_default(self, monkeypatch):
+        # Path("") is the working directory, so an empty value would otherwise
+        # drop the compressed-vocab cache beside wherever the server started.
+        monkeypatch.setenv("ATOM_ENGRAM_CACHE_DIR", "")
+        assert _get_envs().ATOM_ENGRAM_CACHE_DIR == str(
+            Path.home() / ".cache" / "atom" / "engram"
+        )
+
+    def test_rtl_trace_dir_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_RTL_TRACE_DIR", "/tmp/rtl")
+        assert _get_envs().ATOM_RTL_TRACE_DIR == "/tmp/rtl"
+
+    def test_empty_rtl_trace_dir_reads_as_unset(self, monkeypatch):
+        monkeypatch.setenv("ATOM_RTL_TRACE_DIR", "")
+        assert _get_envs().ATOM_RTL_TRACE_DIR is None
 
     def test_profiler_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_MORE", "1")
@@ -296,10 +378,6 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "true")
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
 
-    def test_mega_mask_pad_rows_can_be_disabled(self, monkeypatch):
-        monkeypatch.setenv("ATOM_MEGA_MASK_PAD_ROWS", "0")
-        assert _get_envs().ATOM_MEGA_MASK_PAD_ROWS is False
-
 
 class TestIsSet:
     """Test the is_set() helper function."""
@@ -383,3 +461,19 @@ def test_malformed_offload_timeout_names_the_variable(monkeypatch):
     monkeypatch.setenv("OFFLOAD_PUBLICATION_TIMEOUT_S", "soon")
     with pytest.raises(ValueError, match="OFFLOAD_PUBLICATION_TIMEOUT_S must be"):
         _ = _get_envs().OFFLOAD_PUBLICATION_TIMEOUT_S
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, False), ("0", False), ("1", True), ("TRUE", True), ("false", False)],
+)
+def test_otel_enable_environment(value, expected, monkeypatch):
+    if value is not None:
+        monkeypatch.setenv("ATOM_ENABLE_OTEL_TRACE", value)
+    assert _get_envs().ATOM_ENABLE_OTEL_TRACE is expected
+
+
+def test_otel_version_environment(monkeypatch):
+    assert _get_envs().ATOM_TRACE_VERSION == "unknown"
+    monkeypatch.setenv("ATOM_TRACE_VERSION", "build-test")
+    assert _get_envs().ATOM_TRACE_VERSION == "build-test"

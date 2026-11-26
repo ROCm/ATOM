@@ -75,7 +75,7 @@ def _install_api_server_stubs() -> list[str]:
         def from_cli_args(cls, args):
             return cls()
 
-        def create_engine(self, tokenizer=None):
+        def create_engine(self, tokenizer=None, **kwargs):
             return None
 
     _try_import_else_stub(
@@ -142,6 +142,21 @@ def _run_bounded(coro, timeout=5.0):
 def _boom(*_args, **_kwargs):
     """A step that fails. Named so the loop's warning names something real."""
     raise RuntimeError("boom")
+
+
+@pytest.mark.parametrize("state,expected", [(None, 503), (False, 503), (True, 200)])
+def test_health_reports_worker_readiness(monkeypatch, state, expected):
+    from fastapi.testclient import TestClient
+
+    value = (
+        None
+        if state is None
+        else SimpleNamespace(core_mgr=SimpleNamespace(is_healthy=lambda: state))
+    )
+    monkeypatch.setattr(api_server, "engine", value)
+    # No lifespan: this test supplies the engine and does not load a model.
+    response = TestClient(api_server.app).get("/health")
+    assert response.status_code == expected
 
 
 class TestMultimodalInputs:
@@ -328,6 +343,20 @@ class TestDPSessionAffinityHeaders:
             "child",
             "parent",
         )
+
+    def test_mlperf_session_id_header(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "1")
+        request = SimpleNamespace(
+            headers={"x-session-id": "conv", "x-correlation-id": "fallback"}
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == ("conv", None)
+
+    def test_dynamo_session_id_wins_over_session_id(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "1")
+        request = SimpleNamespace(
+            headers={"x-dynamo-session-id": "child", "x-session-id": "conv"}
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == ("child", None)
 
     def test_correlation_id_is_session_fallback(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "true")
@@ -815,3 +844,524 @@ class TestTheCensusEndpointKeepsTheLoopFree:
             )
 
         assert asyncio.run(call()) == [False, False], "two walks ran at once"
+
+
+def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
+    events = []
+    loop_thread = threading.get_ident()
+
+    def initialize():
+        assert threading.get_ident() != loop_thread
+        events.append("initialize")
+
+    for name in (
+        "tune_gc",
+        "maybe_attach_gc_debug_callback",
+        "freeze_gc_heap",
+        "arm_reclaim_watch",
+    ):
+        monkeypatch.setattr(api_server, name, lambda *a, **k: None)
+    monkeypatch.setattr(api_server, "engine", None)
+    monkeypatch.setattr(api_server, "initialize_tracing", initialize)
+    monkeypatch.setattr(
+        api_server, "shutdown_tracing", lambda: events.append("shutdown")
+    )
+
+    async def drive():
+        async with api_server.lifespan(api_server.app):
+            assert events == ["initialize"]
+            events.append("serving")
+
+    asyncio.run(drive())
+    assert events == ["initialize", "serving", "shutdown"]
+
+
+# ---- /kv_event_sources: where a router follows each DP rank's KV events ----
+
+
+def _kv_events_engine(
+    monkeypatch,
+    parallel=None,
+    *,
+    enable_dp_attention=False,
+    tp=1,
+    kv_transfer_config=None,
+    **events,
+):
+    """An engine with KV events configured as `events`, by default DP=2 on one
+    node, serving the sources its CoreManager builds."""
+    from atom.config import KVEventsConfig, ParallelConfig
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.model_engine.engine_core_mgr import kv_event_sources
+
+    config = SimpleNamespace(
+        kv_events_config=KVEventsConfig(**events),
+        parallel_config=parallel or ParallelConfig(data_parallel_size=2),
+        enable_dp_attention=enable_dp_attention,
+        tensor_parallel_size=tp,
+        pipeline_parallel_size=1,
+        kv_cache_block_size=16,
+        decode_context_parallel_size=2,
+        kv_transfer_config=kv_transfer_config,
+        hf_config=SimpleNamespace(num_hidden_layers=4, model_type="glm_moe_dsa"),
+        model="test-model",
+        kv_cache_dtype="fp8",
+        speculative_config=None,
+    )
+    config.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(config)
+    monkeypatch.setattr(api_server, "model_name", "m")
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(
+            config=config,
+            core_mgr=SimpleNamespace(kv_event_sources=kv_event_sources(config)),
+        ),
+    )
+    return config
+
+
+def _tcp_sources(ports):
+    # 16-token KV blocks under DCP 2 hash 32 tokens per block.
+    return {
+        str(rank): {"endpoint": f"tcp://*:{port}", "topic": "kv", "block_size": 32}
+        for rank, port in ports.items()
+    }
+
+
+def test_kv_event_sources_reports_every_dp_rank_publisher(monkeypatch):
+    _kv_events_engine(monkeypatch, enable=True, endpoint="tcp://*:5557", topic="kv")
+    sources = asyncio.run(api_server.kv_event_sources())
+    assert sources == _tcp_sources({0: 5557, 1: 5558})
+    assert "kv_event_sources" not in asyncio.run(api_server.server_info())
+
+
+def test_kv_event_sources_keys_the_global_rank_on_a_later_node(monkeypatch):
+    from atom.config import ParallelConfig
+
+    # The second node of a DP=4 run: its engines are global ranks 2 and 3 and
+    # bind their endpoints offset from rank 2, not from 0.
+    parallel = ParallelConfig(
+        data_parallel_size=4, data_parallel_size_local=2, data_parallel_rank=2
+    )
+    _kv_events_engine(
+        monkeypatch, parallel, enable=True, endpoint="tcp://*:5557", topic="kv"
+    )
+    sources = asyncio.run(api_server.kv_event_sources())
+    assert sources == _tcp_sources({2: 5559, 3: 5560})
+
+
+@pytest.mark.parametrize("node_rank, first", [(0, 0), (2, 4)])
+def test_kv_event_sources_lists_every_tp_rank_under_dp_attention(
+    monkeypatch, node_rank, first
+):
+    from atom.config import ParallelConfig
+
+    # DP-attention runs one engine, and so one publisher, per TP rank: DP=2
+    # per node at TP=2 is four, numbered globally in TP units.
+    parallel = ParallelConfig(
+        data_parallel_size=2 + node_rank,
+        data_parallel_size_local=2,
+        data_parallel_rank=node_rank,
+    )
+    _kv_events_engine(
+        monkeypatch,
+        parallel,
+        enable_dp_attention=True,
+        tp=2,
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+    )
+    ranks = range(first, first + 4)
+    sources = asyncio.run(api_server.kv_event_sources())
+    assert sources == _tcp_sources({rank: 5557 + rank for rank in ranks})
+
+
+def test_kv_event_sources_suffixes_ipc_endpoints_per_rank(monkeypatch):
+    _kv_events_engine(monkeypatch, enable=True, endpoint="ipc:///tmp/kv")
+    assert asyncio.run(api_server.kv_event_sources()) == {
+        "0": {"endpoint": "ipc:///tmp/kv", "topic": "", "block_size": 32},
+        "1": {"endpoint": "ipc:///tmp/kv_dp1", "topic": "", "block_size": 32},
+    }
+
+
+def test_kv_event_sources_offsets_the_replay_endpoint_per_rank(monkeypatch):
+    _kv_events_engine(
+        monkeypatch,
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+        replay_endpoint="tcp://*:5600",
+    )
+    sources = asyncio.run(api_server.kv_event_sources())
+    expected = _tcp_sources({0: 5557, 1: 5558})
+    expected["0"]["replay_endpoint"] = "tcp://*:5600"
+    expected["1"]["replay_endpoint"] = "tcp://*:5601"
+    assert sources == expected
+
+
+@pytest.mark.parametrize(
+    "events", [{"enable": False}, {"enable": True, "publisher": "null"}]
+)
+def test_kv_event_sources_is_empty_without_a_publisher(monkeypatch, events):
+    _kv_events_engine(monkeypatch, **events)
+    assert asyncio.run(api_server.kv_event_sources()) == {}
+
+
+@pytest.fixture
+def fake_aiter(monkeypatch):
+    """AITER's fp8 and arch as on gfx950: the Store namespace asks for both."""
+    import torch
+
+    package = types.ModuleType("aiter")
+    package.dtypes = SimpleNamespace(d_dtypes={"fp8": torch.float8_e4m3fn})
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx = lambda: "gfx950"
+    for name, module in (
+        ("aiter", package),
+        ("aiter.jit", types.ModuleType("aiter.jit")),
+        ("aiter.jit.utils", types.ModuleType("aiter.jit.utils")),
+        ("aiter.jit.utils.chip_info", chip_info),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+@pytest.mark.parametrize(
+    "min_load, reported", [(None, 512), ("1024", 1024)], ids=["store-default", "env"]
+)
+def test_kv_event_sources_reports_the_store_keys_as_its_connector_builds_them(
+    monkeypatch, fake_aiter, min_load, reported
+):
+    from atom.kv_transfer.offload.mooncake_store import keys
+
+    if min_load is None:
+        monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", min_load)
+    pools = {
+        "rdma0": {"master": "10.0.0.1:50051", "metadata": "http://10.0.0.1:8080"},
+        "rdma1": {"master": "10.0.0.1:50051", "metadata": "http://10.0.0.9:8080"},
+        "rdma2": {"master": "10.0.0.3:50051", "metadata": "http://10.0.0.3:8080"},
+    }
+    store = {
+        "kv_connector": "mooncake_store",
+        "kv_role": "offload",
+        "kv_connector_extra_config": {
+            "mooncake_store.pools": pools,
+            "mooncake_store.local_hostname": "10.0.0.2",
+            "mooncake_store.chunk_tokens": 64,
+        },
+    }
+    pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    config = _kv_events_engine(
+        monkeypatch,
+        kv_transfer_config={"kv_connector": "multi", "connectors": [pd, store]},
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+    )
+    # The Store connector's own view of the config under `multi`.
+    leaf = SimpleNamespace(**vars(config) | {"kv_transfer_config": store})
+    expected = _tcp_sources({0: 5557, 1: 5558})
+    for source in expected.values():
+        source["offload"] = {
+            "backend": "mooncake_store",
+            "masters": ["10.0.0.1:50051", "10.0.0.3:50051"],
+            "namespace": keys.store_namespace(leaf, 64),
+            "chunk_tokens": 64,
+            "world": 1,
+            "min_load_tokens": reported,
+            "chain_check": keys.chunk_hash_chain(range(64), 64).hex(),
+        }
+    assert asyncio.run(api_server.kv_event_sources()) == expected
+
+
+# ---- --api-server-count: the worker side of api_server ----
+
+
+def test_engine_routes_are_the_management_endpoints():
+    # Registered with `_engine_route`: a worker relays exactly these to the
+    # hub. Everything else, inference and /debug/gc_census included, is served
+    # where it arrives, so a new route is local unless it says otherwise.
+    assert api_server._ENGINE_ROUTES == {
+        "/health",
+        "/metrics",
+        "/debug/mtp_stats",
+        "/debug/cache_stats",
+        "/kv_transfer_info",
+        "/kv_event_sources",
+        "/server_info",
+        "/start_profile",
+        "/stop_profile",
+    }
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Unix socket")
+def test_worker_relays_engine_routes_to_the_hub_over_its_unix_socket(
+    monkeypatch, tmp_path
+):
+    from aiohttp import web
+    from fastapi.testclient import TestClient
+
+    seen = []
+
+    async def hub_handler(request):
+        seen.append(
+            (request.method, request.path, request.query_string, await request.read())
+        )
+        return web.json_response({"from": "hub"}, status=503)
+
+    uds = str(tmp_path / "hub.sock")
+    ready = threading.Event()
+    stop = {}
+
+    def serve():
+        loop = asyncio.new_event_loop()
+        hub = web.Application()
+        hub.router.add_route("*", "/{tail:.*}", hub_handler)
+        runner = web.AppRunner(hub)
+        loop.run_until_complete(runner.setup())
+        loop.run_until_complete(web.UnixSite(runner, uds).start())
+        stop["loop"], stop["runner"] = loop, runner
+        ready.set()
+        loop.run_forever()
+        loop.run_until_complete(runner.cleanup())
+        loop.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(5)
+    monkeypatch.setattr(api_server, "_frontend_hub_uds", uds)
+    monkeypatch.setattr(api_server, "model_name", "m")
+    client = TestClient(api_server.app)
+    try:
+        # Each TestClient call runs on a fresh loop; a worker has one.
+        api_server._frontend_hub_session = None
+        reply = client.get("/health?a=1&a=2")
+        assert reply.status_code == 503 and reply.json() == {"from": "hub"}
+        api_server._frontend_hub_session = None
+        reply = client.post("/start_profile", content=b"x")
+        assert reply.json() == {"from": "hub"}
+        assert seen == [
+            ("GET", "/health", "a=1&a=2", b""),
+            ("POST", "/start_profile", "", b"x"),
+        ]
+        # Served by the worker itself, never relayed.
+        api_server._frontend_hub_session = None
+        assert client.get("/v1/models").json()["data"][0]["id"] == "m"
+        assert client.get("/no/such/route").status_code == 404
+        assert len(seen) == 2
+    finally:
+        api_server._frontend_hub_session = None
+        stop["loop"].call_soon_threadsafe(stop["loop"].stop)
+        thread.join(5)
+
+
+def test_health_is_unavailable_once_a_frontend_worker_dies(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(core_mgr=SimpleNamespace(is_healthy=lambda: True)),
+    )
+    dead = []
+    monkeypatch.setattr(
+        api_server, "_frontend_hub", SimpleNamespace(dead_workers=lambda: dead)
+    )
+    client = TestClient(api_server.app)
+    assert client.get("/health").status_code == 200
+    dead.append(2)
+    reply = client.get("/health")
+    assert reply.status_code == 503 and "[2]" in reply.json()["detail"]
+
+
+def test_hub_flush_runs_even_when_the_local_flush_fails():
+    # The engine output thread's flush with a hub. A failing local flush must
+    # not keep the step's outputs from the workers' clients.
+    calls = []
+
+    def local():
+        calls.append("local")
+        raise RuntimeError("local flush")
+
+    hub = SimpleNamespace(flush=lambda: calls.append("hub"))
+    flush = api_server._flush_local_and_hub(local, hub)
+    with pytest.raises(RuntimeError):
+        flush()
+    assert calls == ["local", "hub"]
+    calls.clear()
+    api_server._flush_local_and_hub(None, hub)()
+    assert calls == ["hub"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Unix socket")
+def test_relay_answers_503_while_the_hub_is_not_serving(monkeypatch, tmp_path):
+    # Workers are serving before the hub binds its socket (and after it exits).
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(api_server, "_frontend_hub_uds", str(tmp_path / "none.sock"))
+    api_server._frontend_hub_session = None
+    try:
+        reply = TestClient(api_server.app).get("/health")
+    finally:
+        api_server._frontend_hub_session = None
+    assert reply.status_code == 503
+    assert reply.json()["detail"] == "Engine hub is not serving"
+
+
+class TestPreparePrompt:
+    """`_prepare_prompt`: render and tokenize the engine's way, on the
+    executor, for /v1/messages and /v1/responses. Never cut to the context."""
+
+    @pytest.fixture
+    def prepare(self, monkeypatch):
+        from atom.model_engine.segment_tokenizer import PrefixEncoding
+
+        encoded = {}
+
+        def encode_prompt(text):
+            # One id per character; with a block-hash chain when asked.
+            ids = list(range(len(text)))
+            return PrefixEncoding(ids, "chain") if encoded.get("chain") else ids
+
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(max_model_len=100),
+                io_processor=SimpleNamespace(encode_prompt=encode_prompt),
+            ),
+        )
+        monkeypatch.setattr(api_server, "custom_message_encoder", None)
+        monkeypatch.setattr(
+            api_server,
+            "apply_chat_template",
+            lambda _tok, _enc, messages, **kwargs: messages,
+        )
+
+        def run(prompt, chain=False):
+            encoded["chain"] = chain
+            return api_server._prepare_prompt(
+                prompt, {}, tools=None, preserve_tool_call_arguments=False
+            )
+
+        return run
+
+    def test_a_prompt_goes_to_the_engine_as_encoded(self, prepare):
+        engine_input, text = prepare("x" * 50, chain=True)
+        # The engine's own encoding, chain included, so preprocess reuses it.
+        assert engine_input.token_ids == list(range(50))
+        assert engine_input.block_hashes == "chain"
+        assert text == "x" * 50
+
+    def test_an_over_long_prompt_is_not_cut(self, prepare):
+        # 100-token context: the prompt is left whole for admission to refuse.
+        engine_input, text = prepare("x" * 150)
+        assert engine_input == list(range(150))
+        assert text == "x" * 150
+
+
+class TestDeploymentDefaultOutputCap:
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_small_deployment_distinguishes_default_from_explicit(
+        self, monkeypatch, explicit
+    ):
+        from types import SimpleNamespace as NS
+
+        monkeypatch.setattr(
+            api_server, "_get_engine_config", lambda: NS(max_model_len=4096)
+        )
+        monkeypatch.setattr(api_server, "custom_message_encoder", None)
+        kwargs = {
+            "temperature": 1.0,
+            "max_tokens": 8192,
+            "stop_strings": None,
+            "ignore_eos": False,
+            "max_tokens_is_default": not explicit,
+        }
+        if explicit:
+            with pytest.raises(ValueError, match="max_tokens must be <= 4096"):
+                api_server._build_sampling_params(**kwargs)
+            return
+        sampling = api_server._build_sampling_params(**kwargs)
+        assert sampling.max_tokens == 4096
+        monkeypatch.setattr(api_server, "_get_engine_max_model_len", lambda: 4096)
+        monkeypatch.setattr(api_server, "_get_engine_max_pool_tokens", lambda: None)
+        seq = NS(num_prompt_tokens=100, max_tokens=sampling.max_tokens)
+        api_server._validate_sequence_context_length(seq, sampling)
+        assert seq.max_tokens == 3996
+
+    @pytest.mark.parametrize("prompt", [4096, 4097])
+    def test_full_prompt_is_not_given_zero_or_negative_output(
+        self, monkeypatch, prompt
+    ):
+        from types import SimpleNamespace as NS
+
+        monkeypatch.setattr(api_server, "_get_engine_max_model_len", lambda: 4096)
+        with pytest.raises(ValueError, match="no context space"):
+            api_server._validate_sequence_context_length(
+                NS(num_prompt_tokens=prompt, max_tokens=4096),
+                NS(max_tokens_is_default=True),
+            )
+
+    def test_explicit_cap_is_not_silently_reduced_after_tokenization(self, monkeypatch):
+        from types import SimpleNamespace as NS
+
+        monkeypatch.setattr(api_server, "_get_engine_max_model_len", lambda: 4096)
+        seq = NS(num_prompt_tokens=4000, max_tokens=512)
+        with pytest.raises(ValueError, match="maximum context length"):
+            api_server._validate_sequence_context_length(
+                seq, NS(max_tokens_is_default=False)
+            )
+        assert seq.max_tokens == 512
+
+
+@pytest.mark.parametrize(
+    "keeps, needs_strings, preserve",
+    [(True, False, True), (False, True, True), (False, False, False)],
+    ids=["kimi-k3", "concatenating-template", "mapping-template"],
+)
+def test_reasoning_and_tool_setup_publishes_every_module_global(
+    monkeypatch, keeps, needs_strings, preserve
+):
+    # Front-end workers run this split-out part of main(); an assignment
+    # without its `global` would set a local and leave the module default.
+    names = (
+        "reasoning_dialect",
+        "model_starts_in_reasoning",
+        "reasoning_toggle",
+        "tool_call_parser_cls",
+        "preserve_tool_call_arguments",
+        "required_tool_channel",
+    )
+    for name in names:
+        monkeypatch.setattr(api_server, name, "unset", raising=False)
+    dialect = SimpleNamespace(think_end_marker="</think>")
+    stubs = {
+        "chat_template_source": lambda *_a: "template",
+        "resolve_dialect": lambda *_a: (dialect, True),
+        "render_probe_prompt": lambda *_a, **_kw: "probe",
+        "template_opens_reasoning_implicitly": lambda *_a: True,
+        "resolve_reasoning_toggle": lambda *_a: ("thinking", False, True),
+        "resolve_tool_call_parser": lambda *_a, **_kw: "parser",
+        "template_keeps_tool_call_arguments": lambda *_a: keeps,
+        "template_needs_tool_call_argument_strings": lambda *_a: needs_strings,
+        "required_call_channel": lambda *_a: "channel",
+    }
+    for name, stub in stubs.items():
+        monkeypatch.setattr(api_server, name, stub)
+    monkeypatch.setattr(api_server, "tokenizer", object())
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+
+    api_server._setup_reasoning_and_tools(
+        SimpleNamespace(tool_call_parser="auto", model="m")
+    )
+
+    assert api_server.reasoning_dialect is dialect
+    assert api_server.model_starts_in_reasoning is True
+    assert api_server.reasoning_toggle == ("thinking", False, True)
+    assert api_server.tool_call_parser_cls == "parser"
+    assert api_server.preserve_tool_call_arguments is preserve
+    assert api_server.required_tool_channel == "channel"

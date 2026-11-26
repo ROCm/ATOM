@@ -5,7 +5,7 @@
       "source_path": "deepseek-ai/DeepSeek-R1-0528",
       "path": "deepseek-ai/DeepSeek-R1-0528",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -23,7 +23,7 @@
       "source_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
       "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -40,7 +40,7 @@
       "choice_label": "DeepSeek-V4-Pro",
       "source_path": "deepseek-ai/DeepSeek-V4-Pro",
       "path": "deepseek-ai/DeepSeek-V4-Pro",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -59,10 +59,46 @@
       ]
     },
     {
+      "choice_label": "DeepSeek-V4-Flash",
+      "source_path": "deepseek-ai/DeepSeek-V4-Flash",
+      "path": "deepseek-ai/DeepSeek-V4-Flash",
+      "runner": "linux-atom-pitt-mi350x-8",
+      "nightly_group": "B",
+      "variants": [
+        {
+          "tp_size": 4,
+          "display": "DeepSeek-V4-Flash TP4",
+          "dashboard_model": "DeepSeek-V4-Flash-tp4",
+          "prefix": "deepseek-v4-flash-tp4",
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --gpu-memory-utilization 0.9 --max-num-seqs 512 --tokenizer-mode deepseek_v4 --no-async-scheduling",
+          "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nVLLM_USE_V2_MODEL_RUNNER=1"
+        }
+      ]
+    },
+    {
+      "choice_label": "DeepSeek-V4.1-Flash",
+      "source_path": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "path": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "runner": "linux-atom-pitt-mi350x-8",
+      "nightly_group": "B",
+      "variants": [
+        {
+          "tp_size": 4,
+          "display": "DeepSeek-V4.1-Flash DSpark TP4",
+          "dashboard_model": "DeepSeek-V4.1-Flash-DSpark-tp4",
+          "prefix": "deepseek-v4-1-flash-dspark-tp4",
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --tokenizer-mode deepseek_v4 --kv-cache-dtype auto --gpu-memory-utilization 0.9 --max-model-len 16384 --max-num-batched-tokens 8192 --max-num-seqs 64 --speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"kv_cache_dtype\":\"fp8_ds_mla\"}'",
+          "env_vars": "VLLM_USE_BREAKABLE_CUDAGRAPH=1\nATOM_V41_EXPERIMENTAL_CUDAGRAPH=1"
+        }
+      ]
+    },
+    {
       "choice_label": "gpt-oss-120b",
       "source_path": "openai/gpt-oss-120b",
       "path": "openai/gpt-oss-120b",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "C",
       "variants": [
         {
@@ -108,7 +144,7 @@
       "source_path": "zai-org/GLM-5.1-FP8",
       "path": "zai-org/GLM-5.1-FP8",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "C",
       "variants": [
         {
@@ -129,7 +165,7 @@
       "source_path": "zai-org/GLM-5.2-FP8",
       "path": "zai-org/GLM-5.2-FP8",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "variants": [
         {
@@ -175,7 +211,7 @@
       "source_path": "moonshotai/Kimi-K3",
       "path": "moonshotai/Kimi-K3",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -185,6 +221,16 @@
           "prefix": "kimi-k3-tp8",
           "extra_args": "--trust-remote-code --language-model-only --tensor-parallel-size 8 --kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.93 --block-size 128 --no-enable-prefix-caching --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --additional-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*self_attn.[qkv]_conv1d*\",\"*block_sparse_moe.experts*\",\"*block_sparse_moe.routed_expert_*\",\"*vision_tower*\",\"*mm_projector*\"]}}'",
           "env_vars": ""
+        },
+        {
+          "tp_size": 8,
+          "display": "Kimi-K3 DSpark DCP8 TP8",
+          "dashboard_model": "Kimi-K3-DSpark-DCP8-tp8",
+          "prefix": "kimi-k3-dspark-dcp8-tp8",
+          "draft_model_path": "Inferact/Kimi-K3-DSpark",
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --language-model-only --tensor-parallel-size 8 --decode-context-parallel-size 8 --kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.91 --block-size 128 --enable-prefix-caching --mamba-cache-mode align --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --additional-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*self_attn.[qkv]_conv1d*\",\"*block_sparse_moe.experts*\",\"*block_sparse_moe.routed_expert_*\",\"*vision_tower*\",\"*mm_projector*\"]}}' --speculative-config '{\"method\":\"dspark\",\"model\":\"/models/Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":7}'",
+          "env_vars": ""
         }
       ]
     },
@@ -193,7 +239,7 @@
       "source_path": "Qwen/Qwen3.5-397B-A17B-FP8",
       "path": "Qwen/Qwen3.5-397B-A17B-FP8",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "variants": [
         {
@@ -225,7 +271,7 @@
       "source_path": "Qwen/Qwen3.5-397B-A17B",
       "path": "Qwen/Qwen3.5-397B-A17B",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "variants": [
         {
@@ -246,7 +292,7 @@
       "source_path": "amd/Qwen3.5-397B-A17B-MXFP4",
       "path": "amd/Qwen3.5-397B-A17B-MXFP4",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "variants": [
         {
@@ -266,7 +312,7 @@
       "choice_label": "Qwen3-Next-80B-A3B-Instruct-FP8",
       "source_path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
       "path": "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "variants": [
         {
@@ -338,7 +384,7 @@
       "choice_label": "DeepSeek-V3.2 FP8",
       "source_path": "deepseek-ai/DeepSeek-V3.2",
       "path": "deepseek-ai/DeepSeek-V3.2",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -374,7 +420,7 @@
       "choice_label": "DeepSeek-V3.2 FP8 PTPC",
       "source_path": "amd/DeepSeek-V3.2-mtp-ptpc",
       "path": "amd/DeepSeek-V3.2-mtp-ptpc",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -401,7 +447,7 @@
       "choice_label": "GLM-4.7-FP8",
       "source_path": "zai-org/GLM-4.7-FP8",
       "path": "zai-org/GLM-4.7-FP8",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -428,7 +474,7 @@
       "choice_label": "GLM-4.7-FP8 MTP",
       "source_path": "zai-org/GLM-4.7-FP8",
       "path": "zai-org/GLM-4.7-FP8",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -456,7 +502,7 @@
       "source_path": "zai-org/GLM-5.1-FP8",
       "path": "zai-org/GLM-5.1-FP8",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "C",
       "variants": [
         {
@@ -476,7 +522,7 @@
       "choice_label": "GLM-5.2-MXFP4",
       "source_path": "amd/GLM-5.2-MXFP4",
       "path": "amd/GLM-5.2-MXFP4",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -500,10 +546,28 @@
       ]
     },
     {
+      "choice_label": "GLM-5.3-Flash",
+      "source_path": "zai-org/GLM-5.3-Flash",
+      "path": "zai-org/GLM-5.3-Flash",
+      "runner": "linux-atom-pitt-mi350x-8",
+      "nightly_group": "B",
+      "variants": [
+        {
+          "tp_size": 4,
+          "display": "GLM-5.3-Flash kpool MTP prefix-cache TP4",
+          "dashboard_model": "GLM-5.3-Flash-kpool-MTP-PC-tp4",
+          "prefix": "glm-5-3-flash-kpool-mtp-pc-tp4",
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 4 --max-model-len 16384 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.85 --enable-prefix-caching --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'",
+          "env_vars": ""
+        }
+      ]
+    },
+    {
       "choice_label": "MiniMax-M2.5",
       "source_path": "MiniMaxAI/MiniMax-M2.5",
       "path": "MiniMaxAI/MiniMax-M2.5",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -539,7 +603,7 @@
       "choice_label": "MiniMax-M3-MXFP4",
       "source_path": "amd/MiniMax-M3-MXFP4",
       "path": "amd/MiniMax-M3-MXFP4",
-      "runner": "atom-mi355-8gpu-oot-benchmark",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "variants": [
         {
@@ -549,6 +613,16 @@
           "prefix": "minimax-m3-mxfp4-tp4",
           "bench_args": "",
           "extra_args": "--no-trust-remote-code --tensor-parallel-size 4 --gpu-memory-utilization 0.85 --max-model-len 32768 --max-num-seqs 128 --max-num-batched-tokens 32768 --block-size 128 --no-async-scheduling --no-enable_prefix_caching --kv_cache_dtype auto --language-model-only --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}'",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+        },
+        {
+          "tp_size": 4,
+          "display": "MiniMax-M3-MXFP4 EAGLE3 TP4",
+          "dashboard_model": "MiniMax-M3-MXFP4-EAGLE3-tp4",
+          "prefix": "minimax-m3-mxfp4-eagle3-tp4",
+          "draft_model_path": "Inferact/MiniMax-M3-EAGLE3-GQA",
+          "bench_args": "",
+          "extra_args": "--tensor-parallel-size 4 --kv-cache-dtype fp8 --no-trust-remote-code --gpu-memory-utilization 0.85 --block-size 128 --max-model-len 32768 --max-num-seqs 128 --max-num-batched-tokens 32768 --no-enable_prefix_caching --no-async-scheduling --language-model-only --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}' --speculative-config '{\"method\":\"eagle3\",\"model\":\"/models/Inferact/MiniMax-M3-EAGLE3-GQA\",\"num_speculative_tokens\":3}'",
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         }
       ]

@@ -3,11 +3,14 @@
 
 # This code is adapted from https://github.com/ROCm/vllm/blob/main/vllm/model_executor/model_loader/weight_utils.py
 
+import contextlib
 import fnmatch
+import functools
 import hashlib
 import json
 import logging
 import os
+import struct
 import tempfile
 import time
 from pathlib import Path
@@ -17,6 +20,7 @@ import filelock
 import huggingface_hub.constants
 import torch
 from huggingface_hub import HfFileSystem, snapshot_download
+from torch import nn
 from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
@@ -72,9 +76,10 @@ def local_model_dir(model: str) -> str:
     `deepseek-ai/DeepSeek-V4.1-Flash/model.safetensors.index.json` reached a
     `FileNotFoundError` in CI.
 
-    Resolution only, never a download: every caller runs after the weights have
-    loaded, so the snapshot is already in the hub cache and `allow_patterns=[]`
-    asks for no files.
+    Resolution only, never a download: `allow_patterns=[]` asks for no files.
+    Most callers run after the weights have loaded, when the snapshot is in the
+    hub cache; the weight cache's key is taken before, from what is there so
+    far.
 
     A name that resolves to nothing comes back unchanged, because every caller
     already has an answer for "there is no such directory" and none of them is
@@ -89,6 +94,48 @@ def local_model_dir(model: str) -> str:
         return snapshot_download(model, local_files_only=True, allow_patterns=[])
     except Exception:  # noqa: BLE001 -- any failure to resolve means "not local"
         return model
+
+
+# safetensors dtype tags of unquantized storage.
+_PLAIN_FLOAT_TAGS = frozenset({"F32", "BF16", "F16"})
+
+
+def checkpoint_layer_key(name: str) -> str:
+    """A tensor's or module's name from `layers.` on (whole outside the layer
+    stack), so checkpoint and model prefixes need not agree."""
+    at = name.find("layers.")
+    return name if at < 0 else name[at:]
+
+
+@functools.lru_cache(maxsize=4)
+def unquantized_layer_keys(model: str) -> frozenset[str]:
+    """`checkpoint_layer_key`s of the layers the local checkpoint `model`
+    stores unquantized: every `weight*` tensor of the layer is a plain float.
+    Read from the shard headers, without loading a tensor. Empty when `model`
+    is not a local directory (a hub id not downloaded yet)."""
+    model_dir = local_model_dir(model)
+    if not model_dir or not os.path.isdir(model_dir):
+        return frozenset()
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index) as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+    else:
+        shards = sorted(n for n in os.listdir(model_dir) if n.endswith(".safetensors"))
+    plain, quantized = set(), set()
+    for shard in shards:
+        with open(os.path.join(model_dir, shard), "rb") as f:
+            (header_size,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(header_size))
+        for name, info in header.items():
+            stem, _, leaf = name.rpartition(".")
+            if not leaf.startswith("weight"):
+                continue
+            stored_plain = info["dtype"] in _PLAIN_FLOAT_TAGS
+            (plain if stored_plain else quantized).add(checkpoint_layer_key(stem))
+    # A key some checkpoint layer stores quantized stays quantized: prefixes
+    # cut away (e.g. an MTP or vision stack) can make two layers share one.
+    return frozenset(plain - quantized)
 
 
 def download_weights_from_hf(
@@ -201,3 +248,42 @@ def filter_duplicate_safetensors_files(
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
+
+
+def swap_param(old, new: nn.Parameter, attrs: dict) -> bool:
+    """Move ``new``'s data into ``old``, keeping the Parameter object other
+    references hold, with attributes ``attrs``. False: it cannot be swapped
+    (another type, or extra references to its data)."""
+    if type(old) is not nn.Parameter:
+        return False
+    try:
+        torch.utils.swap_tensors(old, new)
+    except Exception:  # noqa: BLE001 - the caller installs ``new`` instead
+        return False
+    old.__dict__.clear()
+    old.__dict__.update(attrs)
+    return True
+
+
+@contextlib.contextmanager
+def params_on_meta():
+    """Build a model with every Parameter on the meta device; buffers are
+    built normally. Each Parameter stays the object the constructor holds, so
+    attributes set on it later (set_weight_attrs) land."""
+    orig = nn.Module.register_parameter
+
+    def register_parameter(self, name, param):
+        orig(self, name, param)
+        p = self._parameters.get(name)
+        if p is None or p.is_meta:
+            return
+        meta = nn.Parameter(p.detach().to("meta"), requires_grad=p.requires_grad)
+        if not swap_param(p, meta, dict(vars(p))):
+            meta.__dict__.update(vars(p))
+            self._parameters[name] = meta
+
+    nn.Module.register_parameter = register_parameter
+    try:
+        yield
+    finally:
+        nn.Module.register_parameter = orig

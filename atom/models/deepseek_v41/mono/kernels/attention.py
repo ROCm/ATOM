@@ -1,101 +1,126 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""K2a's decode sparse attention: the original path's Triton split + reduce
-(``_paged_decode_split_kernel`` / ``_paged_decode_reduce_kernel``, a 16-head
-tile, D = 512, bf16 pool: 64 splits, 16-key tiles, D_CHUNK 128), bit for
-bit. Both orders were read off the kernels' ISA and LLVM IR and are pinned by
-``harness/p32_split.py`` and ``harness/p32_reduce_emul.py``. The original picks
-its splits (``_kv_splits_heuristic``: 64 up to T = 8, 32 at T = 12) and its
-reduce's D chunk from the step's rows and heads; this keeps the order of a
-``ORDER_ROWS`` (6)-row call over one 16-head tile at every S and TP size, so a
-row's sums never depend on the other rows of its step or the rank's head count
-(``check._attention_ref`` runs its reference ``ORDER_ROWS`` rows and a tile at
-a time).
+# Copyright (c) 2026 ATOM Project Contributors
+"""K2a's decode sparse attention: the scores' tasks put raw scores, a merge
+task lands its values before one poll of them and runs the softmax itself, on
+the original path's arithmetic: ``qk_scale`` and ``exp2``, p rounded to bf16
+before PV and the output to bf16 before the inverse RoPE. Only the sums' order
+differs from the original split + reduce (``_paged_decode_split_kernel`` /
+``_paged_decode_reduce_kernel``).
 
-The rank's heads (``Dims.heads``) are tiles of 16, one a task: its 16 heads the
-MFMA's N, as the original's ``block_h`` 16. A ragged tile's (TP8: 8 heads) dead
-heads read the last live head and write nothing.
+The rank's heads (``Dims.heads``) are tiles of 16. A ragged tile's (TP8: 8
+heads) dead heads read the last live head and write nothing.
 
-A token has at most ``ATTENTION_KEYS_MAX`` = 1024 keys (``config_refusal``), so
-every split is one 16-key tile: split s is keys 16 s .., there are
-cdiv(kv_len, 16) of them, and a split's (m, l, acc) is its tile's alone
-(acc = MFMA(kv^T, bf16(p), 0): the split kernel's rn(0 x alpha)).
+A token's keys sit in ``ATTENTION_KEYS_MAX`` = 640 fixed slots
+(``config_refusal``): the selection's 512 then the window's 128, or in a build
+whose keys hold no selection (``AttnPostBuild.attn_sel``: the DSpark draft's
+window and block) the window's 640, in chunks of 64 (``attention_plan``: a
+pass's kind its position; ``c["sel_slots"]`` the build's selection slots).
 
-score (S x tiles x 8 tasks, task (t, tile, group sg), wave w: split 8 sg + w):
-scores C[key][head] = 16 chained 16x16x32 bf16 MFMAs over D (A = kv rows, B = q), x
-qk_scale, NEG past kv_len; m = max; p = exp2(s - m) (v_exp_f32); l = the row sum
-(p0 + p2) + (p1 + p3) in lane, + lane^32, + lane^16 -> AM, AL, and bf16 p in the
-PV operand's lane order -> AP.
+score (S x tiles x CHUNKS tasks, task (t, tile, chunk)): waves 0 .. 3 take 16
+slots each, their rows through the wave's LDS; C[key][head] = 16 chained
+16x16x32 bf16 MFMAs over D (A = kv rows, B = q), x qk_scale, NEG at a slot
+without a key -> AS [t][tile][chunk][head][slot].
 
-pv (S x tiles x 16 tasks, task (t, tile, 32 columns dc)): wave w' holds the
-splits w' + 8 r, which are the reduce's thread (w = w' // 2, hb = w' % 2) group, each split's
-acc[d][head] (16x16x16 bf16 MFMA, the 32 columns) in registers. m_max, alpha =
-exp2(m - m_max) and l_comb (the reduce's DPP tree) per head; per element
-t_i = fma(a_2i, alpha_2i, rn(a_2i+1 alpha_2i+1)), T = (t0 + t1) + (t2 + t3),
-X_w = T(2 w) + T(2 w + 1), (X0 + X2) + (X1 + X3); the sink fold,
-rn(acc alpha_kv) / max(l_final, 1e-30), bf16 -> ``att["out"]`` LDS [16][32],
-which the same task's inverse-RoPE quant reads.
+merge (S x tiles x 16 / MH x 8 tasks, task (t, tile, head group, 64-dim
+slice), MH ``attention_plan.merge_heads``): the slice of every key's value
+into LDS [8-column block][key][8 columns], then the group's scores of every
+chunk in one poll; m = the max over the keys, with the sink's; p = exp2(s - m),
+the denominator sum(p) + exp2(sink - m) in f32, bf16 p into LDS [head][key];
+P V on 16x16x16 bf16 MFMAs (A = V^T by transposing LDS reads, B = p), wave w
+the 16 dims 16 (w % 4) .. over key half w // 4; o / den, bf16 ->
+``att["out"]`` LDS [head][64], which the same task's inverse-RoPE quant reads.
+
+An FP8 pool (``kv_fp8``: MXFP8 rows, 512 E4M3 in the data plane, 16 E8M0 in
+the scale plane) follows the
+original FP8 path (``mla_sparse_prefill_v41``): QK on FP8, PV on BF16. score:
+q quantized to MXFP8 by the KV row's rule once a CTA (``_q_shared``), 4 chained
+16x16x128 scaled MFMAs over D on the rows as stored; merge: a row's 8 columns
+dequantized by their group's code (exact in bf16) into the same bf16 tiles.
 """
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v41.mono import attention_plan as aplan
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.config import ATTENTION_KEYS_MAX
-from atom.models.deepseek_v41.mono.kernels.dims import HEAD_DIM, HEAD_TILE
+from atom.models.deepseek_v41.mono.kernels.dims import (
+    HEAD_DIM,
+    HEAD_TILE,
+    kvrow_scale0,
+)
+from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.step_meta import KMETA
+from atom.mono.device.mx import (
+    FP8_MAX,
+    UNIT_SCALE,
+    clamp_fp8,
+    code_ceil,
+    mfma_scaled,
+    pow2,
+    rcp_pow2,
+)
 from atom.mono.device.ops import (
     bf16_round,
+    butterflies,
     butterfly,
+    fp8_pack4,
     hw_exp2,
-    lane_gather,
     ld_dev,
     ld_i32,
     mfma_bf16,
+    mxfp8_to_bf16x8,
     readlane,
-    row_shr,
+    readlane64,
     rsrc,
     traced,
     xshfl,
 )
-from atom.mono.plan.execution import BLOCKS
+from atom.mono.device.sync import Quad
+from atom.mono.plan.execution import BLOCKS, THREADS
 
-SPLITS, BK = aplan.SPLITS, aplan.BK  # a split is a 16-key tile
-# the original decode call whose split and reduce order this keeps: T rows
-# (``_kv_splits_heuristic`` and the reduce's D chunk follow T x heads)
-ORDER_ROWS = 6
-assert SPLITS * BK == ATTENTION_KEYS_MAX
-# a score split's 16 key rows in the wave's LDS: a row's 1 KB and 16 B of
-# padding (a lane's read-back of 16 rows at one column hits distinct banks)
+CH, CHUNKS = aplan.CH, aplan.CHUNKS  # keys a chunk, chunks a token
+BK = 16  # keys a score wave (an MFMA's 16 rows)
+SCORE_WAVES = CH // BK  # a score task's waves with keys
+# a score wave's 16 key rows in its LDS: a row's 1 KB and 16 B of padding (a
+# lane's read-back of 16 rows at one column hits distinct banks)
 SCORE_LDS_ROW = HEAD_DIM // 2 + 4  # words
 SCORE_LDS_WORDS = BK * SCORE_LDS_ROW  # a wave's
-COLS = 32  # the pv task's columns: one FP8 quant group
-GROUPS = HEAD_DIM // COLS  # a head's column groups
+# the layer kernel's q tile in LDS (``_q_tile``): a head's row padded alike, so
+# the 16 heads a lane group reads at one column hit distinct banks
+Q_LDS_ROW = HEAD_DIM // 2 + 4  # words
+Q_LDS_WORDS = HEAD_TILE * Q_LDS_ROW
+# an FP8 pool's q operands in LDS (``_q_shared``): [K step][lane] 8 words (32 B
+# aligned for the vector access), then [K step][lane] their codes
+Q_LDS_CODES = HEAD_DIM // 128 * 64 * 8
+SCORE_Q_WORDS = Q_LDS_CODES + HEAD_DIM // 128 * 64
+SLICE = 64  # a merge task's dims: two FP8 quant groups
+SLICES = HEAD_DIM // SLICE
+COLS = 32  # an FP8 quant group's dims
+# the merge's LDS (words): V [8-column block][key][8 columns] (4 words a key's
+# block), P [head][key] (bf16 pairs), the heads' chunk maxima and partial sums,
+# the second key half's P V and the output [head][dim]
+MERGE_V_WORDS = SLICE // 8 * ATTENTION_KEYS_MAX * 4
+# words a head's P row, padded: the PV reads 16 heads at one key
+P_ROW = ATTENTION_KEYS_MAX // 2 + 4
+MERGE_P_WORDS = HEAD_TILE * P_ROW
+MERGE_STAT_WORDS = HEAD_TILE * CHUNKS
+MERGE_SUM_WORDS = HEAD_TILE * CHUNKS
+MERGE_TREE_WORDS = SLICE // 16 * 64 * 4
+MERGE_OUT_WORDS = HEAD_TILE * SLICE
 
 
-def score_tasks(s, tiles) -> int:
-    """Score tasks a (token, head tile) (``stage_attn_score``): the most, up to
-    a split a wave, that keep a step's tasks to one round of the CTAs. Past it
-    (48 rows: 8 a token) 128 CTAs ran two in series, the stage's end 14 us;
-    four a token, a wave's two splits' loads together: attention 34 -> 32 us."""
-    per = SPLITS // 8
-    while s * tiles * per > BLOCKS and per > 1:
-        per //= 2
-    return per
+def merge_groups(tokens) -> int:
+    """Head groups a 16-head tile in the merge (``attention_plan.merge_heads``)."""
+    return HEAD_TILE // aplan.merge_heads(tokens)
 
 
-def pv_groups(s, tiles) -> int:
-    """Column groups a PV task covers (``stage_attn_pv``): the fewest that keep
-    a step's tasks to one round of the CTAs. A task's cost is its latency (the
-    score outputs' poll, the key rows' loads), shared by its groups."""
-    groups = 1
-    while s * tiles * GROUPS // groups > BLOCKS and groups < GROUPS:
-        groups *= 2
-    return groups
+def merge_tasks(tokens, tiles) -> int:
+    """The merge stage's tasks a step: (token, tile, head group, slice)."""
+    return tokens * tiles * merge_groups(tokens) * SLICES
 
 
 NEG = -3.4028234663852886e38
@@ -104,11 +129,8 @@ ROW_BYTES = HEAD_DIM * 2
 
 
 def scratch_pairs(tokens: int, d) -> dict[str, int]:
-    return {
-        "am": tokens * SPLITS * d.heads,
-        "al": tokens * SPLITS * d.heads,
-        "ap": tokens * d.head_tiles.count * SPLITS * 64 * 2,
-    }
+    """AS: every (token, tile, chunk, head, key)'s raw score, a pair each."""
+    return {"as": tokens * d.head_tiles.count * CHUNKS * HEAD_TILE * CH}
 
 
 def tile_task(task, per, tiles):
@@ -131,82 +153,431 @@ def tile_head(d, tile, h):
     return fx.min(head, d.heads - 1), head < d.heads
 
 
-def _row_ptr(pool, row, byte):
-    """Pool row ``row`` at ``byte``: 64-bit, a row index times the 1 KB row
-    passing 2^32 (``pool_index.row_offset``), so neither a buffer offset nor an
-    i32 product can carry it."""
-    return pool + fx.Int64(row) * ROW_BYTES + fx.Int64(byte)
+def _plane_ptr(c, row, scale=False):
+    """An FP8 key row's data (or ``scale``) plane row. The row space
+    concatenates this owner's CSA and this layer's SWA; in the layer kernel a
+    row of this step is ``row`` = -1 - j for row j of ``kvrow``
+    (``dims.kvrow_bytes``)."""
+    a = c["args"]
+    width = HEAD_DIM // 32 if scale else HEAD_DIM
+    is_window = row >= a["ring_off"]
+    base = is_window.select(
+        a["window_scale"] if scale else a["window"],
+        a["pool_scale"] if scale else a["pool"],
+    )
+    local = is_window.select(row - a["ring_off"], row)
+    pool_row = base + fx.Int64(local) * width
+    if const_expr(not c["fused"]):
+        return pool_row
+    plane = a["kvrow"] + (kvrow_scale0(c["S"]) if scale else 0)
+    step_row = plane + fx.Int64(-1 - row) * width
+    return fx.Int64((row < 0).select(step_row, pool_row))
 
 
-def _rows_to_lds(c, pool, slot, kv):
-    """A split's 16 key rows (row ``slot`` of lane k, k < 16) whole into this
-    wave's LDS ``kv``: one LDS DMA a row, 16 B a lane, read back in the MFMA's
-    layout (``_rows_from_lds``). A descriptor a row: the pool passes the 4 GiB
-    a buffer descriptor reaches, so no one view of it can be copied from."""
-    for r in range_constexpr(BK):
-        row = readlane(slot, r)
-        rocdl.buffer_load_to_lds(
-            rsrc(pool + fx.Int64(row) * ROW_BYTES),
-            fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
-            c["lane"] * 16,
-            size_bytes=16,
-        )
+def _row_ptr(pool, row, byte, row_bytes):
+    """Pool row ``row`` at ``byte``: 64-bit, a row index times the row passing
+    2^32 (``pool_index.row_offset``), so neither a buffer offset nor an i32
+    product can carry it."""
+    return pool + fx.Int64(row) * row_bytes + fx.Int64(byte)
 
 
-def _rows_from_lds(c, kv):
-    """The split's key operands back from LDS ``kv``: lane l row l % 16, bytes
-    (ch 32 + 8 (l // 16)) 2, a K chunk ch each (``_score_split``'s ``kws``)."""
-    lane = c["lane"]
-    at = kv + (lane % BK) * SCORE_LDS_ROW + 4 * (lane // 16)
+def _key_base(c, pool, row, row_bytes):
+    """Key row ``row``'s address (``_key_row``): a pool row, or in the layer
+    kernel a row of this step, ``row`` = -1 - j for row j of ``kvrow``."""
+    if const_expr(not c["fused"]):
+        return _row_ptr(pool, row, 0, row_bytes)
+    step_row = c["args"]["kvrow"] + fx.Int64(-1 - row) * row_bytes
+    return fx.Int64((row < 0).select(step_row, _row_ptr(pool, row, 0, row_bytes)))
+
+
+def _new_rows(c, t):
+    """The layer kernel: token t's window keys written in this launch, the
+    last ``n`` of its count, and the step row of its last key: (n, that row).
+    Causal (the target): its own and its request's earlier rows of the step
+    (a request's rows consecutive, their slot row base, ``kmeta`` word 3,
+    alike), its last key its own. A block of ``block_rows`` (the DSpark
+    draft's: every row sees all of it, a request's block at rows
+    ``[r * block_rows, (r + 1) * block_rows)``): the whole block, its last
+    key the block's last row. None in a K2 launch, whose keys are all in the
+    pool."""
+    if const_expr(not c["fused"]):
+        return None
+    block = c["block_rows"]
+    if const_expr(block):
+        return fx.Int32(block), t - t % block + (block - 1)
+    kmeta = c["args"]["kmeta"]
+    base = ld_i32(kmeta, t * KMETA + 3)
+    run, own = fx.Int32(1), fx.Int32(1)
+    for k in range(1, c["S"]):
+        same = (t - k >= 0) & (ld_i32(kmeta, fx.max(t - k, 0) * KMETA + 3) == base)
+        own = same.select(own, fx.Int32(0))
+        run = run + own
+    return run, t
+
+
+def _slot_valid(meta, slot):
+    """Whether key slot ``slot`` of the token (``_keys``' ``meta``) holds a key
+    (``attention_plan.slot_valid``)."""
+    n_sel, _, _, count, _, _, sel_slots, _ = meta
+    return aplan.slot_valid(slot, n_sel, count, sel_slots)
+
+
+@traced
+def await_step_rows(c, meta, last_slot):
+    """The layer kernel: before this wave loads key slots up to ``last_slot``
+    of a token (``_keys``' ``meta``), this launch's window rows (KRDY, every
+    token) written if one of them is among them, polled at K1's tag (the
+    wave's own loads follow: no barrier). The selected keys and the older
+    window rows, from earlier launches, need no wait."""
+    if const_expr(c["fused"]):
+        _, _, _, count, _, (n_new, _), sel_slots, _ = meta
+        if last_slot >= sel_slots + count - n_new:
+            c["k1_poll"]([(c["krdy"], c["lane"] % c["S"], 1)])
+
+
+@traced
+def _q_tile(c, t, tile):
+    """The layer kernel: token t's q of a head tile from wq_b's tagged pairs
+    (QP, K1's tag), polled once a CTA into LDS (``red``, which the score stage
+    has no other use for: exactly a tile's bf16 q, a head a ``Q_LDS_ROW`` row;
+    a thread 16 values) -> its words there."""
+    d, tid = c["d"], c["tid"]
+    q = fx.recast_iter(fx.Int32, c["red"])
+    # a thread 8 words of one head's row: 32 threads a row
+    assert THREADS * 8 == HEAD_TILE * HEAD_DIM // 2
+    row_words = HEAD_DIM // 2 // 8
+    # a ragged tile's dead heads poll the last live one's row (``tile_head``):
+    # past it the pairs are the next token's, or past the step's, never written
+    head = tile_head(d, tile, tid // row_words)[0]
+    base = (t * d.heads + head) * HEAD_DIM + tid % row_words * 16
+    got = c["k1_poll"]([(c["qp"], Quad(base // 4 + k), 2) for k in range(4)])
+    words = [w for pair in got for w in pair]
+    at = tid // row_words * Q_LDS_ROW + tid % row_words * 8
+    fx.ptr_store(fx.Vector.from_elements(words, fx.Int32), q + at)
+    gpu.barrier()
+    return q
+
+
+def _q_tile_words(q, head, g):
+    """``_q_words`` of head ``head`` of the tile in LDS ``q`` (``_q_tile``)."""
     return [
         fx.Vector(
-            fx.ptr_load(at + ch * 16, result_type=fx.Vector.make_type(4, fx.Int32))
+            fx.ptr_load(
+                q + (head * Q_LDS_ROW + (ch * 32 + 8 * g) // 2),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
         )
         for ch in range(HEAD_DIM // 32)
     ]
 
 
-def _ld_row4(pool, row, byte):
+def _dequant8(w0, w1, code):
+    """Eight E4M3 of two dwords times their E8M0 ``code``, as bf16 pairs (exact:
+    a power of two times an E4M3 is a bf16) -- a BF16 pool's operand words."""
+    return mxfp8_to_bf16x8(w0, w1, pow2(code)).bitcast(fx.Int32)
+
+
+def _q_load4(c, at):
+    """Four words of q at word ``at`` (q's [token][head][dim] layout): of
+    ``q``, or in the layer kernel polled from wq_b's tagged pairs (QP, K1's
+    tag), as ``_q_tile`` does."""
+    if const_expr(not c["fused"]):
+        return fx.Vector(
+            bo.buffer_load(rsrc(c["args"]["q"]), at, vec_width=4, dtype=T.i32)
+        )
+    got = c["k1_poll"]([(c["qp"], Quad(at // 2 + k), 2) for k in range(2)])
+    return fx.Vector.from_elements([w for pair in got for w in pair], fx.Int32)
+
+
+def _q_step(c, row, g, st):
+    """K step ``st`` of head ``row``'s q (bf16, ``row`` its word offset,
+    ``_q_load4``) as the 16x16x128 scaled MFMA's B operand. Lane group j holds dims 16 j .. + 16
+    of the step, then 16 from 64 past them, but its E8M0 scales block j (dims
+    32 j .. + 32): a half's block, here dims 128 st + 16 g (+ 64) and the 16
+    of lane group g ^ 1 (xor 16), takes their amax, and block g's code comes
+    from a half of this pair or of the one xor 32. Quantized by the KV row's
+    rule (amax floored at AMAX_FLOOR, the ceil code, an exact x / scale, E4M3
+    RNE): 8 words, and block g's code."""
+    words, codes = [], []
+    for half in range_constexpr(2):
+        at = row + (st * 128 + half * 64 + 16 * g) // 2
+        v = [
+            _q_load4(c, at + 4 * i).bitcast(fx.BFloat16).to(fx.Float32)
+            for i in range(2)
+        ]
+        v = [v[i // 8][i % 8] for i in range(16)]
+        amax = fx.Float32(0.0)
+        for i in range_constexpr(16):
+            amax = fx.max(amax, abs(v[i]))
+        amax = butterfly(amax, (16,), fx.max)
+        code = code_ceil(
+            fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX)
+        )
+        inv = rcp_pow2(code)
+        words += [
+            fp8_pack4(*[clamp_fp8(v[4 * k + i] * inv) for i in range(4)])
+            for k in range(4)
+        ]
+        codes.append(fx.Int32(code))
+    lo, hi = codes
+    mine = (g == 0).select(
+        lo,
+        (g == 1).select(xshfl(lo, 32), (g == 2).select(xshfl(hi, 32), hi)),
+    )
+    return words, mine
+
+
+@traced
+def _q_shared(c, row, g):
+    """The task's q operands (``_q_step``, its words straight from ``q`` or
+    from wq_b's pairs: no LDS staging first) for every K step, each quantized
+    once a CTA: wave w < 4 its step w into LDS ``score_q`` (``Q_LDS_CODES``),
+    then every wave reads all four. The second barrier keeps a fast wave's
+    next task from overwriting what a slow one has yet to read."""
+    lane, wave = c["lane"], c["wave"]
+    q = c["att"]["score_q"]
+    if wave < HEAD_DIM // 128:
+        words, code = _q_step(c, row, g, wave)
+        fx.ptr_store(
+            fx.Vector.from_elements(words, fx.Int32), q + (wave * 64 + lane) * 8
+        )
+        fx.ptr_store(fx.Int32(code), q + (Q_LDS_CODES + wave * 64 + lane))
+    gpu.barrier()
+    out = []
+    for st in range_constexpr(HEAD_DIM // 128):
+        out.append(
+            (
+                fx.Vector(
+                    fx.ptr_load(
+                        q + (st * 64 + lane) * 8,
+                        result_type=fx.Vector.make_type(8, fx.Int32),
+                    )
+                ),
+                fx.Int32(
+                    fx.ptr_load(q + (Q_LDS_CODES + st * 64 + lane), result_type=T.i32)
+                ),
+            )
+        )
+    rocdl.s_waitcnt(lgkmcnt=0)
+    gpu.barrier()
+    return out
+
+
+@traced
+def _rows_to_lds(c, pool, slot, kv):
+    """A split's 16 key rows (row ``slot`` of lane k, k < 16) whole into this
+    wave's LDS ``kv``, 16 B a lane, read back in the MFMA's layout
+    (``_rows_from_lds``). Descriptors are row-local because the pool can exceed
+    4 GiB. FP8: the data plane only, lanes 0..31 (its scales: ``_row_codes``);
+    each lane's row's address is computed once (``slot``: its own row), a
+    row's read from its lane before the lanes split (a lane branch would have
+    the compiler compute it there, on its lanes only)."""
+    if const_expr(c["kv_fp8"]):
+        data = _plane_ptr(c, slot)
+    for r in range_constexpr(BK):
+        if const_expr(c["kv_fp8"]):
+            row_data = readlane64(data, r)
+            if c["lane"] < HEAD_DIM // 16:
+                rocdl.buffer_load_to_lds(
+                    rsrc(row_data, HEAD_DIM),
+                    fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
+                    c["lane"] * 16,
+                    size_bytes=16,
+                )
+        else:
+            row = readlane(slot, r)
+            rocdl.buffer_load_to_lds(
+                rsrc(_key_base(c, pool, row, ROW_BYTES)),
+                fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
+                c["lane"] * 16,
+                size_bytes=16,
+            )
+
+
+def _row_codes(c, slot):
+    """FP8 row ``slot``'s 16 E8M0 codes (a word a K step of 128), straight
+    into this lane's registers: lane l's row is l % 16 (``_rows_to_lds``)."""
     ptr = fx.inttoptr(
-        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16), _row_ptr(pool, row, byte)
+        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
+        _plane_ptr(c, slot, scale=True),
     )
     return fx.Vector(fx.ptr_load(ptr, result_type=fx.Vector.make_type(4, fx.Int32)))
 
 
-def _keys(a, t):
-    """Token t's key count and what ``_key_row`` needs: its selected count (the
-    selection's valid ids, ``index_plan.selected`` of its scorer's bound), its
-    first window position and its slot's row base (word 2 of its metadata, the
-    block table offset, is the indexer's: ``index_score._selected_rows``)."""
+def _rows_from_lds(c, kv, codes=None):
+    """The split's key operands back from LDS ``kv``, lane l row l % 16: a BF16
+    row's bytes (ch 32 + 8 (l // 16)) 2, a K chunk ch each; an FP8 row's
+    scaled-MFMA A operand (``_q_step``'s layout) -- K step st's 16 bytes from
+    128 st + 16 (l // 16), then 16 from 64 past them -- with ``codes``
+    (``_row_codes``)."""
+    lane = c["lane"]
+    g = lane // 16
+    row = kv + (lane % BK) * SCORE_LDS_ROW
+    if const_expr(not c["kv_fp8"]):
+        return [
+            fx.Vector(
+                fx.ptr_load(
+                    row + 4 * g + ch * 16, result_type=fx.Vector.make_type(4, fx.Int32)
+                )
+            )
+            for ch in range(HEAD_DIM // 32)
+        ]
+    steps = []
+    for st in range_constexpr(HEAD_DIM // 128):
+        lo, hi = (
+            fx.Vector(
+                fx.ptr_load(
+                    row + st * 32 + half * 16 + 4 * g,
+                    result_type=fx.Vector.make_type(4, fx.Int32),
+                )
+            )
+            for half in range(2)
+        )
+        steps.append(
+            fx.Vector.from_elements(
+                [lo[e] for e in range(4)] + [hi[e] for e in range(4)], fx.Int32
+            )
+        )
+    return steps, codes
+
+
+def _ld_row4(c, pool, row, col):
+    """Row ``row``'s 8 columns from ``col``, as loaded (``_tile_words`` turns
+    them into bf16 pairs where they are used, so the loads stay in flight):
+    a BF16 row's 16 B, or an FP8 row's 8 B (their scale: ``_ld_codes``)."""
+    if const_expr(not c["kv_fp8"]):
+        ptr = fx.inttoptr(
+            fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
+            _key_base(c, pool, row, ROW_BYTES) + fx.Int64(col * 2),
+        )
+        return fx.Vector(fx.ptr_load(ptr, result_type=fx.Vector.make_type(4, fx.Int32)))
+    values = fx.inttoptr(
+        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 8),
+        _plane_ptr(c, row) + fx.Int64(col),
+    )
+    return fx.Vector(fx.ptr_load(values, result_type=fx.Vector.make_type(2, fx.Int32)))
+
+
+def _ld_codes(c, row, dc):
+    """FP8 row ``row``'s E8M0 codes of column groups 4 (dc // 4) .. + 4, a byte
+    each in one word: a PV task's consecutive groups take one load a row."""
+    ptr = fx.inttoptr(
+        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+        _plane_ptr(c, row, scale=True) + fx.Int64(dc // 4 * 4),
+    )
+    return fx.Int32(fx.ptr_load(ptr, result_type=T.i32))
+
+
+def _tile_words(c, tile, code=None):
+    """An ``_ld_row4`` result as 4 bf16-pair words (an FP8 one by its group's
+    E8M0 ``code``)."""
+    if const_expr(not c["kv_fp8"]):
+        return tile
+    return _dequant8(tile[0], tile[1], code)
+
+
+def _keys(c, t):
+    """Token t's key slots (``attention_plan``) and what ``_key_row`` needs:
+    its selected count (the selection's valid ids, ``index_plan.selected`` of
+    its scorer's bound), its first window position's ring slot and its slot's
+    row base (word 2 of its metadata, the block table offset, is the
+    indexer's: ``index_score._selected_rows``), its window count and, in the
+    layer kernel, its window rows of this step (``_new_rows``)."""
+    a = c["args"]
     first, count, base = [ld_i32(a["kmeta"], t * KMETA + i) for i in (0, 1, 3)]
     n_sel = ip.selected(fx.Int32(ld_dev(a["sbound"], t)))
-    return aplan.kv_len(n_sel, count), (n_sel, first, base)
+    first_slot = first % a["ring_slots"]
+    new = _new_rows(c, t)
+    fresh = None
+    if const_expr(c.get("cp_ratio")):
+        # a compressing layer kernel: (ratio, the request's first position of
+        # the step, the token's) -- which selected entries this launch writes;
+        # the request's rows before t and t itself: ``new`` less those past it
+        pos = ld_i32(a["pos"], 2 * t)
+        n_new, last = new
+        fresh = (c["cp_ratio"], pos - (n_new - (last - t) - 1), pos, c["S"])
+    return n_sel, first_slot, base, count, t, new, c["sel_slots"], fresh
 
 
 @traced
 def await_selection(c, t):
     """A layer that selects: its token t's selection is written this launch. A
     build without the indexer (``index_bound_max`` 0: the DSpark draft) has no
-    selection to wait for."""
+    selection to wait for. A compressing layer kernel: this launch's new
+    entries too (every compress plan row's CRDY, a lane each), before any of
+    them is read from ``kvrow``."""
+    fresh = c.get("cp_ratio")
     if const_expr("irdy" in c):  # noqa: SIM102
         if c["args"]["iact"] != 0:
             c["poll"]([(c["irdy"], t, 1)])
+    if const_expr(fresh):  # noqa: SIM102
+        if c["cp_ncap"] > 0:
+            c["k1_poll"]([(c["crdy"], fx.min(c["lane"], c["cp_ncap"] - 1), 1)])
 
 
-def _key_row(a, t, meta, key):
-    """Pool row of token t's key ``key``, in the original index build's order
-    (``indices._indices``): the selected compressed rows ascending (``sel``: the
-    pool rows the selecting layer's indexer wrote with its selection,
-    ``index_score._selected_rows``), then the window rows oldest first."""
-    n_sel, first, base = meta
-    key = fx.max(key, 0)
-    picked = key < n_sel
-    # a layer without a selection passes a dummy ``sel``: its row is never used
-    selected = fx.Int32(
-        picked.select(ld_dev(a["sel"], t * a["topk"] + fx.min(key, a["topk"] - 1)), 0)
+def _key_row(a, t, meta, slot):
+    """Pool row of token t's key slot ``slot`` (``attention_plan``): a
+    selection slot's (``_selected_row``, its word loaded here) or a window
+    slot's (``_window_row``). For a slot whose kind is not known at trace time
+    (the score's: its chunk is the task's); a pass over a known kind calls
+    those directly."""
+    at = t * a["topk"] + fx.min(slot, a["topk"] - 1)
+    word = _sel_word(a, meta[7] is not None, at)
+    sel_slots = meta[6]
+    return fx.Int32(
+        (slot < sel_slots).select(
+            _selected_row(meta, slot, word), _window_row(a, t, meta, slot - sel_slots)
+        )
     )
-    window = base + a["ring_off"] + (first + key - n_sel) % a["ring_slots"]
-    return fx.Int32(picked.select(selected, window))
+
+
+def _sel_word(a, fresh, at):
+    """Selection word ``at`` as ``_selected_row`` takes it: (its pool row, and
+    in a compressing layer kernel -- ``fresh`` -- its compressed index,
+    ``isel``)."""
+    ci = ld_dev(a["isel"], at) if fresh else None
+    return ld_dev(a["sel"], at), ci
+
+
+def _selected_row(meta, slot, word):
+    """Selection slot ``slot``'s pool row (``word``: the selecting layer's
+    indexer's ``(pool row, compressed index)``, ``index_score._selected_rows``),
+    row 0 past the token's selection (its value masked; a layer without one
+    passes a dummy ``sel``). A compressing layer kernel's entry this launch
+    writes for the token -- index in [p_first // ratio, (pos + 1) // ratio):
+    completed at or before its position, not before the step -- is
+    -1 - (S + r), r the step row completing it (<= t): its ``kvrow`` row
+    (``_key_base``)."""
+    n_sel, fresh = meta[0], meta[7]
+    row, ci = word
+    if const_expr(fresh is not None):
+        ratio, p_first, pos, s = fresh
+        t = meta[4]
+        step_row = -1 - (s + t - (pos - (ratio * ci + ratio - 1)))
+        this_step = (ci >= p_first // ratio) & (ci < (pos + 1) // ratio)
+        row = this_step.select(step_row, row)
+    return fx.Int32((slot < n_sel).select(row, 0))
+
+
+def _window_row(a, t, meta, w):
+    """Window slot w's row (oldest first): the ring row of the first window
+    position's slot plus w; in the layer kernel the last ``n_new`` of its
+    ``count`` this step's (``_new_rows``), -1 - its step row (``_key_base``),
+    counted back from the last key's."""
+    _, first_slot, base, count, _, new, _, _ = meta
+    # a window key's offset is below the window, which the ring holds: its
+    # slot past the first one's wraps at most once. A slot past the token's
+    # count (a chunk's tail, its value masked) takes the last key's row: its
+    # load must stay in the ring, which a small one (the draft's) would leave
+    slot = first_slot + fx.min(w, fx.max(count - 1, 0))
+    slot = (slot >= a["ring_slots"]).select(slot - a["ring_slots"], slot)
+    row = base + a["ring_off"] + slot
+    if const_expr(new is None):
+        return fx.Int32(row)
+    n_new, last = new
+    step = (w >= count - n_new) & (w < count)
+    step_row = -1 - (last - (count - 1 - w))
+    return fx.Int32(step.select(step_row, row))
 
 
 def only_live(cond, live):
@@ -214,36 +585,87 @@ def only_live(cond, live):
     return cond if live is True else cond & live
 
 
-def _ms(d, t, s, h):
-    return (t * SPLITS + s) * d.heads + h
+def _as(d, t, tile, chunk, head, key):
+    """AS's pair of token t's head tile, chunk, head (of the tile), key (of the
+    chunk)."""
+    return (
+        ((t * d.head_tiles.count + tile) * CHUNKS + chunk) * HEAD_TILE + head
+    ) * CH + key
 
 
-def _ap(d, t, tile, s):
-    """Split s of token t's head tile in AP: its bf16 p, a pair a lane."""
-    if d.head_tiles.count == 1:
-        return (t * SPLITS + s) * 64
-    return ((t * d.head_tiles.count + tile) * SPLITS + s) * 64
+def score_tasks(tokens, tiles) -> tuple[int, int]:
+    """(chunks a score task, the stage's tasks): ``attention_plan.score_chunks``."""
+    per = aplan.score_chunks(tokens, tokens * tiles * CHUNKS, BLOCKS)
+    return per, tokens * tiles * CHUNKS // per
 
 
 @traced
 def stage_attn_score(c, task, per):
-    """Score task ``task``, ``per`` a (token, head tile) (``score_tasks``): wave
-    w its splits (sg + per k) 8 + w, each split's key rows through the wave's
-    LDS (``_rows_to_lds``), the next split's in flight under a split's MFMAs."""
+    """Score task ``task`` (token, head tile, ``per`` chunks from per x its
+    index): waves 4 i .. 4 i + 3 chunk i's 16-key rows through their LDS
+    (``_rows_to_lds``), in flight through q's wait; the other waves join the
+    CTA's barriers only. A chunk without a key of the token
+    (``attention_plan.chunk_written``) is not written."""
     lane, wave, d = c["lane"], c["wave"], c["d"]
     a = c["args"]
     g = lane // 16
     head = lane % 16
-    t, tile, sg = tile_task(task, per, d.head_tiles)
+    t, tile, cg = tile_task(task, CHUNKS // per, d.head_tiles)
     qh, live = tile_head(d, tile, head)
+    # the FP8 pool's original attention reads q as MXFP8 (``rope_quant_window``'s
+    # ``query_fp8``): quantized before a selection's wait, which it does not
+    # depend on; without one, under the rows' DMA
+    q_first = c["kv_fp8"] and "irdy" in c
+    if const_expr(q_first):
+        q8 = _q_shared(c, (t * d.heads + qh) * (HEAD_DIM // 2), g)
+    # the token's metadata (the host's) before the selection's wait: after it
+    # only the selection words' loads stand before the rows' DMA
+    meta = _keys(c, t)
     await_selection(c, t)
-    kv_len, meta = _keys(a, t)
-    ss = [
-        aplan.score_split(sg, per, k, wave)
-        for k in range(aplan.score_splits_a_wave(per))
+    n_sel, count = meta[0], meta[3]
+    sel_slots = c["sel_slots"]
+    written = [
+        aplan.chunk_written(cg * per + i, n_sel, count, sel_slots) for i in range(per)
     ]
-    slots = [_key_row(a, t, meta, fx.min(s * BK + head, kv_len - 1)) for s in ss]
-    qws = [
+    if written[0] if per == 1 else written[0] | written[1]:
+        slot_w = fx.min(wave, SCORE_WAVES * per - 1)
+        chunk = cg * per + slot_w // SCORE_WAVES
+        key0 = chunk * CH + slot_w % SCORE_WAVES * BK
+        slot = _key_row(a, t, meta, key0 + head)
+        kv = c["att"]["score_kv"] + slot_w * SCORE_LDS_WORDS
+        keyed = (wave < SCORE_WAVES * per) & aplan.chunk_written(
+            chunk, n_sel, count, sel_slots
+        )
+        codes = fx.Vector.filled(4, 0, fx.Int32)
+        if keyed:
+            await_step_rows(c, meta, key0 + BK - 1)
+            _rows_to_lds(c, a["pool"], slot, kv)
+            if const_expr(c["kv_fp8"]):
+                codes = _row_codes(c, slot)
+        if const_expr(q_first):
+            qws = q8
+        elif const_expr(c["kv_fp8"]):
+            qws = _q_shared(c, (t * d.heads + qh) * (HEAD_DIM // 2), g)
+        elif const_expr(c["fused"]):
+            # the layer kernel: the tile's q from K1's pairs, in LDS
+            qws = _q_tile_words(_q_tile(c, t, tile), qh - tile * HEAD_TILE, g)
+        else:
+            qws = _q_words(a, d, t, qh, g)
+        if keyed:
+            rocdl.s_waitcnt(vmcnt=0)
+            kws = _rows_from_lds(c, kv, codes)
+            # the whole read-back before the first MFMA (left to the scheduler,
+            # each MFMA waited on its own chunk's read)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            _score_keys(c, t, tile, chunk, key0, qh, live, meta, kws, qws)
+        # the next task's rows overwrite the LDS this one read
+        gpu.barrier()
+
+
+def _q_words(a, d, t, qh, g):
+    """Token t's q of head ``qh``, this lane's 16 B of each 32-dim chunk (the
+    score MFMA's B operand)."""
+    return [
         fx.Vector(
             bo.buffer_load(
                 rsrc(a["q"]),
@@ -254,230 +676,268 @@ def stage_attn_score(c, task, per):
         )
         for ch in range(HEAD_DIM // 32)
     ]
-    kv = c["att"]["score_kv"] + c["wave"] * SCORE_LDS_WORDS
-    _rows_to_lds(c, a["pool"], slots[0], kv)
-    for k in range_constexpr(len(ss)):
-        rocdl.s_waitcnt(vmcnt=0)
-        kws = _rows_from_lds(c, kv)
-        if const_expr(k + 1 < len(ss)):
-            # the read-back done before the next split's rows overwrite it
-            rocdl.s_waitcnt(lgkmcnt=0)
-            _rows_to_lds(c, a["pool"], slots[k + 1], kv)
-        _score_split(c, t, tile, ss[k], qh, live, kv_len, kws, qws)
 
 
 @traced
-def _score_split(c, t, tile, s, qh, live, kv_len, kws, qws):
-    """Split s of token t, head tile ``tile``, on this wave from its key and q
-    operands: the scores' max, sum and bf16 probabilities -> AM / AL / AP."""
+def _score_keys(c, t, tile, chunk, key0, qh, live, meta, kws, qws):
+    """Key slots key0 .. key0 + 16 of token t, head tile ``tile``, on this wave
+    from its key and q operands: scores x qk_scale, NEG at a slot without a
+    key -> AS (lane (g, head): slots 4 g .. + 4 of its head, two pairs a
+    store)."""
     lane, d = c["lane"], c["d"]
     a = c["args"]
     g = lane // 16
-    if s < aplan.written_splits(kv_len):
-        key = s * BK + lane % 16
-        ok = key < kv_len
-        sc = fx.Vector.filled(4, 0.0, fx.Float32)
+    ok = _slot_valid(meta, key0 + lane % 16)
+    sc = fx.Vector.filled(4, 0.0, fx.Float32)
+    if const_expr(c["kv_fp8"]):
+        # 4 scaled FP8 MFMAs (K = 128): a slot without a key zero at unit
+        # scale (a zero operand does not hold back a NaN scale)
+        steps, codes = kws
+        for st in range_constexpr(HEAD_DIM // 128):
+            kw = fx.Vector.from_elements(
+                [ok.select(steps[st][e], fx.Int32(0)) for e in range(8)], fx.Int32
+            )
+            kcode = ok.select(codes[st] >> (8 * g) & 0xFF, fx.Int32(UNIT_SCALE))
+            qw, qcode = qws[st]
+            sc = mfma_scaled(kw, qw, sc, kcode, qcode)
+    else:
         for ch in range_constexpr(HEAD_DIM // 32):
             kw = fx.Vector.from_elements(
                 [ok.select(kws[ch][e], fx.Int32(0)) for e in range(4)], fx.Int32
             )
             qw = qws[ch]
             sc = mfma_bf16(kw.bitcast(fx.BFloat16), qw.bitcast(fx.BFloat16), sc)
-        scale = fx.Int32(a["qk_scale"]).bitcast(fx.Float32)
-        sv = [
-            fx.Float32(
-                (s * BK + 4 * g + i < kv_len).select(sc[i] * scale, fx.Float32(NEG))
-            )
-            for i in range(4)
-        ]
-        m = butterfly(
-            fx.max(fx.max(sv[0], sv[1]), fx.max(sv[2], sv[3])), (32, 16), fx.max
-        )
-        p = [hw_exp2(sv[i] - m) for i in range(4)]
-        ssum = (p[0] + p[2]) + (p[1] + p[3])
-        ssum = ssum + xshfl(ssum, 32)
-        ssum = ssum + xshfl(ssum, 16)
-        if only_live(g == 0, live):
-            c["put"](c["am"], _ms(d, t, s, qh), m)
-            c["put"](c["al"], _ms(d, t, s, qh), ssum)
-        pw = fx.Vector.from_elements(p, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
-        c["put_words"](c["ap"], (_ap(d, t, tile, s) + lane) * 2, [pw[0], pw[1]])
-
-
-def _l_tree(l, alpha, lane):
-    """The reduce's sum of l x alpha over lanes = splits (read at lane 63)."""
-    x = l * alpha
-    v = fx.Float32(fmath.fma(l, alpha, row_shr(x, lane, 8)))
-    for k in (4, 2, 1):
-        v = row_shr(v, lane, k) + v
-    row = lane // 16
-    b15 = lane_gather(v.bitcast(fx.Int32), fx.max(row * 16 - 1, 0)).bitcast(fx.Float32)
-    v = fx.Float32((row % 2 == 1).select(b15 + v, v))
-    b31 = lane_gather(v.bitcast(fx.Int32), 31).bitcast(fx.Float32)
-    v = fx.Float32((row >= 2).select(b31 + v, v))
-    return lane_gather(v.bitcast(fx.Int32), 63).bitcast(fx.Float32)
-
-
-@traced
-def _stat_specs(c, t, tile, last, lane, wave):
-    """Lane = split (``attention_plan.polled_split``), wave w: (m, l) of the tile's heads 2 w,
-    2 w + 1."""
-    d = c["d"]
-    src = aplan.polled_split(lane, last)
-    heads = [tile_head(d, tile, 2 * wave + k)[0] for k in range(2)]
-    return [(c["am"], _ms(d, t, src, heads[k]), 1) for k in range(2)] + [
-        (c["al"], _ms(d, t, src, heads[k]), 1) for k in range(2)
+    scale = fx.Int32(a["qk_scale"]).bitcast(fx.Float32)
+    sv = [
+        fx.Float32(
+            _slot_valid(meta, key0 + 4 * g + i).select(sc[i] * scale, fx.Float32(NEG))
+        ).bitcast(fx.Int32)
+        for i in range(4)
     ]
+    if only_live(True, live):
+        at = _as(d, t, tile, chunk, qh - tile * HEAD_TILE, key0 % CH + 4 * g)
+        c["put_words"](c["as"], Quad(at // 2), sv[:2])
+        c["put_words"](c["as"], Quad(at // 2 + 1), sv[2:])
+
+
+def merge_task(task, tokens, tiles):
+    """Merge task ``task`` -> (token, head tile, head group, slice)."""
+    t, tile, rest = tile_task(task, merge_groups(tokens) * SLICES, tiles)
+    return t, tile, rest // SLICES, rest % SLICES
 
 
 @traced
-def _pv_stats(got, act, lane, wave, att):
-    """``_stat_specs``' words -> per head m_max, alpha [split][head] and l_comb
-    in LDS."""
-    live = lane < act
-    for k in range_constexpr(2):
-        h = 2 * wave + k
-        m = fx.Float32(live.select(got[k][0].bitcast(fx.Float32), fx.Float32(NEG)))
-        l = fx.Float32(live.select(got[2 + k][0].bitcast(fx.Float32), fx.Float32(0.0)))
-        m_max = butterfly(m, (32, 16, 8, 4, 2, 1), fx.max)
-        alpha = hw_exp2(m - m_max)
-        l_comb = _l_tree(l, alpha, lane)
-        fx.ptr_store(alpha, att["alpha"] + (lane * HEAD_TILE + h))
-        if lane == 0:
-            fx.ptr_store(m_max, att["stat"] + h)
-            fx.ptr_store(l_comb, att["stat"] + (HEAD_TILE + h))
-
-
-@traced
-def stage_attn_pv(c, task, groups):
-    """Token t, ``groups`` column groups of 32 (from 32 ``groups`` g0) of every
-    head of a tile -> ``att["out"]`` [group][head][column] (f32 of bf16),
-    barriers included. The score outputs' poll serves every group; a group's
-    pool loads issue under the previous group's MFMAs."""
-    lane, wave, d = c["lane"], c["wave"], c["d"]
-    att = c["att"]
-    a = c["args"]
-    t, tile, g0 = tile_task(task, GROUPS // groups, d.head_tiles)
+def stage_attn_merge(c, t, tile, hg, sl, mh):
+    """Token t, heads ``mh`` hg .. of ``tile``, dims 64 sl .. -> ``att["out"]``
+    [head][64] (f32 of bf16), barriers included: every key's values landed
+    while the scores come, then one poll of them."""
+    d, a = c["d"], c["args"]
     await_selection(c, t)
-    kv_len, meta = _keys(a, t)
-    act = (kv_len + BK - 1) // BK
-    last = aplan.last_split(kv_len)
-    splits = [wave + 8 * r for r in range(8)]
-    # each split's 16 keys x 32 columns, a lane a quarter row (16 B), all issued
-    # before the first is used
-    rows = [
-        _key_row(a, t, meta, fx.min(sp * BK + lane // 4, kv_len - 1)) for sp in splits
-    ]
-
-    def group_tiles(i):
-        dc = g0 * groups + i
-        return [
-            _ld_row4(a["pool"], rows[r], (dc * COLS + 8 * (lane % 4)) * 2)
-            for r in range(8)
-        ]
-
-    tiles = group_tiles(0)
-    # thread (head, column)'s sink: one load a task, not a group
+    sels = _sel_words(c, t)
+    meta = _keys(c, t)
+    h = c["tid"] // 32 % mh
     sink = fx.Float32(
         bo.buffer_load(
-            rsrc(a["sink"]), tile_head(d, tile, c["tid"] // COLS)[0], vec_width=1,
+            rsrc(a["sink"]), tile_head(d, tile, hg * mh + h)[0], vec_width=1,
             dtype=T.f32,
         )
     )  # fmt: skip
-    stats = _stat_specs(c, t, tile, last, lane, wave)
-    # wave 0 waits (its lane = split: every split's stats) before the CTA polls:
-    # 512 spinning threads load the memory the score tasks read (S=48 -1 us)
-    if wave == 0:
-        c["poll"](stats)
+    if const_expr(c["fused"]):
+        # the task loads its last key, always one of this launch's window rows
+        # (``_new_rows`` >= 1): the poll unconditional, in flight with the
+        # metadata's loads instead of after them (``await_step_rows``)
+        c["k1_poll"]([(c["krdy"], c["lane"] % c["S"], 1)])
+    _merge_values_land(c, _merge_values(c, t, meta, sl, sels), meta, sl)
+    _merge_softmax(c, t, tile, hg, mh, meta, sink * fx.Float32(LOG2E))
     gpu.barrier()
-    # the score stage's outputs, one poll batch: stats, then each split's p
-    got = c["poll"](
-        stats
-        + [
-            (c["ap"], (_ap(d, t, tile, aplan.polled_split(sp, last)) + lane) * 2, 2)
-            for sp in splits
-        ],
-        batch=12,
-    )
-    _pv_stats(got[:4], act, lane, wave, att)
-    pws = got[4:]
-    gpu.barrier()
-    al = [fx.ptr_load(att["alpha"] + (sp * HEAD_TILE + lane % 16)) for sp in splits]
-    for i in range_constexpr(groups):
-        nxt = group_tiles(i + 1) if i + 1 < groups else None
-        _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i)
-        tiles = nxt
+    _merge_out(c, _merge_pv(c, meta, mh), mh)
+
+
+def _sel_words(c, t):
+    """``_merge_values``' selection words (``_sel_word``), a selection pass's
+    slot a thread: loaded before the token's metadata decides which slots hold
+    keys (a slot past them reads row 0, its value masked)."""
+    a, tid = c["args"], c["tid"]
+    fresh = bool(c.get("cp_ratio"))
+    return [
+        _sel_word(a, fresh, t * a["topk"] + fx.min(i * 64 + tid // 8, a["topk"] - 1))
+        for i in range(aplan.window_chunk(c["sel_slots"]))
+    ]
+
+
+def _merge_values(c, t, meta, sl, sels):
+    """Slice ``sl`` of the token's key slots, thread (slot tid // 8 of each
+    pass of 64, a chunk, 8-column block tid % 8): its 16 B of a BF16 row (an
+    FP8 row's 8 B and its group's code word), every pass's loads issued at
+    once, a pass's kind (selection or window) its position; a slot without a
+    key reads a row it is masked at where it lands. ``sels``: ``_sel_words``."""
+    a = c["args"]
+    tid = c["tid"]
+    col = sl * SLICE + tid % 8 * 8
+    out = []
+    sel_slots = c["sel_slots"]
+    for i in range_constexpr(CHUNKS):
+        slot = i * 64 + tid // 8
+        if const_expr(i < aplan.window_chunk(sel_slots)):
+            row = _selected_row(meta, slot, sels[i])
+        else:
+            row = _window_row(a, t, meta, slot - sel_slots)
+        code = _ld_codes(c, row, col // COLS) if c["kv_fp8"] else None
+        out.append((_ld_row4(c, a["pool"], row, col), code))
+    return out
 
 
 @traced
-def _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i):
-    """``stage_attn_pv``'s group i: each split's PV MFMAs on its key tile
-    ``tiles``, their alpha-weighted tree, the combine (with thread (head,
-    column)'s ``sink``) -> ``att["out"]`` group i."""
-    lane, wave, tid = c["lane"], c["wave"], c["tid"]
-    att = c["att"]
-    g = lane // 16
-    head = lane % 16
-    kt = att["kv"] + wave * (BK * COLS // 2)
-    accs = []
-    for r in range_constexpr(8):
-        sp = splits[r]
-        pb = fx.Vector.from_elements([pws[r][0], pws[r][1]], fx.Int32).bitcast(fx.Int16)
-        ok = sp * BK + lane // 4 < kv_len
-        # this wave's LDS tile: [key][32 columns], this lane's quarter row
+def _merge_values_land(c, vals, meta, sl):
+    """``_merge_values``' words (an FP8 row's dequantized by its group's code,
+    exact in bf16) into LDS V [8-column block][slot][8 columns], zeros at a
+    slot without a key."""
+    tid = c["tid"]
+    blk = tid % 8
+    shift = 8 * ((sl * SLICE + blk * 8) // COLS % 4)
+    for i in range_constexpr(len(vals)):
+        key = i * 64 + tid // 8
+        words, code = vals[i]
+        words = _tile_words(c, words, None if code is None else code >> shift & 0xFF)
+        ok = _slot_valid(meta, key)
         fx.ptr_store(
             fx.Vector.from_elements(
-                [ok.select(tiles[r][e], fx.Int32(0)) for e in range(4)], fx.Int32
+                [ok.select(words[e], fx.Int32(0)) for e in range(4)], fx.Int32
             ),
-            kt + (lane // 4 * (COLS // 2) + lane % 4 * 4),
+            c["att"]["vt"] + (blk * ATTENTION_KEYS_MAX + key) * 4,
         )
-        for tt in range_constexpr(2):
-            col = tt * 16 + head
-            half = [
-                fx.Int32(fx.ptr_load(kt + ((4 * g + i4) * (COLS // 2) + col // 2)))
-                >> (col % 2 * 16)
-                & 0xFFFF
-                for i4 in range(4)
-            ]
-            av = fx.Vector.from_elements(
-                [half[0] | (half[1] << 16), half[2] | (half[3] << 16)], fx.Int32
+
+
+@traced
+def _merge_softmax(c, t, tile, hg, mh, meta, sink2):
+    """Thread (chunk group g, head h of the group, key pair j): the group's
+    scores of chunks g, g + G, .. (``attention_plan.polled_chunk``; G =
+    512 / (32 mh)) in one poll; each chunk's max into LDS, then m = the max over
+    the chunks and the sink's (``sink2``: the sink x log2e); p = exp2(s - m),
+    bf16 into LDS P [head][key]; each chunk's sum of p (f32), m and the sink's
+    term's exponent per head into LDS."""
+    tid, d, att = c["tid"], c["d"], c["att"]
+    groups = THREADS // (mh * 32)
+    g, h, j = tid // (mh * 32), tid // 32 % mh, tid % 32
+    hh = tile_head(d, tile, hg * mh + h)[0] - tile * HEAD_TILE
+    n_sel, count = meta[0], meta[3]
+    ccs = [g + groups * i for i in range(-(-CHUNKS // groups))]
+    got = c["poll"](
+        [
+            (c["as"], Quad(_as(d, t, tile, aplan.polled_chunk(fx.min(cc, CHUNKS - 1), n_sel, count, c["sel_slots"]), hh, 2 * j) // 2), 2)
+            for cc in ccs
+        ]
+    )  # fmt: skip
+    svs = []
+    for i in range_constexpr(len(ccs)):
+        cc = ccs[i]
+        sv = []
+        for e in range_constexpr(2):
+            # a slot holding a key is in a written chunk: one polled in place
+            ok = (cc < CHUNKS) & _slot_valid(meta, cc * CH + 2 * j + e)
+            sv.append(
+                fx.Float32(ok.select(got[i][e].bitcast(fx.Float32), fx.Float32(NEG)))
             )
-            acc = fx.Vector(
-                rocdl.mfma_f32_16x16x16bf16_1k(
-                    T.vec(4, T.f32),
-                    [av.bitcast(fx.Int16), pb, fx.Vector.filled(4, 0.0, fx.Float32)],
+        svs.append(sv)
+    # every chunk's reduction a level at a time: their
+    # cross-lane latencies overlap, each chunk's order unchanged
+    mxs = butterflies([fx.max(sv[0], sv[1]) for sv in svs], (1, 2, 4, 8, 16), fx.max)
+    for i in range_constexpr(len(ccs)):
+        if (j == 0) & (ccs[i] < CHUNKS):
+            fx.ptr_store(mxs[i], att["mx"] + (h * CHUNKS + ccs[i]))
+    gpu.barrier()
+    m = fx.Float32(NEG)
+    for cc in range_constexpr(CHUNKS):
+        m = fx.max(m, fx.ptr_load(att["mx"] + (h * CHUNKS + cc)))
+    m = fx.max(m, sink2)
+    ps = [[hw_exp2(svs[i][e] - m) for e in range(2)] for i in range(len(ccs))]
+    # each chunk's sum apart, added in chunk order by ``_merge_out``: the same
+    # order whatever the head group's size (``merge_heads``, a width's)
+    lsums = butterflies([p[0] + p[1] for p in ps], (1, 2, 4, 8, 16))
+    for i in range_constexpr(len(ccs)):
+        cc = ccs[i]
+        pw = (
+            fx.Vector.from_elements(ps[i], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+        )
+        if cc < CHUNKS:
+            fx.ptr_store(pw[0], att["p"] + (h * P_ROW + cc * (CH // 2) + j))
+            if j == 0:
+                fx.ptr_store(lsums[i], att["sum"] + (h * CHUNKS + cc))
+    if (j == 0) & (g == 0):
+        fx.ptr_store(m, att["stat"] + h)
+        fx.ptr_store(sink2, att["stat"] + (HEAD_TILE + h))
+
+
+@traced
+def _merge_pv(c, meta, mh):
+    """P V of the slice: wave w the 16 dims 16 (w % 4) .. over key half w // 4,
+    a 16-slot block an MFMA (A = V^T by a transposing LDS read, B = P; a head
+    past the group zero), a block without a key skipped (the wave's
+    condition: the slots holding keys are a prefix of the selection's and of
+    the window's, which a block does not straddle, so its first slot says)."""
+    lane = c["lane"]
+    wave, att = c["wave"], c["att"]
+    g, n = lane // 16, lane % 16
+    db, kh = wave % 4, wave // 4
+    # ds_read_b64_tr_b16's source: lane (g, n) points at key 4 g + n // 4 of
+    # the block, columns 4 (n % 4) .. + 4 of the dim block's 8-column pair
+    tr = ((2 * db + n % 4 // 2) * ATTENTION_KEYS_MAX + 4 * g + n // 4) * 4 + n % 2 * 2
+    nn = fx.min(n, mh - 1)
+    blocks = ATTENTION_KEYS_MAX // 16 // 2
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    for b in range_constexpr(blocks):
+        kb = kh * blocks + b
+        nxt = acc
+        if _slot_valid(meta, kb * 16):
+            av = rocdl.ds_read_tr16_b64(
+                fx.Vector.make_type(4, fx.BFloat16),
+                fx.to_llvm_ptr(att["vt"] + (tr + kb * 16 * 4)),
+            ).result
+            pw = fx.Vector(
+                fx.ptr_load(
+                    att["p"] + (nn * P_ROW + (kb * 16 + 4 * g) // 2),
+                    result_type=fx.Vector.make_type(2, fx.Int32),
                 )
             )
-            live = sp < act
-            accs.append(
-                [fx.Float32(live.select(acc[j], fx.Float32(0.0))) for j in range(4)]
+            live = n < mh
+            pw = fx.Vector.from_elements(
+                [live.select(pw[e], fx.Int32(0)) for e in range(2)], fx.Int32
             )
-    for k in range_constexpr(8):
-        tt, j = k // 4, k % 4
-        av = [accs[2 * r + tt][j] for r in range(8)]
-        pr = [
-            fx.Float32(fmath.fma(av[2 * m], al[2 * m], av[2 * m + 1] * al[2 * m + 1]))
-            for m in range(4)
-        ]
-        node = (pr[0] + pr[1]) + (pr[2] + pr[3])
-        fx.ptr_store(node, att["tree"] + ((wave * 64 + lane) * 8 + k))
+            nxt = fx.Vector(
+                rocdl.mfma_f32_16x16x16bf16_1k(
+                    T.vec(4, T.f32),
+                    [fx.Vector(av).bitcast(fx.Int16), pw.bitcast(fx.Int16), acc],
+                )
+            )
+        acc = nxt
+    return acc
+
+
+@traced
+def _merge_out(c, acc, mh):
+    """The two key halves' P V summed, / the denominator (the chunks' sums in
+    chunk order and the sink's term), bf16 -> ``att["out"]`` [head][64]: lane
+    (g, n) of wave w holds dims 16 (w % 4) + 4 g .. + 4 of head n."""
+    lane, wave, att = c["lane"], c["wave"], c["att"]
+    g, n = lane // 16, lane % 16
+    db, kh = wave % 4, wave // 4
+    tree = att["tree"] + (db * 64 + lane) * 4
+    if kh == 1:
+        for i in range_constexpr(4):
+            fx.ptr_store(fx.Float32(acc[i]), tree + i)
     gpu.barrier()
-    # thread (head, column): the lane that holds the element, its node k
-    h = tid // COLS
-    col = tid % COLS
-    owner = col % 16 // 4 * 16 + h
-    k = col // 16 * 4 + col % 4
-    w = [fx.ptr_load(att["tree"] + ((ww * 64 + owner) * 8 + k)) for ww in range(8)]
-    x = [w[2 * m] + w[2 * m + 1] for m in range(4)]
-    tot = (x[0] + x[2]) + (x[1] + x[3])
-    m_max = fx.ptr_load(att["stat"] + h)
-    l_comb = fx.ptr_load(att["stat"] + (HEAD_TILE + h))
-    log2e = fx.Float32(LOG2E)
-    m_final = fx.max(m_max, sink * log2e)
-    alpha_kv = hw_exp2(m_max - m_final)
-    alpha_sink = hw_exp2(fx.Float32(fmath.fma(sink, log2e, -m_final)))
-    l_final = fx.Float32(fmath.fma(l_comb, alpha_kv, alpha_sink))
-    o = (tot * alpha_kv) / fx.max(l_final, fx.Float32(1e-30))
-    o = fx.Float32((l_final > fx.Float32(0.0)).select(o, fx.Float32(0.0)))
-    fx.ptr_store(bf16_round(o), att["out"] + ((i * HEAD_TILE + h) * COLS + col))
+    if (kh == 0) & (n < mh):
+        nn = fx.min(n, mh - 1)
+        den = fx.Float32(0.0)
+        for cc in range_constexpr(CHUNKS):
+            den = den + fx.ptr_load(att["sum"] + (nn * CHUNKS + cc))
+        m = fx.ptr_load(att["stat"] + nn)
+        sink2 = fx.ptr_load(att["stat"] + (HEAD_TILE + nn))
+        den = den + hw_exp2(sink2 - m)
+        for i in range_constexpr(4):
+            o = (fx.Float32(acc[i]) + fx.ptr_load(tree + i)) / fx.max(
+                den, fx.Float32(1e-30)
+            )
+            o = fx.Float32((den > fx.Float32(0.0)).select(o, fx.Float32(0.0)))
+            fx.ptr_store(bf16_round(o), att["out"] + (nn * SLICE + db * 16 + 4 * g + i))
     gpu.barrier()

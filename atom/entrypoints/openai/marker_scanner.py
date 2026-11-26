@@ -38,7 +38,8 @@ said the opposite before the arms were alternated.
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
+import re
+from typing import NamedTuple
 
 
 def partial_suffix_len(text: str, marker: str) -> int:
@@ -117,7 +118,7 @@ def _plan(markers: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...], d
     complete in the buffer*. A chunk ending exactly at the shorter of a
     prefix pair reports the shorter one, because the longer one has not
     arrived to be preferred -- so which of the two fires is a function of
-    where the chunk boundary landed, not of the text. `_earliest_complete`
+    where the chunk boundary landed, not of the text. `MarkerScanner.feed`
     says the same thing from the other side.
 
     Nothing here withholds a complete match on the chance it could still
@@ -138,6 +139,17 @@ def _plan(markers: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...], d
     return ordered, firsts, {k: frozenset(v) for k, v in by_len.items()}
 
 
+@functools.lru_cache(maxsize=64)
+def _pattern_for(ordered: tuple[str, ...]) -> re.Pattern:
+    """One alternation of the markers, longest first.
+
+    A search finds the leftmost position where any marker starts, and at
+    that position tries the alternatives in order, so the longest one wins:
+    the same answer as a `find` per marker, in one C call per hit.
+    """
+    return re.compile("|".join(re.escape(m) for m in ordered))
+
+
 def held_suffix_len(text: str, markers: tuple[str, ...]) -> int:
     """Longest suffix of `text` that is a proper prefix of any of `markers`.
 
@@ -150,19 +162,16 @@ def held_suffix_len(text: str, markers: tuple[str, ...]) -> int:
     return _suffix_len(text, *_plan_for(markers))
 
 
-@dataclass(frozen=True)
-class Scan:
-    """What one chunk produced.
+class Scan(NamedTuple):
+    """What one step of the scan produced.
 
     `released` is safe to send now. `hit` is the marker that completed, if one
-    did, and `rest` is everything after it -- handed back rather than kept,
-    because who owns the text after a marker is the caller's decision and not
-    this class's.
+    did. The text after it stays in the scanner: `feed("")` goes on reading
+    it, and `take_rest` hands it to a caller that routes it elsewhere.
     """
 
     released: str
     hit: str | None = None
-    rest: str = ""
 
 
 class MarkerScanner:
@@ -170,8 +179,14 @@ class MarkerScanner:
 
     Stateful across chunks and cheap to hold: what it *withholds* is bounded by
     the longest marker, which is what makes the withhold bounded and the cost
-    per chunk independent of how long the response runs. What it *scans* is
-    that tail plus the incoming chunk, which the caller sizes.
+    per chunk independent of how long the response runs.
+
+    Linear in what it is fed, however many markers that carries. It keeps one
+    buffer and a cursor, and each search runs from the cursor to the next
+    marker, so a hit neither copies the text after it nor searches past the
+    next one. Handing the remainder back on every hit, and searching all of
+    it for every marker, made one large feed quadratic in its marker count:
+    31.7 s for an 819K-character output with 32,768 markers.
     """
 
     def __init__(self, markers: tuple[str, ...]):
@@ -180,53 +195,60 @@ class MarkerScanner:
         self._plan = _plan_for(markers)
         self._markers, self._firsts, self._prefixes_by_len = self._plan
         self._longest = len(self._markers[0])
+        self._pattern = _pattern_for(self._markers)
         self._buf = ""
+        self._pos = 0  # where the unread text starts in `_buf`
 
     @property
     def held(self) -> str:
-        """What is being withheld right now. Bounded by the longest marker."""
-        return self._buf
+        """What is in hand and not yet released. After a scan that found no
+        marker, this is bounded by the longest marker."""
+        return self._buf[self._pos :]
 
     def feed(self, text: str) -> Scan:
-        buf = self._buf + text
-        if not any(c in buf for c in self._firsts):
-            # Nothing here can begin a marker, so nothing needs holding: the
-            # fast path, not a shortcut past correctness. `in` on a str is a
-            # C substring search; a set intersection would hash every
-            # character of `buf` instead, which is 25x more for the same
-            # answer and is paid once per token per stream.
-            self._buf = ""
-            return Scan(buf)
+        """Add `text` and read up to the first complete marker, if any."""
+        if text:
+            if self._pos >= len(self._buf) and not any(c in text for c in self._firsts):
+                # Nothing in hand and nothing here can begin a marker, so
+                # nothing needs holding: the fast path, not a shortcut past
+                # correctness. `in` on a str is a C substring search; a set
+                # intersection would hash every character instead, which is
+                # 25x more for the same answer and is paid once per token per
+                # stream.
+                self._reset("")
+                return Scan(text)
+            self._reset(self._buf[self._pos :] + text)
 
-        at, hit = self._earliest_complete(buf)
-        if hit is not None:
-            self._buf = ""
-            return Scan(buf[:at], hit, buf[at + len(hit) :])
+        buf, pos = self._buf, self._pos
+        # Earliest wins, and at the same position the longest does -- `<think>`
+        # must not be reported where `<thinking>` was meant when both are
+        # registered. Only among those already complete in `buf`, though: see
+        # `_plan` for why that is weaker than it sounds, and what holds the
+        # registered formats inside the gap.
+        found = self._pattern.search(buf, pos)
+        if found is not None:
+            self._pos = found.end()
+            return Scan(buf[pos : found.start()], buf[found.start() : found.end()])
 
-        cut = len(buf) - _suffix_len(buf, *self._plan)
-        self._buf = buf[cut:]
+        start = max(pos, len(buf) - self._longest + 1)
+        cut = len(buf) - _suffix_len(buf[start:], *self._plan)
+        released = buf[pos:cut]
+        self._reset(buf[cut:])
         # The invariant the whole class exists for: a stall is not something
         # to test for here, it is something that cannot be represented.
         assert len(self._buf) < self._longest, "withheld more than a marker could be"
-        return Scan(buf[:cut])
+        return Scan(released)
+
+    def take_rest(self) -> str:
+        """Everything in hand and not yet released, handed over and forgotten:
+        for a caller that routes the text after a marker somewhere else."""
+        rest = self._buf[self._pos :]
+        self._reset("")
+        return rest
 
     def flush(self) -> str:
         """Release the held tail at end of stream; it never became a marker."""
-        out, self._buf = self._buf, ""
-        return out
+        return self.take_rest()
 
-    def _earliest_complete(self, buf: str) -> tuple[int, str | None]:
-        """Where the first complete marker starts, and which one it is.
-
-        Earliest wins, and at the same position the longest does -- `<think>`
-        must not be reported where `<thinking>` was meant when both are
-        registered. Only among those already complete in `buf`, though: see
-        `_plan` for why that is weaker than it sounds, and what holds the
-        registered formats inside the gap.
-        """
-        best_at, best = len(buf), None
-        for m in self._markers:  # already longest-first
-            at = buf.find(m)
-            if 0 <= at < best_at:
-                best_at, best = at, m
-        return best_at, best
+    def _reset(self, buf: str) -> None:
+        self._buf, self._pos = buf, 0

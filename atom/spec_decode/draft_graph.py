@@ -14,33 +14,31 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from atom.utils import envs
+from atom.utils.region_graph import ReqGraph
 
 if TYPE_CHECKING:
     from atom.config import Config
 
 
-def _owned(value: Any, staged: tuple[torch.Tensor, ...] = ()) -> Any:
-    """A copy the graph pool cannot re-issue.
-
-    Outputs that alias declared staged inputs already live outside the graph
-    pool and can be handed back directly. Clone every other tensor because the
-    pool may re-issue its storage on a later replay.
-    """
+def _owned(value: Any, clones: Any) -> Any:
+    """``value`` with every tensor ``clones`` marks (``ReqGraph.allocated``:
+    in the graph pool) cloned out of it; the rest -- a staged input, a buffer
+    the model owns -- handed back as they are, as the eager pass hands them."""
     if isinstance(value, torch.Tensor):
-        if any(value.data_ptr() == tensor.data_ptr() for tensor in staged):
-            return value
-        return value.clone()
+        return value.clone() if clones else value
     if isinstance(value, tuple):
-        return tuple(_owned(v, staged) for v in value)
+        return tuple(_owned(v, c) for v, c in zip(value, clones, strict=True))
     return value
 
 
 @dataclass(frozen=True)
 class StagedInput:
-    """One staged input's type: everything but the leading batch axis."""
+    """One staged input's type: everything but the batch axis, which sits at
+    ``batch_dim`` (``1`` for MRoPE positions, ``[3, N]``)."""
 
     shape: tuple[int, ...] = ()
     dtype: torch.dtype = torch.int32
+    batch_dim: int = 0
 
 
 @dataclass
@@ -72,7 +70,8 @@ class DraftGraph:
     Everything here counts SEQUENCES, in the target's own words:
     ``scheduled_bs`` is what this rank was handed, ``running_bs`` is the
     DP-agreed batch a recording holds, and ``capture_sizes`` is the ladder
-    the startup sweep warms.
+    the startup sweep warms. A recording is a `ReqGraph` bucket per
+    ``running_bs``.
     """
 
     forward: Callable[..., Any]  # (running_bs, **staged) -> Any
@@ -81,9 +80,13 @@ class DraftGraph:
     capture_supported: bool = True
     inputs: "Mapping[str, StagedInput]" = field(default_factory=dict)
     warmup_inputs: Callable[..., None] | None = None
+    # Tells apart two passes declared over one forward, in `name` and `label`.
+    variant: str = ""
 
     _buffers: dict[str, torch.Tensor] = field(init=False, default_factory=dict)
-    _cuda_graphs: dict[int, tuple] = field(init=False, default_factory=dict)
+    # Keyed by `running_bs` alone: a pass drafts the same tokens per sequence
+    # on every step.
+    _graph: ReqGraph = field(init=False, default_factory=ReqGraph)
 
     @property
     def name(self) -> str:
@@ -94,7 +97,8 @@ class DraftGraph:
         across the repo on its own, and the words available -- "block", "step"
         -- are the three most overloaded in it.
         """
-        return self.forward.__qualname__
+        name = self.forward.__qualname__
+        return f"{name}[{self.variant}]" if self.variant else name
 
     def bind(self, config: "Config", device) -> "DraftGraph":
         """Give the declared pass its storage. Once, at drafter init.
@@ -109,7 +113,11 @@ class DraftGraph:
         )
         self._buffers = {
             role: torch.zeros(
-                (config.max_num_seqs, *staged.shape),
+                (
+                    *staged.shape[: staged.batch_dim],
+                    config.max_num_seqs,
+                    *staged.shape[staged.batch_dim :],
+                ),
                 dtype=staged.dtype,
                 device=device,
             )
@@ -123,7 +131,8 @@ class DraftGraph:
         return self.capture_supported and envs.ATOM_DRAFT_CUDAGRAPH
 
     def label(self, scheduled_bs: int, running_bs: int) -> str:
-        """``bs=<scheduled>/<running>``, plus ``graph`` when this step replays.
+        """``bs=<scheduled>/<running>``, plus ``graph`` when this step replays,
+        plus the ``variant`` when there is one.
 
         One convention, one implementation: "did the draft get into a graph" is
         then a single grep across every flavor, rather than each flavor writing
@@ -131,19 +140,25 @@ class DraftGraph:
         predicate `run` does, so the mark cannot claim a replay that did not
         happen.
         """
-        return f"bs={scheduled_bs}/{running_bs}" + (
+        label = f"bs={scheduled_bs}/{running_bs}" + (
             " graph" if self.is_captured(running_bs) else ""
         )
+        return f"{label} {self.variant}" if self.variant else label
 
     def stage(
         self, running_bs: int, srcs: "Mapping[str, torch.Tensor]"
     ) -> dict[str, torch.Tensor]:
-        """Copy every input into its fixed buffer, widening the batch to ``running_bs``.
+        """Copy every input into its fixed buffer, widening to ``running_bs``.
 
         How many rows are real comes from the sources, never from the caller: a
         count that cannot disagree with the tensor it describes.
         """
-        counts = {t.shape[0] for t in srcs.values()}
+        undeclared = sorted(srcs.keys() - self._buffers.keys())
+        assert not undeclared, (
+            f"{self.name} has no staged inputs {undeclared}; "
+            f"declared roles are {sorted(self._buffers)}"
+        )
+        counts = {t.shape[self.inputs[role].batch_dim] for role, t in srcs.items()}
         assert len(counts) <= 1, (
             f"{self.name} was handed batches of {sorted(counts)}; they "
             f"describe one step, so one of them is not this step's"
@@ -163,26 +178,25 @@ class DraftGraph:
             f"{self.name} has no staged input {role!r}; "
             f"declared roles are {sorted(self._buffers)}"
         )
-        buf = self._buffers[role]
-        assert 0 <= bs <= buf.shape[0], (
+        buf, d = self._buffers[role], self.inputs[role].batch_dim
+        assert 0 <= bs <= buf.shape[d], (
             f"{self.name} requested {bs} rows from draft input {role!r}, "
-            f"whose capacity is {buf.shape[0]}"
+            f"whose capacity is {buf.shape[d]}"
         )
-        return buf[:bs]
+        return buf.narrow(d, 0, bs)
 
     def _stage_one(self, role: str, running_bs: int, src: torch.Tensor | None):
-        """Copy ``src`` into this input's fixed buffer, tail-repeating its last row.
+        """Copy ``src`` into fixed storage and repeat its last row to ``running_bs``.
 
-        Every input repeats the same last index, so a pad row is a coherent copy
-        of the last real one and only redoes work that row already does. Zeros
-        instead faulted 8/8 ranks at the first padded decode step, and repeating
-        one input alone -- an incoherent mix -- faulted too.
+        Every input repeats the same last index along ``batch_dim``, so a pad
+        row is a coherent copy of the last real one. Zero-filled tails faulted
+        all ranks at the first padded decode step in the validated graph path.
 
         ``src=None`` hands back the view unwritten: warmup wants a well-formed
         batch, not a particular one.
         """
-        buf = self._buffers[role]
-        out = buf[:running_bs]
+        buf, d = self._buffers[role], self.inputs[role].batch_dim
+        out = buf.narrow(d, 0, running_bs)
         if src is None:
             return out
         assert src.dtype == buf.dtype, (
@@ -191,12 +205,17 @@ class DraftGraph:
         )
         assert src.ndim == buf.ndim, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
-            f"whose leading axis is not the batch; this pass stages "
-            f"{tuple(buf.shape[1:])} per sequence. MRoPE positions ([3, N]) are "
-            f"the case that reaches here"
+            f"but this pass stages {self.inputs[role].shape} per sequence with "
+            f"the batch at axis {d}"
         )
-        scheduled_bs = src.shape[0]
-        dst = out[:scheduled_bs]
+        scheduled_bs = src.shape[d]
+        assert scheduled_bs <= running_bs and (scheduled_bs > 0 or running_bs == 0), (
+            f"draft input '{role}' of {self.name} arrived with {scheduled_bs} "
+            f"rows for a running batch of {running_bs}; a pass widens one or "
+            f"more real rows by repeating the last, so it needs "
+            f"0 < rows <= running_bs (or both zero)"
+        )
+        dst = out.narrow(d, 0, scheduled_bs)
         assert src.shape == dst.shape, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
             f"but its fixed storage expects {tuple(dst.shape)}"
@@ -206,7 +225,9 @@ class DraftGraph:
         if src.data_ptr() != dst.data_ptr() or src.stride() != dst.stride():
             dst.copy_(src)
         if running_bs > scheduled_bs:
-            out[scheduled_bs:].copy_(src[-1])  # broadcasts; no expand needed
+            out.narrow(d, scheduled_bs, running_bs - scheduled_bs).copy_(
+                src.narrow(d, scheduled_bs - 1, 1)
+            )
         return out
 
     def is_captured(self, running_bs: int) -> bool:
@@ -224,7 +245,7 @@ class DraftGraph:
         reason: ``Drafter.warmup_draft_graphs`` records on a real decode-shaped
         context, and this pass is that shape whatever the target just did.
         """
-        return running_bs in self._cuda_graphs
+        return running_bs in self._graph
 
     def release_graphs(self) -> int:
         """Drop every recording, so what it captured can be freed.
@@ -234,16 +255,14 @@ class DraftGraph:
         pool has to drop these too, or the first replay after the wake reads a
         pool that has since been reallocated. `is_captured` answers False
         afterwards, so `run` calls the pass directly until the next warmup
-        records it again -- which `capture_cudagraph` ends in on both the manual
-        and the piecewise path.
+        records it again -- which `capture_cudagraph` ends in with request
+        graphs and token graphs alike.
 
         The staged `_buffers` stay: they are ordinary allocations, sized once at
         `bind` for the very reason that a capture must not be the thing that
         allocates them.
         """
-        dropped = len(self._cuda_graphs)
-        self._cuda_graphs.clear()
-        return dropped
+        return self._graph.release_graphs()
 
     @property
     def _to_capture(self) -> Callable[..., Any]:
@@ -261,19 +280,17 @@ class DraftGraph:
         What leaves here is a VALUE. A replay hands back the tensors the
         capture allocated, and the pool re-issues those addresses to sizes
         captured later -- a reference does not hold them the way the eager
-        allocator's does. Only ``capture_epilogue`` can put a survivor in
-        there; the eager path allocates normally and needs no copy.
+        allocator's does: those it clones, as the recording found them
+        (``ReqGraph.allocated``); an output in a buffer the model owns is handed back as
+        the eager pass hands it. Only ``capture_epilogue`` can put a survivor
+        in there; the eager path allocates normally and needs no copy.
         """
-        captured = (
-            self._cuda_graphs.get(running_bs) if self.is_captured(running_bs) else None
-        )
-        if captured is None:
+        if running_bs not in self._graph:
             out = self._to_capture(running_bs, **staged)
         else:
-            graph, out = captured
-            graph.replay()
+            out = self._graph.replay(key=running_bs)
             if self.capture_epilogue:
-                out = _owned(out, tuple(staged.values()))
+                out = _owned(out, self._graph.allocated(running_bs, out))
         return (
             out
             if self.capture_epilogue
@@ -291,23 +308,19 @@ class DraftGraph:
         )
 
     @torch.inference_mode()
-    def warmup(self, running_bs: int, *, pool=None, stream=None):
-        """Run the pass once at one captured size, paying its per-shape JIT here."""
+    def warmup(self, running_bs: int):
+        """Run the pass once at one captured size, paying its per-shape JIT
+        here, then record it on the current stream -- a capture stream."""
         staged = {role: self._stage_one(role, running_bs, None) for role in self.inputs}
         if self.warmup_inputs is not None:
             self.warmup_inputs(running_bs, **staged)
         # forward AND epilogue, so nothing serving runs is left cold.
         self._forward_and_epilogue(running_bs, **staged)
         if not self.will_capture:
-            return pool
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        # thread_local, not the "global" default: global invalidates a capture
-        # when ANY thread makes an unsafe HIP call, and the NCCL watchdog polls
-        # `hipEventQuery` every ~100ms. Same reasoning as `cuda_graph.py`'s.
-        with torch.cuda.graph(
-            graph, pool, stream=stream, capture_error_mode="thread_local"
-        ):
-            out = self._to_capture(running_bs, **staged)
-        self._cuda_graphs[running_bs] = (graph, out)
-        return pool or graph.pool()
+            return
+        out = self._graph.record(
+            lambda: self._to_capture(running_bs, **staged), key=running_bs
+        )
+        if self.capture_epilogue:
+            # which outputs a replay copies, worked out here, not mid-serving
+            self._graph.allocated(running_bs, out)

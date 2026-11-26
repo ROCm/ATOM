@@ -698,7 +698,9 @@ def _nvfp4_moe_layer(
         layer_quant_config=source,
         source_is_nvfp4=True,
         params_dtype=NVFP4_DTYPE,
-        quant_method=SimpleNamespace(intermediate_pad=0),
+        quant_method=SimpleNamespace(
+            intermediate_pad=0, need_normalize_e4m3fn_to_e4m3fnuz=False
+        ),
         moe_config=SimpleNamespace(),
         moe_quant_params={"params_dtype": NVFP4_DTYPE},
         _stream_online_quant=False,
@@ -1053,6 +1055,32 @@ def test_minimax_m3_root_layer_layout_reaches_text_config(root_fields, text_fiel
         False,
         False,
         False,
+        True,
+    ]
+
+
+def test_minimax_m3_coerces_a_dict_text_config():
+    """transformers 5 leaves MiniMax-M3.1's remote VL config with a raw dict."""
+    hf_config = SimpleNamespace(
+        model_type="minimax_m3_vl",
+        use_index_cache=True,
+        text_config={
+            "num_hidden_layers": 4,
+            "moe_layer_freq": [0, 0, 1, 1],
+            "hidden_act": "swigluoai",
+        },
+    )
+
+    _normalize_minimax_m3_text_config(hf_config)
+
+    text_config = hf_config.text_config
+    assert not isinstance(text_config, dict)
+    assert text_config.use_index_cache is True
+    assert text_config.swiglu_beta == 1.0
+    assert [_is_moe_layer(text_config, i) for i in range(4)] == [
+        False,
+        False,
+        True,
         True,
     ]
 

@@ -3,7 +3,8 @@
 Registers model architecture classes via SGLANG_EXTERNAL_MODEL_PACKAGE,
 replacing sglang's built-in implementations with ATOM-optimized versions.
 
-To add a new model, append its architecture class name to _MODEL_NAMES.
+To add a new model, add its architecture to ``MODEL_ARCH_SPECS`` in
+``atom/plugin/sglang/runtime/model_arch.py``.
 """
 
 import inspect
@@ -12,10 +13,10 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.runtime_context import get_parallel
 from torch import nn
 
 from atom.plugin.sglang.runtime import (
@@ -26,7 +27,9 @@ from atom.plugin.sglang.runtime import (
     get_current_forward_batch,
     get_model_arch_spec,
     plugin_runtime_scope,
+    resolve_model_arch_spec,
 )
+from atom.plugin.sglang.runtime.model_arch import DEEPSEEK_V41_ARCH
 from atom.plugin.sglang.tbo import (
     SGLangPluginUBatchWrapper,
     prepare_sglang_tbo_forward_inputs,
@@ -82,7 +85,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         super().__init__()
         logger.info("Initializing ATOM backend for %s", self.__class__.__name__)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
         self.config = config
         vocab_size = getattr(config, "vocab_size", None)
@@ -96,6 +99,10 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.unpadded_vocab_size = vocab_size
         self.model_arch = getattr(config, "architectures", [""])[0]
         self.model_arch_spec = get_model_arch_spec(self.model_arch)
+        # SGLang renames DeepSeek-V4.1 to V4: resolve it by model_type.
+        resolved_arch, resolved_spec = resolve_model_arch_spec(config)
+        if resolved_arch == DEEPSEEK_V41_ARCH:
+            self.model_arch, self.model_arch_spec = resolved_arch, resolved_spec
         self.capture_aux_hidden_states = False
         self.atom_tbo_wrapper: SGLangPluginUBatchWrapper | None = None
         self._tbo_fallback_reasons_logged: set[str] = set()
@@ -381,6 +388,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 input_embeds=input_embeds,
                 set_forward_context=not self.model_arch_spec.wrapper_binds_gdn_context,
                 save_kv_cache=model_kwargs.get("save_kv_cache"),
+                expand_forward_inputs=self.model_arch_spec.expand_forward_inputs,
             ) as runtime:
                 if self.model_arch_spec.bind_cache_views is not None:
                     self.model_arch_spec.bind_cache_views(self.model, runtime)

@@ -28,7 +28,6 @@ _RESOURCE_KEYS = {
 }
 _OPTIONAL = ("vgpr_spill", "sgpr_spill")
 _SYMBOL_KEY = b".symbol"
-_BIN = re.compile(r'bin\s*=\s*"')
 _MANGLED = re.compile(r"_ZN((?:\d+\w+?)+)E")
 
 
@@ -57,14 +56,12 @@ def compile_kernels(kernels) -> list:
 
 def trace(launcher, abi) -> Record:
     """``launcher``'s hand-offs, traced compile-only (no launch, no GPU needed
-    with ``ARCH`` set). A build served from FlyDSL's disk cache is not traced,
-    so the caller disables the cache (``FLYDSL_RUNTIME_ENABLE_CACHE=0``)."""
+    with ``ARCH`` set). FlyDSL traces a build before it looks it up, so a
+    build in its disk cache is traced too."""
     with recording() as rec:
         compile_kernels([(launcher, abi)])
     if not rec.stages:
-        raise RuntimeError(
-            "nothing traced: a cached build? set FLYDSL_RUNTIME_ENABLE_CACHE=0"
-        )
+        raise RuntimeError("nothing traced")
     return rec
 
 
@@ -89,6 +86,15 @@ def scratch_bytes(launcher) -> int:
     return max(sizes)
 
 
+def kernel_names(launcher) -> list[str]:
+    """The kernel name of each binary a compiled ``launcher`` holds: a mono
+    kernel's name spells its build's parameters."""
+    return [
+        _symbol(_code_object(artifact._ir_text))
+        for artifact in launcher._mem_cache.values()
+    ]
+
+
 def launcher_resources(launcher) -> list[dict]:
     """``kernel_resources`` of each binary a compiled ``launcher`` holds (its
     ``_mem_cache``): what this process runs, unlike FlyDSL's disk cache, whose
@@ -100,24 +106,33 @@ def launcher_resources(launcher) -> list[dict]:
 
 
 def _code_object(module_text: str) -> bytes:
-    """The ``gpu.binary``'s ELF: the ``bin = "..."`` string, MLIR-escaped (\\XX a
-    byte, \\\\ and \\" themselves)."""
-    m = _BIN.search(module_text)
-    if m is None:
+    """Read the first binary's first object through MLIR (Binary or Fatbin)."""
+    # Keep compiler imports lazy so host-only metadata readers need no FlyDSL.
+    from flydsl._mlir import ir
+    from flydsl._mlir.dialects import gpu
+
+    binaries = []
+
+    def visit(op):
+        # Preserve the legacy reader's first-binary selection. FlyDSL selects
+        # binaries by launch symbol; this reader has no launch-symbol argument.
+        if op.name == "gpu.binary" and not binaries:
+            objects = ir.ArrayAttr(op.attributes["objects"])
+            # Within that binary, keep the first object; do not try other targets.
+            binaries.append(gpu.ObjectAttr(objects[0]).object if len(objects) else None)
+        return ir.WalkResult.ADVANCE
+
+    with ir.Context() as ctx:
+        ctx.enable_multithreading(False)
+        ctx.load_all_available_dialects()
+        ir.Module.parse(module_text).operation.walk(visit)
+
+    if not binaries:
         raise RuntimeError("no gpu.binary object in the compiled module")
-    out, i = bytearray(), m.end()
-    while module_text[i] != '"':
-        ch = module_text[i]
-        if ch != "\\":
-            out.append(ord(ch))
-            i += 1
-        elif module_text[i + 1] in '\\"':
-            out.append(ord(module_text[i + 1]))
-            i += 2
-        else:
-            out.append(int(module_text[i + 1 : i + 3], 16))
-            i += 3
-    return bytes(out)
+    binary = binaries[0]
+    if not isinstance(binary, (bytes, bytearray)) or not binary.startswith(b"\x7fELF"):
+        raise RuntimeError("gpu.binary does not contain an ELF code object")
+    return bytes(binary)
 
 
 def kernel_resources(elf: bytes) -> dict:

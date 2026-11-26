@@ -39,7 +39,7 @@ import ast
 import collections
 import inspect
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -657,12 +657,16 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
 
     sends = []
     for r in range(n_ranks):
-        send = torch.empty((n_ranks, b, h_local, d + pack), dtype=dtype, device=DEV)
+        # An unwritten record is NaN, not stale data, so the combine drops it
+        # and the reference comparison fails.
+        send = torch.full(
+            (n_ranks, b, h_local, d + pack), float("nan"), dtype=dtype, device=DEV
+        )
         o_r = o_per_rank[r].contiguous()
         l_r = lse_per_rank[r].contiguous().to(torch.float32)
         has_owned_counts = owned_counts_per_rank is not None
         counts_r = owned_counts_per_rank[r].contiguous() if has_owned_counts else l_r
-        _dcp_a2a_pack_kernel[(b, h_total)](
+        _dcp_a2a_pack_kernel[(b, n_ranks)](
             o_r,
             l_r,
             counts_r,
@@ -675,6 +679,7 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
             send.stride(1),
             send.stride(2),
             H_LOCAL=h_local,
+            H_ROUNDED=triton.next_power_of_2(h_local),
             HEAD_DIM=d,
             LSE_PACK=pack,
             HAS_OWNED_COUNTS=has_owned_counts,
@@ -733,6 +738,34 @@ def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype):
 
     tol = 1e-5 if dtype == torch.float32 else 3e-2
     torch.testing.assert_close(got.float(), ref.float(), rtol=tol, atol=tol)
+
+
+@needs_gpu
+def test_a2a_handles_a_non_power_of_two_head_split():
+    """K3's shape: H=96 over DCP 8, so each destination owns 12 heads.
+
+    The pack kernel handles one destination's whole H_LOCAL slice per program,
+    and tl.arange needs a power of two, so 12 heads are processed as 16 lanes
+    with the top 4 masked. Those lanes must neither write outside the
+    destination's slice nor drop a real head.
+
+    _a2a_roundtrip fills the staging buffer with NaN before packing: a head the
+    pack kernel skipped is NaN, not stale data, so the combine drops it and the
+    reference comparison fails.
+    """
+    b, h, d, n_ranks = 3, 96, 128, 8
+    assert (h // n_ranks) & (h // n_ranks - 1), "meaningless if H_LOCAL is 2**k"
+    g = torch.Generator(device=DEV).manual_seed(96)
+    o = [
+        torch.randn(b, h, d, generator=g, device=DEV).to(torch.bfloat16)
+        for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+
+    got = _a2a_roundtrip(o, lse, n_ranks)
+    ref = _merge_partials(torch.stack(o), torch.stack(lse))
+
+    torch.testing.assert_close(got.float(), ref.float(), rtol=3e-2, atol=3e-2)
 
 
 @needs_gpu
@@ -827,9 +860,10 @@ def test_defaults():
     # is the way a default flip silently turns a comparison into a no-op.
     assert cfg.enable_query_replication is True
     assert cfg.enable_project_before_merge is True
-    # a2a: measured faster than ag_rs on the decode shapes here. Pinned because
-    # it also decides what an A/B control arm gets when it passes nothing.
-    assert cfg.comm_backend == "a2a"
+    # auto: Config resolves it to the mailbox where validated, else a2a. Pinned
+    # because it also decides what an A/B control arm gets when it passes
+    # nothing: a control arm must now pass "a2a" explicitly.
+    assert cfg.comm_backend == "auto"
 
 
 def test_from_dict_parses_both_keys():
@@ -855,7 +889,7 @@ def test_from_dict_empty_and_none_give_defaults():
             cfg.enable_query_replication,
             cfg.enable_project_before_merge,
             cfg.comm_backend,
-        ) == (1, True, True, "a2a")
+        ) == (1, True, True, "auto")
 
 
 def test_from_dict_coerces_types():
@@ -972,15 +1006,39 @@ def test_qrep_for_step_truth_table(qrep, seg, prefill, prefill_qrep, expected):
 def test_sparse_prefill_nonps_gate(
     monkeypatch, env, dcp, heads, fp8, gfx950, page, mbt, expected
 ):
+    from atom.distributed import dcp_utils
+
     monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_NONPS", env)
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", page)
-    assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, gfx950, mbt) is expected
+    monkeypatch.setattr(dcp_utils, "_runs_on_gfx950", lambda: gfx950)
+    assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, mbt) is expected
+
+
+@pytest.mark.parametrize("arch,expected", [("gfx950", True), ("gfx1250", False)])
+def test_sparse_prefill_nonps_asks_the_gpu_it_runs_on(monkeypatch, arch, expected):
+    """Not whether DCP decode runs persistent: gfx1250 PS1 does, and its
+    non-persistent kernel takes 64-token pages only."""
+    import sys
+    import types
+
+    for parent in ("aiter", "aiter.jit", "aiter.jit.utils"):
+        if parent not in sys.modules:  # CPU runner: no aiter
+            monkeypatch.setitem(sys.modules, parent, types.ModuleType(parent))
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx_runtime = lambda: arch
+    monkeypatch.setitem(sys.modules, "aiter.jit.utils.chip_info", chip_info)
+    monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1")
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, 16384) is expected
 
 
 def test_sparse_prefill_nonps_is_on_by_default(monkeypatch):
+    from atom.distributed import dcp_utils
+
     monkeypatch.delenv("ATOM_DCP_SPARSE_PREFILL_NONPS", raising=False)
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
-    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, True, 16384)
+    monkeypatch.setattr(dcp_utils, "_runs_on_gfx950", lambda: True)
+    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, 16384)
 
 
 @pytest.mark.parametrize("persistent, width", [(True, 64), (False, 128)])
@@ -1028,14 +1086,34 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         dtype_kv=None,
         model_runner=SimpleNamespace(forward_vars=collections.defaultdict(object)),
     )
+    forward_vars = builder.model_runner.forward_vars
+    forward_vars["sparse_cu_seqlens_q"] = SimpleNamespace(
+        gpu=torch.arange(5, dtype=torch.int32)
+    )
+    forward_vars["sparse_kv_last_page_lens"] = SimpleNamespace(
+        gpu=torch.ones(4, dtype=torch.int32)
+    )
+    builder._dcp_sparse_prefill_mode = "q"
+    builder.sparse_prefill_num_heads = 64
+    builder._sparse_prefill_work_view_cache = {}
+    for name in (
+        "_sparse_prefill_work_plan",
+        "_sparse_prefill_work_views",
+        "_sparse_prefill_work_widths",
+    ):
+        setattr(
+            builder,
+            name,
+            MethodType(getattr(aiter_mla.AiterMLAMetadataBuilder, name), builder),
+        )
     md = SimpleNamespace(
         cu_seqlen_ks=torch.zeros(4, dtype=torch.int32),
         cu_seqlen_ke=torch.arange(4, dtype=torch.int32),
-        batch_id_per_q_token=torch.zeros(4, dtype=torch.int32),
         slot_mapping=torch.arange(4),
+        batch_id_per_q_token=torch.zeros(4, dtype=torch.int32),
     )
     aiter_mla.AiterMLAMetadataBuilder._apply_pcp_reindex(
-        builder, md, 4, np.array([1, 2, 3, 4])
+        builder, md, 4, np.array([1, 2, 3, 4]), ""
     )
     assert len(built) == plans
     assert hasattr(md, "sparse_prefill_work_meta_data") == bool(plans)
@@ -1239,6 +1317,131 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
         "self.qrep_num_heads",
         "self.qk_head_dim",
     ], f"qrep_enabled_for_layer's call site changed shape: got {arg_names}"
+
+
+@needs_gpu
+@pytest.mark.parametrize(
+    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 128)]
+)
+@pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
+def test_sparse_prefill_builder_allocates_for_its_consumer(
+    monkeypatch, world, decode_heads, prefill_heads, cache_dtype
+):
+    """12 heads per rank need distinct decode and prefill work buffers."""
+    from aiter import get_mla_metadata_info_v1
+
+    from atom.model_ops.attentions import aiter_mla, backends
+
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    monkeypatch.setenv("ATOM_MLA_KV_SHUFFLED", "0")
+    monkeypatch.setattr(backends, "attn_head_shard_size", lambda: 8)
+    for module in (backends, aiter_mla):
+        monkeypatch.setattr(module, "get_dcp_world_size", lambda: world)
+        monkeypatch.setattr(module, "get_dcp_rank", lambda: 0)
+    from atom.model_ops import attention_mla
+
+    monkeypatch.setattr(attention_mla, "dcp_persistent_supported", lambda *_: True)
+    cfg = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            num_attention_heads=96,
+            index_topk=2048,
+            index_n_heads=32,
+            index_head_dim=128,
+        ),
+        max_model_len=16384,
+        max_num_batched_tokens=16,
+        kv_cache_dtype=cache_dtype,
+        index_cache_dtype="fp8",
+        attn_prefill_chunk_size=0,
+        speculative_config=None,
+        enable_tbo=False,
+        enable_tbo_decode=False,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    runner = SimpleNamespace(
+        config=cfg,
+        block_size=128,
+        device=torch.device("cuda"),
+        max_num_batched_tokens=16,
+        max_bs=4,
+        num_spec_tokens=0,
+        has_mla_indexer=True,
+        forward_vars={},
+    )
+    builder = aiter_mla.AiterMLAMetadataBuilder(runner)
+    assert builder.persistent_num_heads == decode_heads
+    assert builder.sparse_prefill_num_heads == prefill_heads
+    names = (
+        "work_meta_data",
+        "work_indptr",
+        "work_info_set",
+        "reduce_indptr",
+        "reduce_final_map",
+        "reduce_partial_map",
+    )
+    for prefix, rows, heads in (
+        ("", 4, decode_heads),
+        ("sparse_prefill_", 16, prefill_heads),
+    ):
+        info = get_mla_metadata_info_v1(
+            rows,
+            1,
+            heads,
+            builder.dtype_q,
+            builder.dtype_kv,
+            is_sparse=True,
+            fast_mode=True,
+        )
+        for name, (shape, dtype) in zip(names, info, strict=True):
+            tensor = runner.forward_vars[prefix + name]
+            expected_shape = (shape,) if isinstance(shape, int) else tuple(shape)
+            assert tuple(tensor.shape) == expected_shape
+            assert tensor.dtype == dtype
+
+
+@needs_gpu
+@pytest.mark.parametrize("lengths", [(45, 17), (1,), (13, 17, 3)])
+def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengths):
+    """A pass reads its own requests' table rows, not running_bs padding."""
+    from aiter import dtypes, indexer_k_quant_and_cache
+
+    from atom.model_ops.indexer import score
+    from atom.model_ops.indexer import workspace as ws
+    from atom.model_ops.indexer.rows import ConcatKeys, IndexCache
+
+    total = sum(lengths)
+    keys = torch.ones(total, 128, dtype=torch.bfloat16, device=DEV)
+    token = torch.arange(total, device=DEV)
+    for digit in range(2):
+        code = ((token >> (4 * digit)) & 15) - 8
+        keys[:, 2 * digit] = code
+        keys[:, 2 * digit + 1] = -code
+    # Distinct nonidentity pages for each real request; padding points at an
+    # unwritten page so reading it cannot reproduce the expected token tags.
+    table = torch.tensor([[3], [2], [1], [0]], dtype=torch.int32, device=DEV)
+    slots = torch.cat(
+        [
+            torch.arange(length, device=DEV) + (3 - request) * 128
+            for request, length in enumerate(lengths)
+        ]
+    )
+    cache = torch.full((4, 128, 132), 0xA5, dtype=torch.uint8, device=DEV)
+    indexer_k_quant_and_cache(keys, cache, slots, 128, "ue8m0", preshuffle=True)
+    # Put readable guards after the logical view. A gather that erroneously
+    # uses four table rows sees a bogus extra request overlapping valid rows.
+    cums = [0] + np.cumsum(lengths).tolist()
+    backing = torch.tensor(
+        cums + [0, total, total, total], dtype=torch.int32, device=DEV
+    )
+    gather = ws.DcpGather(total, backing[: len(cums)], torch.arange(total, device=DEV))
+    workspace = ws.ConcatKeyWorkspace(total, 128, dtypes.fp8, DEV, total)
+    step = ConcatKeys(table, None, total, None, workspace)
+    whole = ws.ConcatPass(0, len(lengths), 0, total, 0, 0, 0, 1, 0, 0, (), gather)
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+    monkeypatch.setattr(score, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(score, "_all_gather_slot", lambda *args: None)
+    values, scales = score._gather_pass_keys(IndexCache(cache, None, 128), step, whole)
+    torch.testing.assert_close(values.float() * scales, keys.float(), rtol=0, atol=0)
 
 
 def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
@@ -1839,6 +2042,85 @@ def test_sparse_prefill_persistence_does_not_look_at_dtype():
         "the DCP sparse-prefill persistence predicate must not key off KV "
         f"cache dtype; got parameters {list(params)}"
     )
+
+
+@pytest.mark.parametrize(
+    "dcp,q,causal,cp_world_size",
+    [(8, 1, True, 1), (8, 8, True, 8), (8, 8, False, 1), (1, 8, True, 1)],
+    ids=["one_row", "causal_verify", "draft_block", "no_dcp"],
+)
+def test_dcp_decode_call_is_the_one_forward_makes(dcp, q, causal, cp_world_size):
+    """Only a causal multi-row decode takes the round-robin kernel; aiter routes
+    gfx1250 to the asm table (no kernel) for cp_world_size > 1 without it."""
+    from atom.distributed.dcp_utils import mla_dcp_decode_call
+
+    call = mla_dcp_decode_call(dcp, q, causal)
+    assert call["cp_world_size"] == cp_world_size
+    assert call["cp_round_robin"] is (cp_world_size > 1)
+    assert call["causal"] is causal and call["return_lse"] is True
+
+
+@pytest.mark.parametrize(
+    "supported,backend,expected",
+    [
+        (True, "asm", True),
+        (False, "asm", False),
+        (None, "flydsl_ps1", True),
+        # A failed asm query is not a yes.
+        (None, "asm", False),
+    ],
+)
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "bf16"])
+def test_dcp_persistent_supported_reads_aiters_answer(
+    monkeypatch, supported, backend, expected, kv_cache_dtype
+):
+    import enum
+    import sys
+    import types
+
+    from atom.distributed.dcp_utils import dcp_persistent_supported
+
+    class MlaBackend(str, enum.Enum):
+        ASM = "asm"
+        FLYDSL_PS1 = "flydsl_ps1"
+
+    calls = []
+
+    def get_mla_decode_shape_support(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(supported=supported, backend=MlaBackend(backend))
+
+    fp8 = object()
+    aiter = types.ModuleType("aiter")
+    aiter.dtypes = SimpleNamespace(fp8=fp8)
+    ops = types.ModuleType("aiter.ops")
+    attention = types.ModuleType("aiter.ops.attention")
+    attention.MlaBackend = MlaBackend
+    attention.get_mla_decode_shape_support = get_mla_decode_shape_support
+    for name, module in (
+        ("aiter", aiter),
+        ("aiter.ops", ops),
+        ("aiter.ops.attention", attention),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+
+    assert dcp_persistent_supported(64, kv_cache_dtype, 8) is expected
+    dtype = fp8 if kv_cache_dtype == "fp8" else torch.bfloat16
+    assert calls == [
+        (
+            (64, 1, dtype, dtype),
+            {
+                "persistent": True,
+                "page_size": 1,
+                # A one-row decode passes no round-robin arguments.
+                "return_lse": True,
+                "causal": True,
+                "cp_world_size": 1,
+                "cp_round_robin": False,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize("dcp_world_size", [1, 2, 8])

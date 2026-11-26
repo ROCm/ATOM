@@ -27,9 +27,12 @@ from atom.models.utils import maybe_prefix
 from atom.plugin.sglang.models.kv_cache_utils import is_fp8_kv_cache_dtype
 
 try:
-    from sglang.srt.model_executor.runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner_utils import get_is_capture_mode
 except ImportError:
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    try:
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+    except ImportError:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
     batched_gemm_a16wfp4,
 )
@@ -325,7 +328,7 @@ def mla_absorbed_bmm(
     )
 
     if attn.use_deep_gemm_bmm:
-        from sglang.srt.layers import deep_gemm_wrapper
+        import sglang.srt.layers.deep_gemm_wrapper as deep_gemm_wrapper  # noqa: PLR0402
 
         val, scale, masked_m, expected_m, aligned_m = (
             per_token_group_quant_mla_deep_gemm_masked_fp8(inp.transpose(0, 1))

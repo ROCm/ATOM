@@ -291,7 +291,6 @@ class TestChatCompletionNonStreaming:
                 "messages": [{"role": "user", "content": "Hi"}],
                 "max_tokens": 32,
                 "stream": False,
-                "stream_options": {"include_usage": True},
                 "tools": [],
                 "tool_choice": "auto",
                 "presence_penalty": 0.0,
@@ -300,6 +299,19 @@ class TestChatCompletionNonStreaming:
             },
         )
         assert r.status_code == 200
+
+    def test_nonstream_stream_options_rejected(self, base_url):
+        r = requests.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": False,
+                "stream_options": {"include_usage": True},
+            },
+        )
+        assert r.status_code == 400
+        assert r.json()["error"]["message"] == "stream_options requires stream=true"
 
     def test_system_message(self, base_url):
         r = requests.post(

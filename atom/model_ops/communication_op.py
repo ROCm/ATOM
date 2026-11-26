@@ -56,3 +56,25 @@ def tensor_model_parallel_all_reduce(x: torch.Tensor) -> torch.Tensor:
     from aiter.dist.communication_op import tensor_model_parallel_all_reduce as ar
 
     return ar(x)
+
+
+def tensor_model_parallel_all_reduce_add(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """All-reduce ``x + y`` across the TP group.
+
+    The result is the sum over ranks of each rank's ``x + y``, not
+    ``all_reduce(x) + y``. Requires aiter at or after ROCm/aiter#7499
+    (``06b7fd32``). aiter takes the gfx1250 HIP Lamport one-shot kernel where
+    the input fits and otherwise adds, then all-reduces. The TBO path stays
+    here, so it gets that materialized sum.
+    """
+    from aiter.dist.parallel_state import get_tp_group
+
+    if _tbo_aware_tp_reduce(get_tp_group().world_size):
+        return tensor_model_parallel_all_reduce(x + y)
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_all_reduce_add as aiter_all_reduce_add,
+    )
+
+    return aiter_all_reduce_add(x, y)

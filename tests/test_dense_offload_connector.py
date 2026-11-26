@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from conftest import with_min_load
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
@@ -26,22 +27,26 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
+from atom.kv_transfer.offload.lookup_client import as_lookup_client
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
     SaveSpec,
 )
+from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
 
 
 def _config(role="offload"):
-    return SimpleNamespace(
-        kv_transfer_config={"kv_role": role},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    return with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": role},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
 
@@ -66,6 +71,8 @@ def _load_seq(req_id, *, num_prompt_tokens=8):
         num_prompt_tokens=num_prompt_tokens,
         token_ids=list(range(num_prompt_tokens)),
         block_table=list(range(num_prompt_tokens // 8)),
+        offload_loaded=False,
+        offload_load_failed=False,
     )
 
 
@@ -85,6 +92,7 @@ def _arm_load(scheduler, seq, *, hbm=0, lmcache=8):
 
 def _engine_scheduler(connector):
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler._early_load = EarlyLoadState()
     scheduler.kv_connector = connector
     scheduler.finished_recving_kv_req_ids = []
     scheduler.failed_recving_kv_req_ids = []
@@ -135,7 +143,6 @@ def test_loaded_prefix_can_publish_suffix_and_be_reused(
     # Model all ranks reporting successful load, then compute the next block.
     host._mark_offload_load_ready(seq)
     assert seq.num_cached_tokens == 16
-    assert seq.offload_promoted_tokens == 16 - hbm
     host.block_manager.hash_blocks(seq, 8)
     seq.num_cached_tokens = 24
 
@@ -379,7 +386,8 @@ def test_dense_worker_exact_save_generations_do_not_form_cross_tp_quorum():
                     block_ids=[3],
                     save_spec=SaveSpec(skip_leading_tokens=skip),
                     save_operation=operation,
-                )
+                ),
+                producer_event=SimpleNamespace(synchronize=lambda: None),
             )
             outputs.append(worker.get_finished())
 
@@ -410,6 +418,9 @@ def test_dense_save_passes_one_step_producer_event_to_every_store(monkeypatch):
             assert threading.get_ident() == rpc_thread
             assert stream is rpc_stream
             trace.append(("record", self))
+
+        def synchronize(self):
+            pass
 
     monkeypatch.setattr(torch.cuda, "Event", Event)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: rpc_stream)
@@ -724,8 +735,8 @@ def test_unused_lookup_releases_worker_pin(monkeypatch, outcome):
             raise RuntimeError("lookup transport failed after a worker pinned")
         return 0 if outcome == "miss" else 16
 
-    scheduler._lookup_client = SimpleNamespace(
-        lookup=lookup, clear_lookup_status=lambda _sid: None
+    scheduler._lookup_client = as_lookup_client(
+        SimpleNamespace(lookup=lookup, clear_lookup_status=lambda _sid: None)
     )
     worker._engine = SimpleNamespace(lookup_unpin=pins.discard)
     seq = _load_seq(52, num_prompt_tokens=24)
@@ -753,9 +764,11 @@ def test_unused_lookup_releases_worker_pin(monkeypatch, outcome):
 
 def test_pending_load_keeps_pin_until_cancelled(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_consumer")
-    scheduler._lookup_client = SimpleNamespace(
-        lookup=lambda *_args, **_kwargs: 16,
-        clear_lookup_status=lambda _sid: None,
+    scheduler._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            lookup=lambda *_args, **_kwargs: 16,
+            clear_lookup_status=lambda _sid: None,
+        )
     )
     seq = _load_seq(53, num_prompt_tokens=24)
     assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
@@ -782,8 +795,8 @@ def test_scheduler_abort_before_allocation_releases_lookup_pin(
         pins.add(lookup_id)
         return 16
 
-    connector._lookup_client = SimpleNamespace(
-        lookup=lookup, clear_lookup_status=lambda _sid: None
+    connector._lookup_client = as_lookup_client(
+        SimpleNamespace(lookup=lookup, clear_lookup_status=lambda _sid: None)
     )
     worker._engine = SimpleNamespace(lookup_unpin=pins.discard)
     scheduler.kv_connector = connector
@@ -831,9 +844,11 @@ def test_scheduler_abort_before_allocation_releases_lookup_pin(
 def test_lookup_id_reuse_does_not_consume_an_old_pin(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_consumer")
     calls = []
-    scheduler._lookup_client = SimpleNamespace(
-        lookup=lambda _tokens, lookup_id: calls.append(lookup_id) or 16,
-        clear_lookup_status=lambda _sid: None,
+    scheduler._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            lookup=lambda _tokens, lookup_id: calls.append(lookup_id) or 16,
+            clear_lookup_status=lambda _sid: None,
+        )
     )
     old = _load_seq(54, num_prompt_tokens=24)
     new = _load_seq(54, num_prompt_tokens=32)
@@ -848,9 +863,11 @@ def test_lookup_id_reuse_does_not_consume_an_old_pin(monkeypatch):
 
 def test_hbm_catches_up_after_a_pending_cpu_lookup(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_consumer")
-    scheduler._lookup_client = SimpleNamespace(
-        lookup=lambda *_args, **_kwargs: 16,
-        clear_lookup_status=lambda _sid: None,
+    scheduler._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            lookup=lambda *_args, **_kwargs: 16,
+            clear_lookup_status=lambda _sid: None,
+        )
     )
     seq = _load_seq(55, num_prompt_tokens=24)
     assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
@@ -885,7 +902,7 @@ def test_native_retry_on_a_full_kv_cache_reuses_the_lookup(
 
     connector = _scheduler(monkeypatch, "kv_consumer")
     calls = []
-    connector._lookup_client = _counting_lookup(calls, 0)
+    connector._lookup_client = as_lookup_client(_counting_lookup(calls, 0))
     scheduler.kv_connector = connector
     seq = seq_factory(list(range(24)))
     scheduler.add(seq)
@@ -912,7 +929,7 @@ def test_native_admission_spends_the_memo(monkeypatch, scheduler, seq_factory):
 
     connector = _scheduler(monkeypatch, "kv_consumer")
     calls = []
-    connector._lookup_client = _counting_lookup(calls, 0)
+    connector._lookup_client = as_lookup_client(_counting_lookup(calls, 0))
     scheduler.kv_connector = connector
     seq = seq_factory(list(range(24)))
     scheduler.add(seq)
@@ -941,10 +958,12 @@ def test_prefetch_skips_a_request_that_resumes_after_its_load(monkeypatch, settl
 
     sched = _scheduler(monkeypatch)
     submitted = []
-    sched._lookup_client = SimpleNamespace(
-        submit=lambda _tokens, sid: submitted.append(sid) or True,
-        pump=lambda: None,
-        pending_ids=lambda: (),
+    sched._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            submit=lambda _tokens, sid: submitted.append(sid) or True,
+            pump=lambda: None,
+            pending_ids=lambda: (),
+        )
     )
     resumed = _load_seq(70, num_prompt_tokens=16)
     setattr(resumed, settled, True)
@@ -971,10 +990,12 @@ def test_prefetch_skips_exactly_what_admission_resumes(monkeypatch, flags, block
 
     sched = _scheduler(monkeypatch)
     submitted = []
-    sched._lookup_client = SimpleNamespace(
-        submit=lambda _tokens, sid: submitted.append(sid) or True,
-        pump=lambda: None,
-        pending_ids=lambda: (),
+    sched._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            submit=lambda _tokens, sid: submitted.append(sid) or True,
+            pump=lambda: None,
+            pending_ids=lambda: (),
+        )
     )
     seq = _load_seq(74, num_prompt_tokens=16)
     seq.block_table = blocks
@@ -993,10 +1014,12 @@ def test_prefetch_skips_a_finished_load_before_admission(monkeypatch):
 
     sched = _scheduler(monkeypatch)
     submitted = []
-    sched._lookup_client = SimpleNamespace(
-        submit=lambda _tokens, sid: submitted.append(sid) or True,
-        pump=lambda: None,
-        pending_ids=lambda: (),
+    sched._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            submit=lambda _tokens, sid: submitted.append(sid) or True,
+            pump=lambda: None,
+            pending_ids=lambda: (),
+        )
     )
     loaded = _load_seq(72, num_prompt_tokens=16)
     loaded.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
@@ -1023,7 +1046,7 @@ def test_a_declined_load_is_not_looked_up_again_every_step(monkeypatch):
     sched = _scheduler(monkeypatch, "kv_consumer")
     sched._min_load_tokens = 8192  # every hit here is "too small" to transfer
     calls = []
-    sched._lookup_client = _counting_lookup(calls, 16)
+    sched._lookup_client = as_lookup_client(_counting_lookup(calls, 16))
     seq = _load_seq(60, num_prompt_tokens=24)
 
     for _ in range(8):
@@ -1049,7 +1072,7 @@ def test_a_moved_frontier_is_re_derived_from_the_same_hit(monkeypatch):
     sched = _scheduler(monkeypatch, "kv_consumer")
     sched._min_load_tokens = 0
     calls = []
-    sched._lookup_client = _counting_lookup(calls, 16)
+    sched._lookup_client = as_lookup_client(_counting_lookup(calls, 16))
     seq = _load_seq(61, num_prompt_tokens=24)
 
     assert sched.get_num_new_matched_tokens(seq) == (16, True)
@@ -1081,8 +1104,8 @@ def test_a_failed_lookup_backs_off_before_it_is_retried(monkeypatch):
         calls.append(lookup_id)
         return replies.pop(0)
 
-    sched._lookup_client = SimpleNamespace(
-        lookup=lookup, clear_lookup_status=lambda _sid: None
+    sched._lookup_client = as_lookup_client(
+        SimpleNamespace(lookup=lookup, clear_lookup_status=lambda _sid: None)
     )
     seq = _load_seq(62, num_prompt_tokens=24)
 
@@ -1112,7 +1135,7 @@ def test_a_stale_memo_expires_and_asks_the_tier_again(monkeypatch):
     sched._min_load_tokens = 8192  # every hit here is declined after alloc
     sched._tier_memo_steps = 2
     calls = []
-    sched._lookup_client = _counting_lookup(calls, 16)
+    sched._lookup_client = as_lookup_client(_counting_lookup(calls, 16))
     seq = _load_seq(65, num_prompt_tokens=24)
 
     for _ in range(4):
@@ -1128,34 +1151,39 @@ def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
     """Losing to another sub must not cost a fresh hash every step.
 
     `MultiConnectorScheduler` queries *every* sub on every scheduler pass and
-    cancels the pending load of everyone but the winner, so under the supported
-    `[moriio, lmcache_offload]` ordering the offload sub arms a load and has it
-    taken away. The cancel does not forget the hit: the tier did not stop
-    holding the prefix because another connector won this step. So when moriio
-    stops matching -- its `kv_async_tagged` is one-shot -- the offload sub
+    cancels the pending load of everyone but the winner, so with a P/D sub
+    ahead of it (e.g. `[moriio, lmcache_offload]`) the offload sub arms a load
+    and has it taken away. The cancel does not forget the hit: the tier did not
+    stop holding the prefix because another connector won this step. So when
+    moriio stops matching -- once its receive is queued -- the offload sub
     answers from what it already knows, and only the dispatch pays the tier.
+    No shipped config reaches this today; `validate_multi_config` refuses a P/D
+    consumer with an offload tier, so this pins the composite's cancel contract.
     """
 
     sched = _scheduler(monkeypatch, "kv_consumer")
     sched._min_load_tokens = 0
     calls = []
-    sched._lookup_client = _counting_lookup(calls, 16)
-    moriio_matched = {"yes": False}
+    sched._lookup_client = as_lookup_client(_counting_lookup(calls, 16))
+    moriio_queued = {"yes": False}
 
     def moriio_match(_seq):
-        if moriio_matched["yes"]:
-            return 0, False
-        moriio_matched["yes"] = True
-        return 16, True
+        return (0, False) if moriio_queued["yes"] else (16, True)
 
-    moriio = SimpleNamespace(get_num_new_matched_tokens=moriio_match)
+    moriio = SimpleNamespace(
+        get_num_new_matched_tokens=moriio_match,
+        cancel_pending_load=lambda seq: None,
+        update_state_after_alloc=lambda seq: moriio_queued.update(yes=True),
+    )
     multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
     multi._connectors = [moriio, sched]
     multi._load_winner = {}
     seq = _load_seq(64, num_prompt_tokens=24)
 
-    for _ in range(5):
+    for step in range(5):
         assert multi.get_num_new_matched_tokens(seq) == (16, True)
+        if step == 0:
+            moriio.update_state_after_alloc(seq)
         sched.build_connector_meta()
 
     assert calls == ["64"]
@@ -1165,7 +1193,7 @@ def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
 def test_a_finished_request_leaves_no_memo_behind(monkeypatch):
     sched = _scheduler(monkeypatch, "kv_consumer")
     calls = []
-    sched._lookup_client = _counting_lookup(calls, 0)
+    sched._lookup_client = as_lookup_client(_counting_lookup(calls, 0))
     seq = _load_seq(63, num_prompt_tokens=24)
 
     sched.get_num_new_matched_tokens(seq)
@@ -1177,9 +1205,11 @@ def test_a_finished_request_leaves_no_memo_behind(monkeypatch):
 def test_cpu_pin_is_retained_until_retrieve_finishes(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_consumer")
     scheduler._min_load_tokens = 0
-    scheduler._lookup_client = SimpleNamespace(
-        lookup=lambda *_args, **_kwargs: 16,
-        clear_lookup_status=lambda _sid: None,
+    scheduler._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            lookup=lambda *_args, **_kwargs: 16,
+            clear_lookup_status=lambda _sid: None,
+        )
     )
     seq = _load_seq(56, num_prompt_tokens=24)
     scheduler.get_num_new_matched_tokens(seq)
@@ -1357,7 +1387,7 @@ class _StubLookupClient:
 
 def _lookup_scheduler(monkeypatch, hit, *, role="offload"):
     sched = _scheduler(monkeypatch, role)
-    sched._lookup_client = _StubLookupClient(hit)
+    sched._lookup_client = as_lookup_client(_StubLookupClient(hit))
     sched._min_load_tokens = 0  # these prompts are far below the 8192 default
     return sched
 
@@ -1443,3 +1473,138 @@ def test_dense_request_finished_releases_the_failed_load_mark(monkeypatch):
 
     sched.request_finished(seq)
     assert sched._load_failed_seqs == {}
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize(
+    "method", ["gpu_to_chunk_major_device_buffer", "chunk_major_device_buffer_to_gpu"]
+)
+def test_block_id_stage_pins_stream_when_runner_switches(prepared, method):
+    stream_a, stream_b = object(), object()
+    state = SimpleNamespace(pack_stream=stream_a)
+    calls = []
+    owner = SimpleNamespace(group_count=1, upload_count=1)
+
+    def prepare(groups, *, device, stream):
+        assert stream is stream_a
+        state.pack_stream = stream_b
+        return owner
+
+    def run(*args, stream):
+        calls.append(stream)
+
+    codec = SimpleNamespace(**{method: run})
+    if prepared:
+        codec.prepare_block_id_groups = prepare
+        setattr(codec, method + "_prepared", run)
+    connector = object.__new__(BlockGPUConnector)
+    connector.codec = codec
+    connector.device = "cuda:0"
+    connector._tls = threading.local()
+    connector._assert_fused_chunk_major_available = lambda: None
+    group = SimpleNamespace(chunks=[SimpleNamespace(block_ids=[1])])
+    stage, retained_owner, enabled = connector._prepare_block_id_stage(
+        state, [group], method
+    )
+    state.pack_stream = stream_b
+    stage.run(group, object())
+    assert stage.stream is stream_a
+    assert calls == [stream_a]
+    assert enabled is prepared
+    assert retained_owner is (owner if prepared else None)
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # Synthetic CPU streams model completion via synchronize(). Real streams
+    # keep the actual event fence; its ordering has dedicated contract tests.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)
+
+
+@pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
+def test_a_prompt_carries_its_media_salt_to_lookup_save_and_load(
+    monkeypatch, cache_seed, salt
+):
+    """Image placeholder ids are the same for every picture, so each tier key
+    of a seeded prompt carries its `cache_seed`; a text prompt carries none."""
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    asked = []
+
+    def lookup(_token_ids, lookup_id, **kwargs):
+        asked.append(kwargs)
+        return 16
+
+    sched._lookup_client.lookup = lookup
+    loader, saver = _load_seq(950, num_prompt_tokens=24), _load_seq(951)
+    loader.cache_seed = saver.cache_seed = cache_seed
+    saver.num_cached_tokens = 8
+    sched._save_tracker["951"] = [saver, 0]
+
+    sched.get_num_new_matched_tokens(loader)
+    sched.update_state_after_alloc(loader)
+    load, save = sched.build_connector_meta().requests
+
+    expected = {"request_configs": {"lmcache.tag.cache_salt": salt}} if salt else {}
+    assert asked and all(kwargs == expected for kwargs in asked)
+    assert (load.load_spec is not None, load.cache_salt) == (True, salt)
+    assert (save.save_spec is not None, save.cache_salt) == (True, salt)
+
+
+@pytest.mark.parametrize(
+    "cache_salt, configs", [("11", {"lmcache.tag.cache_salt": "11"}), ("", None)]
+)
+def test_dense_worker_loads_and_stores_under_the_prompts_salt(cache_salt, configs):
+    worker = DenseOffloadConnector(_config())
+    load = LMCacheReqMeta(
+        req_id=22,
+        token_ids=list(range(8)),
+        block_ids=[3],
+        load_spec=LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=8, can_load=True),
+        load_operation=LoadOperationId(req_id=22, generation=1),
+        cache_salt=cache_salt,
+    )
+    save = LMCacheReqMeta(
+        req_id=23,
+        token_ids=list(range(8)),
+        block_ids=[4],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        cache_salt=cache_salt,
+    )
+    worker.chunk_size = 8
+    received = []
+
+    class Engine:
+        gpu_connector = None
+
+        @staticmethod
+        def retrieve(_tokens, *, mask, **kwargs):
+            received.append(kwargs.get("request_configs"))
+            return mask.clone()
+
+        @staticmethod
+        def store(_tokens, **kwargs):
+            received.append(kwargs.get("request_configs"))
+
+        @staticmethod
+        def lookup_unpin(_lookup_id):
+            pass
+
+    try:
+        worker._engine = Engine()
+        worker._do_load_req(load)
+        worker._do_save_req(
+            save, producer_event=SimpleNamespace(synchronize=lambda: None)
+        )
+    finally:
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+    assert received == [configs, configs]

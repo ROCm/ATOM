@@ -59,9 +59,22 @@ class Family(StrEnum):
         `per_request_state=True`. Applying a token to it advances it, so
         unlike a paged write -- which lands at the token's own position --
         doing it twice is not idempotent.
-        """
-        return self in (Family.KIMI_MLA, Family.QSA_GDN, Family.GDN)
 
+        DeepSeek-V4.1 (CSA2) keeps one too: its STATE slot's cursor, compressor
+        rings and Engram history advance per token, and a consumer resuming it
+        checks the cursor sits exactly at the prompt's end.
+        """
+        return self in (Family.KIMI_MLA, Family.QSA_GDN, Family.GDN, Family.CSA2)
+
+
+#: The families whose *draft* caches into a KV pool of its own: an MHA draft keeps
+#: its own K and V, there is no target tensor its rows could be. Every other family's
+#: draft binds into the target's pool (an MLA / CSA draft's latent is the target's).
+#: A table on the family, not a flag on the backend class, so `Config` (which runs in
+#: the API process, where importing a backend would import aiter) and the draft
+#: builder read the same answer; tests/test_kv_pool_contract.py pins it to the
+#: backends that define `make_kv_pool`.
+DRAFT_POOL_FAMILIES = frozenset({Family.MHA})
 
 # What makes a hybrid one is which of its layers are linear, and no field says
 # that -- so these two are named, and everything else is read off the shape.

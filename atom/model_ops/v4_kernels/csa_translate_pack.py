@@ -53,9 +53,9 @@ from atom.utils.decorators import mark_trace
 _CSA_TARGET_WG = 512
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["row_stride"])
 def _csa_translate_pack_kernel(
-    topk_local_ptr,  # [T, index_topk] int32 — indexer raw output
+    topk_local_ptr,  # [T, index_topk] int32 — indexer raw output, rank-major under ROW_WORLD > 1
     block_tables_ptr,  # [bs, mnbps] int32 — page table
     positions_ptr,  # [T] int — global token positions (only read under INLINE_SKIP_FROM_POS)
     kv_indptr_csa_ptr,  # [T+1] int32 — packed cumsum; per-token valid_k = indptr[t+1]-indptr[t]-skip[t]
@@ -63,15 +63,23 @@ def _csa_translate_pack_kernel(
     skip_prefix_len_per_token_ptr,  # [T] int32 — per-token write offset; ignored when INLINE_SKIP_FROM_POS
     kv_indices_csa_ptr,  # [total_indices] int32 — destination
     mnbps,  # i32 — max blocks per seq, runtime int
+    row_stride,  # i32 — rows per rank slot of a striped split; read only under ROW_WORLD > 1
     index_topk: tl.constexpr,
     csa_block_capacity: tl.constexpr,
     ENVELOPE_ROWS: tl.constexpr,  # rows one block occupies across all layers
     BLOCK_K: tl.constexpr,
     INLINE_SKIP_FROM_POS: tl.constexpr,  # True → skip = min(pos+1, WINDOW_SIZE) (decode); False → load from buffer (prefill)
     WINDOW_SIZE: tl.constexpr,  # SWA window; only used under INLINE_SKIP_FROM_POS
+    ROW_WORLD: tl.constexpr,  # ranks of a striped split; 1 = rows in order
 ):
     pid_t = tl.program_id(0)
     pid_kb = tl.program_id(1)
+    # A striped split leaves the rows rank-major: row t is the (t // W)-th
+    # row of rank t % W, whose slot starts at (t % W) * row_stride.
+    if ROW_WORLD > 1:
+        src_t = (pid_t % ROW_WORLD) * row_stride + pid_t // ROW_WORLD
+    else:
+        src_t = pid_t
 
     # CG-padded slot sentinel: builder fills [actual_T:padded_T] with -1
     # so the captured kernel grid (= padded_T) bails on padded entries.
@@ -116,7 +124,7 @@ def _csa_translate_pack_kernel(
     in_range = k_offs < valid_k
 
     topk = tl.load(
-        topk_local_ptr + pid_t * index_topk + k_offs,
+        topk_local_ptr + src_t * index_topk + k_offs,
         mask=in_range,
         other=0,
     )
@@ -152,6 +160,7 @@ def csa_translate_pack(
     envelope_rows: int,
     csa_block_capacity: int,
     window_size: int = 0,
+    stripe=None,
     prefix: str = "",
 ) -> None:
     """Fused topk translate + packed write into `kv_indices_csa` (in-place).
@@ -209,10 +218,17 @@ def csa_translate_pack(
                                    per-token skip inline (decode shortcut);
                                    when 0 the per-token buffer is loaded.
                                    Keyword-only.
+      stripe:                      the striped `RowSplit` the indexer scored
+                                   `topk_local` under, or None. Its rows are
+                                   then rank-major (`score_topk`) and
+                                   `topk_local` is the first `T` of the
+                                   gathered slots, read through the split.
+                                   Keyword-only.
     """
     T, index_topk = topk_local.shape
     if T == 0:
         return
+    row_world, row_stride = _stripe_shape(topk_local, stripe)
 
     inline_skip = window_size > 0
     if not inline_skip and skip_prefix_len_per_token is None:
@@ -261,13 +277,36 @@ def csa_translate_pack(
         skip_ptr,
         kv_indices_csa,
         mnbps,
+        row_stride,
         index_topk=index_topk,
         csa_block_capacity=csa_block_capacity,
         ENVELOPE_ROWS=envelope_rows,
         BLOCK_K=BLOCK_K,
         INLINE_SKIP_FROM_POS=inline_skip,
         WINDOW_SIZE=window_size,
+        ROW_WORLD=row_world,
     )
+
+
+def _stripe_shape(topk_local: torch.Tensor, stripe) -> tuple[int, int]:
+    """`(world, stride)` of a striped selection, `(1, 0)` for rows in order.
+    The kernel reads past `T` into the other slots, so `topk_local` must be a
+    dense view at the start of all `world * stride` of them."""
+    if stripe is None or not stripe.stripe or stripe.world == 1:
+        return 1, 0
+    T, index_topk = topk_local.shape
+    rows = stripe.world * stripe.stride
+    held = topk_local.untyped_storage().nbytes() // topk_local.element_size()
+    if (
+        rows < T
+        or not topk_local.is_contiguous()
+        or topk_local.storage_offset() + rows * index_topk > held
+    ):
+        raise ValueError(
+            f"a striped selection needs {rows} slot rows behind its [{T}, "
+            f"{index_topk}] view; storage holds {held // index_topk}"
+        )
+    return stripe.world, stripe.stride
 
 
 def csa_translate_pack_reference(
@@ -282,13 +321,20 @@ def csa_translate_pack_reference(
     envelope_rows: int,
     csa_block_capacity: int,
     window_size: int = 0,
+    stripe=None,
 ) -> None:
     """Pure-torch reference. Mirrors the kernel — derives per-token valid_k
     inline from the `kv_indptr_csa` delta minus skip. When `window_size > 0`,
     derives per-token skip inline as `min(positions[t]+1, window_size)` and
-    ignores `skip_prefix_len_per_token` (which may be None).
+    ignores `skip_prefix_len_per_token` (which may be None). A `stripe`'s
+    rank-major rows are put back in row order first.
     """
-    T, _ = topk_local.shape
+    T, index_topk = topk_local.shape
+    world, stride = _stripe_shape(topk_local, stripe)
+    if world > 1:
+        slots = topk_local.as_strided((world * stride, index_topk), (index_topk, 1))
+        t = torch.arange(T, device=topk_local.device)
+        topk_local = slots[t % world * stride + t // world]
     indptr = kv_indptr_csa.to(torch.int64)
     poses = positions.to(torch.int64)
     bids = batch_id_per_q_token.to(torch.int64)

@@ -7,7 +7,12 @@ Native MTP verify does not snapshot a full SSM state per draft token. It
 appends (k, u, g) records and advances ``write_pos`` by the accepted count
 after the step. SGLang's later ``fused_mamba_state_scatter_with_mask`` would
 overwrite that checkpoint with a per-step snapshot, so once this path is
-engaged the commit hook scatters only the conv window.
+engaged the commit hook scatters only the conv window for the live slot.
+
+The mamba radix cache (extra_buffer) needs a full state in the track slot at
+each tracking boundary. The commit hook rebuilds that one from the checkpoint
+and the records up to the tracked step (``replayssm_materialize``), so the
+ring and the radix cache run together.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import torch
 from atom.model_ops.fla_ops.replayssm import (
     flush_threshold_ok,
     replayssm_commit,
+    replayssm_materialize,
 )
 from atom.utils import envs
 
@@ -65,6 +71,9 @@ def replayssm_enabled() -> bool:
     ``ATOM_ENABLE_REPLAYSSM=0`` keeps the per-step snapshot path.
     ``ATOM_ENABLE_REPLAYSSM=1`` forces the ring even without server args
     (tests). Unset follows whether this process is an MTP server.
+
+    The SGLang radix cache does not change the choice: the commit hook
+    materializes the tracked step's state into the track slot itself.
     """
     override = envs.ATOM_ENABLE_REPLAYSSM
     if override is not None:
@@ -72,13 +81,17 @@ def replayssm_enabled() -> bool:
     return _server_is_speculative()
 
 
-def _server_is_speculative() -> bool:
+def _server_args() -> Any:
     try:
         from sglang.srt.runtime_context import get_server_args
 
-        args = get_server_args()
+        return get_server_args()
     except Exception:  # noqa: BLE001 - unit tests have no server
-        return False
+        return None
+
+
+def _server_is_speculative() -> bool:
+    args = _server_args()
     if args is None:
         return False
     if int(getattr(args, "speculative_num_steps", 0) or 0) > 0:
@@ -161,20 +174,24 @@ def prepare_layer(
     return (*bufs, _RUNTIME.write_pos)
 
 
-def note_full_state_write(slot_idx: torch.Tensor | None) -> None:
+def note_full_state_write(slot_idx: torch.Tensor) -> None:
     """A prefill just rewrote the checkpoint. Drop uncommitted records.
 
     Commit runs after verify, not before the next kernel, so the Native
     prefill sentinel (-1) would discard the first verify's accepts. Parking
     the cursor at 0 is the equivalent: the next verify folds nothing.
+
+    Pad rows (< 0) are routed to a spare trailing entry rather than dropped
+    with a boolean mask, whose size the host would have to read back.
     """
     write_pos = _RUNTIME.write_pos
-    if write_pos is None or slot_idx is None or slot_idx.numel() == 0:
+    if write_pos is None or slot_idx.numel() == 0:
         return
-    live = slot_idx[slot_idx >= 0].to(torch.int64)
-    if live.numel() == 0:
-        return
-    write_pos.index_fill_(0, live, 0)
+    slots = int(write_pos.shape[0])
+    rows = slot_idx.to(torch.int64).masked_fill(slot_idx < 0, slots)
+    parked = torch.zeros(slots + 1, dtype=torch.bool, device=write_pos.device)
+    parked.index_fill_(0, rows, True)
+    write_pos.masked_fill_(parked[:slots], 0)
 
 
 def install_sglang_replayssm_commit() -> None:
@@ -238,6 +255,16 @@ def _commit_accepted(
     slot_idx = metadata.mamba_cache_indices[:request_number]
     if slot_idx.dtype != torch.int32:
         slot_idx = slot_idx.to(torch.int32)
+    track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if track:
+        # Before the commit: the rebuild re-derives this step's record offset
+        # from the cursor the commit is about to advance.
+        _materialize_track_states(
+            linear,
+            slot_idx,
+            mamba_track_indices[:request_number],
+            mamba_steps_to_track[:request_number],
+        )
     # Chain verify: step index of the last accepted token, plus one, is the
     # accept count including the bonus. A full reject is -1 and commits 0.
     num_accepted = (last_correct_step_indices + 1).to(torch.int32)
@@ -258,7 +285,7 @@ def _commit_accepted(
             slot_idx,
             last_correct_step_indices,
         )
-    if mamba_track_indices is None:
+    if not track:
         return
     for conv_states, window in zip(
         mamba_caches.conv, mamba_caches.intermediate_conv_window
@@ -268,4 +295,34 @@ def _commit_accepted(
             window,
             mamba_track_indices,
             mamba_steps_to_track,
+        )
+
+
+def _materialize_track_states(
+    linear: Any,
+    slot_idx: torch.Tensor,
+    track_idx: torch.Tensor,
+    steps: torch.Tensor,
+) -> None:
+    """Write each tracked step's SSM state into its radix track slot.
+
+    One launch per GDN layer, all on the device: untracked rows carry step -1
+    and the kernel skips them, so no mask is read back to the host.
+    """
+    if not track_idx.is_contiguous():
+        track_idx = track_idx.contiguous()
+    if not steps.is_contiguous():
+        steps = steps.contiguous()
+    pool = linear.req_to_token_pool
+    for layer_num, (buf_k, buf_u, buf_g) in _RUNTIME.bufs.items():
+        replayssm_materialize(
+            pool.mamba2_layer_cache(layer_num).temporal,
+            buf_k,
+            buf_u,
+            buf_g,
+            _RUNTIME.write_pos,
+            slot_idx,
+            track_idx,
+            steps,
+            _RUNTIME.max_query_len,
         )

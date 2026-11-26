@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """V4.1's router GEMV for decode: bf16 x [T, 5120] times the gate weight
 [384, 5120] -> bf16 logits, T <= 16, in one fixed summation order.
 
@@ -23,8 +24,10 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int64, T
 
@@ -58,7 +61,7 @@ def router_tile(x, w, task, part, s, lane, wave, red):
     router_tile_mfma(wvs, xvs, lane, wave, red)
 
 
-def _k0s(part, lane, wave):
+def router_k_offsets(part, lane, wave):
     """The K offsets of this lane's loads in part ``part`` (8 bf16 each)."""
     per_wave = HIDDEN // 32 // WAVES // PARTS
     assert per_wave * 32 * WAVES * PARTS == HIDDEN
@@ -83,7 +86,7 @@ def router_weight_loads(w, task, part, lane, wave, w_cm=0):
                 cache_modifier=w_cm,
             )
         )
-        for k0 in _k0s(part, lane, wave)
+        for k0 in router_k_offsets(part, lane, wave)
     ]
 
 
@@ -104,7 +107,7 @@ def router_x_loads(x, part, s, lane, wave, x_cm=0, t0=0):
                 cache_modifier=x_cm,
             )
         )
-        for k0 in _k0s(part, lane, wave)
+        for k0 in router_k_offsets(part, lane, wave)
     ]
 
 
@@ -159,8 +162,11 @@ def _build(tokens: int):
 
 
 def router_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    # a gfx950 kernel (wave64, 16x16x32 bf16 MFMA), as is the mono MoE whose
+    # summation order it shares
     return (
-        x.dim() == 2
+        get_gfx() == "gfx950"
+        and x.dim() == 2
         and 1 <= x.shape[0] <= MAX_TOKENS
         and x.shape[1] == HIDDEN
         and x.dtype == torch.bfloat16
@@ -179,10 +185,11 @@ def _router_logits_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 def router_logits(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """[T, 384] bf16 logits of ``x`` (``router_supported``)."""
     out = torch.empty((x.shape[0], EXPERTS), dtype=torch.bfloat16, device=x.device)
-    _build(x.shape[0])(
+    _run_compiled(
+        _build(x.shape[0]),
         x.data_ptr(),
         weight.data_ptr(),
         out.data_ptr(),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return out

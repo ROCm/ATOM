@@ -32,7 +32,7 @@ if _atom_config_stub is not None:
 
         _atom_config_stub.CUDAGraphMode = _enum.Enum(
             "CUDAGraphMode",
-            {"NONE": 0, "PIECEWISE": 1, "FULL": 2, "FULL_AND_PIECEWISE": 3},
+            {"NONE": 0, "TR_HYBRID": 1, "FULL": 2, "FULL_AND_TR_HYBRID": 3},
         )
     if not hasattr(_atom_config_stub, "DSparkConfig"):
         # arg_utils imports DSparkConfig and calls DSparkConfig.from_dict() to
@@ -43,6 +43,32 @@ if _atom_config_stub is not None:
 
 from atom.model_engine.arg_utils import EngineArgs
 from atom.utils.arg_parser import FlexibleArgumentParser
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_request_context_metrics_cli_reaches_engine_kwargs(enabled):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(
+        parser.parse_args(["--enable-request-context-metrics"] if enabled else [])
+    )
+    assert args.enable_request_context_metrics is enabled
+    assert args._get_engine_kwargs()["enable_request_context_metrics"] is enabled
+
+
+@pytest.mark.parametrize(
+    "argv,want",
+    [([], "interval"), (["--prefill-admit-policy", "adaptive"], "adaptive")],
+)
+def test_prefill_admit_policy_cli_reaches_engine_kwargs(argv, want):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(parser.parse_args(argv))
+    assert args._get_engine_kwargs()["prefill_admit_policy"] == want
+
+
+def test_prefill_admit_policy_cli_rejects_unknown():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--prefill-admit-policy", "eoq"])
 
 
 class TestFlexibleArgumentParser:
@@ -202,10 +228,41 @@ class TestEngineArgsSpeculativeValidation:
             method="mtp",
             model=args.model,
             num_speculative_tokens=3,
+            kv_cache_dtype=None,
             synthetic_acceptance_rate=None,
             synthetic_acceptance_length=None,
         )
         assert kwargs["speculative_config"] is fake_spec_config
+
+    def test_spec_decode_kv_cache_dtype_reaches_speculative_config(self):
+        """--spec-decode-kv-cache-dtype is SpeculativeConfig.kv_cache_dtype; the
+        native CLI has no --spec-decode-config JSON to carry it."""
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        argv = ["--method", "mtp", "--spec-decode-kv-cache-dtype", "bf16"]
+        with patch("atom.model_engine.arg_utils.SpeculativeConfig") as mock_cls:
+            EngineArgs.from_cli_args(parser.parse_args(argv))._get_engine_kwargs()
+        assert mock_cls.call_args.kwargs["kv_cache_dtype"] == "bf16"
+
+    @pytest.mark.parametrize(
+        "argv", [[], ["--method", "mtp", "--num-speculative-tokens", "0"]]
+    )
+    def test_spec_decode_kv_cache_dtype_without_speculation_is_refused(self, argv):
+        """Both ways speculation is off: no --method, or one given with no tokens."""
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        args = EngineArgs.from_cli_args(
+            parser.parse_args(["--spec-decode-kv-cache-dtype", "fp8", *argv])
+        )
+        with pytest.raises(
+            ValueError, match="needs --method and --num-speculative-tokens > 0"
+        ):
+            args._get_engine_kwargs()
+
+    def test_spec_decode_kv_cache_dtype_has_no_fp4(self, capsys):
+        """No draft pool has an FP4 layout, so the flag does not offer one."""
+        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--spec-decode-kv-cache-dtype", "fp4"])
+        assert "invalid choice" in capsys.readouterr().err
 
 
 class TestEngineArgsIndexCacheDtype:

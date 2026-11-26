@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Token parallel: a rank's view of an S-row step as its own S / TP tokens, the
 per-token stages running on it unchanged."""
 
@@ -13,6 +14,7 @@ TOKEN_ROW_BYTES = {
     "res_out": HC * HIDDEN * 2,
     "pend": HIDDEN * 2,
     "normed": HIDDEN * 2,
+    "x": HIDDEN * 2,
     "aux": HIDDEN * 2,
     "out": HIDDEN * 2,
     "pre_in": HC * 4,
@@ -26,6 +28,8 @@ TOKEN_ROW_BYTES = {
     "qr_out": Q_RANK,
     "qrs_out": Q_RANK // 32,
 }
+# layer 0's (``AttnPreBuild.embed_in``): its residual input is the embedding
+EMBED_ROW_BYTES = dict(TOKEN_ROW_BYTES, res_in=HIDDEN * 2)
 
 
 def own_count(s, tp):
@@ -34,13 +38,19 @@ def own_count(s, tp):
     return s // tp
 
 
-def own_view(c, names):
+def own_rows(s, tp, rank):
+    """(first row, rows) ``rank`` owns of a token-parallel s-row step."""
+    n = own_count(s, tp)
+    return rank * n, n
+
+
+def own_view(c, names, row_bytes=TOKEN_ROW_BYTES):
     """``c`` seen from this rank's tokens: S their count, ``t0`` the first one's
-    row of the step, and each per-token argument in ``names`` moved to it."""
-    n = own_count(c["S"], c["d"].tp)
-    t0 = c["rank"] * n
+    row of the step, and each per-token argument in ``names`` moved to it (a
+    token's row: ``row_bytes``)."""
+    t0, n = own_rows(c["S"], c["d"].ranks, c["rank"])
     lo = fx.Int64(t0)
     args = dict(c["args"])
     for name in names:
-        args[name] = args[name] + lo * TOKEN_ROW_BYTES[name]
+        args[name] = args[name] + lo * row_bytes[name]
     return {**c, "S": n, "args": args, "t0": t0}

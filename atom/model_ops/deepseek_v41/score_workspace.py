@@ -18,34 +18,13 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
-from atom.utils import envs
-
-# A packed row starts on a 256-byte boundary, which the row-group scorer's
-# stores need to run at speed, and on a whole candidate block, so its block
-# maxima start at its logits' start over the block.
-ROW_ALIGN = 64
-
-
-def plane_rows(width):
-    """Query rows a `width`-column logits plane may hold at once.
-
-    Its readers reach a row as `row * stride` in int32, so a plane past 2**31
-    elements wraps to a negative address. `width` follows the model-length cap
-    and not the live context, so only a long-context configuration can get
-    there; wherever a batch already fits, this leaves it in one piece.
-    """
-    return max(1, (2**31 - 1) // width)
-
-
-def logits_rows(rows, width):
-    """One logits band's rows, shared by allocation and execution."""
-    return min(
-        plane_rows(width),
-        sparse_indexer_row_chunk(
-            rows, width, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
-        ),
-    )
+from atom.model_ops.indexer.workspace import ROW_ALIGN, aligned_spans, band_offsets
+from atom.model_ops.sparse_indexer_chunk import (
+    LogitsWorkspace,
+    logits_rows,
+    plane_rows,
+)
+from atom.model_ops.sparse_indexer_chunk import flat_view as _view
 
 
 def packed_capacity(geometry, pages, max_tokens, plane_elements):
@@ -65,34 +44,6 @@ def packed_capacity(geometry, pages, max_tokens, plane_elements):
     return min(live, plane_elements)
 
 
-def aligned_spans(visible):
-    """Each row's packed length: its visibility rounded up to `ROW_ALIGN`."""
-    return (visible + ROW_ALIGN - 1) // ROW_ALIGN * ROW_ALIGN
-
-
-def band_offsets(visible, capacity, out):
-    """Pack rows `visible` [rows] into bands of at most `capacity` elements.
-
-    Writes each row's start, counted from its band's, into `out` and returns
-    the bands as `(first, end)` row ranges in order. A row longer than the
-    capacity is refused: no band could hold it.
-    """
-    spans = aligned_spans(visible.astype(np.int64))
-    if spans.size and int(spans.max()) > capacity:
-        raise ValueError(
-            f"a {int(spans.max())}-element row exceeds the {capacity}-element "
-            "packed logits buffer"
-        )
-    ends = np.cumsum(spans)
-    bands, first, base = [], 0, 0
-    while first < len(spans):
-        end = int(np.searchsorted(ends, base + capacity, side="right"))
-        out[first:end] = ends[first:end] - spans[first:end] - base
-        bands.append((first, end))
-        base, first = int(ends[end - 1]), end
-    return tuple(bands)
-
-
 class PackedRows(NamedTuple):
     """A step's rows at one ratio laid out in the packed logits: each row's
     visibility, where its logits and its block maxima start, counted from its
@@ -104,9 +55,9 @@ class PackedRows(NamedTuple):
     bands: tuple[tuple[int, int], ...]
 
 
-class ScoreWorkspace:
-    """The scorer's logits band and each ratio's tile table, at their largest,
-    and the row starts of one-row sequences. The FP4 plane has no tile tables:
+class ScoreWorkspace(LogitsWorkspace):
+    """The scorer's logits plane (`LogitsWorkspace`) and each ratio's tile
+    table, at their largest, and the row starts of one-row sequences. The FP4 plane has no tile tables:
     its scorers read the PAGE table itself, and its logits are packed
     (`capacity` elements, `packed_logits`, laid out by `pack`) with the
     candidate pick's block maxima packed beside them.
@@ -146,10 +97,13 @@ class ScoreWorkspace:
         self.packed = geometry.index_fp4
         if self.packed and pages is None:
             raise ValueError("the FP4 plane packs its logits: it needs the PAGEs")
-        self.capacity = (
-            packed_capacity(geometry, pages, max_tokens, plane)
-            if self.packed
-            else plane
+        super().__init__(
+            (
+                packed_capacity(geometry, pages, max_tokens, plane)
+                if self.packed
+                else plane
+            ),
+            device,
         )
         # A step's rows see the most at the widest ratio; what they may fill is
         # what is left by the padding rows a captured graph adds, each at
@@ -158,7 +112,6 @@ class ScoreWorkspace:
         self._rows_capacity = self.capacity - max_tokens * aligned_spans(
             1 // self._ratio
         )
-        self._logits = torch.empty(self.capacity, dtype=torch.float32, device=device)
         self.block_rows = geometry.index_block_rows
         self._maxima = (
             torch.empty(
@@ -192,10 +145,6 @@ class ScoreWorkspace:
                 for ratio, flat in self._tiles.items()
             }
         )
-
-    def logits(self, rows, width):
-        """`[rows, width]` fp32, one band of the scorer's logits plane."""
-        return _view(self._logits, rows, width)
 
     def fits(self, rows, contexts):
         """Whether a step of requests with `rows` query rows each, every row
@@ -232,18 +181,6 @@ class ScoreWorkspace:
             raise ValueError("only the FP4 plane packs its logits")
         return self._maxima
 
-    def logits_rows(self, rows, width):
-        """Rows that fit both the byte budget and this fixed allocation.
-
-        A narrower live/candidate width can round to more total elements than
-        a configured width. Bound by actual storage too, without reallocating
-        buffers captured by graphs or retained by overlapping microbatches.
-        """
-        capacity = self._logits.numel() // width
-        if capacity == 0:
-            raise ValueError("One logits row exceeds the scorer workspace")
-        return min(logits_rows(rows, width), capacity)
-
     def row_starts(self, rows):
         """`[rows + 1]` int32 0 .. rows: each of `rows` rows its own sequence."""
         return self._row_starts[: rows + 1]
@@ -255,12 +192,3 @@ class _TileWorkspace:
 
     def unit_table(self, ratio, tokens, width):
         return _view(self._tiles[ratio], tokens, width)
-
-
-def _view(flat, rows, width):
-    if rows * width > flat.numel():
-        raise ValueError(
-            f"a [{rows}, {width}] scorer temporary exceeds its workspace of "
-            f"{flat.numel()} elements"
-        )
-    return flat[: rows * width].view(rows, width)

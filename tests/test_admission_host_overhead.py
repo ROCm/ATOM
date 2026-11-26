@@ -9,6 +9,7 @@ import pickle
 import queue
 import random
 import sys
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -25,7 +26,7 @@ from test_state_checkpoint import (
     stateful_seq,
 )
 
-from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.block_manager import AdmissionProbe, BlockManager
 from atom.model_engine.prefix_hash import (
     attach_shipped_chains,
     chained_block_hashes,
@@ -74,11 +75,12 @@ def pool_state(bm):
 
 def admit(bm, seq, chunk=None):
     """Phase 2: probe, record, allocate, forward."""
-    hashes = []
-    hit = bm.can_allocate(seq, record=False, block_hashes=hashes)
+    probe = AdmissionProbe()
+    hit = bm.can_allocate(seq, record=False, probe=probe)
+    hashes = probe.block_hashes
     if hit < 0:
         return (hit, hashes)
-    bm.record_allocation(seq, hit, hashes)
+    bm.record_allocation(seq, probe)
     assert bm.allocate(seq, hit)
     replay = seq.replays_hit, seq.replay_kv_load
     todo = seq.num_tokens - seq.num_cached_tokens
@@ -543,6 +545,7 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
     poller = SimpleNamespace(register=lambda *a: None, poll=lambda: [(sock, 1)])
     monkeypatch.setattr(core.zmq, "Poller", lambda: poller)
     engine = object.__new__(core.EngineCore)
+    engine._kv_progress_event = threading.Event()
     engine.label, engine.input_queue = "test", queue.Queue()
     engine.process_input_sockets("input", "control")
     want = reference_chain(tokens, BLOCK, -1, 10)

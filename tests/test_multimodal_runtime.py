@@ -145,7 +145,7 @@ def test_scheduler_ack_retry_preempt_abort_and_no_decode_payload():
     core = SimpleNamespace(
         runner_mgr=SimpleNamespace(call_func=lambda *args: calls.append(args))
     )
-    EngineCore._release_multimodal_requests(core, finished)
+    EngineCore._release_request_resources(core, finished)
     assert calls == [("release_multimodal_requests", [seq.id])]
 
 
@@ -206,3 +206,54 @@ def test_prefill_ack_omits_media_and_decode_has_no_payload():
         )
     assert scheduler.is_finished() and decoded and prefills == 4
     assert seq.multimodal_data is None
+
+
+def test_kimi_k3_image_prompt_longer_than_the_token_budget_is_chunked():
+    # Kimi-K3 used to hand the scheduler span-less media, so an image prompt
+    # longer than `max_num_batched_tokens` was rejected outright and the client
+    # got an empty response (OCRBench document images at the 8192 default).
+    from atom.models.kimi_k3.image_processing import build_kimi_k3_inputs
+
+    def processor(**kwargs):
+        return {
+            "input_ids": torch.tensor([[9, 42, 7]]),
+            "pixel_values": torch.ones(64, 3, 14, 14),
+            "grid_thws": torch.tensor([[1, 4, 16]]),
+        }
+
+    atom_config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(
+            media_placeholder_token_id=42,
+            vision_config=SimpleNamespace(merge_kernel_size=[2, 2]),
+        )
+    )
+    token_ids, data = build_kimi_k3_inputs(
+        atom_config, processor, [{"role": "user", "content": []}], [object()], {}
+    )
+    assert token_ids == [9] + [42] * 16 + [7]
+    assert data["embedding_spans"] == ((1, 16),)
+
+    scheduler = Scheduler(
+        MockConfig(
+            max_num_batched_tokens=6,
+            max_model_len=128,
+            num_kvcache_blocks=100,
+            enable_chunked_prefill=True,
+        )
+    )
+    seq = Sequence(
+        token_ids, 4, SamplingParams(temperature=0, max_tokens=2), multimodal_data=data
+    )
+    assert scheduler._unschedulable_reason(seq) is None
+    scheduler.add(seq)
+    chunks = []
+    while seq.num_cached_tokens < len(token_ids):
+        batch, _ = scheduler.schedule()
+        assert batch.multimodal_data[seq.id]["embedding_spans"] == ((1, 16),)
+        chunks.append(batch.total_tokens_num_prefill)
+        scheduler.postprocess(
+            list(scheduler.running),
+            ScheduledBatchOutput([], [], None, None, None),
+            batch=batch,
+        )
+    assert chunks == [6, 6, 6]

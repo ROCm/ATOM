@@ -36,7 +36,7 @@ def _install_thread_local_tbo_attention_backend_patch() -> None:
     imports the getter by value.
     """
 
-    from sglang.srt.layers import radix_attention
+    import sglang.srt.layers.radix_attention as radix_attention  # noqa: PLR0402
     from sglang.srt.model_executor import forward_context
 
     original_attr = "_atom_sglang_original_get_attn_backend"

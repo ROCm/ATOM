@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """K2b's build key and route shape: what a ``moe`` build is for (``MoeBuild``),
 and the task counts, placements and LDS route table that follow from its
 routing (``RouteShape``), with the table's readers. Plain Python but for the
@@ -11,13 +12,17 @@ import flydsl.expr as fx
 
 from atom.model_ops.deepseek_v41.router import PARTS as ROUTER_PARTS
 from atom.models.deepseek_v41.mono import moe_plan as mplan
+from atom.models.deepseek_v41.mono.config import MAX_ROWS
+from atom.models.deepseek_v41.mono.kernels.attn_post import NORM0
 from atom.models.deepseek_v41.mono.kernels.attn_pre import ROWS, TILE, token_tiles
-from atom.models.deepseek_v41.mono.kernels.dims import UG_PART, Dims
+from atom.models.deepseek_v41.mono.kernels.dims import TOPK, UG_PART, Dims
 from atom.mono.plan.execution import BLOCKS, WAVES
 
-EXPERTS, TOPK = 384, 6  # the target's routing (a build's: ``MoeBuild``)
+EXPERTS = 384  # the target's routed experts (a build's: ``MoeBuild``)
 ROUTER0 = 8  # the router's first task: past the xq tasks (a token each)
-MASK_WORDS = 2  # an expert's token bitmap in the route table: tokens <= 64
+# an expert's token bitmap in the route table: words of 32 tokens, at least
+# this many (``RouteShape.mask_words``)
+MASK_WORDS = 2
 # a route lane's experts (EXPERTS / 64) sorted descending, ties kept in index
 # order: the network by their count
 SORT_NETS = {
@@ -41,6 +46,23 @@ class MoeBuild:
     diag_off: int = -1
     # FP4 groups an ug task (``RouteShape.ug_groups``)
     ug_groups: int = 2
+    # expert-parallel ranks (``Dims``): rank r holds routed experts r E / ep ..
+    # at their whole width; 1 under TP
+    ep: int = 1
+    # DP attention with the MoE TP over the DP ranks (``tp`` of them): the rows
+    # every rank's step's, rank r's own its own (expert parallel implies it)
+    dp_attention: bool = False
+    # the regions kept in two copies, one on each I/O die (``numa_plan``); the
+    # calibration word that picks a CTA's copy is the ``numa_word`` argument
+    numa: str = ""
+    # K2a's seam runs before it in the launch, on every row (``layer_post`` /
+    # the layer kernel, neither token parallel nor DP attention): where it fits,
+    # the router normalizes the seam's LIN itself, on the CTAs past the seam's
+    # (``RouteShape.router_reads_seam``)
+    after_seam: bool = False
+    # token parallel: the router and route on a rank's own rows (ready with
+    # its own norm, not the gather), the routes pushed to every rank's RT
+    own_routes: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,10 +83,42 @@ class RouteShape:
     # closer together: faster at the draft's widths (40 rows -4 us), slower at
     # the target's (48 rows +3 us; the runners pick)
     ug_groups: int = 2
+    ep: int = 1
+    dp_attention: bool = False
+    after_seam: bool = False
+    own_routes: bool = False
+
+    @property
+    def dpa(self) -> bool:
+        """DP attention: the rows every rank's step's, a rank's own its own
+        (``router_rows``), the shared expert replicated (``MoeBuild``): the
+        MoE TP over its ranks, or expert parallel at attention TP 1."""
+        return self.dims.dp_attention
+
+    @property
+    def routes_pushed(self) -> bool:
+        """A rank routes its own rows and pushes their routes to every rank's
+        RT: DP attention, or token parallel (``MoeBuild.own_routes``)."""
+        return self.dpa or self.own_routes
 
     @property
     def dims(self) -> Dims:
-        return Dims(self.tp)
+        return Dims(self.tp, self.ep, self.dp_attention)
+
+    @property
+    def local_experts(self) -> int:
+        """The routed experts a rank holds: all of them under TP."""
+        return self.experts // self.ep
+
+    @property
+    def down_one_call(self) -> bool:
+        """A CTA's down tasks in one call, a CTA with one task running it twice
+        (pushed once): past a step's rows (``MAX_ROWS``: DP attention's MoE
+        over every rank's), where a call for one task and one for two kept
+        each other's addresses live (a spill). Below it the repeat costs (TP
+        2, 48 rows +11 us). With K in parts (expert parallel) the call is
+        ``down_by_units``, else ``stage_down``."""
+        return self.tokens > MAX_ROWS
 
     @property
     def ug_parts(self) -> int:
@@ -83,27 +137,69 @@ class RouteShape:
 
     @property
     def max_u(self) -> int:
-        return min(self.picks, self.experts)
+        return min(self.picks, self.local_experts)
+
+    @property
+    def router_rows(self) -> int:
+        """The rows a rank routes: its own (DP attention: its own step's), their
+        routes pushed to every rank (``routes_pushed``, ``moe.stage_route``);
+        else all."""
+        return self.tokens // self.dims.ranks if self.routes_pushed else self.tokens
 
     @property
     def router_groups(self) -> tuple[int, int]:
         """``stage_router``'s token groups and their tokens: a group a token
         tile, as many as one round of CTAs holds (a CTA running two serialized
         them: the route waited on the 32 that did at 48 rows)."""
-        per_group = self.experts // ROWS * ROUTER_PARTS
-        groups = max(1, min(len(token_tiles(self.tokens)), BLOCKS // per_group))
-        tokens = -(-self.tokens // groups)
-        assert (groups - 1) * tokens < self.tokens
+        return self._router_groups(self.router_tiles)
+
+    def _router_groups(self, tiles) -> tuple[int, int]:
+        rows = self.router_rows
+        per_group = self._router_group_tasks(tiles)
+        groups = max(1, min(len(token_tiles(rows)), BLOCKS // per_group))
+        tokens = -(-rows // groups)
+        assert (groups - 1) * tokens < rows
         return groups, tokens
+
+    def _router_group_tasks(self, tiles) -> int:
+        return self.experts // ROWS // tiles * ROUTER_PARTS
+
+    @property
+    def router_group_tasks(self) -> int:
+        """A token group's router tasks: (``router_tiles`` 16-row tiles, K part)."""
+        return self._router_group_tasks(self.router_tiles)
+
+    @property
+    def router_reads_seam(self) -> bool:
+        """After the seam (``after_seam``), whether the router normalizes the
+        seam's LIN itself (``moe.router_x_normed``) on the CTAs past the
+        seam's, which its tasks of two row tiles each must all fit on: a task
+        on a slice or xq CTA starts only after that CTA's own stage. Else it
+        waits for the norm's row, as a launch without the seam."""
+        if not self.after_seam:
+            return False
+        groups, _ = self._router_groups(2)
+        return groups * self._router_group_tasks(2) <= BLOCKS - NORM0 - self.tokens
+
+    @property
+    def router_tiles(self) -> int:
+        """A router task's 16-row tiles of the gate weight: reading the seam
+        two (one x landing for both, ``router_reads_seam``); else one."""
+        return 2 if self.router_reads_seam else 1
 
     @property
     def router_tasks(self) -> int:
-        # (token group, 16-row tile, K part): ``stage_router``
-        return self.router_groups[0] * self.experts // ROWS * ROUTER_PARTS
+        # (token group, row tiles, K part): ``stage_router``
+        return self.router_groups[0] * self.router_group_tasks
 
     @property
     def router0(self) -> int:
-        """Past the xq tasks (a token each from CTA 0)."""
+        """Past the xq tasks (a token each from CTA 0); reading the seam
+        (``router_reads_seam``) past its slice, gate and norm CTAs, so the
+        router's wait for the slice starts as K2a's wo_b ends, not after a
+        slice task."""
+        if self.router_reads_seam:
+            return NORM0 + self.tokens
         return max(ROUTER0, self.tokens)
 
     @property
@@ -112,6 +208,11 @@ class RouteShape:
 
     @property
     def shared0(self) -> int:
+        """Past the route; reading the seam (``router_reads_seam``), past the
+        xq tasks, on slice CTAs (the router's past them would wrap onto xq's,
+        which wait for the norm)."""
+        if self.router_reads_seam:
+            return max(8, self.tokens)
         return self.route0 + max(8, self.tokens)
 
     @property
@@ -139,6 +240,15 @@ class RouteShape:
         return self.tokens > TILE
 
     @property
+    def down_y(self) -> bool:
+        """Down by queue units: MID as tagged pairs, down units of a
+        slot from a queue each waiting on its own slot's MID only, each pick's
+        bf16 y as tagged pairs, then a combine that polls them
+        (``moe.run_down_y``); past one token tile a unit is a pick tile's.
+        TP (no DP attention, no expert parallel)."""
+        return not self.dpa and self.ep == 1
+
+    @property
     def slot_tiles(self) -> int:
         """A slot's pick tiles at most (a token picks an expert once)."""
         return len(token_tiles(self.tokens))
@@ -162,7 +272,12 @@ class RouteShape:
     @property
     def queue0(self) -> int:
         """The ug task this CTA took from the queue (``take_ug_task``)."""
-        return self.mask0 + MASK_WORDS * self.experts
+        return self.mask0 + self.mask_words * self.experts
+
+    @property
+    def mask_words(self) -> int:
+        """An expert's token bitmap's words (``MASK_WORDS`` at least)."""
+        return max(MASK_WORDS, -(-self.tokens // 32))
 
     @property
     def expert_slot0(self) -> int:
@@ -189,6 +304,10 @@ class RouteShape:
         """A slot's picks at most: a token picks an expert once."""
         return min(self.tokens, 16)
 
+    def route_id(self, tab, s, t, k):
+        """Token t's k-th routed expert (global id)."""
+        return fx.ptr_load(tab + (t * 2 * self.topk + k))
+
     def route_w(self, tab, s, t, k):
         return fx.ptr_load(tab + (t * 2 * self.topk + self.topk + k)).bitcast(
             fx.Float32
@@ -214,4 +333,7 @@ class RouteShape:
 
 
 def route_shape(key: MoeBuild) -> RouteShape:
-    return RouteShape(key.experts, key.topk, key.tokens, key.tp, key.ug_groups)
+    return RouteShape(
+        key.experts, key.topk, key.tokens, key.tp, key.ug_groups, key.ep,
+        key.dp_attention, key.after_seam, key.own_routes,
+    )  # fmt: skip

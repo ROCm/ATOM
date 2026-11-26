@@ -3,8 +3,10 @@
 Flash uses `qwen4_exp` / `Qwen4ExpForConditionalGeneration`. Target and MTP
 compute run through Native ATOM `Qwen4Exp` and `Qwen4ExpMTP`; the plugin
 adapts SGLang scheduling, QSA KV pools, PLE state and HC hidden storage.
-It requires the Native Flash implementation in this tree and SGLang 0.5.17.
-The recognition patch supplies Flash config registration for that version.
+It requires the Native Flash implementation in this tree and SGLang 0.5.20 or
+newer (CI and the release image use v0.5.22); upstream recognizes
+`qwen4_exp`, and the recognition patch adds only the MTP draft-arch and
+HC-width adapters.
 
 `Qwen4ExpForConditionalGeneration` is 48 layers: 36 Gated-DeltaNet and 12 QSA
 (query-sparse, 2048-token budget) attention layers, 4-stream
@@ -131,6 +133,73 @@ message size, so decode all-reduces stay exact. It perturbs prefill
 activations (max ~3% of a tensor's range per reduction), so validate accuracy
 on the target workload before enabling it.
 
+## Optional: bursty prefill on an idle server
+
+When several requests reach an idle server at once and their prefill takes
+more than one batch, overlap scheduling launches the next prefill batch before
+it processes the results of the previous one. The first batch's requests then
+get their first token only after the next batch has also run. To process each
+prefill batch's results before the next prefill batch launches, add one
+variable to the MTP command above and keep all of its flags:
+
+```bash
+export SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=1
+```
+
+* It only changes back-to-back prefill (extend) batches. Decode and
+  target-verify batches keep overlap scheduling. Unlike
+  `--disable-overlap-schedule`, decode stays asynchronous.
+* It helps only when prefill batches run back to back, for example a burst
+  that does not fit in one batch. A short request that arrives alone sees no
+  change.
+* SGLang notes that this setting may slightly hurt throughput. Every pair of
+  back-to-back prefill batches loses overlap, including the chunks of one
+  long prompt. Measure steady-load throughput on the target workload before
+  enabling it.
+* The recv-skipper settings (`--scheduler-recv-interval` with
+  `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_*`) can also gather a burst into one
+  batch. They are not recommended here: the window counts scheduler
+  iterations rather than time, so its length depends on the host and the load.
+
+Measured with the MTP command above on 2x MI308X (gfx942), ROCm 7.2.4, SGLang
+v0.5.22. The default was run twice, before and after the switch, to show
+run-to-run drift. Burst TTFT in ms, median / mean / P99, for N requests sent
+together to an idle server:
+
+| Prompt | N | Default | Default, repeat | Switch on |
+|---|---|---|---|---|
+| 2048 | 1 | 233 / 238 / 269 | 229 / 240 / 293 | 228 / 230 / 242 |
+| 2048 | 2 | 453 / 455 / 464 | 477 / 474 / 505 | 344 / 343 / 460 |
+| 2048 | 4 | 585 / 585 / 590 | 613 / 614 / 646 | 587 / 498 / 591 |
+| 2048 | 8 | 1003 / 1001 / 1018 | 1046 / 1045 / 1102 | 1000 / 907 / 1017 |
+| 4096 | 1 | 275 / 282 / 314 | 282 / 292 / 330 | 274 / 274 / 277 |
+| 4096 | 2 | 538 / 539 / 543 | 549 / 552 / 571 | 411 / 410 / 552 |
+| 4096 | 4 | 947 / 950 / 978 | 950 / 971 / 1027 | 948 / 780 / 951 |
+| 4096 | 8 | 1813 / 1731 / 1836 | 1868 / 1785 / 1913 | 1159 / 1299 / 1834 |
+
+In every wave the first request of the burst was admitted alone (splits
+`1+1`, `1+3`, `1+7`, and `1+4+3` for 4096 x 8). The switch returns
+that request after its own batch instead of after the next one. When the
+median request falls in the second batch (N=4, and 2048 x 8), only the mean
+improves. P99 is set by the last batch. With the switch it is within or below
+the range of the two default runs.
+
+Steady-load output throughput in tok/s, mean of 4 runs (`bench_serving`
+random, 128 prompts, `--max-concurrency 8`). Request rates inf and 2 were run
+twice each; the concurrency cap holds both at the same achieved 1.0 / 1.3
+req/s, so they are pooled:
+
+| Input / output | Default | Default, repeat | Switch on |
+|---|---|---|---|
+| 2048 / 512 | 512 | 509 | 503 |
+| 6144 / 256 | 331 | 342 | 336 |
+
+In the 2048 / 512 runs at request rate 2, the switch was 2-5% lower (mean 487
+vs 498-515 for the two default runs; single runs 472.5 / 502.3 vs 513.5 /
+516.9 / 507.8 / 488.0). The other runs were within noise. Median ITL is
+9.7-9.8 ms in all runs. GSM8K (5-shot, chat, 200 questions): 0.98 / 0.985
+default, 0.99 with the switch.
+
 ## Benchmark
 
 ```bash
@@ -155,4 +224,6 @@ python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30080 \
   parallel sizes and speculative horizons.
 - On a SGLang upgrade, review recognition and MTP EntryClass mapping separately.
   Upstream Flash recognition does not replace Native ATOM compute or the
-  plugin's graph padding and post-draft metadata refresh contracts.
+  plugin's graph padding and post-draft metadata refresh contracts. Also check
+  that `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP`, an internal SGLang
+  scheduler variable, still exists and keeps the same meaning.

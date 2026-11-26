@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
-use crate::{config::types::PolicyConfig, core::Worker};
+use crate::{config::types::PolicyConfig, core::Worker, kv_index::PrefixMatchProvider};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -29,6 +29,9 @@ pub struct PolicyRegistry {
 
     /// Decode policy for PD mode (set once at startup, lock-free reads via OnceLock)
     decode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
+
+    /// The KV event index, for cache-aware policies (set once at startup)
+    kv_events: Arc<OnceLock<Arc<dyn PrefixMatchProvider>>>,
 }
 
 impl PolicyRegistry {
@@ -42,6 +45,28 @@ impl PolicyRegistry {
             default_policy,
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
+            kv_events: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Lets every cache-aware policy, the ones created later included, place requests by
+    /// the KV event index.
+    pub(crate) fn set_kv_events(&self, provider: Arc<dyn PrefixMatchProvider>) {
+        let _ = self.kv_events.set(provider);
+        let policies = [self.prefill_policy.get(), self.decode_policy.get()];
+        for policy in policies.into_iter().flatten() {
+            self.hand_kv_events(policy);
+        }
+        self.hand_kv_events(&self.default_policy);
+        for entry in self.model_policies.iter() {
+            self.hand_kv_events(entry.value());
+        }
+    }
+
+    fn hand_kv_events(&self, policy: &Arc<dyn LoadBalancingPolicy>) {
+        let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>();
+        if let (Some(provider), Some(cache_aware)) = (self.kv_events.get(), cache_aware) {
+            cache_aware.set_kv_events(provider.clone());
         }
     }
 
@@ -73,6 +98,7 @@ impl PolicyRegistry {
 
         // New model - determine policy
         let policy = self.determine_policy_for_model(model_id, policy_hint);
+        self.hand_kv_events(&policy);
 
         info!(
             "Assigning policy {} to new model {}",
@@ -194,6 +220,7 @@ impl PolicyRegistry {
 
     /// Set the prefill policy for PD mode (lock-free, set once at startup)
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        self.hand_kv_events(&policy);
         // OnceLock::set returns Err if already set, which we ignore since
         // the policy should only be set once at startup
         let _ = self.prefill_policy.set(policy);
@@ -201,6 +228,7 @@ impl PolicyRegistry {
 
     /// Set the decode policy for PD mode (lock-free, set once at startup)
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        self.hand_kv_events(&policy);
         // OnceLock::set returns Err if already set, which we ignore since
         // the policy should only be set once at startup
         let _ = self.decode_policy.set(policy);
@@ -570,5 +598,49 @@ mod tests {
         // Unknown policy type should fall back to default
         let policy = registry.on_worker_added("model", Some("nonexistent_policy"));
         assert_eq!(policy.name(), "round_robin"); // Falls back to default
+    }
+
+    use crate::policies::CacheAwareConfig;
+
+    #[derive(Debug)]
+    struct NoHits;
+
+    impl PrefixMatchProvider for NoHits {
+        fn match_workers(&self, _tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
+            vec![None; workers.len()]
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_events_reach_every_cache_aware_policy() {
+        let cache_aware = || {
+            let config = CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            };
+            Arc::new(CacheAwarePolicy::with_config(config))
+        };
+        let registry = PolicyRegistry::new(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 100,
+        });
+        registry.set_prefill_policy(cache_aware());
+        registry.set_kv_events(Arc::new(NoHits));
+        registry.set_decode_policy(cache_aware());
+        let model = registry.on_worker_added("m", Some("cache_aware"));
+        for policy in [
+            registry.get_default_policy(),
+            registry.get_prefill_policy(),
+            registry.get_decode_policy(),
+            model,
+        ] {
+            assert!(policy.wants_tokens());
+        }
+        assert!(!registry
+            .on_worker_added("n", Some("round_robin"))
+            .wants_tokens());
     }
 }

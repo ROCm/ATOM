@@ -12,9 +12,12 @@ KV output aggregator.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
+
+from atom.kv_transfer.disaggregation.chunked_prefill import PrefillHandoff
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -22,7 +25,7 @@ from typing import Any
 
 EngineId = str
 ReqId = str | int
-TransferId = int
+TransferId = str | int
 
 
 def kv_config_has_producer(kv_config: object) -> bool:
@@ -38,6 +41,24 @@ def kv_config_has_producer(kv_config: object) -> bool:
     if kv_config.get("kv_role") == "kv_producer":
         return True
     return any(kv_config_has_producer(sub) for sub in kv_config.get("connectors", []))
+
+
+def produced_no_handoff(seq: object) -> bool:
+    """Whether a finishing request on a P/D producer has nothing to hand off.
+
+    True when it was aborted or rejected as unschedulable, or when its prompt
+    prefill never completed on this scheduler (`Sequence.prefill_completed`).
+    Both reasons end a request that is leaving the waiting queue, so it holds
+    no blocks: one that never ran has no KV and no first token, and one that
+    ran, was preempted and is then rejected has had its blocks freed. A
+    producer then publishes a cancellation and keeps no send claim.
+    """
+    reason = getattr(seq, "leave_reason", None) or ""
+    return (
+        reason == "aborted"
+        or reason.startswith("unschedulable")
+        or not getattr(seq, "prefill_completed", True)
+    )
 
 
 @dataclass(frozen=True)
@@ -100,6 +121,17 @@ class LoadOperationId:
 LoadCompletionId = ReqId | LoadOperationId
 
 
+def raw_req_id(completion: Any) -> ReqId:
+    """The request id of a completion id, bare or tagged with a generation, in
+    the type the engine compares against (`seq.id`)."""
+    return getattr(completion, "req_id", completion)
+
+
+def req_id_of(completion: Any) -> str:
+    """`raw_req_id` as a string key."""
+    return str(raw_req_id(completion))
+
+
 @dataclass(frozen=True)
 class StateStoreOperationId:
     """Exact identity of one hand-out of a state checkpoint to the CPU tier.
@@ -121,12 +153,25 @@ class StateStoreOperationId:
             raise ValueError("state store generation must be nonnegative")
 
 
+@dataclass(frozen=True)
+class StateTouchId:
+    """One LRU refresh of a voted state image. Every TP worker reports on its
+    own shard under this id, so the failure-dominant quorum says gone when any
+    shard is. `generation` keeps repeated touches of one hash distinct
+    identities.
+    """
+
+    prefix_hash: int
+    generation: int
+
+
 ConnectorCompletionId = (
     ReqId
     | SaveOperationId
     | SaveSourceGroupId
     | LoadOperationId
     | StateStoreOperationId
+    | StateTouchId
 )
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
 
@@ -199,10 +244,96 @@ class KVTransferRegion:
     # makes equal-sized planes distinguishable across code versions.
     semantic_role: str | None = None
 
+    @staticmethod
+    def unit_offset(
+        index: int, total_bytes: int, unit_bytes: int, reverse_indexed: bool
+    ) -> int:
+        if reverse_indexed:
+            return total_bytes - (index + 1) * unit_bytes
+        return index * unit_bytes
+
+    @staticmethod
+    def chunk_sizes(total_bytes: int, unit_bytes: int, max_bytes: int) -> list[int]:
+        """Split a region into MR chunks, each <= ``max_bytes`` and, apart from
+        the last, a whole number of units, so no unit crosses an MR boundary.
+
+        A unit larger than ``max_bytes`` cannot be aligned and is left to
+        straddle.
+        """
+        sizes: list[int] = []
+        offset = 0
+        while offset < total_bytes:
+            remaining = total_bytes - offset
+            chunk = min(max_bytes, remaining)
+            if chunk < remaining and chunk >= unit_bytes > 0:
+                chunk -= chunk % unit_bytes
+            sizes.append(chunk)
+            offset += chunk
+        return sizes
+
     def unit_addr(self, index: int) -> int:
-        if self.reverse_indexed:
-            return self.base_addr + self.total_bytes - (index + 1) * self.unit_bytes
-        return self.base_addr + index * self.unit_bytes
+        return self.base_addr + self.unit_offset(
+            index, self.total_bytes, self.unit_bytes, self.reverse_indexed
+        )
+
+
+@dataclass(frozen=True)
+class PageUnitSpec:
+    """A PAGE unit's identity, `(namespace, field, layer)`, and its format.
+
+    The same on every TP size and PP stage; heads per rank are `head_major_runs`.
+    """
+
+    namespace: str
+    field: str
+    # The owning module's `layer_num`, so a PP stage names a unit as the
+    # unsplit model does.
+    layer: int
+    # Elements per token, per head where the unit is per head.
+    dim: int
+    dtype: str
+
+
+def pair_units(
+    local: Sequence[PageUnitSpec],
+    consumer: Sequence[PageUnitSpec],
+    first_layer: int = 0,
+    end_layer: int | None = None,
+) -> list[int]:
+    """The consumer region each local unit lands in, matched by identity.
+
+    Every consumer unit of layers `[first_layer, end_layer)` must be matched.
+    """
+    index: dict[tuple[str, str, int], int] = {}
+    for i, spec in enumerate(consumer):
+        key = (spec.namespace, spec.field, spec.layer)
+        if key in index:
+            raise ValueError(f"consumer publishes {key} twice")
+        index[key] = i
+    cmap = []
+    for spec in local:
+        i = index.get((spec.namespace, spec.field, spec.layer))
+        if i is None:
+            raise ValueError(f"consumer has no unit for {spec}")
+        if consumer[i] != spec:
+            raise ValueError(
+                f"unit format mismatch: ours {spec}, consumer's {consumer[i]}"
+            )
+        cmap.append(i)
+    if len(set(cmap)) != len(cmap):
+        raise ValueError("two local units share one identity")
+    owned = {
+        i
+        for i, spec in enumerate(consumer)
+        if spec.layer >= first_layer and (end_layer is None or spec.layer < end_layer)
+    }
+    missing = sorted(owned.difference(cmap))
+    if missing:
+        raise ValueError(
+            f"{len(missing)} consumer unit(s) of layers [{first_layer}, "
+            f"{end_layer}) are not held here, e.g. {consumer[missing[0]]}"
+        )
+    return cmap
 
 
 @dataclass(frozen=True)
@@ -219,6 +350,10 @@ class PageRegion:
 
     region: KVTransferRegion
     view: Any = None
+    # `(heads, widths)`: one run per width, each this rank's `heads` KV heads of
+    # `width` B one after another. None: not per head (replicated).
+    head_major_runs: tuple[int, tuple[int, ...]] | None = None
+    unit_spec: PageUnitSpec | None = None
 
 
 @dataclass
@@ -302,6 +437,21 @@ class KVTransferTensors:
     # those are ordinary PAGE KV, never part of the state image. None means
     # every region. Appended for positional compatibility.
     paged_state_region_count: int | None = None
+    # `slot_regions`' twin of `block_region_consumer_indices`: where each
+    # region sits in a whole-model peer's slot region list, for a layout the
+    # connector's group-major inference (layer l of group g at
+    # g * (peer regions / groups) + `start_layer` + l) cannot place: a PP stage
+    # of a hybrid, whose slot regions count recurrent layers only.
+    slot_region_consumer_indices: list[int] | None = None
+    # Per slot region, the byte runs one unit splits into, each sharded
+    # contiguously over TP ranks: a peer at k times this side's TP holds the
+    # q-th k-th of every run, concatenated in run order. None for a region
+    # that cannot be split; a region in `slot_region_tp_replicated` ignores
+    # its segments and moves whole.
+    slot_region_tp_segments: list[tuple[int, ...] | None] | None = None
+    # Per slot region, whether every TP rank holds the same unit (ReplaySSM's
+    # cursor), so a peer at any TP size takes it whole instead of a shard.
+    slot_region_tp_replicated: list[bool] | None = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is
@@ -322,6 +472,15 @@ class KVTransferTensors:
         the producer published addresses only.
         """
         return tuple(page.view for page in self.pages if page.view is not None)
+
+    def without_slots(self) -> KVTransferTensors:
+        """A copy without the live request SLOTs a composite P/D connector
+        publishes, for an offload tier that rebuilds state by replay; the shared
+        descriptor stays intact for the other connector."""
+        pages = copy(self)
+        pages.num_slots = 0
+        pages.slot_regions = []
+        return pages
 
     def merge_pages(self, other: KVTransferTensors) -> None:
         """Append another contributor's PAGE units (a draft's own pool).
@@ -397,6 +556,9 @@ class KVConnectorOutput:
     failed_loading: set[LoadCompletionId] = field(default_factory=set)
     expected_finished_count: int = 0
     connector_completions: set[ConnectorCompletion] = field(default_factory=set)
+    # Final P/D metadata travels with successful receive completion. The TP
+    # aggregator validates agreement and discards it on any worker failure.
+    received_handoffs: dict[ReqId, PrefillHandoff] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
@@ -408,6 +570,7 @@ class KVConnectorOutput:
             and not self.finished_loading
             and not self.failed_loading
             and not self.connector_completions
+            and not self.received_handoffs
         )
 
     def __repr__(self) -> str:
@@ -441,7 +604,7 @@ class ReqMeta:
     remote_dp_rank: int = 0
     remote_pp_size: int = 1
     remote_tp_size: int = 0
-    transfer_id: int = 0
+    transfer_id: TransferId = 0
     local_slot_index: int = -1
     # Producer's final committed state slot. This is distinct from
     # `local_slot_index`, which is the consumer destination slot. Prefix
@@ -459,6 +622,11 @@ class ReqMeta:
     # region loop like block ids do. Empty for backends with no SWA state.
     local_swa_block_ids: list[int] = field(default_factory=list)
     remote_swa_block_ids: list[int] = field(default_factory=list)
+    chunked_transfer: bool = False
+    num_prompt_tokens: int = 0
+    prefill_handoff: dict | None = None
+    prefill_aborted: bool = False
+    prompt_digest: str | None = None
 
 
 @dataclass
@@ -503,6 +671,7 @@ class ConnectorMetadata:
         "reqs_to_send",
         "reqs_in_batch",
         "reqs_not_processed",
+        "chunked_admissions",
     )
 
     def __init__(self) -> None:
@@ -511,7 +680,10 @@ class ConnectorMetadata:
         self.reqs_to_send: dict[ReqId, float] = {}
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
-        self.request_id_to_transfer_id: dict[ReqId, int] = {}
+        self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
+        # Register P logical requests before allocating source blocks. Workers
+        # report D readiness through the existing TP/PP completion channel.
+        self.chunked_admissions: dict[ReqId, TransferId] = {}
 
     def has_work(self) -> bool:
         """Whether the worker has anything to do with this snapshot."""
@@ -534,8 +706,8 @@ class ConnectorMetadata:
             remote_host=kv_transfer_params.get("remote_host"),
             remote_port=kv_transfer_params.get("remote_port"),
             remote_handshake_port=kv_transfer_params.get("remote_handshake_port"),
-            remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
-            remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
+            remote_dp_size=int(kv_transfer_params.get("remote_dp_size") or 1),
+            remote_dp_rank=int(kv_transfer_params.get("remote_dp_rank") or 0),
             remote_pp_size=kv_transfer_params.get("remote_pp_size", 1),
             remote_tp_size=kv_transfer_params.get("remote_tp_size", 0),
             tp_size=(
@@ -548,6 +720,11 @@ class ConnectorMetadata:
             remote_slot_index=kv_transfer_params.get("remote_slot_index", -1),
             num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
             src_block_skip_factor=kv_transfer_params.get("src_block_skip_factor", 1),
+            chunked_transfer=kv_transfer_params.get("chunked_transfer", False),
+            num_prompt_tokens=kv_transfer_params.get("num_prompt_tokens", 0),
+            prefill_handoff=kv_transfer_params.get("prefill_handoff"),
+            prefill_aborted=kv_transfer_params.get("prefill_aborted", False),
+            prompt_digest=kv_transfer_params.get("prompt_digest"),
         )
 
     def add_new_req_to_save(

@@ -20,27 +20,18 @@ from atom.kv_transfer.disaggregation.base import (
 )
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.kv_transfer.offload._offload_common import validated_kv_role
+from atom.kv_transfer.offload.capabilities import (
+    copies_paged_state as _copies_paged_state,
+)
+from atom.kv_transfer.offload.capabilities import (
+    publishes_native_state as _publishes_native_state,
+)
+from atom.kv_transfer.offload.capabilities import (
+    replays_state,
+)
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
-
-
-def _publishes_native_state(transfer_tensors: Any) -> bool:
-    """Validate and detect the reusable PAGE-backed native-state contract."""
-
-    spec = getattr(transfer_tensors, "paged_state_checkpoint_spec", None)
-    copy = getattr(transfer_tensors, "execute_paged_state_copies", None)
-    if spec is None and copy is None:
-        return False
-    if spec is None:
-        raise ValueError(
-            "execute_paged_state_copies requires paged_state_checkpoint_spec"
-        )
-    if not callable(copy):
-        raise TypeError(
-            "paged_state_checkpoint_spec requires a callable execute_paged_state_copies"
-        )
-    return True
 
 
 def _has_per_request_state(kv_caches: Any) -> bool:
@@ -51,18 +42,6 @@ def _has_per_request_state(kv_caches: Any) -> bool:
     return any(
         getattr(value, "per_request_state", False) for value in kv_caches.values()
     )
-
-
-def _copies_paged_state(transfer_tensors: Any) -> bool:
-    """Whether the backend keeps PAGE-backed state checkpoints.
-
-    This is the predicate `BlockManager` builds `paged_state_checkpoints` from,
-    and that coordinator is what selects the native-state scheduler.
-    """
-
-    builder = getattr(transfer_tensors, "state_backend", None)
-    state_transfer = getattr(builder, "state_transfer", None)
-    return callable(state_transfer) and bool(state_transfer().copies)
 
 
 class LMCacheMPConnector(KVConnectorBase):
@@ -103,6 +82,12 @@ class LMCacheMPConnector(KVConnectorBase):
                 "but publishes no paged_state_checkpoint_spec and "
                 "execute_paged_state_copies for the native-state transfer"
             )
+        elif replays_state(transfer_tensors):
+            # The forward rebuilds the state from the PAGE below any hit
+            # (`StateTransfer.replay`), a tier load's included, so PAGE alone
+            # is all a load has to bring.
+            transfer_tensors = transfer_tensors.without_slots()
+            impl = mp_worker.LMCacheMPConnector(self._config)
         elif _has_per_request_state(kv_caches):
             # Fork-slot GDN (pipeline parallelism, RapidServe) publishes no
             # checkpoint image. PAGE-only would restore full-attention KV
@@ -214,8 +199,22 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
             prefetch(seqs)
 
     def lookup_pending(self, seq: Any) -> bool:
-        pending = getattr(self._require_impl(), "lookup_pending", None)
-        return bool(pending(seq)) if callable(pending) else False
+        return self._require_impl().lookup_pending(seq)
+
+    def lookup_would_defer(self, seq: Any) -> bool:
+        return self._require_impl().lookup_would_defer(seq)
+
+    # The base class defines these as defaults, which would shadow `__getattr__`
+    # and leave the impl's own unreached: forward each explicitly.
+    def cancel_pending_load(self, seq: Any) -> None:
+        self._require_impl().cancel_pending_load(seq)
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        self._require_impl().cancel_preadmission(seq)
+
+    def close(self) -> None:
+        if self._impl is not None:
+            self._impl.close()
 
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         check = getattr(self._require_impl(), "can_detach_lookup", None)

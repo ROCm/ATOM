@@ -37,7 +37,7 @@ Reference: `llama.py` (simple), `qwen3_5.py` (hybrid attention), `deepseek_v2.py
 
 ### 3. Register the Model
 
-Add to `support_model_arch_dict` in `atom/model_engine/model_runner.py`:
+Add to `support_model_arch_dict` in `atom/models/registry.py`:
 
 ```python
 support_model_arch_dict = {
@@ -211,7 +211,8 @@ Add to `.github/benchmark/models_accuracy.json`:
 | File | Purpose |
 |------|---------|
 | `atom/models/` | Model implementations |
-| `atom/model_engine/model_runner.py` | Registration (`support_model_arch_dict`), KV cache binding |
+| `atom/models/registry.py` | Registration (`support_model_arch_dict`) |
+| `atom/model_engine/model_runner.py` | KV cache binding |
 | `atom/spec_decode/eagle.py` | MTP registration (`support_eagle_model_arch_dict`), propose loop |
 | `atom/config.py` | `SpeculativeConfig` MTP type mapping |
 | `atom/model_loader/loader.py` | Weight loading, name remap dispatch |

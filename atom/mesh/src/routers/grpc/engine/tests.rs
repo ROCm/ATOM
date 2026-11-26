@@ -507,6 +507,7 @@ mod d_pd_stream_merge {
             request_id: "r".to_string(),
             weight_version: None,
             cached_tokens: 0,
+            timing: None,
         }
     }
 
@@ -930,6 +931,7 @@ mod f_drop_propagation {
                 request_id: "r".to_string(),
                 weight_version: None,
                 cached_tokens: 0,
+                timing: None,
             },
         }
     }

@@ -26,17 +26,22 @@ def _graph(**kw):
 
 
 def test_an_unwidened_empty_batch_stages_nothing():
-    """`stage` tail-repeats `src[-1]`, which a zero-row source does not have.
-
-    No caller can ask for one: `prepare_model` asserts the batch carries tokens,
-    so every drafter sees at least one row. Pinned as the boundary anyway --
-    entering at the real count must stay a no-op, not an IndexError.
-    """
+    """A zero-row source is valid when no widening is requested."""
     g = _graph()
     assert g.stage(0, {"row": torch.zeros(0, dtype=torch.int32)})["row"].shape[0] == 0
 
 
-def test_owning_a_recording_says_nothing_about_a_batch_it_is_not_at():
+@pytest.mark.parametrize(("rows", "running_bs"), [(0, 4), (5, 4)])
+def test_a_batch_that_cannot_be_widened_names_the_input_and_pass(rows, running_bs):
+    """No last row to repeat, or more rows than the batch: refused by name."""
+    g = _graph()
+    with pytest.raises(AssertionError, match=rf"'row' of {g.name}.*{rows} rows"):
+        g.stage(running_bs, {"row": torch.zeros(rows, dtype=torch.int32)})
+
+
+def test_owning_a_recording_says_nothing_about_a_batch_it_is_not_at(
+    req_graph_recordings,
+):
     """The proposers widen to `running_bs` only when `is_captured` says that
     batch replays, so this answer decides whether a pad row is ever fabricated.
 
@@ -46,13 +51,15 @@ def test_owning_a_recording_says_nothing_about_a_batch_it_is_not_at():
     rows on a step that replays nothing.
     """
     g = _graph()
-    g._cuda_graphs[48] = ("graph", "out")
+    req_graph_recordings.add(48, "out")
     assert g.is_captured(48)
     assert not g.is_captured(256)
     assert not g.is_captured(44)
 
 
-def test_releasing_the_recordings_leaves_the_pass_runnable_eagerly():
+def test_releasing_the_recordings_leaves_the_pass_runnable_eagerly(
+    req_graph_recordings,
+):
     """A draft pass WRITES the KV it attends, so its recording holds the base of
     the pool a decode graph does, and a sleep that frees the pool has to drop
     these too (`atom/rollout/memory_manager.py`). Nothing else has to be
@@ -60,8 +67,8 @@ def test_releasing_the_recordings_leaves_the_pass_runnable_eagerly():
     `ATOM_DRAFT_CUDAGRAPH=0` state, and the next warmup records again.
     """
     g = _graph()
-    g._cuda_graphs[48] = ("graph", "out")
-    g._cuda_graphs[64] = ("graph", "out")
+    req_graph_recordings.add(48, "out")
+    req_graph_recordings.add(64, "out")
 
     assert g.release_graphs() == 2
     assert not g.is_captured(48)
@@ -87,13 +94,7 @@ def test_a_pass_that_stages_nothing_is_refused():
 
 
 def test_staged_tail_repeats_a_real_row_rather_than_zero_filling():
-    """Zero-filling faults the GPU at the first padded decode step.
-
-    Measured on V4-Flash-DSpark tp8: an all-zero tail gives
-    `Memory access fault ... on address (nil)` on 8/8 ranks; repeating a real
-    row is clean on the same workload. Which input cannot take a zero was not
-    isolated, so this pins the repeat, not the reason.
-    """
+    """Padding repeats one coherent real row instead of fabricating zeros."""
     g = _graph()
     first = g._stage_one("row", 8, torch.arange(3, dtype=torch.int32) + 100)
     assert first.tolist() == [100, 101, 102, 102, 102, 102, 102, 102]
@@ -153,6 +154,14 @@ def test_fixed_storage_accessor_checks_role_and_capacity():
         g.buffer("row", 257)
 
 
+def test_staging_an_undeclared_role_names_it():
+    g = _graph()
+    with pytest.raises(
+        AssertionError, match=r"\['missing'\]; declared roles are \['row'\]"
+    ):
+        g.stage(1, {"missing": torch.zeros(1, dtype=torch.int32)})
+
+
 def test_staging_rejects_a_wrong_trailing_shape_before_identity_check():
     g = _graph(inputs={"row": StagedInput(shape=(4,), dtype=torch.int32)})
     wrong = g._buffers["row"][:2, :1]
@@ -167,16 +176,51 @@ def test_staging_a_wrong_dtype_fails_loudly():
 
 
 def test_staging_a_source_whose_leading_axis_is_not_the_batch_fails_loudly():
-    """Every staged source is indexed as `[rows, *StagedInput.shape]`.
+    """Every leading-batch source is indexed as `[rows, *StagedInput.shape]`.
 
     MRoPE positions are the live case: they keep the token axis LAST (`[3, N]`),
-    so a drafter must not hand them to a pass at all. Without this the mismatch
+    so a drafter must declare them `batch_dim=1`. Without this the mismatch
     surfaced as a `copy_` size error two frames down, which reads like a
     batch-size bug rather than a layout one.
     """
     g = _graph()
-    with pytest.raises(AssertionError, match="leading axis is not the batch"):
+    with pytest.raises(AssertionError, match="batch at axis 0"):
         g._stage_one("row", 8, torch.zeros(3, 8, dtype=torch.int32))
+
+
+def _mrope_graph():
+    return _graph(
+        inputs={
+            "pos": StagedInput(shape=(3,), dtype=torch.int64, batch_dim=1),
+            "row": StagedInput(dtype=torch.int32),
+        }
+    )
+
+
+def test_a_batch_dim_1_input_stages_columns_and_tail_repeats_the_last_one():
+    """MRoPE positions stage as the first `bs` columns of one `[3, max_num_seqs]`
+    buffer, beside a leading-batch input a producer filled in place
+    (`hidden_states`)."""
+    g = _mrope_graph()
+    src = torch.arange(6, dtype=torch.int64).view(3, 2) * 10
+    g.buffer("row", 2).copy_(torch.tensor([1, 2], dtype=torch.int32))
+    staged = g.stage(4, {"pos": src, "row": g.buffer("row", 2)})
+    pos = staged["pos"]
+    assert pos.shape == (3, 4)
+    assert pos.stride() == (g._buffers["pos"].shape[1], 1)
+    assert pos.tolist() == [[0, 10, 10, 10], [20, 30, 30, 30], [40, 50, 50, 50]]
+    assert staged["row"].tolist() == [1, 2, 2, 2]
+    assert pos.data_ptr() == g._buffers["pos"].data_ptr()
+
+
+def test_a_batch_dim_1_producer_view_is_the_front_of_the_staged_one():
+    """A producer-owned prefix is preserved while stage pads its tail."""
+    g = _mrope_graph()
+    fill = g.buffer("pos", 2)
+    fill.copy_(torch.tensor([[1, 2], [3, 4], [5, 6]]))
+    pos = g.stage(4, {"pos": fill})["pos"]
+    assert pos.data_ptr() == fill.data_ptr() and pos.stride() == fill.stride()
+    assert pos.tolist() == [[1, 2, 2, 2], [3, 4, 4, 4], [5, 6, 6, 6]]
 
 
 def test_sources_that_disagree_on_the_batch_are_refused():
@@ -193,6 +237,17 @@ def test_sources_that_disagree_on_the_batch_are_refused():
             {
                 "a": torch.zeros(3, dtype=torch.int32),
                 "b": torch.zeros(5, dtype=torch.int32),
+            },
+        )
+
+
+def test_batch_dim_1_sources_must_agree_with_leading_ones():
+    with pytest.raises(AssertionError, match="batches of"):
+        _mrope_graph().stage(
+            4,
+            {
+                "pos": torch.zeros(3, 2, dtype=torch.int64),
+                "row": torch.zeros(3, dtype=torch.int32),
             },
         )
 
@@ -263,15 +318,11 @@ def test_a_captured_epilogue_can_feed_output_back_to_fixed_input(monkeypatch):
     assert second.tolist() == [12, 22]
 
 
-def test_run_replays_the_recording_instead_of_the_forward():
+def test_run_replays_the_recording_instead_of_the_forward(req_graph_recordings):
     """The replay seam. A `run` that returned the recorded output WITHOUT
     replaying would serve every step the previous step's draft tokens, and
     nothing else in the suite would notice."""
     replays, forwards = [], []
-
-    class _Graph:
-        def replay(self):
-            replays.append(1)
 
     g = _graph(forward=lambda running_bs, **rows: forwards.append(running_bs))
     src = {"row": torch.zeros(4, dtype=torch.int32)}
@@ -280,13 +331,15 @@ def test_run_replays_the_recording_instead_of_the_forward():
     g.run(4, **g.stage(4, src))
     assert (forwards, replays) == ([4], []), "no recording: must run the forward"
 
-    g._cuda_graphs[4] = (_Graph(), "recorded")
+    req_graph_recordings.add(4, "recorded", on_replay=lambda: replays.append(1))
     assert g.is_captured(4)
     assert g.run(4, **g.stage(4, src)) == "recorded"
     assert (forwards, replays) == ([4], [1]), "recorded: must replay, not re-run"
 
 
-def test_a_replay_hands_back_a_value_not_the_recordings_own_storage():
+def test_a_replay_hands_back_a_value_not_the_recordings_own_storage(
+    req_graph_recordings,
+):
     """What `run` returns has to survive the next replay of any other size.
 
     The recording's tensors are allocated inside the capture, so they live in
@@ -302,14 +355,10 @@ def test_a_replay_hands_back_a_value_not_the_recordings_own_storage():
     gathered on those floats and faulted all eight ranks.
     """
 
-    class _Graph:
-        def replay(self):
-            pass
-
     ids = torch.full((4, 3), 9, dtype=torch.int32)
     conf = torch.zeros(4, 3)
     g = _graph(epilogue=lambda out, running_bs, **rows: out, capture_epilogue=True)
-    g._cuda_graphs[4] = (_Graph(), (ids, conf))
+    req_graph_recordings.add(4, (ids, conf))
 
     got_ids, got_conf = g.run(
         4, **g.stage(4, {"row": torch.zeros(4, dtype=torch.int32)})
@@ -321,6 +370,25 @@ def test_a_replay_hands_back_a_value_not_the_recordings_own_storage():
     conf.fill_(5.0)
     assert got_ids.tolist() != ids.tolist(), "handed out a window into the recording"
     assert got_conf.tolist() != conf.tolist(), "every output, not just the ids"
+
+
+def test_a_replay_hands_back_an_output_the_forward_owns_without_a_copy(
+    req_graph_recordings,
+):
+    """An output outside the pool -- a buffer the forward owns, as the mono
+    draft head's ids and confidences -- is no storage the pool re-issues: a
+    replay hands it back as the eager pass would, copying only the pool's."""
+    ids = torch.full((4, 3), 9, dtype=torch.int32)
+    conf = torch.zeros(4, 3)
+    req_graph_recordings.owned.append(ids)
+    g = _graph(epilogue=lambda out, running_bs, **rows: out, capture_epilogue=True)
+    req_graph_recordings.add(4, (ids, conf))
+
+    got_ids, got_conf = g.run(
+        4, **g.stage(4, {"row": torch.zeros(4, dtype=torch.int32)})
+    )
+    assert got_ids is ids, "the forward's own buffer, not a copy"
+    assert got_conf is not conf and torch.equal(got_conf, conf), "the pool's, copied"
 
 
 def test_the_eager_path_hands_back_what_it_allocated():
@@ -340,7 +408,7 @@ def test_the_eager_path_hands_back_what_it_allocated():
     assert g.run(2, **g.stage(2, {"row": torch.zeros(2, dtype=torch.int32)})) is made
 
 
-def test_a_dummy_replays_in_lockstep_with_the_real_ranks():
+def test_a_dummy_replays_in_lockstep_with_the_real_ranks(req_graph_recordings):
     """`is_dummy_run` is per-rank, so no decision that feeds a collective may
     read it.
 
@@ -358,12 +426,8 @@ def test_a_dummy_replays_in_lockstep_with_the_real_ranks():
     """
     replays, forwards = [], []
 
-    class _Graph:
-        def replay(self):
-            replays.append(1)
-
     g = _graph(forward=lambda running_bs, **rows: forwards.append(running_bs))
-    g._cuda_graphs[1] = (_Graph(), "recorded")
+    req_graph_recordings.add(1, "recorded", on_replay=lambda: replays.append(1))
     src = {"row": torch.zeros(1, dtype=torch.int32)}
 
     for _dummy in (False, True):
@@ -417,6 +481,6 @@ def test_unsupported_capture_still_warms_both_halves(monkeypatch):
         capture_supported=False,
     )
     assert not g.will_capture
-    assert g.warmup(2, pool=None, stream=None) is None
+    assert g.warmup(2) is None
     assert calls == ["backbone", "head"]
     assert not g.is_captured(2)

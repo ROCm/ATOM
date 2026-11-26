@@ -40,13 +40,25 @@ CSA_INDEXER_DATA = "csa_indexer_data"
 CSA_INDEXER_SCALE = "csa_indexer_scale"
 
 FP4_GFX950_PRESHUFFLE = "fp4-gfx950-preshuffle"
+FP4_GFX950_OPUS = "fp4-gfx950-opus"
 FP4_GFX1250_NATURAL = "fp4-gfx1250-natural"
 
 
-def fp4_indexer_layout_for_arch(arch: str) -> str:
-    """Return the on-wire FP4 indexer layout for a GPU architecture."""
+def fp4_indexer_layout_for_arch(arch: str, *, backend: str) -> str:
+    """Map an explicit architecture and backend to the on-wire FP4 layout.
+
+    Callers own backend selection, including reading environment settings;
+    the layout package stays independent of the runtime.
+    """
     if arch == "gfx1250":
         return FP4_GFX1250_NATURAL
+    if arch == "gfx950":
+        if backend not in ("opus", "flydsl"):
+            raise ValueError(
+                f"ATOM_V4_UNIFIED_MQA must be opus or flydsl, got {backend!r}"
+            )
+        if backend == "opus":
+            return FP4_GFX950_OPUS
     return FP4_GFX950_PRESHUFFLE
 
 
@@ -92,7 +104,7 @@ def fp4_indexer_block_fields(
 ) -> list[EntryField]:
     """Packed E2M1 plus one e8m0 byte per group of 32, one layer's block.
 
-    gfx950 keeps the legacy `pa_mqa_logits_fp4` preshuffle. gfx1250 OPUS reads
+    gfx950 selects FlyDSL preshuffle or OPUS MFMA scales. gfx1250 OPUS reads
     natural rows: 64 packed E2M1 bytes and four E8M0 bytes for D=128. One pool
     per region here, so a region's shape is a pool's shape after the layer and
     block axes.
@@ -102,6 +114,13 @@ def fp4_indexer_block_fields(
             f"FP4 index_head_dim must be a multiple of 128, got {index_head_dim}"
         )
     k_tiles = index_head_dim // 128
+    if layout == FP4_GFX950_OPUS:
+        if rows != 64 or index_head_dim != 128:
+            raise ValueError("gfx950 OPUS FP4 requires 64 rows per block and dim=128")
+        return [
+            EntryField(CSA_INDEXER_DATA, 1, (4, 64, 16), torch.uint8),
+            EntryField(CSA_INDEXER_SCALE, 1, (2, 32, 4), torch.uint8),
+        ]
     if layout == FP4_GFX1250_NATURAL:
         return [
             EntryField(CSA_INDEXER_DATA, 1, (rows, index_head_dim // 2), torch.uint8),

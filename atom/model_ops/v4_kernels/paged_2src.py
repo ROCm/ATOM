@@ -52,6 +52,7 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.v4_kernels.paged_decode import _cu_count
 from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -395,6 +396,199 @@ def _sparse_attn_v4_paged_2src_csa_kernel(
     tl.store(out_ptrs, out, mask=h_mask[:, None])
 
 
+@triton.jit
+def _sparse_attn_v4_paged_2src_csa_split_kernel(
+    q_ptr,  # [N, H, D]
+    unified_kv_ptr,
+    kv_indices_prefix_ptr,
+    kv_indptr_prefix_ptr,
+    kv_ptr,
+    kv_indices_extend_ptr,
+    kv_indptr_extend_ptr,
+    part_acc_ptr,  # [N, S, H, D] fp32, unnormalized
+    part_ml_ptr,  # [N, S, H, 2] fp32: running max (log2 units) and sum
+    q_stride_t: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    pkv_stride_n: tl.constexpr,
+    pkv_stride_d: tl.constexpr,
+    ekv_stride_n: tl.constexpr,
+    ekv_stride_d: tl.constexpr,
+    H: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Split-KV form of the CSA kernel for few-token steps: each program takes
+    # one of NUM_SPLITS chunks of a token's keys (prefix then extend).
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    s = tl.program_id(2)
+
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    h_mask = h_offs < H
+    q = tl.load(
+        q_ptr
+        + t * q_stride_t
+        + h_offs[:, None] * q_stride_h
+        + d_offs[None, :] * q_stride_d,
+        mask=h_mask[:, None],
+        other=0.0,
+    )
+
+    neg_large = -3.4028234663852886e38
+    qk_scale = softmax_scale * 1.4426950408889634
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+    k_offs = tl.arange(0, BLOCK_K)
+
+    p_start = tl.load(kv_indptr_prefix_ptr + t)
+    p_len = tl.load(kv_indptr_prefix_ptr + t + 1) - p_start
+    e_start = tl.load(kv_indptr_extend_ptr + t)
+    e_len = tl.load(kv_indptr_extend_ptr + t + 1) - e_start
+    total = p_len + e_len
+    chunk = tl.cdiv(tl.cdiv(total, NUM_SPLITS), BLOCK_K) * BLOCK_K
+    lo = s * chunk
+    hi = tl.minimum(lo + chunk, total)
+
+    # Prefix part of this chunk: positions [lo, min(hi, p_len)).
+    p_hi = tl.minimum(hi, p_len)
+    for k_start in tl.range(lo, p_hi, BLOCK_K):
+        k_pos = k_start + k_offs
+        valid = k_pos < p_hi
+        slot = tl.load(kv_indices_prefix_ptr + p_start + k_pos, mask=valid, other=0)
+        kv = tl.load(
+            unified_kv_ptr
+            + row_offset(slot, pkv_stride_n)[:, None]
+            + d_offs[None, :] * pkv_stride_d,
+            mask=valid[:, None],
+            other=0.0,
+        )
+        scores = tl.dot(q, tl.trans(kv)) * qk_scale
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.where(
+            h_mask[:, None] & valid[None, :], tl.exp2(scores - m_new[:, None]), 0.0
+        )
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+
+    # Extend part: positions [max(lo, p_len), hi).
+    e_lo = tl.maximum(lo, p_len) - p_len
+    e_hi = hi - p_len
+    for e_k_start in tl.range(e_lo, e_hi, BLOCK_K):
+        k_pos = e_k_start + k_offs
+        valid = k_pos < e_hi
+        slot = tl.load(kv_indices_extend_ptr + e_start + k_pos, mask=valid, other=0)
+        kv = tl.load(
+            kv_ptr + slot[:, None] * ekv_stride_n + d_offs[None, :] * ekv_stride_d,
+            mask=valid[:, None],
+            other=0.0,
+        )
+        scores = tl.dot(q, tl.trans(kv)) * qk_scale
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.where(
+            h_mask[:, None] & valid[None, :], tl.exp2(scores - m_new[:, None]), 0.0
+        )
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+
+    row = (t * NUM_SPLITS + s) * H + h_offs
+    tl.store(
+        part_acc_ptr + row[:, None] * BLOCK_D + d_offs[None, :],
+        acc,
+        mask=h_mask[:, None],
+    )
+    tl.store(part_ml_ptr + row * 2, m_i, mask=h_mask)
+    tl.store(part_ml_ptr + row * 2 + 1, l_i, mask=h_mask)
+
+
+@triton.jit
+def _sparse_attn_v4_split_combine_kernel(
+    part_acc_ptr,
+    part_ml_ptr,
+    attn_sink_ptr,
+    out_ptr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
+    H: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_DC: tl.constexpr,
+):
+    # Merge the splits, then finalize with the sink as the unsplit kernel does.
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.program_id(2) * BLOCK_DC + tl.arange(0, BLOCK_DC)
+    h_mask = h_offs < H
+    neg_large = -3.4028234663852886e38
+
+    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+    m_final = sink * 1.4426950408889634
+    for s in tl.static_range(NUM_SPLITS):
+        row = (t * NUM_SPLITS + s) * H + h_offs
+        m_final = tl.maximum(
+            m_final, tl.load(part_ml_ptr + row * 2, mask=h_mask, other=neg_large)
+        )
+    l_final = tl.exp2(sink * 1.4426950408889634 - m_final)
+    acc = tl.zeros((BLOCK_H, BLOCK_DC), dtype=tl.float32)
+    for s in tl.static_range(NUM_SPLITS):
+        row = (t * NUM_SPLITS + s) * H + h_offs
+        m_s = tl.load(part_ml_ptr + row * 2, mask=h_mask, other=neg_large)
+        l_s = tl.load(part_ml_ptr + row * 2 + 1, mask=h_mask, other=0.0)
+        w = tl.exp2(m_s - m_final)
+        l_final += l_s * w
+        acc += (
+            tl.load(
+                part_acc_ptr + row[:, None] * BLOCK_D + d_offs[None, :],
+                mask=h_mask[:, None],
+                other=0.0,
+            )
+            * w[:, None]
+        )
+    denom = tl.maximum(l_final, 1.0e-30)
+    out = tl.where(l_final[:, None] > 0.0, acc / denom[:, None], 0.0)
+    tl.store(
+        out_ptr
+        + t * out_stride_t
+        + h_offs[:, None] * out_stride_h
+        + d_offs[None, :] * out_stride_d,
+        out,
+        mask=h_mask[:, None],
+    )
+
+
+# Split-KV for few-token CSA steps: about two programs per CU, at least
+# `_SPLIT_MIN_KEYS` keys per split. A short list of split counts
+# bounds the compiled variants.
+_SPLIT_COUNTS = (20, 10, 5, 3, 2)
+_SPLIT_MIN_KEYS = 32
+_SPLIT_BLOCK_K = 16
+_COMBINE_BLOCK_DC = 64  # D columns per combine program
+
+
+def _csa_num_splits(tokens: int, head_blocks: int, avg_keys: float) -> int:
+    target = 2 * _cu_count()
+    programs = tokens * head_blocks
+    if not programs or programs >= target // 2:
+        return 1
+    want = -(-target // programs)
+    cap = max(1, int(avg_keys // _SPLIT_MIN_KEYS))
+    return next((s for s in _SPLIT_COUNTS if s <= min(want, cap)), 1)
+
+
 def _sparse_attn_v4_paged_2src_triton(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -457,6 +651,67 @@ def _sparse_attn_v4_paged_2src_triton(
     # Only long-prefix CSA with D=512 uses the CSA fast kernel. Other prefix
     # shapes, including HCA and non-512 V4 variants, use the generic kernel.
     use_csa_fast_kernel = has_prefix and avg_prefix_len > 16 and D == 512 and full_d
+    num_splits = (
+        _csa_num_splits(
+            T,
+            triton.cdiv(H, block_h),
+            avg_prefix_len + kv_indices_extend.numel() / max(T, 1),
+        )
+        if use_csa_fast_kernel
+        else 1
+    )
+    if num_splits > 1:
+        head_blocks = triton.cdiv(H, block_h)
+        part_acc = torch.empty(
+            (T * num_splits * H, block_d), device=q.device, dtype=torch.float32
+        )
+        part_ml = torch.empty(
+            (T * num_splits * H, 2), device=q.device, dtype=torch.float32
+        )
+        _sparse_attn_v4_paged_2src_csa_split_kernel[(T, head_blocks, num_splits)](
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            part_acc,
+            part_ml,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            unified_kv.stride(0),
+            unified_kv.stride(1),
+            kv.stride(0),
+            kv.stride(1),
+            H,
+            float(softmax_scale),
+            NUM_SPLITS=num_splits,
+            BLOCK_H=block_h,
+            BLOCK_D=block_d,
+            BLOCK_K=_SPLIT_BLOCK_K,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        _sparse_attn_v4_split_combine_kernel[
+            (T, head_blocks, triton.cdiv(block_d, _COMBINE_BLOCK_DC))
+        ](
+            part_acc,
+            part_ml,
+            attn_sink,
+            out,
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            H,
+            NUM_SPLITS=num_splits,
+            BLOCK_H=block_h,
+            BLOCK_D=block_d,
+            BLOCK_DC=_COMBINE_BLOCK_DC,
+            num_warps=2,
+        )
+        return out
     if use_csa_fast_kernel:
         _sparse_attn_v4_paged_2src_csa_kernel[(T, triton.cdiv(H, block_h))](
             q,
@@ -635,8 +890,8 @@ def sparse_attn_v4_paged_2src(
       kv_indptr_extend:  [T+1] int32 — true prefix sum.
       attn_sink:         [H] — per-head softmax-denom bias.
       softmax_scale:     float.
-      out:               optional output buffer. Can alias q when the caller no
-        longer needs q after attention (bf16 path only).
+      out:               optional contiguous output buffer, including a token-row
+        slice. Can alias q when it is no longer needed (bf16 path only).
       unified_kv_rope:   [total_pages, rd] bf16 RoPE prefix pool — presence
         selects the native fp8 2buff path.
       q_packed / q_rope: fp8 2buff Q ([T, H, 512] fp8 / [T, H, 64] bf16).
@@ -646,6 +901,8 @@ def sparse_attn_v4_paged_2src(
     Returns:
       out: [T, H, D] bf16.
     """
+    if out is not None and not out.is_contiguous():
+        raise ValueError("prefill output must be contiguous")
     if unified_kv_rope is not None:
         # Native fp8 prefill (op4): 2buff fp8 prefix pool + op-quantized fp8 Q
         # and extend K fed directly. No dequant of the prefix, no torch quant.
@@ -676,18 +933,24 @@ def sparse_attn_v4_paged_2src(
             and q_packed.shape[1] == _PREFILL_ASM_HEADS
         ):
             try:
-                return mla_sparse_prefill_fp8_asm(*args)
+                return mla_sparse_prefill_fp8_asm(*args, out=out)
             except RuntimeError:
                 # The ASM path has stricter runtime dtype/shape constraints;
                 # OPUS covers configurations it cannot serve.
                 pass
 
-        return pa_sparse_prefill_fp8_opus(*args)  # [S, H, head_dim] bf16
+        return pa_sparse_prefill_fp8_opus(*args, out=out)
     # Backend selection: prefer OPUS when available; fall back to Triton on
     # import failure, env override, or runtime error (e.g. unsupported GPU).
     # OPUS covers both archs: gfx950 from source, gfx1250 from a prebuilt code
     # object (bf16 only — fp16 raises and falls through).
-    if not envs.ATOM_FORCE_ATTN_TRITON and _HAS_OPUS:
+    # OPUS uses Q's strides for output stores. A different Q layout uses
+    # Triton, which writes the caller's buffer without an output temporary.
+    if (
+        not envs.ATOM_FORCE_ATTN_TRITON
+        and _HAS_OPUS
+        and (out is None or out.stride() == q.stride())
+    ):
         try:
             return pa_sparse_prefill_opus(
                 q,
@@ -704,7 +967,6 @@ def sparse_attn_v4_paged_2src(
         except RuntimeError:
             pass
     if get_gfx() == "gfx1250":
-        # gfx12 Triton fallback; allocates its own output (no `out=` kwarg).
         return pa_prefill_sparse(
             q,
             unified_kv,
@@ -715,7 +977,9 @@ def sparse_attn_v4_paged_2src(
             kv_indptr_extend,
             attn_sink,
             softmax_scale,
+            out=out,
         )
+    # Native Triton kernels use independent Q and output strides.
     return _sparse_attn_v4_paged_2src_triton(
         q,
         unified_kv,

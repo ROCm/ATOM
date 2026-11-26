@@ -5,8 +5,11 @@ verify's q tokens of a request count as q, see ``token_rows``).
 
 Each dense layer 0..2 is three launches: K1 built dense (``dense_pre``: q, the
 K / V insert), its original attention kernel, then ``dense_post`` (o_proj
-through the MLP, both all-reduces in-kernel -> (ar, h_mid)). Every sparse MoE
-layer is one launch of K4 with the layer's K1 fused in front of its stages::
+through the MLP, both all-reduces in-kernel -> (ar, h_mid)). A model whose
+prefix layers are sparse-attention instead (M3.1) has no kernels for them and
+runs them on the original modules (``dense_prefix_mono``, ``run_dense``), mono
+taking over at the first MoE layer. Every sparse MoE layer is one launch of K4
+with the layer's K1 fused in front of its stages::
 
     K1 part        (ar, res) -> h, q; K / V / index cache insert; indexer scores
     K4 part        top-k, attention .. FFN, both all-reduces in-kernel
@@ -31,10 +34,12 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 import atom.model_ops.topK as topk_meta
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
+from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
 from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
@@ -47,6 +52,7 @@ from atom.models.minimax_m3.mono.config import (
     TP,
     IndexHeads,
 )
+from atom.models.minimax_m3.mono.kernels.common import KV_PAGE_BYTES
 from atom.models.minimax_m3.mono.kernels.dense_post import (
     DENSE_POST_ABI,
     build_dense_post_kernel,
@@ -64,10 +70,19 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     SCRATCH_BYTES as K1_SCRATCH_BYTES,
 )
-from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_layout
+from atom.models.minimax_m3.mono.kernels.pre_attn import (
+    SCRATCH_XSC as K1_SCRATCH_XSC,
+)
+from atom.models.minimax_m3.mono.layout import (
+    SCRATCH,
+    SCRATCH_OF,
+    diag_region_names,
+    sym_layout,
+)
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
 from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
 from atom.mono.plan.execution import BLOCKS
+from atom.mono.runtime.aux_taps import bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import (
     DIAG_BYTES,
@@ -78,13 +93,17 @@ from atom.mono.runtime.debug import (
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.timeline import LayerTimeline
+from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
+from atom.spec_decode.dspark_proposer import DSparkProposer
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
 N_DENSE = 3
+# LLVM options of the rebuild of a layer kernel that needs scratch (``MonoDecodeRunner._lean_layer_kernels``)
+LEAN_LLVM_OPTIONS = {"amdgpu-use-amdgpu-trackers": True}
 # a width's kernels by kind (``_build_layer_kernels``): the sparse ones' is K4's
 _KERNEL_ABI = {
     "dense_pre0": K1_ABI,
@@ -95,6 +114,12 @@ _KERNEL_ABI = {
 
 def _ptr(t: torch.Tensor) -> int:
     return t.data_ptr()
+
+
+def _opt_ptr(t: torch.Tensor | None) -> int:
+    """An argument the build does not read (``fused_shared``: the MXFP8 shared
+    expert's weights) is 0."""
+    return 0 if t is None else t.data_ptr()
 
 
 def _sparse_metadata(fwd):
@@ -120,6 +145,21 @@ def token_rows(fwd, n: int) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
+def dense_prefix_mono(layers) -> bool:
+    """Whether layers 0..N_DENSE-1 run on the fused dense kernels.
+
+    The prefix never runs on the MoE kernels, so its FFN has to be the dense
+    MLP. M3's prefix is dense full-attention and takes ``dense_pre`` /
+    ``dense_post``; M3.1's is sparse attention + indexer, which only the
+    original modules serve (``run_dense``)."""
+    if len(layers) <= N_DENSE or any(layers[i].is_moe_layer for i in range(N_DENSE)):
+        raise MonoUnsupported(f"layers 0..{N_DENSE - 1} must be dense-MLP layers")
+    return not any(
+        getattr(layers[i].self_attn, "is_indexed_sparse_attention", False)
+        for i in range(N_DENSE)
+    )
+
+
 class MonoDecodeRunner:
     """Owns the per-layer weight views, scratch, peer buffers and compiled kernels.
 
@@ -127,16 +167,21 @@ class MonoDecodeRunner:
     shard, then all agree (``consensus.bind_agreed``) before the peer handshake, so a rank that
     refuses turns mono off on every rank instead of leaving the others waiting."""
 
-    def __init__(self, causal_lm) -> None:
+    def __init__(self, causal_lm, drafter=None, require_aux: bool = False) -> None:
         group = get_tp_group().cpu_group
-        bind_agreed(lambda: self._bind(causal_lm), group)
+        bind_agreed(lambda: self._bind(causal_lm, drafter, require_aux), group)
         self._allocate(group)
         # per decode batch size (every graph captures its own) a sparse layer
-        # kernel of each kind the layers use (``self.k4[n][lw.index_topk]``) and
-        # the dense layers' (``self.k4[n]["dense_pre0" | "dense_pre" |
-        # "dense_post"]``), built and compiled on its first step (``prepare``)
+        # kernel of each kind the layers use (``self.k4[n][lw.index_topk]``) and,
+        # with a mono dense prefix, the dense layers' (``self.k4[n]["dense_pre0"
+        # | "dense_pre" | "dense_post"]``), built and compiled on its first step
+        self._width_of: dict[int, int] = {}
         self.k4 = WidthBuilds(
-            self._build_layer_kernels, self._layer_kernels, group, "MiniMax-M3 mono"
+            self._build_layer_kernels,
+            self._layer_kernels,
+            group,
+            "MiniMax-M3 mono",
+            lean=self._lean_layer_kernels,
         )
 
     def _build_layer_kernels(self, n: int) -> dict:
@@ -144,10 +189,31 @@ class MonoDecodeRunner:
             index_topk: self._build_k4(n, index_topk=index_topk)
             for index_topk in {lw.index_topk for lw in self.sparse}
         }
-        kernels["dense_pre0"] = self._build_dense_pre(n, plain_norm=True)
-        kernels["dense_pre"] = self._build_dense_pre(n)
-        kernels["dense_post"] = self._build_dense_post(n)
+        if self.dense_mono:
+            kernels["dense_pre0"] = self._build_dense_pre(n, plain_norm=True)
+            kernels["dense_pre"] = self._build_dense_pre(n)
+            kernels["dense_post"] = self._build_dense_post(n)
+        self._width_of[id(kernels)] = n
         return kernels
+
+    def _lean_layer_kernels(self, built: dict, spilled: list) -> dict | None:
+        """A width whose layer kernel needs scratch (fp8 caches + a4w4 at 6 and 8 tokens: the
+        compiler keeps a 36 B frame of two SGPR spill slots that no instruction touches, and any
+        schedule change flips it) is rebuilt unchanged except for the machine scheduler's
+        register-pressure trackers (``LEAN_LLVM_OPTIONS``), scratch-free at every width 1..16
+        (same arithmetic: only the instruction order moves). None when only the dense kernels
+        spilled: there is no leaner build of those."""
+        lean = dict(built)
+        n = self._width_of[id(built)]
+        rebuilt = [
+            kind
+            for kind, launch in built.items()
+            if isinstance(kind, bool) and launch in spilled
+        ]
+        for kind in rebuilt:
+            lean[kind] = self._build_k4(n, index_topk=kind)
+            lean[kind].compile_hints["llvm_options"] = LEAN_LLVM_OPTIONS
+        return lean if rebuilt else None
 
     @staticmethod
     def _layer_kernels(kernels: dict) -> list:
@@ -156,7 +222,7 @@ class MonoDecodeRunner:
             (launch, _KERNEL_ABI.get(kind, K4_ABI)) for kind, launch in kernels.items()
         ]
 
-    def _bind(self, causal_lm) -> None:
+    def _bind(self, causal_lm, drafter, require_aux: bool) -> None:
         """This rank's checks and weight views; raises ``MonoUnsupported``."""
         model = causal_lm.model
         config = causal_lm.config
@@ -164,12 +230,16 @@ class MonoDecodeRunner:
         if npes != TP:
             raise MonoUnsupported(f"TP {npes}")
         layers = model.layers
-        if len(layers) <= N_DENSE or any(
-            getattr(layers[i].self_attn, "is_indexed_sparse_attention", False)
-            or layers[i].is_moe_layer
-            for i in range(N_DENSE)
-        ):
-            raise MonoUnsupported("layers 0..2 must be dense full-attention layers")
+        self.dense_mono = dense_prefix_mono(layers)
+        if require_aux and drafter is None:
+            raise MonoUnsupported("no DSpark drafter")
+        self.aux = (
+            bind_aux_taps(
+                drafter, config.hidden_size, DSparkProposer._extract_layer_hidden
+            )
+            if require_aux
+            else None
+        )
         self.model = model
         self.npes = npes
         self.rank = get_tensor_model_parallel_rank()
@@ -187,29 +257,67 @@ class MonoDecodeRunner:
         # (the original path raises on a cache miss there)
         if not self.sparse[0].index_topk:
             raise MonoUnsupported("the first sparse layer reuses a selection")
-        self.dense = [DenseLayer.from_layer(layers[i], i) for i in range(N_DENSE)]
-        for d in self.dense:
-            # the decode dispatch reads what the original rope_cache step sets on
-            # the impl; mono skips that step (a decode can precede every prefill:
-            # the graph capture), so it sets it by the same rule
-            d.attn_impl.use_triton_attn = (
-                envs.ATOM_FORCE_ATTN_TRITON
-                or d.attn_impl.sliding_window != -1
-                or d.attn_impl.head_dim != 128
-            )
+        self.dense = (
+            [DenseLayer.from_layer(layers[i], i) for i in range(N_DENSE)]
+            if self.dense_mono
+            else []
+        )
         swiglu = {(d.swiglu_alpha, d.swiglu_beta, d.swiglu_limit) for d in self.dense}
-        if len(swiglu) != 1:
+        if self.dense_mono and len(swiglu) != 1:
             raise MonoUnsupported(f"dense layers' swiglu parameters {swiglu}")
         impl = self.sparse[0].attn_impl
         experts = layers[N_DENSE].block_sparse_moe.experts
         eps = config.rms_norm_eps
         route_scale = float(layers[N_DENSE].block_sparse_moe.routed_scaling_factor)
-        # the fused shared expert's routing weight is whatever the topK metadata holds
-        # read through the module: the metadata is assigned after this file is imported
-        total_w, total_ids = topk_meta.aiter_topK_meta_data
-        if int(total_ids[0, TOP_K].item()) != N_ROUTED:
-            raise MonoUnsupported("fused shared expert id")
-        shared_weight = float(total_w[0, TOP_K].item())
+        # NVFP4 K/V + index pages (single-buffer): every layer alike, both caches together
+        self.nvfp4 = impl.kv_cache_dtype == "nvfp4"
+        if self.nvfp4 and heads.count > 1:
+            raise MonoUnsupported("indexer context parallelism with NVFP4 caches")
+        kv_data = get_forward_context().kv_cache_data
+        kv = kv_data[f"layer_{self.sparse[0].layer_id}"]
+        pools = [t for t in (kv.k_cache, kv.v_cache) if t is not None]
+        if max(t.numel() * t.element_size() for t in pools) > 1 << 32:
+            raise MonoUnsupported("KV cache over 4 GiB a layer (32-bit buffer offsets)")
+        if any(
+            lw.attn_impl.kv_cache_dtype != impl.kv_cache_dtype for lw in self.sparse
+        ):
+            raise MonoUnsupported("KV cache dtype differs between layers")
+        if self.nvfp4:
+            # the pool's page view is both K and V; the kernels step pages by KV_PAGE_BYTES
+            for lw in self.sparse:
+                pages = kv_data[f"layer_{lw.layer_id}"].k_cache
+                if pages.stride() != (KV_PAGE_BYTES, 1) or pages.dtype != torch.uint8:
+                    raise MonoUnsupported(
+                        f"NVFP4 KV pages {pages.dtype} {tuple(pages.shape)} {pages.stride()}"
+                    )
+        # the checkpoint's MXFP8 1x32 attention linears (native quantization) or the
+        # ptpc-FP8 requantization: every layer alike (the K1 / K4 builds read one kind)
+        self.attn_mxfp8 = self.sparse[0].attn_mxfp8
+        if any(lw.attn_mxfp8 != self.attn_mxfp8 for lw in self.sparse):
+            raise MonoUnsupported("attention linears quantized differently per layer")
+        if self.attn_mxfp8 and self.dense_mono:
+            raise MonoUnsupported("native MXFP8 attention with a mono dense prefix")
+        # the shared expert fused into the routed tables (expert N_ROUTED) or an MXFP8
+        # MLP of its own: every layer alike (the K4 builds read one kind)
+        self.fused_shared = self.sparse[0].fused_shared
+        if any(lw.fused_shared != self.fused_shared for lw in self.sparse):
+            raise MonoUnsupported("shared expert fused in some layers only")
+        logger.info(
+            "MiniMax-M3 mono: attention linears %s, shared expert %s",
+            "native MXFP8 1x32" if self.attn_mxfp8 else "ptpc FP8",
+            "fused (MXFP4, a8w4)" if self.fused_shared else "MXFP8 MLP",
+        )
+        if self.fused_shared:
+            # the fused shared expert's routing weight is whatever the topK metadata
+            # holds, read through the module: the metadata is assigned after this
+            # file is imported
+            total_w, total_ids = topk_meta.aiter_topK_meta_data
+            if int(total_ids[0, TOP_K].item()) != N_ROUTED:
+                raise MonoUnsupported("fused shared expert id")
+            shared_weight = float(total_w[0, TOP_K].item())
+        else:
+            # the unfused shared expert is added to the routed sum as it is
+            shared_weight = 1.0
         self.sm_scale = impl.scale
         if abs(self.sm_scale - HEAD_DIM**-0.5) > 1e-12:
             raise MonoUnsupported(f"softmax scale {self.sm_scale}")
@@ -243,30 +351,35 @@ class MonoDecodeRunner:
             timeline=self.timeline is not None,
             heads=heads,
             debug=self.debug,
+            kv_nvfp4=self.nvfp4,
+            index_nvfp4=self.nvfp4,
+            attn_mxfp8=self.attn_mxfp8,
+            fused_shared=self.fused_shared,
         )
         # a dense layer's kernels around its original attention
-        self._build_dense_pre = functools.partial(
-            build_pre_attn_kernel,
-            eps,
-            self.sm_scale,
-            impl.init_blocks,
-            impl.local_blocks,
-            dense=True,
-        )
-        self._build_dense_post = functools.partial(
-            build_dense_post_kernel,
-            npes,
-            eps,
-            *swiglu.pop(),
-            debug=self.debug,
-            index_heads=heads.count,
-        )
+        if self.dense_mono:
+            self._build_dense_pre = functools.partial(
+                build_pre_attn_kernel,
+                eps,
+                self.sm_scale,
+                impl.init_blocks,
+                impl.local_blocks,
+                dense=True,
+            )
+            self._build_dense_post = functools.partial(
+                build_dense_post_kernel,
+                npes,
+                eps,
+                *swiglu.pop(),
+                debug=self.debug,
+                index_heads=heads.count,
+            )
 
     def _allocate(self, group) -> None:
         """Scratch, the peer handshake and the activation buffers (every rank)."""
         dev = self.dev
-        self.scratch1 = torch.zeros(K1_SCRATCH_BYTES, dtype=torch.uint8, device=dev)
-        self.scratch4 = torch.zeros(K4_SCRATCH_BYTES, dtype=torch.uint8, device=dev)
+        self.scratch1 = uncached_bytes(K1_SCRATCH_BYTES, dev)
+        self.scratch4 = uncached_bytes(K4_SCRATCH_BYTES, dev)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
             sym_layout(self.npes)["_bytes"],
@@ -275,9 +388,14 @@ class MonoDecodeRunner:
             self.npes,
             dev,
         )
-        # every mailbox pair, zeroed at each step's start (forward)
+        # every mailbox pair, zeroed at each step's start (forward): the scratch this
+        # runner's builds use (K1's codes only ``attn_mxfp8``'s, K4's MoE regions
+        # only its shared-expert kind's)
         self.mailboxes = StepMailboxes(
-            self.peers, self.scratch1, self.scratch4, debug=self.debug
+            self.peers,
+            self.scratch1[: K1_SCRATCH_BYTES if self.attn_mxfp8 else K1_SCRATCH_XSC],
+            self.scratch4[: SCRATCH_OF[self.fused_shared]["_bytes"]],
+            debug=self.debug,
         )
         bf16 = torch.bfloat16
         # row k = token k of the step; sparse layer i reads ars[i % 2] (the
@@ -326,10 +444,15 @@ class MonoDecodeRunner:
         aux: list[torch.Tensor] = []
         self.mailboxes.begin_step()
         fwd = get_forward_context()
-        res = self.run_dense_mono(input_ids, positions, fwd, aux_layers, aux)
+        res = (
+            self.run_dense_mono(input_ids, positions, fwd, aux_layers, aux)
+            if self.dense_mono
+            else self.run_dense(input_ids, positions, aux_layers, aux)
+        )
         rows = token_rows(fwd, res.shape[0])
         for i, lw in enumerate(self.sparse):
             res = self.run_sparse_layer(i, lw, fwd, positions, res, rows)
+            self._write_aux(lw.layer_id - 1, self.h[: res.shape[0]])
             if lw.layer_id in aux_layers:
                 aux.append(self.h[: res.shape[0]].clone())
         hidden = self.finish_step(res)
@@ -358,7 +481,8 @@ class MonoDecodeRunner:
         for d, lw in enumerate(self.dense):
             kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
             pre = kernels["dense_pre0" if d == 0 else "dense_pre"]
-            pre(
+            _run_compiled(
+                pre,
                 *K1_ABI.pack(
                     {
                         "ar": _ptr(ar), "res": _ptr(res), "h_out": _ptr(self.h),
@@ -374,12 +498,13 @@ class MonoDecodeRunner:
                         "layer": lw.layer_id, "tl": 0,
                     }
                 ),
-                stream=stream,
+                stream,
             )  # fmt: skip
             if lw.layer_id in aux_layers:
                 aux.append(self.h[:n].clone())
             attn = self.attend_dense(lw, n, fwd, kv)
-            kernels["dense_post"](
+            _run_compiled(
+                kernels["dense_post"],
                 *DENSE_POST_ABI.pack(
                     {
                         "attn": _ptr(attn), "h_in": _ptr(self.h), "w_o": _ptr(lw.w_o),
@@ -391,7 +516,7 @@ class MonoDecodeRunner:
                         **self.peers.kernel_args(), "layer": lw.layer_id, "tl": 0,
                     }
                 ),
-                stream=stream,
+                stream,
             )  # fmt: skip
             ar, res = self.ars[d % 2][:n], self.h_mids[d % 2][:n]
         return res
@@ -417,9 +542,9 @@ class MonoDecodeRunner:
         aux_layers: tuple[int, ...] = (),
         aux: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Embedding and the dense layers on the original modules; leaves the first
+        """Embedding and the prefix layers on the original modules; leaves the first
         sparse layer's (ar, res) in ``self.ars[0][:S]`` and the returned residual.
-        Appends the aux hidden state of the dense ones among ``aux_layers``."""
+        Appends the aux hidden state of the prefix ones among ``aux_layers``."""
         n = input_ids.numel()
         hidden = self.model.get_input_embeddings(input_ids)
         residual = None
@@ -450,11 +575,14 @@ class MonoDecodeRunner:
         sparse_md = _sparse_metadata(fwd)
         block_table, seq_lens = rows
         stream = torch.cuda.current_stream()
-        impl = lw.attn_impl
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
-        k16, v16, ks16, vs16 = impl._to_page16_shuffle(
-            kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
-        )
+        if self.nvfp4:
+            k16 = v16 = kv.k_cache
+            ks16, vs16 = lw.attn_impl.nvfp4_k_scale, lw.attn_impl.nvfp4_v_scale
+        else:
+            k16, v16, ks16, vs16 = to_page16_shuffle(
+                kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
+            )
         args = {
             "h_in": _ptr(self.h), "q": _ptr(self.q), "block_table": _ptr(block_table),
             "seq_lens": _ptr(seq_lens), "k_cache": _ptr(k16), "v_cache": _ptr(v16),
@@ -470,18 +598,28 @@ class MonoDecodeRunner:
             "k1_args": _ptr(self.k1_args[i]), "positions": _ptr(positions),
             "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res),
             "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
+            "w13s": _opt_ptr(lw.w13s), "s13s": _opt_ptr(lw.s13s),
+            "w2s": _opt_ptr(lw.w2s), "s2s": _opt_ptr(lw.s2s),
         }  # fmt: skip
-        self.k4[n][lw.index_topk](*K4_ABI.pack(args), stream=stream)
+        _run_compiled(self.k4[n][lw.index_topk], *K4_ABI.pack(args), stream)
         return self.h_mids[(i + 1) % 2][:n]
 
     def finish_step(self, res: torch.Tensor) -> torch.Tensor:
         """The final norm (the mailboxes are cleared at the next step's start:
         ``StepMailboxes.begin_step``)."""
         ar = self.ars[len(self.sparse) % 2]
-        hidden, _ = self.model.norm(ar[: res.shape[0]], res)
+        hidden, residual = self.model.norm(ar[: res.shape[0]], res)
+        self._write_aux(self.sparse[-1].layer_id, residual)
         if self.debug and not torch.cuda.is_current_stream_capturing():
             self.raise_on_given_up_waits(res.shape[0])
         return hidden
+
+    def _write_aux(self, layer_id: int, value: torch.Tensor) -> None:
+        if self.aux is None or layer_id not in self.aux.layer_ids:
+            return
+        self.aux.buffers[self.aux.layer_ids.index(layer_id)][: value.shape[0]].copy_(
+            value
+        )
 
     def raise_on_given_up_waits(self, n: int) -> None:
         """A debug build's step: raise with every mailbox wait that gave up (its

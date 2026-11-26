@@ -1,6 +1,7 @@
 self-hosted-runner:
   # Labels of self-hosted runner in array of strings.
   labels:
+    - atom-bot
     - atom-mi35x-8gpu-oot-acc
     - atom-mi355-8gpu.predownload
     - atom-mi355-8gpu-aac-runner
@@ -13,11 +14,14 @@ self-hosted-runner:
     - atom-plugin-acc-validation-runner-sgl
     - build-only-atom
     - linux-atom-do-mi350x-8
+    - linux-atom-pitt-mi350x-8
+    - linux-atom-general-mi350x-8
     - linux-atom-mi35x-1
     - linux-atom-mi35x-4
     - linux-atom-mi355-1
     - linux-atom-mi355-4
     - linux-atom-mi355-8
+    - linux-atom-pitt-mi350x-8
 
 # Configuration variables in array of strings defined in your repository or
 # organization. `null` means disabling configuration variables check.

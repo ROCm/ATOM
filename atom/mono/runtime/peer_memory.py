@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Symmetric peer memory for in-kernel TP reductions."""
 
 from __future__ import annotations
@@ -7,40 +8,21 @@ from __future__ import annotations
 import torch
 from typing_extensions import Self
 
-from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
+from atom.distributed.group_agreement import group_agree
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.hip_ipc import (
     close_ipc_handle,
     get_allocation_base,
     get_ipc_handle,
     open_ipc_handle,
 )
-
-
-def _ipc_heap():
-    """aiter's uncached IPC heap, imported on use.
-
-    `PeerBuffer` needs it; `SymmetricPeerBuffer` below drives HIP directly and
-    needs nothing from aiter. Importing it at module scope would make the whole
-    module -- and so every test of either class -- require an AITER build,
-    which the CPU test gate does not have.
-    """
-
-    from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap
-
-    return UncachedIpcHeap
-
-
-class _DeviceBytes:
-    """``__cuda_array_interface__`` of ``nbytes`` bytes at a raw device address, for a
-    non-owning torch view."""
-
-    def __init__(self, ptr: int, nbytes: int):
-        self.__cuda_array_interface__ = {
-            "shape": (nbytes,),
-            "typestr": "|u1",
-            "data": (ptr, False),
-            "version": 3,
-        }
+from atom.mono.runtime.uncached import (
+    DeviceBytes,
+    alloc_uncached,
+    fine_grained_bytes,
+    ipc_heap,
+    uncached_bytes,
+)
 
 
 class PeerBuffer:
@@ -49,11 +31,12 @@ class PeerBuffer:
     overwrites a peer's unread data, is the model's layout's to say.
 
     ``bytes`` is the data region, the part zeroed between steps; the step
-    fence's slots sit past it (``step_begin``).
+    fence's slots sit past it (``step_begin``), and past them ``plain``, never
+    zeroed: words a step overwrites whole before any read.
 
     The constructor is collective over ``group`` (the handle exchange, then an
     agreement that every rank mapped every peer): every rank must reach it, so a
-    runner reaches it only after ``tp_agree``. A failed mapping on any rank raises
+    runner reaches it only after ``group_agree``. A failed mapping on any rank raises
     ``MonoUnsupported`` on all of them.
     """
 
@@ -64,20 +47,24 @@ class PeerBuffer:
         rank: int,
         npes: int,
         device: torch.device,
+        plain_bytes: int = 0,
     ):
         # imported here, not at module scope: `step_begin` compiles FlyDSL on
         # the way in, and `SymmetricPeerBuffer` below needs neither.
         from atom.mono.runtime.step_begin import FENCE_BYTES
 
-        self.local = _ipc_heap().alloc_uncached(nbytes + FENCE_BYTES)
-        # a view, not an owner: close() frees the memory under it
-        self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
+        # kept until the process exits (``uncached``): close() only drops the views
+        self.local = alloc_uncached(nbytes + FENCE_BYTES + plain_bytes)
+        self.bytes = torch.as_tensor(DeviceBytes(self.local, nbytes), device=device)
+        self.plain = torch.as_tensor(
+            DeviceBytes(self.local + nbytes + FENCE_BYTES, plain_bytes), device=device
+        )
         self.rank = rank
         self._opened: list[int] = []
         addresses = [self.local]
         if npes > 1:
-            handles = _ipc_heap().gather_object_list_via_broadcast(
-                group, _ipc_heap().get_mem_handle_bytes(self.local)
+            handles = ipc_heap().gather_object_list_via_broadcast(
+                group, ipc_heap().get_mem_handle_bytes(self.local)
             )
             addresses, failure = [], None
             try:
@@ -85,12 +72,12 @@ class PeerBuffer:
                     if peer == rank:
                         addresses.append(self.local)
                     else:
-                        base = _ipc_heap().open_mem_handle(handle)
+                        base = ipc_heap().open_mem_handle(handle)
                         self._opened.append(base)
                         addresses.append(base)
             except RuntimeError as err:  # every rank must still reach the agreement
                 failure = err
-            if not tp_agree(failure is None, group):
+            if not group_agree(failure is None, group):
                 self.close()
                 raise MonoUnsupported(
                     f"peer memory handshake failed on {'this' if failure else 'another'}"
@@ -108,53 +95,55 @@ class PeerBuffer:
         }
 
     def close(self) -> None:
-        """Close the peer mappings and free the local buffer; idempotent. Only once no
-        kernel of any rank can still touch it (the runner is being dropped)."""
+        """Close the peer mappings and drop the local buffer's views; idempotent.
+        Only once no kernel of any rank can still touch it (the runner is being
+        dropped). The memory itself stays (``uncached``)."""
         opened, self._opened = self._opened, []
         for base in opened:
-            _ipc_heap().close_mem_handle(base)
+            ipc_heap().close_mem_handle(base)
         if self.local:
-            self.bytes = None
-            _ipc_heap().free_device_mem(self.local)
+            self.bytes = self.plain = None
             self.local = 0
 
 
 # ---------------------------------------------------------------------------
 # A SECOND implementation of the same idea, used by GLM-5.2's kernel.
 #
-# `PeerBuffer` above gets its memory from aiter (`UncachedIpcHeap`);
-# `SymmetricPeerBuffer` below drives HIP directly through `hip_ipc`. They are
-# not two copies of one routine -- they differ in how they allocate, exchange
-# and free IPC handles -- so merging them is a behaviour change on a GPU, not a
+# Both take their memory from `uncached.alloc_uncached`; `PeerBuffer` above
+# exchanges IPC handles through aiter (`UncachedIpcHeap`), `SymmetricPeerBuffer`
+# below through `hip_ipc` and torch.distributed. They are not two copies of one
+# routine -- they differ in how they exchange and close IPC handles -- so
+# merging them is a behaviour change on a GPU, not a
 # move, and a wrong merge is silent wrong numerics rather than a failing
 # import. They sit together so the duplication is visible and the next person
 # to touch peer memory has to decide, instead of finding the second one later.
 # ---------------------------------------------------------------------------
 
 
-class SymmetricPeerBuffer:
-    """Allocate one symmetric buffer and exchange its address with every rank.
+class PeerView:
+    """Every rank's address of a device allocation each rank holds, exchanged
+    over HIP IPC (``addresses``, int64, indexed by rank): ``make_local()``
+    gives this rank's address (anywhere inside its allocation), its failure
+    reported to every rank. ``what`` names the memory in a refusal.
 
-    Remote HIP IPC mappings are closed by :meth:`close`. The local allocation is
-    owned by ``storage`` and stays alive for the wrapper's lifetime.
+    Remote HIP IPC mappings are closed by :meth:`close`; the local memory is
+    whoever made it's.
     """
 
-    def __init__(self, nbytes: int, rank: int = 0, npes: int = 1, group=None):
-        if nbytes <= 0:
-            raise ValueError(f"nbytes must be positive, got {nbytes}")
+    def __init__(self, make_local, rank: int = 0, npes: int = 1, group=None,
+                 what: str = "peer memory"):  # fmt: skip
         if not 0 <= rank < npes:
             raise ValueError(f"rank must be in [0, {npes}), got {rank}")
-        device = None
         self.rank = rank
         self.npes = npes
         self.group = group
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        device = self.device
         self._remote_bases: list[int] = []
         self._safety_barrier_complete = False
 
         if npes == 1:
-            device = torch.device("cuda", torch.cuda.current_device())
-            self.storage = torch.zeros(nbytes, dtype=torch.uint8, device=device)
-            self.local_address = self.storage.data_ptr()
+            self.local_address = make_local()
             addresses = [self.local_address]
         else:
             import torch.distributed as dist
@@ -162,9 +151,7 @@ class SymmetricPeerBuffer:
             local_error = None
             mine = None
             try:
-                device = torch.device("cuda", torch.cuda.current_device())
-                self.storage = torch.zeros(nbytes, dtype=torch.uint8, device=device)
-                self.local_address = self.storage.data_ptr()
+                self.local_address = make_local()
                 base = get_allocation_base(self.local_address)
                 mine = (get_ipc_handle(base), self.local_address - base)
             except Exception as error:  # noqa: BLE001 - reported to every rank below
@@ -184,9 +171,7 @@ class SymmetricPeerBuffer:
                 # failed IPC export here must disable mono, not take the server
                 # down with it. The old PeerBuffer raised MonoUnsupported for
                 # the same reason.
-                raise MonoUnsupported(
-                    f"symmetric peer allocation/export failed: {detail}"
-                )
+                raise MonoUnsupported(f"{what} allocation/export failed: {detail}")
 
             addresses = []
             open_error = None
@@ -219,10 +204,9 @@ class SymmetricPeerBuffer:
                         pass
                 self._remote_bases.clear()
                 detail = "; ".join(f"rank {peer}: {error}" for peer, error in failed)
-                raise MonoUnsupported(f"symmetric peer open failed: {detail}")
+                raise MonoUnsupported(f"{what} open failed: {detail}")
 
             dist.barrier(group=group)
-        assert device is not None
         self.addresses = torch.tensor(addresses, dtype=torch.int64, device=device)
 
     def close(self) -> None:
@@ -233,7 +217,7 @@ class SymmetricPeerBuffer:
         """
 
         if not self._safety_barrier_complete:
-            torch.cuda.synchronize(self.storage.device)
+            torch.cuda.synchronize(self.device)
             if self.npes > 1:
                 import torch.distributed as dist
 
@@ -262,3 +246,32 @@ class SymmetricPeerBuffer:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
+
+
+class SymmetricPeerBuffer(PeerView):
+    """Allocate one symmetric buffer and exchange its address with every rank.
+
+    Remote HIP IPC mappings are closed by :meth:`close`. The local allocation is
+    uncached memory viewed by ``storage``, kept until the process exits
+    (``uncached``).
+    """
+
+    def __init__(
+        self,
+        nbytes: int,
+        rank: int = 0,
+        npes: int = 1,
+        group=None,
+        fine_grained: bool = False,
+    ):
+        if nbytes <= 0:
+            raise ValueError(f"nbytes must be positive, got {nbytes}")
+
+        def allocate() -> int:
+            device = torch.device("cuda", torch.cuda.current_device())
+            self.storage = (fine_grained_bytes if fine_grained else uncached_bytes)(
+                nbytes, device
+            )
+            return self.storage.data_ptr()
+
+        super().__init__(allocate, rank, npes, group, "symmetric peer")

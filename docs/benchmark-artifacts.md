@@ -72,9 +72,10 @@ memory utilization and unified graph capture sizes:
 | nightly | 2 | 1, 2, 4, 8, 16, 32, 64, 128 | 3600 | 5 |
 | nightly | 4 | 1, 4, 8 | 3600 | 5 |
 
-Nightly uses FP4 weight metadata, BF16 KV, FP8 index cache, five-token DSpark
-with fixed AL 3.51, 16K batching/prefill chunks, prefix caching
-with block size 16, 8K state checkpoints, level 3, FULL graphs and `dsml_v41`.
+Nightly uses FP4 weight metadata, FP8 (MXFP8) KV, FP4 index cache, five-token
+DSpark with fixed AL 3.51, 16K batching/prefill chunks, prefix caching, 8K state
+checkpoints, level 3, FULL graphs and `dsml_v41`. The test profile shares the
+FP8 KV and FP4 index cache.
 Both test and nightly set `--gpu-memory-utilization 0.95`, leave `--max-num-seqs`
 unset (the checked-out engine supplies its default), and capture sizes 1–32 plus
 48/64/96/128/160/192/224/256 for every point. There is no EP or KV offload.

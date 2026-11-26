@@ -15,6 +15,7 @@ target's capture left -- or a later size's `kv_indptr` runs backwards.
 import types
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 # Named on the module, not on "aiter", for the reason tests/test_dspark.py gives:
@@ -67,7 +68,7 @@ def _fake_proposer(num_attention_heads, *, fused, returns_slots=False):
         prepare_mtp_decode=prepare_mtp_decode,
     )
     proposer = types.SimpleNamespace(
-        _share_mtp_indices=False,
+        share_mtp_indices=False,
         device=torch.device("cpu"),
         runner=types.SimpleNamespace(attn_metadata_builder=builder),
         # The real rewrite drops the metadata to one row per sequence and
@@ -166,12 +167,13 @@ class _AdvancingPass:
     """
 
     name = "step"
+    will_capture = True  # read by the warm-up log line
 
     def __init__(self, var):
         self.var = var
         self.seen = {}
 
-    def warmup(self, bs, *, pool=None, stream=None):
+    def warmup(self, bs):
         kv_indptr = self.var["kv_indptr"].gpu
         kv_indptr[: bs + 1] += torch.arange(bs + 1, dtype=kv_indptr.dtype)
         self.var["context_lens"].gpu[:bs] += 1
@@ -179,47 +181,54 @@ class _AdvancingPass:
             kv_indptr[: bs + 1].clone(),
             self.var["context_lens"].gpu[:bs].clone(),
         )
-        return pool
 
 
 def _warmup_all_sizes(warmup_draft_graphs, capture_sizes=(4, 2, 1)):
     var = {
         "kv_indptr": _Buf(torch.zeros(9, dtype=torch.int32)),
         "context_lens": _Buf(torch.full((8,), 7, dtype=torch.int32)),
+        "batch_info": _Buf(torch.zeros(3, dtype=torch.int32)),
     }
     pass_ = _AdvancingPass(var)
     proposer = object.__new__(EagleProposer)
     proposer.runner = types.SimpleNamespace(
         forward_vars=var,
         capture_sizes=list(capture_sizes),
-        graph_pool=None,
         rank=0,
+        running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
     )
     proposer.draft_graphs = (pass_,)
-    proposer.config = None
+    proposer.config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(data_parallel_size=1)
+    )
 
     def build_context(bs):
         return types.SimpleNamespace(), types.SimpleNamespace()
 
+    forward_context = types.SimpleNamespace(context=types.SimpleNamespace())
     with (
         patch("atom.spec_decode.drafter.set_forward_context"),
+        patch(
+            "atom.spec_decode.drafter.get_forward_context",
+            return_value=forward_context,
+        ),
         patch("torch.cuda.synchronize"),
     ):
-        warmup_draft_graphs(proposer, build_context, stream=None)
+        warmup_draft_graphs(proposer, build_context)
     return var, pass_.seen
 
 
 def test_accumulated_warmup_runs_kv_indptr_backwards():
     # The hazard, shown on the base loop: sizes warm smallest first, and each
     # one's in-place bump lands on the rows every earlier size already bumped.
-    _, seen = _warmup_all_sizes(Drafter.warmup_draft_graphs)
+    _, seen = _warmup_all_sizes(Drafter._warmup_draft_graphs)
     kv_indptr, _ = seen[4]
     assert kv_indptr.tolist() == [0, 3, 4, 3, 4]
     assert (kv_indptr.diff() < 0).any()
 
 
 def test_every_size_warms_from_the_capture_state():
-    var, seen = _warmup_all_sizes(EagleProposer.warmup_draft_graphs)
+    var, seen = _warmup_all_sizes(EagleProposer._warmup_draft_graphs)
     for bs, (kv_indptr, context_lens) in seen.items():
         # One drafted token per sequence on top of an untouched capture.
         assert kv_indptr.tolist() == list(range(bs + 1))

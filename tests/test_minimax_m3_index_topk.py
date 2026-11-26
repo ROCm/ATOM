@@ -279,14 +279,26 @@ def test_emitted_order_is_full_blocks_by_score_then_the_partial_tail():
     kw = _inputs(qlens, prefixes, heads, "cuda")
     total_q, max_block = sum(qlens), triton.cdiv(kw["max_seq_len"], SPARSE_BLOCK_SIZE)
     score = torch.empty((heads, total_q, max_block), dtype=torch.float32, device="cuda")
-    q_tiles = triton.cdiv(kw["max_query_len"], m.SCORE_BLOCK_SIZE_Q)
-    cb = m._score_chunk_blocks(max_block, q_tiles, len(qlens), heads, torch.device("cuda"))  # fmt: skip
+    config = m._prefill_score_config(
+        m.get_gfx_runtime(),
+        kw["index_kv_cache"].dtype in m._FP8_DTYPES,
+        kw["max_query_len"],
+        max_block,
+        len(qlens),
+        heads,
+        m._compute_units(kw["idx_q"].device.index),
+    )
+    q_tiles = triton.cdiv(kw["max_query_len"], config.block_size_q)
+    cb = config.chunk_blocks
     m._index_block_score_kernel[(q_tiles, len(qlens) * heads, triton.cdiv(max_block, cb))](
         kw["idx_q"], kw["index_kv_cache"], score, kw["block_table"], kw["cu_seqlens_q"],
         kw["seq_lens"], kw["prefix_lens"], heads, HEAD_DIM, kw["sm_scale"], cb,
         *kw["idx_q"].stride(), *kw["index_kv_cache"].stride(), *score.stride(),
-        kw["block_table"].stride(0), BLOCK_SIZE_Q=m.SCORE_BLOCK_SIZE_Q,
-        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE, num_stages=m.SCORE_NUM_STAGES,
+        kw["block_table"].stride(0), BLOCK_SIZE_Q=config.block_size_q,
+        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE, STORE_GROUP=config.store_group,
+        PREFETCH_PAGES=config.prefetch_pages,
+        POST_REDUCE_SCALE=config.post_reduce_scale,
+        num_warps=config.num_warps, num_stages=config.num_stages,
     )  # fmt: skip
     idx, sbt, _ = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
 
@@ -504,21 +516,74 @@ class TestSelectorDispatch:
     stricter when the call also emits.
     """
 
+    @staticmethod
+    def _gfx950_wins(width, emit):
+        return m._aiter_selector_wins(
+            width,
+            emit,
+            arch="gfx950",
+            selector_rows=1,
+            compute_units=256,
+        )
+
     def test_narrow_rows_stay_on_triton(self):
         for width in (1, 64, 512, m._AITER_MIN_WIDTH - 1):
-            assert not m._aiter_selector_wins(width, emit=False)
-            assert not m._aiter_selector_wins(width, emit=True)
+            assert not self._gfx950_wins(width, emit=False)
+            assert not self._gfx950_wins(width, emit=True)
 
     def test_emission_raises_the_bar(self):
         between = m._AITER_MIN_WIDTH
         assert between < m._AITER_MIN_WIDTH_WITH_EMIT
-        assert m._aiter_selector_wins(between, emit=False)
-        assert not m._aiter_selector_wins(between, emit=True)
+        assert self._gfx950_wins(between, emit=False)
+        assert not self._gfx950_wins(between, emit=True)
 
     def test_wide_rows_take_aiter(self):
         for width in (m._AITER_MIN_WIDTH_WITH_EMIT, 8192):
-            assert m._aiter_selector_wins(width, emit=False)
-            assert m._aiter_selector_wins(width, emit=True)
+            assert self._gfx950_wins(width, emit=False)
+            assert self._gfx950_wins(width, emit=True)
+
+    @pytest.mark.parametrize(
+        "width,selector_rows,want",
+        [
+            (511, 65536, False),
+            (512, 8191, False),
+            (512, 8192, True),
+            (1895, 4104, True),
+        ],
+    )
+    def test_gfx1250_uses_work_per_cu(self, width, selector_rows, want):
+        assert (
+            m._aiter_selector_wins(
+                width,
+                emit=True,
+                arch="gfx1250",
+                selector_rows=selector_rows,
+                compute_units=256,
+            )
+            == want
+        )
+
+    @pytest.mark.parametrize(
+        "width,emit,want",
+        [
+            (1023, False, False),
+            (1024, False, True),
+            (2047, True, False),
+            (2048, True, True),
+        ],
+    )
+    def test_gfx1250_decode_uses_width_only_gate(self, width, emit, want):
+        assert (
+            m._aiter_selector_wins(
+                width,
+                emit=emit,
+                arch="gfx1250",
+                selector_rows=65536,
+                compute_units=256,
+                decode_max_q=4,
+            )
+            is want
+        )
 
 
 @gpu
@@ -532,8 +597,6 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     from atom.model_ops.minimax_m3 import index_topk as m2
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
-    if m2.topk_per_row_small_k is None:
-        pytest.skip("aiter's small-k selector is not installed")
     batch, heads, ctx = 2, 1, m2._AITER_MIN_WIDTH_WITH_EMIT * SPARSE_BLOCK_SIZE
     kw = _inputs([1] * batch, [ctx - 1] * batch, heads, "cuda")
     md = make_sparse_decode_metadata(
@@ -562,3 +625,386 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     )
     assert torch.equal(ait_ctx, tri_ctx)
     assert torch.equal(ait_bt, tri_bt)
+
+
+@gpu
+@pytest.mark.parametrize(
+    "S,heads,width",
+    [
+        (8, 2, 70),
+        (1, 2, m._AITER_MIN_WIDTH_WITH_EMIT + 252),
+        (8, 1, m._AITER_MIN_WIDTH_WITH_EMIT + 252),
+    ],
+)
+def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
+    monkeypatch, S, heads, width
+):
+    """A decode step padded from 3 to 6 requests (pad rows length 0, a poisoned block
+    table), on both selectors: a pad row emits context 0 and page 0 and never reads
+    its table; a live row's context is the closed form of its selection. The wide
+    case must actually be served by aiter's selector, and agree with Triton."""
+    live_lens = [width * SPARSE_BLOCK_SIZE - 5, 300 + S, 9 * SPARSE_BLOCK_SIZE + S]
+    batch, live = 6, len(live_lens)
+    dev = "cuda"
+    seq = torch.zeros(batch, dtype=torch.int32, device=dev)
+    seq[:live] = torch.tensor(live_lens, dtype=torch.int32)
+    table = torch.full((batch, width), 0x7FFFFFFF, dtype=torch.int32, device=dev)
+    table[:live] = torch.randperm(10_000, device=dev)[: live * width].reshape(live, -1).int()  # fmt: skip
+    total_q = batch * S
+    score = torch.randn(heads, total_q, width, device=dev)
+    nvalid = m.build_n_valid_column_per_row(
+        seq, seq, batch=batch, total_q=total_q, num_idx_heads=heads, decode_max_q=S
+    )
+
+    served = []
+    real, supported = m._small_k_selector()
+
+    def served_by(*a):
+        served.append(1)
+        return real(*a)
+
+    monkeypatch.setattr(m, "_small_k_selector", lambda: (served_by, supported))
+    monkeypatch.setattr(m, "_AITER_SERVES", {})
+
+    def run(bounds):
+        topk_idx = torch.empty((heads, total_q, TOPK), dtype=torch.int32, device=dev)
+        (sbt, sctx), args = m._alloc_emit(total_q, heads, TOPK, table, True, dev, 1)
+        m._launch_select(
+            score, topk_idx, seq, seq, batch, TOPK, 0, 1, table, (sbt, sctx, *args[2:]),
+            heads, rows_per_req=S, decode_max_q=S,
+            block_size_k=m.DECODE_TOPK_BLOCK_SIZE_K, num_warps=m.DECODE_TOPK_NUM_WARPS,
+            emit=True, block_page_stride=1, n_valid_column_per_row=bounds,
+            pages_per_block=1,
+        )  # fmt: skip
+        return topk_idx, sbt, sctx
+
+    tri_idx, tri_bt, tri_ctx = run(None)
+    assert not served
+    ait_idx, ait_bt, ait_ctx = run(nvalid)
+    assert bool(served) == (width >= m._AITER_MIN_WIDTH_WITH_EMIT)
+    rows = heads * total_q
+    assert torch.equal(
+        torch.sort(ait_idx.reshape(rows, TOPK), dim=1).values,
+        torch.sort(tri_idx.reshape(rows, TOPK), dim=1).values,
+    )
+    for bt, ctx in ((tri_bt, tri_ctx), (ait_bt, ait_ctx)):
+        n = live * S * heads
+        # live rows (token-major, head-minor): the closed form of the context
+        for r in range(live * S):
+            b, t = divmod(r, S)
+            causal = live_lens[b] - S + t + 1
+            last = (causal - 1) // SPARSE_BLOCK_SIZE
+            want = (min(TOPK, last + 1) - 1) * SPARSE_BLOCK_SIZE + causal - last * SPARSE_BLOCK_SIZE  # fmt: skip
+            assert ctx[r * heads : (r + 1) * heads].tolist() == [want] * heads
+        # pad rows: nothing, and no poisoned page id got out
+        assert int(ctx[n:].abs().max()) == 0 and int(bt[n:].abs().max()) == 0
+        assert int(bt[:n].max()) < 10_000 * 8 * heads
+    assert torch.equal(ait_ctx, tri_ctx) and torch.equal(ait_bt, tri_bt)
+
+
+@gpu
+@pytest.mark.parametrize(
+    "q_len,prefix_len,heads",
+    [
+        (4104, 238336, 1),
+        (16384, 65536, 4),
+        (32768, 49152, 4),
+    ],
+)
+def test_gfx1250_wave32_selector_matches_prefill_fallback(
+    monkeypatch, q_len, prefix_len, heads
+):
+    if m.get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 wave32 selector regression")
+    m._small_k_selector()
+
+    kw = _inputs([q_len], [prefix_len], heads, "cuda")
+    bounds = m.build_n_valid_column_per_row(
+        kw["cu_seqlens_q"],
+        kw["prefix_lens"],
+        batch=1,
+        total_q=q_len,
+        num_idx_heads=heads,
+        decode_max_q=0,
+    )
+    used_aiter = False
+    original_select = m._select_with_aiter
+
+    def tracked_select(*args, **kwargs):
+        nonlocal used_aiter
+        used_aiter = True
+        return original_select(*args, **kwargs)
+
+    monkeypatch.setattr(m, "_select_with_aiter", tracked_select)
+    candidate = m.minimax_m3_index_topk(
+        **kw,
+        emit_sparse_block_table=True,
+        n_valid_column_per_row=bounds,
+    )
+    assert used_aiter
+
+    fallback = m.minimax_m3_index_topk(
+        **kw,
+        emit_sparse_block_table=True,
+        n_valid_column_per_row=None,
+    )
+    assert all(torch.equal(a, b) for a, b in zip(candidate, fallback))
+
+
+@gpu
+def test_page128_prefill_emit_uses_aiter_or_fallback_without_parallel_workspace(
+    monkeypatch,
+):
+    """MXFP4's one-page output is too small to alias as parallel-topk workspace."""
+    if m.get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 page-128 selector regression")
+
+    rows, width = 4096, 1280
+    dev = "cuda"
+    score = torch.randn((1, rows, width), device=dev)
+    row_starts = torch.tensor([0, rows], dtype=torch.int32, device=dev)
+    prefix = width * SPARSE_BLOCK_SIZE - rows
+    row_prefix = torch.tensor([prefix], dtype=torch.int32, device=dev)
+    block_table = torch.arange(width, dtype=torch.int32, device=dev)[None, :]
+    bounds = m.build_n_valid_column_per_row(
+        row_starts,
+        row_prefix,
+        batch=1,
+        total_q=rows,
+        num_idx_heads=1,
+        decode_max_q=0,
+    )
+
+    def run(n_valid):
+        topk_idx = torch.empty((1, rows, TOPK), dtype=torch.int32, device=dev)
+        (sparse_bt, sparse_ctx), emit_args = m._alloc_emit(
+            rows, 1, TOPK, block_table, True, dev, pages_per_block=1
+        )
+        m._launch_select(
+            score,
+            topk_idx,
+            row_starts,
+            row_prefix,
+            1,
+            TOPK,
+            INIT,
+            LOCAL,
+            block_table,
+            emit_args,
+            1,
+            rows_per_req=rows,
+            decode_max_q=0,
+            block_size_k=m._prefill_topk_block_size_k(width),
+            num_warps=m.PREFILL_TOPK_NUM_WARPS,
+            emit=True,
+            block_page_stride=1,
+            n_valid_column_per_row=n_valid,
+            pages_per_block=1,
+        )
+        return topk_idx, sparse_bt, sparse_ctx
+
+    aiter_out = run(bounds)
+    monkeypatch.setattr(
+        m,
+        "_launch_parallel_prefill_selector",
+        lambda *args, **kwargs: pytest.fail(
+            "page-128 output cannot provide parallel-selector workspace"
+        ),
+    )
+    fallback_out = run(None)
+    assert all(torch.equal(a, b) for a, b in zip(aiter_out, fallback_out))
+
+
+@gpu
+@pytest.mark.parametrize("heads", [1, 4])
+@pytest.mark.parametrize("strided_q", [False, True])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "qlens,prefixes,q_zero",
+    [
+        ([1], [128], False),
+        ([129, 17, 0], [127, 4096, 0], False),
+        ([257], [4096], True),
+        ([1703, 717], [120832, 114432], False),
+        ([640] * 4, [32256] * 4, False),
+        ([2517], [102784], False),
+        ([2858], [501632], False),
+        ([4104], [238336], False),
+        ([2331], [343936], True),
+        ([2858, 2331], [501632, 343936], False),
+    ],
+)
+def test_prefill_launch_policy_preserves_scores_and_selection(
+    monkeypatch, heads, strided_q, cache_dtype, qlens, prefixes, q_zero
+):
+    """Compare the tuned launch with `_default_prefill_score_config`'s launch."""
+    import triton
+
+    if m.get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 launch-policy regression")
+    kw = _inputs(qlens, prefixes, heads, "cuda")
+    q = kw["idx_q"]
+    if strided_q:
+        storage = torch.empty(
+            (q.shape[0], heads * 2, HEAD_DIM), dtype=q.dtype, device=q.device
+        )
+        storage[:, 1 : heads + 1].copy_(q)
+        q = storage[:, 1 : heads + 1]
+        kw["idx_q"] = q
+    if q_zero:
+        q.zero_()
+    cache = kw["index_kv_cache"].to(cache_dtype)
+    kw["index_kv_cache"] = cache
+    # Check that logical and physical page ids are not accidentally conflated.
+    kw["block_table"] = torch.randperm(
+        cache.shape[0], dtype=torch.int32, device=q.device
+    ).reshape(kw["block_table"].shape)
+    total_q = sum(qlens)
+    max_block = triton.cdiv(kw["max_seq_len"], SPARSE_BLOCK_SIZE)
+    valid_counts = torch.cat(
+        [
+            (torch.arange(length, device=q.device) + prefix + SPARSE_BLOCK_SIZE)
+            // SPARSE_BLOCK_SIZE
+            for length, prefix in zip(qlens, prefixes)
+        ]
+    )
+    valid = (
+        torch.arange(max_block, device=q.device)[None, None, :]
+        < valid_counts[None, :, None]
+    ).expand(heads, -1, -1)
+
+    def score(block_q, chunk, warps, stages, kernel_config):
+        q_tiles = triton.cdiv(kw["max_query_len"], block_q)
+        store_group, prefetch_pages, post_reduce_scale = kernel_config
+        result = torch.full((heads, total_q, max_block), float("nan"), device=q.device)
+        m._index_block_score_kernel[
+            (q_tiles, len(qlens) * heads, triton.cdiv(max_block, chunk))
+        ](
+            q,
+            cache,
+            result,
+            kw["block_table"],
+            kw["cu_seqlens_q"],
+            kw["seq_lens"],
+            kw["prefix_lens"],
+            heads,
+            HEAD_DIM,
+            kw["sm_scale"],
+            chunk,
+            *q.stride(),
+            *cache.stride(),
+            *result.stride(),
+            kw["block_table"].stride(0),
+            BLOCK_SIZE_Q=block_q,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            STORE_GROUP=store_group,
+            PREFETCH_PAGES=prefetch_pages,
+            POST_REDUCE_SCALE=post_reduce_scale,
+            num_warps=warps,
+            num_stages=stages,
+        )
+        return result
+
+    arch, is_fp8 = m.get_gfx_runtime(), cache_dtype in m._FP8_DTYPES
+    policy_args = (
+        arch,
+        is_fp8,
+        kw["max_query_len"],
+        max_block,
+        len(qlens),
+        heads,
+        m._compute_units(q.device.index),
+    )
+    old_config = m._prefill_policy._default_prefill_score_config(*policy_args)
+    score_config = m._prefill_score_config(*policy_args)
+    kernel_config = (
+        score_config.store_group,
+        score_config.prefetch_pages,
+        score_config.post_reduce_scale,
+    )
+    old_score = score(
+        old_config.block_size_q,
+        old_config.chunk_blocks,
+        old_config.num_warps,
+        old_config.num_stages,
+        (
+            old_config.store_group,
+            old_config.prefetch_pages,
+            old_config.post_reduce_scale,
+        ),
+    )
+    new_score = score(
+        score_config.block_size_q,
+        score_config.chunk_blocks,
+        score_config.num_warps,
+        score_config.num_stages,
+        kernel_config,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(old_score[valid]).all()
+    assert torch.equal(old_score[valid], new_score[valid])
+
+    # Exercise the production wrapper too; do not validate only a raw launch.
+    parallel_launches = []
+    real_parallel_launch = m._launch_parallel_prefill_selector
+
+    def tracked_parallel_launch(*args, **kwargs):
+        parallel_launches.append(1)
+        return real_parallel_launch(*args, **kwargs)
+
+    monkeypatch.setattr(m, "_launch_parallel_prefill_selector", tracked_parallel_launch)
+    new_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    if qlens == [2858, 2331] and heads == 1:
+        assert parallel_launches
+    expect_parallel = m._parallel_prefill_selector_wins(
+        arch=arch,
+        width=max_block,
+        query_rows=total_q,
+        compute_units=m._compute_units(q.device.index),
+        emit=True,
+        topk=TOPK,
+        num_idx_heads=heads,
+        decode_max_q=0,
+        pages_per_block=m.PAGES_PER_SPARSE_BLOCK,
+    )
+    assert bool(parallel_launches) is expect_parallel
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            m,
+            "_prefill_score_config",
+            m._prefill_policy._default_prefill_score_config,
+        )
+        patch.setattr(m, "_parallel_prefill_selector_wins", lambda **kwargs: False)
+        old_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    torch.cuda.synchronize()
+    for old_output, new_output in zip(old_outputs, new_outputs):
+        assert torch.equal(old_output, new_output)
+
+
+@gpu
+@pytest.mark.parametrize("q_zero", [False, True])
+@pytest.mark.parametrize(
+    "q_len,prefix_len",
+    [(2369, 95_935), (2517, 102_784), (2688, 128_384)],
+)
+def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
+    monkeypatch, q_zero, q_len, prefix_len
+):
+    """The measured #341 launch changes only geometry, including tie-heavy rows."""
+    if m.get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 #341 launch regression")
+    kw = _inputs([q_len], [prefix_len], 1, "cuda")
+    kw["index_kv_cache"] = kw["index_kv_cache"].to(torch.float8_e4m3fn)
+    if q_zero:
+        kw["idx_q"].zero_()
+
+    tuned = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            m,
+            "_prefill_score_config",
+            m._prefill_policy._default_prefill_score_config,
+        )
+        previous = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(tuned, previous))

@@ -197,6 +197,18 @@ pub mod labels {
     pub const WORKER_HTTP: &str = "http";
     pub const WORKER_GRPC: &str = "grpc";
 
+    // Routing decisions
+    pub const AFFINITY_HIT: &str = "hit";
+    pub const AFFINITY_NEW: &str = "new";
+    pub const AFFINITY_REBIND: &str = "rebind";
+    pub const AFFINITY_EXPIRED: &str = "expired";
+    pub const WORKER_CHANGE_RANK_MAPPING: &str = "rank_mapping";
+    pub const DP_RANK_NONE: &str = "none";
+    pub const CACHE_PROMPT: &str = "prompt";
+    pub const CACHE_CACHED: &str = "cached";
+    pub const CACHE_ESTIMATED: &str = "estimated";
+    pub const CACHE_ACTUAL: &str = "actual";
+
     // Token types
     pub const TOKEN_INPUT: &str = "input";
     pub const TOKEN_OUTPUT: &str = "output";
@@ -252,6 +264,18 @@ pub mod names {
     pub const MANUAL_POLICY_BRANCH_TOTAL: &str = "mesh_manual_policy_branch_total";
     pub const PREFIX_HASH_POLICY_BRANCH_TOTAL: &str = "mesh_prefix_hash_policy_branch_total";
     pub const WORKER_ROUTING_KEYS_ACTIVE: &str = "mesh_worker_routing_keys_active";
+
+    pub const ROUTE_BRANCH_TOTAL: &str = "mesh_route_branch_total";
+    pub const ROUTE_PREFIX_MATCH_RATIO: &str = "mesh_route_prefix_match_ratio";
+    pub const ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS: &str =
+        "mesh_route_selected_worker_active_requests";
+    pub const SESSION_WORKER_CHANGE_TOTAL: &str = "mesh_session_worker_change_total";
+    pub const SELECTED_DP_RANK_TOTAL: &str = "mesh_selected_dp_rank_total";
+    pub const ROUTE_CACHE_TOKENS_TOTAL: &str = "mesh_route_cache_tokens_total";
+    pub const ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL: &str = "mesh_route_cache_estimate_tokens_total";
+    pub const ROUTE_CACHE_ESTIMATE_ERROR_RATIO: &str = "mesh_route_cache_estimate_error_ratio";
+    pub const KV_EVENTS_DROPPED_PREDICTIONS_TOTAL: &str =
+        "mesh_kv_events_dropped_predictions_total";
 
     pub const WORKER_CB_STATE: &str = "mesh_worker_cb_state";
     pub const WORKER_CB_TRANSITIONS_TOTAL: &str = "mesh_worker_cb_transitions_total";
@@ -443,13 +467,67 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::PREFIX_HASH_POLICY_BRANCH_TOTAL,
         kind: MetricKind::Counter,
-        help: "Prefix hash policy execution branches by branch",
+        help: "Deprecated, use mesh_route_branch_total{policy=\"prefix_hash\"}. Prefix hash policy execution branches by branch",
         status: MetricStatus::Active,
     },
     MetricSpec {
         name: names::WORKER_ROUTING_KEYS_ACTIVE,
         kind: MetricKind::Gauge,
         help: "Active routing keys per worker",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::ROUTE_BRANCH_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Routing decisions by pool, policy, branch",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::ROUTE_PREFIX_MATCH_RATIO,
+        kind: MetricKind::Histogram,
+        help: "Prefix match ratio of the best candidate at selection by pool, policy",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS,
+        kind: MetricKind::Histogram,
+        help: "Router-tracked active requests on the selected worker, read at selection before the request is added, by pool, policy, branch",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::SESSION_WORKER_CHANGE_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Session requests dispatched to a different worker (URL and DP rank) than the previous request, by pool, reason (rebind/expired/rank_mapping)",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::SELECTED_DP_RANK_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Dispatched requests after rank mapping by pool, worker (base URL), dp_rank (HTTP routers)",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::ROUTE_CACHE_TOKENS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Tokens of routed requests whose response reported cached tokens by pool (regular/prefill), kind (prompt/cached) (HTTP routers)",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Tokens of those requests that also have a router cache estimate by pool, kind (prompt/estimated/actual)",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO,
+        kind: MetricKind::Histogram,
+        help: "Per-request (estimated - actual) cached tokens over prompt tokens by pool",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::KV_EVENTS_DROPPED_PREDICTIONS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Routed prompts left out of the KV index's predictions as its writer was behind, by model, pool",
         status: MetricStatus::Active,
     },
     MetricSpec {
@@ -550,6 +628,26 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     },
 ];
 
+/// Buckets for routing histograms whose values are not durations.
+pub(crate) const ROUTE_HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
+    (
+        names::ROUTE_PREFIX_MATCH_RATIO,
+        &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0],
+    ),
+    (
+        names::ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS,
+        &[
+            0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+        ],
+    ),
+    (
+        names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO,
+        &[
+            -1.0, -0.5, -0.25, -0.1, -0.05, -0.01, 0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0,
+        ],
+    ),
+];
+
 /// Register HELP/TYPE metadata for every metric with a complete schema entry.
 ///
 /// Planned metrics remain in the inventory so recorder APIs and future wiring
@@ -600,6 +698,22 @@ mod tests {
             "metrics still missing describe entries: {:?}",
             missing_describe
         );
+    }
+
+    #[test]
+    fn route_histogram_buckets_belong_to_sorted_histograms() {
+        for (name, buckets) in ROUTE_HISTOGRAM_BUCKETS {
+            assert!(
+                METRIC_INVENTORY
+                    .iter()
+                    .any(|metric| metric.name == *name && metric.kind == MetricKind::Histogram),
+                "{name} is not an inventoried histogram"
+            );
+            assert!(
+                buckets.windows(2).all(|pair| pair[0] < pair[1]),
+                "{name} buckets are not strictly increasing"
+            );
+        }
     }
 
     #[test]

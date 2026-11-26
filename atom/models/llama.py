@@ -30,6 +30,9 @@ import torch
 from aiter import QuantType
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import LlamaConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 
@@ -52,8 +55,7 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import LlamaConfig
+from atom.utils.region_graph import token_graph
 
 ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT = (
     envs.ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT
@@ -353,6 +355,7 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@token_graph
 @support_torch_compile
 class LlamaModel(nn.Module):
     def __init__(

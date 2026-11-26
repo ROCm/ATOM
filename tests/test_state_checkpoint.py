@@ -18,17 +18,30 @@ from types import SimpleNamespace
 
 import pytest
 from conftest import MockConfig
+from test_state_offload_index import STALE
 
-from atom.model_engine.block_manager import BlockManager
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+from atom.model_engine.block_manager import (
+    AdmissionProbe,
+    BlockManager,
+    JointBoundaryDecision,
+)
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
 )
+from atom.model_engine.prefix_hash import full_prompt_blocks
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
-from atom.model_engine.state_cache import StateCache
+from atom.model_engine.state_cache import (
+    KEEP_NONE,
+    KEEP_SETTLED,
+    KEEP_SNAPSHOT,
+    StateCache,
+)
+from atom.model_engine.state_offload import StateOffloadIndex
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     StateRuntime,
@@ -46,6 +59,34 @@ PAGED_COPY_RUNTIME = StateRuntime(
     transfer=PAGED_COPY_TRANSFER,
     checkpoint_spec=PAGED_COPY_SPEC,
 )
+
+
+def test_mixed_batch_carries_current_state_maintenance():
+    from atom.model_engine.sequence import SequenceStatus
+
+    sched = make_scheduler(
+        paged_copy_config(num_kvcache_blocks=40, enable_mixed_prefill_decode=True),
+        state_runtime=PAGED_COPY_RUNTIME,
+    )
+    decode = stateful_seq(list(range(BLOCK)))
+    assert sched.block_manager.allocate(decode, 0)
+    decode.num_cached_tokens = BLOCK
+    decode.append_token(42)
+    decode.type = SequenceType.DECODE
+    decode.status = SequenceStatus.RUNNING
+    sched.running.append(decode)
+    sched.add(stateful_seq([21] * BLOCK))
+    checkpoints = sched.block_manager.paged_state_checkpoints
+    operation = checkpoints.store.begin_store(33, src_slot=decode.state_slots[0])
+    assert operation is not None
+    checkpoints.store.complete_inflight()
+    assert checkpoints.begin_restore(33, dst_slot=decode.state_slots[0])
+
+    batch, _ = sched.schedule()
+    assert batch.is_mixed
+    restores = batch.state_maintenance_ops.checkpoint_restores
+    assert len(restores) == 1 and restores[0].dst_slot == decode.state_slots[0]
+    assert not sched.block_manager.take_state_maintenance_ops().checkpoint_restores
 
 
 def ckpt_config(**overrides):
@@ -1404,6 +1445,9 @@ class TestPagedCopyCheckpoint:
         def could_serve(self, h):
             return h in self.hashes
 
+        def want_touch(self, h):
+            pass
+
         def request_load(self, req_id, h):
             if h not in self.hashes:
                 return False
@@ -1566,6 +1610,613 @@ class TestPagedCopyCheckpoint:
         # The KV leg has real work: the walk stopped well below the boundary.
         assert hbm_hit * BLOCK < second.offload_joint.kv_tokens
 
+    def test_an_unaligned_hbm_hit_still_reaches_the_rung_above_it(self):
+        """A hit that is not a multiple of the KV chunk used to refuse the
+        whole CPU prefix (`hbm_off_chunk_grid`). The shared claim stops at
+        the chunk floor and the partial chunk is reloaded into private
+        blocks, so the rung above the real HBM hit stays reachable.
+        """
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        # 5 blocks (20 tokens) is off the 16-token chunk grid and still in
+        # HBM. 8 blocks (32 tokens) is the rung only the CPU tier can serve.
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        # One boundary per drain: a second pending boundary of the same seq
+        # supersedes the first, because both would be read from one slot.
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared_last = first.block_table[3]  # tokens [12, 16)
+        shared_tail = first.block_table[4]  # tokens [16, 20), partial chunk
+        victim = first.block_table[6]  # walk stops at 6 blocks, hit gates to 5
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h_cpu)
+        self._with_tier(bm, h_cpu)
+        h = h_cpu
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert hbm_hit * BLOCK % chunk != 0
+        assert bm.joint_boundaries == 1, bm.joint_skips
+        assert "hbm_off_chunk_grid" not in bm.joint_skips
+        assert second.offload_joint.boundary_tokens == 8 * BLOCK
+        assert second.offload_joint.claim_tokens == chunk
+        assert second.offload_joint.kv_tokens == 8 * BLOCK
+
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == chunk
+        assert second.block_table[3] == shared_last
+        assert second.block_table[4] != shared_tail
+        assert second.offload_joint.load_hash == h
+
+    def _occupy_vacant_until(self, bm, free_target: int) -> None:
+        """Pin vacant blocks until `num_free` is `free_target`.
+
+        `_fresh_block` takes vacant ids before cached ones, so the published
+        prefix and its checkpoint stay put while the free list is trimmed to
+        an exact fit.
+        """
+        while bm.kv.num_free > free_target:
+            bm._fresh_block()
+        assert bm.kv.num_free == free_target
+
+    def test_a_live_tail_on_an_exact_fit_pool_keeps_the_hbm_hit(self):
+        """The partial chunk is held by a live seq and the pool fits exactly.
+
+        `can_allocate` does not count that in-use tail. Treating `num_free >=
+        extra` as room then raises from `_fresh_block`. The joint is skipped
+        instead, the request keeps the HBM hit, and the live block is claimed
+        rather than replaced.
+        """
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared_tail = first.block_table[4]
+        victim = first.block_table[6]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h_cpu)
+        self._with_tier(bm, h_cpu)
+
+        # No lookup, so this one claims the HBM hit and stays on the tail.
+        holder = stateful_seq(PROMPT)
+        holder_hit = bm.can_allocate(holder)
+        assert holder_hit == 5
+        assert bm.allocate(holder, holder_hit)
+        assert holder.block_table[4] == shared_tail
+        assert bm.kv.block(shared_tail).ref_count == 1
+
+        num_new = bm._n_hash_blocks(holder) - holder_hit
+        self._occupy_vacant_until(bm, num_new)
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert bm.joint_boundaries == 0
+        assert bm.state_tier_boundaries == 0
+        assert bm.state_hbm_boundaries == 0
+        assert bm.joint_skips.get("partial_chunk_no_room") == 1
+        assert second.offload_joint.boundary_tokens == 0
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == hbm_hit * BLOCK
+        assert second.block_table[4] == shared_tail
+        assert holder.block_table[4] == shared_tail
+        assert bm.kv.block(shared_tail).ref_count == 2
+        assert bm.checkpoint_funnel()["state_gate_lost_boundary"] == 0
+
+    def test_a_live_tail_stays_shared_when_the_private_copy_fits(self):
+        """Room for the private copy must not rewrite the block a live seq holds."""
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared_tail = first.block_table[4]
+        victim = first.block_table[6]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h_cpu)
+        self._with_tier(bm, h_cpu)
+
+        holder = stateful_seq(PROMPT)
+        holder_hit = bm.can_allocate(holder)
+        assert bm.allocate(holder, holder_hit)
+        assert holder.block_table[4] == shared_tail
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert bm.joint_boundaries == 1, bm.joint_skips
+        assert second.offload_joint.claim_tokens == chunk
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == chunk
+        assert second.block_table[4] != shared_tail
+        assert holder.block_table[4] == shared_tail
+        assert bm.kv.block(shared_tail).ref_count == 1
+        assert bm.kv.block(second.block_table[4]).hash == -1
+
+    def test_a_compressed_hit_above_the_gated_hit_keeps_its_chunk_floor(self):
+        """The KV walk's own chunk floor is a legal start when it clears the hit.
+
+        Gated hit 20, compressed hit 40, chunk 16: the claim is 32, not the
+        HBM hit's floor of 16. `[16, 32)` is still resident, so it stays shared
+        and is not refetched.
+        """
+        chunk = 16
+        tokens = list(range(64))
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, tokens)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 12)[11]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 12, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared = list(first.block_table[:8])  # tokens [0, 32)
+        victim = first.block_table[10]  # compressed hit stops at 40 tokens
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h_cpu)
+        self._with_tier(bm, h_cpu)
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(tokens)
+        second.offload_joint.kv_prefix_tokens = len(tokens)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert hbm_hit * BLOCK == 20
+        assert bm.joint_boundaries == 1, bm.joint_skips
+        assert "partial_chunk_no_room" not in bm.joint_skips
+        assert second.offload_joint.claim_tokens == 32
+        assert second.offload_joint.boundary_tokens == 48
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == 20
+        # `block_table` is an `array`, which does not compare equal to a list.
+        assert list(second.block_table[:8]) == shared
+
+    def test_partial_chunk_no_room_keeps_the_hit_and_its_checkpoint(self):
+        """Skipping the joint is not also a boundary, and it does not spend the rung.
+
+        The boundary image is the only evictable checkpoint and it is the one
+        the joint would pin. Funding the private tail with it used to disown
+        the request to token 0. The skip happens before the commit, so the
+        counters count a skip and not a boundary, the HBM hit stands, and the
+        image is still there.
+        """
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared_tail = first.block_table[4]
+        victim = first.block_table[6]
+        # Both images stay in HBM. The holder's restore pins the hit, so the
+        # rung image is the only evictable checkpoint, and it is the one the
+        # joint would pin (`state_from_hbm`).
+        self._with_tier(bm, h_cpu)
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+
+        holder = stateful_seq(PROMPT)
+        holder_hit = bm.can_allocate(holder)
+        assert holder_hit == 5
+        assert bm.allocate(holder, holder_hit)
+        # Hold the rung's KV block so trimming the free list cannot unindex
+        # its checkpoint. Drop every other cached free block first, then leave
+        # exactly the HBM-path demand as vacant units.
+        rung_block = bm.kv.lookup(h_cpu)
+        assert rung_block >= 0
+        bm.kv.claim(rung_block)
+        for block in list(bm.kv.blocks):
+            if block.ref_count != 0 or block.hash == -1:
+                continue
+            if block.block_id in bm.kv._free:
+                bm.kv.allocate(block.block_id)
+        num_new = bm._n_hash_blocks(holder) - holder_hit
+        self._occupy_vacant_until(bm, num_new)
+        self._reset_joint_counters(bm)
+        assert bm.paged_state_checkpoints.contains(h_cpu)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert bm.joint_boundaries == 0
+        assert bm.state_hbm_boundaries == 0
+        assert bm.state_tier_boundaries == 0
+        assert bm.joint_skips.get("partial_chunk_no_room") == 1
+        assert bm.paged_state_checkpoints.contains(h_cpu)
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == hbm_hit * BLOCK
+        assert second.block_table[4] == shared_tail
+        assert bm.paged_state_checkpoints.contains(h_cpu)
+        assert bm.checkpoint_funnel()["state_gate_lost_boundary"] == 0
+        assert second.offload_joint.load_hash == -1
+
+    def _leave_free(self, bm, free_target: int, keep: set[int]) -> None:
+        """Drop cached blocks we do not need, then pin vacant ones.
+
+        `_fresh_block` takes vacant ids before cached ones, so a target below
+        the cached-prefix count would evict the hit. Destroy the other cached
+        blocks first; `keep` stays indexed.
+        """
+        for block in list(bm.kv.blocks):
+            if block.block_id in keep or block.ref_count != 0 or block.hash == -1:
+                continue
+            if block.block_id in bm.kv._free:
+                bm.kv.allocate(block.block_id)
+        self._occupy_vacant_until(bm, free_target)
+
+    def _exact_fit_boundary_image_pool(self):
+        """A pool where pinning the joint's boundary image leaves `allocate`
+        one checkpoint short: HBM hit at 5 blocks, the tail cached-free, the
+        boundary image (8 blocks) in HBM, free `demand - units_per_checkpoint`.
+        """
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        victim = first.block_table[6]
+        rung = first.block_table[7]
+        keep = set(first.block_table[:6]) | {rung}
+        bm.paged_state_checkpoints.unindex(h_hbm)
+        self._with_tier(bm, h_hbm)
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.kv.claim(rung)
+        probe = stateful_seq(PROMPT)
+        probe.offload_joint.kv_prefix_tokens = len(PROMPT)
+        # The probe commits. Roll it back and tighten the pool to the figure
+        # it computed, minus the boundary image, then admit for real.
+        admission = AdmissionProbe()
+        assert bm.can_allocate(probe, probe=admission) == 5
+        num_new = admission.num_new_blocks
+        self._reset_joint_counters(bm)
+        units = bm.paged_state_checkpoints.store.units_per_checkpoint
+        self._leave_free(bm, num_new - units, keep)
+        return bm
+
+    def test_an_exact_fit_boundary_image_is_not_pinned_then_spent(self):
+        """The tail is cached-free, so it adds no demand, and the boundary
+        image is the unit `can_allocate` was counting on.
+
+        `allocate` pins that image before taking fresh blocks. Free was
+        `demand - units_per_checkpoint`, so the pin makes `_fresh_block`
+        raise. The joint is skipped first and the request keeps the HBM hit.
+        """
+        bm = self._exact_fit_boundary_image_pool()
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert bm.joint_boundaries == 0
+        assert bm.joint_skips.get("partial_chunk_no_room") == 1
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == hbm_hit * BLOCK
+
+    def _probed_joint(self, bm):
+        """A `record=False` probe of PROMPT and the joint it would commit."""
+        seq = stateful_seq(PROMPT)
+        seq.offload_joint.kv_prefix_tokens = len(PROMPT)
+        probe = AdmissionProbe()
+        bm.can_allocate(seq, record=False, probe=probe)
+        decision = bm._joint_kv_boundary(
+            seq, probe.num_cached_blocks, probe.block_hashes
+        )
+        assert decision.skip_reason is None
+        return seq, probe, decision
+
+    def test_the_unchecked_exact_fit_joint_does_crash_allocate(self):
+        """What `_fit_joint` guards against, committed without it."""
+        bm = self._exact_fit_boundary_image_pool()
+        second, probe, decision = self._probed_joint(bm)
+        assert decision.state_from_hbm
+        bm._commit_joint_boundary(second, decision)
+        with pytest.raises(AssertionError, match="No PAGE unit available"):
+            bm.allocate(second, probe.num_cached_blocks)
+
+    def test_a_joint_without_probe_demand_is_skipped_not_committed(self):
+        """No demand means the joint never passed the fit: fail closed.
+
+        On the exact-fit pool the unchecked joint makes `allocate` raise (the
+        test above). Without the probe's demand `record_allocation` skips the
+        joint and the request keeps the HBM hit.
+        """
+        bm = self._exact_fit_boundary_image_pool()
+        second, probe, _ = self._probed_joint(bm)
+        assert probe.num_cached_blocks == 5
+        probe.num_new_blocks = None
+
+        bm.record_allocation(second, probe)
+
+        assert bm.joint_boundaries == 0
+        assert bm.joint_skips == {"no_probe_demand": 1}
+        assert second.offload_joint.boundary_tokens == 0
+        assert bm.allocate(second, 5)
+        assert second.num_cached_tokens == 5 * BLOCK
+
+    def test_a_tier_joint_without_probe_demand_is_skipped_too(self):
+        """A tier joint with no private tail skips the room check, since
+        `can_allocate` already counted its demand. Without a probe nothing
+        did, so it is skipped as well."""
+        bm = self._joint_bm()
+        first, h = self._prompt_with_a_rung_at(bm, 8)
+        victim = first.block_table[1]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        self._with_tier(bm, h)
+        bm.paged_state_checkpoints.unindex(h)
+        self._reset_joint_counters(bm)
+        seq, probe, decision = self._probed_joint(bm)
+        assert not decision.state_from_hbm
+        assert bm._fit_joint(decision, probe) == decision
+        probe.num_new_blocks = None
+
+        bm.record_allocation(seq, probe)
+
+        assert bm.joint_boundaries == 0
+        assert bm.joint_skips == {"no_probe_demand": 1}
+
+    def test_a_refused_probe_keeps_no_demand_from_an_earlier_one(self):
+        """Each probe resets the demand, so a reused probe cannot carry a
+        stale one past a fit that refused."""
+        bm = self._joint_bm()
+        first, _h = self._prompt_with_a_rung_at(bm, 8)
+        bm.deallocate(first)
+        seq = stateful_seq(PROMPT)
+        probe = AdmissionProbe()
+        assert bm.can_allocate(seq, record=False, probe=probe) >= 0
+        assert probe.num_new_blocks is not None
+
+        self._occupy_vacant_until(bm, 0)
+
+        assert bm.can_allocate(seq, record=False, probe=probe) == -1
+        assert probe.num_cached_blocks == -1
+        assert probe.num_new_blocks is None
+
+    def test_an_aligned_hbm_boundary_is_protected_on_an_exact_fit_pool(self):
+        """The same pin happens when the hit is already on the chunk grid.
+
+        `can_allocate` protected the hit image, which is only on the tier.
+        The boundary image is what `allocate` pins. Free was short by that
+        image, so the joint is skipped instead of raising.
+        """
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 4)[3]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        bm.paged_state_checkpoints.checkpoint(first, 4, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        victim = first.block_table[5]
+        rung = first.block_table[7]
+        keep = set(first.block_table[:5]) | {rung}
+        bm.paged_state_checkpoints.unindex(h_hbm)
+        self._with_tier(bm, h_hbm)
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.kv.claim(rung)
+        probe = stateful_seq(PROMPT)
+        probe.offload_joint.kv_prefix_tokens = len(PROMPT)
+        admission = AdmissionProbe()
+        assert bm.can_allocate(probe, probe=admission) == 4
+        num_new = admission.num_new_blocks
+        self._reset_joint_counters(bm)
+        units = bm.paged_state_checkpoints.store.units_per_checkpoint
+        self._leave_free(bm, num_new - units, keep)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 4
+        assert hbm_hit * BLOCK % chunk == 0
+        assert bm.joint_boundaries == 0
+        assert bm.joint_skips.get("state_hbm_no_room") == 1
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == hbm_hit * BLOCK
+
+    def test_a_tier_joint_may_spend_the_unpinned_hit_checkpoint(self):
+        """The hit image is not what a tier joint pins.
+
+        The tail is in use and the pool fits the original demand exactly.
+        The hit checkpoint is the only evictable image. Protecting it would
+        refuse the joint; spending it funds the private tail.
+        """
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared_tail = first.block_table[4]
+        victim = first.block_table[6]
+        keep = set(first.block_table[:6])
+        bm.paged_state_checkpoints.unindex(h_cpu)
+        self._with_tier(bm, h_cpu)
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.kv.claim(shared_tail)
+        probe = stateful_seq(PROMPT)
+        probe.offload_joint.kv_prefix_tokens = len(PROMPT)
+        admission = AdmissionProbe()
+        assert bm.can_allocate(probe, probe=admission) == 5
+        num_new = admission.num_new_blocks
+        # The probe claimed nothing; the manual claim on the tail remains.
+        assert bm.kv.block(shared_tail).ref_count == 1
+        self._reset_joint_counters(bm)
+        self._leave_free(bm, num_new, keep)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert bm.joint_boundaries == 1, bm.joint_skips
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == chunk
+        assert second.block_table[4] != shared_tail
+        assert bm.kv.block(shared_tail).ref_count == 1
+
+    @pytest.mark.parametrize(
+        "shipped_chain", [False, True], ids=["local_chain", "shipped_chain"]
+    )
+    def test_a_failed_unaligned_joint_resumes_at_the_hbm_hit(self, shipped_chain):
+        """The boundary image disappears between the probe and `allocate`.
+
+        The joint cannot pin it. The HBM hit still has its image and its
+        blocks, so the request resumes there instead of at token 0.
+
+        `shipped_chain`: the prompt chain is the frontend's and differs from
+        what this engine would hash from `cache_seed`. The retreat reads the
+        chain `can_allocate` walked, so it still finds the hit.
+        """
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        if shipped_chain:
+            bm._adopt_shipped_chain = self._foreign_chain(bm)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared_tail = first.block_table[4]
+        victim = first.block_table[6]
+        index = self._with_tier(bm, h_cpu)
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+        assert hbm_hit == 5
+        assert second.offload_joint.claim_tokens == chunk
+        local = bm.compute_hash(bm._hash_block_tokens(second, 0), second.cache_seed)
+        assert (bm._prompt_hashes(second)[0] != local) == shipped_chain
+        bm.paged_state_checkpoints.unindex(h_cpu)
+        index.hashes.discard(h_cpu)
+
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == hbm_hit * BLOCK
+        assert second.block_table[4] == shared_tail
+        assert second.offload_joint.boundary_tokens == 0
+        assert second.offload_joint.hbm_hit_tokens == 0
+        assert bm.paged_state_checkpoints.restore_queued_for(second.state_slot)
+
+    @staticmethod
+    def _foreign_chain(bm):
+        """`_adopt_shipped_chain` for a frontend whose chain this engine would
+        not reproduce from `cache_seed` (here: a different seed)."""
+
+        def adopt(seq):
+            assert seq.cache_seed != 0x5A5A5A5A
+            chain, h = [], 0x5A5A5A5A
+            for i in range(full_prompt_blocks(seq, bm.hash_block_size)):
+                h = bm.compute_hash(bm._hash_block_tokens(seq, i), h)
+                chain.append(h)
+            return chain
+
+        return adopt
+
     def test_the_split_says_which_tier_the_state_leg_came_from(self):
         """`state_tier` is the only counter here that cannot be non-zero with
         the CPU tier switched off, which makes it the honest test of "did this
@@ -1664,6 +2315,100 @@ class TestPagedCopyCheckpoint:
 # ── Checkpoints past the prompt ────────────────────────────────────────────
 
 
+class TestDecodeBoundaryStep:
+    """A decode boundary carries the verify step its slot holds to the store."""
+
+    def _decode_to(self, bm, end, step):
+        seq = stateful_seq(list(range(10)))
+        run_prompt(bm, seq)  # ends off the grid: keeps nothing
+        while seq.num_tokens < end:
+            seq.append_token(500 + seq.num_tokens)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, end, next_forward_tokens=1, snapshot_step=step)
+        return seq
+
+    def _bm(self, keep):
+        runtime = StateRuntime(
+            transfer=StateTransfer.copy(PAGED_COPY_SPEC.layout_id, decode_keep=keep),
+            checkpoint_spec=PAGED_COPY_SPEC,
+        )
+        return make_block_manager(ckpt_config(), state_runtime=runtime)
+
+    def test_a_snapshot_backend_builds_the_step_in_scratch(self):
+        bm = self._bm(KEEP_SNAPSHOT)
+        seq = self._decode_to(bm, 3 * BLOCK, step=2)
+        (op,) = bm.take_state_maintenance_ops().checkpoint_stores
+        assert (op.src_slot, op.step) == (seq.state_slot, 2)
+        assert op.scratch_slot not in (-1, seq.state_slot)
+        assert not bm.state.is_free(op.scratch_slot)
+        bm.complete_previous_state_batch()
+        assert bm.state.is_free(op.scratch_slot), "the scratch is lent one batch"
+
+    def test_a_settled_slot_is_copied_as_it_stands(self):
+        bm = self._bm(KEEP_SETTLED)
+        seq = self._decode_to(bm, 3 * BLOCK, step=2)
+        (op,) = bm.take_state_maintenance_ops().checkpoint_stores
+        assert (op.src_slot, op.step, op.scratch_slot) == (seq.state_slot, -1, -1)
+
+    @staticmethod
+    def _serving(seq):
+        sched = make_scheduler(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        sched.add(seq)
+        return sched, sched.schedule()[0]
+
+    @staticmethod
+    def _postprocess(sched, seq, token, batch):
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(token,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
+
+    def test_the_real_loop_stores_the_boundaries_it_files(self):
+        """`schedule` counts a forward before `postprocess` files its boundary,
+        so the next `schedule` stores it rather than dropping it as stale."""
+        seq = stateful_seq(list(range(BLOCK)))
+        sched, batch = self._serving(seq)
+        stores = 0
+        for token in range(500, 510):
+            self._postprocess(sched, seq, token, batch)
+            batch, _ = sched.schedule()
+            stores += len(batch.state_maintenance_ops.checkpoint_stores)
+        assert stores >= 2
+        assert sched.block_manager.paged_state_checkpoints.checkpoints_dropped == 0
+
+    def test_a_boundary_overtaken_before_the_drain_is_dropped(self):
+        """A forward scheduled between the filing and the drain has moved the
+        slot past the boundary, so the drain drops it rather than store it."""
+        seq = stateful_seq(list(range(BLOCK)))
+        sched, batch = self._serving(seq)
+        ckpts = sched.block_manager.paged_state_checkpoints
+        for token in range(500, 510):
+            self._postprocess(sched, seq, token, batch)
+            if ckpts._pending:
+                break
+            batch, _ = sched.schedule()
+        assert ckpts._pending, "no boundary was filed"
+        Scheduler._consume_state_forks({seq.id: seq})  # a forward the drain missed
+        batch, _ = sched.schedule()
+        assert batch.state_maintenance_ops.checkpoint_stores == ()
+        assert ckpts.checkpoints_dropped == 1
+
+    @pytest.mark.parametrize("step", [0, 2])
+    def test_a_class_keeping_nothing_files_no_step(self, step):
+        """Nor does it spend the spacing on one it cannot keep."""
+        bm = self._bm(KEEP_NONE)
+        seq = self._decode_to(bm, 3 * BLOCK, step=step)
+        assert bm.take_state_maintenance_ops().checkpoint_stores == ()
+        assert seq.last_checkpoint_pos == 0
+
+
 class TestDecodePointPublishing:
     """The same ladder, walked by generation instead of by prompt.
 
@@ -1679,7 +2424,9 @@ class TestDecodePointPublishing:
         while seq.num_tokens < end:
             seq.append_token(500 + seq.num_tokens)
             bm.may_append(seq)
-            bm.hash_decode_blocks(seq, seq.num_tokens, next_forward_tokens=room)
+            bm.hash_decode_blocks(
+                seq, seq.num_tokens, next_forward_tokens=room, snapshot_step=0
+            )
 
     def _prompt_of_10(self, bm):
         """A prompt that ends between rungs, so prefill publishes nothing."""
@@ -1859,6 +2606,7 @@ class StubStateCache:
         self.successor_room = successor_room
         self.enabled = enabled
         self.readable_midstep = readable_midstep
+        self.decode_keep = KEEP_SETTLED
         self._cap = cap
 
     def applies(self, seq):
@@ -1867,7 +2615,7 @@ class StubStateCache:
     def resumable_hit(self, seq, P, block_hashes, assume_checkpointed=False):
         return P if self._cap is None else min(P, self._cap)
 
-    def checkpoint(self, seq, boundary_blocks, h):
+    def checkpoint(self, seq, boundary_blocks, h, step=-1):
         pass
 
     def reserve_midstep(self, seq, positions):
@@ -2604,7 +3352,9 @@ class TestPromptEndAnchorTemplateMargin:
 
     The setting mirrors Qwen3.5 AgentX: block 16, PAGE copy checkpoints, no
     ladder (`interval -1`) and no demand rung, so the anchor is the only
-    checkpoint a prompt leaves.
+    checkpoint a prompt leaves. The exception is the LMCache chunk grid
+    section, which turns the demand rung on: what it pins is which demands
+    survive once the anchor is floored.
     """
 
     BLOCK = 16
@@ -2628,8 +3378,9 @@ class TestPromptEndAnchorTemplateMargin:
         monkeypatch.delenv("ATOM_STATE_CHECKPOINT_END_MARGIN", raising=False)
         self._next_token = iter(range(1000, 10**7))
         self._monkeypatch = monkeypatch
+        self.forwards = 0
 
-    def _bm(self, margin=None, block=None, runtime=PAGED_COPY_RUNTIME):
+    def _bm(self, margin=None, block=None, runtime=PAGED_COPY_RUNTIME, interval=-1):
         if margin is not None:
             self._monkeypatch.setenv("ATOM_STATE_CHECKPOINT_END_MARGIN", str(margin))
         return make_block_manager(
@@ -2639,7 +3390,7 @@ class TestPromptEndAnchorTemplateMargin:
                 max_num_batched_tokens=4096,
                 max_model_len=4096,
                 pool_entries={"state": 8},
-                state_checkpoint_interval_tokens=-1,
+                state_checkpoint_interval_tokens=interval,
                 state_checkpoint_demand=False,
             ),
             state_runtime=runtime,
@@ -2678,6 +3429,7 @@ class TestPromptEndAnchorTemplateMargin:
             seq.num_cached_tokens = start + chunk
             bm.take_state_maintenance_ops()
             bm.complete_previous_state_batch()
+            self.forwards += 1
         bm.deallocate(seq)
         return resumed, anchor
 
@@ -2754,6 +3506,189 @@ class TestPromptEndAnchorTemplateMargin:
             )
             bm.can_allocate(seq)
             assert seq.checkpoint_end_pos == 6 * self.BLOCK, margin  # (131-32)//16*16
+
+    # ── The LMCache chunk grid (demand rung on) ─────────────────────────────
+
+    CHUNK = 4 * BLOCK
+
+    def _grid_bm(self, interval=-1):
+        self._monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMAND", "1")
+        bm = self._bm(interval=interval)
+        # As in `_joint_bm`: the LMCache config is not importable here.
+        bm._joint_chunk_tokens = self.CHUNK
+        return bm
+
+    def _demand_cuts(self, bm):
+        return bm.checkpoint_funnel()["chunks_cut_for_demand"]
+
+    def _dropped(self, bm):
+        return bm.checkpoint_funnel()["demands_dropped_at_grid_hit"]
+
+    def test_the_next_turn_cuts_no_demand_above_the_floored_anchor(self):
+        """The anchor is floored so the joint load, which needs the whole chunk
+        covering it, can restore it from the CPU tier. The next turn resumes
+        there, under one chunk below the prompt end, and does not cut a demand
+        at the unfloored position its KV reaches."""
+        bm = self._grid_bm()
+        t1 = self._prompt([], 7 * self.BLOCK + 5)
+        _, anchor = self._run_turn(bm, t1)
+        resumed, _ = self._run_turn(bm, t1 + self._fresh(80))
+        assert (anchor, resumed, self._demand_cuts(bm)) == (self.CHUNK, self.CHUNK, 0)
+        assert self._dropped(bm) == 1
+
+    def test_a_deferred_next_turn_is_dropped_once_however_often_it_asks(self):
+        """Counted once per seq, as the other two demand counters are, and not
+        at all for a replayed hit, which wants no demand whatever the floor."""
+        bm = self._grid_bm()
+        t1 = self._prompt([], 7 * self.BLOCK + 5)
+        self._run_turn(bm, t1)
+        nxt = Sequence(t1 + self._fresh(80), self.BLOCK, has_per_req_cache=True)
+        for _ in range(5):
+            assert bm.can_allocate(nxt) >= 0
+        assert self._dropped(bm) == 1, "counted per attempt"
+        self._monkeypatch.setattr(bm, "state_replay_tokens", 8)
+        replayed = Sequence(t1 + self._fresh(80), self.BLOCK, has_per_req_cache=True)
+        assert bm.can_allocate(replayed) >= 0 and replayed.replays_hit
+        assert self._dropped(bm) == 1, "a replayed hit counted"
+
+    def _conversation(self, bm, turns=6):
+        """`turns` turns, each resending the last verbatim and going on."""
+        prompt = self._prompt([], 7 * self.BLOCK + 5)
+        for turn in range(turns):
+            if turn:
+                history = prompt + self._fresh(37) + [self.IM_END, self.NL]
+                prompt = self._prompt(history, len(history) + 43)
+            self._run_turn(bm, prompt)
+
+    @pytest.mark.parametrize("interval", [-1, CHUNK], ids=["no_ladder", "ladder_chunk"])
+    def test_a_conversation_takes_two_forwards_a_turn(self, interval):
+        """One cut at the floored anchor and the rest of the prompt: 12 forwards
+        over six turns, with or without a ladder on the chunk grid. Main cuts a
+        demand on four of the five later turns (16 forwards)."""
+        bm = self._grid_bm(interval=interval)
+        self._conversation(bm)
+        assert (self.forwards, self._demand_cuts(bm)) == (12, 0)
+
+    @pytest.mark.parametrize("extra", range(0, CHUNK, BLOCK), ids=lambda e: f"+{e}")
+    def test_the_next_turn_resumes_under_one_chunk_below_the_prompt_end(self, extra):
+        """The price of the floor: the next turn resumes on the chunk grid, up
+        to one chunk below where its KV reaches, and recomputes the gap inside
+        the forward it runs anyway."""
+        bm = self._grid_bm()
+        t1 = self._prompt([], 5 * self.BLOCK + 5 + extra)
+        self._run_turn(bm, t1)
+        self.forwards = 0
+        resumed, _ = self._run_turn(bm, t1 + self._fresh(80))
+        reach = (len(t1) // self.BLOCK) * self.BLOCK
+        assert resumed % self.CHUNK == 0
+        assert 0 <= reach - resumed < self.CHUNK, (reach, resumed)
+        assert (self.forwards, self._demand_cuts(bm)) == (2, 0)
+
+    def test_the_floored_anchor_still_resumes_from_the_cpu_tier(self):
+        """Once the prompt has left HBM, the joint load restores the floored
+        anchor: the chunk covering it is a whole one LMCache stored."""
+        bm = self._grid_bm()
+        t1 = self._prompt([], 7 * self.BLOCK + 5)
+        seq = Sequence(t1, self.BLOCK, has_per_req_cache=True)
+        bm.allocate(seq, bm.can_allocate(seq))
+        anchor = seq.checkpoint_end_pos
+        bm.hash_blocks(seq, anchor)
+        seq.num_cached_tokens = anchor
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        h = bm._chain_to(seq, [], anchor // self.BLOCK)[-1]
+        assert bm.paged_state_checkpoints.contains(h), "precondition: kept"
+        victim = seq.block_table[1]
+        bm.deallocate(seq)
+        TestPagedCopyCheckpoint._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h)
+        index = TestPagedCopyCheckpoint._TierIndex(h)
+        bm.state_offload = index
+        bm.paged_state_checkpoints.attach_offload(index)
+
+        nxt = Sequence(t1 + self._fresh(80), self.BLOCK, has_per_req_cache=True)
+        # LMCache holds t1's whole chunks; its partial last chunk is keyed by
+        # tokens the next turn does not resend.
+        nxt.offload_joint.kv_prefix_tokens = (len(t1) // self.CHUNK) * self.CHUNK
+        bm.can_allocate(nxt)
+        assert (anchor, bm.state_tier_boundaries) == (self.CHUNK, 1), bm.joint_skips
+        assert nxt.offload_joint.boundary_tokens == anchor
+
+    def test_a_fork_just_above_a_grid_rung_loses_its_demand(self):
+        """What the drop gives up. Prompts share a 6-block prefix and fork
+        after it; the first one's anchor floors to 4 blocks, inside the shared
+        part. The second resumes there, and its demand at the fork, 2 blocks
+        up, is dropped, so every later fork resumes 2 blocks short of it and
+        recomputes them (while the prefix is in HBM: past it, the off-grid
+        demand would be out of reach anyway). Nothing more is cut."""
+        bm = self._grid_bm()
+        shared = self._fresh(6 * self.BLOCK)
+        forks = [shared + self._fresh(self.BLOCK + 5) for _ in range(3)]
+        _, anchor = self._run_turn(bm, forks[0])
+        resumed = [self._run_turn(bm, f)[0] for f in forks[1:]]
+        assert anchor == self.CHUNK
+        assert resumed == [self.CHUNK, self.CHUNK]
+        assert (self._demand_cuts(bm), self._dropped(bm)) == (0, 2)
+
+    def test_a_short_shared_header_keeps_its_demand(self):
+        """A hit at 0 is no floored anchor (one under a chunk stays put), so a
+        fork under one chunk in still gets its rung."""
+        bm = self._grid_bm()
+        header = self._fresh(3 * self.BLOCK)
+        forks = [header + self._fresh(4 * self.BLOCK + 5) for _ in range(3)]
+        self._run_turn(bm, forks[0])
+        resumed = [self._run_turn(bm, f)[0] for f in forks[1:]]
+        assert resumed == [0, 3 * self.BLOCK]
+        assert (self._demand_cuts(bm), self._dropped(bm)) == (1, 0)
+
+    def _forks_one_chunk_up(self, bm):
+        """Forks a whole chunk above the floored anchor (8 blocks, anchor 4)."""
+        first = self._fresh(8 * self.BLOCK)
+        self._run_turn(bm, first)
+        return [first + self._fresh(self.BLOCK + 5) for _ in range(2)]
+
+    def _forks_above_an_offgrid_hit(self, bm):
+        """Forks under one chunk above a hit off the chunk grid: a short
+        header's rung at 3 blocks, and the fork's own floor at 4."""
+        header = self._fresh(3 * self.BLOCK)
+        for _ in range(2):
+            self._run_turn(bm, header + self._fresh(4 * self.BLOCK + 5))
+        p3 = header + self._fresh(5 * self.BLOCK + 5)
+        self._run_turn(bm, p3)
+        return [p3[: 5 * self.BLOCK] + self._fresh(self.BLOCK + 5) for _ in range(2)]
+
+    def _forks_below_an_offgrid_hit(self, bm):
+        """Forks two blocks above a hit off the chunk grid: a short header's
+        rung at 1 block, with the fork's own floor, 0, below it."""
+        header = self._fresh(self.BLOCK)
+        for _ in range(2):
+            self._run_turn(bm, header + self._fresh(3 * self.BLOCK + 5))
+        p3 = header + self._fresh(4 * self.BLOCK + 5)
+        self._run_turn(bm, p3)
+        return [p3[: 3 * self.BLOCK] + self._fresh(self.BLOCK + 5) for _ in range(2)]
+
+    @pytest.mark.parametrize(
+        "forks, resumed, dropped",
+        [
+            (_forks_one_chunk_up, [CHUNK, 2 * CHUNK], 0),
+            (_forks_above_an_offgrid_hit, [3 * BLOCK, CHUNK], 1),
+            (_forks_below_an_offgrid_hit, [BLOCK, 3 * BLOCK], 0),
+        ],
+        ids=["one_chunk_up", "offgrid_hit", "floor_below_offgrid_hit"],
+    )
+    def test_a_demand_outside_the_dropped_shape_keeps_its_rung(
+        self, forks, resumed, dropped
+    ):
+        """Only a demand under one chunk above a nonzero hit on the chunk grid
+        is dropped. One a whole chunk up, or above a hit off the grid, still
+        cuts its rung, and the second fork resumes there; in `offgrid_hit` that
+        new rung is on the grid, so the second fork's own demand is dropped."""
+        bm = self._grid_bm()
+        prompts = forks(self, bm)
+        cuts, before = self._demand_cuts(bm), self._dropped(bm)
+        assert [self._run_turn(bm, p)[0] for p in prompts] == resumed
+        assert self._demand_cuts(bm) - cuts == 1
+        assert self._dropped(bm) - before == dropped
 
     # ── The margin's range (review of #2589) ────────────────────────────────
 
@@ -3272,6 +4207,14 @@ class TestGenerationIsHeldToSpacingNotTheGrid:
         # between two of them has nothing to file it under.
         assert not self.keepers(bm, seq, INTERVAL + 1, aimed=False)
 
+    def test_a_copy_keeps_nothing_with_no_forward_after(self):
+        """A copy needs no successor room, so 0 has to refuse on its own: the
+        stopping request's slot is freed before anything reads it."""
+        bm = make_block_manager(demand_config(), state_runtime=PAGED_COPY_RUNTIME)
+        seq = stateful_seq(PROMPT)
+        assert bm.checkpointers_at(seq, INTERVAL + BLOCK, 1, aimed=False)
+        assert not bm.checkpointers_at(seq, INTERVAL + BLOCK, 0, aimed=False)
+
     def test_spacing_is_measured_from_the_last_one_kept(self):
         bm = make_block_manager(demand_config())
         seq = stateful_seq(PROMPT)
@@ -3316,7 +4259,7 @@ class TestTheCacheCannotStarveLiveKv:
         cache can put the pool in.
         """
         bm = make_block_manager(
-            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            paged_copy_config(num_kvcache_blocks=4, state_checkpoint_interval_tokens=0),
             state_runtime=PAGED_COPY_RUNTIME,
         )
         checkpoints = bm.paged_state_checkpoints
@@ -3380,7 +4323,7 @@ class TestTheCacheCannotStarveLiveKv:
         possible once the pinned image becomes spendable again.
         """
         scheduler = make_scheduler(
-            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            paged_copy_config(num_kvcache_blocks=4, state_checkpoint_interval_tokens=0),
             state_runtime=PAGED_COPY_RUNTIME,
         )
         # The same pinned pool as the tests above, built inside a scheduler,
@@ -3829,6 +4772,7 @@ def test_checkpoint_funnel_includes_second_state_class():
         """Minimal StateCache with checkpoint_fates — mimics a second real class."""
 
         successor_room = 0
+        decode_keep = KEEP_SETTLED
 
         def applies(self, seq):
             return False
@@ -3836,7 +4780,7 @@ def test_checkpoint_funnel_includes_second_state_class():
         def resumable_hit(self, seq, P, block_hashes, assume_checkpointed=False):
             return 0
 
-        def checkpoint(self, seq, boundary_blocks, h):
+        def checkpoint(self, seq, boundary_blocks, h, step=-1):
             pass
 
         def checkpoint_fates(self) -> dict:
@@ -3884,6 +4828,9 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
 
         def could_serve(self, h):
             return self.can_load and h in self.hashes
+
+        def want_touch(self, h):
+            pass
 
         def request_load(self, req_id, h):
             if h not in self.hashes:
@@ -3942,3 +4889,407 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
 
         assert seq.state_slot >= 0
         assert bm.state_gate_lost_boundary == before
+
+
+# ── state tier hit refresh: the admission hold and the voters ──────────────
+
+
+def _paged_bm():
+    bm = make_block_manager(
+        ckpt_config(num_kvcache_blocks=160, pool_entries={"state": 8}),
+        state_runtime=PAGED_COPY_RUNTIME,
+    )
+    bm.state_offload = StateOffloadIndex(verified_for_s=5.0)
+    return bm
+
+
+def _seq():
+    return stateful_seq(list(range(40)))
+
+
+class TestAdmissionHold:
+    """`record_allocation(defer_unverified=True)` holds an admission that
+    would load an unconfirmed image, and commits nothing while it does."""
+
+    def _joint(self, bm, monkeypatch, *, h=77, from_hbm=False):
+        decision = JointBoundaryDecision(
+            boundary_tokens=16,
+            boundary_hash=h,
+            kv_tokens=16,
+            claim_tokens=16,
+            state_from_hbm=from_hbm,
+        )
+        commits = []
+        monkeypatch.setattr(bm, "_joint_kv_boundary", lambda *a: decision)
+        monkeypatch.setattr(bm, "_fit_joint", lambda d, probe: d)
+        monkeypatch.setattr(
+            bm, "_commit_joint_boundary", lambda seq, d: commits.append(d)
+        )
+        return commits
+
+    def test_an_unconfirmed_joint_image_is_held(self, offload_clock, monkeypatch):
+        bm = _paged_bm()
+        commits = self._joint(bm, monkeypatch)
+        bm.state_offload.note_stored(77)
+        offload_clock[0] += STALE
+        seq = _seq()
+
+        assert not bm.record_allocation(
+            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+        assert commits == [] and bm.state_offload.loads_deferred_for_verify == 1
+        assert bm.state_offload.take_touches() == [77]
+
+        bm.state_offload.apply_touch_verdict(77, True)
+        assert bm.record_allocation(
+            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+        assert len(commits) == 1
+
+    def test_a_gone_image_is_not_parked_on(self, offload_clock, monkeypatch):
+        """The verdict drops the hash; the retry's boundary search no longer
+        sees the tier rung (`could_serve` is False), so it plans a lower one."""
+        bm = _paged_bm()
+        self._joint(bm, monkeypatch)
+        bm.state_offload.note_stored(77)
+        offload_clock[0] += STALE
+        assert not bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+        bm.state_offload.take_touches()
+        bm.state_offload.apply_touch_verdict(77, False)
+        assert not bm._tier_can_serve(77)
+
+    def test_a_recently_confirmed_image_goes_straight_through(
+        self, offload_clock, monkeypatch
+    ):
+        bm = _paged_bm()
+        commits = self._joint(bm, monkeypatch)
+        bm.state_offload.note_stored(77)
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+        assert len(commits) == 1
+
+    def test_a_state_resident_in_hbm_is_never_held(self, offload_clock, monkeypatch):
+        bm = _paged_bm()
+        self._joint(bm, monkeypatch, from_hbm=True)
+        bm.state_offload.note_stored(77)
+        offload_clock[0] += STALE
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+
+    def test_the_fit_probe_path_never_holds(self, offload_clock, monkeypatch):
+        bm = _paged_bm()
+        self._joint(bm, monkeypatch)
+        bm.state_offload.note_stored(77)
+        offload_clock[0] += STALE
+        assert bm.record_allocation(_seq(), AdmissionProbe(2, [1, 2]))
+
+    def _hbm_hit(self, bm, monkeypatch, resident):
+        """No joint; the HBM hit's state (hash 2) is stale on the tier and in
+        HBM while `resident` holds it."""
+        monkeypatch.setattr(
+            bm,
+            "_joint_kv_boundary",
+            lambda *a: JointBoundaryDecision(skip_reason="no_kv_reach"),
+        )
+        monkeypatch.setattr(bm, "_commit_joint_boundary", lambda seq, d: None)
+        monkeypatch.setattr(
+            bm.paged_state_checkpoints, "contains", lambda h: h in resident
+        )
+        bm.state_offload.note_stored(2)
+
+    def test_an_hbm_hit_holds_only_for_a_tier_sourced_state(
+        self, offload_clock, monkeypatch
+    ):
+        bm = _paged_bm()
+        resident = {2}
+        self._hbm_hit(bm, monkeypatch, resident)
+        offload_clock[0] += STALE
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+        resident.clear()
+        assert not bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+
+    def test_a_replayed_hit_is_not_held(self, offload_clock, monkeypatch):
+        bm = _paged_bm()
+        self._hbm_hit(bm, monkeypatch, set())
+        monkeypatch.setattr(bm, "state_replay_tokens", 8)
+        offload_clock[0] += STALE
+        seq = _seq()
+        seq.replays_hit = True
+        assert bm.record_allocation(
+            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+
+    def test_the_hold_judges_the_joint_fit_kept(self, offload_clock, monkeypatch):
+        """A joint `_fit_joint` drops is not loaded, so its stale image must not
+        hold an admission that resumes at an HBM-resident hit."""
+        bm = _paged_bm()
+        commits = self._joint(bm, monkeypatch)
+        monkeypatch.setattr(
+            bm, "_fit_joint", lambda d, probe: bm._no_joint("partial_chunk_no_room")
+        )
+        monkeypatch.setattr(bm.paged_state_checkpoints, "contains", lambda h: h == 2)
+        bm.state_offload.note_stored(77)
+        offload_clock[0] += STALE
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2], 1), defer_unverified=True
+        )
+        assert [d.skip_reason for d in commits] == ["partial_chunk_no_room"]
+        assert bm.state_offload.loads_deferred_for_verify == 0
+
+
+class TestVotersRegisterTouches:
+    """`could_serve` only answers; the voters register the hits they count."""
+
+    def _bm(self):
+        bm = _paged_bm()
+        bm.paged_state_checkpoints.attach_offload(bm.state_offload)
+        bm.state_offload.note_stored(77)
+        return bm
+
+    def test_the_resumable_scan_registers_a_tier_hit(self, offload_clock):
+        bm = self._bm()
+        assert bm.paged_state_checkpoints._reachable(77)
+        assert bm.state_offload.take_touches() == [77]
+
+    def test_an_hbm_hit_is_not_a_tier_vote(self, offload_clock, monkeypatch):
+        bm = self._bm()
+        monkeypatch.setattr(
+            bm.paged_state_checkpoints.store, "contains", lambda h: True
+        )
+        assert bm.paged_state_checkpoints._reachable(77)
+        assert bm.state_offload.take_touches() == []
+
+    def test_asking_whether_the_tier_can_serve_registers_nothing(self, offload_clock):
+        bm = self._bm()
+        assert bm._tier_can_serve(77)
+        assert bm.state_offload.take_touches() == []
+
+
+class TestResumeHash:
+    """`allocate` and the admission hold pick the state to resume from with
+    one helper, `_state_resume_hash`."""
+
+    def test_the_joint_boundary_wins_then_a_replay_then_the_hit(self, monkeypatch):
+        bm = _paged_bm()
+        seq = _seq()
+        assert bm._state_resume_hash(seq, 77, 2) == 77
+        assert bm._state_resume_hash(seq, -1, 2) == 2
+        assert bm._state_resume_hash(seq, -1, -1) == -1
+        monkeypatch.setattr(bm, "state_replay_tokens", 8)
+        seq.replays_hit = True
+        assert bm._state_resume_hash(seq, -1, 2) == -1, "a replay restores none"
+        assert bm._state_resume_hash(seq, 77, 2) == 77
+
+    def test_the_hold_judges_the_hash_allocate_then_loads(
+        self, offload_clock, monkeypatch
+    ):
+        bm = _paged_bm()
+        offload = bm.state_offload
+        bm.paged_state_checkpoints.attach_offload(offload)
+        first = _seq()
+        bm.allocate(first, bm.can_allocate(first))
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        # The image left HBM; only the tier has it, and not confirmed lately.
+        bm.paged_state_checkpoints.unindex(h)
+        offload.note_stored(h)
+        offload_clock[0] += STALE
+
+        asked, attached = [], []
+        hold, attach = offload.hold_admission, bm._attach_state_slots
+        monkeypatch.setattr(
+            offload, "hold_admission", lambda x: asked.append(x) or hold(x)
+        )
+        monkeypatch.setattr(
+            bm, "_attach_state_slots", lambda s, x: attached.append(x) or attach(s, x)
+        )
+        second = stateful_seq(list(range(48)))
+        probe = AdmissionProbe()
+        probe.num_cached_blocks = bm.can_allocate(second, record=False, probe=probe)
+        assert probe.num_cached_blocks > 0
+        assert not bm.record_allocation(second, probe, defer_unverified=True)
+        offload.apply_touch_verdict(h, True)
+        assert bm.record_allocation(second, probe, defer_unverified=True)
+        assert bm.allocate(second, probe.num_cached_blocks)
+        assert set(asked) == {h} and attached == [h]
+        assert second.offload_joint.load_hash == h
+
+
+def test_the_scheduler_retries_a_held_admission(monkeypatch):
+    """A held seq stays waiting and is admitted on a later pass."""
+    sched = make_scheduler(ckpt_config())
+    bm = sched.block_manager
+    real = bm.record_allocation
+    holds = [True]
+
+    def record(seq, probe, *, defer_unverified=False):
+        assert defer_unverified, "admission asks to hold unverified loads"
+        if holds.pop() if holds else False:
+            return False
+        return real(seq, probe, defer_unverified=defer_unverified)
+
+    monkeypatch.setattr(bm, "record_allocation", record)
+    seq = stateful_seq(list(range(12)))
+    sched.add(seq)
+    _, scheduled = sched.schedule()
+    assert scheduled == {}
+    assert list(sched.waiting) == [seq] and len(seq.block_table) == 0
+    _, scheduled = sched.schedule()
+    assert seq.id in scheduled and not sched.waiting
+
+
+def test_the_scheduler_publishes_touches_with_the_state_loads(offload_clock):
+    idx = StateOffloadIndex(verified_for_s=5.0)
+    idx.note_stored(7)
+    idx.want_touch(7)
+    sent = []
+    s = Scheduler.__new__(Scheduler)
+    s.kv_connector = SimpleNamespace(
+        enqueue_state_touches=lambda hs: sent.extend(hs) or True
+    )
+    s.block_manager = SimpleNamespace(state_offload=idx)
+    s._publish_state_loads()
+    assert sent == [7]
+
+
+def test_the_scheduler_applies_touch_verdicts(offload_clock):
+    idx = StateOffloadIndex(verified_for_s=5.0)
+    idx.note_stored(7)
+    offload_clock[0] += 1
+    idx.want_touch(7)
+    assert idx.take_touches() == [7]
+    s = Scheduler.__new__(Scheduler)
+    s.kv_connector = SimpleNamespace(take_state_touch_verdicts=lambda: {7: False})
+    s.block_manager = SimpleNamespace(state_offload=idx)
+    s.finished_recving_kv_req_ids = []
+    s.failed_recving_kv_req_ids = []
+    s.deferred_free_blocks = {}
+    s._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert not idx.could_serve(7)
+
+
+# ── a fresh allocation starts from nothing restored ────────────────────────
+
+
+class _OffloadConnector:
+    """The scheduler-side connector, reduced to the offload flag and the
+    hooks admission and the park call."""
+
+    is_offload = True
+    supports_early_load = False
+
+    def update_state_after_alloc(self, seq):
+        pass
+
+    def build_connector_meta(self):
+        return None
+
+    def get_finished(self):
+        return set(), set()
+
+    def enqueue_state_loads(self, loads):
+        return True
+
+    def lookup_pending(self, seq):
+        return False
+
+    def lookup_would_defer(self, seq):
+        return False
+
+    def get_num_new_matched_tokens(self, seq):
+        return 0, False
+
+    def can_detach_lookup(self, seq):
+        return False
+
+    def cancel_preadmission(self, seq):
+        pass
+
+    def cancel_pending_load(self, seq):
+        pass
+
+
+def _state_only_park(stale):
+    """A request admitted onto a state-only tier load at rung r, carrying the
+    fields `stale` left over from an earlier restore. HBM still holds the KV
+    below r; only the state image is a tier load. -> (scheduler, seq, r)"""
+    sched = make_scheduler(
+        ckpt_config(num_kvcache_blocks=160, pool_entries={"state": 8}),
+        state_runtime=PAGED_COPY_RUNTIME,
+    )
+    sched.kv_connector = _OffloadConnector()
+    bm = sched.block_manager
+    first = stateful_seq(list(range(24)))
+    assert bm.allocate(first, bm.can_allocate(first))
+    bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+    h = boundary_hash(bm, first)
+    r = bm.checkpoint_limit(first)
+    bm.take_state_maintenance_ops()
+    bm.complete_previous_state_batch()
+    bm.deallocate(first)
+    # The image left HBM; the tier still advertises it.
+    bm.paged_state_checkpoints.unindex(h)
+    index = StateOffloadIndex(verified_for_s=5.0)
+    index.note_stored(h)
+    bm.state_offload = index
+    bm.paged_state_checkpoints.attach_offload(index)
+
+    seq = stateful_seq(list(range(48)))
+    for name, value in stale.items():
+        setattr(seq, name, value)
+    sched.add(seq)
+    sched.schedule()
+    assert seq.status.name == "WAITING_FOR_REMOTE_KVS"
+    assert seq.offload_joint.load_hash == h, "a state-only tier load"
+    return sched, seq, r
+
+
+def test_a_state_only_repark_after_a_restore_is_not_woken_past_its_rung():
+    # Restored 44 tokens, preempted, its HBM prefix evicted below that, now
+    # re-parked on a state-only tier load at the lower rung r. No connector
+    # plans a KV load for it, so nothing rewrites `offload_loaded_tokens`.
+    sched, seq, r = _state_only_park(
+        {
+            "offload_loaded": True,
+            "offload_loaded_tokens": 44,
+            "offload_load_start_tokens": 16,
+        }
+    )
+    assert 0 < r < 44
+    # Parked with nothing of the earlier restore left: a connector that does
+    # plan a load sets both, and one that does not must not inherit them.
+    assert seq.offload_loaded_tokens == 0
+    assert seq.offload_load_start_tokens is None
+    assert not seq.offload_loaded
+
+    sched.finished_recving_kv_req_ids.append(seq.id)
+    sched._resolve_offload_load(seq)
+
+    assert seq.num_cached_tokens == r, "rows r..44 were never filled"
+
+
+def test_an_abort_after_a_failed_load_and_repark_waits_for_the_new_load():
+    # A failed load leaves `offload_load_failed` set (and an empty table); the
+    # request re-parks on a state-only load and is aborted while it is in
+    # flight. It must wait for that load, not be cleaned up at once.
+    sched, seq, _r = _state_only_park({"offload_load_failed": True})
+    free = sched.block_manager.kv.num_free
+
+    assert sched.abort_request(seq.id)
+    assert seq.id in sched.deferred_free_blocks
+    assert sched.block_manager.kv.num_free == free, "the load is still writing"
+
+    sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_loading=[seq.id]))
+    assert seq.id not in sched.deferred_free_blocks
+    assert seq.id not in sched.finished_recving_kv_req_ids
+    assert sched._num_parked_remote_kv == 0

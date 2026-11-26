@@ -36,6 +36,14 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 decode_positions = _mod.decode_positions
 
+
+def uniform_positions(ctx, q, out=None):
+    """`decode_positions` of sequences each running `q` query tokens."""
+    lengths = np.full(len(ctx), q, dtype=np.int32)
+    cu = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
+    return decode_positions(ctx, lengths, cu, out=out)
+
+
 _SLOTS = _PATH.with_name("slots.py")
 _sspec = importlib.util.spec_from_file_location("_slots_under_test", _SLOTS)
 _smod = importlib.util.module_from_spec(_sspec)
@@ -107,7 +115,19 @@ CASES = [
 )
 def test_positions_match_the_builders_transcription(ctx, max_q):
     ctx_np = np.asarray(ctx, dtype=np.int32)
-    assert np.array_equal(decode_positions(ctx_np, max_q), ref_positions(ctx_np, max_q))
+    lengths = np.full(len(ctx_np), max_q, dtype=np.int32)
+    cu = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
+    assert np.array_equal(
+        decode_positions(ctx_np, lengths, cu), ref_positions(ctx_np, max_q)
+    )
+
+
+def test_positions_follow_each_sequence_s_own_query_length():
+    """Each sequence forwards its own last `lengths[i]` context tokens."""
+    ctx = np.array([10, 7, 20], dtype=np.int32)
+    lengths = np.array([3, 1, 2], dtype=np.int32)
+    cu = np.array([0, 3, 4, 6], dtype=np.int32)
+    assert decode_positions(ctx, lengths, cu).tolist() == [7, 8, 9, 6, 18, 19]
 
 
 @pytest.mark.parametrize(
@@ -117,7 +137,7 @@ def test_slot_mapping_matches_the_builders_transcription(ctx, max_q):
     """The shared gather, on a decode rectangle, against the loop it replaced."""
     ctx_np = np.asarray(ctx, dtype=np.int32)
     tables = tables_for(ctx_np)
-    positions = decode_positions(ctx_np, max_q)
+    positions = uniform_positions(ctx_np, max_q)
     got = slot_mapping(positions, np.full(len(ctx), max_q, np.int32), packed(tables), B)
     assert got.tolist() == ref_slot_mapping(tables, ctx_np, max_q, B)
     assert got.shape[0] == len(ctx) * max_q
@@ -128,7 +148,7 @@ def test_a_token_lands_on_the_slot_its_position_names():
     reference: the slot of token `t` is the slot of `positions[t]`."""
     ctx = np.asarray([100, 48], dtype=np.int32)
     tables = tables_for(ctx)
-    positions = decode_positions(ctx, 4)
+    positions = uniform_positions(ctx, 4)
     slots = slot_mapping(positions, np.full(2, 4, np.int32), packed(tables), B).tolist()
     for t, (pos, slot) in enumerate(zip(positions.tolist(), slots)):
         row = tables[t // 4]
@@ -140,7 +160,7 @@ def test_each_sequence_reads_its_own_row():
     that makes the per-sequence table load-bearing."""
     ctx = np.asarray([B * 2, B * 2], dtype=np.int32)
     tables = [array.array("i", [5, 6]), array.array("i", [900, 901])]
-    positions = decode_positions(ctx, B)
+    positions = uniform_positions(ctx, B)
     slots = slot_mapping(positions, np.full(2, B, np.int32), packed(tables), B)
     assert slots[0] == 6 * B and slots[B] == 901 * B
 
@@ -149,7 +169,7 @@ def test_positions_end_on_the_last_token_of_each_sequence():
     """A decode step's last row is `context_lens[i] - 1`; off by one here puts
     every draft one slot early and the answer stays plausible."""
     ctx = np.asarray([100, 48, 7], dtype=np.int32)
-    got = decode_positions(ctx, 3).reshape(3, 3)
+    got = uniform_positions(ctx, 3).reshape(3, 3)
     assert got[:, -1].tolist() == [99, 47, 6]
     assert got[:, 0].tolist() == [97, 45, 4]
 
@@ -157,7 +177,7 @@ def test_positions_end_on_the_last_token_of_each_sequence():
 def test_positions_written_into_a_caller_buffer():
     ctx = np.asarray([64, 32], dtype=np.int32)
     dst = np.full(2 * 4 + 5, -7, dtype=np.int32)
-    got = decode_positions(ctx, 4, out=dst[:-5])
+    got = uniform_positions(ctx, 4, out=dst[:-5])
     assert np.shares_memory(got, dst)
     assert np.array_equal(dst[:-5], ref_positions(ctx, 4))
     assert (dst[-5:] == -7).all()
@@ -169,11 +189,18 @@ def test_a_trimmed_context_moves_the_whole_span():
     full = np.asarray([100], dtype=np.int32)
     tables = tables_for(full)
     trimmed = np.asarray([97], dtype=np.int32)
-    assert decode_positions(trimmed, 2).tolist() == [95, 96]
+    assert uniform_positions(trimmed, 2).tolist() == [95, 96]
     # The row is NOT trimmed here on purpose: the packed table the gather reads
     # keeps every entry, and a token's block index stays under the trimmed
     # length, so both must give the loop's answer over the untrimmed row.
     got = slot_mapping(
-        decode_positions(trimmed, 2), np.full(1, 2, np.int32), packed(tables), B
+        uniform_positions(trimmed, 2), np.full(1, 2, np.int32), packed(tables), B
     )
     assert got.tolist() == ref_slot_mapping(tables, trimmed, 2, B)
+
+
+def test_a_step_is_uniform_only_when_every_sequence_runs_max_seqlen_q():
+    assert _mod.query_is_uniform(np.array([4, 4, 4]), 4)
+    assert _mod.query_is_uniform(np.array([], dtype=np.int32), 4)
+    assert not _mod.query_is_uniform(np.array([4, 2, 4]), 4)
+    assert not _mod.query_is_uniform(np.array([2, 2]), 4)

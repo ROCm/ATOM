@@ -12,9 +12,12 @@ import textwrap
 import unittest
 from pathlib import Path
 
-JOB_SCRIPT = (
-    Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_slurm_job.sh"
-)
+import yaml
+from atomesh_workflow_helpers import github_expressions
+
+ROOT = Path(__file__).resolve().parents[1]
+JOB_SCRIPT = ROOT / ".github/scripts/atomesh/pd_slurm_job.sh"
+TEMPLATE = ROOT / ".github/workflows/atomesh-benchmark-tmpl.yaml"
 
 
 class SpurDispatchTest(unittest.TestCase):
@@ -73,6 +76,24 @@ class SpurDispatchTest(unittest.TestCase):
                 workers.append(subprocess.Popen(command, env=env))
             codes = [worker.wait() for worker in workers]
             sys.exit(next((code for code in codes if code), 0))
+            """,
+        )
+        self.write_tool(
+            "scontrol",
+            """
+            import os
+            import sys
+            from pathlib import Path
+
+            counter = Path(os.environ["TEST_ROOT"]) / "scontrol.count"
+            index = int(counter.read_text()) if counter.exists() else 0
+            counter.write_text(str(index + 1))
+            states = os.environ.get("SCONTROL_STATES", "RUNNING").split(",")
+            state = states[min(index, len(states) - 1)]
+            if state == "FAIL":
+                sys.exit(1)
+            job = sys.argv[sys.argv.index("job") + 1]
+            print(f"JobId={job} JobName=test\\n   JobState={state} Reason=None")
             """,
         )
         self.write_tool(
@@ -197,6 +218,12 @@ class SpurDispatchTest(unittest.TestCase):
             interface = "eno0" if rank == 0 else "enp5s0"
             self.assertIn(f"NCCL_SOCKET_IFNAME=={interface}", runs[0])
             self.assertIn(f"MORI_SOCKET_IFNAME={interface}", runs[0])
+            # Otherwise gloo advertises the hostname's 127.0.1.1 to its peers.
+            self.assertIn(f"GLOO_SOCKET_IFNAME={interface}", runs[0])
+            # MoRI reads neither NCCL_IB_HCA nor NCCL_IB_GID_INDEX.
+            hcas = ",".join(f"ionic_{index}" for index in range(8))
+            self.assertIn(f"MORI_RDMA_DEVICES={hcas}", runs[0])
+            self.assertIn("MORI_IB_GID_INDEX=1", runs[0])
             self.assertIn(["rm", "-f", f"atomesh-test-cell-42-{rank}"], calls)
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "0\n")
             result = json.loads(
@@ -217,6 +244,35 @@ class SpurDispatchTest(unittest.TestCase):
         result = json.loads((self.run_dir / "rank-workload-1.json").read_text())
         self.assertEqual(result["status"], "running")
         self.assertIn(["rm", "-f", "atomesh-test-cell-42-1"], self.docker_calls(1))
+
+    def scontrol_queries(self):
+        counter = self.root / "scontrol.count"
+        return int(counter.read_text()) if counter.exists() else 0
+
+    def test_dispatch_waits_until_controller_reports_running(self):
+        result = self.run_job(
+            SCONTROL_STATES="PENDING,CONFIGURING,RUNNING",
+            ATOMESH_SPUR_RUNNING_POLL_INTERVAL="0",
+        )
+        self.assertEqual(self.scontrol_queries(), 3)
+        self.assertIn("controller state is now RUNNING", result.stdout)
+        self.assertTrue((self.root / "dispatch.json").exists())
+
+    def test_dispatch_proceeds_after_pending_timeout(self):
+        result = self.run_job(
+            SCONTROL_STATES="PENDING", ATOMESH_SPUR_RUNNING_TIMEOUT="0"
+        )
+        self.assertIn("still PENDING after 0s", result.stderr)
+        self.assertTrue((self.root / "dispatch.json").exists())
+
+    def test_unavailable_controller_does_not_delay_dispatch(self):
+        self.run_job(SCONTROL_STATES="FAIL")
+        self.assertEqual(self.scontrol_queries(), 1)
+        self.assertTrue((self.root / "dispatch.json").exists())
+
+    def test_worker_does_not_query_controller(self):
+        self.run_job("--spur-worker", SCONTROL_STATES="PENDING")
+        self.assertEqual(self.scontrol_queries(), 0)
 
     def test_dispatch_failure_is_not_reported_as_success(self):
         self.run_job(expected_rc=9, DISPATCH_RC="9")
@@ -249,6 +305,72 @@ class SpurDispatchTest(unittest.TestCase):
         )
         self.assertIn("GPU 0 already uses 84003 MB VRAM", result.stderr)
         self.assertEqual(len(list((self.run_dir / "gpu-busy").iterdir())), 1)
+
+    def preflight_with_gpu_holder(self, squeue_jobs="", kill="1", **env):
+        """Preflight on a host where one live process has the GPUs open."""
+        holder = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        kfd = self.root / "kfd"
+        (kfd / str(holder.pid)).mkdir(parents=True)
+        self.write_tool(
+            "squeue",
+            """
+            import os
+            import sys
+
+            if os.environ.get("SQUEUE_FAIL"):
+                sys.exit(1)
+            print(os.environ["SQUEUE_JOBS"])
+            """,
+        )
+        self.write_tool(
+            "amd-smi", 'print("GPU  XCP  VRAM_USED   VRAM_FREE  VRAM_TOTAL    VRAM%")'
+        )
+        result = self.run_job(
+            "--spur-preflight",
+            ATOMESH_KILL_GPU_HOLDERS=kill,
+            ATOMESH_KFD_PROC_DIR=str(kfd),
+            ATOMESH_GPU_IDLE_WAIT_SECONDS="0",
+            SQUEUE_JOBS=squeue_jobs,
+            **env,
+        )
+        return holder, result
+
+    def assert_killed(self, holder, result):
+        self.assertEqual(holder.wait(timeout=5), -9, result.stdout + result.stderr)
+        self.assertIn(f"killed pid {holder.pid}", result.stdout)
+
+    def test_manual_preflight_kills_gpu_holders_beside_another_users_job(self):
+        holder, result = self.preflight_with_gpu_holder(
+            f"7 {os.getuid() + 1} other RUNNING"
+        )
+        self.assert_killed(holder, result)
+        self.assertIn("also lists other's job 7 (RUNNING)", result.stdout)
+
+    def test_manual_preflight_kills_gpu_holders_when_squeue_fails(self):
+        holder, result = self.preflight_with_gpu_holder(SQUEUE_FAIL="1")
+        self.assert_killed(holder, result)
+        self.assertIn("did not answer", result.stdout)
+
+    def test_manual_preflight_does_not_count_its_own_job_as_another(self):
+        holder, result = self.preflight_with_gpu_holder(f"42 {os.getuid()} me RUNNING")
+        self.assert_killed(holder, result)
+
+    def test_manual_preflight_keeps_gpu_holders_beside_a_sibling_job(self):
+        holder, result = self.preflight_with_gpu_holder(
+            f"42 {os.getuid()} me RUNNING\n"
+            f"6 {os.getuid() + 1} other RUNNING\n"
+            f"7 {os.getuid()} me RUNNING"
+        )
+        self.assertIsNone(holder.poll())
+        self.assertIn("keep GPU holders", result.stdout)
+        self.assertNotIn("killed too", result.stdout)
+
+    def test_other_runs_leave_gpu_holders_alone(self):
+        holder, result = self.preflight_with_gpu_holder(kill="0")
+        self.assertIsNone(holder.poll())
+        self.assertNotIn("kill GPU holders", result.stdout)
 
     def test_large_container_output_stays_in_shared_log(self):
         size = 33 * 1024 * 1024
@@ -336,6 +458,14 @@ class SpurDispatchTest(unittest.TestCase):
         run = next(call for call in self.docker_calls(0) if call[0] == "run")
         self.assertIn("NCCL_SOCKET_IFNAME==eno0", run)
         self.assertIn("MORI_SOCKET_IFNAME=custom0", run)
+        self.assertIn("GLOO_SOCKET_IFNAME=custom0", run)
+
+    def test_explicit_gloo_interface_override_is_preserved(self):
+        self.run_job("--spur-worker", GLOO_SOCKET_IFNAME="custom2")
+        run = next(call for call in self.docker_calls(0) if call[0] == "run")
+        self.assertIn("NCCL_SOCKET_IFNAME==eno0", run)
+        self.assertIn("MORI_SOCKET_IFNAME=eno0", run)
+        self.assertIn("GLOO_SOCKET_IFNAME=custom2", run)
 
     def test_explicit_interfaces_skip_address_lookup(self):
         self.run_job(
@@ -347,6 +477,7 @@ class SpurDispatchTest(unittest.TestCase):
         run = next(call for call in self.docker_calls(0) if call[0] == "run")
         self.assertIn("NCCL_SOCKET_IFNAME==custom0", run)
         self.assertIn("MORI_SOCKET_IFNAME=custom1", run)
+        self.assertIn("GLOO_SOCKET_IFNAME=custom1", run)
 
     def test_flydsl_aot_cache_is_extracted_once_and_mounted(self):
         aot_root = self.root / "flydsl-aot"
@@ -407,6 +538,16 @@ class SpurDispatchTest(unittest.TestCase):
             )
             self.assertEqual(result["status"], "running")
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "8\n")
+
+
+class KillGpuHoldersSwitchTest(unittest.TestCase):
+    def test_only_manual_runs_kill_gpu_holders(self):
+        steps = yaml.safe_load(TEMPLATE.read_text())["jobs"]["benchmark"]["steps"]
+        step = next(s for s in steps if s.get("name") == "Run Slurm benchmark cell")
+        switch = step["env"]["ATOMESH_KILL_GPU_HOLDERS"]
+        self.assertEqual(github_expressions(switch, "workflow_dispatch"), "1")
+        for event in ("schedule", "push", "pull_request"):
+            self.assertEqual(github_expressions(switch, event), "0", event)
 
 
 if __name__ == "__main__":

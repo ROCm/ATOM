@@ -258,6 +258,12 @@ def entry_bytes_for(fields: list[EntryField]) -> int:
     return _align_up(end)
 
 
+def published_bytes_for(fields: list[EntryField]) -> int:
+    """Bytes one entry publishes as transfer regions: `entry_bytes_for`
+    without any alignment padding, including the tail."""
+    return sum(field.bytes_per_entry for field in fields)
+
+
 def checkpoint_ranges_for(fields: list[EntryField]) -> list[tuple[int, int]]:
     """`(offset, num_bytes)` of an entry a checkpoint image holds.
 
@@ -318,6 +324,11 @@ class SplitEntryMajorArena:
     def field_offset(self, name: str) -> int:
         """Bytes into the plane's slot where field `name` begins."""
         return self._by_field[name].field_offset(name)
+
+    def refill_live(self) -> None:
+        """`EntryMajorArena.refill_live` on every plane."""
+        for arena in self.arenas:
+            arena.refill_live()
 
 
 class EntryMajorArena:
@@ -408,8 +419,19 @@ class EntryMajorArena:
                     "buffer, which needs the offset to divide every itemsize"
                 )
             self.buf = buf
+        self.refill_live()
+
+    def refill_live(self) -> None:
+        """Put every field of the live entries back to its `fill`.
+
+        Construction does this once; a caller that lets something write the
+        entries before any request owns them (a CUDA graph capture's warmup)
+        calls it again to hand them out as if fresh.
+        """
         for field in self.fields:
-            self.view(field.name)[:, entries - self.live_entries :].fill_(field.fill)
+            self.view(field.name)[:, self.entries - self.live_entries :].fill_(
+                field.fill
+            )
 
     @property
     def total_bytes(self) -> int:
@@ -582,3 +604,26 @@ class LayerMajorArena:
             typed.storage_offset()
             + self._offsets[field.name] * self.entries // itemsize,
         )
+
+    def region_layout(self) -> list[tuple[int, int]]:
+        """`(base address, bytes per entry)` of each field's layers, from the
+        declared offsets rather than `view`."""
+        base = self.buf.data_ptr()
+        regions: list[tuple[int, int]] = []
+        for field in self.fields:
+            unit = field.per_layer_numel * field.dtype.itemsize
+            start = base + self._offsets[field.name] * self.entries
+            regions.extend(
+                (start + layer * unit * self.entries, unit)
+                for layer in range(field.layers)
+            )
+        return regions
+
+    def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
+        """One `(role, view(name)[layer])` per (field, layer), in field order."""
+        regions = []
+        for field in self.fields:
+            view = self.view(field.name)
+            for layer in range(field.layers):
+                regions.append((f"{field.name}.layer_{layer}", view[layer]))
+        return regions

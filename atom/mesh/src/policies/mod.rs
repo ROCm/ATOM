@@ -29,6 +29,32 @@ pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
 pub use tree::PrefixMatchResult;
 
+/// Branch for selections that found no healthy candidate.
+pub const NO_HEALTHY_WORKERS: &str = "no_healthy_workers";
+
+/// What a policy decided for one selection.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteDecision {
+    pub branch: &'static str,
+    /// Prefix match ratio of the best candidate, for policies that estimate one.
+    pub match_ratio: Option<f64>,
+    /// Expected prefix cache hit ratio on the selected worker, reconciled with the
+    /// cached tokens its response reports. `cache_aware`'s tree branches set it only
+    /// when the selected worker is the best candidate, its KV event branches always;
+    /// other policies leave it None.
+    pub estimated_hit_ratio: Option<f64>,
+}
+
+impl RouteDecision {
+    pub fn branch(branch: &'static str) -> Self {
+        Self {
+            branch,
+            match_ratio: None,
+            estimated_hit_ratio: None,
+        }
+    }
+}
+
 /// Core trait for load balancing policies
 ///
 /// This trait provides a unified interface for implementing routing algorithms
@@ -39,15 +65,26 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// This is used for regular routing mode where requests go to a single worker.
     /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
+    /// Returns the branch that chose the worker along with its index; the
+    /// placement layer records one decision per call.
     ///
     /// # Arguments
     /// * `workers` - Available workers to select from
     /// * `info` - Additional information for routing decisions
+    async fn select_with_decision(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> (Option<usize>, RouteDecision);
+
+    /// [`Self::select_with_decision`] without the decision.
     async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize>;
+    ) -> Option<usize> {
+        self.select_with_decision(workers, info).await.0
+    }
 
     /// Update policy state after request completion
     ///
@@ -55,6 +92,18 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// policies to update their internal state.
     fn on_request_complete(&self, _worker_url: &str, _success: bool) {
         // Default: no-op for stateless policies
+    }
+
+    /// Called when a request is sent to `worker` in `pool`, not when the worker
+    /// is selected or reserved. DP rank mapping runs after selection, so it can
+    /// differ from the selected worker.
+    fn on_dispatch(
+        &self,
+        _pool: &'static str,
+        _headers: Option<&http::HeaderMap>,
+        _worker: &Arc<dyn Worker>,
+    ) {
+        // Default: no-op for policies that do not track sessions
     }
 
     /// Get policy name for metrics and debugging
@@ -66,6 +115,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     }
 
     fn needs_tokens(&self) -> bool {
+        false
+    }
+
+    /// The policy routes better with the request's tokens but routes without them too, so
+    /// the router tokenizes the request only when it can.
+    fn wants_tokens(&self) -> bool {
         false
     }
 
@@ -145,6 +200,8 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    /// The request has media, so its tokens cannot match the KV event index.
+    pub carries_media: bool,
 }
 
 #[cfg(test)]

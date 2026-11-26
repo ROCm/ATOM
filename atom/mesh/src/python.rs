@@ -9,7 +9,8 @@ use crate::{
         parse_prefill_args_from, Backend, Cli, CliArgs, Commands,
     },
     config::RoutingMode,
-    routers::atom_standalone::AtomStandaloneRuntime,
+    core::runtime::build_runtime,
+    routers::atom_bridge::{py_bridge::StepSink, AtomBridgeRuntime},
     server::{self, ServerConfig},
     version,
 };
@@ -54,29 +55,40 @@ impl PyServerConfig {
 #[pyo3(signature = (
     *,
     server_config,
-    standalone_service = None
+    token_bridge = None,
+    served_model_name = None,
+    default_chat_template_kwargs = None
 ))]
 pub fn launch_mesh(
     py: Python<'_>,
     mut server_config: PyRefMut<'_, PyServerConfig>,
-    standalone_service: Option<Py<PyAny>>,
+    token_bridge: Option<Bound<'_, PyAny>>,
+    served_model_name: Option<String>,
+    default_chat_template_kwargs: Option<String>,
 ) -> PyResult<()> {
-    let runtime = standalone_service.map(|service| {
-        Arc::new(AtomStandaloneRuntime {
-            service,
-            close_service_on_shutdown: false,
-        })
-    });
+    let bridge_runtime = match token_bridge {
+        Some(bridge) => {
+            let name = served_model_name.ok_or_else(|| {
+                PyRuntimeError::new_err("token_bridge requires served_model_name")
+            })?;
+            Some(Arc::new(AtomBridgeRuntime::from_bridge(
+                bridge,
+                name,
+                default_chat_template_kwargs.as_deref(),
+            )?))
+        }
+        None => None,
+    };
 
     let mut server_config = server_config.inner.take().unwrap();
-    server_config.router_config.atom_standalone = runtime.is_some();
-    server_config.atom_standalone_runtime = runtime;
+    server_config.router_config.atom_standalone = bridge_runtime.is_some();
+    server_config.atom_bridge_runtime = bridge_runtime;
 
     py.detach(move || startup_runtime(server_config))
 }
 
 fn startup_runtime(server_config: ServerConfig) -> PyResult<()> {
-    let tokio_runtime = tokio::runtime::Runtime::new()
+    let tokio_runtime = build_runtime()
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {e}")))?;
     tokio_runtime
         .block_on(async move { server::startup(server_config).await })
@@ -147,6 +159,7 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
     cli_args_dict.set_item("log_dir", cli_args.log_dir)?;
     cli_args_dict.set_item("log_level", cli_args.log_level)?;
     cli_args_dict.set_item("json_log", cli_args.json_log)?;
+    cli_args_dict.set_item("route_log_sample_rate", cli_args.route_log_sample_rate)?;
     cli_args_dict.set_item("prometheus_port", cli_args.prometheus_port)?;
     cli_args_dict.set_item("prometheus_host", cli_args.prometheus_host)?;
     cli_args_dict.set_item(
@@ -257,6 +270,7 @@ pub fn version_verbose_string() -> String {
 #[pymodule]
 pub fn atomesh_runner(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServerConfig>()?;
+    m.add_class::<StepSink>()?;
     m.add_function(wrap_pyfunction!(launch_mesh, m)?)?;
     m.add_function(wrap_pyfunction!(parse_from, m)?)?;
     m.add_function(wrap_pyfunction!(cliargs_backend_name, m)?)?;
@@ -265,10 +279,35 @@ pub fn atomesh_runner(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "ext-proc"))]
-mod ext_proc_tests {
+#[cfg(test)]
+mod tests {
     use super::*;
 
+    #[test]
+    fn python_parser_preserves_prepare_pool_options() {
+        Python::attach(|py| {
+            let parsed = parse_from(
+                py,
+                vec![
+                    "--prepare-workers".into(),
+                    "2".into(),
+                    "--prepare-queue-capacity".into(),
+                    "6".into(),
+                    "--prepare-max-tokenize-bytes".into(),
+                    "8192".into(),
+                ],
+            )
+            .unwrap();
+            let object = parsed.bind(py).get_item("server_config").unwrap().unwrap();
+            let config: PyRef<'_, PyServerConfig> = object.extract().unwrap();
+            let router = &config.inner.as_ref().unwrap().router_config;
+            assert_eq!(router.resolved_prepare_workers(), 2);
+            assert_eq!(router.resolved_prepare_pool().unwrap().queue_capacity, 6);
+            assert_eq!(router.resolved_max_tokenize_bytes(), 8192);
+        });
+    }
+
+    #[cfg(feature = "ext-proc")]
     #[test]
     fn python_parser_preserves_ext_proc_server_configuration() {
         Python::attach(|py| {
@@ -286,6 +325,15 @@ mod ext_proc_tests {
             let ext_proc = &config.inner.as_ref().unwrap().router_config.ext_proc;
             assert!(ext_proc.enabled);
             assert_eq!(ext_proc.listen.port(), 9012);
+            assert_eq!(
+                config
+                    .inner
+                    .as_ref()
+                    .unwrap()
+                    .router_config
+                    .resolved_prepare_workers(),
+                crate::core::runtime::default_prepare_workers()
+            );
         });
     }
 }

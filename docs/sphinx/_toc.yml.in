@@ -43,6 +43,8 @@ subtrees:
         title: Context parallelism
       - file: compilation_cudagraph_guide
         title: Compilation and CUDA graphs
+      - file: structured_output_capabilities
+        title: Structured output and deployment discovery
       - file: serving_benchmarking_guide
         title: Serving and benchmarking
 
@@ -55,6 +57,8 @@ subtrees:
     entries:
       - file: hermes_agent_guide
         title: Hermes Agent with ATOM
+      - file: claude_code_guide
+        title: Claude Code with ATOM
 
   - caption: API reference
     entries:

@@ -261,9 +261,9 @@ def test_each_ratio_publishes_its_own_window_len():
     checked = 0
     for ratio, is_overlap in RATIOS_OVERLAP:
         p = plans[ratio]
-        if p.compress_plan_cpu is not None:
-            _rows_carry_own_k(p.compress_plan_cpu, extend, ratio, is_overlap)
-            checked += len(p.compress_plan_cpu)
+        compress_rows = bufs[ratio]["compress"].np[: p.num_compress]
+        _rows_carry_own_k(compress_rows, extend, ratio, is_overlap)
+        checked += p.num_compress
         write_rows = bufs[ratio]["write"].np[: p.num_write]
         _rows_carry_own_k(write_rows, extend, ratio, is_overlap)
         checked += p.num_write
@@ -372,15 +372,13 @@ def test_write_from_drops_groups_the_cache_already_holds():
         extra_write=0,
         write_from=np.asarray([512, 0], dtype=np.int32),
     )
-    rows = plans[2].compress_plan_cpu
+    rows = bufs[2]["compress"].np[: plans[2].num_compress]
     first = rows[rows[:, 1] == 0][:, POSITION_COL]
     second = rows[rows[:, 1] == 1][:, POSITION_COL]
     # every group of the first ends at or past the hit, and none is lost there
     assert first.min() == 513 and len(first) == (556 - 512) // 2
     assert np.all((first + 1) % 2 == 0)
     assert len(second) == 150
-    # the per-seq counts slice the plan the same way
-    assert plans[2].cu_compress_cpu.tolist() == [0, len(first), len(first) + 150]
 
 
 def test_write_from_at_a_replay_end_drops_the_cached_prefix_boundaries():
@@ -394,8 +392,9 @@ def test_write_from_at_a_replay_end_drops_the_cached_prefix_boundaries():
     extend = np.array([280, 64], dtype=np.int32)
     context = np.array([304, 512], dtype=np.int32)
     floor = np.array([256, 0], dtype=np.int32)
+    plain_bufs = _buffers(512, 512)
     plain = make_compress_plans(
-        extend, context, RATIOS_OVERLAP, plan_buffers=_buffers(512, 512), extra_write=0
+        extend, context, RATIOS_OVERLAP, plan_buffers=plain_bufs, extra_write=0
     )
     floored_bufs = _buffers(512, 512)
     floored = make_compress_plans(
@@ -406,20 +405,23 @@ def test_write_from_at_a_replay_end_drops_the_cached_prefix_boundaries():
         extra_write=0,
         write_from=floor,
     )
+
+    def rows(bufs, plans, ratio):
+        return bufs[ratio]["compress"].np[: plans[ratio].num_compress]
+
     for ratio, _ in RATIOS_OVERLAP:
-        kept = floored[ratio].compress_plan_cpu
-        full = plain[ratio].compress_plan_cpu
+        kept = rows(floored_bufs, floored, ratio)
+        full = rows(plain_bufs, plain, ratio)
         expected = full[(full[:, 2] >= floor[full[:, 1]])]
         assert np.array_equal(kept, expected)
         assert (kept[kept[:, 1] == 0][:, 2] >= 256).all()
         assert floored[ratio].num_write == plain[ratio].num_write
     # CSA: seq0 keeps 259..303 (12 rows) and seq1 all 16 of 451..511.
-    csa = floored[4].compress_plan_cpu
+    csa = rows(floored_bufs, floored, 4)
     assert int((csa[:, 1] == 0).sum()) == 12
     assert int((csa[:, 1] == 1).sum()) == 16
-    assert list(floored[4].cu_compress_cpu) == [0, 12, 28]
     # HCA: seq0's only boundary in range is 255, below the floor.
-    assert int((floored[128].compress_plan_cpu[:, 1] == 0).sum()) == 0
+    assert int((rows(floored_bufs, floored, 128)[:, 1] == 0).sum()) == 0
 
 
 def test_an_all_zero_write_from_drops_nothing():

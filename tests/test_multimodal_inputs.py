@@ -3,6 +3,7 @@
 
 import base64
 import io
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -119,8 +120,8 @@ def test_video_requires_valid_frame_timing(timing):
 @pytest.mark.parametrize(
     "source_kind", ["path", "file_url", "data_url", "bytes", "pil"]
 )
-def test_image_sources_produce_the_same_rgb_image(tmp_path, source_kind, image_module):
-    original = image_module.new("RGBA", (2, 3), (10, 20, 30, 255))
+def test_image_sources_produce_the_same_image(tmp_path, source_kind, image_module):
+    original = image_module.new("RGBA", (2, 3), (10, 20, 30, 128))
     encoded = io.BytesIO()
     original.save(encoded, format="PNG")
     path = tmp_path / "image with spaces.png"
@@ -136,9 +137,76 @@ def test_image_sources_produce_the_same_rgb_image(tmp_path, source_kind, image_m
     inputs = normalize_multimodal_data({"image": sources[source_kind]})
     media = load_multimodal_data(inputs, MediaLoader())
     loaded = media["image"][0]
-    assert loaded.mode == "RGB"
+    # The decoded mode is kept: color conversion is the processor's.
+    assert loaded.mode == "RGBA"
     assert loaded.size == (2, 3)
-    assert loaded.getpixel((0, 0)) == (10, 20, 30)
+    assert loaded.getpixel((0, 0)) == (10, 20, 30, 128)
+
+
+def _png(image, **save_kwargs):
+    data = io.BytesIO()
+    image.save(data, format="PNG", **save_kwargs)
+    return data.getvalue()
+
+
+def _transparency_cases(image_module):
+    """Encoded PNGs that carry transparency in each way PNG can."""
+    rgba = image_module.new("RGBA", (40, 30), (0, 0, 0, 0))
+    rgba.paste((20, 20, 20, 255), (10, 10, 30, 20))
+    keyed_rgb = image_module.new("RGB", (40, 30), (0, 0, 0))
+    keyed_rgb.paste((200, 50, 50), (10, 10, 30, 20))
+    palette = image_module.new("P", (40, 30), 0)
+    palette.putpalette([0, 0, 0, 20, 20, 20] + [0, 0, 0] * 254)
+    palette.paste(1, (10, 10, 30, 20))
+    return {
+        "rgba": _png(rgba),
+        "rgb_trns": _png(keyed_rgb, transparency=(0, 0, 0)),
+        "palette_transparency": _png(palette, transparency=0),
+        "opaque_rgba": _png(image_module.new("RGBA", (40, 30), (9, 8, 7, 255))),
+        "grayscale": _png(image_module.new("L", (40, 30), 77)),
+    }
+
+
+@pytest.mark.parametrize(
+    "case, mode",
+    [
+        ("rgba", "RGBA"),
+        ("rgb_trns", "RGB"),
+        ("palette_transparency", "P"),
+        ("opaque_rgba", "RGBA"),
+        ("grayscale", "L"),
+    ],
+)
+def test_loaded_images_keep_their_mode_and_transparency(image_module, case, mode):
+    encoded = _transparency_cases(image_module)[case]
+    loaded = MediaLoader().load_image(encoded)
+    with image_module.open(io.BytesIO(encoded)) as reference:
+        assert loaded.mode == reference.mode == mode
+        assert loaded.info.get("transparency") == reference.info.get("transparency")
+        assert loaded.tobytes() == reference.tobytes()
+
+
+def test_kimi_k3_processor_sees_the_same_image_as_the_reference(image_module):
+    """The checkpoint processor gives the same pixels for an ATOM-loaded image
+    as for the encoded image it would open itself, transparency included.
+
+    Set ATOM_KIMI_K3_REFERENCE to a Kimi-K3 checkpoint directory (only the
+    processor files are read).
+    """
+
+    directory = os.environ.get("ATOM_KIMI_K3_REFERENCE")
+    if not directory:
+        pytest.skip("Set ATOM_KIMI_K3_REFERENCE for the checkpoint processor")
+    from transformers import AutoImageProcessor
+
+    processor = AutoImageProcessor.from_pretrained(directory, trust_remote_code=True)
+    for case, encoded in _transparency_cases(image_module).items():
+        loaded = MediaLoader().load_image(encoded)
+        actual = processor.preprocess([{"type": "image", "image": loaded}])
+        expected = processor.preprocess([{"type": "image", "image": encoded}])
+        assert np.array_equal(
+            np.asarray(actual["pixel_values"]), np.asarray(expected["pixel_values"])
+        ), case
 
 
 def test_http_image_loading_uses_the_shared_connector(monkeypatch, image_module):
@@ -264,6 +332,9 @@ def test_kimi_preparation_expands_each_image_and_keeps_interleaving(image_module
     assert token_ids == [9] + [42] * 4 + [7] + [42] * 8 + [8]
     assert model_inputs["image_grid_thw"] is grid
     assert model_inputs["pixel_values"] is pixel_values
+    # One span per expanded run, in image order, so the prefill can chunk.
+    assert model_inputs["embedding_spans"] == ((1, 4), (6, 8))
+    assert isinstance(model_inputs["cache_seed"], int)
     assert [part["type"] for part in seen["messages"][0]["content"]] == [
         "image",
         "text",

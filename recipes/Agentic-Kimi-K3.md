@@ -82,12 +82,12 @@ C8–C48 use 128 GiB LMCache; C56–C80 use **192 GiB**. LMCache CPU size is
 other band (C1…C48).
 
 `ATOM_MONO_ENABLE=1` is enabled only at C1. Its two kernels replace the KDA
-layers of a verify step -- the attention seam through the KDA recurrence, and
-`o_proj` plus the latent MoE -- leaving the MLA layers on the paged path. The
-reason it is C1 only is arithmetic, not a judgement about batching: mono serves
-a step of at most 8 rows, and C1 with seven speculative tokens is exactly 8.
-C2 at the same draft width is 16 rows, which mono declines step by step, so
-leaving it `1` there would cost the refusal check and buy nothing.
+layers of a decode step -- the attention seam through the KDA recurrence, and
+`o_proj` plus the latent MoE -- and run K2 on the MLA layers. This table
+predates mono's 64-row cap (it served 8 rows when the bands were tuned: C1 at
+seven speculative tokens); mono now serves any step up to 64 rows, with or
+without ReplaySSM, but the other bands have not been measured with it on, so
+they keep it off here.
 
 `ATOM_PREFILL_DECODE_INTERVAL=4` and `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000` on
 **C16 and up**; unset on C1…C14.
@@ -187,14 +187,10 @@ case "${CONC}" in
     SPEC_DECODE_ACCEPTANCE_LENGTH=3.84
     if [[ "${CONC}" == "1" ]]; then
       ATOM_MONO_ENABLE=1
-      # Both overrides are C1-only, because mono is C1-only. They are
-      # preconditions, not tuning: without them mono refuses at build time and
-      # C1 silently serves the paged path, which is what `ATOM_MONO_ENABLE=1`
-      # above claims it does not do.
-      #
-      # The mono KDA kernel reads the SSM state pool as fp32; the band default
-      # above requests fp16, which `kimi_k3/mono/config.py` refuses outright.
-      ATOM_GDN_SSM_DTYPE=fp32
+      # The `ONLINE_QUANT_CONFIG` override below is C1-only, because mono is
+      # C1-only. It is a precondition, not tuning: without it mono refuses at
+      # build time and C1 silently serves the paged path, which is what
+      # `ATOM_MONO_ENABLE=1` above claims it does not do.
       # The five projections mono loads as plain bf16 (`kimi_k3/mono/weights.py`:
       # `_plain_bf16` on in_proj, f_b_proj, o_proj and the two shared-expert
       # projections). Online ptpc_fp8 would quantize them and the bf16 load

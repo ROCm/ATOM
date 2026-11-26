@@ -74,6 +74,34 @@ DECODE_DCP_SIZE="${DECODE_DCP_SIZE:-1}"
 PREFILL_ENABLE_DP="${PREFILL_ENABLE_DP:-false}"
 DECODE_ENABLE_DP="${DECODE_ENABLE_DP:-false}"
 
+# A worker may span nodes: one DP-attention instance whose ranks run on
+# nodes_per_worker consecutive nodes. A worker's first node coordinates its DP
+# group and is the only one serving HTTP; the others only host engines.
+PREFILL_NODES_PER_WORKER="${PREFILL_NODES_PER_WORKER:-1}"
+DECODE_NODES_PER_WORKER="${DECODE_NODES_PER_WORKER:-1}"
+if (( PREFILL_NODES_PER_WORKER > 1 || DECODE_NODES_PER_WORKER > 1 )) \
+  && [[ "${ATOMESH_PD_WORKER_LAYOUT}" != "multi_node" ]]; then
+  echo "ERROR: nodes_per_worker > 1 needs pd_worker_layout multi_node, got ${ATOMESH_PD_WORKER_LAYOUT}" >&2
+  exit 2
+fi
+PREFILL_NODE_COUNT=$((xP * PREFILL_NODES_PER_WORKER))
+
+# "<role> <worker> <node within worker>" for a node rank: prefill workers take
+# the first nodes, decode workers the rest, and an aggregated server node 0 on.
+node_role_of() {
+  local rank="$1"
+  if [[ "${AGGREGATED}" == "1" ]]; then
+    echo "server 0 ${rank}"
+  elif (( rank < PREFILL_NODE_COUNT )); then
+    echo "prefill $((rank / PREFILL_NODES_PER_WORKER)) $((rank % PREFILL_NODES_PER_WORKER))"
+  else
+    local d=$((rank - PREFILL_NODE_COUNT))
+    echo "decode $((d / DECODE_NODES_PER_WORKER)) $((d % DECODE_NODES_PER_WORKER))"
+  fi
+}
+read -r NODE_ROLE NODE_WORKER NODE_IN_WORKER <<< "$(node_role_of "${NODE_RANK}")"
+echo "[layout] rank=${NODE_RANK} role=${NODE_ROLE} worker=${NODE_WORKER} node=${NODE_IN_WORKER} nodes_per_worker=P${PREFILL_NODES_PER_WORKER}/D${DECODE_NODES_PER_WORKER}"
+
 PREFILL_PORT="${PREFILL_PORT:-8010}"
 DECODE_PORT="${DECODE_PORT:-8020}"
 ROUTER_PORT="${ROUTER_PORT:-8000}"
@@ -82,8 +110,17 @@ ATOM_PD_RANK_MAPPING_POLICY="${ATOM_PD_RANK_MAPPING_POLICY:-none}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-29100}"
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
 PREFILL_DP_MASTER_PORT="${PREFILL_DP_MASTER_PORT:-29500}"
-PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
 DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29700}"
+# Across nodes ATOM moves each rank's engine sockets onto TCP, three per rank
+# from master + 100, over the single-node base ports below. A role spanning
+# nodes puts its model-runner store past them.
+if (( ${PREFILL_NODES_PER_WORKER:-1} > 1 )); then
+  PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-$((PREFILL_DP_MASTER_PORT + 400))}"
+fi
+if (( ${DECODE_NODES_PER_WORKER:-1} > 1 )); then
+  DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-$((DECODE_DP_MASTER_PORT + 400))}"
+fi
+PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
 DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-29800}"
 # Mooncake Store (MOONCAKE_STORE=1): master RPC, its HTTP metadata and metrics
 # servers, and the owners' service ports (owner i uses the base + i). Below
@@ -155,6 +192,11 @@ USE_EXPLICIT_DP_PORTS=0
 if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" || "${PACKED_NODES_PD}" == "1" || "${AGGREGATED}" == "1" ]]; then
   USE_EXPLICIT_DP_PORTS=1
 fi
+# ATOM refuses a multi-node DP group without the same nonzero base port on
+# every node.
+if (( PREFILL_NODES_PER_WORKER > 1 || DECODE_NODES_PER_WORKER > 1 )); then
+  USE_EXPLICIT_DP_PORTS=1
+fi
 
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
@@ -169,6 +211,29 @@ ONLINE_QUANT_CONFIG="${ONLINE_QUANT_CONFIG:-}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
 SPEC_METHOD="${SPEC_METHOD:-}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
+
+# Catalog paths name the Hugging Face org (<root>/<org>/<model>), but some
+# clusters keep the same weights flat under <root>/<model>.
+resolve_model_path() {
+  local path="$1"
+  local trimmed="${path%/}"
+  if [[ "${trimmed}" != /* || -e "${trimmed}" ]]; then
+    printf '%s' "${path}"
+    return 0
+  fi
+  local flat
+  flat="$(dirname -- "$(dirname -- "${trimmed}")")"
+  flat="${flat%/}/$(basename -- "${trimmed}")"
+  if [[ -e "${flat}" ]]; then
+    echo "[paths] ${path} not found; using ${flat}" >&2
+    printf '%s' "${flat}"
+  else
+    printf '%s' "${path}"
+  fi
+}
+MODEL_PATH="$(resolve_model_path "${MODEL_PATH}")"
+DRAFT_MODEL_PATH="$(resolve_model_path "${DRAFT_MODEL_PATH}")"
+
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-}"
 SPEC_DECODE_ACCEPTANCE_LENGTH="${SPEC_DECODE_ACCEPTANCE_LENGTH:-}"
 STATE_CHECKPOINT_INTERVAL_TOKENS="${STATE_CHECKPOINT_INTERVAL_TOKENS:-}"
@@ -251,10 +316,10 @@ WAIT_SERVER_TIMEOUT="${WAIT_SERVER_TIMEOUT:-5000}"
 WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 
 BENCHMARK_KIND="${BENCHMARK_KIND:-random}"
-AIPERF_DIR="${AIPERF_DIR:-/tmp/atomesh-aiperf}"
-AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-aiperf-venv}"
-AIPERF_COMMIT="${AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}"
-AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
+# The AgentX client InferenceX benchmarks with (infx/bench/agentic/requirements.txt).
+AGENTX_HARNESS_VERSION="${AGENTX_HARNESS_VERSION:-1.0.9}"
+AGENTX_VENV="${AGENTX_VENV:-/tmp/atomesh-agentx-venv}"
+AIPERF_SCENARIO="${AIPERF_SCENARIO:-agentx}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
 AIPERF_APPLY_CHAT_TEMPLATE="${AIPERF_APPLY_CHAT_TEMPLATE:-false}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-262144}"
@@ -269,7 +334,6 @@ AIPERF_FAILED_REQUEST_THRESHOLD="${AIPERF_FAILED_REQUEST_THRESHOLD:-0.50}"
 AIPERF_SLICE_DURATION="${AIPERF_SLICE_DURATION:-1.0}"
 AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT:-300}"
 AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT:-900000}"
-AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES:-0}"
 AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT:-1800}"
 AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT:-1800}"
 AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
@@ -283,16 +347,19 @@ ATOMESH_TORCH_PROFILE_ROLES="${ATOMESH_TORCH_PROFILE_ROLES:-prefill,decode}"
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
 
-default_profiler_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
+# Rank 0's online_quant_info_*.json dump for this run. It has its own variable
+# so that collecting it does not also hand the engine a profiler directory on
+# every launch; the profiler window below supplies one per worker instead.
+online_quant_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
 if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
-  default_profiler_dir="${RUN_DIR}/online_quant/${ATOMESH_EXECUTION_PHASE}/rank-${NODE_RANK}"
+  online_quant_dir="${RUN_DIR}/online_quant/${ATOMESH_EXECUTION_PHASE}/rank-${NODE_RANK}"
 fi
-export ATOM_TORCH_PROFILER_DIR="${ATOM_TORCH_PROFILER_DIR:-${default_profiler_dir}}"
+export ATOM_ONLINE_QUANT_INFO_DIR="${ATOM_ONLINE_QUANT_INFO_DIR:-${online_quant_dir}}"
 RUNTIME_LOG_DIR="${RUN_DIR}/logs"
 if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
   RUNTIME_LOG_DIR="${RUNTIME_LOG_DIR}/${ATOMESH_EXECUTION_PHASE}"
 fi
-mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
+mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_ONLINE_QUANT_INFO_DIR}"
 
 role_tp="${PREFILL_TP_SIZE}"
 if [[ "${AGGREGATED}" == "1" ]]; then
@@ -301,7 +368,7 @@ if [[ "${AGGREGATED}" == "1" ]]; then
   role_tp="${DECODE_TP_SIZE}"
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
   role_tp="${DECODE_TP_SIZE}"
-elif [[ "${NODE_RANK}" -ge "${xP}" ]]; then
+elif [[ "${NODE_ROLE}" == "decode" ]]; then
   role_tp="${DECODE_TP_SIZE}"
 fi
 if [[ -z "${HIP_VISIBLE_DEVICES:-}" ]]; then
@@ -366,6 +433,61 @@ apply_role_env() {
   apply_prefixed_env "${prefix}" "${role_ip}"
 }
 
+# KV_CONNECTOR (env.common) picks the connector of the built-in kv-transfer
+# configs. MoRI IO advertises get_ip(), which falls back to the default-route
+# address, so pin it to the address the router and the peer role dial.
+prepare_kv_connector() {
+  case "${KV_CONNECTOR:-mooncake}" in
+    mooncake) ;;
+    moriio)
+      export ATOM_HOST_IP="${ATOM_HOST_IP:-${host_ip}}"
+      python3 - <<'PY' || true
+import importlib.metadata as md
+
+for dist in ("amd-mori-nightly", "amd-mori", "mori"):
+    try:
+        print(f"[kv] moriio with {dist} {md.version(dist)}")
+        break
+    except md.PackageNotFoundError:
+        continue
+else:
+    print("[kv] moriio: no MoRI distribution metadata found")
+PY
+      ;;
+    *)
+      echo "ERROR: unsupported KV_CONNECTOR=${KV_CONNECTOR} (expected mooncake or moriio)" >&2
+      return 2
+      ;;
+  esac
+}
+
+# A role's catalog JSON wins over the built-in config, but must not name a
+# different connector than an explicit KV_CONNECTOR.
+kv_transfer_config() {
+  local role="$1"
+  local override="$2"
+  local ip="$3"
+  local port="$4"
+  if [[ -z "${override}" ]]; then
+    local extra=""
+    if [[ "${KV_CONNECTOR:-mooncake}" == moriio ]]; then
+      extra=',"moriio_mode":"write"'
+    fi
+    printf '{"kv_role":"%s","kv_connector":"%s","proxy_ip":"%s","handshake_port":%s%s}' \
+      "${role}" "${KV_CONNECTOR:-mooncake}" "${ip}" "${port}" "${extra}"
+    return 0
+  fi
+  if [[ -n "${KV_CONNECTOR:-}" ]]; then
+    local named
+    named="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("kv_connector", ""))' "${override}")" || return 2
+    if [[ "${named}" != "${KV_CONNECTOR}" ]]; then
+      echo "ERROR: KV_CONNECTOR=${KV_CONNECTOR} but the ${role} kv-transfer-config names '${named}'" >&2
+      return 2
+    fi
+  fi
+  printf '%s' "${override}"
+}
+
 host_ip="$(echo "${IPADDRS}" | tr ',' '\n' | sed -n "$((NODE_RANK + 1))p")"
 if [[ -z "${host_ip}" ]]; then
   host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -373,6 +495,18 @@ fi
 host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
+prepare_kv_connector || exit 2
+
+# Cross-node MoRI EP goes through the host proxy unless the cell says otherwise.
+# Only a worker spanning nodes has a cross-node leg: a one-node worker's EP runs
+# IntraNode, so it keeps MoRI's default.
+case "${NODE_ROLE:-}" in
+  prefill) role_nodes="${PREFILL_NODES_PER_WORKER:-1}" role_args="${PREFILL_SERVER_ARGS}" ;;
+  *) role_nodes="${DECODE_NODES_PER_WORKER:-1}" role_args="${DECODE_SERVER_ARGS}" ;;
+esac
+if (( role_nodes > 1 )) && has_cli_flag "${role_args}" "--enable-expert-parallel"; then
+  export MORI_ENABLE_HOST_PROXY="${MORI_ENABLE_HOST_PROXY:-1}"
+fi
 
 # GPU timing is opt-in; agentic reports need it on both service roles.
 if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
@@ -485,14 +619,21 @@ elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
     decode_args+=(--decode "http://${IP_ARRAY[$decode_node_idx]}:${decode_port}")
   done
 else
+  needed_nodes=$((PREFILL_NODE_COUNT + yD * DECODE_NODES_PER_WORKER))
+  if (( ${#IP_ARRAY[@]} < needed_nodes )); then
+    echo "ERROR: ${xP}P${yD}D at ${PREFILL_NODES_PER_WORKER}/${DECODE_NODES_PER_WORKER} node(s) per worker needs ${needed_nodes} nodes, got ${#IP_ARRAY[@]}" >&2
+    exit 2
+  fi
+  # Only a worker's first node serves HTTP, so it is the one the router dials.
   for idx in $(seq 0 $((xP - 1))); do
-    prefill_ips+=("${IP_ARRAY[$idx]}")
+    node_idx=$((idx * PREFILL_NODES_PER_WORKER))
+    prefill_ips+=("${IP_ARRAY[$node_idx]}")
     prefill_ports+=("${PREFILL_PORT}")
-    prefill_args+=(--prefill "http://${IP_ARRAY[$idx]}:${PREFILL_PORT}")
+    prefill_args+=(--prefill "http://${IP_ARRAY[$node_idx]}:${PREFILL_PORT}")
   done
 
   for idx in $(seq 0 $((yD - 1))); do
-    node_idx=$((xP + idx))
+    node_idx=$((PREFILL_NODE_COUNT + idx * DECODE_NODES_PER_WORKER))
     decode_ips+=("${IP_ARRAY[$node_idx]}")
     decode_ports+=("${DECODE_PORT}")
     decode_args+=(--decode "http://${IP_ARRAY[$node_idx]}:${DECODE_PORT}")
@@ -514,6 +655,31 @@ decode_parallel=(
 if [[ "${DECODE_ENABLE_DP}" == "true" ]]; then
   decode_parallel+=("--enable-dp-attention")
 fi
+
+# This node's slice of a worker that spans nodes; nothing for a one-node worker.
+multinode_dp_args() {  # nodes_per_worker node_in_worker coordinator_ip
+  (( $1 > 1 )) || return 0
+  printf '%s\n' -dp "$1" --data-parallel-size-local 1 \
+    --data-parallel-rank "$2" --data-parallel-master-ip "$3"
+}
+node_dp_args=()
+case "${NODE_ROLE}" in
+  prefill)
+    mapfile -t node_dp_args < <(multinode_dp_args "${PREFILL_NODES_PER_WORKER}" \
+      "${NODE_IN_WORKER}" "${prefill_ips[${NODE_WORKER}]:-}")
+    prefill_parallel+=(${node_dp_args[@]+"${node_dp_args[@]}"})
+    ;;
+  decode)
+    mapfile -t node_dp_args < <(multinode_dp_args "${DECODE_NODES_PER_WORKER}" \
+      "${NODE_IN_WORKER}" "${decode_ips[${NODE_WORKER}]:-}")
+    decode_parallel+=(${node_dp_args[@]+"${node_dp_args[@]}"})
+    ;;
+  server)
+    mapfile -t node_dp_args < <(multinode_dp_args "${DECODE_NODES_PER_WORKER}" \
+      "${NODE_IN_WORKER}" "${IP_ARRAY[0]}")
+    decode_parallel+=(${node_dp_args[@]+"${node_dp_args[@]}"})
+    ;;
+esac
 
 # AgentX captures every query-token count the engine can produce, i.e. the dense
 # range [1, graph_max] with graph_max = seqs * (1 + spec_tokens), where seqs
@@ -716,6 +882,7 @@ wait_http() {
   local timeout="$3"
   local pid="${4:-}"
   local deadline=$(( $(date +%s) + timeout ))
+  local peer
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
     exit_if_mooncake_store_died
@@ -727,6 +894,12 @@ wait_http() {
       [[ "${rc}" -eq 0 ]] && rc=1
       echo "[wait][FAIL] ${name} process exited before becoming ready rc=${rc}" >&2
       exit "${rc}"
+    fi
+    # After this node's own checks: when both failed, its own failure is the
+    # one to report.
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] ${name}: another node's launcher exited (${peer})" >&2
+      exit 1
     fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       echo "[wait][FAIL] ${name} not ready after ${timeout}s" >&2
@@ -877,10 +1050,11 @@ purge_lmcache_disk() {
 #  - MOONCAKE_STORE_POOLS=per_nic (default shared), for owners that must share
 #    the stages' NICs: one master per owner NIC, every owner on exactly one
 #    NIC, and each stage reads its own NIC's pool (mooncake_store.pools).
-#  - MOONCAKE_STORE_DECODE_OWNERS, in the same format: owners the decode node
-#    starts on its own memory, joining the prefill node's masters
-#    (pd_worker_layout multi_node, one prefill node and one decode node). The
-#    prefill workers start once every pool counts the owners of both nodes.
+#  - MOONCAKE_STORE_DECODE_OWNERS, in the same format: owners each decode node
+#    starts on its own memory, joining the masters of the one prefill worker's
+#    node (pd_worker_layout multi_node: every decode node; packed_nodes: each
+#    node with decode workers only, at its first one). The prefill workers
+#    start once every pool counts the owners of all nodes.
 #  - MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS (colon-separated, default the model):
 #    the owners pin huge pages under MPOL_BIND, so the clean page cache of
 #    these goes first; each node must then fit its pins with 128 GiB to spare,
@@ -890,9 +1064,9 @@ purge_lmcache_disk() {
 #    pages its NICs refuse to register.
 #  - MOONCAKE_STORE_WAIT_TIMEOUT (default 1200 s) bounds each wait for the
 #    Store once this node has compacted: for every pool to count its owners,
-#    and on a decode node for the prefill node's masters. A wait on the other
+#    and on a decode node for the prefill node's masters. A wait on another
 #    node's part also allows for that node's compaction, which its Store waits
-#    for: 2 x MOONCAKE_STORE_COMPACT_TIMEOUT, one per NUMA node.
+#    for: MOONCAKE_STORE_COMPACT_TIMEOUT per NUMA node its owners pin.
 # Every Mooncake process runs with MC_NUM_QP_PER_EP=1, the decode workers' P->D
 # transfer engine included (peers with different QP counts cannot connect).
 # The launcher owns the workers' ATOM_KV_OFFLOAD and
@@ -929,6 +1103,8 @@ mooncake_store_master_count=0
 # metrics of the run are saved.
 mooncake_store_ready=0
 mooncake_store_metrics_saved=0
+# Set once this node started its decode owners, at its first decode worker.
+mooncake_store_decode_owners_started=0
 # The prefill workers' env for the running Store, set by start_mooncake_store.
 mooncake_store_prefill_env=()
 
@@ -1028,6 +1204,32 @@ plan_mooncake_store_owners() {
     mooncake_owner_plan_numa mooncake_owner_plan_gib mooncake_owner_plan_devices
 }
 
+# mooncake_node_starts_decode_owners <rank>: whether that node's decode workers
+# start MOONCAKE_STORE_DECODE_OWNERS; a packed prefill's node has its own owners.
+mooncake_node_starts_decode_owners() {
+  [[ "${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" != "packed_nodes" \
+    || "$1" != "${prefill_nodes[0]:-0}" ]]
+}
+
+# How many nodes start MOONCAKE_STORE_DECODE_OWNERS, each once: every decode
+# node under multi_node, each node with decode workers only under packed_nodes.
+mooncake_decode_owner_node_count() {
+  local node
+  local -A owner_nodes=()
+  case "${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" in
+    multi_node) echo $(( ${yD:-1} * ${DECODE_NODES_PER_WORKER:-1} )) ;;
+    packed_nodes)
+      for node in ${decode_nodes[@]+"${decode_nodes[@]}"}; do
+        if mooncake_node_starts_decode_owners "${node}"; then
+          owner_nodes[${node}]=1
+        fi
+      done
+      echo "${#owner_nodes[@]}"
+      ;;
+    *) echo 0 ;;
+  esac
+}
+
 # Fills mooncake_pool_devices and mooncake_pool_capacity from the owners of
 # every node, numbering the pools alike on each; exits 2 on an invalid setting.
 plan_mooncake_store_pools() {
@@ -1036,7 +1238,11 @@ plan_mooncake_store_pools() {
   local -a numa=() gib=() devices=()
   parse_mooncake_owner_spec MOONCAKE_STORE_OWNERS numa gib devices
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
-    parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS numa gib devices
+    local node node_count
+    node_count="$(mooncake_decode_owner_node_count)"
+    for ((node = 0; node < node_count; node++)); do
+      parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS numa gib devices
+    done
   fi
   mooncake_pool_devices=()
   mooncake_pool_capacity=()
@@ -1077,7 +1283,7 @@ plan_mooncake_store_pools() {
 
 # Refuses a Store port outside the TCP range, or one that two Store processes
 # of a node would bind: each pool's master, metadata and metrics ports, and the
-# owners' service ports, on the prefill node, which runs the masters; the
+# owners' service ports, on the prefill node, which runs the masters; each
 # decode node's owners only join them. Needs both plans.
 check_mooncake_store_ports() {
   local -a names=() ports=() decode_numa=() decode_gib=() decode_devices=()
@@ -1193,10 +1399,13 @@ check_mooncake_store_settings() {
   fi
   require_mooncake_qp_per_endpoint
   refuse_mooncake_nic_auto_discovery
-  local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}" num_decode="${yD:-1}"
+  local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}"
+  local prefill_nodes_per_worker="${PREFILL_NODES_PER_WORKER:-1}" decode_owner_node_count
+  decode_owner_node_count="$(mooncake_decode_owner_node_count)"
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
-    && [[ "${layout}" != "multi_node" || "${num_prefill}" != "1" || "${num_decode}" != "1" ]]; then
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node, here ${layout}), one prefill node (here ${num_prefill}), whose masters they join, and one decode node (here ${num_decode}): the pools count the decode owners once" >&2
+    && [[ "${num_prefill}" != "1" || "${prefill_nodes_per_worker}" != "1" \
+      || "${decode_owner_node_count}" == "0" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node or packed_nodes, here ${layout}, with ${decode_owner_node_count} such node(s)) and one prefill worker (here ${num_prefill}) on one node (prefill nodes_per_worker, here ${prefill_nodes_per_worker}), whose masters they join: every prefill node starts masters of its own" >&2
     exit 2
   fi
   # This shell starts one Store, planned for its first prefill worker's GPUs;
@@ -1257,7 +1466,7 @@ validate_mooncake_store_settings() {
   while IFS='=' read -r name _; do
     if [[ "${name}" == ATOMESH_DECODE_ENV_MOONCAKE_STORE \
       || "${name}" == ATOMESH_DECODE_ENV_MOONCAKE_STORE_* ]]; then
-      echo "[mooncake-store][FAIL] ${name}: the Mooncake Store settings belong to the prefill role env (ATOMESH_PREFILL_ENV_), which every node reads; in the decode role env only the decode node would see them" >&2
+      echo "[mooncake-store][FAIL] ${name}: the Mooncake Store settings belong to the prefill role env (ATOMESH_PREFILL_ENV_), which every node reads; in the decode role env only the decode nodes would see them" >&2
       exit 2
     fi
   done < <(env)
@@ -1273,7 +1482,7 @@ validate_mooncake_store_settings() {
     check_mooncake_store_settings
   )
   (
-    # The decode node's owners start from the decode role env.
+    # Each decode node's owners start from the decode role env.
     apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
     require_mooncake_qp_per_endpoint
     refuse_mooncake_nic_auto_discovery
@@ -1437,13 +1646,34 @@ stop_mooncake_store() {
   [[ -z "${mooncake_store_failed_rc}" ]]
 }
 
+# Prints the rank-rc-* of another node whose launcher exited non-zero: the
+# servers, router or Store owners that node was to bring never come. Only Spur
+# workers publish rank-rc-* (cleanup_spur in pd_slurm_job.sh); under plain
+# Slurm there are none, and srun --kill-on-bad-exit=1 stops the other nodes.
+failed_peer_node() {
+  local f rc
+  for f in "${RUN_DIR}"/rank-rc-*; do
+    [[ -f "${f}" && "${f}" != *.tmp && "${f##*/}" != "rank-rc-${NODE_RANK}" ]] || continue
+    rc="$(cat "${f}" 2>/dev/null)"
+    if [[ -n "${rc}" && "${rc}" != "0" ]]; then
+      echo "${f##*/}=${rc}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Fails startup (stopping what it started) unless <condition> holds within
-# <timeout> seconds; a dying Store process fails it at once.
+# <timeout> seconds. It fails at once when a Store process dies, when a Store
+# log reports a failure (Failed to setup client, Failed to mount, Check failed,
+# FATAL), or when another node's launcher exits non-zero, checked in that
+# order: when this node and another both failed, this node's failure is the
+# one to report.
 wait_for_mooncake_store() {
   local what="$1" timeout="$2"
   shift 2
   local deadline=$(( $(date +%s) + timeout ))
-  local log
+  local log peer
   until "$@"; do
     if ! reap_dead_mooncake_store; then
       echo "[wait][FAIL] mooncake-store ${what}: a Store process exited" >&2
@@ -1458,6 +1688,11 @@ wait_for_mooncake_store() {
         exit 1
       fi
     done
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] mooncake-store ${what}: another node's launcher exited (${peer})" >&2
+      stop_mooncake_store || true
+      exit 1
+    fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       for log in "${mooncake_store_logs[@]}"; do
         tail -n 20 "${log}" >&2 || true
@@ -1597,7 +1832,7 @@ report_mooncake_store_owners() {
   done
 }
 
-# mooncake_store_cross_node_timeout <owner setting>: the wait for the other
+# mooncake_store_cross_node_timeout <owner setting>: the wait for another
 # node's part of the Store, whose owners <owner setting> lists:
 # MOONCAKE_STORE_WAIT_TIMEOUT plus that node's compaction, which comes first
 # there: numa_memory_budget.py compacts each NUMA node with pins in turn, and
@@ -1688,7 +1923,7 @@ start_mooncake_store() {
   local owners_timeout
   owners_timeout="$(mooncake_store_wait_timeout)"
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
-    # The decode node mounts its owners only once it has compacted its memory.
+    # Each decode node mounts its owners only once it has compacted its memory.
     owners_timeout="$(mooncake_store_cross_node_timeout MOONCAKE_STORE_DECODE_OWNERS)"
   fi
   wait_for_mooncake_store "owners" "${owners_timeout}" \
@@ -1708,13 +1943,17 @@ start_mooncake_store() {
   echo "[wait][OK] mooncake-store masters=${host_ip}:${ATOMESH_MOONCAKE_MASTER_PORT}+100/pool pools=${mooncake_pool_devices[*]:-shared} metrics=http://${host_ip}:${ATOMESH_MOONCAKE_METRICS_PORT}/metrics"
 }
 
-# On a decode node: starts MOONCAKE_STORE_DECODE_OWNERS on this node's memory,
-# joining the prefill node's masters, before the decode workers load. Waits
-# until every pool counts the owners of all nodes, as the prefill node does
-# before its workers start.
+# On a node that starts them (mooncake_node_starts_decode_owners): starts
+# MOONCAKE_STORE_DECODE_OWNERS on this node's memory, joining the prefill
+# node's masters, before the decode workers load. Waits until every pool counts
+# the owners of all nodes, as the prefill node does before its workers start.
 start_mooncake_store_decode_owners() {
   mooncake_store_requested || return 0
   [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] || return 0
+  # Once per node, at its first decode worker: a packed node can run several.
+  mooncake_node_starts_decode_owners "${NODE_RANK}" || return 0
+  [[ "${mooncake_store_decode_owners_started}" == "0" ]] || return 0
+  mooncake_store_decode_owners_started=1
   plan_mooncake_store_pools
   plan_mooncake_store_owners MOONCAKE_STORE_DECODE_OWNERS
   check_mooncake_owner_devices
@@ -1724,15 +1963,15 @@ start_mooncake_store_decode_owners() {
   mooncake_store_logs=()
   mooncake_store_names=()
   mooncake_store_master_count=0
-  local timeout
-  timeout="$(mooncake_store_wait_timeout)"
   # The prefill node starts its masters only once it has compacted its memory.
   wait_for_mooncake_store "prefill-node masters" \
     "$(mooncake_store_cross_node_timeout MOONCAKE_STORE_OWNERS)" \
     mooncake_masters_ready "${NODE0_ADDR}"
   start_mooncake_store_owners "${NODE0_ADDR}"
   echo "[wait] mooncake-store decode owners=${#mooncake_owner_plan_numa[@]} joining ${NODE0_ADDR}"
-  wait_for_mooncake_store "owners" "${timeout}" \
+  # Another decode node mounts its owners only once it has compacted, too.
+  wait_for_mooncake_store "owners" \
+    "$(mooncake_store_cross_node_timeout MOONCAKE_STORE_DECODE_OWNERS)" \
     mooncake_store_capacity_reaches "${NODE0_ADDR}"
   report_mooncake_store_owners
   echo "[wait][OK] mooncake-store decode owners mounted on ${NODE0_ADDR}'s pools ${mooncake_pool_devices[*]:-shared}"
@@ -1779,10 +2018,10 @@ write_metadata() {
 EOF
 }
 
-# ATOM_TORCH_PROFILER_DIR above does not reach the engine: EngineArgs always
-# passes its own torch_profiler_dir (None by default), which overrides the env
-# default in Config, so the profiler is off unless the flag is on the command.
-# One directory per worker keeps P/D ranks that share a node apart.
+# Put a profiler directory on the command line only while the window is on:
+# this script exports no ATOM_TORCH_PROFILER_DIR, so a launch that does not
+# profile carries none. One directory per worker keeps P/D ranks that share a
+# node apart; an explicit flag also outranks the environment default in Config.
 build_torch_profiler_args() {
   local log_name="$1"
   local -n out_args="$2"
@@ -1821,11 +2060,7 @@ start_prefill() {
     )
   fi
   local prefill_kv_transfer_config
-  if [[ -n "${PREFILL_KV_TRANSFER_CONFIG}" ]]; then
-    prefill_kv_transfer_config="${PREFILL_KV_TRANSFER_CONFIG}"
-  else
-    prefill_kv_transfer_config="{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
-  fi
+  prefill_kv_transfer_config="$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a prefill_profiler_args=()
   build_torch_profiler_args "${log_name}" prefill_profiler_args
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
@@ -1888,11 +2123,7 @@ start_decode() {
     )
   fi
   local decode_kv_transfer_config
-  if [[ -n "${DECODE_KV_TRANSFER_CONFIG}" ]]; then
-    decode_kv_transfer_config="${DECODE_KV_TRANSFER_CONFIG}"
-  else
-    decode_kv_transfer_config="{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
-  fi
+  decode_kv_transfer_config="$(kv_transfer_config kv_consumer "${DECODE_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a decode_profiler_args=()
   build_torch_profiler_args "${log_name}" decode_profiler_args
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
@@ -2089,28 +2320,25 @@ run_benchmark() {
   done
 }
 
-ensure_aiperf() {
-  local current_commit=""
-  if [[ -d "${AIPERF_DIR}/.git" ]]; then
-    current_commit="$(git -C "${AIPERF_DIR}" rev-parse HEAD 2>/dev/null || true)"
-  fi
-  if [[ -x "${AIPERF_VENV}/bin/aiperf" && "${current_commit}" == "${AIPERF_COMMIT}" ]]; then
-    return
-  fi
+ensure_agentx_harness() {
+  # The ATOM image ships this release in its own venv and links `agentx` onto
+  # PATH; reuse it, or an earlier install, on an exact match.
+  local bin
+  for bin in "$(command -v agentx 2>/dev/null)" "${AGENTX_VENV}/bin/agentx"; do
+    if [[ -x "${bin}" && "$("${bin}" --version 2>/dev/null)" == "${AGENTX_HARNESS_VERSION}" ]]; then
+      AGENTX_VENV="$(dirname "$(dirname "$(readlink -f "${bin}")")")"
+      echo "[agentx] using agentx-harness ${AGENTX_HARNESS_VERSION} in ${AGENTX_VENV}"
+      return
+    fi
+  done
 
-  echo "[aiperf] preparing ${AIPERF_DIR} @ ${AIPERF_COMMIT}"
-  mkdir -p "$(dirname "${AIPERF_DIR}")" "$(dirname "${AIPERF_VENV}")"
-  if [[ ! -d "${AIPERF_DIR}/.git" ]]; then
-    rm -rf "${AIPERF_DIR}"
-    git clone https://github.com/SemiAnalysisAI/aiperf.git "${AIPERF_DIR}"
-  fi
-  git -C "${AIPERF_DIR}" fetch https://github.com/SemiAnalysisAI/aiperf.git "${AIPERF_COMMIT}"
-  git -C "${AIPERF_DIR}" checkout --detach "${AIPERF_COMMIT}"
-  rm -rf "${AIPERF_VENV}"
-  python3 -m venv "${AIPERF_VENV}"
-  "${AIPERF_VENV}/bin/python" -m pip install --upgrade pip
-  "${AIPERF_VENV}/bin/python" -m pip install -e "${AIPERF_DIR}"
-  "${AIPERF_VENV}/bin/aiperf" --version
+  echo "[agentx] installing agentx-harness==${AGENTX_HARNESS_VERSION} into ${AGENTX_VENV}"
+  mkdir -p "$(dirname "${AGENTX_VENV}")"
+  rm -rf "${AGENTX_VENV}"
+  python3 -m venv "${AGENTX_VENV}"
+  "${AGENTX_VENV}/bin/python" -m pip install --upgrade pip
+  "${AGENTX_VENV}/bin/python" -m pip install "agentx-harness==${AGENTX_HARNESS_VERSION}"
+  "${AGENTX_VENV}/bin/agentx" --version
 }
 
 write_aiperf_dashboard_json() {
@@ -2301,8 +2529,20 @@ wait_for_torch_traces() {
   done
 }
 
+# Saves the router's /metrics with its scrape time. A failed scrape only warns.
+save_router_metrics() {
+  local output="$1"
+  local scraped_at metrics
+  scraped_at="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+  if metrics="$(curl -sSf --max-time 10 "http://127.0.0.1:${ROUTER_PORT}/metrics")"; then
+    printf '# scraped_at %s\n%s\n' "${scraped_at}" "${metrics}" > "${output}"
+  else
+    echo "[aiperf] WARNING: router /metrics snapshot failed" >&2
+  fi
+}
+
 run_aiperf_agentic_benchmark() {
-  ensure_aiperf
+  ensure_agentx_harness
 
   if is_agentic_session_affinity; then
     # dp_sticky keys off X-Session-ID. Without it every turn is placed by load
@@ -2370,15 +2610,20 @@ run_aiperf_agentic_benchmark() {
         > >(tee "${out_dir}/torch_profile.log") 2>&1 &
       profile_pid=$!
     fi
+    # collect_metrics.py creates metrics/ itself, so the baseline waits outside it.
+    local router_before="${out_dir}/router-metrics-before.prom"
+    rm -f "${router_before}"
+    if [[ "${AGGREGATED}" != "1" ]]; then
+      save_router_metrics "${router_before}"
+    fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
-    AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
       python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
       --output "${out_dir}/metrics" "${report_args[@]}" -- \
-      "${AIPERF_VENV}/bin/aiperf" profile \
+      "${AGENTX_VENV}/bin/agentx" profile \
       "${unsafe_args[@]}" \
       --scenario "${AIPERF_SCENARIO}" \
       --url "http://127.0.0.1:${ROUTER_PORT}" \
@@ -2412,6 +2657,22 @@ run_aiperf_agentic_benchmark() {
     echo "${aiperf_pid}" > "${aiperf_pid_file}"
     local aiperf_rc=0
     wait "${aiperf_pid}" || aiperf_rc=$?
+    if [[ "${AGGREGATED}" != "1" ]]; then
+      # Every concurrency level shares this router, so the counters after the
+      # run include the earlier levels. Stage the baseline and this run's
+      # increase with the latency report.
+      local router_metrics="${out_dir}/metrics"
+      mkdir -p "${router_metrics}"
+      save_router_metrics "${router_metrics}/router-metrics.prom"
+      if [[ -f "${router_before}" ]]; then
+        mv "${router_before}" "${router_metrics}/"
+      fi
+      python3 "${ATOMESH_SCRIPT_DIR}/observability/router_metrics_delta.py" \
+        "${router_metrics}/router-metrics-before.prom" \
+        "${router_metrics}/router-metrics.prom" \
+        --output "${router_metrics}/router-metrics-delta.prom" \
+        || echo "[aiperf] WARNING: router metrics increase not computed" >&2
+    fi
 
     if [[ -n "${profile_pid}" ]]; then
       touch "${profile_done}"
@@ -2580,6 +2841,7 @@ run_eval() {
 
   IFS=',' read -r -a eval_concs <<< "${EVAL_CONCURRENCY}"
   local eval_conc tag result_dir
+  local below=()
   for eval_conc in "${eval_concs[@]}"; do
     eval_conc="${eval_conc//[[:space:]]/}"
     [[ -n "${eval_conc}" ]] || continue
@@ -2600,13 +2862,14 @@ run_eval() {
       --log_samples \
       --output_path "${result_dir}"
 
-    python3 - "${result_dir}" "${eval_conc}" <<'PY'
+    if ! python3 - "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 result_dir = Path(sys.argv[1])
 eval_conc = sys.argv[2]
+threshold = sys.argv[3]
 json_files = list(result_dir.rglob("*.json")) if result_dir.is_dir() else []
 if not json_files:
     print("[eval] ERROR: no result JSON found")
@@ -2623,10 +2886,27 @@ print("=========================================")
 print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
 print("=========================================")
 print(json.dumps(data.get("results", {}), indent=2))
+if threshold:
+    if not isinstance(score, (int, float)) or score < float(threshold):
+        raise SystemExit(
+            f"[eval] FAIL: concurrent={eval_conc} gsm8k score {score} "
+            f"is below threshold {float(threshold):.4f}"
+        )
+    print(
+        f"[eval] PASS: concurrent={eval_conc} gsm8k score {score:.4f} "
+        f">= threshold {float(threshold):.4f}"
+    )
 PY
+    then
+      below+=("${eval_conc}")
+    fi
   done
 
   echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
+  if (( ${#below[@]} )); then
+    echo "[eval] FAIL: concurrency ${below[*]} did not pass" >&2
+    return 1
+  fi
 }
 
 run_benchmark_and_eval() {
@@ -2659,17 +2939,23 @@ write_metadata
 # before their server, so a start that fails stops what it and the starts
 # before it left running.
 if [[ "${AGGREGATED}" == "1" ]]; then
-  if [[ "${NODE_RANK}" -ne 0 ]]; then
-    echo "[server] rank=${NODE_RANK} idle: aggregated serves from a single node"
+  if (( NODE_RANK >= DECODE_NODES_PER_WORKER )); then
+    echo "[server] rank=${NODE_RANK} idle: the aggregated server spans ${DECODE_NODES_PER_WORKER} node(s)"
     exit 0
   fi
   trap 'cleanup_processes ${aggregated_pid:-}' EXIT
-  start_aggregated "server-rank-0"
+  start_aggregated "server-rank-${NODE_RANK}"
   aggregated_pid="${server_pid}"
-  # No router to wait on: the server owns ROUTER_PORT, so the benchmark and eval
-  # clients reach it at the same address they use for a P/D cell.
-  wait_http "http://127.0.0.1:${ROUTER_PORT}/health" "server" "${WAIT_SERVER_TIMEOUT}" "${aggregated_pid}"
-  run_benchmark_and_eval
+  if [[ "${NODE_RANK}" -eq 0 ]]; then
+    # No router to wait on: the server owns ROUTER_PORT, so the benchmark and
+    # eval clients reach it at the same address they use for a P/D cell.
+    wait_http "http://127.0.0.1:${ROUTER_PORT}/health" "server" "${WAIT_SERVER_TIMEOUT}" "${aggregated_pid}"
+    run_benchmark_and_eval
+  else
+    # Engines only; node 0's server answers for them, and its exit ends this node.
+    wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "server" "${WAIT_SERVER_TIMEOUT}" "${aggregated_pid}"
+    wait_router_closed
+  fi
   cleanup_processes "${aggregated_pid}"
 elif [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
@@ -2813,13 +3099,20 @@ elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
-elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
+elif [[ "${NODE_ROLE}" == "prefill" ]]; then
+  # A further prefill worker, or a further node of a worker that spans nodes,
+  # which hosts engines and serves no HTTP: either way it waits on the router.
   trap 'cleanup_processes ${server_pid:-}' EXIT
   start_prefill "prefill-rank-${NODE_RANK}"
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 else
+  # Only the per-worker node layout sets needed_nodes; a node past them hosts no worker.
+  if [[ -n "${needed_nodes:-}" ]] && (( NODE_RANK >= needed_nodes )); then
+    echo "[server] rank=${NODE_RANK} idle: ${xP}P${yD}D at ${PREFILL_NODES_PER_WORKER}/${DECODE_NODES_PER_WORKER} node(s) per worker spans ${needed_nodes} node(s)"
+    exit 0
+  fi
   trap 'cleanup_processes ${server_pid:-}' EXIT
   start_decode
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"

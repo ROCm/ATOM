@@ -43,8 +43,8 @@ class MoRIIOWrapper:
     Thread-safety:
         ``transfer_status``, ``done_req_ids``, ``done_write_cache_req_ids``,
         and ``done_remote_allocate_req_dict`` are guarded by ``self.lock``.  The ZMQ socket cache ``self._sockets``
-        is *not* thread-safe — callers must ensure ``send_notify`` is invoked
-        from a single thread.
+        is *not* thread-safe — callers must ensure ``send_notify`` and
+        ``send_message`` are invoked from a single thread.
 
     Args:
         moriio_engine: MoRIIO IOEngine instance.
@@ -181,6 +181,23 @@ class MoRIIOWrapper:
         with self.lock:
             self.transfer_status.append(transfer_status)
 
+    def write_remote_data_status(
+        self, transfer_size_byte, local_offset=0, remote_offset=0, session=None
+    ):
+        """Issue a batch RDMA write and return its status for the caller to poll.
+
+        Unlike :meth:`write_remote_data`, the status is not parked on
+        ``transfer_status``, so per-request tracking stays with the caller.
+        """
+        assert self.local_memory_registered, "You have not register local memory data!"
+        assert self.moriio_engine is not None, "MoRIIO engine must be set first"
+        return session.batch_write(
+            local_offset,
+            remote_offset,
+            transfer_size_byte,
+            self.moriio_engine.allocate_transfer_uid(),
+        )
+
     def write_remote_data_single(
         self, transfer_size_byte, local_offset=0, remote_offset=0, sess_idx=0
     ):
@@ -309,16 +326,8 @@ class MoRIIOWrapper:
             logger.warning("Cannot send notification: missing remote_ip or remote_port")
             return
 
-        path = make_zmq_path("tcp", remote_ip, int(remote_port))
-
-        if path not in self._sockets:
-            ctx = zmq.Context.instance()
-            self._sockets[path] = make_zmq_socket(
-                ctx=ctx, path=path, socket_type=zmq.DEALER, bind=False
-            )
-
+        path, sock = self._dealer(remote_ip, remote_port)
         id_list = req_ids if isinstance(req_ids, list) else [req_ids]
-        sock = self._sockets[path]
         try:
             for rid in id_list:
                 rid_str = str(rid) if isinstance(rid, int) else rid
@@ -332,6 +341,28 @@ class MoRIIOWrapper:
             logger.error("Failed to send notification to %s: %s", path, e)
             self._sockets.pop(path, None)
             raise
+
+    def send_message(
+        self, frames: list[bytes], remote_ip: str, remote_port: str | int
+    ) -> None:
+        """Send one multipart message to a peer's handshake listener."""
+        path, sock = self._dealer(remote_ip, remote_port)
+        try:
+            sock.send_multipart(frames)
+        except Exception as e:
+            logger.error("Failed to send %s to %s: %s", frames[0], path, e)
+            self._sockets.pop(path, None)
+            raise
+
+    def _dealer(self, remote_ip: str, remote_port: str | int) -> tuple[str, Any]:
+        """The cached DEALER socket for a peer, created on first use."""
+        path = make_zmq_path("tcp", remote_ip, int(remote_port))
+        if path not in self._sockets:
+            ctx = zmq.Context.instance()
+            self._sockets[path] = make_zmq_socket(
+                ctx=ctx, path=path, socket_type=zmq.DEALER, bind=False
+            )
+        return path, self._sockets[path]
 
     def pop_finished_req_ids(self) -> set[str]:
         """Return and clear the set of completed send-side request IDs."""

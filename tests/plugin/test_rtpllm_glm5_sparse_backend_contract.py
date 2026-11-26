@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import torch
 
 _SPARSE_BACKEND_MODULE = "atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend"
+_INDEXER_FORWARD_MODULE = "atom.model_ops.indexer.indexer_forward"
 _FORBIDDEN_CUDA_SPARSE_MODULES = (
     "flashmla_sparse",
     "flash_mla",
@@ -53,9 +54,9 @@ def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
     def fake_sparse_attn_indexer(*args):
         calls.append(args)
 
-    fake_deepseek = type(sys)("atom.models.deepseek_v2")
-    fake_deepseek.sparse_attn_indexer = fake_sparse_attn_indexer
-    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
+    fake_forward = type(sys)(_INDEXER_FORWARD_MODULE)
+    fake_forward.sparse_attn_indexer = fake_sparse_attn_indexer
+    monkeypatch.setitem(sys.modules, _INDEXER_FORWARD_MODULE, fake_forward)
 
     tensor = torch.empty(1)
     dcp_indptr = torch.empty(0, dtype=torch.int32)
@@ -114,9 +115,9 @@ def test_rtp_sparse_attn_indexer_uses_rtp_topk_path_when_context_exists(monkeypa
     def _unexpected_call(*args, **kwargs):
         raise AssertionError("RTP context path must not call deepseek sparse indexer")
 
-    fake_deepseek = type(sys)("atom.models.deepseek_v2")
-    fake_deepseek.sparse_attn_indexer = _unexpected_call
-    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
+    fake_forward = type(sys)(_INDEXER_FORWARD_MODULE)
+    fake_forward.sparse_attn_indexer = _unexpected_call
+    monkeypatch.setitem(sys.modules, _INDEXER_FORWARD_MODULE, fake_forward)
 
     calls = []
 
@@ -183,9 +184,9 @@ def test_rtp_sparse_attn_indexer_short_prefill_fills_causal_topk(monkeypatch):
             "short prefill path should not call deepseek sparse_attn_indexer"
         )
 
-    fake_deepseek = type(sys)("atom.models.deepseek_v2")
-    fake_deepseek.sparse_attn_indexer = _unexpected_call
-    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
+    fake_forward = type(sys)(_INDEXER_FORWARD_MODULE)
+    fake_forward.sparse_attn_indexer = _unexpected_call
+    monkeypatch.setitem(sys.modules, _INDEXER_FORWARD_MODULE, fake_forward)
 
     topk_buffer = torch.full((3, 8), -99, dtype=torch.int32)
     positions = torch.tensor([0, 1, 3], dtype=torch.int32)

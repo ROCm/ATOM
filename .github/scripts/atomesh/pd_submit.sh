@@ -140,9 +140,8 @@ exports = {
     "REQUEST_RATE": cell["request_rate"],
     "BENCH_NUM_PROMPTS_MULTIPLIER": cell["num_prompts_multiplier"],
     "BENCHMARK_KIND": benchmark.get("kind", "random"),
-    "AIPERF_DIR": benchmark.get("aiperf_dir", ""),
-    "AIPERF_VENV": benchmark.get("aiperf_venv", ""),
-    "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),
+    "AGENTX_HARNESS_VERSION": benchmark.get("agentx_harness_version", ""),
+    "AGENTX_VENV": benchmark.get("agentx_venv", ""),
     "AIPERF_SCENARIO": benchmark.get("scenario", ""),
     "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
     "AIPERF_APPLY_CHAT_TEMPLATE": str(
@@ -170,9 +169,6 @@ exports = {
         "cancel_drain_timeout", ""
     ),
     "AIPERF_HTTP_TCP_USER_TIMEOUT": benchmark.get("http_tcp_user_timeout", ""),
-    "AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES": benchmark.get(
-        "dataset_weka_live_assistant_responses", ""
-    ),
     "AIPERF_DATASET_CONFIGURATION_TIMEOUT": benchmark.get(
         "dataset_configuration_timeout", ""
     ),
@@ -184,6 +180,8 @@ exports = {
     "WAIT_ROUTER_TIMEOUT": cell["wait_router_timeout"],
     "PREFILL_WORKERS": prefill.get("workers", 1),
     "DECODE_WORKERS": decode.get("workers", 1),
+    "PREFILL_NODES_PER_WORKER": prefill.get("nodes_per_worker", 1),
+    "DECODE_NODES_PER_WORKER": decode.get("nodes_per_worker", 1),
     "PREFILL_TP": prefill.get("tp", 8),
     "DECODE_TP": decode.get("tp", 8),
     "PREFILL_DCP_SIZE": prefill.get("dcp", 1),
@@ -254,8 +252,8 @@ exports = {
     "SWEBENCH_MAX_WORKERS": "" if accuracy.get("max_workers") is None else accuracy.get("max_workers"),
     "SWEBENCH_EVAL_TIMEOUT": "" if accuracy.get("instance_timeout") is None else accuracy.get("instance_timeout"),
     "SLURM_SUBMIT_RUNNER": slurm_submit_runner,
-    "SLURM_ACCOUNT": "amd-aifw-dev" if is_crusoe_v2 else runner.get("slurm_account", "amd-frameworks"),
-    "SLURM_PARTITION": "" if is_crusoe_v2 else runner.get("slurm_partition", "amd-frameworks"),
+    "SLURM_ACCOUNT": "amd-aifw-dev" if is_crusoe_v2 else runner.get("slurm_account", "amd-atom"),
+    "SLURM_PARTITION": "" if is_crusoe_v2 else runner.get("slurm_partition", "amd-spur"),
     "SLURM_QOS": "amd-aifw-dev-qos" if is_crusoe_v2 else runner.get("slurm_qos", ""),
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
@@ -387,10 +385,18 @@ stream_spur_shared_logs_once() {
   shopt -u nullglob
 }
 
+# Each Spur worker publishes rank-workload-* on entry and rank-rc-* on exit.
+spur_workers_started() {
+  compgen -G "${LOG_ROOT}/slurm_job-$1/rank-workload-*.json" >/dev/null ||
+    compgen -G "${LOG_ROOT}/slurm_job-$1/rank-rc-*" >/dev/null
+}
+
 # Every Spur worker writes container output to shared storage, regardless of
 # runner label. Stream it from the submitter rather than through Spur RPCs.
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once
+  SLURM_STARTUP_PROGRESS_CHECK=spur_workers_started
+  SLURM_STARTUP_TIMEOUT="${ATOMESH_SPUR_STARTUP_TIMEOUT:-900}"
 fi
 install_slurm_cancel_traps
 
@@ -416,7 +422,10 @@ EOF
 EOF
   {
     printf 'export %q=%q\n' GITHUB_WORKSPACE "${REPO_ROOT}"
-    printf 'exec %q\n' "${JOB_SCRIPT}"
+    # git tracks the job script as 0644 and only the workflow chmods it, so a
+    # submission from anywhere else would exec a non-executable file and die
+    # with 126 before writing a log. Every other call site already uses bash.
+    printf 'exec bash %q\n' "${JOB_SCRIPT}"
   } >> "${SUBMIT_SCRIPT}"
   chmod +x "${SUBMIT_SCRIPT}"
 }
@@ -550,8 +559,8 @@ if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" resolve \
     --run-dir "${SLURM_STATUS_DIR}" --job-id "${JOB_ID}" \
     --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" \
-    --scheduler-state "${SLURM_STATE}" --scheduler-exit-code "${SLURM_EXIT_CODE}" \
-    --scheduler-rc "${SLURM_JOB_RC}" --spur 1
+    --scheduler-state="${SLURM_STATE}" --scheduler-exit-code="${SLURM_EXIT_CODE}" \
+    --scheduler-rc="${SLURM_JOB_RC}" --spur 1
   SBATCH_RC=$?
   set -e
 fi

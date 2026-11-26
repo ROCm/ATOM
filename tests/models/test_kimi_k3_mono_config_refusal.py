@@ -19,7 +19,6 @@ import pytest
 from atom.models.kimi_k3.mono import config as k3_config
 from atom.models.kimi_k3.mono.config import (
     ATTN_RES_BLOCK,
-    BLOCKS,
     CONV_WIDTH,
     EXPERTS,
     HEAD_DIM,
@@ -33,6 +32,7 @@ from atom.models.kimi_k3.mono.config import (
     TOPK,
     config_refusal,
 )
+from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime import deployment
 
 
@@ -74,14 +74,13 @@ def _atom_config(**hf_overrides):
         enable_expert_parallel=False,
         decode_context_parallel_size=1,
         prefill_context_parallel_size=1,
+        is_multinode_tp=False,
         enable_tbo=False,
         enable_tbo_decode=False,
         kv_transfer_config=None,
         compilation_config=SimpleNamespace(
             level=3,
-            cudagraph_mode=SimpleNamespace(
-                requires_piecewise_compilation=lambda: False
-            ),
+            cudagraph_mode=SimpleNamespace(uses_tr_hybrid=lambda: False),
         ),
         speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=3),
     )
@@ -93,7 +92,7 @@ def servable(monkeypatch):
     `config_refusal` is reporting on the checkpoint and nothing else."""
     monkeypatch.setattr(deployment, "is_vllm", lambda: False)
     monkeypatch.setattr(deployment, "is_sglang", lambda: False)
-    monkeypatch.setattr(k3_config, "_cu_count", lambda: BLOCKS)
+    monkeypatch.setattr(deployment, "_cu_count", lambda: BLOCKS)
     monkeypatch.setattr(k3_config.envs, "ATOM_MONO_ENABLE", True)
     monkeypatch.setattr(k3_config.envs, "ATOM_GDN_SSM_DTYPE", "fp32")
     monkeypatch.setattr(k3_config.envs, "ATOM_ENABLE_REPLAYSSM", False)
@@ -103,6 +102,102 @@ def test_the_shipped_k3_router_is_served(servable):
     # sigmoid + renormalize -- so the two refusals below are latent today, and
     # this is the assertion that keeps them latent.
     assert config_refusal(_atom_config()) is None
+
+
+def test_a_deployment_without_a_drafter_is_served_as_plain_decode(
+    servable, monkeypatch
+):
+    # ReplaySSM only matters to a verify step's slot table; left at its
+    # default it must not turn a drafter-less deployment away
+    monkeypatch.setattr(k3_config.envs, "ATOM_ENABLE_REPLAYSSM", None)
+    atom_config = _atom_config()
+    atom_config.speculative_config = None
+    assert config_refusal(atom_config) is None
+
+
+def test_a_replayssm_deployment_is_served(servable, monkeypatch):
+    # K1 rebuilds a request's state from its checkpoint and records
+    # (``KdaPreBuild.replay_cap``) rather than reading per-token snapshots
+    monkeypatch.setattr(k3_config.envs, "ATOM_ENABLE_REPLAYSSM", True)
+    assert config_refusal(_atom_config()) is None
+
+
+def test_decode_context_parallelism_is_served(servable):
+    # the kernels run no attention: the MLA layers keep the KV split
+    atom_config = _atom_config()
+    atom_config.decode_context_parallel_size = 8
+    assert config_refusal(atom_config) is None
+
+
+@pytest.mark.parametrize("connector", ["lmcache_mp", "lmcache_offload", "multi"])
+def test_lmcache_mp_can_run_beside_k3_and_shared_dsa_mono(servable, connector):
+    from atom.mono.dsa_indexer.dispatch import config_refusal as dsa_refusal
+
+    atom_config = _atom_config()
+    atom_config.kv_transfer_config = {"kv_connector": connector}
+    expected = None if connector == "lmcache_mp" else f"KV connector {connector}"
+    assert config_refusal(atom_config) == expected
+    assert dsa_refusal(atom_config) == expected
+
+
+def test_other_mono_models_still_refuse_decode_context_parallelism(servable):
+    from atom.models.kimi_k3.mono.config import SUPPORTED_TP, Dims
+
+    atom_config = _atom_config()
+    atom_config.decode_context_parallel_size = 8
+    checks = deployment.common_refusals(atom_config, Dims, SUPPORTED_TP)
+    assert deployment.first_refusal(checks) == "decode CP"
+
+
+_MOONCAKE_DECODE = {"kv_role": "kv_consumer", "kv_connector": "mooncake"}
+
+
+def _with_transport(kv_transfer_config):
+    cfg = _atom_config()
+    cfg.kv_transfer_config = kv_transfer_config
+    return cfg
+
+
+@pytest.mark.parametrize("name", ["mooncake", "Mooncake", " mooncake "])
+def test_a_mooncake_pd_decode_is_served(servable, name):
+    # its receives are NIC writes; it queues no copy kernel beside mono's
+    decode = dict(_MOONCAKE_DECODE, kv_connector=name)
+    assert config_refusal(_with_transport(decode)) is None
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        {"kv_role": "kv_producer", "kv_connector": "mooncake"},
+        {"kv_role": "kv_consumer", "kv_connector": "moriio"},
+        {"kv_connector": "lmcache_offload"},
+        {
+            "kv_role": "kv_consumer",
+            "kv_connector": "multi",
+            "connectors": [dict(_MOONCAKE_DECODE), {"kv_connector": "lmcache_offload"}],
+        },
+    ],
+    ids=["mooncake-producer", "moriio-consumer", "offload", "mooncake-plus-offload"],
+)
+def test_a_transport_that_may_copy_on_its_own_stream_is_refused(
+    servable, kv_transfer_config
+):
+    assert (
+        config_refusal(_with_transport(kv_transfer_config))
+        == f"KV connector {kv_transfer_config['kv_connector']}"
+    )
+
+
+def test_a_mooncake_pd_decode_with_decode_context_parallelism_is_refused(servable):
+    # mono serves decode CP on its own, but never behind a connector
+    atom_config = _with_transport(dict(_MOONCAKE_DECODE))
+    atom_config.decode_context_parallel_size = 8
+    assert config_refusal(atom_config) == "KV connector mooncake"
+
+
+def test_other_mono_models_still_refuse_a_mooncake_pd_decode(servable):
+    checks = deployment.resident_grid_refusals(_with_transport(dict(_MOONCAKE_DECODE)))
+    assert deployment.first_refusal(checks) == "KV connector mooncake"
 
 
 @pytest.mark.parametrize(
@@ -116,3 +211,74 @@ def test_a_router_the_route_stage_does_not_implement_is_refused(
     servable, override, reason
 ):
     assert reason in config_refusal(_atom_config(**override))
+
+
+@pytest.mark.parametrize(
+    ("draft_tokens", "refused"),
+    [
+        (7, False),  # 8 tokens a request
+        (15, False),  # 16 tokens a request: the widest query K1 tiles for
+        (16, True),  # 17 tokens a request
+    ],
+)
+def test_the_query_cap_bounds_the_speculative_width(servable, draft_tokens, refused):
+    assert k3_config.MAX_QLEN == 16
+    atom_config = _atom_config()
+    atom_config.speculative_config = SimpleNamespace(
+        method="dspark", num_speculative_tokens=draft_tokens
+    )
+    assert (config_refusal(atom_config) is not None) is refused
+
+
+@pytest.mark.parametrize("arch", ["K3DSparkGQAModel", "K3DSparkModel"])
+def test_both_k3_drafts_are_served(servable, arch):
+    # Mono hands the drafter's own extract the step's bank, so the DSpark GQA
+    # draft's aggregate tap is formed on a mono step as on the regular path.
+    atom_config = _atom_config()
+    atom_config.speculative_config = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=5,
+        draft_model_hf_config=SimpleNamespace(architectures=[arch]),
+    )
+    assert config_refusal(atom_config) is None
+
+
+def test_installer_keeps_a_model_without_a_layer_stack_on_native(monkeypatch, caplog):
+    import logging
+    import sys
+
+    from torch import nn
+
+    from atom.models.kimi_k3.mono import dispatch
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("a model without a layer stack must not prepare or route indexers")
+
+    monkeypatch.setattr(dispatch, "config_refusal", lambda config: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.mono.dsa_indexer.bind",
+        SimpleNamespace(
+            indexer_modules=unexpected,
+            prepare_weights=unexpected,
+            routing_refusal=unexpected,
+        ),
+    )
+    model = nn.Module()
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert dispatch.install_mono_decode(model, _atom_config(), None) is model
+    assert "model has no layer stack" in caplog.text
+    assert "armed" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("ssm", "refused"), [("fp32", False), ("fp16", False), ("bf16", True)]
+)
+def test_the_recurrent_state_dtype_gate(servable, monkeypatch, ssm, refused):
+    # K1 reads the pool in place as fp32 or fp16; a bf16 one would be
+    # reinterpreted rather than converted
+    monkeypatch.setattr(k3_config.envs, "ATOM_GDN_SSM_DTYPE", ssm)
+    reason = config_refusal(_atom_config())
+    assert (reason is not None) is refused
+    if refused:
+        assert f"ATOM_GDN_SSM_DTYPE={ssm}" in reason

@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
+from conftest import with_min_load
+
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     KVConnectorOutput,
@@ -37,6 +39,7 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
 )
 from atom.model_engine.sequence import Sequence
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 
 CHUNK = 8
 REPLAY = 6
@@ -144,14 +147,18 @@ def _scheduler(monkeypatch, *, chunks, replay=REPLAY, min_load=0):
         return adapter
 
     monkeypatch.setattr(mp_scheduler, "_make_scheduler_adapter", connect)
-    config = SimpleNamespace(
-        kv_cache_block_size=4,
-        kv_transfer_config={
-            "kv_role": "offload",
-            "kv_connector_extra_config": {"lmcache.chunk_size": CHUNK},
-        },
-        parallel_config=SimpleNamespace(data_parallel_rank=0),
-        state_replay_tokens=replay,  # what `Config.__post_init__` sets
+    config = with_min_load(
+        SimpleNamespace(
+            kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+            dcp_config=SimpleNamespace(interleave_size=1),
+            kv_transfer_config={
+                "kv_role": "offload",
+                "kv_connector_extra_config": {"lmcache.chunk_size": CHUNK},
+            },
+            parallel_config=SimpleNamespace(data_parallel_rank=0),
+            state_replay_tokens=replay,  # what `Config.__post_init__` sets
+        )
     )
     scheduler = NativeStateLMCacheMPConnectorScheduler(config)
     checkpoints = PagedStateCheckpointCoordinator(
@@ -400,7 +407,7 @@ def test_a_page_only_save_stores_page_alone_with_no_checkpoint(monkeypatch):
     assert request.native_state.kv_only
     assert request.native_state.unit_ids == ()
     assert request.native_state.boundary_tokens == 32
-    assert request.token_ids == list(seq.token_ids[:32])
+    assert _shipped_tokens(request) == list(seq.token_ids[:32])
     assert request.save_spec.skip_leading_tokens == 0
     assert checkpoints.store.pool.num_free == free
     operation = request.save_operation

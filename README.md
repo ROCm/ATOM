@@ -13,6 +13,8 @@
 
 ## 📢 News
 
+- **[2026/11] Featured ROCm Blog:** [FlyDSL Mono Kernels for High-Interactivity LLM Serving in ATOM](https://rocm.blogs.amd.com/software-tools-optimization/flydsl-mono-atom/README.html) shows how ATOM brings FlyDSL mono kernels into decode for GLM-5.2, Kimi-K3, DeepSeek-V4.1, and MiniMax-M3, fusing a layer's stages so weight loads, ready outputs, and reductions overlap. On MI355X, MiniMax-M3 at TP4 and batch 1 moves from 11.47 ms per decode step with separate kernels to 7.00 ms with FlyDSL Mono (1.64x), and to 6.26 ms with indexer context parallelism (1.83x); DeepSeek-V4.1-Flash in vLLM at TP2 and concurrency 1 raises 90th-percentile interactivity from 318.1 to 429.1 tokens/s/user (1.35x). See [shared FlyDSL mono decode](atom/mono/).
+- **[2026/11] Featured KVCache.AI Blog:** [ATOM Meets Mooncake: A Shared KV Pool for Agentic Serving on AMD Instinct GPUs](https://kvcache.ai/blog/atom-meets-mooncake/) shows how ATOM, serving agentic workloads with P/D disaggregation, pools the prefill and decode sides' host memory into one KV pool with Mooncake Store. On one 8x MI355X server ATOM serves around a hundred concurrent agent sessions at about 44K tokens/s per GPU and reuses over 95% of prompt tokens; on four MI350X servers at NeuroSpark AI, one shared pool reaches up to about 2x the throughput of per-server pools. See [Mooncake Store offload](atom/kv_transfer/offload/README.md#mooncake-store-offload-without-lmcache-mooncake_store).
 - **[2026/08]** ATOM now supports **Qwen3.8** (`Qwen3_5MoeForCausalLM`, text-only MoE). The [amd/Qwen3.8-2.4T-A95B-Quark-MXFP4](https://huggingface.co/amd/Qwen3.8-2.4T-A95B-Quark-MXFP4) checkpoint, whose MoE (expert) weights are quantized to MXFP4, runs directly on a single 8-rank MI355 machine.
 - **[2026/07] Featured AMD Developer Article:** [Day 0 Kimi-K3 Inference Deployment with ATOM on AMD Instinct MI355X GPUs](https://www.amd.com/en/developer/resources/technical-articles/2026/kimi-k3-on-amd-instinct-gpus.html) walks through Day 0 deployment of the 2.78T-parameter Kimi-K3 (KDA + Gated MLA) on a single 8x MI355X node with TP8 — why the ~1.56 TB checkpoint fits, how the weights are distributed under TP8, and how to bring the model up with ATOM and run a minimal correctness check. See [Kimi-K3 recipe](recipes/Kimi-K3.md).
 - **[2026/07]** ATOM now supports **DeepSeek-V4-Pro DSpark** speculative decoding — a semi-autoregressive block drafter (parallel backbone + Markov head + confidence head) with confidence-scheduled ragged verification, FP8 KV cache, DP attention, and PIECEWISE CUDA graphs. See [DSpark recipe](recipes/DSpark.md).
@@ -261,11 +263,12 @@ lm_eval --model local-completions \
 | Compilation | torch.compile levels, CUDA graphs, piecewise compilation | [Compilation Guide](docs/compilation_cudagraph_guide.md) |
 | Distributed | Tensor/data/expert parallelism, multi-GPU deployment | [Distributed Guide](docs/distributed_guide.md) |
 | Serving & Benchmarks | OpenAI API server, benchmarking, profiling, speculative decoding | [Serving Guide](docs/serving_benchmarking_guide.md) |
+| Observability (experimental) | Opt-in request tracing, configuration and test tools | [OpenTelemetry Guide](docs/observability/README.md) |
 | Environment Variables | All `ATOM_*` variable definitions | [Env Vars](docs/environment_variables.md) |
 
 **Deployment Recipes:**
 
-- [DeepSeek-V4.1-Flash AgentX](recipes/DeepSeek-V4.1-Flash-Agentic.md) — TP2/TP4, no EP, DSpark5, fixed AL=3.51 benchmark commands and measured operating points
+- [DeepSeek-V4.1-Flash AgentX](recipes/DeepSeek-V4.1-Flash-Agentic.md) — per-concurrency TP2/TP4/DTP2/DEP2 settings, DSpark5, fixed AL=3.51 benchmark commands matching the InferenceX config
 - [DeepSeek-R1](recipes/DeepSeek-R1.md) — FP8/MXFP4 with MTP speculative decoding on 8 GPUs
 - [Qwen3-235B-A22B](recipes/Qwen3-235b.md) — TP8 + EP with FP8 KV cache
 - [Qwen3-Next](recipes/Qwen3-Next.md) — Hybrid GDN + MoE architecture

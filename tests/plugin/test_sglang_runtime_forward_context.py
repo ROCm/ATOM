@@ -129,7 +129,7 @@ def test_dp_token_counts_materialize_every_idle_rank():
     atom_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4))
     forward_batch = SimpleNamespace(global_num_tokens_cpu=[0, 3, 0, 2])
 
-    token_counts = module._resolve_num_tokens_across_dp(
+    token_counts = module._resolve_running_tokens_per_dp_rank(
         atom_config, forward_batch, num_tokens=1
     )
 

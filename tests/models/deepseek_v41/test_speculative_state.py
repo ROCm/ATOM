@@ -15,7 +15,7 @@ from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
 
 
 def encoded_rows(positions, layer, geometry, device):
-    width = geometry.window_row_bytes if geometry.packed else geometry.head_dim
+    width = geometry.head_dim
     values = (
         torch.as_tensor(positions, device=device)[:, None]
         + layer * 71
@@ -36,13 +36,18 @@ def write_window(cache, layer, step, rows):
             positions = (
                 torch.arange(span.position, span.end) % cache.geometry.ring_slots
             )
-            cache.state.view("window")[layer, span.slot, positions] = rows[
-                span.token_slice
-            ]
+            cache.window_view(layer)[span.slot, positions] = rows[span.token_slice]
     elif cache.packed:
         dim = cache.geometry.head_dim
         cache.write_window(
-            layer, (rows[:, :dim].contiguous(), rows[:, dim:].contiguous()), step
+            layer,
+            (
+                rows.contiguous(),
+                torch.zeros(
+                    (rows.shape[0], dim // 32), dtype=torch.uint8, device=rows.device
+                ),
+            ),
+            step,
         )
     else:
         cache.write_window(layer, rows.unsqueeze(0), step)
@@ -64,7 +69,7 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
         128,
         128,
         32,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         speculative_tokens=5,
         # The only class the window-only specs below ask for.
         layer_ratios=(0,),
@@ -82,10 +87,10 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
             max(0, span.position - geometry.ring_slots), span.position, device=device
         )
         for layer in range(2):
-            cache.state.view("window")[layer, span.slot, kept % geometry.ring_slots] = (
+            cache.window_view(layer)[span.slot, kept % geometry.ring_slots] = (
                 encoded_rows(kept, layer, geometry, device)
             )
-    untouched = cache.state_bytes[0].clone()
+    untouched = torch.cat(cache.state_views(0)).clone()
     old_cursors = cache.cursor.clone()
     step = begin_step(cache, spans, tentative=True)
     cache.prepare_state(step)
@@ -107,14 +112,14 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
     with pytest.raises(RuntimeError, match="Commit the accepted prefix"):
         copies.entry(4)
     cache.commit_tentative(step, anchors(step, accepted_lengths))
-    assert torch.equal(cache.state_bytes[0], untouched)
+    assert torch.equal(torch.cat(cache.state_views(0)), untouched)
     for i, (span, count) in enumerate(zip(spans, accepted_lengths)):
         end = span.position + count
         assert cache.cursor[span.slot].tolist() == [end] + expected_histories[i]
         positions = torch.arange(max(0, end - geometry.window_size), end, device=device)
         for layer in range(2):
-            actual = cache.state.view("window")[
-                layer, span.slot, positions % geometry.ring_slots
+            actual = cache.window_view(layer)[
+                span.slot, positions % geometry.ring_slots
             ]
             assert torch.equal(actual, encoded_rows(positions, layer, geometry, device))
     # Reorder requests after acceptance. Addressing must use each noncontiguous
@@ -263,10 +268,11 @@ def test_a_rejected_round_leaves_the_next_one_as_if_it_never_drafted(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("packed", [False, True])
-def test_block_context_read_decodes_only_the_selected_request_windows(packed):
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp4", "fp8"])
+def test_block_context_read_decodes_only_the_selected_request_windows(kv_dtype):
     from atom.model_ops.blockscale import quantize_fp8
 
+    packed = kv_dtype != "bf16"  # an FP8 window
     geometry = V41PoolGeometry(
         2,
         ((0, 2),),
@@ -274,7 +280,7 @@ def test_block_context_read_decodes_only_the_selected_request_windows(packed):
         128,
         512,
         32,
-        packed=packed,
+        kv_dtype=kv_dtype,
         speculative_tokens=5,
         layer_ratios=(0,),
     )
@@ -292,19 +298,29 @@ def test_block_context_read_decodes_only_the_selected_request_windows(packed):
         1, quantize_fp8(values) if packed else expected_rows.unsqueeze(0), step
     )
     cache.advance_cursor(step, [[1, 2, 3], [4, 5, 6]])
-    actual = cache.read_window(1, torch.tensor([1, 3, 1], device="cuda"))
+    slots = torch.tensor([1, 3, 1], device="cuda")
+    actual = cache.read_window(1, slots)
     expected = torch.empty_like(actual)
     for i, span in enumerate((spans[1], spans[0], spans[1])):
         for p in range(span.end - geometry.ring_slots, span.end):
             expected[i, p % geometry.ring_slots] = expected_rows[span.offset + p]
     assert torch.equal(actual, expected)
 
+    # every stage in one read, as the draft graph captures it
+    layers = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+    cache.read_windows(layers, slots)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        windows = cache.read_windows(layers, slots)
+    graph.replay()
+    assert torch.equal(windows[0], actual)
+    assert torch.equal(windows[1], cache.read_window(0, slots))
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("packed", [False, True])
 def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
     from atom.model_ops.attentions.deepseek_v41.packed_attention import packed_decode
-    from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
     from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 
@@ -316,7 +332,7 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
         4,
         512,
         32,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         speculative_tokens=5,
         layer_ratios=(0,),
     )
@@ -324,8 +340,11 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
     raw = torch.randn(13, 512, device="cuda", dtype=torch.bfloat16)
     quantized = quantize_fp8(raw)
     keys = quantize_fp8(raw, dequantize=True)
-    stored = pack_rows(*quantized) if packed else keys
-    cache.state.view("window")[0, 0, :7] = stored[:7]
+    if packed:
+        cache.window_view(0)[0, :7] = quantized[0][:7].view(torch.uint8)
+        cache.ring_view(0)[1][:7] = quantized[1][:7].view(torch.uint8)
+    else:
+        cache.window_view(0)[0, :7] = keys[:7]
     cache.cursor[0, 0] = 7
     step = begin_step(cache, (PagedRequest(1, 7, 0, 6, 0, (0,)),), tentative=True)
     cache.prepare_state(step)
@@ -342,7 +361,14 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
 
     def function(query, pool, indices, ptr, sink, scale):
         if packed:
-            return packed_decode(query, pool, indices, ptr, sink, scale)
+            return packed_decode(
+                query,
+                (cache.main_view(None), cache.ring_view(0)),
+                indices,
+                ptr,
+                sink,
+                scale,
+            )
         ring = cache.ring_view(0)
         return sparse_attn_v4_paged_2src(
             query, pool, indices, ptr, ring, window, wptr, sink, scale
@@ -359,7 +385,7 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
     assert (output.float() - expected).norm() / expected.norm() < 0.004
     # All rows were physically written; the final future row still cannot
     # affect any preceding query's attention result.
-    cache.state.view("window")[0, 0, 12 % geometry.ring_slots].zero_()
+    cache.window_view(0)[0, 12 % geometry.ring_slots].zero_()
     changed = function(query, cache.pool, indices, ptr, sink, 512**-0.5)
     assert torch.equal(changed[:-1], output[:-1])
     assert not torch.equal(changed[-1], output[-1])

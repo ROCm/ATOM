@@ -10,6 +10,9 @@ from atom.plugin.sglang.patches.prefill_compile_only_patch import (
 from atom.plugin.sglang.patches.triton_kernel_retention_patch import (
     apply_triton_kernel_retention_patch,
 )
+from atom.plugin.sglang.patches.xgrammar_hip_bitmask_patch import (
+    apply_xgrammar_hip_bitmask_patch,
+)
 
 logger = logging.getLogger("atom.plugin.sglang.register")
 
@@ -145,6 +148,34 @@ def _install_decode_graph_forward_context_patch() -> None:
             return original_capture_one_shape(self, *args, **kwargs)
 
     DecodeCudaGraphRunner.capture_one_shape = capture_one_shape_with_forward_context
+
+    # Post-replay mamba track epilogue for Native GDN. Community bakes the
+    # decode track inside the graph; ``_track_mamba_radix_slots`` skips capture,
+    # so for a replayed decode this epilogue is the only snapshot writer. A
+    # failure propagates: a track slot left unwritten would be offered to later
+    # prefix hits as if it held this request's state.
+    if not getattr(DecodeCudaGraphRunner, "_atom_mamba_track_epilogue", False):
+        original_execute = DecodeCudaGraphRunner.execute
+
+        def execute_with_mamba_track_epilogue(self, forward_batch, *args, **kwargs):
+            output = original_execute(self, forward_batch, *args, **kwargs)
+            from atom.plugin.sglang.attention_backend.attention_gdn import (
+                track_mamba_radix_after_decode_graph,
+            )
+
+            track_mamba_radix_after_decode_graph(
+                forward_batch,
+                attn_backend=self.model_runner.attn_backend,
+            )
+            return output
+
+        DecodeCudaGraphRunner.execute = execute_with_mamba_track_epilogue
+        DecodeCudaGraphRunner._atom_mamba_track_epilogue = True
+        logger.info(
+            "Installed Native GDN post-replay mamba track epilogue on "
+            "DecodeCudaGraphRunner.execute"
+        )
+
     DecodeCudaGraphRunner._atom_forward_context_patched = True
 
 
@@ -219,8 +250,16 @@ def register_plugin() -> None:
     _install_loader_quant_patch()
     _register_tc_piecewise_attention_split_ops()
     _install_decode_graph_forward_context_patch()
+    # Before SGLang resolves its server args: whether a DeepSeek-V4.1 launch
+    # ATOM serves keeps SGLang's radix cache on.
+    from atom.plugin.sglang.deepseek_v41_radix import (
+        register_v41_radix_launch_policy,
+    )
+
+    register_v41_radix_launch_policy()
     apply_prefill_compile_only_patch()
     apply_triton_kernel_retention_patch()
+    apply_xgrammar_hip_bitmask_patch()
     from atom.plugin.sglang.attention_backend.gdn_replayssm import (
         install_sglang_replayssm_commit,
     )
@@ -234,8 +273,9 @@ def register_plugin() -> None:
     # 0.5.20 recognizes Flash. This call only installs MTP draft-arch and
     # HC hidden-width adapters that upstream still does not provide.
     apply_qwen4_exp_recognition_patch()
-    # EP decode asm MoE and HIP topk=1 Triton tree/verify. Plugin-only;
-    # keeps Ling's Flash MTP adapter off atom/model_ops and eagle3_llama.
+    # HIP topk=1 Triton tree/verify and the gfx950 BF16 hipBLASLt bypass.
+    # Plugin-only; keeps Ling's Flash MTP adapter off atom/model_ops and
+    # eagle3_llama.
     apply_qwen4_exp_rocm_patch()
     _keep_atom_full_attn_for_native_qwen4_exp()
     install_sglang_replayssm_commit()

@@ -9,6 +9,8 @@ and which bands the plane so that this kernel's `row * stride` stays inside
 int32.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -116,15 +118,27 @@ def restrict_to_candidates_reference(logits, candidates, visible, block_size, ti
     )
 
 
+@functools.cache
+def _gfx1250():
+    """gfx1250 takes the wider maxima grid and the 128-wide candidate tile;
+    other archs keep the values they were tuned with."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx1250"
+
+
 def _maxima_lanes(rows):
-    """Programs per row for `_block_maxima_kernel`, about 2048 in the grid.
+    """Programs per row for `_block_maxima_kernel`, about 2048 in the grid
+    (16384 on gfx1250).
 
     A tile is one load and one max, so extra lanes have little latency to hide
     and an idle one is pure launch cost: the grid wants to fill the machine
     once and no more. Within about 10% of the best lane count from 6 to 8191
-    rows and 2k to 256k context.
+    rows and 2k to 256k context. gfx1250 needs more programs in flight to keep
+    its loads coming, so its grid is wider.
     """
-    return min(256, max(1, 2048 // max(rows, 1)))
+    target = 16384 if _gfx1250() else 2048
+    return min(256, max(1, target // max(rows, 1)))
 
 
 @triton.jit(do_not_specialize=["lanes"])
@@ -186,7 +200,7 @@ def _block_maxima_kernel(
         tl.store(ends + row, last)
 
 
-def pick_candidate_blocks(logits, visible, block_size, out, tile=64):
+def pick_candidate_blocks(logits, visible, block_size, out, tile=None):
     """Write the best blocks per row into `out`, ascending, `-1` padded.
 
     `out` is as wide as the count to keep. A block's score is its best visible
@@ -222,7 +236,7 @@ def pick_candidate_blocks_packed(
     block_size,
     out,
     plane_width,
-    tile=64,
+    tile=None,
 ):
     """`pick_candidate_blocks` on packed logits (`ScoreWorkspace`): row r's at
     `offsets[r]` of the flat `logits`, its block maxima to `block_offsets[r]`
@@ -258,6 +272,8 @@ def pick_candidate_blocks_packed(
 def _block_maxima(logits, visible, maxima, block_size, blocks, tile, packed=None):
     """`_block_maxima_kernel` over a plane, or packed rows (`packed`: their
     logits and maxima starts); each row's block count."""
+    if tile is None:
+        tile = 128 if _gfx1250() else 64
     rows = visible.shape[0]
     ends = torch.empty(rows, dtype=torch.int32, device=visible.device)
     lanes = min(_maxima_lanes(rows), triton.cdiv(blocks, tile))

@@ -1864,7 +1864,7 @@ def rtp_sparse_attn_indexer(
         )
         return
 
-    from atom.models.deepseek_v2 import sparse_attn_indexer
+    from atom.model_ops.indexer.indexer_forward import sparse_attn_indexer
 
     sparse_attn_indexer(
         hidden_states,

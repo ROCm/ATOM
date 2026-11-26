@@ -38,8 +38,9 @@ export AITER_LOG_LEVEL=WARNING
 # are satisfied.
 export ATOM_AITER_FP8_PREFILL_ATTN=1
 
-# Keep tc_piecewise FX/Inductor compilation while executing prefill without
-# per-bucket CUDA Graph capture, token padding, or static input staging.
+# SGLang 0.5.22 launches prefill as breakable. This flag rewrites that backend
+# to the internal piecewise Inductor compiler and skips per-bucket CUDA Graph
+# capture, token padding, and static input staging.
 export ATOM_SGLANG_PREFILL_COMPILE_ONLY=1
 
 export TORCHINDUCTOR_COMPILE_THREADS=128
@@ -61,10 +62,9 @@ python3 -m sglang.launch_server \
     --reasoning-parser qwen3 \
     --enable-torch-compile \
     --torch-compile-max-bs 64 \
-    --cuda-graph-backend-prefill tc_piecewise \
+    --cuda-graph-backend-prefill breakable \
     --cuda-graph-max-bs-prefill 16384 \
     --cuda-graph-bs-prefill 8192 16384 \
-    --cuda-graph-tc-compiler inductor \
     2>&1 | tee qwen38-2.4t-tp8-sglang-server.log
 ```
 
@@ -72,9 +72,10 @@ SGLang continues to own request scheduling and KV/Mamba pool allocation. The
 ATOM plugin binds those pools as zero-copy Native ATOM cache views and executes
 full MHA and GDN with ATOM attention implementations.
 
-`ATOM_SGLANG_PREFILL_COMPILE_ONLY=1` is optional. Set it to `0` to use the real
-prefill tc_piecewise CUDA Graph path; that path uses graph-stable mutable
-attention outputs between captured segments.
+`ATOM_SGLANG_PREFILL_COMPILE_ONLY=1` is optional. Set it to `0` to keep the
+breakable prefill CUDA graph path. When it is `1`, the plugin rewrites the
+published prefill backend to the internal piecewise Inductor compiler and
+skips graph capture.
 
 Prefix caching and speculative decoding are not validated for this
 configuration and should remain disabled.
@@ -165,5 +166,5 @@ python -m atom.benchmarks.benchmark_serving \
 - FP8 KV cache with 16-token pages.
 - Native ATOM MHA and GDN under the SGLang scheduler.
 - Full decode CUDA Graph with Torch Compile coverage through batch size 64.
-- tc_piecewise Inductor prefill, optionally executed in compile-only mode.
+- Piecewise Inductor prefill, launched as breakable and optionally executed in compile-only mode.
 - Radix/prefix cache and speculative decoding disabled.

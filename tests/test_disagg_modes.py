@@ -352,3 +352,44 @@ def test_prefill_only_window_still_reports_its_queues():
     metrics = _aggregate(_snapshot("prefill", running=6, waiting=2))
     assert metrics["requests_running"] == 6
     assert metrics["requests_waiting"] == 2
+
+
+@pytest.mark.parametrize(
+    "base, override, engine, scheduler",
+    [(1, 1, 2, 1), (1, 4, 4, None), (8, 1, 2, 1), (8, 4, 4, None)],
+)
+def test_disagg_prefill_override_redoes_the_dspark_sizing(
+    base, override, engine, scheduler
+):
+    """`disagg_prefill_max_num_seqs` replaces max_num_seqs after the deepcopy;
+    the prefill process must get its own DSpark sizing (and not inherit the
+    decode side's admission cap)."""
+    from types import SimpleNamespace
+
+    from atom.config import Config
+    from atom.model_engine.engine_core_mgr import _apply_prefill_max_num_seqs
+
+    spec = SimpleNamespace(use_dspark=lambda: True)
+    cfg = SimpleNamespace(
+        max_num_seqs=base,
+        scheduler_max_num_seqs=None,
+        speculative_config=spec,
+    )
+    cfg._size_engine_for_dspark_drafter = (
+        lambda: Config._size_engine_for_dspark_drafter(cfg)
+    )
+    cfg.max_num_seqs, cfg.scheduler_max_num_seqs = (2, 1) if base == 1 else (base, None)
+    _apply_prefill_max_num_seqs(cfg, override)
+    assert (cfg.max_num_seqs, cfg.scheduler_max_num_seqs) == (engine, scheduler)
+
+
+def test_disagg_prefill_override_without_dspark_is_plain():
+    from types import SimpleNamespace
+
+    from atom.model_engine.engine_core_mgr import _apply_prefill_max_num_seqs
+
+    cfg = SimpleNamespace(
+        max_num_seqs=8, scheduler_max_num_seqs=None, speculative_config=None
+    )
+    _apply_prefill_max_num_seqs(cfg, 1)
+    assert (cfg.max_num_seqs, cfg.scheduler_max_num_seqs) == (1, None)

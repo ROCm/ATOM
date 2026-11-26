@@ -138,6 +138,8 @@ class DenseKVByteCodec:
                 # `build_page_namespace` has no segment order in it to notice --
                 # so a reorder has to bump `PAGE_LAYOUT_VERSION`.
                 getattr(kvt, "index_scale", None),
+                # Same rule: new tails, never a reorder.
+                *(plane for _, plane in kvt.extra_planes),
             ):
                 if t is not None and isinstance(t, torch.Tensor) and t.numel() > 0:
                     self._segments.append(t)
@@ -199,6 +201,9 @@ class DenseKVByteCodec:
     @property
     def has_fused_chunk_major_staging(self) -> bool:
         return self._fused_kv_staging is not None
+
+    # A Store slot run is restored through the contiguous view only.
+    supports_strided_restore = False
 
     # -- helpers ----------------------------------------------------------
     def _device_ctx(self):

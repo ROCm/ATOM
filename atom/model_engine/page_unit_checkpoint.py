@@ -8,12 +8,14 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict, deque
 from collections.abc import Hashable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import monotonic
 
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.state_cache import KEEP_SETTLED, KEEP_SNAPSHOT
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_entry_bytes
 
 _CHANGE_LOG_LIMIT = 4096
 
@@ -43,6 +45,14 @@ class PagedStateCheckpointSpec:
     # geometry cross-check in `allocate_per_req_cache`, and the startup log
     # line that reports an image as a fraction of one.
     image_bytes: int
+    # Pipeline stages hold images of different sizes in units of different
+    # sizes, yet one scheduler hands every stage the same unit ids. These are
+    # what the stages agreed on: the largest unit count any stage needs and
+    # the bytes an op names (every stage's image, summed), which also splits
+    # the stages' CPU state budget. 0 outside PP, where the image alone
+    # decides both. `layout_id` is then the stages' joint id.
+    pipeline_units: int = 0
+    pipeline_op_bytes: int = 0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -59,35 +69,106 @@ class PagedStateCheckpointSpec:
             )
         if not isinstance(self.layout_id, str) or not self.layout_id:
             raise ValueError("paged state checkpoints need a non-empty layout id")
+        for name, value in (
+            ("pipeline_units", self.pipeline_units),
+            ("pipeline_op_bytes", self.pipeline_op_bytes),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if bool(self.pipeline_units) != bool(self.pipeline_op_bytes):
+            raise ValueError("pipeline_units and pipeline_op_bytes are agreed together")
+        if self.pipeline_units and self.pipeline_units < self._own_units:
+            raise ValueError(
+                f"the stages agreed on {self.pipeline_units} units but this "
+                f"image needs {self._own_units}"
+            )
+        if self.pipeline_op_bytes and self.pipeline_op_bytes < self.image_bytes:
+            raise ValueError(
+                f"pipeline_op_bytes {self.pipeline_op_bytes} is less than this "
+                f"stage's own {self.image_bytes} B image"
+            )
+
+    @property
+    def _own_units(self) -> int:
+        return (self.image_bytes + self.page_unit_bytes - 1) // self.page_unit_bytes
 
     @property
     def units_per_checkpoint(self) -> int:
-        return (self.image_bytes + self.page_unit_bytes - 1) // self.page_unit_bytes
+        return self.pipeline_units or self._own_units
+
+    @property
+    def op_bytes(self) -> int:
+        """The `total_bytes` a store or restore op names for one image."""
+        return self.pipeline_op_bytes or self.image_bytes
+
+    def for_pipeline(
+        self, layout_id: str, units: int, op_bytes: int
+    ) -> PagedStateCheckpointSpec:
+        """This stage's spec under the geometry every stage agreed on."""
+        return replace(
+            self, layout_id=layout_id, pipeline_units=units, pipeline_op_bytes=op_bytes
+        )
 
     def to_wire(self) -> dict[str, int | str]:
-        return {
+        wire: dict[str, int | str] = {
             "page_unit_bytes": self.page_unit_bytes,
             "slot_bytes": self.slot_bytes,
             "image_bytes": self.image_bytes,
             "layout_id": self.layout_id,
         }
+        # Only when set: the wire form names the LMCache MP namespace, which
+        # must not move for a run that is not pipelined.
+        if self.pipeline_units:
+            wire["pipeline_units"] = self.pipeline_units
+            wire["pipeline_op_bytes"] = self.pipeline_op_bytes
+        return wire
 
     @classmethod
     def from_wire(cls, wire: object) -> PagedStateCheckpointSpec:
         if not isinstance(wire, Mapping):
             raise TypeError("paged state checkpoint spec must be a mapping")
         expected = {"page_unit_bytes", "slot_bytes", "image_bytes", "layout_id"}
-        if set(wire) != expected:
+        pipelined = expected | {"pipeline_units", "pipeline_op_bytes"}
+        if set(wire) not in (expected, pipelined):
             raise ValueError(
                 "invalid paged state checkpoint spec fields: "
-                f"expected={sorted(expected)}, got={sorted(wire)}"
+                f"expected={sorted(expected)} or {sorted(pipelined)}, "
+                f"got={sorted(wire)}"
             )
         return cls(
             page_unit_bytes=wire["page_unit_bytes"],  # type: ignore[arg-type]
             slot_bytes=wire["slot_bytes"],  # type: ignore[arg-type]
             image_bytes=wire["image_bytes"],  # type: ignore[arg-type]
             layout_id=wire["layout_id"],  # type: ignore[arg-type]
+            pipeline_units=wire.get("pipeline_units", 0),  # type: ignore[arg-type]
+            pipeline_op_bytes=wire.get("pipeline_op_bytes", 0),  # type: ignore[arg-type]
         )
+
+
+def published_page_unit_bytes(builder) -> int:
+    """Bytes of one PAGE unit a checkpoint transfer publishes for `builder`.
+
+    The state image lives in the target's own PAGE rows, so the unit is the
+    target builder's share of the paged class, not the merged entry: a draft
+    KV pool joined to the same class is ordinary KV after those rows. A
+    backend whose charged share exceeds what it publishes (alignment padding
+    that is not a region) narrows it with `checkpoint_page_unit_bytes()`;
+    `None` keeps the share.
+    """
+    unit = page_entry_bytes(builder.sub_pool_specs())
+    if unit <= 0:
+        raise RuntimeError(f"{type(builder).__name__} declares no PAGE bytes")
+    published_unit = getattr(builder, "checkpoint_page_unit_bytes", None)
+    published = published_unit() if callable(published_unit) else None
+    if published is None:
+        return unit
+    published = int(published)
+    if published <= 0 or published > unit:
+        raise RuntimeError(
+            f"checkpoint PAGE unit is {published} B but "
+            f"{type(builder).__name__} declares {unit} B per block"
+        )
+    return published
 
 
 def checkpoint_copy_ops_per_batch(max_num_seqs: int) -> int:
@@ -111,6 +192,12 @@ class CheckpointStoreOp:
     unit_ids: tuple[int, ...]
     total_bytes: int
     layout_id: str
+    # A decode boundary's verify step, the scratch slot the backend builds the
+    # image of that step in, and the slot a verify left that step's state in
+    # when it leaves one per step; -1 for a slot that already holds it whole.
+    step: int = -1
+    scratch_slot: int = -1
+    step_slot: int = -1
 
 
 @dataclass(frozen=True)
@@ -289,7 +376,7 @@ class PageUnitCheckpointStore:
         """Whether `count` units could be had, evicting if it came to that.
 
         Asked once per waiting sequence in `can_allocate` and once per running
-        one in `can_append`, so it is per-sequence per-pass and the walk has to
+        one in the decode append room check, so it is per-sequence per-pass and the walk has to
         be paid for. Two things keep it cheap. The free list is checked first,
         which is the whole answer whenever the pool is not tight. And the walk
         below stops at the shortfall rather than totalling the cache: the
@@ -374,7 +461,7 @@ class PageUnitCheckpointStore:
         return CheckpointStoreOp(
             src_slot=src_slot,
             unit_ids=record.unit_ids,
-            total_bytes=self.spec.image_bytes,
+            total_bytes=self.spec.op_bytes,
             layout_id=self.spec.layout_id,
         )
 
@@ -394,7 +481,7 @@ class PageUnitCheckpointStore:
         op = CheckpointRestoreOp(
             dst_slot=dst_slot,
             unit_ids=record.unit_ids,
-            total_bytes=self.spec.image_bytes,
+            total_bytes=self.spec.op_bytes,
             layout_id=self.spec.layout_id,
         )
         self._queued_restores.append((checkpoint_id, op))
@@ -531,8 +618,9 @@ class PageUnitCheckpointStore:
         READY and nowhere else: `begin_store` is too early (the scatter has not
         ridden a batch, so the units hold no image yet) and `_evict`/`unindex`
         are too late (they fire when the pool wants those units *now*). READY is
-        when the bytes first exist and when the record is least wanted -- it has
-        just entered the LRU at the cold end.
+        when the copy that writes the bytes has been issued -- not run, so the
+        store fences on it -- and when the record is least wanted: it has just
+        entered the LRU at the cold end.
 
         Nomination, not reservation: a queued candidate is unpinned, so
         `_next_victim` may still spend it. The pool never waits on the CPU tier.
@@ -925,9 +1013,11 @@ class PagedStateCheckpointCoordinator:
         enabled: bool,
         offload=None,
         readable_midstep: bool = False,
+        decode_keep: str = KEEP_SETTLED,
     ) -> None:
         self.enabled = enabled
         self.readable_midstep = bool(readable_midstep)
+        self.decode_keep = decode_keep
         # The state pool scratch slots are borrowed from, and how many stores
         # one batch's copy descriptor has room for. Set by
         # `attach_midstep_scratch`; a readable coordinator without them
@@ -952,7 +1042,12 @@ class PagedStateCheckpointCoordinator:
         # one overwrite the earlier before either was stored. Re-reaching the
         # *same* hash still collapses, which is what the hash in the key is
         # for -- that is one boundary reached twice, not two boundaries.
-        self._pending: dict[tuple[int, int], tuple[Sequence, int]] = {}
+        # `(seq, hash, step, forwards)`: `CheckpointStoreOp.step`, and the
+        # `Sequence.num_forwards` at which the slot holds the boundary.
+        self._pending: dict[tuple[int, int], tuple[Sequence, int, int, int]] = {}
+        # Boundaries whose forward is in the batch being built, held back from
+        # that batch's drain; see `checkpoint_when_scheduled`.
+        self._staged: dict[tuple[int, int], tuple[Sequence, int, int, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
         # External loads write temporary PAGE images before a runner gathers
         # them into an Active Slot. Owners include a transfer generation, so a
@@ -1072,12 +1167,18 @@ class PagedStateCheckpointCoordinator:
         `hashes` from its own stores but cannot load them back, and voting a hit
         it would then refuse strands the scan at the tier rung -- skipping a
         still-resident HBM rung -- and forfeits the checkpoint to a recompute.
+        A tier hit accepted here is a vote (`want_touch`).
         """
         if self.store.contains(h):
             return True
-        return self.offload is not None and self.offload.could_serve(h)
+        if self.offload is None or not self.offload.could_serve(h):
+            return False
+        self.offload.want_touch(h)
+        return True
 
-    def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
+    def checkpoint(
+        self, seq: Sequence, boundary_blocks: int, h: int, step: int = -1
+    ) -> None:
         """File a boundary to be stored, keyed by hash rather than by seq.
 
         Every boundary a seq reaches survives, not just its last: an anchor and
@@ -1112,7 +1213,21 @@ class PagedStateCheckpointCoordinator:
         del boundary_blocks
         if self.applies(seq) and seq.state_slot >= 0:
             self._supersede(id(seq))
-            self._pending[(id(seq), h)] = (seq, h)
+            self._pending[(id(seq), h)] = (seq, h, step, seq.num_forwards)
+
+    def checkpoint_when_scheduled(self, seq: Sequence, h: int) -> None:
+        """File a boundary whose forward is in the batch being built.
+
+        That batch's own drain must not take it: its copy runs before the
+        forward that fills the slot. Staged here, it becomes pending once the
+        drain has passed, so the *next* batch carries the copy -- after the
+        boundary's forward and before anything later, on every stage, since
+        each runs its batches in order. With several forwards in flight this is
+        the only point the slot is known to be read at the right moment: by
+        retire, the chunk after the boundary has been issued and written it.
+        """
+        if self.applies(seq) and seq.state_slot >= 0:
+            self._staged[(id(seq), h)] = (seq, h, -1, seq.num_forwards + 1)
 
     def _supersede(self, seq_id: int) -> None:
         """Drop this seq's earlier pending boundaries; the slot has moved on.
@@ -1133,8 +1248,9 @@ class PagedStateCheckpointCoordinator:
         that is about to go back on the free list, so all of them die with it.
         """
         seq_id = id(seq)
-        for key in [k for k in self._pending if k[0] == seq_id]:
-            del self._pending[key]
+        for filed in (self._pending, self._staged):
+            for key in [k for k in filed if k[0] == seq_id]:
+                del filed[key]
         self.store.cancel_queued_restore(seq.state_slot)
 
     def restore_queued_for(self, dst_slot: int) -> bool:
@@ -1152,17 +1268,33 @@ class PagedStateCheckpointCoordinator:
         self,
     ) -> tuple[tuple[CheckpointStoreOp, ...], tuple[CheckpointRestoreOp, ...]]:
         pending, self._pending = self._pending, {}
-        for seq, h in pending.values():
+        for seq, h, step, forwards in pending.values():
             # Safe to read now because `checkpoint` keeps at most one pending
             # boundary per seq: this slot holds the state as of that boundary
-            # and no other. See `_supersede`.
+            # (of its verify `step`, for a decode one) and no other. See
+            # `_supersede`.
             src_slot = seq.state_slot
             if src_slot < 0 or self.store.contains_or_pending(h):
+                continue
+            if seq.num_forwards != forwards:
+                # A forward was scheduled since: the slot has moved past it.
+                self.checkpoints_dropped += 1
+                continue
+            build = step >= 0 and self.decode_keep == KEEP_SNAPSHOT
+            if build and not self._scratch.has_free():
+                self.checkpoints_dropped += 1
                 continue
             op = self.store.begin_store(h, src_slot)
             if op is None:
                 self.checkpoints_dropped += 1
                 continue
+            if build:
+                scratch = self._scratch.pop()
+                self._scratch_issued.append(scratch)
+                # A slot per verify step, or one for all of them (ReplaySSM).
+                slots = seq.state_slots
+                step_slot = slots[step] if len(slots) > 1 else src_slot
+                op = replace(op, step=step, scratch_slot=scratch, step_slot=step_slot)
             self._store_ops.append(op)
             self.checkpoints_kept += 1
         restores = self.store.take_restore_ops()
@@ -1170,6 +1302,7 @@ class PagedStateCheckpointCoordinator:
             self._take_scratch_stores(
                 self._max_ops_per_batch - len(self._store_ops) - len(restores)
             )
+        self._pending, self._staged = self._staged, {}
         stores, self._store_ops = self._store_ops, []
         return tuple(stores), restores
 
@@ -1307,9 +1440,12 @@ class PagedStateCheckpointCoordinator:
         # `_pending` is keyed by `(seq, hash)`, so one hash can be pending for
         # several sequences at once -- two turns of a conversation reaching the
         # same boundary. All of them lose it together.
-        stale = [key for key, (_, pending_h) in self._pending.items() if pending_h == h]
-        for key in stale:
-            del self._pending[key]
+        stale = 0
+        for filed in (self._pending, self._staged):
+            keys = [key for key, (_, filed_h, *_) in filed.items() if filed_h == h]
+            for key in keys:
+                del filed[key]
+            stale += len(keys)
         removed = self.store.unindex(h)
         if stale or removed:
             self.checkpoints_orphaned += 1
@@ -1326,6 +1462,7 @@ class PagedStateCheckpointCoordinator:
         `checkpoints_kept`'s growth rate, and in the admin call itself.
         """
         self._pending.clear()
+        self._staged.clear()
         self.store.clear()
 
     def checkpoint_fates(self) -> dict[str, int]:

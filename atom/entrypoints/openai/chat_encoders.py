@@ -81,6 +81,9 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
             logger.debug("No model_type for encoder %s", enc_path, exc_info=True)
 
     logger.info(f"Loaded message encoder from {enc_path}")
+    # Its own message processing, for text placed after the render (an
+    # assistant prefix); see `MessageEncoderAdapter.process_image_messages`.
+    process = getattr(mod, "process_image_messages", None)
     # Handed to the adapter rather than applied in a wrapper here. A wrapper
     # runs *after* the adapter has filtered kwargs against the encoder's
     # signature, so the one kwarg it adds is the one the filter cannot remove:
@@ -94,6 +97,7 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         enc_path,
         defaults={"thinking_mode": "thinking"},
         model_type=model_type,
+        process_image_messages=process if callable(process) else None,
     )
 
 
@@ -270,12 +274,49 @@ def render_probe_prompt(
         return None
 
 
+def template_needs_tool_call_argument_strings(
+    tokenizer: Any, custom_encoder: MessageEncoderAdapter | None
+) -> bool:
+    """Whether the template refuses history tool-call arguments as a mapping
+    but renders them as the JSON string the client sent.
+
+    Arguments are parsed into a mapping by default because most templates
+    iterate them; DeepSeek-R1/V3's concatenates them as a string and raises
+    ``TypeError`` on a mapping, failing every turn after a tool call.
+    """
+    # Custom encoders are model-scoped Python with their own message preparation,
+    # not Jinja; their argument handling stays theirs (DeepSeek-V4.1's takes the
+    # mapping).
+    if custom_encoder is not None:
+        return False
+
+    def renders(arguments: Any) -> bool:
+        call = {"name": "get_weather", "arguments": arguments}
+        messages = [
+            *PROBE_MESSAGES,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_0", "type": "function", "function": call}],
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "sunny"},
+        ]
+        try:
+            apply_chat_template(tokenizer, None, messages, tools=PROBE_TOOLS)
+        except _PROBE_REFUSALS:
+            return False
+        return True
+
+    return not renders({"city": "Paris"}) and renders('{"city": "Paris"}')
+
+
 def apply_chat_template(
     tokenizer: Any,
     custom_encoder: MessageEncoderAdapter | None,
     messages: list[dict] | list[ChatMessage],
     *,
     tools: list[dict] | None = None,
+    preserve_tool_call_arguments: bool = False,
     **kwargs: Any,
 ) -> str:
     """Render ``messages`` to a prompt string.
@@ -291,7 +332,10 @@ def apply_chat_template(
             custom_encoder is not None and custom_encoder.preserve_content
         )
         messages = [
-            message.to_template_dict(preserve_content=preserve_content)
+            message.to_template_dict(
+                preserve_content=preserve_content,
+                preserve_tool_call_arguments=preserve_tool_call_arguments,
+            )
             for message in messages
         ]
     if custom_encoder is not None:

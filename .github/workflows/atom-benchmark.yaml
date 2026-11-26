@@ -40,24 +40,12 @@ on:
         description: "Benchmark DeepSeek-V4.1-Flash DSpark (TP4, c<=64)"
         type: boolean
         default: true
-      glm-5-2-fp8:
-        description: "Benchmark GLM-5.2-FP8"
-        type: boolean
-        default: true
-      glm-5-2-mxfp4:
-        description: "Benchmark GLM-5.2-MXFP4 (+ MTP3)"
-        type: boolean
-        default: true
       deepseek-r1-0528-mxfp4:
         description: "Benchmark DeepSeek-R1-0528 MXFP4 (+ MXFP4-MTP3)"
         type: boolean
         default: true
       gpt-oss-120b:
         description: "Benchmark gpt-oss-120b"
-        type: boolean
-        default: true
-      kimi-k27-code-mxfp4:
-        description: "Benchmark Kimi-K2.7-Code-MXFP4"
         type: boolean
         default: true
       kimi-k3:
@@ -617,12 +605,16 @@ jobs:
           if-no-files-found: ignore
 
   # ---------- Profiler analysis (lightweight, runs on regression OR manual profiler) ----------
+  # Also runs when a regression was detected but no rerun cell was generated
+  # (regression-rerun and collect-regression-traces are then skipped), so the
+  # [Perf Regression] issue created by the last step is still filed.
   profiler-analysis:
     if: >-
       always()
       && (needs.collect-regression-traces.result != 'cancelled'
           && needs.collect-regression-traces.result != 'skipped'
-          || inputs.enable_profiler == true)
+          || inputs.enable_profiler == true
+          || needs.summarize-benchmark-result.outputs.has_regression == 'true')
     name: Profiler trace analysis
     needs: [benchmark, summarize-benchmark-result, generate-regression-matrix, regression-rerun, collect-regression-traces]
     runs-on: ubuntu-latest
