@@ -1931,6 +1931,7 @@ def test_last_unadmitted_cancel_reaches_worker_despite_idle_throttle(
     assert p.abort_request(seq.id)
     core = EngineCore.__new__(EngineCore)
     core._wake_event = threading.Event()
+    core._load_event_wait = False
     core.input_queue = queue.Queue()
     core.utility_queue = queue.Queue()
     core.scheduler = p

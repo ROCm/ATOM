@@ -428,7 +428,7 @@ def test_offload_env_vars_are_documented():
     offload = [
         name
         for name in envs.environment_variables
-        if name.startswith(("OFFLOAD_", "LMCACHE_"))
+        if name.startswith(("OFFLOAD_", "LMCACHE_", "ATOM_OFFLOAD_", "ATOM_STORE_"))
     ]
     assert offload
     assert [name for name in offload if f"**{name}**" not in doc] == []
