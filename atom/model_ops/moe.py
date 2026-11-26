@@ -19,6 +19,7 @@ from aiter.ops.shuffle import (
     interleave_gate_up_rows,
     moe_shuffle_scale,
     moe_shuffle_weight,
+    moe_shuffle_weight_scale,
 )
 from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
 from torch import nn
@@ -2061,20 +2062,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         # ── C. FlyDSL fused_moe ───────────────────────────────────────────────
-        # shuffle weight (arch-aware: gfx1250 does the GUGU row interleave +
-        # WMMA tile shuffle internally, other archs use the lane-level path)
-        layer.w13_weight.data = moe_shuffle_weight(
+        # shuffle weight and scale (arch-aware: gfx1250 does the GUGU row
+        # interleave + WMMA tile shuffle internally, other archs use the
+        # lane-level path). aiter may also re-lay them IOD-placed (gfx1250), a
+        # layout neither the Triton decode views nor EPLB's expert-major
+        # migration can read, so those keep the shuffled layout.
+        allow_relayout = not (
+            self.use_triton_decode
+            or getattr(get_current_atom_config(), "eplb_enable", False)
+        )
+        w13_weight, w13_scale = moe_shuffle_weight_scale(
             layer.w13_weight,
-            experts_cnt=self.num_experts,
+            layer.w13_weight_scale.reshape(-1, layer.w13_weight_scale.shape[-1]),
+            self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=True,
+            allow_relayout=allow_relayout,
         )
-        layer.w2_weight.data = moe_shuffle_weight(
+        w2_weight, w2_scale = moe_shuffle_weight_scale(
             layer.w2_weight,
-            experts_cnt=self.num_experts,
+            layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1]),
+            self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=False,
+            allow_relayout=allow_relayout,
         )
+        layer.w13_weight.data = w13_weight
+        layer.w2_weight.data = w2_weight
         layer.w13_weight.is_shuffled = True
         layer.w2_weight.is_shuffled = True
 
@@ -2082,26 +2096,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.is_gfx1250 and self.is_guinterleave and layer.w13_bias is not None:
             layer.w13_bias.data = interleave_gate_up_rows(layer.w13_bias.data)
 
-        # shuffle scale
-        w13_scale_2d = layer.w13_weight_scale.reshape(
-            -1, layer.w13_weight_scale.shape[-1]
-        )
-        w2_scale_2d = layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1])
-
-        shuffled_w13_scale = moe_shuffle_scale(
-            w13_scale_2d,
-            self.num_experts,
-            is_guinterleave=self.is_guinterleave,
-            gate_up=True,
-        )
-        shuffled_w2_scale = moe_shuffle_scale(
-            w2_scale_2d,
-            self.num_experts,
-            is_guinterleave=self.is_guinterleave,
-            gate_up=False,
-        )
-        layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
-        layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
+        layer.w13_weight_scale = atom_parameter(w13_scale)
+        layer.w2_weight_scale = atom_parameter(w2_scale)
 
     def _triton_views_of_flydsl_weights(self, layer) -> tuple:
         """Zero-copy Triton/gluon views of the FlyDSL-shuffled MXFP4 weights.
