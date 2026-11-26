@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """gfx942 delayed mHC seam for prefill row counts (off: ATOM_DSV41_MHC_ROWS=0
 or ATOM_DSV41_MHC_BACKEND=triton).
 
 The Triton seam is a split-K GEMM whose programs read 64-128 B of each row per
-load; on MI308X that runs far below bandwidth. SGLang's gfx942 boundary splits
-the seam instead (hc_post_rows_gfx942.hip there): a row kernel does the post,
-the collapse, both square sums and here also the sublayer RMSNorm; one
+load; on MI308X that runs far below bandwidth. Following an unpublished AMD
+gfx942 kernel (mhc_rows_gfx942.hip), this splits the seam instead: a row kernel
+does the post, the collapse, both square sums and the sublayer RMSNorm; one
 hipBLASLt GEMM against fn split into bf16 hi + lo gives the mixing dots in
 fp32; a one-thread-per-row kernel computes the gates. Same outputs as
 `mhc_fused_post_pre_delayed_rmsnorm`, not bitwise (operation order, exact

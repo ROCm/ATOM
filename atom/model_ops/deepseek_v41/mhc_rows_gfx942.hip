@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-// gfx942 delayed mHC seam for prefill-sized row counts, the HIP half of mhc_rows_gfx942.py. Adapted from SGLang's
-// hc_post_rows_gfx942.hip (Apache-2.0): one wave per row reads 1 KB contiguous per instruction, where the split-K
-// Triton seam reads 64-128 B per row per instruction.
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// gfx942 delayed mHC seam for prefill-sized row counts, the HIP half of mhc_rows_gfx942.py. Based on an unpublished
+// AMD gfx942 kernel by a co-author of this change: one wave per row reads 1 KB contiguous per instruction, where the
+// split-K Triton seam reads 64-128 B per row per instruction.
 //
 // mhc_rows_gfx942_*: R'_j = post_j * y + sum_h comb[h][j] * R_h (bf16), x1 = sum_j pre_j * R'_j (bf16),
 // sq = (sum R'^2, sum x1^2), and the sublayer's RMSNorm of x1 written in place: out = bf16(x1 * rstd * w).
