@@ -161,6 +161,8 @@ def test_param_lists_override_and_conc_band():
     assert sorted(c["suffix"] for c in cells) == [
         "-dpa",
         "-dpa-dspark",
+        "-dpa-mixed",
+        "-dpa-mixed-dspark",
         "-dpa-tbo",
     ]
     rfs = {c["result_filename"] for c in cells}

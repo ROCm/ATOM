@@ -53,6 +53,8 @@ def rebuild_ipc_handle(
 
 def _abort_weight_sync(core_mgr, path: str) -> None:
     """Best-effort close of a sync whose sender stopped before its last bucket."""
+    if not core_mgr.claim_weight_sync_abort():
+        return
     try:
         core_mgr.broadcast_utility_command_sync(
             DISCARD_WEIGHT_SYNC_CMD,

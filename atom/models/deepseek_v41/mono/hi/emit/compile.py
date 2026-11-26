@@ -32,6 +32,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 
 from atom.mono.runtime import srcloc
+from atom.mono.runtime.compile import _code_object
 
 from ..plan.check import check, check_memory
 from ..plan.program import Program
@@ -47,9 +48,6 @@ _RESOURCE_KEYS = {
     "sgpr_spill": b".sgpr_spill_count",
 }
 _OPTIONAL = ("vgpr_spill", "sgpr_spill", "agpr")
-# the opening quote of the gpu.object's ELF string: after ``bin =``, or after
-# its kernel metadata where FlyDSL records it, bare
-_BIN = re.compile(r'"(?=\\7FELF)')
 
 
 class ResourceError(Exception):
@@ -331,27 +329,6 @@ def gate(
         problems.append(f"HIP admits {blocks} x {cus} CUs < the grid of {grid} CTAs")
     if problems:
         raise ResourceError("; ".join(problems))
-
-
-def _code_object(module_text: str) -> bytes:
-    """The gpu.binary's ELF from the module text (its object's string,
-    MLIR-escaped)."""
-    m = _BIN.search(module_text)
-    if m is None:
-        raise RuntimeError("no gpu.binary in the compiled module")
-    out, i = bytearray(), m.end()
-    while module_text[i] != '"':
-        ch = module_text[i]
-        if ch != "\\":
-            out.append(ord(ch))
-            i += 1
-        elif module_text[i + 1] in '\\"':
-            out.append(ord(module_text[i + 1]))
-            i += 2
-        else:
-            out.append(int(module_text[i + 1 : i + 3], 16))
-            i += 3
-    return bytes(out)
 
 
 def _note_uint(elf: bytes, key: bytes, optional: bool = False):

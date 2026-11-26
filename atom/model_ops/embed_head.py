@@ -263,14 +263,16 @@ class ParallelLMHead(VocabParallelEmbedding):
             forward_context: ForwardContext = get_forward_context()
             context = forward_context.context
             attn_metadata = forward_context.attn_metadata
-            # context = get_context()
             if context.is_prefill and not context.is_draft:
-                # The scheduled requests' last tokens only: a padding request
-                # has none.
-                bs = context.scheduled_bs
-                last_indices = attn_metadata.cu_seqlens_q[1 : bs + 1] - 1
-                # Under Ulysses SP, x is this rank's token shard.
-                x = sp_gather_rows(x, last_indices)
+                if attn_metadata.is_mixed:
+                    x = x[attn_metadata.sampled_token_indices].contiguous()
+                else:
+                    # The scheduled requests' last tokens only: a padding
+                    # request has none.
+                    bs = context.scheduled_bs
+                    last_indices = attn_metadata.cu_seqlens_q[1 : bs + 1] - 1
+                    # Under Ulysses SP, x is this rank's token shard.
+                    x = sp_gather_rows(x, last_indices)
             if self._can_use_dp_sharded_head(context):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
             if sp_is_enabled() and not self.num_embeddings % get_pcp_group().world_size:

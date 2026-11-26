@@ -375,7 +375,10 @@ impl CacheAwarePolicy {
     }
 
     /// Where the tree learns a request's text, the KV event index predicts its tokens, but
-    /// not those of a request with media, whose blocks an engine keys by the media.
+    /// not those of a request with media, whose blocks an engine keys by the media (ATOM
+    /// every block, by the media and the text up to the last, DeepSeek-V4.1 also by the
+    /// prompt's length, which the routing text's front digest does not see; vLLM and
+    /// SGLang the blocks from the media on).
     fn routed(&self, info: &SelectWorkerInfo<'_>, worker: &dyn Worker) {
         let tokens = info
             .tokens
