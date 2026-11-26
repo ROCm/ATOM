@@ -189,10 +189,10 @@ async fn tokenize(
         .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
             let metadata = parsed.metadata();
             let tokens = routing
-                .tokens(&parsed, &metadata, ctx, true)
+                .tokens(&parsed, None, &metadata, ctx, true)
                 .map_err(|error| error.message);
             let prompt = match parsed.chat() {
-                Some(chat) => routing.render_chat(&entry, chat),
+                Some(chat) => routing.render_chat(&entry, chat, &chat.messages),
                 None => Ok(metadata.text.clone()),
             };
             let encode = prompt.ok().filter(|_| tokens.is_ok()).map(|prompt| {

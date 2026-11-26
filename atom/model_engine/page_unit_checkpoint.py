@@ -983,9 +983,9 @@ class PagedStateCheckpointCoordinator:
     # out of a slot. Unreadable by default: the image then comes from the slot
     # a forward *ended* in, so the engine cuts prefill chunks onto rungs.
     #
-    # A backend whose kernel exposes interior states (GDN's `h`) can declare
-    # `readable_midstep`, and then a position inside a forward reaches the
-    # image through a scratch slot borrowed from the state pool:
+    # A backend that obtains interior states, from GDN chunk snapshots or Kimi
+    # KDA head re-runs, can declare `readable_midstep`. Each target reaches the
+    # image through a scratch slot borrowed from the shared state pool:
     #
     #   `reserve_midstep`  before the forward, borrow a scratch slot per
     #                      position. The runner copies the interior state in.
@@ -1005,6 +1005,8 @@ class PagedStateCheckpointCoordinator:
     #
     # A scratch slot is never a request's runtime slot, so nothing the owner
     # does next can overwrite it before its store is issued.
+    # If no scratch can back an anchor, `plan_midstep` cuts there and uses the
+    # ordinary boundary copy from the runtime slot between forwards.
 
     def __init__(
         self,
@@ -1073,21 +1075,37 @@ class PagedStateCheckpointCoordinator:
         self._scratch = slot_pool
         self._max_ops_per_batch = int(max_ops_per_batch)
 
+    def needs_anchor_cut(self, seq, positions: list[tuple[int, int]]) -> bool:
+        """An unbacked anchor must use the runtime slot when scratch is full."""
+        if self._scratch is not None and self._scratch.has_free():
+            return False
+        queued = {h for h, _slot in self._scratch_queued}
+        return any(
+            pos == seq.midstep_anchor_pos
+            and h not in queued
+            and not self.store.contains_or_pending(h)
+            for pos, h in positions
+        )
+
     def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
         """Borrow a scratch slot for each `(position, hash)` this forward covers.
 
-        Best-effort and order-preserving, like the slot pool's: once no slot
-        is free, every position still wanting one is dropped, and counted. A
-        hash already stored, or already on its way, is skipped -- writing it
-        again would be refused by `begin_store` after spending the slot and
-        the copy.
+        Best-effort, with the prompt-end anchor taking scratch before guesses:
+        once no slot is free, every position still wanting one is dropped, and
+        counted. Returned reservations keep position order. A hash already
+        stored, or already on its way, is skipped -- writing it again would be
+        refused by `begin_store` after spending the slot and the copy.
         """
-        if not (self.readable_midstep and self.applies(seq)):
+        if not positions or not (self.readable_midstep and self.applies(seq)):
             return []
         if self._scratch is None:
             return []
         queued = {h for h, _slot in self._scratch_queued}
         out = []
+        if len(positions) > 1:
+            positions = sorted(
+                positions, key=lambda item: item[0] != seq.midstep_anchor_pos
+            )
         for pos, h in positions:
             if h in queued or self.store.contains_or_pending(h):
                 continue
@@ -1095,6 +1113,8 @@ class PagedStateCheckpointCoordinator:
                 self.checkpoints_dropped += 1
                 continue
             out.append((self._scratch.pop(), pos, h))
+        if len(out) > 1:
+            out.sort(key=lambda reservation: reservation[1])
         return out
 
     def publish_midstep(self, reservations: list[tuple], seq=None) -> None:

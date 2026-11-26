@@ -4,7 +4,7 @@
 
 """Kimi-K3's midstep checkpoints, wired from the builder to the kernels.
 
-`test_kda_midstep_checkpoints.py` pins what `atom.models.kimi_k3.midstep`
+`test_kda_midstep_snapshots.py` pins what `atom.models.kimi_k3.midstep`
 computes; this pins where it is called. Both modules involved import AITER at
 load, so they are imported against `aiter_stub`'s stand-ins for AITER and
 Triton, and run on the CPU:

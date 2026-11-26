@@ -482,9 +482,9 @@ class StateSlotPool:
     #
     # `checkpoint` below keeps state at the position a forward *ended* at, which
     # is the only position a backend can be assumed to expose. A backend that
-    # declares `readable_midstep` exposes more: its chunk kernel already
-    # materializes the recurrent state at every interior chunk boundary, so a
-    # snapshot at any of them is a copy rather than a forward.
+    # declares `readable_midstep` can also obtain interior states, through
+    # chunk snapshots or head re-runs. The runner writes each into a reserved
+    # slot; how it obtains the state is independent of the transfer policy.
     #
     # That splits keeping a checkpoint into two moments that `checkpoint` runs
     # as one:

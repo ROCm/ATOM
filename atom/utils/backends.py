@@ -417,8 +417,8 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             )
 
             # A compiled piece is graphed with the rest of the forward: a
-            # `TokenGraph` records it inline, breaking only at the split ops
-            # declared `eager_region`.
+            # `TokenGraph` records it inline, breaking only where a split op
+            # calls an `eager_region`.
             self.module.__dict__[target] = piecewise_backend
 
             compilation_counter.num_piecewise_capturable_graphs_seen += 1

@@ -14,9 +14,14 @@ import triton
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.prefix_hash import hash_block_size_for
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_cache import KEEP_NONE, KEEP_SETTLED, KEEP_SNAPSHOT
-from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
+from atom.model_engine.state_runtime import (
+    StateTransfer,
+    midstep_checkpoint_targets,
+    snapped_checkpoint_interval,
+)
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
 from atom.model_ops.fla_ops.index import prepare_chunk_offsets
@@ -430,7 +435,7 @@ class GDNStateMixin(PoolRowsMixin):
     def finish_prefill(self, batch, attn_metadata, running_bs, running_tokens):
         super().finish_prefill(batch, attn_metadata, running_bs, running_tokens)
         if batch.block_tables == []:
-            if any(getattr(batch, "state_save_all", None) or ()):
+            if any(batch.state_save_all):
                 raise RuntimeError(
                     "midstep checkpoints reserved for a prefill with no GDN "
                     "metadata; nothing would write them"
@@ -440,12 +445,16 @@ class GDNStateMixin(PoolRowsMixin):
         # `stage_prefill` has already marshalled them, and the early return
         # above is the only case where it would not have.
         gdn_metadata = self.prepare_gdn_metadata(
-            batch, attn_metadata, is_prefill=True, prepare_block_tables=False
+            batch,
+            attn_metadata,
+            is_prefill=True,
+            prepare_block_tables=False,
+            running_tokens=running_tokens,
         )
 
         gdn_metadata.ssm_checkpoints = ckpt = self._checkpoint_targets(batch)
         gdn_metadata.ssm_conv_state_len = self._conv_state_len()
-        if ckpt is not None:
+        if ckpt is not None and self._needs_chunk_checkpoint_snapshots():
             # Same mapping the chunk kernel builds internally, computed once
             # per step rather than per layer.
             gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
@@ -744,7 +753,7 @@ class GDNStateMixin(PoolRowsMixin):
         scratch = (
             self.state_transfer().decode_keep == KEEP_SNAPSHOT
             and cfg.enable_prefix_caching
-            and cfg.state_checkpoint_interval_tokens > 0
+            and self._checkpoint_interval() > 0
         )
         return state_pool(
             STATE_SLOT_CLASS,
@@ -752,6 +761,15 @@ class GDNStateMixin(PoolRowsMixin):
             entries_per_req=self.slots_per_req(),
             extra_entries=(DECODE_SNAPSHOT_SCRATCH_SLOTS if scratch else 0)
             + self.state_transfer_slots(),
+        )
+
+    def _checkpoint_interval(self) -> int:
+        cfg = self.model_runner.config
+        return snapped_checkpoint_interval(
+            cfg.state_checkpoint_interval_tokens,
+            hash_block_size_for(
+                cfg.kv_cache_block_size, cfg.decode_context_parallel_size
+            ),
         )
 
     def state_transfer_slots(self) -> int:
@@ -1361,6 +1379,26 @@ class GDNStateMixin(PoolRowsMixin):
         """
         return self.model_runner.config.hf_config.linear_conv_kernel_dim - 1
 
+    def _midstep_targets(self, batch: ScheduledBatch, grid: int) -> list:
+        """Validate this step's nonempty checkpoint reservations."""
+        # Every reservation is checked against the predicate the scheduler
+        # placed it with, and raises if it fails: `commit_midstep` publishes
+        # its hash after this forward regardless, so a target dropped here is
+        # a findable checkpoint over unwritten bytes.
+        return midstep_checkpoint_targets(
+            batch.state_rows,
+            batch.num_cached_tokens,
+            batch.num_scheduled_tokens,
+            batch.state_slots_committed,
+            batch.state_save_all,
+            num_slots=self.model_runner.mamba_k_cache.shape[1],
+            grid=grid,
+            min_offset=self._conv_state_len(),
+        )
+
+    def _needs_chunk_checkpoint_snapshots(self) -> bool:
+        return True
+
     def _checkpoint_targets(self, batch: ScheduledBatch) -> dict | None:
         """Checkpoints this step reaches, as device index tensors.
 
@@ -1404,25 +1442,9 @@ class GDNStateMixin(PoolRowsMixin):
         is. One slot is the whole checkpoint — a resumed prefix has no
         speculation to roll back, so it needs no scratch beside it.
         """
-        all_saves = getattr(batch, "state_save_all", None)
-        if not all_saves or not any(all_saves):
+        if not any(batch.state_save_all):
             return None
-        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
-
-        # Every reservation is checked against the predicate the scheduler
-        # placed it with, and raises if it fails: `commit_midstep` publishes
-        # its hash after this forward regardless, so a target dropped here is
-        # a findable checkpoint over unwritten bytes.
-        found = midstep_checkpoint_targets(
-            batch.state_rows,
-            batch.num_cached_tokens,
-            batch.num_scheduled_tokens,
-            batch.state_slots_committed,
-            all_saves,
-            num_slots=self.model_runner.mamba_k_cache.shape[1],
-            grid=CHUNK_SIZE,
-            min_offset=self._conv_state_len(),
-        )
+        found = self._midstep_targets(batch, CHUNK_SIZE)
         if not found:
             return None
 
@@ -1546,6 +1568,7 @@ class GDNStateMixin(PoolRowsMixin):
         is_prefill: bool = False,
         *,
         prepare_block_tables: bool = True,
+        running_tokens: int = 0,
     ) -> GDNAttentionMetadata:
 
         num_decodes = batch.total_seqs_num_decode
@@ -1639,9 +1662,13 @@ class GDNStateMixin(PoolRowsMixin):
                 if cached is not None
                 else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
             )
+            # Sized for every row the conv is handed: a split KDA layer hands
+            # it a token-graph bucket's (`_kda_recurrence`), and `causal_conv1d_fn`
+            # rebuilds a map sized for fewer rows in every layer.
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(
-                    non_spec_query_start_loc, batch.total_tokens_num
+                    non_spec_query_start_loc,
+                    max(batch.total_tokens_num, running_tokens),
                 )
             )
         else:
