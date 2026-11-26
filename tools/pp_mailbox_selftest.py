@@ -102,6 +102,7 @@ def main():
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--max-rows", type=int, default=16384)
     ap.add_argument("--compute-ms", type=float, default=150.0)
+    ap.add_argument("--compute-kind", choices=("elementwise", "gemm"), default="elementwise")
     ap.add_argument("--slots", type=int, default=2)
     ap.add_argument("--check-every", type=int, default=1)
     ap.add_argument("--first-layers", type=str, default="")
@@ -136,15 +137,30 @@ def main():
             aux_cols_in=taps_in * HIDDEN, aux_cols_out=0 if rank == world - 1 else taps_out * HIDDEN,
             max_rows=args.max_rows, slots=args.slots,
         )  # fmt: skip
-    # the compute stand-in: a bf16 GEMM chain sized to ~compute_ms
-    a = torch.randn(8192, 8192, dtype=torch.bfloat16, device=device)
+    # The compute stand-in, sized to ~compute_ms. "elementwise" (default): in-place FMAs over a 1 GiB tensor. "gemm":
+    # bf16 8192^3 matmuls; on gfx1250 / the K3 images these Tensile kernels memory-fault when another stream runs a
+    # kernel beside them, with NCCL as with the mailbox (11-26), so the default keeps BLAS out of the check.
+    if args.compute_kind == "gemm":
+        a = torch.randn(8192, 8192, dtype=torch.bfloat16, device=device)
+
+        def unit():
+            a @ a
+
+    else:
+        a = torch.ones(1 << 29, dtype=torch.bfloat16, device=device)
+
+        def unit():
+            a.mul_(0.5).add_(0.5)
+
+    for _ in range(3):  # warm up (first launches, allocator, library init) before timing
+        unit()
     torch.cuda.synchronize()
     t = time.perf_counter()
-    for _ in range(5):
-        a @ a
+    for _ in range(20):
+        unit()
     torch.cuda.synchronize()
-    per_gemm_ms = (time.perf_counter() - t) / 5 * 1e3
-    gemms = max(1, round(args.compute_ms / per_gemm_ms))
+    per_gemm_ms = (time.perf_counter() - t) / 20 * 1e3
+    gemms = 0 if args.compute_ms <= 0 else max(1, round(args.compute_ms / per_gemm_ms))
 
     gen = torch.Generator().manual_seed(1234)  # same row counts on every rank
     rows_of = [
@@ -169,7 +185,7 @@ def main():
             if args.check_every and step % args.check_every == 0:
                 bad += check(got, step, rank - 1, rows, closed_in, taps_in, device)
         for _ in range(gemms):
-            a @ a
+            unit()
         if rank < world - 1:
             out = payload(step, rank, rows, closed_out, taps_out, device)
             if box is not None and box.send_enabled:
