@@ -61,6 +61,34 @@ PAGED_COPY_RUNTIME = StateRuntime(
 )
 
 
+def test_mixed_batch_carries_current_state_maintenance():
+    from atom.model_engine.sequence import SequenceStatus
+
+    sched = make_scheduler(
+        paged_copy_config(num_kvcache_blocks=40, enable_mixed_prefill_decode=True),
+        state_runtime=PAGED_COPY_RUNTIME,
+    )
+    decode = stateful_seq(list(range(BLOCK)))
+    assert sched.block_manager.allocate(decode, 0)
+    decode.num_cached_tokens = BLOCK
+    decode.append_token(42)
+    decode.type = SequenceType.DECODE
+    decode.status = SequenceStatus.RUNNING
+    sched.running.append(decode)
+    sched.add(stateful_seq([21] * BLOCK))
+    checkpoints = sched.block_manager.paged_state_checkpoints
+    operation = checkpoints.store.begin_store(33, src_slot=decode.state_slots[0])
+    assert operation is not None
+    checkpoints.store.complete_inflight()
+    assert checkpoints.begin_restore(33, dst_slot=decode.state_slots[0])
+
+    batch, _ = sched.schedule()
+    assert batch.is_mixed
+    restores = batch.state_maintenance_ops.checkpoint_restores
+    assert len(restores) == 1 and restores[0].dst_slot == decode.state_slots[0]
+    assert not sched.block_manager.take_state_maintenance_ops().checkpoint_restores
+
+
 def ckpt_config(**overrides):
     defaults = {
         "kv_cache_block_size": BLOCK,
