@@ -232,11 +232,17 @@
     "pool-exit.rc": 86,
     "gpool-release.rc": 0
   },
-  "cleanup_remaining": [
-    "e3115e7e1a74"
-  ],
   "release_note": "Initial release refused while VRAM drained; subsequent normal release succeeded. No force release.",
   "archive_sha256": "2cee0408f0cb5fd15e1f6b01a98b149678263e360a07d6dda2d527ad42ba4363",
   "conclusion": "Short protocol and real four-stage WRITE passed; C80 warmup failed before900s profiling. Native port0 startup passed. No end-to-end stability/performance/accuracy pass.",
-  "next_hypothesis": "Missing MoRI-specific traffic class104. Actual image and generated worker env have no MoRI QoS override; the existing MoRI harness uses104. Not yet a proven cause of the retry-exceeded failure."
+  "next_hypothesis": "Missing MoRI-specific traffic class104. Actual image and generated worker env have no MoRI QoS override; the existing MoRI harness uses104. Not yet a proven cause of the retry-exceeded failure.",
+  "inner_cleanup_remaining_snapshot": [
+    "e3115e7e1a74"
+  ],
+  "final_ownership_audit": {
+    "containers": [],
+    "owned_parent_exists": false
+  },
+  "cleanup_note": "Inner cleanup briefly reported a zombie container; outer cleanup and the later exact-label audit confirm no remaining task containers or parent process. Release succeeded normally.",
+  "rdma_counter_window_note": "The final delta includes cleanup; earlier snapshots at21:30:22 through21:32:40 already show ACK timeout/sequence error growth before the21:33:02 native failure."
 }
