@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("aiter")
-from atom.spec_decode.dspark_proposer import DSparkProposer  # noqa: E402
+from atom.spec_decode.dspark_proposer import DSparkProposer
 
 
 def _proposer(max_seqs=64, lossless=None):

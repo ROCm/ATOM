@@ -96,12 +96,15 @@ class DSparkProposer(Drafter):
         ladder = getattr(self, "_bs_ladder", None)
         if ladder is None:
             raw = envs.ATOM_DSPARK_BLOCK_BS_LADDER.strip()
-            ladder = sorted({int(x) for x in raw.split(",") if x.strip()}) if raw else []
+            ladder = (
+                sorted({int(x) for x in raw.split(",") if x.strip()}) if raw else []
+            )
             ladder = [b for b in ladder if b <= self.config.max_num_seqs]
             self._bs_ladder = ladder
             if ladder:
                 logger.info(
-                    "ATOM_DSPARK_BLOCK_BS_LADDER: DSpark block batch pinned to %s", ladder
+                    "ATOM_DSPARK_BLOCK_BS_LADDER: DSpark block batch pinned to %s",
+                    ladder,
                 )
         if not ladder or self.lossless is not None:
             return running_bs
