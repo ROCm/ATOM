@@ -3524,6 +3524,9 @@ class PrefillScheduler:
                 self.waiting.remove(seq)
                 seq.status = SequenceStatus.RUNNING
                 seq.type = SequenceType.PREFILL
+                # Admitted: both front-tier claims are spent (as in `Scheduler`).
+                seq.is_preempted = False
+                seq.num_skipped_steps = 0
                 self.running.append(seq)
                 scheduled_seqs[seq.id] = seq
                 num_scheduled_tokens.append(num_new_tokens)

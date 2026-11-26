@@ -278,3 +278,28 @@ def test_sjf_promotes_a_repeatedly_skipped_prefill(seq_factory):
 
     assert order[2] == [long_seq.id]
     assert long_seq.id not in order[0] + order[1]
+
+
+def test_sjf_admission_spends_the_front_tier_claims(seq_factory):
+    """An admitted request carries no skip count or preempted mark forward,
+    as in `Scheduler`."""
+    sched = _sjf_scheduler()
+    seq = seq_factory(list(range(8)))
+    seq.block_table = [0]
+    seq.num_skipped_steps = 5
+    seq.is_preempted = True
+    sched.extend([seq])
+    _, seqs = sched.schedule()
+    assert list(seqs) == [seq.id]
+    assert seq.num_skipped_steps == 0 and not seq.is_preempted
+
+
+def test_negative_sjf_skip_bound_is_rejected():
+    import pytest
+
+    from atom.config import Config
+
+    with pytest.raises(ValueError, match="sjf_max_skip_steps"):
+        Config.__post_init__(
+            type("C", (), {"sjf_max_skip_steps": -1, "moe_all2all_backend": "auto"})()
+        )

@@ -1736,6 +1736,13 @@ class Config:
         return list(sizes)
 
     def __post_init__(self):
+        if self.sjf_max_skip_steps < 0:
+            # A negative bound would fail `0 < max_skip_steps` and silently turn
+            # the starvation bound off; 0 is the explicit way to say "unbounded".
+            raise ValueError(
+                f"sjf_max_skip_steps must be >= 0 (0 = unbounded), "
+                f"got {self.sjf_max_skip_steps}"
+            )
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
