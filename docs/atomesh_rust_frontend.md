@@ -24,15 +24,15 @@ pydantic, the chat template, tokenizing, detokenizing, SSE. It runs on one
 event loop and one GIL (`frontend_workers.py` exists because of it). Moving
 that work to Rust removes the bulk of the frontend's cost while keeping
 everything below the frontend -- DP routing, back-pressure, the schedulers --
-as it is. What a request carries to it that the bridge does not pass yet (P/D
-transfers, grammars) is refused, not dropped (see Status).
+as it is. What a request carries to it that the bridge does not pass yet
+(grammars, media) is refused, not dropped (see Status).
 
 Two ways to do it were weighed:
 
 | | A: Rust -> LLMEngine / CoreManager (this page) | B: Rust -> EngineCore (`engine_v1`) |
 |---|---|---|
 | Python on the data path | one admission per request (`Sequence`, pickle), one output pass per step | none |
-| CoreManager's features (DP router, prefix_spread / share_cache, session affinity, back-pressure, PP, multi-node, metrics) | all of them, unchanged; P/D's `kv_transfer_params` and structured output are not carried yet (P2, P4) | re-implemented in Rust, or refused |
+| CoreManager's features (DP router, prefix_spread / share_cache, session affinity, back-pressure, PP, multi-node, metrics) | all of them, unchanged, P/D's `kv_transfer_params` included; structured output is not carried yet (P2) | re-implemented in Rust, or refused |
 | Python changes | a ~200-line adapter | the Core / CoreManager protocol (pickle -> `engine_v1`) |
 | Effect on the OpenAI server | none | it shares the new protocol |
 | Ceiling | the frontend-workers hub's: Python admission and output threads | the EngineCores' |
@@ -152,6 +152,19 @@ mesh's gRPC routing already runs.
   server ignores them.
 * `data_parallel_rank` in the body, `--default-chat-template-kwargs` under a
   request's `chat_template_kwargs`.
+* A P/D leg behind the Atomesh router (`--pd-disaggregation --backend atom`),
+  on `/v1/chat/completions` and `/v1/completions`, legacy and chunked, as the
+  OpenAI server serves it: `kv_transfer_params` reach `preprocess_fanout`
+  (refused as `_validate_kv_transfer_params` refuses them, from
+  `openai/pd_handoff.py`, which both frontends call); a decode submits the
+  prompt its prefill ran (`kv_transfer_params.prompt_token_ids`) in place of
+  its own render, which still names the prompt's opener; a prefill's response
+  carries its `kv_transfer_params_output` as `kv_transfer_params`, and with
+  `return_token_ids` its `prompt_token_ids`; `/kv_transfer_info` and
+  `/server_info` answer the router's registration and dp-aware discovery.
+  A prefill leg is served without streaming (the router never streams one),
+  and `/generate` takes no P/D request: its response, a list, has no place
+  for the handoff.
 * DP session affinity: with `ATOM_DP_SESSION_AFFINITY`, the session and its
   parent come from the headers the OpenAI server reads
   (`x-dynamo-session-id` / `x-session-id` / `x-correlation-id`,
@@ -174,8 +187,7 @@ mesh's gRPC routing already runs.
 
 Refused with a 400 until they are built: image, video or audio content
 (the engine is handed token ids only, so it would be dropped silently),
-P/D requests (`kv_transfer_params`, or `/generate`'s bootstrap fields: served
-plainly, the peer would wait for a transfer that never comes), a chat whose
+P/D over `/generate` (`kv_transfer_params`, or its bootstrap fields), a chat whose
 tool calls the OpenAI server would hold to their schemas (Kimi-K3's
 tool-call grammar, with `ATOM_TOOL_CALL_GRAMMAR` and the structured-output
 backend; unconstrained, K3 can copy an empty call out of its history),
@@ -215,7 +227,7 @@ submit, the finish-reason mapping); `reasoning/kimi_k3.rs` (the K3 channels);
 | P1 | `/health` and `/metrics` with the engine's state and series (`get_metrics_statistics`, same metric names); `/start_profile`, `/stop_profile`, `/debug/mtp_stats`, `/debug/cache_stats` through the bridge; wait for the tokenizer before reporting ready; `ttft_s` / `tpot_s` / `latency_s` in a completion's `usage` (its render is the generate one, re-wrapped); ATOM's reasoning controls as `_chat_completions` resolves them (`thinking`, `reasoning_effort`) |
 | P2 | logprobs and streaming `n > 1` (the streamed chat render writes one choice); structured output (`json_schema` to `SamplingParams`), and with it Kimi-K3's tool-call grammar (`configure_tool_call_grammar` -> `SamplingParams.structured_tool_format`), refused until then; OpenAI error bodies as the OpenAI server writes them; batching submits (one GIL entry for many requests) if admission shows up in profiles |
 | P3 | `/v1/messages` (Anthropic), `/v1/responses` checked against the OpenAI server, FIM and prefix completion |
-| P4 | multimodal (images to `preprocess_fanout(multimodal_data=...)`), `kv_transfer_params` for P/D (refused until then) |
+| P4 | multimodal (images to `preprocess_fanout(multimodal_data=...)`), and its P/D handoff (`cache_seed`, `mrope_position_delta`); a decode that skips its render where it is handed its prefill's ids |
 
 Each model served this way is checked against the OpenAI server: the prompt
 tokens (`atom/mesh/scripts/atom_token_parity.py`, #3596), the SSE and JSON of
@@ -228,8 +240,8 @@ every endpoint, GSM8K, and a concurrency sweep.
   ones; a model whose template or parser differs between the two can render
   or parse differently.
 * Streaming with `n > 1` is refused; the Python service streamed it.
-* P/D requests are refused (P4): neither frontend carried `kv_transfer_params`;
-  the Python service served them as plain requests.
+* P/D legs are served as the OpenAI server serves them; the Python service
+  served them as plain requests.
 * With `ATOM_TOOL_CALL_GRAMMAR`, a Kimi-K3 chat with tools is refused (P2):
   the OpenAI server holds its calls to their schemas, the Python service did
   not.

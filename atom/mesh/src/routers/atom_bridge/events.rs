@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     task::{Context, Poll},
     time::Instant,
@@ -41,11 +41,37 @@ pub(crate) enum SeqEvent {
     Failed(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct SeqFinish {
     /// The engine's own reason (`eos`, `max_tokens`, `stop_sequence`, ...).
     pub reason: Option<String>,
     pub cached_tokens: u32,
+    /// A prefill's handoff for its decode (`kv_transfer_params_output`), as JSON.
+    pub handoff: Option<String>,
+}
+
+/// What a request's response carries back besides its render, filled in as
+/// the request runs: the prompt it submitted and a prefill's handoff.
+#[derive(Debug, Default)]
+pub(crate) struct Returned {
+    return_token_ids: bool,
+    /// The prompt submitted, kept only where the request asked for it.
+    pub prompt_token_ids: OnceLock<Vec<u32>>,
+    pub kv_transfer_params: OnceLock<String>,
+}
+
+impl Returned {
+    /// `return_token_ids`: the response names the prompt's ids.
+    pub(crate) fn new(return_token_ids: bool) -> Self {
+        Self {
+            return_token_ids,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn wants_prompt_token_ids(&self) -> bool {
+        self.return_token_ids
+    }
 }
 
 /// Where a backend delivers events, by the key the request was registered
@@ -189,6 +215,7 @@ pub(crate) struct SeqEventSource {
     next_complete: usize,
     ready: VecDeque<TokenChunk>,
     done: bool,
+    returned: Option<Arc<Returned>>,
 }
 
 /// One of a request's sequences, as far as its steps have come.
@@ -222,7 +249,14 @@ impl SeqEventSource {
             next_complete: 0,
             ready: VecDeque::new(),
             done: false,
+            returned: None,
         }
+    }
+
+    /// Where a prefill's handoff goes when it finishes.
+    pub(crate) fn returning(mut self, returned: Option<Arc<Returned>>) -> Self {
+        self.returned = returned;
+        self
     }
 
     /// Take in one step; queue what it makes ready.
@@ -243,8 +277,11 @@ impl SeqEventSource {
                 logprobs: None,
             });
         }
-        if finish.is_some() {
-            sibling.finish = finish;
+        if let Some(mut finish) = finish {
+            if let (Some(returned), Some(handoff)) = (&self.returned, finish.handoff.take()) {
+                let _ = returned.kv_transfer_params.set(handoff);
+            }
+            sibling.finish = Some(finish);
             sibling.finished_at = Some(now);
         }
         while let Some(Sibling {
@@ -267,10 +304,7 @@ impl SeqEventSource {
     fn complete(&self, sibling: Sibling) -> TokenChunk {
         let prompt_tokens = self.prompt_tokens;
         let timing = self.timing(&sibling);
-        let finish = sibling.finish.unwrap_or(SeqFinish {
-            reason: None,
-            cached_tokens: 0,
-        });
+        let finish = sibling.finish.unwrap_or_default();
         let completion_tokens = sibling.output.len() as u32;
         TokenChunk::Complete {
             token_ids: sibling.output,
@@ -388,8 +422,10 @@ mod tests {
         let (key, events) = registry.register();
         let admission = Admission::new(key, Arc::clone(&registry), aborter.clone());
         assert!(!submitted(&admission.stage()));
+        let returned = Arc::new(Returned::new(false));
         let mut source =
-            SeqEventSource::new(events, admission, "req-1".into(), 4, 1, Instant::now());
+            SeqEventSource::new(events, admission, "req-1".into(), 4, 1, Instant::now())
+                .returning(Some(Arc::clone(&returned)));
 
         registry.deliver(
             key,
@@ -407,6 +443,7 @@ mod tests {
                 finish: Some(SeqFinish {
                     reason: Some("eos".into()),
                     cached_tokens: 2,
+                    handoff: Some(r#"{"dp_rank":1}"#.into()),
                 }),
             },
         );
@@ -419,6 +456,11 @@ mod tests {
             TokenChunk::Partial { .. },
             TokenChunk::Complete { token_ids, finish_reason: FinishReason::Stop, usage, meta, .. },
         ] if token_ids == &[1, 2, 3] && usage.total_tokens == 7 && meta.cached_tokens == 2));
+        // A prefill's handoff, for the response.
+        assert_eq!(
+            returned.kv_transfer_params.get().unwrap(),
+            r#"{"dp_rank":1}"#
+        );
         drop(source);
         // It finished on its own: nothing to stop.
         assert_eq!(aborter.0.load(Ordering::SeqCst), 0);
@@ -439,6 +481,7 @@ mod tests {
             Some(SeqFinish {
                 reason: None,
                 cached_tokens: 0,
+                handoff: None,
             })
         };
         for (index, token_ids, finish) in [

@@ -44,13 +44,8 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
 from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
-from atom.kv_transfer.disaggregation.chunked_prefill import chunked_topology_supported
-from atom.kv_transfer.disaggregation.mooncake.endpoint import (
-    DEFAULT_HANDSHAKE_PORT,
-    producer_endpoint,
-)
 from atom.model_engine.arg_utils import EngineArgs
-from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
+from atom.model_engine.llm_engine import load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import leaves_media_on_prefill, new_token_ids
@@ -98,6 +93,9 @@ from .fim import FimFormat, resolve_fim_format
 from .images import check_chat_images, load_chat_images
 from .logprobs import LogprobCollector, TokenBytes
 from .metrics_setup import create_metrics_exporter
+from .pd_handoff import chunked_receive_refusal, is_chunked_receive
+from .pd_handoff import kv_transfer_info as pd_kv_transfer_info
+from .pd_handoff import server_info as pd_server_info
 from .prefix_completion import continue_prompt, take_assistant_prefix
 from .protocol import (
     DEFAULT_TEMPERATURE,
@@ -1359,31 +1357,11 @@ def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
     The router cancels the waiting P request on this HTTP error. A worker-only
     receive failure would let D recover locally while P waits for ready forever.
     """
-    if not params or not (
-        params.get("chunked_transfer") and params.get("do_remote_prefill")
-    ):
+    if not is_chunked_receive(params):
         return
-    cfg = engine.config
-    if not chunked_topology_supported(
-        params.get("remote_tp_size", 1),
-        cfg.tensor_parallel_size,
-        cfg.pipeline_parallel_size,
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Chunked P/D requires D PP=1 and D TP a multiple of positive P TP",
-        )
-    # Not checkable at startup: chunked transfer is P's setting, and P learns
-    # D's DCP only from a request.
-    if (
-        cfg.decode_context_parallel_size > 1
-        and cfg.hf_config.model_type
-        in InputOutputProcessor._per_req_cache_model_types()
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Chunked P/D does not send per-request state to a DCP decode",
-        )
+    refusal = chunked_receive_refusal(params, engine.config)
+    if refusal is not None:
+        raise HTTPException(status_code=400, detail=refusal)
 
 
 def _validate_kv_transfer_params(params: dict[str, Any] | None) -> None:
@@ -3684,58 +3662,9 @@ async def get_gc_census(top: int = 30, types_per_owner: int = 2):
         ) from e
 
 
-def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
-    kv_role = kv_cfg.get("kv_role")
-    handshake_port = kv_cfg.get("handshake_port", DEFAULT_HANDSHAKE_PORT)
-    if kv_role is not None or kv_cfg.get("kv_connector") != "multi":
-        return kv_role, handshake_port
-
-    # MultiConnector wraps the real transfer connector. Surface the producer
-    # role so a P/D proxy can recognize multi[mooncake-producer + offload] as a
-    # prefill node.
-    fallback_role = None
-    fallback_port = handshake_port
-    for sub_cfg in kv_cfg.get("connectors", []):
-        sub_role = sub_cfg.get("kv_role")
-        if sub_role is None:
-            continue
-        if fallback_role is None:
-            fallback_role = sub_role
-            fallback_port = sub_cfg.get("handshake_port", handshake_port)
-        if sub_role == "kv_producer":
-            return sub_role, sub_cfg.get("handshake_port", handshake_port)
-    return fallback_role, fallback_port
-
-
 @_engine_route("/kv_transfer_info")
 async def kv_transfer_info():
-    cfg = engine.config
-    kv_cfg = cfg.kv_transfer_config or {}
-    kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
-    info = {
-        "tp_size": cfg.tensor_parallel_size,
-        "dp_size": cfg.parallel_config.data_parallel_size,
-        "kv_role": kv_role,
-        "handshake_port": handshake_port,
-    }
-    from atom.kv_transfer.disaggregation.pd_producer import iter_connector_configs
-    from atom.utils.network import get_ip
-
-    for sub, _ in iter_connector_configs(kv_cfg):
-        if (
-            sub.get("kv_connector") == "mooncake"
-            and sub.get("kv_role", "kv_producer") == "kv_producer"
-            and sub.get("enable_chunked_transfer", False)
-        ):
-            info["chunked_transfer"] = producer_endpoint(
-                host=get_ip(),
-                handshake_port=sub.get("handshake_port", DEFAULT_HANDSHAKE_PORT),
-                pp_size=cfg.pipeline_parallel_size,
-                block_size=cfg.kv_cache_block_size,
-                dcp_size=cfg.decode_context_parallel_size,
-            )
-            break
-    return info
+    return pd_kv_transfer_info(engine.config)
 
 
 @_engine_route("/kv_event_sources")
@@ -3747,19 +3676,8 @@ async def kv_event_sources():
 
 @_engine_route("/server_info")
 async def server_info():
-    """Server metadata for the Atomesh router.
-
-    The router's dp-aware discovery reads ``dp_size`` here to expand the
-    per-DP-rank worker set and enable cache-aware routing to the rank that
-    holds a request's prefix.
-    """
-    cfg = engine.config
-    return {
-        "model_id": model_name,
-        "served_model_name": model_name,
-        "tp_size": cfg.tensor_parallel_size,
-        "dp_size": cfg.parallel_config.data_parallel_size,
-    }
+    """Server metadata for the Atomesh router (`pd_handoff.server_info`)."""
+    return pd_server_info(engine.config, model_name)
 
 
 @_engine_route("/start_profile", methods=["POST"])
