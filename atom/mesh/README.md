@@ -165,12 +165,29 @@ without `mesh-only`, it defaults to ATOM standalone mode.
 ```bash
 ./target/release/atomesh launch \
   --worker-urls http://worker1:8000 http://worker2:8000 \
-  --policy cache_aware
+  --policy cache_aware \
+  --backend atom
 
 USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 ```
+
+ATOM workers need `--backend atom`, in regular mode as in PD mode. Without it
+the router keys an image chat as it would for SGLang: two chats that differ only
+in an image past `prefix_hash`'s token window, or after a long shared text, get
+the same `cache_aware` or `prefix_hash` key, though ATOM keys every KV block of
+a media prompt by all its media and shares no block between them. The binary
+defaults to `--backend sglang`; the Python entrypoint's `mesh-only` passes
+`--backend atom` unless the command line sets `--backend` (or its alias
+`--runtime`) itself, so put `--backend sglang` there to route to SGLang workers.
+
+`--backend atom` also changes how the router discovers an HTTP worker's model:
+it reads `/v1/models` instead of SGLang's `/server_info` and `/model_info`, and
+the model id it returns names the worker's model. For a worker serving under an
+alias (`--served-model-name`) that id is the alias, so the router loads the
+worker's tokenizer from `--tokenizer-path` or `--model-path` when either is
+set, and from the model id only otherwise.
 
 ### Envoy external processing
 
@@ -273,6 +290,17 @@ llm-tokenizer renders with a built-in encoder chosen from `config.json`, not a
 chat template, such as DeepSeek V3.2 and V4
 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
 need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
+
+The router renders a chat it tokenizes with the model's chat template and the
+request's `reasoning_effort` and `chat_template_kwargs`. A checkpoint whose
+`config.json` has `model_type` `deepseek_v41` (DeepSeek-V4.1) renders with
+llm-tokenizer's port of V4.1's encoder instead, and the router gives it the
+effort and mode as ATOM's V4.1 encoder takes them: `minimal` as `low`, `medium`
+and `xhigh` as `high`, `none` as chat mode, and the mode from `thinking_mode`,
+or chat mode where `enable_thinking` is false. Other controls, such as a
+message's list of text blocks, can still render otherwise than on ATOM; ATOM
+renders the chat again, so the difference costs prefix hits, not a different
+prompt.
 
 ## Tokenization
 

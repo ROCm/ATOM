@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -24,7 +24,8 @@ use crate::{
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{
-        atom_bridge::AtomBridgeRuntime, prepare::fast_tokenizer::TokenizeLimits,
+        atom_bridge::AtomBridgeRuntime,
+        prepare::{chat_controls::ChatControls, fast_tokenizer::TokenizeLimits},
         router_manager::RouterManager,
     },
     tokenizer::registry::TokenizerRegistry,
@@ -55,6 +56,10 @@ pub struct AppContext {
     /// their Jinja template, found as each registers. HTTP routing does not
     /// tokenize those chats.
     pub chats_without_template: Arc<RwLock<HashSet<String>>>,
+    /// The reasoning controls ATOM renders a tokenizer's chats under, by
+    /// registry id, for the checkpoints that have their own; HTTP routing
+    /// takes the effort of those chats as ATOM does.
+    pub(crate) chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
     /// `router_config`'s tokenization byte limits.
     pub(crate) tokenize_limits: TokenizeLimits,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -300,6 +305,7 @@ impl AppContextBuilder {
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
             chats_without_template: Default::default(),
+            chat_controls: Default::default(),
             tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,

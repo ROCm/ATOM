@@ -1725,9 +1725,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         return (selected, None, None) if self.kv_cache_dtype == "nvfp4" else selected
 
     def _metadata_rows(self, q, covered: int) -> int:
-        """The rows of ``q`` this step's sparse metadata covers: what the selector writes
-        and so all attention may read, in decode and prefill (a DP step can hand ``q``
-        more). Only the FP4 indexes keep to it; the others run every row."""
+        """The rows of ``q`` this prefill's sparse metadata covers: what the selector
+        writes and so all attention may read (a DP step can hand ``q`` more). Only the
+        FP4 indexes keep to it; the others run every row."""
         if self.index_cache_dtype not in FP4_CACHE_DTYPES:
             return q.shape[0]
         assert covered <= q.shape[0], (covered, q.shape)
@@ -2094,8 +2094,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             max_query_len,
             sparse_metadata.max_seq_len,
         )
-        # after the cache key: skip-index layers hold only the full shape
-        rows = self._metadata_rows(q, decode_md.seq_lens.shape[0] * max_query_len)
+        # after the cache key: skip-index layers hold only the full shape. Every index
+        # cache runs the rows the decode metadata covers (`finish_decode`).
+        rows = decode_md.seq_lens.shape[0] * max_query_len
+        assert rows <= q.shape[0], (rows, q.shape)
         cached_topk = self._load_cached_topk(sparse_metadata, topk_key)
         fused_scores = None
         if cached_topk is None:

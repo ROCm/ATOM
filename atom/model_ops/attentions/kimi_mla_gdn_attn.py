@@ -8,7 +8,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.state_runtime import StateTransfer
+from atom.model_engine.state_runtime import StateTransfer, midstep_rerun_rows
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
@@ -19,6 +19,7 @@ from atom.model_ops.glm5_next.geometry import (
     speculative_kpool_history_size,
 )
 from atom.utils import CpuGpuBuffer, envs
+from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_mla import (
     MLA_ROWS,
@@ -31,6 +32,13 @@ from .pool_layout.page_unit_geometry import PageUnitGeometryMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .token_layout.slots import slot_mapping
 from .triton_mla import TritonMLAMetadataBuilder
+
+# A scratch slot is held from scheduling until the batch after its forward has
+# issued the store, so two steps' checkpoints are out at once.
+# This adds room for two targets per step, not two prefills: one prefill can
+# need both a rung and an anchor. Other free runtime slots are also available.
+# A full shared pool drops optional targets and cuts at an unbacked anchor.
+MIDSTEP_SCRATCH_SLOTS = 4
 
 
 class KimiMLAGDNBackend(AttentionBackend):
@@ -361,6 +369,25 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         """
         return not getattr(self.model_runner.config, "enable_rapidserve", False)
 
+    def _reads_midstep(self) -> bool:
+        """Whether a checkpoint inside a prefill forward is written in it.
+
+        `chunk_kimi_delta_attn` returns only the final state, so K3's forward
+        re-runs each interior target's head instead (`_checkpoint_targets`);
+        GLM-5.3's linear attention writes none. Without it the scheduler cuts
+        the prefill at every checkpoint, and a prompt pays a second step for
+        its prompt-end anchor. Not under PP: the scratch slot is handed back two
+        scheduler passes after its forward, which no midstep path has checked
+        against a deeper pipeline (Qwen's keeps PAGE off under PP).
+        """
+        runner = self.model_runner
+        return (
+            self._uses_paged_checkpoints()
+            and runner.hf_text_config.model_type == "kimi_linear"
+            and self._decode_image_is_conv_and_ssm()
+            and runner.config.pipeline_parallel_size == 1
+        )
+
     def state_transfer(self) -> StateTransfer:
         """A PAGE-image copy, not `GDNStateMixin`'s fork.
 
@@ -369,21 +396,15 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         127 ordinary KV blocks — 0.112% of the paged pool — drawn from the same
         free list as everything else, and evicted by the same LRU.
 
-        Not midstep-readable, for want of plumbing rather than of state: KDA
-        goes through aiter's `chunk_kimi_delta_attn`, whose returned tuple
-        carries only the final state. The per-chunk `h` an interior checkpoint
-        would be sliced out of *is* computed — by the same
-        `chunk_gated_delta_rule_fwd_h` the GDN path uses — and then dropped
-        before the return. Exposing it is what this backend would need to
-        answer `True`. `PagedStateCheckpointCoordinator` says `False` for its
-        own reasons, so the two agree meanwhile.
+        Midstep-readable on grid 1 (`_reads_midstep`): the re-run ends a head
+        at any token, and the conv window needs `conv_kernel - 1` of the
+        forward's tokens before the target.
 
-        Dtype-safe by construction, which a checkpoint cut from `h` would not
-        be here — `_state_dtypes` gives kimi_linear a v side of its own dtype
-        (`ATOM_GDN_SSM_DTYPE`). An image is copied slot to slot with no kernel
-        output in between, so it round-trips exactly whatever that dtype is.
-        Both dtypes are named in the layout id, so a build that changed either
-        cannot read another's images.
+        Interior SSM images use the head re-run's final state, converted by
+        the shared checkpoint writer to the pool dtype (`ATOM_GDN_SSM_DTYPE`).
+        End targets copy the settled runtime state. PAGE storage and restore
+        preserve those slot bytes exactly. Both pool dtypes are named in the
+        layout id, so a build that changed either cannot read another's images.
         """
         if not self._uses_paged_checkpoints():
             return StateTransfer.fork(1)
@@ -419,7 +440,48 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             f":spec={self.num_spec}"
             ":carry=all"
         )
-        return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
+        if not self._reads_midstep():
+            return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
+        return StateTransfer.copy(
+            layout_id,
+            decode_keep=self._decode_keep(),
+            readable_midstep=True,
+            midstep_grid=1,
+            midstep_min_offset=self._conv_state_len(),
+        )
+
+    def _checkpoint_targets(self, batch) -> dict | None:
+        """This step's midstep checkpoints, as `midstep_rerun_rows` device
+        tensors for the KDA forward to write them from."""
+        if not any(batch.state_save_all):
+            return None
+        found = self._midstep_targets(batch, 1)
+        if not found:
+            return None
+        rows = midstep_rerun_rows(found, batch.num_scheduled_tokens)
+        head_ranges = rows.pop("head_ranges", ())
+        # One small metadata transfer; token-sized ranges are built on the device.
+        packed = torch.tensor(
+            [value for values in rows.values() for value in values],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        result, offset = {}, 0
+        for name, values in rows.items():
+            result[name] = packed[offset : offset + len(values)]
+            offset += len(values)
+        if head_ranges:
+            result["kda_tokens"] = torch.cat(
+                [torch.arange(sum(batch.num_scheduled_tokens), device=self.device)]
+                + [
+                    torch.arange(start, start + length, device=self.device)
+                    for start, length in head_ranges
+                ]
+            )
+        return result
+
+    def _needs_chunk_checkpoint_snapshots(self) -> bool:
+        return False
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN
@@ -538,16 +600,25 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         Widening the existing entry rather than declaring a second class keeps
         one slot id per request: the tail must be addressed by exactly the
         index KDA's state is, or a request would read another's partial pool.
+
+        Midstep checkpoints are written into scratch slots borrowed from this
+        pool, which otherwise holds exactly one slot per admitted request:
+        with every request in, there would be none to borrow.
         """
         base = super().state_spec()
-        extra = self._kpool_tail_bytes()
-        if not extra:
-            return base
+        cfg = self.model_runner.config
+        scratch = (
+            MIDSTEP_SCRATCH_SLOTS
+            if self._reads_midstep()
+            and cfg.enable_prefix_caching
+            and self._checkpoint_interval() != 0
+            else 0
+        )
         return state_pool(
             base.name,
-            base.entry_bytes + extra,
+            base.entry_bytes + self._kpool_tail_bytes(),
             entries_per_req=base.entries_per_req,
-            extra_entries=base.extra_entries,
+            extra_entries=base.extra_entries + scratch,
         )
 
     def allocate_per_req_cache(self, entries: dict[str, int]) -> dict:
@@ -720,6 +791,71 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         _, lengths, _ = self.decode_spans(batch)
         self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
         return built
+
+    @property
+    def supports_token_graph(self) -> bool:
+        """Every launch outside the model's eager regions -- the KDA recurrence
+        and the MLA prefill core -- is sized by the token count alone, so a
+        prefill may pad to a recorded token-graph bucket. The regions
+        (`_kda_recurrence`, `attention_mla._mla_prefill_core`) run the whole
+        bucket too. A pad row belongs to no request: its batch id and KV slot
+        are -1, it lies past every request's `cu_seqlens` (a padding request
+        there is zero long), and the KDA metadata names the requests' rows and
+        state slots alone. Their kernels skip it.
+
+        Not under DP: a decoding or idle rank would replay the prefill
+        recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
+        prefill alone. Only while the model opted every MLA layer of its own
+        into the prefill split (`MLAAttention.split_prefill_recording`, which
+        Kimi-K3 sets) and each can take it
+        (`MLAAttention.prefill_split_supported`: no sparse layer, PCP or
+        ``ATOM_USE_TRITON_GEMM``). Any other layer would run as one region,
+        which cannot serve a padded bucket: `forward_impl` takes no live row
+        count, so its FP8 prefill attention would quantize the bucket's pad
+        rows with the step's. A sparse layer's DSA indexer is besides no
+        eager region and returns on the recording's dummy step, so a replay
+        would attend with a stale top-k. So no model on this builder with a
+        sparse MLA layer records: Kimi-K3.1, whose layers opt in but all carry
+        a DSA indexer, and GLM-5.3-Flash, whose layers are all sparse and opt
+        nothing in. A drafter's layers, numbered past the target's
+        (`layer_offset`), do not count: the recording runs the target alone."""
+        config = self.model_runner.config
+        if config.parallel_config.data_parallel_size != 1:
+            return False
+        target_layers = config.hf_config.num_hidden_layers
+        sfc = config.compilation_config.static_forward_context
+        target_mla = [
+            impl
+            for module in sfc.values()
+            if isinstance(impl := getattr(module, "impl", None), MLAAttention)
+            and impl.layer_num < target_layers
+        ]
+        return bool(target_mla) and all(
+            impl.split_prefill_recording and impl.prefill_split_supported()
+            for impl in target_mla
+        )
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A request-less prefill of ``tokens`` rows for recording that
+        token-graph bucket. A dummy step: its regions hand back zeros of their
+        output's shape and touch no KV or state -- a replay runs them on the
+        live step -- and the segments need only its shape."""
+        if not 0 < tokens <= self.model_runner.config.max_num_batched_tokens:
+            raise ValueError(
+                f"token-graph bucket {tokens} exceeds max_num_batched_tokens"
+            )
+        positions = self.model_runner.forward_vars["positions"].gpu[:tokens]
+        positions.zero_()
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
+        return AttentionMetaData(max_seqlen_q=tokens, max_seqlen_k=tokens), context
 
     def _stage_draft_ctx_slots(
         self, batch, seqlens_q: np.ndarray, rows: int, group
