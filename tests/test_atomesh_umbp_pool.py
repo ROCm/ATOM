@@ -530,7 +530,13 @@ run_benchmark_and_eval() { echo "BENCHMARK"; }
         exports = submit[start : submit.index("\nPY\n", start)]
         cls.exports = {}
         with tempfile.TemporaryDirectory() as directory:
-            for suite in ("umbp_kv_events", "umbp_smoke", "umbp_2p1d_kv_events"):
+            for suite in (
+                "umbp_kv_events",
+                "umbp_smoke",
+                "umbp_2p1d_kv_events",
+                "umbp_2p1d_kv_events_dshare",
+                "umbp_12p12d_kv_events_opt",
+            ):
                 output = Path(directory) / f"{suite}.json"
                 subprocess.run(
                     [
@@ -696,15 +702,22 @@ run_benchmark_and_eval() { echo "BENCHMARK"; }
         )
         self.assert_one_server_served_and_stopped()
 
-    def test_only_the_cells_of_one_node_take_mooncake_off_hip_ipc(self):
-        # Where the prefill and the decode share a node, a prefill worker's two
-        # devices cannot open the memory of the decode's third and fourth.
+    def test_only_the_cells_with_a_shared_node_take_mooncake_off_hip_ipc(self):
+        # Where a prefill and a decode worker share a node, the prefill's two
+        # devices cannot open the memory of the decode's third and fourth. The
+        # 12 + 12 cells have such a node: node 1.
         self.assertEqual(
             {
                 suite: exports.get("ATOMESH_ENV_MC_DISABLE_HIP")
                 for suite, exports in self.exports.items()
             },
-            {"umbp_kv_events": None, "umbp_smoke": "1", "umbp_2p1d_kv_events": "1"},
+            {
+                "umbp_kv_events": None,
+                "umbp_smoke": "1",
+                "umbp_2p1d_kv_events": "1",
+                "umbp_2p1d_kv_events_dshare": "1",
+                "umbp_12p12d_kv_events_opt": "1",
+            },
         )
 
     def test_the_prefill_node_runs_one_server_for_its_four_workers(self):
@@ -735,6 +748,85 @@ run_benchmark_and_eval() { echo "BENCHMARK"; }
                 namespaces.add(pool["kv_connector_extra_config"]["namespace"])
         self.assertEqual(len(namespaces), 4)
         self.assert_one_server_served_and_stopped()
+
+    def test_a_decode_worker_can_keep_its_pool_on_the_nodes_server(self):
+        workers = self.launch("umbp_2p1d_kv_events_dshare", rank=0, nodes=1)
+        self.assertEqual(
+            sorted(workers),
+            [
+                "decode-rank-0-worker-0",
+                "prefill-rank-0-worker-0",
+                "prefill-rank-0-worker-1",
+            ],
+        )
+        devices, env, command = workers["decode-rank-0-worker-0"]
+        self.assertEqual(devices, "4,5,6,7")
+        # The server's ordinals of its devices, as a prefill worker is told.
+        self.assertEqual(env["ATOM_UMBP_DEVICE_ORDINALS"], "4,5,6,7")
+        p_d, pool = json.loads(self.flag(command, "--kv-transfer-config"))["connectors"]
+        self.assertEqual(
+            (p_d["kv_role"], p_d["kv_connector"], p_d["handshake_port"]),
+            ("kv_consumer", "mooncake", 6305),
+        )
+        self.assertEqual(
+            pool,
+            {
+                "kv_connector": "umbp_pool",
+                "kv_connector_extra_config": {
+                    "address": "unix:///tmp/umbp-l1/server.sock",
+                    # Apart from the prefill workers' p6301 and p6303.
+                    "namespace": "d6305",
+                    # It offers its blocks and copies none in.
+                    "fetch": False,
+                },
+            },
+        )
+        self.assert_one_server_served_and_stopped()
+
+    def test_the_twelve_twelve_cells_fill_node_0_with_four_prefill_workers(self):
+        workers = self.launch("umbp_12p12d_kv_events_opt", rank=0, nodes=3)
+        self.assertEqual(
+            sorted(workers), [f"prefill-rank-0-worker-{index}" for index in range(4)]
+        )
+        self.assert_one_server_served_and_stopped()
+
+    def test_the_twelve_twelve_cells_pack_two_prefill_workers_beside_a_decode(self):
+        workers = self.launch("umbp_12p12d_kv_events_opt", rank=1, nodes=3)
+        self.assertEqual(
+            {
+                name: (devices, env.get("ATOM_UMBP_DEVICE_ORDINALS"))
+                for name, (devices, env, _) in workers.items()
+            },
+            {
+                "prefill-rank-1-worker-4": ("0,1", "0,1"),
+                "prefill-rank-1-worker-5": ("2,3", "2,3"),
+                # Its pool is its own: the cell does not set UMBP_POOL_DECODE.
+                "decode-rank-1-worker-0": ("4,5,6,7", None),
+            },
+        )
+        for index in (4, 5):
+            with self.subTest(worker=index):
+                _, _, command = workers[f"prefill-rank-1-worker-{index}"]
+                self.assertEqual(self.flag(command, "--server-port"), str(8010 + index))
+                # The role's value follows the common one, and the last wins.
+                self.assertEqual(
+                    [
+                        command[at + 1]
+                        for at, word in enumerate(command)
+                        if word == "--gpu-memory-utilization"
+                    ][-1],
+                    "0.95",
+                )
+        # Node 1 has a server of its own, for its two prefill workers.
+        self.assert_one_server_served_and_stopped()
+
+    def test_the_twelve_twelve_cells_leave_node_2_to_two_decode_workers(self):
+        workers = self.launch("umbp_12p12d_kv_events_opt", rank=2, nodes=3)
+        self.assertEqual(
+            {name: devices for name, (devices, _, _) in workers.items()},
+            {"decode-rank-2-worker-1": "0,1,2,3", "decode-rank-2-worker-2": "4,5,6,7"},
+        )
+        self.assertEqual(self.server_calls(), [])
 
     def test_a_decode_node_starts_no_server(self):
         workers = self.launch("umbp_kv_events", rank=1, nodes=3)

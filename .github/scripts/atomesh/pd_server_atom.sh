@@ -2373,6 +2373,23 @@ start_decode() {
       "ATOM_DP_BASE_PORT=${dp_base_port}"
     )
   fi
+  # UMBP_POOL_DECODE=1 (decode role env, in a case whose prefill has
+  # UMBP_POOL=1) keeps this decode worker's paged KV in pools of the node's
+  # UMBP server as well: the case's DECODE_KV_TRANSFER_CONFIG names the
+  # umbp_pool connector beside the Mooncake consumer (multi). A decode rank
+  # indexes the prompt blocks it receives, so the prefill ranks of its node
+  # can then copy a prefix out of its pool as they do out of each other's. A
+  # node with decode workers alone gets its server here; the worker's visible
+  # devices are the server's ordinals, as for a prefill worker.
+  local -a decode_umbp_env=()
+  if [[ "${UMBP_POOL_DECODE:-0}" == "1" ]]; then
+    if ! umbp_pool_requested; then
+      echo "[umbp-pool][FAIL] UMBP_POOL_DECODE=1 needs UMBP_POOL=1 in the prefill role env: the server's settings are the prefill's" >&2
+      exit 2
+    fi
+    start_umbp_pool_server
+    decode_umbp_env=("ATOM_UMBP_DEVICE_ORDINALS=${HIP_VISIBLE_DEVICES}")
+  fi
   local decode_kv_transfer_config
   decode_kv_transfer_config="$(kv_transfer_config kv_consumer "${DECODE_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a decode_profiler_args=()
@@ -2390,8 +2407,8 @@ start_decode() {
     "${decode_profiler_args[@]}"
     ${DECODE_SERVER_ARGS}
   )
-  dump_launch_info "DECODE" "${decode_mooncake_env[@]}" "${decode_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_mooncake_env[@]}" "${decode_cmd[@]}"
+  dump_launch_info "DECODE" "${decode_mooncake_env[@]}" "${decode_umbp_env[@]}" "${decode_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_mooncake_env[@]}" "${decode_umbp_env[@]}" "${decode_cmd[@]}"
 }
 
 # The aggregated server reads the `decode` service block and `env.decode`: it is

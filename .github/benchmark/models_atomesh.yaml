@@ -2904,3 +2904,44 @@ models:
           name: ds-v41-flash-12p12d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-opt-c1228
           display_topology: 12P12D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-OPT
           router: *dsv41_umbp_kvev_router
+
+      # umbp_2p1d_kv_events_opt with a prefill step taking at most 8192 tokens
+      # of any one request. A step runs to its end before the requests that
+      # arrived during it are looked at, and a rank's requests are taken in
+      # order: a prompt with tens of thousands of uncached tokens otherwise
+      # fills steps of up to max_num_batched_tokens by itself, and the short
+      # suffixes behind it wait for each of them.
+      umbp_2p1d_kv_events_lpt:
+        - <<: *dsv41_2p1d_umbp_kvev
+          name: ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-lpt-c64
+          display_topology: 2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-LPT
+          prefill:
+            <<: *dsv41_p2ep2_prefill_hbm95
+            workers: 2
+            extra_args: "--enable-dp-attention --enable-expert-parallel --dp-load-balance share_cache --attn-prefill-chunk-size 65536 --gpu-memory-utilization 0.95 --long-prefill-token-threshold 8192"
+          env:
+            common: *dsv41_one_node_env_common
+            prefill: *dsv41_umbp_wait_env_prefill
+
+      # umbp_2p1d_kv_events_opt with the decode worker's paged KV in pools of
+      # the node's UMBP server too (UMBP_POOL_DECODE, pd_server_atom.sh). A
+      # decode rank's pool is about 107 GiB at its 75% of the GPU and holds, in
+      # its prefix index, the prompt blocks of the requests it decoded: with
+      # the pool in the node's share group the prefill ranks copy a prefix they
+      # no longer hold out of it, as out of each other's. The decode ranks only
+      # offer their blocks (fetch off): a V4.1 request's KV always comes whole
+      # from its prefill.
+      umbp_2p1d_kv_events_dshare:
+        - <<: *dsv41_2p1d_umbp_kvev
+          name: ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-dshare-c64
+          display_topology: 2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-DSHARE
+          prefill:
+            <<: *dsv41_p2ep2_prefill_hbm95
+            workers: 2
+          env:
+            common: *dsv41_one_node_env_common
+            prefill: *dsv41_umbp_wait_env_prefill
+            decode: &dsv41_umbp_env_decode_pool
+              UMBP_POOL_DECODE: "1"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"umbp_pool","kv_connector_extra_config":{"address":"unix:///tmp/umbp-l1/server.sock","namespace":"d${HANDSHAKE_PORT}","fetch":false}}]}
