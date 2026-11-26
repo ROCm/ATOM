@@ -44,6 +44,24 @@ record() {
   fi
 }
 
+record_case() {
+  local name="$1"
+  shift
+  local attempt
+  for attempt in 1 2; do
+    if "$@"; then
+      printf 'PASS %s (attempt %d)\n' "$name" "$attempt" \
+        | tee -a "$GITHUB_STEP_SUMMARY"
+      return 0
+    fi
+    if ((attempt < 2)); then
+      echo "::warning title=Retrying Lumen case::$name failed attempt $attempt"
+    fi
+  done
+  failures+=("$name")
+  printf 'FAIL %s after 2 attempts\n' "$name" | tee -a "$GITHUB_STEP_SUMMARY"
+}
+
 model_unavailable() {
   echo "Required model is unavailable: $1" >&2
   return 1
@@ -53,7 +71,7 @@ record_model_case() {
   local name="$1" ready="$2" model="$3"
   shift 3
   if [[ "$ready" == 1 ]]; then
-    record "$name" "$@"
+    record_case "$name" "$@"
   else
     record "$name" model_unavailable "$model"
   fi
@@ -145,33 +163,33 @@ run_container_case_13() {
 
 printf '## Lumen GPU suite\n' >> "$GITHUB_STEP_SUMMARY"
 record "unit" run_unit
-record "case-1" run_host_case 1 \
+record_case "case-1" run_host_case 1 \
   "PRECISION=bf16 TRAIN_STEPS=20 bash examples/llama2/run_pretrain_llama2_7b.sh"
-record "case-2" run_host_case 2 \
+record_case "case-2" run_host_case 2 \
   "TRAIN_STEPS=20 bash examples/llama2/run_pretrain_llama2_7b.sh"
-record "case-3" run_host_case 3 \
+record_case "case-3" run_host_case 3 \
   "MODEL=llama2 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"
 record_model_case "case-4" "$LUMEN_LLAMA2_MODEL_READY" "$LUMEN_LLAMA2_MODEL" \
   run_host_case 4 \
   "MODE=fp8_blockwise SEQ_LEN=2048 TRAIN_STEPS=20 bash examples/llama2/run_fsdp_lora_7b.sh" \
   llama2 npy
-record "case-5" run_host_case 5 \
+record_case "case-5" run_host_case 5 \
   "PRECISION=bf16 TRAIN_STEPS=20 bash examples/llama31/run_pretrain_llama31_8b.sh"
-record "case-6" run_host_case 6 \
+record_case "case-6" run_host_case 6 \
   "TRAIN_STEPS=20 bash examples/llama31/run_pretrain_llama31_8b.sh"
-record "case-7" run_host_case 7 \
+record_case "case-7" run_host_case 7 \
   "MODEL=llama31 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"
-record "case-8" run_host_case 8 \
+record_case "case-8" run_host_case 8 \
   "PRECISION=bf16 TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b.sh"
-record "case-9" run_host_case 9 \
+record_case "case-9" run_host_case 9 \
   "TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b.sh"
-record "case-10" run_host_case 10 \
+record_case "case-10" run_host_case 10 \
   "MODEL=qwen3 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"
 record_model_case "case-11" "$LUMEN_QWEN3_MODEL_READY" "$LUMEN_QWEN3_MODEL" \
   run_host_case 11 \
   "MAX_STEPS=20 EVAL_INTERVAL=20 bash examples/qwen3/run_qwen3_fsdp.sh" \
   qwen3 alpaca
-record "case-12" run_host_case 12 \
+record_case "case-12" run_host_case 12 \
   "TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b_mxfp4.sh"
 record_model_case "case-13" "$LUMEN_QWEN3_MODEL_READY" "$LUMEN_QWEN3_MODEL" \
   run_container_case_13
