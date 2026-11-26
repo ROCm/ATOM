@@ -412,7 +412,6 @@ class LLMEngine:
                 "checkpoints_superseded",
                 "superseded_events",
                 "checkpoints_trimmed",
-                "checkpoints_trimmed",
                 "slots_held",
                 "demands_recorded",
                 "demands_declined_no_room",

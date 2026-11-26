@@ -224,14 +224,14 @@ class TestStatePoolBacking:
         return state, pool, sb
 
     def test_a_slot_takes_a_superblock_only_when_handed_out(self):
-        state, pool, sb = self.backed()
+        state, _pool, sb = self.backed()
         assert sb.occupancy()["supers_state"] == 0, "nothing reserved up front"
         slot = state.pop()
         assert sb.occupancy()["supers_state"] == 1
         assert state._slot_super[slot] >= 0
 
     def test_a_vacant_slot_gives_its_superblock_back(self):
-        state, pool, sb = self.backed()
+        state, _pool, sb = self.backed()
         slot = state.pop()
         state.release(slot)
         assert sb.occupancy()["supers_state"] == 0, "capacity returned to KV"
@@ -243,7 +243,7 @@ class TestStatePoolBacking:
         Handing the backing back on release would leave the index pointing at
         memory the paged pool had already reused — findable, and wrong.
         """
-        state, pool, sb = self.backed()
+        state, _pool, sb = self.backed()
         slot = state.pop()
         state._index(101, slot)
         state.release(slot)
@@ -252,16 +252,19 @@ class TestStatePoolBacking:
 
     def test_admission_asks_the_paged_pool_for_the_shortfall(self):
         """`has_free` must agree with what `pop` can actually back."""
-        state, pool, sb = self.backed(num_blocks=8, per=4, slots=4)
+        state, _pool, _sb = self.backed(num_blocks=8, per=4, slots=4)
         first = state.pop()
         second = state.pop()
         assert not state.has_free(), "both superblocks are spoken for"
         state.release(first)
         assert state.has_free()
-        assert state.pop() == first or second >= 0
+        # The released slot is the one handed back, not the still-live `second`.
+        reused = state.pop()
+        assert reused == first
+        assert reused != second
 
     def test_slots_already_backed_need_no_further_superblock(self):
-        state, pool, sb = self.backed(num_blocks=8, per=4, slots=4)
+        state, _pool, _sb = self.backed(num_blocks=8, per=4, slots=4)
         slot = state.pop()
         state._index(101, slot)
         state.release(slot)  # keeps its backing, being a checkpoint
@@ -385,14 +388,14 @@ class TestElasticSlots:
         Sizing the tensor for the supply instead is not an option either: 627
         slots is 32.8 GiB at Kimi-K3's geometry, which is the whole paged pool.
         """
-        state, pool, sb = self.elastic(num_blocks=320, per=32, slots=2, max_slots=5)
+        state, _pool, sb = self.elastic(num_blocks=320, per=32, slots=2, max_slots=5)
         while state.has_free() and state.num_slots < 50:
             state.pop()
         assert state.num_slots == 5, "minted past the tensor"
         assert sb.occupancy()["supers_reclaimable"] > 0, "supply was not the limit"
 
     def test_the_index_space_grows_past_its_initial_ceiling(self):
-        state, pool, sb = self.elastic(slots=2)
+        state, _pool, _sb = self.elastic(slots=2)
         taken = []
         while state.has_free() and len(taken) < 50:
             taken.append(state.pop())
@@ -419,7 +422,7 @@ class TestElasticSlots:
         fell through to spending checkpoints. On hardware that was 114
         evictions against 627 free superblocks.
         """
-        state, pool, sb = self.elastic(num_blocks=320, per=32, slots=2)
+        state, _pool, _sb = self.elastic(num_blocks=320, per=32, slots=2)
         # Fill both starting slots and file a checkpoint on each, so every
         # free slot is checkpointed and none is vacant — the state the server
         # actually ran in (`8/32 used, 24 checkpointed, 0 vacant`).
@@ -439,7 +442,7 @@ class TestElasticSlots:
 
     def test_a_checkpoint_is_spent_only_once_growth_is_exhausted(self):
         """Minting is second in the order, not a replacement for eviction."""
-        state, pool, sb = self.elastic(num_blocks=128, per=32, slots=1)
+        state, _pool, _sb = self.elastic(num_blocks=128, per=32, slots=1)
         slot = state.pop()
         state._index(101, slot)
         state.release(slot)
