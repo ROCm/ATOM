@@ -1679,6 +1679,8 @@ def _pp_head(monkeypatch, connector, scheduler=None):
 
     def core_init(self, _config, *_args):
         self.scheduler, self.kv_transfer_enabled, self.label = scheduler, True, "head"
+        # PPEngineCoreProc names its stage on the runner manager's label.
+        self.runner_mgr = SimpleNamespace(label="head")
 
     reports = _StageReports()
     monkeypatch.setattr(pp_engine_core.EngineCore, "__init__", core_init)

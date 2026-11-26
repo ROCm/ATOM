@@ -124,6 +124,9 @@ class LazySaveSchedulerMixin:
     """
 
     needs_hbm_probe_before_lookup = True
+    # How log lines name the tier, and the request-id prefix of its demotions.
+    _lazy_label = "LMCache lazy"
+    _lazy_demotion_req_id = _DEMOTION_REQ_ID
 
     def _init_lazy_save(self) -> None:
         chunk = int(self.chunk_size)
@@ -140,31 +143,7 @@ class LazySaveSchedulerMixin:
                 f"spans ({self.virtual_block_size}: the block size, times the "
                 f"DCP size under DCP)"
             )
-        if not self._prehashed:
-            raise ValueError(
-                "save_policy 'lazy' needs prehashed saves "
-                "(ATOM_OFFLOAD_PREHASHED_SAVE=1), which are off (with the flag "
-                "set, the 'ATOM_OFFLOAD_PREHASHED_SAVE ignored' line above says "
-                "why)"
-            )
-        kvc = getattr(self._config, "kv_transfer_config", None)
-        if getattr(offcfg.build_lmcache_config(kvc), "enable_kv_events", False):
-            raise ValueError(
-                "save_policy 'lazy' cannot emit LMCache KV events: a demotion "
-                "stores blocks of many prefixes as one save, whose events would "
-                "name the wrong parents and tokens"
-            )
-        # Checked now rather than on the first prompt (`_prefix_chunk_hashes`):
-        # a demotion has no token path to fall back to, so a mismatch found
-        # while serving would leave the tier empty.
-        tokens = list(range(2 * chunk))
-        chain: list[int] = []
-        self._extend_prehash_chain(chain, tokens, 2)
-        if not self._verify_prehash_chain(tokens, chain, 2):
-            raise ValueError(
-                "save_policy 'lazy': the scheduler's chunk hashes do not match "
-                "LMCache's"
-            )
+        self._check_lazy_backend(chunk)
         # No request saves its prompt: the save tracker, the save loop and the
         # deferred free all follow `_do_save`.
         self._do_save = False
@@ -215,6 +194,55 @@ class LazySaveSchedulerMixin:
         pp = max(1, int(getattr(self._config, "pipeline_parallel_size", 1) or 1))
         self._max_demotions = (
             _MAX_DEMOTIONS_IN_FLIGHT * (2 if self._exclusive else 1) * pp
+        )
+
+    def _check_lazy_backend(self, chunk: int) -> None:
+        """Refuse a tier this policy cannot run on. The LMCache tier: it needs
+        prehashed saves, no LMCache KV events, and the scheduler's chunk hashes
+        must be LMCache's own. A tier with its own keys overrides this."""
+        if not self._prehashed:
+            raise ValueError(
+                "save_policy 'lazy' needs prehashed saves "
+                "(ATOM_OFFLOAD_PREHASHED_SAVE=1), which are off (with the flag "
+                "set, the 'ATOM_OFFLOAD_PREHASHED_SAVE ignored' line above says "
+                "why)"
+            )
+        kvc = getattr(self._config, "kv_transfer_config", None)
+        if getattr(offcfg.build_lmcache_config(kvc), "enable_kv_events", False):
+            raise ValueError(
+                "save_policy 'lazy' cannot emit LMCache KV events: a demotion "
+                "stores blocks of many prefixes as one save, whose events would "
+                "name the wrong parents and tokens"
+            )
+        # Checked now rather than on the first prompt (`_prefix_chunk_hashes`):
+        # a demotion has no token path to fall back to, so a mismatch found
+        # while serving would leave the tier empty.
+        tokens = list(range(2 * chunk))
+        chain: list[int] = []
+        self._extend_prehash_chain(chain, tokens, 2)
+        if not self._verify_prehash_chain(tokens, chain, 2):
+            raise ValueError(
+                "save_policy 'lazy': the scheduler's chunk hashes do not match "
+                "LMCache's"
+            )
+
+    def _demotion_request(
+        self, operation: SaveOperationId, block_ids: list[int], hashes: list
+    ) -> LMCacheReqMeta:
+        """The save that stores a demotion: chunk i is `block_ids[i]`, keyed
+        by `hashes[i]`. The LMCache tier takes it as a `PrehashedSave`; a tier
+        with its own keys overrides this."""
+        return LMCacheReqMeta(
+            req_id=operation.req_id,
+            token_ids=[],
+            block_ids=block_ids,
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=operation,
+            prehashed_save=PrehashedSave(
+                start=0,
+                hashes=tuple(hashes),
+                must_store_all=True,
+            ),
         )
 
     def bind_save_abandoned(self, report) -> None:
@@ -425,21 +453,10 @@ class LazySaveSchedulerMixin:
             for block_id in block_ids:
                 pool.claim_unreused(block_id)
             nonce = self._save_nonce
-            operation = SaveOperationId(f"{_DEMOTION_REQ_ID}-{nonce}", nonce)
+            operation = SaveOperationId(f"{self._lazy_demotion_req_id}-{nonce}", nonce)
             self._save_nonce += 1
             meta.add_request(
-                LMCacheReqMeta(
-                    req_id=operation.req_id,
-                    token_ids=[],
-                    block_ids=block_ids,
-                    save_spec=SaveSpec(skip_leading_tokens=0),
-                    save_operation=operation,
-                    prehashed_save=PrehashedSave(
-                        start=0,
-                        hashes=tuple(h for _, h in batch),
-                        must_store_all=True,
-                    ),
-                )
+                self._demotion_request(operation, block_ids, [h for _, h in batch])
             )
             self._demotions[operation] = (block_ids, now)
             self._track_save_statistics(operation, len(block_ids) * chunk)
@@ -472,9 +489,10 @@ class LazySaveSchedulerMixin:
         if pool.blocks_evicted_dirty == count or now - at < 60.0:
             return
         logger.warning(
-            "LMCache lazy: %d unsaved blocks evicted from HBM since the last "
+            "%s: %d unsaved blocks evicted from HBM since the last "
             "report (no clean block left to evict); %d held, %d demotions "
             "failed so far",
+            self._lazy_label,
             pool.blocks_evicted_dirty - count,
             pool.num_held,
             self.total_lazy_demotions_failed,
@@ -491,8 +509,9 @@ class LazySaveSchedulerMixin:
         for operation, (block_ids, at) in list(self._demotions.items()):
             if now - at >= timeout:
                 logger.warning(
-                    "LMCache lazy demotion %s of %d blocks did not report in "
+                    "%s demotion %s of %d blocks did not report in "
                     "%.0fs; unpinning it unsaved",
+                    self._lazy_label,
                     operation,
                     len(block_ids),
                     timeout,
@@ -536,9 +555,10 @@ class LazySaveSchedulerMixin:
             if failed & (failed - 1) == 0:
                 # The 1st, 2nd, 4th, ...: a line, not a line per demotion.
                 logger.warning(
-                    "LMCache lazy demotion failed (%d so far): the CPU tier "
+                    "%s demotion failed (%d so far): the CPU tier "
                     "refused a chunk or the store failed; its blocks stay "
                     "unsaved and demotions pause %.0fs",
+                    self._lazy_label,
                     failed,
                     _DEMOTION_BACKOFF_S,
                 )
