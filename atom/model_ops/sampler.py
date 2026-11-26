@@ -179,8 +179,10 @@ class Sampler(nn.Module):
         its request's temperature, and picks the lowest-id argmax on rows at or
         below ``SAMPLER_EPS`` and the race of ``mixed_sample_outer_exponential``
         on the others. That race scales by ``1/T`` before subtracting the row
-        max, where ``fused_mixed_sample`` subtracts first, so the two can part
-        on a near tie at small ``T``; the law sampled is the same.
+        max, where ``fused_mixed_sample`` subtracts first, so on the same noise
+        the two can pick different tokens on a near tie at small ``T``: the
+        law sampled is the same, the tokens are not bit for bit those of the
+        two-call path.
         """
         rows, requests = target_logits_indices.numel(), bonus_logits_indices.numel()
         vocab_size, device = logits.shape[1], logits.device

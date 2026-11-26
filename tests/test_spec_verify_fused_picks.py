@@ -35,7 +35,22 @@ def test_verify_picks_draws_the_two_calls_noise_in_their_order(monkeypatch):
     stream gives the same noise either way."""
     seen = {}
 
-    def op(out_t, out_b, logits, expo_t, expo_b, temps, target, bonus, cu, **kw):
+    # eps / greedy_eps are keyword-only in aiter's contract: a positional
+    # pass would fail here as it does against the routed op.
+    def op(
+        out_t,
+        out_b,
+        logits,
+        expo_t,
+        expo_b,
+        temps,
+        target,
+        bonus,
+        cu,
+        *,
+        eps,
+        greedy_eps,
+    ):
         seen.update(
             out_t=out_t,
             out_b=out_b,
@@ -46,7 +61,8 @@ def test_verify_picks_draws_the_two_calls_noise_in_their_order(monkeypatch):
             target=target,
             bonus=bonus,
             cu=cu,
-            **kw,
+            eps=eps,
+            greedy_eps=greedy_eps,
         )
         out_t.fill_(7)
         out_b.fill_(9)
