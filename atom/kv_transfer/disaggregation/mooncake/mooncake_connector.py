@@ -509,9 +509,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # waits on D; were P's pool full of them while D's pages hold requests
         # P cannot admit, each side would wait on the other. So such sources
         # may hold at most this many of P's blocks (past it, an early request
-        # waits for D like a gated one), and a finished one D has not reached
-        # within the pin timeout is cancelled.
-        self._early_pin_timeout_s = envs.ATOM_PD_EARLY_HANDOFF_PIN_TIMEOUT_S
+        # waits for D like a gated one). A finished one D never reaches is
+        # cancelled by the worker's lookup timeout (`ChunkedPrefill.source_safe`,
+        # PREFILL_LOOKUP_TIMEOUT), whose `pd_source_safe` report releases it.
         self._early_pin_limit = 0.0
         if self._early_skip_gate:
             fraction = envs.ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION
@@ -525,9 +525,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             self._early_pin_limit = (
                 math.inf if fraction >= 1.0 else fraction * num_blocks
             )
-        # Early requests allocated before D's report, by request id:
-        # [sequence, pinned pages, deadline once its prefill finished].
-        self._early_pins: dict[ReqId, list] = {}
+        # Early requests allocated before D's report: request id -> pinned
+        # pages.
+        self._early_pins: dict[ReqId, int] = {}
         self._chunked_receiving: dict[ReqId, Sequence] = {}
         self._chunked_admission_timeout_s = float(
             kv_transfer_config.get("chunked_admission_timeout_s", 300)
@@ -656,10 +656,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         now = time.monotonic()
         for seq, deadline in list(self._chunked_waiting.values()):
             self._expire_chunked_admission(seq, deadline, now)
-        if self._early_skip_gate:
-            for seq, _, deadline in list(self._early_pins.values()):
-                if deadline is not None and now >= deadline:
-                    self._release_early_pin(seq)
         meta = ConnectorMetadata()
         meta.request_id_to_transfer_id = self.request_id_to_transfer_id
         meta.chunked_admissions = self._pending_chunked_admissions
@@ -747,7 +743,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         ):
             # Allocated before D's report: count it against the cap until D
             # reaches P or the source is released.
-            self._early_pins[seq.id] = [seq, len(seq.block_table), None]
+            self._early_pins[seq.id] = len(seq.block_table)
         if params.get("chunked_transfer") and (
             self.is_producer or params.get("do_remote_prefill")
         ):
@@ -843,14 +839,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             aborted = produced_no_handoff(seq)
             self._chunked_waiting.pop(seq.id, None)
             self._chunked_ready.discard(seq.id)
-            pin = self._early_pins.get(seq.id) if self._early_skip_gate else None
-            if pin is not None:
-                if aborted:
-                    # Its cancellation is queued below.
-                    del self._early_pins[seq.id]
-                else:
-                    # From here the source only waits for D.
-                    pin[2] = time.monotonic() + self._early_pin_timeout_s
+            if aborted and self._early_skip_gate:
+                # Its cancellation is queued below. A finished source keeps
+                # its pin until D reaches P or the worker reports it safe.
+                self._early_pins.pop(seq.id, None)
             params["prefill_aborted"] = aborted
             if not aborted:
                 drafts = getattr(seq, "spec_token_ids", None)
@@ -1001,28 +993,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def _early_pin_room(self, seq: Sequence) -> bool:
         """Whether `seq`'s prompt fits under the cap on sources allocated
         before D's report."""
-        pinned = sum(pages for _, pages, _ in self._early_pins.values())
         pages = -(-seq.num_prompt_tokens // (self.block_size * self.dcp_size))
-        return pinned + pages <= self._early_pin_limit
-
-    def _release_early_pin(self, seq: Sequence) -> None:
-        """Cancel a finished early source that D has not reached in time.
-
-        Queues the existing cancellation: the worker cancels the source, it is
-        freed once no reader holds it (`pd_source_safe`), and D's late write
-        request finds a retired transfer and fails, so D aborts the request.
-        """
-        del self._early_pins[seq.id]
-        logger.warning(
-            "P/D early handoff: D did not reach request %s within %.1f s of "
-            "its prefill; cancelling its source",
-            seq.id,
-            self._early_pin_timeout_s,
-        )
-        params = seq.kv_transfer_params
-        params["prefill_aborted"] = True
-        params.pop("prefill_handoff", None)
-        self._reqs_need_save[seq.id] = (seq, list(seq.block_table), seq.state_slot)
+        return sum(self._early_pins.values()) + pages <= self._early_pin_limit
 
     def _expire_chunked_admission(
         self, seq: Sequence, deadline: float, now: float
@@ -1052,7 +1024,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             elif completion.channel == "pd_admission_ready":
                 # An early source allocated before this report no longer
                 # waits on D (or, on failure, was already retired by the
-                # worker): it leaves the cap and the pin timeout.
+                # worker): it leaves the cap.
                 if self._early_skip_gate:
                     self._early_pins.pop(completion.operation_id, None)
                 pending = self._chunked_waiting.get(completion.operation_id)

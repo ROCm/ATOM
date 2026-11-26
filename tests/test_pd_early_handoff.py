@@ -468,7 +468,7 @@ def test_opposite_admission_order_progresses_in_early_mode(
     A's source before D reserved it, D's pages (or, with `byte_limit`, its
     admission bytes) would hold B, P's would hold a finished A that only D's
     A reader can free, and neither side could admit its other request (the
-    pair stalls until the pin timeout). With the gate (SKIP_GATE=0), or with
+    pair stalls until the worker's lookup timeout). With the gate (SKIP_GATE=0), or with
     the skip and the default cap (a 3-page prompt is past half of P's 3
     pages, so it waits for D), P follows D's order: both requests finish, no
     transfer fails, nothing is recomputed.
@@ -591,7 +591,7 @@ def test_cap_sends_early_requests_past_it_through_the_gate(
     b = seq_factory(list(range(10)), kv_transfer_params=p_params("early-b"))
     assert p.admission_ready(a)  # 3 pages of 6: at the cap.
     _allocate(p, a, [0, 1, 2])
-    assert p._early_pins[a.id][1] == 3
+    assert p._early_pins == {a.id: 3}
     assert p.admission_ready(b) is ready
     assert b.id in p._chunked_waiting  # Registered either way.
     _ack(p, a)  # D reached A: its source no longer waits on D.
@@ -637,45 +637,67 @@ def test_undone_allocation_leaves_the_cap(monkeypatch, seq_factory):
     assert not p._early_pins and a.id in p._chunked_waiting
 
 
-@pytest.mark.parametrize("d_arrives", [False, True])
-def test_pin_timeout_cancels_a_finished_source_d_never_reached(
-    monkeypatch, seq_factory, d_arrives
-):
-    """The clock starts when the prefill finishes (until then the source is
-    in use). A finished early source D has not reached within the pin
-    timeout is cancelled through the existing protocol: P stays the claim
-    holder until the worker reports it safe, and D's late write request fails.
-    D reaching P first stops the clock."""
-    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_PIN_TIMEOUT_S", "5")
+def test_reallocation_after_d_reached_p_takes_no_pin(monkeypatch, seq_factory):
+    """`admission_ready` re-admits a request that already holds its source
+    (e.g. resuming a MultiConnector load), and the scheduler allocates it
+    again. Once D has reached P that source no longer waits on D, so the
+    second allocation must not count it against the cap again."""
     p = make_scheduler_connector(monkeypatch, True, early=True, num_kvcache_blocks=6)
-    clock = [100.0]
-    monkeypatch.setattr(mc.time, "monotonic", lambda: clock[0])
     a = seq_factory(list(range(10)), kv_transfer_params=p_params("early-a"))
+    b = seq_factory(list(range(10)), kv_transfer_params=p_params("early-b"))
     assert p.admission_ready(a)
     _allocate(p, a, [0, 1, 2])
-    clock[0] += 60  # A long prefill: no clock yet.
-    assert not p.build_connector_meta().reqs_to_save
-    _finish_prefill(p, a)
-    meta = p.build_connector_meta()
-    assert meta.reqs_to_save[a.id].prefill_handoff["first_token_id"] == 42
-    if d_arrives:
-        _ack(p, a)
-    clock[0] += 4.9
-    assert not p.build_connector_meta().reqs_to_save
-    clock[0] += 0.2
-    meta = p.build_connector_meta()
-    if d_arrives:
-        assert not meta.reqs_to_save
-        return
-    cancel = meta.reqs_to_save[a.id]
-    assert cancel.prefill_aborted and cancel.prefill_handoff is None
-    assert cancel.transfer_id == "early-a"
+    assert p._early_pins == {a.id: 3}
+    _ack(p, a)
     assert not p._early_pins
-    # Freed only once the worker reports no reader holds it.
-    assert p.should_defer_free(a)
-    p.send_finished(a.id)
-    assert not p.should_defer_free(a)
-    assert not p.build_connector_meta().reqs_to_save  # Cancelled once.
+    assert p.admission_ready(a)  # It holds its send claim: re-admitted.
+    _allocate(p, a, [0, 1, 2, 3])
+    assert not p._early_pins
+    assert p.admission_ready(b)  # 3 pages of 6: the cap has room.
+
+
+def test_worker_lookup_timeout_releases_a_finished_pin(monkeypatch, seq_factory):
+    """P itself never cancels a finished early source D has not reached: it
+    keeps its pin (and its send claim) until the worker's lookup timeout
+    (`ChunkedPrefill.source_safe`) cancels it and reports it safe. The
+    scheduler's `send_finished` for that report takes it out of the cap at
+    once, so an early request past the cap can skip the gate again."""
+    from atom.model_engine.scheduler import ScheduledBatchOutput
+    from atom.sampling_params import SamplingParams
+
+    p = _p_scheduler(monkeypatch, num_blocks=6)
+    a, b = (
+        seq_factory(
+            list(range(10)),
+            sampling_params=SamplingParams(max_tokens=1),
+            kv_transfer_params=p_params(name),
+        )
+        for name in ("early-a", "early-b")
+    )
+    p.extend([a])
+    for _ in range(3):
+        batch, seqs = p.schedule()
+        assert list(seqs) == [a.id]
+        p.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput([a.id], [(42,)], None, None, None),
+            batch=batch,
+        )
+    handoff = p.kv_connector.build_connector_meta().reqs_to_save[a.id]
+    assert not handoff.prefill_aborted
+    assert p.kv_connector._early_pins == {a.id: 3}
+    assert a.id in p.deferred_free_blocks
+    assert not p.kv_connector.admission_ready(b)  # 3 + 3 pages > half of 6.
+    p._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            connector_completions={
+                mc.ConnectorCompletion("pd_source_safe", a.id, True)
+            }
+        )
+    )
+    assert not p.kv_connector._early_pins
+    assert not p.deferred_free_blocks and p.block_manager.kv.num_free == 6
+    assert p.kv_connector.admission_ready(b)
 
 
 def test_aborted_early_request_leaves_the_cap(monkeypatch, seq_factory):
@@ -704,11 +726,10 @@ def test_gate_mode_tracks_no_pins(monkeypatch, seq_factory):
 @pytest.mark.parametrize(
     "name,raw,expected",
     [
-        ("ATOM_PD_EARLY_HANDOFF_PIN_TIMEOUT_S", None, 30.0),
-        ("ATOM_PD_EARLY_HANDOFF_PIN_TIMEOUT_S", "0", 30.0),
-        ("ATOM_PD_EARLY_HANDOFF_PIN_TIMEOUT_S", "2.5", 2.5),
         ("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", None, 0.5),
         ("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", "1.5", 0.5),
+        ("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", "half", 0.5),
+        ("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", "0.25", 0.25),
         ("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", "0", 0.0),
         ("ATOM_PD_EARLY_HANDOFF", None, True),
         ("ATOM_PD_EARLY_HANDOFF", "0", False),
@@ -726,17 +747,18 @@ def test_valve_env_defaults_and_validation(monkeypatch, name, raw, expected):
     assert getattr(envs, name) == expected
 
 
-def test_pin_timeout_breaks_the_opposite_order_cycle(monkeypatch, seq_factory):
+def test_lookup_timeout_breaks_the_opposite_order_cycle(monkeypatch, seq_factory):
     """Without the cap (fraction 1) the reviewer's cycle forms for real: P
     allocates and finishes A before D reached it, D reserved B, and P cannot
-    admit B. The pin timeout cancels A's source: B then runs on both sides,
-    D's late A write request fails and D aborts A. Both pools end empty."""
+    admit B. The worker's lookup timeout (PREFILL_LOOKUP_TIMEOUT, shortened
+    here) cancels A's source: B then runs on both sides, D's late A write
+    request fails and D aborts A. Both pools end empty."""
     from atom.model_engine.scheduler import ScheduledBatchOutput
     from atom.model_engine.sequence import SequenceStatus
     from atom.sampling_params import SamplingParams
 
     monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", "1")
-    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_PIN_TIMEOUT_S", "0.05")
+    monkeypatch.setattr(mc, "PREFILL_LOOKUP_TIMEOUT", 0.05)
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "0")
     p = _p_scheduler(monkeypatch, num_blocks=3)
     d = _d_scheduler(monkeypatch, num_blocks=3)

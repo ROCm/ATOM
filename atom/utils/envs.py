@@ -232,16 +232,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_EARLY_HANDOFF_SKIP_GATE": lambda: _flag_env(
         "ATOM_PD_EARLY_HANDOFF_SKIP_GATE", "1"
     ),
-    # Safety valve for the skip: seconds a finished early prefill whose D has
-    # not reached P may keep its source pinned. P then cancels the source
-    # (D's late write request fails, and D aborts the request) so P's pool
-    # cannot stay full of sources that wait for a D that waits for P.
-    "ATOM_PD_EARLY_HANDOFF_PIN_TIMEOUT_S": lambda: _positive_float_env(
-        "ATOM_PD_EARLY_HANDOFF_PIN_TIMEOUT_S", "30"
-    ),
     # Safety valve for the skip: the share of P's KV blocks that sources
     # allocated before D's report may hold at once. An early request that
     # would cross it waits for D like a gated one. 0 = never skip, 1 = no cap.
+    # A finished source D never reaches is released by the worker's lookup
+    # timeout (PREFILL_LOOKUP_TIMEOUT, 60 s), as any chunked source is.
     "ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION": lambda: _checked_float_env(
         "ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION",
         "0.5",
