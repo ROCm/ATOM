@@ -1669,9 +1669,11 @@ async def _race_disconnect(coro, raw_request, request_id):
     ``abort_request`` + ``io_processor.requests.pop`` (for fan-out, this aborts
     every sibling). We then raise ``_ClientDisconnected``.
 
-    ``request.receive()`` is safe here because FastAPI has already parsed the
-    request body into a pydantic model before this handler runs, so there is no
-    unread body for ``receive()`` to race against.
+    ``request.receive()`` is safe here because the request body has already
+    been read to EOF before this runs, so there is no unread body for
+    ``receive()`` to race against: on the plain routes FastAPI parsed it into a
+    pydantic model before the handler ran; on ``PD_LATE_KV_PATH``,
+    ``_read_late_kv_request`` drains it with ``_LateKvBody.rest()``.
     """
     handler_task = asyncio.ensure_future(coro)
 
@@ -1993,6 +1995,9 @@ async def _relay_to_hub(request: Request) -> Response:
 
 # ---- Error handlers ----
 
+# ATOM_PD_LATE_KV's decode leg (see pd_late_kv_chat_completions below).
+PD_LATE_KV_PATH = "/v1/pd/late_kv/chat/completions"
+
 # Generation routes whose errors use the OpenAI envelope.
 _OPENAI_ERROR_ROUTES = frozenset(
     {
@@ -2001,9 +2006,8 @@ _OPENAI_ERROR_ROUTES = frozenset(
         "/v1/responses",
         "/beta/chat/completions",
         "/beta/completions",
-        # ATOM_PD_LATE_KV's decode leg (PD_LATE_KV_PATH); the router relays
-        # D's errors to the client.
-        "/v1/pd/late_kv/chat/completions",
+        # The router relays the late-KV decode leg's errors to the client.
+        PD_LATE_KV_PATH,
     }
 )
 
@@ -2162,15 +2166,14 @@ async def beta_chat_completions(
 # ---------------------------------------------------------------------------
 # ATOM_PD_LATE_KV: decode leg of the router's concurrent P/D dispatch.
 # ---------------------------------------------------------------------------
-# atomesh (ATOMESH_ATOM_PD_CONCURRENT=1) opens this request at the same time
-# as the prefill leg and streams a two-line body: line 1 is the chat request,
-# line 2 -- sent once P answers -- is `{"kv_transfer_params": {...}}`. D parses
-# and validates line 1 while P parses its own copy, so the large-body ingest
-# leaves the P->D critical path. Nothing reaches the engine before line 2, so
-# a failed prefill (body ends early, or the router drops the connection) never
+# PD_LATE_KV_PATH: atomesh (--atom-pd-concurrent) opens this request at the
+# same time as the prefill leg and streams a two-line body: line 1 is the chat
+# request, line 2 -- sent once P answers -- is `{"kv_transfer_params": {...}}`.
+# D parses and validates line 1 while P parses its own copy, so the large-body
+# ingest leaves the P->D critical path. Nothing reaches the engine before line
+# 2, so a failed prefill (the router aborts the body, or it ends early) never
 # enqueues anything on D. With the flag off the route answers 404, which the
 # router takes as "fall back to the serial relay".
-PD_LATE_KV_PATH = "/v1/pd/late_kv/chat/completions"
 
 
 class _LateKvBody:
@@ -2248,7 +2251,9 @@ async def _read_late_kv_request(raw_request: Request) -> ChatCompletionRequest:
         request = ChatCompletionRequest.model_validate(payload)
     except ValidationError as exc:
         raise RequestValidationError(exc.errors(), body=payload) from exc
-    del payload
+    # Release line 1's raw bytes and parsed dict before waiting on P: for a
+    # multi-MB prompt-id body they would otherwise double the pending hold.
+    del payload, head
     if request.kv_transfer_params is not None:
         raise HTTPException(
             400, "late-kv request line must not carry kv_transfer_params"

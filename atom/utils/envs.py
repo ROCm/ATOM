@@ -200,7 +200,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
     # P/D decode side: serve /v1/pd/late_kv/chat/completions, the decode leg of
-    # atomesh's concurrent dispatch (ATOMESH_ATOM_PD_CONCURRENT=1). The router
+    # atomesh's concurrent dispatch (--atom-pd-concurrent). The router
     # streams the chat request first and P's kv_transfer_params as a second
     # line, so D parses the body while P works. 0 = route answers 404 and the
     # router falls back to its serial relay.

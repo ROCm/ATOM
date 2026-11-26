@@ -108,7 +108,7 @@ def _post(chunks, events=None, gap_s=0.05):
             return await client.post(
                 PATH,
                 content=body(),
-                headers={"content-type": "application/json", "x-atom-pd-late-kv": "1"},
+                headers={"content-type": "application/json"},
             )
 
     return asyncio.run(asyncio.wait_for(post(), 10))
@@ -172,7 +172,11 @@ def test_echoed_ids_in_kv_line_are_reused_without_tokenizing(server):
 def test_malformed_bodies_are_rejected_before_enqueue(server, chunks, detail):
     response = _post(chunks)
     assert response.status_code == 400, response.text
-    assert detail in response.text
+    # OpenAI envelope (_OPENAI_ERROR_ROUTES), not FastAPI's {"detail": ...}:
+    # the router relays D's error to the client as is.
+    error = response.json()["error"]
+    assert detail in error["message"]
+    assert error["type"] == "invalid_request_error"
     assert server.generate == []
 
 
@@ -184,6 +188,9 @@ def test_trailing_whitespace_is_tolerated(server):
 def test_invalid_request_line_is_422_like_the_plain_route(server):
     response = _post([_head(messages="not-a-list"), _kv_line()])
     assert response.status_code == 422, response.text
+    error = response.json()["error"]
+    assert error["code"] == 422
+    assert "messages" in error["message"]
     assert server.generate == []
 
 
@@ -259,9 +266,7 @@ def test_chunked_http_body_through_uvicorn(server):
 
         async def post():
             async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as c:
-                return await c.post(
-                    PATH, content=body(), headers={"x-atom-pd-late-kv": "1"}
-                )
+                return await c.post(PATH, content=body())
 
         response = asyncio.run(asyncio.wait_for(post(), 10))
         assert response.status_code == 200, response.text
