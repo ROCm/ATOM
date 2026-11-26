@@ -241,6 +241,20 @@ async fn fetch_base_loads(
         }
         return loads;
     }
+    if backend == BackendType::Vllm {
+        let Some(body) = get_text(client, &format!("{base}/metrics"), api_key.as_deref()).await
+        else {
+            return HashMap::new();
+        };
+        let engines = parse_vllm_engine_loads(&body);
+        return group
+            .iter()
+            .filter_map(|worker| {
+                let load = vllm_load(&engines, worker.dp_rank())?;
+                Some((worker.url().to_string(), load))
+            })
+            .collect();
+    }
 
     let body = match get_text(client, &format!("{base}/get_load"), api_key.as_deref()).await {
         Some(body) => body,
@@ -263,7 +277,11 @@ async fn fetch_base_loads(
     loads
 }
 
-async fn get_text(client: &reqwest::Client, url: &str, api_key: Option<&str>) -> Option<String> {
+pub(crate) async fn get_text(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Option<String> {
     let mut req = client.get(url).timeout(REQUEST_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
@@ -301,6 +319,57 @@ pub(crate) fn parse_queued_requests(body: &str) -> Option<isize> {
     let running = gauge("atom:requests_running")?;
     let waiting = gauge("atom:requests_waiting").unwrap_or(0.0);
     Some((running + waiting) as isize)
+}
+
+/// vLLM's per-engine gauges, in the order [`parse_vllm_engine_loads`] stores them.
+const VLLM_GAUGES: [&str; 3] = [
+    "vllm:num_requests_running",
+    "vllm:num_requests_waiting",
+    "vllm:kv_cache_usage_perc",
+];
+
+/// Running, waiting and KV usage (a 0-1 fraction) per `engine` label. A gauge the
+/// body lacks for an engine stays `None`.
+pub(crate) fn parse_vllm_engine_loads(body: &str) -> HashMap<&str, [Option<f64>; 3]> {
+    let mut engines: HashMap<&str, [Option<f64>; 3]> = HashMap::new();
+    for (index, name) in VLLM_GAUGES.into_iter().enumerate() {
+        for (rest, value) in samples(body, name) {
+            if let Some(engine) = label_value(rest, "engine") {
+                engines.entry(engine).or_default()[index] = Some(value);
+            }
+        }
+    }
+    engines
+}
+
+/// `1000 * (running + waiting)` plus the KV per-mille as a tie-break, over engine
+/// `rank`, or over every engine (requests summed, KV averaged) without one. Any
+/// gauge missing on an engine it reads, or no engine at all, gives no load.
+///
+/// Why 1000: the load is one `isize` because `PowerOfTwoPolicy` compares one
+/// cached value per worker, so two keys are packed into it. The request count
+/// decides first and KV usage only breaks a tie: KV is in per-mille (0.1% steps)
+/// and capped at 999, so one request (1000) outweighs any KV usage and a full
+/// cache never reads as one more request. The scale is fixed, not a tuning knob.
+fn vllm_load(engines: &HashMap<&str, [Option<f64>; 3]>, rank: Option<usize>) -> Option<isize> {
+    let rank = rank.map(|rank| rank.to_string());
+    let (mut requests, mut kv, mut count) = (0.0, 0.0, 0usize);
+    for (engine, gauges) in engines {
+        if rank.as_deref().is_some_and(|rank| rank != *engine) {
+            continue;
+        }
+        let [Some(running), Some(waiting), Some(usage)] = *gauges else {
+            return None;
+        };
+        requests += running + waiting;
+        kv += usage;
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    let kv_per_mille = ((1000.0 * kv / count as f64).floor() as isize).min(999);
+    Some(1000 * requests as isize + kv_per_mille)
 }
 
 /// The label block and finite value of each `name` sample in a Prometheus text body.
@@ -480,6 +549,10 @@ impl Drop for LoadMonitor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/routing/vllm_load_tests.rs"]
+mod vllm_load_tests;
 
 #[cfg(test)]
 mod tests {

@@ -936,6 +936,94 @@ async fn vllm_prefill_aborted_before_it_starts_records_no_dispatch() {
 }
 
 #[tokio::test]
+async fn vllm_least_load_charges_decode_at_selection_and_releases_at_stream_end() {
+    let mut p = GatedServer::start(WorkerType::Prefill {
+        bootstrap_port: None,
+    })
+    .await;
+    let mut chosen = GatedServer::start(WorkerType::Decode).await;
+    let busy = GatedServer::start(WorkerType::Decode).await;
+    busy.worker.increment_load();
+
+    let mut router = tests::create_test_pd_router();
+    router.backend = BackendType::Vllm;
+    let mut info = VllmPrefillInfo::default();
+    let prefill_url = p.worker.url().to_string();
+    info.bootstrap_addrs
+        .insert(prefill_url.clone(), "127.0.0.1:8998".to_string());
+    info.engine_ids
+        .insert(prefill_url, [(0, "engine-0".to_string())].into());
+    router.adapter = Arc::new(VllmAdapter::new(Arc::new(info)));
+    router
+        .policy_registry
+        .set_decode_policy(Arc::new(crate::policies::LeastLoadPolicy::default()));
+    for worker in [&p.worker, &chosen.worker, &busy.worker] {
+        router.worker_registry.register(worker.clone());
+    }
+
+    let tokens: Vec<u32> = (1..=6).collect();
+    let task = tokio::spawn(async move {
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream: true,
+            return_logprob: false,
+            request_text: None,
+            tokens: Some(&tokens),
+            carries_media: false,
+            model_id: None,
+            headers: None,
+        };
+        let planner = router.planner.clone();
+        router
+            .dispatch_pd(None, json!({"stream": true}), context, planner.as_ref())
+            .await
+    });
+    let charged = |worker: &Arc<dyn Worker>| (worker.load(), worker.decode_kv_tokens());
+
+    // Charged at selection: the decode is still blocked before any response.
+    chosen.wait_entered().await;
+    assert_eq!(charged(&chosen.worker), (1, 6));
+    assert_eq!(
+        charged(&busy.worker),
+        (1, 0),
+        "the busy decode is untouched"
+    );
+
+    let (response, tx) = stream_response(StatusCode::OK);
+    chosen.respond(response);
+    let response = result(task).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    tx.send(Ok(Bytes::from_static(b"data: {\"text\":\"hello\"}\n\n")))
+        .unwrap();
+    timeout(Duration::from_secs(5), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        charged(&chosen.worker),
+        (1, 6),
+        "held after the first frame"
+    );
+
+    tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+        .unwrap();
+    drop(tx);
+    timeout(Duration::from_secs(5), body.collect())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(charged(&chosen.worker), (0, 0), "released at stream end");
+    assert_eq!(charged(&busy.worker), (1, 0));
+
+    p.wait_entered().await;
+    p.respond(prefill_response());
+    wait_load(&p.worker, 0).await;
+}
+
+#[tokio::test]
 async fn nonstreaming_dispatch_releases_prefill_before_decode_body() {
     for kind in KINDS {
         let (mut p, mut d) = servers().await;
