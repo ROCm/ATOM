@@ -256,6 +256,10 @@ def test_indexer_to_sparse_mla_matches_attention_reference(
             },
         )
         _forward_work_plan(meta, width, q.dtype, topk)
+        if attn.dcp_sparse_prefill_plan_native:
+            # The native plan keeps rows whole for FP8 too: it runs without
+            # split buffers, so a split row would write out of bounds.
+            assert int(meta.sparse_prefill_reduce_indptr[-1]) == 0
         return attn._forward_prefill_mla(q, cache, meta, return_lse=True)[0]
 
     modes = ("prefill", "decode", "decode_persistent")

@@ -145,7 +145,7 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
     production, native, supported, dtype
 ):
     ns = production
-    rebuilds, patches, launches = [], [], []
+    rebuilds, patches, launches, partials = [], [], [], []
     q = torch.empty(2, 64, 12, dtype=dtype)
     kv = torch.empty(16, 1, 12, dtype=dtype)
     ptr = torch.tensor([0, 4, 9], dtype=torch.int32)
@@ -200,6 +200,7 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
         for name, value in buffers.items():
             assert kwargs[name] is value
         launches.append(kvptr.clone())
+        partials.append(kwargs["has_partials"])
         out.zero_()
         return out, torch.zeros(query.shape[:2])
 
@@ -244,6 +245,9 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
     attn.owns_sparse_indexer = False
     attn._forward_prefill_mla(q, kv, md, return_lse=True, q_prepadded=True)
     assert len(launches) == 3
+    # Only whole-row plans skip the reduce: any bf16 plan, or the native one.
+    whole = dtype == torch.bfloat16 or (native and supported is True)
+    assert partials == [not whole] * 3
     if native and supported is True:
         assert len(patches) == 2 and not rebuilds
     else:

@@ -1568,21 +1568,30 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
 
 @needs_gpu
 @pytest.mark.parametrize(
-    "kpool,cache_dtype,granularity",
-    [(1, "bf16", 2048), (64, "bf16", 4096), (64, "fp8", 16)],
+    "world,kpool,cache_dtype,granularity,local_granularity",
+    [
+        (1, 1, "bf16", 2048, 2048),
+        (1, 64, "bf16", 4096, 4096),
+        (1, 64, "fp8", 16, 16),
+        # The dcp>1 "q" plan is whole for FP8 too: its native use runs
+        # without split buffers.
+        (8, 64, "fp8", 4096, 16),
+    ],
 )
 def test_builder_plans_bf16_sparse_prefill_rows_whole(
-    monkeypatch, kpool, cache_dtype, granularity
+    monkeypatch, world, kpool, cache_dtype, granularity, local_granularity
 ):
     """A pooled BF16 row is 2176 wide (top-k plus the unscored tail pool), so
     planning it whole takes 4096, not top-k's 2048."""
     from atom.model_ops.attentions import aiter_mla
 
     monkeypatch.setenv("ATOM_GLM5_KPOOL", "1")
-    runner = _builder_runner(monkeypatch, 1, cache_dtype, index_kpool=kpool)
+    runner = _builder_runner(monkeypatch, world, cache_dtype, index_kpool=kpool)
     builder = aiter_mla.AiterMLAMetadataBuilder(runner)
     assert builder._sparse_prefill_kv_granularity == granularity
-    assert builder._sparse_prefill_local_kv_granularity == granularity
+    assert builder._sparse_prefill_local_kv_granularity == local_granularity
+    if world > 1:
+        assert granularity >= builder.index_topk_out
 
 
 @needs_gpu

@@ -37,7 +37,9 @@ def sparse_prefill_rows_whole(dtype_q, dtype_kv):
     write out of bounds. Every planner of these rows keeps them whole: the
     builder's dcp>1 "q" plans use the next power of two of the row width, head
     groups use REGION, and the rest (dcp=1 builder, DCP rebuild, the sglang
-    GLM-5.2 bridge) take `sparse_prefill_kv_granularity`."""
+    GLM-5.2 bridge) take `sparse_prefill_kv_granularity`. The builder's dcp>1
+    "q" plan is whole for any dtype, so its native FP8 use also skips the
+    split buffers (decided at the call site)."""
     return dtype_q == dtype_kv == torch.bfloat16
 
 

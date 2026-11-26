@@ -2923,9 +2923,12 @@ class MLAAttention(nn.Module):
                 kv_scale=self._k_scale if is_fp8 else None,
                 return_lse=return_lse,
                 # A whole-row plan has no split rows: skip the reduce launch.
+                # bf16 plans are whole on every path; fp8 ones only as the
+                # builder's native "q" plan, which IndexShare consumers reuse.
                 # Ignored without a work plan (non-persistent split-KV kernel).
-                has_partials=not sparse_prefill_rows_whole(
-                    kernel_q.dtype, kv_c_and_k_pe_cache.dtype
+                has_partials=not (
+                    sparse_prefill_rows_whole(kernel_q.dtype, kv_c_and_k_pe_cache.dtype)
+                    or (sparse_dcp_persistent and self.dcp_sparse_prefill_plan_native)
                 ),
                 **work,
             )
