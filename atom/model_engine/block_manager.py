@@ -397,7 +397,7 @@ class BlockManager:
         from atom.model_engine.state_offload import (
             state_tier_capability,
             state_tier_chunk_tokens,
-            state_tier_cpu_entries,
+            state_tier_index_cap,
             state_tier_verified_for_s,
         )
 
@@ -587,11 +587,7 @@ class BlockManager:
                 # Not `slot_bytes`: under MTP a slot holds more than an image
                 # (DSpark3: 42.45 vs 29.51 MiB), and dividing by it would cap
                 # this index a third below the codec, hiding images it holds.
-                max_cpu_entries=(
-                    state_tier_cpu_entries(checkpoint_spec, config)
-                    if checkpoint_spec is not None
-                    else None
-                ),
+                max_cpu_entries=state_tier_index_cap(checkpoint_spec, config),
                 verified_for_s=state_tier_verified_for_s(config),
             )
             # Attached rather than passed at construction: the coordinator is

@@ -240,8 +240,24 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             )
             return
 
-        tp = get_tp_group()
-        rank, world = pp_aware_rank_and_world(self._config, tp)
+        rank, world = pp_aware_rank_and_world(self._config, get_tp_group())
+        codec = self._make_state_codec(
+            backend, spec, entry_bytes, layout_id, rank, world
+        )
+        # No index here: StateOffloadIndex lives in the engine process; both
+        # directions report and the engine applies.
+        self._state_tier = StateOffloadTier(codec)
+        logger.info(
+            "kimi_k3 offload: state tier up, entry=%.2f MiB rank=%d, "
+            "max_state_entries=%s, layout=%s",
+            entry_bytes / (1 << 20),
+            rank,
+            codec._max_entries,
+            layout_id,
+        )
+
+    def _make_state_codec(self, backend, spec, entry_bytes, layout_id, rank, world):
+        """The codec that moves checkpoint images: LMCache's CPU pool here."""
         cfg = offcfg.build_lmcache_config(
             getattr(self._config, "kv_transfer_config", None)
         )
@@ -269,17 +285,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # Share the allocator, but cap state retention separately so old
         # checkpoints cannot consume nearly the whole paged-KV CPU pool.
         codec.bind_storage_manager(self._engine.storage_manager)
-        # No index here: StateOffloadIndex lives in the engine process; both
-        # directions report and the engine applies.
-        self._state_tier = StateOffloadTier(codec)
-        logger.info(
-            "kimi_k3 offload: state tier up, entry=%.2f MiB rank=%d, "
-            "sharing the paged-KV CPU pool, max_state_entries=%d, layout=%s",
-            entry_bytes / (1 << 20),
-            rank,
-            codec._max_entries,
-            layout_id,
-        )
+        return codec
 
     # -- per-step ----------------------------------------------------------
     def start_load_kv(self, metadata) -> None:
@@ -680,14 +686,14 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             )
 
 
-class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
-    """Scheduler side: dense KV, plus the state tier's load queue and the
-    save-stall guard that keeps a stopped backend from stopping the engine.
+class KimiK3StateScheduling(StateOffloadFace):
+    """Scheduler side of the K3 state tier, mixed in front of a chunked KV
+    transport (LMCache's or the Mooncake Store's): the tier's queues, the joint
+    KV-and-state load boundary, and the save-stall guard.
 
-    Inherits `StateOffloadFace` -- the only offload scheduler that hosts the KDA
-    state tier -- so routing can select it with `isinstance` rather than probing
-    for a method the delegating shell defines on every layout (see
-    `StateOffloadFace` and the shell's `has_state_tier`)."""
+    Inherits `StateOffloadFace` so routing can select it with `isinstance`
+    rather than probing for a method the delegating shell defines on every
+    layout (see `StateOffloadFace` and the shell's `has_state_tier`)."""
 
     _supports_early_block_release = False
 
@@ -789,6 +795,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         return (
             not self._save_stalled
             and len(self._save_inflight) < self._max_pending_saves
+            and super()._may_emit_save()
         )
 
     def has_pending_work(self) -> bool:
@@ -1010,12 +1017,8 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
                 op = completion.operation_id
                 self._state_load_survived.add(raw_req_id(op))
             return True
-        # Channels this connector does not own. `DenseOffloadConnector` and the
-        # rest of the MRO define no `connector_completion`, so `super().` would
-        # raise AttributeError; `False` is the caller's contract for "unhandled"
-        # (see `_offload_common._apply_connector_completions`) and matches the
-        # DSV4 sibling connector.
-        return False
+        # The transport's own channels (PAGE source-safe, store terminals).
+        return super().connector_completion(completion)
 
     def take_state_source_releases(self) -> set:
         """Drain the stores whose PAGE units the GPU has finished reading.
@@ -1052,3 +1055,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         survived = self._state_load_survived
         self._state_load_survived = set()
         return survived
+
+
+class KimiK3OffloadScheduler(KimiK3StateScheduling, DenseOffloadScheduler):
+    """The K3 state tier's scheduler half over LMCache's dense transport."""

@@ -55,6 +55,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
     StorePool,
     check_engine_compatibility,
     parse_mooncake_store_config,
+    store_state_tier,
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     STORE_TAINT_KEY,
@@ -107,6 +108,21 @@ class MooncakeStoreOffloadConnector(KVStoreOffloadConnector):
 
     LABEL = "Mooncake Store offload"
     POOL_CLASS = TransferSlotPool
+
+    def __new__(cls, config: Any = None, *args: Any, **kwargs: Any):
+        # Registered once for every layout; one with state adds its tier.
+        # No config: `copy` and `pickle` rebuilding an instance.
+        if (
+            cls is MooncakeStoreOffloadConnector
+            and config is not None
+            and store_state_tier(config)
+        ):
+            from atom.kv_transfer.offload.mooncake_store.state_tier import (
+                MooncakeStoreStateConnector,
+            )
+
+            return super().__new__(MooncakeStoreStateConnector)
+        return super().__new__(cls)
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)
