@@ -1,4 +1,4 @@
-# DeepSeek V4.1-Flash 4P4D on one 8-GPU node (TTFT-optimized)
+﻿# DeepSeek V4.1-Flash 4P4D on one 8-GPU node (TTFT-optimized)
 
 This recipe describes a single-node prefill/decode (P/D) split for
 DeepSeek-V4.1-Flash-1017 on 8x MI355X running the AgentX C256 workload. The
@@ -520,8 +520,7 @@ What the tables show:
 
 ![DeepSeek-V4.1-Flash P/D on MI355X: token throughput per GPU vs P90 interactivity (AgentX, 3600 s)](DeepSeek-V4.1-Flash-PD-4P8D-AgentX-curve.png)
 
-The red solid line is this ladder (filled points are connected; hollow points are 1P1D / other P:D
-shapes kept for reference). Reference curves: B300 Dynamo vLLM FP4 and B200 / MI355X vLLM from public
+The red solid line is this ladder (every point is connected). Reference curves: B300 Dynamo vLLM FP4 and B200 / MI355X vLLM from public
 InferenceX data. x = 1000 / P90 ITL (tok/s/user); y = total tok/s divided by all GPUs in the deployment.
 
 This part is a two-node P/D deployment of DeepSeek-V4.1-Flash-1017 on 12x
