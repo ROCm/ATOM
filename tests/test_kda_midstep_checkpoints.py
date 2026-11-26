@@ -590,7 +590,7 @@ def test_a_head_ends_on_the_state_a_forward_ending_there_would(k3_modules, heads
     batch = SimpleNamespace(state_save_all=[[True]], num_scheduled_tokens=lens)
     ckpt = k3_modules.builder._KimiMLAGDNCommon._checkpoint_targets(builder, batch)
 
-    out, last, head = attn._prefill_kda(stub, q, k, v, g, beta, initial, ckpt)
+    out, last, head = attn._prefill_kda(stub, q, k, v, g, beta, initial, cu, ckpt)
 
     want_out, want_last = stub._run_kda(q, k, v, g, beta, initial, cu, True)
     span = slice(300, 300 + at)
