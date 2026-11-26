@@ -18,7 +18,8 @@ so it is pinned here on the CPU:
 
 How a KDA layer writes them is pinned where it happens: the builder and the
 layer in test_kimi_k3_midstep_wiring.py, the kernel in
-test_kda_midstep_ckpt_kernel.py.
+test_kda_midstep_ckpt_kernel.py. With the switch off the backend re-runs
+heads instead; test_kda_midstep_checkpoints.py pins that.
 """
 
 import pytest
@@ -79,14 +80,10 @@ def _clean_switches(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def k3_runtime(midstep_on: bool) -> StateRuntime:
-    """What the Kimi-K3 backend's `state_transfer()` declares, either way."""
-    transfer = (
-        kda_midstep_transfer(
-            KDA_SPEC.layout_id, CONV_KERNEL, grid=GRID, decode_keep="settled"
-        )
-        if midstep_on
-        else StateTransfer.copy(KDA_SPEC.layout_id)
+def k3_runtime() -> StateRuntime:
+    """What the Kimi-K3 backend's `state_transfer()` declares under the switch."""
+    transfer = kda_midstep_transfer(
+        KDA_SPEC.layout_id, CONV_KERNEL, grid=GRID, decode_keep="settled"
     )
     return StateRuntime(transfer=transfer, checkpoint_spec=KDA_SPEC)
 
@@ -148,35 +145,16 @@ def test_the_transfer_reads_midstep_on_the_flash_kda_grid():
     assert StateTransfer.from_wire(transfer.to_wire()) == transfer
 
 
-# ── switch off: nothing changes ──────────────────────────────────────────────
+# ── switch on: what one forward's positions become ───────────────────────────
 
 
-def test_off_the_anchor_still_cuts_the_chunk():
-    bm = make_block_manager(k3_config(), state_runtime=k3_runtime(False))
-    assert bm.paged_state_checkpoints.readable_midstep is False
-    seq = admitted(bm)
-    assert bm.checkpoint_cut(seq, 0, len(PROMPT)) == ANCHOR
-    bm.plan_midstep(seq, 0, len(PROMPT))
-    assert seq.midstep_reservations == []
-
-
-@pytest.mark.parametrize("on", [False, True])
-def test_one_scheduler_pass(on, monkeypatch):
-    """Off: the anchor cuts the prompt into two forwards, as before. On: one
-    forward covers it, and its anchor, moved onto the 32-token grid, becomes
-    one snapshot target."""
-    if on:
-        monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
-    scheduler = make_scheduler(
-        k3_config(), state_runtime=k3_runtime(kda_midstep_enabled())
-    )
+def test_one_scheduler_pass():
+    """One forward covers the prompt, and its anchor, moved onto the 32-token
+    grid, becomes one snapshot target."""
+    scheduler = make_scheduler(k3_config(), state_runtime=k3_runtime())
     scheduler.add(stateful_seq(PROMPT))
     batch, _scheduled = scheduler.schedule()
     (n,) = [int(x) for x in batch.num_scheduled_tokens]
-    if not on:
-        assert n == ANCHOR
-        assert batch.state_save_all == [[]]
-        return
     assert n == len(PROMPT)
     ((slot, pos),) = batch.state_save_all[0]
     assert pos == ANCHOR // GRID * GRID
@@ -194,13 +172,10 @@ def test_one_scheduler_pass(on, monkeypatch):
     assert snaps.is_end.tolist() == [0]
 
 
-# ── switch on: what one forward's positions become ───────────────────────────
-
-
 def test_several_positions_in_one_forward_become_several_targets():
     """A demand rung and the anchor inside one 100-token forward: two interior
     targets, each with its own scratch slot and conv window."""
-    bm = make_block_manager(demand_config(), state_runtime=k3_runtime(True))
+    bm = make_block_manager(demand_config(), state_runtime=k3_runtime())
     seq = admitted(bm, list(range(100)))
     # As `_record_checkpoint_demand` leaves it after a refused hit at 32.
     seq.checkpoint_demand_pos = 32
@@ -219,7 +194,7 @@ def test_several_positions_in_one_forward_become_several_targets():
 def test_an_interior_and_an_end_position_in_one_forward():
     """A rung at 32 is a recurrence snapshot; the anchor at the forward's end
     is the runtime slot's own state, so it is a copy, not a target."""
-    bm = make_block_manager(demand_config(), state_runtime=k3_runtime(True))
+    bm = make_block_manager(demand_config(), state_runtime=k3_runtime())
     seq = admitted(bm)
     bm.plan_midstep(seq, 0, ANCHOR)
     saves = saves_of(seq)
@@ -261,7 +236,7 @@ def test_a_full_state_pool_drops_the_checkpoint():
     positions, the anchor takes it, the rung is dropped and counted, and the
     chunk is not cut for it."""
     bm = make_block_manager(
-        demand_config(pool_entries={"state": 2}), state_runtime=k3_runtime(True)
+        demand_config(pool_entries={"state": 2}), state_runtime=k3_runtime()
     )
     seq = admitted(bm)
     assert bm.checkpoint_cut(seq, 0, ANCHOR) == 0
@@ -275,7 +250,7 @@ def test_every_position_without_a_scratch_slot_is_counted():
     forward's end are both lost. The forward stops short of the anchor, which
     a full pool would cut the chunk at instead (`plan_midstep`)."""
     bm = make_block_manager(
-        demand_config(pool_entries={"state": 1}), state_runtime=k3_runtime(True)
+        demand_config(pool_entries={"state": 1}), state_runtime=k3_runtime()
     )
     seq = admitted(bm, list(range(100)))
     seq.checkpoint_demand_pos = 32
