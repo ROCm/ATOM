@@ -13,7 +13,8 @@
        no wave32 build yet)
   Ff   aiter's FlyDSL scorer on its flat (length-proportional) plan alone
   Tk   the Triton selector + emit alone (on a scored plane)
-  Sk   aiter's FlyDSL selector + emit alone (index_select_decode)
+  Sk1  aiter's FlyDSL selector + emit alone (index_select_decode), one wave a
+       row; Sk4: four waves a row
   TS   Triton scorer + FlyDSL selector + emit
   XX   the whole decode indexer through aiter (ATOM_M3_DECODE_INDEX_TOPK_FLYDSL:
        flat FlyDSL scorer + FlyDSL selector + emit)
@@ -26,7 +27,8 @@ block: e2m1 rows + E4M3 scales) / time, as % of 17.5 TB/s. Before timing, F's
 live scores must equal T's bit for bit, FT's outputs TT's exactly and FA's / TA's
 block sets TT's (--no-check skips). XX's ids /
 table / lengths must equal TT's exactly, Ff's scores T's bit for bit, TS's
-outputs TT's and Sk's Tk's.
+outputs TT's and Sk1's / Sk4's Tk's; a new variant whose check fails is
+reported (CHECK FAIL) and not timed, the others go on.
 
   python scripts/performance/bench_m3_decode_index_flydsl.py                  # B 4/8/14/16 x 150K, 4 heads x 8 rows
   python scripts/performance/bench_m3_decode_index_flydsl.py --ctx 50000 300000
@@ -204,10 +206,10 @@ def bench(a, ctx, bs, rows):
         )  # fmt: skip
         return topk_idx, sbt, sctx
 
-    def flydsl_select(plane=sel_score, seq=seq, bt=bt):
+    def flydsl_select(plane=sel_score, seq=seq, bt=bt, waves=None):
         index_select_decode(
             plane, seq, topk_idx, a.mq, a.init, a.keep, block_table=bt,
-            sparse_bt=sbt, sparse_ctx=sctx,
+            sparse_bt=sbt, sparse_ctx=sctx, waves=waves,
         )  # fmt: skip
         return topk_idx, sbt, sctx
 
@@ -241,6 +243,24 @@ def bench(a, ctx, bs, rows):
         print("aiter's selector declines this device: FA / TA dropped")
 
     ref = mask = None
+    failed = set()  # variants whose check failed: reported, not timed
+
+    def check(tag, ok_fn):
+        try:
+            ok_fn()
+        except AssertionError as e:
+            print(f"CHECK FAIL {bs} {ctx} {tag}: {e}")
+            failed.add(tag)
+
+    def same_bits(got, what):
+        torch.cuda.synchronize()
+        bad = ref.view(torch.int32)[mask] != got.view(torch.int32)[mask]
+        assert not bad.any(), f"{what} errRatio {bad.float().mean().item():.3e}"
+
+    def same_outputs(want, got, tag):
+        for name, x, y in zip(("topk", "bt", "ctx"), want, got):
+            assert torch.equal(x, y), f"{tag} {name}"
+
     if not a.no_check:
         rotate(0)
         mask = (
@@ -249,27 +269,18 @@ def bench(a, ctx, bs, rows):
         )
         mask = mask.repeat_interleave(a.mq, 0)[None].expand(a.heads, -1, -1)
         ref = triton_score().clone()
-        got = flydsl_score()
-        torch.cuda.synchronize()
-        bad = ref.view(torch.int32)[mask] != got.view(torch.int32)[mask]
-        assert not bad.any(), f"score errRatio {bad.float().mean().item():.3e}"
-        got = flat_score()
-        torch.cuda.synchronize()
-        bad = ref.view(torch.int32)[mask] != got.view(torch.int32)[mask]
-        assert not bad.any(), f"flat score errRatio {bad.float().mean().item():.3e}"
+        check("F", lambda: same_bits(flydsl_score(), "score"))
+        check("Ff", lambda: same_bits(flat_score(), "flat score"))
         tt = [t.clone() for t in step(False, False)]
-        for name, x, y in zip(("topk", "bt", "ctx"), tt, step(True, False)):
-            assert torch.equal(x, y), f"FT {name}"
-        for name, x, y in zip(
-            ("topk", "bt", "ctx"), tt, step(False, False, whole=True)
-        ):
-            assert torch.equal(x, y), f"XX {name}"
-        for name, x, y in zip(("topk", "bt", "ctx"), tt, triton_then_flydsl_select()):
-            assert torch.equal(x, y), f"TS {name}"
+        check("FT", lambda: same_outputs(tt, step(True, False), "FT"))
+        check("XX", lambda: same_outputs(tt, step(False, False, whole=True), "XX"))
+        check("TS", lambda: same_outputs(tt, triton_then_flydsl_select(), "TS"))
         sel_score.copy_(ref)
         tk = [t.clone() for t in triton_select()]
-        for name, x, y in zip(("topk", "bt", "ctx"), tk, flydsl_select()):
-            assert torch.equal(x, y), f"Sk {name}"
+        for w in (1, 4):
+            check(
+                f"Sk{w}", lambda w=w: same_outputs(tk, flydsl_select(waves=w), f"Sk{w}")
+            )
         for tag, fly in (("FA", True), ("TA", False)) if aiter_selects else ():
             out = step(fly, True)
             for name, x, y in zip(("topk", "bt"), tt, out):
@@ -287,7 +298,8 @@ def bench(a, ctx, bs, rows):
         ("F  flydsl score", flydsl_score, True),
         ("Ff flydsl flat score", flat_score, True),
         ("Tk triton select+emit", triton_select, False),
-        ("Sk flydsl select+emit", flydsl_select, False),
+        ("Sk1 select, 1 wave a row", lambda: flydsl_select(waves=1), False),
+        ("Sk4 select, 4 waves a row", lambda: flydsl_select(waves=4), False),
         ("TT triton + triton", lambda: step(False, False), False),
         ("FT flydsl + triton", lambda: step(True, False), False),
         ("TS triton + flydsl sel", triton_then_flydsl_select, False),
@@ -308,6 +320,7 @@ def bench(a, ctx, bs, rows):
             for ring in (4, 6, 8)
             for wg in (512, 768, 1024, 1536, 2048)
         ]
+    variants = [v for v in variants if v[0].split()[0] not in failed]
     for name, fn, is_score in variants:
         if a.sweep and ref is not None:  # every ring / budget: the same bits
             rotate(0)
