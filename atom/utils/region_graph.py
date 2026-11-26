@@ -319,12 +319,7 @@ def forks(stream: torch.cuda.Stream | None) -> bool:
     so its fork is no branch of a graph."""
     if stream is None:
         return False
-    if _recorder() is not None:
-        return True
-    return (
-        forward_context.get_forward_context().in_hipgraph
-        and not forward_context.graph_records_single_stream()
-    )
+    return _recorder() is not None or forward_context.graph_may_fork()
 
 
 def join_stream(*streams: torch.cuda.Stream | None) -> None:

@@ -1055,8 +1055,9 @@ def pass_scheduled_tokens_gpu(rows: int) -> torch.Tensor | None:
 def graph_records_single_stream() -> bool:
     """Whether this forward is in a graph window that ATOM_GRAPH_SIDE_STREAMS
     keeps on one stream. Every side-stream fork a graph can record asks this
-    one predicate: `side_stream` (and the region graph's `forks`), the
-    dual-stream MoE, DeepSeek-V4's compressors and the Engram lookup.
+    one predicate: the dual-stream MoE and the Engram lookup directly, and
+    `side_stream`, the region graph's `forks` and DeepSeek-V4's compressors,
+    which fork under a graph only, through `graph_may_fork`.
 
     The window is the capture loop's whole `in_hipgraph`, its warmup forward
     included, so a warmup forks exactly where its capture does, and any other
@@ -1073,6 +1074,16 @@ def graph_records_single_stream() -> bool:
     return get_forward_context().in_hipgraph or torch.cuda.is_current_stream_capturing()
 
 
+def graph_may_fork() -> bool:
+    """Whether this forward is in the capture loop (`in_hipgraph`, its warmup
+    forward included) and its graph may record side-stream branches: not where
+    ATOM_GRAPH_SIDE_STREAMS keeps it on one stream
+    (`graph_records_single_stream`). The forks a graph alone allows ask this:
+    `side_stream`, a whole-forward capture's region (`region_graph.forks`) and
+    DeepSeek-V4's compressors."""
+    return bool(envs.ATOM_GRAPH_SIDE_STREAMS) and get_forward_context().in_hipgraph
+
+
 @contextmanager
 def side_stream(stream: torch.cuda.Stream | None):
     """Issue the block beside the main stream instead of on it.
@@ -1086,7 +1097,7 @@ def side_stream(stream: torch.cuda.Stream | None):
     `in_hipgraph` covers that loop's warmup forward too, which matters because
     AITER caches a kernel's scratch per `(device, stream)` and rejects a first
     allocation made during capture. Not where the graph stays on one stream
-    (`graph_records_single_stream`).
+    (`graph_may_fork`).
 
     The gate lives here rather than at each caller so that two branches of one
     layer cannot drift into disagreeing about when forking is allowed. A caller
@@ -1094,7 +1105,7 @@ def side_stream(stream: torch.cuda.Stream | None):
     switch needs no second branch anywhere.
     """
     context = get_forward_context()
-    if stream is None or not context.in_hipgraph or graph_records_single_stream():
+    if stream is None or not graph_may_fork():
         yield context.main_stream, None
         return
     stream.wait_stream(context.main_stream)
