@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
@@ -123,6 +124,70 @@ def test_profile_addresses_include_full_draft_lookahead(
         assert all(
             len(draft) == 7 for draft in batch.scheduled_spec_decode_tokens[-decodes:]
         )
+
+
+@pytest.mark.parametrize("width", [1, 8])
+def test_pure_decode_profile_prepares_requested_width(
+    runner_module, monkeypatch, width
+):
+    runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
+    runner.config = SimpleNamespace(
+        max_model_len=257,
+        max_num_seqs=4,
+        speculative_config=SimpleNamespace(use_dspark=lambda: True),
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+        enable_tbo=False,
+        enable_tbo_decode=False,
+    )
+    runner.block_size = 64
+    runner.pool_plan = SimpleNamespace(entries_per_req={STATE_SLOT_CLASS: 2})
+    runner.drafter = SimpleNamespace(
+        mtp_k=7,
+        is_block_drafter=True,
+        uses_confidence_schedule=True,
+        verify_scheduler=SimpleNamespace(ell_by_req={}),
+    )
+    full, full_pages = _batch(runner, 0, 4, 8, long_context=True)
+    batch, pages = _batch(runner, 0, 4, width, long_context=True)
+    assert batch.block_tables == full.block_tables
+    assert pages == full_pages
+    assert batch.context_lens.tolist() == full.context_lens.tolist()
+    assert runner.drafter.mtp_k == 7
+
+    def all_gather(outputs, local, group):
+        for output in outputs:
+            output.copy_(local)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    monkeypatch.setattr(
+        runner_module, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+    runner.enforce_eager = True
+    runner.capture_sizes_np = np.array([0], dtype=np.int32)
+    runner.running_tokens_per_dp_rank = np.zeros(2, dtype=np.int32)
+    runner.tbo_decode_graphs = False
+    runner._local_tbo_eligibility = lambda batch: (False, False, 0, 0)
+    runner._producer_graph_shapes = lambda: None
+    runner._cut_ubatches = lambda mode, batch: mode
+    runner.prepare_sample = lambda batch, group: (None, None, None, True, False)
+    runner.h2d_groups = {"token_inputs": Mock()}
+    runner.attn_metadata_builder = Mock(
+        step_needs_eager=Mock(return_value=False),
+        consumes_device_verdict=Mock(return_value=False),
+        settles_spec_status=Mock(return_value=False),
+        query_lengths=Mock(return_value=batch.num_scheduled_tokens),
+    )
+    runner.tokenID_processor = Mock()
+    runner.prepare_inputs = Mock()
+
+    # Real prepare_model, DSpark shrink and DP shape reduction: fresh IDs must
+    # reach the sharded head at the requested width, not both at K+1.
+    runner.prepare_model(batch)
+    mode = runner.prepare_inputs.call_args.kwargs["forward_mode"]
+    assert not mode.is_prefill and mode.running_tokens_are_unified
+    assert mode.max_seqlen_q == width
+    assert mode.running_bs == 4 and mode.running_tokens == 4 * width
+    assert runner.tokenID_processor.prepare_input_ids.call_args.args[1] == width
 
 
 @pytest.mark.parametrize("max_seqs", [512, 1024])

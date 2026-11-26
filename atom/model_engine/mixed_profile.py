@@ -116,6 +116,9 @@ def _batch(runner, prefill_tokens, decode_seqs, width, *, long_context):
         )
         next_page += write_pages
         seqs[seq.id] = seq
+    # Fresh profile requests have no confidence history to shrink decode.
+    # Set its forward width explicitly; draft/KV capacity above stays at K.
+    spec_tokens = full_q - 1 if prefill_lens else width - 1
     batch = ScheduledBatch(
         seqs,
         lengths,
@@ -125,9 +128,9 @@ def _batch(runner, prefill_tokens, decode_seqs, width, *, long_context):
         total_seqs_num=len(lengths),
         total_seqs_num_prefill=len(prefill_lens),
         total_seqs_num_decode=decode_seqs,
-        num_spec_step=full_q - 1,
+        num_spec_step=spec_tokens,
         scheduled_spec_decode_tokens={
-            s.id: np.zeros(full_q - 1, dtype=np.int32)
+            s.id: np.zeros(spec_tokens, dtype=np.int32)
             for s in seqs.values()
             if s.type is SequenceType.DECODE
         },
