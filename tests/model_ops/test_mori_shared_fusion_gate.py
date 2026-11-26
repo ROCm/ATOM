@@ -13,15 +13,20 @@ from conftest import atom_config_double
 
 
 @pytest.fixture(scope="module")
-def topk():
+def impl():
     with atom_without_aiter() as load:
-        yield load("atom.model_ops.topK")
+        yield SimpleNamespace(
+            topk=load("atom.model_ops.topK"),
+            mori_v2=load("atom.model_ops.fused_moe.mori_v2_prepare_finalize"),
+        )
 
 
-def _fused(monkeypatch, topk, *, eplb, switch, mori_v2, backend="auto", ep=True):
+def _fused(monkeypatch, impl, *, eplb, switch, transport, backend="auto", ep=True):
+    topk = impl.topk
     monkeypatch.setattr(topk.envs, "ATOM_FUSE_SHARED_EXPERT", switch)
     monkeypatch.setattr(topk.envs, "ATOM_DISABLE_MORI_EP", False)
-    monkeypatch.setattr(topk.envs, "ATOM_MORI_V2", mori_v2)
+    monkeypatch.setattr(topk.envs, "ATOM_MORI_V2", transport != "v1")
+    monkeypatch.setattr(impl.mori_v2, "_MEGA_STAGE1_FUSED", transport == "v2 compact")
     # Stated, not inherited: the gate asks whether MoRI is importable.
     monkeypatch.setattr(topk, "_has_module", lambda name: True)
     config = atom_config_double(
@@ -37,33 +42,38 @@ def _fused(monkeypatch, topk, *, eplb, switch, mori_v2, backend="auto", ep=True)
 
 
 @pytest.mark.parametrize(
-    "eplb, switch, mori_v2, expected",
+    "eplb, switch, transport, expected",
     [
         # EPLB fuses the shared expert as a routed expert.
-        (True, False, False, True),
-        (True, False, True, True),
-        # Without EPLB it is a LOCAL_REPLICA: MoRI v1 follows the switch...
-        (False, False, False, False),
-        (False, True, False, True),
-        # ...and MoRI v2 never fuses it.
-        (False, True, True, False),
+        (True, False, "v1", True),
+        (True, False, "v2 mori", True),
+        # Without EPLB it is a LOCAL_REPLICA: MoRI v1 and MegaMoE's compact
+        # dispatch follow the switch...
+        (False, False, "v1", False),
+        (False, True, "v1", True),
+        (False, False, "v2 compact", False),
+        (False, True, "v2 compact", True),
+        # ...and MegaMoE's MoRI dispatch never fuses it.
+        (False, True, "v2 mori", False),
     ],
 )
-def test_mori_shared_expert_fusion(monkeypatch, topk, eplb, switch, mori_v2, expected):
-    fused = _fused(monkeypatch, topk, eplb=eplb, switch=switch, mori_v2=mori_v2)
+def test_mori_shared_expert_fusion(
+    monkeypatch, impl, eplb, switch, transport, expected
+):
+    fused = _fused(monkeypatch, impl, eplb=eplb, switch=switch, transport=transport)
     assert fused is expected
 
 
 @pytest.mark.parametrize("backend, ep", [("rccl", True), ("auto", False)])
-def test_gate_is_only_for_mori_ep(monkeypatch, topk, backend, ep):
+def test_gate_is_only_for_mori_ep(monkeypatch, impl, backend, ep):
     """RCCL, or DP attention without EP, keeps fusing on MoRI v2 with the
     switch off."""
     fused = _fused(
         monkeypatch,
-        topk,
+        impl,
         eplb=False,
         switch=False,
-        mori_v2=True,
+        transport="v2 mori",
         backend=backend,
         ep=ep,
     )

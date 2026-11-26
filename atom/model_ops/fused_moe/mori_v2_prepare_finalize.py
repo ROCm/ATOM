@@ -13,9 +13,10 @@ the dispatch (flydsl compact plan, or mori), stage 2 the combine (gemm2 epilogue
 P2P-writing each weighted (token,k) result into the peers' staging so combine
 only barriers + sums, or mori's combine over fused_moe's rows).
 
-Shared experts are NOT fused in the mori EP+DP path (ATOM disables fusion there,
-see topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config), so
-topk_ids carry only routed expert ids and mori routes them cleanly.
+Without EPLB a shared expert is fused (as a LOCAL_REPLICA, when
+ATOM_FUSE_SHARED_EXPERT asks) only on the compact dispatch; on mori's dispatch
+it stays a separate MLP, so topk_ids carry only routed expert ids (see
+topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config).
 """
 
 import contextlib
@@ -164,6 +165,11 @@ _MEGA_STAGE1_FUSED = (
     and _MEGA_STAGE2_FUSED
     and _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
 )
+
+
+def uses_compact_dispatch() -> bool:
+    """Whether MegaMoE dispatches on the compact plan rather than on mori."""
+    return _MEGA_STAGE1_FUSED
 
 
 # The one VMM granule a DevComm's resource window takes; init_mega_transport
