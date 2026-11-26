@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 """Write interior SSM+conv state checkpoints in one launch.
 
-A checkpoint at a *prompt-end* position is free: the chunk kernel already
-leaves the final state in the slot. A checkpoint *inside* the step is not —
-that state exists only as a slice of the chunk kernel's per-chunk
-intermediates, ``h[:, j]``, and its conv half as a window of the conv input.
-Both have to be copied out before the next step overwrites them.
+A target at the end of a row reads its settled runtime state. An interior
+target reads ``h``: GDN supplies chunk snapshots, while Kimi KDA supplies the
+final states of head re-runs. The conv half is a window of the step's input.
+Both halves are copied into the reserved slot before the next step writes it.
 
 The two halves share everything that varies per target — the row, the
 destination slot, the token offset — and differ only in which buffer they read
@@ -30,7 +29,7 @@ import triton.language as tl
 
 @triton.jit
 def _copy_checkpoints_kernel(
-    h,  # [1, NT_total, H, K, V] per-chunk states, batch-concatenated
+    h,  # Packed interior states; explicit h_rows or per-sequence chunk offsets.
     ssm_dst,  # [num_slots, H, K, V] the state pool
     x,  # [total_tokens, D] the conv input, batch-concatenated
     conv_dst,  # [num_slots, D, >= STATE_LEN] the conv state pool
@@ -66,20 +65,16 @@ def _copy_checkpoints_kernel(
 
     if i_blk < NBLK_SSM:
         # ── recurrent state -> slot ────────────────────────────────────────
-        # Interior target: the state at `off` is a chunk boundary in `h`.
-        # End target: it is NOT in `h` — `h` holds boundaries strictly before
-        # the end, and `chunk_offsets[row] + T // CHUNK` is the NEXT
-        # sequence's first chunk. The final state exists only in the row's
-        # runtime slot, which the chunk kernel just wrote.
+        # Interior targets read their snapshot in `h`. End targets read the
+        # settled runtime slot; chunk-offset arithmetic would point past the
+        # row's interior snapshots.
         idx = i_blk * BLOCK + tl.arange(0, BLOCK)
         mask = idx < HKV
         dst_idx = idx
         if STATE_VK:
             dst_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
-        # Both branches cast to the pool's dtype: `h` is bf16 (the chunk
-        # kernel allocates it with `k.new_empty`) while the pool is fp32, so
-        # the two loads have different types and Triton requires them to
-        # agree before the store.
+        # Snapshot and pool dtypes can differ. Both branches must agree on
+        # the pool dtype before the store.
         if tl.load(is_end + i_t) != 0:
             src_slot = tl.load(runtime_slots + i_t).to(tl.int64)
             sv = tl.load(ssm_dst + src_slot * HKV + dst_idx, mask=mask, other=0.0).to(
@@ -136,8 +131,8 @@ def write_state_checkpoints(
     only one of them would pair a state at P with a window from elsewhere,
     which is silently wrong — hence the single entry point.
 
-    ``is_end`` picks the SSM source per target: 0 reads the chunk kernel's
-    intermediates (an interior position), 1 reads ``runtime_slots[i]`` (a
+    ``is_end`` picks the SSM source per target: 0 reads an interior snapshot
+    from ``h``, 1 reads ``runtime_slots[i]`` (a
     position at the end of the row's tokens, which is only ever in the runtime
     slot). The conv half is the same window slice either way.
 
@@ -160,7 +155,8 @@ def write_state_checkpoints(
     When snapshots are needed, ``interior_state_snapshots`` plans those rows
     and the chunk kernel fills the ``h_snap`` buffer allocated by
     ``GatedDeltaNet``; pass that buffer as ``h`` with the planned ``h_rows``.
-    Without it the row is the chunk boundary,
+    Kimi KDA instead supplies head re-runs' final states with explicit rows.
+    Without ``h_rows`` the row is the chunk boundary,
     ``chunk_offsets[row] + off // chunk``.
     """
     n = rows.numel()
@@ -171,8 +167,8 @@ def write_state_checkpoints(
     assert 0 < state_len <= conv_state.shape[2], "conv window wider than the pool"
     assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
     BLOCK = 1024
-    nblk_ssm = triton.cdiv(hkv, BLOCK)
-    grid = (n, nblk_ssm + triton.cdiv(d, BLOCK))
+    nblk_ssm = (hkv + BLOCK - 1) // BLOCK
+    grid = (n, nblk_ssm + (d + BLOCK - 1) // BLOCK)
     _copy_checkpoints_kernel[grid](
         h,
         ssm_state,

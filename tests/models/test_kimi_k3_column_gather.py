@@ -290,6 +290,7 @@ def test_peer_close_quiesces_and_retries_only_unclosed_mappings(modules, monkeyp
     events, failures = [], [17]
     buffer = object.__new__(modules.peer_memory.SymmetricPeerBuffer)
     buffer.storage = torch.empty(1, dtype=torch.uint8)
+    buffer.device = buffer.storage.device
     buffer.npes, buffer.group = 2, object()
     buffer._remote_bases = [17, 23]
     buffer._safety_barrier_complete = False

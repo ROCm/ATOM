@@ -42,7 +42,7 @@
       <div class="card"><div class="trend-layout"><span class="section-label">Historical Trends</span><div><div class="trend-selector" id="trend-selector"></div><div class="trend-grid" id="trend-grid"></div></div></div></div>
     </section>
     <section id="accuracy" class="panel">
-      <div class="card"><h2>Atomesh Standalone Accuracy (GSM8K)</h2><div id="accuracy-table"></div></div>
+      <div class="card"><h2>Atomesh Accuracy (GSM8K)</h2><div id="accuracy-table"></div></div>
     </section>
   </main>
   <footer><button class="download-btn" id="download-json">Download JSON</button><span>Powered by <a href="https://github.com/benchmark-action/github-action-benchmark">github-action-benchmark</a> · ATOMesh Distributed Inference Framework</span></footer>
@@ -60,7 +60,7 @@
   const latencyMetrics=['avg latency','p99 latency','p999 latency'];
   const pointStyles=['circle','triangle','rectRot','star','crossRot','rectRounded','cross'];
   const enabledTopologies=new Set(['1P1D','2P1D','3P1D']);
-  const atomeshModels=new Set(['Meta-Llama-3-8B-Instruct','DeepSeek-R1-0528','DeepSeek-V4-Pro MTP','gpt-oss-120b']);
+  const atomeshModels=new Set(['Meta-Llama-3-8B-Instruct','DeepSeek-R1-0528','DeepSeek-V4-Pro MTP','gpt-oss-120b','gpt-oss-120b-1p1d']);
   const valueLabelPlugin={
     id:'valueLabelPlugin',
     afterDatasetsDraw(chart){
