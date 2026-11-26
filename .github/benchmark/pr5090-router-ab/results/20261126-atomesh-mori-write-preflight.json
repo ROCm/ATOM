@@ -1,0 +1,47 @@
+{
+  "status": "cpu_passed_gpu_queued",
+  "gpu_validated": false,
+  "harness_sha": "2b48517dd09031f75fa1df7d70cdbcd02dd195f8",
+  "router_sha": "bff5eef4234de826e8a1ee889fe4f5372e043906",
+  "srt_base_sha": "85ecf60ac3931f38abdb0dd82f909f35057d5e12",
+  "srt_patch_sha256": "815d1de295884ff639993003b838a1138b1c26bbec6214e8d3201ea3e2960965",
+  "request_id": "Rd043da",
+  "lease": null,
+  "topology": "one node eight GPUs; P TP1 PP4 natural order; D TP1 DP4 EP4; C80 D20/rank DSpark7 capture160",
+  "worker": "fixed M3.1 image plus merged vLLM64693 PP backport; MoRI RDMA WRITE workers4 QP4; P MultiConnector with SimpleCPUOffload; original model kernels",
+  "srt_frontend_tests_passed": 29,
+  "cpu_checks": [
+    "actual contract generation and srtctl dry-run",
+    "real SweepOrchestrator with mocked external processes",
+    "router peer host/port equality with generated workers",
+    "native worker method D rank0..3 notifications",
+    "real PP port/four-distinct-stage completion regression"
+  ],
+  "rust_test_selections": {
+    "moriio": 13,
+    "routers::http_pd_router::load_tests": 33,
+    "config::": 94,
+    "cli_moriio_write_peer_json": 1
+  },
+  "rust_counts_overlap": true,
+  "mock_peers": [
+    {
+      "url": "http://127.0.0.1:6100",
+      "host": "127.0.0.1",
+      "handshake_port": 26000,
+      "notify_port": 27000,
+      "tp_size": 1,
+      "dp_size": 1
+    },
+    {
+      "url": "http://127.0.0.1:6132",
+      "host": "127.0.0.1",
+      "handshake_port": 26004,
+      "notify_port": 27004,
+      "tp_size": 1,
+      "dp_size": 4
+    }
+  ],
+  "upstream_prs_unchanged": true,
+  "remaining": "GPU protocol/SSE/tools/disconnect/four-stage KV proof and AgentX warmup+900s; then put WRITE changes in Draft PRs while preserving the READ/Mooncake-error split"
+}
