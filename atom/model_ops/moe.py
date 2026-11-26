@@ -5948,8 +5948,12 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         # Decided here, at run time: the row count is symbolic while compiling.
-        if self.sp_mega_moe is not None and self.sp_mega_moe.runs(
-            hidden_states.shape[0]
+        # (TP MegaMoE covers the shared expert too: the model's MoE block
+        # calls it, see `TPMegaMoE.serves_block`.)
+        if (
+            self.sp_mega_moe is not None
+            and not self.sp_mega_moe.serves_block
+            and self.sp_mega_moe.runs(hidden_states.shape[0])
         ):
             return self.sp_mega_moe.forward(self, hidden_states, router_logits)
 

@@ -45,6 +45,12 @@ from atom.model_ops.linear import (
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
+from atom.model_ops.module_dispatch_ops import (
+    tp_mega_add_norm_op,
+    tp_mega_add_norm_quant_op,
+    tp_mega_layer_output_op,
+    tp_mega_moe_forward_op,
+)
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
@@ -148,16 +154,71 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     return moe_layer_freq[layer_id] != 0
 
 
-def _ffn_output_reduced(config: PretrainedConfig, layer_id: int) -> bool:
-    """Whether layer ``layer_id``'s FFN output is already TP-reduced: every FFN
-    leaves it to the next fused all-reduce + add + norm, except TP MegaMoE's MoE
-    layers (``--moe-backend mega``), reduced on every step. Static per layer."""
+def _tp_mega_layer(config: PretrainedConfig, layer_id: int) -> bool:
+    """Whether layer ``layer_id``'s MoE runs TP MegaMoE (``--moe-backend mega``
+    on pure TP). Static per layer; whether a step's output is all-reduced is
+    not: only on the steps the kernel takes (`MiniMaxM3MoE.tp_mega_serves`),
+    the others leave it TP-partial for the next fused all-reduce + norm, like
+    every other FFN."""
     return (
         tp_mega_moe_selected(get_current_atom_config())
         and layer_id >= 0
         and _is_moe_layer(config, layer_id)
         and get_tensor_model_parallel_world_size() > 1
     )
+
+
+def _register_tp_mega_op_module(name: str, module) -> None:
+    """Make `module` the target of the TP MegaMoE custom ops called with
+    ``layer_name=name`` (`atom.model_ops.module_dispatch_ops`)."""
+    context = get_current_atom_config().compilation_config.static_forward_context
+    if name in context:
+        raise ValueError(f"Duplicate layer name: {name}")
+    context[name] = module
+
+
+class _TPMegaInputNorm:
+    """The add + Gemma RMSNorm (+ per-token FP8 quant) after a TP MegaMoE layer.
+
+    Its input is all-reduced on the steps the kernel took and TP-partial on
+    the others, which a compiled forward cannot branch on (the row count is
+    symbolic there): the custom ops `tp_mega_add_norm[_quant]` decide per step,
+    at run time (or per graph bucket while recording), the same way the MoE
+    layer did. A plain object, not a module, so it is no second parent of
+    ``norm``."""
+
+    def __init__(self, norm: GemmaRMSNorm, moe_name: str):
+        self.norm = norm
+        self.moe_name = moe_name
+
+    def _reduced(self, rows: int) -> bool:
+        context = get_current_atom_config().compilation_config.static_forward_context
+        return context[self.moe_name].tp_mega_serves(rows)
+
+    def add_norm(self, hidden_states, residual):
+        return fused_allreduce_gemma_rms_norm(
+            hidden_states,
+            residual,
+            self.norm,
+            reduced=self._reduced(hidden_states.shape[0]),
+        )
+
+    def add_norm_quant(self, hidden_states, residual):
+        return fused_allreduce_gemma_rms_norm_quant(
+            hidden_states,
+            residual,
+            self.norm,
+            reduced=self._reduced(hidden_states.shape[0]),
+        )
+
+
+def _sibling_layer_prefix(prefix: str, layer_num: int) -> str:
+    """The prefix of decoder layer `layer_num` next to the one at `prefix`
+    (``<model>.layers.<i>``)."""
+    parent, _, index = prefix.rpartition(".")
+    if not parent or not index.isdigit():
+        raise ValueError(f"not a decoder layer prefix: {prefix!r}")
+    return f"{parent}.{layer_num}"
 
 
 def _rope_theta(config: PretrainedConfig) -> float:
@@ -359,16 +420,19 @@ class MiniMaxM3MoE(nn.Module):
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
-        # TP MegaMoE: the output is all-reduced on every step (in-kernel, or by
-        # FusedMoE's own on the steps it skips). The kernel runs the shared expert
-        # as one more routed expert, hence the fused one.
-        if _ffn_output_reduced(config, layer_id):
-            if not self.fuse_shared_experts:
+        # TP MegaMoE: one AITER launch runs the routed experts, the MXFP8
+        # shared expert (kept MXFP8, AITER's `w1_shared`) and the all-reduce,
+        # on the steps it takes (`tp_mega_serves`); the other steps run this
+        # block's standard path. `reduce_results` stays False either way.
+        self.tp_mega = _tp_mega_layer(config, layer_id)
+        if self.tp_mega:
+            if self.fuse_shared_experts or not getattr(config, "n_shared_experts", 0):
                 raise ValueError(
-                    "--moe-backend mega needs the shared expert fused into the "
-                    "MXFP4 experts (ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1 for MXFP8)"
+                    "--moe-backend mega on pure TP needs MiniMax-M3's MXFP8 shared "
+                    "expert kept apart (unset ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4)"
                 )
-            self.experts.reduce_results = True
+            self.layer_name = prefix
+            _register_tp_mega_op_module(prefix, self)
 
         self.shared_experts: MiniMaxM3MLP | None = None
         if getattr(config, "n_shared_experts", 0) and not self.fuse_shared_experts:
@@ -380,9 +444,52 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        orig_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, orig_shape[-1])
+    def process_weights_after_loading(self) -> None:
+        """TP MegaMoE: the shared expert in the layout of AITER's kernel. The
+        loader processes a parent before its children, so the MLP's weights
+        are still the row-major MXFP8 checkpoint bytes here (its GEMMs then
+        shuffle them their own way, for the steps the kernel does not take)."""
+        if not self.tp_mega:
+            return
+        from atom.model_ops.fused_moe.sp_mega_moe import tp_shared_expert_weights
+
+        gate_up, down = self.shared_experts.gate_up_proj, self.shared_experts.down_proj
+        self.experts.tp_mega_shared = tp_shared_expert_weights(
+            gate_up.weight.data,
+            gate_up.weight_scale.data,
+            down.weight.data,
+            down.weight_scale.data,
+        )
+
+    def tp_mega_serves(self, rows: int) -> bool:
+        """Whether TP MegaMoE takes a `rows`-row step (its output is then
+        all-reduced)."""
+        backend = self.experts.sp_mega_moe
+        return backend is not None and backend.runs(rows)
+
+    def tp_mega_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The block's output: all-reduced from the kernel on the steps it
+        takes, else the standard path's TP-partial sum. Behind the custom op
+        `tp_mega_moe_forward`, which runs it eagerly (or while recording a
+        graph bucket) with the real row count."""
+        if self.tp_mega_serves(hidden_states.shape[0]):
+            router_logits = self.gate(hidden_states)
+            return self.experts.sp_mega_moe.forward(
+                self.experts, hidden_states, router_logits
+            )
+        return self._forward(hidden_states)
+
+    def tp_mega_layer_output(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor:
+        """The residual stream after this layer (`MiniMaxM3DecoderLayer.
+        aux_hidden_state`), all-reducing the block's output on the steps the
+        kernel did not."""
+        if not self.tp_mega_serves(hidden_states.shape[0]):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return hidden_states + residual
+
+    def _forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits = self.gate(hidden_states)
 
         routed_output = self.experts(
@@ -395,7 +502,16 @@ class MiniMaxM3MoE(nn.Module):
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
 
-        return routed_output.view(orig_shape)
+        return routed_output
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, orig_shape[-1])
+        if self.tp_mega:
+            output = tp_mega_moe_forward_op(hidden_states, self.layer_name)
+        else:
+            output = self._forward(hidden_states)
+        return output.view(orig_shape)
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -691,9 +807,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # Whether this layer's FFN output / its input is already all-reduced.
-        self.ffn_output_reduced = _ffn_output_reduced(config, layer_num)
-        self.input_reduced = _ffn_output_reduced(config, layer_num - 1)
+        # After a TP MegaMoE layer the input norm decides per step whether its
+        # input is all-reduced already (`_TPMegaInputNorm`).
+        self.input_norm_name = None
+        if _tp_mega_layer(config, layer_num - 1):
+            self.input_norm_name = f"{prefix}.input_layernorm"
+            _register_tp_mega_op_module(
+                self.input_norm_name,
+                _TPMegaInputNorm(
+                    self.input_layernorm,
+                    _sibling_layer_prefix(prefix, layer_num - 1) + ".block_sparse_moe",
+                ),
+            )
 
     def forward(
         self,
@@ -716,21 +841,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif self.input_norm_name is not None and fuse_input_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, residual = tp_mega_add_norm_quant_op(
+                hidden_states, residual, self.input_norm_name
+            )
+        elif self.input_norm_name is not None:
+            hidden_states, residual = tp_mega_add_norm_op(
+                hidden_states, residual, self.input_norm_name
+            )
         elif fuse_input_ar_rmsnorm_quant:
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
-                    hidden_states,
-                    residual,
-                    self.input_layernorm,
-                    reduced=self.input_reduced,
+                    hidden_states, residual, self.input_layernorm
                 )
             )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states,
-                residual,
-                self.input_layernorm,
-                reduced=self.input_reduced,
+                hidden_states, residual, self.input_layernorm
             )
 
         # Eagle3 aux hidden state = the all-reduced residual stream entering this
@@ -768,11 +895,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
         ``hidden`` is TP-partial -- o_proj and the FFN skip their all-reduce,
         which the next layer's fused all-reduce RMSNorm performs -- so it is
         reduced here first. That costs one all-reduce per tapped layer per
-        target forward, only when a DSpark drafter taps this layer (not for a
-        TP MegaMoE layer, reduced already).
+        target forward, only when a DSpark drafter taps this layer (not on a
+        step TP MegaMoE took, reduced already).
         """
         hidden_states, residual = output[0], output[1]
-        if get_tensor_model_parallel_world_size() > 1 and not self.ffn_output_reduced:
+        if self.is_moe_layer and self.block_sparse_moe.tp_mega:
+            return tp_mega_layer_output_op(
+                hidden_states, residual, self.block_sparse_moe.layer_name
+            )
+        if get_tensor_model_parallel_world_size() > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return hidden_states + residual
 
@@ -825,10 +956,16 @@ class MiniMaxM3Model(nn.Module):
         # Eagle3 aux hidden-state capture layer ids. Empty unless an Eagle3 drafter
         # registers them via MiniMaxM3SparseForCausalLM.set_aux_hidden_state_layers.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
-        # A plain bool, so the compiled forward sees a constant.
-        self.final_input_reduced = _ffn_output_reduced(
-            config, config.num_hidden_layers - 1
-        )
+        # After a last TP MegaMoE layer the final norm decides per step whether
+        # its input is all-reduced already (`_TPMegaInputNorm`).
+        self.final_norm_name = None
+        last = config.num_hidden_layers - 1
+        if get_pp_group().is_last_rank and _tp_mega_layer(config, last):
+            self.final_norm_name = f"{prefix}.norm"
+            _register_tp_mega_op_module(
+                self.final_norm_name,
+                _TPMegaInputNorm(self.norm, f"{prefix}.layers.{last}.block_sparse_moe"),
+            )
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -873,12 +1010,14 @@ class MiniMaxM3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = fused_allreduce_gemma_rms_norm(
-            hidden_states,
-            residual,
-            self.norm,
-            reduced=self.final_input_reduced,
-        )
+        if self.final_norm_name is not None:
+            hidden_states, _ = tp_mega_add_norm_op(
+                hidden_states, residual, self.final_norm_name
+            )
+        else:
+            hidden_states, _ = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.norm
+            )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

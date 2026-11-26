@@ -22,6 +22,8 @@ Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward  — V2/V3.2/V4 MoE (summed)
   - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared unsummed)
   - torch.ops.aiter.indexer_score_topk         — V4 sparse indexer
+  - torch.ops.aiter.tp_mega_moe_forward, tp_mega_add_norm[_quant],
+    tp_mega_layer_output                      — MiniMax-M3 TP MegaMoE
 """
 
 import torch
@@ -226,6 +228,126 @@ direct_register_custom_op(
     # in, so functionalization stays unaware and skips defensive clones.
     mutates_args=(),
     fake_impl=_indexer_score_topk_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# ---------------------------------------------------------------------------
+# TP MegaMoE (MiniMax-M3, `--moe-backend mega` on pure TP)
+# ---------------------------------------------------------------------------
+#
+# On the steps the kernel takes, a MoE layer's output comes back all-reduced
+# (one launch: routed + shared expert + all-reduce); on the others it stays
+# TP-partial for the next fused all-reduce + add + norm. Which one depends on
+# the step's row count, symbolic in a compiled forward, so the MoE layer and
+# whatever consumes its output decide inside these ops, at run time (or per
+# bucket while a graph records), with the same row count.
+#
+# Caller contracts (the module looked up by `layer_name`):
+#   - tp_mega_moe_forward: `tp_mega_forward(hidden_states) -> Tensor`
+#   - tp_mega_add_norm[_quant]: `add_norm(hidden_states, residual)
+#     -> (out, residual)`, `add_norm_quant(...) -> (out_fp8, scale, residual)`
+#   - tp_mega_layer_output: `tp_mega_layer_output(hidden_states, residual)
+#     -> Tensor`
+
+
+def tp_mega_moe_forward(hidden_states: torch.Tensor, layer_name: str) -> torch.Tensor:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self.tp_mega_forward(hidden_states)
+
+
+tp_mega_moe_forward_op = direct_register_custom_op(
+    op_name="tp_mega_moe_forward",
+    op_func=tp_mega_moe_forward,
+    mutates_args=(),
+    fake_impl=lambda hidden_states, layer_name: torch.empty_like(hidden_states),
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _fresh(out: torch.Tensor, *inputs: torch.Tensor) -> torch.Tensor:
+    # A custom op's outputs must not alias its inputs.
+    return out.clone() if any(out.data_ptr() == x.data_ptr() for x in inputs) else out
+
+
+def tp_mega_add_norm(
+    hidden_states: torch.Tensor, residual: torch.Tensor, layer_name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    out, residual_out = self.add_norm(hidden_states, residual)
+    return (
+        _fresh(out, hidden_states, residual),
+        _fresh(residual_out, hidden_states, residual),
+    )
+
+
+tp_mega_add_norm_op = direct_register_custom_op(
+    op_name="tp_mega_add_norm",
+    op_func=tp_mega_add_norm,
+    mutates_args=(),
+    fake_impl=lambda hidden_states, residual, layer_name: (
+        torch.empty_like(hidden_states),
+        torch.empty_like(residual),
+    ),
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def tp_mega_add_norm_quant(
+    hidden_states: torch.Tensor, residual: torch.Tensor, layer_name: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    out, scale, residual_out = self.add_norm_quant(hidden_states, residual)
+    return out, scale, _fresh(residual_out, hidden_states, residual)
+
+
+def _tp_mega_add_norm_quant_fake(
+    hidden_states: torch.Tensor, residual: torch.Tensor, layer_name: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.utility.dtypes import fp8
+
+    return (
+        torch.empty_like(hidden_states, dtype=fp8),
+        torch.empty(
+            (*hidden_states.shape[:-1], 1),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        ),
+        torch.empty_like(residual),
+    )
+
+
+tp_mega_add_norm_quant_op = direct_register_custom_op(
+    op_name="tp_mega_add_norm_quant",
+    op_func=tp_mega_add_norm_quant,
+    mutates_args=(),
+    fake_impl=_tp_mega_add_norm_quant_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def tp_mega_layer_output(
+    hidden_states: torch.Tensor, residual: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self.tp_mega_layer_output(hidden_states, residual)
+
+
+tp_mega_layer_output_op = direct_register_custom_op(
+    op_name="tp_mega_layer_output",
+    op_func=tp_mega_layer_output,
+    mutates_args=(),
+    fake_impl=lambda hidden_states, residual, layer_name: torch.empty_like(
+        hidden_states
+    ),
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
