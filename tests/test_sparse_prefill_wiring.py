@@ -58,14 +58,15 @@ def test_granularity_rounds_to_the_next_power_of_two():
 
 
 @pytest.mark.parametrize(
-    "row_width, applies",
-    [(2048, True), (1025, True), (1024, False), (2176, False)],
+    "kv_granularity, applies", [(2048, True), (1024, False), (4096, False)]
 )
-def test_head_groups_take_rows_that_round_to_one_region(row_width, applies):
+def test_head_groups_take_rows_of_one_region(kv_granularity, applies):
     q = torch.empty(4, 128, 576, dtype=BF16)
     o = torch.empty(4, 128, 512, dtype=BF16)
     kv = torch.empty(8, 576, dtype=BF16)
-    assert head_groups.SparsePrefillHeadGroups.applies(q, o, kv, row_width) is applies
+    assert (
+        head_groups.SparsePrefillHeadGroups.applies(q, o, kv, kv_granularity) is applies
+    )
 
 
 def _capture(monkeypatch, module):
@@ -78,13 +79,15 @@ def _capture(monkeypatch, module):
     return seen
 
 
-def test_builder_plans_with_its_granularity(monkeypatch):
+@pytest.mark.parametrize("local_heads, expected", [(False, 4096), (True, 2048)])
+def test_builder_plans_with_its_granularity(monkeypatch, local_heads, expected):
     seen = _capture(monkeypatch, aiter_mla)
     builder = object.__new__(aiter_mla.AiterMLAMetadataBuilder)
     builder.dcp_sparse_prefill_nonps = False
     builder.block_size = 1
     builder.dtype_q = builder.dtype_kv = BF16
-    builder.sparse_prefill_kv_granularity = 4096
+    builder._sparse_prefill_kv_granularity = 4096
+    builder._sparse_prefill_local_kv_granularity = 2048
     work = {name: torch.zeros(1) for name in WORK}
     builder._sparse_prefill_work_views = lambda prefix, heads: work
     md = SimpleNamespace(
@@ -92,9 +95,11 @@ def test_builder_plans_with_its_granularity(monkeypatch):
         sparse_kv_indptr=torch.arange(3, dtype=torch.int32),
     )
 
-    builder._sparse_prefill_work_plan(md, "", 16, torch.ones(2, dtype=torch.int32))
+    builder._sparse_prefill_work_plan(
+        md, "", 16, torch.ones(2, dtype=torch.int32), local_heads=local_heads
+    )
 
-    assert seen["kv_granularity"] == 4096
+    assert seen["kv_granularity"] == expected
     for name in WORK:
         assert getattr(md, f"sparse_prefill_{name}") is work[name]
 
@@ -108,7 +113,7 @@ def test_dcp_rebuild_plans_sparse_prefill_rows_whole(
 ):
     seen = _capture(monkeypatch, attention_mla)
     layer = attention_mla.MLAAttention.__new__(attention_mla.MLAAttention)
-    layer._sparse_prefill_row_width = 2176
+    layer._sparse_prefill_kv_granularity = 4096
     md = SimpleNamespace(
         max_seqlen_q=1,
         **{f"{work_prefix}{name}": torch.zeros(1) for name in WORK},

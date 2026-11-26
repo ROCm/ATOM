@@ -34,9 +34,10 @@ def sparse_prefill_rows_whole(dtype_q, dtype_kv):
     """Whether a sparse-prefill work plan keeps each row in one work item. Such
     a plan has no split rows, so `mla_decode_fwd` is called with
     has_partials=False and allocates no split buffers: a split row would then
-    write out of bounds. Every planner of these rows (metadata builder, DCP
-    rebuild, head groups, the sglang GLM-5.2 bridge) takes its kv_granularity
-    from `sparse_prefill_kv_granularity`, which keeps them whole."""
+    write out of bounds. Every planner of these rows keeps them whole: the
+    builder's dcp>1 "q" plans use the next power of two of the row width, head
+    groups use REGION, and the rest (dcp=1 builder, DCP rebuild, the sglang
+    GLM-5.2 bridge) take `sparse_prefill_kv_granularity`."""
     return dtype_q == dtype_kv == torch.bfloat16
 
 
@@ -121,18 +122,17 @@ class SparsePrefillHeadGroups:
         q: torch.Tensor,
         output: torch.Tensor,
         kv_cache: torch.Tensor,
-        row_width: int,
+        kv_granularity: int,
     ) -> bool:
         """Whether this step's sparse-prefill call has the geometry above.
-        `row_width` (the layer's top-k output row width, `topk_out_width`)
-        bounds each row's region; it rounds up to REGION."""
+        `kv_granularity` (the layer's row width) bounds each row's region."""
         return (
             0 < q.shape[0] <= MAX_HEAD_GROUP_ROWS
             and q.dtype == kv_cache.dtype == torch.bfloat16
             and q.shape[1:] == (HEADS, Q_DIM)
             and output.shape[1:] == (HEADS, KV_LORA_RANK)
             and q.is_contiguous()
-            and REGION // 2 < row_width <= REGION
+            and kv_granularity == REGION
         )
 
     def prepare(self, q, output, indptr, indices):
