@@ -3,6 +3,7 @@
 
 # This code is adapted from https://github.com/ROCm/vllm/blob/main/vllm/model_executor/model_loader/weight_utils.py
 
+import contextlib
 import fnmatch
 import functools
 import hashlib
@@ -19,6 +20,7 @@ import filelock
 import huggingface_hub.constants
 import torch
 from huggingface_hub import HfFileSystem, snapshot_download
+from torch import nn
 from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
@@ -74,9 +76,10 @@ def local_model_dir(model: str) -> str:
     `deepseek-ai/DeepSeek-V4.1-Flash/model.safetensors.index.json` reached a
     `FileNotFoundError` in CI.
 
-    Resolution only, never a download: every caller runs after the weights have
-    loaded, so the snapshot is already in the hub cache and `allow_patterns=[]`
-    asks for no files.
+    Resolution only, never a download: `allow_patterns=[]` asks for no files.
+    Most callers run after the weights have loaded, when the snapshot is in the
+    hub cache; the weight cache's key is taken before, from what is there so
+    far.
 
     A name that resolves to nothing comes back unchanged, because every caller
     already has an answer for "there is no such directory" and none of them is
@@ -245,3 +248,42 @@ def filter_duplicate_safetensors_files(
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
+
+
+def swap_param(old, new: nn.Parameter, attrs: dict) -> bool:
+    """Move ``new``'s data into ``old``, keeping the Parameter object other
+    references hold, with attributes ``attrs``. False: it cannot be swapped
+    (another type, or extra references to its data)."""
+    if type(old) is not nn.Parameter:
+        return False
+    try:
+        torch.utils.swap_tensors(old, new)
+    except Exception:  # noqa: BLE001 - the caller installs ``new`` instead
+        return False
+    old.__dict__.clear()
+    old.__dict__.update(attrs)
+    return True
+
+
+@contextlib.contextmanager
+def params_on_meta():
+    """Build a model with every Parameter on the meta device; buffers are
+    built normally. Each Parameter stays the object the constructor holds, so
+    attributes set on it later (set_weight_attrs) land."""
+    orig = nn.Module.register_parameter
+
+    def register_parameter(self, name, param):
+        orig(self, name, param)
+        p = self._parameters.get(name)
+        if p is None or p.is_meta:
+            return
+        meta = nn.Parameter(p.detach().to("meta"), requires_grad=p.requires_grad)
+        if not swap_param(p, meta, dict(vars(p))):
+            meta.__dict__.update(vars(p))
+            self._parameters[name] = meta
+
+    nn.Module.register_parameter = register_parameter
+    try:
+        yield
+    finally:
+        nn.Module.register_parameter = orig

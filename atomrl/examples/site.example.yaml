@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Template for examples/site.yaml (or any file passed with --site, or named by
+# $ATOMRL_SITE). Without a site file, run.sh uses this machine alone and takes
+# the data root from $DATA_ROOT.
+#
+# The data root, the AtomRL checkout and every path under `mounts` must exist
+# at the same path on every host: they are bind-mounted into the containers.
+
+# Holds models/, data_cached/ and logs/. Same path on every host.
+data_root: /data/atomrl
+
+# Docker CLI on the hosts, e.g. "sudo docker".
+docker: docker
+
+# Container name prefix; the image key is appended (atomrl-ex-release).
+container: atomrl-ex
+
+# Extra host paths to mount, e.g. the target of symlinks under data_root.
+mounts: []
+
+# Hosts in order. The first is the head: single-node examples run there, and
+# multi-node examples start the Ray head and the trainer driver there.
+# `address: local` is this machine; other addresses go through `exec`.
+hosts:
+  - name: node0
+    address: local
+    ip: 10.0.0.1          # the address the other hosts reach this one at
+  - name: node1
+    address: node1        # handed to `exec` as {host}
+    ip: 10.0.0.2
+
+# How to run a command on a non-local host. {host} is the address; {cmd} is the
+# command as one argument, {qcmd} the same command shell-quoted for transports
+# that re-parse it (ssh). Default:
+exec: [ssh, -o, BatchMode=yes, "{host}", "bash -c {qcmd}"]
+# A scheduler that runs argv on an allocated node, e.g.:
+# exec: [srun, --jobid, "{host}", bash, -c, "{cmd}"]
+
+# Shell lines run before every host command (keep them silent).
+# host_prelude: export DOCKER_CONFIG=/tmp/.docker; mkdir -p /tmp/.docker
+
+# Lines matching these regexes are dropped from host command output.
+# output_filter: ["low-power"]
+
+# RDMA NIC used by multi-node examples, for both NCCL and weight sync.
+rdma:
+  interface: ens3
+  hca: mlx5_0
+  gid_index: 3
+  env:                    # extra NCCL settings for this fabric
+    NCCL_DMABUF_ENABLE: "1"
+
+# Environment for every container command.
+env: {}
+
+# Image references by key (see `run.sh list`): a tag replaces the reference
+# (e.g. a local build, atomrl:release), "@<key>" swaps in another image
+# definition from examples.yaml.
+images:
+  release: rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119
+
+# Where results go (default atomrl/output/regression).
+# results_dir: /data/atomrl/regression
+
+# A GPU counts as busy above this much memory in use.
+idle_vram_gb: 2

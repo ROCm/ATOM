@@ -180,6 +180,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """Keep parent resources alive until all microbatch work is enqueued."""
         return nullcontext()
 
+    def publish_draft_state(self, metadata):
+        """Publish target state-slot addresses consumed by the draft forward."""
+
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""
 
@@ -374,6 +377,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return StateTransfer.none()
 
+    def state_transfer_slots(self) -> int:
+        """State slots past the live ones, kept for a P/D producer's pushes."""
+        return 0
+
     def checkpoint_image_bytes(self) -> int | None:
         """Bytes of an Active Slot a checkpoint image has to hold.
 
@@ -403,6 +410,21 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError(
             f"{type(self).__name__} owns per-request state but does not "
             "implement relocate_state_slots"
+        )
+
+    def owned_pool_layout(self):
+        """`(arena, PAGE regions)` of a paged pool this builder allocated
+        itself rather than carving from the runner's buffer, or None. A
+        backend that allocates its own arena (DeepSeek-V4.1) implements it, so
+        a pool-providing connector learns where its blocks are."""
+
+    def copy_paged_blocks(self, copies: Sequence[tuple[int, int]]) -> None:
+        """Copy whole paged blocks `(source, destination)` on the compute
+        stream, before the forward (a split pool demoting a private block into
+        its shared part). A backend whose pool can be split implements it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot copy paged blocks; "
+            "a share_ratio below 1 (umbp_pool connector) is not supported for this model"
         )
 
     def execute_paged_state_copies(
@@ -1218,7 +1240,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         group.publish()
 
     def decode_spans(self, batch: ScheduledBatch) -> tuple[int, np.ndarray, np.ndarray]:
-        """A pure-decode step's `(bs, per-request lengths, exclusive prefix sum)`.
+        """The decode region's `(bs, per-request lengths, exclusive prefix sum)`.
 
         One place, so no caller can pair a length vector with someone else's
         cumsum: both come off `num_scheduled_tokens` and the buffer
@@ -1228,7 +1250,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         bs = batch.total_seqs_num_decode
         return (
             bs,
-            batch.num_scheduled_tokens[:bs],
+            batch.num_scheduled_tokens[batch.total_seqs_num_prefill :],
             self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
         )
 
@@ -1679,6 +1701,10 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
+        if state_ops.block_copies:
+            self.copy_paged_blocks(state_ops.block_copies)
+        if batch.is_mixed:
+            return self.prepare_mixed(batch, running_bs, running_tokens, ubatch_slices)
         if is_prefill:
             built = self.prepare_prefill(
                 batch, running_bs, running_tokens, ubatch_slices, pcp_groups
@@ -1704,6 +1730,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     # `ReqGraph`s, each on `build_for_req_graph_capture`'s step
     # (`ModelRunner._record_prefill_req_graphs`). Empty: none.
     prefill_req_graph_sizes: tuple[int, ...] = ()
+
+    def prepare_mixed(self, batch, running_bs, running_tokens, ubatch_slices=None):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support mixed prefill+decode "
+            "batches: this metadata builder has no prepare_mixed. Disable "
+            "--enable-mixed-prefill-decode."
+        )
 
 
 class AttentionImpl(nn.Module):
