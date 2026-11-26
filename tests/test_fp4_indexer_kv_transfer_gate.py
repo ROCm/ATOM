@@ -43,8 +43,9 @@ AiterMLAMetadataBuilder = pytest.importorskip(
 def _fp4_builder(kv_transfer_config, *, hf_config=None):
     """A stub carrying only what `get_kv_transfer_tensors` reads before the gate.
 
-    `kv_pool` is a sentinel rather than a pool: reaching it would mean the gate
-    fell through, and every later line needs a real one -- so an attribute error
+    `kv_pool` is a sentinel rather than a pool: it answers only `nvfp4`, read
+    before the gate, and reaching anything else would mean the gate fell
+    through, and every later line needs a real one -- so an attribute error
     past this point is the test failing loudly rather than passing by accident.
 
     `hf_config` reaches `select_offload_layout`, which decides the offload family
@@ -57,7 +58,7 @@ def _fp4_builder(kv_transfer_config, *, hf_config=None):
                 hf_config=hf_config,
             )
         ),
-        kv_pool=object(),
+        kv_pool=SimpleNamespace(nvfp4=False),
         _indexer_fp4=True,
     )
 

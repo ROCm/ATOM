@@ -473,10 +473,12 @@ class _FakePool:
 
     The binder asks it for one thing -- a layer's slice by field name -- and
     the transfer path for the tensors those slices come from, so the double is
-    two methods rather than a tensor that has to behave like a tensor.
+    two methods rather than a tensor that has to behave like a tensor. Both
+    first ask whether it holds NVFP4 planes; this one holds the FP8 rows.
     """
 
     entry_dim = 576
+    nvfp4 = False
 
     def __init__(self, regions=(), index=True, layers=0):
         self.index = object() if index else None
@@ -529,6 +531,7 @@ def _bind_builder(module, index_cache_layer_map, *, rows_before: int, cls=None):
     builder.model_runner = runner
     builder.invalidate_pool_rows()
     builder.kv_pool = _FakePool()
+    builder.nvfp4_cache = None
     return builder
 
 
