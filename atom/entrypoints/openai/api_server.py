@@ -2381,11 +2381,29 @@ async def _chat_completions(
 
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
-        pretokenized = request.get_prompt_token_ids()
+        has_media = _has_multimodal_content(messages)
+        # A media decode leg's client-body b64 ids are not expanded; it runs on
+        # its prefill's ids from kv_transfer_params (`get_prompt_token_ids`).
+        media_decode_leg = has_media and bool(
+            (kv_transfer_params or {}).get("do_remote_prefill")
+        )
+        pretokenized = request.get_prompt_token_ids(media_decode_leg=media_decode_leg)
         # A decode leg takes its prefill's expanded ids; its media went to P.
         # Without P's cache seed its blocks would hash as text: keep the media.
-        is_multimodal = _has_multimodal_content(messages) and not (
+        is_multimodal = has_media and not (
             pretokenized is not None and leaves_media_on_prefill(kv_transfer_params)
+        )
+        # ATOM_PROMPT_IDS_B64 on a P/D prefill leg: the caller sent these ids
+        # itself, and the PD router forwards that same field to decode.
+        # Echoing them as a JSON list would have the router carry a second
+        # copy into decode's kv_transfer_params, which decode then has to
+        # parse and compare. Any other request (a single server's
+        # `return_token_ids`) still echoes, and so does a multimodal prefill:
+        # its ids have the image placeholders expanded, which decode needs.
+        echo_ids = bool(request.return_token_ids) and not (
+            request.prompt_ids_from_b64()
+            and not has_media
+            and bool((kv_transfer_params or {}).get("do_remote_decode"))
         )
         if assistant_prefix is not None and (is_multimodal or pretokenized is not None):
             # Only rendered text can be continued.
@@ -2527,7 +2545,7 @@ async def _chat_completions(
                     request_id,
                     multimodal_data=multimodal_data,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2554,7 +2572,7 @@ async def _chat_completions(
                     sampling_params,
                     request_id,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2581,7 +2599,7 @@ async def _chat_completions(
                     sampling_params,
                     request_id,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2607,7 +2625,7 @@ async def _chat_completions(
                     sampling_params,
                     request_id,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
