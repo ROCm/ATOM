@@ -12,10 +12,12 @@ import torch
 import zmq
 
 from atom.config import Config
+from atom.distributed.group_agreement import group_max_each
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.dp_sync_gate import MAX_DP_SYNC_INTERVAL, DPSyncGate
 from atom.model_engine.dynamic_chunking import (
     DYNAMIC_CHUNKING_POLL_STEPS,
     ChunkSizePredictor,
@@ -200,6 +202,7 @@ class EngineCore:
             config.pool_entries = block_info.get("pool_entries", {})
             config.pool_entry_bytes = block_info.get("pool_entry_bytes", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
+            config.state_transfer_slots = block_info.get("state_transfer_slots", 0)
             self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
@@ -526,7 +529,9 @@ class EngineCore:
         Waits until KV transfers in flight have reported back (with
         ``ATOM_STORE_ASYNC_RENEW`` a load parked on its lease renewal counts,
         and the metadata build may dispatch its GET meanwhile), then preempts
-        what is running so it recomputes on what follows. When the weights
+        what is running so it recomputes on what follows; an image decode leg
+        whose media its prefill kept cannot recompute, and is finished
+        instead (`Scheduler.preempt_running`). When the weights
         change, the KV connector must also drop what it keeps for later
         requests. Raises with the reason, changing nothing that was running.
         """
@@ -690,7 +695,8 @@ class EngineCore:
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
                 self.scheduler.prefill_delayer.notify_prefill_executed(
-                    scheduled_batch.total_tokens_num_prefill
+                    scheduled_batch.total_tokens_num_prefill,
+                    decoded=scheduled_batch.total_seqs_num_decode > 0,
                 )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
@@ -1154,8 +1160,16 @@ class DPEngineCoreProc(EngineCore):
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
+            interval = self._validate_dp_sync_interval(envs.ATOM_DP_SYNC_INTERVAL)
+            # Interval 1 syncs every round, as on main: no gate.
+            gate = DPSyncGate(interval) if interval > 1 else None
             while True:
-                self.utility_handler.process_queue(self.utility_queue, self)
+                sync_now = gate is None or gate.should_sync()
+                if sync_now:
+                    # Utility commands can hold the engine (offload, weight
+                    # sync, pause). Applying them only on rounds that sync lets
+                    # every rank see a hold before its next forward.
+                    self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
                     next_metrics_push = now + metrics_interval
@@ -1173,9 +1187,20 @@ class DPEngineCoreProc(EngineCore):
 
                 # MAX-reduced: one held rank holds every rank of the group, so
                 # their forwards stay paired.
-                global_has_unfinished, global_shutdown, global_held = (
-                    self._sync_dp_state(local_unfinished, shutdown, local_held)
-                )
+                if sync_now:
+                    global_has_unfinished, global_shutdown, global_held = (
+                        self._sync_dp_state(local_unfinished, shutdown, local_held)
+                    )
+                    if gate is not None:
+                        gate.synced(global_has_unfinished, global_shutdown, global_held)
+                else:
+                    # The last sync found unfinished work in the group: stay
+                    # paired, including a dummy on ranks with no local work.
+                    global_has_unfinished, global_shutdown, global_held = (
+                        True,
+                        False,
+                        False,
+                    )
 
                 if global_shutdown and not global_has_unfinished:
                     logger.info(
@@ -1210,6 +1235,8 @@ class DPEngineCoreProc(EngineCore):
                 # After the pair, so the idle rank's dummy counts too: that is
                 # what keeps every rank's step number equal. See `bump_step`.
                 self.scheduler.engine_stats.bump_step()
+                if gate is not None:
+                    gate.busy_round_done()
         finally:
             try:
                 # Isolate the final publish so a publisher hiccup cannot skip
@@ -1223,6 +1250,37 @@ class DPEngineCoreProc(EngineCore):
                 self.scheduler.close_kv_connector()
             finally:
                 tracing.shutdown()
+
+    def _validate_dp_sync_interval(self, interval: int | None) -> int:
+        """Reject different sync cadences before any rank enters the busy loop.
+
+        One MAX reduction gives both bounds. Every rank sees the same mismatch
+        and raises, rather than pairing a state collective with a peer's model
+        collective on the first skipped round. A peer lost here shuts the loop
+        down as `_sync_dp_state` does.
+        """
+        # Packed capped, so any int fits the int64 payload; past the cap is invalid.
+        value = 0 if interval is None else min(interval, MAX_DP_SYNC_INTERVAL + 1)
+        try:
+            highest, neg_lowest, invalid = group_max_each(
+                (value, -value, int(interval is None or value > MAX_DP_SYNC_INTERVAL)),
+                self.dp_group,
+            )
+        except RuntimeError as e:
+            logger.warning(f"{self.label}: DP sync interval agreement failed: {e}")
+            self._shutting_down = True
+            return 1
+        if invalid:
+            raise ValueError(
+                f"ATOM_DP_SYNC_INTERVAL must be an integer up to {MAX_DP_SYNC_INTERVAL} "
+                "on every DP rank; at least one rank has an invalid value"
+            )
+        if highest != -neg_lowest:
+            raise ValueError(
+                "ATOM_DP_SYNC_INTERVAL must match on every DP rank; "
+                f"got values from {-neg_lowest} to {highest}"
+            )
+        return value
 
     def _execute_dummy_batch(self):
         fwd_out = self.runner_mgr.call_func("dummy_execution", wait_out=True)

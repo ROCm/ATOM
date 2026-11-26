@@ -40,6 +40,16 @@ class LoadPolicy:
 
 
 class SessionPolicy(LoadPolicy):
+    """A session stays on the rank that holds its conversation.
+
+    With `rank_reqs` -- given only when the ranks share their KV pools, so a
+    session's history follows it -- a session whose rank is crowded moves to
+    the emptiest one: its owner runs at least `margin` (a fraction of the mean)
+    more requests than the mean while that one runs at least as many fewer.
+    Under DP-attention every rank waits for the busiest one's step, and the
+    move costs only the copy of its history from the old rank's pool.
+    """
+
     stateful = True
 
     def __init__(
@@ -54,8 +64,10 @@ class SessionPolicy(LoadPolicy):
         prefix_index: Any = None,
         owner_tokens: int = 0,
         owner_extra_reqs: int = 0,
-        rank_reqs: Callable[[], list[int]] | None = None,
+        load_reqs: Callable[[], list[int]] | None = None,
         prefix_owner_seen: Callable[[str, int], None] | None = None,
+        rank_reqs: Callable[[], list[int]] | None = None,
+        margin: float = 0.1,
     ) -> None:
         super().__init__(lightest)
         self.select_session = select_session
@@ -69,11 +81,27 @@ class SessionPolicy(LoadPolicy):
         self.prefix_index = prefix_index
         self.owner_tokens = owner_tokens
         self.owner_extra_reqs = owner_extra_reqs
-        self.rank_reqs = rank_reqs
+        # The requests in flight per rank, read by the prefix-owner guard (always
+        # given with a prefix index; `rank_reqs` below is the session spill's).
+        self.load_reqs = load_reqs
         # Told what became of each new session whose prefix is on another rank
         # than the lightest: "follow", "threshold" or "guard", and the tokens
         # that rank holds more.
         self.prefix_owner_seen = prefix_owner_seen
+        self.rank_reqs = rank_reqs
+        self.margin = margin
+
+    def _relieve(self, owner: int) -> int | None:
+        """The rank a session on crowded `owner` moves to, or None."""
+        reqs = self.rank_reqs()[: self.rank_count]
+        mean = sum(reqs) / len(reqs)
+        slack = max(1.0, self.margin * mean)
+        if reqs[owner] < mean + slack:
+            return None
+        target = min(range(len(reqs)), key=lambda r: (reqs[r], r))
+        if reqs[target] > mean - slack:
+            return None
+        return target
 
     def select(self, seq: Any, explicit_rank: int | None) -> Route:
         session = getattr(seq, "dp_session_id", None)
@@ -104,6 +132,10 @@ class SessionPolicy(LoadPolicy):
                     decision = "affinity_new_prefix_owner_total"
         else:
             decision = "affinity_owner_hit_total"
+            target = None if self.rank_reqs is None else self._relieve(owner)
+            if target is not None:
+                owner = target
+                decision = "affinity_spill_total"
         self.owners[session] = owner
         if index is not None:
             index.record(seq, owner)
@@ -118,7 +150,7 @@ class SessionPolicy(LoadPolicy):
         hits = self.prefix_index.confirmed_hits(seq, self.rank_count)
         if not hits:
             return lightest, 0
-        reqs = self.rank_reqs()
+        reqs = self.load_reqs()
         rank = max(hits, key=lambda r: (hits[r], -reqs[r], -r))
         gained = hits[rank] - hits.get(lightest, 0)
         if rank == lightest or gained <= 0:

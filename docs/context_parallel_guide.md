@@ -296,7 +296,7 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 | `-dcp N` / `--decode-context-parallel-size N` | `1` | Enable DCP with size `N`. `world = tp`; requires `tp % N == 0` |
 | `--dcp-config '{...}'` | see below | JSON dict of the four DCP knobs (`interleave_size`, `enable_query_replication`, `enable_project_before_merge`, `comm_backend`). Unknown keys raise. See [`--dcp-config`](#--dcp-config-the-four-dcp-knobs) |
 | `--kv-cache-dtype fp8` | `auto` | Supported with DCP (per-tensor scale). `auto`/`bf16` also fine |
-| `--enable_prefix_caching` | off | Supported with DCP |
+| `--enable_prefix_caching` | on; `--no-enable_prefix_caching` disables it | Supported with DCP |
 | `--enable_chunked_prefill` / `--no-enable_chunked_prefill` | on | Chunked prefill is supported with DCP; on by default |
 
 | Goal (8 GPUs) | Command |

@@ -63,6 +63,11 @@ fn on_decode_rank(prefill: Vec<Arc<dyn Worker>>, decode: &dyn Worker) -> Vec<Arc
     }
 }
 
+/// Prompt tokens charged to the worker that prefills `req`.
+fn prompt_tokens(req: &RequestDescriptor<'_>) -> usize {
+    req.tokens.map_or(0, <[u32]>::len)
+}
+
 pub struct DefaultPlanner {
     workers: Arc<dyn WorkerSource>,
     policies: Arc<dyn PolicySource>,
@@ -115,6 +120,9 @@ impl DefaultPlanner {
         Ok(PlacementPlan::Single {
             worker: chosen,
             policy_name: policy.name(),
+            // The router releases the charge at the response's first frame, which a
+            // non-streaming response sends only after decoding.
+            prefill_tokens: if req.stream { prompt_tokens(req) } else { 0 },
         })
     }
 
@@ -176,6 +184,7 @@ impl DefaultPlanner {
             decode,
             prefill_policy: prefill_policy.name(),
             decode_policy: decode_policy.name(),
+            prefill_tokens: prompt_tokens(req),
         })
     }
 }
@@ -183,6 +192,7 @@ impl DefaultPlanner {
 #[async_trait]
 impl PdPlanner for DefaultPlanner {
     async fn plan(&self, req: &RequestDescriptor<'_>) -> Result<PlacementPlan, PlacementError> {
+        route_trace::record_media_count(req.media_count);
         let conn_mode = self.connection_mode(req);
 
         if let Some(m) = req.model_id {
