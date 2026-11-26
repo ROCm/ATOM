@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .op import exp
+from .op import exp, zero_pad_output
 
 
 @triton.heuristics(
@@ -117,11 +117,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             # A row past the scheduled ones (PAD_SLOT_ID) owns no state; its
             # outputs are zeros, as the consumers read the whole `o`.
             if state_idx_in < 0:
-                for _ in range(T):
-                    tl.store(
-                        p_o, tl.zeros([BV], dtype=p_o.dtype.element_ty), mask=mask_v
-                    )
-                    p_o += HV * V
+                zero_pad_output(p_o, T, mask_v, HV * V)
                 return
             p_h0 = h0 + state_idx_in * stride_init_state_token
         else:

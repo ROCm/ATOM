@@ -41,7 +41,7 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
-from .op import exp
+from .op import exp, zero_pad_output
 
 __all__ = [
     "PAD_SLOT_ID",
@@ -681,18 +681,6 @@ def replayssm_materialize(
 # --------------------------------------------------------------------------- #
 
 
-@triton.jit
-def _zero_pad_output(
-    o, bos, T, i_v, i_hv, HV: tl.constexpr, V: tl.constexpr, BV: tl.constexpr
-):
-    """A padded entry (slot < 0) owns no state, but consumers read all of `o`."""
-    o_v = i_v * BV + tl.arange(0, BV)
-    p_o = o + (bos * HV + i_hv) * V + o_v
-    for _ in range(T):
-        tl.store(p_o, tl.zeros([BV], dtype=p_o.dtype.element_ty), mask=o_v < V)
-        p_o += HV * V
-
-
 @triton.jit(do_not_specialize=["N", "T_TOT", "T_MAX", "CAP"])
 def _replayssm_fwd_kernel(
     q,
@@ -750,7 +738,9 @@ def _replayssm_fwd_kernel(
 
     slot = tl.load(slot_idx + i_n).to(tl.int64)
     if slot < 0:  # padded / idle batch entry
-        _zero_pad_output(o, bos, T, i_v, i_hv, HV, V, BV)
+        o_v = i_v * BV + tl.arange(0, BV)
+        p_o = o + (bos * HV + i_hv) * V + o_v
+        zero_pad_output(p_o, T, o_v < V, HV * V)
         return
 
     h = tl.load(write_pos + slot).to(tl.int32)
@@ -1217,7 +1207,9 @@ def _replayssm_ut_fwd_kernel(
         return
     slot = tl.load(slot_idx + i_n).to(tl.int64)
     if slot < 0:
-        _zero_pad_output(o, bos, T, i_v, i_hv, HV, V, BV)
+        o_v = i_v * BV + tl.arange(0, BV)
+        p_o = o + (bos * HV + i_hv) * V + o_v
+        zero_pad_output(p_o, T, o_v < V, HV * V)
         return
 
     h = tl.load(write_pos + slot).to(tl.int32)
@@ -1691,7 +1683,9 @@ def _replayssm_kda_fwd_kernel(
         return
     slot = tl.load(slot_idx + i_n).to(tl.int64)
     if slot < 0:
-        _zero_pad_output(o, bos, T, i_v, i_hv, HV, V, BV)
+        o_v = i_v * BV + tl.arange(0, BV)
+        p_o = o + (bos * HV + i_hv) * V + o_v
+        zero_pad_output(p_o, T, o_v < V, HV * V)
         return
 
     h = tl.load(write_pos + slot).to(tl.int32)

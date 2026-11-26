@@ -8,9 +8,10 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import torch
-
 import triton
 import triton.language as tl
+
+from .op import zero_pad_output
 
 
 @triton.heuristics(
@@ -117,8 +118,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             state_idx = tl.load(
                 ssm_state_indices_in + i_n * stride_indices_seq + i_t
             ).to(tl.int64)
-            # Skip if state index is invalid (PAD_SLOT_ID = -1)
+            # A padded row owns no state, but consumers read all of its output.
             if state_idx < 0:
+                zero_pad_output(p_o, T, mask_v, HV * V)
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:

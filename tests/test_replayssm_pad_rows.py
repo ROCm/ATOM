@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""ReplaySSM padding writes +0, preserving real rows and all unowned state."""
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, ATOM Project Contributors. All rights reserved.
+"""Recurrent padding writes +0, preserving real rows and all unowned state."""
 
 from __future__ import annotations
 
@@ -7,15 +9,20 @@ import pytest
 import torch
 
 if not torch.cuda.is_available():
-    pytest.skip("ReplaySSM kernels require a GPU", allow_module_level=True)
+    pytest.skip("Recurrent kernels require a GPU", allow_module_level=True)
 
+from atom.model_ops.fla_ops.fused_sigmoid_gating import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_gated_delta_rule,
     replayssm_sigmoid_gating_delta_rule,
 )
 
-# V spans multiple serial/KDA tiles and a partial last tile.
+# V=48 uses two KDA BV=32 tiles (last partial) and one partial UT BV=64 tile.
+# Serial uses one partial BV=64 tile on gfx942 or at T=1; for T>1 on gfx950
+# these small batches use three full BV=16 tiles.
 H, HV, K, V = 1, 2, 32, 48
 NUM_SLOTS = 8
 REAL_SLOTS = [3, 0, 5, 2]
@@ -136,6 +143,104 @@ def check(kind, t, route, layout, all_pad, device, dtype=torch.bfloat16):
 @pytest.mark.parametrize("all_pad", [False, True], ids=["mixed", "all_pad"])
 def test_pad_entries_write_zeros_and_touch_no_state(kind, t, route, layout, all_pad):
     check(kind, t, route, layout, all_pad, "cuda")
+
+
+@pytest.mark.parametrize(
+    "kind, t, state_dtype",
+    [
+        ("gdn", 1, torch.float32),
+        ("gdn", 4, torch.bfloat16),
+        ("kda", 1, torch.bfloat16),
+        ("kda", 4, torch.float32),
+    ],
+)
+@pytest.mark.parametrize("layout", ["uniform", "ragged", "empty"])
+@pytest.mark.parametrize("all_pad", [False, True], ids=["mixed", "all_pad"])
+@pytest.mark.parametrize("supplied_output", [False, True], ids=["allocated", "caller"])
+def test_fused_sigmoid_pad_entries_write_zeros_and_touch_no_state(
+    kind, t, state_dtype, layout, all_pad, supplied_output
+):
+    lengths = {
+        "uniform": [t] * 4,
+        "ragged": [t, 0, max(1, t - 1), t],
+        "empty": [0] * 4,
+    }[layout]
+    slots = [-1] * 4 if all_pad else [3, -1, 5, -1]
+    # Both fused gate variants use [slot, HV, V, K] state. Reuse the KDA
+    # fixture, reducing a/dt_bias to headwise scalars only for the GDN gate.
+    initial, cu = _inputs("kda", t, lengths, "cuda", torch.bfloat16)
+    initial["ckpt"] = initial["ckpt"].to(state_dtype)
+    if kind == "gdn":
+        initial["a"] = initial["a"][..., 0].contiguous()
+        initial["dt_bias"] = initial["dt_bias"][:, 0].contiguous()
+    pad = (
+        torch.tensor(slots, device="cuda")
+        .lt(0)
+        .repeat_interleave(torch.tensor(lengths, device="cuda"))
+    )
+    writes = (
+        torch.tensor(REAL_SLOTS, device="cuda", dtype=torch.int32)
+        .view(-1, 1)
+        .expand(-1, t)
+        .contiguous()
+    )
+
+    def launch(read_slots):
+        x = {
+            name: initial[name].clone()
+            for name in ("q", "k", "v", "a", "b", "A_log", "dt_bias", "ckpt")
+        }
+        reads = (
+            torch.tensor(read_slots, device="cuda", dtype=torch.int32)
+            .view(-1, 1)
+            .expand(-1, t)
+            .contiguous()
+        )
+        masked = (reads[:, 0] < 0).repeat_interleave(
+            torch.tensor(lengths, device="cuda")
+        )
+        for name in ("q", "k", "v", "a", "b"):
+            x[name][0, masked] = float("nan")
+        arena = torch.full(
+            (sum(lengths) + 2, HV, V), 17.0, device="cuda", dtype=torch.bfloat16
+        )
+        destination = arena[1:-1].unsqueeze(0)
+        destination.fill_(float("nan"))
+        output, state = fused_sigmoid_gating_delta_rule_update(
+            x["A_log"],
+            x["a"],
+            x["b"],
+            x["dt_bias"],
+            x["q"],
+            x["k"],
+            x["v"],
+            o=destination if supplied_output else None,
+            initial_state=x["ckpt"],
+            cu_seqlens=cu,
+            ssm_state_indices=writes,
+            ssm_state_indices_in=reads,
+            use_qk_l2norm_in_kernel=True,
+            is_kda=kind == "kda",
+            lower_bound=-5.0 if kind == "kda" else None,
+        )
+        assert state.data_ptr() == x["ckpt"].data_ptr()
+        if supplied_output:
+            assert output.data_ptr() == destination.data_ptr()
+        assert output.shape == (1, sum(lengths), HV, V)
+        assert torch.all(arena[[0, -1]] == 17), "output red zone overwritten"
+        return output[0], state
+
+    out, state = launch(slots)
+    reference, reference_state = launch(REAL_SLOTS)
+    assert torch.equal(out[pad], torch.zeros_like(out[pad])), "pad rows not zero"
+    assert not torch.signbit(out[pad]).any(), "pad rows contain negative zero"
+    assert torch.equal(out[~pad], reference[~pad]), "real rows differ"
+    live = [s for s, n in zip(slots, lengths) if s >= 0 and n > 0]
+    want = initial["ckpt"].clone()
+    want[live] = reference_state[live]
+    # Even a valid write-side slot must remain untouched when its read side is
+    # padding. FP32/BF16 state also exercises BV=32/64 with this partial V tile.
+    assert torch.equal(state, want), "unowned or live state differs"
 
 
 @pytest.mark.parametrize(

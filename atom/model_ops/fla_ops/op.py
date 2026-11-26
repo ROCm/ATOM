@@ -27,6 +27,15 @@ exp = tl.exp
 log = tl.log
 log2 = tl.log2
 
+
+@triton.jit
+def zero_pad_output(p_o, T, mask_v, token_stride: tl.constexpr):
+    """Zero this V tile for every token of a padded sequence, without state access."""
+    for _ in range(T):
+        tl.store(p_o, 0.0, mask=mask_v)
+        p_o += token_stride
+
+
 if not is_gather_supported:
 
     @triton.jit
