@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import wraps
@@ -1611,6 +1612,14 @@ def get_live_expert_location_metadata() -> ExpertLocationMetadata | None:
     return _MANAGER.live_metadata if _MANAGER is not None else None
 
 
+def add_eplb_commit_listener(listener: Callable[[int], None]) -> None:
+    """``EPLBManager.add_commit_listener`` on the live manager, which
+    ``initialize_eplb_runtime`` must have built."""
+    if _MANAGER is None or _MANAGER.live_metadata is None:
+        raise RuntimeError("EPLB runtime is not initialized")
+    _MANAGER.add_commit_listener(listener)
+
+
 def _replica_spread(gathered: bool = False) -> tuple[int, int]:
     """`(dp_size, dp_rank)` the forced-remote spread mixes into a row's hash
     (see `EPLBManager.replica_spread`). `gathered` rows are the DP group's,
@@ -1697,6 +1706,7 @@ class EPLBManager:
         self._expert_weights_of_layer: dict[int, list[torch.Tensor]] = {}
         self._reusable_temp_buffers: list[torch.Tensor] | None = None
         self._expert_map_tails: dict[int, torch.Tensor] = {}
+        self._commit_listeners: list[Callable[[int], None]] = []
         self._ep_group: Any | None = None
         # Dedicated process group for EPLB weight-migration P2P, isolated from the
         # EP group that the forward pass (MoE all-to-all etc.) runs on. NCCL/RCCL
@@ -2131,6 +2141,11 @@ class EPLBManager:
             return
         next(self._gen)
 
+    def add_commit_listener(self, listener: Callable[[int], None]) -> None:
+        """``listener(layer_id)`` after each layer's placement commits, on the
+        stream the migration ran on, before any later forward reads it."""
+        self._commit_listeners.append(listener)
+
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:
         if not self.enabled:
             return
@@ -2287,7 +2302,8 @@ class EPLBManager:
                     p2p_batch_chunk_size=self._p2p_batch_chunk_size,
                     cuda_stream=None,
                 )
-                # if needed, just refresh relayer expert_map/mask here
+                for listener in self._commit_listeners:
+                    listener(layer_id)
             _chunk_ms = (_time.perf_counter() - _tc) * 1000.0
             logger.info(
                 "EPLB rebalance #%d ep_rank=%d chunk %d/%d layers=%s migrate=%.1fms",

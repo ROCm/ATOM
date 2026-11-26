@@ -369,3 +369,42 @@ def test_execute_rebalance_drains_runtime_generator():
     with pytest.raises(StopIteration):
         next(gen)
     assert steps == ["chunk0", "chunk1"]
+
+
+def test_runtime_rebalance_tells_listeners_each_committed_layer(monkeypatch):
+    """A commit listener hears each layer right after that layer commits, before
+    the next layer migrates (a forward between chunks reads it)."""
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=1,
+        rebalance_min_balancedness=0.8,
+        rebalance_balancedness_agg="min",
+    )
+    manager.live_metadata = types.SimpleNamespace(
+        num_physical_experts=4,
+        ep_size=2,
+        ep_rank=0,
+        max_num_replicas=1,
+        physical_to_logical_map=None,
+    )
+    manager._ep_group = object()
+    manager._moe_layers = {0: types.SimpleNamespace(), 1: types.SimpleNamespace()}
+    monkeypatch.setattr(monitor, "dump_global_logical_load", lambda: torch.ones(2, 4))
+    monkeypatch.setattr(eplb, "rebalance_experts", lambda *a, **k: (None, None, None))
+    monkeypatch.setattr(
+        eplb.ExpertLocationMetadata, "from_rebalance_result", lambda **k: None
+    )
+    monkeypatch.setattr(manager, "_log_rebalance_metrics", lambda **k: None)
+    events = []
+    monkeypatch.setattr(
+        eplb,
+        "migrate_and_commit_chunk",
+        lambda *, layer_ids, **k: events.append(("commit", *layer_ids)),
+    )
+    manager.add_commit_listener(lambda layer_id: events.append(("heard", layer_id)))
+
+    for _ in manager._execute_runtime_rebalance():
+        pass
+    assert events == [("commit", 0), ("heard", 0), ("commit", 1), ("heard", 1)]

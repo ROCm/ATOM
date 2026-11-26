@@ -137,7 +137,14 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
         ({"is_multinode_tp": True}, "TP group spans nodes"),
         ({"enable_tbo": True}, "TBO"),
         ({"enable_tbo_decode": True}, "TBO"),
-        ({**_DPA, "eplb_enable": True}, "EPLB"),
+        (
+            {
+                **_DPA,
+                "eplb_enable": True,
+                "eplb_config": SimpleNamespace(num_redundant_experts=8),
+            },
+            "EPLB with redundant experts",
+        ),
         (
             {
                 "compilation_config": SimpleNamespace(
@@ -198,6 +205,15 @@ def test_unsupported_deployment_is_refused(native, overrides, reason):
 
 def test_dp_attention_with_expert_parallel_is_served(native):
     assert mono_config.config_refusal(_atom_config(**_DPA)) is None
+
+
+def test_eplb_without_redundant_experts_is_served(native):
+    config = _atom_config(
+        **_DPA,
+        eplb_enable=True,
+        eplb_config=SimpleNamespace(num_redundant_experts=0),
+    )
+    assert mono_config.config_refusal(config) is None
 
 
 def test_dp_attention_with_moe_tp_is_served(native):

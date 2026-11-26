@@ -114,7 +114,10 @@ def test_mono_eplb_refusal_is_cpu_tested(monkeypatch):
     )
     assert config_refusal(config) is None
     config.eplb_enable = True
-    assert config_refusal(config) == "EPLB"
+    config.eplb_config = SimpleNamespace(num_redundant_experts=0)
+    assert config_refusal(config) is None
+    config.eplb_config = SimpleNamespace(num_redundant_experts=8)
+    assert config_refusal(config) == "EPLB with redundant experts"
 
 
 def test_production_geometry_has_only_four_global_owners():

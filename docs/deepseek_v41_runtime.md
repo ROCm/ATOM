@@ -155,8 +155,10 @@ under decoder bounded replay it places only layers before `decoder_start`
 (0..19 on V4.1-Flash), whose prefills run every row. Later layers keep the
 ordinary EP expert layout, without redundant slots, remapping, load recording
 or migration. Without decoder bounded replay, EPLB places all target MoE
-layers. V4.1 mono decode refuses EPLB because its kernel reads logical expert
-IDs directly. Plugin execution is no longer among them: V4.1
+layers. V4.1 mono decode serves EPLB without redundant experts: the placement
+is then a permutation of the experts over the ranks' slots, which the mono
+router takes on as its gate rows in slot order (`mono/eplb_gate.py`, reordered
+on each layer's commit). With redundant experts it refuses EPLB. Plugin execution is no longer among them: V4.1
 runs on the vLLM plugin backend, described in
 [the plugin backend guide](vllm_plugin_backend_guide.md). `lmcache_mp` offloads PAGE units. With
 encoder SWA bounded replay (the default) it moves PAGE alone, and a tier load

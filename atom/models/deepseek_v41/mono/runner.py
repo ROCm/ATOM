@@ -56,6 +56,7 @@ from atom.models.deepseek_v41.mono.compress_launch import MonoCompressor
 from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS
 from atom.models.deepseek_v41.mono.draft_ctx_launch import MonoDraftContext
 from atom.models.deepseek_v41.mono.engram_launch import MonoEngram
+from atom.models.deepseek_v41.mono.eplb_gate import bind_eplb_gates
 from atom.models.deepseek_v41.mono.head_launch import bind_lm_head
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
@@ -340,7 +341,7 @@ class V41MonoDecodeRunner:
     def _bind(self, model, drafter) -> None:
         self.model = model
         self._bind_rank()
-        self.layers = bind_model(model, self.dims, self.moe_tp)
+        self.layers = bind_eplb_gates(bind_model(model, self.dims, self.moe_tp))
         # without a drafter no layer taps its residual
         self.aux = (
             AuxTaps((), ())

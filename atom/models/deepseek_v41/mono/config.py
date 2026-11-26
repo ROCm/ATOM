@@ -92,7 +92,12 @@ def config_refusal(atom_config) -> str | None:
         # a side-stream compressor would run beside the persistent kernels and
         # contend for their CUs
         (envs.ATOM_DSV41_SIDE_STREAMS == 0, "ATOM_DSV41_SIDE_STREAMS"),
-        # the MoE kernel reads a rank's experts by logical id, not EPLB's slots
-        (not atom_config.eplb_enable, "EPLB"),
+        # EPLB's placement reaches the MoE kernel as its router's gate rows in
+        # slot order (``eplb_gate``): a permutation, so no expert in two slots
+        (
+            not atom_config.eplb_enable
+            or atom_config.eplb_config.num_redundant_experts == 0,
+            "EPLB with redundant experts",
+        ),
     ]
     return first_refusal(checks)
