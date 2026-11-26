@@ -162,7 +162,7 @@ run_container_case_13() {
 }
 
 printf '## Lumen GPU suite\n' >> "$GITHUB_STEP_SUMMARY"
-record "unit" run_unit
+record_case "unit" run_unit
 record_case "case-1" run_host_case 1 \
   "PRECISION=bf16 TRAIN_STEPS=20 bash examples/llama2/run_pretrain_llama2_7b.sh"
 record_case "case-2" run_host_case 2 \

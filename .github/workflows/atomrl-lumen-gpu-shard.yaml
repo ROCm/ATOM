@@ -123,6 +123,8 @@ jobs:
             ready=0
             if docker run --rm --network=host \
                 -e HF_TOKEN="${HF_TOKEN:-}" \
+                -e MODEL_ID="$model_id" \
+                -e TARGET_DIR="$target_dir" \
                 -e MODEL_DOWNLOAD_TIMEOUT \
                 -e MODEL_LOCK_WAIT_SECONDS \
                 -e MODEL_LOCK_POLL_INTERVAL \
