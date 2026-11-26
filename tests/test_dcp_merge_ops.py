@@ -1353,6 +1353,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         kv_cache_dtype=cache_dtype,
         index_cache_dtype="fp8",
         attn_prefill_chunk_size=0,
+        speculative_config=None,
         enable_tbo=False,
         enable_tbo_decode=False,
         compilation_config=SimpleNamespace(static_forward_context={}),

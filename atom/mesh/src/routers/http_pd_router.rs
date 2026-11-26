@@ -956,6 +956,14 @@ impl PDRouter {
         let prefill_headers = headers.cloned();
         let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
         let mut canceled = placement.canceled.subscribe();
+        let (failure_tx, failure_rx) = tokio::sync::oneshot::channel();
+        let mut prefill_failure = Box::pin(async move {
+            match failure_rx.await {
+                Ok(error) => error,
+                // Successful P completion must not interrupt D or its response body.
+                Err(_) => std::future::pending::<(StatusCode, String)>().await,
+            }
+        });
         let work = async move {
             let _prefill_guard = prefill_guard;
             match prefill_router
@@ -974,10 +982,18 @@ impl PDRouter {
                             "vLLM prefill {} request_id={} returned non-success status={}",
                             prefill_url_for_log, correlation_for_log, status
                         );
+                        let status = StatusCode::from_u16(status.as_u16())
+                            .unwrap_or(StatusCode::BAD_GATEWAY);
+                        let _ = failure_tx.send((status, format!("Prefill returned {status}")));
+                        return;
                     }
                     // Drain body so the connection can be reused.
                     if let Err(error) = res.drain().await {
                         warn!(%error, "failed to drain prefill response");
+                        let _ = failure_tx.send((
+                            StatusCode::BAD_GATEWAY,
+                            format!("Failed to read prefill response: {error}"),
+                        ));
                     }
                 }
                 Err(e) => {
@@ -985,6 +1001,10 @@ impl PDRouter {
                         "vLLM prefill {} request_id={} failed: {}",
                         prefill_url_for_log, correlation_for_log, e
                     );
+                    let _ = failure_tx.send((
+                        StatusCode::BAD_GATEWAY,
+                        format!("Prefill server error: {e}"),
+                    ));
                 }
             }
         };
@@ -1018,7 +1038,13 @@ impl PDRouter {
             Ok(req) => req,
             Err(resp) => return resp,
         };
-        let decode_result = self.send_worker(decode_post, decode.clone(), headers).await;
+        let decode_result = tokio::select! {
+            biased;
+            (status, message) = &mut prefill_failure => {
+                return error::create_error(status, "prefill_server_error", message);
+            }
+            result = self.send_worker(decode_post, decode.clone(), headers) => result,
+        };
         events::RequestReceivedEvent {}.emit();
 
         let res = match decode_result {
@@ -1054,8 +1080,27 @@ impl PDRouter {
 
         if context.is_stream {
             let response_headers = header_utils::preserve_response_headers(res.headers());
+            let stream = futures_util::stream::unfold(
+                (Some(res.bytes_stream().boxed()), prefill_failure),
+                |(stream, mut failure)| async move {
+                    let mut stream = stream?;
+                    tokio::select! {
+                        biased;
+                        (status, message) = &mut failure => {
+                            // Drop D immediately, including while it is waiting for KV.
+                            drop(stream);
+                            let payload = json!(error::payload(status, "prefill_server_error", &message));
+                            let chunk = bytes::Bytes::from(format!("data: {payload}\n\ndata: [DONE]\n\n"));
+                            Some((Ok(chunk), (None, failure)))
+                        }
+                        chunk = stream.next() => {
+                            chunk.map(|chunk| (chunk, (Some(stream), failure)))
+                        }
+                    }
+                },
+            );
             let response = self.create_streaming_response(
-                res.bytes_stream(),
+                stream,
                 status,
                 None,
                 false,
@@ -1069,7 +1114,14 @@ impl PDRouter {
             response
         } else {
             let response_headers = header_utils::preserve_response_headers(res.headers());
-            match res.bytes().await {
+            let body = tokio::select! {
+                biased;
+                (status, message) = &mut prefill_failure => {
+                    return error::create_error(status, "prefill_server_error", message);
+                }
+                body = res.bytes() => body,
+            };
+            match body {
                 Ok(decode_body) => {
                     prefill_task.finish().await;
                     let mut response = Response::new(Body::from(decode_body));

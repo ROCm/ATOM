@@ -204,6 +204,14 @@ class MLAModules:
    - Prefill (sparse): `mla_prefill_fwd`.
 3. V up-projection + O projection via batched BMM (`_v_up_proj_and_o_proj`).
 
+**Decode query-head width.** A rank with fewer query heads than the decode dispatches pads its query with zero heads (`padded_num_heads`, dropped again after the kernel). `mla_dense_min_query_heads` is the one model-level floor: `MLAAttention` pads to it and `AiterMLAMetadataBuilder` plans the step's single `work_*` plan for it. It is 16, or 12 on a rank with exactly 12 heads (Kimi-K3 at `-tp 8`, which then decodes unpadded) when all of these hold:
+
+- ATOM measured 12 heads faster: an fp8 KV cache at an 8-token verify (`_MLA_NARROW_QLEN`; Kimi-K3's interactive band, DSpark 7). The MI355X numbers are in the comment on `_MLA_NARROW_QLEN` in `atom/model_ops/attention_mla.py`.
+- The decode is the one the builder plans for: native ATOM (not the vLLM, SGLang or RTP-LLM plugins, whose builders plan the decode themselves), no indexer (`has_mla_indexer`; every layer of such a model, dense or sparse, keeps 16), no DCP, neither the Triton MLA decode (`ATOM_USE_TRITON_MLA`) nor the shuffled KV layout (`ATOM_MLA_KV_SHUFFLED`), and persistent by `mla_decode_is_persistent`, the predicate `MLAAttention.decode_is_persistent` uses (so page size 1).
+- ATOM asks `aiter.ops.attention.get_mla_decode_shape_support` about that decode, described as `_forward_decode` calls `mla_decode_fwd`, and it answers native and supported at 12 heads.
+
+Anything else keeps 16, including a bf16 KV cache (not measured), decoding without speculation, any other verify width, and any other head count on a rank (fewer than 12 heads still pad to 16).
+
 **Batched GEMM backends for MLA projections:**
 
 | Condition | Kernel |

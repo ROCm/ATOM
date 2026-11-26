@@ -1001,6 +1001,97 @@ async fn vllm_detached_prefill_retains_load_until_it_finishes() {
     drop(tx);
 }
 
+async fn check_vllm_prefill_failure_before_decode_headers(streaming: bool) {
+    let (mut p, d) = servers().await;
+    let task = dispatch(DispatchKind::Vllm, &p, &d, streaming);
+    p.wait_entered().await;
+    d.wait_entered().await;
+    p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    let response = result(task).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(response);
+    wait_load(&p.worker, 0).await;
+    wait_load(&d.worker, 0).await;
+}
+
+#[tokio::test]
+async fn vllm_prefill_failure_cancels_pending_streaming_decode() {
+    check_vllm_prefill_failure_before_decode_headers(true).await;
+}
+
+#[tokio::test]
+async fn vllm_prefill_failure_cancels_pending_buffered_decode() {
+    check_vllm_prefill_failure_before_decode_headers(false).await;
+}
+
+#[tokio::test]
+async fn vllm_prefill_failure_interrupts_open_decode_stream() {
+    let (mut p, mut d) = servers().await;
+    let task = dispatch(DispatchKind::Vllm, &p, &d, true);
+    p.wait_entered().await;
+    d.wait_entered().await;
+    let (response, tx) = stream_response(StatusCode::OK);
+    d.respond(response);
+    let response = result(task).await;
+    p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    let bytes = timeout(Duration::from_secs(5), response.into_body().collect())
+        .await
+        .expect("prefill failure left the decode stream open")
+        .unwrap()
+        .to_bytes();
+    assert!(String::from_utf8_lossy(&bytes).contains("prefill_server_error"));
+    wait_load(&p.worker, 0).await;
+    wait_load(&d.worker, 0).await;
+    drop(tx);
+}
+
+#[tokio::test]
+async fn vllm_prefill_failure_interrupts_buffered_decode_body() {
+    let (mut p, mut d) = servers().await;
+    let task = dispatch(DispatchKind::Vllm, &p, &d, false);
+    p.wait_entered().await;
+    d.wait_entered().await;
+    let (response, tx) = stream_response(StatusCode::OK);
+    d.respond(response);
+    p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    let response = result(task).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(response);
+    wait_load(&p.worker, 0).await;
+    wait_load(&d.worker, 0).await;
+    drop(tx);
+}
+
+#[tokio::test]
+async fn vllm_prefill_failure_reports_transport_error() {
+    let (p, d) = servers().await;
+    p.task.abort();
+    tokio::task::yield_now().await;
+    let response = result(dispatch(DispatchKind::Vllm, &p, &d, false)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    drop(response);
+    wait_load(&p.worker, 0).await;
+    wait_load(&d.worker, 0).await;
+}
+
+#[tokio::test]
+async fn vllm_prefill_failure_reports_incomplete_body() {
+    let (mut p, d) = servers().await;
+    let task = dispatch(DispatchKind::Vllm, &p, &d, false);
+    p.wait_entered().await;
+    d.wait_entered().await;
+    let (response, tx) = stream_response(StatusCode::OK);
+    p.respond(response);
+    tx.send(Err(std::io::Error::other("prefill body interrupted")))
+        .unwrap();
+    drop(tx);
+    let response = result(task).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    drop(response);
+    wait_load(&p.worker, 0).await;
+    wait_load(&d.worker, 0).await;
+}
+
 #[tokio::test]
 async fn vllm_prefill_aborted_before_it_starts_records_no_dispatch() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
