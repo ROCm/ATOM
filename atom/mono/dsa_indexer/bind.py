@@ -16,7 +16,7 @@ run -- calls the indexer's own forward on every rank alike.
 
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from aiter.dist.parallel_state import (
@@ -60,6 +60,7 @@ class IndexerBinding:
     peer_offset: int = 0
     dual_score: bool = False
     short_gemm: bool = False
+    dc1: int = 0  # ``IxBuild.dc1`` where it fits the build
 
     def key(self, rows: int, qlen: int = 1) -> kix.IxBuild:
         dual = (
@@ -70,7 +71,10 @@ class IndexerBinding:
                 or rows in DUAL_SCORE_ROWS
             )
         )
-        return kix.IxBuild(
+        dc1 = self.dc1
+        if rows < kix.PACKED_HIST_MIN_ROWS:
+            dc1 &= ~kix.DC1_PACKED_HIST
+        key = kix.IxBuild(
             self.shape,
             rows,
             self.world,
@@ -79,7 +83,11 @@ class IndexerBinding:
             qlen=qlen,
             score_blocks=2 * BLOCKS if dual else BLOCKS,
             short_gemm=self.short_gemm,
+            dc1=dc1,
         )
+        if key.dc1 and kix.unfit(key):
+            key = replace(key, dc1=0)
+        return key
 
     def serves(self, rows: int, qlen: int, ilog) -> bool:
         """Whether the kernel has a build for this step and, replicated, the
@@ -273,6 +281,7 @@ def bind_indexers(inner, tp: int, rank: int) -> IndexerBinding | None:
         replicated,
         dual_score=dual,
         short_gemm=short_gemm,
+        dc1=kix.DC1_DEFAULT,
     )
 
 

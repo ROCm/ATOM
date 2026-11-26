@@ -19,6 +19,36 @@ MAX_LEGACY_TOKENS = 64
 MAX_TOKENS = BLOCKS
 MAX_VERIFY_TOKENS = BLOCKS
 TL_PASS0 = 7
+# ``IxBuild.dc1`` bits
+DC1_ACTIVE_POLL = 1
+DC1_PACKED_HIST = 2
+DC1_FLAT_STORE = 16
+DC1_XPOSE_SUM = 32
+DC1_EARLY_CNT = 64
+DC1_BUCKET_EXIT = 128
+DC1_EARLY_W = 1024
+DC1_JOINT_POLL = 2048
+DC1_ALL = (
+    DC1_ACTIVE_POLL
+    | DC1_PACKED_HIST
+    | DC1_FLAT_STORE
+    | DC1_XPOSE_SUM
+    | DC1_EARLY_CNT
+    | DC1_BUCKET_EXIT
+    | DC1_EARLY_W
+    | DC1_JOINT_POLL
+)
+# The options every binding builds with (``bind.bind``): all of them. Chosen on
+# the production DCP8 build (Kimi-K3.1, 128K, K4, 8 x MI355X), every option
+# bitwise equal to the kernel without them (indices, indptr, counts and logits,
+# 5..60 rows, equal-logit rows): without / with all but ``DC1_PACKED_HIST``
+# (3313) / with all (3315), us a launch: 34.96 / 30.88 / 31.81 at 5 rows,
+# 41.77 / 38.04 / 37.31 at 20, 62.95 / 53.79 / 50.47 at 60. Packing the
+# histograms pays from ``PACKED_HIST_MIN_ROWS`` rows, which ``bind`` applies.
+DC1_DEFAULT = DC1_ALL
+# ``packed_hist`` from this many rows a step: with fewer, packing the pushes
+# costs more than their smaller size saves
+PACKED_HIST_MIN_ROWS = 20
 
 
 def local_step_symbol(rows, qlen, world, compact, debug=False):
@@ -63,6 +93,8 @@ class IxBuild:
     score_blocks: int = field(default=BLOCKS, metadata={"sym": "sb"})
     # gfx950 short verify: BF16 prepacked Q projection and local MQA scheduling.
     short_gemm: bool = field(default=False, metadata={"sym": "sq"})
+    # DC1's bit-identical changes (``DC1_*``), a mask; 0 names no symbol field
+    dc1: int = field(default=0, metadata={"sym": "dc"})
 
     @property
     def stream_scores(self) -> bool:
@@ -164,12 +196,57 @@ class IxBuild:
         return self.shape.qrows // TILE
 
     @property
+    def active_poll(self) -> bool:
+        """Only the deciding waves poll the ranks' histograms (``select._decide``)."""
+        return bool(self.dc1 & DC1_ACTIVE_POLL)
+
+    @property
+    def packed_hist(self) -> bool:
+        """The ranks' histograms pushed three bins a pair (``select.PACK``)."""
+        return bool(self.dc1 & DC1_PACKED_HIST)
+
+    @property
+    def flat_store(self) -> bool:
+        return bool(self.dc1 & DC1_FLAT_STORE)
+
+    @property
+    def xpose_sum(self) -> bool:
+        """Score head sums four (row, unit)s a reduction, a store each
+        (``ops.head_sums4``; masked stores as ``flat_store``'s)."""
+        return bool(self.dc1 & DC1_XPOSE_SUM)
+
+    @property
+    def early_cnt(self) -> bool:
+        """A long row's CNT (``rows_before``) from its radix passes' counts of
+        this rank, before its segments' winners are counted (``_choose``)."""
+        return bool(self.dc1 & DC1_EARLY_CNT)
+
+    @property
+    def bucket_exit(self) -> bool:
+        """A long row's radix passes stop once its threshold bin is needed
+        whole (``stage_segment``): the same keys, in the same order."""
+        return bool(self.dc1 & DC1_BUCKET_EXIT)
+
+    @property
+    def early_w(self) -> bool:
+        """A q quant task's head weight is loaded before its QRDY poll."""
+        return bool(self.dc1 & DC1_EARLY_W)
+
+    @property
+    def joint_poll(self) -> bool:
+        """A long row's segment polls the earlier rows' CNT (``rows_before``)
+        alongside its row's earlier segments' SGE, before one barrier (their
+        CNT is early: ``early_cnt``)."""
+        return bool(self.dc1 & DC1_JOINT_POLL)
+
+    @property
     def name(self) -> str:
         from atom.mono.plan.build_key import symbol_params
 
-        return kernel_symbol(
-            f"mono_dsa_indexer_{self.shape.tag}", **symbol_params(self)
-        )
+        params = symbol_params(self)
+        if not params["dc"]:
+            del params["dc"]
+        return kernel_symbol(f"mono_dsa_indexer_{self.shape.tag}", **params)
 
 
 def unfit(key: IxBuild) -> str:
@@ -218,6 +295,18 @@ def unfit(key: IxBuild) -> str:
     if key.row_keys >= isel.ARRIVED:
         # a row histogram word holds a bin's count below its segments
         return f"{key.row_keys} keys a row: the row histograms count < {isel.ARRIVED}"
+    if key.dc1 & ~DC1_ALL:
+        return f"unknown DC1 bits {key.dc1:#x}"
+    if key.packed_hist and (
+        key.replicated
+        or key.radix != isel.DEFAULT_RADIX
+        or key.row_keys >= 1 << isel.PACK_BITS
+    ):
+        return "packed histograms: DCP builds of the default radix, counts < 2^18"
+    if (key.bucket_exit or key.early_cnt) and key.replicated:
+        return "bucket exit / early CNT: DCP builds"
+    if key.joint_poll and not key.early_cnt:
+        return "joint CNT / SGE poll: with early CNT"
     return ""
 
 

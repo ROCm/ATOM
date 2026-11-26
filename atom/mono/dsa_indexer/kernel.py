@@ -85,6 +85,10 @@ from atom.mono.runtime.abi import KernelAbi
 MAX_TOKENS = build_plan.MAX_TOKENS
 MAX_VERIFY_TOKENS = build_plan.MAX_VERIFY_TOKENS
 dual_score_shape = build_plan.dual_score_shape
+DC1_ALL = build_plan.DC1_ALL
+DC1_DEFAULT = build_plan.DC1_DEFAULT
+DC1_PACKED_HIST = build_plan.DC1_PACKED_HIST
+PACKED_HIST_MIN_ROWS = build_plan.PACKED_HIST_MIN_ROWS
 
 SOURCES = source_digest("mono")
 Q_AMAX_SEED = 1e-10
@@ -192,7 +196,9 @@ def peer_layout(key: IxBuild) -> dict:
     their regions, so a rank already in the next kernel cannot land pushes on
     pairs this one's peers are still polling)."""
     return pair_layout(
-        isel.peer_pairs(key.tokens, key.world, key.replicated, key.radix).items()
+        isel.peer_pairs(
+            key.tokens, key.world, key.replicated, key.radix, key.packed_hist
+        ).items()
     )
 
 
@@ -363,19 +369,28 @@ def stage_iquant(c, bid, tokens):
     n = fx.Int32(tokens * sh.heads)
     rounds = -(-(tokens * sh.heads) // (BLOCKS * WAVES))
     groups = sh.head_dim // gemv.ROWS
+    ws = [None] * rounds
+    if const_expr(c["early_w"]):
+        # a task's head weight is the step's input, not this launch's: ahead of
+        # the poll (a past-the-end task loads the last one's)
+        a = c["args"]
+        for r in range_constexpr(rounds):
+            tk = fx.min(bid + BLOCKS * (r * WAVES + wave), n - 1) + offset
+            ws[r] = ld_f32(a["wp"], tk // sh.heads * a["kw_ld"] + tk % sh.heads, T.bf16)
     if tid < groups:
         c["poll"]([(c["qrdy"], ready_offset + (bid % sh.heads) * groups + tid, 1)])
     gpu.barrier()
     for r in range_constexpr(rounds):
         task = bid + BLOCKS * (r * WAVES + wave)
         if task < n:
-            iquant_task(c, task + offset, lane)
+            iquant_task(c, task + offset, lane, ws[r])
         publish(c["put"], c["qq"], task + offset, fx.Int32(1), (lane == 0) & (task < n))
 
 
 @traced
-def iquant_task(c, task, lane):
-    """Token task // heads, head task % heads on one wave, 2 dims a lane."""
+def iquant_task(c, task, lane, w=None):
+    """Token task // heads, head task % heads on one wave, 2 dims a lane
+    (``w``: its head weight, loaded ahead)."""
     sh = c["shape"]
     t = task // sh.heads
     h = task % sh.heads
@@ -386,11 +401,11 @@ def iquant_task(c, task, lane):
         )
     )
     x0, x1 = bf2_f32(qw)
-    iquant_values(c, task, lane, x0, x1)
+    iquant_values(c, task, lane, x0, x1, w)
 
 
 @traced
-def iquant_values(c, task, lane, x0, x1):
+def iquant_values(c, task, lane, x0, x1, w=None):
     a, sh = c["args"], c["shape"]
     t, h = task // sh.heads, task % sh.heads
     at = t * sh.qrows + h * sh.head_dim + 2 * lane
@@ -418,9 +433,9 @@ def iquant_values(c, task, lane, x0, x1):
             fx.Int16(q & 0xFFFF), rsrc(c["iq8"]), at // 2, cache_modifier=CM_DEV
         )
     if lane == 0:
-        w = ld_f32(a["wp"], t * a["kw_ld"] + h, T.bf16)
+        hw = ld_f32(a["wp"], t * a["kw_ld"] + h, T.bf16) if const_expr(w is None) else w
         bo.buffer_store(
-            (w * scale) * fx.Float32(sh.weights_scale),
+            (hw * scale) * fx.Float32(sh.weights_scale),
             rsrc(c["iw"]),
             t * sh.heads + h,
             cache_modifier=CM_DEV,
@@ -618,7 +633,9 @@ def build(key: IxBuild):
             before: fx.Array[fx.Int32, 2 * BLOCKS, 16]
         # ``select.SEL_*``: a pass's decisions, then a word a row (or, a
         # replicated row's gather, a rank)
-        sel: fx.Array[fx.Int32, isel.SEL_ROWS + max(s, key.world), 16]
+        sel: fx.Array[
+            fx.Int32, isel.SEL_ROWS + max(s, key.world) + 2 * int(key.early_cnt), 16
+        ]
         # a block scan's wave totals; ``select._sum_before``'s two halves
         scan: fx.Array[fx.Int32, 2 * WAVES, 16]
         # every row's kind (``select.step_table``, including all wide tiles)
@@ -711,8 +728,20 @@ def build(key: IxBuild):
             "delay_ticks": key.delay_ticks,
             "put": mb.put,
             "put_words": mb.put_words,
+            "put_raw": mb.put_raw,
             "poll": mb.poll,
+            "poll_raw": mb.poll_raw,
             "spin": mb.spin,
+            "tag": mb.tag,
+            "active_poll": key.active_poll,
+            "packed_hist": key.packed_hist,
+            "flat_store": key.flat_store,
+            "xpose_sum": key.xpose_sum,
+            "early_cnt": key.early_cnt,
+            "bucket_exit": key.bucket_exit,
+            "early_w": key.early_w,
+            "joint_poll": key.joint_poll,
+            "sel_rank": isel.SEL_ROWS + max(s, key.world),
             "red": lds.red.ptr,
             "xl": lds.xl.ptr,
             "xrow": xrow,
