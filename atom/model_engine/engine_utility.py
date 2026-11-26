@@ -1052,9 +1052,18 @@ class EngineUtilityHandler:
     def _handle_weights_in_use(self, args: dict) -> dict:
         """Go on after ``weights_stopped``. With ``changed`` what was running
         has been preempted to recompute on the weights as they are now
-        (``kv_change``), and the cached prefixes are forgotten."""
-        self.engine.resume_generation()
+        (``kv_change``), the cached prefixes are forgotten, and the runners
+        first derive again what they had made of the weights; one that cannot
+        leaves the engine stopped."""
         reply = {"cmd": WEIGHTS_IN_USE_CMD}
+        if args.get("changed"):
+            reply = self._utility_on_every_rank(
+                WEIGHTS_IN_USE_CMD,
+                "weights_changed",
+                timeout=_remaining_timeout(args, 300.0),
+            )
+        if "error" not in reply:
+            self.engine.resume_generation()
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 

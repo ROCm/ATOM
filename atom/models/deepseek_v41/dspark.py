@@ -351,6 +351,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 )
             except MonoUnsupported as why:
                 logger.warning("V4.1 DSpark: peer embedding off: %s", why)
+        self._noise_row = self._read_noise_row()
+        self._embedding_bound = True
+
+    def _read_noise_row(self) -> torch.Tensor:
+        """The noise token's row of the shared embedding as it is now."""
+        embed = self.embed
         ids = torch.full(
             (1,),
             self.config.dspark_noise_token_id,
@@ -361,15 +367,32 @@ class DeepseekV41DSpark(DSparkDraftModel):
             row = self._embed_peer(
                 ids, embed.weight.new_empty(1, embed.weight.shape[1])
             )
-        elif sharded:
+        elif isinstance(embed, VocabParallelEmbedding) and embed.tp_size > 1:
             row = masked_embedding(
                 ids, embed.weight, embed.vocab_start_idx, embed.vocab_end_idx
             )
             dist.all_reduce(row, group=get_tp_group().device_group)
         else:
             row = embed(ids)
-        self._noise_row = row.flatten()
-        self._embedding_bound = True
+        return row.flatten()
+
+    @torch.inference_mode()  # they were made in a forward: written only there
+    def refresh_derived_weights(self) -> None:
+        """What the first draft steps made of the weights and kept (the noise
+        row, `_context_kv_fusion`, `_draft_kv_tail_fusion`), made again of the
+        weights as they are now and written where it is: a recorded graph or
+        a mono launch may hold its address."""
+        if self._noise_row is not None:
+            self._noise_row.copy_(self._read_noise_row())
+        layers = self.context_layers
+        fused = self.__dict__.get("_context_kv_fused")
+        if fused:
+            shards = [a.wkv_shard for a in layers]
+            fused[0].copy_(torch.cat([s.weight for s in shards]))
+            fused[1].copy_(torch.cat([s.weight_scale for s in shards]))
+        tail = self.__dict__.get("_draft_kv_tail")
+        if tail:
+            tail[0].copy_(torch.stack([a.kv_norm.weight for a in layers]))
 
     def target_aux_capture_spec(self, layer_ids, hidden_size, _target_layers=None):
         # Published taps (37, 38, 39) have no Engram. A block pre-hook at an

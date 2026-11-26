@@ -154,12 +154,28 @@ def test_stopped_weights_hold_the_engine_until_they_are_in_use_again():
     # Unchanged, what was running goes on where it was...
     _run(engine, WEIGHTS_IN_USE_CMD, {"changed": False})
     assert not engine._generation_paused and list(sched.running) == seqs
-    # ...and on other values it recomputes its context.
+    # ...and on other values every rank derives again what it had made of the
+    # weights, and it recomputes its context.
     _run(engine, WEIGHTS_STOPPED_CMD, {}, runners)
-    _run(engine, WEIGHTS_IN_USE_CMD, {"changed": True})
+    _run(engine, WEIGHTS_IN_USE_CMD, {"changed": True}, runners)
+    assert asked[-1] == ("weights_changed", ())
     batch, active = sched.schedule()
     assert batch.total_seqs_num_prefill == 2
     assert sorted(active) == sorted(seq.id for seq in seqs)
+
+
+def test_a_rank_that_cannot_follow_other_weights_leaves_the_engine_stopped():
+    engine = _engine(Scheduler(MockConfig(num_kvcache_blocks=64)))
+
+    def utility_rpc(method, payload, timeout):
+        error = "kept the old ones" if method == "weights_changed" else None
+        return [RpcResult(payload.request_id, 0, error=error)]
+
+    runners = SimpleNamespace(utility_rpc=utility_rpc)
+    _run(engine, WEIGHTS_STOPPED_CMD, {"rewrite": True}, runners)
+    reply = _run(engine, WEIGHTS_IN_USE_CMD, {"changed": True}, runners)
+
+    assert "kept the old ones" in reply["error"] and engine._generation_paused
 
 
 # ── the busy loops ─────────────────────────────────────────────────────────

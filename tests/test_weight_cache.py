@@ -2468,6 +2468,60 @@ def test_stopped_weights_no_server_has_are_not_kept(one_gpu_daemon):
     assert idle.wait(5)  # well before the idle timeout
 
 
+def test_a_runner_has_its_modules_derive_again_what_they_made_of_the_weights(
+    monkeypatch,
+):
+    runner = gpu_stack_import("atom.model_engine.model_runner").ModelRunner
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    done = []
+
+    class Keeps(nn.Module):
+        def refresh_derived_weights(self):
+            done.append(self)
+
+    model, draft = nn.Sequential(Keeps(), nn.Linear(1, 1)), Keeps()
+    rank = SimpleNamespace(model=model, drafter=SimpleNamespace(model=draft), device=0)
+    runner.weights_changed(rank)
+    assert done == [model[0], draft]
+    del rank.drafter  # a launch without one
+    runner.weights_changed(rank)
+    assert done[2:] == [model[0]]
+
+
+def test_v41_dspark_derives_again_what_its_first_draft_steps_kept():
+    dspark = gpu_stack_import("atom.models.deepseek_v41.dspark").DeepseekV41DSpark
+
+    def stage(v):
+        shard = SimpleNamespace(
+            weight=torch.full((2, 4), v), weight_scale=torch.full((1, 1), v)
+        )
+        norm = SimpleNamespace(weight=torch.full((4,), v))
+        return SimpleNamespace(wkv_shard=shard, kv_norm=norm)
+
+    layers = [stage(1.0), stage(2.0)]
+    with torch.inference_mode():  # as a draft step makes them
+        fused = (torch.zeros(4, 4), torch.zeros(2, 1), 16, 4)
+        tail, row = (torch.zeros(2, 4), 1e-6), torch.zeros(3)
+    draft = SimpleNamespace(
+        context_layers=layers,
+        _context_kv_fused=fused,
+        _draft_kv_tail=tail,
+        _noise_row=row,
+        _read_noise_row=lambda: torch.ones(3),
+    )
+    dspark.refresh_derived_weights(draft)
+    # The tensors a recorded graph may hold the addresses of, with other values.
+    assert draft._context_kv_fused is fused and draft._noise_row is row
+    assert fused[0][:, 0].tolist() == [1, 1, 2, 2]
+    assert fused[1].flatten().tolist() == [1, 2]
+    assert tail[0][:, 0].tolist() == [1, 2] and row.tolist() == [1, 1, 1]
+    # Nothing kept yet (no draft step so far, or a model it does not fuse for).
+    idle = SimpleNamespace(
+        context_layers=layers, _context_kv_fused=None, _noise_row=None
+    )
+    dspark.refresh_derived_weights(idle)
+
+
 def test_the_command_line_does_not_change_weights(cache_dir):
     # A server's /model_weight routes do; `daemon` is how a launch starts one.
     for argv in (["load", "/b"], ["stop", "/b"], ["daemon"]):

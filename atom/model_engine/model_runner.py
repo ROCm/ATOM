@@ -3533,6 +3533,19 @@ class ModelRunner:
             )
         torch.cuda.synchronize(self.device)
 
+    @torch.inference_mode()  # what a forward made is written only there
+    def weights_changed(self) -> None:
+        """The weights this rank maps hold other values (a weight cache
+        daemon's `load`): every module derives again, where it keeps it, what
+        it made of them after they loaded (``refresh_derived_weights``)."""
+        drafter = getattr(self, "drafter", None)
+        models = [self.model] if drafter is None else [self.model, drafter.model]
+        for model in models:
+            for module in model.modules():
+                if hasattr(module, "refresh_derived_weights"):
+                    module.refresh_derived_weights()
+        torch.cuda.synchronize(self.device)
+
     def prepare_structured_output(
         self,
         schema,
