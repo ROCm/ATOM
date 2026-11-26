@@ -2937,9 +2937,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             and max_seqlen_q > 1
             and self.use_spec_decode
             and envs.ATOM_GDN_FUSED_DECODE_PAD
-            and not late_pack.active()
+            and (not late_pack.active() or late_pack.opened_early())
         )
-        if packing:
+        if packing and not late_pack.active():
             late_pack.begin(self.num_accepted_tokens.device)
         try:
             attn_metadata, positions = super().prepare_decode(

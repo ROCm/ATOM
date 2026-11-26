@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ctypes
+import functools
 import gc
 import inspect
 import logging
@@ -144,6 +145,15 @@ _FUSED_PROLOGUE = _EARLY_META and os.environ.get("ATOM_HOSTNEXT_FUSED_PROLOGUE",
 # per step shape (`model_ops.post_verify_graph`); the same bits as the eager
 # chain, which runs wherever the recording does not apply.
 _POST_GRAPH = os.environ.get("ATOM_HOSTNEXT_POST_GRAPH", "0") == "1"
+# ATOM_PRESENCE_IN_SAMPLER=1 (default off): a verify step's presence penalty is not
+# applied to the verify logits in place (`PresencePenaltyStep.apply`, one launch) but
+# made in the rejection sampler's stats / select kernels (aiter topk_topp_sample
+# ``presence`` with ``anchor``: the same bf16(x - p) values, the anchors' marks set in
+# the select). Any other consumer of the logits gets them applied as before.
+_PRESENCE_IN_SAMPLER = os.environ.get("ATOM_PRESENCE_IN_SAMPLER", "0") == "1"
+# ATOM_PROLOGUE_FILL_FUSED=1 (default off; with ATOM_PROLOGUE_EARLY_PACK): the step's
+# fill_deferred_decode_ids in the fused prologue's launch (early_meta._early_prologue_kernel)
+_FILL_FUSED = os.environ.get("ATOM_PROLOGUE_FILL_FUSED", "0") == "1"
 
 support_model_arch_dict = {
     "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
@@ -664,6 +674,21 @@ class tokenIDProcessor:
                 fused=_FUSED_PROLOGUE,
             )
         self.early_fix = early
+        if early is not None and early.fused and _FILL_FUSED:
+            # ATOM_PROLOGUE_FILL_FUSED: the deferred fill rides the prologue launch
+            fill = self.__dict__.get("_pending_fill")
+            if fill is not None:
+                from atom.model_ops.attentions.early_meta import fill_fusable
+
+                fa = fill.args + (fill.keywords["max_tokens_per_seq"], fill.keywords["width"])
+                if fill_fusable(fa, early.bs):
+                    early.fill = fa
+                    del self._pending_fill
+        if early is None or not early.fused:
+            from atom.utils import late_pack
+
+            if late_pack.opened_early():
+                late_pack.flush()  # ATOM_PROLOGUE_EARLY_PACK: no fused prologue here
         if early is not None:
             # The host builds the metadata with nothing rejected on the
             # carried-over rows; `early_meta_fix` subtracts the real counts on
@@ -830,7 +855,8 @@ class tokenIDProcessor:
             )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
-        fill_deferred_decode_ids(
+        fill = functools.partial(
+            fill_deferred_decode_ids,
             self.input_ids.gpu,
             self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
             self.decode_src.gpu[:bs],
@@ -839,12 +865,26 @@ class tokenIDProcessor:
             max_tokens_per_seq=int(lens.max()) if bs else 1,
             width=fill_to,
         )
+        from atom.utils import late_pack
+
+        if late_pack.opened_early():
+            # ATOM_PROLOGUE_EARLY_PACK: its inputs are in the window: after the flush
+            # (ATOM_PROLOGUE_FILL_FUSED: in the prologue launch, see prepare_input_ids)
+            self._pending_fill = fill
+            late_pack.after_flush(self._run_pending_fill)
+        else:
+            fill()
 
         # Slice by the width this path actually staged. Prefill returned above,
         # so the decode total is the whole batch; a worker-side speculative q
         # shrink rewrites it, and reading any other total here would leave the
         # attention metadata wider than input_ids.
         return self.input_ids.gpu[:total_tokens_decode], locs
+
+    def _run_pending_fill(self) -> None:
+        fill = self.__dict__.pop("_pending_fill", None)
+        if fill is not None:
+            fill()
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
@@ -2933,9 +2973,10 @@ class ModelRunner:
         # ATOM_HOSTNEXT_EARLY_META: only a replayed decode graph (an eager step
         # may read host-side lengths) builds before the status arrives.
         self.tokenID_processor._early_ok = bool(forward_mode.use_cudagraph)
+        token_group = self.h2d_groups.get("token_inputs")
+        self._open_early_pack(batch, forward_mode, token_group)
         # Before the step's GPU wait (in prepare_input_ids): needs no status.
         self._presence_step = self._begin_presence_step(batch, None)
-        token_group = self.h2d_groups.get("token_inputs")
         spec_decode_indices = None
         temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
             self.prepare_sample(batch, publication_group=token_group)
@@ -2993,6 +3034,33 @@ class ModelRunner:
             all_greedy,
             needs_independent_noise,
         )
+
+    def _open_early_pack(self, batch, forward_mode, token_group) -> None:
+        """ATOM_PROLOGUE_EARLY_PACK: open the build's packed-upload window (late_pack)
+        now, on a decode step that can take the fused prologue; the token inputs and
+        the presence rows then join its single upload. prepare_input_ids closes it at
+        once when the step does not take the fused prologue."""
+        from atom.utils import late_pack
+
+        if not late_pack.early_enabled() or late_pack.active():
+            return
+        proc = self.tokenID_processor
+        b = self.attn_metadata_builder
+        if not (
+            _FUSED_PROLOGUE
+            and token_group is not None
+            and forward_mode.use_cudagraph
+            and forward_mode.max_seqlen_q > 1
+            and not batch.is_dummy_run
+            and batch.total_seqs_num_prefill == 0
+            and proc.is_deferred_out
+            and proc.prev_batch is not None
+            and getattr(b, "use_spec_decode", False)
+            and hasattr(b, "_fused_prologue")
+            and envs.ATOM_GDN_FUSED_DECODE_PAD
+        ):
+            return
+        late_pack.begin(self.device, early=True)
 
     @staticmethod
     def _detailed_label_suffix(batch: ScheduledBatch | None) -> str:
@@ -3230,6 +3298,13 @@ class ModelRunner:
         greedy_ids: bool = False,
         topk_cands: int = 0,
     ) -> tuple[torch.Tensor | GreedyTokenIds | TopKCandidates, torch.Tensor]:
+        from atom.utils import late_pack as _lp
+
+        if _lp.opened_early():
+            # ATOM_PROLOGUE_EARLY_PACK: never reached on the fused-prologue path
+            # (the build flushes); a step that skipped it uploads before its forward
+            logger.warning("ATOM_PROLOGUE_EARLY_PACK: window still open at run_model; flushing")
+            _lp.flush()
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.scheduled_bs
@@ -3471,6 +3546,13 @@ class ModelRunner:
                         ):
                             # postprocess applies it, recorded or not
                             self._pg_pending_apply = logits
+                        elif (
+                            _PRESENCE_IN_SAMPLER
+                            and forward_context.spec_decode_metadata is not None
+                        ):
+                            # ATOM_PRESENCE_IN_SAMPLER: postprocess's sampler makes
+                            # it (or applies it)
+                            self._ps_pending_apply = logits
                         else:
                             self._presence_step.apply(logits)
                 else:
@@ -3783,6 +3865,7 @@ class ModelRunner:
                 temperatures,
                 top_ks,
                 top_ps,
+                presence_step=self.__dict__.pop("_ps_for_sampler", None),
             )
         if isinstance(logits, torch.Tensor) and fused_topk_topp_applicable(
             logits, top_ks, top_ps
@@ -4369,6 +4452,24 @@ class ModelRunner:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
+            # ATOM_PRESENCE_IN_SAMPLER: the penalty run_model left, for the rejection
+            # sampler's kernels when it is the logits' only reader, else applied now
+            ps_pending = self.__dict__.pop("_ps_pending_apply", None)
+            if ps_pending is not None:
+                rs_ = getattr(self, "_spec_rs", None)
+                if not (
+                    ps_pending is logits
+                    and isinstance(logits, torch.Tensor)
+                    and envs.ATOM_SPEC_FUSED_VERIFY_SAMPLE
+                    and not all_greedy
+                    and target_logits_indices.numel()
+                    and not any(batch.return_logprobs)
+                    and rs_ is not None
+                    and rs_.applies(logits, top_ks, top_ps)
+                ):
+                    self._presence_step.apply(ps_pending)
+                else:
+                    self._ps_for_sampler = self._presence_step
 
             if _POST_GRAPH:
                 post = self._post_graph_verify(

@@ -29,6 +29,7 @@ and only the GDN hybrid's builder (`supports_fused_mtp_glue`) is matched.
 
 import dataclasses
 import itertools
+import os
 from dataclasses import dataclass
 
 import torch
@@ -703,6 +704,144 @@ def draft_reads_kv_indices(builder) -> bool:
     ) in (256, 1024)
 
 
+# ATOM_MTP_ADVANCE_IN_SELECT=1 (default off; needs the draft span graph's recording,
+# ATOM_MTP_DRAFT_SPAN_GRAPH, and the fused draft select): each draft pass's advance
+# (`_advance_draft_pass_kernel`, passes 0 .. k-2) and the last pass's tail
+# (`_last_draft_pass_kernel`) run in that pass's select kernel (aiter
+# topk_topp_sample ``advance=``): the metadata in one more program, each row's next
+# ids, hidden row, draft id and records in the row's program after its draw. The
+# same writes (every byte a reader reads): one launch fewer a pass.
+ADVANCE_IN_SELECT = os.environ.get("ATOM_MTP_ADVANCE_IN_SELECT", "0") == "1"
+_PENDING_SELECT_ADVANCE = [None]
+
+
+@dataclass
+class SelectAdvance:
+    """A draft pass's advance (``mid``) or last-pass tail for its select
+    kernel; `advance_draft_pass` / `store_last_draft_pass`'s arguments.
+    ``consumed`` is set by the sampler that launched it."""
+
+    mid: bool
+    builder: object
+    draft_ids: torch.Tensor
+    draft_col: int
+    scheduled_bs: int
+    running_bs: int
+    records: object = None
+    dst_ids: torch.Tensor | None = None
+    dst_hidden: torch.Tensor | None = None
+    dst_positions: torch.Tensor | None = None
+    num_slot_rows: int = 0
+    num_reject_tokens: torch.Tensor | None = None
+    positions_src: torch.Tensor | None = None
+    anchors: torch.Tensor | None = None
+    token_split: "DraftTokenSplit | None" = None
+    consumed: bool = False
+
+
+def set_select_advance(spec: "SelectAdvance | None") -> None:
+    _PENDING_SELECT_ADVANCE[0] = spec
+
+
+def take_select_advance() -> "SelectAdvance | None":
+    spec = _PENDING_SELECT_ADVANCE[0]
+    _PENDING_SELECT_ADVANCE[0] = None
+    return spec
+
+
+def select_advance_kwargs(spec: SelectAdvance, src_hidden: torch.Tensor, n: int, kb: int) -> dict | None:
+    """The select kernel's ``adv_*`` arguments for ``spec`` (aiter topk_topp_sample
+    ``advance={"kw": ..., "mid": ...}``), or None where it does not apply (then
+    the caller's launch stays). ``n``: the select's rows; ``kb``: its KB."""
+    rbs, sbs = spec.running_bs, spec.scheduled_bs
+    if n != rbs or not (1 <= sbs <= rbs):
+        return None
+    d = spec.draft_ids
+    if d.dim() != 2 or d.shape[0] != sbs or d.stride(1) != 1:
+        return None
+    kw = dict(
+        adv_draft_ptr=d,
+        adv_draft_stride=d.stride(0),
+        adv_col=int(spec.draft_col),
+        adv_sbs=sbs,
+        adv_rbs=rbs,
+        adv_n=n,
+        ADV=1 if spec.mid else 2,
+    )
+    if spec.records is not None:
+        rec, tok, _scratch, _tok_scratch, slots, col, bs = spec.records
+        if (
+            int(col) != int(spec.draft_col)
+            or rec.shape[-1] != 3 * kb + 2
+            or rec.stride(-1) != 1
+            or tok.stride(-1) != 1
+        ):
+            return None
+        kw.update(
+            adv_rec_ptr=rec,
+            adv_rtok_ptr=tok,
+            adv_rslot_ptr=slots,
+            adv_rec_slot_stride=rec.stride(0),
+            adv_rec_col_stride=rec.stride(1),
+            adv_rtok_slot_stride=tok.stride(0),
+            adv_rec_bs=int(bs),
+            ADV_REC=True,
+        )
+    if not spec.mid:
+        return kw
+    b = spec.builder
+    var = b.model_runner.forward_vars
+    context_lens = var["context_lens"].gpu
+    dst_hidden = spec.dst_hidden
+    first = spec.positions_src is not None
+    h = dst_hidden.shape[-1]
+    if (
+        src_hidden.dim() != 2
+        or src_hidden.shape[0] < sbs
+        or src_hidden.shape[-1] != h
+        or src_hidden.stride(-1) != 1
+        or dst_hidden.stride(-1) != 1
+        or src_hidden.dtype != dst_hidden.dtype
+        or h & (h - 1)
+        or rbs >= context_lens.shape[0] + 1
+    ):
+        return None
+    dst_hidden = dst_hidden.view(-1, h)
+    block_tables = var["block_tables"].gpu
+    ts = spec.token_split
+    kw.update(
+        adv_ids_ptr=spec.dst_ids,
+        adv_hsrc_ptr=src_hidden,
+        adv_hsrc_stride=src_hidden.stride(0),
+        adv_hdst_ptr=dst_hidden,
+        adv_hdst_stride=dst_hidden.stride(0),
+        adv_pos_ptr=spec.dst_positions,
+        adv_ctx_ptr=context_lens,
+        adv_rej_ptr=(
+            spec.num_reject_tokens if spec.num_reject_tokens is not None else context_lens
+        ),
+        adv_indptr_ptr=var["kv_indptr"].gpu[: rbs + 1],
+        adv_bt_ptr=block_tables,
+        adv_bt_stride=block_tables.stride(0),
+        adv_slot_ptr=var["slot_mapping"].gpu[:rbs],
+        adv_cuq_ptr=var["cu_seqlens_q"].gpu,
+        adv_rowids_ptr=b.row_ids,
+        adv_possrc_ptr=spec.positions_src if first else spec.dst_positions,
+        adv_anchors_ptr=spec.anchors if first else spec.dst_positions,
+        adv_tiles_ptr=ts.tiles if ts is not None else context_lens,
+        adv_nslot=int(spec.num_slot_rows),
+        ADV_FIRST=first,
+        ADV_REJECT=spec.num_reject_tokens is not None,
+        ADV_BLOCK=_block(context_lens.shape[0]),
+        ADV_H=h,
+        ADV_KV_PAGE=b.block_size,
+        ADV_SLOT_PAGE=b.model_runner.block_size,
+    )
+    if ts is not None:
+        kw.update({"ADV_" + k: v for k, v in ts.constexprs().items()})
+    return kw
+
+
 def advance_draft_pass(
     builder,
     *,
@@ -723,6 +862,7 @@ def advance_draft_pass(
     token_split: DraftTokenSplit | None = None,
     kv_indices: bool = True,
     records=None,
+    launch: bool = True,
 ) -> dict:
     """Advance the one-row-per-sequence metadata a drafted token and stage the
     next pass, as `_enter_decode_metadata` (``positions_src`` given: the first
@@ -743,7 +883,8 @@ def advance_draft_pass(
     kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
     block_tables = var["block_tables"].gpu
     slot_mapping = var["slot_mapping"].gpu[:running_bs]
-    _launch_advance(
+    if launch:  # (launch=False: ATOM_MTP_ADVANCE_IN_SELECT, the pass's select made these writes)
+      _launch_advance(
         src_ids=src_ids,
         src_hidden=src_hidden,
         dst_ids=dst_ids,

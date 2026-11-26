@@ -342,6 +342,35 @@ class PresencePenaltyStep:
         )
         return logits
 
+    def sampler_presence(self, logits: torch.Tensor):
+        """ATOM_PRESENCE_IN_SAMPLER: aiter topk_topp_sample's ``presence`` (with
+        ``anchor``) standing in for `apply` on these verify logits -- the same
+        penalized values, made in the sampler's kernels, and the anchors' marks set
+        by its select -- or None where `apply`'s fused-anchors launch would not be
+        the one taken (then call `apply`)."""
+        rows = min(self.num_rows, logits.shape[0])
+        nseq = self.seq_start.numel()
+        if (
+            self._anchors_marked
+            or rows < nseq
+            or rows == 0
+            or logits.shape[1] != self.state.mask.shape[1]
+            or logits.stride(1) != 1
+        ):
+            return None
+        self._anchors_marked = True
+        return {
+            "input_ids": self.input_ids,
+            "row_seq": self.row_seq,
+            "row_pos": self.row_pos,
+            "seq_start": self.seq_start,
+            "slots": self.slots,
+            "penalties": self.penalties,
+            "mask": self.state.mask,
+            "max_extra": self.state.max_extra,
+            "anchor": True,
+        }
+
     def mark(self, tokens: torch.Tensor):
         """Record emitted tokens: `tokens` `[seqs, T]`, -1 where nothing was emitted."""
         self._mark_anchors()
@@ -487,7 +516,14 @@ class PresencePenaltyState:
                 dev = fixed[:total]
                 dev.copy_(host[:total], non_blocking=True)
             else:
-                dev = host[:total].to(self.device, non_blocking=True)
+                from atom.utils import late_pack
+
+                if late_pack.opened_early():
+                    # ATOM_PROLOGUE_EARLY_PACK: in the step's single upload
+                    dev = torch.empty(total, dtype=torch.int32, device=self.device)
+                    late_pack.add(dev, host[:total])
+                else:
+                    dev = host[:total].to(self.device, non_blocking=True)
         else:
             host = torch.from_numpy(
                 np.concatenate(

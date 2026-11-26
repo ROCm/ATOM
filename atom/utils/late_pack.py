@@ -29,6 +29,14 @@ import triton
 import triton.language as tl
 
 _ENABLED = os.environ.get("ATOM_PROLOGUE_PACKED_H2D", "0") == "1"
+# ATOM_PROLOGUE_EARLY_PACK=1 (default off; with ATOM_PROLOGUE_PACKED_H2D): the window opens
+# at the start of a decode step's preparation (model_runner.prepare_model), so the step's
+# token inputs (the token_inputs group: one H2D + one scatter_packed_bytes) and the
+# presence rows (one H2D) join the build's single upload too. The one GPU reader in
+# between, fill_deferred_decode_ids, is launched right after the flush (`after_flush`).
+# A step that turns out not to take the fused prologue closes the window at once
+# (model_runner, after the early-fix decision), before any reader.
+_EARLY = _ENABLED and os.environ.get("ATOM_PROLOGUE_EARLY_PACK", "0") == "1"
 _CHECK = os.environ.get("ATOM_PROLOGUE_PACKED_H2D_CHECK", "0") == "1"
 _RING = 8  # pinned arenas in rotation (the host runs at most ~1 step ahead; see spec_rejection)
 _ALIGN = 16
@@ -36,6 +44,21 @@ _ALIGN = 16
 
 def enabled() -> bool:
     return _ENABLED
+
+
+def early_enabled() -> bool:
+    return _EARLY
+
+
+def opened_early() -> bool:
+    """The open window was opened by the step's preparation (ATOM_PROLOGUE_EARLY_PACK)."""
+    return _S.active and _S.early
+
+
+def after_flush(fn) -> None:
+    """Run ``fn()`` right after this window's scatter (a reader of its members)."""
+    assert _S.active
+    _S.after.append(fn)
 
 
 @triton.jit
@@ -64,6 +87,8 @@ class _State:
         self.used = 0
         self.kernel = None
         self.windows = 0
+        self.early = False
+        self.after = []
 
 
 _S = _State()
@@ -88,9 +113,11 @@ def _arena(nbytes: int):
     return t
 
 
-def begin(device) -> None:
+def begin(device, early: bool = False) -> None:
     """Open a window: uploads go to the arena until `flush`."""
     assert not _S.active
+    _S.early = early
+    _S.after = []
     _S.active = True
     _S.device = device
     _S.members = []
@@ -113,9 +140,14 @@ def _reserve(nbytes: int) -> int:
     return off
 
 
-def add(dst: torch.Tensor, src: torch.Tensor) -> None:
+_DEBUG = int(os.environ.get("KC_LATE_DEBUG", "0") or 0)  # kc: print the first N windows' members
+
+
+def add(dst: torch.Tensor, src: torch.Tensor, name: str = "?") -> None:
     """Upload `src` (host) into `dst` (device, contiguous, same byte size) at `flush`."""
     assert _S.active
+    if _DEBUG and _S.windows <= _DEBUG:
+        print(f"[late_pack] window {_S.windows} early={_S.early} member {name} {src.numel() * src.element_size()} B", flush=True)
     assert dst.is_contiguous() and src.is_contiguous() and src.device.type == "cpu"
     nbytes = src.numel() * src.element_size()
     assert nbytes == dst.numel() * dst.element_size(), (tuple(src.shape), tuple(dst.shape))
@@ -130,6 +162,16 @@ def flush() -> None:
     """Close the window: one H2D of header + payload, one scatter launch."""
     assert _S.active
     _S.active = False
+    after = _S.after
+    _S.after = []
+    try:
+        _flush_members()
+    finally:
+        for fn in after:
+            fn()
+
+
+def _flush_members() -> None:
     members = _S.members
     _S.members = []
     if not members:

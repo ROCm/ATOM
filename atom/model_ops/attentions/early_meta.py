@@ -47,6 +47,9 @@ class EarlyFix:
     attn: dict | None = None
     gdn: dict | None = None
     kv: tuple | None = None
+    # ATOM_PROLOGUE_FILL_FUSED: fill_deferred_decode_ids' arguments (out, cu, src, prev,
+    # draft or None, max_tokens_per_seq, width), done by the prologue launch
+    fill: tuple | None = None
 
 
 @triton.jit(do_not_specialize=["bs", "running_bs", "bt_stride", "mrope_width"])
@@ -223,6 +226,7 @@ def early_gdn_accepted(fix: EarlyFix, num_accepted_tokens: torch.Tensor) -> None
     do_not_specialize=[
         "bs", "running_bs", "bt_stride", "mrope_width", "mask_len", "commit_n",
         "T_MAX", "CAP", "ns_len", "sp_rows", "sp_stride", "qsl_len", "acc_len",
+        "fill_bs", "fill_width",
     ]
 )
 def _early_prologue_kernel(
@@ -237,8 +241,33 @@ def _early_prologue_kernel(
     TILES_LO: tl.constexpr, TILES_HI: tl.constexpr,
     HAS_COMMIT: tl.constexpr, HAS_NS: tl.constexpr, PAD: tl.constexpr, SP_COLS: tl.constexpr,
     PBLOCK: tl.constexpr,
+    # ATOM_PROLOGUE_FILL_FUSED: fill_deferred_decode_ids (decode_input_ids) in this launch
+    fout_ptr=None, fcu_ptr=None, fsrc_ptr=None, fprev_ptr=None, fdraft_ptr=None, fdraft_stride=None,
+    fill_bs=None, fill_width=None,
+    HAS_FILL: tl.constexpr = False, FILL_DRAFT: tl.constexpr = False, FILL_BLOCK: tl.constexpr = 16,
 ):
     # ---- loads (every load before any store) ----
+    if HAS_FILL:
+        # _fill_deferred_decode_ids_kernel's values, one lane a token: request f_req of
+        # token ft (its span [cu[f_req], cu[f_req + 1])), the anchor at column 0 from the
+        # previous step's sampled ids, the drafts after it; new requests' spans (src < 0)
+        # kept as staged
+        frq = tl.arange(0, BLOCK_ROWS)
+        ft = tl.arange(0, FILL_BLOCK)
+        f_ends = tl.load(fcu_ptr + 1 + frq, mask=frq < fill_bs, other=2147483647)
+        f_end = tl.load(fcu_ptr + fill_bs)
+        f_req = tl.sum((f_ends[None, :] <= ft[:, None]).to(tl.int32), axis=1)
+        f_in = ft < f_end
+        f_src = tl.load(fsrc_ptr + f_req, mask=f_in, other=-1)
+        f_start = tl.load(fcu_ptr + f_req, mask=f_in, other=0)
+        f_col = ft - f_start
+        f_live = f_in & (f_src >= 0)
+        if FILL_DRAFT:
+            f_prev = tl.load(fprev_ptr + f_src, mask=f_live & (f_col == 0), other=0)
+            f_drf = tl.load(fdraft_ptr + f_src * fdraft_stride + (f_col - 1), mask=f_live & (f_col > 0), other=0)
+            f_val = tl.where(f_col == 0, f_prev, f_drf)
+        else:
+            f_val = tl.load(fprev_ptr + f_src, mask=f_live, other=0)
     rows = tl.arange(0, BLOCK_ROWS)
     real = rows < bs
     src = tl.load(src_ptr + rows, mask=real, other=-1)
@@ -269,6 +298,9 @@ def _early_prologue_kernel(
         clive = crow & (cslot >= 0)
         h = tl.load(wpos_ptr + cslot, mask=clive, other=0)
     tl.debug_barrier()
+    if HAS_FILL:
+        tl.store(fout_ptr + ft, f_val, mask=f_live)
+        tl.store(fout_ptr + ft, tl.zeros_like(ft), mask=(ft >= f_end) & (ft < fill_width))
     # ---- early fix (as _early_meta_fix_kernel) ----
     tl.store(ctx_ptr + rows, ctx, mask=real)
     nblk = tl.where(real, (ctx + INDPTR_BLOCK - 1) // INDPTR_BLOCK, 0)
@@ -321,6 +353,38 @@ def _early_prologue_kernel(
         tl.store(sp_idx_ptr + r.to(tl.int64) * sp_stride + c, tl.full([SP_COLS], PAD, sp_idx_ptr.dtype.element_ty))
 
 
+_FILL_CHECK = __import__("os").environ.get("ATOM_PROLOGUE_FILL_FUSED_CHECK", "0") == "1"
+_FILL_CHECKED = [0]
+
+
+def fill_fusable(fill: tuple, bs: int) -> bool:
+    """ATOM_PROLOGUE_FILL_FUSED: whether the prologue's one program takes this
+    fill_deferred_decode_ids (a [tokens, rows] lane grid of at most 16K)."""
+    out, cu, src, prev, draft, max_q, width = fill
+    rows = max(16, triton.next_power_of_2(max(bs, 1)))
+    return (
+        int(src.shape[0]) == bs
+        and triton.next_power_of_2(max(int(width), 16)) * rows <= 16384
+        and (draft is not None or max_q == 1)
+    )
+
+
+def _fill_kwargs(fill, block_rows: int) -> dict:
+    if fill is None:
+        return {}
+    out, cu, src, prev, draft, max_q, width = fill
+    bs = int(src.shape[0])
+    assert cu.shape[0] == bs + 1 and block_rows >= bs
+    return dict(
+        fout_ptr=out, fcu_ptr=cu, fsrc_ptr=src, fprev_ptr=prev,
+        fdraft_ptr=draft if draft is not None else prev,
+        fdraft_stride=draft.stride(0) if draft is not None else 0,
+        fill_bs=bs, fill_width=int(width),
+        HAS_FILL=True, FILL_DRAFT=draft is not None,
+        FILL_BLOCK=triton.next_power_of_2(max(int(width), 16)),
+    )
+
+
 def early_prologue(fix: EarlyFix) -> None:
     """Launch the deferred prologue (`fix.attn` from the MHA builder, `fix.gdn`
     from the GDN one) and then kv_indices (`fix.kv`)."""
@@ -339,6 +403,13 @@ def early_prologue(fix: EarlyFix) -> None:
     sp = g["sp_idx"]
     cols = sp.shape[1]
     assert sp.dim() == 2 and sp.stride(1) == 1 and cols == triton.next_power_of_2(cols)
+    ref = None
+    if fix.fill is not None and _FILL_CHECK:
+        from atom.model_ops.decode_input_ids import fill_deferred_decode_ids
+
+        out, cu_, src_, prev_, draft_, max_q, width = fix.fill
+        ref = out.clone()
+        fill_deferred_decode_ids(ref, cu_, src_, prev_, draft_, max_tokens_per_seq=max_q, width=width)
     _early_prologue_kernel[(1,)](
         fix.src, fix.prev_rejected, fix.prev_bonus,
         a["context_lens"], a["positions"] if a["positions"] is not None else dummy,
@@ -355,7 +426,17 @@ def early_prologue(fix: EarlyFix) -> None:
         HAS_TILES=has_tiles, TILE=tile, HEADS=heads, PROGRAMS=programs, TILES_LO=lo, TILES_HI=hi,
         HAS_COMMIT=commit, HAS_NS=ns is not None, PAD=g["pad"], SP_COLS=cols, PBLOCK=256,
         num_warps=4,
+        **_fill_kwargs(fix.fill, block_rows),
     )
-    kv_indices_generate_triton(*fix.kv)
+    if ref is not None:
+        # ATOM_PROLOGUE_FILL_FUSED_CHECK: the fused fill against the kernel it replaces
+        torch.cuda.synchronize()
+        out, width = fix.fill[0], int(fix.fill[6])
+        if not torch.equal(out[:width], ref[:width]):
+            bad = int((out[:width] != ref[:width]).sum())
+            raise RuntimeError(f"ATOM_PROLOGUE_FILL_FUSED check: {bad} of {width} ids differ")
+        _FILL_CHECKED[0] += 1
+    if fix.kv is not None:  # (None: ATOM_SKIP_VERIFY_KV_INDICES, no reader)
+        kv_indices_generate_triton(*fix.kv)
     fix.applied_attn = True
     fix.applied_gdn = True

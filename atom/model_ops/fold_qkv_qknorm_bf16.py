@@ -52,6 +52,14 @@ def _gemm_bf16_qkv_qknorm_kernel(
     V_FP4PT: gl.constexpr = False,
     KLDS: gl.constexpr = False,
     KWORD: gl.constexpr = False,
+    # ATOM_FOLD_QKV_BF16_INPUT_NORM: A = GemmaRMSNorm(x) made in the prologue (the gluon norm kernel's rstd)
+    nw_ptr=None,
+    norm_eps=None,
+    NORM_A: gl.constexpr = False,
+    NORM_K: gl.constexpr = 2048,
+    norm_layout: gl.constexpr = None,
+    shared_A_all: gl.constexpr = None,
+    NORM_EXP: gl.constexpr = 0,
 ):
     gl.static_assert(BLOCK_SIZE_N == 256)
     pid = gl.program_id(axis=0)
@@ -65,6 +73,17 @@ def _gemm_bf16_qkv_qknorm_kernel(
         sin_ptr, stride_cos, slot_mapping_ptr, num_slots, BLOCK_SIZE_M, Q_HEADS, SECTION_H, SECTION_W,
         row_layout, rope_layout, kd, ks, kd64, ks64)
 
+    if NORM_A:
+        _gemm_normed_a_tail(
+            a_ptr, b_ptr, c_ptr, M, N, stride_am, stride_bn, stride_cm, nw_ptr, norm_eps, tile_m, tile_n,
+            w_e, wlo_e, whi_e, cos_e, sin_e, slot_e,
+            q_weight_ptr, k_weight_ptr, positions_ptr, stride_positions, cos_ptr, sin_ptr, stride_cos,
+            q_out_ptr, k_out_ptr, slot_mapping_ptr, num_slots, k_cache_ptr, v_cache_ptr, kv_inv_scale,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, NUM_BUFFERS, num_ctas, NORM_K,
+            wmma_layout, dot_a_layout, dot_b_layout, shared_A, shared_B, shared_C, norm_layout, shared_A_all,
+            EPS, Q_HEADS, K_HEADS, SECTION_H, SECTION_W, BLOCK_SIZE, FP8_MAX, SCALE_PRESHUFFLE,
+            row_layout, rope_layout, kl, kd, ks, kl64, kd64, ks64, FOLD, V_FP4PT, KLDS, KWORD, GATE_TILES, NORM_EXP)
+        return
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=a_ptr + tile_m * BLOCK_SIZE_M * stride_am,
         shape=(M - tile_m * BLOCK_SIZE_M, K), strides=(stride_am, 1),
@@ -146,6 +165,98 @@ def _gemm_bf16_qkv_qknorm_kernel(
                                 KLDS, KWORD)
 
 
+@gluon.jit
+def _gemm_normed_a_tail(
+    a_ptr, b_ptr, c_ptr, M, N, stride_am, stride_bn, stride_cm, nw_ptr, norm_eps, tile_m, tile_n,
+    w_e, wlo_e, whi_e, cos_e, sin_e, slot_e,
+    q_weight_ptr, k_weight_ptr, positions_ptr, stride_positions, cos_ptr, sin_ptr, stride_cos,
+    q_out_ptr, k_out_ptr, slot_mapping_ptr, num_slots, k_cache_ptr, v_cache_ptr, kv_inv_scale,
+    BLOCK_SIZE_M: gl.constexpr, BLOCK_SIZE_N: gl.constexpr, BLOCK_SIZE_K: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr, num_ctas: gl.constexpr, NORM_K: gl.constexpr,
+    wmma_layout: gl.constexpr, dot_a_layout: gl.constexpr, dot_b_layout: gl.constexpr,
+    shared_A: gl.constexpr, shared_B: gl.constexpr, shared_C: gl.constexpr, norm_layout: gl.constexpr,
+    shared_A_all: gl.constexpr, EPS: gl.constexpr, Q_HEADS: gl.constexpr, K_HEADS: gl.constexpr,
+    SECTION_H: gl.constexpr, SECTION_W: gl.constexpr, BLOCK_SIZE: gl.constexpr,
+    FP8_MAX: gl.constexpr, SCALE_PRESHUFFLE: gl.constexpr,
+    row_layout: gl.constexpr, rope_layout: gl.constexpr, kl: gl.constexpr, kd: gl.constexpr,
+    ks: gl.constexpr, kl64: gl.constexpr, kd64: gl.constexpr, ks64: gl.constexpr,
+    FOLD: gl.constexpr, V_FP4PT: gl.constexpr, KLDS: gl.constexpr, KWORD: gl.constexpr, GATE_TILES: gl.constexpr,
+    NORM_EXP: gl.constexpr = 0,
+):
+    """NORM_A (ATOM_FOLD_QKV_BF16_INPUT_NORM): the kernel with A = bf16(x * rstd * (1 + w)) made by every CTA
+    in its prologue -- rstd as the gluon norm kernel (_gluon_fused_rms_kernel, [1, 8] x 32 lanes x 4 warps a
+    2048-wide row: the same sum order) -- into LDS, all K tiles; the K loop then streams only B (the first
+    NUM_BUFFERS - 1 tiles in flight during the prologue) and multiplies the K tiles in the same order: the same
+    y as the norm kernel + the GEMM. No A multicast, so no cluster barrier in the loop."""
+    K_TILES: gl.constexpr = NORM_K // BLOCK_SIZE_K
+    gl.static_assert(K_TILES >= NUM_BUFFERS)
+    b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=b_ptr + tile_n * BLOCK_SIZE_N * stride_bn,
+        shape=(N - tile_n * BLOCK_SIZE_N, NORM_K), strides=(stride_bn, 1),
+        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K), layout=shared_B)
+    smem_B = gl.allocate_shared_memory(b_ptr.type.element_ty, [NUM_BUFFERS, BLOCK_SIZE_N, BLOCK_SIZE_K],
+                                       layout=shared_B)
+    for i in gl.static_range(NUM_BUFFERS - 1):
+        gl.amd.gfx1250.tdm.async_load(b_desc, [0, i * BLOCK_SIZE_K], smem_B.index(i))
+    # the normed rows, 4 at a time (64 values a lane), into an LDS copy of all of A
+    a_all = gl.allocate_shared_memory(a_ptr.type.element_ty, [BLOCK_SIZE_M, NORM_K], layout=shared_A_all)
+    NR: gl.constexpr = 4
+    cols = gl.arange(0, NORM_K, layout=gl.SliceLayout(0, norm_layout))
+    w = gl.load(nw_ptr + cols).to(gl.float32) + 1.0
+    for c in gl.static_range(BLOCK_SIZE_M // NR):
+        # chunks past M stay unwritten: their rows of acc are never stored (C is clipped to M rows) and the
+        # epilogue reads rows < M only
+        if (tile_m * BLOCK_SIZE_M + c * NR < M) and (NORM_EXP == 0):
+            rows = tile_m * BLOCK_SIZE_M + c * NR + gl.arange(0, NR, layout=gl.SliceLayout(1, norm_layout))
+            ok = rows < M
+            x = gl.load(a_ptr + gl.where(ok, rows, 0).to(gl.int64)[:, None] * stride_am + cols[None, :])
+            x = gl.where(ok[:, None], x.to(gl.float32), 0.0)
+            rstd = gl.rsqrt(gl.sum(x * x, axis=1) / NORM_K + norm_eps)
+            y = (x * rstd[:, None] * w[None, :]).to(a_ptr.type.element_ty)
+            a_all.slice(c * NR, NR, dim=0).store(y)
+    acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_layout)
+    gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2)
+    gl.barrier()
+    cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(a_all.slice(0, BLOCK_SIZE_K, dim=1), dot_a_layout)
+    cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_B.index(0).permute([1, 0]), dot_b_layout)
+    for kt in gl.static_range(K_TILES):
+        if kt + NUM_BUFFERS - 1 < K_TILES:
+            # every warp is past its reads of the buffer B tile kt + NUM_BUFFERS - 1 goes to
+            gl.barrier()
+            gl.amd.gfx1250.tdm.async_load(b_desc, [0, (kt + NUM_BUFFERS - 1) * BLOCK_SIZE_K],
+                                          smem_B.index((kt + NUM_BUFFERS - 1) % NUM_BUFFERS))
+        if kt + 1 < K_TILES:
+            gl.amd.gfx1250.tdm.async_wait(min(K_TILES, kt + NUM_BUFFERS) - kt - 2)
+            nxt_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                a_all.slice((kt + 1) * BLOCK_SIZE_K, BLOCK_SIZE_K, dim=1), dot_a_layout)
+            nxt_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                smem_B.index((kt + 1) % NUM_BUFFERS).permute([1, 0]), dot_b_layout)
+        acc = gl.amd.gfx1250.wmma(cur_a, cur_b, acc)
+        if kt + 1 < K_TILES:
+            cur_a = nxt_a
+            cur_b = nxt_b
+
+    c_buffer = gl.allocate_shared_memory(c_ptr.type.element_ty, shape=[BLOCK_SIZE_M, BLOCK_SIZE_N], layout=shared_C)
+    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=c_ptr, shape=(M, N), strides=(stride_cm, 1),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), layout=shared_C)
+    c_buffer.store(acc.to(c_ptr.type.element_ty))
+    gl.amd.gfx1250.tdm.async_store(c_desc, [tile_m * BLOCK_SIZE_M, tile_n * BLOCK_SIZE_N], c_buffer)
+    gl.amd.gfx1250.tdm.async_wait(0)
+    if FOLD:
+        if tile_n >= GATE_TILES:
+            if num_ctas > 1:
+                gl.amd.gfx1250.cluster.arrive()
+            _fold_epilogue_rows(c_ptr, stride_cm, M, tile_m * BLOCK_SIZE_M, tile_n - GATE_TILES,
+                                w_e, wlo_e, whi_e, cos_e, sin_e, slot_e,
+                                q_weight_ptr, k_weight_ptr, positions_ptr, stride_positions, cos_ptr, sin_ptr,
+                                stride_cos, q_out_ptr, k_out_ptr, slot_mapping_ptr, num_slots, k_cache_ptr,
+                                v_cache_ptr, kv_inv_scale, BLOCK_SIZE_M, num_ctas, EPS, Q_HEADS, K_HEADS,
+                                SECTION_H, SECTION_W, BLOCK_SIZE, FP8_MAX, SCALE_PRESHUFFLE,
+                                row_layout, rope_layout, kl, kd, ks, kl64, kd64, ks64, num_ctas > 1, V_FP4PT,
+                                KLDS, KWORD)
+
+
 # Cluster tile 16 x 256 (one head); the per-CTA tile is 16 x (256 / num_ctas), BLOCK_K and the WMMA shape those of
 # aiter's tuned bf16 decode configs (16 x 32 / 16 x 64, BLOCK_K 256, 16x16x32 WMMA): the same K order per element.
 # M 17-48 (the drafter's pass 0 at bs 5-12: 4 rows a sequence; graph buckets 5-8, 12 -> 20-32, 48 rows) as fold B's
@@ -209,6 +320,7 @@ def _layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas):
 def fused_gemm_bf16_qkv_qknorm_mrope_cache(
     x, w, q_weight, k_weight, eps, positions, cos, sin, mrope_section,
     k_cache, v_cache, slot_mapping, kv_scale, num_q_heads, num_kv_heads, y=None, config=None, fold=True,
+    norm_weight=None, norm_eps=0.0,
 ):
     """y = x @ w^T (bf16 [M, N], N = (2 Hq + 2 Hk) * 256: gate | q | k | v), bitwise aiter's gemm_a16w16 at decode
     sizes, plus what fused_qk_norm_mrope_cache(q, k, v, ..., kv_scale) does for an A8K4V8 cache (v_cache fp8 5-D) or
@@ -219,6 +331,24 @@ def fused_gemm_bf16_qkv_qknorm_mrope_cache(
     assert M <= KERNEL_MAX_M and N == (2 * num_q_heads + 2 * num_kv_heads) * 256
     assert x.stride(1) == 1 and w.stride(1) == 1
     cfg = fold_config(M)
+    norm_kw = {}
+    if norm_weight is not None:
+        # ATOM_FOLD_QKV_BF16_INPUT_NORM: x is the norm's input; its rstd needs 4 warps along a row (the norm
+        # kernel's order), so the 4-warp 32-row tile (fold B's, the same K order) up to 32 rows
+        assert K == 2048 and M <= 32 and norm_weight.shape == (K,) and norm_weight.stride(0) == 1
+        cfg = dict(FOLD_CONFIGS[32]) if M > 16 else dict(FOLD_CONFIGS[16], num_warps=4)
+        if os.environ.get("ATOM_FOLD_QKV_BF16_INPUT_NORM_CFG32") == "1":
+            cfg = dict(FOLD_CONFIGS[32])
+        cga0 = [[0, 0]] * (cfg["num_ctas"].bit_length() - 1)
+        norm_kw = dict(nw_ptr=norm_weight, norm_eps=float(norm_eps), NORM_A=True, NORM_K=K,
+                       NORM_EXP=int(os.environ.get("KC_NORM_EXP", "0")),
+                       norm_layout=gl.BlockedLayout([1, 8], [1, 32], [1, 4], [1, 0], cga0))
+        _l = _layouts(cfg["num_warps"], cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["BLOCK_SIZE_K"], cfg["num_ctas"])
+        # KC_NORM_A_LOCAL=1 (experiment): the normed-A LDS copy without the CGA layout (each CTA its own)
+        _cga = None if os.environ.get("KC_NORM_A_LOCAL") == "1" else _l["dot_a_layout"].cga_layout
+        norm_kw["shared_A_all"] = (gl.PaddedSharedLayout.with_identity_for(
+            [[min(cfg["BLOCK_SIZE_K"], 256), 8]], [cfg["BLOCK_SIZE_M"], K], [1, 0], _cga) if _cga is not None else
+            gl.PaddedSharedLayout.with_identity_for([[min(cfg["BLOCK_SIZE_K"], 256), 8]], [cfg["BLOCK_SIZE_M"], K], [1, 0], cga0))
     if config:
         cfg.update(config)
     assert K % cfg["BLOCK_SIZE_K"] == 0
@@ -251,7 +381,7 @@ def fused_gemm_bf16_qkv_qknorm_mrope_cache(
         q_out, k_out, slot_mapping, slot_mapping.shape[0], k_cache, vc, 1.0 / kv_scale,
         EPS=eps, Q_HEADS=num_q_heads, K_HEADS=num_kv_heads, SECTION_H=mrope_section[1], SECTION_W=mrope_section[2],
         BLOCK_SIZE=page_block, FP8_MAX=torch.finfo(q_dtype).max, SCALE_PRESHUFFLE=min(128, page_block),
-        FOLD=fold, V_FP4PT=v_fp4pt, **cfg, **layouts,
+        FOLD=fold, V_FP4PT=v_fp4pt, **cfg, **layouts, **norm_kw,
     )
     return y, q_out, k_out
 
@@ -260,7 +390,12 @@ def fused_gemm_bf16_qkv_qknorm_mrope_cache(
 ENABLED = os.environ.get("ATOM_FOLD_QKNORM_QKV_BF16", "0") == "1"
 
 
-def try_fold_qkv_bf16(attn, positions, hidden_states):
+# ATOM_FOLD_QKV_BF16_INPUT_NORM=1 (default off; with ATOM_FOLD_QKNORM_QKV_BF16): the drafter layer's input
+# GemmaRMSNorm (no residual) in this fold's prologue (Qwen3NextDecoderLayer hands the raw rows and the norm over)
+INPUT_NORM = ENABLED and os.environ.get("ATOM_FOLD_QKV_BF16_INPUT_NORM", "0") == "1"
+
+
+def try_fold_qkv_bf16(attn, positions, hidden_states, norm=None):
     """The bf16 qkv_proj (unquantized: the MTP drafter's) with the Q/K norm, MRoPE and the A8K4V8 (or, with
     ATOM_FOLD_QKNORM_QKV_BF16_FP4PT, A8K4V4PT) cache write in its epilogue, for a decode batch of at most FOLD_MAX_M
     (ATOM_FOLD_QKNORM_QKV_BF16_MAX_M) rows; leaves the fp8 Q / bf16 K for the attention's rope_cache
@@ -300,6 +435,11 @@ def try_fold_qkv_bf16(attn, positions, hidden_states):
     m = x2.shape[0]
     if m == 0 or m > FOLD_MAX_M or x2.dtype != torch.bfloat16 or x2.stride(1) != 1:
         return None
+    if norm is not None and (
+        m > 32 or k != 2048 or norm.weight.dtype != torch.bfloat16 or norm.weight.shape != (k,)
+        or not norm.weight.is_contiguous()
+    ):
+        return None
     if positions is None or positions.dim() != 2 or positions.shape != (3, m) or positions.stride(1) != 1:
         return None
     kvd = fc.kv_cache_data[f"layer_{impl.layer_num}"]
@@ -318,6 +458,7 @@ def try_fold_qkv_bf16(attn, positions, hidden_states):
         x2, w, attn.q_norm.weight, attn.k_norm.weight, attn.q_norm.variance_epsilon, positions,
         rot.cos_cache.view(-1, half), rot.sin_cache.view(-1, half), rot.mrope_section, k_cache, v_cache,
         fc.attn_metadata.slot_mapping, impl.kv_scale_float, attn.num_heads, attn.num_kv_heads,
+        **({"norm_weight": norm.weight, "norm_eps": norm.variance_epsilon} if norm is not None else {}),
     )
     impl._fold_pending = (q_out, k_out)
     return y.view(*hidden_states.shape[:-1], n)

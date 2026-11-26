@@ -366,10 +366,14 @@ class SpecRejectionSampling:
         out: torch.Tensor,
         draft_presence=None,
         stats: torch.Tensor | None = None,
+        advance=None,
     ) -> torch.Tensor:
         """Each draft row's token, drawn from its q by the verify's sampler, into
         ``out``; the sampler's records into the scratch. ``stats``: the LM
-        head's records (lmhead_stats_args), in place of the stats kernel."""
+        head's records (lmhead_stats_args), in place of the stats kernel.
+        ``advance`` (ATOM_MTP_ADVANCE_IN_SELECT): an `eagle_fused_glue.
+        SelectAdvance` (with ``src_hidden``) the fused select also runs; marked
+        ``consumed`` when it did."""
         from aiter.ops.triton.fusions import topk_topp_sample as tts
 
         rows = logits.shape[0]
@@ -389,6 +393,15 @@ class SpecRejectionSampling:
             rec = None
             if draft_presence is not None:
                 rec = (draft_presence.ctx, draft_presence.pos, draft_presence.ctx_width)
+            adv = None
+            if advance is not None:
+                from atom.spec_decode.eagle_fused_glue import select_advance_kwargs
+
+                kw = select_advance_kwargs(
+                    advance, advance.src_hidden, rows, max(16, triton.next_power_of_2(self.draft_k))
+                )
+                if kw is not None:
+                    adv = {"advance": {"kw": kw, "mid": advance.mid}}
             tts.topk_topp_sample(
                 logits,
                 self.row_temp,
@@ -403,8 +416,11 @@ class SpecRejectionSampling:
                 out2=out.view(-1),
                 record=rec,
                 **({"stats": stats} if stats is not None else {}),
+                **(adv or {}),
             )
             self.recorded_presence = rec is not None
+            if adv is not None:
+                advance.consumed = True
             return out
         assert stats is None, "the LM head's records need the fused select path"
         if envs.ATOM_MTP_DRAFT_DEVICE_RNG:
@@ -455,12 +471,15 @@ class SpecRejectionSampling:
         temperatures: torch.Tensor,
         top_k: int,
         top_ps,
+        presence_step=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``(target tokens of the verify rows [R], bonus tokens [bs])``: the
         official sampler's draw of every row (its records kept), the verify
         rows' rejection decisions written over its draws, the bonus draws as
-        drawn."""
-        from atom.model_ops.sampler import fused_topk_topp_sample
+        drawn. ``presence_step`` (ATOM_PRESENCE_IN_SAMPLER): the step's presence
+        penalty, not yet applied to ``logits``: made in the sampler's kernels
+        where they take it, else applied here first."""
+        from atom.model_ops.sampler import fused_topk_topp_sample, gluon_select_eager
 
         cu = metadata.cu_num_draft_tokens
         tli = metadata.target_logits_indices
@@ -471,6 +490,17 @@ class SpecRejectionSampling:
         dev = logits.device
         kb_p = _kb(top_k)
         dbg = torch.empty(n_v + bs, 3 * kb_p + 2, dtype=torch.int32, device=dev)
+        pres = {}
+        if presence_step is not None:
+            p = (
+                presence_step.sampler_presence(logits)
+                if gluon_select_eager(logits, int(top_k))
+                else None
+            )
+            if p is None:
+                presence_step.apply(logits)
+            else:
+                pres = {"presence": p}
         tokens = fused_topk_topp_sample(
             logits,
             temperatures,
@@ -480,6 +510,7 @@ class SpecRejectionSampling:
             bonus_rows=metadata.bonus_logits_indices,
             cu_num_draft_tokens=cu,
             debug=dbg,
+            **pres,
         )
         lp = max(kb_p, self.KB_Q)
         # fp32 explicitly: the runner's default dtype is the model's (bf16).
