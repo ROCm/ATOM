@@ -1335,6 +1335,7 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
         "tool_call_parser_cls",
         "preserve_tool_call_arguments",
         "required_tool_channel",
+        "mid_system_supported",
     )
     for name in names:
         monkeypatch.setattr(api_server, name, "unset", raising=False)
@@ -1349,6 +1350,7 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
         "template_keeps_tool_call_arguments": lambda *_a: keeps,
         "template_needs_tool_call_argument_strings": lambda *_a: needs_strings,
         "required_call_channel": lambda *_a: "channel",
+        "template_takes_mid_system": lambda *_a: False,
     }
     for name, stub in stubs.items():
         monkeypatch.setattr(api_server, name, stub)
@@ -1365,3 +1367,4 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
     assert api_server.tool_call_parser_cls == "parser"
     assert api_server.preserve_tool_call_arguments is preserve
     assert api_server.required_tool_channel == "channel"
+    assert api_server.mid_system_supported is False

@@ -52,6 +52,7 @@ __all__ = [
     "forks",
     "graph_pool",
     "join_stream",
+    "prefill_token_graph_capture",
     "token_graph",
 ]
 
@@ -293,6 +294,21 @@ def eager_region(
         return wrapper
 
     return decorate
+
+
+def prefill_token_graph_capture() -> bool:
+    """Whether this forward records a prefill token-graph bucket, or is the
+    warmup forward before it: the capture's dummy prefill, run under
+    `in_hipgraph` but not recorded. A layer that records its prefill split
+    around a region (the MLA head, the KDA projections) takes the split on
+    both, so the warmup runs what the recording captures."""
+    fwd_ctx = forward_context.get_forward_context()
+    context = fwd_ctx.context
+    if context is None or not context.is_prefill:
+        return False
+    return fwd_ctx.tr_graph == "record" or (
+        fwd_ctx.in_hipgraph and context.is_dummy_run
+    )
 
 
 def forks(stream: torch.cuda.Stream | None) -> bool:

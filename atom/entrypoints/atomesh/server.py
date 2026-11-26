@@ -362,9 +362,25 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
     )
 
 
+def _with_atom_backend(mesh_args: list[str]) -> list[str]:
+    """Route to ATOM workers unless the command line names a backend.
+
+    The router defaults to `--backend sglang`, which keys an image chat by
+    SGLang's prefix cache rather than ATOM's and discovers workers through
+    SGLang's endpoints. Appended rather than prepended, so it lands inside a
+    `launch` subcommand's arguments when one is given.
+    """
+    names_backend = any(
+        arg in ("--backend", "--runtime")
+        or arg.startswith(("--backend=", "--runtime="))
+        for arg in mesh_args
+    )
+    return mesh_args if names_backend else mesh_args + ["--backend", "atom"]
+
+
 def launch_atomesh(atomesh_runner: Any, raw_args: list[str]) -> None:
     parsed_args = atomesh_runner.parse_from(
-        [arg for arg in raw_args if arg != "mesh-only"]
+        _with_atom_backend([arg for arg in raw_args if arg != "mesh-only"])
     )
     cli_args = parsed_args["cli_args"]
     prefill_urls = parsed_args["prefill_urls"]

@@ -384,10 +384,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def _target_layer_input(inputs, block):
         # Settled, because a pre-hook runs before the fold: the block ahead of
         # this one leaves its FFN post owed, and `residual` is by definition
-        # the value before it. The block pays the same post again into its own
-        # pre, which is the one seam where the draft costs the target a kernel.
-        residual = inputs[0].settle().residual
-        return residual.mean(dim=-2).reshape(-1, residual.shape[-1])
+        # the value before it. The block still pays that post into its own pre;
+        # the tap reads it with the mean (`stream_mean`), in one launch where
+        # `post_reduce_supported` holds, without writing the settled residual.
+        state = inputs[0]
+        return state.stream_mean().reshape(-1, state.residual.shape[-1])
 
     def project_context(self, taps):
         """`main_norm(main_proj(concat(taps)))` as `[1, N, hidden]`."""
