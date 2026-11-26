@@ -39,8 +39,12 @@ def test_forward_kind():
 def _blocked_step(batch, tokens):
     # `ModelRunner` pulls in AITER's ops, GEMM and MoE modules at import: only
     # a real AITER build (not a stub) can load it, so these tests skip on CPU.
-    pytest.importorskip("aiter.ops")
-    from atom.model_engine.model_runner import ModelRunner
+    # Other test files leave partial AITER stubs in sys.modules, so probe the
+    # import itself rather than a package name.
+    try:
+        from atom.model_engine.model_runner import ModelRunner
+    except ImportError as e:
+        pytest.skip(f"ModelRunner needs a real AITER build: {e}")
 
     calls = []
     runner = SimpleNamespace(
