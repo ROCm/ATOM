@@ -16,7 +16,7 @@ from atom.config import (
     _is_minimax_m3_config,
     kv_cache_torch_dtype,
 )
-from atom.distributed.ulysses_sp import local_num_kv_heads
+from atom.distributed.ulysses_sp import local_num_kv_heads, sp_is_enabled
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
@@ -1287,11 +1287,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         rows its metadata does not cover (`_metadata_rows`). That trim exists
         for the FP4 index caches only: with a BF16 / FP8 index the padded rows
         would run the selector and the sparse attention on unwritten
-        selection rows, so those keep the eager prefill."""
+        selection rows, so those keep the eager prefill.
+
+        Refused under Ulysses SP: an FP4 index cache does not force an FP4 KV
+        cache (`MiniMaxM3.validate_runtime_config` only runs the
+        sequence-parallel refusal for an FP4 *KV* cache), so SP can reach this
+        gate with `_index_fp4` true. Under SP a layer whose `o_proj` takes
+        per-token FP8 input dispatches through `sp_attention_fp8`
+        (`atom/model_ops/paged_attention.py`), not through
+        `unified_attention_with_output_base`'s eager region this property's
+        assumption depends on, so recording and replaying a captured graph
+        there would run the wrong path."""
         return (
             self._has_sparse_attention
             and self._index_fp4
             and envs.ATOM_M3_PREFILL_TOKEN_GRAPH
+            and not sp_is_enabled()
         )
 
     # A bucket is recorded on one synthetic request of that many rows: it must

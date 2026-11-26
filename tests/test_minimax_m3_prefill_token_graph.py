@@ -19,6 +19,7 @@ def m():
     with atom_without_aiter() as load:
         builder = load("atom.model_ops.attentions.aiter_attention")
         yield SimpleNamespace(
+            builder=builder,
             supports=builder.AiterAttentionMetadataBuilder.supports_token_graph.fget,
             capture=builder.AiterAttentionMetadataBuilder.build_for_token_graph_capture,
             attention_mha=load("atom.model_ops.attention_mha"),
@@ -34,6 +35,7 @@ def test_default_off(monkeypatch, m):
 
 def test_flag_needs_sparse_builder(monkeypatch, m):
     monkeypatch.setenv("ATOM_M3_PREFILL_TOKEN_GRAPH", "1")
+    monkeypatch.setattr(m.builder, "sp_is_enabled", lambda: False)
     assert m.supports(SimpleNamespace(_has_sparse_attention=True, _index_fp4=True))
     assert not m.supports(SimpleNamespace(_has_sparse_attention=False, _index_fp4=True))
 
@@ -42,7 +44,20 @@ def test_non_fp4_index_keeps_eager_prefill(monkeypatch, m):
     """A BF16 / FP8 index would run the padded rows' selection on unwritten rows
     (`_metadata_rows` trims FP4 indexes only), so such a cache records no graphs."""
     monkeypatch.setenv("ATOM_M3_PREFILL_TOKEN_GRAPH", "1")
+    monkeypatch.setattr(m.builder, "sp_is_enabled", lambda: False)
     assert not m.supports(SimpleNamespace(_has_sparse_attention=True, _index_fp4=False))
+
+
+def test_sp_refuses_token_graph(monkeypatch, m):
+    """Under Ulysses SP a layer whose o_proj takes per-token FP8 input dispatches
+    through `sp_attention_fp8`, not the eager-region path this gate assumes
+    (`AiterAttentionMetadataBuilder.supports_token_graph`), and an FP4 index cache
+    does not force an FP4 KV cache, so SP can reach here with `_index_fp4` true
+    (`MiniMaxM3.validate_runtime_config` only runs the SP refusal for an FP4 KV
+    cache). Must stay refused even with the flag on and an FP4 index."""
+    monkeypatch.setenv("ATOM_M3_PREFILL_TOKEN_GRAPH", "1")
+    monkeypatch.setattr(m.builder, "sp_is_enabled", lambda: True)
+    assert not m.supports(SimpleNamespace(_has_sparse_attention=True, _index_fp4=True))
 
 
 def test_metadata_rows_trims_fp4_pad_rows_only(m):
