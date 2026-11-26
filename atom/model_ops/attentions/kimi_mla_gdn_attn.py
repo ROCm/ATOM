@@ -8,7 +8,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.state_runtime import StateTransfer
+from atom.model_engine.state_runtime import StateTransfer, midstep_rerun_rows
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
@@ -32,6 +32,13 @@ from .pool_layout.page_unit_geometry import PageUnitGeometryMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .token_layout.slots import slot_mapping
 from .triton_mla import TritonMLAMetadataBuilder
+
+# A scratch slot is held from scheduling until the batch after its forward has
+# issued the store, so two steps' checkpoints are out at once.
+# This adds room for two targets per step, not two prefills: one prefill can
+# need both a rung and an anchor. Other free runtime slots are also available.
+# A full shared pool drops optional targets and cuts at an unbacked anchor.
+MIDSTEP_SCRATCH_SLOTS = 4
 
 
 class KimiMLAGDNBackend(AttentionBackend):
@@ -362,6 +369,25 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         """
         return not getattr(self.model_runner.config, "enable_rapidserve", False)
 
+    def _reads_midstep(self) -> bool:
+        """Whether a checkpoint inside a prefill forward is written in it.
+
+        `chunk_kimi_delta_attn` returns only the final state, so K3's forward
+        re-runs each interior target's head instead (`_checkpoint_targets`);
+        GLM-5.3's linear attention writes none. Without it the scheduler cuts
+        the prefill at every checkpoint, and a prompt pays a second step for
+        its prompt-end anchor. Not under PP: the scratch slot is handed back two
+        scheduler passes after its forward, which no midstep path has checked
+        against a deeper pipeline (Qwen's keeps PAGE off under PP).
+        """
+        runner = self.model_runner
+        return (
+            self._uses_paged_checkpoints()
+            and runner.hf_text_config.model_type == "kimi_linear"
+            and self._decode_image_is_conv_and_ssm()
+            and runner.config.pipeline_parallel_size == 1
+        )
+
     def state_transfer(self) -> StateTransfer:
         """A PAGE-image copy, not `GDNStateMixin`'s fork.
 
@@ -370,21 +396,15 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         127 ordinary KV blocks — 0.112% of the paged pool — drawn from the same
         free list as everything else, and evicted by the same LRU.
 
-        Not midstep-readable, for want of plumbing rather than of state: KDA
-        goes through aiter's `chunk_kimi_delta_attn`, whose returned tuple
-        carries only the final state. The per-chunk `h` an interior checkpoint
-        would be sliced out of *is* computed — by the same
-        `chunk_gated_delta_rule_fwd_h` the GDN path uses — and then dropped
-        before the return. Exposing it is what this backend would need to
-        answer `True`. `PagedStateCheckpointCoordinator` says `False` for its
-        own reasons, so the two agree meanwhile.
+        Midstep-readable on grid 1 (`_reads_midstep`): the re-run ends a head
+        at any token, and the conv window needs `conv_kernel - 1` of the
+        forward's tokens before the target.
 
-        Dtype-safe by construction, which a checkpoint cut from `h` would not
-        be here — `_state_dtypes` gives kimi_linear a v side of its own dtype
-        (`ATOM_GDN_SSM_DTYPE`). An image is copied slot to slot with no kernel
-        output in between, so it round-trips exactly whatever that dtype is.
-        Both dtypes are named in the layout id, so a build that changed either
-        cannot read another's images.
+        Interior SSM images use the head re-run's final state, converted by
+        the shared checkpoint writer to the pool dtype (`ATOM_GDN_SSM_DTYPE`).
+        End targets copy the settled runtime state. PAGE storage and restore
+        preserve those slot bytes exactly. Both pool dtypes are named in the
+        layout id, so a build that changed either cannot read another's images.
         """
         if not self._uses_paged_checkpoints():
             return StateTransfer.fork(1)
@@ -420,7 +440,48 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             f":spec={self.num_spec}"
             ":carry=all"
         )
-        return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
+        if not self._reads_midstep():
+            return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
+        return StateTransfer.copy(
+            layout_id,
+            decode_keep=self._decode_keep(),
+            readable_midstep=True,
+            midstep_grid=1,
+            midstep_min_offset=self._conv_state_len(),
+        )
+
+    def _checkpoint_targets(self, batch) -> dict | None:
+        """This step's midstep checkpoints, as `midstep_rerun_rows` device
+        tensors for the KDA forward to write them from."""
+        if not any(batch.state_save_all):
+            return None
+        found = self._midstep_targets(batch, 1)
+        if not found:
+            return None
+        rows = midstep_rerun_rows(found, batch.num_scheduled_tokens)
+        head_ranges = rows.pop("head_ranges", ())
+        # One small metadata transfer; token-sized ranges are built on the device.
+        packed = torch.tensor(
+            [value for values in rows.values() for value in values],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        result, offset = {}, 0
+        for name, values in rows.items():
+            result[name] = packed[offset : offset + len(values)]
+            offset += len(values)
+        if head_ranges:
+            result["kda_tokens"] = torch.cat(
+                [torch.arange(sum(batch.num_scheduled_tokens), device=self.device)]
+                + [
+                    torch.arange(start, start + length, device=self.device)
+                    for start, length in head_ranges
+                ]
+            )
+        return result
+
+    def _needs_chunk_checkpoint_snapshots(self) -> bool:
+        return False
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN
@@ -539,16 +600,25 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         Widening the existing entry rather than declaring a second class keeps
         one slot id per request: the tail must be addressed by exactly the
         index KDA's state is, or a request would read another's partial pool.
+
+        Midstep checkpoints are written into scratch slots borrowed from this
+        pool, which otherwise holds exactly one slot per admitted request:
+        with every request in, there would be none to borrow.
         """
         base = super().state_spec()
-        extra = self._kpool_tail_bytes()
-        if not extra:
-            return base
+        cfg = self.model_runner.config
+        scratch = (
+            MIDSTEP_SCRATCH_SLOTS
+            if self._reads_midstep()
+            and cfg.enable_prefix_caching
+            and self._checkpoint_interval() != 0
+            else 0
+        )
         return state_pool(
             base.name,
-            base.entry_bytes + extra,
+            base.entry_bytes + self._kpool_tail_bytes(),
             entries_per_req=base.entries_per_req,
-            extra_entries=base.extra_entries,
+            extra_entries=base.extra_entries + scratch,
         )
 
     def allocate_per_req_cache(self, entries: dict[str, int]) -> dict:
