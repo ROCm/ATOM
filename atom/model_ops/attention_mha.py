@@ -1369,6 +1369,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # The selection's block-table shape follows the KV layout: one page-128 page a
         # block for MXFP4 KV, the page-16 SHUFFLE defaults otherwise.
         self._select_page_kwargs = {}
+        # ATOM_M3_FUSED_INDEX_SELECT: read the flag and probe aiter once here, not per step
+        self._decode_select_supported = self._probe_decode_select()
         if self.kv_cache_dtype == "fp4":
             from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
             from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
@@ -2003,14 +2005,27 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             **self._select_page_kwargs,
         )
 
+    def _probe_decode_select(self):
+        """aiter's ``decode_select_supported`` when ``ATOM_M3_FUSED_INDEX_SELECT`` is set on an
+        NVFP4 KV cache and the installed aiter has the fused selection, else None. Bound once
+        in ``__init__``: the flag and the import are not read on the decode hot path."""
+        if not envs.ATOM_M3_FUSED_INDEX_SELECT or self.kv_cache_dtype != "nvfp4":
+            return None
+        try:
+            from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
+                decode_select_supported,
+            )
+        except ImportError:  # an aiter without the fused selection
+            return None
+        return decode_select_supported
+
     def _fused_index_select(self, rows: int, sparse_metadata) -> bool:
         """Whether this decode step lets the NVFP4 attention select the top-16 itself
         (``ATOM_M3_FUSED_INDEX_SELECT``): one-GPU NVFP4 index, a row count aiter measured
         it at, an aiter that has ``index_score=``. Anything else keeps scorer + selector.
         """
         if (
-            not envs.ATOM_M3_FUSED_INDEX_SELECT
-            or self.kv_cache_dtype != "nvfp4"
+            self._decode_select_supported is None
             or self.indexer_cp_group is not None
             or self.index_cache_dtype not in FP4_CACHE_DTYPES
             or sparse_metadata.index_scorer is None
@@ -2018,13 +2033,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             or self.topk != 16
         ):
             return False
-        try:
-            from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
-                decode_select_supported,
-            )
-        except ImportError:  # an aiter without the fused selection
-            return False
-        return decode_select_supported(rows, self.topk)
+        return self._decode_select_supported(rows, self.topk)
 
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
     def _sparse_decode(

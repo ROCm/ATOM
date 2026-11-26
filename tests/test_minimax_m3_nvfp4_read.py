@@ -256,6 +256,92 @@ def test_decode_select_and_attend(lens, S, heads, gs):
 
 
 @pytest.mark.parametrize(
+    "lens, S, heads",
+    [
+        ([128 * 40 + 17, 128 * 9 + 128, 300, 128 * 33 - 5], 1, 1),
+        ([128 * 40 + 17, 128 * 9 + 5, 129], 4, 1),
+        ([128 * 25, 128 * 17 + 3, 700], 1, 2),
+    ],
+)
+def test_fused_decode_select_matches_unfused(lens, S, heads):
+    """ATOM_M3_FUSED_INDEX_SELECT: the scorer alone feeding ``sparse_pa_nvfp4_decode(index_score=)``
+    (the producer layer) selects the same blocks and attends to the same output as scorer +
+    selector, and the ``topk_idx`` it leaves behind is what a skip-index (reuse) layer attends with.
+    """
+    from aiter.ops.flydsl import (
+        minimax_m3_index_score_work_map,
+        minimax_m3_index_score_work_map_capacity,
+        sparse_pa_nvfp4_decode,
+    )
+    from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
+        decode_select_supported,
+    )
+
+    from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
+    from atom.model_ops.minimax_m3.index_topk import (
+        minimax_m3_index_score_decode,
+        minimax_m3_index_topk_decode,
+    )
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+    case = Case(lens, heads=heads, seed=len(lens) * 5 + S, gs=(1.0, 1.0))
+    seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    rows = len(lens) * S
+    if not decode_select_supported(rows, TOPK):
+        pytest.skip("this aiter has no fused selection at this row count")
+    q, iq = case.queries(rows)
+    sm = DIM**-0.5
+    bound = case.table.shape[1]
+    wm = torch.empty(
+        (minimax_m3_index_score_work_map_capacity(len(lens), bound, S, heads), 2),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    wm = minimax_m3_index_score_work_map(seq, bound, S, heads, out=wm)
+    scorer = IndexScoreBuffers(
+        LogitsWorkspace(heads * rows * bound, "cuda"), wm, bound, nvfp4=True
+    )
+    # unfused: scorer + selector, then the attention
+    topk_u = minimax_m3_index_topk_decode(
+        iq, case.idx, case.table, seq, bound * 128, TOPK, 0, 1, heads, sm,
+        emit_sparse_block_table=False, max_query_len=S, index_scorer=scorer,
+    )  # fmt: skip
+    out_u = torch.empty_like(q)
+    sparse_pa_nvfp4_decode(
+        q, case.kv, topk_u, case.table, seq, sm,
+        out=out_u, k_scale=case.ks, v_scale=case.vs, query_len=S,
+    )  # fmt: skip
+    # fused producer: the scorer alone, the attention selects
+    scores = minimax_m3_index_score_decode(
+        iq, case.idx, case.table, seq, bound * 128, heads, sm, S, scorer
+    )
+    topk_f = torch.empty((heads, rows, TOPK), dtype=torch.int32, device="cuda")
+    out_f = torch.empty_like(q)
+    sparse_pa_nvfp4_decode(
+        q, case.kv, topk_f, case.table, seq, sm,
+        out=out_f, k_scale=case.ks, v_scale=case.vs, query_len=S,
+        index_score=scores, index_max_seq_len=bound * 128,
+        init_blocks=0, local_blocks=1,
+    )  # fmt: skip
+    rows_req = [r // S for r in range(rows)]
+    rows_causal = [lens[r // S] - S + r % S + 1 for r in range(rows)]
+    for r, want in enumerate(expected_blocks(case, iq, rows_req, rows_causal, sm)):
+        for h in range(heads):
+            got_f = {x for x in topk_f[h, r].tolist() if x >= 0}
+            assert got_f == want[h], f"fused row {r} head {h}"
+            assert got_f == {x for x in topk_u[h, r].tolist() if x >= 0}
+    assert rel_l2(out_f, out_u) < 2.5e-3
+    # a reuse layer attends with the producer's cached ids
+    out_r = torch.empty_like(q)
+    sparse_pa_nvfp4_decode(
+        q, case.kv, topk_f, case.table, seq, sm,
+        out=out_r, k_scale=case.ks, v_scale=case.vs, query_len=S,
+    )  # fmt: skip
+    ref = attend_reference(case, q, topk_f, rows_req, rows_causal, sm)
+    assert rel_l2(out_r, ref) < 2.5e-3
+
+
+@pytest.mark.parametrize(
     "qlens,prefix,heads",
     [([37, 200, 5], [0, 128 * 12, 128 * 30 + 3], 1), ([64, 9], [128 * 8, 0], 2)],
 )
