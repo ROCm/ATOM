@@ -159,8 +159,10 @@ def test_long_context_work_is_bounded_without_reducing_query_shapes(
 
 @pytest.mark.parametrize("fail_unsplit", [False, True])
 @pytest.mark.parametrize("confidence", [False, True])
+@pytest.mark.parametrize("dp_attention", [False, True])
+@pytest.mark.parametrize("token_budget,spec_bs", [(16, 2), (64, 4)])
 def test_profile_budgets_reserved_peak_and_releases_scratch(
-    monkeypatch, fail_unsplit, confidence
+    monkeypatch, fail_unsplit, confidence, dp_attention, token_budget, spec_bs
 ):
     from atom.model_engine import mixed_profile
     from atom.spec_decode.dspark_verify import VerifyScheduler
@@ -173,9 +175,17 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
         max_num_seqs=4,
         max_model_len=128,
         speculative_config=None,
+        enable_dp_attention=dp_attention,
     )
-    memory = {"allocated": 80, "reserved": 80, "peak": 85, "reserved_peak": 85}
+    memory = {
+        "allocated": 80,
+        "reserved": 80,
+        "peak": 85,
+        "reserved_peak": 85,
+        "non_torch": 7,
+    }
     observed = []
+    shapes = []
     pool_open = False
 
     @contextmanager
@@ -192,20 +202,22 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
     def forward(batch):
         assert runner.gpu_forward_metrics is None
         observed.append(memory["reserved"])
+        shapes.append((batch.prefill, batch.decode, batch.width))
         if confidence:
             verify._ell_map = {42: 1}
             verify._ell_pending.append(object())
         if fail_unsplit:
             raise RuntimeError("unsplit forward failed")
-        allocated, reserved = 128, 140
+        allocated, reserved = (148, 170) if batch.prefill == 0 else (128, 140)
         memory.update(peak=allocated, reserved_peak=reserved, reserved=reserved)
+        memory["non_torch"] = 13 if batch.prefill == 0 else 7
 
     runner = SimpleNamespace(
         config=config,
         gpu_forward_metrics=object(),
         max_bs=4,
         block_size=16,
-        warmup_max_tokens=lambda: 64,
+        warmup_max_tokens=lambda: token_budget,
         attn_metadata_builder=SimpleNamespace(temporary_profile_cache=temporary_pool),
         tokenID_processor=SimpleNamespace(clean=lambda: None),
         forward=forward,
@@ -215,7 +227,12 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
     monkeypatch.setattr(
         mixed_profile,
         "_batch",
-        lambda *args, **kwargs: (SimpleNamespace(context_lens=[64, 64]), 1),
+        lambda runner, prefill, decode, width, **kwargs: (
+            SimpleNamespace(
+                context_lens=[64, 64], prefill=prefill, decode=decode, width=width
+            ),
+            1,
+        ),
     )
     cuda = mixed_profile.torch.cuda
     monkeypatch.setattr(cuda, "synchronize", lambda: None)
@@ -228,7 +245,9 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
     monkeypatch.setattr(cuda, "max_memory_allocated", lambda: memory["peak"])
     monkeypatch.setattr(cuda, "max_memory_reserved", lambda: memory["reserved_peak"])
     monkeypatch.setattr(
-        cuda, "mem_get_info", lambda: (1000 - memory["reserved"] - 7, 1000)
+        cuda,
+        "mem_get_info",
+        lambda: (1000 - memory["reserved"] - memory["non_torch"], 1000),
     )
 
     original_metrics = runner.gpu_forward_metrics
@@ -237,7 +256,17 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
             mixed_profile.profile_mixed_memory(runner)
     else:
         # Include the unsplit reserved peak, excluding the temporary pool.
-        assert mixed_profile.profile_mixed_memory(runner) == (80 + (140 - 100), 7)
+        expected_reserved = 170 if dp_attention else 140
+        assert mixed_profile.profile_mixed_memory(runner) == (
+            80 + (expected_reserved - 100),
+            13 if dp_attention else 7,
+        )
+        decode_shapes = {(d, q) for p, d, q in shapes if p == 0}
+        assert decode_shapes == (
+            {(spec_bs, 1), (spec_bs, 8)}
+            if dp_attention and confidence
+            else {(4, 1)} if dp_attention else set()
+        )
     assert not pool_open
     assert runner.gpu_forward_metrics is original_metrics
     assert observed
