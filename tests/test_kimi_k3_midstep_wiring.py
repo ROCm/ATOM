@@ -181,6 +181,30 @@ def test_a_prefill_without_gdn_metadata_is_left_alone(k3, monkeypatch):
     assert finish_prefill(k3, monkeypatch, SAVES, builds_gdn_metadata=False) is None
 
 
+@pytest.mark.parametrize(
+    "switch, prefill_tokens, saves, eager",
+    [
+        (True, T, SAVES, True),
+        (True, T, NO_SAVES, False),
+        (True, 0, NO_SAVES, False),
+        (False, T, SAVES, False),
+    ],
+)
+def test_a_prefill_that_takes_snapshots_is_not_replayed(
+    k3, monkeypatch, switch, prefill_tokens, saves, eager
+):
+    """A token-graph replay runs the recurrence through the split, which writes
+    no checkpoint, so the builder asks for an eager step. A prefill without
+    reservations replays, a decode is left alone, and off the switch the step
+    is not this path's."""
+    monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1" if switch else "0")
+    builder = object.__new__(k3.backend.KimiAiterMLAGDNMetadataBuilder)
+    batch = SimpleNamespace(
+        total_tokens_num_prefill=prefill_tokens, state_save_all=saves
+    )
+    assert builder.step_needs_eager(batch) is eager
+
+
 def test_the_gdn_metadata_declares_the_field(k3):
     """The KDA layer reads `kda_snapshots` directly, so native ATOM's GDN
     metadata declares it, None unless the builder attached a step's."""

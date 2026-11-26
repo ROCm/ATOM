@@ -956,6 +956,22 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             device=self.device,
         )
 
+    def step_needs_eager(self, batch: ScheduledBatch) -> bool:
+        """Also for a prefill that takes KDA snapshots.
+
+        `KimiKDAAttention._forward_impl` writes them. A prefill replaying a
+        token graph runs the recurrence through the split instead
+        (`_kda_recurrence`), which writes no checkpoint, and the scheduler
+        files every reserved position after the forward whether or not it was
+        written. A step with no reservation still replays. The switch is read
+        last: a decode, or a prefill without reservations, does not pay for it.
+        """
+        return super().step_needs_eager(batch) or (
+            batch.total_tokens_num_prefill > 0
+            and any(batch.state_save_all)
+            and kda_midstep_enabled()
+        )
+
     def build_for_cudagraph_capture(self, bs: int, *, decode_ubatch_slices=None):
         attn_metadata, context = super().build_for_cudagraph_capture(
             bs, decode_ubatch_slices=decode_ubatch_slices
