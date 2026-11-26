@@ -177,7 +177,8 @@ def _is_e8m0_blockscale(
     quant_config: QuantizationConfig | None, quant_type: QuantType
 ) -> bool:
     """Whether a per_1x128 consumer runs E8M0 block scales (same test as
-    LinearBase). FP32-scale fused producers stand down for it."""
+    LinearBase). The MLA q/kv norm then emits E8M0 scales; the FP32-scale o_proj
+    producer stands down."""
     return (
         quant_config is not None
         and quant_type.value == QuantType.per_1x128.value
@@ -447,7 +448,11 @@ class KimiSparseMoeBlock(nn.Module):
         self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
         if self.shared_experts is not None and self.alt_stream is not None:
             tbo_active = get_current_atom_config().enable_tbo
-            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
+            if (
+                envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+                and not tbo_active
+                and self.experts.allows_concurrent_shared_stream
+            ):
                 self._use_dual_stream = True
         if self._use_dual_stream:
             # Register self so `maybe_dual_stream_split_forward` can look this module up
@@ -850,10 +855,8 @@ class KimiFullAttention(nn.Module):
         qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
-        self.fuse_qknorm_quant = qknorm_dtype in (
-            dtypes.fp8,
-            dtypes.fp4x2,
-        ) and not _is_e8m0_blockscale(quant_config, qknorm_type)
+        self.qknorm_e8m0_scale = _is_e8m0_blockscale(quant_config, qknorm_type)
+        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
         self.qknorm_quant_type_value = (
             qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
@@ -931,6 +934,7 @@ class KimiFullAttention(nn.Module):
             quant_type=self.qknorm_quant_type_value,
             output_unquantized_inp1=False,
             transpose_scale=True,
+            e8m0_scale=self.qknorm_e8m0_scale,
         )
         if self.indexer is not None:
             # Projection weights retain checkpoint precision; the indexer owns

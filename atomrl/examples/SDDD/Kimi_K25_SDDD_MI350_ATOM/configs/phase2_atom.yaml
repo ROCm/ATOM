@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Phase 2: Mixed Domain Training (ATOM MXFP4 teacher, resume from Phase 1 HF)
+# Dataset: mixed corpus (~181K samples) — VL, Chinese, tool-call, agent, writing
+# Steps: 22609 (1 epoch × ceil(180870/8))
+# Teacher: amd/Kimi-K2.5-MXFP4 via ATOM (TP=4, GPUs 4-7)
+# Draft: Eagle3 v2, 1-layer Transformer, loaded from Phase 1 HF checkpoint (FSDP2, GPUs 0-3)
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/Kimi-K2.5-MXFP4
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 20000
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  learning_rate: 5e-5
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.015
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    position_decay: 0.8
+    num_target_layers: 1
+    spec_length: 4
+  teacher:
+    model_name: /dev/shm/Kimi-K2.5-MXFP4
+    inference_backend: atom
+    tensor_parallel_size: 4
+    gpu_ids: [4, 5, 6, 7]
+    quantization: ""
+    transport: mooncake
+    atom:
+      enforce_eager: true
+      trust_remote_code: true
+      extra_args:
+        default_chat_template_kwargs:
+          enable_thinking: false
+        kv_cache_dtype: fp8
+        max_num_batched_tokens: 20000
+        max_model_len: 20016
+        gpu_memory_utilization: 0.9
+        level: 0
+  draft:
+    from_scratch: false
+    num_layers: 1
+    num_heads: 64
+    head_dim: 128
+    ffn_dim: 12288
+    rms_norm_eps: 1e-6
+    rope_theta: 50000.0
+    rope_scaling_type: yarn
+    rope_scaling_factor: 64.0
+    rope_original_max_pos: 4096
+    rope_beta_fast: 32.0
+    rope_beta_slow: 1.0
+    rope_mscale: 1.0
+    rope_mscale_all_dim: 1.0
+    max_window_layers: 36
+    dtype: bfloat16
+    resume_from: /dev/shm/Kimi_K25_eagle3_v2_phase1_HF  # output of tools/export_eagle3_hf_phase1.py
+
+mooncake:
+  protocol: tcp
+  device_name: ""
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+quantization:
+  training:
+    fp8: null
+    lumen_norm: true
+    lumen_linear: true
+    hf_attn_patch: true
+  rollout_correction:
+    enabled: false
+
+dataset:
+  chat_template: kimi-k25
+  last_turn_loss_only: "auto"
+  num_preprocess_workers: 16
+  cache_dir: /dev/shm/atomrl_cache
+
+reward:
+  type: function
+  function: math_reward
+  dataset: /dev/shm/kimi-mtp-dataset-phase2/train.jsonl
+
+eval:
+  enabled: true
+  interval: 1000
+  num_samples: 256
+  micro_batch_size: 8
+
+checkpointing:
+  checkpoint_dir: /dev/shm/checkpoints/kimi_k25_eagle3_v2_phase2_atom
+  save_steps: 1000
+  save_total_limit: 3
+  resume: true
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 22609
+seed: 42
