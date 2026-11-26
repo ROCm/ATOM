@@ -1,0 +1,242 @@
+{
+  "lease": "L473e3d",
+  "node": "pit2-p03-g08",
+  "gpus": 8,
+  "harness_sha": "148cfb8e5b40a740fc791bbf127c012a34386bd9",
+  "router_sha": "bff5eef4234de826e8a1ee889fe4f5372e043906",
+  "protocol_probes": [
+    {
+      "endpoint": "/v1/chat/completions",
+      "stream": false
+    },
+    {
+      "endpoint": "/v1/completions",
+      "stream": false
+    },
+    {
+      "endpoint": "/v1/chat/completions",
+      "stream": true
+    },
+    {
+      "endpoint": "/v1/chat/completions",
+      "stream": false
+    },
+    {
+      "endpoint": "/v1/completions",
+      "stream": false
+    }
+  ],
+  "kv_transfer": {
+    "transport": "moriio-write",
+    "proof": "positive-byte native writes completed by all four PP stages for the same transfer",
+    "complete_transfers": 5,
+    "transferred_bytes": 101376000,
+    "passed": true
+  },
+  "native_engine_ports": {
+    "passed": true,
+    "engines": [
+      {
+        "event": "engine_started",
+        "is_producer": true,
+        "pp_rank": 3,
+        "dp_rank": 0,
+        "tp_rank": 0,
+        "host": "127.0.0.1",
+        "requested_port": 0,
+        "bound_port": 38457,
+        "engine_key": "producer:127.0.0.1:26000:tp0:dp0:pp3",
+        "pid": 1668,
+        "time_ns": 1795728312691125832
+      },
+      {
+        "event": "engine_started",
+        "is_producer": true,
+        "pp_rank": 0,
+        "dp_rank": 0,
+        "tp_rank": 0,
+        "host": "127.0.0.1",
+        "requested_port": 0,
+        "bound_port": 43771,
+        "engine_key": "producer:127.0.0.1:26000:tp0:dp0:pp0",
+        "pid": 1665,
+        "time_ns": 1795728312732524356
+      },
+      {
+        "event": "engine_started",
+        "is_producer": true,
+        "pp_rank": 1,
+        "dp_rank": 0,
+        "tp_rank": 0,
+        "host": "127.0.0.1",
+        "requested_port": 0,
+        "bound_port": 37511,
+        "engine_key": "producer:127.0.0.1:26000:tp0:dp0:pp1",
+        "pid": 1667,
+        "time_ns": 1795728312714457328
+      },
+      {
+        "event": "engine_started",
+        "is_producer": true,
+        "pp_rank": 2,
+        "dp_rank": 0,
+        "tp_rank": 0,
+        "host": "127.0.0.1",
+        "requested_port": 0,
+        "bound_port": 41159,
+        "engine_key": "producer:127.0.0.1:26000:tp0:dp0:pp2",
+        "pid": 1666,
+        "time_ns": 1795728312714910238
+      },
+      {
+        "event": "engine_started",
+        "is_producer": false,
+        "pp_rank": 0,
+        "dp_rank": 1,
+        "tp_rank": 0,
+        "host": "127.0.0.1",
+        "requested_port": 0,
+        "bound_port": 45901,
+        "engine_key": "consumer:127.0.0.1:26004:tp0:dp1",
+        "pid": 3327,
+        "time_ns": 1795728392683374910
+      },
+      {
+        "event": "engine_started",
+        "is_producer": false,
+        "pp_rank": 0,
+        "dp_rank": 3,
+        "tp_rank": 0,
+        "host": "127.0.0.1",
+        "requested_port": 0,
+        "bound_port": 37891,
+        "engine_key": "consumer:127.0.0.1:26004:tp0:dp3",
+        "pid": 3326,
+        "time_ns": 1795728392711620959
+      },
+      {
+        "event": "engine_started",
+        "is_producer": false,
+        "pp_rank": 0,
+        "dp_rank": 0,
+        "tp_rank": 0,
+        "host": "127.0.0.1",
+        "requested_port": 0,
+        "bound_port": 37513,
+        "engine_key": "consumer:127.0.0.1:26004:tp0:dp0",
+        "pid": 3226,
+        "time_ns": 1795728392751941626
+      },
+      {
+        "event": "engine_started",
+        "is_producer": false,
+        "pp_rank": 0,
+        "dp_rank": 2,
+        "tp_rank": 0,
+        "host": "127.0.0.1",
+        "requested_port": 0,
+        "bound_port": 37515,
+        "engine_key": "consumer:127.0.0.1:26004:tp0:dp2",
+        "pid": 3328,
+        "time_ns": 1795728392898467658
+      }
+    ]
+  },
+  "disconnect_gauges_zero": true,
+  "gpu_prefill_failure_probe": "not run in performance-mode harness",
+  "accuracy_validated": false,
+  "profiling_started": false,
+  "performance_metrics": null,
+  "warmup": {
+    "target": 884,
+    "last_progress": {
+      "sent": 84,
+      "returned": 71,
+      "in_flight": 13,
+      "elapsed_seconds": 150
+    }
+  },
+  "first_native_error": "[2026-11-26 21:33:02.405] [1665] [io] [error] ProcessOneCqe: [ROOT CAUSE] CQE error: wr_id=0 status=12(transport retry counter exceeded) qp_num=7 vendor_err=11 hint=transport retry limit exceeded; check peer liveness/connectivity, verify GID selection (unset or correct MORI_IB_GID_INDEX), and if running RoCE verify QoS settings such as MORI_IO_SL/MORI_IO_TC or MORI_RDMA_SL/MORI_RDMA_TC.",
+  "native_root_error_count": 10,
+  "native_error_type": "status12 transport retry exceeded, vendor_err11; subsequent QP flush errors",
+  "decode_first_shutdown": "2026-11-26 21:33:05 UTC, after the21:33:02.405 UTC native error",
+  "rdma_counters": {
+    "from": "2026-11-26T21:29:37.183059+00:00",
+    "to": "2026-11-26T21:33:25.808199+00:00",
+    "nonzero_deltas": {
+      "rdma0/1/hw_counters/req_rx_cqe_err": 8,
+      "rdma0/1/hw_counters/req_rx_dup_response": 2,
+      "rdma0/1/hw_counters/req_rx_pkt_seq_err": 1732,
+      "rdma0/1/hw_counters/req_tx_retry_excd_err": 4,
+      "rdma0/1/hw_counters/rx_rdma_ucast_pkts": 285394,
+      "rdma0/1/hw_counters/tx_rdma_ack_timeout": 646,
+      "rdma0/1/hw_counters/tx_rdma_retx_bytes": 91838661632,
+      "rdma0/1/hw_counters/tx_rdma_retx_pkts": 22470015,
+      "rdma0/1/hw_counters/tx_rdma_ucast_bytes": 237478787072,
+      "rdma0/1/hw_counters/tx_rdma_ucast_pkts": 58099545,
+      "rdma1/1/hw_counters/req_rx_cqe_err": 4,
+      "rdma1/1/hw_counters/req_rx_dup_response": 3,
+      "rdma1/1/hw_counters/req_rx_pkt_seq_err": 3004,
+      "rdma1/1/hw_counters/req_tx_retry_excd_err": 2,
+      "rdma1/1/hw_counters/rx_rdma_ucast_pkts": 324956,
+      "rdma1/1/hw_counters/tx_rdma_ack_timeout": 1179,
+      "rdma1/1/hw_counters/tx_rdma_retx_bytes": 221104928768,
+      "rdma1/1/hw_counters/tx_rdma_retx_pkts": 54652794,
+      "rdma1/1/hw_counters/tx_rdma_ucast_bytes": 442779094016,
+      "rdma1/1/hw_counters/tx_rdma_ucast_pkts": 108843957,
+      "rdma2/1/hw_counters/req_rx_cqe_err": 4,
+      "rdma2/1/hw_counters/req_rx_dup_response": 9,
+      "rdma2/1/hw_counters/req_rx_pkt_seq_err": 3153,
+      "rdma2/1/hw_counters/req_tx_retry_excd_err": 2,
+      "rdma2/1/hw_counters/rx_rdma_ucast_pkts": 286817,
+      "rdma2/1/hw_counters/tx_rdma_ack_timeout": 1149,
+      "rdma2/1/hw_counters/tx_rdma_retx_bytes": 182152189952,
+      "rdma2/1/hw_counters/tx_rdma_retx_pkts": 44505400,
+      "rdma2/1/hw_counters/tx_rdma_ucast_bytes": 327652720640,
+      "rdma2/1/hw_counters/tx_rdma_ucast_pkts": 80100419,
+      "rdma3/1/hw_counters/req_rx_cqe_err": 4,
+      "rdma3/1/hw_counters/req_rx_dup_response": 22,
+      "rdma3/1/hw_counters/req_rx_pkt_seq_err": 415,
+      "rdma3/1/hw_counters/req_tx_retry_excd_err": 2,
+      "rdma3/1/hw_counters/rx_rdma_ucast_pkts": 289425,
+      "rdma3/1/hw_counters/tx_rdma_ack_timeout": 174,
+      "rdma3/1/hw_counters/tx_rdma_retx_bytes": 16643618816,
+      "rdma3/1/hw_counters/tx_rdma_retx_pkts": 4069514,
+      "rdma3/1/hw_counters/tx_rdma_ucast_bytes": 162283744256,
+      "rdma3/1/hw_counters/tx_rdma_ucast_pkts": 39699044,
+      "rdma4/1/hw_counters/resp_rx_outouf_seq": 3537,
+      "rdma4/1/hw_counters/resp_tx_pkt_seq_err": 3662,
+      "rdma4/1/hw_counters/rx_rdma_ucast_bytes": 167496637440,
+      "rdma4/1/hw_counters/rx_rdma_ucast_pkts": 40963070,
+      "rdma4/1/hw_counters/tx_rdma_ucast_pkts": 288423,
+      "rdma5/1/hw_counters/resp_rx_outouf_seq": 95,
+      "rdma5/1/hw_counters/resp_tx_pkt_seq_err": 95,
+      "rdma5/1/hw_counters/rx_rdma_ucast_bytes": 161329029120,
+      "rdma5/1/hw_counters/rx_rdma_ucast_pkts": 39440715,
+      "rdma5/1/hw_counters/tx_rdma_ucast_pkts": 222220,
+      "rdma6/1/hw_counters/resp_rx_outouf_seq": 669,
+      "rdma6/1/hw_counters/resp_tx_pkt_seq_err": 669,
+      "rdma6/1/hw_counters/rx_rdma_ucast_bytes": 160081073152,
+      "rdma6/1/hw_counters/rx_rdma_ucast_pkts": 39084589,
+      "rdma6/1/hw_counters/tx_rdma_ucast_pkts": 9419,
+      "rdma7/1/hw_counters/resp_rx_outouf_seq": 3778,
+      "rdma7/1/hw_counters/resp_tx_pkt_seq_err": 3878,
+      "rdma7/1/hw_counters/rx_rdma_ucast_bytes": 166903770112,
+      "rdma7/1/hw_counters/rx_rdma_ucast_pkts": 40908193,
+      "rdma7/1/hw_counters/tx_rdma_ucast_pkts": 666530
+    }
+  },
+  "image_rdma_env": {},
+  "exit_codes": {
+    "pool-workload.rc": 86,
+    "pool-exit.rc": 86,
+    "gpool-release.rc": 0
+  },
+  "cleanup_remaining": [
+    "e3115e7e1a74"
+  ],
+  "release_note": "Initial release refused while VRAM drained; subsequent normal release succeeded. No force release.",
+  "archive_sha256": "2cee0408f0cb5fd15e1f6b01a98b149678263e360a07d6dda2d527ad42ba4363",
+  "conclusion": "Short protocol and real four-stage WRITE passed; C80 warmup failed before900s profiling. Native port0 startup passed. No end-to-end stability/performance/accuracy pass.",
+  "next_hypothesis": "Missing MoRI-specific traffic class104. Actual image and generated worker env have no MoRI QoS override; the existing MoRI harness uses104. Not yet a proven cause of the retry-exceeded failure."
+}
