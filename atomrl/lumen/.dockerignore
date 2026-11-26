@@ -1,0 +1,21 @@
+.git/
+.github/
+# Run artifacts, 14 GB of them, and the COPY carries the whole context into
+# every layer that has one: they made the base image 40 GB and the qwen3 image
+# 55 GB. Nothing here is a build or runtime input — the launchers bind-mount a
+# results dir over RESULTS_ROOT.
+examples/*/results/
+examples/*/wandb/
+wandb/
+outputs/
+runs/
+**/*.pt.trace.json
+**/events.out.tfevents.*
+
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+.claude/
+*.log
+examples/dsv4/.bootstrap-build/tilelang/
+examples/dsv4/miles_compat/

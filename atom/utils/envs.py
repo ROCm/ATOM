@@ -163,6 +163,15 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
     return value
 
 
+def _dp_sync_interval_env() -> int | None:
+    """None for a non-integer, so every DP rank can reject it together; 0 and
+    negative values mean 1."""
+    try:
+        return max(1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1")))
+    except ValueError:
+        return None
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
@@ -190,6 +199,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # P/D decode side: serve /v1/pd/late_kv/chat/completions, the decode leg of
+    # atomesh's concurrent dispatch (--atom-pd-concurrent). The router
+    # streams the chat request first and P's kv_transfer_params as a second
+    # line, so D parses the body while P works. 0 = route answers 404 and the
+    # router falls back to its serial relay.
+    "ATOM_PD_LATE_KV": lambda: _flag_env("ATOM_PD_LATE_KV", "0"),
     # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
     # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
     "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
@@ -604,6 +619,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # index, prefix hits).
     "ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS": lambda: int(
         os.getenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", str(1 << 26))
+    ),
+    # gfx1250 FP4 indexer: fold the per-layer weights_proj GEMM into the query
+    # RoPE/MXFP4-quant launch for a step of at most _MAX_FUSED_PROJECT_ROWS (128)
+    # rows -- decode and short-prefill chunks alike. The kernel emits the head
+    # weights as bf16 (weights_dtype), so the fold is a single launch with no
+    # trailing cast. A larger step keeps the standalone GEMM, which is not
+    # launch-bound there. Off always runs the standalone GEMM.
+    "ATOM_DSV41_FUSE_WEIGHTS_PROJ": lambda: _flag_env(
+        "ATOM_DSV41_FUSE_WEIGHTS_PROJ", "1"
     ),
     # DCP sparse (DSA) prefill, "q" transport: when QREP is active, produce the
     # whole DCP group's query heads locally, as decode does, instead of
@@ -1109,6 +1133,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # DP > 1 (single- or multi-node; not read under PP): after a sync that saw
+    # unfinished work, run the cross-DP state all_reduce only every N engine
+    # rounds (1 = every round, at most 16; 0 and negative values mean 1).
+    # Utility commands, abort and shutdown are applied only on rounds that sync,
+    # and once the group drains every rank still runs up to N-1 dummy rounds
+    # before the next sync.
+    "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
     # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
@@ -1177,7 +1208,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
     # --- Structured output ---
     # Hold tool calls to the declared schemas when the tool parser declares a
-    # grammar for them (Kimi-K3) and the structured-output extra is installed.
+    # grammar for them (Kimi-K3) and the structured-output backend is available.
     "ATOM_TOOL_CALL_GRAMMAR": lambda: (
         os.getenv("ATOM_TOOL_CALL_GRAMMAR", "0").lower() == "1"
     ),
@@ -1366,6 +1397,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FRONTEND_PREFIX_HASH": lambda: (
         os.getenv("ATOM_FRONTEND_PREFIX_HASH", "1") == "1"
     ),
+    # Read a chat request's `prompt_token_ids_b64` (base64 of
+    # `array("I", ids).tobytes()`, uint32 little-endian) instead of a JSON id
+    # list. A P/D prefill leg (`do_remote_decode`) whose ids came this way does
+    # not echo them to the PD router, which already sends the same field to
+    # decode; every other request keeps its `return_token_ids` echo. A request
+    # without the field is unchanged. Enable on P and D together (a mixed
+    # setup is not supported). Upgrade P and D before a client sends the
+    # field. A P or D that runs an ATOM without this change, or sets it to 0,
+    # makes the pair mixed. "0": the field is ignored.
+    "ATOM_PROMPT_IDS_B64": lambda: os.getenv("ATOM_PROMPT_IDS_B64", "1") == "1",
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
