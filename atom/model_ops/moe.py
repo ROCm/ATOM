@@ -2001,10 +2001,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
-        # AITER_MOE_LOC=1 on gfx1250: IOD-placed copy of W1 for GEMM1.
-        moe_shuffle_weight_iod(
-            layer.w13_weight, layer.w13_weight_scale, self.num_experts
-        )
+        # aiter may re-lay both stages IOD-placed (AITER_MOE_LOC on gfx1250), a
+        # layout neither the Triton decode views nor EPLB's expert-major
+        # migration can read, so those keep the shuffled layout.
+        if not (
+            self.use_triton_decode
+            or getattr(get_current_atom_config(), "eplb_enable", False)
+        ):
+            moe_shuffle_weight_iod(
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                self.num_experts,
+                gate_up=True,
+            )
+            moe_shuffle_weight_iod(
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                self.num_experts,
+                gate_up=False,
+            )
 
     def _triton_views_of_flydsl_weights(self, layer) -> tuple:
         """Zero-copy Triton/gluon views of the FlyDSL-shuffled MXFP4 weights.
