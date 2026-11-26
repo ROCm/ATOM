@@ -28,6 +28,7 @@ logger = logging.getLogger("atom")
 def _ring_kv_progress(_future) -> None:
     progress_doorbell.ring()
 
+
 # How long the scheduler thread waits for its own advisory renewal RPC: a slow
 # Store RPC must not stall the scheduler and, through the DP lockstep, its peers.
 RENEW_TIMEOUT_S = 1.0

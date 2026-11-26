@@ -142,9 +142,7 @@ class LoadWaitState:
         """
         if gain <= 0 or self.tick_s <= 0.0:
             return 0.0
-        return min(
-            self.tick_s, self.tick_s * gain / (max(1, cost) * self.dp_size)
-        )
+        return min(self.tick_s, self.tick_s * gain / (max(1, cost) * self.dp_size))
 
     def _reset(self) -> None:
         self.steps = 0  # steps that started at least one load ahead of schedule()
