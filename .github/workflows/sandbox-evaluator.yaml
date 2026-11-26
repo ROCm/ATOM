@@ -1,8 +1,7 @@
 name: Sandbox Evaluator
 
-# CI evaluator design sandbox (ci-sandbox/* only; not for main). Checks what
-# the collaborator-permission endpoint returns to a GITHUB_TOKEN with no
-# permissions, as dispatch-approval.yaml would call it.
+# CI evaluator design sandbox (ci-sandbox/* only; not for main). Checks which
+# GITHUB_TOKEN permissions the evaluator's GraphQL / REST reads need.
 
 on:
   push:
@@ -11,19 +10,49 @@ on:
 
 permissions: {}
 
+env:
+  PROBE: |
+    probe() {
+      local name="$1"; shift
+      if out="$("$@" 2>&1)"; then echo "PROBE ${name}: OK $(echo "${out}" | head -c 160)"; else echo "PROBE ${name}: FAIL $(echo "${out}" | head -c 300)"; fi
+    }
+    probe reconcile-status gh api graphql -f query='{repository(owner:"ROCm",name:"ATOM"){pullRequests(states:OPEN,baseRefName:"main",first:2){nodes{number labels(first:5){nodes{name}} commits(last:1){nodes{commit{status{contexts{context state}}}}}}}}}'
+    probe pr-query gh api graphql -f query='{repository(owner:"ROCm",name:"ATOM"){pullRequest(number:3862){number reviewDecision changedFiles labels(first:5){nodes{name}} timelineItems(last:1,itemTypes:[BASE_REF_CHANGED_EVENT]){nodes{__typename}}}}}'
+    probe issue-or-pr-on-issue gh api graphql -f query='{repository(owner:"ROCm",name:"ATOM"){d: issueOrPullRequest(number:3871){__typename}}}'
+    probe pr-on-issue-number gh api graphql -f query='{repository(owner:"ROCm",name:"ATOM"){d: pullRequest(number:3871){number}}}'
+    probe rest-pull-on-issue gh api repos/ROCm/ATOM/pulls/3871 --jq .number
+    probe big-number gh api graphql -f query='{repository(owner:"ROCm",name:"ATOM"){d: pullRequest(number:99999999999){number}}}'
+    probe rest-big-number gh api repos/ROCm/ATOM/pulls/99999999999 --jq .number
+
 jobs:
-  role:
+  contents-prs:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
-      - name: Read roles with an empty-permission token
-        env:
+      - env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          for user in valarLip whx-sjtu; do
-            if out="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${user}/permission" \
-                --jq '"\(.permission) role=\(.role_name) admin=\(.user.permissions.admin) maintain=\(.user.permissions.maintain)"' 2>&1)"; then
-              echo "ROLE ${user}: ${out}"
-            else
-              echo "ROLE_FAILED ${user}: ${out}"
-            fi
-          done
+        run: eval "${PROBE}"
+
+  plus-statuses:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: eval "${PROBE}"
+
+  plus-issues:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: eval "${PROBE}"
