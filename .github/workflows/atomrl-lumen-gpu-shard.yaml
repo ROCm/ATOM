@@ -9,6 +9,10 @@ on:
         type: string
         default: atomrl:lumen-ci
 
+concurrency:
+  group: atomrl-lumen-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   lumen-case:
     name: Lumen case ${{ matrix.id }} (${{ matrix.name }})
@@ -35,7 +39,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     concurrency:
-      group: lumen-readme-${{ matrix.runner }}
+      group: lumen-readme-${{ github.ref }}
       cancel-in-progress: false
     permissions:
       contents: read
@@ -116,64 +120,66 @@ jobs:
             "$LUMEN_IMAGE" bash -lc \
             "python3 -m pytest atomrl/tests/lumen -q"
 
-      - name: Resolve shared model
+      - name: Download or reuse shared model
         if: matrix.model != 'none'
+        timeout-minutes: 150
         env:
           MODEL_KIND: ${{ matrix.model }}
+          HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
+          MODEL_DOWNLOAD_TIMEOUT: "3h"
+          MODEL_LOCK_WAIT_SECONDS: "7200"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
         run: |
           set -euo pipefail
-          model_dir_is_complete() {
-            [[ -f "$1/config.json" ]] || return 1
-            compgen -G "$1/*.safetensors" >/dev/null ||
-              compgen -G "$1/*.bin" >/dev/null ||
-              [[ -f "$1/model.safetensors.index.json" ]] ||
-              [[ -f "$1/pytorch_model.bin.index.json" ]]
-          }
-          roots=(
-            /share_nfs/models
-            /mnt/dcgpuval
-            /shared/data/WRH/models
-            /shared_nfs/models
-            /data/pretrained_model
-            /data/models
-            /models
-          )
           if [[ "$MODEL_KIND" == llama2 ]]; then
-            variants=(NousResearch/Llama-2-7b-hf nousresearch/Llama-2-7b-hf Llama-2-7b-hf llama2/Llama-2-7b-hf llama2-7b-hf)
-            basenames=(Llama-2-7b-hf llama2-7b-hf)
+            model_id="NousResearch/Llama-2-7b-hf"
           elif [[ "$MODEL_KIND" == qwen3 ]]; then
-            variants=(Qwen/Qwen3-8B Qwen3-8B qwen/Qwen3-8B qwen3-8b)
-            basenames=(Qwen3-8B qwen3-8b)
+            model_id="Qwen/Qwen3-8B"
           else
             echo "Unknown model kind: $MODEL_KIND" >&2
             exit 2
           fi
-          resolved=""
-          for root in "${roots[@]}"; do
-            [[ -d "$root" ]] || continue
-            for relative in "${variants[@]}"; do
-              candidate="$root/$relative"
-              if model_dir_is_complete "$candidate"; then
-                resolved="$candidate"
-                break 2
-              fi
-            done
-            while IFS= read -r candidate; do
-              if model_dir_is_complete "$candidate"; then
-                resolved="$candidate"
-                break 2
-              fi
-            done < <(find "$root" -maxdepth 4 -type d \( \
-              -name "${basenames[0]}" -o -name "${basenames[1]}" \) -print 2>/dev/null)
+
+          model_root=""
+          for candidate in \
+            /models \
+            /shared_nfs/huggingface_models \
+            /shared_nfs/models \
+            /it-share/models \
+            /mnt/raid0/pretrained_model \
+            /shared/data/WRH/models \
+            /data/models \
+            /data/pretrained_model; do
+            if [[ -d "$candidate" && -w "$candidate" ]]; then
+              model_root="$candidate"
+              break
+            fi
           done
-          if [[ -z "$resolved" ]]; then
-            echo "ERROR: no complete $MODEL_KIND model found; downloads are disabled." >&2
-            echo "Searched shared roots:" >&2
-            printf '  - %s\n' "${roots[@]}" >&2
-            echo "Accepted relative variants:" >&2
-            printf '  - %s\n' "${variants[@]}" >&2
-            exit 1
+          if [[ -z "$model_root" ]]; then
+            model_root="$RUNNER_TEMP/lumen-models"
+            mkdir -p "$model_root"
+            echo "::warning::No writable shared model cache found; using $model_root"
           fi
+
+          target_dir="/models/$model_id"
+          echo "Using model cache root $model_root for $model_id"
+          docker run --rm --network=host \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            -e MODEL_ID="$model_id" \
+            -e TARGET_DIR="$target_dir" \
+            -e MODEL_DOWNLOAD_TIMEOUT \
+            -e MODEL_LOCK_WAIT_SECONDS \
+            -e MODEL_LOCK_POLL_INTERVAL \
+            -e MODEL_PROGRESS_INTERVAL \
+            -e MODEL_LOCK_ROOT=/models/.atom-model-locks \
+            -e MODEL_STAGING_ROOT=/models/.atom-model-staging \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$model_root:/models" \
+            "$LUMEN_IMAGE" bash -lc \
+            'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'
+
+          resolved="$model_root/$model_id"
           echo "RESOLVED_MODEL_PATH=$resolved" >> "$GITHUB_ENV"
           echo "Resolved $MODEL_KIND model: $resolved"
 
