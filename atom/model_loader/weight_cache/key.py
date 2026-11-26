@@ -67,6 +67,8 @@ _ENV_VARS = (
     "ATOM_MHC_USE_BF16",
     "ATOM_MLA_ABSORB_BF16",
     "ATOM_USE_TRITON_MXFP4_BMM",
+    # Whether online quantization takes each rank's shard by itself.
+    "ATOM_ONLINE_QUANT_STREAMING",
     # Whether each rank holds the whole vocabulary embedding.
     "ATOM_REPLICATE_VOCAB_EMBED",
     # Whether loading realigns a fused norm's quantization to the layer after.
@@ -161,6 +163,9 @@ def compute_key(config, rank: int) -> dict:
             "tp": config.tensor_parallel_size,
             "tp_world": config.tp_world_size,
             "pcp": config.pcp_group_size,
+            "sp": config.sequence_parallel_size,
+            "pp": config.pipeline_parallel_size,
+            "pp_rank": pc.pipeline_parallel_rank,
             "dp": pc.data_parallel_size,
             "dp_rank": pc.data_parallel_rank,
             "dp_attention": bool(config.enable_dp_attention),

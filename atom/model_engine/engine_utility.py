@@ -46,6 +46,10 @@ WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
 # As vLLM's pause_generation(mode="keep") / resume_generation.
 PAUSE_GENERATION_CMD = "pause_generation"
 RESUME_GENERATION_CMD = "resume_generation"
+# A weight cache daemon's `stop` and `load`, for the engine whose runners map
+# its weights (weight_cache.session.serve_notices).
+WEIGHTS_STOPPED_CMD = "weights_stopped"
+WEIGHTS_IN_USE_CMD = "weights_in_use"
 
 
 def memory_tags(args) -> tuple[str, ...]:
@@ -64,6 +68,9 @@ def kv_change(cmd: str, args) -> str | None:
         return "weights" if completes_weight_sync(cmd, args) else None
     if cmd == "clear_kv_cache":
         return "kv"
+    # The daemon wrote other values into the weights the runners map.
+    if cmd == WEIGHTS_IN_USE_CMD and args.get("changed"):
+        return "weights"
     # A resume reallocates the pool too, so the block tables running sequences
     # hold no longer point at their KV.
     if cmd in ("release_memory", "resume_memory") and "kv_cache" in memory_tags(args):
@@ -214,6 +221,8 @@ class EngineUtilityHandler:
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
         PAUSE_GENERATION_CMD: "_handle_pause_generation",
         RESUME_GENERATION_CMD: "_handle_resume_generation",
+        WEIGHTS_STOPPED_CMD: "_handle_weights_stopped",
+        WEIGHTS_IN_USE_CMD: "_handle_weights_in_use",
     }
 
     def __init__(
@@ -1020,6 +1029,32 @@ class EngineUtilityHandler:
         self.engine.resume_generation()
         reply = {"cmd": RESUME_GENERATION_CMD}
         logger.info(f"{self.label}: generation resumed")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_weights_stopped(self, args: dict) -> dict:
+        """Schedule nothing until ``weights_in_use``, and answer once what
+        the runners sent to their devices has run: nothing reads the weights
+        then. ``rewrite``: they are about to hold other values, and a runner
+        that could not go on with them refuses."""
+        self.engine.pause_generation(
+            deadline=time.monotonic() + _remaining_timeout(args, _KV_QUIESCE_TIMEOUT_S)
+        )
+        reply = self._utility_on_every_rank(
+            WEIGHTS_STOPPED_CMD,
+            "await_forwards",
+            bool(args.get("rewrite")),
+            timeout=_remaining_timeout(args, 300.0),
+        )
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_weights_in_use(self, args: dict) -> dict:
+        """Go on after ``weights_stopped``. With ``changed`` what was running
+        has been preempted to recompute on the weights as they are now
+        (``kv_change``), and the cached prefixes are forgotten."""
+        self.engine.resume_generation()
+        reply = {"cmd": WEIGHTS_IN_USE_CMD}
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 

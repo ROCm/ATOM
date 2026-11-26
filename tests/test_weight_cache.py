@@ -6,6 +6,7 @@ daemon management with fake processes."""
 
 import dataclasses
 import json
+import multiprocessing
 import os
 import pathlib
 import pickle
@@ -35,6 +36,7 @@ from atom.model_loader.weight_cache import (
     export,
     key,
     preload,
+    session,
     transport,
     values,
 )
@@ -103,13 +105,15 @@ def _key_config(tmp_path, **settings):
             "model": str(tmp_path),
             "hf_config": SimpleNamespace(to_dict=lambda: {"hidden_size": 8}),
             "parallel_config": SimpleNamespace(
-                data_parallel_size=1, data_parallel_rank=0
+                data_parallel_size=1, data_parallel_rank=0, pipeline_parallel_rank=0
             ),
             "speculative_config": None,
             "quant_config": None,
             "tensor_parallel_size": 1,
             "tp_world_size": 1,
             "pcp_group_size": 1,
+            "sequence_parallel_size": 1,
+            "pipeline_parallel_size": 1,
             "enable_dp_attention": False,
             "enable_expert_parallel": False,
             "dcp_config": SimpleNamespace(**dcp),
@@ -608,17 +612,27 @@ def test_a_daemon_rank_loads_without_communicators_or_moe_setup(monkeypatch):
         for name, fake in (
             ("worker_process_name", lambda config, rank: "TP0"),
             ("socket_path", lambda gpu: "/nonexistent/gpu.sock"),
+            ("daemon_socket", lambda pid: "/nonexistent/daemon.sock"),
             ("gpu_identity", lambda gpu: "gpu"),
             ("_DaemonLock", lambda *a, **k: None),
             ("init_model_env", init_model_env),
         ):
             monkeypatch.setattr(daemon, name, fake)
         monkeypatch.setattr(daemon.loader, "MOE_PREPARE_FINALIZE", True)
+        ready = queue.Queue()
+        config = SimpleNamespace(model="m", sequence_parallel_size=1)
         with pytest.raises(Stop):
-            daemon._serve_rank(0, SimpleNamespace(model="m"), None, 0, None)
+            daemon._serve_rank(0, config, ready, 0, None)
+        # The main process learns which GPU this rank holds before it loads.
+        assert ready.get_nowait() == ("holds", 0, "gpu.sock")
         # Servers set up MoE communication themselves, on their own groups.
         assert asked == [{"device_communicators": False}]
         assert daemon.loader.MOE_PREPARE_FINALIZE is False
+        # Building a model for sequence parallelism takes a communicator.
+        config.sequence_parallel_size = 2
+        with pytest.raises(Stop):
+            daemon._serve_rank(0, config, ready, 0, None)
+        assert asked[1:] == [{"device_communicators": True}]
 
 
 class Tied(nn.Module):
@@ -901,13 +915,33 @@ def test_process_helpers():
 def test_record_launch_saves_the_environment_from_exec(cache_dir, monkeypatch):
     monkeypatch.setenv("ATOM_PRELOAD", "1")
     monkeypatch.setenv("WC_TEST_SET_AT_RUNTIME", "1")  # like an import setting a var
-    preload.record_launch()
+    preload.record_launch("m", {"tp": 2})
     path = preload._launch_file()
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600  # holds the environment
     with open(path) as f:
         launch = json.load(f)
     assert launch["argv"][0] == sys.executable and launch["cwd"] == os.getcwd()
     assert "PATH" in launch["env"] and "WC_TEST_SET_AT_RUNTIME" not in launch["env"]
+    # What the daemon it starts reads back: the engine's arguments.
+    assert launch["argv"][1:] == [
+        "-m",
+        "atom.model_loader.weight_cache",
+        "daemon",
+        path,
+    ]
+    engine = preload.launch_engine(path)
+    assert (engine.model, engine._get_engine_kwargs()) == ("m", {"tp": 2})
+
+
+def test_a_launch_records_the_settings_loading_goes_by_as_they_are(
+    cache_dir, monkeypatch
+):
+    # A launch that is a script may have set one itself, after exec.
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+    monkeypatch.setenv("ATOM_MOE_GU_ITLV", "wc-test")
+    preload.record_launch("m", {})
+    with open(preload._launch_file()) as f:
+        assert json.load(f)["env"]["ATOM_MOE_GU_ITLV"] == "wc-test"
 
 
 def _saved_launch(cache_dir, tmp_path, monkeypatch, code, **env):
@@ -923,7 +957,7 @@ def _saved_launch(cache_dir, tmp_path, monkeypatch, code, **env):
     monkeypatch.setenv(preload._LAUNCH_ENV, "1_1")
 
 
-def test_spawned_daemon_is_detached_and_started_once(cache_dir, tmp_path, monkeypatch):
+def test_a_spawned_daemon_is_detached(cache_dir, tmp_path, monkeypatch):
     out = tmp_path / "out"
     code = (
         "import os, time\n"
@@ -933,7 +967,6 @@ def test_spawned_daemon_is_detached_and_started_once(cache_dir, tmp_path, monkey
     _saved_launch(cache_dir, tmp_path, monkeypatch, code, WC_OUT=str(out))
     first = preload._spawn_daemon()
     try:
-        assert preload._spawn_daemon() == first  # the other ranks get the same daemon
         _wait_for(lambda: out.exists() and out.read_text())
         assert out.read_text() == "daemon"  # the same launch, as a daemon
         assert preload._pid_running(first["pid"])
@@ -945,32 +978,20 @@ def test_spawned_daemon_is_detached_and_started_once(cache_dir, tmp_path, monkey
         os.kill(first["pid"], signal.SIGKILL)
 
 
-def test_a_daemon_whose_start_cannot_be_recorded_is_stopped(
+def test_a_launch_that_cannot_be_started_as_a_daemon_goes_without(
     cache_dir, tmp_path, monkeypatch
 ):
-    _saved_launch(cache_dir, tmp_path, monkeypatch, "import time\ntime.sleep(60)\n")
-    started = []
-
-    def no_space(info, f):  # the marker the other ranks read
-        started.append(info["pid"])
-        raise OSError(28, "No space left on device")
-
-    files = SimpleNamespace(load=json.load, dump=no_space)
-    monkeypatch.setattr(preload, "json", files)
-    try:
-        # The ranks go on to a disk load: not beside a daemon that loads too.
-        with pytest.raises(values._Miss, match="could not record"):
-            preload._spawn_daemon()
-        _wait_for(lambda: not preload._pid_running(started[0]), timeout=30)
-    finally:
-        for pid in started:
-            if preload._pid_running(pid):
-                os.kill(pid, signal.SIGKILL)
+    _saved_launch(cache_dir, tmp_path, monkeypatch, "raise SystemExit(3)")
+    monkeypatch.setattr(sys, "executable", "/nonexistent/python")
+    with pytest.raises(values._Miss, match="could not start"):
+        preload._spawn_daemon()
 
 
 _FAKE_MAIN = """
 import os, signal, subprocess, sys, time
-child = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])
+from atom.model_loader.weight_cache.transport import _Server
+server = _Server(sys.argv[3], "t")
+child = subprocess.Popen([sys.executable, *sys.argv[1:]])
 def stop(*_):
     child.terminate()
     child.wait()
@@ -984,7 +1005,8 @@ _FAKE_RUNNER = """
 import os, signal, sys, time
 from atom.model_loader.weight_cache.transport import _DaemonLock
 lock = _DaemonLock(
-    sys.argv[1], name="TP0", model="toy-model", daemon_pid=os.getppid(), idle_timeout_s=3600
+    sys.argv[1], name="TP0", model="toy-model", daemon_pid=os.getppid(),
+    socket=sys.argv[2], idle_timeout_s=3600,
 )
 def stop(*_):
     lock.release()  # like a runner: the lock goes early in the shutdown
@@ -1002,11 +1024,11 @@ def test_status_and_stop_a_daemon_launch(cache_dir, tmp_path, capsys):
     (tmp_path / "main.py").write_text(_FAKE_MAIN)
     (tmp_path / "runner.py").write_text(_FAKE_RUNNER)
     path = os.path.join(transport.socket_dir(), "gpu_test.sock")
+    sock = os.path.join(transport.socket_dir(), "daemon_test.sock")
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    scripts = [str(tmp_path / "main.py"), str(tmp_path / "runner.py")]
     main = subprocess.Popen(
-        [sys.executable, str(tmp_path / "main.py"), str(tmp_path / "runner.py"), path],
-        env=env,
-        start_new_session=True,
+        [sys.executable, *scripts, path, sock], env=env, start_new_session=True
     )
     try:
         _wait_for(
@@ -1019,6 +1041,11 @@ def test_status_and_stop_a_daemon_launch(cache_dir, tmp_path, capsys):
             and st["state"] == "loading"
             and st["model"] == "toy-model"
         )
+        # A daemon that was killed leaves its socket; the next one removes it.
+        left = pathlib.Path(transport.daemon_socket(_NO_PID))
+        left.touch()
+        preload.prune_sockets()
+        assert not left.exists() and os.path.exists(sock)
         assert cli.main(["status"]) == 0
         shown = capsys.readouterr().out
         assert f"daemon pid {main.pid}: toy-model" in shown and "TP0: loading" in shown
@@ -1034,89 +1061,193 @@ def test_status_and_stop_a_daemon_launch(cache_dir, tmp_path, capsys):
             os.killpg(main.pid, signal.SIGKILL)  # the main process and its runner
 
 
-def test_idle_timeout_counts_connected_servers(cache_dir):
-    path = os.path.join(transport.socket_dir(), "gpu_idle.sock")
+class _Daemon:
+    """A daemon's socket with rank processes' weights behind it (threads
+    here), wired as run_daemon and _serve_rank wire them: ``gpus`` maps a
+    GPU's name to (payload, views)."""
+
+    def __init__(self, name, gpus):
+        d = transport.socket_dir()
+        self.socket = os.path.join(d, f"daemon_{name}.sock")
+        self.server = transport._Server(self.socket, "t")
+        self.stop, self.holders, self.paths = threading.Event(), {}, {}
+        for gpu, (payload, views) in gpus.items():
+            path = self.paths[gpu] = os.path.join(d, f"{gpu}.sock")
+            with open(path + ".state", "w") as f:
+                json.dump({"socket": self.socket, "state": "serving"}, f)
+            ours, theirs = multiprocessing.Pipe()
+            holder = self.holders[gpu] = transport._Holder(theirs, payload, views, "t")
+            threading.Thread(
+                target=holder.serve, args=(self.stop.is_set,), daemon=True
+            ).start()
+            self.server.add(os.path.basename(path), ours)
+        self.path = next(iter(self.paths.values()))
+
+    def ask(self, path=None, **request):
+        conn = transport._connect(path or self.path)
+        request = {"v": transport.PROTOCOL, "who": "test", **request}
+        transport._send(conn, request)
+        return conn, transport._recv(conn)
+
+    def get(self, path=None):
+        path = path or self.path
+        return self.ask(path, cmd="get", gpu=os.path.basename(path))
+
+    def close(self):
+        self.stop.set()
+        self.server.close()
+
+
+@pytest.fixture
+def one_gpu_daemon(cache_dir):
+    daemons = []
+
+    def start(views=None):
+        daemons.append(_Daemon("t", {"gpu_t": ({"key": 1}, views or {})}))
+        return daemons[-1]
+
+    yield start
+    for d in daemons:
+        d.close()
+
+
+def test_idle_timeout_counts_connected_servers(one_gpu_daemon):
+    d = one_gpu_daemon()
     idle, all_serving = threading.Event(), threading.Event()
-    server = transport._Server(path, {"key": 1}, {}, "t")
-    server.watch_idle(1, idle.set, all_serving)
+    d.server.watch_idle(1, idle.set, all_serving)
+    # The clock starts once every rank of the daemon serves.
+    assert not idle.wait(1.6)
+    all_serving.set()
+    conn, payload = d.get()
+    assert payload["key"] == 1
+    assert not idle.wait(1.6)  # a connected server keeps the daemon
+    assert transport._ping(d.path)["clients"] == 1
+    conn.close()
+    assert idle.wait(3)
+    assert transport._ping(d.path)["clients"] == 0
+    # Stopping now: a server that arrives late is turned away.
+    late, reply = d.get()
+    assert "shutting down" in reply["error"]
+    late.close()
+    assert not os.path.exists(d.socket + f".{os.getpid()}.tmp")
+
+
+def test_every_gpu_of_a_daemon_is_served_on_its_one_socket(cache_dir):
+    d = _Daemon("two", {"gpu_a": ({"key": "a"}, {}), "gpu_b": ({"key": "b"}, {})})
     try:
-        # The clock starts once every rank of the daemon serves.
-        assert not idle.wait(1.6)
-        all_serving.set()
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.connect(path)
-        transport._send(conn, {"cmd": "get", "who": "test"})
-        assert transport._recv(conn)["key"] == 1
-        assert not idle.wait(1.6)  # a connected server keeps the daemon
-        assert transport._ping(path)["clients"] == 1
+        a, b = d.paths["gpu_a"], d.paths["gpu_b"]
+        conn_a, payload_a = d.get(a)
+        conn_b, payload_b = d.get(b)
+        assert (payload_a["key"], payload_b["key"]) == ("a", "b")
+        conn_b.close()
+        _wait_for(lambda: transport._ping(b)["clients"] == 0, 5)
+        assert transport._ping(a)["clients"] == 1  # counted by GPU
+        conn_a.close()
+        # A GPU another daemon holds, and a server that speaks other messages.
+        conn, reply = d.ask(cmd="get", gpu="gpu_c.sock")
+        assert "no rank of this daemon holds gpu_c.sock" in reply["error"]
         conn.close()
-        assert idle.wait(3)
-        assert transport._ping(path)["clients"] == 0
-        # Stopping now: a server that arrives late is turned away.
-        late = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        late.connect(path)
-        transport._send(late, {"cmd": "get", "who": "late"})
-        assert "shutting down" in transport._recv(late)["error"]
-        late.close()
+        conn, reply = d.ask(cmd="get", gpu="gpu_a.sock", v=transport.PROTOCOL - 1)
+        assert "restart it" in reply["error"]
+        conn.close()
     finally:
-        server.close()
+        d.close()
 
 
-def _get(path):
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    conn.connect(path)
-    transport._send(conn, {"cmd": "get", "who": "test"})
-    return conn, transport._recv(conn)
-
-
-def test_write_into_shared_weights_is_caught_after_the_writer_left(cache_dir):
-    path = os.path.join(transport.socket_dir(), "gpu_check.sock")
-    weights = torch.zeros(64, dtype=torch.uint8)
-    server = transport._Server(path, {"key": 1}, {1: weights}, "t")
+def test_a_launch_attaches_to_the_daemon_that_serves_it(cache_dir, monkeypatch):
+    d = _Daemon("at", {"gpu_a": ({"key": "a"}, {}), "gpu_b": ({"key": "b"}, {})})
+    names = [os.path.basename(p) for p in d.paths.values()]
+    keys = {name: {"checkpoint": "c", "rank": i} for i, name in enumerate(names)}
     try:
-        assert not [p for p in os.listdir(transport.socket_dir()) if p.endswith(".tmp")]
-        conn, payload = _get(path)
-        assert "error" not in payload
-        weights[5] = 7  # the connected server writes into the shared weights
+        # Its ranks have not all taken their GPUs: asked again in a moment.
+        d.server.ranks = 3
+        conn, reply = d.ask(cmd="attach", launch="1_1.0", keys=keys)
+        assert reply == {"fits": False, "starting": True}
         conn.close()
-        _wait_for(lambda: server.poisoned, timeout=10)  # checked once it left
-        _, payload = _get(path)
-        assert "changed since export" in payload["error"]
-    finally:
-        server.close()
-
-
-def test_a_daemon_about_to_be_stopped_takes_no_server(cache_dir):
-    path = os.path.join(transport.socket_dir(), "gpu_use.sock")
-    assert preload._hold_unused(path, wait_s=0.2) == (None, None)  # not serving
-    server = transport._Server(path, {"key": 1}, {}, "t")
-    try:
-        conn, _ = _get(path)
-        hold, why = preload._hold_unused(path, wait_s=0.2)
-        assert hold is None and "1 other running server" in why
+        d.server.ranks = 2
+        for name in names:
+            d.server.keys[name] = keys[name]
+        # Another checkpoint, or other GPUs: it says why.
+        other = {**keys, names[1]: {"checkpoint": "d", "rank": 1}}
+        conn, reply = d.ask(cmd="attach", launch="1_1.0", keys=other)
+        assert (
+            reply["fits"] is False and "checkpoint: daemon=c client=d" in reply["why"]
+        )
         conn.close()
-        hold, why = preload._hold_unused(path, wait_s=5)  # once it has gone
+        conn, reply = d.ask(
+            cmd="attach", launch="1_1.0", keys={names[0]: keys[names[0]]}
+        )
+        assert "it holds 2 GPU(s) and the launch runs on 1" in reply["why"][0]
+        conn.close()
+        # The launch it serves stays connected, and counts as a server from
+        # then on: another launch cannot stop the daemon, its own ranks can.
+        conn, reply = d.ask(cmd="attach", launch="1_1.0", keys=keys)
+        assert reply == {"fits": True}
+        monkeypatch.setenv(preload._LAUNCH_ENV, "2_2.0")
+        assert "1 other running server" in preload._hold_unused(d.path, wait_s=0.2)[1]
+        monkeypatch.setenv(preload._LAUNCH_ENV, "1_1.0")
+        hold, why = preload._hold_unused(d.path, wait_s=0.2)
         assert why is None
-        # Held: a server that arrives before the stop is turned away...
-        late = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        late.connect(path)
-        transport._send(late, {"cmd": "get", "who": "late"})
-        assert "shutting down" in transport._recv(late)["error"]
-        late.close()
-        # ...and so is another launch that wants to stop it.
-        assert "being stopped" in preload._hold_unused(path, wait_s=0.2)[1]
-        hold.close()  # let go without stopping it: it serves again
-        _wait_for(lambda: not server.held, 5)
-        conn, payload = _get(path)
-        assert payload["key"] == 1
+        hold.close()
         conn.close()
     finally:
-        server.close()
+        d.close()
 
 
-def test_a_hold_whose_holder_went_before_the_reply_is_let_go(cache_dir, monkeypatch):
-    path = os.path.join(transport.socket_dir(), "gpu_gone.sock")
-    server = transport._Server(path, {"key": 1}, {}, "t")
+def test_write_into_shared_weights_is_caught_after_the_writer_left(one_gpu_daemon):
+    weights = torch.zeros(64, dtype=torch.uint8)
+    d = one_gpu_daemon({1: weights})
+    conn, payload = d.get()
+    assert "error" not in payload
+    weights[5] = 7  # the connected server writes into the shared weights
+    conn.close()
+    holder = d.holders["gpu_t"]
+    _wait_for(lambda: holder.poisoned, timeout=10)  # checked once it left
+    assert transport._ping(d.path)["poisoned"] == 1
+    conn, payload = d.get()
+    assert "changed since export" in payload["error"]
+    conn.close()
+    # Refused, so no server is counted as using it.
+    _wait_for(lambda: transport._ping(d.path)["clients"] == 0, 5)
+    assert holder.clients == 0
+
+
+def test_a_daemon_about_to_be_stopped_takes_no_server(one_gpu_daemon, monkeypatch):
+    nowhere = os.path.join(transport.socket_dir(), "gpu_none.sock")
+    assert preload._hold_unused(nowhere, wait_s=0.2) == (None, None)  # no daemon
+    d = one_gpu_daemon()
+    conn, _ = d.get()
+    hold, why = preload._hold_unused(d.path, wait_s=0.2)
+    assert hold is None and "1 other running server" in why
+    conn.close()
+    monkeypatch.setenv(preload._LAUNCH_ENV, "1_1.0")
+    hold, why = preload._hold_unused(d.path, wait_s=5)  # once it has gone
+    assert why is None
+    # Held: a server that arrives before the stop is turned away...
+    late, reply = d.get()
+    assert "shutting down" in reply["error"]
+    late.close()
+    # ...and so is another launch that wants to stop it...
+    monkeypatch.setenv(preload._LAUNCH_ENV, "2_2.0")
+    assert "being stopped" in preload._hold_unused(d.path, wait_s=0.2)[1]
+    # ...but not another rank of the launch that holds it.
+    monkeypatch.setenv(preload._LAUNCH_ENV, "1_1.0")
+    second, why = preload._hold_unused(d.path, wait_s=0.2)
+    assert why is None
+    hold.close()
+    time.sleep(0.3)
+    assert d.server.held_by is not None  # while one of them holds it
+    second.close()  # let go without stopping it: it serves again
+    _wait_for(lambda: d.server.held_by is None, 5)
+    conn, payload = d.get()
+    assert payload["key"] == 1
+    conn.close()
+
+
+def test_a_hold_whose_holder_went_before_the_reply_is_let_go(
+    one_gpu_daemon, monkeypatch
+):
+    d = one_gpu_daemon()
     send = transport._send
 
     def reply_fails(conn, obj):
@@ -1125,18 +1256,14 @@ def test_a_hold_whose_holder_went_before_the_reply_is_let_go(cache_dir, monkeypa
         send(conn, obj)
 
     monkeypatch.setattr(transport, "_send", reply_fails)
-    try:
-        holder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        holder.connect(path)
-        send(holder, {"cmd": "hold"})
-        assert holder.recv(16) == b""  # the daemon gave the request up
-        holder.close()
-        assert not server.held
-        conn, payload = _get(path)  # so it serves, and can be held again
-        assert payload["key"] == 1
-        conn.close()
-    finally:
-        server.close()
+    holder = transport._connect(d.path)
+    send(holder, {"cmd": "hold", "v": transport.PROTOCOL})
+    assert holder.recv(16) == b""  # the daemon gave the request up
+    holder.close()
+    _wait_for(lambda: d.server.held_by is None, 5)
+    conn, payload = d.get()  # so it serves, and can be held again
+    assert payload["key"] == 1
+    conn.close()
 
 
 @pytest.fixture
@@ -1176,16 +1303,27 @@ def daemon_launch(monkeypatch):
             raise queue.Empty
 
     pc = SimpleNamespace(data_parallel_master_ip="127.0.0.1")
-    config = SimpleNamespace(parallel_config=pc, tp_world_size=2, pcp_group_size=1)
+    config = SimpleNamespace(
+        parallel_config=pc, tp_world_size=2, pcp_group_size=1, pipeline_parallel_size=1
+    )
+    launch.config = config
     engine = SimpleNamespace(
         prepare_config=lambda model, **options: (config, None),
         layout_engines=lambda config: [(0, 0), (1, 1)],
-        engine_config=lambda config, dp, local: f"dp{dp}",
+        engine_config=lambda config, dp, local, pp: f"dp{dp}" + f"pp{pp}" * (pp > 0),
     )
-    ctx = SimpleNamespace(Queue=Ready, Event=threading.Event, Process=Proc)
+    ctx = SimpleNamespace(Queue=Ready, Pipe=lambda: (None, None), Process=Proc)
+    server = SimpleNamespace(
+        watch_idle=lambda *a: None, close=lambda: launch.closed.append(1)
+    )
+    launch.closed, launch.server = [], server
     with atom_without_aiter() as load, monkeypatch.context() as m:
         daemon = load("atom.model_loader.weight_cache.daemon")
         m.setattr(daemon.multiprocessing, "get_context", lambda kind: ctx)
+        m.setattr(daemon, "daemon_socket", lambda pid: "/nonexistent/daemon.sock")
+        m.setattr(daemon, "prune_sockets", lambda: None)
+        m.setattr(daemon, "compute_key", lambda config, rank: {"rank": rank})
+        m.setattr(daemon, "_Server", lambda path, label, ranks: server)
         m.setattr(signal, "signal", lambda *a: None)  # this process keeps its own
         store = SimpleNamespace(port=1)
         m.setattr(torch.distributed, "TCPStore", lambda *a, **k: store)
@@ -1202,9 +1340,19 @@ def test_a_daemon_runs_a_process_for_every_rank_of_every_engine(daemon_launch):
     daemon_launch.run()  # that rank's load cannot be cached: no failure
     ranks = [p.args[:2] for p in daemon_launch.procs]
     assert ranks == [(0, "dp0"), (1, "dp0"), (0, "dp1"), (1, "dp1")]
-    # The others are stopped with it.
+    # The others are stopped with it, and no server is taken meanwhile.
     stopped = -signal.SIGTERM
     assert [p.exitcode for p in daemon_launch.procs] == [stopped, 0, stopped, stopped]
+    assert daemon_launch.server.stopping and daemon_launch.closed
+
+
+def test_a_daemon_runs_the_ranks_of_every_pipeline_stage(daemon_launch):
+    daemon_launch.config.pipeline_parallel_size = 2
+    daemon_launch.exits = {"WeightCache1": 0}
+    daemon_launch.run()
+    ranks = [p.args[:2] for p in daemon_launch.procs]
+    assert ranks[:4] == [(0, "dp0"), (1, "dp0"), (0, "dp0pp1"), (1, "dp0pp1")]
+    assert len(ranks) == 8
 
 
 def test_a_daemon_whose_rank_fails_exits_with_an_error(daemon_launch):
@@ -1263,14 +1411,14 @@ def test_a_daemon_tells_servers_what_it_holds_beside_the_weights(monkeypatch):
             ("worker_process_name", lambda config, rank: "TP0"),
             ("_release_other_memory", lambda views, device, label: None),
             ("share_storages", lambda views: dict.fromkeys(views)),
-            ("_Server", lambda path, payload, views, label: served.append(payload)),
+            ("_Holder", lambda conn, payload, *held: served.append(payload)),
             # On this GPU its process holds 5 MiB more than the weights.
             ("_own_device_memory", lambda device: 64 + (5 << 20)),
         ):
             monkeypatch.setattr(daemon, name, fake)
         lock = SimpleNamespace(set_state=lambda state, **info: None)
         daemon._load_and_serve(
-            SimpleNamespace(), 0, torch.device("cpu"), "/x.sock", lock, 0.0
+            SimpleNamespace(), 0, torch.device("cpu"), None, lock, 0.0
         )
     assert served[0]["load_extra"] == 5 << 20
 
@@ -1349,11 +1497,20 @@ class _Conn:
         pass
 
 
+_SESSION = {
+    "socket": "/nonexistent/daemon.sock",
+    "pid": _NO_PID,
+    "log": "daemon.log",
+    "paths": ["/nonexistent/gpu.sock"],
+}
+
+
 @pytest.fixture
 def loop(client, monkeypatch):
-    """The client with the daemon replaced: ``probes`` lists what each probe
-    finds, (daemon there, why it cannot be used)."""
-    calls = SimpleNamespace(probes=[], spawned=0, stopped=0, built={})
+    """One rank's client with the daemon replaced: ``session`` is what the
+    launch's main process found (None: no daemon), ``reasons`` why this rank
+    cannot use that daemon's weights."""
+    calls = SimpleNamespace(session=dict(_SESSION), reasons=[], stopped=0, built={})
     payload = {
         "structure": {},
         "export": {"plan": {}, "storages": {}},
@@ -1367,30 +1524,20 @@ def loop(client, monkeypatch):
         "load_extra": 7 << 20,
     }
 
-    def probe(me, started, held, key):
-        present, reasons = calls.probes.pop(0)
-        if not present:
-            return None, None, [], client._NONE
-        status = client._UNUSABLE if reasons else client._USABLE
-        return (None if reasons else _Conn()), payload, reasons, status
-
-    def spawn():
-        calls.spawned += 1
-        return {"pid": _NO_PID, "log": "daemon.log"}
+    def probe(me, session, key):
+        return (None if calls.reasons else _Conn()), payload, calls.reasons
 
     def stop(path):
         calls.stopped += 1
 
     for name, fn in {
+        "read_session": lambda: calls.session,
         "_probe": probe,
-        "_wait_together": lambda me, started: False,
+        "_wait_serving": lambda me, session: False,
         # The fake pids must never be signalled.
         "_pid_running": lambda pid, created=None: False,
-        "_spawn_daemon": spawn,
         "stop_daemon": stop,
         "socket_path": lambda device: "/nonexistent/gpu.sock",
-        "_started_by_launch": lambda: None,
-        "launch_recorded": lambda: True,
         "_hold_unused": lambda path: (None, None),
         # What needs the GPU stack: the launch's group, the real build, a key.
         "_rank": lambda config, device, rank: client._Rank(
@@ -1398,8 +1545,6 @@ def loop(client, monkeypatch):
         ),
         "build_model": lambda config, model_class, device: model_class(config),
         "compute_key": lambda config, rank: {"rank": rank},
-        "unsupported": lambda config: [],
-        "uncacheable": lambda key: None,
         "exported_structure": lambda built, export: calls.built,
         "apply_export": lambda model, export, device: 0,
         "apply_process": lambda export, device: 0,
@@ -1413,21 +1558,48 @@ def loop(client, monkeypatch):
     return calls
 
 
-def test_starts_a_daemon_and_maps_it(loop, client):
-    loop.probes = [(False, []), (True, [])]
+def test_a_rank_maps_the_weights_of_the_launchs_daemon(loop, client):
     assert isinstance(_from_cache(client), _Model)
-    assert loop.spawned == 1
+    assert loop.stopped == 0
 
 
-def test_outside_the_api_server_it_loads_from_disk(loop, client, monkeypatch):
-    # No saved launch to start daemons with: any daemon there is left alone.
-    # E.g. a plugin host with ATOM_PRELOAD in its environment, whose config
-    # the launch check could not even read.
-    monkeypatch.setattr(client, "launch_recorded", lambda: False)
-    monkeypatch.setattr(client, "unsupported", lambda c: pytest.fail("read it"))
-    loop.probes = [(True, ["env X: daemon=1 client=2"])]
+def test_a_rank_of_a_launch_without_a_daemon_loads_from_disk(loop, client, monkeypatch):
+    # The launch's main process found none it may use, or there is no such
+    # process: a plugin host with ATOM_PRELOAD in its environment, a TP
+    # worker node (it builds no engine). Any daemon there is left alone, and
+    # the rank leaves before it waits for the others.
+    loop.session = None
+    for name in ("_rank", "_wait_serving", "_probe", "group_agree"):
+        monkeypatch.setattr(client, name, lambda *a: pytest.fail("looked for one"))
     assert _from_cache(client) is None
-    assert loop.stopped == loop.spawned == 0 and len(loop.probes) == 1
+    assert loop.stopped == 0
+
+
+def test_a_rank_gets_its_model_from_the_daemon_or_else_the_checkpoint(
+    loop, client, monkeypatch
+):
+    read = []
+    monkeypatch.setattr(
+        client, "load_weights", lambda model, config: read.append(model) or {"w"}
+    )
+    config = _config()
+    config.load_dummy = False
+
+    def load():
+        return client.build_and_load_model(config, _Model, torch.device("cpu"), rank=0)
+
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+    assert load()[1] is None and not read  # the daemon's
+    # None to use: read from the checkpoint, whose names come back.
+    loop.session = None
+    model, loaded = load()
+    assert read == [model] and loaded == {"w"}
+    # Without ATOM_PRELOAD no daemon is looked for.
+    monkeypatch.delenv("ATOM_PRELOAD")
+    monkeypatch.setattr(client, "read_session", lambda: pytest.fail("looked for one"))
+    assert load()[0] is read[-1]
+    config.load_dummy = True  # no checkpoint is read
+    assert load()[1] is None
 
 
 class _Drafter:
@@ -1437,11 +1609,25 @@ class _Drafter:
     def attach_to_target(self, target, loaded):
         self.attached = (target, loaded)
 
+    def load_model(self, target):
+        self.read = target
+
+
+def test_a_drafter_comes_from_where_its_model_came_from(loop, client, monkeypatch):
+    monkeypatch.setattr(client, "construct_drafter", lambda c, d, r: _Drafter(c))
+    cpu = torch.device("cpu")
+    config = _config()
+    target = _from_cache(client, config)
+    drafter = client.build_and_load_drafter(config, cpu, None, target, rank=0)
+    assert drafter.attached[0] is target and not hasattr(drafter, "read")
+    # A model read from the checkpoint: so is its drafter.
+    drafter = client.build_and_load_drafter(config, cpu, None, target, rank=0)
+    assert drafter.read is target and not hasattr(drafter, "attached")
+
 
 def test_drafter_comes_from_the_daemon_the_model_came_from(loop, client, monkeypatch):
     monkeypatch.setattr(client, "construct_drafter", lambda c, d, r: _Drafter(c))
     cpu = torch.device("cpu")
-    loop.probes = [(True, [])]
     config = _config()
     target = _from_cache(client, config)
     drafter = client.load_drafter_from_cache(config, cpu, None, target, rank=0)
@@ -1449,7 +1635,6 @@ def test_drafter_comes_from_the_daemon_the_model_came_from(loop, client, monkeyp
     # Taken once: a later drafter has nothing to map (a disk load follows).
     assert client.load_drafter_from_cache(config, cpu, None, target, rank=0) is None
     # One built differently loads from disk, after unregistering its meta build.
-    loop.probes = [(True, [])]
     target = _from_cache(client, config)
     loop.built = {"mtp.0": "another layer"}
     del config.compilation_config.static_forward_context["layers.0"]
@@ -1472,7 +1657,6 @@ def test_drafter_modules_left_out_come_from_attaching(loop, client, monkeypatch)
             ["embed.weight"] if made and not hasattr(made[-1], "attached") else []
         ),
     )
-    loop.probes = [(True, [])]
     config = _config()
     target = _from_cache(client, config)
     drafter = client.load_drafter_from_cache(
@@ -1481,12 +1665,18 @@ def test_drafter_modules_left_out_come_from_attaching(loop, client, monkeypatch)
     assert drafter is made[-1] and drafter.attached[0] is target
 
 
-def test_a_daemon_that_vanished_is_not_no_daemon(client, tmp_path):
-    # Its memory may still be in use: a disk load could run out of it.
+def test_a_rank_takes_only_the_daemon_the_launch_found(client, monkeypatch, tmp_path):
     me = client._Rank("TP0", str(tmp_path / "gpu.sock"), None, None)
-    assert client._probe(me, None, False, dict)[3] == client._NONE
-    _, _, reasons, status = client._probe(me, None, True, dict)
-    assert status == client._UNUSABLE and "exited before serving" in reasons[0]
+    session = {**_SESSION, "paths": [me.path]}
+    monkeypatch.setattr(client, "_fetch", lambda me: pytest.fail("took its weights"))
+    # It exited before it served: its memory may still be in use.
+    _, _, reasons = client._probe(me, session, {})
+    assert "exited before serving" in reasons[0]
+    # Another daemon holds the GPU (one an aborted launch left starting).
+    monkeypatch.setattr(client, "daemon_alive", lambda path: True)
+    monkeypatch.setattr(client, "daemon_state", lambda path: {"socket": "/other.sock"})
+    _, _, reasons = client._probe(me, session, {})
+    assert "another daemon holds this GPU" in reasons[0]
 
 
 def test_no_rank_stops_a_daemon_another_rank_must_keep(client, monkeypatch):
@@ -1516,29 +1706,12 @@ def test_a_gpu_no_daemon_had_is_not_waited_for(client, monkeypatch):
     assert time.monotonic() - t0 < 1
 
 
-def test_a_daemon_an_aborted_launch_left_goes_with_ones_own(client, monkeypatch):
-    # It took the GPUs before this launch's own daemon could: both go.
-    stopped, signalled = [], []
-    monkeypatch.setattr(client, "_hold_unused", lambda path: (None, None))
-    monkeypatch.setattr(client, "_stop_and_reclaim", lambda *a: stopped.append(a[0]))
-    monkeypatch.setattr(client, "_pid_running", lambda pid, created=None: True)
-    monkeypatch.setattr(os, "kill", lambda pid, sig: signalled.append((pid, sig)))
-    client._stop_together(
-        client._Rank("TP0", "/x.sock", None, None),
-        [],
-        False,
-        started={"pid": _NO_PID, "log": "l"},
-    )
-    assert stopped == ["/x.sock"] and signalled == [(_NO_PID, signal.SIGTERM)]
-
-
 def test_drafter_that_cannot_attach_loads_from_disk(loop, client, monkeypatch):
     class Broken(_Drafter):
         def attach_to_target(self, target, loaded):
             raise RuntimeError("no such module")
 
     monkeypatch.setattr(client, "construct_drafter", lambda c, d, r: Broken(c))
-    loop.probes = [(True, [])]
     config = _config()
     target = _from_cache(client, config)
     del config.compilation_config.static_forward_context["layers.0"]
@@ -1583,7 +1756,7 @@ def test_a_launch_that_cannot_be_recorded_goes_without_the_cache(
         raise PermissionError("not this user's directory")
 
     monkeypatch.setattr(preload, "socket_dir", taken)
-    preload.record_launch()  # the server starts all the same
+    preload.record_launch("m", {"tp": 2})  # the server starts all the same
     assert not preload.launch_recorded()
 
 
@@ -1601,74 +1774,34 @@ def test_socket_dir_must_be_private(monkeypatch):
         os.rmdir(d)
 
 
-def test_restarts_a_daemon_it_cannot_use_once(loop, client):
-    loop.probes = [(True, ["atom/model_loader/loader.py:load_model"]), (True, [])]
-    assert isinstance(_from_cache(client), _Model)
-    assert loop.stopped == 1 and loop.spawned == 1
-
-
-def test_a_daemon_on_some_gpus_only_is_replaced(loop, client, monkeypatch):
-    # Another rank of the launch finds no daemon on its GPU (another layout).
-    lo = iter([client._NONE])
-    monkeypatch.setattr(client, "group_min", lambda status, group: next(lo, status))
-    loop.probes = [(True, []), (True, [])]
-    assert isinstance(_from_cache(client), _Model)
-    assert loop.stopped == 1 and loop.spawned == 1
-
-
-def test_loads_from_disk_when_its_own_daemon_does_not_fit(loop, client, monkeypatch):
-    monkeypatch.setattr(
-        client, "_started_by_launch", lambda: {"pid": _NO_PID, "log": "d.log"}
-    )
-    loop.probes = [(True, [])]
+def test_a_daemon_whose_weights_do_not_fit_is_stopped_for_a_disk_load(loop, client):
+    # E.g. it loaded under a setting the key does not list. The next launch
+    # finds no daemon and starts its own.
     loop.built = {"layers.0": "another layer"}
     config = _config()
     assert _from_cache(client, config) is None  # a disk load follows
-    assert loop.stopped == 1 and loop.spawned == 0
+    assert loop.stopped == 1
     # The meta-built model is unregistered, so the disk load can build it again.
     assert config.compilation_config.static_forward_context == {"other": 1}
 
 
-def test_another_launchs_daemon_that_does_not_fit_is_replaced(
-    loop, client, monkeypatch
-):
-    # E.g. it loaded under a setting the key does not list.
-    built = iter([{"layers.0": "another layer"}])
-    monkeypatch.setattr(client, "exported_structure", lambda b, e: next(built, {}))
-    loop.probes = [(True, []), (True, [])]
-    assert isinstance(_from_cache(client), _Model)
-    assert loop.stopped == loop.spawned == 1
+def test_a_rank_whose_daemon_is_gone_loads_from_disk(loop, client):
+    # E.g. it found its load uncacheable, recorded that and exited.
+    loop.reasons = ["the weight cache daemon does not hold this GPU"]
+    assert _from_cache(client) is None
+    assert loop.stopped == 1  # nothing left of it holds the GPU
 
 
-def test_loads_from_disk_when_the_model_cannot_be_built_on_meta(
-    loop, client, monkeypatch
-):
+def test_loads_from_disk_when_the_model_cannot_be_built_on_meta(loop, client):
     class Broken(nn.Module):
         def __init__(self, config):
             super().__init__()
             config.compilation_config.static_forward_context["layers.0"] = self
             raise RuntimeError("reads a parameter's value")
 
-    monkeypatch.setattr(
-        client, "_started_by_launch", lambda: {"pid": _NO_PID, "log": "d.log"}
-    )
-    loop.probes = [(True, [])]
     config = _config()
     assert client.load_from_cache(config, Broken, torch.device("cpu"), rank=0) is None
     assert config.compilation_config.static_forward_context == {"other": 1}
-
-
-@pytest.mark.parametrize(
-    "error",
-    [values._Miss("launcher exited with 1"), PermissionError("the launch's marker")],
-)
-def test_loads_from_disk_when_no_daemon_can_start(loop, client, monkeypatch, error):
-    def no_spawn():
-        raise error  # whatever it is: the other ranks wait for this one's word
-
-    monkeypatch.setattr(client, "_spawn_daemon", no_spawn)
-    loop.probes = [(False, [])]
-    assert _from_cache(client) is None
 
 
 def test_drafter_state_that_cannot_be_applied_loads_from_disk(
@@ -1679,7 +1812,6 @@ def test_drafter_state_that_cannot_be_applied_loads_from_disk(
     def broken(export, device):
         raise RuntimeError("a global the daemon's load set cannot be set here")
 
-    loop.probes = [(True, [])]
     config = _config()
     target = _from_cache(client, config)
     monkeypatch.setattr(client, "apply_process", broken)
@@ -1689,7 +1821,6 @@ def test_drafter_state_that_cannot_be_applied_loads_from_disk(
 
 def test_ranks_agree_before_the_drafters_moe_setup(loop, client, monkeypatch):
     monkeypatch.setattr(client, "construct_drafter", lambda c, d, r: _Drafter(c))
-    loop.probes = [(True, [])]
     config = _config()
     target = _from_cache(client, config)
     order = []
@@ -1705,16 +1836,16 @@ def test_ranks_agree_before_the_drafters_moe_setup(loop, client, monkeypatch):
     assert order[at : at + 3] == ["state", "agree", "moe"]
 
 
-def test_leaves_a_daemon_other_servers_use(loop, client, monkeypatch):
+def test_a_rank_leaves_a_daemon_other_servers_use(loop, client, monkeypatch):
     monkeypatch.setattr(
         client,
         "_hold_unused",
         lambda path: (None, "1 other running server(s) use it"),
     )
-    loop.probes = [(True, ["atom/model_loader/loader.py:load_model"])]
+    loop.reasons = ["atom/model_loader/loader.py:load_model"]
     with pytest.raises(RuntimeError, match="other running server"):
         _from_cache(client)
-    assert loop.stopped == loop.spawned == 0
+    assert loop.stopped == 0
 
 
 def test_a_server_that_is_its_containers_init_goes_without_the_cache(
@@ -1722,7 +1853,7 @@ def test_a_server_that_is_its_containers_init_goes_without_the_cache(
 ):
     # Its exit stops the container, and the daemon in it.
     monkeypatch.setattr(os, "getpid", lambda: 1)
-    preload.record_launch()
+    preload.record_launch("m", {"tp": 2})
     assert not preload.launch_recorded()
 
 
@@ -1743,19 +1874,15 @@ def _launch_config(**settings):
     return config
 
 
-def test_a_launch_the_cache_does_not_serve_loads_from_disk(loop, client, monkeypatch):
-    monkeypatch.setattr(client, "unsupported", preload.unsupported)
-    # Not every rank of such a launch comes here (a TP worker node builds no
-    # engine): one that does must leave before it waits for the others.
-    for name in ("_rank", "group_max", "group_min", "group_agree"):
-        monkeypatch.setattr(client, name, lambda *a: pytest.fail("waited"))
-    config = _launch_config(is_multinode_tp=True)
-    assert client.load_from_cache(config, _Model, torch.device("cpu"), rank=0) is None
-    assert loop.spawned == loop.stopped == 0
+def test_a_launch_the_cache_does_not_serve_loads_from_disk(launch, monkeypatch):
+    monkeypatch.setattr(session, "unsupported", preload.unsupported)
+    monkeypatch.setattr(session, "_ranks", lambda c: pytest.fail("looked for one"))
+    session.open_session(_launch_config(is_multinode_tp=True), "m", {})
+    assert "tensor parallelism across nodes" in launch.off[0] and not launch.written
     assert preload.unsupported(_launch_config()) == []
     assert preload.unsupported(_launch_config(eplb_enable=True)) == ["EPLB"]
     both = _launch_config(sequence_parallel_size=2, fake_eplb=True)
-    assert preload.unsupported(both) == ["--fake-eplb", "sequence parallelism"]
+    assert preload.unsupported(both) == ["--fake-eplb"]
 
 
 def test_every_rank_finds_the_same_launch_unsupported():
@@ -1772,13 +1899,49 @@ def test_every_rank_finds_the_same_launch_unsupported():
     assert dp(4, 2, 0) == dp(4, 2, 2) == ["data parallelism across nodes"]
 
 
-def test_streaming_online_quantization_goes_without_the_cache(monkeypatch):
-    # It swaps parameters, which the daemon's diff of the load holds on to.
+def test_streaming_online_quantization_is_served_under_its_own_key(monkeypatch):
+    # It quantizes each rank's shard by itself: other values than without it.
     quant = _launch_config(online_quant_config={"global_quant_config": "ptpc_fp8"})
-    assert preload.unsupported(quant) == []
     monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
-    assert preload.unsupported(quant) == ["streaming online quantization"]
-    assert preload.unsupported(_launch_config()) == []  # nothing to stream
+    assert preload.unsupported(quant) == []
+    assert "ATOM_ONLINE_QUANT_STREAMING" in key._ENV_VARS
+
+
+class Streamed(nn.Module):
+    """A module whose weights are quantized as they arrive."""
+
+    def __init__(self):
+        super().__init__()
+        self._stream_online_quant = True
+        for name, n in (("weight", 4), ("bias", 2)):
+            meta = torch.zeros(n, device="meta")
+            setattr(self, name, nn.Parameter(meta, requires_grad=False))
+
+    def load(self):
+        # As the streamer gives a parameter its memory: no weak reference to
+        # it may be held.
+        new = nn.Parameter(torch.arange(4.0), requires_grad=False)
+        torch.utils.swap_tensors(self.weight, new)
+        self.bias = None
+        self._stream_lock = threading.Lock()
+        self._stream_online_quant = False
+
+
+def test_parameters_swapped_while_loading_travel_as_replaced():
+    _, exp = _export(Streamed(), Streamed.load)
+    assert exp["plan"][""]["params"]["weight"]["replaced"]
+    with weight_utils.params_on_meta():
+        client = Streamed()
+    export.apply_export(client, exp, torch.device("cpu"))
+    assert torch.equal(client.weight, torch.arange(4.0)) and client.bias is None
+    assert not client._stream_online_quant
+
+
+def test_what_streaming_kept_for_the_load_is_not_exported():
+    with atom_without_aiter() as load_module:
+        daemon = load_module("atom.model_loader.weight_cache.daemon")
+        rec = daemon._load_and_export(None, Streamed, Streamed.load)
+    assert rec.export["unshippable"] == [] and not hasattr(rec.model, "_stream_lock")
 
 
 def test_the_daemons_progress_bar_is_read_from_its_log(client, tmp_path):
@@ -1794,13 +1957,13 @@ def test_the_daemons_progress_bar_is_read_from_its_log(client, tmp_path):
 def test_rank_0_draws_the_daemons_bar_while_it_waits(client, monkeypatch, capsys):
     bars = iter(["bar  10%|#  | 1/10 [a]", "bar 100%|###| 10/10 [b]"])
     monkeypatch.setattr(client, "_load_bar", lambda log: next(bars, ""))
-    monkeypatch.setattr(client, "daemon_alive", lambda path: True)  # loading
-    monkeypatch.setattr(client, "daemon_state", lambda path: {"log": "daemon.log"})
-    waits = iter([1, 1, 0])  # two looks at the log, then it serves
-    monkeypatch.setattr(client, "group_max", lambda value, group: next(waits))
+    states = iter(["loading", "loading", "serving"])  # two looks at the log
+    monkeypatch.setattr(client, "daemon_alive", lambda path: True)
+    monkeypatch.setattr(client, "daemon_state", lambda path: {"state": next(states)})
+    monkeypatch.setattr(client, "_pid_running", lambda pid, created=None: True)
     monkeypatch.setattr(time, "sleep", lambda s: None)
     me = client._Rank("TP0", "/nonexistent/gpu.sock", torch.device("cpu"), None)
-    assert client._wait_together(me, None) is True
+    assert client._wait_serving(me, _SESSION) is True
     # As a disk load's own bar: redrawn in place, a new line once it is full.
     assert capsys.readouterr().err == (
         "\r[weight-cache] daemon: bar  10%|#  | 1/10 [a]"
@@ -1809,46 +1972,44 @@ def test_rank_0_draws_the_daemons_bar_while_it_waits(client, monkeypatch, capsys
 
 
 @pytest.mark.parametrize(
-    "started, steps, asked, held",
+    "steps, held",
     [
-        # Another launch's daemon is loading: until its socket is there.
-        (False, ["serves"], [1, 0], True),
-        # This launch's own has yet to take the GPU, then loads.
-        (True, ["takes the GPU", "serves"], [1, 1, 0], True),
-        # ... or exits before it does.
-        (True, ["exits"], [1, 0], False),
-        (False, [], [0], False),  # no daemon: nothing to wait for
+        (["serves"], True),  # the launch found it loading
+        # The one the launch started has yet to take the GPUs, then loads...
+        (["takes the GPUs", "serves"], True),
+        (["exits"], False),  # ... or exits before it does
     ],
 )
-def test_a_rank_waits_while_a_daemon_is_on_its_way_to_serving(
-    client, monkeypatch, tmp_path, started, steps, asked, held
+def test_a_rank_waits_until_the_daemon_holds_every_gpus_weights(
+    client, monkeypatch, tmp_path, steps, held
 ):
-    me = client._Rank("TP0", str(tmp_path / "gpu.sock"), torch.device("cpu"), None)
+    me = client._Rank("TP0", str(tmp_path / "gpu0.sock"), torch.device("cpu"), None)
+    other = str(tmp_path / "gpu1.sock")  # another rank's
     steps = list(steps)
-    # Whether a daemon holds the GPU, and whether this launch's own runs.
-    now = SimpleNamespace(alive=bool(steps) and not started, running=started)
+    # Whether the daemon holds the GPUs, and whether its main process runs.
+    now = SimpleNamespace(alive=steps[0] == "serves", running=True, state="loading")
 
     def step(seconds):  # between two looks
         what = steps.pop(0)
         if what == "serves":
-            pathlib.Path(me.path).touch()
-        elif what == "takes the GPU":
+            now.state = "serving"
+        elif what == "takes the GPUs":
             now.alive = True
         else:
             now.running = False
 
-    waits = []
-    monkeypatch.setattr(client, "daemon_alive", lambda path: now.alive)
-    monkeypatch.setattr(client, "daemon_state", lambda path: None)
-    monkeypatch.setattr(client, "_pid_running", lambda pid, created=None: now.running)
+    looks = []
     monkeypatch.setattr(
-        client, "group_max", lambda value, group: waits.append(value) or value
+        client, "daemon_alive", lambda path: looks.append(path) or now.alive
     )
+    monkeypatch.setattr(client, "daemon_state", lambda path: {"state": now.state})
+    monkeypatch.setattr(client, "_pid_running", lambda pid, created=None: now.running)
     clock = SimpleNamespace(monotonic=time.monotonic, sleep=step)
     monkeypatch.setattr(client, "time", clock)  # this module's only
-    launch = {"pid": _NO_PID, "log": None} if started else None
-    assert client._wait_together(me, launch) is held
-    assert waits == asked
+    session = {**_SESSION, "log": None, "paths": [me.path, other]}
+    assert client._wait_serving(me, session) is held
+    # Every rank waits for all of them (none is held: nothing to wait for).
+    assert not steps and (other in looks) is held
 
 
 def test_a_markov_head_built_ahead_of_its_weights_arms_lossless_sampling(monkeypatch):
@@ -1907,7 +2068,7 @@ def test_a_daemon_whose_load_cannot_be_shared_records_it_and_exits(
     why = ["layers.0.workspace: a dataclass with __slots__"]
 
     def get_model(config, device, load):
-        load.key = key
+        load.key = {"rank": 0, "checkpoint": "c", "quant": "as the rank has it"}
         load.rec = SimpleNamespace(export={"unshippable": why}, process={})
 
     with atom_without_aiter() as load:
@@ -1916,45 +2077,436 @@ def test_a_daemon_whose_load_cannot_be_shared_records_it_and_exits(
         monkeypatch.setattr(daemon, "worker_process_name", lambda config, rank: "TP0")
         with pytest.raises(SystemExit) as exit_:
             daemon._load_and_serve(
-                SimpleNamespace(), 0, torch.device("cpu"), "/x.sock", None, 0.0
+                SimpleNamespace(), 0, torch.device("cpu"), None, None, 0.0, key
             )
     # By design, so the daemon's main process reports no failure (run_daemon).
     assert exit_.value.code == 0
+    # Under the key a launch's main process has for that rank: it looks there.
     assert preload.uncacheable(key) == why
 
 
-def test_a_load_a_daemon_found_uncacheable_starts_no_daemon(loop, client, monkeypatch):
-    why = ["layers.0.workspace: a dataclass with __slots__"]
-    monkeypatch.setattr(client, "uncacheable", lambda key: why)
-    loop.probes = [(False, [])]
-    assert _from_cache(client) is None  # a disk load, at once
-    assert loop.spawned == loop.stopped == 0
-    # A daemon of another launch on these GPUs is stopped for the disk load.
-    loop.probes = [(True, ["options.moe_backend: daemon=standard client=mega"])]
-    assert _from_cache(client) is None
-    assert loop.spawned == 0 and loop.stopped == 1
+# --------------------------------------------------------------------------
+# A launch's decisions, in its main process (the daemon-facing calls replaced)
+# --------------------------------------------------------------------------
+
+_GPUS = ["/x/gpu0.sock", "/x/gpu1.sock"]
+_STATE = {"daemon_pid": 7, "socket": "/x/daemon_7.sock", "log": "d.log", "bytes": 4}
 
 
-def test_the_launch_whose_daemon_found_its_load_uncacheable_loads_from_disk(
-    loop, client, monkeypatch
-):
-    monkeypatch.setattr(
-        client, "_started_by_launch", lambda: {"pid": _NO_PID, "log": "d.log"}
+@pytest.fixture
+def launch(monkeypatch):
+    """A two-rank launch's main process with the daemons replaced: ``held``
+    maps the GPUs a daemon holds to its state, ``unfit`` is why that daemon
+    does not serve the launch, ``in_use`` why it must not be stopped,
+    ``marks`` the loads found uncacheable, by rank."""
+    calls = SimpleNamespace(
+        held={}, unfit=[], in_use=None, marks={}, spawned=0, stopped=[], off=[]
     )
-    monkeypatch.setattr(client, "uncacheable", lambda key: ["model.lock: a lock"])
-    loop.probes = [(True, ["the daemon on this GPU exited before serving"])]
-    assert _from_cache(client) is None
-    assert loop.stopped == 1 and loop.spawned == 0
+    calls.written = []
+    ranks = [
+        session._Rank(f"TP{i}", _GPUS[i], f"gpu{i}|0000:0{i}:00", {"rank": i})
+        for i in range(2)
+    ]
+
+    def spawn():
+        calls.spawned += 1
+        return {"pid": _NO_PID, "log": "daemon.log", "created": 1.0}
+
+    for name, fn in {
+        "record_launch": lambda model, kwargs: None,
+        "launch_recorded": lambda: True,
+        "unsupported": lambda config: [],
+        "_ranks": lambda config: ranks,
+        "daemon_alive": lambda path: path in calls.held,
+        "daemon_state": lambda path: calls.held.get(path),
+        "_attach": lambda sock, ranks: calls.unfit,
+        "_hold_unused": lambda path: (None, calls.in_use),
+        "stop_daemon": lambda path: calls.stopped.append(path) or 7,
+        "vram_used": lambda gpu: None,
+        "uncacheable": lambda key: calls.marks.get(key["rank"]),
+        "_spawn_daemon": spawn,
+        "daemon_socket": lambda pid: f"/x/daemon_{pid}.sock",
+        "write_session": calls.written.append,
+        "_off": calls.off.append,
+    }.items():
+        monkeypatch.setattr(session, name, fn)
+    return calls
 
 
-def test_a_load_another_rank_found_uncacheable_starts_no_daemon_here(
-    loop, client, monkeypatch
+def test_a_launch_with_no_daemon_on_its_gpus_starts_one(launch):
+    session.open_session(None, "m", {})
+    (found,) = launch.written
+    assert launch.spawned == 1 and not launch.stopped and not launch.off
+    assert found["started"] and found["paths"] == _GPUS
+    assert (found["pid"], found["socket"]) == (_NO_PID, f"/x/daemon_{_NO_PID}.sock")
+
+
+def test_a_launch_uses_the_daemon_that_serves_it(launch):
+    launch.held = dict.fromkeys(_GPUS, _STATE)
+    session.open_session(None, "m", {})
+    assert launch.written == [
+        {"socket": "/x/daemon_7.sock", "pid": 7, "log": "d.log", "paths": _GPUS}
+    ]
+    assert launch.spawned == 0 and not launch.stopped
+
+
+def test_a_daemon_that_does_not_serve_the_launch_is_replaced(launch, monkeypatch):
+    launch.held = dict.fromkeys(_GPUS, _STATE)
+    launch.unfit = ["env X: daemon=1 client=2"]
+    session.open_session(None, "m", {})
+    assert launch.stopped == _GPUS and launch.spawned == 1
+    assert launch.written[0]["started"]
+    # One of another layout holds only some of the GPUs: not even asked.
+    launch.held, launch.stopped = {_GPUS[0]: _STATE}, []
+    monkeypatch.setattr(session, "_attach", lambda *a: pytest.fail("asked it"))
+    session.open_session(None, "m", {})
+    assert launch.stopped == _GPUS[:1] and launch.spawned == 2
+
+
+def test_a_launch_fails_when_the_daemon_to_replace_is_in_use(launch):
+    launch.held = dict.fromkeys(_GPUS, _STATE)
+    launch.unfit = ["atom/model_loader/loader.py:load_model"]
+    launch.in_use = "1 other running server(s) use it"
+    with pytest.raises(RuntimeError, match="other running server"):
+        session.open_session(None, "m", {})
+    assert not launch.stopped and launch.spawned == 0 and not launch.written
+
+
+@pytest.mark.parametrize(
+    "error",
+    [values._Miss("launcher exited with 1"), PermissionError("the launch's marker")],
+)
+def test_a_launch_loads_from_disk_when_no_daemon_can_start(launch, monkeypatch, error):
+    def no_spawn():
+        raise error
+
+    monkeypatch.setattr(session, "_spawn_daemon", no_spawn)
+    session.open_session(None, "m", {})  # the server starts all the same
+    assert not launch.written and len(launch.off) == 1
+
+
+def test_a_daemon_whose_start_cannot_be_told_to_the_ranks_is_stopped(
+    launch, monkeypatch
 ):
-    # Only the rank whose load left the state has the record; all go by it.
-    monkeypatch.setattr(client, "group_max", lambda value, group: 1)
-    me = client._Rank("TP0", "/nonexistent/gpu.sock", torch.device("cpu"), None)
-    assert client._replace_daemon(me, [], False, None, None, False, {}) is None
-    assert loop.spawned == 0
+    def no_space(found):
+        raise OSError(28, "No space left on device")
+
+    signalled = []
+    monkeypatch.setattr(session, "write_session", no_space)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+    session.open_session(None, "m", {})
+    # The ranks go on to a disk load: not beside a daemon that loads too.
+    assert signalled == [(_NO_PID, signal.SIGTERM)] and len(launch.off) == 1
+    # One the launch only found is left to those it serves.
+    launch.held, signalled[:] = dict.fromkeys(_GPUS, _STATE), []
+    session.open_session(None, "m", {})
+    assert not signalled and len(launch.off) == 2
+
+
+def test_a_load_a_daemon_found_uncacheable_starts_no_daemon(launch):
+    # Whichever rank's load left the state: the launch's main has every key.
+    launch.marks = {1: ["layers.0.workspace: a dataclass with __slots__"]}
+    session.open_session(None, "m", {})  # a disk load, at once
+    assert launch.spawned == 0 and not launch.stopped and not launch.written
+    assert "cannot share" in launch.off[0] and "layers.0.workspace" in launch.off[0]
+    # A daemon of another launch on these GPUs is stopped for the disk load.
+    launch.held = dict.fromkeys(_GPUS, _STATE)
+    launch.unfit = ["options.moe_backend: daemon=standard client=mega"]
+    session.open_session(None, "m", {})
+    assert launch.spawned == 0 and launch.stopped == _GPUS and not launch.written
+
+
+def test_outside_a_recorded_launch_no_daemon_is_looked_for(launch, monkeypatch):
+    # E.g. a server that is its container's PID 1.
+    monkeypatch.setattr(session, "launch_recorded", lambda: False)
+    monkeypatch.setattr(session, "unsupported", lambda c: pytest.fail("read it"))
+    session.open_session(None, "m", {})
+    assert not launch.written and not launch.off
+
+
+def test_a_launchs_main_process_stays_connected_to_its_daemon(cache_dir, monkeypatch):
+    d = _Daemon("ctl", {"gpu_a": ({"key": "a"}, {}), "gpu_b": ({"key": "b"}, {})})
+    ranks = [
+        session._Rank(f"TP{i}", path, f"gpu{i}|0000:0{i}:00", {"rank": i})
+        for i, path in enumerate(d.paths.values())
+    ]
+    for r in ranks:
+        d.server.keys[os.path.basename(r.path)] = r.key
+    monkeypatch.setenv(preload._LAUNCH_ENV, "1_1.0")
+    monkeypatch.setattr(session, "_control", None)
+    try:
+        # Its ranks are still taking their GPUs: asked again until they have.
+        d.server.ranks = 3
+        monkeypatch.setattr(
+            session.time, "sleep", lambda s: setattr(d.server, "ranks", 2)
+        )
+        assert session._attach(d.socket, ranks) == []
+        assert d.server.users == {"1_1.0": 1}  # in use, before any rank maps
+        session._control.close()
+        _wait_for(lambda: not d.server._users(), 5)
+        # Another checkpoint: why, and no connection is kept.
+        other = [ranks[0], ranks[1]._replace(key={"rank": 7})]
+        assert session._attach(d.socket, other) == ["rank: daemon=1 client=7"]
+        assert not d.server._users()
+    finally:
+        d.close()
+    assert "does not answer" in session._attach(d.socket, ranks)[0]  # it has gone
+
+
+# --------------------------------------------------------------------------
+# stop and load: the weights a daemon holds, and the servers that have them
+# --------------------------------------------------------------------------
+
+
+def test_a_daemon_rank_serves_what_a_load_wrote_into_its_storages():
+    held = torch.full((4,), 1, dtype=torch.uint8)
+    holder = transport._Holder(None, {"key": "a"}, {1: held}, "TP0")
+    holder.poisoned = [1]  # as `writing` leaves them: a load is writing there
+    held.fill_(2)
+    assert not holder._hand_out()[0]  # nobody gets them half written
+    assert holder._filled("b", "/b") == []
+    handed_out, payload = holder._hand_out()  # as they are now, under its key
+    assert handed_out and pickle.loads(payload) == {"key": "b"}
+
+
+def test_stop_and_load_reach_the_servers_that_have_the_weights(cache_dir, monkeypatch):
+    d = _Daemon("sl", {"gpu_a": ({"key": "a"}, {})})
+    gpu = os.path.basename(d.path)
+    rank = session._Rank("TP0", d.path, "gpu0|0000:00:00", {"rank": 0})
+    d.server.keys[gpu] = rank.key
+    monkeypatch.setenv(preload._LAUNCH_ENV, "1_1.0")
+    monkeypatch.setattr(session, "_control", None)
+    found = {"socket": d.socket, "paths": [d.path]}
+    monkeypatch.setattr(session, "read_session", lambda: found)
+    # A launch that has no daemon's weights has none to change.
+    assert "ATOM_PRELOAD" in session.change_weights("stop")[0]
+    assert session.weights_status() is None
+    told = []
+
+    def stop(rewrite):
+        told.append(("stop", rewrite))
+        if rewrite:
+            raise RuntimeError("mono kernels keep copies")
+
+    try:
+        assert session._attach(d.socket, [rank]) == []
+        # Its servers do not serve yet: they cannot be told, so nothing stops.
+        assert "still starting" in d.server.stop()[0] and not d.server.stopped
+        session.serve_notices(stop, lambda changed: told.append(("use", changed)))
+        # Asked once whether it could go on with other weights.
+        assert told == [("stop", True), ("use", False)]
+        _wait_for(lambda: d.server.cannot_stop(rewrite=True), 5)
+        assert "mono kernels" in d.server.cannot_stop(rewrite=True)[0]
+        assert d.server.stop() == [] and told[-1] == ("stop", False)
+        # Stopped: no server gets them, and `status` says so.
+        conn, reply = d.get()
+        assert "stopped" in reply["error"]
+        conn.close()
+        assert transport._ping(d.path)["stopped"]
+        assert d.server.resume(changed=True, keys={gpu: {"rank": 9}}) == []
+        assert told[-1] == ("use", True) and d.server.keys[gpu] == {"rank": 9}
+        conn, reply = d.get()
+        assert reply["key"] == "a"
+        conn.close()
+        # `load` is the daemon's to do; why it did not goes to whoever asked.
+        d.server.load = lambda model: [f"no room for {model}"]
+        conn, reply = d.ask(cmd="load", model="/b")
+        assert reply == {"why": ["no room for /b"], "servers": 1}
+        conn.close()
+        # A server asks for its launch (the API server's /model_weight routes).
+        assert session.change_weights("load", "/b") == ["no room for /b"]
+        assert session.change_weights("stop") == [] and told[-1] == ("stop", False)
+        # No rank of a server has this GPU's weights mapped here.
+        assert session.weights_status() == {
+            "model_path": None,
+            "stopped": True,
+            "servers": 0,
+            "daemon_pid": None,
+        }
+    finally:
+        session._control.close()
+        d.close()
+
+
+def _held_plan(model):
+    """How a daemon would hold ``model`` on a device: (the plan of its
+    parameters, the tensors they are held in by storage)."""
+    plan, held = {}, {}
+    for path, mod in model.named_modules():
+        params = {}
+        for k, p in mod._parameters.items():
+            held[len(held) + 1] = p.detach().clone()
+            params[k] = {
+                "storage": len(held),
+                "offset": 0,
+                "shape": tuple(p.shape),
+                "stride": tuple(p.stride()),
+                "dtype": p.dtype,
+                "grad": False,
+                "replaced": False,
+                "pattrs": {},
+            }
+        if params:
+            plan[path] = {"params": params, "buffers": {}, "attrs": {}, "delete": []}
+    return plan, held
+
+
+def test_a_load_is_written_where_a_daemon_holds_the_model():
+    plan, held = _held_plan(nn.Linear(2, 2))
+
+    def make(meta):
+        return held[meta["storage"]]
+
+    model = nn.Linear(2, 2)  # another checkpoint's values
+    weight = model.weight.detach().clone()
+    assert export.refill(model, plan, make) == 6 * 4
+    assert torch.equal(held[1], weight)
+    export.install(model, plan, make)
+    assert model.weight.data_ptr() == held[1].data_ptr()  # the model holds it now
+    assert export.refill(model, plan, make) == 6 * 4  # nothing to copy: it is there
+    # A load that leaves anything but other values is refused, saying where.
+    with pytest.raises(ValueError, match="weight.*held as"):
+        export.refill(nn.Linear(3, 2), plan, make)
+    plan[""]["attrs"]["scale"] = ("V", 2.0)
+    model.scale = 3.0
+    with pytest.raises(ValueError, match="scale"):
+        export.refill(model, plan, make)
+
+
+class _Layered(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Parameter(torch.zeros(4))
+        self.layers = nn.ModuleList(nn.Linear(2, 2) for _ in range(3))
+        self.head = nn.Linear(2, 2)
+
+
+def test_a_checkpoint_loads_into_held_weights_a_group_at_a_time(monkeypatch):
+    with atom_without_aiter() as load:
+        daemon = load("atom.model_loader.weight_cache.daemon")
+    monkeypatch.setattr(daemon, "_GROUP_BYTES", 1)
+    served = _Layered()
+    # As its processing leaves it: held in another form than it is built in.
+    served.layers[2].weight = nn.Parameter(served.layers[2].weight.half())
+    plan, held = _held_plan(served)
+    with weight_utils.params_on_meta():
+        model = _Layered()
+    groups = daemon._Groups(
+        model, plan, lambda meta: held[meta["storage"]], torch.device("cpu")
+    )
+    assert groups.order() == ["", "layers.0", "layers.1", "layers.2"]
+    assert groups.of("layers.1.weight") == "layers.1" and groups.of("head.bias") == ""
+    # The modules before the first group go with the rest; `head` is after.
+    assert [name for name, _ in groups.modules("")] == ["", "layers"]
+    assert [name for name, _ in groups.modules("layers.1")] == ["layers.1"]
+    # Only that weight takes memory of its own while its group loads.
+    assert groups.own_bytes("layers.2") == 16 and groups.own_bytes("layers.0") == 0
+    for value, group in enumerate(groups.order()):
+        groups.begin(group)
+        for _, _, p, _ in groups.params[group]:
+            p.data.fill_(float(value))  # the loader writes it
+        if group == "layers.0":
+            # Loaded where the daemon holds it, and nothing after it is loaded.
+            assert model.layers[0].weight.data_ptr() == held[2].data_ptr()
+            assert model.layers[1].weight.is_meta
+        if group == "layers.2":
+            layer = model.layers[2]
+            layer.weight = nn.Parameter(layer.weight.half())  # its processing
+        groups.end(group)
+    groups.write("")
+    assert export._leftover_meta(model) == []
+    by_group = {1: 0, 2: 1, 3: 1, 4: 2, 5: 2, 6: 3, 7: 3, 8: 0, 9: 0}
+    for storage, value in by_group.items():
+        assert held[storage].eq(value).all(), storage
+    assert held[6].dtype == torch.float16 and model.layers[2].weight is not None
+    assert model.layers[2].weight.data_ptr() == held[6].data_ptr()
+
+
+def test_the_loader_loads_a_group_of_parameters_at_a_time():
+    from atom.model_loader.loading_core import load_weights_into_model
+
+    model = nn.ModuleList(nn.Linear(2, 2) for _ in range(2))
+    for p in model.parameters():
+        p.data.zero_()
+    # A checkpoint's tensors are not grouped by layer.
+    names = ["0.weight", "1.weight", "1.bias", "0.bias"]
+    shard = {
+        n: torch.full_like(model.get_parameter(n), 1.0 + i) for i, n in enumerate(names)
+    }
+    seen = []
+
+    def weights(path, disable_mmap, wants):
+        yield from ((n, t) for n, t in shard.items() if wants(n))
+
+    def groups():
+        for layer in ("1.", "0."):
+            # Asked for right before its tensors are read.
+            seen.append([float(p.detach().sum()) for p in model.parameters()])
+            yield (lambda name, layer=layer: name.startswith(layer)), lambda: None
+
+    load_weights_into_model(
+        model=model,
+        model_name_or_path="<synthetic>",
+        hf_config=SimpleNamespace(num_hidden_layers=2),
+        default_weight_loader=lambda param, w: param.data.copy_(w),
+        fuse_shared_expert=lambda *a: False,
+        is_rank0=lambda: True,
+        weights_iterator=weights,
+        groups=groups(),
+    )
+    # Layer 1 was whole before anything of layer 0 was read.
+    assert seen == [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 8.0, 6.0]]
+    assert [float(p.detach().sum()) for p in model.parameters()] == [4.0, 8.0, 8.0, 6.0]
+
+
+def test_stopped_weights_no_server_has_are_not_kept(one_gpu_daemon):
+    d = one_gpu_daemon()
+    idle, all_serving = threading.Event(), threading.Event()
+    all_serving.set()
+    d.server.watch_idle(8, idle.set, all_serving)
+    d.server.stopped = True
+    assert idle.wait(5)  # well before the idle timeout
+
+
+def test_the_command_line_does_not_change_weights(cache_dir):
+    # A server's /model_weight routes do; `daemon` is how a launch starts one.
+    for argv in (["load", "/b"], ["stop", "/b"], ["daemon"]):
+        with pytest.raises(SystemExit):
+            cli.main(argv)
+
+
+def test_what_a_launch_decided_reaches_its_ranks(cache_dir, monkeypatch):
+    assert preload.read_session() is None  # no launch: a disk load
+    preload.record_launch("m", {"tp": 2})
+    assert preload.launch_recorded() and preload.read_session() is None
+    found = {"socket": "/x/daemon_7.sock", "pid": 7, "log": None, "paths": _GPUS}
+    preload.write_session(found)
+    assert preload.read_session() == found
+    # A launch that goes without the cache after all: its ranks find none.
+    preload._off("the weight cache does not support EPLB")
+    assert preload.read_session() is None
+
+
+def test_gpus_are_asked_of_another_process():
+    # Not this one: a launch's main process initializes no GPU runtime.
+    assert len(preload.gpu_identities()) == torch.cuda.device_count()
+    assert preload.vram_used("GPU-none|ffff:ff:1f") is None  # no such device
+
+
+def test_a_stopped_daemons_memory_is_waited_for(launch, monkeypatch):
+    # The driver frees it after the process has gone.
+    used = iter([10, 10, 9, 5, 1])
+    monkeypatch.setattr(session, "vram_used", lambda gpu: next(used, 1))
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    rank = session._Rank("TP0", _GPUS[0], "gpu0|0000:00:00", {})
+    session._stop_and_reclaim(rank, 8)
+    assert next(used, None) is None  # until it held 0.9 x 8 less
+    # No daemon held the GPU: nothing to wait for.
+    looks = []
+    monkeypatch.setattr(session, "stop_daemon", lambda path: None)
+    monkeypatch.setattr(session, "vram_used", lambda gpu: looks.append(gpu) or 10)
+    session._stop_and_reclaim(rank, 8)
+    assert len(looks) == 1
 
 
 def test_a_daemon_that_exits_by_itself_while_it_is_stopped_is_gone(monkeypatch):
@@ -1977,8 +2529,11 @@ def test_a_daemon_that_exits_by_itself_while_it_is_stopped_is_gone(monkeypatch):
 
 def test_a_daemon_that_exits_while_asked_who_uses_it_is_gone(cache_dir, monkeypatch):
     path = os.path.join(transport.socket_dir(), "gpu_exit.sock")
+    main = os.path.join(transport.socket_dir(), "daemon_exit.sock")
+    with open(path + ".state", "w") as f:
+        json.dump({"socket": main}, f)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(path)
+    listener.bind(main)
     listener.listen(2)
 
     def hung_up(sock):
@@ -1997,6 +2552,5 @@ def test_a_daemon_that_exits_while_asked_who_uses_it_is_gone(cache_dir, monkeypa
 def test_a_server_learns_what_its_daemon_holds_beside_the_weights(loop, client):
     # For the KV budget, which counts only the weights, as a disk load would.
     assert client.daemon_load_extra() == 0
-    loop.probes = [(True, [])]
     assert isinstance(_from_cache(client), _Model)
     assert client.daemon_load_extra() == 7 << 20

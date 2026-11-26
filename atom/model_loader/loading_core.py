@@ -124,8 +124,15 @@ def load_weights_into_model(
     is_rank0: Callable[[], bool],
     weights_iterator: Callable[..., Iterable[tuple[str, torch.Tensor]]],
     online_quant_streamer: "OnlineQuantStreamer | None" = None,
+    groups: Iterable[tuple[Callable[[str], bool], Callable[[], None]]] | None = None,
 ) -> set[str]:
     """Copy every checkpoint tensor into the model parameter it belongs to.
+
+    ``groups`` loads a group of parameters at a time instead: each item is
+    ``(takes, loaded)``, where ``takes(name)`` says whether a tensor (by its
+    name in the model) is the group's, and ``loaded()`` is called once all of
+    them are written. The iterable is advanced right before a group is read,
+    so a generator can ready its parameters there.
 
     The four keyword-only callables are the host environment this module
     refuses to import itself:
@@ -305,8 +312,11 @@ def load_weights_into_model(
     num_tensors = 0
     t_read = t_drain = t_quant_drain = t_flush = 0.0
 
-    try:
-        disable_mmap = envs.ATOM_DISABLE_MMAP
+    disable_mmap = envs.ATOM_DISABLE_MMAP
+
+    def _load(wants) -> None:
+        """Write the wanted checkpoint tensors, and wait until they are."""
+        nonlocal num_tensors, t_read, t_drain, t_quant_drain, t_flush
         # Reject by name before the tensor is materialized. A drafter load reads
         # the whole target checkpoint to pick out the MTP block, so most shards
         # can be skipped without being read at all. Under `--load_dummy` nothing
@@ -316,7 +326,7 @@ def load_weights_into_model(
         for name, weight_tensor in weights_iterator(
             model_name_or_path,
             disable_mmap,
-            (lambda _: False) if load_dummy else _wanted,
+            (lambda _: False) if load_dummy else wants,
         ):
             if load_dummy:
                 continue
@@ -328,24 +338,21 @@ def load_weights_into_model(
                 continue
             dispatcher.dispatch(_orig_ckpt_name, name, weight_tensor)
             num_tensors += 1
-        t_read = time.perf_counter() - _t0
+        t_read += time.perf_counter() - _t0
 
         _t0 = time.perf_counter()
         if executor is not None:
             # Drain all tasks (surfacing errors) before the safety flush.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
-        t_drain = time.perf_counter() - _t0
+            futures.clear()
+        t_drain += time.perf_counter() - _t0
 
         # Measure the non-overlapped streaming tail.
         if online_quant_streamer is not None:
             _t0 = time.perf_counter()
             online_quant_streamer.drain()
-            t_quant_drain = time.perf_counter() - _t0
-
-        loaded_weights_record = dispatcher.loaded_weights_record
-        dropped_ckpt_keys = dispatcher.dropped_ckpt_keys
-        dtype_mismatches = dispatcher.dtype_mismatches
+            t_quant_drain += time.perf_counter() - _t0
 
         # Whatever the pool still holds is written back here; anything short of
         # its expected region count means the checkpoint never delivered some
@@ -354,7 +361,7 @@ def load_weights_into_model(
         # at all -- so report it while the (slot, shard) detail is still around.
         _t0 = time.perf_counter()
         staging_report = staging_pool.flush_pending()
-        t_flush = time.perf_counter() - _t0
+        t_flush += time.perf_counter() - _t0
         if staging_report.incomplete:
             detail = "\n  ".join(staging_report.incomplete)
             message = (
@@ -368,6 +375,17 @@ def load_weights_into_model(
                     "anyway, leaving those expert slots at their init values."
                 )
             logger.warning("%s\nLoading anyway (strict coverage disabled).", message)
+
+    try:
+        if groups is None:
+            _load(_wanted)
+        else:
+            for takes, loaded in groups:
+                _load(lambda n, takes=takes: _wanted(n) and takes(rewritten[n]))
+                loaded()
+        loaded_weights_record = dispatcher.loaded_weights_record
+        dropped_ckpt_keys = dispatcher.dropped_ckpt_keys
+        dtype_mismatches = dispatcher.dtype_mismatches
     finally:
         if executor is not None:
             executor.shutdown(wait=True)

@@ -5,20 +5,24 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import contextlib
 import glob
 import hashlib
 import json
 import os
+import pickle
 import signal
-import socket
 import subprocess
 import sys
 import time
 
 import psutil
 
+from atom.model_loader.weight_cache.key import _ENV_VARS
 from atom.model_loader.weight_cache.transport import (
+    PROTOCOL,
+    _connect,
     _recv,
     _send,
     daemon_alive,
@@ -28,12 +32,12 @@ from atom.model_loader.weight_cache.transport import (
 from atom.model_loader.weight_cache.values import _TAG, _Miss, logger
 from atom.utils import envs
 
-# Set by the API server for its processes (record_launch): the launch's name.
+# Set by a launch's main process for its others (record_launch): its name.
 _LAUNCH_ENV = "ATOM_PRELOAD_LAUNCH"
 # Starts the daemon in a new session and exits at once, so the daemon is no
 # server's descendant: a server's shutdown kills its whole process tree, and a
 # terminal's Ctrl-C signals its whole process group.
-# It runs on the CPUs the API server had: a runner that starts it is bound to
+# It runs on the CPUs the launch had: a runner that starts it is bound to
 # its own GPU's NUMA node.
 _DETACH = (
     "import os, subprocess, sys\n"
@@ -97,30 +101,107 @@ def _prune_logs(d: str, keep: int = 9) -> None:
     _remove(*[p for _, p in sorted(logs)[:-keep]])
 
 
+def prune_sockets() -> None:
+    """Remove the sockets of daemons that are gone: one that was killed
+    leaves its own."""
+    for p in glob.glob(os.path.join(socket_dir(), "daemon_*.sock")):
+        with contextlib.suppress(ValueError):
+            if not _pid_running(int(os.path.basename(p)[7:-5])):
+                _remove(p)
+
+
 def _launch_file() -> str | None:
-    """Where this launch's API server saved its command line, if it did."""
+    """Where this launch's main process recorded it, if it did."""
     launch = envs.ATOM_PRELOAD_LAUNCH
     return os.path.join(socket_dir(), f"launch_{launch}.json") if launch else None
+
+
+def launch_ranks(config) -> list[tuple]:
+    """(rank, its engine's Config) of every rank process a launch runs on
+    this node, in the order CoreManager lays them out. Rewrites ``config``
+    as that does (DP attention): give it a copy to keep."""
+    from atom.model_engine.engine_core_mgr import engine_config, layout_engines
+
+    engines = layout_engines(config)
+    span = config.tp_world_size * config.pcp_group_size
+    stages = range(config.pipeline_parallel_size)
+    return [
+        (rank, engine_config(config, dp, local, pp))
+        for dp, local in engines
+        for pp in stages
+        for rank in range(span)
+    ]
+
+
+# Asked of a process of its own: a GPU runtime in a launch's main process
+# would hold device memory on its first GPU for good.
+_PROBE = (
+    "import json, torch\n"
+    "from atom.model_loader.weight_cache.transport import gpu_identity\n"
+    "n = torch.cuda.device_count()\n"
+    "print(json.dumps([gpu_identity(torch.device('cuda', i)) for i in range(n)]))\n"
+)
+
+
+def gpu_identities() -> list[str]:
+    """gpu_identity of the GPUs this process's children see, by index."""
+    out = subprocess.run(
+        [sys.executable, "-c", _PROBE],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(f"no GPU could be asked: {out.stderr.strip()[-500:]}")
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def vram_used(identity: str) -> int | None:
+    """Device memory in use on a GPU, as the kernel counts it (no GPU
+    runtime needed); None: it does not say."""
+    pci = identity.rsplit("|", 1)[-1]
+    try:
+        with open(f"/sys/bus/pci/devices/{pci}.0/mem_info_vram_used") as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+def write_session(session: dict) -> None:
+    """What the launch's main process decided, for its rank processes."""
+    path = _launch_file() + ".session"
+    with open(path + ".tmp", "w") as f:
+        json.dump(session, f)
+    os.replace(path + ".tmp", path)
+
+
+def read_session() -> dict | None:
+    """The daemon this launch's main process found or started for it and the
+    GPUs it serves; None: the launch loads from disk."""
+    launch = _launch_file()
+    if launch is None:
+        return None
+    try:
+        with open(launch + ".session") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 def unsupported(config) -> list[str]:
     """What in a launch the cache does not serve. Servers map the daemon's
     weights: nothing may write them in place (EPLB, RLHF updates, RapidServe's
-    own sharing), and a daemon serves the GPUs of its own node. A daemon has no
-    device communicators (sequence parallelism builds on them), a server
-    builds without its weights (--fake-eplb makes a tensor from one), and
-    streaming online quantization swaps parameters the daemon's diff holds.
+    own sharing), and a daemon serves the GPUs of its own node. A server
+    builds without its weights (--fake-eplb makes a tensor from one).
     Every rank of a launch gets the same answer, on every node."""
     default_runner = "atom.model_engine.model_runner.ModelRunner"
-    streams = envs.ATOM_ONLINE_QUANT_STREAMING and config.online_quant_config
     pc = config.parallel_config
     checks = (
         (config.runner_qualname, config.runner_qualname != default_runner),
         ("EPLB", config.eplb_enable),
         ("--fake-eplb", config.fake_eplb),
-        ("streaming online quantization", bool(streams)),
-        ("pipeline parallelism", config.pipeline_parallel_size > 1),
-        ("sequence parallelism", config.sequence_parallel_size > 1),
         # Not is_multinode_dp, which is also true of a worker's own rank > 0.
         (
             "data parallelism across nodes",
@@ -129,6 +210,23 @@ def unsupported(config) -> list[str]:
         ("tensor parallelism across nodes", config.is_multinode_tp),
     )
     return [name for name, used in checks if used]
+
+
+class _InUse(RuntimeError):
+    """The daemon on a launch's GPUs can neither be used nor be stopped."""
+
+
+def _detail(reasons: list[str]) -> str:
+    return "\n  ".join(reasons[:25]) or "another rank cannot (see its log)"
+
+
+def _fail(label: str, reasons: list[str], pid=None) -> _InUse:
+    return _InUse(
+        f"{_TAG} {label}: ATOM_PRELOAD cannot use or replace the weight cache daemon"
+        f"{f' (pid {pid})' if pid else ''}: {_detail(reasons)}\nFix the cause above, or launch "
+        "without ATOM_PRELOAD once the daemon is gone (python -m "
+        "atom.model_loader.weight_cache stop; --force stops one that servers use)."
+    )
 
 
 def _off(why: str) -> None:
@@ -140,10 +238,26 @@ def _off(why: str) -> None:
     )
 
 
-def record_launch() -> None:
-    """Called by the API server (ATOM_PRELOAD=1) before it starts any
-    process: name the launch for them, and save its command line and
-    environment, to start a daemon with."""
+class _Engine:
+    """A launch's engine arguments, as `run_daemon` takes an API server's."""
+
+    def __init__(self, model: str, kwargs: dict):
+        self.model, self.kwargs = model, kwargs
+
+    def _get_engine_kwargs(self) -> dict:
+        return dict(self.kwargs)
+
+
+def launch_engine(path: str) -> _Engine:
+    """The engine arguments of the launch recorded at ``path``."""
+    with open(path) as f:
+        return _Engine(*pickle.loads(base64.b64decode(json.load(f)["engine"])))
+
+
+def record_launch(model: str, kwargs: dict) -> None:
+    """Called by a launch's main process (ATOM_PRELOAD=1) before it starts
+    any process: name the launch for them, and save its engine's arguments
+    (LLMEngine's) and its environment, to start a daemon with."""
     if os.getpid() == 1:
         # Its exit stops the container, and the daemon in it.
         _off(
@@ -153,73 +267,51 @@ def record_launch() -> None:
         )
         return
     try:
-        _record_launch()
-    except OSError as e:
-        _off(str(e))
+        _record_launch(model, kwargs)
+    except Exception as e:  # noqa: BLE001 - the launch runs all the same
+        _off(f"its launch cannot be recorded ({e!r})")
 
 
-def _record_launch() -> None:
+def _record_launch(model: str, kwargs: dict) -> None:
     os.environ[_LAUNCH_ENV] = f"{os.getpid()}_{time.time()!r}"
     d = socket_dir()
     for old in glob.glob(os.path.join(d, "launch_*.json")):
         with contextlib.suppress(ValueError, IndexError):
             if not _pid_running(int(os.path.basename(old).split("_")[1])):
-                _remove(old, old + ".daemon")
+                _remove(old, old + ".session")
     path = _launch_file()
+    # As it was at exec, with the settings loading goes by as they are now: a
+    # launch that is a script may have set them itself.
+    env = _initial_environ()
+    env.update({k: os.environ[k] for k in _ENV_VARS if k in os.environ})
     launch = {
-        "argv": [sys.executable, *sys.orig_argv[1:]],
+        # The daemon reads the engine's arguments back from this file.
+        "argv": [sys.executable, "-m", __package__, "daemon", path],
+        "engine": base64.b64encode(pickle.dumps((model, kwargs))).decode(),
         "cwd": os.getcwd(),
-        "env": _initial_environ(),
+        "env": env,
         "cpus": sorted(os.sched_getaffinity(0)),
     }
     # 0600: it holds the environment.
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(launch, f)
-    atexit.register(_remove, path, path + ".daemon")
+    atexit.register(_remove, path, path + ".session")
 
 
 def launch_recorded() -> bool:
-    """Whether this process may start daemons: its API server saved the
+    """Whether this process may start daemons: its main process saved the
     launch to start them with (record_launch)."""
     path = _launch_file()
     return path is not None and os.path.exists(path)
 
 
-def _started_by_launch() -> dict | None:
-    """The daemon this launch has started already, if any."""
-    launch = _launch_file()
-    if launch is None:
-        return None
-    try:
-        with open(launch + ".daemon") as f:
-            info = json.load(f)
-    except (OSError, ValueError):
-        return None
-    return None if "error" in info else info
-
-
 def _spawn_daemon() -> dict:
-    """Start a daemon with this server's command line and environment. Every
-    rank calls this; the first one starts it, the others get its pid and log."""
-    launch_path = _launch_file()  # callers check launch_recorded()
-    marker = launch_path + ".daemon"
+    """Start a daemon with this launch's engine arguments and environment (its
+    main process does, once): the daemon's main pid, when it started, and
+    its log. Raises _Miss."""
     try:
-        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        deadline = time.monotonic() + 180
-        while time.monotonic() < deadline:
-            with contextlib.suppress(OSError, ValueError):
-                with open(marker) as f:
-                    info = json.load(f)
-                if "error" in info:
-                    raise _Miss(info["error"])
-                return info
-            time.sleep(0.2)
-        raise _Miss("the rank that starts the daemon did not report it")
-    pid = None
-    try:
-        with open(launch_path) as f:
+        with open(_launch_file()) as f:  # callers check launch_recorded()
             launch = json.load(f)
         # The same launch, as a daemon (it names itself anew).
         env = {k: v for k, v in launch["env"].items() if k != _LAUNCH_ENV}
@@ -245,21 +337,13 @@ def _spawn_daemon() -> dict:
                 f"launcher exited with {out.returncode}: {out.stderr.strip()[-2000:]}"
             )
         pid = int(out.stdout.split()[-1])  # last: a startup hook may print too
-        # With when it started: its pid alone may come to name another process.
-        info = {"pid": pid, "log": log, "created": psutil.Process(pid).create_time()}
-    except Exception as e:  # noqa: BLE001 - the other ranks wait for the marker
-        info = {"error": f"could not start a weight cache daemon: {e!r}"}
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(info, f)
-    except OSError as e:  # the other ranks do not learn of the daemon
-        info = {"error": f"could not record the weight cache daemon: {e!r}"}
-    if "error" in info:
-        if pid is not None:  # started all the same: not next to the disk load
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGTERM)
-        raise _Miss(info["error"])
-    return info
+    except Exception as e:  # noqa: BLE001
+        raise _Miss(f"could not start a weight cache daemon: {e!r}") from None
+    # With when it started: its pid alone may come to name another process.
+    created = None  # gone already: nobody finds it running
+    with contextlib.suppress(psutil.Error):
+        created = psutil.Process(pid).create_time()
+    return {"pid": pid, "log": log, "created": created}
 
 
 def stop_daemon(path: str, timeout_s: float = 180) -> int | None:
@@ -339,41 +423,48 @@ def forget_uncacheable() -> int:
 
 
 def _hold_unused(path: str, wait_s: float = 5):
-    """Before stopping this GPU's daemon. (connection, None): no server uses
-    it, and none gets its weights while the connection is open. (None, None):
-    no daemon serves here. (None, why): it must not be stopped."""
+    """Before stopping the daemon that holds this GPU. (connection, None):
+    no server uses that daemon, and none gets its weights while the
+    connection is open; the ranks of one launch each get one. (None, None):
+    no daemon holds this GPU. (None, why): it must not be stopped."""
+    # Whoever asks for the same launch stops the same daemon together.
+    by = envs.ATOM_PRELOAD_LAUNCH or f"pid {os.getpid()}"
     deadline = time.monotonic() + wait_s
     while True:  # this server has just closed its own connection
-        others = None
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        others, sock = None, None
         try:
-            sock.settimeout(10)
-            sock.connect(path)
-            _send(sock, {"cmd": "hold"})
+            sock = _connect(path, timeout=10)
+            _send(sock, {"cmd": "hold", "v": PROTOCOL, "by": by})
             reply = _recv(sock)
             if reply.get("held"):
                 sock.settimeout(None)
                 return sock, None
-            others = reply.get("clients") or None  # none: it is being stopped
-        except FileNotFoundError:
-            sock.close()
-            return None, None  # not serving (yet): nobody can be connected
-        except ConnectionRefusedError:
-            if not daemon_alive(path):
+            if "error" in reply:
                 sock.close()
-                return None, None  # it has stopped serving and exited
+                return None, reply["error"]
+            others = reply.get("clients") or None  # none: it is being stopped
+        except (FileNotFoundError, ConnectionRefusedError):
+            # Its socket is not there (any more): gone, or of another version.
+            if not daemon_alive(path):
+                return None, None
         except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
-            sock.close()
+            if sock is not None:
+                sock.close()
             if not daemon_alive(path):
                 return None, None  # it exited by itself while it was asked
             return None, f"could not ask the daemon whether servers use it: {e!r}"
-        sock.close()
+        if sock is not None:
+            sock.close()
         if time.monotonic() > deadline:
             break
         time.sleep(0.1)
     if others is None:
-        return None, "the daemon on this GPU is being stopped, or does not answer"
+        return None, (
+            "the daemon on this GPU is being stopped, or does not answer (one "
+            "started by another version of ATOM does not: stop it with python -m "
+            "atom.model_loader.weight_cache stop --force)"
+        )
     return None, (
-        f"{others} other running server(s) use the daemon's weights on this GPU; they keep "
-        "them in memory, so a new daemon would not fit. Stop them first"
+        f"{others} other running server(s) use the daemon's weights; they keep them "
+        "in memory, so a new daemon would not fit. Stop them first"
     )

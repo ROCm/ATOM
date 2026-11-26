@@ -57,16 +57,25 @@ def snapshot(model: nn.Module, config=None) -> dict:
         if is_module:
             entry["type"] = f"{type(obj).__module__}.{type(obj).__qualname__}"
             # Parameters are always exported, so their identity is enough (not
-            # held: loading frees the ones it replaces).
+            # held: loading frees the ones it replaces). Not of a module that
+            # is quantized as its weights arrive: that swaps its Parameters'
+            # data, which a weak reference forbids. They count as replaced.
+            ref = (
+                _swapped if getattr(obj, "_stream_online_quant", False) else weakref.ref
+            )
             entry["params"] = {
-                k: None if p is None else weakref.ref(p)
-                for k, p in obj._parameters.items()
+                k: None if p is None else ref(p) for k, p in obj._parameters.items()
             }
             entry["buffers"] = {k: _fp(b) for k, b in obj._buffers.items()}
         walk[path] = entry
     deep, held = _unwalked(model)
     held += [obj for _, obj in config_objects(config)] if config is not None else []
     return {"walk": walk, "deep": deep, "held": held}
+
+
+def _swapped(p):
+    """In place of a weak reference to ``p``: one that names nothing."""
+    return lambda: None
 
 
 def _by_address(fp) -> bool:
@@ -574,13 +583,111 @@ def apply_process(export: dict, device: torch.device) -> int:
 def apply_export(model: nn.Module, export: dict, device: torch.device) -> int:
     """Point ``model`` (built on meta) at the daemon's tensors. Returns bytes mapped."""
     make, mapped = _maker(export, device)
+    install(model, export["plan"], make)
+    return mapped
+
+
+def _rewrite(meta: dict, t, make, where: str) -> int:
+    """Write tensor ``t`` where the daemon holds the tensor ``meta`` names.
+    Returns the bytes written."""
+    is_tensor = isinstance(t, torch.Tensor)
+    got = (tuple(t.shape), t.dtype) if is_tensor else type(t).__name__
+    if got != (tuple(meta["shape"]), meta["dtype"]):
+        raise ValueError(
+            f"{where}: {got}, held as {tuple(meta['shape'])} {meta['dtype']}"
+        )
+    if meta.get("empty"):
+        return 0
+    if t.is_meta:
+        raise ValueError(f"{where}: nothing was loaded there")
+    held = make(meta)
+    if isinstance(meta["storage"], str):
+        # Servers have a host tensor by value: it cannot change under them.
+        if not torch.equal(held, t.detach().to(held.device)):
+            raise ValueError(f"{where}: a host tensor holds other values")
+        return 0
+    if held.data_ptr() != t.data_ptr():  # else loaded where it is held
+        held.copy_(t.detach())
+    return held.numel() * held.element_size()
+
+
+def _rewrite_packed(packed, value, make, where: str) -> int:
+    """`_rewrite` for a packed value (`_pack`) and what another load of the
+    same model left in its place; raises where they are not alike."""
+    kind = packed[0]
+    if kind == "T":
+        return _rewrite(packed[1], value, make, where)
+    if kind == "V":
+        if type(value) is not type(packed[1]) or value != packed[1]:
+            raise ValueError(
+                f"{where}: {str(value)[:60]}, held as {str(packed[1])[:60]}"
+            )
+    elif kind == "C":
+        if not isinstance(value, (list, tuple)) or len(value) != len(packed[2]):
+            raise ValueError(f"{where}: not the {len(packed[2])} items held")
+        return sum(
+            _rewrite_packed(p, v, make, f"{where}[{i}]")
+            for i, (p, v) in enumerate(zip(packed[2], value))
+        )
+    elif kind in ("D", "O"):
+        items = value if kind == "D" else vars(value)
+        if not isinstance(items, dict) or set(items) != {k for k, _ in packed[-1]}:
+            raise ValueError(f"{where}: other entries than the ones held")
+        return sum(
+            _rewrite_packed(p, items[k], make, f"{where}.{k}") for k, p in packed[-1]
+        )
+    return 0  # a name, a path or an object sent before: nothing of its own
+
+
+def refill(model: nn.Module, plan: dict, make) -> int:
+    """Write what ``model`` holds at ``plan``'s places into the tensors
+    ``make`` gives for them: a daemon's, which serves another checkpoint of
+    the model under that plan. Returns the bytes written. Raises ValueError
+    where loading left anything but other values in device tensors."""
+    written = 0
+    for path, item in plan.items():
+        obj = _resolve(model, path)
+        where = path or "<root>"
+        held = (
+            {"param": obj._parameters, "buffer": obj._buffers}
+            if isinstance(obj, nn.Module)
+            else {}
+        )
+        for kind, k in item["delete"]:
+            if k in held.get(kind, vars(obj)):
+                raise ValueError(f"{where}.{k}: there, and not when it was held")
+        for k, meta in item["params"].items():
+            p = obj._parameters.get(k)
+            if meta is None or p is None:
+                if meta is not p:
+                    raise ValueError(f"{where}.{k}: a parameter on one side only")
+                continue
+            written += _rewrite(meta, p, make, f"{where}.{k}")
+            for a, packed in meta["pattrs"].items():
+                written += _rewrite_packed(
+                    packed, vars(p).get(a), make, f"{where}.{k}.{a}"
+                )
+        for k, meta in item["buffers"].items():
+            b = obj._buffers.get(k)
+            if meta is None or b is None:
+                if meta is not b:
+                    raise ValueError(f"{where}.{k}: a buffer on one side only")
+                continue
+            written += _rewrite(meta, b, make, f"{where}.{k}")
+        for k, packed in item["attrs"].items():
+            written += _rewrite_packed(packed, vars(obj).get(k), make, f"{where}.{k}")
+    return written
+
+
+def install(model: nn.Module, plan: dict, make) -> None:
+    """Point ``model`` at the tensors ``make`` gives for ``plan``'s places."""
     created = {}
 
     def unpack(packed):
         return _unpack(packed, make, lambda path: _resolve(model, path), created)
 
     filled = {}  # id(Parameter the model was built with) -> where its data is
-    for path, item in export["plan"].items():
+    for path, item in plan.items():
         obj = _resolve(model, path)
         is_module = isinstance(obj, nn.Module)
         d = vars(obj)
@@ -606,7 +713,6 @@ def apply_export(model: nn.Module, export: dict, device: torch.device) -> int:
                     f"{path}.{k}: attribute shadows a parameter, buffer or submodule"
                 )
             d[k] = unpack(packed)
-    return mapped
 
 
 def _leftover_meta(model: nn.Module) -> list[str]:

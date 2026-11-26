@@ -3762,6 +3762,49 @@ async def server_info():
     }
 
 
+def _model_weight_reply(why: list[str], done: str):
+    if why:
+        reply = {"success": False, "message": "\n".join(why)}
+        return JSONResponse(reply, status_code=400)
+    return {"success": True, "message": done}
+
+
+@_engine_route("/model_weight/load", methods=["POST"])
+async def model_weight_load(raw_request: Request):
+    """Write the checkpoint at ``model_path`` (another one of this model) into
+    the weights this server has from its weight cache daemon, for every server
+    that has them. Answers once they serve it."""
+    from atom.model_loader.weight_cache.session import change_weights
+
+    model = (await raw_request.json()).get("model_path")
+    if not isinstance(model, str) or not model:
+        raise HTTPException(status_code=400, detail="model_path: the checkpoint")
+    why = await asyncio.to_thread(change_weights, "load", model)
+    return _model_weight_reply(why, f"The weights are now {model}'s.")
+
+
+@_engine_route("/model_weight/stop", methods=["POST"])
+async def model_weight_stop():
+    """The servers that have this server's weight cache daemon's weights run
+    nothing on them until a load."""
+    from atom.model_loader.weight_cache.session import change_weights
+
+    why = await asyncio.to_thread(change_weights, "stop")
+    return _model_weight_reply(why, "The weights are stopped until a load.")
+
+
+@_engine_route("/model_weight/status")
+async def model_weight_status():
+    """The checkpoint this server's weight cache daemon holds."""
+    from atom.model_loader.weight_cache.session import weights_status
+
+    status = await asyncio.to_thread(weights_status)
+    if status is None:
+        detail = "This server's weights are not a weight cache daemon's."
+        raise HTTPException(status_code=404, detail=detail)
+    return status
+
+
 @_engine_route("/start_profile", methods=["POST"])
 async def start_profile():
     """Start profiling the engine."""
@@ -3882,10 +3925,6 @@ def main():
 
         run_daemon(EngineArgs.from_cli_args(args))
         return
-    if envs.ATOM_PRELOAD == "server":
-        from atom.model_loader.weight_cache.preload import record_launch
-
-        record_launch()  # the runners start a daemon with it
 
     _setup_frontend(args)
 

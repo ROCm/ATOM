@@ -19,9 +19,12 @@ from conftest import MockConfig
 with stubbed_aiter():
     from atom.model_engine.engine_core import DPEngineCoreProc, EngineCore
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
+from atom.model_engine.collective_rpc import RpcResult
 from atom.model_engine.engine_utility import (
     PAUSE_GENERATION_CMD,
     RESUME_GENERATION_CMD,
+    WEIGHTS_IN_USE_CMD,
+    WEIGHTS_STOPPED_CMD,
     EngineUtilityHandler,
 )
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
@@ -60,9 +63,11 @@ def _engine(scheduler, cls=EngineCore):
     return engine
 
 
-def _run(engine, cmd, args=None):
+def _run(engine, cmd, args=None, runners=None):
     out = queue.Queue()
-    handler = EngineUtilityHandler(None, out, label="test", scheduler=engine.scheduler)
+    handler = EngineUtilityHandler(
+        runners, out, label="test", scheduler=engine.scheduler
+    )
     pending = queue.Queue()
     pending.put_nowait((cmd, {} if args is None else args))
     engine._has_pending_utility = True
@@ -124,6 +129,34 @@ def test_paused_update_resumed_recomputes_on_the_new_weights():
     _run(engine, RESUME_GENERATION_CMD)
 
     assert handler_runs == ["update_weights"]
+    batch, active = sched.schedule()
+    assert batch.total_seqs_num_prefill == 2
+    assert sorted(active) == sorted(seq.id for seq in seqs)
+
+
+def test_stopped_weights_hold_the_engine_until_they_are_in_use_again():
+    # A weight cache daemon's `stop` and `load`, for the engine that maps its
+    # weights.
+    sched, seqs = _running(2)
+    engine = _engine(sched)
+    asked = []
+
+    def utility_rpc(method, payload, timeout):
+        asked.append((method, payload.args))
+        return [RpcResult(payload.request_id, 0)]
+
+    runners = SimpleNamespace(utility_rpc=utility_rpc)
+    reply = _run(engine, WEIGHTS_STOPPED_CMD, {"rewrite": True}, runners)
+
+    assert "error" not in reply and engine._generation_paused
+    # Every rank let what it had sent to its device finish.
+    assert asked == [("await_forwards", (True,))]
+    # Unchanged, what was running goes on where it was...
+    _run(engine, WEIGHTS_IN_USE_CMD, {"changed": False})
+    assert not engine._generation_paused and list(sched.running) == seqs
+    # ...and on other values it recomputes its context.
+    _run(engine, WEIGHTS_STOPPED_CMD, {}, runners)
+    _run(engine, WEIGHTS_IN_USE_CMD, {"changed": True})
     batch, active = sched.schedule()
     assert batch.total_seqs_num_prefill == 2
     assert sorted(active) == sorted(seq.id for seq in seqs)
