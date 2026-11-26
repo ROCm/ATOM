@@ -1328,10 +1328,12 @@ pub enum AtomRole {
     Encode(EncodeReply),
 }
 
-/// The `ec_transfer_params` a stub encode server answers with.
+/// The `ec_transfer_params` a stub encode server answers with: an
+/// `atom.ec_transfer` handle, which ATOMesh forwards without reading.
 pub fn stub_ec_transfer_params() -> serde_json::Value {
-    json!({"session": "e0:17001", "cache_seed": 42, "addr": 4096, "len": 2048,
-           "generation": 3, "rows": [[0, 16]]})
+    json!({"transport": "mooncake", "key": 42, "rows": 16, "dtype": "bfloat16",
+           "mooncake": {"session": "e0:17001", "address": 4096, "length": 2048,
+                        "generation": 3}})
 }
 
 /// The `cache_seed` a stub prefill server returns in its `kv_transfer_params`.

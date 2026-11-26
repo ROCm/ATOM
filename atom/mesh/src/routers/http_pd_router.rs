@@ -798,7 +798,8 @@ impl PDRouter {
     }
 
     /// Runs E for an ATOM chat request with media and adds E's opaque
-    /// `ec_transfer_params` to the body P receives. A client-supplied
+    /// `ec_transfer_params` (an `atom.ec_transfer` handle naming its
+    /// transport) to the body P receives. A client-supplied
     /// `ec_transfer_params` is always removed first, so only E's reaches P.
     /// With no available encode worker, or when E fails or times out, P gets
     /// the body without it and encodes the media itself.
