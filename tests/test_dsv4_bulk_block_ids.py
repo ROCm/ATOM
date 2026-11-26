@@ -119,6 +119,8 @@ def contract(monkeypatch):
     for api in ("synchronize", "current_stream", "current_device", "Stream", "Event"):
         monkeypatch.setattr(torch.cuda, api, forbidden)
     monkeypatch.setattr(codec, "_region_plan", lambda kind, *, stream: plan)
+    # This stack keeps the blocking `_static_device_i64` upload (main's
+    # `upload_numpy` one came with ROCm/ATOM#3324 and is not ported).
     monkeypatch.setattr(module, "_static_device_i64", upload)
     monkeypatch.setattr(module, "_device_i64", forbidden)
     monkeypatch.setattr(module, "_gather_region_items_kernel", Kernel("gather"))
@@ -164,8 +166,14 @@ def test_one_upload_preserves_group_order_and_kernel_arguments(
     assert [call[2][1].tolist() for call in contract.launches] == [[6, 4, 2], [4, 0]]
     for _, _, args, kwargs in contract.launches:
         assert args[0] is payload
-        assert args[9:] == (0, 4)
-        assert kwargs == {"REVERSE": False, "TILE": 1024, "num_warps": 8}
+        expected_kwargs = {"REVERSE": False, "TILE": 1024, "num_warps": 8}
+        if direction == "scatter":
+            # Unstrided restore: one item per chunk at the item stride.
+            assert args[9:] == (0, 4, 4)
+            expected_kwargs.update(ITEMS_PER_CHUNK=1)
+        else:
+            assert args[9:] == (0, 4)
+        assert kwargs == expected_kwargs
         assert (
             args[1].untyped_storage().data_ptr()
             == owner._device_ids.untyped_storage().data_ptr()
@@ -272,6 +280,57 @@ def test_prepared_launch_rejects_invalid_id_tensor(contract, ids):
     with pytest.raises((TypeError, ValueError)):
         contract.codec.gpu_to_chunk_major_device_buffer_prepared(
             _buffer(), owner, 0, stream=contract.stream
+        )
+    assert not contract.launches
+
+
+def test_strided_prepared_copy_rejects_gather(contract):
+    owner = _prepare(contract, [[0, 2]])
+    with pytest.raises(ValueError, match="restore only"):
+        contract.codec._copy_prepared_block_id_group(
+            _buffer(),
+            owner,
+            0,
+            gather=True,
+            stream=contract.stream,
+            items_per_chunk=1,
+            chunk_stride_bytes=8,
+        )
+    assert not contract.launches
+
+
+# Two 4-byte items: no items per chunk, a stride shorter than a chunk, and a
+# chunk size that does not divide the items.
+@pytest.mark.parametrize(
+    ("items_per_chunk", "chunk_stride_bytes"), [(0, 8), (1, 3), (3, 16)]
+)
+def test_strided_restore_rejects_invalid_geometry(
+    contract, items_per_chunk, chunk_stride_bytes
+):
+    owner = _prepare(contract, [[0, 2]])
+    with pytest.raises(ValueError, match="geometry"):
+        contract.codec.chunk_major_strided_buffer_to_gpu_prepared(
+            _buffer(),
+            owner,
+            0,
+            stream=contract.stream,
+            items_per_chunk=items_per_chunk,
+            chunk_stride_bytes=chunk_stride_bytes,
+        )
+    assert not contract.launches
+
+
+def test_strided_restore_rejects_too_small_buffer(contract):
+    # Two 4-byte chunks 8 bytes apart span 12 bytes.
+    owner = _prepare(contract, [[0, 2]])
+    with pytest.raises(ValueError, match="too small"):
+        contract.codec.chunk_major_strided_buffer_to_gpu_prepared(
+            _buffer(11),
+            owner,
+            0,
+            stream=contract.stream,
+            items_per_chunk=1,
+            chunk_stride_bytes=8,
         )
     assert not contract.launches
 

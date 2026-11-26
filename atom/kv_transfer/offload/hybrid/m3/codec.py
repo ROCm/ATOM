@@ -232,3 +232,9 @@ class _PreparedShardedGroups:
     @property
     def upload_count(self) -> int:
         return int(self.whole.upload_count) + int(self.sharded.upload_count)
+
+
+# ported from main (#2752): the codec id for M3's complete-PAGE bytes as
+# `pure_page_codec` builds them (pool -> field -> layer, then the draft's
+# `merge_pages`). Bump when that order or the region set changes.
+M3_CODEC_ID = "m3-page-regions"

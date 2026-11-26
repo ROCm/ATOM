@@ -63,3 +63,28 @@ KVConnectorFactory.register(
     # The dense codec builds from `KVCacheTensor`s; the region map is unread.
     reads_block_regions=False,
 )
+
+# Port note: umbp_store (ROCm/ATOM#3194) over the kv_store layer (#3374, #3475).
+KVConnectorFactory.register(
+    "umbp_store",
+    worker_module="atom.kv_transfer.offload.umbp_store.worker",
+    worker_class="UMBPStoreOffloadConnector",
+    scheduler_module="atom.kv_transfer.offload.umbp_store.scheduler",
+    scheduler_class="UMBPStoreOffloadScheduler",
+    requires_pd_staging=False,
+    offload=True,
+    # The same 256-token chunks as mooncake_store, so the same floor.
+    min_load_tokens=512,
+    # One UMBP standalone server per node, shared by every DP rank there.
+    shared_tier=True,
+    chunk_tokens="atom.kv_transfer.offload.umbp_store.config:store_chunk_tokens",
+    # Dense ignores the region map; the M3 PAGE layout reads it (NSA index included).
+    reads_block_regions=lambda config: __import__(
+        "atom.kv_transfer.offload.config", fromlist=["select_offload_layout"]
+    ).select_offload_layout(config)
+    != "dense",
+    copies_whole_block_regions=True,
+    # v2 gates NVFP4/FP4 M3 caches in Config (m3_fp4_cache_unsupported_reason),
+    # not per connector; declared so a later main-style gate accepts PAGE units.
+    moves_nvfp4_pages=True,
+)

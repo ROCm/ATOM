@@ -152,7 +152,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
         # by the OFFLOAD_UNALIGNED_HANDOFF env var; now unconditional.)
-        self._min_load_tokens = envs.OFFLOAD_MIN_LOAD_TOKENS
+        # ported from main (#3097): Config settles it; stand-in configs fall back to env.
+        settled = getattr(config, "offload_min_load_tokens", None)
+        self._min_load_tokens = (
+            envs.OFFLOAD_MIN_LOAD_TOKENS if settled is None else int(settled)
+        )
 
     def bind_block_manager(self, block_manager) -> None:
         if self._block_manager is not None and self._block_manager is not block_manager:

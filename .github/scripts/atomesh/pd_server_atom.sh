@@ -1300,7 +1300,7 @@ kv_transfer_offload_connector() {
   local config="${1,,}" name
   config="${config//[[:space:]]/}"
   for name in lmcache_offload lmcacheoffloadconnector lmcacheconnectorv1 \
-    lmcache_mp lmcachempconnector mooncake_store; do
+    lmcache_mp lmcachempconnector mooncake_store umbp_store; do
     if [[ "${config}" == *"\"kv_connector\":\"${name}\""* ]]; then
       printf '%s' "${name}"
       return 0

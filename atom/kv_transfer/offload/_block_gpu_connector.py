@@ -83,6 +83,10 @@ class BlockByteCodec(Protocol):
     @property
     def has_fused_chunk_major_staging(self) -> bool: ...
 
+    # Whether the codec can restore a padded run of Store slots in place
+    # (``chunk_major_strided_buffer_to_gpu_prepared``).
+    supports_strided_restore: bool
+
     def gpu_to_chunk_major_device_buffer(
         self,
         device_buf: torch.Tensor,
@@ -206,6 +210,7 @@ class BlockGPUConnector:
         virtual_block_size: int | None = None,
         source_safe_callback: Callable[[SaveSourceGroupId], None] | None = None,
         max_staging_bytes: int | None = None,
+        compute_stream_provider: Callable[[], Any] | None = None,
     ) -> None:
         self.codec = codec
         # Bytes a chunk stores: its blocks' `bytes_per_block`, unless the codec
@@ -214,6 +219,9 @@ class BlockGPUConnector:
         # also lays out a group's staging buffer (`staging_layout`) and bounds
         # a chunk of n blocks (`max_chunk_bytes`).
         self._exact_chunks = callable(getattr(codec, "chunk_nbytes", None))
+        # Set by a connector that stages on the forward's stream (the Mooncake
+        # Store); every other user keeps side streams.
+        self._compute_stream_provider = compute_stream_provider
         self.physical_block_size = int(block_size)
         if self.physical_block_size <= 0:
             raise ValueError("ATOM LMCache connector: block_size must be > 0")
@@ -447,6 +455,7 @@ class BlockGPUConnector:
             state = _ThreadTransferState(
                 self.device,
                 self._use_cuda(),
+                self._compute_stream_provider,
             )
             states[key] = state
         return state
@@ -461,6 +470,10 @@ class BlockGPUConnector:
         state without a pack stream cannot honor the dependency; the fused
         staging pipeline rejects that device anyway, so refuse loudly instead of
         host-synchronizing on the save thread.
+
+        Always waits, also on a state that follows the forward's stream: the
+        stream may have changed between the producer's record and this job's
+        pin, and waiting on an event of one's own stream is free.
         """
 
         if state.pack_stream is None:
@@ -684,6 +697,8 @@ class BlockGPUConnector:
         directions; the returned owner must survive the pipeline's final or
         recovery fence.
         """
+        # Pin the stream: the runner can switch compute streams concurrently.
+        pack_stream = state.pack_stream
         prepare = getattr(self.codec, "prepare_block_id_groups", None)
         prepared_call = (
             getattr(self.codec, f"{method_name}_prepared", None)
@@ -693,9 +708,9 @@ class BlockGPUConnector:
         if not callable(prepared_call):
             return (
                 _PipelineStage(
-                    state.pack_stream,
+                    pack_stream,
                     lambda group, buf: getattr(self.codec, method_name)(
-                        buf, self._group_block_ids(group), stream=state.pack_stream
+                        buf, self._group_block_ids(group), stream=pack_stream
                     ),
                 ),
                 None,
@@ -709,7 +724,7 @@ class BlockGPUConnector:
         owner = prepare(
             [self._group_block_ids(group) for group in groups],
             device=self.device,
-            stream=state.pack_stream,
+            stream=pack_stream,
         )
         stats = getattr(self._tls, "active_transfer_stats", None)
         if stats is not None:
@@ -720,9 +735,9 @@ class BlockGPUConnector:
             )
         return (
             _PipelineStage(
-                state.pack_stream,
+                pack_stream,
                 lambda group, buf: prepared_call(
-                    buf, owner, group_indices[id(group)], stream=state.pack_stream
+                    buf, owner, group_indices[id(group)], stream=pack_stream
                 ),
             ),
             owner,
@@ -929,6 +944,7 @@ class BlockGPUConnector:
         if not memory_objs:
             return None
         state = self._thread_state()
+        state.begin_transfer()
         chunks = self._iter_transfer_chunks(memory_objs, block_id_groups, starts, ends)
         if not chunks:
             return None
@@ -1003,8 +1019,9 @@ class BlockGPUConnector:
         Each group flows ``stage_a`` -> ``stage_b`` on their respective streams,
         handed off via the staging buffer's ready event; the free event gates a
         later group's reuse of the same buffer. ``stage_b``'s stream produces
-        the observable result, so it is the one synchronized at the end. An
-        exception fences both streams; an unconfirmed fence permanently
+        the observable result. A fresh completion event fences only this
+        operation's submitted work. An exception fences both streams; an
+        unconfirmed fence permanently
         quarantines that tensor and its prepared block IDs, forcing fresh
         allocation on the next call.
         """
@@ -1074,7 +1091,7 @@ class BlockGPUConnector:
                     state, groups, "gpu_to_chunk_major_device_buffer"
                 )
             )
-            copy_stream = state.pack_stream if _SINGLE_STREAM else state.copy_stream
+            copy_stream = pack_stage.stream if _SINGLE_STREAM else state.copy_stream
             self._run_staged_pipeline(
                 state,
                 groups,
@@ -1111,7 +1128,7 @@ class BlockGPUConnector:
                     state, groups, "chunk_major_device_buffer_to_gpu"
                 )
             )
-            copy_stream = state.pack_stream if _SINGLE_STREAM else state.copy_stream
+            copy_stream = pack_stage.stream if _SINGLE_STREAM else state.copy_stream
             self._run_staged_pipeline(
                 state,
                 groups,

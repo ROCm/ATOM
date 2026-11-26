@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import importlib
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, ClassVar
 
 from atom.kv_transfer.disaggregation.base import (
@@ -84,7 +84,7 @@ class KVConnectorFactory:
     # Absent means yes: a backend that never says otherwise is refused the
     # cache layouts that cannot publish one, rather than handed a `None`
     # its `register_kv_caches` may not survive.
-    _reads_block_regions: ClassVar[dict[str, bool]] = {}
+    _reads_block_regions: ClassVar[dict[str, bool | Callable[[Any], bool]]] = {}
     # Whether a region-reading backend copies whole blocks of every published
     # region, so a layer may publish several planes per role (the FP4 indexer's
     # data and e8m0 scale). Absent means no: the P/D backends parse one region
@@ -93,6 +93,13 @@ class KVConnectorFactory:
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
+    # ported from main (#3097/#2755/#3472/#3194): tier facts read off the registry.
+    _moves_nvfp4_pages: ClassVar[dict[str, bool]] = {}
+    _reads_page_images: ClassVar[dict[str, bool]] = {}
+    _min_load_tokens: ClassVar[dict[str, int | None]] = {}
+    _shared_tier: ClassVar[dict[str, bool]] = {}
+    _chunk_tokens: ClassVar[dict[str, str]] = {}
+    _lowers_hbm_hit_to_chunk: ClassVar[dict[str, bool]] = {}
 
     @classmethod
     def register(
@@ -104,10 +111,16 @@ class KVConnectorFactory:
         scheduler_module: str,
         scheduler_class: str,
         aliases: Iterable[str] = (),
-        reads_block_regions: bool = True,
+        reads_block_regions: bool | Callable[[Any], bool] = True,
         copies_whole_block_regions: bool = False,
         requires_pd_staging: bool = True,
         offload: bool = False,
+        reads_page_images: bool = False,
+        min_load_tokens: int | None = None,
+        shared_tier: bool = False,
+        chunk_tokens: str | None = None,
+        lowers_hbm_hit_to_chunk: bool = False,
+        moves_nvfp4_pages: bool = False,
     ) -> None:
         """Register a KV connector backend.
 
@@ -140,9 +153,21 @@ class KVConnectorFactory:
                 )
             cls._aliases[normalized] = name
         cls._requires_pd_staging[name] = bool(requires_pd_staging)
-        cls._reads_block_regions[name] = bool(reads_block_regions)
+        if isinstance(reads_block_regions, bool) or callable(reads_block_regions):
+            cls._reads_block_regions[name] = reads_block_regions
+        else:
+            raise TypeError(
+                "reads_block_regions must be a bool or a predicate of the config"
+            )
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
+        cls._reads_page_images[name] = bool(reads_page_images)
+        cls._min_load_tokens[name] = min_load_tokens
+        cls._shared_tier[name] = bool(shared_tier)
+        cls._lowers_hbm_hit_to_chunk[name] = bool(lowers_hbm_hit_to_chunk)
+        cls._moves_nvfp4_pages[name] = bool(moves_nvfp4_pages)
+        if chunk_tokens:
+            cls._chunk_tokens[name] = chunk_tokens
 
     @classmethod
     def canonical_name(cls, value: object, *, path: str = "kv_transfer_config") -> str:
@@ -169,6 +194,93 @@ class KVConnectorFactory:
         """Whether the registered backend ``name`` (canonical) is an offload tier."""
 
         return cls._offload.get(name, False)
+
+    @classmethod
+    def reads_page_images(cls, name: str) -> bool:
+        return cls._reads_page_images.get(name, False)
+
+    @classmethod
+    def shared_offload_connectors(cls) -> frozenset[str]:
+        return frozenset(
+            name
+            for name in cls._registry
+            if cls._offload.get(name, False) and cls._shared_tier.get(name, False)
+        )
+
+    @classmethod
+    def lowers_hbm_hit_to_chunk(cls, name: str) -> bool:
+        return cls._lowers_hbm_hit_to_chunk.get(name, False)
+
+    @classmethod
+    def resolve_min_load_tokens(cls, config: Any) -> int:
+        """`OFFLOAD_MIN_LOAD_TOKENS`: the user's value, else the configured
+        offload tier's own default, else `DEFAULT_MIN_LOAD_TOKENS` (main #3097)."""
+        import os
+
+        from atom.kv_transfer.offload.config import DEFAULT_MIN_LOAD_TOKENS
+        from atom.utils import envs
+
+        # v2's envs.OFFLOAD_MIN_LOAD_TOKENS defaults to 8192 rather than None:
+        # only an explicit setting overrides the tier's own default.
+        if os.environ.get("OFFLOAD_MIN_LOAD_TOKENS", "").strip():
+            return envs.OFFLOAD_MIN_LOAD_TOKENS
+        for name, _ in cls.leaf_connectors(config) or ():
+            if cls.is_offload_backend(name):
+                tier = cls._min_load_tokens.get(name)
+                return DEFAULT_MIN_LOAD_TOKENS if tier is None else tier
+        return DEFAULT_MIN_LOAD_TOKENS
+
+    @classmethod
+    def offload_tier(cls, config: Any):
+        """The configured offload tier's `OffloadTierProfile` (main #3097; the
+        Mooncake-Store pools check is left out: v2 runs no shared-prefix routing)."""
+        from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+        kv_cfg = getattr(config, "kv_transfer_config", None) or {}
+        if not isinstance(kv_cfg, dict):
+            return OffloadTierProfile()
+        tier = shared = False
+        chunk_tokens = 1
+        lowers = False
+        for name, sub in cls.leaf_connectors(config) or ():
+            role = (getattr(sub, "kv_transfer_config", None) or {}).get(
+                "kv_role", "offload"
+            )
+            if cls.is_offload_backend(name) and role in ("offload", "kv_both"):
+                if name == "umbp_store" and config.parallel_config.is_multinode_dp:
+                    raise ValueError(
+                        "Shared-prefix DP routing with umbp_store is single-node "
+                        "only: each node's DP ranks reach only that node's UMBP "
+                        "standalone server"
+                    )
+                tier = True
+                shared |= cls._shared_tier.get(name, False)
+                lowers |= cls._lowers_hbm_hit_to_chunk.get(name, False)
+                hook = cls._chunk_tokens.get(name)
+                if hook:
+                    module, _, attr = hook.partition(":")
+                    chunk_tokens = getattr(importlib.import_module(module), attr)(
+                        sub.kv_transfer_config
+                    )
+        if not tier:
+            return OffloadTierProfile()
+        return OffloadTierProfile(
+            loads=shared,
+            min_load_tokens=config.offload_min_load_tokens,
+            load_chunk_tokens=chunk_tokens,
+            lowers_hbm_hit_to_chunk=lowers,
+        )
+
+    @classmethod
+    def topology_moves_nvfp4_pages(cls, config: Any) -> bool:
+        leaves = cls.leaf_connectors(config)
+        return bool(leaves) and all(
+            cls._moves_nvfp4_pages.get(name, False) for name, _ in leaves
+        )
+
+    @classmethod
+    def nvfp4_page_connectors(cls) -> tuple[str, ...]:
+        return tuple(sorted(n for n, moves in cls._moves_nvfp4_pages.items() if moves))
 
     @classmethod
     def connector_name(cls, kv_transfer_config: dict[str, Any] | None) -> str | None:
@@ -293,7 +405,10 @@ class KVConnectorFactory:
 
     @classmethod
     def _leaf_reads_block_regions(cls, connector: str, config: Any) -> bool:
-        if cls._reads_block_regions.get(connector, True):
+        declared = cls._reads_block_regions.get(connector, True)
+        if callable(declared):
+            return bool(declared(config))
+        if declared:
             return True
         if connector == "lmcache_offload":
             from atom.kv_transfer.offload.config import select_offload_layout

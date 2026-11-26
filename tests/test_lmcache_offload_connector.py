@@ -1266,6 +1266,9 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
         def record(self, stream):
             trace.append(("record", self.name, stream.name))
 
+        def synchronize(self):
+            trace.append(("host_wait", self.name))
+
     class _StreamContext:
         def __init__(self, state, stream):
             self.state = state
@@ -1281,6 +1284,9 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
             self.state.current_stream = None
 
     class _FakeState:
+        def begin_transfer(self):  # Port note: main #3097 staging state
+            pass
+
         def __init__(self):
             self.current_stream = None
             self.staging_buffer = SimpleNamespace(
@@ -1363,7 +1369,13 @@ def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
         def record(self, stream):
             calls.append(("record", self.name))
 
+        def synchronize(self):
+            calls.append(("host_wait", self.name))
+
     class _FakeState:
+        def begin_transfer(self):  # Port note: main #3097 staging state
+            pass
+
         def __init__(self):
             self.staging_buffer = SimpleNamespace(
                 tensor=None,
@@ -1438,7 +1450,13 @@ def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | Non
         def record(self, stream) -> None:
             self.record_calls += 1
 
+        def synchronize(self) -> None:
+            pass
+
     class _FakeState:
+        def begin_transfer(self):  # Port note: main #3097 staging state
+            pass
+
         def __init__(self) -> None:
             self.pack_stream = _FakeStream("pack")
             self.copy_stream = _FakeStream("copy")
@@ -1629,6 +1647,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure_staging_buffer)
 
     class _FakeState:
+        def begin_transfer(self):  # Port note: main #3097 staging state
+            pass
+
         def __init__(self) -> None:
             # Real streams and events, not doubles: the connector hands these
             # to `torch.cuda.stream()` and to `Stream.wait_event`, which read a
@@ -7900,3 +7921,19 @@ def test_m31_tier_horizon_is_the_budget_over_kv_bytes_per_token(monkeypatch, pp)
         lambda _kvc=None: SimpleNamespace(max_local_cpu_size=0.0),
     )
     assert offcfg.lmcache_tier_horizon_tokens(config) is None
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # ported from main (#3097): synthetic CPU streams model completion via
+    # synchronize(); real streams keep the actual event fence.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)

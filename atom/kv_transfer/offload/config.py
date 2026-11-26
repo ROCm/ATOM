@@ -899,3 +899,68 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
         # collide on it.
         engine_id=lmcache_engine_id(config),
     )
+
+
+# --- ported from main: helpers the kv_store / umbp_store layer reads (main #2755, #3097, #3194) ---
+from collections.abc import Mapping as _Mapping  # noqa: E402
+from numbers import Real as _Real  # noqa: E402
+
+
+def _strict_text(name: str, value: object) -> str:
+    """A non-empty string setting without leading or trailing whitespace."""
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ValueError(
+            f"{name} must be a non-empty string without leading or trailing spaces"
+        )
+    return value
+
+
+def _positive_seconds(name: str, value: object) -> float:
+    """A finite, positive number of seconds."""
+    if isinstance(value, bool) or not isinstance(value, _Real):
+        raise ValueError(f"{name} must be a number of seconds")  # noqa: TRY004
+    seconds = float(value)
+    if not isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{name} must be finite and > 0, got {value!r}")
+    return seconds
+
+
+def connector_extras(kv_transfer_config) -> _Mapping:
+    """Read one connector's extra settings with a shared mapping contract."""
+    if kv_transfer_config is None:
+        return {}
+    if not isinstance(kv_transfer_config, _Mapping):
+        raise ValueError("kv_transfer_config must be a JSON object")  # noqa: TRY004
+    extra = kv_transfer_config.get("kv_connector_extra_config", kv_transfer_config)
+    if extra is None:
+        return {}
+    if not isinstance(extra, _Mapping):
+        raise ValueError("kv_connector_extra_config must be a JSON object")  # noqa: TRY004
+    return extra
+
+
+def connector_integer(extra, name: str, default: int, *, minimum: int = 1) -> int:
+    """Read integer settings, accepting integer text but rejecting fractional values."""
+    value = extra.get(name, default)
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+    return _strict_integer(name, value, minimum=minimum)
+
+
+def lmcache_chunk_tokens(kv_transfer_config) -> int:
+    """The LMCache chunk the connector is configured for, in tokens."""
+    import os
+
+    extra = connector_extras(kv_transfer_config)
+    if "lmcache.chunk_size" in extra:
+        return connector_integer(extra, "lmcache.chunk_size", 256)
+    # v2 has no envs.LMCACHE_CHUNK_SIZE; LMCache reads the raw variable.
+    env = os.environ.get("LMCACHE_CHUNK_SIZE", "256")
+    return connector_integer({"lmcache.chunk_size": env}, "lmcache.chunk_size", 256)
+
+
+# The smallest tier hit worth loading unless the user or the tier says otherwise.
+DEFAULT_MIN_LOAD_TOKENS = 8192

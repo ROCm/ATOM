@@ -77,20 +77,19 @@ logger = logging.getLogger("atom")
 # ---------------------------------------------------------------------------
 
 
-def _build_subconnectors(config: Any, role: str) -> list:
-    """Instantiate each sub-connector listed in ``kv_transfer_config.connectors``.
+# ported from main (#3097 + #3194 015213e07): offload tiers that run only without a
+# P/D transport beside them.
+_OFFLOAD_WITHOUT_PD = frozenset({"umbp_store"})
 
-    Each entry is a full ``kv_transfer_config`` dict (with its own
-    ``kv_connector`` name). We shallow-copy the engine config, swap in the
-    sub-dict, and route through the normal factory — no recursion, since each
-    sub names a concrete backend (moriio / lmcache_offload / ...), not ``multi``.
+
+def validate_multi_config(kv_transfer_config: dict) -> list:
+    """The sub-connector configs of a ``multi`` transfer config, after refusing
+    a topology the composite cannot run. Builds nothing, so `Config` calls it
+    before the model loads and `_build_subconnectors` before any sub is built.
     """
-    # Imported lazily: the factory module registers backends at import time and
-    # we must not create an import cycle with it.
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    kvc = getattr(config, "kv_transfer_config", None) or {}
-    subs = kvc.get("connectors")
+    subs = kv_transfer_config.get("connectors")
     if not subs:
         raise ValueError(
             "multi connector requires a non-empty 'connectors' list in "
@@ -120,6 +119,48 @@ def _build_subconnectors(config: Any, role: str) -> list:
             "multi permits at most one offload sub-connector; got "
             + ", ".join(offload_subs)
         )
+    # A P/D consumer (decode instance) with an offload tier: the scheduler
+    # keys its handling of a completed receive on the connector being an
+    # offload one, so a received prefill would be resumed as a tier load
+    # (main #3097). v2's decode runs MoRIIO alone; refuse the combination.
+    consumers = [
+        sub["kv_connector"]
+        for sub in subs
+        if not KVConnectorFactory.is_offload_backend(
+            KVConnectorFactory.canonical_name(sub["kv_connector"])
+        )
+        and sub.get("kv_role", "kv_producer") != "kv_producer"
+    ]
+    solo = [name for name in offload_subs if name in _OFFLOAD_WITHOUT_PD]
+    if solo and consumers:
+        raise ValueError(
+            "multi does not support "
+            + ", ".join(solo)
+            + " beside a P/D consumer ("
+            + ", ".join(consumers)
+            + "): a received prefill would be prefilled again on the decode "
+            "instance. Run the decode instance with the P/D connector alone."
+        )
+    # Port note: a P/D *producer* beside umbp_store is allowed, as lmcache_offload
+    # is (the M3.1 PP4 prefill: multi[moriio fabric producer, offload tier]).
+    # The upstream scope guard (015213e07) refused it for review scope only.
+    return subs
+
+
+def _build_subconnectors(config: Any, role: str) -> list:
+    """Instantiate each sub-connector listed in ``kv_transfer_config.connectors``.
+
+    Each entry is a full ``kv_transfer_config`` dict (with its own
+    ``kv_connector`` name). We shallow-copy the engine config, swap in the
+    sub-dict, and route through the normal factory — no recursion, since each
+    sub names a concrete backend (moriio / lmcache_offload / ...), not ``multi``.
+    """
+    # Imported lazily: the factory module registers backends at import time and
+    # we must not create an import cycle with it.
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    kvc = getattr(config, "kv_transfer_config", None) or {}
+    subs = validate_multi_config(kvc)
 
     connectors = []
     for i, sub in enumerate(subs):

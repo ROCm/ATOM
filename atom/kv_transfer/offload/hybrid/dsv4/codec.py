@@ -655,6 +655,8 @@ class DSV4PageSlotCodec:
             self, stream, plans, tuple(offsets), device_ids, region_plan
         )
 
+    supports_strided_restore = True
+
     def _copy_prepared_block_id_group(
         self,
         device_buf: torch.Tensor,
@@ -663,6 +665,8 @@ class DSV4PageSlotCodec:
         *,
         gather: bool,
         stream: torch.cuda.Stream | None,
+        items_per_chunk: int = 1,
+        chunk_stride_bytes: int | None = None,
     ) -> None:
         if not isinstance(owner, _PreparedBlockIdGroups) or owner._codec is not self:
             raise ValueError("prepared block IDs belong to a different codec")
@@ -690,6 +694,20 @@ class DSV4PageSlotCodec:
         ):
             raise ValueError("prepared block IDs have an invalid shape or layout")
         _, item_ids, buffer_offset = sections[0]
+        stride_kwargs = {}
+        if chunk_stride_bytes is not None:
+            if gather:
+                raise ValueError("strided prepared buffers support restore only")
+            count = _integer("items_per_chunk", items_per_chunk)
+            stride = _integer("chunk_stride_bytes", chunk_stride_bytes)
+            chunk_bytes = count * self.bytes_per_block
+            if count <= 0 or stride < chunk_bytes or len(item_ids) % count:
+                raise ValueError("invalid strided PAGE chunk geometry")
+            chunks = len(item_ids) // count
+            required = buffer_offset + (chunks - 1) * stride + chunk_bytes
+            if int(device_buf.numel()) < required:
+                raise ValueError("strided PAGE buffer is too small")
+            stride_kwargs = {"items_per_chunk": count, "chunk_stride_bytes": stride}
         with (
             torch.cuda.device(self.device)
             if self.device.index is not None
@@ -706,6 +724,7 @@ class DSV4PageSlotCodec:
                 device_buf,
                 buffer_offset=buffer_offset,
                 stream=stream,
+                **stride_kwargs,
                 prepared_item_ids=ids[
                     owner._offsets[index] : owner._offsets[index + 1]
                 ],
@@ -733,6 +752,27 @@ class DSV4PageSlotCodec:
     ) -> None:
         self._copy_prepared_block_id_group(
             device_buf, owner, group_index, gather=False, stream=stream
+        )
+
+    def chunk_major_strided_buffer_to_gpu_prepared(
+        self,
+        device_buf: torch.Tensor,
+        owner: _PreparedBlockIdGroups,
+        group_index: int,
+        *,
+        items_per_chunk: int,
+        chunk_stride_bytes: int,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Restore aligned Store slots without copying away their padding."""
+        self._copy_prepared_block_id_group(
+            device_buf,
+            owner,
+            group_index,
+            gather=False,
+            stream=stream,
+            items_per_chunk=items_per_chunk,
+            chunk_stride_bytes=chunk_stride_bytes,
         )
 
     def gather_slot(

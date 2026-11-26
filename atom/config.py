@@ -2385,6 +2385,9 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
+    # ported from main (#3097): the smallest tier hit worth loading, settled once from
+    # OFFLOAD_MIN_LOAD_TOKENS or the configured offload tier's own default.
+    offload_min_load_tokens: int | None = field(default=None, init=False)
     # A frontend's own stable form of its speculative config, which the offload
     # PAGE namespace hashes in place of `speculative_config`: only the frontend
     # knows which of its fields differ between processes. None hashes
@@ -2936,6 +2939,15 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+            from atom.kv_transfer.disaggregation.multi.multi_connector import (
+                validate_multi_config,
+            )
+
+            if (self.kv_transfer_config or {}).get("kv_connector") == "multi":
+                validate_multi_config(self.kv_transfer_config)
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+        self.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(self)
         self._resolve_dynamic_chunking()
         self._resolve_tbo()
         self._check_pp_support()
