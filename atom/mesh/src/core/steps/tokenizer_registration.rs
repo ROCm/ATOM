@@ -24,7 +24,7 @@ use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
     routers::prepare::{
-        chat_controls::ChatControls,
+        chat_render::ChatControls,
         fast_tokenizer::{
             tokenizer_json, with_fastokens, FastTokenizer, DOWNLOAD_FAILURE, STRICT_REFUSAL,
         },
@@ -315,34 +315,36 @@ fn renders_without_template(tokenizer: &mut dyn Tokenizer) -> bool {
             .is_ok_and(|text| text != PROBE)
 }
 
-/// The reasoning controls ATOM renders `source`'s chats under, by the
-/// `model_type` in the `config.json` beside its `tokenizer.json`, if the
-/// checkpoint has its own. A HuggingFace model ID's tokenizer that cannot be
-/// downloaded fails the registration, to be retried, rather than leave the
-/// model's chats rendered without them.
+/// The encoder ATOM renders `source`'s chats with (`chat_render`), by the
+/// `model_type` in the checkpoint's `config.json`: the one in a directory
+/// (a tiktoken checkpoint, Kimi-K3's, has no `tokenizer.json`), else the one
+/// beside its `tokenizer.json`. A HuggingFace model ID's tokenizer that
+/// cannot be downloaded fails the registration, to be retried, rather than
+/// leave the model's chats rendered without them.
 async fn checkpoint_chat_controls(
     name: &str,
     source: &str,
 ) -> Result<Option<ChatControls>, String> {
+    let dir = Path::new(source);
+    if dir.is_dir() {
+        return Ok(controls_of(name, &dir.join("config.json")).await);
+    }
     match tokenizer_json(source).await {
-        Ok(tokenizer) => Ok(controls_beside(name, &tokenizer).await),
+        Ok(tokenizer) => Ok(controls_of(name, &tokenizer.with_file_name("config.json")).await),
         Err(reason) if reason.starts_with(DOWNLOAD_FAILURE) => Err(reason),
         Err(_) => Ok(None),
     }
 }
 
-/// The reasoning controls for the `model_type` in the `config.json` beside
-/// `tokenizer`, if there is one.
-async fn controls_beside(name: &str, tokenizer: &Path) -> Option<ChatControls> {
-    let config = tokio::fs::read(tokenizer.with_file_name("config.json"))
-        .await
-        .ok()?;
+/// The encoder controls for the `model_type` in the `config` file, if any.
+async fn controls_of(name: &str, config: &Path) -> Option<ChatControls> {
+    let config = tokio::fs::read(config).await.ok()?;
     let config: Value = serde_json::from_slice(&config).ok()?;
     let model_type = config.get("model_type")?.as_str()?;
     let controls = ChatControls::of_model_type(model_type)?;
     info!(
         tokenizer = name,
-        model_type, "HTTP routing takes the effort of these chats as ATOM does for the model"
+        model_type, "These chats render with the model's encoder, as ATOM renders them"
     );
     Some(controls)
 }

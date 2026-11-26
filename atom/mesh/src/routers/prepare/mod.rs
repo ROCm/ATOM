@@ -18,7 +18,7 @@ use crate::{
     tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
 };
 
-pub(crate) mod chat_controls;
+pub(crate) mod chat_render;
 pub(crate) mod chat_template;
 pub(crate) mod fast_tokenizer;
 pub mod generation_payload;
@@ -31,7 +31,7 @@ pub(crate) mod tool_constraints;
 #[cfg(test)]
 mod tests;
 
-use chat_template::{process_chat_messages, ProcessedMessages};
+use chat_template::ProcessedMessages;
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
@@ -50,16 +50,6 @@ pub fn lookup_tokenizer(
     })
 }
 
-/// A chat prompt rendered outside the router, for a model whose template the
-/// router cannot render (ATOM's Python message encoders).
-#[derive(Debug, Clone)]
-pub struct RenderedChat {
-    pub text: String,
-    pub token_ids: Vec<u32>,
-    /// The channel opener the prompt ends on (`ResponseContext::prompt_opener`).
-    pub prompt_opener: Option<String>,
-}
-
 pub fn prepare_chat(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
@@ -69,15 +59,16 @@ pub fn prepare_chat(
     prepare_chat_with(req, headers, model_id, components, None, false)
 }
 
-/// `prepare_chat`, taking the prompt as `rendered` when it is given, and,
-/// with `reads_prompt_opener`, naming the opener a prompt it renders ends on
-/// (`ResponseContext::prompt_opener`; a rendered prompt names its own).
+/// `prepare_chat`, rendering the prompt (`chat_render::render_chat`) with the
+/// chat's body as `sent` where the caller has it, and, with
+/// `reads_prompt_opener`, naming the opener the prompt ends on
+/// (`ResponseContext::prompt_opener`).
 pub fn prepare_chat_with(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
     model_id: Option<String>,
     components: &AppContext,
-    rendered: Option<RenderedChat>,
+    sent: Option<&serde_json::Map<String, serde_json::Value>>,
     reads_prompt_opener: bool,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
@@ -88,28 +79,18 @@ pub fn prepare_chat_with(
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
 
-    let (processed, token_ids, prompt_opener) = match rendered {
-        Some(rendered) => (
-            ProcessedMessages {
-                text: rendered.text,
-                stop_sequences: body_ref.stop.clone(),
-            },
-            rendered.token_ids,
-            rendered.prompt_opener,
-        ),
-        None => {
-            let processed = process_chat_messages(&body_ref, &*tokenizer)
-                .map_err(|e| error::bad_request("process_messages_failed", e))?;
-            let encoding = tokenizer
-                .encode(&processed.text, false)
-                .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
-            let token_ids = encoding.token_ids().to_vec();
-            let prompt_opener = reads_prompt_opener
-                .then(|| response_context::prompt_opener(&processed.text))
-                .flatten();
-            (processed, token_ids, prompt_opener)
-        }
+    let controls = components.chat_controls_of(model_id_str);
+    let (text, prompt_opener) = chat_render::render_chat(&body_ref, sent, &*tokenizer, controls)
+        .map_err(|e| error::bad_request("process_messages_failed", e))?;
+    let processed = ProcessedMessages {
+        text,
+        stop_sequences: body_ref.stop.clone(),
     };
+    let encoding = tokenizer
+        .encode(&processed.text, false)
+        .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
+    let token_ids = encoding.token_ids().to_vec();
+    let prompt_opener = prompt_opener.filter(|_| reads_prompt_opener);
 
     let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
         generate_tool_constraints(tools, &req.tool_choice, &req.model)

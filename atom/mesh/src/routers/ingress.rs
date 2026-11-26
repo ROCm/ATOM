@@ -28,14 +28,17 @@ use crate::{
         ConnectionMode, Worker, WorkerRegistry, WorkerType,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
-    protocols::chat::{ChatCompletionRequest, ChatMessage},
+    protocols::chat::ChatCompletionRequest,
     routers::{
         comm::error::{IngressError, MeshLocalError},
         prepare::{
-            chat_controls::ChatControls,
+            chat_render::{render_chat, ChatControls},
             chat_template::{render_chat_messages, template_kwargs},
             fast_tokenizer::TokenizeLimits,
-            inference::{InferenceMetadata, InferenceRequest, ParsedInference, RoutingChat},
+            inference::{
+                digest_sent_media, InferenceMetadata, InferenceRequest, ParsedInference,
+                RoutingChat,
+            },
         },
     },
     server::AppState,
@@ -501,7 +504,12 @@ impl InferenceEnvelope {
                 let mut request = parse()?;
                 if let Some(routing) = routing {
                     let metadata = request.metadata.clone();
-                    request.routed = Some(routing.prepare_from(&request.parsed, metadata, ctx)?);
+                    request.routed = Some(routing.prepare_from(
+                        &request.parsed,
+                        &request.body,
+                        metadata,
+                        ctx,
+                    )?);
                     request.dp_rank_body = routing.dp_rank_body(&request.metadata, &request.body);
                 }
                 Ok(request)
@@ -547,7 +555,13 @@ impl InferenceEnvelope {
         let routing = routing.clone();
         self.prepare(pool, move |request, ctx| {
             let media_count = request.metadata.media_count;
-            routing.prepare_text_and_tokens(&request.parsed, media_count, tokens, ctx)
+            routing.prepare_text_and_tokens(
+                &request.parsed,
+                &request.body,
+                media_count,
+                tokens,
+                ctx,
+            )
         })
         .await
     }
@@ -704,12 +718,15 @@ impl IngressRouting {
     }
 
     /// Validate the request against this topology and prepare what its policy needs.
+    /// `body` is the request as sent, which an encoder model's chat renders
+    /// from (`chat_render`).
     pub(crate) fn prepare(
         &self,
         parsed: &ParsedInference,
+        body: &[u8],
         ctx: &JobContext,
     ) -> Result<RoutingPreparation, IngressError> {
-        self.prepare_from(parsed, parsed.metadata_with_text(false), ctx)
+        self.prepare_from(parsed, body, parsed.metadata_with_text(false), ctx)
     }
 
     /// [`Self::prepare`] from `parsed`'s text-free `metadata`, whose media
@@ -717,6 +734,7 @@ impl IngressRouting {
     fn prepare_from(
         &self,
         parsed: &ParsedInference,
+        body: &[u8],
         metadata: InferenceMetadata,
         ctx: &JobContext,
     ) -> Result<RoutingPreparation, IngressError> {
@@ -725,7 +743,7 @@ impl IngressRouting {
         if !needs_text && tokens == Tokens::Unused {
             return Ok((metadata, None));
         }
-        self.prepare_text_and_tokens(parsed, metadata.media_count, tokens, ctx)
+        self.prepare_text_and_tokens(parsed, body, metadata.media_count, tokens, ctx)
     }
 
     /// Validate the API and topology, then return whether the policy needs
@@ -741,6 +759,7 @@ impl IngressRouting {
     fn prepare_text_and_tokens(
         &self,
         parsed: &ParsedInference,
+        body: &[u8],
         media_count: usize,
         tokens: Tokens,
         ctx: &JobContext,
@@ -748,7 +767,9 @@ impl IngressRouting {
         let (metadata, routed) = parsed.routing_metadata(media_count, self.front_media_digest);
         let routed = routed.as_ref();
         let tokens = match tokens {
-            Tokens::Needed { wanted } => Some(self.tokens(parsed, routed, &metadata, ctx, wanted)?),
+            Tokens::Needed { wanted } => {
+                Some(self.tokens(parsed, body, routed, &metadata, ctx, wanted)?)
+            }
             // The index cannot match media, and these APIs have no token-routing template.
             Tokens::Wanted
                 if metadata.carries_media()
@@ -760,7 +781,7 @@ impl IngressRouting {
                 None
             }
             // With the special tokens, as ATOM's `tokenizer.encode(prompt)` stores the blocks.
-            Tokens::Wanted => match self.tokens(parsed, routed, &metadata, ctx, true) {
+            Tokens::Wanted => match self.tokens(parsed, body, routed, &metadata, ctx, true) {
                 Ok(tokens) => Some(tokens),
                 // Routed by its text, unless the job is cancelled or late.
                 Err(error) => {
@@ -866,9 +887,10 @@ impl IngressRouting {
     /// The request's `input_ids`, or its prompt encoded, with the tokenizer's special tokens
     /// when `add_special_tokens`. A chat's prompt is templated over its `routed`
     /// messages, when it has them, after their `front` digest.
-    fn tokens(
+    pub(crate) fn tokens(
         &self,
         parsed: &ParsedInference,
+        body: &[u8],
         routed: Option<&RoutingChat>,
         metadata: &InferenceMetadata,
         ctx: &JobContext,
@@ -909,8 +931,7 @@ impl IngressRouting {
             if self.chats_without_template.read().contains(&entry.id) {
                 return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
             }
-            let messages = routed.map_or(&chat.messages, |routed| &routed.messages);
-            let mut prompt = self.render_chat(&entry, chat, messages)?;
+            let mut prompt = self.render_chat(&entry, chat, body, routed)?;
             if let Some(front) = routed.and_then(|routed| routed.front.as_deref()) {
                 prompt.insert_str(0, front);
             }
@@ -936,21 +957,30 @@ impl IngressRouting {
         Ok(tokens)
     }
 
-    /// The prompt the router renders `chat` to with `entry`'s template, under
-    /// the reasoning controls of its model where ATOM has its own.
-    fn render_chat(
+    /// The prompt `chat` renders to with `entry`'s tokenizer
+    /// (`chat_render::render_chat`), from its `body` as sent where an encoder
+    /// renders it.
+    pub(crate) fn render_chat(
         &self,
         entry: &TokenizerEntry,
         chat: &ChatCompletionRequest,
-        messages: &[ChatMessage],
+        body: &[u8],
+        routed: Option<&RoutingChat>,
     ) -> Result<String, IngressError> {
-        let controls = self.chat_controls.read().get(&entry.id).copied();
-        match controls {
-            Some(controls) => controls.render(chat, messages, &*entry.tokenizer),
-            None => render_chat_messages(chat, messages, &*entry.tokenizer, &template_kwargs(chat))
-                .map(|rendered| rendered.text),
+        let Some(controls) = self.chat_controls.read().get(&entry.id).copied() else {
+            let messages = routed.map_or(&chat.messages, |routed| &routed.messages);
+            return render_chat_messages(chat, messages, &*entry.tokenizer, &template_kwargs(chat))
+                .map(|rendered| rendered.text)
+                .map_err(IngressError::invalid);
+        };
+        let mut sent: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(body).map_err(|e| IngressError::invalid(e.to_string()))?;
+        if let Some(messages) = sent.get_mut("messages").filter(|_| routed.is_some()) {
+            digest_sent_media(messages);
         }
-        .map_err(IngressError::invalid)
+        render_chat(chat, Some(&sent), &*entry.tokenizer, Some(controls))
+            .map(|(prompt, _)| prompt)
+            .map_err(IngressError::invalid)
     }
 }
 

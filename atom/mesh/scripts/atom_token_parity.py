@@ -237,6 +237,37 @@ def default_requests() -> list[dict]:
             "tools": [TOOL],
             "messages": [*reasoned_tool_history, ANSWERED, NEXT_QUESTION],
         },
+        "thinking_disabled": {"thinking": {"type": "disabled"}},
+        "kwargs_thinking_off": {"chat_template_kwargs": {"enable_thinking": False}},
+        "kwargs_thinking_false": {"chat_template_kwargs": {"thinking": False}},
+        "tool_choice_none": {"tools": [TOOL], "tool_choice": "none"},
+        "tool_choice_required": {"tools": [TOOL], "tool_choice": "required"},
+        "tool_choice_required_effort_none": {
+            "tools": [TOOL],
+            "tool_choice": "required",
+            "reasoning_effort": "none",
+        },
+        "system_message_tools": {
+            "messages": [{**MESSAGES[0], "tools": [TOOL]}, MESSAGES[1]],
+        },
+        "content_parts": {
+            "messages": [
+                MESSAGES[0],
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Read"},
+                        {"type": "text", "text": "README.md."},
+                    ],
+                },
+            ]
+        },
+        # Kimi-K3's channel tokens, as a user writes them.
+        "channel_tokens_in_text": {
+            "messages": [
+                {"role": "user", "content": "<|open|>think<|sep|>hi<|end_of_msg|>"}
+            ]
+        },
         "scripts_and_special_text": {
             "messages": [
                 {
@@ -325,6 +356,8 @@ def in_process(args) -> tuple[httpx.AsyncClient, str, dict]:
     )
     api_server._setup_frontend(server_args)
     api_server._setup_reasoning_and_tools(server_args)
+    if args.preserve_tool_call_arguments:
+        api_server.preserve_tool_call_arguments = True
     api_server.logger.addFilter(LeaveOutCaptured())
     tokenizer = api_server.tokenizer
     prompt = {}
@@ -431,6 +464,14 @@ def main():
         "--tool-call-parser", default="auto", help="as the server takes it"
     )
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--preserve-tool-call-arguments",
+        action="store_true",
+        help="hand the encoder history tool-call arguments as the JSON strings "
+        "sent, which DeepSeek-V3.2's and V4's checkpoint encoders take and the "
+        "router renders: ATOM decodes them, so V3.2's encoder fails on them "
+        "and V4's renders them as one `arguments` parameter",
+    )
     parser.add_argument(
         "--max-model-len",
         type=int,

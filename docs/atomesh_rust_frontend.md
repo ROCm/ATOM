@@ -98,18 +98,28 @@ the bottleneck.
   has the parser read that opener first (`ResponseContext.prompt_opener`),
   on this router only (`Pipeline::reading_prompt_opener`): gRPC routing keeps
   its parsers' own start.
-* **Python templates.** A model whose chat template the router cannot render
-  -- a Python message encoder (DeepSeek-V4), or a tokenizer whose template is
-  code (Kimi-K3) -- has each chat prompt rendered by `TokenBridge.render_chat`
-  (ATOM's `apply_chat_template`, encoded as the engine encodes a prompt); the
-  router then runs the rest. `src/reasoning` adds the `kimi_k3` reasoning
-  parser the `reasoning-parser` crate lacks.
+* **One render, in Rust.** Every chat prompt is rendered and tokenized by
+  `routers/prepare/chat_render.rs`, the one place the router renders a chat
+  for HTTP routing, gRPC and this bridge alike; Python takes token ids only.
+  A Jinja template renders as the gRPC router renders it. A model ATOM renders
+  with an encoder of its own -- DeepSeek-V3.2's, V4's and V4.1's message
+  encoders, Kimi-K3's code template, picked by the `model_type` in
+  `config.json` -- renders with llm-tokenizer's port of that encoder, given the chat
+  as ATOM's server gives it: the body as sent (`thinking`, a system message's
+  `tools`, the `tool_choice` before the bridge reads it as `auto`), messages
+  as `ChatMessage.to_template_dict` writes them, `thinking` /
+  `reasoning_effort` through ATOM's reasoning controls and V4.1's effort rules,
+  V4.1's refusal of a forced `tool_choice` in thinking mode, V3.2's and V4's
+  ports called as ATOM's adapter calls their checkpoints' `encode_messages`,
+  and the prompt's text encoded as ATOM encodes it. `src/reasoning` adds the `kimi_k3`
+  reasoning parser the `reasoning-parser` crate lacks.
 
 ### Code
 
 | Where | What |
 |---|---|
-| `atom/entrypoints/atomesh/token_bridge.py` | `TokenBridge`: `submit`, `abort`, `is_healthy`, `render_chat`, the step flush; `ChatRenderer` |
+| `atom/entrypoints/atomesh/token_bridge.py` | `TokenBridge`: `submit`, `abort`, `is_healthy`, the step flush; `ChatFormat` (the encoder's output cap, the tool-call format and its grammar check) |
+| `atom/mesh/src/routers/prepare/chat_render.rs` | `render_chat`: every chat's prompt and token ids; `ChatControls` (DeepSeek-V3.2, V4, V4.1, Kimi-K3) |
 | `atom/entrypoints/atomesh/server.py` | builds the bridge, picks the router's parsers, hands both to `launch_mesh` |
 | `atom/mesh/src/routers/atom_bridge/mod.rs` | `AtomBridgeRouter` (`RouterTrait`), `AtomBridgeRuntime`, the one-engine planner |
 | `atom/mesh/src/routers/atom_bridge/events.rs` | backend-neutral: `EventRegistry`, `SeqEventSource` (events -> `TokenChunk`), `Admission` |
@@ -144,7 +154,7 @@ mesh's gRPC routing already runs.
   it has one (Kimi-K3's `required_channel`).
 * Reasoning read from a prompt that opened it; a non-streamed reply over the
   parser's 64 KiB buffer is split rather than refused.
-* Models with a Python chat template (DeepSeek-V4 / V4.1, Kimi-K3), with
+* Models with a Python chat template (DeepSeek-V3.2 / V4 / V4.1, Kimi-K3), with
   `thinking` / `reasoning_effort` resolved by the encoder's own rules
   (V4.1's effort aliases and budgets) and a string `tool_choice` passed to
   the template, as `_chat_completions` does.
@@ -171,12 +181,17 @@ so passing them through would answer unconstrained without saying so.
 Checked: GSM8K (3-shot, `local-completions`) on Qwen3-30B-A3B, TP 1, against
 the Python standalone service on the same build: 0.6876 / 0.8901
 (flexible / strict) against 0.6808 / 0.8825. Models whose prompt ATOM
-renders are checked token for token against the OpenAI server's chat render
-(`_chat_completions`'s steps), on the body as the router serializes it: 13
-requests (thinking on and off through `thinking`, `reasoning_effort` and
-`chat_template_kwargs`, content lists, tools with `tool_choice` auto and
-required, multi-turn tool calls with `reasoning_content`) match on
-DeepSeek-V4.1-Flash, DeepSeek-V4-Flash and Kimi-K3. These models still need
+renders with an encoder of its own are checked token for token against the
+OpenAI server (`scripts/atom_token_parity.py`, then
+`test_requests_tokenize_as_on_atom`, which tokenizes each request for HTTP
+routing and as this bridge prepares it): its 34 requests (efforts and their
+aliases, `thinking`, thinking switched off through each control, tools with
+`tool_choice` auto, none and required, tools on a system message, content
+lists, multi-turn tool calls with `reasoning_content`, control tokens in a
+message's text, a 2 MiB agent history) match on DeepSeek-V4.1-Flash,
+Kimi-K3 and DeepSeek-V4-Flash, and on DeepSeek-V3.2 but for a system message's
+tools (below); V3.2 and V4 with `--preserve-tool-call-arguments`, which hands
+their encoders tool-call arguments as the strings they take. These models still need
 a GPU run: V4.1 on gfx942 needs the FP4PTPC checkpoint.
 
 Tests: `tests/entrypoints/test_token_bridge.py` (admission, submit, the
@@ -213,8 +228,14 @@ every endpoint, GSM8K, and a concurrency sweep.
   not.
 * `/v1/completions` requires `model` in the body, as the mesh's typed
   request does.
-* `thinking` / `reasoning_effort` reach only a model whose prompt ATOM
-  renders; a Jinja-rendered model (Qwen3, ...) takes its switch through
+* DeepSeek V3.2 / V4 render a history tool call's arguments as the JSON
+  string their checkpoints' encoders take; ATOM's server decodes them first
+  (V3.2 then fails with a 500, V4 renders them as one `arguments` parameter).
+* DeepSeek-V3.2's tools block has no blank lines between its paragraphs, as
+  llm-tokenizer's port (the serving engines' copy of the encoder) writes it;
+  ATOM reads the checkpoint's file, which has them.
+* `thinking` / `reasoning_effort` reach DeepSeek V3.2 / V4 / V4.1 and Kimi-K3
+  as ATOM resolves them; a Jinja-rendered model (Qwen3, ...) takes its switch through
   `chat_template_kwargs`. `reasoning_effort` is a string in the mesh's typed
   request, so an integer budget goes through `thinking.effort`.
 * The mesh's typed request refuses what the OpenAI server accepts: an
