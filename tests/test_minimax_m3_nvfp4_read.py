@@ -268,14 +268,17 @@ def test_fused_decode_select_matches_unfused(lens, S, heads):
     (the producer layer) selects the same blocks and attends to the same output as scorer +
     selector, and the ``topk_idx`` it leaves behind is what a skip-index (reuse) layer attends with.
     """
-    from aiter.ops.flydsl import (
-        minimax_m3_index_score_work_map,
-        minimax_m3_index_score_work_map_capacity,
-        sparse_pa_nvfp4_decode,
-    )
-    from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
-        decode_select_supported,
-    )
+    try:
+        from aiter.ops.flydsl import (
+            minimax_m3_index_score_work_map,
+            minimax_m3_index_score_work_map_capacity,
+            sparse_pa_nvfp4_decode,
+        )
+        from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
+            decode_select_supported,
+        )
+    except ImportError:
+        pytest.skip("this aiter has no fused index selection (optional feature)")
 
     from atom.model_ops.minimax_m3.index_buffers import IndexScoreBuffers
     from atom.model_ops.minimax_m3.index_topk import (
