@@ -257,11 +257,6 @@ class TokenLocations(NamedTuple):
 
 
 class tokenIDProcessor:
-    # `_ids_pinned_view`'s ring; a class default too, for processors built
-    # without `__init__` (they copy with `Tensor.to`).
-    _ids_pinned_ring: list | None = None
-    _ids_pinned_next = 0
-
     def __init__(
         self,
         runner: "ModelRunner",
@@ -363,8 +358,7 @@ class tokenIDProcessor:
         (deferred output), so ``pending`` stays far inside the ring."""
         ring = self._ids_pinned_ring
         if (
-            ring is None
-            or pending >= len(ring) - 1
+            pending >= len(ring) - 1
             or not gpu_tensor.is_cuda
             or not gpu_tensor.is_contiguous()
         ):
