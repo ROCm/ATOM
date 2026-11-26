@@ -78,7 +78,8 @@ def load_calibration(config, device):
         profile,
         calibration_identity(config, device),
         width=config.speculative_config.num_speculative_tokens,
-        max_batch=config.max_num_seqs,
+        # the admission limit: `--max-num-seqs 1` sizes the engine for 2 but runs 1
+        max_batch=config.scheduler_max_num_seqs or config.max_num_seqs,
     )
     return (
         torch.tensor(profile["sps_table"], dtype=torch.float32, device=device),
