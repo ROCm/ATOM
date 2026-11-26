@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 """The FP8 cache: contiguous source planes read by AITER sparse attention."""
 
+import functools
 from dataclasses import replace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
 from atom.model_ops.attentions.pool_layout.entry_arena import field_extents
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
@@ -100,15 +102,28 @@ def test_v41_attention_matches_its_dequantized_reference(heads, planar):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("heads", [8, 16, 32, 64])
-@pytest.mark.parametrize("path", ["entry", "in_kernel", "unique", "per_entry", "ring"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "entry_split",
+        "entry_whole",
+        "in_kernel",
+        "in_kernel_whole",
+        "unique",
+        "per_entry",
+        "ring",
+    ],
+)
 def test_v41_bf16_query_attention_matches_its_dequantized_reference(
     monkeypatch, heads, path
 ):
     """The BF16-query attention over MXFP8 planes (the path gfx942 takes)
-    against V4's reference on the dequantized rows: the in-register split
-    kernel, the prefill gather with its rows decoded once, the per-entry
-    gather past the scratch bound, a decode-sized ring gathered by row, and
-    the BF16 entry that picks between them. Eight heads is one TP8 rank of
+    against V4's reference on the dequantized rows: the in-register kernel
+    split and whole (the in-kernel sink, which graph capture reaches once a
+    bucket fills the CUs), the prefill gather with its rows decoded once, the
+    per-entry gather past the scratch bound, a decode-sized ring gathered by
+    row, and the BF16 entry, which takes the in-register kernel when V4 would
+    split the keys and the gather otherwise. Eight heads is one TP8 rank of
     the 64-head Flash model."""
     from atom.model_ops.attentions.deepseek_v41 import fp8_attention
     from atom.model_ops.blockscale import quantize_fp8
@@ -154,13 +169,42 @@ def test_v41_bf16_query_attention_matches_its_dequantized_reference(
         sink,
         dim**-0.5,
     )
-    if path == "entry":
+    taken = []
+    if path.startswith("entry"):
+        # Seven tokens split on any real device; the split count is what the
+        # entry's choice turns on.
+        splits = 5 if path == "entry_split" else 1
+        monkeypatch.setattr(fp8_attention, "_csa_num_splits", lambda *_: splits)
+        for name in (
+            "sparse_attn_v41_paged_2src_fp8kv",
+            "sparse_attn_v41_paged_2src_gather",
+        ):
+            impl = getattr(fp8_attention, name)
+            monkeypatch.setattr(
+                fp8_attention,
+                name,
+                lambda *a, impl=impl, name=name, **kw: (
+                    taken.append(name) or impl(*a, **kw)
+                ),
+            )
         attend = fp8_attention.sparse_attn_v41_paged_2src_bf16
     elif path == "in_kernel":
         attend = fp8_attention.sparse_attn_v41_paged_2src_fp8kv
+    elif path == "in_kernel_whole":
+        attend = functools.partial(
+            fp8_attention.sparse_attn_v41_paged_2src_fp8kv, num_splits=1
+        )
     else:
         attend = fp8_attention.sparse_attn_v41_paged_2src_gather
     actual = attend(*args)
+    if path.startswith("entry"):
+        assert taken == [
+            (
+                "sparse_attn_v41_paged_2src_fp8kv"
+                if path == "entry_split"
+                else "sparse_attn_v41_paged_2src_gather"
+            )
+        ]
     expected = sparse_attn_v4_paged_2src_reference(
         query.float(),
         fp8_attention.dequantize_rows(*fp8_attention._split(pool, dim)),
@@ -173,3 +217,32 @@ def test_v41_bf16_query_attention_matches_its_dequantized_reference(
         dim**-0.5,
     )
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("backend", ["opus", None])
+def test_native_fp8_attention_asks_aiter_once_per_device_and_shape(
+    monkeypatch, backend
+):
+    """AITER decides from the live device, not from the build's `GPU_ARCHS`;
+    a device it does not serve, gfx942 or any other, takes the BF16 query."""
+    with atom_without_aiter() as load:
+        fp8_attention = load("atom.model_ops.attentions.deepseek_v41.fp8_attention")
+    asked = []
+
+    def ask(device, q_shape, **dtypes):
+        asked.append((device, q_shape, dtypes))
+        return backend
+
+    monkeypatch.setattr(fp8_attention, "get_mla_sparse_prefill_v41_backend", ask)
+    fp8_attention._native_fp8_attention.cache_clear()
+    try:
+        for rows in ((5, 8, 512), (1, 7, 8, 512)):
+            query = torch.empty(rows, dtype=torch.bfloat16)
+            assert fp8_attention.native_fp8_attention(query) is (backend is not None)
+    finally:
+        fp8_attention._native_fp8_attention.cache_clear()
+    ((device, q_shape, dtypes),) = asked
+    assert (device, q_shape) == (torch.device("cpu"), (1, 8, 512))
+    assert dtypes["layout"] == "contiguous"
+    assert dtypes["unified_kv_dtype"] == dtypes["q_dtype"] == torch.float8_e4m3fn
+    assert dtypes["unified_kv_scale_dtype"] == torch.float8_e8m0fnu

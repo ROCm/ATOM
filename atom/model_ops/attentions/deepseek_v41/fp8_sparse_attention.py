@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Sparse attention reading MXFP8 CSA and SWA planes directly, BF16 query.
 
 The kernel loads each selected row's FP8 values as 32-bit words and its

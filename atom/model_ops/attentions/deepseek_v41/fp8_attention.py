@@ -5,9 +5,9 @@ CSA and SWA have independent row spaces. A prefill's SWA source contains
 the current batch's rings followed by the current chunk; decode uses the ring directly.
 Legacy packed rows remain accepted by the standalone wrappers.
 
-gfx942, which AITER's MXFP8 kernel does not serve, attends with a BF16 query instead, on a
-Triton kernel that decodes the planes in registers (`fp8_sparse_attention`)
-for split-KV launches (decode, short chunks) and during graph capture. Full-width
+A device AITER's MXFP8 kernel does not serve (gfx942 today) attends with a
+BF16 query instead, on a Triton kernel that decodes the planes in registers
+(`fp8_sparse_attention`) for split-KV launches (decode, short chunks) and during graph capture. Full-width
 prefill launches, where that kernel is slower, decode the rows each source
 contributes into bounded BF16 scratch for V4's BF16 attention, as the packed
 FP4 adapter does.
@@ -18,8 +18,10 @@ import functools
 import torch
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
+from aiter.ops.mla_sparse_prefill import (
+    get_mla_sparse_prefill_v41_backend,
+    mla_sparse_prefill_v41,
+)
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.v4_kernels import (
@@ -36,11 +38,30 @@ from .packed_rows import _read_plane
 _SCRATCH_ROWS = 1 << 18
 
 
+def native_fp8_attention(query):
+    """Whether AITER's MXFP8 sparse attention serves `query` [..., H, D] on
+    its device, asked of AITER once per device and shape."""
+    *_, heads, dim = query.shape
+    return _native_fp8_attention(query.device, heads, dim)
+
+
 @functools.cache
-def native_fp8_attention():
-    """Whether AITER's MXFP8 sparse attention serves this device; gfx942 has
-    no build of it."""
-    return get_gfx() != "gfx942"
+def _native_fp8_attention(device, heads, dim):
+    return (
+        get_mla_sparse_prefill_v41_backend(
+            device,
+            (1, heads, dim),
+            unified_kv_dtype=torch.float8_e4m3fn,
+            softmax_scale=dim**-0.5,
+            q_dtype=torch.float8_e4m3fn,
+            q_scale_dtype=torch.float8_e8m0fnu,
+            unified_kv_scale_dtype=torch.float8_e8m0fnu,
+            kv_dtype=torch.float8_e4m3fn,
+            kv_scale_dtype=torch.float8_e8m0fnu,
+            layout="contiguous",
+        )
+        is not None
+    )
 
 
 def _split(rows, dim, scale_dtype=torch.float8_e8m0fnu):
@@ -124,7 +145,8 @@ def _gather_rows(
     inside = i < CAPACITY
     valid = (i < count) & inside
     row = tl.load(rows + start + i, valid, other=-1)
-    # A -1 sentinel stays one, so V4 skips it rather than scoring a zero key.
+    # V4's CSA kernels read every entry in range, -1 included; the serving
+    # CSR names only live rows there, and `local` is -1 only past `count`.
     live = valid & (row >= 0)
     dims = tl.arange(0, D)
     value = _read_plane(data, scale, tl.where(live, row, 0), dims, live, D, False)
@@ -200,10 +222,16 @@ def _gathered(source, indices, indptr, first, end, capacity, dim):
 
 def _unique_rows(source, indices, indptr, dim):
     """Each source row that the CSR (`indices` up to `indptr[-1]`) names,
-    decoded once, and `indices` renumbered into it. -1, any ID past the
-    source, and every entry past the CSR stay -1: a layer without a CSA pool
-    attends over a 0-row source. None when the rows exceed the scratch bound;
-    the count is the one host read."""
+    decoded once, and `indices` renumbered into it. Entries past the CSR, and
+    any -1 or ID past the source, become -1; V4's CSA kernels do not skip -1,
+    so this relies on the CSR naming only live rows, as the serving CSR does.
+    A layer without a CSA pool attends over a 0-row source. None when the
+    rows exceed the scratch bound; the count is the one host read.
+
+    Besides the scratch, `marks` and `rank` are sized by the whole source, not
+    by the step: 8 B per pool row (about 1.5% of an MXFP8 pool at D=512), a
+    cumsum and an `_order_marked` scan over them for every CSA layer of a
+    prefill, freed after each layer."""
     data, scale = source
     rows, entries = data.shape[0], indices.numel()
     if not rows:
@@ -293,7 +321,7 @@ def sparse_attn_v41_paged_2src_gather(
             query,
             prefix,
             prefix_indices,
-            _rebased(kv_indptr_prefix, 0, tokens),
+            kv_indptr_prefix[: tokens + 1],
             window,
             kv_indices_extend,
             kv_indptr_extend,

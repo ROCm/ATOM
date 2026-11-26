@@ -604,7 +604,7 @@ def _attend_block(
     if cache.packed and not a8w4:
         pool = (pool, cache.ring_view(self.spec.layer_id))
     kwargs = {"out": flat_query}
-    if a8w4 or (cache.kv_fp8 and native_fp8_attention()):
+    if a8w4 or (cache.kv_fp8 and native_fp8_attention(query)):
         attend = sparse_attn_v41_paged_2src
         attending = tuple(part.flatten(0, 1) for part in query_fp8)
         if a8w4:

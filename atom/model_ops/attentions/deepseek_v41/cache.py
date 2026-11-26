@@ -992,7 +992,7 @@ class PagedAttentionCache:
 
     def query_fp8(self, query, *, a8w4=False):
         """MXFP8 Q for A8W8 or A8W4 attention; None for the BF16 adapter."""
-        if not (a8w4 or (self.kv_fp8 and native_fp8_attention())):
+        if not (a8w4 or (self.kv_fp8 and native_fp8_attention(query))):
             return None
         *rows, dim = query.shape
         return (
