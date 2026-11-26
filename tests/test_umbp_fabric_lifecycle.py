@@ -264,7 +264,7 @@ def test_fabric_close_waits_for_inflight_commit(owner, monkeypatch, commit_fails
     def close():
         try:
             memory.close()
-        except BaseException as exc:
+        except (AssertionError, RuntimeError) as exc:
             errors.append(exc)
 
     closer = threading.Thread(target=close, daemon=True)

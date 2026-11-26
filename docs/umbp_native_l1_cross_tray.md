@@ -221,6 +221,9 @@ extension hashes, and service copy counters were independently checked. All
 were clear before the dedicated empty containers were stopped.
 
 This follow-up validates allocation accounting and adapter functionality.
+The production adapter and GPU accounting test remained unchanged after the
+GPU run. A later test-only lint correction removed an extra blank line and
+narrowed the CPU close-worker exception handler; the CPU suite passed again.
 It did not repeat the model or native GPU matrix from the earlier campaign,
 and the saved load baseline was busy. It does not establish performance or
 bandwidth under idle conditions.

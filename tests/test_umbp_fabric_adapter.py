@@ -15,7 +15,6 @@ from atom.kv_transfer.pool.umbp import pool as umbp_pool
 from atom.kv_transfer.pool.umbp.pool import UmbpPoolMemory, pool_id_for
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 
-
 ADDRESS = "unix:///unused-umbp-l1.sock"
 
 
