@@ -1,0 +1,207 @@
+name: AtomRL DAPO GPU shard (internal)
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: "Local AtomRL DAPO image tag"
+        required: false
+        type: string
+        default: atomrl:dapo-ci
+      data_root:
+        description: "Shared data root containing the DAPO models and datasets"
+        required: false
+        type: string
+        default: /data/atomrl
+
+jobs:
+  atomrl-gpu-unit:
+    name: AtomRL GPU unit tests
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    runs-on: atom-mi355-8gpu.predownload
+    timeout-minutes: 120
+    concurrency:
+      group: atomrl-dapo-atom-mi355-8gpu.predownload
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      DATA_ROOT: ${{ inputs.data_root }}
+      DSV3_REVISION: 634c1d1f51816415fa371e51281e435ce4422469
+      IMAGE_TAG: ${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}-unit
+      CONTAINER_NAME: atomrl_gpu_unit_${{ github.run_id }}_${{ github.run_attempt }}
+    steps:
+      - name: Checkout ATOM repository
+        uses: actions/checkout@v6
+
+      - name: Build AtomRL GPU unit image
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            --file atomrl/docker/Dockerfile.dev \
+            --tag "$IMAGE_TAG" \
+            .
+
+      - name: Prepare AtomRL GPU unit models
+        run: |
+          set -euo pipefail
+          mkdir -p "$DATA_ROOT/hf"
+          docker run --rm --network=host \
+            -v "$DATA_ROOT:$DATA_ROOT" \
+            "$IMAGE_TAG" python \
+            examples/DAPO/tools/prepare_data.py \
+              --data-root "$DATA_ROOT" \
+              --models Qwen3-8B-Base \
+              --models-only
+          docker run --rm --network=host \
+            -e HF_HOME=/data/rl_data/hf \
+            -e DSV3_REVISION="$DSV3_REVISION" \
+            -v "$DATA_ROOT/hf:/data/rl_data/hf" \
+            "$IMAGE_TAG" python -c \
+            "import os; from huggingface_hub import snapshot_download; snapshot_download('bzantium/tiny-deepseek-v3', revision=os.environ['DSV3_REVISION'])"
+
+      - name: Run AtomRL GPU unit tests
+        run: |
+          set -euo pipefail
+          docker run --rm --name "$CONTAINER_NAME" \
+            --device=/dev/kfd --device=/dev/dri --group-add video \
+            --ipc=host --network=host --privileged \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 \
+            -v "$DATA_ROOT/models/Qwen3-8B-Base:/dev/shm/atomrl_weight_sync:ro" \
+            -v "$DATA_ROOT/hf:/data/rl_data/hf:ro" \
+            -w /opt/atomrl/ATOM \
+            "$IMAGE_TAG" bash -lc \
+            'python3 -m pytest atomrl/tests/unit atomrl/tests/atomrl \
+              -m "gpu or multigpu" -q'
+
+      - name: Clean up AtomRL GPU unit image
+        if: always()
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker rmi -f "$IMAGE_TAG" 2>/dev/null || true
+
+  dapo-case:
+    name: AtomRL DAPO example ${{ matrix.id }} (${{ matrix.name }})
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - id: "1"
+            name: Qwen3-8B BF16 vLLM
+            runner: atom-mi355-8gpu.predownload
+          - id: "2"
+            name: Qwen3-8B FP8 rollout
+            runner: atom-mi355-8gpu.predownload
+          - id: "3"
+            name: Qwen3-8B FP8 end-to-end
+            runner: atom-mi355-8gpu.predownload
+          - id: "4"
+            name: Qwen3-8B ATOM FP8
+            runner: atom-mi355-8gpu.predownload
+          - id: "5"
+            name: Qwen3-8B ATOM BF16
+            runner: atom-mi355-8gpu.predownload
+          - id: "6"
+            name: Qwen3-30B-A3B vLLM
+            runner: atom-mi355-8gpu.predownload
+          - id: "7"
+            name: Qwen3-30B-A3B Megatron EP8
+            runner: atom-mi355-8gpu.predownload
+          - id: "9"
+            name: Qwen3-30B-A3B ATOM BF16
+            runner: atom-mi355-8gpu.predownload
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    concurrency:
+      group: atomrl-dapo-${{ matrix.runner }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      DATA_ROOT: ${{ inputs.data_root }}
+      IMAGE_TAG: ${{ inputs.image_tag }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
+      CONTAINER_NAME: atomrl-ex-${{ github.run_id }}-${{ matrix.id }}
+      ATOMRL_CONTAINER: atomrl-ex-${{ github.run_id }}-${{ matrix.id }}
+
+    steps:
+      - name: Checkout ATOM repository
+        uses: actions/checkout@v6
+
+      - name: Build case validation image
+        run: |
+          set -euo pipefail
+          docker build --pull \
+            --file atomrl/docker/Dockerfile.dev \
+            --tag "$IMAGE_TAG" \
+            .
+
+      - name: Prepare pinned DAPO models and data
+        run: |
+          set -euo pipefail
+          models=(Qwen3-8B-Base)
+          if [[ "${{ matrix.id }}" == "6" || "${{ matrix.id }}" == "7" || "${{ matrix.id }}" == "9" ]]; then
+            models+=(Qwen3-30B-A3B-Base)
+          fi
+          docker run --rm --network=host \
+            -v "$DATA_ROOT:$DATA_ROOT" \
+            "$IMAGE_TAG" python \
+            examples/DAPO/tools/prepare_data.py \
+              --data-root "$DATA_ROOT" \
+              --models "${models[@]}"
+
+      - name: Check shared DAPO models and data
+        run: |
+          set -euo pipefail
+          required=(
+            "models/Qwen3-8B-Base"
+            "data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+            "data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+          )
+          if [[ "${{ matrix.id }}" == "6" || "${{ matrix.id }}" == "7" || "${{ matrix.id }}" == "9" ]]; then
+            required+=("models/Qwen3-30B-A3B-Base")
+          fi
+          missing=0
+          for relative in "${required[@]}"; do
+            if [[ ! -e "$DATA_ROOT/$relative" ]]; then
+              echo "::error title=Missing DAPO input::$DATA_ROOT/$relative"
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            echo "Prepare the shared data root before running the DAPO GPU check." >&2
+            exit 1
+          fi
+
+      - name: Install harness dependency
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+
+      - name: Run DAPO example
+        run: |
+          set -euo pipefail
+          bash atomrl/examples/run.sh "${{ matrix.id }}" \
+            --data-root "$DATA_ROOT" \
+            --image "release=${IMAGE_TAG}" \
+            --results "$GITHUB_WORKSPACE/atomrl/output/regression" \
+            --strict
+
+      - name: Upload DAPO regression result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomrl-dapo-example-${{ matrix.id }}-${{ github.run_id }}
+          path: |
+            atomrl/output/regression
+            ${{ env.DATA_ROOT }}/logs/atomrl-*.log
+          if-no-files-found: warn
+
+      - name: Clean up DAPO container
+        if: always()
+        run: |
+          docker rm -f "$CONTAINER_NAME-release" 2>/dev/null || true
+          docker rmi -f "$IMAGE_TAG" 2>/dev/null || true
+          docker container prune -f || true

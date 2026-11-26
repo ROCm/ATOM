@@ -1,8 +1,9 @@
-"""Differential tests for the default batched GDN target-verify path.
+"""Differential tests for the batched GDN target-verify path.
 
-The production SGLang plugin folds the whole draft block into one conv update
-and one SSM recurrent call. These tests retain the removed per-draft-step
-implementation as a test-only numerical reference.
+The SGLang plugin's batched TARGET_VERIFY path (``ATOM_ENABLE_REPLAYSSM=0``)
+folds the whole draft block into one conv update and one SSM recurrent call.
+These tests retain the removed per-draft-step implementation as a test-only
+numerical reference.
 
 These tests check, with the real kernels, whether the two call patterns are
 numerically interchangeable, and whether SGLang's buffer layouts can be
@@ -17,10 +18,15 @@ addressed the way ATOM's batched kernels expect:
 
 The negative-control tests exist so that a future refactor cannot make the
 equivalence tests pass vacuously: they assert that realistic adapter bugs are
-still detected. See section 17 of ``ATOM_Qwen3.5_DFLASH_TP8复现与实现报告.md``.
+still detected.
 
-Apart from ``_conv_batched_live``, which repeats the plugin's production conv
-call (``_spec_conv_qkv``), nothing here touches the plugin's production path.
+These tests call the kernels directly, not the plugin's ``forward()`` or
+``_verify_batched_ssm``. ``_conv_batched_live`` repeats the kernel call from
+``_spec_conv_qkv``. The SSM stand-in ``_ssm_batched`` covers only the plain
+state layout (no FlyDSL logical KV view), slots ``cache_index * draft + step``
+and no pad rows;
+``test_sglang_gdn_verify_batched_ssm.py`` covers the plugin's own call through
+``forward()``.
 """
 
 from __future__ import annotations
@@ -50,7 +56,6 @@ CONV_DIM = 2 * K_DIM + V_DIM  # q, k and v are packed into mixed_qkv
 
 NUM_SLOTS = 24
 
-# Draft lengths spanning the sweep in section 16 of the report.
 DRAFT_LENS = [4, 8, 16]
 BATCH_SIZES = [1, 3]
 
@@ -217,16 +222,6 @@ def test_ssm_per_step_loop_matches_batched_slot_table(bs: int, draft: int):
     torch.testing.assert_close(inter_b, inter_a, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("draft", DRAFT_LENS)
-def test_batched_ssm_leaves_live_state_untouched(draft: int):
-    """The batched path writes only into the slot pool, so the plugin's
-    snapshot/restore of the live SSM state becomes unnecessary."""
-    inp = _Inputs(3, draft)
-    live_before = inp.live_ssm.clone()
-    _ssm_batched(inp)
-    torch.testing.assert_close(inp.live_ssm, live_before, rtol=0, atol=0)
-
-
 def test_ssm_equivalence_detects_collapsed_slot_table():
     """Negative control: a naive adapter reusing one slot for every step (what
     a 1D index table would do) must NOT compare equal.
@@ -260,7 +255,8 @@ def test_ssm_equivalence_detects_missing_live_state_seed():
 # Conv
 # --------------------------------------------------------------------------
 def _conv_per_step_loop(inp: _Inputs):
-    """Plugin behaviour today: one narrow-window update per draft step."""
+    """Removed production path (one narrow-window update per draft step), retained
+    as a test-only numerical reference."""
     conv = inp.live_conv.clone()
     qkv = torch.zeros(inp.bs, inp.draft, CONV_DIM, device="cuda", dtype=torch.bfloat16)
     windows = torch.zeros(
@@ -438,7 +434,7 @@ def test_intermediate_ssm_layout_is_flattenable():
 
     This mirrors the allocation in SGLang's
     ``MambaPool.__init__`` (memory_pool.py); if that ever stops being
-    contiguous the conversion layer must copy instead of view."""
+    contiguous, ``_verify_batched_ssm`` raises rather than viewing it."""
     draft = 8
     layers, slots = 2, NUM_SLOTS
     cache = torch.zeros(

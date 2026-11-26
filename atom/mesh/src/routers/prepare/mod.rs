@@ -18,6 +18,7 @@ use crate::{
     tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
 };
 
+pub(crate) mod chat_controls;
 pub(crate) mod chat_template;
 pub(crate) mod fast_tokenizer;
 pub mod generation_payload;
@@ -30,7 +31,7 @@ pub(crate) mod tool_constraints;
 #[cfg(test)]
 mod tests;
 
-use chat_template::process_chat_messages;
+use chat_template::{process_chat_messages, ProcessedMessages};
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
@@ -49,11 +50,35 @@ pub fn lookup_tokenizer(
     })
 }
 
+/// A chat prompt rendered outside the router, for a model whose template the
+/// router cannot render (ATOM's Python message encoders).
+#[derive(Debug, Clone)]
+pub struct RenderedChat {
+    pub text: String,
+    pub token_ids: Vec<u32>,
+    /// The channel opener the prompt ends on (`ResponseContext::prompt_opener`).
+    pub prompt_opener: Option<String>,
+}
+
 pub fn prepare_chat(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
     model_id: Option<String>,
     components: &AppContext,
+) -> Result<(GenerationPayload, ResponseContext), Response> {
+    prepare_chat_with(req, headers, model_id, components, None, false)
+}
+
+/// `prepare_chat`, taking the prompt as `rendered` when it is given, and,
+/// with `reads_prompt_opener`, naming the opener a prompt it renders ends on
+/// (`ResponseContext::prompt_opener`; a rendered prompt names its own).
+pub fn prepare_chat_with(
+    req: Arc<ChatCompletionRequest>,
+    headers: Option<HeaderMap>,
+    model_id: Option<String>,
+    components: &AppContext,
+    rendered: Option<RenderedChat>,
+    reads_prompt_opener: bool,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
         error!("model_id not set");
@@ -63,13 +88,28 @@ pub fn prepare_chat(
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
 
-    let processed = process_chat_messages(&body_ref, &*tokenizer)
-        .map_err(|e| error::bad_request("process_messages_failed", e))?;
-
-    let encoding = tokenizer
-        .encode(&processed.text, false)
-        .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
-    let token_ids = encoding.token_ids().to_vec();
+    let (processed, token_ids, prompt_opener) = match rendered {
+        Some(rendered) => (
+            ProcessedMessages {
+                text: rendered.text,
+                stop_sequences: body_ref.stop.clone(),
+            },
+            rendered.token_ids,
+            rendered.prompt_opener,
+        ),
+        None => {
+            let processed = process_chat_messages(&body_ref, &*tokenizer)
+                .map_err(|e| error::bad_request("process_messages_failed", e))?;
+            let encoding = tokenizer
+                .encode(&processed.text, false)
+                .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
+            let token_ids = encoding.token_ids().to_vec();
+            let prompt_opener = reads_prompt_opener
+                .then(|| response_context::prompt_opener(&processed.text))
+                .flatten();
+            (processed, token_ids, prompt_opener)
+        }
+    };
 
     let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
         generate_tool_constraints(tools, &req.tool_choice, &req.model)
@@ -114,6 +154,7 @@ pub fn prepare_chat(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opener,
     };
 
     Ok((payload, ctx))
@@ -168,6 +209,7 @@ pub fn prepare_generate(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opener: None,
     };
 
     Ok((payload, ctx))
