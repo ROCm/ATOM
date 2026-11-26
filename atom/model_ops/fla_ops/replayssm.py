@@ -979,8 +979,8 @@ def _replayssm_fwd_kernel(
         BH,
         IS_KDA,
     )
-    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
     if T1_FAST:
+        owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
         # T == 1: nothing chains from token to token, so S_h is never needed as
         # a value -- only its two contractions, S_h^T k and S_h^T q, and both
         # distribute over the record sum because (k_j (x) u_j)^T x = (k_j.x)u_j:
@@ -1077,6 +1077,7 @@ def _replayssm_fwd_kernel(
     # is a bare k~ @ u with no transpose to stage through LDS.
     b_h = b_s0 * b_decay[:, None]
     b_h += _replay_dot(b_kw, b_ru, True, DOT_MODE)
+    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
 
     # ---- 2. flush: the checkpoint absorbs the committed prefix --------------
     if do_flush:
