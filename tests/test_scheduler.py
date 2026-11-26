@@ -24,6 +24,7 @@ from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.prefill_delayer import PrefillDecision, PrefillDelayer
 from atom.model_engine.scheduler import (
+    PrefillLimits,
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
@@ -1933,6 +1934,18 @@ class TestInitialRampFullChunk:
         assert report["full_chunk"] is True  # 20 + 20 >= 32
         assert report["admittable_requests"] == 2
 
+    def test_fill_is_measured_against_this_steps_prefill_budget(self, seq_factory):
+        """With mixed batching the decode reservation shrinks the step's
+        prefill budget (`limits.tokens`); target_fill is a fraction of that,
+        not of max_num_batched_tokens (64): 12 probed tokens fill half of a
+        16-token budget but not half of 64."""
+        sched = self._sched()
+        sched.add(seq_factory(list(range(10, 30))))
+        sched.set_prefill_delayer(_RampDelayer())
+        sched._probe_fresh, sched._probe_filled_budget = 1, False
+        full = sched._ramp_full_chunk(True, 1, 2, 12, PrefillLimits(16))
+        assert full and not sched._ramp_full_chunk(True, 1, 2, 12, PrefillLimits(64))
+
     def test_waiting_prompts_short_of_target_fill(self, seq_factory):
         sched = self._sched()
         sched.add(seq_factory(list(range(10, 30))))
@@ -2039,10 +2052,10 @@ class TestInitialRampFullChunk:
         sched.add(seq_factory(list(range(10, 50))))
         second = seq_factory(list(range(50, 90)))
         sched.add(second)
-        sched._local_prefill_pending_work()
+        sched._local_prefill_pending_work(sched._prefill_limits())
         assert sched._probe_filled_budget and sched._probe_fresh == 1
         sched.waiting.remove(second)
-        sched._local_prefill_pending_work()
+        sched._local_prefill_pending_work(sched._prefill_limits())
         assert not sched._probe_filled_budget and sched._probe_fresh == 1
 
     @pytest.mark.parametrize("stop", ["kv_refusal", "inflight_prefix", "replay"])
@@ -2065,7 +2078,7 @@ class TestInitialRampFullChunk:
         else:
             patch = mock.patch.object(sched, "_waits_below_resume", return_value=True)
         with patch:
-            sched._local_prefill_pending_work()
+            sched._local_prefill_pending_work(sched._prefill_limits())
         assert not sched._probe_filled_budget and sched._probe_fresh == 0
 
     def test_dp_counts_past_an_in_flight_prefix_as_admission_does(self, seq_factory):

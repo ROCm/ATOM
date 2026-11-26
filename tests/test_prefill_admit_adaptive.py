@@ -183,7 +183,8 @@ def test_cycle_matches_eoq_with_fitted_costs(a_us, lam):
 # ---- initial ramp (ATOM_PREFILL_INITIAL_RAMP) under the adaptive policy ----
 # reduce-buffer slots: the ranks whose free seq slots fill target_fill of a chunk,
 # and (no cost slots) the first adaptive one, the requests a FIRE could admit
-_FULL_CHUNK = 11
+_PREFILL_BUDGET = 12
+_FULL_CHUNK = 13
 _ADMITTABLE = _FIXED_SLOTS
 
 
@@ -206,7 +207,7 @@ def _adaptive_delayer(dp_size=1, prefill_ramp=True, clock=None):
 def _sibling(full=True, running=10):
     """The other rank of a two-rank group: a whole chunk pending, 5 admittable
     requests, `running` decode seqs; `full`: its free slots fill a chunk."""
-    slots = {0: 1, 1: 16384, 2: running, _ADMITTABLE: 5}
+    slots = {0: 1, 1: 16384, 2: running, _ADMITTABLE: 5, _PREFILL_BUDGET: 16384}
     if full:
         slots[_FULL_CHUNK] = 1
     return slots
@@ -229,6 +230,7 @@ def _tick(d, full=True, running=10, kv_usage=0.5, sibling=None):
             waiting_requests=5,
             admittable_requests=5,
             full_chunk=full,
+            prefill_budget=16384,
         ).allow
 
 

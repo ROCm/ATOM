@@ -68,6 +68,7 @@ def test_schedule_passes_reserved_limits_to_every_prefill_probe(monkeypatch, pro
         sched.cost_balance = probe == "_estimate_prefill_chunk_cost"
         sched.prefill_delayer = SimpleNamespace(
             protects_decode=lambda count: False,
+            prefill_ramp=False,
             max_queue_ms=None,
             should_allow_prefill=lambda **kw: PrefillDecision(
                 allow=False, prefillable_ranks=1
