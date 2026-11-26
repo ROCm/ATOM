@@ -1110,7 +1110,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables the fork.
     # Eligible Kimi latent TP blocks keep their dispatch op: outside capture/TBO
-    # the row tail starts at max(threshold + 1, KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS).
+    # the row tail also requires the model's fixed minimum row count.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
