@@ -54,6 +54,15 @@ def _flag_env(name: str, default: str = "0") -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
+def _graph_side_streams_default() -> str:
+    # Off where HIP's pool has more than four hardware queues (HIP's default
+    # is four): the fifth queue is the first on the launch queue's command
+    # processor pipe (queue ids four apart), and a graph branch HIP binds to it
+    # runs several times slower (`graph_records_single_stream`).
+    raw = os.getenv("GPU_MAX_HW_QUEUES", "").strip()
+    return "0" if raw.isdigit() and int(raw) > 4 else "1"
+
+
 def _profiler_detail_env(name: str) -> bool:
     # Unset or empty falls back to ATOM_PROFILER_MORE, so the per-option flag
     # always wins when given and ATOM_PROFILER_MORE=1 alone still enables all.
@@ -1128,7 +1137,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 records every CUDA graph on one stream: the side-stream forks (dual-
     # stream MoE, DeepSeek-V4's compressors, the Engram lookup, `side_stream`
     # regions) run inline in the graph window, its warmup forward included.
-    "ATOM_GRAPH_SIDE_STREAMS": lambda: _flag_env("ATOM_GRAPH_SIDE_STREAMS", "1"),
+    # Unset, it follows GPU_MAX_HW_QUEUES (`_graph_side_streams_default`).
+    "ATOM_GRAPH_SIDE_STREAMS": lambda: _flag_env(
+        "ATOM_GRAPH_SIDE_STREAMS", _graph_side_streams_default()
+    ),
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")

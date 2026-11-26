@@ -6,7 +6,7 @@ binds no parallel branch of it to a hardware queue; eager forwards keep theirs.
 
 One predicate, `graph_records_single_stream`, answers for every fork over the
 whole graph window: the capture loop's warmup forward as well as its capture,
-and any other stream capture."""
+and any other stream capture. Unset, the switch follows GPU_MAX_HW_QUEUES."""
 
 import sys
 from contextlib import nullcontext
@@ -21,7 +21,8 @@ from atom.utils import envs, forward_context, region_graph
 
 @pytest.fixture
 def switch(monkeypatch):
-    """Set ATOM_GRAPH_SIDE_STREAMS (None: unset)."""
+    """Set ATOM_GRAPH_SIDE_STREAMS (None: unset) over a default queue pool."""
+    monkeypatch.delenv("GPU_MAX_HW_QUEUES", raising=False)
 
     def set_to(value):
         if value is None:
@@ -53,6 +54,32 @@ def window(monkeypatch):
 
     place.main = main
     return place
+
+
+@pytest.mark.parametrize(
+    ("queues", "value", "side_streams"),
+    [
+        (None, None, True),
+        ("4", None, True),
+        ("5", None, False),
+        ("8", None, False),
+        ("abc", None, True),
+        ("5", "1", True),
+        ("4", "0", False),
+        (None, "0", False),
+    ],
+)
+def test_unset_the_switch_follows_the_queue_pool(
+    monkeypatch, queues, value, side_streams
+):
+    """HIP's pool holds four queues by default; a fifth is the first to share
+    the launch queue's command processor pipe. An explicit value wins."""
+    for name, v in (("GPU_MAX_HW_QUEUES", queues), ("ATOM_GRAPH_SIDE_STREAMS", value)):
+        if v is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, v)
+    assert envs.ATOM_GRAPH_SIDE_STREAMS is side_streams
 
 
 @pytest.mark.parametrize(

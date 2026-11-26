@@ -35,6 +35,10 @@ def recorded(monkeypatch):
     """A main and a side stream, and the log of every edge and region."""
     log = []
     main, side = RecordingStream(log, "main"), RecordingStream(log, "side")
+    # Graphs keep their side streams here (`graph_records_single_stream`),
+    # whatever queue pool the shell running the tests exports.
+    monkeypatch.delenv("ATOM_GRAPH_SIDE_STREAMS", raising=False)
+    monkeypatch.delenv("GPU_MAX_HW_QUEUES", raising=False)
 
     class Region:
         def __init__(self, stream):
