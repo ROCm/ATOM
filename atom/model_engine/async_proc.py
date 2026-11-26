@@ -30,7 +30,9 @@ import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
 
 from atom.config import local_device_index
+from atom.kv_transfer import progress_doorbell
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
+from atom.kv_transfer.progress_doorbell import KV_PROGRESS_DOORBELL
 from atom.model_engine.block_table_codec import (
     FORWARD_RPC,
     BlockTableDeltaDecoder,
@@ -209,6 +211,13 @@ class AsyncIOProc:
             )
             t.start()
             self.io_threads.append(t)
+            if envs.ATOM_OFFLOAD_LOAD_EVENT_WAIT:
+                # A finished tier load says so on this channel at once, not
+                # with the next completion answer (`progress_doorbell`).
+                kv_queue = self.kv_queue
+                progress_doorbell.install(
+                    lambda: kv_queue.put_nowait(KV_PROGRESS_DOORBELL)
+                )
 
         # Dedicated collective-RPC reply thread
         if self.rpc_output_addr is not None:
@@ -533,6 +542,9 @@ class AsyncIOProcManager:
         ]
         self._pending_kv_aggregation: _PendingKvAggregation | None = None
         self.kv_output_threads: list[threading.Thread] = []
+        # Set when a worker rings the KV progress doorbell (`progress_doorbell`):
+        # a load finished or failed there since its last completion answer.
+        self.kv_doorbell_event = threading.Event()
 
         # Generic collective-RPC reply channels, one per rank
         self.rpc_output_addrs = [self._reply_addr(i, host) for i in range(proc_num)]
@@ -704,7 +716,11 @@ class AsyncIOProcManager:
                     continue
                 obj = output_socket.recv(copy=False)
                 obj = pickle.loads(obj)
-                self.kv_outputs_queues[worker_id].put_nowait(obj)
+                if isinstance(obj, str) and obj == KV_PROGRESS_DOORBELL:
+                    # Not an answer: it never joins an aggregation.
+                    self.kv_doorbell_event.set()
+                else:
+                    self.kv_outputs_queues[worker_id].put_nowait(obj)
                 if self.kv_progress_event is not None:
                     self.kv_progress_event.set()
         finally:
@@ -998,6 +1014,14 @@ class AsyncIOProcManager:
         )
         self._pending_kv_aggregation = pending
         return pending
+
+    @property
+    def kv_aggregation_started_at(self) -> float | None:
+        """When the outstanding KV aggregation was requested (engine clock);
+        None when none is outstanding. Its answer holds every completion the
+        workers recorded before that moment."""
+        pending = self._pending_kv_aggregation
+        return None if pending is None else pending.started_at
 
     def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):
         """RPC call with KV output aggregation across all workers.
