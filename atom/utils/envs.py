@@ -1339,6 +1339,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # race it closes was seen); 0: never.
     "ATOM_STATE_OPS_DRAIN": lambda: os.getenv("ATOM_STATE_OPS_DRAIN", "1"),
     "ATOM_GDN_GRAPH_MAX_SEQS": lambda: int(os.getenv("ATOM_GDN_GRAPH_MAX_SEQS", "8")),
+    # Mixed steps (atom/model_engine/mixed_step.py): a step that prefills also
+    # carries the running decode batch. One target forward over [prefill rows |
+    # decode rows] (norms, GEMMs, router/shared expert, MoE once over all rows),
+    # attention and GDN per segment on today's kernels and metadata, sampling,
+    # verify and draft passes per segment as today. Numerical (the decode rows'
+    # GEMMs run at another M), so default off; off = today's code paths.
+    "ATOM_MIXED_STEP": lambda: os.getenv("ATOM_MIXED_STEP", "0") == "1",
     # Prefill token graphs for the GDN/MHA builder (Qwen3.5 / Qwen3-Next) under
     # DP attention. A DP group replays a prefill bucket only on a step every
     # rank prefills (`ForwardMode.prefill_graph_all_ranks`); any other step --

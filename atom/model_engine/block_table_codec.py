@@ -77,6 +77,9 @@ class BlockTableDeltaEncoder:
         return (self.encode(args[0]), *args[1:])
 
     def encode(self, batch):
+        mixed = getattr(batch, "mixed_decode", None)
+        if mixed is not None:
+            return self._encode_mixed(batch, mixed)
         rows = getattr(batch, "block_tables", None)
         req_ids = getattr(batch, "req_ids", None)
         if not rows or req_ids is None:
@@ -141,6 +144,26 @@ class BlockTableDeltaEncoder:
         self._full_send_reason = None
         return wire_batch
 
+    def _encode_mixed(self, batch, mixed):
+        """ATOM_MIXED_STEP: a prefill batch carrying the decode batch (`mixed_decode`). Both halves against the
+        tables the workers already hold; afterwards the workers hold both halves' rows (the next plain decode
+        step then ships deltas, not every decode row whole)."""
+        before = dict(self._published)
+        wire_dec = self.encode(mixed)
+        pub_dec = dict(self._published)
+        self._published = before
+        outer = copy.copy(batch)
+        outer.mixed_decode = None
+        wire = self.encode(outer)
+        if isinstance(getattr(wire, "block_tables", None), BlockTableDelta) and isinstance(
+            getattr(wire_dec, "block_tables", None), BlockTableDelta
+        ):
+            self._published.update(pub_dec)
+        else:
+            self._published.clear()
+        wire.mixed_decode = wire_dec
+        return wire
+
     def _send_whole(self, batch, reason: str):
         """Fall back to the plain batch, and drop what the workers were told.
 
@@ -169,6 +192,24 @@ class BlockTableDeltaDecoder:
         return args
 
     def decode(self, batch):
+        mixed = getattr(batch, "mixed_decode", None)
+        if mixed is not None:
+            # the encoder's `_encode_mixed`, mirrored: decode half first, both halves' rows kept
+            both_delta = isinstance(getattr(mixed, "block_tables", None), BlockTableDelta) and isinstance(
+                getattr(batch, "block_tables", None), BlockTableDelta
+            )
+            before = dict(self._rows)
+            md = self.decode(mixed)
+            rows_dec = dict(self._rows)
+            self._rows = before
+            batch.mixed_decode = None
+            out = self.decode(batch)
+            out.mixed_decode = md
+            if both_delta:
+                self._rows.update(rows_dec)
+            else:
+                self._rows.clear()
+            return out
         delta = getattr(batch, "block_tables", None)
         if not isinstance(delta, BlockTableDelta):
             # Whole tables arrived, so whatever was cached is superseded --

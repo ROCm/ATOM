@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -505,6 +506,11 @@ class EngineCore:
                 self._advance_idle_kv_transfer()
                 return False
             has_seqs = len(scheduled_batch.req_ids) > 0
+            mixed_seqs = (
+                self.scheduler.take_mixed_decode_seqs()
+                if getattr(scheduled_batch, "mixed_decode", None) is not None
+                else None
+            )
             early = has_seqs and self._early_prefill_ok(scheduled_batch)
             step_key, fwd_out = self._dispatch_forward(
                 scheduled_batch, seqs, step_t0, wait=not early
@@ -523,7 +529,13 @@ class EngineCore:
                 # Arm post-prefill decode protection only after the prefill
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
-                self.scheduler.prefill_delayer.notify_prefill_executed()
+                self.scheduler.prefill_delayer.notify_prefill_executed(
+                    mixed=(
+                        envs.ATOM_MIXED_STEP
+                        and os.environ.get("ATOM_MIXED_CADENCE", "1") == "1"
+                        and getattr(scheduled_batch, "mixed_decode", None) is not None
+                    )
+                )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         self._poll_kv_transfer_progress()
@@ -532,6 +544,13 @@ class EngineCore:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
             return False
 
+        if inflight is None and mixed_seqs is not None:
+            # ATOM_MIXED_STEP: the decode half's output first, as a decode step
+            # followed by a prefill step would have delivered them.
+            out_decode, fwd_out = fwd_out
+            self._postprocess(
+                mixed_seqs.values(), out_decode, scheduled_batch.mixed_decode
+            )
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
         if step_key is not None:
             timeline.mark(step_key, "postprocessed")
@@ -603,6 +622,9 @@ class EngineCore:
         delayer = getattr(sch, "prefill_delayer", None)
         return (
             envs.ATOM_EARLY_PREFILL_SCHEDULE
+            # A mixed step schedules its decode half with the prefill half,
+            # which must not run before the previous decode's postprocess.
+            and not envs.ATOM_MIXED_STEP
             and self._steps_alone()
             and (delayer is None or delayer.is_local)
             and not self.kv_transfer_enabled
