@@ -28,6 +28,7 @@ def _layer(
     experts=2,
     stream=False,
     quant_type=None,
+    hidden=256,
 ):
     parallel = SimpleNamespace(
         tp_size=tp,
@@ -49,7 +50,7 @@ def _layer(
     layer.moe_parallel_config = parallel
     layer._stream_online_quant = stream
     layer.intermediate_size_per_partition = logical
-    layer.hidden_size = 256
+    layer.hidden_size = hidden
     layer.local_num_experts = experts
     layer.global_num_experts = experts
     layer.num_redundant_experts = 0
@@ -74,7 +75,7 @@ def _layer(
     config = moe.FusedMoEConfig(
         num_experts=experts,
         experts_per_token=1,
-        hidden_dim=256,
+        hidden_dim=hidden,
         num_local_experts=experts,
         moe_parallel_config=parallel,
         expert_layout=layer.expert_layout,
@@ -83,7 +84,7 @@ def _layer(
     layer.quant_method.create_weights(
         layer,
         experts,
-        256,
+        hidden,
         logical,
         torch.float8_e4m3fn,
         weight_loader=layer.weight_loader,
@@ -168,29 +169,29 @@ def test_half_block_scales_and_weights_match_each_rank_reference(
         assert torch.count_nonzero(gate[64:].float()) == 0
         assert torch.count_nonzero(up[64:].float()) == 0
         assert torch.count_nonzero(layer.w2_weight[expert, :, 64:].float()) == 0
-        assert torch.equal(
-            layer.w13_weight_scale[expert, 0], scales["w1"][expert, rank // 2]
-        )
-        assert torch.equal(
-            layer.w13_weight_scale[expert, 1], scales["w3"][expert, rank // 2]
-        )
-        assert torch.equal(
-            layer.w2_weight_scale[expert, :, 0], scales["w2"][expert, :, rank // 2]
-        )
 
         inputs = torch.linspace(-0.5, 0.5, 3 * 256).reshape(3, 256)
         full_gate = _dequant(weights["w1"][expert], scales["w1"][expert])
         full_up = _dequant(weights["w3"][expert], scales["w3"][expert])
         full_down = _dequant(weights["w2"][expert], scales["w2"][expert])
+        # Dequantize the whole checkpoint before taking logical TP slices.
+        # This oracle does not calculate or reuse the loader's scale-block index.
+        gate_scale, up_scale = layer.w13_weight_scale[expert].chunk(2, dim=0)
+        loaded_gate = _dequant(gate, gate_scale)
+        loaded_up = _dequant(up, up_scale)
+        loaded_down = _dequant(layer.w2_weight[expert], layer.w2_weight_scale[expert])
+        torch.testing.assert_close(loaded_gate[:64], full_gate[source], rtol=0, atol=0)
+        torch.testing.assert_close(loaded_up[:64], full_up[source], rtol=0, atol=0)
+        torch.testing.assert_close(
+            loaded_down[:, :64], full_down[:, source], rtol=0, atol=0
+        )
         expected = (
             torch.nn.functional.silu(inputs @ full_gate[source].T)
             * (inputs @ full_up[source].T)
         ) @ full_down[:, source].T
-        gate_scale, up_scale = layer.w13_weight_scale[expert].chunk(2, dim=0)
         actual = (
-            torch.nn.functional.silu(inputs @ _dequant(gate, gate_scale).T)
-            * (inputs @ _dequant(up, up_scale).T)
-        ) @ _dequant(layer.w2_weight[expert], layer.w2_weight_scale[expert]).T
+            torch.nn.functional.silu(inputs @ loaded_gate.T) * (inputs @ loaded_up.T)
+        ) @ loaded_down.T
         torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
     assert layer.quant_method.get_fused_moe_quant_config(layer).block_shape == [
         128,
