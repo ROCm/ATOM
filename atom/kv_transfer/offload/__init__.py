@@ -70,7 +70,7 @@ KVConnectorFactory.register(
     worker_module="atom.kv_transfer.offload.umbp_store.worker",
     worker_class="UMBPStoreOffloadConnector",
     scheduler_module="atom.kv_transfer.offload.umbp_store.scheduler",
-    scheduler_class="UMBPStoreOffloadScheduler",
+    scheduler_class="make_umbp_store_scheduler",
     requires_pd_staging=False,
     offload=True,
     # The same 256-token chunks as mooncake_store, so the same floor.

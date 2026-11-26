@@ -67,6 +67,21 @@ class UMBPStoreOffloadConfig:
     load_pool_mib: int
     save_pool_mib: int
     save_abandon_timeout_s: float
+    # ``eager`` (the default): every prompt chunk a prefill computes is put
+    # after the prefill, so the server holds a superset of the HBM prefix
+    # cache. ``lazy``: a block is put only when HBM is about to evict it
+    # (`LazySaveSchedulerMixin`), so the two tiers together hold more prefixes
+    # -- the policy for a node whose DRAM is not much larger than its HBM.
+    # Lazy needs one chunk per KV block (``chunk_tokens`` = the block size).
+    save_policy: str = "eager"
+    # Threads that run tier lookups off the scheduler thread: prefetched for
+    # the head of the waiting queue (`prefetch_lookups`) and consumed at
+    # admission. 0 runs every lookup synchronously on the scheduler thread.
+    lookup_threads: int = 1
+    # Chunks of the scheduler's own record of what the server holds
+    # (`TierIndex`), for ``ATOM_PREFILL_ORDER=cached_first`` ranking only; 0
+    # ranks waiting requests by HBM and prefetched lookups alone.
+    tier_index_chunks: int = 0
 
     @property
     def load_pool_bytes(self) -> int:
@@ -141,7 +156,29 @@ def parse_umbp_store_config(
             f"{KEY_PREFIX}save_abandon_timeout_s",
             values.get("save_abandon_timeout_s", 300.0),
         ),
+        save_policy=_save_policy(values.get("save_policy", "eager")),
+        lookup_threads=offcfg._strict_integer(
+            f"{KEY_PREFIX}lookup_threads", values.get("lookup_threads", 1), minimum=0
+        ),
+        tier_index_chunks=offcfg._strict_integer(
+            f"{KEY_PREFIX}tier_index_chunks",
+            values.get("tier_index_chunks", 0),
+            minimum=0,
+        ),
     )
+
+
+SAVE_POLICIES = ("eager", "lazy")
+
+
+def _save_policy(value: Any) -> str:
+    policy = offcfg._strict_text(f"{KEY_PREFIX}save_policy", value)
+    if policy not in SAVE_POLICIES:
+        raise ValueError(
+            f"{KEY_PREFIX}save_policy must be one of {', '.join(SAVE_POLICIES)}, "
+            f"got {policy!r}"
+        )
+    return policy
 
 
 def check_engine_compatibility(cfg: UMBPStoreOffloadConfig, config: Any) -> None:
@@ -183,10 +220,19 @@ def check_engine_compatibility(cfg: UMBPStoreOffloadConfig, config: Any) -> None
         offload="the UMBP offload",
         chunk_setting=f"{KEY_PREFIX}chunk_tokens",
     )
+    if cfg.save_policy == "lazy":
+        block = int(getattr(config, "kv_cache_block_size", 0) or 0)
+        if block and cfg.chunk_tokens != block:
+            raise ValueError(
+                f"{KEY_PREFIX}save_policy 'lazy' stores one chunk per KV block: "
+                f"{KEY_PREFIX}chunk_tokens ({cfg.chunk_tokens}) must equal the "
+                f"block size ({block})"
+            )
 
 
 __all__ = [
     "KEY_PREFIX",
+    "SAVE_POLICIES",
     "UMBP_LAYOUTS",
     "UMBPStoreOffloadConfig",
     "check_engine_compatibility",

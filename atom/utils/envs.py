@@ -1706,12 +1706,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # evicts it, so a chunk both tiers hold costs the tier no room
     # (lazy_save.py). Off by default.
     "ATOM_OFFLOAD_LAZY_EXCLUSIVE": lambda: _flag_env("ATOM_OFFLOAD_LAZY_EXCLUSIVE"),
+    # umbp_store: classify each admitted request's reusable prefix (served from
+    # HBM, from the tier, held by the tier but not loaded, evicted from both)
+    # and log the totals once a minute (offload/miss_accounting.py). Off by
+    # default; the digest set it keeps costs about 100 bytes a chunk.
+    "ATOM_OFFLOAD_MISS_ACCOUNTING": lambda: _flag_env("ATOM_OFFLOAD_MISS_ACCOUNTING"),
+    # Chunks of computed prompts the miss accounting remembers, oldest dropped.
+    "ATOM_OFFLOAD_MISS_ACCOUNTING_CHUNKS": lambda: _nonnegative_int_env(
+        "ATOM_OFFLOAD_MISS_ACCOUNTING_CHUNKS", 4_000_000
+    ),
     # Seconds a KV aggregation may wait on a worker before the manager logs it
     # and dumps the missing workers' and its own thread stacks (once per
     # aggregation). Lower it to catch shorter pipeline stalls.
-    "ATOM_KV_AGG_STALL_S": lambda: _positive_float_env(
-        "ATOM_KV_AGG_STALL_S", "10"
-    ),
+    "ATOM_KV_AGG_STALL_S": lambda: _positive_float_env("ATOM_KV_AGG_STALL_S", "10"),
     # lmcache_mp sends tier lookups for the head of the waiting queue ahead of
     # admission; this is how many waiting requests per scheduling pass.
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
