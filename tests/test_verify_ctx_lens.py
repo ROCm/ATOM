@@ -9,14 +9,17 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from aiter_stub import atom_without_aiter
 
-# On the module, not on "aiter" -- see tests/test_dspark.py for why a name-only
-# guard passes on the non-GPU runner and then aborts collection.
-runner_module = pytest.importorskip(
-    "atom.model_engine.model_runner",
-    reason="requires AITER to import model_runner",
-    exc_type=ImportError,
-)
+
+@pytest.fixture(scope="module", autouse=True)
+def load_runner():
+    global runner_module
+    with atom_without_aiter() as load:
+        runner_module = load("atom.model_engine.model_runner")
+        yield
+
+
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import SequenceType
 from atom.model_ops.attentions.token_layout.decode import decode_positions

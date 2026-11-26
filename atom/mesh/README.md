@@ -2,7 +2,7 @@
 
 High-performance model routing gateway for **PD (Prefill–Decode) disaggregated** LLM serving. It routes inference across heterogeneous worker fleets with cache-aware load balancing, a gRPC pipeline that keeps tokenization in Rust, and built-in reliability primitives.
 
-Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine, tokenizer, and OpenAI-compatible serving semantics, while Atomesh provides the HTTP server, request routing, lifecycle management, observability, and PyO3 bridge. This allows the same Atomesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
+Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine (LLMEngine and its CoreManager), while Atomesh serves the OpenAI API itself: it renders the chat template, tokenizes, detokenizes, runs the reasoning and tool-call parsers and writes the SSE, and hands token ids to the engine through a PyO3 token bridge (`routers/atom_bridge`, see `docs/atomesh_rust_frontend.md`). This allows the same Atomesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
 
 ## Features
 
@@ -137,9 +137,11 @@ image must provide `protoc` either way, for `smg-grpc-client`.
 
 ### ATOM standalone
 
-ATOM standalone mode starts the ATOM engine and tokenizer in Python, while Rust
-Mesh provides the HTTP server, lifecycle handling, observability, and PyO3
-request bridge. Enable the Atomesh entrypoint through
+ATOM standalone mode starts the ATOM engine in Python, while Rust Mesh serves
+the OpenAI API (template, tokenizer, parsers, SSE) and hands each request's
+token ids to the engine through the token bridge. A model whose chat template
+is Python (DeepSeek-V4's encoder, Kimi-K3's tokenizer) has its prompt rendered
+by ATOM instead. Enable the Atomesh entrypoint through
 `USE_ATOMESH_ENTRYPOINTS=1`:
 
 ```bash
@@ -163,12 +165,29 @@ without `mesh-only`, it defaults to ATOM standalone mode.
 ```bash
 ./target/release/atomesh launch \
   --worker-urls http://worker1:8000 http://worker2:8000 \
-  --policy cache_aware
+  --policy cache_aware \
+  --backend atom
 
 USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 ```
+
+ATOM workers need `--backend atom`, in regular mode as in PD mode. Without it
+the router keys an image chat as it would for SGLang: two chats that differ only
+in an image past `prefix_hash`'s token window, or after a long shared text, get
+the same `cache_aware` or `prefix_hash` key, though ATOM keys every KV block of
+a media prompt by all its media and shares no block between them. The binary
+defaults to `--backend sglang`; the Python entrypoint's `mesh-only` passes
+`--backend atom` unless the command line sets `--backend` (or its alias
+`--runtime`) itself, so put `--backend sglang` there to route to SGLang workers.
+
+`--backend atom` also changes how the router discovers an HTTP worker's model:
+it reads `/v1/models` instead of SGLang's `/server_info` and `/model_info`, and
+the model id it returns names the worker's model. For a worker serving under an
+alias (`--served-model-name`) that id is the alias, so the router loads the
+worker's tokenizer from `--tokenizer-path` or `--model-path` when either is
+set, and from the model id only otherwise.
 
 ### Envoy external processing
 
@@ -272,6 +291,64 @@ chat template, such as DeepSeek V3.2 and V4
 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
 need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
+The router renders a chat it tokenizes with the model's chat template and the
+request's `reasoning_effort` and `chat_template_kwargs`. A checkpoint whose
+`config.json` has `model_type` `deepseek_v41` (DeepSeek-V4.1) renders with
+llm-tokenizer's port of V4.1's encoder instead, and the router gives it the
+effort and mode as ATOM's V4.1 encoder takes them: `minimal` as `low`, `medium`
+and `xhigh` as `high`, `none` as chat mode, and the mode from `thinking_mode`,
+or chat mode where `enable_thinking` is false. Other controls, such as a
+message's list of text blocks, can still render otherwise than on ATOM; ATOM
+renders the chat again, so the difference costs prefix hits, not a different
+prompt.
+
+## Tokenization
+
+The router tokenizes requests with their model's HuggingFace tokenizer, or with
+[fastokens](https://github.com/crusoecloud/fastokens) for the models listed in
+`--fastokens-models`, by the name or source their tokenizer registers under, or
+`*` for every model. fastokens encodes a `tokenizer.json` BPE faster than
+HuggingFace `tokenizers`, and splits a long text between special tokens across
+a pool of its own threads (one per logical core up to 32;
+`FASTOKENS_BPE_THREADS` sets the number). Decoding, chat templates and vocabulary lookups stay with the
+HuggingFace tokenizer.
+
+A model encodes with fastokens only if fastokens encodes a set of probe texts
+exactly as its HuggingFace tokenizer does, with special tokens and without. The
+probe covers added tokens, digits, whitespace, several scripts, a chat, a 1 MiB
+text and a 256 KiB one with no newline. A model that fails the probe keeps
+HuggingFace, with a warning, or under `--fastokens-strict` its tokenizer fails
+to register, with no retries. A `tokenizer.json` that fastokens cannot find or
+download fails no probe: the model keeps HuggingFace, with a warning, or under
+`--fastokens-strict` its registration fails and is retried.
+
+fastokens loads `tokenizer.json` alone, as HuggingFace `tokenizers` does, so
+both encode the tokens only `tokenizer_config.json` declares (Qwen3.5's audio
+tokens, for one) as text, where `transformers`, and so the engine, encodes them
+as tokens. With gRPC workers the router sends
+the ids it encodes as the prompt, so the model runs on fastokens' ids, not only
+routes by them. `mesh_fastokens_tokenizers_total{outcome}` counts tokenizers as
+`loaded`, `fallback` or `refused`.
+
+The prompts of these models tokenize up to `--fastokens-max-tokenize-bytes`
+(default: the larger of 64 MiB and the other models' limit), and so do their
+`/v1/tokenize` batches. `--fastokens-segment-cache-mb` sizes
+fastokens' cache of the ids of the text between special tokens, per tokenizer
+(default: 1024; 0 turns it off). An agent re-sends its history with each
+request, and the cache keeps the router from encoding it again. It replaces
+`--tokenizer-cache-*`, which does not apply to these models.
+
+`test_requests_tokenize_as_on_atom` checks that requests tokenize for routing as
+on ATOM, with either backend, and times encoding. `scripts/atom_token_parity.py`
+tokenizes a set of requests, or recorded ones, with ATOM's own chat and
+completion endpoints, in process and without a GPU, and the test compares the
+router's tokens with those, in the file `$ATOM_TOKEN_PARITY` names, so it runs
+only when asked for. CI's mesh unit tests run the two for a DeepSeek-V4.1-Flash
+revision, whose tokenizer files and chat encoder the script downloads from
+HuggingFace, or `$HF_ENDPOINT`, and the test with
+`cargo test --lib -- --ignored routers::ingress::token_parity`. The script's
+docstring shows how to run them for another checkpoint.
+
 ## Reliability
 
 - **Request preparation**: Parsing, template rendering and tokenization use a fixed
@@ -287,7 +364,9 @@ need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
   `--prepare-queue-timeout-ms` deadline (default: 250 ms); canceled waiters release
   their slot immediately. All request parsing runs on this pool. Each request's
   preparation shares one `--prepare-timeout-ms` deadline (default: 5000 ms), and
-  tokenization input is limited by `--prepare-max-tokenize-bytes` (default: 1 MiB).
+  tokenization input is limited by `--prepare-max-tokenize-bytes` (default: 1 MiB),
+  or for the models fastokens encodes by `--fastokens-max-tokenize-bytes`
+  (default: the larger of that limit and 64 MiB).
   When ext-proc is enabled, the legacy `--ext-proc-parser-concurrency` and
   `--ext-proc-max-tokenize-bytes` options apply only if the corresponding
   `--prepare-*` option is unset; neither has a default of its own. On shutdown,
@@ -323,6 +402,7 @@ changing worker metric names.
 | Routing | `mesh_route_*`, `mesh_session_*` | Policy decisions, session worker changes, engine-reported cached tokens against the router estimate |
 | Circuit breaker | `mesh_worker_cb_*` | State, transitions, outcomes |
 | Retry | `mesh_worker_retries_*` | Attempts, exhaustion, backoff |
+| Tokenization | `mesh_fastokens_*` | Tokenizers that encode with fastokens, keep HuggingFace or fail to register |
 
 [Routing metrics](docs/metrics.md) covers each routing metric's labels, the
 policies and branches that record it, how to read the values, and example

@@ -265,6 +265,39 @@ def test_renewal_is_served_ahead_of_queued_lookups():
         lookup.close()
 
 
+def test_async_renewal_is_served_ahead_of_queued_lookups():
+    import threading
+
+    answered, started = [], threading.Event()
+
+    class Backend(LookupClient):
+        def lookup(self, seq, lookup_id=None):
+            started.set()
+            time.sleep(0.05)
+            answered.append(lookup_id)
+            return 1
+
+        def renew_keys(self, keys):
+            return len(keys)
+
+    lookup = AsyncStoreLookup(Backend())
+    try:
+        for i in range(40):  # two seconds of queued arrival lookups
+            assert lookup.submit(SimpleNamespace(id=i), str(i))
+        assert started.wait(2)  # the queue is draining when the renewal comes
+        deadline = time.monotonic() + 5
+        while (state := lookup.renew_async("99", (0, 256), lambda: ("k",))) == (
+            "pending"
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        assert state == "ready"
+        # It waited for the call in flight, not for the queue behind it.
+        assert len(answered) < 10
+    finally:
+        lookup.close()
+
+
 def test_close_does_not_wait_for_a_hung_query():
     import threading
 

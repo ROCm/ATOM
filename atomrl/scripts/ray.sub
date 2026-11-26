@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=atomrl
+#SBATCH --output=logs/%j.out
+#SBATCH --error=logs/%j.err
+#SBATCH --time=48:00:00
+#SBATCH --exclusive
+
+set -euo pipefail
+
+mkdir -p logs
+
+HEAD_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+HEAD_PORT=6379
+HEAD_ADDR="${HEAD_NODE}:${HEAD_PORT}"
+NUM_GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-8}
+
+echo "Head node: ${HEAD_NODE}"
+echo "Total nodes: ${SLURM_JOB_NUM_NODES}"
+echo "GPUs per node: ${NUM_GPUS_PER_NODE}"
+
+if [[ "$(hostname)" == "${HEAD_NODE}" ]]; then
+    echo "Starting Ray head on $(hostname)"
+    ray start --head --port="${HEAD_PORT}" --num-gpus="${NUM_GPUS_PER_NODE}"
+else
+    echo "Starting Ray worker on $(hostname), connecting to ${HEAD_ADDR}"
+    sleep 5
+    ray start --address="${HEAD_ADDR}" --num-gpus="${NUM_GPUS_PER_NODE}"
+fi
+
+sleep 10
+
+if [[ "$(hostname)" == "${HEAD_NODE}" ]]; then
+    echo "Launching training: ${COMMAND}"
+    eval "${COMMAND}"
+fi
+
+ray stop --force

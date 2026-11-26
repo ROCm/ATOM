@@ -14,6 +14,7 @@ from atom.model_loader.weight_names import (
     shared_expert_prefixes,
     shared_expert_slot_name,
 )
+from atom.model_ops.fused_moe.expert_layout import zero_unpacked_expert_padding
 from atom.rollout.reload_policy import (
     FP8_REQUANTISERS,
     ReloadPolicyMixin,
@@ -583,9 +584,8 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
     ) -> None:
         """Write a whole fused expert buffer sent under ATOM's own name.
 
-        Checks support, writes through the fence, and registers every expert
-        slice for the relayout -- the same three obligations as the per-expert
-        route, reached by a different name.
+        Checks support, writes through the fence, clears padding, and registers
+        every expert slice for the relayout, as the per-expert route does.
 
         ``w13_weight`` and ``w2_weight`` are real parameters of the FusedMoE,
         so a trainer that mirrors ATOM's state dict rather than the
@@ -620,6 +620,13 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
                 f"shard, not the global tensor -- or one tensor per expert."
             )
         self._copy_into_param(param, tensor.to(device=self.device, dtype=param.dtype))
+        # Whole-buffer copies bypass the loaders' tail clearing. Only this
+        # buffer is row-major now; its unwritten counterpart may still be shuffled.
+        zero_unpacked_expert_padding(
+            param.data if param_name == "w13_weight" else None,
+            param.data if param_name == "w2_weight" else None,
+            module.intermediate_size_per_partition,
+        )
         # One tensor covers every expert, so every slice of the buffer is new.
         arrived = self._expert_relayout_pending.setdefault((module, param_name), {})
         for expert_id in range(param.shape[0]):
@@ -994,11 +1001,12 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         from atom.model_ops.utils import shuffle_weights
 
         # The same decision the initial load makes, from the same function.
+        native_group_rows = getattr(module, "native_a8_group_rows", None)
         needs_shuffle = weight_is_stored_preshuffled(
             quant_type,
             getattr(module, "params_dtype", param.dtype),
             needs_preshuffled_weight=getattr(module, "needs_preshuffled_weight", False),
-            native_group_rows=getattr(module, "native_a8_group_rows", None),
+            native_group_rows=native_group_rows,
         )
 
         # And the same rank check. 3D is Qwen3-Next's GDN conv1d, which the
@@ -1010,7 +1018,14 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
             # overwritten -- and the one the PR measured a decode graph
             # catching half-done, five syncs out of seven.
             self._await_readers_of(param)
-            shuffle_weights(param)
+            # A synced native scale takes the load's layout: a 1x32 scale is
+            # re-laid out in place by aiter's helper, a 32x32 one stays row-major.
+            if param is not weight_scale or native_group_rows is None:
+                shuffle_weights(param)
+            elif native_group_rows == 1:
+                from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale
+
+                param.data.copy_(shuffle_mxfp8_bpreshuffle_scale(param.data))
 
     def _open_sync(self) -> WeightSyncRecord:
         """The record of the sync this update belongs to, opened by its first.

@@ -20,6 +20,7 @@ from atom.plugin.sglang.attention_backend import attention_gdn, gdn_replayssm
 from atom.plugin.sglang.attention_backend.attention_gdn import (
     SGLangGatedDeltaNet,
     SGLangGDNForwardContext,
+    _GDNStep,
 )
 
 CONV_DIM = 6
@@ -32,6 +33,9 @@ class _Mode:
     def __init__(self, kind: str):
         self.kind = kind
 
+    def is_target_verify(self):
+        return False
+
     def is_decode_or_idle(self):
         return self.kind == "decode"
 
@@ -42,12 +46,18 @@ class _Mode:
 class _LinearBackend:
     def __init__(self, metadata):
         self.forward_metadata = metadata
-        self.layer_cache = SimpleNamespace(
-            conv=[torch.zeros(NUM_SLOTS, CONV_DIM, STATE_LEN)],
-            temporal=torch.zeros(NUM_SLOTS, 2, 4, 4),
+        state = SimpleNamespace(
+            conv=[torch.zeros(1, NUM_SLOTS, CONV_DIM, STATE_LEN)],
+            temporal=torch.zeros(1, NUM_SLOTS, 2, 4, 4),
         )
+        self.layer_cache = SimpleNamespace(
+            conv=[state.conv[0][0]], temporal=state.temporal[0]
+        )
+        mamba_map = {LAYER_NUM: 0}
         self.req_to_token_pool = SimpleNamespace(
-            mamba2_layer_cache=lambda layer: self.layer_cache
+            mamba_map=mamba_map,
+            mamba_pool=SimpleNamespace(mamba_cache=state),
+            mamba2_layer_index=mamba_map.__getitem__,
         )
         self.calls = []
 
@@ -87,7 +97,7 @@ def backend(monkeypatch):
 def test_no_track_mask_is_a_no_op(backend):
     lb = backend(SimpleNamespace())
     fb = SimpleNamespace(mamba_track_mask=None, forward_mode=_Mode("decode"))
-    _impl()._track_mamba_states(fb, torch.zeros(4, CONV_DIM))
+    _impl()._track_mamba_states(_GDNStep(fb), torch.zeros(4, CONV_DIM))
     assert lb.calls == []
 
 
@@ -102,7 +112,7 @@ def test_decode_tracks_through_the_radix_slot_helper(backend, monkeypatch):
     fb = SimpleNamespace(
         mamba_track_mask=torch.tensor([True, False]), forward_mode=_Mode("decode")
     )
-    _impl()._track_mamba_states(fb, torch.zeros(2, CONV_DIM))
+    _impl()._track_mamba_states(_GDNStep(fb), torch.zeros(2, CONV_DIM))
     # One owner for decode: the helper that also backs the post-replay
     # epilogue, never SGLang's in-graph per-layer call.
     assert seen == [(fb, LAYER_NUM)]
@@ -154,7 +164,7 @@ def test_extend_copies_conv_window_from_pre_conv_input(backend, monkeypatch):
         mamba_track_mask=torch.tensor([True, True]), forward_mode=_Mode("extend")
     )
 
-    _impl()._track_mamba_states(fb, mixed_qkv)
+    _impl()._track_mamba_states(_GDNStep(fb), mixed_qkv)
 
     conv = lb.layer_cache.conv[0]
     torch.testing.assert_close(conv[6], mixed_qkv[2:5].T)
@@ -162,7 +172,9 @@ def test_extend_copies_conv_window_from_pre_conv_input(backend, monkeypatch):
     assert conv[[0, 2, 3, 4, 5, 7]].abs().sum() == 0
     (call,) = lb.calls
     assert call[0] == "extend" and call[1] is h
-    assert call[2] is lb.layer_cache.temporal
+    temporal = lb.layer_cache.temporal
+    assert call[2].data_ptr() == temporal.data_ptr()
+    assert call[2].shape == temporal.shape and call[2].stride() == temporal.stride()
     # Consumed, so a later forward cannot read a stale `h`.
     assert chunk_mod.ChunkGatedDeltaRuleFunction.last_h is None
 
@@ -177,7 +189,7 @@ def test_extend_derives_conv_destination_when_backend_did_not(backend, monkeypat
         mamba_track_mask=torch.tensor([False, True]), forward_mode=_Mode("extend")
     )
 
-    _impl()._track_mamba_states(fb, mixed_qkv)
+    _impl()._track_mamba_states(_GDNStep(fb), mixed_qkv)
 
     conv = lb.layer_cache.conv[0]
     torch.testing.assert_close(conv[7], mixed_qkv[1:4].T)
@@ -191,7 +203,7 @@ def test_extend_without_kept_states_fails_closed(backend, monkeypatch):
         mamba_track_mask=torch.tensor([True]), forward_mode=_Mode("extend")
     )
     with pytest.raises(RuntimeError, match="intermediate states"):
-        _impl()._track_mamba_states(fb, torch.zeros(4, CONV_DIM))
+        _impl()._track_mamba_states(_GDNStep(fb), torch.zeros(4, CONV_DIM))
 
 
 def test_extend_metadata_keeps_states_only_when_tracking(monkeypatch):

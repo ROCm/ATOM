@@ -132,7 +132,7 @@ class DeepseekV41RuntimeModelVllm(DeepseekV41RuntimeModel):
                 image_mask=image_mask,
             )
             if spec.layer_id + 1 in self.aux_hidden_state_layers:
-                aux_hidden_states.append(state.settle().residual.mean(dim=-2))
+                aux_hidden_states.append(state.stream_mean())
         hidden = state.collapse()
         if aux_hidden_states:
             self._aux_hidden_states = aux_hidden_states

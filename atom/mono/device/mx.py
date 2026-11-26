@@ -10,7 +10,7 @@ An E8M0 code is a biased exponent; ``pow2(code)`` is the scale it stands for.
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 
 from atom.mono.device.ops import CM_NT
 
@@ -77,5 +77,38 @@ def mfma_scaled(a, b, c, sa, sb, a_fmt=FP8, b_fmt=FP8, sa_byte=0, sb_byte=0):
     return fx.Vector(
         rocdl.mfma_scale_f32_16x16x128_f8f6f4(
             T.vec(4, T.f32), [a, b, c, a_fmt, b_fmt, sa_byte, sa, sb_byte, sb]
+        )
+    )
+
+
+FP4_INV_MAX = (
+    1.0 / 6.0
+)  # f32(1/6) = 0x3E2AAAAB: the constant aiter's HIP / FlyDSL RoundUp multiply by
+
+
+def fp4_scale(amax):
+    """(E8M0 code, forward scale 2^(code - 127)) of an MXFP4 32-block of absolute maximum ``amax``:
+    aiter's RoundUp, ceil_pow2(amax * f32(1/6)) (``mxfp4_gemm_common._e8m0_roundup``, csrc
+    mx_quant_utils.h ``fp_f32_to_e8m0_scale<RoundUp, FP4_E2M1>``), the same code for every
+    amax > 0. An all-zero block (amax == 0) gets code 1 (``code_ceil``'s floor) where aiter's
+    gives 0: its elements are e2m1 zeros under either scale, so the dequantized block is the same.
+    """
+    e = code_ceil(amax * fx.Float32(FP4_INV_MAX))
+    return e, pow2(e)
+
+
+def fp4_pack2(old, a, b, scale, sel):
+    """``old`` with byte ``sel`` (0..3, compile time) := the e2m1 nibbles of ``a`` (low) and ``b``
+    (high) divided by ``scale`` (a power of two, the forward scale), RNE, saturating at 6
+    (``v_cvt_scalef32_pk_fp4_f32``; bit-exact with aiter's quantization).
+    """
+    return fx.Int32(
+        rocdl.cvt_scalef32_pk_fp4_f32(
+            T.i32,
+            as_ir_value(fx.Int32(old)),
+            as_ir_value(fx.Float32(a)),
+            as_ir_value(fx.Float32(b)),
+            as_ir_value(fx.Float32(scale)),
+            sel,
         )
     )

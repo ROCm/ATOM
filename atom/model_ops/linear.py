@@ -33,6 +33,7 @@ from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
+    padded_partition_size,
     requantize_with_max_scale,
     shuffle_weights,
 )
@@ -254,10 +255,6 @@ def _zero_pad_tail(param, dim: int, start: int, length: int) -> None:
     other tiles; re-shuffled, they would land in the pad."""
     if length > 0:
         param.data.narrow(dim, start, length).view(torch.uint8).zero_()
-
-
-def padded_partition_size(size: int, align: int | None) -> int:
-    return size if not align else (size + align - 1) // align * align
 
 
 def _zero_k_pad(layer: nn.Module, quant_config, prefix: str) -> None:
@@ -756,12 +753,13 @@ def weight_is_stored_preshuffled(
     forward.
 
     ``native_group_rows`` marks a native group32 weight, otherwise read as
-    checkpoint bytes. Native 32x32 weights are shuffled on gfx950 for AITER's
-    preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
-    always on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL
-    one. Native 1x32 weights are shuffled only when the existing
-    ``needs_preshuffled_weight`` override is set, as the M3.1 shape-gated
-    opt-in path does.
+    checkpoint bytes. Native 1x32 and 32x32 weights are shuffled alike: always
+    on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL one; on
+    gfx950 for AITER's preshuffled group32 GEMM under
+    ATOM_GROUP32_WEIGHT_PRESHUFFLE (on by default); and anywhere the
+    ``needs_preshuffled_weight`` override is set. A shuffled 1x32 weight's
+    scale takes the layout of aiter's ``shuffle_mxfp8_bpreshuffle_scale``; a
+    32x32 weight's scale stays row-major.
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -1451,6 +1449,13 @@ class LinearBase(nn.Module):
                 native_group_rows=self.native_a8_group_rows,
             ):
                 shuffle_weights(self.weight)
+                if self.native_a8_group_rows == 1:
+                    # Needs aiter with ROCm/aiter#8084.
+                    from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale
+
+                    self.weight_scale.data = shuffle_mxfp8_bpreshuffle_scale(
+                        self.weight_scale.data
+                    )
             return
         if self.weight.numel() == 0:
             return
@@ -1893,6 +1898,12 @@ class LinearBase(nn.Module):
                 "a shuffled weight may only be row-sliced on 16-row boundaries "
                 f"(shuffle block size); got start={start} length={length}"
             )
+            # Its 1x32 scale may be in 32-row tiles (n32k4 on gfx1250).
+            if self.native_a8_group_rows == 1 and (start % 32 or length % 32):
+                raise ValueError(
+                    "a shuffled native 1x32 weight may only be row-sliced on "
+                    f"32-row boundaries; got start={start} length={length}"
+                )
 
         view = copy.copy(self)
         # nn.Module bookkeeping is shared by the shallow copy; give the view its

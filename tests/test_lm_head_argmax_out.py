@@ -100,6 +100,7 @@ def test_prefill_head_projects_the_scheduled_requests_last_tokens(
     from types import SimpleNamespace
 
     from atom.distributed import ulysses_sp
+    from atom.utils.forward_context import AttentionMetaData
 
     monkeypatch.setattr(ulysses_sp, "sp_is_enabled", lambda: False)
     monkeypatch.setattr(embed_head, "sp_is_enabled", lambda: False)
@@ -112,7 +113,7 @@ def test_prefill_head_projects_the_scheduled_requests_last_tokens(
         is_prefill=True, is_draft=False, scheduled_bs=len(lengths)
     )
     fc = SimpleNamespace(
-        context=context, attn_metadata=SimpleNamespace(cu_seqlens_q=cu)
+        context=context, attn_metadata=AttentionMetaData(cu_seqlens_q=cu)
     )
     head = _tp1_head(torch.empty(0), monkeypatch)
     monkeypatch.setattr(embed_head, "is_plugin_mode", lambda: False)

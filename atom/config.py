@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import enum
 import fnmatch
@@ -19,6 +20,7 @@ from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.multi.multi_connector import validate_multi_config
 from atom.model_engine.capabilities import pcp_group_size_of
+from atom.model_engine.mixed_budget import prefill_floor
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
@@ -30,6 +32,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
 )
 from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
+from atom.mono import polling_env
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -74,6 +77,11 @@ class KVCacheTensor:
     # without their exponents, and every index it computes stays in bounds while
     # doing it. Whatever moves one must move the other.
     index_scale: torch.Tensor | None = None
+    # Per-block planes a layer's pages carry beyond the fields above, as
+    # ``(role, plane)`` in stored byte order. A layer's configuration and
+    # cache formats determine its optional planes, so a position alone does
+    # not identify a plane.
+    extra_planes: tuple[tuple[str, torch.Tensor], ...] = field(default=(), init=False)
     # ReplaySSM record buffers for linear-attention layers: this layer's slice
     # of the (k, u, g) pools.  None for every other attention type.  Carried
     # here because the layer-id -> linear-attn-index mapping already lives in
@@ -185,10 +193,10 @@ class CompilationConfig:
     - FULL_AND_TR_HYBRID.
 
     TR_HYBRID mode mixes token graphs and request graphs: the compiled forward
-    is recorded as a `TokenGraph` per token bucket, breaking only at the split
-    ops whose launches depend on host data (`eager_region`), which run between
-    its segments -- eagerly, or as a `ReqGraph` where the request bucket fixes
-    their launches.
+    is recorded as a `TokenGraph` per token bucket, breaking only where a split
+    op calls an `eager_region`, whose launches depend on host data: it runs
+    between the segments -- eagerly, or as a `ReqGraph` where the request
+    bucket fixes its launches.
 
     FULL mode: Capture full cudagraph for all batches. Can be good for small
     models or workloads with small prompts; not supported by many backends.
@@ -1406,6 +1414,10 @@ class SpeculativeConfig:
     # probability that the first i+1 draft tokens are all accepted), filled in by
     # __post_init__. None => real draft/target rejection sampling.
     synthetic_acceptance_rates: list[float] | None = None
+    # The draft's KV dtype as the user asked for it (--spec-decode-kv-cache-dtype):
+    # None = not asked, else "bf16" / "fp8". Never rewritten; the dtype the draft
+    # will use is `draft_kv_dtype`.
+    kv_cache_dtype: str | None = None
     # The draft's KV dtype: None until `Config` settles it (`resolve_draft_kv_dtype`,
     # once the target's dtype is known); every reader (the draft's pool, its
     # attention, the calibration identity, the compile hash) reads this one.
@@ -2006,6 +2018,17 @@ def qrep_for_step(
 FP4_CACHE_DTYPES = ("fp4", "nvfp4")
 
 
+def kv_cache_torch_dtype(kv_cache_dtype: str) -> torch.dtype:
+    """The torch dtype a ``kv_cache_dtype`` cache is stored in: uint8 for the FP4
+    caches (packed bytes, which aiter's ``d_dtypes`` has no entry for), else aiter's
+    entry."""
+    if kv_cache_dtype in FP4_CACHE_DTYPES:
+        return torch.uint8
+    from aiter import dtypes
+
+    return dtypes.d_dtypes[kv_cache_dtype]
+
+
 def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
     """``--kv-cache-dtype fp4`` (MXFP4) is MiniMax-M3.1's to ask for and DeepSeek-V4.1's
     own, and ``nvfp4`` is MiniMax-M3's alone; each is refused for every other model.
@@ -2020,11 +2043,32 @@ def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
         raise ValueError("--kv-cache-dtype nvfp4 is supported by MiniMax-M3 only")
 
 
-def resolve_draft_kv_dtype(target_dtype: str, *, own_pool: bool) -> str:
-    """The KV dtype of a speculative draft's pages: the target's, except bf16 for a
-    draft with a pool of its own (``own_pool``) under an FP4 target, which has no
-    draft layout. A draft in the target's pool has the target's dtype."""
-    return "bf16" if own_pool and target_dtype in FP4_CACHE_DTYPES else target_dtype
+def resolve_draft_kv_dtype(
+    target_dtype: str, *, own_pool: bool, requested: str | None = None
+) -> str:
+    """The KV dtype of a speculative draft's pages.
+
+    A draft with a pool of its own (``own_pool``) takes the dtype it ``requested``
+    (``--spec-decode-kv-cache-dtype``), else the target's, except bf16 under an FP4
+    target (fp4 / nvfp4), which has no draft layout. A draft in the target's pool has the
+    target's dtype and cannot request another.
+    """
+    # argparse restricts the flag; a Python caller can pass anything
+    if requested not in (None, "bf16", "fp8"):
+        raise ValueError(
+            f"speculative kv_cache_dtype must be 'bf16' or 'fp8', got {requested!r}"
+        )
+    if not own_pool:
+        if requested is not None and requested != target_dtype:
+            raise ValueError(
+                f"--spec-decode-kv-cache-dtype {requested} differs from "
+                f"--kv-cache-dtype {target_dtype}, but this draft caches in the "
+                "target's KV pool and cannot have its own dtype"
+            )
+        return target_dtype
+    if requested is not None:
+        return requested
+    return "bf16" if target_dtype in FP4_CACHE_DTYPES else target_dtype
 
 
 def indexer_cp_unsupported_reason(
@@ -2035,7 +2079,6 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
-    nvfp4_caches: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -2063,8 +2106,6 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
-    if nvfp4_caches:
-        return "the NVFP4 caches are not wired to the CP scorer"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -2193,22 +2234,29 @@ def _hf_architecture_factor(hf_config) -> tuple:
     return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
-def _check_mono_poll_sleep_units() -> None:
-    """Reject a bad ATOM_MONO_POLL_SLEEP_UNITS (importing ``atom.mono.polling``
-    raises) before the workers, which read the same environment, spawn; warn
-    once when it is below the default."""
-    from atom.mono import polling
-
-    if polling.POLL_SLEEP_UNITS < polling.DEFAULT:
+def _resolve_mono_poll_sleep_units(kv_copies: bool) -> None:
+    """The Mono mailbox retry spacing of this deployment, fixed before this
+    process or the workers it spawns import ``atom.mono.polling`` (which reads
+    it once; only the variable's vocabulary, ``polling_env``, is imported
+    here): ``COPY_SAFE`` where a KV transfer or offload connector copies beside
+    the Mono kernels (``kv_copies``) and ATOM_MONO_POLL_SLEEP_UNITS is unset,
+    else as set or ``DEFAULT``. A bad value is rejected; one below
+    ``COPY_SAFE`` beside such copies is warned about once."""
+    units = polling_env.units(os.environ.get(polling_env.ENV))
+    if not kv_copies:
+        return
+    if not os.environ.get(polling_env.ENV, "").strip():
+        os.environ[polling_env.ENV] = str(polling_env.COPY_SAFE)
+        return
+    if units < polling_env.COPY_SAFE:
         logger.warning(
-            "%s=%d: Mono mailbox polls back off less than the default %d. "
-            "Values below %d hung beside concurrent KV copies (offload or P/D "
-            "connectors) in the reproducer (ROCm/ATOM#3369); use it only on a "
-            "deployment without them.",
-            polling.ENV,
-            polling.POLL_SLEEP_UNITS,
-            polling.DEFAULT,
-            polling.DEFAULT,
+            "%s=%d beside a KV transfer or offload connector: Mono mailbox "
+            "polls back off less than %d, and values below %d hung beside "
+            "concurrent KV copies in the reproducer (ROCm/ATOM#3369).",
+            polling_env.ENV,
+            units,
+            polling_env.COPY_SAFE,
+            polling_env.COPY_SAFE,
         )
 
 
@@ -2300,6 +2348,8 @@ class Config:
     stop_token_ids: list[int] = field(default_factory=list)
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
+    # A MoRIIO producer's state transfer slots, sized by the runner.
+    state_transfer_slots: int = field(default=0, init=False)
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
     # FP4 physical layout, resolved before config is sent to scheduler/workers.
@@ -2334,6 +2384,10 @@ class Config:
     # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
     # rebuild, so the floor is what bounds that amplification.
     dynamic_chunking_min_chunk_size: int = 4096
+    # Mix prefill chunks and decode seqs into the same forward pass. DeepSeek-V4
+    # only (`_validate_mixed_prefill_decode` refuses the rest at launch). Off:
+    # the scheduler emits prefill-only or decode-only batches as before.
+    enable_mixed_prefill_decode: bool = False
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -2398,6 +2452,10 @@ class Config:
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # Disable AITER's custom IPC all-reduce path during distributed setup.
+    # This is a public runner option so callers do not need to patch AITER
+    # internals when a platform cannot provide HIP IPC handles.
+    disable_custom_all_reduce: bool = False
     # The runners take weight syncs and say which they cannot
     # (`get_worker_capabilities`), as RLHFModelRunner does: EngineCore asks
     # them once, at startup. Set by AsyncLLMEngine.
@@ -2771,7 +2829,6 @@ class Config:
             raise ValueError("sequence_parallel_size must be at least 1")
         if envs.ATOM_DSV41_A8W4_ATTN not in ("auto", "off"):
             raise ValueError("ATOM_DSV41_A8W4_ATTN must be auto or off")
-        _check_mono_poll_sleep_units()
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2944,6 +3001,9 @@ class Config:
             # Refuse a composite the engine cannot run now, not when a worker
             # builds it after the weights are loaded.
             validate_multi_config(self.kv_transfer_config)
+        # after the CLI's JSON string ("{}" when unset) is parsed: the string
+        # itself is truthy
+        _resolve_mono_poll_sleep_units(bool(self.kv_transfer_config))
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
@@ -3232,7 +3292,6 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
-                "nvfp4" in (self.index_cache_dtype, self.kv_cache_dtype),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -3287,12 +3346,58 @@ class Config:
             from atom.spec_decode.draft_kv import draft_owns_kv_pool
 
             spec = self.speculative_config
+            if (
+                spec.kv_cache_dtype is not None
+                and spec.method == "dspark"
+                and self.hf_config.model_type == "deepseek_v41_text"
+            ):
+                # V4.1's draft reads windows from the target's pool and its attention
+                # takes its dtype from DSparkConfig, never from this flag.
+                raise ValueError(
+                    "--spec-decode-kv-cache-dtype does not apply to a DeepSeek-V4.1 "
+                    "DSpark draft, which caches in the target's KV pool. Its attention "
+                    'dtype is --dspark-config \'{"draft_kv_dtype":"fp8"}\' '
+                    "(default auto: BF16 drafting; fp8 needs an FP8 or FP4 target)"
+                )
             # The one place the draft's pool and dtype are settled: everything
             # downstream (the draft builder, the proposer, the calibration identity)
             # reads `spec.draft_kv_dtype`.
             spec.draft_kv_dtype = resolve_draft_kv_dtype(
-                self.kv_cache_dtype, own_pool=draft_owns_kv_pool(self)
+                self.kv_cache_dtype,
+                own_pool=draft_owns_kv_pool(self),
+                requested=spec.kv_cache_dtype,
             )
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+            from atom.models.minimax_m3.config import draft_dtype_moves
+
+            # An M3 DSpark draft beside an NVFP4 KV moves as bytes of its own: Mooncake
+            # P/D's pair_units refuses other draft units; the PAGE namespace hashes its dtype.
+            if (
+                spec.draft_kv_dtype != self.kv_cache_dtype
+                and self.kv_transfer_config
+                and not (is_m3 and draft_owns_kv_pool(self) and draft_dtype_moves(self))
+            ):
+                # Not verified: no other KV connector or offload path (save,
+                # restore, P/D transfer) has run with a draft whose dtype differs
+                # from the target's. The flag has no fp4 / nvfp4 to match an FP4
+                # target with.
+                hint = (
+                    ""
+                    if self.kv_cache_dtype in FP4_CACHE_DTYPES
+                    else ". Pass --spec-decode-kv-cache-dtype "
+                    f"{self.kv_cache_dtype} to match the target"
+                )
+                exception = (
+                    ", except a MiniMax-M3 DSpark draft beside an NVFP4 KV under "
+                    + ", ".join(KVConnectorFactory.own_dtype_draft_connectors())
+                    if is_m3
+                    else ""
+                )
+                raise ValueError(
+                    f"draft KV dtype {spec.draft_kv_dtype} differs from the "
+                    f"target's {self.kv_cache_dtype}: not supported with KV "
+                    f"offload or --kv-transfer-config{exception}{hint}"
+                )
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
 
@@ -3327,6 +3432,8 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+        self._validate_mixed_prefill_decode()
 
     def _check_kv_cache_dtype(self) -> None:
         """Validate FP4 support and report performance guidance before sizing."""
@@ -3649,6 +3756,165 @@ class Config:
         )
         self.enable_dynamic_chunking = False
 
+    def _validate_mixed_prefill_decode(self) -> None:
+        """Validate mixed batching capabilities before loading the model."""
+        if not self.enable_mixed_prefill_decode:
+            return
+
+        from atom.kv_transfer.disaggregation.pd_producer import pd_producer_configured
+        from atom.kv_transfer.disaggregation.types import kv_config_has_producer
+        from atom.utils import get_hf_text_config
+        from atom.utils.selector import Family, attn_family
+
+        hf = get_hf_text_config(self.hf_config)
+        family = attn_family(hf)
+        spec = self.speculative_config
+        spec_method = None if spec is None else spec.method
+        cg_mode = self.compilation_config.cudagraph_mode
+        rope_parameters = getattr(hf, "rope_parameters", None) or {}
+        # (is this config affected, what it is, why it cannot run mixed)
+        refusals = [
+            (
+                self.enable_rapidserve,
+                "RapidServe",
+                "its separate prefill/decode schedulers do not form mixed batches",
+            ),
+            (
+                pd_producer_configured(self),
+                "P/D kv_producer",
+                "a prefill-only producer cannot use mixed scheduling or its memory profile",
+            ),
+            (
+                spec is not None and kv_config_has_producer(self.kv_transfer_config),
+                "speculative decoding with kv_producer",
+                "producer scheduling disables verification but mixed profiling uses the configured draft width",
+            ),
+            (
+                self.enable_tbo or self.enable_tbo_decode,
+                "TBO",
+                "mixed microbatch splitting is not enabled; disable both TBO modes",
+            ),
+            # Only the V4 builder implements `prepare_mixed`. Compared by
+            # family, not `is_mla`: V4 is its own family despite its latent
+            # rank, and dense MLA (DeepSeek-V2/V3/R1, Kimi) is not supported.
+            (
+                family != Family.V4,
+                f"the {family} attention family",
+                (
+                    "mixed prefill+decode batching is implemented for "
+                    "DeepSeek-V4 only"
+                ),
+            ),
+            # The same predicate `DeepseekV4Attention.forward` routes on: a
+            # TR_HYBRID V4 layer takes its narrow split order on EVERY forward,
+            # captured or not, and that order has no mixed form -- it hands the
+            # merged carrier to the paged prefill kernel whole, which then fails
+            # on the segment index arrays only the per-segment metadata
+            # carries. Only the FULL path (`forward_impl`) splits a mixed batch.
+            (
+                family == Family.V4
+                and cg_mode is not None
+                and cg_mode.uses_tr_hybrid(),
+                f"--cudagraph-mode {getattr(cg_mode, 'name', cg_mode)} on DeepSeek-V4",
+                (
+                    "a TR_HYBRID V4 layer runs its narrow split order on every "
+                    "forward, which has no mixed form; use FULL (the CLI default), "
+                    "FULL_DECODE_ONLY or NONE"
+                ),
+            ),
+            # Speculative decoding runs mixed only as V4 + DSpark: a prefill row
+            # verifies as a 0-draft spec row and the V4 decode half is the
+            # spec-shaped `prepare_decode` with decode-local rejection counts. See
+            # docs/scheduling_kv_cache_guide.md#mixed-prefill-and-decode-on-deepseek-v4.
+            (
+                spec is not None and not spec.use_dspark(),
+                f"speculative decoding via {spec_method!r}",
+                (
+                    "only DSpark is wired through the mixed split so far; MTP "
+                    "and EAGLE share its data flow but are unvalidated there"
+                ),
+            ),
+            (
+                spec is not None and self.pipeline_parallel_size > 1,
+                "speculative decoding with pipeline parallel",
+                (
+                    "mixed speculative input staging and attention rollback "
+                    "are not wired for PP's undeferred output"
+                ),
+            ),
+            # The decode-first `prefill_budget` holds only while prefill is
+            # chunked: unchunked admission takes the first prompt whole even
+            # past the budget, so it can starve the decode rows it reserved.
+            (
+                not self.enable_chunked_prefill,
+                "chunked prefill off",
+                (
+                    "an unchunked prompt is admitted whole even past the "
+                    "decode-first prefill budget, which then cannot hold"
+                ),
+            ),
+            # Keyed off the same predicate as the runner's `use_mrope`, not off
+            # the family: no V4 checkpoint carries `mrope_section` today, but
+            # the family check alone would admit one. `prepare_prefill` lays
+            # M-RoPE positions over every request in the batch, so a mixed
+            # batch's decode rows would write past the prefill positions.
+            (
+                "mrope_section" in rope_parameters,
+                "M-RoPE",
+                (
+                    "the prefill builder lays M-RoPE positions over the whole "
+                    "mixed batch, decode rows included"
+                ),
+            ),
+            (
+                self.prefill_context_parallel_size > 1,
+                "prefill context parallel",
+                (
+                    "the PCP round-robin query split and its attention reindex "
+                    "run over the whole batch, decode rows included"
+                ),
+            ),
+            (
+                self.decode_context_parallel_size > 1,
+                "decode context parallel",
+                "mixed batching requires decode context parallel size 1",
+            ),
+            (
+                self.eplb_enable,
+                "EPLB",
+                "its prefill load window cannot exclude decode tokens in a mixed step",
+            ),
+        ]
+        blocked = [(what, why) for cond, what, why in refusals if cond]
+        if blocked:
+            raise ValueError(
+                "--enable-mixed-prefill-decode is not supported with "
+                + "; ".join(f"{what} ({why})" for what, why in blocked)
+                + ". Drop the flag, or the feature it conflicts with."
+            )
+
+        # When decode append pages fit, keep 1/8 of the token budget for prefill.
+        # FCFS decode tails can wait for the entire long prefill.
+        if spec is not None and spec.num_speculative_tokens:
+            full_reserve = self.max_num_seqs * (spec.num_speculative_tokens + 1)
+            decode_budget = self.max_num_batched_tokens - prefill_floor(
+                self.max_num_batched_tokens
+            )
+            if full_reserve > decode_budget:
+                logger.warning(
+                    "--enable-mixed-prefill-decode with %d speculative tokens: a "
+                    "full decode set (max_num_seqs=%d) needs %d tokens with "
+                    "--max-num-batched-tokens=%d. The scheduler reserves at "
+                    "least 1/8 of that budget for prefill when decode append "
+                    "pages fit, so some decodes "
+                    "at the FCFS tail may wait until preceding decodes finish "
+                    "or the long prefill ends.",
+                    spec.num_speculative_tokens,
+                    self.max_num_seqs,
+                    full_reserve,
+                    self.max_num_batched_tokens,
+                )
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -3702,6 +3968,9 @@ class Config:
         # share one artifact, as they should.
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
+        # Keep mixed attention dispatch/metadata artifacts separate from runs
+        # that only admit homogeneous batches.
+        factors.append(self.enable_mixed_prefill_decode)
         factors.append(self.index_cache_dtype)
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the

@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Draft loading and target-feature contracts, without full model weights."""
 
 from types import SimpleNamespace
@@ -283,6 +285,7 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
         tokenID_processor=SimpleNamespace(
             num_rejected=np.array([0, 4]),
             verify_ctx_lens=lambda ctx: ctx - np.array([0, 4]),
+            spec_status_owed=False,
         ),
         forward_vars=metadata_buffers(2, 4, 10, geometry=builder.geometry),
     )

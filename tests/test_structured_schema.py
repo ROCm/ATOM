@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+from atom import structured_output
 from atom.structured_output import schema as normalization
 from atom.structured_output.schema import (
     SchemaExpansionLimit,
@@ -18,6 +19,13 @@ from atom.structured_output.schema import (
 from atom.structured_output.validation import schema_from_format, validate_output
 
 Draft202012Validator = pytest.importorskip("jsonschema").Draft202012Validator
+
+
+@pytest.fixture(autouse=True)
+def _structured_output_installed(monkeypatch):
+    # These test the schema rules; whether the backend is installed is
+    # tests/entrypoints/test_structured_output_availability.py's concern.
+    monkeypatch.setattr(structured_output, "available", lambda: True)
 
 
 VALUES = [
