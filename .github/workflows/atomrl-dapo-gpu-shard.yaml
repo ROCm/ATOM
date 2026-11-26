@@ -46,6 +46,11 @@ jobs:
       - name: Prepare pinned DAPO models and data
         run: |
           set -euo pipefail
+          docker run --rm \
+            -e DATA_ROOT \
+            -v "$DATA_ROOT:$DATA_ROOT" \
+            "$IMAGE_TAG" bash -euc \
+            'mkdir -p "$DATA_ROOT/hf"; chmod 0777 "$DATA_ROOT/hf"'
           docker run --rm --network=host \
             -v "$DATA_ROOT:$DATA_ROOT" \
             "$IMAGE_TAG" python \

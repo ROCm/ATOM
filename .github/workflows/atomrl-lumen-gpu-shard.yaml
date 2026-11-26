@@ -114,26 +114,34 @@ jobs:
             echo "::warning::No writable shared model cache found; using $model_root"
           fi
 
-          for model_id in NousResearch/Llama-2-7b-hf Qwen/Qwen3-8B; do
+          for model_spec in \
+            "LLAMA2|NousResearch/Llama-2-7b-hf" \
+            "QWEN3|Qwen/Qwen3-8B"; do
+            IFS='|' read -r model_key model_id <<< "$model_spec"
             target_dir="/models/$model_id"
             echo "Using model cache root $model_root for $model_id"
-            docker run --rm --network=host \
-              -e HF_TOKEN="${HF_TOKEN:-}" \
-              -e MODEL_DOWNLOAD_TIMEOUT \
-              -e MODEL_LOCK_WAIT_SECONDS \
-              -e MODEL_LOCK_POLL_INTERVAL \
-              -e MODEL_PROGRESS_INTERVAL \
-              -e MODEL_LOCK_ROOT=/models/.atom-model-locks \
-              -e MODEL_STAGING_ROOT=/models/.atom-model-staging \
-              -v "$GITHUB_WORKSPACE:/repo:ro" \
-              -v "$model_root:/models" \
-              -w /repo \
-              "$LUMEN_IMAGE" bash \
-              /repo/.github/scripts/download_model_with_lock.sh \
-              "$model_id" "$target_dir"
+            ready=0
+            if docker run --rm --network=host \
+                -e HF_TOKEN="${HF_TOKEN:-}" \
+                -e MODEL_DOWNLOAD_TIMEOUT \
+                -e MODEL_LOCK_WAIT_SECONDS \
+                -e MODEL_LOCK_POLL_INTERVAL \
+                -e MODEL_PROGRESS_INTERVAL \
+                -e MODEL_LOCK_ROOT=/models/.atom-model-locks \
+                -e MODEL_STAGING_ROOT=/models/.atom-model-staging \
+                -v "$GITHUB_WORKSPACE:/repo:ro" \
+                -v "$model_root:/models" \
+                -w /repo \
+                "$LUMEN_IMAGE" bash \
+                /repo/.github/scripts/download_model_with_lock.sh \
+                "$model_id" "$target_dir"; then
+              ready=1
+            else
+              echo "::error title=Model unavailable::$model_id could not be prepared"
+            fi
+            echo "LUMEN_${model_key}_MODEL=$model_root/$model_id" >> "$GITHUB_ENV"
+            echo "LUMEN_${model_key}_MODEL_READY=$ready" >> "$GITHUB_ENV"
           done
-          echo "LUMEN_LLAMA2_MODEL=$model_root/NousResearch/Llama-2-7b-hf" >> "$GITHUB_ENV"
-          echo "LUMEN_QWEN3_MODEL=$model_root/Qwen/Qwen3-8B" >> "$GITHUB_ENV"
 
       - name: Generate deterministic smoke data
         run: |

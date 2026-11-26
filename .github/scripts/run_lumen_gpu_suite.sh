@@ -12,6 +12,8 @@ set -euo pipefail
 : "${LUMEN_NPY_DATA:?LUMEN_NPY_DATA is required}"
 : "${LUMEN_ALPACA_DATA:?LUMEN_ALPACA_DATA is required}"
 
+LUMEN_LLAMA2_MODEL_READY="${LUMEN_LLAMA2_MODEL_READY:-0}"
+LUMEN_QWEN3_MODEL_READY="${LUMEN_QWEN3_MODEL_READY:-0}"
 failures=()
 log_root="$GITHUB_WORKSPACE/lumen-ci-logs"
 result_root="${RUNNER_TEMP}/lumen-ci-results"
@@ -39,6 +41,21 @@ record() {
   else
     failures+=("$name")
     printf 'FAIL %s\n' "$name" | tee -a "$GITHUB_STEP_SUMMARY"
+  fi
+}
+
+model_unavailable() {
+  echo "Required model is unavailable: $1" >&2
+  return 1
+}
+
+record_model_case() {
+  local name="$1" ready="$2" model="$3"
+  shift 3
+  if [[ "$ready" == 1 ]]; then
+    record "$name" "$@"
+  else
+    record "$name" model_unavailable "$model"
   fi
 }
 
@@ -134,7 +151,8 @@ record "case-2" run_host_case 2 \
   "TRAIN_STEPS=20 bash examples/llama2/run_pretrain_llama2_7b.sh"
 record "case-3" run_host_case 3 \
   "MODEL=llama2 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"
-record "case-4" run_host_case 4 \
+record_model_case "case-4" "$LUMEN_LLAMA2_MODEL_READY" "$LUMEN_LLAMA2_MODEL" \
+  run_host_case 4 \
   "MODE=fp8_blockwise SEQ_LEN=2048 TRAIN_STEPS=20 bash examples/llama2/run_fsdp_lora_7b.sh" \
   llama2 npy
 record "case-5" run_host_case 5 \
@@ -149,12 +167,14 @@ record "case-9" run_host_case 9 \
   "TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b.sh"
 record "case-10" run_host_case 10 \
   "MODEL=qwen3 TRAIN_STEPS=20 bash examples/run_fp8_blockwise_pretrain.sh"
-record "case-11" run_host_case 11 \
+record_model_case "case-11" "$LUMEN_QWEN3_MODEL_READY" "$LUMEN_QWEN3_MODEL" \
+  run_host_case 11 \
   "MAX_STEPS=20 EVAL_INTERVAL=20 bash examples/qwen3/run_qwen3_fsdp.sh" \
   qwen3 alpaca
 record "case-12" run_host_case 12 \
   "TRAIN_STEPS=20 bash examples/qwen3/run_pretrain_qwen3_8b_mxfp4.sh"
-record "case-13" run_container_case_13
+record_model_case "case-13" "$LUMEN_QWEN3_MODEL_READY" "$LUMEN_QWEN3_MODEL" \
+  run_container_case_13
 
 if ((${#failures[@]})); then
   printf 'Failed Lumen checks: %s\n' "${failures[*]}" >&2
