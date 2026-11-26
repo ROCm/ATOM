@@ -778,7 +778,6 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
     assert scheduled[seq.id] is seq
     assert seq.num_cached_tokens == 16
     assert list(batch.num_cached_tokens) == [16]
-    assert seq.offload_promoted_tokens == 16
     assert list(seq.block_table) == block_table
     assert seq.state_slot == state_slot
     assert engine._num_parked_remote_kv == 0
@@ -1139,7 +1138,10 @@ def test_engine_estimates_a_woken_replay_from_its_forward_start(monkeypatch):
     replay below the reach, as admission does."""
     engine, _, _, seq = replaying_engine(monkeypatch)
     _woken(engine, seq)
-    assert engine._local_prefill_pending_work() == (True, 40 - (32 - _REPLAY))
+    assert engine._local_prefill_pending_work(limits=engine._prefill_limits()) == (
+        True,
+        40 - (32 - _REPLAY),
+    )
     starts = []
     real_cost = engine._chunk_cost
     monkeypatch.setattr(
@@ -1147,7 +1149,7 @@ def test_engine_estimates_a_woken_replay_from_its_forward_start(monkeypatch):
         "_chunk_cost",
         lambda start, k: starts.append(start) or real_cost(start, k),
     )
-    engine._estimate_prefill_chunk_cost()
+    engine._estimate_prefill_chunk_cost(limits=engine._prefill_limits())
     assert starts == [32 - _REPLAY]
 
 

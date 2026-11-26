@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# Quick HF-backend smoke test — single GPU, Qwen3-8B, 2 steps
+# Validates Eagle3 v3 architecture: 3 aux hidden states, YaRN-capable RoPE, fc called once.
+# No vLLM/Mooncake — pure HF teacher forward for fast iteration.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0 python -m atomrl.trainer.main \
+#     --config examples/SDDD/Kimi_K25_SDDD_MI350_ATOM/configs/smoke_test_hf.yaml
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+
+policy:
+  model_name: /dev/shm/Qwen3-8B
+  training_backend: fsdp2
+  generation_backend: hf
+  max_total_sequence_length: 512
+  train_global_batch_size: 2
+  train_micro_batch_size: 2
+  learning_rate: 1e-4
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.0
+
+algorithm:
+  name: spec_distill
+  spec_distill:
+    draft_type: eagle3
+    loss_type: forward_kl
+    position_decay: 0.8
+    num_target_layers: 1
+    spec_length: 4
+  teacher:
+    model_name: /dev/shm/Qwen3-8B
+    inference_backend: hf
+  draft:
+    from_scratch: true
+    num_layers: 1
+
+quantization:
+  training:
+    fp8: null
+  rollout_correction:
+    enabled: false
+
+reward:
+  type: function
+  function: math_reward
+
+checkpointing:
+  checkpoint_dir: /dev/shm/checkpoints/smoke_test_hf
+  save_steps: 9999
+  save_total_limit: 1
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 2
+seed: 42
