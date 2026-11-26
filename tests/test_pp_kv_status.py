@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: MIT
 # PP-stage offload KV status aggregation (GPU-free).
 
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import zmq
 from aiter_stub import stubbed_aiter
 
 with stubbed_aiter():
+    from atom.distributed.pp_transport import (
+        PPKVStatusPusher,
+        PPStageTransport,
+        stages_push_load_terminals,
+    )
     from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
     from atom.kv_transfer.disaggregation.types import (
         ConnectorCompletion,
@@ -476,3 +483,180 @@ def test_downstream_reports_ready_without_waiting_for_a_forward(
     assert reports == ([report] if kv_enabled else [])
     assert all(c.args[0] != "forward" for c in proc.runner_mgr.call_func.call_args_list)
     proc.pp_transport.send_tokens.assert_not_called()
+
+
+# --- load terminals pushed by the stage runners (`stages_push_load_terminals`) ---
+
+
+def test_a_pushed_load_terminal_still_needs_every_stage():
+    """A runner's push lands on the head's kv_status socket as its stage's
+    report, the head's own stage (0) included: the quorum is unchanged."""
+    op = LoadOperationId(5, 1)
+    proc = _head(
+        pp_size=3,
+        local_outputs=[KVConnectorOutput()] * 3,
+        downstream_messages=[
+            [(0, KVConnectorOutput(finished_loading={op}))],
+            [(2, KVConnectorOutput(finished_loading={op}))],
+            [(1, KVConnectorOutput(finished_loading={op}))],
+        ],
+    )
+    proc._poll_kv_transfer_progress()
+    proc._poll_kv_transfer_progress()
+    assert not any(out.finished_loading for out in proc.scheduler.outputs)
+    proc._poll_kv_transfer_progress()
+    assert [out.finished_loading for out in proc.scheduler.outputs] == [{op}]
+
+
+def test_a_pushed_load_failure_fails_closed_once_every_stage_reported():
+    op = LoadOperationId(6, 1)
+    proc = _head(
+        pp_size=2,
+        local_outputs=[KVConnectorOutput()] * 2,
+        downstream_messages=[
+            [(1, KVConnectorOutput(failed_loading={op}))],
+            [(0, KVConnectorOutput(finished_loading={op}))],
+        ],
+    )
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.outputs == []  # stage 0 is still loading into the blocks
+    proc._poll_kv_transfer_progress()
+    [out] = proc.scheduler.outputs
+    assert out.failed_loading == {op} and out.finished_loading == set()
+
+
+def test_a_runner_push_reaches_the_head_socket(tmp_path):
+    addrs = [f"ipc://{tmp_path}/meta{i}" for i in range(2)]
+    ctx = zmq.Context()  # the head's close() terms it, not the shared instance
+    head = PPStageTransport(
+        0,
+        2,
+        addrs,
+        f"ipc://{tmp_path}/tok",
+        kv_status_addr=f"ipc://{tmp_path}/kv",
+        ctx=ctx,
+    )
+    pushers = [PPKVStatusPusher(rank, f"ipc://{tmp_path}/kv") for rank in (0, 1)]
+    try:
+        for rank, pusher in enumerate(pushers):
+            assert pusher.try_send(
+                KVConnectorOutput(finished_loading={LoadOperationId(rank, 0)})
+            )
+        got = []
+        for _ in range(50):
+            got += head.recv_kv_status(timeout_ms=100)
+            if len(got) == 2:
+                break
+        assert sorted((r, o.finished_loading) for r, o in got) == [
+            (0, {LoadOperationId(0, 0)}),
+            (1, {LoadOperationId(1, 0)}),
+        ]
+    finally:
+        for pusher in pushers:
+            pusher.close()
+        head.close()
+        ctx.term()
+
+
+def test_a_push_the_head_does_not_take_is_refused_not_waited_on(tmp_path):
+    pusher = PPKVStatusPusher(1, f"ipc://{tmp_path}/kv")  # no head binds it
+    try:
+        queued = 0
+        while queued < 100_000 and pusher.try_send(KVConnectorOutput()):
+            queued += 1
+        assert 0 < queued < 100_000  # zmq's high-water mark, then False
+    finally:
+        pusher.close()
+
+
+@pytest.mark.parametrize(
+    ("pp", "tp", "pcp", "connectors", "pushes"),
+    [
+        (4, 1, 1, ["mooncake_store"], True),
+        (4, 1, 1, ["mooncake", "mooncake_store"], True),  # P/D beside the Store
+        (1, 1, 1, ["mooncake_store"], False),
+        (4, 2, 1, ["mooncake_store"], False),
+        (4, 1, 2, ["mooncake_store"], False),
+        (4, 1, 1, ["lmcache_offload"], False),  # other offloads keep the poll
+    ],
+)
+def test_which_deployments_push_load_terminals(pp, tp, pcp, connectors, pushes):
+    subs = [{"kv_connector": name, "kv_role": "kv_both"} for name in connectors]
+    config = SimpleNamespace(
+        pipeline_parallel_size=pp,
+        tensor_parallel_size=tp,
+        prefill_context_parallel_size=pcp,
+        kv_transfer_config=(
+            subs[0] if len(subs) == 1 else {"kv_connector": "multi", "connectors": subs}
+        ),
+    )
+    assert stages_push_load_terminals(config) is pushes
+
+
+@pytest.mark.parametrize(
+    ("tp", "connector", "pushes"),
+    [(1, "mooncake_store", True), (2, "mooncake_store", False), (1, None, False)],
+)
+def test_a_pp_engine_core_takes_the_push_choice_from_its_config(
+    tp, connector, pushes, monkeypatch
+):
+    def engine_core_init(self, config, input_address, output_address):
+        self.label = "pp-head"
+        self.scheduler = SimpleNamespace(
+            block_manager=SimpleNamespace(enable_prefix_caching=False)
+        )
+
+    # The class's own module and base: modules imported under the stub are dropped.
+    monkeypatch.setitem(
+        PPEngineCoreProc.__init__.__globals__, "PPStageTransport", MagicMock()
+    )
+    monkeypatch.setattr(PPEngineCoreProc.__bases__[0], "__init__", engine_core_init)
+    config = SimpleNamespace(
+        pipeline_parallel_size=2,
+        tensor_parallel_size=tp,
+        kv_transfer_config=(
+            {"kv_connector": connector, "kv_role": "kv_both"} if connector else {}
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_rank=0, pp_meta_addrs=[], pp_token_addr=""
+        ),
+    )
+    head = PPEngineCoreProc(config, "in", "out")
+    assert head._stages_push_load_terminals is pushes
+
+
+@pytest.mark.parametrize("pushes", [True, False])
+def test_the_head_takes_kv_reports_between_the_launches_of_a_step(pushes):
+    """Where stages push, a report that landed during one forward RPC reaches
+    the scheduler before the next schedule() of the same step."""
+    order = []
+    batch = SimpleNamespace(
+        req_ids=[1],
+        connector_meta_output=None,
+        produces_output=lambda: False,
+    )
+    head = SimpleNamespace(
+        _in_flight=deque(),
+        _stages_push_load_terminals=pushes,
+        pp_max_inflight=3,
+        kv_transfer_enabled=True,
+        output_queue=MagicMock(),
+        runner_mgr=MagicMock(),
+        pp_transport=MagicMock(),
+        scheduler=MagicMock(),
+        _poll_kv_transfer_progress=lambda: order.append("poll"),
+        _poll_dynamic_chunking_calibration=lambda: None,
+        _collect_pp_completions=lambda poll_ms: None,
+    )
+    head.scheduler.take_rejected.return_value = None
+
+    def schedule():
+        order.append("schedule")
+        return batch, {}
+
+    head.scheduler.schedule.side_effect = schedule
+    PPEngineCoreProc._pp_head_step(head)
+    if pushes:
+        assert order == ["schedule", "poll", "schedule", "poll", "schedule", "poll"]
+    else:
+        assert order == ["schedule", "schedule", "schedule", "poll"]
