@@ -209,6 +209,7 @@ def fork_read_table(write: torch.Tensor, read: torch.Tensor) -> torch.Tensor:
 class GDNStateMixin(PoolRowsMixin):
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
+        self.replayssm_flush_wait = None
         self._init_gdn_state(model_runner)
 
     def _init_gdn_state(
