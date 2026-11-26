@@ -26,7 +26,9 @@ pub struct ProcessedMessages {
     pub stop_sequences: Option<StringOrArray>,
 }
 
-/// Process chat messages and apply the HuggingFace chat template.
+/// Process chat messages and apply the HuggingFace chat template, with the
+/// request's `reasoning_effort` and then its `chat_template_kwargs` as the
+/// template kwargs.
 ///
 /// Requires a HuggingFace tokenizer (directly or via `CachedTokenizer` or
 /// `FastTokenizer`); other tokenizer kinds return an error because the gRPC path
@@ -35,14 +37,42 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
-    process_chat_messages_as(request, &request.messages, tokenizer)
+    render_chat_messages(
+        request,
+        &request.messages,
+        tokenizer,
+        &template_kwargs(request),
+    )
 }
 
-/// [`process_chat_messages`] with `messages` in place of the request's own.
-pub(crate) fn process_chat_messages_as(
+/// The template kwargs `process_chat_messages` renders `request` with.
+pub(crate) fn template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+    let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
+    let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
+
+    if let Some(reasoning_effort) = &request.reasoning_effort {
+        combined_template_kwargs.insert(
+            "reasoning_effort".to_string(),
+            Value::String(reasoning_effort.clone()),
+        );
+    }
+
+    if let Some(template_kwargs) = &request.chat_template_kwargs {
+        for (key, value) in template_kwargs {
+            combined_template_kwargs.insert(key.clone(), value.clone());
+        }
+    }
+
+    combined_template_kwargs
+}
+
+/// `process_chat_messages` with `messages` in place of the request's own and
+/// `template_kwargs` as the template kwargs.
+pub(crate) fn render_chat_messages(
     request: &ChatCompletionRequest,
     messages: &[ChatMessage],
     tokenizer: &dyn Tokenizer,
+    template_kwargs: &HashMap<String, Value>,
 ) -> Result<ProcessedMessages, String> {
     let any = tokenizer.as_any();
     let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
@@ -76,32 +106,10 @@ pub(crate) fn process_chat_messages_as(
         .transpose()
         .map_err(|e| format!("Failed to serialize tools: {}", e))?;
 
-    let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
-    let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
-
-    if let Some(reasoning_effort) = &request.reasoning_effort {
-        combined_template_kwargs.insert(
-            "reasoning_effort".to_string(),
-            Value::String(reasoning_effort.clone()),
-        );
-    }
-
-    if let Some(template_kwargs) = &request.chat_template_kwargs {
-        for (key, value) in template_kwargs {
-            combined_template_kwargs.insert(key.clone(), value.clone());
-        }
-    }
-
-    let final_template_kwargs = if combined_template_kwargs.is_empty() {
-        None
-    } else {
-        Some(&combined_template_kwargs)
-    };
-
     let params = ChatTemplateParams {
         add_generation_prompt: true,
         tools: tools_json.as_deref(),
-        template_kwargs: final_template_kwargs,
+        template_kwargs: (!template_kwargs.is_empty()).then_some(template_kwargs),
         ..Default::default()
     };
 

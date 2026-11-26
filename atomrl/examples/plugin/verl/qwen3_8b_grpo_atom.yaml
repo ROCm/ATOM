@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# verl + AtomRL plugin: Qwen3-8B GRPO with atomrl_fsdp2 training + vLLM BF16 rollout.
+#
+# Inherits verl's full default config via _generated_ppo_trainer,
+# then overrides only the fields needed for the AtomRL plugin.
+
+defaults:
+  - _generated_ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: ${oc.env:DATA_ROOT}/models/Qwen3-8B-Base
+    enable_gradient_checkpointing: true
+    use_remove_padding: false
+
+  actor:
+    strategy: atomrl_fsdp2
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 1
+    grad_clip: 1.0
+    use_torch_compile: false
+    calculate_entropy: true
+    use_kl_loss: false
+    optim:
+      lr: 1.0e-6
+      weight_decay: 0.1
+      lr_scheduler_type: constant
+      lr_warmup_steps: 10
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+      dtype: bfloat16
+
+  rollout:
+    name: atom
+    mode: async
+    log_prob_micro_batch_size_per_gpu: 1
+    gpu_memory_utilization: 0.30
+    tensor_model_parallel_size: 1
+    dtype: bfloat16
+    max_model_len: 1024
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 4096
+    max_num_seqs: 64
+    enforce_eager: true
+    quantization: null
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+
+  ref:
+    strategy: atomrl_fsdp2
+    fsdp_config:
+      param_offload: false
+
+data:
+  train_files: ${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
+  val_files: ${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet
+  train_batch_size: 8
+  max_prompt_length: 512
+  max_response_length: 512
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  filter_groups:
+    enable: false
+  kl_ctrl:
+    kl_coeff: 0.0
+
+reward:
+  custom_reward_function:
+    path: pkg://atomrl.rewards.math_reward
+    name: dapo_math_reward
+
+critic:
+  enable: false
+
+trainer:
+  total_training_steps: 3
+  logger:
+    - console
+  project_name: atomrl-plugin-verl
+  experiment_name: qwen3-8b-grpo-atomrl-fsdp2-atom
+  n_gpus_per_node: 8
+  nnodes: 1
+  save_freq: -1
+  val_before_train: false
+  use_v1: false

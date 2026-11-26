@@ -1,8 +1,8 @@
 # DeepSeek-V4.1-Flash with ATOM SGLang Plugin
 
 This recipe serves DeepSeek-V4.1-Flash (FP4 PTPC checkpoint) through the ATOM SGLang plugin, without speculative
-decoding and with SGLang's radix cache off, eagerly (no CUDA graphs yet). The configuration below is TP4 on MI308X
-with SGLang 0.5.22.
+decoding, with SGLang's radix cache and decode CUDA graphs (SGLang's overlap scheduler stays on, its default). The
+configuration below is TP4 on MI308X with SGLang 0.5.22.
 
 SGLang keeps the server, scheduler, page allocation and sampling. ATOM owns the model, its weights, the CSA2 KV pool
 (which replaces SGLang's DeepSeek-V4 pool) and the attention kernels; the plugin translates each SGLang batch into
@@ -11,7 +11,7 @@ ATOM's step metadata.
 The FP4PTPC checkpoint runs only with its routed experts converted to per-channel FP8 at load, as in native ATOM: the
 launch passes ATOM's online quantization through `--model-loader-extra-config` (below). Without it the plugin refuses
 the checkpoint before loading weights, as native ATOM refuses it without `--online_quant_config`. Use aiter a53213dc4
-or later, the commit native ATOM's DeepSeek-V4.1-Flash recipe pins.
+or later (the commit native ATOM's DeepSeek-V4.1-Flash recipe pins).
 
 ## Launching Server
 
@@ -29,8 +29,8 @@ python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" --trust-remote-code \
     --tp-size 4 --host 0.0.0.0 --port "${PORT}" \
     --language-model-only --kv-cache-dtype bfloat16 --page-size 256 \
-    --disable-radix-cache \
-    --disable-decode-cuda-graph --disable-prefill-cuda-graph \
+    --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled \
+    --cuda-graph-max-bs-decode 64 --cuda-graph-bs-decode 1 2 4 8 16 32 48 64 \
     --context-length 65536 \
     --chunked-prefill-size 8192 --max-prefill-tokens 16384 \
     --mem-fraction-static 0.85 --max-running-requests 64 \
@@ -42,20 +42,57 @@ The plugin refuses, before loading weights:
 - the FP4PTPC checkpoint without the `--model-loader-extra-config` above;
 - `--chunked-prefill-size -1` (unchunked prefill): SGLang would admit a first prompt whole, past the step size the
   plugin's metadata buffers hold;
-- CUDA graphs (launch with `--disable-decode-cuda-graph --disable-prefill-cuda-graph`, as above, or
-  `--disable-cuda-graph`);
-- `--kv-cache-dtype` other than `bfloat16`: the pool is BF16. That includes the default `auto`, which SGLang resolves
-  to `fp8_e4m3` for DeepSeek-V4.1, so the launch passes `--kv-cache-dtype bfloat16` (above);
-- `--enable-decoder-swa-bounded-replay`: every prefill row runs every layer (no decoder SWA bounded replay yet);
+- prefill CUDA graphs (launch with `--cuda-graph-backend-prefill disabled`);
+- with decode CUDA graphs on: `SGLANG_ENABLE_METADATA_GLUE_GRAPH=1` (the plugin stages every replay on the host,
+  outside the captured region), and `ATOM_ENGRAM_UVA=0` or `ATOM_ENGRAM_OVERLAP=0` (a decode graph records Engram's
+  device staging; either variable moves it to the host). If Engram's tables cannot be page-locked at load, Engram falls
+  back to the host too, and the decode-graph setup refuses that after the weights load (launch with
+  `--cuda-graph-backend-decode disabled`);
+- `--kv-cache-dtype` other than `bfloat16` or `fp8_e4m3`. That includes the default `auto`, which SGLang resolves to
+  `fp8_e4m3` for DeepSeek-V4.1, so the launch names the format (`--kv-cache-dtype bfloat16` above);
+- `--enable-decoder-swa-bounded-replay` with `ATOM_SGLANG_V41_DECODER_REPLAY` off (below): decoder SWA bounded replay
+  is on by default, so the flag restates the default and contradicts the variable;
 - `--enable-encoder-swa-bounded-replay` (SGLang itself refuses it on hardware other than CUDA and gfx950, MI308X
   included);
 - `--disable-hybrid-swa-memory`: the pool is sized by SGLang's hybrid-SWA full token count;
 - `--enable-memory-saver`: the ATOM pool is allocated outside SGLang's memory-saver region;
-- `--enable-unified-memory`: not validated with the ATOM pool;
-- radix cache (launch with `--disable-radix-cache`), hierarchical cache, speculative decoding (SGLang admits DSpark
-  only for DeepSeek-V4.1), PD disaggregation, DP attention, decode context parallelism (`--dcp-size` above 1), and
-  multimodal requests (launch with `--language-model-only`).
+- a MoE all-to-all backend (`--moe-a2a-backend` other than `none`, which `--moe-runner-backend megamoe` and
+  `--enable-waterfill` also set), and `--moe-dense-tp-size`: either makes SGLang gather attention inputs
+  across attention-TP ranks, which the ATOM model does not read, and round its decode-graph batch sizes up past
+  `--max-running-requests`;
+- hierarchical cache, speculative decoding (SGLang admits DSpark only for DeepSeek-V4.1), PD disaggregation, DP
+  attention, decode context parallelism (`--dcp-size` above 1), and multimodal requests (launch with
+  `--language-model-only`).
 
-SGLang itself refuses, in its DeepSeek-V4.1 feature check (`validate_deepseek_v41_features`), before the plugin is
-asked: two-batch overlap (`--enable-two-batch-overlap`), HiSparse, pipeline parallelism, and speculative decoding other
-than DSpark. The plugin adds no environment knobs of its own.
+SGLang itself refuses, before the plugin is asked: in its DeepSeek-V4.1 feature check
+(`validate_deepseek_v41_features`), two-batch overlap (`--enable-two-batch-overlap`), HiSparse, pipeline parallelism,
+and speculative decoding other than DSpark; and `--enable-unified-memory`, whose attention-backend allow-list does
+not hold this model's (`dsv4`).
+
+`--kv-cache-dtype` takes `bfloat16` (BF16 pool) or `fp8_e4m3` (FP8 pool). `fp8_e4m3` is refused before the weights
+load when aiter's `get_mla_sparse_prefill_v41_backend` reports no FP8 backend for this model's attention on the device;
+with aiter a53213dc4 that covers gfx950 / gfx1250 only, so on MI308X (gfx942) launch with `bfloat16`. The indexer's FP8
+index plane is separate and is not affected.
+
+## Radix cache
+
+Radix is on by default for V4.1 on the plugin: without `--disable-radix-cache` the plugin serves SGLang's radix
+(prefix) cache. When a request hits the cache at `P` tokens, the 128 rows below `P` are recomputed into its fresh STATE
+slot (window ring, compressor rings, Engram history) inside the step's own forward, prepended to the request's rows, as
+native ATOM's encoder SWA bounded replay does. The plugin refuses radix cache beside mixed chunks, session radix cache,
+a custom radix cache backend, and a KV storage backend (LMCache, FlexKV, the external cache linker). Unchunked prefill
+and unified memory stay refused for every launch (above). With radix cache on, a request that carries positional
+embedding overrides gets a 400: SGLang never matches or caches such a request's prefix, but a prefill step holding it
+hands the model input embeddings for the whole batch, which a prefix hit's replay rows in the same step are not part
+of. SGLang's tokenizer already refuses `input_embeds` with radix cache, and `--language-model-only` refuses multimodal
+inputs. Launch with `--disable-radix-cache` to serve such requests. `ATOM_SGLANG_V41_RADIX=0` turns SGLang's radix
+cache off for the launch, with one warning, as `--disable-radix-cache` does.
+
+## Environment variables
+
+Read by the plugin (`atom/plugin/sglang/deepseek_v41_envs.py`):
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_SGLANG_V41_DECODER_REPLAY** | bool | 1 (true) | Decoder SWA bounded replay: a prefill runs V4.1's decoder layers on each request's last 128 rows only, as native ATOM does. `0` / `false` / `no` / `off`, or an empty value, turn it off (every prefill row runs every layer), as native's `--no-decoder-swa-bounded-replay` does. Unlike native, which backs a short resumed chunk off to a full window, a chunk SGLang resumes with fewer rows than the window computes every row, and so does a step in which SGLang reads more than each request's last row (input logprobs, a full hidden-state capture, a prefill-only batch); the plugin's prefill output therefore depends on where SGLang cuts a prompt. |
+| **ATOM_SGLANG_V41_RADIX** | bool | 1 (true) | Serve SGLang's radix cache with the replay above whenever it is on. `0` / `false` / `no` / `off`, or an empty value, turn SGLang's radix cache off for the launch (declared through SGLang's model-override registry when the server arguments are resolved, so the tokenizer manager and the schedulers agree; one warning). |

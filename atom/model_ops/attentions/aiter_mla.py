@@ -46,12 +46,12 @@ from atom.kv_transfer.disaggregation.pd_producer import mooncake_pd_producer_con
 from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
-    _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
     mla_dcp_kernel_num_heads,
     mla_dcp_persistent_width,
     mla_dcp_sparse_prefill_num_heads,
+    mla_dense_min_query_heads,
     mla_kernel_num_heads,
 )
 from atom.model_ops.attentions.selection_pack import (
@@ -534,9 +534,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
         # Must equal `MLAAttention.padded_num_heads`: that pads the query, this
-        # sizes the kernel's work descriptors for it.
+        # sizes the kernel's work descriptors for it. Both take the floor from
+        # the one model-level `mla_dense_min_query_heads`.
         self.padded_num_attention_heads = mla_kernel_num_heads(
-            max(self.num_attention_heads, _MLA_MIN_HEADS)
+            self.num_attention_heads,
+            mla_dense_min_query_heads(
+                config, self.num_attention_heads, get_dcp_world_size()
+            ),
         )
         self.is_sparse = model_runner.has_mla_indexer
         self.index_topk = hf_config.index_topk if self.is_sparse else -1

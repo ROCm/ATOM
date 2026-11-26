@@ -662,6 +662,10 @@ class WritePathTest(unittest.TestCase):
         conn._built_state_sessions = {}
         conn._verify_state_before = {}
         conn._write_state_digests = {}
+        conn._first_transfer_slot = 0
+        conn._has_transfer_slots = False
+        conn._staged_sources = {}
+        conn._config = types.SimpleNamespace(state_transfer_slots=0)
 
         conn.sent = []
         conn.writes = []
