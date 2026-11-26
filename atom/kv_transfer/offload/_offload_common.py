@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
+from atom.kv_transfer import progress_doorbell
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     KVConnectorOutput,
@@ -238,6 +239,24 @@ def build_offload_engine(
     return engine, cfg, meta
 
 
+class LoadExecutor(ThreadPoolExecutor):
+    """The load pool: every job rings the KV progress doorbell when it ends.
+
+    A load job records its terminal result (`_done_load` / `_failed_load`)
+    before it returns, so the ring follows the record. With no doorbell
+    installed (`progress_doorbell.install`) the ring is a no-op.
+    """
+
+    def submit(self, fn, /, *args, **kwargs):
+        future = super().submit(fn, *args, **kwargs)
+        future.add_done_callback(_ring_kv_progress)
+        return future
+
+
+def _ring_kv_progress(_future) -> None:
+    progress_doorbell.ring()
+
+
 class OffloadWorkerMixin:
     """Executor plumbing + completion reporting shared by offload workers.
 
@@ -290,7 +309,7 @@ class OffloadWorkerMixin:
         self._save_executor = ThreadPoolExecutor(
             max_workers=n_save, thread_name_prefix=f"{thread_name_prefix}-save"
         )
-        self._load_executor = ThreadPoolExecutor(
+        self._load_executor = LoadExecutor(
             max_workers=n_load, thread_name_prefix=f"{thread_name_prefix}-load"
         )
         self._lock = threading.Lock()
