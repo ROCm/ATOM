@@ -222,6 +222,26 @@ class ATOMRayServer:
         }
         return SamplingParams(**sp_kwargs)
 
+    @staticmethod
+    def _completion(out: Any, prompt_ids: list[int]) -> dict[str, Any]:
+        """One ATOM output as the result dict every generate path returns.
+
+        ``routed_experts`` (R3, int16 ``[seq_len-1, layers, top_k]``) is kept
+        when the engine returned it.
+        """
+        out = out if isinstance(out, dict) else {}
+        logprobs = out.get("logprobs")
+        result = {
+            "text": out.get("text", ""),
+            "prompt_token_ids": list(prompt_ids),
+            "token_ids": list(out.get("token_ids", [])),
+            "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
+        }
+        routed = out.get("routed_experts")
+        if routed is not None:
+            result["routed_experts"] = routed
+        return result
+
     async def generate(
         self,
         prompt: list[int],
@@ -244,14 +264,7 @@ class ATOMRayServer:
             return self.engine.generate([prompt_ids], sp, request_ids=[rid])[0]
 
         out = await asyncio.get_event_loop().run_in_executor(None, _generate_blocking)
-        token_ids = list(out.get("token_ids", [])) if isinstance(out, dict) else []
-        logprobs = out.get("logprobs") if isinstance(out, dict) else None
-        return {
-            "text": out.get("text", "") if isinstance(out, dict) else "",
-            "prompt_token_ids": prompt_ids,
-            "token_ids": token_ids,
-            "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
-        }
+        return self._completion(out, prompt_ids)
 
     async def generate_batch(
         self,
@@ -298,26 +311,12 @@ class ATOMRayServer:
 
         outs = await asyncio.get_event_loop().run_in_executor(None, _generate_blocking)
         self._log_kv_pressure()
-        results: list[dict[str, Any]] = []
         expanded_prompts = [
             p for p, n in zip(grouped_prompts, grouped_counts) for _ in range(n)
         ]
         if os.environ.get("ATOMRL_ATOM_CHECK_ALIGNMENT"):
             self._audit_alignment(expanded_prompts, outs)
-        for p_ids, out in zip(expanded_prompts, outs):
-            token_ids = list(out.get("token_ids", [])) if isinstance(out, dict) else []
-            logprobs = out.get("logprobs") if isinstance(out, dict) else None
-            results.append(
-                {
-                    "text": out.get("text", "") if isinstance(out, dict) else "",
-                    "prompt_token_ids": p_ids,
-                    "token_ids": token_ids,
-                    "logprobs": (
-                        [float(x) for x in logprobs] if logprobs is not None else None
-                    ),
-                }
-            )
-        return results
+        return [self._completion(out, p) for p, out in zip(expanded_prompts, outs)]
 
     async def generate_group(
         self,
@@ -353,20 +352,7 @@ class ATOMRayServer:
         sp = self._build_sampling_params(sampling_params, prompt_length=len(prompt_ids))
         sp.n = num_generations
         outs = await self._pump.submit(prompt_ids, sp, request_id or uuid4().hex)
-        results = []
-        for out in outs:
-            logprobs = out.get("logprobs")
-            results.append(
-                {
-                    "text": out.get("text", ""),
-                    "prompt_token_ids": list(prompt_ids),
-                    "token_ids": list(out.get("token_ids", [])),
-                    "logprobs": (
-                        [float(x) for x in logprobs] if logprobs is not None else None
-                    ),
-                }
-            )
-        return results
+        return [self._completion(out, prompt_ids) for out in outs]
 
     def _log_kv_pressure(self) -> None:
         """Report how hard this batch leaned on the KV pool.
