@@ -36,6 +36,12 @@ Weight prep uses aiter's own shuffles (``aiter.ops.shuffle``):
 Shuffled tensors stay expert-major + contiguous, so EPLB can migrate their
 expert-major views in place.
 
+A target layer whose shared expert runs apart (DeepSeek-V4.1's MXFP8 one, not
+fused into the routed experts) can hand it to the routed call
+(``attach_mega_shared_expert``): with ``shared_in`` (ROCm/aiter#8491) AITER
+computes it inside the small-input kernel where that kernel can, and otherwise
+runs it dense on the caller's stream; the call returns ``routed + shared``.
+
 Memory: MegaMoEV2 instances are shared across all MoE layers (process-level
 cache keyed by shape/quant/mtpr); the capacities are built in the same order
 on all ranks before capture. Per-layer weights are swapped in before forward
@@ -45,6 +51,7 @@ not baked into the kernel).
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -181,6 +188,85 @@ def mega_builds_fused_route(
         topk=topk,
         quant=quant,
         swiglu_limit=float(swiglu_limit),
+    )
+
+
+@functools.cache
+def _shared_expert_input_cls():
+    """AITER's ``SharedExpertInput`` whose MXFP8 pair of x is made the first time
+    the kernel reads it, or None for an AITER without ``shared_in``.
+
+    ``SharedExpertInput`` and ``MegaMoEV2.forward(shared_in=...)`` come in one
+    change (ROCm/aiter#8491), and MegaMoE has no version of its own, so the class
+    is the capability. AITER reads ``x_fp8`` / ``x_scale`` only once it has
+    decided the call fuses the shared expert; a call it cannot fuse runs
+    ``dense()``, which quantizes x itself, so x is quantized once either way.
+    """
+    from aiter.ops.flydsl.kernels.mega_moe import weights
+
+    base = getattr(weights, "SharedExpertInput", None)
+    if base is None:
+        return None
+    from atom.model_ops.blockscale import quantize_fp8
+
+    class LazySharedExpertInput(base):
+        def __init__(self, x, gate_up, gate_up_scale, down, down_scale, dense):
+            self._x, self._x_mxfp8 = x, None
+            super().__init__(
+                None, None, gate_up, gate_up_scale, down, down_scale, dense
+            )
+
+        def _pair(self):
+            if self._x_mxfp8 is None:
+                self._x_mxfp8 = quantize_fp8(self._x)
+            return self._x_mxfp8
+
+        # The base constructor assigns both; they come from x instead.
+        x_fp8 = property(lambda self: self._pair()[0], lambda self, value: None)
+        x_scale = property(lambda self: self._pair()[1], lambda self, value: None)
+
+    return LazySharedExpertInput
+
+
+def attach_mega_shared_expert(layer, shared_expert) -> bool:
+    """Have ``run_mega_moe`` add ``shared_expert`` (its ``gate_up_proj`` / ``w2``
+    hold MXFP8 weights with 32x32-block scales) into ``layer``'s routed output.
+
+    Only where every routed call of the layer reaches ``run_mega_moe`` on this
+    rank's own rows and nothing reduces after it: the Mega method, no
+    comm-fused or sequence-parallel MegaMoE, no PCP merge or DP-logical split,
+    no reduction in the experts. Returns whether it did; the caller computes
+    the shared expert itself otherwise.
+    """
+    from atom.distributed.ulysses_sp import sp_is_enabled
+    from atom.model_ops.moe import MegaMxfp4MoEMethod
+
+    if not isinstance(getattr(layer, "quant_method", None), MegaMxfp4MoEMethod):
+        return False
+    parallel = layer.moe_parallel_config
+    if (
+        layer._comm_fused_moe is not None
+        or sp_is_enabled()
+        or layer.reduce_results
+        or parallel.pcp_merge
+        or parallel.dp_logical_ratio > 1
+        or _shared_expert_input_cls() is None
+    ):
+        return False
+    # Not a submodule: that would rename the shared expert's parameters.
+    object.__setattr__(layer, "_mega_shared_expert", shared_expert)
+    return True
+
+
+def _shared_expert_input(shared_expert, x: torch.Tensor):
+    gate_up, down = shared_expert.gate_up_proj, shared_expert.w2
+    return _shared_expert_input_cls()(
+        x,
+        gate_up.weight,
+        gate_up.weight_scale,
+        down.weight,
+        down.weight_scale,
+        dense=lambda: shared_expert(x),
     )
 
 
@@ -465,14 +551,22 @@ def run_mega_moe(
         # The weights are bound above; select this layer's protocol slot.
         mega.select_layer_state(layer.layer_id)
 
+    x = x.contiguous()
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
+    shared_expert = getattr(layer, "_mega_shared_expert", None)
+    # attach_mega_shared_expert: the output holds the shared expert too.
+    shared = (
+        {}
+        if shared_expert is None
+        else {"shared_in": _shared_expert_input(shared_expert, x)}
+    )
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
         # construction (see the cache key above). Routing sends a pad row's
         # slots to -1, which combine must skip rather than sum stale data from.
         out = mega.forward(
-            x.contiguous(), wts, ids, mask_invalid_slots=True, max_tokens=max_tokens
+            x, wts, ids, mask_invalid_slots=True, max_tokens=max_tokens, **shared
         )
     return out
 
