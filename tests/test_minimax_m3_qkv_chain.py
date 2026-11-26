@@ -96,6 +96,32 @@ def test_take_refuses_token_graph(monkeypatch):
         assert qkv_chain.take(40) is want
 
 
+@pytest.mark.parametrize("tr_graph", ["record", "replay"])
+def test_take_refuses_tr_hybrid_record_and_replay(monkeypatch, tr_graph):
+    # the TR_HYBRID record pass has forward_mode None; only ForwardContext.tr_graph marks it
+    import atom.utils.forward_context as fc
+
+    ctx = SimpleNamespace(
+        tr_graph=tr_graph,
+        context=SimpleNamespace(
+            is_prefill=False, is_dummy_run=False, forward_mode=None
+        ),
+    )
+    monkeypatch.setattr(fc, "get_forward_context", lambda: ctx)
+    assert qkv_chain.take(40) is False
+    ctx.tr_graph = None
+    assert qkv_chain.take(40) is True
+
+
+def test_enabled_needs_gfx950(monkeypatch):
+    monkeypatch.setattr(qkv_chain.envs, "ATOM_M3_QKV_CHAIN", True, raising=False)
+    monkeypatch.setattr(qkv_chain, "available", lambda: True)
+    monkeypatch.setattr(qkv_chain, "_is_gfx950", lambda: False)
+    assert not qkv_chain.enabled()
+    monkeypatch.setattr(qkv_chain, "_is_gfx950", lambda: True)
+    assert qkv_chain.enabled()
+
+
 def test_linear_ok_requires_native_1x32_mxfp8():
     ok = SimpleNamespace(
         native_a8_group_rows=1,
@@ -173,3 +199,26 @@ def test_one_shot_activity_log(monkeypatch, caplog):
     assert "aiter features: qkv_chain_cooperative_insert" in msgs[0]
     assert "taken=1, prefill=1, dummy=1, token_graph=1, out_of_window=1" in msgs[1]
     assert st["calls"] == 5 and st["done"]
+
+
+def test_linear_imports_qkv_chain_before_the_preshuffle_branch():
+    """The not-preshuffled fallback calls ``qkv_chain.note_layer``: the import must run on both branches
+    (it used to sit inside the is_shuffled branch -> UnboundLocalError at load with preshuffle off).
+    """
+    import ast
+    import importlib.util
+
+    # read the source without importing linear (that needs a visible GPU for the arch probe)
+    with open(importlib.util.find_spec("atom.model_ops.linear").origin) as f:
+        src = f.read()
+    hits = []
+    for node in ast.walk(ast.parse(src)):
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Call)
+            and ast.unparse(node.test) == "getattr(self, '_qkv_chain', False)"
+        ):
+            hits.append(node)
+    assert len(hits) == 1
+    first = hits[0].body[0]
+    assert isinstance(first, ast.ImportFrom) and first.names[0].name == "qkv_chain"
