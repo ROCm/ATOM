@@ -107,20 +107,21 @@ TL_STAGES = k1.TL_STAGES + k2.TL_STAGES
 TL_POINTS = 1 + len(TL_STAGES)
 # K1's hand-over flags (module docstring), in its scratch past K2's regions
 FLAGS = ("sdone", "gdone", "krdy", "qp", "iqdone")
-# An index layer's code (296 .. 308 KB at s6) runs once a step, tens of MB of weights
-# after its last launch: L2-cold, its I-cache misses go to HBM (an ordinary
-# layer's ~100 KB, launched every layer, stays warm). At entry one wave of each
-# of the last 8 CTAs (one an XCD) reads it into its XCD's L2 (``warm_code``,
-# from its pc up to CODE_WARM_SPAN bytes, clamped at the code's end) and waits
-# for it there: those CTAs hold no slice, gate (block) or seam norm task, their
-# first wait the normed rows' (wqkv_a, a compressor's projection). 0: off
+# A layer's code meets its I-cache misses in an L2 a whole layer of weights has
+# streamed through since its last launch: an index layer's (296 .. 308 KB at
+# s6, once a step) and, as measured, an ordinary layer's (~100 KB, launched
+# every layer) too. At entry one wave of each of the last 8 CTAs (one an XCD)
+# reads it into its XCD's L2 (``warm_code``, from its pc up to CODE_WARM_SPAN
+# bytes, clamped at the code's end) and waits for it there: those CTAs hold no
+# slice, gate (block) or seam norm task, their first wait the normed rows'
+# (wqkv_a, a compressor's projection). Every layer build; 0: off
 CODE_WARM_SPAN = 320 * 1024
 CODE_WARM_CTA0 = BLOCKS - 8
 CODE_WARM_WAVE = WAVES - 1
 
 
 @traced
-def warm_index_code(on, tid, bid):
+def warm_layer_code(on, tid, bid):
     if const_expr(on):  # noqa: SIM102
         if (bid >= CODE_WARM_CTA0) & (uniform(tid // 64) == CODE_WARM_WAVE):
             warm_code(tid % 64, CODE_WARM_SPAN)
@@ -282,7 +283,7 @@ def build_layer(key: LayerBuild):
     if comp is not None:
         members["cp"] = compress_smem(comp)
     Parts = lds_union("LayerLds", members)
-    warm = pre.feeds_index and CODE_WARM_SPAN > 0
+    warm = CODE_WARM_SPAN > 0
     if warm:
         # the seam norm's CTAs end before WQKV0 or at NORM0 + its rows
         norm_rows = s // pre.tp if pre.tok_par else s
@@ -342,7 +343,7 @@ def build_layer(key: LayerBuild):
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        warm_index_code(warm, tid, bid)
+        warm_layer_code(warm, tid, bid)
         # the scratch regions' base a value of its own (``sync.fresh_s64``), not
         # a part of the merged kernarg load a compressing build reloads whole
         scratch = fresh_s64(scratch)
