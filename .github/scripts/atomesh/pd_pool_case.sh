@@ -19,6 +19,7 @@ case "${case_name}" in
   pp4-dep4-timeout) contract_file=single-node-pp4-dep4-timeout.json; budget=75m ;;
   pp4-dep4-te5840-base) contract_file=single-node-pp4-dep4-te5840-base.json; budget=75m ;;
   pp4-dep4-te5840-patched) contract_file=single-node-pp4-dep4-te5840-patched.json; budget=75m ;;
+  pp4-dep4-te5840-natural) contract_file=single-node-pp4-dep4-te5840-natural.json; budget=75m ;;
   *) exit 2 ;;
 esac
 export REPO_ROOT="${3:?checkout path}"

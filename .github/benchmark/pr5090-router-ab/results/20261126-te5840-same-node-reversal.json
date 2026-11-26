@@ -1,0 +1,55 @@
+{
+  "same_node": "g27",
+  "baseline_lease": "La98fa2",
+  "candidate_lease": "Lf1b699",
+  "harness_sha": "8e1c42075e26e75d8a372c38bef59d9db4b0be5d",
+  "matched_actual_contracts": true,
+  "compared_fields": [
+    "P/D argv,env,GPU allocation",
+    "source/model/image",
+    "C80/duration900/dataset/client",
+    "router source/lockfile/policy",
+    "srt source",
+    "P order0,1,3,2"
+  ],
+  "baseline_engine_sha256": "2833931581a1e3b0d676fd237185d3350ace814b6e2ba034bbf5ff0da726b16d",
+  "candidate_engine_sha256": "3c8196c03d57a4cf10c83b5ec681f62a0851646f7b005939709e329df2c41511",
+  "baseline_failure": {
+    "pid": 1699,
+    "tid": 35585,
+    "time_ns": 1795661838538578148,
+    "monotonic_ns": 7716930365487721,
+    "role": "prefill",
+    "pp_rank": 3,
+    "device_id": "3",
+    "sender_workers": 10,
+    "async_sender_tasks": 20,
+    "event": "failed_native_write",
+    "return_code": -1,
+    "duration_s": 31.66922872606665,
+    "registered": true,
+    "native_call_start_monotonic_ns": 7716898695258995,
+    "descriptor_count": 19740,
+    "total_bytes": 1667778560,
+    "source_outside_ranges": [],
+    "descriptors_omitted": 0
+  },
+  "kv": {
+    "metric": "vllm:mooncake_bytes_transferred_sum",
+    "prefill_before": 0.0,
+    "prefill_after": 101376000.0,
+    "transferred_bytes_delta": 101376000.0,
+    "passed": true
+  },
+  "base_exit_codes": {
+    "pool-workload.rc": 86,
+    "pool-exit.rc": 86,
+    "gpool-release.rc": 0
+  },
+  "base_archive_sha256": "acf1eef21ce4ed336ae920bc0e00907bd2ebdcea3f529f301c26e535eb61a77e",
+  "candidate_result": "warmup884 errors0;900s window3062 completed/2 grace-end cancels/errors0;zero native write failures;release0",
+  "conclusion": "Matched same-node patched-pass/unpatched-fail reversal supports the repeated RDMA queue metadata sweep as a cause of this sender10 PP3 timeout. Natural P device order and longer reliability validation remain outstanding. No new SA performance point.",
+  "first_failure_utc": "2026-11-26T02:57:18.538578Z",
+  "cleanup_started_utc": "2026-11-26T02:57:20Z",
+  "post_cleanup_failures_excluded": true
+}
