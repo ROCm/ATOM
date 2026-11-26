@@ -2,7 +2,7 @@
 
 This recipe serves DeepSeek-V4.1-Flash (FP4 PTPC checkpoint) through the ATOM SGLang plugin, without speculative
 decoding or with DSpark (below), with SGLang's radix cache and decode CUDA graphs (SGLang's overlap scheduler stays
-on, its default). The configuration below is TP4 on MI308X with SGLang 0.5.22.
+on, its default). The configuration below is TP4 on MI308X with SGLang 0.5.23.
 
 SGLang keeps the server, scheduler, page allocation and sampling. ATOM owns the model, its weights, the CSA2 KV pool
 (which replaces SGLang's DeepSeek-V4 pool) and the attention kernels; the plugin translates each SGLang batch into
@@ -39,8 +39,8 @@ python3 -m sglang.launch_server \
 
 The plugin refuses, before loading weights:
 
-- an SGLang other than 0.5.22 (an exact match on `sglang.__version__`, so `0.5.22.post1` is refused too),
-  before the plugin's DeepSeek-V4.1 rewiring of SGLang: that rewiring is written against 0.5.22 and has no fallback;
+- an SGLang other than 0.5.23 (an exact match on `sglang.__version__`, so `0.5.23.post1` is refused too),
+  before the plugin's DeepSeek-V4.1 rewiring of SGLang: that rewiring is written against 0.5.23 and has no fallback;
 - the FP4PTPC checkpoint without the `--model-loader-extra-config` above;
 - `--chunked-prefill-size -1` (unchunked prefill): SGLang would admit a first prompt whole, past the step size the
   plugin's metadata buffers hold;

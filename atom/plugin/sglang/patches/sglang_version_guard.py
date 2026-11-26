@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import inspect
 
-SUPPORTED_SGLANG_VERSIONS = ("0.5.22",)
+SUPPORTED_SGLANG_VERSIONS = ("0.5.23",)
 
 
 def sglang_version() -> str:

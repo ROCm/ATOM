@@ -6,7 +6,7 @@ adapts SGLang scheduling, QSA KV pools, PLE state and HC hidden storage.
 Run this recipe inside the ATOM SGLang release Docker image with its bundled
 ATOM, SGLang, and AITER. The
 [release image definition](../../docker/sglang_release.dockerfile) currently
-pins SGLang v0.5.22. This integration requires SGLang 0.5.20 or
+pins SGLang v0.5.23. This integration requires SGLang 0.5.20 or
 newer; upstream recognizes `qwen4_exp`, and the recognition patch adds only
 the MTP draft-arch and HC-width adapters.
 The bundled AITER must include [ROCm/aiter#8083](https://github.com/ROCm/aiter/pull/8083)
