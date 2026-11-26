@@ -2868,19 +2868,9 @@ def test_window_rows_start_each_row_at_its_own_window(window):
         assert tables[row].tolist() == list(range(first, first + P))
 
 
-def test_minimax_m31_dspark_refuses_a_tp_that_splits_a_kv_head(monkeypatch):
-    """A rank holds whole KV heads: 4 of them cannot be shared out at TP 3."""
-    import atom.models.minimax_m3.dspark as m3_dspark
-
-    monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: 3)
-    config = types.SimpleNamespace(num_attention_heads=48, num_key_value_heads=4)
-    with pytest.raises(ValueError, match="4 KV heads"):
-        m3_dspark.M3DSparkAttention(types.SimpleNamespace(), config, None, layer_num=0)
-
-
 def test_minimax_m31_dspark_holds_every_kv_head_at_tp1(monkeypatch):
-    """At TP1 the draft is built with all 4 KV heads; its block pass decodes a
-    row per (block position, KV head)."""
+    """At TP1 the draft is built with all 4 KV heads (its block tables:
+    `test_dspark_draft.py`)."""
     import atom.models.minimax_m3.dspark as m3_dspark
 
     monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: 1)

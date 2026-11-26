@@ -35,8 +35,9 @@ page-16 table ``prepare_paged_block`` builds outside the graph; the block's own 
 are written into the cache first, except at positions past the request's
 allocated pages. No host sync and fixed shapes, so the block pass is CUDA-graph
 captured like the other drafts. The per-row decode takes one KV head a row: a
-rank that holds several (TP below the KV head count of 4, e.g. TP1 under DP +
-EP) decodes each block position as one row per KV head.
+rank that holds several (all 4 at TP1, e.g. under DP + EP) decodes each block
+position as one row per KV head. The draft runs at TP1 or TP >= 4; TP2 and TP3
+are refused.
 
 Checkpoint layout (``<draft>/dspark``, MXFP8 [1, 32] linears, BF16 rest):
   language_model.model.dspark.fc.weight                       [6144, 5 * 6144]
@@ -171,10 +172,10 @@ class M3DSparkAttention(nn.Module):
                 f"DSpark draft has {self.total_num_heads} attention heads, which "
                 f"is not divisible by TP size {tp_size}."
             )
-        if self.total_num_kv_heads > tp_size and self.total_num_kv_heads % tp_size:
+        if 1 < tp_size < self.total_num_kv_heads:
             raise ValueError(
-                f"DSpark draft has {self.total_num_kv_heads} KV heads, which is "
-                f"not divisible by TP size {tp_size}."
+                "The MiniMax-M3.1 DSpark draft is tested at TP1 and at TP >= its "
+                f"{self.total_num_kv_heads} KV heads; got TP {tp_size}."
             )
         self.num_heads = self.total_num_heads // tp_size
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
@@ -375,8 +376,6 @@ class MiniMaxM3DSpark(DSparkDraftModel):
 
     # Per-row MHA decode; its tables are built in `prepare_paged_block`.
     block_attention_is_mla = False
-    # KV heads a rank holds: 1 at TP >= the KV head count, more below it.
-    kv_heads_per_rank = 1
 
     weights_mapping: ClassVar[dict[str, str]] = {
         "language_model.model.dspark.": "",
@@ -433,6 +432,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             ]
         )
         self.final_norm = GemmaRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        # KV heads a rank holds: 1 at TP >= the KV head count, all of them at TP1.
         self.kv_heads_per_rank = self.layers[0].self_attn.num_kv_heads
         self.init_block_fields(config)
         # 0 or absent: every block row attends the whole context.

@@ -4,6 +4,8 @@
 
 - `AllocationCap`, the allocation staging the paged block drafts share
   (Kimi-K3 DSpark GQA, MiniMax-M3.1 DSpark)
+- MiniMax-M3.1 DSpark's block-row tables, with one or several KV heads a
+  rank, and the TPs it refuses
 - `DSparkDraftModel`'s default target sharing, block sampling, block
   backbone and context-KV fan-out, and the draft layers' slot hand-off
 - `draft_rope_kwargs`, the drafts' shared rope arguments, and the Kimi-K3 MLA
@@ -66,31 +68,58 @@ def test_allocation_cap_masks_writes_past_each_rows_allocation(host_staging, uni
     assert slots.tolist() == [[30, 31, -1]]
 
 
-def test_minimax_m31_dspark_caps_the_rows_but_not_ctx_lens(host_staging):
+@pytest.mark.parametrize("heads", [1, 2, 4])
+def test_minimax_m31_dspark_caps_the_rows_but_not_ctx_lens(host_staging, heads):
     """MiniMax-M3.1's block rows read at most the allocation; the proposer's
-    `ctx_lens` (`attn_metadata.context_lens`) is left as it built it."""
+    `ctx_lens` (`attn_metadata.context_lens`) is left as it built it. A rank
+    holding `heads` KV heads gets a row per (block position, KV head),
+    position-major, whose page-16 ids are `phys16 * heads + head`."""
     import torch
+    from aiter_stub import atom_without_aiter
 
-    m3_dspark = pytest.importorskip(
-        "atom.models.minimax_m3.dspark",
-        reason="the MiniMax-M3.1 draft imports aiter at module load",
-        exc_type=ImportError,
-    )
-    MiniMaxM3DSpark = m3_dspark.MiniMaxM3DSpark
-
-    draft = MiniMaxM3DSpark.__new__(MiniMaxM3DSpark)
-    draft.max_num_seqs, draft._bt16 = 4, None
-    draft.sliding_window = 0
     T = 3
     pos = torch.tensor([[126, 127, 128], [5, 6, 7], [1, 2, 3]])
     slots = torch.tensor([[10, 11, 12], [20, 21, 22], [-1, -1, -1]])
     ctx = torch.tensor([129, 8, 1 + T], dtype=torch.int32)
     md = types.SimpleNamespace()
     block_tables = torch.tensor([[3, 0], [4, 5], [0, 0]], dtype=torch.int32)
-    draft.prepare_paged_block(md, block_tables, pos, slots, ctx, [1, 2], 2, 128)
+    with atom_without_aiter() as load:
+        MiniMaxM3DSpark = load("atom.models.minimax_m3.dspark").MiniMaxM3DSpark
+        draft = MiniMaxM3DSpark.__new__(MiniMaxM3DSpark)
+        draft.max_num_seqs, draft._bt16 = 4, None
+        draft.sliding_window = 0
+        draft.kv_heads_per_rank = heads
+        draft.prepare_paged_block(md, block_tables, pos, slots, ctx, [1, 2], 2, 128)
     assert slots.tolist() == [[10, 11, -1], [20, 21, 22], [-1, -1, -1]]
     assert ctx.tolist() == [129, 8, 1 + T]
-    assert md.dspark_ctx_rows.tolist() == [128] * T + [8] * T + [1 + T] * T
+    # Each request's page-128 ids as page-16 ids, one table per block position.
+    phys16 = [
+        [page * 8 + sub for page in pages for sub in range(8)]
+        for pages in block_tables.tolist()
+        for _ in range(T)
+    ]
+    lens = [128] * T + [8] * T + [1 + T] * T
+    assert md.dspark_bt16_rows.tolist() == [
+        [p * heads + h for p in row] for row in phys16 for h in range(heads)
+    ]
+    assert md.dspark_ctx_rows.tolist() == [n for n in lens for _ in range(heads)]
+
+
+@pytest.mark.parametrize("tp", [2, 3])
+def test_minimax_m31_dspark_refuses_the_untested_tps(monkeypatch, tp):
+    """The draft runs at TP1 (all 4 KV heads on the rank) or TP >= 4 (one)."""
+    from aiter_stub import atom_without_aiter
+
+    config = types.SimpleNamespace(num_attention_heads=48, num_key_value_heads=4)
+    with atom_without_aiter() as load:
+        m3_dspark = load("atom.models.minimax_m3.dspark")
+        monkeypatch.setattr(
+            m3_dspark, "get_tensor_model_parallel_world_size", lambda: tp
+        )
+        with pytest.raises(
+            ValueError, match=f"TP1 and at TP >= its 4 KV heads; got TP {tp}"
+        ):
+            m3_dspark.M3DSparkAttention(None, config, None, layer_num=0)
 
 
 # ---- the base draft's defaults --------------------------------------------
