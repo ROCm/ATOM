@@ -905,6 +905,41 @@ def test_sp_forward_matches_the_tp_forward(sp, monkeypatch, num_tokens):
         close(hooked[rank][0], after[1])
 
 
+def test_sp_forward_feeds_torchspecs_layer_hooks(sp, load, monkeypatch):
+    """TorchSpec's hidden-state export taps the decoder layers with hooks written
+    for the layer's ``(hidden_states, residual)`` when the forward takes no
+    capture argument, as TBO's wrapper over the VL model does not: they read
+    SP's gathered post-layer state."""
+    runner_class = load("atom.rollout.model_runner_ext").RLHFModelRunner
+    models = replicas(("dense", "moe", "dense"), aux_layers=())
+    runners = []
+    for m in models:
+        runner = NS(
+            label="rollout",
+            model=NS(
+                forward=lambda input_ids, positions: None,
+                language_model=NS(model=NS(layers=m.layers)),
+            ),
+            _aux_layer_ids={1},
+            _hook_capture_enabled=True,
+            _hook_captured_hidden_states={},
+        )
+        for name in (
+            "_model_forward_accepts_capture_arg",
+            "_find_decoder_layers_for_capture",
+        ):
+            setattr(runner, name, types.MethodType(getattr(runner_class, name), runner))
+        assert runner_class._register_hidden_state_hooks(runner)
+        runners.append(runner)
+    embeddings = embeddings_of(100)
+    sp_forward(sp, monkeypatch, models, Ranks(), embeddings)
+    _, after = tp_forward(models, embeddings)
+    for runner in runners:
+        captured = runner._hook_captured_hidden_states
+        assert list(captured) == [1]
+        torch.testing.assert_close(captured[1], after[1], rtol=1e-4, atol=1e-5)
+
+
 @pytest.mark.parametrize(
     "num_tokens, max_prefill_tokens, warm_ups",
     [(100, 65536, [16, 112]), (70, 100, [16])],

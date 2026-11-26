@@ -304,8 +304,10 @@ def plan_model(model: nn.Module, num_tokens: int) -> SeqShard | None:
 
 
 class GatheredLayerOutput(tuple):
-    """``(full,)``: a layer's post-layer hidden state, gathered by SP, as its
-    forward hooks receive it (`MiniMaxM3DecoderLayer.aux_hidden_state`)."""
+    """``(full, None)``: a layer's post-layer hidden state, gathered by SP, as its
+    forward hooks receive it -- the layer's ``(hidden_states, residual)`` with no
+    residual left to add (`MiniMaxM3DecoderLayer.aux_hidden_state`, TorchSpec's
+    hidden-state export)."""
 
 
 def _quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -611,7 +613,7 @@ def _ffn_out_phase(sp: SeqShard, model, partial, residual, nxt, want_full):
 
 
 def _fire_output_hooks(layer: nn.Module, positions, full: torch.Tensor) -> None:
-    out = GatheredLayerOutput((full,))
+    out = GatheredLayerOutput((full, None))
     for hook in list(layer._forward_hooks.values()):
         hook(layer, (positions,), out)
 
