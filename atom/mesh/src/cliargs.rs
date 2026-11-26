@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use crate::{
@@ -10,7 +8,6 @@ use crate::{
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
-    routers::atom_standalone::AtomStandaloneRuntime,
     server::{ServerConfig, ServerTlsConfig},
 };
 
@@ -306,7 +303,8 @@ pub struct CliArgs {
     )]
     pub decode_policy: Option<String>,
 
-    /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks
+    /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks; idx2idx
+    /// selects decode first and prefill among the workers on its rank
     #[arg(long, default_value = "none", value_parser = ["none", "idx2idx"], help_heading = "PD Disaggregation")]
     pub atom_pd_rank_mapping_policy: String,
 
@@ -494,7 +492,14 @@ pub struct CliArgs {
     pub tool_call_parser: Option<String>,
 
     // ==================== Backend ====================
-    /// Backend runtime to use
+    /// Backend runtime of the workers; ATOM workers need `atom`
+    ///
+    /// ATOM workers need `atom` in regular mode as in PD mode: it keys an
+    /// image chat by all its media, as ATOM's prefix cache does. It also
+    /// discovers an HTTP worker's model through `/v1/models`, whose model id
+    /// (an alias under `--served-model-name`) names the worker's model;
+    /// `--tokenizer-path` and `--model-path` take precedence over it for the
+    /// worker's tokenizer.
     #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime", help_heading = "Backend")]
     pub backend: Backend,
 
@@ -702,14 +707,6 @@ impl CliArgs {
     }
 
     pub fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
-        self.to_server_config_with_runtime(router_config, None)
-    }
-
-    pub fn to_server_config_with_runtime(
-        &self,
-        router_config: RouterConfig,
-        atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
-    ) -> ServerConfig {
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
             host: self.prometheus_host.clone(),
@@ -745,7 +742,7 @@ impl CliArgs {
                     cert_path: cert_path.clone(),
                     key_path: key_path.clone(),
                 }),
-            atom_standalone_runtime,
+            atom_bridge_runtime: None,
         }
     }
 }

@@ -33,6 +33,7 @@ except ImportError:
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.ops.attention import get_mla_decode_shape_support
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -73,7 +74,10 @@ from atom.model_ops.attentions.nvfp4_mla import (
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     PERSISTENT_WORK_BUFFERS,
 )
-from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
+from atom.model_ops.dcp_ops import (
+    dcp_all_gather_prefill_query_heads,
+    dcp_gather_sparse_prefill_kv,
+)
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
@@ -87,13 +91,17 @@ from atom.model_ops.utils import (
     get_and_maybe_dequant_weights,
     quant_fp8_per_tensor,
 )
-from atom.utils import envs
+from atom.plugin.prepare import is_plugin_mode
+from atom.utils import envs, get_hf_text_config
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import (
     AttentionMetaData,
     ForwardContext,
     get_forward_context,
+    pass_scheduled_tokens_gpu,
 )
+from atom.utils.region_graph import eager_region, prefill_token_graph_capture
+from atom.utils.selector import has_mla_indexer
 
 # Cap on the KV-split budget: aiter cuts the KV walk into
 # `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
@@ -235,7 +243,91 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 
 logger = logging.getLogger("atom")
 
-_MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+_MLA_MIN_HEADS = 16  # MLA decode query-head floor; see mla_dense_min_query_heads
+# The one verify width at which ATOM decodes Kimi-K3's 12 heads a rank unpadded
+# (mla_dense_min_query_heads). A measured choice, not a kernel rule: aiter
+# mla_decode_fwd on MI355X (aiter 0dd2716), fp8 KV, 12- vs 16-head time,
+# median over ctx 4k/32k/128k: at qlen 8, -2.4% / -3.1% / -3.7% / -9.1% at
+# bs 1 / 2 / 4 / 8, with bit-identical output. At qlen 1-4 12 heads is slower
+# at every batch size, 10-43% (medians over ctx; 3.5-44% per shape). At qlen
+# 5-7 the medians run +6.4% to -5.0%, slower at bs 1.
+_MLA_NARROW_QLEN = 8
+
+
+def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) -> int:
+    """Query-head floor of every MLA layer's decode in native ATOM.
+
+    The one model-level value MLAAttention pads its query to and
+    AiterMLAMetadataBuilder plans the step's single ``work_*`` plan for, so
+    the two cannot disagree. ``num_heads`` (Kimi-K3's 12 at tp8, which then
+    decodes unpadded) when both hold:
+
+    - ATOM measured 12 heads a rank faster: an fp8 KV cache at an 8-token
+      verify (``_MLA_NARROW_QLEN``, the Kimi-K3 interactive band's DSpark 7);
+    - ATOM asks aiter's ``get_mla_decode_shape_support`` about the decode it
+      runs, and it answers native and supported at 12 heads.
+
+    16 otherwise, including:
+
+    - a model with an indexer (``has_mla_indexer``): its sparse layers'
+      plans and kernels are sized for 16, and its dense layers share that plan;
+    - plugin mode: vLLM, SGLang and RTP-LLM plan the decode in their own
+      builders, and vLLM runs it non-persistent under DP;
+    - DCP: its decode dispatches the gathered width;
+    - a decode that is not aiter's persistent asm over the builder's plan.
+    """
+    spec = atom_config.speculative_config
+    max_seqlen_q = 1 + (spec.num_speculative_tokens if spec else 0)
+    # ATOM's measured choice (see _MLA_NARROW_QLEN), on fp8 only.
+    narrow_is_faster = (
+        num_heads == 12
+        and atom_config.kv_cache_dtype == "fp8"
+        and max_seqlen_q == _MLA_NARROW_QLEN
+    )
+    if not narrow_is_faster or is_plugin_mode() or dcp_world_size > 1:
+        return _MLA_MIN_HEADS
+    hf_config = get_hf_text_config(atom_config.hf_config)
+    if has_mla_indexer(hf_config):
+        return _MLA_MIN_HEADS
+    # The decode the builder plans for: _forward_decode's asm branch (not the
+    # Triton or shuffled-KV one), persistent by the layer's own predicate.
+    persistent = (
+        not envs.ATOM_USE_TRITON_MLA
+        and not envs.ATOM_MLA_KV_SHUFFLED
+        and mla_decode_is_persistent(
+            dpa_persistent_supported=supports_dpa_persistent_mode(
+                atom_config,
+                kv_cache_dtype=atom_config.kv_cache_dtype,
+                num_heads=num_heads,
+                num_kv_heads=1,
+            ),
+            dcp_world_size=1,
+            # Unread at dcp1; DCP returned 16 above.
+            dcp_persistent_supported=False,
+        )
+    )
+    if not persistent:
+        return _MLA_MIN_HEADS
+    # Described as _forward_decode calls mla_decode_fwd on this path: Q in the
+    # KV cache's dtype (the builder's dtype_q), one KV head, a kv_lora_rank-wide
+    # output, causal, no LSE (only DCP asks for it), no CP, and the builder's
+    # fast_mode plan. arch is the current device's, as at launch.
+    kv_dtype = dtypes.d_dtypes[atom_config.kv_cache_dtype]
+    shape = get_mla_decode_shape_support(
+        num_heads,
+        max_seqlen_q,
+        kv_dtype,
+        kv_dtype,
+        num_heads_k=1,
+        v_head_dim=hf_config.kv_lora_rank,
+        return_lse=False,
+        causal=True,
+        persistent=True,
+        cp_world_size=1,
+        page_size=envs.ATOM_MLA_PAGE_SIZE,
+        fast_mode=True,
+    )
+    return num_heads if shape.native and shape.supported else _MLA_MIN_HEADS
 
 
 def check_kv_shuffled_supported(
@@ -285,12 +377,17 @@ def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
     return _MLA_MIN_HEADS
 
 
-def mla_kernel_num_heads(num_heads: int) -> int:
-    """Round a query-head count up to a width ``mla_decode_fwd`` will dispatch.
+def mla_kernel_num_heads(num_heads: int, min_heads: int = _MLA_MIN_HEADS) -> int:
+    """Round a query-head count up to the width ATOM dispatches
+    ``mla_decode_fwd`` at.
 
-    aiter accepts nhead 16, and above that only multiples of 16 up to 128 (it
-    folds those onto the 16-head kernel); any other value aborts the dispatch.
+    ``min_heads`` is the layer's floor (``MLAAttention.min_query_heads``, from
+    ``mla_dense_min_query_heads``): a count at or below it pads to it. Past it,
+    the count pads to 16 and above 16 rounds up to a multiple of 16. With the
+    12-head floor, 12 heads stay 12 and 13 to 16 pad to 16.
     """
+    if num_heads <= min_heads:
+        return min_heads
     if num_heads <= _MLA_MIN_HEADS:
         return _MLA_MIN_HEADS
     return -(-num_heads // _MLA_MIN_HEADS) * _MLA_MIN_HEADS
@@ -400,9 +497,9 @@ def mla_dcp_sparse_prefill_num_heads(
     *,
     persistent: bool = False,
 ) -> int:
-    """Width to pad the GATHERED query heads to for a DCP sparse prefill.
+    """Width to pad the GATHERED query heads to for a "q" DCP sparse prefill.
 
-    Sparse prefill all-gathers Q on the head dim too, so what dispatches is
+    A "q" sparse prefill all-gathers Q on the head dim too, so what dispatches is
     ``num_heads * dcp_world_size``, not the per-rank count -- needs its own
     table (``_MLA_DCP_SPARSE_PREFILL_WIDTHS``) since decode's widths don't
     compute correctly here.
@@ -596,9 +693,36 @@ def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
     return hidden_size
 
 
+@eager_region()
+def _mla_prefill_core(
+    prefill_q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q8: torch.Tensor | None,
+    k8: torch.Tensor | None,
+    v8: torch.Tensor | None,
+    fp8_scales: tuple[torch.Tensor, ...] | None,
+    layer_name: str,
+) -> torch.Tensor:
+    """The eager break of `MLAAttention.forward_prefill_split`: the KV-cache
+    write and the attention, on every row of the bucket. A pad row belongs to
+    no request: the KV write skips its slot (-1), no request's attention
+    reads it (it lies past every request's `cu_seqlens`), and its output rows
+    are don't-care."""
+    impl = (
+        get_current_atom_config()
+        .compilation_config.static_forward_context[layer_name]
+        .impl
+    )
+    return impl._prefill_attend(
+        prefill_q, k_new, v_new, k_nope, k_rope, q8, k8, v8, fp8_scales
+    )
+
+
 def supports_dpa_persistent_mode(
     atom_config,
-    mla_modules: MLAModules,
     *,
     kv_cache_dtype: str,
     num_heads: int,
@@ -609,6 +733,9 @@ def supports_dpa_persistent_mode(
     AITER's FP8 Q/FP8 KV GQA64 kernel is available only in persistent mode.
     Keep this gate exact so other DPA models retain the existing non-persistent
     policy and all MLA variants continue to use the common 576-wide KV layout.
+
+    Takes no ``MLAModules``, so the metadata builder, which has no layer, can
+    call it through ``mla_dense_min_query_heads``.
     """
     # Force-enabled for now: persistent mode is turned on for all MLA models
     # under DPA. Re-introduce the per-model gate here if a model regresses.
@@ -631,7 +758,32 @@ def should_use_persistent_mode(
     )
 
 
+def mla_decode_is_persistent(
+    *,
+    dpa_persistent_supported: bool,
+    dcp_world_size: int,
+    dcp_persistent_supported: bool,
+) -> bool:
+    """Whether an MLA layer's asm decode runs aiter's persistent kernel over
+    the metadata builder's work plan, at this DP size and ATOM_MLA_PAGE_SIZE.
+
+    The one predicate ``MLAAttention.decode_is_persistent`` and
+    ``mla_dense_min_query_heads`` share. It does not look at the Triton or
+    shuffled-KV decode: ``_forward_decode`` branches to those before it asks.
+    """
+    return should_use_persistent_mode(
+        dp_size=get_dp_group().world_size,
+        dpa_persistent_supported=dpa_persistent_supported,
+        page_size=envs.ATOM_MLA_PAGE_SIZE,
+        dcp_world_size=dcp_world_size,
+        dcp_persistent_supported=dcp_persistent_supported,
+    )
+
+
 class MLAAttention(nn.Module):
+    # (heads, padded heads, floor) already logged, so each decode width logs once.
+    _decode_widths_logged: ClassVar[set[tuple[int, int, int]]] = set()
+
     def __init__(
         self,
         num_heads: int,
@@ -649,6 +801,9 @@ class MLAAttention(nn.Module):
         self._flydsl_fp8_mha_ok: bool | None = None
         self.nvfp4 = None
         self.nvfp4_layer = 0
+        # Set by a model whose prefill token graph records up to the attention
+        # core (`records_prefill_split`).
+        self.split_prefill_recording = False
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -656,12 +811,17 @@ class MLAAttention(nn.Module):
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
-        self.min_query_heads = kwargs.get("min_query_heads", _MLA_MIN_HEADS)
-        # aiter MLA only serves multiples of 16 heads; round up so a per-rank
-        # count like 24 (K3 at tp4) does not abort in get_mla_metadata.
-        self.padded_num_heads = mla_kernel_num_heads(
-            max(num_heads, self.min_query_heads)
-        )
+        # The model's floor (`mla_dense_min_query_heads`), which the metadata
+        # builder plans the work for, unless the caller passes its own (a
+        # DSpark draft, which plans its own work).
+        self.min_query_heads = kwargs.get("min_query_heads")
+        if self.min_query_heads is None:
+            self.min_query_heads = mla_dense_min_query_heads(
+                get_current_atom_config(), num_heads, get_dcp_world_size()
+            )
+        # Pad to the floor, and past it to a multiple of 16: 24 heads (K3 at
+        # tp4) pad to 32.
+        self.padded_num_heads = mla_kernel_num_heads(num_heads, self.min_query_heads)
         # Heads past num_heads are dead lanes: the MLA kernels compute them and
         # `_restore_query_heads` throws them away. They are zeros rather than
         # repeats of the real heads because zeros are what a producer can write
@@ -669,10 +829,12 @@ class MLAAttention(nn.Module):
         # slice of an already-zeroed padded buffer, which a repeat could not do
         # (no producer kernel writes a head twice).
         self.head_pad = self.padded_num_heads - num_heads
-        if self.head_pad and not getattr(MLAAttention, "_head_pad_logged", False):
-            MLAAttention._head_pad_logged = True
+        decode_width = (num_heads, self.padded_num_heads, self.min_query_heads)
+        if decode_width not in MLAAttention._decode_widths_logged:
+            MLAAttention._decode_widths_logged.add(decode_width)
             logger.info(
-                f"MLA query-head padding: {num_heads} -> {self.padded_num_heads}"
+                f"MLA decode query heads: {num_heads} -> {self.padded_num_heads} "
+                f"(floor {self.min_query_heads})"
             )
 
         self.q_lora_rank = mla_modules.q_lora_rank
@@ -704,7 +866,6 @@ class MLAAttention(nn.Module):
         atom_config = get_current_atom_config()
         self._dpa_persistent_supported = supports_dpa_persistent_mode(
             atom_config,
-            mla_modules,
             kv_cache_dtype=self.kv_cache_dtype,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -848,6 +1009,7 @@ class MLAAttention(nn.Module):
         self.qrep_enabled = qrep_enabled_for_layer(
             wants_qrep, self.q_proj, self.qrep_num_heads, self.qk_head_dim
         )
+        self.dcp_prefill_qrep = envs.ATOM_DCP_PREFILL_QREP
         # Keyed on type(self), not the MLAAttention base class: subclasses
         # (SGLangATOMGLM52MLAAttention, the vLLM plugin's AttentionForVllmMLA)
         # would otherwise share one base-class flag/set and mask each other.
@@ -1010,7 +1172,7 @@ class MLAAttention(nn.Module):
                 self.dcp_kernel_num_heads - self.num_heads * dcp_world_size
             )
 
-        # Sparse prefill gathers query heads too, and needs its own width
+        # A "q" sparse prefill gathers query heads too, and needs its own width
         # (mla_dcp_sparse_prefill_num_heads), sized here so the vllm plugin's
         # re-init picks both up. Uses its own persistence predicate so it
         # can't silently borrow decode's answer if the two ever diverge.
@@ -1373,11 +1535,12 @@ class MLAAttention(nn.Module):
     def _local_q_proj(self):
         """This rank's rows of the QREP-widened q_proj, built on first use.
 
-        Dense prefill (and sparse prefill without ATOM_DCP_PREFILL_QREP) needs
-        only its own heads, and slicing the OUTPUT still pays for the whole
-        group's GEMM -- so it projects through a zero-copy row view of the
-        weight. Decode keeps the full q_proj; that is what lets it skip the
-        AllGather Q. See ``ColumnParallelLinear.make_row_view``.
+        Dense prefill, sparse prefill without ATOM_DCP_PREFILL_QREP and a "kv"
+        sparse prefill step need only their own heads, and slicing the OUTPUT
+        still pays for the whole group's GEMM -- so it projects through a
+        zero-copy row view of the weight. Decode keeps the full q_proj; that
+        is what lets it skip the AllGather Q. See
+        ``ColumnParallelLinear.make_row_view``.
         """
         w = self.q_proj.weight.data
         if self._qrep_local_src is not w:
@@ -1501,8 +1664,10 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="dcp_sparse_prefill", torch_compile=False)
     def _dcp_sparse_prefill(self, q_out, kv_cache, attn_metadata, use_qrep=False):
-        """Sparse prefill under DCP: each rank holds a disjoint slice of the
-        global top-k, so its partial output must be merged like decode's.
+        """Sparse prefill under DCP. The "q" transport: each rank holds a
+        disjoint slice of the global top-k, so its partial output must be
+        merged like decode's. The "kv" one (a step whose metadata carries
+        ``dcp_sparse_prefill_kv``) is `_dcp_sparse_prefill_kv`.
 
         Merge dtype is platform-dependent -- on gfx942 the bf16 ReduceScatter
         sum costs ~3.5pp, on gfx950 it is free even at ctx~32k with fp8 KV.
@@ -1513,6 +1678,10 @@ class MLAAttention(nn.Module):
         it the prefill gather fuses rank-to-token reordering with head
         padding, so attention receives its dispatch width directly.
         """
+        if attn_metadata.dcp_sparse_prefill_kv is not None:
+            # forward() turns QREP off for a "kv" step: its plan is per-rank heads.
+            assert not use_qrep, "a DCP kv prefill got the group's query heads"
+            return self._dcp_sparse_prefill_kv(q_out, kv_cache, attn_metadata)
         if not use_qrep:
             q_out = dcp_all_gather_prefill_query_heads(
                 self.dcp_group, q_out, self.dcp_sparse_prefill_num_heads
@@ -1530,6 +1699,61 @@ class MLAAttention(nn.Module):
             merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
             owned_counts=attn_metadata.dcp_owned_counts[: q_out.shape[0]],
         )
+
+    def _hold_dcp_sparse_prefill_scratch(self, num_tokens, device):
+        """Dummy prefill: allocate, and free, what a "kv" sparse prefill adds
+        in this layer, so the memory profile that sizes the KV cache counts it;
+        the dummy run skips the attention itself."""
+        from atom.model_ops.dcp_ops import (
+            dcp_sparse_prefill_kv_blocker,
+            dcp_sparse_prefill_kv_max_tokens_env,
+            dcp_sparse_prefill_kv_profile_rows,
+            dcp_sparse_prefill_kv_scratch_bytes,
+            dcp_sparse_prefill_mode_env,
+        )
+
+        page = max(1, envs.ATOM_MLA_PAGE_SIZE)
+        mode = dcp_sparse_prefill_mode_env()
+        if (
+            mode == "q"
+            or dcp_sparse_prefill_kv_blocker(self.kv_cache_dtype, page) is not None
+        ):
+            return
+        config = get_current_atom_config()
+        # A real step takes up to the batch budget, more than a short dummy
+        # prefill, and the gathered rows and the per-token scratch grow with it.
+        num_tokens = max(num_tokens, config.max_num_batched_tokens)
+        kv_rows = dcp_sparse_prefill_kv_profile_rows(
+            mode,
+            num_tokens,
+            self.num_heads,
+            config.max_num_seqs,
+            config.kv_cache_block_size,
+            self.dcp_world_size,
+            dcp_sparse_prefill_kv_max_tokens_env(),
+        )
+        nbytes = dcp_sparse_prefill_kv_scratch_bytes(
+            num_tokens,
+            self.num_heads,
+            self.padded_num_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            1,  # fp8 KV, which the blocker requires
+            self.dcp_world_size,
+            kv_rows,
+        )
+        torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+    @mark_trace(prefix="dcp_sparse_prefill_kv", torch_compile=False)
+    def _dcp_sparse_prefill_kv(self, q_out, kv_cache, attn_metadata):
+        """Sparse prefill under DCP, "kv" transport: gather the step's KV rows
+        from the group and attend this rank's own heads over the whole top-k
+        (the indexer wrote it as rows of the gathered KV). No LSE, no merge:
+        the output is what the dcp=1 prefill computes for these heads."""
+        kv = dcp_gather_sparse_prefill_kv(
+            self.dcp_group, kv_cache, attn_metadata.dcp_sparse_prefill_kv
+        )
+        return self._forward_prefill_mla(q_out, kv, attn_metadata, dcp_kv=True)
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)
     def _dcp_decode(self, q_out, kv_cache, attn_metadata, use_qrep):
@@ -1734,10 +1958,14 @@ class MLAAttention(nn.Module):
         prefill_q: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Legacy single-pass path: gather the full cached+new context into
         k_full / v_full and run one flash_attn. OOMs on long contexts (peak
-        ≈ total_kv × heads × (qk_dim + v_dim) × dtype)."""
+        ≈ total_kv × heads × (qk_dim + v_dim) × dtype).
+
+        ``q_fp8``: the prefill split's ``(q8, q_descale)``, quantized over the
+        step's rows (`forward_prefill_split`); None quantizes Q here."""
         self._check_flydsl_fp8_mha(prefill_q)
         k_full = torch.empty(
             (
@@ -1775,6 +2003,7 @@ class MLAAttention(nn.Module):
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
             causal=True,
+            q_fp8=q_fp8,
         )
         return self.o_proj(output.flatten(start_dim=-2))
 
@@ -1950,11 +2179,37 @@ class MLAAttention(nn.Module):
         new_lse). The cached prefix is the "prefix" side (smaller token
         positions), new tokens are the "suffix".
         """
-        from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
+        # Step 1's inputs: new-token K/V via kv_b_proj on the latent.
+        prefill_q, k_new, v_new, quant_k_rope = self._new_token_kv(
+            prefill_q, kv_c_normed_new, k_rope_new
+        )
+        # Quantize Q once and reuse it across the new tokens and cached chunks.
+        q_fp8 = new_kv_fp8 = kv_out_scales = None
+        if self._flydsl_fp8_mha_ok:
+            q_fp8, new_kv_fp8, kv_out_scales = self._quantize_new_tokens(
+                prefill_q, k_new, v_new, quant_k_rope
+            )
+        output = self._chunked_prefill_attention(
+            prefill_q,
+            k_new,
+            v_new,
+            q_fp8,
+            new_kv_fp8,
+            kv_out_scales,
+            kv_cache,
+            attn_metadata,
+            chunk_meta,
+        )
+        return self.o_proj(output.flatten(start_dim=-2))
 
+    def _new_token_kv(
+        self,
+        prefill_q: torch.Tensor,
+        kv_c_normed_new: torch.Tensor,
+        k_rope_new: torch.Tensor,
+    ):
+        """``(prefill_q, k_new, v_new, quant_k_rope)`` for the new tokens."""
         self._check_flydsl_fp8_mha(prefill_q)
-
-        # Step 1: new-tokens self-attn via kv_b_proj on the latent.
         if k_rope_new.dim() == 2:
             k_rope_new = k_rope_new.unsqueeze(1)
         kv_nope_new = self.kv_b_proj(kv_c_normed_new).view(
@@ -1965,17 +2220,39 @@ class MLAAttention(nn.Module):
         )
         k_new, quant_k_rope = self._prepare_prefill_k(k_nope_new, k_rope_new)
         prefill_q, k_new = self._drop_rope_pad(prefill_q, k_new)
-        # Quantize Q once and reuse it across the new tokens and cached chunks.
-        q_fp8 = None
-        new_kv_fp8 = None
-        kv_out_scales = None
-        if self._flydsl_fp8_mha_ok:
-            q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
-                prefill_q, k_new, v_new, k_rope=quant_k_rope
-            )
-            q_fp8 = (q8, qs)
-            new_kv_fp8 = (k8, v8, ks, vs)
-            kv_out_scales = (gather_ks, gather_vs)
+        return prefill_q, k_new, v_new, quant_k_rope
+
+    def _quantize_new_tokens(
+        self,
+        prefill_q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        quant_k_rope: torch.Tensor | None,
+        num_rows: torch.Tensor | None = None,
+    ):
+        """``(q_fp8, new_kv_fp8, kv_out_scales)``, or Nones on the BF16 path."""
+        if not self._flydsl_fp8_mha_ok:
+            return None, None, None
+        q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
+            prefill_q, k_new, v_new, k_rope=quant_k_rope, num_rows=num_rows
+        )
+        return (q8, qs), (k8, v8, ks, vs), (gather_ks, gather_vs)
+
+    def _chunked_prefill_attention(
+        self,
+        prefill_q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        q_fp8,
+        new_kv_fp8,
+        kv_out_scales,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+        chunk_meta,
+    ) -> torch.Tensor:
+        """Steps 1-3 of `_forward_prefill_cached_chunked`."""
+        from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
+
         new_out, new_lse = self._flash_attn_prefill(
             prefill_q,
             k_new,
@@ -2078,17 +2355,16 @@ class MLAAttention(nn.Module):
         # back to the new-only output (should not happen since has_cached
         # implies ≥1 seq has cached_len > 0).
         if chunked_out is None:
-            output = new_out
-        else:
-            output = torch.empty_like(new_out)
-            merge_attn_states(
-                output=output,
-                prefix_output=chunked_out,
-                prefix_lse=chunked_lse,
-                suffix_output=new_out,
-                suffix_lse=new_lse,
-            )
-        return self.o_proj(output.flatten(start_dim=-2))
+            return new_out
+        output = torch.empty_like(new_out)
+        merge_attn_states(
+            output=output,
+            prefix_output=chunked_out,
+            prefix_lse=chunked_lse,
+            suffix_output=new_out,
+            suffix_lse=new_lse,
+        )
+        return output
 
     def _dcp_compute_prefill_context(
         self,
@@ -2344,6 +2620,7 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
         q_prepadded: bool = False,
+        dcp_kv: bool = False,
     ) -> torch.Tensor:
         assert attn_metadata is not None
         B = q.shape[0]
@@ -2352,7 +2629,9 @@ class MLAAttention(nn.Module):
         # so it pads to its own kernel width, from its own table -- not decode's
         # (see mla_dcp_sparse_prefill_is_persistent). Every other caller pads
         # the per-rank count.
-        dcp_sparse = self.is_sparse_mla and self.dcp_world_size > 1
+        # A "kv" DCP prefill (`_dcp_sparse_prefill_kv`) runs as dcp=1 does: this
+        # rank's heads over the global top-k of a gathered KV.
+        dcp_sparse = self.is_sparse_mla and self.dcp_world_size > 1 and not dcp_kv
         if q_prepadded:
             # Fused Q writing pads local heads; DCP gather pads the whole group.
             # Restore all real group heads before the cross-rank merge.
@@ -2418,7 +2697,7 @@ class MLAAttention(nn.Module):
             # Sparse attention needs one last-page len per query token; the dense
             # kv_last_page_lens (per-seq) would over-read -> illegal access.
             kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-            if self.dcp_world_size > 1:
+            if dcp_sparse:
                 # The indexer compacted this rank's owned candidates to the front
                 # of each query token's region, so the region lengths are the
                 # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
@@ -2511,7 +2790,9 @@ class MLAAttention(nn.Module):
                 # either way -- use_decode_kernel above already requires fp8
                 # or return_lse, and return_lse is never true when DCP is off
                 # -- kept only so both arms read the same condition.
-                use_work_meta = self.dcp_world_size <= 1 or sparse_dcp_persistent
+                use_work_meta = (
+                    self.dcp_world_size <= 1 or dcp_kv or sparse_dcp_persistent
+                )
                 if group_heads:
                     work = head_groups.work
                 elif use_work_meta:
@@ -2532,7 +2813,7 @@ class MLAAttention(nn.Module):
                     max_q_len,
                     page_size=page_size,
                     num_kv_splits=mla_dcp_sparse_prefill_kv_splits(
-                        nonps, self.dcp_world_size
+                        nonps, 1 if dcp_kv else self.dcp_world_size
                     ),
                     sm_scale=self.scale,
                     q_scale=self._q_scale if is_fp8 else None,
@@ -2698,11 +2979,9 @@ class MLAAttention(nn.Module):
 
     def decode_is_persistent(self) -> bool:
         """Whether this layer's aiter decode runs the persistent kernel over the
-        step's work plan (`should_use_persistent_mode`)."""
-        return should_use_persistent_mode(
-            dp_size=get_dp_group().world_size,
+        step's work plan (`mla_decode_is_persistent`)."""
+        return mla_decode_is_persistent(
             dpa_persistent_supported=self._dpa_persistent_supported,
-            page_size=envs.ATOM_MLA_PAGE_SIZE,
             dcp_world_size=self.dcp_world_size,
             dcp_persistent_supported=self.dcp_persistent_supported,
         )
@@ -2966,14 +3245,21 @@ class MLAAttention(nn.Module):
 
         return self._v_up_proj_and_o_proj(o)
 
-    def _pcp_write_full_kv(self, kv_cache, k_nope, k_rope, slot_mapping):
-        """Write an already-roped full k (kv_lora + rope) into the k-cache.
+    def _write_kv(self, kv_cache, k_nope, k_rope, slot_mapping):
+        """Write an already-roped k (kv_lora + rope) into the k-cache at
+        ``slot_mapping``, in this layer's cache layout (shuffled, segmented or
+        plain), with the per-op kernels. `k_rope` must already be
+        rotary-embedded.
 
-        Used by the PCP prefill path to materialise the full sequence's KV after
-        the fused MLA kernel produced q_out on 1/pcp queries. Mirrors the
-        non-fused k-writes used by the dense (`not use_prefill_mla`) prefill
-        branch so the physical cache layout matches exactly. `k_rope` must
-        already be rotary-embedded.
+        The per-op writer of whole k rows: the dense (`not use_prefill_mla`)
+        prefill and its recorded split (`_prefill_attend`), the PCP prefill
+        materialising the full sequence's KV after the fused MLA kernel produced
+        q_out on 1/pcp queries, and the per-op path of a drafter's context rows
+        (`write_context_kv_latent`). The fused kernels write their own rows,
+        in the same layouts: the absorbed path's RoPE + cache write
+        (`fused_qk_rope_concat_and_cache_mla[_seg]`,
+        `triton_fused_qk_rope_cat_and_cache_mla`) and the fused context write
+        (`fused_mla_ctx_norm_rope_cache`).
         """
         if self.kv_shuffled:
             shuffled_cache = self._shuffled_kv_view(kv_cache)
@@ -2987,6 +3273,11 @@ class MLAAttention(nn.Module):
                 shuffled_kv_cache=True,
             )
         elif self.use_seg_mla:
+            # Write the KV cache in the segmented layout so the decode-phase
+            # mla_decode_fwd (which reads seg layout) sees a consistent cache
+            # for tokens written during prefill. kv_cache is flattened to
+            # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so the
+            # kernel derives page_size from stride(0).
             kv_cache_seg = self._seg_kv_cache_view(kv_cache)
             concat_and_cache_mla_seg(
                 k_nope,
@@ -3026,8 +3317,10 @@ class MLAAttention(nn.Module):
         cache (Kimi-K3 DSpark's ``write_context_kv``) has no query and no
         attn_metadata for those rows, so it cannot reach the cache through
         ``forward_impl``; it holds the raw ``kv_lora`` and the slots itself.
-        This lives here rather than in the model so that every cache layout
-        stays behind one door, as ``_pcp_write_full_kv`` already is.
+        This lives here rather than in the model so that the cache layouts stay
+        with this class: the fused path writes the rows itself
+        (``fused_mla_ctx_norm_rope_cache``), the per-op path through
+        ``_write_kv``.
 
         ``kv_lora`` is ``[N, kv_lora_rank + qk_rope_head_dim]`` straight off the
         projection -- normally the strided ``[..., q_lora_rank:]`` half of a
@@ -3098,7 +3391,155 @@ class MLAAttention(nn.Module):
         # deepseek_v2 does for its own k-only rope under PCP.
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
-        self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
+        self._write_kv(kv_cache, kv_c, k_pe, slot_mapping)
+
+    def _prefill_q(
+        self,
+        q: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        k_rope: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """A dense prefill's query, with RoPE applied (``k_rope`` in place)."""
+        # QREP: q_proj emits the whole DCP-group head set, but dense prefill
+        # needs only this rank's heads: its MHA path never gathers q, so there
+        # is no AllGather Q for QREP to remove here.
+        proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
+        prefill_q = proj(q, x_scale=q_scale).view(-1, self.num_heads, self.qk_head_dim)
+        prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+        self.rotary_emb(positions, prefill_q_pe, k_rope)
+        return prefill_q
+
+    # ---- Dense prefill split for token graphs: the head (Q projection, the
+    # new tokens' kv_b_proj and FP8 quantization) is sized by the rows alone,
+    # so a token graph records it; only the KV write and the attention break.
+
+    def records_prefill_split(self) -> bool:
+        """Whether this forward runs `forward_prefill_split`: a prefill
+        token-graph recording, or the capture's warmup forward before it
+        (`prefill_token_graph_capture`, which a KDA layer's split reads too)."""
+        # NVFP4 publishes the prefill latent on the eager path only.
+        return (
+            self.nvfp4 is None
+            and self.split_prefill_recording
+            and prefill_token_graph_capture()
+            and self.prefill_split_supported()
+        )
+
+    def prefill_split_supported(self) -> bool:
+        """Dense, no ``o_proj`` inside, no PCP group of more than one rank (a
+        group of one shards nothing), and the plain ``kv_b_proj`` the eager
+        prefill uses: under ``ATOM_USE_TRITON_GEMM`` a prefill without a cached
+        prefix takes the fused GEMM + split + cat instead, which the recorded
+        head would not. Kimi records no token graphs unless every MLA layer of
+        its own passes (`supports_token_graph`)."""
+        return (
+            not self.is_sparse_mla
+            and isinstance(self.o_proj, nn.Identity)
+            and not (pcp_is_enabled() and get_pcp_world_size() > 1)
+            and not use_triton_gemm()
+        )
+
+    def forward_prefill_split(
+        self,
+        q: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        positions: torch.Tensor,
+        layer_name: str,
+    ) -> torch.Tensor:
+        """A dense prefill as a token graph records it: the head lands in the
+        graph, the KV write and the attention break (`_mla_prefill_core`)."""
+        prefill_q = self._prefill_q(q, q_scale, k_rope, positions)
+        prefill_q, k_new, v_new, quant_k_rope = self._new_token_kv(
+            prefill_q, k_nope, k_rope
+        )
+        # A bucket's pad rows are not zeros (the regions' outputs there are
+        # don't-care): the FP8 descales must see the live row count, which
+        # every replay reads in place. Every FP8 attention of the step takes
+        # these, the cached prefix's too.
+        num_rows = pass_scheduled_tokens_gpu(prefill_q.shape[0])
+        assert (
+            num_rows is not None or not self._flydsl_fp8_mha_ok
+        ), "a recorded FP8 prefill needs the step's row count"
+        q_fp8, new_kv_fp8, kv_out_scales = self._quantize_new_tokens(
+            prefill_q, k_new, v_new, quant_k_rope, num_rows=num_rows
+        )
+        q8 = k8 = v8 = fp8_scales = None
+        if q_fp8 is not None:
+            (q8, q_descale), (k8, v8, k_descale, v_descale) = q_fp8, new_kv_fp8
+            fp8_scales = (q_descale, k_descale, v_descale, *kv_out_scales)
+        out = _mla_prefill_core(
+            prefill_q, k_new, v_new, k_nope, k_rope, q8, k8, v8, fp8_scales, layer_name
+        )
+        return out.flatten(start_dim=-2)
+
+    def _prefill_attend(
+        self,
+        prefill_q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        q8: torch.Tensor | None,
+        k8: torch.Tensor | None,
+        v8: torch.Tensor | None,
+        fp8_scales: tuple[torch.Tensor, ...] | None,
+    ) -> torch.Tensor:
+        """The KV write and `forward_impl`'s attention on the live step:
+        ``[T, heads, v_head_dim]``. The recording's dummy step touches no KV
+        and hands back zeros, so its warmup forward runs the rest of the layer
+        on finite rows."""
+        fwd_ctx = get_forward_context()
+        if fwd_ctx.context.is_dummy_run:
+            return prefill_q.new_zeros(
+                (prefill_q.shape[0], self.num_heads, self.v_head_dim)
+            )
+        attn_metadata = fwd_ctx.attn_metadata
+        kv_cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"].k_cache
+        if kv_cache.numel() > 0:
+            self._write_kv(kv_cache, k_nope, k_rope, attn_metadata.slot_mapping)
+        q_fp8 = new_kv_fp8 = kv_out_scales = None
+        if fp8_scales is not None:
+            q_descale, k_descale, v_descale, gather_k, gather_v = fp8_scales
+            q_fp8 = (q8, q_descale)
+            new_kv_fp8 = (k8, v8, k_descale, v_descale)
+            kv_out_scales = (gather_k, gather_v)
+        chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
+        if attn_metadata.has_cached and chunk_meta is not None:
+            output = self._chunked_prefill_attention(
+                prefill_q,
+                k_new,
+                v_new,
+                q_fp8,
+                new_kv_fp8,
+                kv_out_scales,
+                kv_cache,
+                attn_metadata,
+                chunk_meta,
+            )
+        elif attn_metadata.has_cached:
+            output = self._forward_prefill_cached_single_pass(
+                prefill_q, kv_cache, attn_metadata, q_fp8=q_fp8
+            )
+        else:
+            output = self._flash_attn_prefill(
+                prefill_q,
+                k_new,
+                v_new,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=attn_metadata.max_seqlen_k,
+                min_seqlen_q=attn_metadata.min_seqlen_q,
+                dropout_p=attn_metadata.dropout_p,
+                causal=True,
+                q_fp8=q_fp8,
+                kv_fp8=new_kv_fp8,
+            )
+        # The single pass returns its rows with the heads flattened.
+        return output.view(-1, self.num_heads, self.v_head_dim)
 
     def forward_impl(
         self,
@@ -3114,6 +3555,8 @@ class MLAAttention(nn.Module):
         context = forward_context.context
         use_prefill_mla = self.is_sparse_mla and attn_metadata.run_sparse
         if forward_context.context.is_dummy_run:
+            if self.is_sparse_mla and self.dcp_world_size > 1 and context.is_prefill:
+                self._hold_dcp_sparse_prefill_scratch(q.shape[0], q.device)
             output_shape = list(q.shape)
             atom_config = get_current_atom_config()
             output_shape[-1] = _mla_output_width(
@@ -3126,15 +3569,7 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
-            # QREP: q_proj emits the whole DCP-group head set, but dense prefill
-            # needs only this rank's heads: its MHA path never gathers q, so there
-            # is no AllGather Q for QREP to remove here.
-            proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
-            prefill_q = proj(q, x_scale=q_scale).view(
-                -1, self.num_heads, self.qk_head_dim
-            )
-            prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
-            self.rotary_emb(positions, prefill_q_pe, k_rope)
+            prefill_q = self._prefill_q(q, q_scale, k_rope, positions)
             # k_rope is post-RoPE from here. Under NVFP4 the FP4 pages are the
             # only cache and get this latent; prefill attention runs on the
             # forward's own K/V below, so nothing reads an FP8 copy.
@@ -3144,44 +3579,8 @@ class MLAAttention(nn.Module):
                     "NVFP4 MLA prefill cannot read cached context; the history "
                     "is only in FP4 pages."
                 )
-
             if self.nvfp4 is None and kv_cache.numel() > 0:
-                if self.kv_shuffled:
-                    shuffled_cache = self._shuffled_kv_view(kv_cache)
-                    triton_cat_and_cache_mla(
-                        k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
-                        k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
-                        shuffled_cache,
-                        attn_metadata.slot_mapping.flatten(),
-                        self._k_scale,
-                        apply_scale=True,
-                        shuffled_kv_cache=True,
-                    )
-                elif self.use_seg_mla:
-                    # Write the KV cache in the segmented layout so the
-                    # decode-phase mla_decode_fwd (which reads seg layout) sees a
-                    # consistent cache for tokens written during prefill.
-                    # kv_cache is flattened to
-                    # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so
-                    # the kernel derives page_size from stride(0).
-                    kv_cache_seg = self._seg_kv_cache_view(kv_cache)
-                    concat_and_cache_mla_seg(
-                        k_nope,
-                        k_rope.squeeze(1),
-                        kv_cache_seg,
-                        attn_metadata.slot_mapping.flatten(),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        scale=self._k_scale,
-                    )
-                else:
-                    concat_and_cache_mla(
-                        k_nope,
-                        k_rope.squeeze(1),
-                        kv_cache,
-                        attn_metadata.slot_mapping.flatten(),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        scale=self._k_scale,
-                    )
+                self._write_kv(kv_cache, k_nope, k_rope, attn_metadata.slot_mapping)
 
             if attn_metadata.has_cached:
                 # Shuffled KV takes either path too: the builder gives the chunked
@@ -3206,11 +3605,14 @@ class MLAAttention(nn.Module):
             # even when use_qrep is False (group=False slices back to per-rank heads
             # and the AG path runs as before); use_qrep only toggles the optimization.
             # Sparse prefill joins under ATOM_DCP_PREFILL_QREP (see qrep_for_step).
+            # A "kv" prefill attends only this rank's heads.
             use_qrep = qrep_for_step(
                 self.qrep_enabled,
                 self.use_seg_mla,
                 context.is_prefill,
-                envs.ATOM_DCP_PREFILL_QREP,
+                context.is_prefill
+                and self.dcp_prefill_qrep
+                and attn_metadata.dcp_sparse_prefill_kv is None,
             )
             # NVFP4 with the fused K-up: q_nope stays un-absorbed and the
             # NVFP4 decode quantizes it inside its own K-up GEMM. Only that path
@@ -3378,7 +3780,7 @@ class MLAAttention(nn.Module):
                     self.rotary_emb(
                         positions_full, k_rope_full, torch.empty_like(k_rope_full)
                     )
-                    self._pcp_write_full_kv(
+                    self._write_kv(
                         kv_cache,
                         k_nope_full,
                         k_rope_full,
