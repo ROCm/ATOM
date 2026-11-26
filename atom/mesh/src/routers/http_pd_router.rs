@@ -2665,6 +2665,7 @@ mod tests {
                     decode,
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_tokens: 0,
                 },
                 None,
             )
