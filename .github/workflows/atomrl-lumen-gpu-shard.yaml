@@ -119,18 +119,18 @@ jobs:
             echo "Using model cache root $model_root for $model_id"
             docker run --rm --network=host \
               -e HF_TOKEN="${HF_TOKEN:-}" \
-              -e MODEL_ID="$model_id" \
-              -e TARGET_DIR="$target_dir" \
               -e MODEL_DOWNLOAD_TIMEOUT \
               -e MODEL_LOCK_WAIT_SECONDS \
               -e MODEL_LOCK_POLL_INTERVAL \
               -e MODEL_PROGRESS_INTERVAL \
               -e MODEL_LOCK_ROOT=/models/.atom-model-locks \
               -e MODEL_STAGING_ROOT=/models/.atom-model-staging \
-              -v "$GITHUB_WORKSPACE:/workspace:ro" \
+              -v "$GITHUB_WORKSPACE:/repo:ro" \
               -v "$model_root:/models" \
-              "$LUMEN_IMAGE" bash -lc \
-              'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'
+              -w /repo \
+              "$LUMEN_IMAGE" bash \
+              /repo/.github/scripts/download_model_with_lock.sh \
+              "$model_id" "$target_dir"
           done
           echo "LUMEN_LLAMA2_MODEL=$model_root/NousResearch/Llama-2-7b-hf" >> "$GITHUB_ENV"
           echo "LUMEN_QWEN3_MODEL=$model_root/Qwen/Qwen3-8B" >> "$GITHUB_ENV"
