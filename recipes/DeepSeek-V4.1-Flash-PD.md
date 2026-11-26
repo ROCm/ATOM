@@ -1,4 +1,11 @@
-# DeepSeek V4.1-Flash 4P4D on one 8-GPU node (TTFT-optimized)
+# DeepSeek V4.1-Flash P/D disaggregation on MI355X
+
+This recipe covers two P/D deployments of DeepSeek-V4.1-Flash on MI355X:
+
+- **4P4D on one 8-GPU node** (P DEP4 + D DEP4, TTFT-optimized for AgentX C256), the first part below.
+- **4P8D on two nodes, 12 GPUs** (P DEP4 + D TP8 Mono at c1-c32, P DEP4 + D DEP8 at c256-c768), the AgentX ladder in [4P8D AgentX ladder](#4p8d-agentx-ladder-c1-c768-3600-s).
+
+## 4P4D on one 8-GPU node (TTFT-optimized)
 
 This recipe describes a single-node prefill/decode (P/D) split for
 DeepSeek-V4.1-Flash-1017 on 8x MI355X running the AgentX C256 workload. The
