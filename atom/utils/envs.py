@@ -1527,6 +1527,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PP_MAX_INFLIGHT": lambda: (
         _optional_int_env("ATOM_PP_MAX_INFLIGHT", min_value=0) or 0
     ),
+    # Set to 1 to move a PP hop between two stages on the same host off NCCL
+    # onto a mailbox (atom/distributed/pp_mailbox.py): the upstream copies its
+    # output into a ring slot in the downstream GPU's memory with the copy
+    # engine and bumps a counter; the downstream's stream waits on the counter
+    # and returns a credit. No kernel spins on a peer and no CPU waits for one,
+    # so a send no longer holds CUs while the next stage is busy. Kimi-K3,
+    # TP 1, eager PP; hops between hosts stay on NCCL. Every stage must agree.
+    "ATOM_PP_MAILBOX": lambda: os.getenv("ATOM_PP_MAILBOX", "0") == "1",
+    # Ring slots per mailbox hop: how many microbatches a stage may have written
+    # ahead of the next stage reading them. Each slot holds a forward's largest
+    # payload (max_num_batched_tokens rows) in the receiver's memory.
+    "ATOM_PP_MAILBOX_SLOTS": lambda: _int_env("ATOM_PP_MAILBOX_SLOTS", 2, min_value=1),
+    # Set to 1 to check, once per microbatch, that a mailbox slot carries the
+    # rows the receiving stage runs (a host sync each time: debugging only).
+    "ATOM_PP_MAILBOX_CHECK": lambda: os.getenv("ATOM_PP_MAILBOX_CHECK", "0") == "1",
+    # Set to 1 to send, on an NCCL PP hop, only the AttnRes bank blocks closed
+    # before the next stage's first layer (Kimi-K3); the receiver rebuilds the
+    # full bank. Mailbox hops always do. Every stage must agree.
+    "ATOM_PP_TRIM_BANK": lambda: os.getenv("ATOM_PP_TRIM_BANK", "0") == "1",
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (`engram.host_memory.pin_rows`), not copied to HBM; the
