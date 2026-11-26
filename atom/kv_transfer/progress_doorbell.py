@@ -26,7 +26,7 @@ Installed per worker process by `AsyncIOProc` only when the engine uses it
 from __future__ import annotations
 
 import threading
-from typing import Callable
+from collections.abc import Callable
 
 # The marker sent on the KV output channel. A plain string so it pickles
 # anywhere and can never be mistaken for a `KVConnectorOutput`.
