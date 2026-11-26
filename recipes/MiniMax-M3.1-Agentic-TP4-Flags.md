@@ -1,13 +1,19 @@
 # MiniMax-M3.1 TP4 + DSpark AgentX: per-concurrency recipes, the PRs that provide them, and what was measured
 
 This is the recipe for the AgentX replay (`inferencex-agentx-mvp`) of MiniMax-M3.1-Flash (MXFP4 experts, native MXFP8
-attention, NVFP4 KV and index caches) with a DSpark draft at TP4 on MI355X, using only ATOM and aiter (no amd-kernels
-import, no overlay, no private tuned CSV). Every flag is off by default; a flag works once the PR named next to it is
-merged. Numbers are from the stack builds described in "Reproducing the stack"; read the caveats first.
+attention and shared expert, i.e. no `--online_quant_config`; NVFP4 KV and index caches) with a DSpark draft at TP4 on MI355X, using only ATOM and aiter (no amd-kernels
+import, no overlay, no private tuned CSV). Every opt-in switch (the `ATOM_M3_*` and ring/graph on-off flags)
+is off by default; the numeric knobs are not all zero by default (`ATOM_PREFILL_DELAYER_TARGET_FILL` defaults to 0.9,
+`ATOM_TOKEN_GRAPH_SIZES` to `256,512,1024,2048,3072`, `ATOM_SCHED_FINISH_HOLD_MAX_MS`/`_MAX_TOKENS` to 500/400,
+`ATOM_SCHED_ITL_RISK_MAX_MS` to 300), and the recipe sets them explicitly. A flag works once the PR named next to it is
+merged. Numbers are from the stack builds described in "Reproducing the stack" (the PR numbers there are the
+live ones as of 2026-11-25; several PRs the builds used were later merged into others, see "PRs the builds used that
+are closed"); read the caveats first.
 
 ## Caveats (read before quoting any number)
 
-1. Every number is a **single 900 s run** (seed 42, synthetic acceptance length 4.04 at k=7, k=3 at c64). Measured
+1. Every number is a **single 900 s run** (seed 42, synthetic acceptance length 4.04 at k=7; at c64 k=3 with 2.88, the vLLM-official forced value, because
+   `--spec-decode-acceptance-length` must be at most k+1 = 4). Measured
    noise on the same node is about 0.2-0.5% tok/s/GPU at c32 and about 1.5% on ix_p90; the c64 noise is not known
    (a repeat is queued). Differences under ~1% tok/s or ~6% ix_p90 between arms are not distinguishable.
 2. The reference ("C17r") is the private production stack re-run the same day on the same node, 900 s windows, not the
@@ -18,7 +24,7 @@ merged. Numbers are from the stack builds described in "Reproducing the stack"; 
 4. The GSM8K gate margin is thin (pooled 8 runs 0.9629 against a 0.9626 line, see "Accuracy gate").
 5. #3510/#3511 are cherry-picked onto public main (they sit on a 55-commit private branch); the recipe needs one
    extra one-line fix and one env entry that are not in any PR yet (see "Commits needed from #3510/#3511").
-6. The aiter side is the image's aiter plus the listed PRs; three of them (#8548 stack, #8555, #8584) carry
+6. The aiter side is the image's aiter plus the listed PRs; three of them (#8548 stack, #8555, #8584 now #8582) carry
    conflict resolutions that the stack builder did by hand (see "Divergences from the PR heads").
 7. aiperf reports `grace_timeout=True` at c64 for these arms and for the reference (in-flight requests at cutoff,
    `leaked_state` 0); the score is still produced.
@@ -30,7 +36,7 @@ merged. Numbers are from the stack builds described in "Reproducing the stack"; 
 | Image | `rocm/atom-dev:latest` (torch 2.10 rocm 7.2.4, triton 3.8, flydsl 0.5.3, aiter at `/app/aiter-test`; ATOM main calls `init_dist_env(device_communicators=...)`: the 2026-11-17 nightly fails at startup) |
 | aiter | the image's `/app/aiter-test` tree with the aiter PRs below merged on top of aiter main `c7d4f9fe1`. The image's JIT `.so` of modules whose C++ changed are **not** rebuilt automatically: delete the stale ones in the copied tree (`custom_all_reduce`, `hipbsolgemm`, `fused_qknorm_idxrqknorm`, `mla_nvfp4`, `kpool_compress`); the first boot rebuilds them (~5-6 min). Never boot two servers on one writable tree. |
 | ATOM | ATOM main `d0dec1480` plus the ATOM PRs below |
-| Server | as `recipes/MiniMax-M3-Agentic-InferenceX.md` with `--kv_cache_dtype nvfp4 --index-cache-dtype nvfp4 --method dspark --draft-model <model>/dspark --num-speculative-tokens 7` (3 at c64), `--max-num-seqs 64`, `--gpu-memory-utilization 0.85`, `--cudagraph-capture-sizes [1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64]`, `--spec-decode-kv-cache-dtype fp8`, `AITER_LOG_LEVEL=WARNING`, `ATOM_FORCE_ATTN_TRITON=1`, `PYTHONHASHSEED=0` |
+| Server | as `recipes/MiniMax-M3-Agentic-InferenceX.md` **except** that (a) `--online_quant_config` (ptpc_fp8 attention) is **omitted**: the measured arms ran native MXFP8 attention and shared-expert weights; (b) `--spec-decode-acceptance-rate 0.5933` is **replaced** by `--spec-decode-acceptance-length 4.04` at k=7 (the rate would give `1 + 7 * 0.5933 = 5.15`; the two options are mutually exclusive) and by `--spec-decode-acceptance-length 2.88` at k=3 (c64; the accepted range is `[1, k+1]`, so 4.04 is rejected at k=3); with `--kv_cache_dtype nvfp4 --index-cache-dtype nvfp4 --method dspark --draft-model <model>/dspark --num-speculative-tokens 7` (3 at c64), `--max-num-seqs 64`, `--gpu-memory-utilization 0.85`, `--cudagraph-capture-sizes [1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64]`, `--spec-decode-kv-cache-dtype fp8`, `AITER_LOG_LEVEL=WARNING`, `ATOM_FORCE_ATTN_TRITON=1`, `PYTHONHASHSEED=0` |
 | Client | AIPerf `inferencex-agentx-mvp`, seed 42, 900 s per point |
 
 ## The two recipes
@@ -41,8 +47,8 @@ Common to both (the F set, all provided by PRs listed below): `ATOM_PREFILL_DECO
 `ATOM_SCHED_ITL_RISK_MS=4.5`, `ATOM_SCHED_ITL_RISK_MAX_MS=150`, `ATOM_PREFIX_DEMOTE_DECODE=1`,
 `ATOM_M3_PREFILL_TOKEN_GRAPH=1`, `ATOM_TOKEN_GRAPH_SIZES=256,512,1024`, `ATOM_MONO_MAX_ROWS=8`,
 `ATOM_DSPARK_BLOCK_BS_LADDER=1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64`, `ATOM_LM_HEAD_RING=1`,
-`ATOM_DSPARK_FC_RING=1`, `ATOM_M3_FUSED_INDEX_SELECT=1`, `AITER_FLY_AR_PULL=1`, `ATOM_M3_PREFILL_TOPK_FLYDSL=0`,
-`ATOM_M3_SP_PREFILL=1`.
+`ATOM_DSPARK_FC_RING=1` (both ring flags belong to the retired ATOM #3776/#3786, see the flag table),
+`ATOM_M3_FUSED_INDEX_SELECT=1`, `AITER_FLY_AR_PULL=1`, `ATOM_M3_PREFILL_TOPK_FLYDSL=0`, `ATOM_M3_SP_PREFILL=1`.
 
 ### c8 / c16 / c32: "FsW"
 
@@ -50,8 +56,10 @@ Common set plus:
 
 ```
 ATOM_M3_SP_SHARED_LOCAL=1      # owner-local shared expert (#3805)
-ATOM_M3_QKV_CHAIN=1            # QKV front chain, 17-128 decode rows (#3809/#3810, aiter #8606/#8607/#8610/#8611)
-ATOM_M3_DECODE_MOE=1           # decode MoE chain (#3787, aiter #8548-#8556 incl. the w13_split commit of #8555)
+ATOM_M3_QKV_CHAIN=1            # QKV front chain, 17-128 decode rows (#3809/#3810, aiter #8607; the measured tree used the
+                               # pre-merge chain #8606/#8607/#8610/#8611, see "PRs the builds used that are closed")
+ATOM_M3_DECODE_MOE=1           # decode MoE chain (old #3787 head, aiter #8548-#8556 incl. the w13_split commit of #8555;
+                               # #3787 is being rewritten onto aiter #8676 fused_moe(shared_folded=True) and the flag goes away)
 --spec-decode-kv-cache-dtype fp8
 ```
 
@@ -94,7 +102,7 @@ Memory and KV pool (the c64 result depends on them):
 | Flag | Price | Evidence |
 |---|---|---|
 | `ATOM_M3_DECODE_MOE=1` with the old #3787 head | +34 GB/GPU (second re-laid w13 copy), -18.5k KV blocks (90% of the loss to the reference) | Fs boot log |
-| `ATOM_M3_DECODE_MOE=1` with #3787 `a779e6967` + aiter #8555 w13_split | +2.4 GB peak (routed w13 is read in place; 36 MiB held per MoE layer and rank) | FsW boot log: peak_torch 76.39 GB |
+| `ATOM_M3_DECODE_MOE=1` with #3787 `a779e6967` + aiter #8555 w13_split (the interface #8676 replaces) | +2.4 GB peak (routed w13 is read in place; 36 MiB held per MoE layer and rank) | FsW boot log: peak_torch 76.39 GB |
 | `ATOM_M3_SP_PREFILL=1` | +3.1 GB/GPU (`o_proj_full`, an unsharded o_proj copy), -1.3k KV blocks | Fs vs Fm |
 | `ATOM_M3_SP_SHARED_LOCAL=1` | +3.1 GiB/GPU (unsharded shared expert, 57 layers), -1.6k KV blocks | Fs3 vs Fs |
 | `--spec-decode-kv-cache-dtype fp8` | draft KV entry 1,986,560 -> 1,827,840 bytes: +8.7% KV blocks (public flag, nothing to port) | FsD/FmK boot logs |
@@ -124,31 +132,60 @@ The gate was run with the SP flags, the chain and the fp8 draft KV on. It is not
 
 All PRs are against `main` unless noted. Merge order (stack bases first):
 
-aiter (aiter main `c7d4f9fe1` as the base of the builds):
+aiter (aiter main `c7d4f9fe1` as the base of the builds; open PRs as of 2026-11-25):
 
-1. `#8548 -> #8551 -> #8552 -> #8553 -> #8555` (decode MoE chain; #8555's head is `#8553`'s plus the `w13_split` commit
-   `9e02b0320`), then `#8556`.
-2. `#8554` (small-M BF16 ring GEMM), `#8573` (draft fc ring), `#8574` (pull all-reduce + Gemma RMSNorm).
-3. `#8575 -> #8577` (sparse decode attention merge, index top-16 in the attention).
-4. `#8576 -> #8580` (NVFP4 insert, DPP insert).
-5. `#8578 -> #8582 -> #8584` (o_proj_full 8-wave picks, persistent 4-wave GEMM, 4-wave backend with the inference-tensor
-   scale-cache-key fix).
-6. `#8581` (prefill top-16 selector; present, flag off).
-7. `#8606 -> #8607 -> #8610 -> #8611` (MXFP8 shuffled quantizer, 17-64 row QKV chain, 65-128 row split GEMM and
-   reduce-insert).
+1. `#8548 -> #8553 -> #8555 -> #8556` (decode MoE chain; #8548 now includes the decode router GEMM work of the closed
+   #8551/#8552; the builds' #8555 head is `#8553`'s plus the `w13_split` commit `9e02b0320`). #8676 sits on top of
+   these four and is the final decode-MoE interface (`fused_moe(shared_folded=True)`, tuned rows, `--decode-chain`
+   tuner); the old #3787 head used the mega_moe_tp ops directly.
+2. `#8675` (small-M BF16 ring GEMM, policies `rg` for lm_head and `rk` for the DSpark draft fc, selected by `tgemm`
+   tuned rows; it replaces the closed #8554/#8573), `#8574` (pull all-reduce + Gemma RMSNorm).
+3. `#8575` (sparse decode attention: all-wave merge, in-kernel index top-16, MXFP8 `quant_out`; it contains the closed
+   #8577 and #8604).
+4. `#8472` (HIP `fused_qknorm_idxrqknorm`: DPP exchanges, xor-atomic V nibbles, hardware converts, NVFP4 insert, prefill
+   variant; it contains the closed #8473, #8576 and #8580).
+5. `#8578 -> #8582` (o_proj_full 8-wave picks; persistent 4-wave GEMM, tuner backend and o_proj_full rows; #8582
+   contains the closed #8584, including the inference-tensor scale-cache-key fix), `#8599` (MXFP8 small-M config rows).
+6. `#8581` (prefill top-16 selector inside `topk_per_row_small_k`; present, flag off).
+7. `#8607` (draft) for the QKV front chain: one op, 1-64 rows one launch and 65-128 rows split-K, reading plain
+   row-major activation codes from `per_group_quant_hip`. The closed #8606 (shuffled quantizer), #8610 and #8611 are
+   folded into it (#8606 is withdrawn: the front no longer needs its layout).
 
-Not part of the recipe: #8587 (pull collectives: no measurable gain, `ATOM_M3_SP_COMM` unset), #8604 + ATOM #3806 (attention
-quant-out: no gain), #8598/#8599 (tuned CSV rows, kernel-level only).
+Not part of the recipe: #8587 (HIP general `all_to_all` / `all_to_all_buffer`, MXFP8 all-to-all; used by ATOM #3812
+only, c32 +0.1..0.6%, no flag), attention quant-out (ATOM #3806 with the `quant_out` of #8575: no gain), #8598 (merged,
+lm_head tuned rows) / #8599 (tuned CSV rows, kernel-level only).
+
+### PRs the builds used that are closed
+
+The measured trees were built before these were folded; every one maps to a live PR and the content is the same
+kernel family:
+
+| Closed PR | What it was | Now in |
+|---|---|---|
+| aiter #8473, #8576, #8580 | NVFP4 converts, FlyDSL NVFP4 insert, DPP / xor-atomic V in `fused_qknorm_idxrqknorm` | #8472 |
+| aiter #8551, #8552 | decode router GEMM split-K, 128-row n-blocks kernel | #8548 |
+| aiter #8554, #8573 | small-M BF16 ring GEMM (lm_head), DSpark fc ring | #8675 (ATOM needs no call site: ATOM #3776 and #3786 are closed, the rows are picked by `tgemm`) |
+| aiter #8577, #8604 | index top-16 in the attention, `quant_out` | #8575 |
+| aiter #8584 | 4-wave backend, o_proj_full rows | #8582 |
+| aiter #8606, #8610, #8611 | MXFP8 shuffled quantizer, split-3 GEMM, reduce + insert | #8607 (#8606 withdrawn) |
 
 ATOM (main `d0dec1480`):
 
 1. `#3721`, `#3722`, `#3723`, `#3724` (any order; each carries the others' `dspark.py` resolution).
-2. `#3775` (scheduler policies), `#3776` (LM head ring, needs aiter #8554), `#3783` (prefill token graphs), `#3784`
-   (mono row cap), `#3785` (fused index select, needs aiter #8577), `#3786` (draft fc ring, needs #8573), `#3789`
-   (draft block batch ladder), `#3788` (prefill top-16; code present, `ATOM_M3_PREFILL_TOPK_FLYDSL=0`).
-3. `#3787` (decode MoE chain; head `a779e6967`, needs aiter #8548-#8556).
+2. `#3775` (scheduler policies), `#3783` (prefill token graphs), `#3784` (mono row cap), `#3785` (fused index select,
+   needs aiter #8575), `#3789` (draft block batch ladder), `#3788` (prefill top-16; code present,
+   `ATOM_M3_PREFILL_TOPK_FLYDSL=0`, needs aiter #8581). `#3776` (LM head ring) and `#3786` (draft fc ring) are closed:
+   the ring GEMMs are reached through aiter #8675's tuned rows, so `ATOM_LM_HEAD_RING` / `ATOM_DSPARK_FC_RING` exist
+   only in the measured trees, not in a live PR. Note the measured trees called the draft fc ring through `fc_taps`
+   (#3786); #3723's `write_context_kv` calls `self.fc` directly and bypassed `fc_taps`, so the ring was not on that
+   fused path there. Whether the tuned-row route covers that call is not measured.
+3. `#3787` (decode MoE chain; the measured head `a779e6967` needs aiter #8548-#8556; the rewrite onto aiter #8676
+   drops `ATOM_M3_DECODE_MOE`).
 4. SP prefill: **#3510 then #3511** (see below), then `#3805` (shared-local), then `#3807` (glue).
-5. `#3809`, `#3810` (QKV chain; need aiter #8606/#8607/#8610/#8611).
+5. `#3809`, `#3810` (QKV chain; draft, need aiter #8607; planned to merge into one thin PR over it).
+   Also `#3811` (`getattr` fix for `moe.fhmoe`), `#3808` (norm + quant hand-off, no end-to-end gain at c32, not in the
+   recipe) and `#3812` (o_proj all-to-all through aiter `all_to_all`, needs aiter #8587, no flag) are stacked on the SP
+   prefill base.
 6. This document (`#3790`).
 
 ### Commits needed from #3510/#3511
@@ -177,9 +214,9 @@ The FsW tree is main + the merges above. The following are not byte-identical me
 | ATOM #3809/#3810 | net diff `3598884c3..03c20fecc` applied with a union resolution in the SP files; changed lines identical to the PR heads, `qkv_chain.py`/tests byte-identical |
 | ATOM #3787 | the tree has the old head merged, then the net diff to `a779e6967`; `decode_moe.py` byte-identical to the new head |
 | ATOM #3788 | tree has `b1583fd10`; the PR is now `d6e9e2ad6` (flag off in both recipes) |
-| aiter #8584 | merged twice (`aa4d246e0` with `-X theirs` on `minimax_m3_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv`, then the fix `77cedd329`); the tree's CSV equals #8584's CSV, which supersedes #8578's 8-wave rows |
+| aiter #8584 (closed, now #8582) | merged twice (`aa4d246e0` with `-X theirs` on `minimax_m3_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv`, then the fix `77cedd329`); the tree's CSV equals #8584's CSV, which supersedes #8578's 8-wave rows |
 | aiter #8555 | the tree merges the old head `8e5592a81`, then cherry-picks the w13_split commit (patch-id identical to `9e02b0320`) |
-| aiter chain | #8606/#8607/#8610/#8611 applied as one net diff `41200e689..773f8736e`; the five chain files are byte-identical to `773f8736e` |
+| aiter chain (closed, now #8607) | #8606/#8607/#8610/#8611 applied as one net diff `41200e689..773f8736e`; the five chain files are byte-identical to `773f8736e` |
 | aiter tree | also contains `aiter/ops/triton/comms/pull_collective.py` and `_triton_kernels/comms/pull_collective.py` copied from #8587 for an earlier arm (inert without `ATOM_M3_SP_COMM=pull`) |
 
 ## Flags by PR (the full list)
@@ -188,22 +225,23 @@ ATOM PRs (ROCm/ATOM):
 
 | Flag | Value used | Needs |
 |---|---|---|
-| `ATOM_PREFILL_DECODE_INTERVAL`, `ATOM_PREFILL_DELAYER_TARGET_FILL` | `1`, `0.225` | on main |
+| `ATOM_PREFILL_DECODE_INTERVAL`, `ATOM_PREFILL_DELAYER_TARGET_FILL` | `1`, `0.225` | on main (defaults 0 and 0.9) |
 | `ATOM_SCHED_DECODE_PREFILL_CAP`, `ATOM_SCHED_IDLE_PREFILL_CAP` | `16384`, `16384` | #3775 |
 | `ATOM_SCHED_FINISH_HOLD_LEFT`, `_MAX_MS`, `_MAX_TOKENS` | `128`, `500`, `400` | #3775 |
 | `ATOM_SCHED_ITL_RISK_MS`, `ATOM_SCHED_ITL_RISK_MAX_MS` | `4.5`, `150` | #3775 |
 | `ATOM_PREFIX_DEMOTE_DECODE` | `1` | #3775 |
-| `ATOM_M3_PREFILL_TOKEN_GRAPH`, `ATOM_TOKEN_GRAPH_SIZES` | `1`, `256,512,1024` | #3783 |
+| `ATOM_M3_PREFILL_TOKEN_GRAPH`, `ATOM_TOKEN_GRAPH_SIZES` | `1`, `256,512,1024` | #3783 (`ATOM_TOKEN_GRAPH_SIZES` is on main, default `256,512,1024,2048,3072`) |
 | `ATOM_MONO_MAX_ROWS` | `8` | #3784 |
 | `ATOM_DSPARK_BLOCK_BS_LADDER` | `1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64` | #3789 |
-| `ATOM_LM_HEAD_RING` | `1` | #3776 and aiter #8554 |
-| `ATOM_DSPARK_FC_RING` | `1` | #3786 and aiter #8573 |
-| `ATOM_M3_FUSED_INDEX_SELECT` | `1` | #3785 and aiter #8577 |
-| `ATOM_M3_DECODE_MOE` | `1` (c8-c32), `0` (c64) | #3787 and aiter #8548-#8556 |
+| `ATOM_LM_HEAD_RING` | `1` (measured trees only) | ATOM #3776 is closed; aiter #8675 tuned rows (`rg`) replace it, no ATOM flag |
+| `ATOM_DSPARK_FC_RING` | `1` (measured trees only) | ATOM #3786 is closed; aiter #8675 tuned rows (`rk`) replace it, no ATOM flag |
+| `ATOM_M3_FUSED_INDEX_SELECT` | `1` | #3785 and aiter #8575 |
+| `ATOM_M3_DECODE_MOE` | `1` (c8-c32), `0` (c64) | old #3787 head and aiter #8548-#8556; the #3787 rewrite on aiter #8676 drops the flag |
 | `ATOM_M3_SP_PREFILL` | `1` | #3510/#3511 |
 | `ATOM_M3_SP_SHARED_LOCAL` | `1` (c8-c32 only) | #3805 |
-| `ATOM_M3_QKV_CHAIN` | `1` (c8-c32 only) | #3809, #3810 and aiter #8606/#8607/#8610/#8611 |
-| `ATOM_M3_PREFILL_TOPK_FLYDSL` | `0` | #3788 and aiter #8581 (measured: no end-to-end gain) |
+| (no flag) | SP glue fusion #3807; o_proj all-to-all through aiter `all_to_all` #3812 (needs aiter #8587; the earlier `ATOM_M3_SP_COMM` knob is removed there) | |
+| `ATOM_M3_QKV_CHAIN` | `1` (c8-c32 only) | #3809, #3810 and aiter #8607 (draft) |
+| `ATOM_M3_PREFILL_TOPK_FLYDSL` | `0` | #3788 and aiter #8581 (measured: no end-to-end gain; off by default) |
 | `--spec-decode-kv-cache-dtype` | `fp8` | public flag |
 
 No flag: #3721, #3722, #3723 (DSpark block, always on), #3724 (step watchdog 5 s and GPU guard, constants in
@@ -220,9 +258,9 @@ decoder already calls it.
 | + shared-local (#3805), Fs -> Fs3 | +0.4% tok/s, +6% ix_p90 |
 | + SP glue (#3807, kernel: -4.3 ms per 16K chunk) | not separately measured end to end |
 | + QKV chain, fp8 draft KV, single-copy MoE (FsW) | the c32 point above (96.5%) |
-| pull collectives (aiter #8587) | no measurable gain, not in the recipe |
-| attention quant-out (aiter #8604, ATOM #3806) | no gain, not in the recipe |
-| prefill top-16 selector (#3788/#8581) | no end-to-end gain, flag off |
+| pull collectives (aiter #8587; ATOM #3812 now uses only the all-to-all) | +0.1..0.6% at c32 on the earlier version, not in the recipe |
+| attention quant-out (aiter #8575's `quant_out`, ATOM #3806) | no gain (-1.1% at c32), not in the recipe |
+| prefill top-16 selector (#3788/aiter #8581) | no end-to-end gain, flag off |
 | `--enable-tbo` for prefill | -0.7%, not used |
 
 ## Not covered
@@ -233,5 +271,5 @@ tile, and decode attention fusions of ~0.1 ms per step each. Remaining gap at c3
 vs 8.5 ms, prefill forward per request +27%.
 
 `AITER_CONFIG_GEMM_BF16` / `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE`: the MXFP8 M3 rows are in aiter main's
-`model_configs` plus the tables of aiter #8578/#8584; the lm_head N=50016 bf16 rows are in aiter #8598 (not in the
-recipe; kernel-level -33..-48% on that shape).
+`model_configs` plus the tables of aiter #8578/#8582; the lm_head N=50016 bf16 rows are in aiter #8598 (merged;
+kernel-level -33..-48% on that shape).
