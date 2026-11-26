@@ -103,7 +103,14 @@ COLS = 32  # an FP8 quant group's dims
 # the merge's LDS (words): V [8-column block][key][8 columns] (4 words a key's
 # block), P [head][key] (bf16 pairs), the heads' chunk maxima and partial sums,
 # the second key half's P V and the output [head][dim]
-MERGE_V_WORDS = SLICE // 8 * ATTENTION_KEYS_MAX * 4
+# V's block: V_SLOTS key slots of 4 words, 10 past ATTENTION_KEYS_MAX
+# (a stride of 10 400 B): unpadded (10 240 B = 0 mod 256 B) a 16-B landing
+# store's 8 lanes of one key, 8 blocks, hit the same banks (8-way); padded,
+# distinct ones. The PV's transposing reads stay 2-way either way. The
+# addresses keep the unpadded ones' form (slots, then words): the keys'
+# offsets stay the stores' and reads' immediates
+V_SLOTS = ATTENTION_KEYS_MAX + 10
+MERGE_V_WORDS = SLICE // 8 * V_SLOTS * 4
 # words a head's P row, padded: the PV reads 16 heads at one key
 P_ROW = ATTENTION_KEYS_MAX // 2 + 4
 MERGE_P_WORDS = HEAD_TILE * P_ROW
@@ -805,7 +812,7 @@ def _merge_values_land(c, vals, meta, sl):
             fx.Vector.from_elements(
                 [ok.select(words[e], fx.Int32(0)) for e in range(4)], fx.Int32
             ),
-            c["att"]["vt"] + (blk * ATTENTION_KEYS_MAX + key) * 4,
+            c["att"]["vt"] + (blk * V_SLOTS + key) * 4,
         )
 
 
@@ -887,7 +894,7 @@ def _merge_pv(c, meta, mh):
     db, kh = wave % 4, wave // 4
     # ds_read_b64_tr_b16's source: lane (g, n) points at key 4 g + n // 4 of
     # the block, columns 4 (n % 4) .. + 4 of the dim block's 8-column pair
-    tr = ((2 * db + n % 4 // 2) * ATTENTION_KEYS_MAX + 4 * g + n // 4) * 4 + n % 2 * 2
+    tr = ((2 * db + n % 4 // 2) * V_SLOTS + 4 * g + n // 4) * 4 + n % 2 * 2
     nn = fx.min(n, mh - 1)
     blocks = ATTENTION_KEYS_MAX // 16 // 2
     sb = c["sel_slots"] // 16  # the first window block
