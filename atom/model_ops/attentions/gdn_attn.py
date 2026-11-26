@@ -467,6 +467,14 @@ class GDNStateMixin:
                     continue
                 if not (start + state_len <= p <= end):
                     continue
+                # An interior target is read from the chunk kernel's `h`, which
+                # holds the state only at 64-token boundaries (the copy kernel
+                # indexes `off // CHUNK`); any other position would pair the
+                # state of the preceding boundary with the conv window at p.
+                # Skipping degrades to "no checkpoint". The step end has its own
+                # exact source (`is_end`).
+                if p != end and (p - start) % 64:
+                    continue
                 found.append((i, dst, p - start, int(p == end), runtime_slots[i]))
         if not found:
             return None

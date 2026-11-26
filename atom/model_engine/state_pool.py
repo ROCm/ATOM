@@ -658,6 +658,11 @@ class StateSlotPool:
         # names a slot index that no longer exists and `dst` has no entry, so
         # the eventual `_unback(dst)` finds nothing and the superblock is never
         # returned to the paged pool.
+        if dst in self._slot_super:
+            # `dst` was itself a checkpoint spent to make room (see
+            # `_take_relocation_target`): its own bytes go back to the paged
+            # pool, or overwriting the entry below would orphan them.
+            self._unback(dst)
         if src in self._slot_super:
             self._slot_super[dst] = self._slot_super.pop(src)
 

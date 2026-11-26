@@ -549,3 +549,26 @@ class TestRetireTopBacking:
         assert moved is not None and moved.relocated_to >= 0
         assert moved.retired not in state._slot_super, "no entry left behind"
         assert moved.relocated_to in state._slot_super, "backing followed"
+
+    def test_a_checkpoint_spent_as_the_target_returns_its_superblock(self):
+        """With no vacant slot the target is another checkpoint, still backed.
+
+        Overwriting its `_slot_super` entry with the source's backing would
+        orphan the target's superblock and shrink the paged pool for good.
+        """
+        from atom.model_engine.state_pool import StateSlotPool
+
+        sb = SuperblockMap(32, 4)
+        pool = BlockPool(32, superblocks=sb)
+        state = StateSlotPool(num_slots=3, superblock_source=pool, max_slots=4)
+        held = [state.pop() for _ in range(state.num_slots)]
+        for i, slot in enumerate(held):
+            state._index(900 + i, slot)
+        for slot in held:
+            state.release(slot)
+        top = state.num_slots - 1
+        target = next(s for s in state._checkpointed if s != top)
+        orphan = state._slot_super[target]
+        assert state.retire_top() is not None
+        assert orphan not in state._slot_super.values(), "target backing released"
+        assert sb.is_reclaimable(orphan)
