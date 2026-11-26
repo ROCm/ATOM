@@ -2857,3 +2857,50 @@ models:
           env:
             common: *dsv41_one_node_env_common
             prefill: *dsv41_umbp_wait_env_prefill
+
+      # The recipe's router over umbp_2p1d_kv_events_opt's engines: that
+      # cell's routing baseline.
+      umbp_2p1d_opt:
+        - <<: *dsv41_2p1d_umbp
+          name: ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-opt-c64
+          display_topology: 2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-OPT
+          prefill:
+            <<: *dsv41_p2ep2_prefill_hbm95
+            workers: 2
+          env:
+            common: *dsv41_one_node_env_common
+            prefill: *dsv41_umbp_wait_env_prefill
+
+      # The three nodes' 24 GPUs split evenly: six prefill workers (node 0's
+      # eight GPUs and four of node 1's) and three decode workers (node 1's
+      # other four GPUs and node 2). A prefill rank's KV pool is all the prefix
+      # cache there is without a tier under it, so a third more prefill ranks
+      # hold a third more sessions (12 pools of about 61 GiB at 95%), and each
+      # prefill rank takes a third less of the load. The pools of a node form a
+      # share group of their own: node 0's eight ranks copy among themselves,
+      # node 1's four among themselves, and the router's share groups keep a
+      # session on the group that holds its prefix. The decode worker of node 1
+      # receives its KV over the NICs, as in the one-node cells.
+      # Suite umbp_12p12d_opt has the recipe's router, umbp_12p12d_kv_events_opt
+      # the cache-aware one.
+      umbp_12p12d_opt:
+        - &dsv41_12p12d_umbp_opt
+          <<: *dsv41_8p16d_umbp
+          name: ds-v41-flash-12p12d-p2ep2-d4noep-dspark5-agentic-umbp-opt-c1228
+          display_topology: 12P12D-P2EP2-D4NOEP-DSPARK5-UMBP-OPT
+          topology: 6p3d_dpa
+          prefill:
+            <<: *dsv41_p2ep2_prefill_hbm95
+            workers: 6
+          decode:
+            <<: *dsv41_d4noep_decode
+            workers: 3
+          env:
+            common: *dsv41_one_node_env_common
+            prefill: *dsv41_umbp_wait_env_prefill
+
+      umbp_12p12d_kv_events_opt:
+        - <<: *dsv41_12p12d_umbp_opt
+          name: ds-v41-flash-12p12d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-opt-c1228
+          display_topology: 12P12D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-OPT
+          router: *dsv41_umbp_kvev_router
