@@ -771,6 +771,12 @@ MLA and MiniMax share the staging pool lifecycle, landing receiver and failure
 handling described above; the peer topology selects ownership and the region
 layout selects bytes.
 
+## P/D concurrent dispatch (late KV)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PD_LATE_KV** | bool | 0 | P/D, set on the decode (`kv_consumer`). Serves `POST /v1/pd/late_kv/chat/completions`, the decode leg of atomesh's concurrent dispatch (`--atom-pd-concurrent` on the router, ATOM backend, legacy relay mode, `/v1/chat/completions` only). The router opens this request together with the prefill leg and streams a two-line body: the chat request, then `{"kv_transfer_params": {...}}` once P has answered. D parses and validates the request while P works, so the request-body ingest leaves the P→D critical path; when the client sent `prompt_token_ids` and the request is text-only, the router also stops asking P to echo them (a request with media keeps P's echo). Nothing is enqueued before the second line, so a failed prefill (the router aborts the leg, or the body ends early) leaves no state on D. The request line must not carry `kv_transfer_params`. On this route D's `atom:time_to_first_token_seconds` and its `atom.request` span start when line 1 arrives, so they include the wait for P: D's TTFT rises when the flag is turned on, so compare the client's (or router's) TTFT instead. 0 = the route answers 404 and the router falls back to its serial relay. |
+
 ## MoRIIO PD
 
 | Variable | Type | Default | Description |
