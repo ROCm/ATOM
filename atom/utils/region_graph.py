@@ -131,9 +131,11 @@ class _Segments:
     @property
     def num_segments(self) -> int:
         return sum(
-            s.segments.num_segments
-            if isinstance(s, _ConditionalStep)
-            else int(isinstance(s, _SegmentReplay))
+            (
+                s.segments.num_segments
+                if isinstance(s, _ConditionalStep)
+                else int(isinstance(s, _SegmentReplay))
+            )
             for s in self._steps
         )
 
