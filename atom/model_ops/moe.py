@@ -3772,6 +3772,7 @@ class FusedMoE(torch.nn.Module):
         pad_align: int | None = None,
         enable_comm_fused: bool = False,
         mxfp4_fp8_activations: bool = False,
+        enable_eplb: bool = True,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3856,7 +3857,9 @@ class FusedMoE(torch.nn.Module):
             and fuses_mxfp8_shared_into_mxfp4(shared_spec, layer_quant_config)
         )
 
-        eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
+        eplb_enabled = (
+            enable_eplb and self.use_ep and getattr(atom_config, "eplb_enable", False)
+        )
         num_redundant_experts = (
             int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
             if eplb_enabled

@@ -52,6 +52,7 @@ class Block(nn.Module):
         alt_stream: torch.cuda.Stream | None = None,
         compress_stream: torch.cuda.Stream | None = None,
         index_stream: torch.cuda.Stream | None = None,
+        enable_eplb: bool = True,
     ):
         super().__init__()
         self.layer_name = f"v41.layers.{spec.layer_id}"
@@ -66,6 +67,7 @@ class Block(nn.Module):
             prefix=f"{prefix}.ffn",
             quant_config=moe_quant_config,
             alt_stream=alt_stream,
+            enable_eplb=enable_eplb,
         )
         # Weights only: each norm runs inside its seam (`pre_delayed`).
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -254,7 +256,9 @@ class DeepseekV41ForCausalLM(nn.Module):
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
-    def __init__(self, config, *, max_length, online_quant_config=None):
+    def __init__(
+        self, config, *, max_length, online_quant_config=None, eplb_layer_end=None
+    ):
         super().__init__()
         group = get_tp_group()
         config.validate_parallelism(group.world_size, group.world_size)
@@ -303,6 +307,9 @@ class DeepseekV41ForCausalLM(nn.Module):
                 alt_stream=self.alt_stream,
                 compress_stream=self.compress_stream,
                 index_stream=self.index_stream,
+                # Unplaced decoder layers keep the non-EPLB expert layout;
+                # weight allocation must not include their unused replicas.
+                enable_eplb=eplb_layer_end is None or spec.layer_id < eplb_layer_end,
             )
             for spec in self.topology
         )
