@@ -911,6 +911,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the Triton `_decode_index_score_transposed_kernel`; the same scores bit for
     # bit, so the same top-k. Opt-in for A/B.
     "ATOM_M3_DECODE_SCORE_FLYDSL": lambda: _flag_env("ATOM_M3_DECODE_SCORE_FLYDSL"),
+    # MiniMax-M3 gfx1250 FP4 index: the whole decode indexer through aiter's
+    # `index_topk_decode_nvfp4` -- the FlyDSL scorer on its length-proportional
+    # plan and a wave-a-row FlyDSL selector with the sparse-table emit -- in
+    # place of the Triton scorer and `_topk_index_packed_kernel`: the same
+    # score bits (the Triton scorer's WMMA pair), so the same ids, order, table
+    # and lengths. Opt-in for A/B; wins over ATOM_M3_DECODE_SCORE_FLYDSL when
+    # both are set.
+    "ATOM_M3_DECODE_INDEX_TOPK_FLYDSL": lambda: _flag_env(
+        "ATOM_M3_DECODE_INDEX_TOPK_FLYDSL"
+    ),
     # Debug: save rank 0's fresh MiniMax-M3 prefill top-k selections of the
     # first ATOM_M3_DUMP_PREFILL_TOPK_CHUNKS prefill forwards whose longest
     # cached prefix is at least ATOM_M3_DUMP_PREFILL_TOPK_MIN_PREFIX tokens to

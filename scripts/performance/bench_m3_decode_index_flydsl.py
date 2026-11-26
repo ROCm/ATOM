@@ -11,14 +11,22 @@
   TA   Triton scorer + aiter selector + emit
        (FA / TA are dropped where aiter's selector declines the device: it has
        no wave32 build yet)
+  Ff   aiter's FlyDSL scorer on its flat (length-proportional) plan alone
+  Tk   the Triton selector + emit alone (on a scored plane)
+  Sk   aiter's FlyDSL selector + emit alone (index_select_decode)
+  TS   Triton scorer + FlyDSL selector + emit
+  XX   the whole decode indexer through aiter (ATOM_M3_DECODE_INDEX_TOPK_FLYDSL:
+       flat FlyDSL scorer + FlyDSL selector + emit)
 
-Each variant is captured in a CUDA graph and replayed; times are the median of
---reps replays (us). Every replay scores another working set (--sets disjoint
+Each variant is captured in a CUDA graph and replayed (--direct: launched
+directly, events around each call); times are the median of --reps runs (us). Every replay scores another working set (--sets disjoint
 page sets a request, rotated through the block table outside the timed region),
 so the index pages come from HBM, not the L2. BW = live index bytes (9216 B a
 block: e2m1 rows + E4M3 scales) / time, as % of 17.5 TB/s. Before timing, F's
 live scores must equal T's bit for bit, FT's outputs TT's exactly and FA's / TA's
-block sets TT's (--no-check skips).
+block sets TT's (--no-check skips). XX's ids /
+table / lengths must equal TT's exactly, Ff's scores T's bit for bit, TS's
+outputs TT's and Sk's Tk's.
 
   python scripts/performance/bench_m3_decode_index_flydsl.py                  # B 4/8/14/16 x 150K, 4 heads x 8 rows
   python scripts/performance/bench_m3_decode_index_flydsl.py --ctx 50000 300000
@@ -39,6 +47,7 @@ from atom.model_ops.minimax_m3.index_fp4 import index_fp4_store
 DEV, D, PAGE, HBM = "cuda", 128, 128, 17.5e12
 BLOCK_BYTES = PAGE * (D // 2 + D // 16)
 FLAG, WIDTH = "ATOM_M3_DECODE_SCORE_FLYDSL", "ATOM_M3_AITER_TOPK_MIN_WIDTH"
+XFLAG = "ATOM_M3_DECODE_INDEX_TOPK_FLYDSL"
 
 
 def make(lens, bound, mq, heads, sets, seed):
@@ -70,6 +79,24 @@ def make(lens, bound, mq, heads, sets, seed):
     return q, payload, scale, tables, seq
 
 
+def timed_direct(fn, reps, rotate):
+    rotate(0)
+    fn()
+    torch.cuda.synchronize()
+    ts = []
+    for i in range(reps):
+        rotate(i + 1)
+        torch.cuda.synchronize()
+        a = torch.cuda.Event(enable_timing=True)
+        b = torch.cuda.Event(enable_timing=True)
+        a.record()
+        fn()
+        b.record()
+        b.synchronize()
+        ts.append(a.elapsed_time(b) * 1e3)
+    return statistics.median(ts)
+
+
 def timed(fn, reps, rotate):
     rotate(0)
     fn()
@@ -95,7 +122,12 @@ def timed(fn, reps, rotate):
 
 def bench(a, ctx, bs, rows):
     """One (context, batch) cell: check, then time every variant."""
-    from aiter.ops.flydsl.index_score_decode import index_score_decode_nvfp4
+    from aiter.ops.flydsl.index_score_decode import (
+        flat_programs,
+        index_score_decode_nvfp4,
+        index_select_decode,
+        index_topk_decode_score_plane,
+    )
 
     sm = a.sm
     bound = max(a.bound, ctx)
@@ -115,7 +147,8 @@ def bench(a, ctx, bs, rows):
     def rotate(i, bt=bt, tables=tables, sets=sets):
         bt.copy_(tables[i % sets])
 
-    score = torch.empty(a.heads, bs * a.mq, blocks, device=DEV)
+    # rows padded as aiter's selector reads them (the Triton kernels take strides)
+    score = index_topk_decode_score_plane(a.heads, bs * a.mq, blocks, DEV)
     bounds = m.build_n_valid_column_per_row(
         seq,
         seq,
@@ -145,8 +178,46 @@ def bench(a, ctx, bs, rows):
         )  # fmt: skip
         return score
 
+    def flat_score(workgroups=None, ring=a.ring, q=q, payload=payload,
+                   scale=scale, bt=bt, seq=seq):  # fmt: skip
+        index_score_decode_nvfp4(
+            q, payload, scale, score, bt, seq, sm, a.mq,
+            workgroups=workgroups, ring=ring, flat=True,
+        )  # fmt: skip
+        return score
+
+    total_q = bs * a.mq
+    topk_idx = torch.empty(a.heads, total_q, 16, dtype=torch.int32, device=DEV)
+    sbt = torch.empty(total_q * a.heads, 16, dtype=torch.int32, device=DEV)
+    sctx = torch.empty(total_q * a.heads, dtype=torch.int32, device=DEV)
+    sel_score = index_topk_decode_score_plane(a.heads, bs * a.mq, blocks, DEV)
+
+    def triton_select(seq=seq, bt=bt):
+        m._launch_select(
+            sel_score, topk_idx, seq, seq, len(seq), 16, a.init, a.keep, bt,
+            (sbt, sctx, bt.stride(0), sbt.stride(0)), a.heads,
+            rows_per_req=a.mq, decode_max_q=a.mq,
+            block_size_k=m._decode_topk_block_size_k("gfx1250", blocks),
+            num_warps=m.DECODE_TOPK_NUM_WARPS, emit=True,
+            block_page_stride=m.NVFP4_PAGES_PER_BLOCK,
+            pages_per_block=m.NVFP4_PAGES_PER_BLOCK,
+        )  # fmt: skip
+        return topk_idx, sbt, sctx
+
+    def flydsl_select(plane=sel_score, seq=seq, bt=bt):
+        index_select_decode(
+            plane, seq, topk_idx, a.mq, a.init, a.keep, block_table=bt,
+            sparse_bt=sbt, sparse_ctx=sctx,
+        )  # fmt: skip
+        return topk_idx, sbt, sctx
+
+    def triton_then_flydsl_select():
+        triton_score()
+        return flydsl_select(plane=score)
+
     def step(flydsl, aiter_select, q=q, payload=payload, scale=scale, bt=bt,
-             seq=seq, bounds=bounds):  # fmt: skip
+             seq=seq, bounds=bounds, whole=False):  # fmt: skip
+        os.environ[XFLAG] = "1" if whole else "0"
         os.environ[FLAG] = "1" if flydsl else "0"
         os.environ[WIDTH] = "1" if aiter_select else ""
         return m.minimax_m3_index_topk_decode(
@@ -182,9 +253,23 @@ def bench(a, ctx, bs, rows):
         torch.cuda.synchronize()
         bad = ref.view(torch.int32)[mask] != got.view(torch.int32)[mask]
         assert not bad.any(), f"score errRatio {bad.float().mean().item():.3e}"
+        got = flat_score()
+        torch.cuda.synchronize()
+        bad = ref.view(torch.int32)[mask] != got.view(torch.int32)[mask]
+        assert not bad.any(), f"flat score errRatio {bad.float().mean().item():.3e}"
         tt = [t.clone() for t in step(False, False)]
         for name, x, y in zip(("topk", "bt", "ctx"), tt, step(True, False)):
             assert torch.equal(x, y), f"FT {name}"
+        for name, x, y in zip(
+            ("topk", "bt", "ctx"), tt, step(False, False, whole=True)
+        ):
+            assert torch.equal(x, y), f"XX {name}"
+        for name, x, y in zip(("topk", "bt", "ctx"), tt, triton_then_flydsl_select()):
+            assert torch.equal(x, y), f"TS {name}"
+        sel_score.copy_(ref)
+        tk = [t.clone() for t in triton_select()]
+        for name, x, y in zip(("topk", "bt", "ctx"), tk, flydsl_select()):
+            assert torch.equal(x, y), f"Sk {name}"
         for tag, fly in (("FA", True), ("TA", False)) if aiter_selects else ():
             out = step(fly, True)
             for name, x, y in zip(("topk", "bt"), tt, out):
@@ -195,11 +280,18 @@ def bench(a, ctx, bs, rows):
                 ), f"{tag} {name}"
             assert torch.equal(tt[2], out[2]), f"{tag} ctx"
 
+    rotate(0)
+    sel_score.copy_(triton_score())  # Tk / Sk select from a scored plane
     variants = [
         ("T  triton score", triton_score, True),
         ("F  flydsl score", flydsl_score, True),
+        ("Ff flydsl flat score", flat_score, True),
+        ("Tk triton select+emit", triton_select, False),
+        ("Sk flydsl select+emit", flydsl_select, False),
         ("TT triton + triton", lambda: step(False, False), False),
         ("FT flydsl + triton", lambda: step(True, False), False),
+        ("TS triton + flydsl sel", triton_then_flydsl_select, False),
+        ("XX flydsl indexer", lambda: step(False, False, whole=True), False),
     ]
     if aiter_selects:
         variants += [
@@ -209,12 +301,12 @@ def bench(a, ctx, bs, rows):
     if a.sweep:
         variants = [
             (
-                f"F  ring {ring} wg {wg}",
-                lambda ring=ring, wg=wg: flydsl_score(wg, ring),
+                f"Ff ring {ring} grid {flat_programs(bs, blocks, wg)}",
+                lambda ring=ring, wg=wg: flat_score(wg, ring),
                 True,
             )
-            for ring in (3, 4, 5, 6)
-            for wg in (64, 256, 512, 768, 1024, 1536)
+            for ring in (4, 6, 8)
+            for wg in (512, 768, 1024, 1536, 2048)
         ]
     for name, fn, is_score in variants:
         if a.sweep and ref is not None:  # every ring / budget: the same bits
@@ -223,10 +315,14 @@ def bench(a, ctx, bs, rows):
             torch.cuda.synchronize()
             bad = ref.view(torch.int32)[mask] != got.view(torch.int32)[mask]
             assert not bad.any(), f"{name}: errRatio {bad.float().mean().item():.3e}"
-        us = timed(fn, a.reps, rotate)
+        us = (timed_direct if a.direct else timed)(fn, a.reps, rotate)
         bw = 100 * nbytes / (us * 1e-6) / HBM
-        print(f"{bs:>4} {ctx:>7} {name:<26} {us:8.1f} {bw:6.1f}")
-        rows.append({"bs": bs, "ctx": ctx, "variant": name, "us": us, "bw_pct": bw})
+        mode = "direct" if a.direct else "graph"
+        print(f"{bs:>4} {ctx:>7} {mode:<6} {name:<26} {us:8.1f} {bw:6.1f}")
+        rows.append(
+            {"bs": bs, "ctx": ctx, "varlen": a.varlen, "mode": mode,
+             "variant": name, "us": us, "bw_pct": bw}
+        )  # fmt: skip
 
 
 def main():
@@ -249,11 +345,13 @@ def main():
     ap.add_argument("--sets", type=int, default=0, help="0: enough for 400 MB")
     ap.add_argument("--reps", type=int, default=200)
     ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--direct", action="store_true", help="no graph: direct launches")
+    ap.add_argument("--ring", type=int, default=4, help="the flat scorer's ring")
     ap.add_argument("--no-check", action="store_true")
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
     rows = []
-    print(f"{'bs':>4} {'ctx':>7} {'variant':<26} {'us':>8} {'BW%':>6}")
+    print(f"{'bs':>4} {'ctx':>7} {'mode':<6} {'variant':<26} {'us':>8} {'BW%':>6}")
     for ctx in a.ctx:
         for bs in a.bs:
             bench(a, ctx, bs, rows)

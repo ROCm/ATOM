@@ -2254,6 +2254,30 @@ def _flydsl_decode_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len):
     return index_score_decode_nvfp4
 
 
+def _flydsl_decode_index_topk(
+    idx_q, index_kv_cache, index_kv_scale, max_block, max_query_len, topk
+):
+    """(aiter's FlyDSL decode indexer, the score plane it scores into) when
+    ``ATOM_M3_DECODE_INDEX_TOPK_FLYDSL`` asks for it and aiter serves the call
+    (the plane is aiter's: rows padded as its selector reads them), else None.
+    Imported directly: the flag needs an aiter that has it."""
+    if index_kv_scale is None or not envs.ATOM_M3_DECODE_INDEX_TOPK_FLYDSL:
+        return None
+    from aiter.ops.flydsl.index_score_decode import (
+        index_topk_decode_nvfp4,
+        index_topk_decode_nvfp4_supported,
+        index_topk_decode_score_plane,
+    )
+
+    total_q, heads, _ = idx_q.shape
+    score = index_topk_decode_score_plane(heads, total_q, max_block, idx_q.device)
+    if not index_topk_decode_nvfp4_supported(
+        idx_q, index_kv_cache, index_kv_scale, score, max_query_len, topk
+    ):
+        return None
+    return index_topk_decode_nvfp4, score
+
+
 @torch.no_grad()
 def minimax_m3_index_topk(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
@@ -2543,6 +2567,38 @@ def minimax_m3_index_topk_decode(
         idx_q.device,
         emit_pages_per_block,
     )
+
+    flydsl_topk = _flydsl_decode_index_topk(
+        idx_q, index_kv_cache, index_kv_scale, max_block, max_query_len, topk
+    )
+    if flydsl_topk is not None:
+        # aiter's FlyDSL indexer (ATOM_M3_DECODE_INDEX_TOPK_FLYDSL): the
+        # selection, its order and the emitted table are this file's
+        # selector's on the same scores.
+        run, score = flydsl_topk
+        emit_kw = {}
+        if emit_out:
+            emit_kw = {
+                "sparse_bt": emit_out[0],
+                "sparse_ctx": emit_out[1],
+                "pages_per_block": emit_pages_per_block,
+                "block_page_stride": block_page_stride,
+            }
+        run(
+            idx_q,
+            index_kv_cache,
+            index_kv_scale,
+            score,
+            block_table,
+            seq_lens,
+            sm_scale,
+            max_query_len,
+            topk_idx,
+            init_blocks,
+            local_blocks,
+            **emit_kw,
+        )
+        return (topk_idx, *emit_out) if emit_out else topk_idx
 
     score = torch.empty(
         (num_idx_heads, total_q, max_block),
