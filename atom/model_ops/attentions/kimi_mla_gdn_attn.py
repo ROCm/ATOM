@@ -416,10 +416,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         127 ordinary KV blocks — 0.112% of the paged pool — drawn from the same
         free list as everything else, and evicted by the same LRU.
 
-        Midstep-readable, by one of two means. By default (`_reads_midstep`)
-        the forward re-runs each interior target's head: grid 1, since a re-run
-        ends at any token, with `conv_kernel - 1` of the forward's tokens
-        before the target for the conv window. Under
+        Midstep-readable where `_reads_midstep` holds, by one of two means. By
+        default the forward re-runs each interior target's head: grid 1, since
+        a re-run ends at any token, with `conv_kernel - 1` of the forward's
+        tokens before the target for the conv window. Under
         `ATOM_K3_KDA_STATE_MIDSTEP=1` (`atom.models.kimi_k3.midstep`), which
         startup refuses under pipeline parallelism, aiter's
         `chunk_kimi_delta_attn` itself stores the state at each interior
@@ -473,6 +473,8 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             f":spec={self.num_spec}"
             ":carry=all"
         )
+        if not self._reads_midstep():
+            return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
         if midstep:
             return kda_midstep_transfer(
                 layout_id,
@@ -480,8 +482,6 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 grid=flash_kda_chunk(),
                 decode_keep=self._decode_keep(),
             )
-        if not self._reads_midstep():
-            return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
         return StateTransfer.copy(
             layout_id,
             decode_keep=self._decode_keep(),

@@ -260,8 +260,23 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
             transfer = Builder.state_transfer(
                 builder(Builder, num_spec=num_spec, kpool=kpool)
             )
-        assert transfer.readable_midstep and transfer.midstep_grid == 32
+        # No snapshot holds a kpool plane, so that model reads none midstep.
+        assert transfer.midstep_grid == (32 if kpool == 1 else 0)
         assert transfer.decode_keep == keep
+
+    def test_the_midstep_switch_writes_nothing_the_head_re_runs_would_not(
+        self, monkeypatch
+    ):
+        """The switch chooses the means where a prefill can write a checkpoint
+        (`_reads_midstep`), and adds no model to them: GLM-5.3 shares the
+        builder but its forward takes no snapshot."""
+        monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
+        with tp_world(TP) as Builder:
+            monkeypatch.setattr(k3_module(Builder), "flash_kda_chunk", lambda: 32)
+            glm = builder(Builder, model_type="glm5_next_text")
+            assert not Builder.state_transfer(glm).readable_midstep
+            kpool = builder(Builder, kpool=4)
+            assert not Builder.state_transfer(kpool).readable_midstep
 
     def test_without_the_midstep_switch_aiter_is_not_asked_for_the_grid(
         self, monkeypatch
