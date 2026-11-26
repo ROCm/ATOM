@@ -298,8 +298,7 @@ given the chat as ATOM's server gives it (`routers/prepare/chat_render.rs`):
 the body as sent, `thinking` and `reasoning_effort` resolved by ATOM's
 reasoning controls (for V4.1, `minimal` as `low`, `medium` and `xhigh` as
 `high`, `none` as chat mode), and the prompt's text encoded as ATOM encodes
-it, so its tokens are ATOM's (`test_requests_tokenize_as_on_atom`), but for
-two DeepSeek V3.2 / V4 cases listed in `docs/atomesh_rust_frontend.md`. The
+it, so its tokens are ATOM's (`test_requests_tokenize_as_on_atom`). The
 same render prepares the chats of the gRPC and ATOM standalone routers. A
 tokenizer llm-tokenizer renders with a built-in encoder chosen from
 `config.json`, whose `model_type` is none of these, is refused at registration

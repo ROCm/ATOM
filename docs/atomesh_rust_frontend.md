@@ -198,8 +198,7 @@ aliases, `thinking`, thinking switched off through each control, tools with
 lists, multi-turn tool calls with `reasoning_content`, control tokens in a
 message's text, a 2 MiB agent history) match on DeepSeek-V4.1-Flash,
 Kimi-K3 and DeepSeek-V4-Flash, and on DeepSeek-V3.2 but for a system message's
-tools (below); V3.2 and V4 with `--preserve-tool-call-arguments`, which hands
-their encoders tool-call arguments as the strings they take. These models still need
+tools, since rendered as the checkpoint's encoder renders them (below). These models still need
 a GPU run: V4.1 on gfx942 needs the FP4PTPC checkpoint.
 
 Tests: `tests/entrypoints/test_token_bridge.py` (admission, submit, the
@@ -237,16 +236,13 @@ every endpoint, GSM8K, and a concurrency sweep.
 * `/v1/completions` requires `model` in the body, as the mesh's typed
   request does.
 * DeepSeek V3.2 / V4 render a history tool call's arguments as the JSON
-  string their checkpoints' encoders take; ATOM's server decodes them first
-  (V3.2 then fails with a 500, V4 renders them as one `arguments` parameter).
-* DeepSeek-V3.2's tools block has no blank lines between its paragraphs, as
-  llm-tokenizer's port (the serving engines' copy of the encoder) writes it;
-  ATOM reads the checkpoint's `encoding_dsv32.py`, which has them. Through
-  this bridge and the gRPC routers these are the tokens the engine runs, not
-  only the tokens HTTP routing matches: a V3.2 chat with tools runs on a
-  prompt that differs from the checkpoint's in those blank lines. Known, until
-  llm-tokenizer's port writes them; serve V3.2 chats with tools through the
-  OpenAI server (`USE_ATOMESH_ENTRYPOINTS=0`) where the exact prompt matters.
+  string their checkpoints' encoders take, on both sides: ATOM's adapter for
+  these encoders (`preserve_tool_call_arguments`) hands them over undecoded.
+* DeepSeek-V3.2's tools block renders as the checkpoint's `encoding_dsv32.py`
+  writes it, blank lines between its paragraphs: llm-tokenizer's port writes
+  the serving engines' copy of the encoder, without them, and `chat_render`
+  puts them back (`tests/fixtures/chat_render/deepseek_v32_tools.json`, from
+  the checkpoint's own encoder).
 * `thinking` / `reasoning_effort` reach DeepSeek V3.2 / V4 / V4.1 and Kimi-K3
   as ATOM resolves them; a Jinja-rendered model (Qwen3, ...) takes its switch through
   `chat_template_kwargs`. `reasoning_effort` is a string in the mesh's typed
