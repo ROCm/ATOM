@@ -7,10 +7,13 @@ when the kernel is traced (``atom.mono.plan``)."""
 
 from __future__ import annotations
 
+import itertools
+import sys
 from dataclasses import dataclass
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -101,42 +104,129 @@ def _spin_bounded(load_all, pending, diag, region_id, index, tag):
     return v
 
 
+# ``fresh_s64``'s asm strings: a counter's, or a call site's (``_site``), both
+# restarted at each trace. FlyDSL traces a launcher in an MLIR context of its
+# own every time, and keys its cache by the traced IR: process-wide counters
+# gave a retrace (or another process) other strings, so a rebuild never hit the
+# cache. Restarted, a kernel's strings depend on its own trace alone
+_FRESH = itertools.count()
+_SITES: dict = {}
+_TRACE = [None]
+
+
+def _this_trace():
+    """Restart the strings' counters when the current MLIR context is not the
+    previous call's: a new trace."""
+    global _FRESH
+    ctx = ir.Context.current
+    if ctx is not _TRACE[0]:
+        _TRACE[0], _FRESH = ctx, itertools.count()
+        _SITES.clear()
+
+
+def _site():
+    """An id of the traced call's Python stack (every frame's file and line):
+    the same in a ``range_constexpr`` loop's unrolled iterations, another at
+    each other call."""
+    _this_trace()
+    f, key = sys._getframe(2), []
+    while f is not None:
+        key.append((f.f_code.co_filename, f.f_lineno))
+        f = f.f_back
+    return _SITES.setdefault(tuple(key), len(_SITES))
+
+
+def fresh_s64(base, site=None):
+    """``base`` (a wave-uniform i64) through an ``s_mov_b64`` LLVM takes for a
+    new value wherever its asm string differs (no side effects, so it schedules
+    freely): ``site`` names it (None: a string of its own). A region's 64-bit
+    address (``Addr.value``) is so computed at its use: made once at the
+    context's creation, the sums of a layer kernel's ~100 regions were held from
+    there to their last use, at the 104-SGPR cap (lane spills; a little more and
+    scratch), and computed at the use from a plain base, LLVM would merge a
+    region's uses across stages into one held value again. An unrolled loop's
+    iterations share their site's string. (SimplifyCFG sinks no inline asm: a
+    per-owner put's copies, ``for p``: ``if owner == p``, keep their payload
+    code each, code size only where the owner is uniform in the wave.) A kernel
+    argument used as a base goes through it once at the kernel's start: one
+    value of its own, not a part of a merged kernarg load (a 16-dword tuple
+    reloaded whole)."""
+    _this_trace()
+    tag = f"f{next(_FRESH)}" if site is None else f"s{site}"
+    return fx.Int64(
+        llvm.inline_asm(
+            T.i64, [fx.Int64(base).ir_value()], f"s_mov_b64 $0, $1 ; {tag}", "=s,s",
+        )
+    )  # fmt: skip
+
+
+def fresh_s32(v):
+    """``v`` (a wave-uniform i32) through an ``s_mov_b32`` of a string of its
+    own (``fresh_s64``'s, 32 bits): a kernel argument a value of its own."""
+    _this_trace()
+    return fx.Int32(
+        llvm.inline_asm(
+            T.i32, [fx.Int32(v).ir_value()], f"s_mov_b32 $0, $1 ; f{next(_FRESH)}", "=s,s",
+        )
+    )  # fmt: skip
+
+
 @dataclass(frozen=True)
 class Addr:
     """A mailbox region's address: the region's name and space, recorded when the
-    kernel is traced (``atom.mono.plan``), and the traced address. The space also
-    sets the hand-off's scope: device for SCRATCH, system for PEER."""
+    kernel is traced (``atom.mono.plan``), and the traced address (``value``:
+    ``base`` + ``offset`` bytes, computed at each use from a ``fresh_s64``
+    base).
+    The space also sets the hand-off's scope: device for SCRATCH, system for
+    PEER."""
 
     region: str
     space: Space
-    value: object
+    base: object
+    offset: object = 0
     # a dual region's (``dreg``): the word offset of the copy this CTA reads
     copy: object = None
+    # ``base`` wave-uniform, taken through ``fresh_s64``; False: a lane's own
+    # base (a select by lane), used as it is -- an SGPR asm operand takes a
+    # lane-varying value through v_readfirstlane, silently: one lane's base
+    # for every lane (col_gather's pushes to the lane's rank hung, G303)
+    fresh: bool = True
+
+    @property
+    def value(self):
+        base = fresh_s64(self.base, _site()) if self.fresh else self.base
+        return base + fx.Int64(self.offset)
 
 
 def sreg(base, offset, region):
     """Scratch region ``region`` at byte ``offset`` of ``base``."""
-    return Addr(region, Space.SCRATCH, base + fx.Int64(offset))
+    return Addr(region, Space.SCRATCH, base, offset)
 
 
 def dreg(base, offset, region, copy):
     """Scratch region ``region`` kept in two copies (``plan.layout.dual_layout``)
     at byte ``offset`` of ``base``: a put writes both, a poll reads the one at
     word offset ``copy`` (``device.numa.local_copy``)."""
-    return Addr(region, Space.SCRATCH, base + fx.Int64(offset), copy)
+    return Addr(region, Space.SCRATCH, base, offset, copy)
 
 
-def preg(base, offset, region):
-    """Peer-symmetric region ``region`` at byte ``offset`` of a rank's buffer ``base``."""
-    return Addr(region, Space.PEER, base + fx.Int64(offset))
+def preg(base, offset, region, fresh=True):
+    """Peer-symmetric region ``region`` at byte ``offset`` of a rank's buffer
+    ``base``; ``fresh`` False where ``base`` varies by lane (``Addr.fresh``)."""
+    return Addr(region, Space.PEER, base, offset, fresh=fresh)
 
 
 def shift(a, delta):
-    """``a`` moved by ``delta`` bytes (a traced or Python integer), same region."""
+    """``a`` moved by ``delta`` bytes (a traced or Python integer), same region:
+    the address made here, once, as a plain ``base + offset + delta``. A
+    runtime delta added at each use is reassociated into ``offset + delta``,
+    which LLVM merges across a divergent branch's two sides into a phi -- a
+    VGPR, every later access through it a waterfall loop (the LM head's launch
+    copies: 26 more)."""
     assert (
         a.copy is None
     ), f"{a.region}: a dual region's copies are laid out from its start"
-    return Addr(a.region, a.space, a.value + delta)
+    return Addr(a.region, a.space, a.base + fx.Int64(a.offset) + delta, 0, None, False)
 
 
 # the store / load cache policy of a hand-off in each space
@@ -174,6 +264,19 @@ def _pair_word(a, i, pairs=1):
 def _noted(a, kind):
     note(a.region, a.space, kind)
     return a.value
+
+
+def _batch_values(specs, kind):
+    """``_noted`` of a batch's specs, the address of a region the batch names
+    more than once (one ``Addr``) computed once: one buffer resource for its
+    loads, as when the value was made once for the kernel."""
+    seen, out = {}, []
+    for a, _, _ in specs:
+        note(a.region, a.space, kind)
+        if id(a) not in seen:
+            seen[id(a)] = a.value
+        out.append(seen[id(a)])
+    return out
 
 
 class Mailbox:
@@ -260,7 +363,7 @@ class Mailbox:
         launch's in VGPRs and compares once (``poll``'s compare a tag, a lane
         mask each, would hold a large batch's SGPRs)."""
         cms = [_SCOPE_CM[a.space] for a, _, _ in specs]
-        bases = [_noted(a, "poll") for a, _, _ in specs]
+        bases = _batch_values(specs, "poll")
         tag = self.tag
 
         def load_all():
@@ -329,7 +432,7 @@ class Mailbox:
         if const_expr(len(specs) > batch):
             return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
         cms = [_SCOPE_CM[a.space] for a, _, _ in specs]
-        bases = [_noted(a, "poll") for a, _, _ in specs]
+        bases = _batch_values(specs, "poll")
         tag = self.tag
 
         def load_all():

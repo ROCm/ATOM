@@ -205,7 +205,8 @@ def push_one(c, g):
     if g < p.pushes:
         dst, pl, t, col = push_task(g, p, c["rank"])
         w = plane_words(c, t, col, pl)
-        cg = preg(pick(c["bases"], dst), c["cg_off"], "cg")
+        # the lane's own rank's base (``dst`` varies by lane): not fresh
+        cg = preg(pick(c["bases"], dst), c["cg_off"], "cg", fresh=False)
         at = cg_pair(t, pl, col)
         c["mb"].put_words(cg, at, [w[0], w[1]])
         c["mb"].put_words(cg, at + 2, [w[2], w[3]])

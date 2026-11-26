@@ -94,6 +94,7 @@ from atom.mono.device.ops import (
 )
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp_begin, stamp_flush
+from atom.mono.device.sync import fresh_s32, fresh_s64
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.layout import pair_layout
@@ -342,6 +343,14 @@ def build_layer(key: LayerBuild):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         warm_index_code(warm, tid, bid)
+        # the scratch regions' base a value of its own (``sync.fresh_s64``), not
+        # a part of the merged kernarg load a compressing build reloads whole
+        scratch = fresh_s64(scratch)
+        # the kernarg tail's other late-read scalars too: no merged 8- / 4-dword
+        # kernarg tuple held across the kernel
+        sym, peers, numa_word = fresh_s64(sym), fresh_s64(peers), fresh_s64(numa_word)
+        rank, layer = fresh_s32(rank), fresh_s32(layer)
+        post_layer, moe_layer = fresh_s32(post_layer), fresh_s32(moe_layer)
         alloc = fx.SharedAllocator()
         tls = alloc.allocate(Stamps).peek().tls.ptr
         smem = alloc.allocate(Parts)
