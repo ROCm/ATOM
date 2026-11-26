@@ -181,8 +181,8 @@ def test_reuse_follows_the_cache_budget_and_its_switch(monkeypatch, env, kept):
         assert list(seq.prompt_hash_chain.hashes) == full_chain(prompt, 16)
         reused.append(served(proc)["blocks_reused"] - before)
     assert served(proc)["enabled"] == (kept is not None)
-    if kept is None:
-        assert reused == [0, 0, 0]
+    if kept is None:  # a store that is off is not consulted
+        assert reused == [0, 0, 0] and served(proc)["prompts"] == 0
     else:  # b1 shares the system prompt with a1; a1's next turn finds a1 or b1
         assert reused == [0, 256, len(a1) // 16 if kept == "a1" else 256]
 
