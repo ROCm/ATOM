@@ -1658,6 +1658,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Qwen3-Next / Qwen3.5: pad each rank's MXFP4 experts to 128 columns instead
     # of 256 when the shard is a multiple of 128 (TP4: 128 rather than 256).
+    # Qwen3.5/3.6: the MXFP4 routed experts take MXFP8 activations (A8W4) rather
+    # than MXFP4 (FusedMoE mxfp4_fp8_activations). Same weights.
+    "ATOM_QWEN_MOE_A8W4": lambda: os.getenv("ATOM_QWEN_MOE_A8W4", "0") == "1",
+    # With fp8_activations (ATOM_QWEN_MOE_A8W4): A8W4 on decode steps only;
+    # prefill steps keep MXFP4 activations (A4W4) and their fused fp4 route quant.
+    "ATOM_MOE_A8W4_PREFILL_A4W4": lambda: (
+        os.getenv("ATOM_MOE_A8W4_PREFILL_A4W4", "0") == "1"
+    ),
     "ATOM_QWEN_MOE_PAD_ALIGN_128": lambda: (
         os.getenv("ATOM_QWEN_MOE_PAD_ALIGN_128", "0").lower() in ("1", "true")
     ),

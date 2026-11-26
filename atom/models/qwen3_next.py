@@ -444,6 +444,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             config=config,
             shared_expert_prefix=f"{prefix}.shared_expert",
+            # ATOM_QWEN_MOE_A8W4: MXFP8 activations into the MXFP4 experts.
+            mxfp4_fp8_activations=envs.ATOM_QWEN_MOE_A8W4,
             # The MXFP4 default pads each rank's experts to 256 columns: at TP4
             # (512 / 4 = 128) half of every expert the grouped GEMMs stream is zeros.
             pad_align=(
@@ -453,6 +455,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 else None
             ),
         )
+        if envs.ATOM_QWEN_MOE_A8W4:
+            m = self.experts.quant_method
+            logger.info(
+                "ATOM_QWEN_MOE_A8W4: %s experts %s fp8_activations=%s",
+                prefix,
+                type(m).__name__,
+                getattr(m, "fp8_activations", None),
+            )
         # ATOM_QWEN_FHMOE (gfx1250, TP1): decode-size steps run the shared expert
         # inside the routed grouped MoE (see `fhmoe_forward`); the experts' quant
         # method builds its operands at load from the shared expert handed here.

@@ -1474,6 +1474,32 @@ def _mxfp8_1x32(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q.to(dtypes.fp8).view(rows, k), (exp + 127).to(torch.uint8)
 
 
+_A8W4_SPLIT_LOGGED = set()
+
+
+def _a8w4_prefill_keeps_a4w4() -> bool:
+    """ATOM_MOE_A8W4_PREFILL_A4W4: True on a prefill step, whose MoE then takes
+    the default MXFP4 activations (A4W4) instead of fp8_activations' MXFP8.
+    Decided per call at trace time, so a recorded graph keeps its step's choice:
+    decode graphs record with is_prefill False, Qwen's prefill token graphs with
+    True. No forward context: not a prefill (A8W4)."""
+    if not envs.ATOM_MOE_A8W4_PREFILL_A4W4:
+        return False
+    try:
+        ctx = get_forward_context().context
+    except AssertionError:
+        ctx = None
+    prefill = ctx is not None and bool(ctx.is_prefill)
+    if prefill not in _A8W4_SPLIT_LOGGED:
+        _A8W4_SPLIT_LOGGED.add(prefill)
+        logger.info(
+            "ATOM_MOE_A8W4_PREFILL_A4W4: first %s MoE call: %s activations",
+            "prefill" if prefill else "decode",
+            "MXFP4 (A4W4)" if prefill else "MXFP8 (A8W4)",
+        )
+    return prefill
+
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -2392,7 +2418,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
-        if self.fp8_activations:
+        if self.fp8_activations and not _a8w4_prefill_keeps_a4w4():
             moe_extra_args["quant_dtype_a"] = dtypes.fp8
         if activation == ActivationType.Situv2:
             moe_extra_args["beta"] = getattr(layer, "activation_situ_beta", None)
