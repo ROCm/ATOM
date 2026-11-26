@@ -289,10 +289,18 @@ def eager_region(
 
 def forks(stream: torch.cuda.Stream | None) -> bool:
     """Whether a region declared on ``stream`` runs beside the main stream
-    in this forward -- recorded, or inside a whole-forward capture."""
+    in this forward -- recorded, or inside a whole-forward capture that may
+    branch (`side_stream`'s gate). A recorded region's fork stays under
+    `graph_records_single_stream`: the region runs eagerly between segments,
+    so its fork is no branch of a graph."""
     if stream is None:
         return False
-    return _recorder() is not None or forward_context.get_forward_context().in_hipgraph
+    if _recorder() is not None:
+        return True
+    return (
+        forward_context.get_forward_context().in_hipgraph
+        and not forward_context.graph_records_single_stream()
+    )
 
 
 def join_stream(*streams: torch.cuda.Stream | None) -> None:

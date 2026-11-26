@@ -14,8 +14,9 @@ import torch
 
 from atom.config import Config, KVCacheTensor, ParallelConfig
 
-# A module, not its names: `region_graph` reads this one back at call time.
-from atom.utils import region_graph
+# Modules, not their names: `region_graph` reads this one back at call time,
+# and `envs` reads a variable each time it is asked.
+from atom.utils import envs, region_graph
 from atom.utils.tbo.ubatch_splitting import UBatchSlice, decode_bucket_splits
 from atom.utils.tbo.ubatching import sync_dp_metadata
 
@@ -1050,6 +1051,27 @@ def pass_scheduled_tokens_gpu(rows: int) -> torch.Tensor | None:
     return context.scheduled_tokens_gpu
 
 
+def graph_records_single_stream() -> bool:
+    """Whether this forward is in a graph window that ATOM_GRAPH_SIDE_STREAMS
+    keeps on one stream. Every side-stream fork a graph can record asks this
+    one predicate: `side_stream` (and the region graph's `forks`), the
+    dual-stream MoE, DeepSeek-V4's compressors and the Engram lookup.
+
+    The window is the capture loop's whole `in_hipgraph`, its warmup forward
+    included, so a warmup forks exactly where its capture does, and any other
+    stream capture: a plugin frontend's own graph, whose forward context does
+    not say it records.
+
+    HIP replays each recorded branch on a parallel stream of the graph's own,
+    bound to one of `GPU_MAX_HW_QUEUES` hardware queues. A branch whose queue
+    shares a command processor pipe with the launch stream's queue has its
+    every fork and join serialized through that pipe, and runs several times
+    slower. Without branches a graph has nothing to bind."""
+    if envs.ATOM_GRAPH_SIDE_STREAMS:
+        return False
+    return get_forward_context().in_hipgraph or torch.cuda.is_current_stream_capturing()
+
+
 @contextmanager
 def side_stream(stream: torch.cuda.Stream | None):
     """Issue the block beside the main stream instead of on it.
@@ -1062,7 +1084,8 @@ def side_stream(stream: torch.cuda.Stream | None):
     drain them, and a replay runs no Python, inheriting the recorded layout.
     `in_hipgraph` covers that loop's warmup forward too, which matters because
     AITER caches a kernel's scratch per `(device, stream)` and rejects a first
-    allocation made during capture.
+    allocation made during capture. Not where the graph stays on one stream
+    (`graph_records_single_stream`).
 
     The gate lives here rather than at each caller so that two branches of one
     layer cannot drift into disagreeing about when forking is allowed. A caller
@@ -1070,7 +1093,7 @@ def side_stream(stream: torch.cuda.Stream | None):
     switch needs no second branch anywhere.
     """
     context = get_forward_context()
-    if stream is None or not context.in_hipgraph:
+    if stream is None or not context.in_hipgraph or graph_records_single_stream():
         yield context.main_stream, None
         return
     stream.wait_stream(context.main_stream)

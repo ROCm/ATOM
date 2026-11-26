@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
-"""ATOM_GRAPH_SIDE_STREAMS=0: a graph recording Engram's lookup records no
-fork. `EngramStaging.start` looks the rows up on the compute stream after the
+"""ATOM_GRAPH_SIDE_STREAMS=0: a graph window holding Engram's lookup records
+no fork. `EngramStaging.start` looks the rows up on the compute stream after the
 cursor advance and `join` has nothing to close; otherwise (and in eager
 forwards) the lookup keeps its side stream."""
 
@@ -13,8 +13,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from atom.utils import forward_context
+
 try:
-    import atom.model_ops.module_dispatch_ops as dispatch
     from atom.model_ops.engram.device import staging as staging_mod
 except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
     pytest.skip(f"requires the device Engram imports: {_e}", allow_module_level=True)
@@ -45,7 +46,7 @@ def staging(monkeypatch):
 
 
 def _single(monkeypatch, value):
-    monkeypatch.setattr(dispatch, "graph_records_single_stream", lambda: value)
+    monkeypatch.setattr(forward_context, "graph_records_single_stream", lambda: value)
 
 
 def test_a_single_stream_recording_looks_up_inline(staging, monkeypatch):

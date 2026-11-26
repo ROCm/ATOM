@@ -257,7 +257,7 @@ class EngramStaging:
             )
 
     def start(self, width):
-        from atom.model_ops.module_dispatch_ops import graph_records_single_stream
+        from atom.utils.forward_context import graph_records_single_stream
 
         # A step whose model looks the rows up itself: only the cursor advance
         # (no snapshot, no side stream), and `join` waits on nothing.
@@ -270,7 +270,7 @@ class EngramStaging:
         self._snapshot(width)
         compute = torch.cuda.current_stream(host.device)
         if graph_records_single_stream():
-            # A graph recorded on one stream (ATOM_GRAPH_SIDE_STREAMS=0): the
+            # A graph window kept on one stream (ATOM_GRAPH_SIDE_STREAMS): the
             # lookup runs inline after the cursor advance, which reads the
             # snapshot too, and `join` has no fork to close.
             self._inline = True

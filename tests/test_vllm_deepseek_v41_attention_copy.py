@@ -342,7 +342,7 @@ def test_the_copy_still_covers_both_dispatch_arms():
             "atom/model_ops/engram/device/staging.py",
             "EngramStaging",
             ("start", "consume", "join"),
-            "a0540c470814f023",
+            "d4d021d4c16388f1",
         ),
     ],
 )

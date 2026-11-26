@@ -1125,11 +1125,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_DRAFT_CUDAGRAPH", "1").lower() == "1"
     ),
     # --- MoE (DeepSeek-style shared experts) ---
-    # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     # 0 records every CUDA graph on one stream: the side-stream forks (dual-
-    # stream MoE, DeepSeek-V4's compressors, the Engram lookup) run inline
-    # while a graph records.
+    # stream MoE, DeepSeek-V4's compressors, the Engram lookup, `side_stream`
+    # regions) run inline in the graph window, its warmup forward included.
     "ATOM_GRAPH_SIDE_STREAMS": lambda: _flag_env("ATOM_GRAPH_SIDE_STREAMS", "1"),
+    # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),

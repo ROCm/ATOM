@@ -29,7 +29,11 @@ import torch
 from atom.config import get_current_atom_config
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-from atom.utils.forward_context import get_forward_context, plugin_graph_is_piecewise
+from atom.utils.forward_context import (
+    get_forward_context,
+    graph_records_single_stream,
+    plugin_graph_is_piecewise,
+)
 
 # ---------------------------------------------------------------------------
 # Dual-stream MoE dispatch (V2 / V3.2 / V4 / K3)
@@ -68,7 +72,8 @@ def _dual_stream_is_active(self, num_tokens: int) -> bool:
 
     # Eager, FULL capture and a token-graph segment all hold the fork/join; a
     # plugin frontend's own PIECEWISE graphs are left single-stream, and so is
-    # every graph recorded under ATOM_GRAPH_SIDE_STREAMS=0.
+    # a graph window ATOM_GRAPH_SIDE_STREAMS keeps on one stream, its warmup
+    # forward included (`graph_records_single_stream`).
     return (
         self._use_dual_stream
         and 0 < num_tokens <= _dual_stream_row_bound(self)
@@ -76,19 +81,6 @@ def _dual_stream_is_active(self, num_tokens: int) -> bool:
         and not plugin_graph_is_piecewise()
         and not graph_records_single_stream()
     )
-
-
-def graph_records_single_stream() -> bool:
-    """Whether a CUDA graph is being recorded under ATOM_GRAPH_SIDE_STREAMS=0,
-    which keeps every recording on one stream: no side-stream fork then
-    (dual-stream MoE here, the Engram lookup in `EngramStaging.start`).
-
-    HIP replays each recorded branch on a parallel stream of the graph's own,
-    bound to one of `GPU_MAX_HW_QUEUES` hardware queues. A branch whose queue
-    shares a command processor pipe with the launch stream's queue has its
-    every fork and join serialized through that pipe, and runs several times
-    slower. Without branches a graph has nothing to bind."""
-    return not envs.ATOM_GRAPH_SIDE_STREAMS and torch.cuda.is_current_stream_capturing()
 
 
 def maybe_dual_stream_forward(
