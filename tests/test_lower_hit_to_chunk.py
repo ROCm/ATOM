@@ -116,6 +116,19 @@ def test_refuses_when_the_pool_cannot_give_the_extra_block(seq_factory):
     assert probe.num_new_blocks == 4
 
 
+def test_lowering_keeps_the_running_decodes_page_reservation(seq_factory):
+    bm = _manager(blocks=5)
+    _held_by_a_request(bm, 104)
+    seq = seq_factory(list(range(64)))
+    probe = _probe(5, new=4)
+    bm.reserved_decode_blocks = 1
+    assert not bm.lower_hit_to_chunk(seq, probe, CHUNK, 48)
+    assert (probe.num_cached_blocks, probe.num_new_blocks) == (5, 4)
+    bm.reserved_decode_blocks = 0
+    assert bm.lower_hit_to_chunk(seq, probe, CHUNK, 48)
+    assert (probe.num_cached_blocks, probe.num_new_blocks) == (4, 5)
+
+
 # -- the early tier load ------------------------------------------------------
 
 
@@ -132,7 +145,7 @@ def test_early_load_starts_an_unaligned_hit_instead_of_skipping_it(
         block_hashes=[7, 8],
         num_new_blocks=2,
     )
-    sched._probe_hbm_prefix = lambda s: probe
+    sched._probe_hbm_prefix = lambda s, **kw: probe
     lowered = []
     sched.block_manager.lower_hit_to_chunk = lambda s, p, *a: (
         lowered.append(a) or setattr(p, "num_cached_blocks", 0) or True
@@ -152,7 +165,7 @@ def test_a_tier_that_does_not_declare_it_keeps_the_hand_off(monkeypatch, seq_fac
     class _Hit:
         num_cached_blocks = 1
 
-    sched._probe_hbm_prefix = lambda s: _Hit()
+    sched._probe_hbm_prefix = lambda s, **kw: _Hit()
     sched._early_load_tier_prefixes()
     assert seq.status == SequenceStatus.WAITING
     assert sched._early_load.skips["unaligned_hbm"] == 1

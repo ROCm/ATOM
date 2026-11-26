@@ -24,6 +24,7 @@ catches it and the width runs production end to end, with no mono kernel
 launched at all.
 """
 
+from collections import namedtuple
 from types import SimpleNamespace
 
 import pytest
@@ -47,7 +48,7 @@ def _pools(window=WINDOW, *, channels=QKV, conv=torch.bfloat16, rec=torch.float3
 
 
 def _runner(monkeypatch, caches, *, mono_layers=(0, 1, 2)):
-    """A runner stubbed down to what `_state_len` reads."""
+    """A runner stubbed down to what `_state_constants` reads."""
     runner = object.__new__(K3MonoDecodeRunner)
     runner.dims = SimpleNamespace(qkv=QKV)
     runner.plans = [
@@ -63,9 +64,12 @@ def _runner(monkeypatch, caches, *, mono_layers=(0, 1, 2)):
     return runner
 
 
-def test_matching_pools_give_the_build_constant(monkeypatch):
-    runner = _runner(monkeypatch, {lid: _pools() for lid in range(4)})
-    assert runner._state_len() == WINDOW
+@pytest.mark.parametrize(
+    ("rec", "state16"), [(torch.float32, False), (torch.float16, True)]
+)
+def test_matching_pools_give_the_build_constant(monkeypatch, rec, state16):
+    runner = _runner(monkeypatch, {lid: _pools(rec=rec) for lid in range(4)})
+    assert runner._state_constants() == (WINDOW, state16)
 
 
 @pytest.mark.parametrize(
@@ -73,7 +77,7 @@ def test_matching_pools_give_the_build_constant(monkeypatch):
     [
         ({"channels": QKV + 1}, "no axis of"),
         ({"conv": torch.float16}, "conv state"),
-        ({"rec": torch.bfloat16}, "recurrent state"),
+        ({"rec": torch.bfloat16}, r"layer 2: recurrent state torch\.bfloat16"),
     ],
 )
 def test_a_later_mono_layers_bad_pool_is_refused_at_bind(monkeypatch, broken, match):
@@ -84,7 +88,7 @@ def test_a_later_mono_layers_bad_pool_is_refused_at_bind(monkeypatch, broken, ma
     caches[2] = _pools(**broken)
     runner = _runner(monkeypatch, caches)
     with pytest.raises(MonoUnsupported, match=match):
-        runner._state_len()
+        runner._state_constants()
 
 
 def test_mono_layers_that_disagree_on_the_window_are_refused(monkeypatch):
@@ -95,7 +99,7 @@ def test_mono_layers_that_disagree_on_the_window_are_refused(monkeypatch):
     caches[2] = _pools(window=WINDOW + 1)
     runner = _runner(monkeypatch, caches)
     with pytest.raises(MonoUnsupported, match="disagree on the conv window"):
-        runner._state_len()
+        runner._state_constants()
 
 
 def test_a_non_mono_layers_pool_is_not_checked(monkeypatch):
@@ -103,4 +107,43 @@ def test_a_non_mono_layers_pool_is_not_checked(monkeypatch):
     caches = {lid: _pools() for lid in range(4)}
     caches[3] = _pools(WINDOW + 7, conv=torch.float16)
     runner = _runner(monkeypatch, caches)
-    assert runner._state_len() == WINDOW
+    assert runner._state_constants() == (WINDOW, False)
+
+
+def test_mono_layers_that_disagree_on_the_recurrent_dtype_are_refused(monkeypatch):
+    # like the window, the dtype is one build constant baked into every K1 key
+    caches = {lid: _pools() for lid in range(4)}
+    caches[2] = _pools(rec=torch.float16)
+    runner = _runner(monkeypatch, caches)
+    with pytest.raises(MonoUnsupported, match="disagree on the recurrent state dtype"):
+        runner._state_constants()
+
+
+class _PastTheChecks(Exception):
+    pass
+
+
+def _past_the_checks(*_):
+    raise _PastTheChecks
+
+
+@pytest.mark.parametrize("built", [torch.float32, torch.float16])
+@pytest.mark.parametrize("rec", [torch.float32, torch.float16])
+def test_a_step_takes_only_the_pool_its_build_was_made_for(monkeypatch, rec, built):
+    # K1 reads the pool at the element size bind built it for, so `_k1` admits
+    # only bind's dtype; `state_slots` is the first thing it does past the checks
+    caches = {lid: _pools(rec=built) for lid in range(4)}
+    runner = _runner(monkeypatch, caches)
+    runner._state_constants()
+    caches.update({lid: _pools(rec=rec) for lid in range(4)})
+    runner.ones = None
+    monkeypatch.setattr(runner_mod, "state_slots", _past_the_checks)
+    key = namedtuple("Key", "state_len")(WINDOW)
+    build = SimpleNamespace(k1_keys={1: key}, k1_launchers={key: None})
+    plan = SimpleNamespace(layer_id=1, kda=None)
+    if rec == built:
+        with pytest.raises(_PastTheChecks):
+            runner._k1(build, plan, None, None, None, None)
+    else:
+        with pytest.raises(MonoUnsupported, match=f"{rec}, K1 is built for {built}$"):
+            runner._k1(build, plan, None, None, None, None)

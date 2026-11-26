@@ -54,6 +54,22 @@ def _flag_env(name: str, default: str = "0") -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
+def _preload_mode() -> str:
+    """ATOM_PRELOAD: "off", "server" (1: take the weights from a weight cache
+    daemon) or "daemon" (be one)."""
+    raw = os.getenv("ATOM_PRELOAD", "").strip().lower()
+    if raw == "daemon":
+        return "daemon"
+    if raw in ("", "0", "false", "no", "off"):  # as _flag_env reads a flag
+        return "off"
+    if raw in ("1", "true", "yes", "on"):
+        return "server"
+    raise ValueError(
+        "ATOM_PRELOAD must be on (1/true/yes/on), off (0/false/no/off) or "
+        f"daemon, not {raw!r}"
+    )
+
+
 def _profiler_detail_env(name: str) -> bool:
     # Unset or empty falls back to ATOM_PROFILER_MORE, so the per-option flag
     # always wins when given and ATOM_PROFILER_MORE=1 alone still enables all.
@@ -145,6 +161,15 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
     if not allow_zero and value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+def _dp_sync_interval_env() -> int | None:
+    """None for a non-integer, so every DP rank can reject it together; 0 and
+    negative values mean 1."""
+    try:
+        return max(1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1")))
+    except ValueError:
+        return None
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -951,6 +976,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # like the other directory knobs.
     "ATOM_RTL_TRACE_DIR": lambda: _optional_path_env("ATOM_RTL_TRACE_DIR"),
     # --- Model Loading ---
+    # Weight cache (docs/environment_variables.md): off, server or daemon.
+    "ATOM_PRELOAD": _preload_mode,
+    # The launch's name, set by its API server for its own processes.
+    "ATOM_PRELOAD_LAUNCH": lambda: os.getenv("ATOM_PRELOAD_LAUNCH"),
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),
@@ -1096,6 +1125,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # DP > 1 (single- or multi-node; not read under PP): after a sync that saw
+    # unfinished work, run the cross-DP state all_reduce only every N engine
+    # rounds (1 = every round, at most 16; 0 and negative values mean 1).
+    # Utility commands, abort and shutdown are applied only on rounds that sync,
+    # and once the group drains every rank still runs up to N-1 dummy rounds
+    # before the next sync.
+    "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
     # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
@@ -1164,7 +1200,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
     # --- Structured output ---
     # Hold tool calls to the declared schemas when the tool parser declares a
-    # grammar for them (Kimi-K3) and the structured-output extra is installed.
+    # grammar for them (Kimi-K3) and the structured-output backend is available.
     "ATOM_TOOL_CALL_GRAMMAR": lambda: (
         os.getenv("ATOM_TOOL_CALL_GRAMMAR", "0").lower() == "1"
     ),
