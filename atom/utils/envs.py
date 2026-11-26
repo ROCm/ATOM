@@ -199,6 +199,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # P/D decode side: serve /v1/pd/late_kv/chat/completions, the decode leg of
+    # atomesh's concurrent dispatch (--atom-pd-concurrent). The router
+    # streams the chat request first and P's kv_transfer_params as a second
+    # line, so D parses the body while P works. 0 = route answers 404 and the
+    # router falls back to its serial relay.
+    "ATOM_PD_LATE_KV": lambda: _flag_env("ATOM_PD_LATE_KV", "0"),
     # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
     # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
     "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
@@ -1393,6 +1399,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FRONTEND_PREFIX_HASH": lambda: (
         os.getenv("ATOM_FRONTEND_PREFIX_HASH", "1") == "1"
     ),
+    # Read a chat request's `prompt_token_ids_b64` (base64 of
+    # `array("I", ids).tobytes()`, uint32 little-endian) instead of a JSON id
+    # list. A P/D prefill leg (`do_remote_decode`) whose ids came this way does
+    # not echo them to the PD router, which already sends the same field to
+    # decode; every other request keeps its `return_token_ids` echo. A request
+    # without the field is unchanged. Enable on P and D together (a mixed
+    # setup is not supported). Upgrade P and D before a client sends the
+    # field. A P or D that runs an ATOM without this change, or sets it to 0,
+    # makes the pair mixed. "0": the field is ignored.
+    "ATOM_PROMPT_IDS_B64": lambda: os.getenv("ATOM_PROMPT_IDS_B64", "1") == "1",
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",

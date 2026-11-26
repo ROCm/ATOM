@@ -32,11 +32,12 @@ from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE, fp4_q_scale_
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region
+from atom.utils.tbo.ubatching import tbo_active
 
 from .layout import MFMA, PRESHUFFLE, fp4_scale_byte
 from .nope import indexer_nope_quant_and_cache
 from .rows import IndexCache
-from .score import score_topk
+from .score import _gather_split, score_topk
 
 
 def _dcp_stage_indexer_fp4_prefill(
@@ -362,6 +363,29 @@ def sparse_attn_indexer(
         )
         return
     rows = attn_metadata.index_rows
+    if (
+        indexer_module.exchange_stream is not None
+        and context.is_prefill
+        and get_dcp_world_size() > 1
+        and attn_metadata.dcp_sparse_prefill_kv is None
+        and rows.passes is None
+        and (exchange := _exchange_stream(indexer_module.exchange_stream)) is not None
+    ):
+        return _dcp_prefill_exchange(
+            exchange,
+            indexer_module,
+            q_quant,
+            q_fp4_scale,
+            weights_mqa,
+            kv_cache,
+            attn_metadata,
+            topk_indices,
+            topk_tokens,
+            weights_scale,
+            stable_topk,
+            runner_block_size,
+            cp_kv_cache_interleave_size,
+        )
     # A single-rank prefill's slot conversion subtracts concat rows' request
     # base itself; decode, the DCP filter and the "kv" index read request-local
     # ids.
@@ -447,6 +471,69 @@ def sparse_attn_indexer(
             out=attn_metadata.sparse_kv_indices,
             row_starts=None if rows.concat is None else rows.concat.row_starts,
         )
+
+
+def _dcp_prefill_exchange(
+    exchange,
+    indexer,
+    query,
+    query_scale,
+    weights,
+    kv_cache,
+    metadata,
+    topk_indices,
+    topk,
+    weight_scale,
+    stable,
+    block_size,
+    interleave_size,
+):
+    """Score the local rows, then gather and filter on the assigned side stream."""
+    rows = metadata.index_rows
+    # Native DCP prefill uses contiguous row shares, not rank-major stripes.
+    assert not rows.split.stripe
+    local_rows = rows._replace(split=rows.split._replace(world=1))
+    topk_indices = score_topk(
+        (
+            (query.unsqueeze(1), query_scale.unsqueeze(1))
+            if indexer._indexer_fp4
+            else query
+        ),
+        weights,
+        _index_cache(indexer, kv_cache, metadata, True),
+        local_rows,
+        topk=topk,
+        weight_scale=weight_scale,
+        stable=stable,
+        out=topk_indices[: rows.out_rows],
+    )
+    exchange.wait_stream(torch.cuda.current_stream())
+    topk_indices.record_stream(exchange)
+    with torch.cuda.stream(exchange):
+        _gather_split(topk_indices, rows.split)
+        triton_filter_and_convert_dcp_index_prefill(
+            metadata.sparse_kv_indptr,
+            metadata.batch_id_per_q_token,
+            topk_indices,
+            metadata.block_tables,
+            get_dcp_rank(),
+            get_dcp_world_size(),
+            block_size,
+            out_kv_indptr=metadata.dcp_sparse_kv_indptr,
+            owned_counts=metadata.dcp_owned_counts,
+            NUM_TOPK_TOKENS=topk,
+            out=metadata.sparse_kv_indices,
+            cp_kv_cache_interleave_size=interleave_size,
+        )
+    metadata.index_exchange_done = exchange.record_event()
+
+
+def _exchange_stream(stream):
+    """Use an eligible DCP prefill's side stream outside graph capture and TBO.
+    The caller excludes decode, DCP=1, packed passes and absent streams."""
+    if torch.cuda.is_current_stream_capturing() or tbo_active():
+        return None
+    return stream
 
 
 def _index_cache(indexer, kv_cache, attn_metadata, is_prefill) -> IndexCache:
