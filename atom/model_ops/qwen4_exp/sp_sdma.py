@@ -347,9 +347,10 @@ class AllGatherWriter:
 class SdmaCollectives:
     """Reduce-scatter and all-gather of [tokens, hidden] rows over the TP group.
 
-    Construction is collective. A rank-local failure leaves `error` set
-    instead of raising, so every rank still runs the same collectives and can
-    then agree on the outcome (`get_sdma_collectives`)."""
+    Construction is collective. A failure on this side leaves `error` set
+    instead of raising, and the ranks agree before and after
+    `SdmaComm.commit()` (`get_sdma_collectives`); a failure inside `commit()`
+    (mori, the arena allocation) can still block the other ranks."""
 
     def __init__(self, capacity_tokens, hidden, dtype, device, cpu_group):
         from aiter.ops.communication import SdmaComm

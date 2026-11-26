@@ -89,7 +89,9 @@ def _rank(rank, world, port, failures):
             ref = torch.zeros(world * local, HIDDEN, device="cuda")
             ref[:tokens] = parts.float().sum(0)
             ref = ref[rank * local : (rank + 1) * local]
-            err = ((got.float() - ref).abs().max() / ref.abs().max()).item()
+            # A padding-only rank has a zero reference: its rows must be 0.
+            scale = ref.abs().max().clamp_min(1.0)
+            err = ((got.float() - ref).abs().max() / scale).item()
             # One bf16 rounding of a sum taken in another order (NaN fails).
             if not err <= 8e-3:
                 errors.append(f"reduce-scatter step {step}: rel err {err:.3g}")

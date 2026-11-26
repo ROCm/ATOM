@@ -1060,7 +1060,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen3.8-Flash-Next under the SGLang plugin: run the sequence-parallel
     # reduce-scatters / all-gathers on the copy engines (mori CCO SDMA),
     # overlapped with the hyper-connections. gfx942 only; needs mori with CCO
-    # SDMA and FlyDSL; otherwise (or across nodes) one warning and RCCL is kept.
+    # SDMA, FlyDSL and aiter's SdmaComm (fallback: docs/environment_variables.md).
     "ATOM_QWEN4_EXP_SP_SDMA": lambda: _flag_env("ATOM_QWEN4_EXP_SP_SDMA", "0"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
