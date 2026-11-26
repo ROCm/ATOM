@@ -222,7 +222,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the early answer and does not see a P failure after it (see the docs
     # row). Single-node DP only; anything but a Mooncake producer's plain
     # prefill leg keeps its path. On by default; 0 = the legacy
-    # answer-after-prefill path.
+    # answer-after-prefill path. D must accept chunked transfer (D PP=1, D TP
+    # a multiple of P TP, no DCP decode for per-request-state models), which
+    # P cannot check: set 0 on P otherwise, or D answers HTTP 400.
     "ATOM_PD_EARLY_HANDOFF": lambda: _flag_env("ATOM_PD_EARLY_HANDOFF", "1"),
     # With ATOM_PD_EARLY_HANDOFF on P: an early request may allocate its
     # source and prefill before D's write request arrives (it skips the
