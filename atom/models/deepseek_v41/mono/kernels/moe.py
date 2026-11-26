@@ -1622,8 +1622,6 @@ def shared_down_units(rs) -> int:
 # a routed unit's weight tiles a wave holds (a 16-row task's K steps each): at
 # TP4 four tasks (512 rows); a wider K takes fewer tasks
 DOWN_Y_WAVE_TILES = 20
-# its tasks whose weights are issued before the MID poll
-DOWN_Y_PRE_TASKS = 1
 
 
 def down_y_wave_tasks(d) -> int:
@@ -1688,11 +1686,15 @@ def down_y_run(c, unit, sl, routed, shared):
 def down_y_unit(c, unit, sl):
     """Down unit ``unit`` (slot ``unit // down_y_unit_blocks`` of U, a hidden
     block): a wave its ``down_y_wave_tasks`` adjacent 16-row tasks -- the
-    scale blocks and the first DOWN_Y_PRE_TASKS tasks' weights
-    issued, the slot's MID rows polled into LDS (``load_mid_rows``: tagged, no
-    flag), then the other tasks' weights, so the poll waits behind few loads --
-    the chains over K, each pick's contribution bf16(v w) to DY as tagged
-    pairs (``down_store_y``)."""
+    slot's MID rows polled into LDS (``load_mid_rows``: tagged, no flag), the
+    poll's first pass issued before the scale blocks and every task's
+    weights and checked after them -- the chains over K, then each pick's
+    contribution bf16(v w) to DY as tagged pairs (``down_store_y``).
+
+    vmcnt counts loads and stores in issue order: a poll issued behind the
+    weights waits for them, and a weight wait issued behind a task's DY stores
+    waits for their acks (G306 / G307 / G312: -16 us/step with all three
+    orders of this and ``shared_down_unit``, none alone)."""
     tab, d, a, rs = c["tab"], c["d"], c["args"], c["rs"]
     n_tasks, blocks = down_y_wave_tasks(d), down_y_unit_blocks(d)
     task0 = (unit % blocks * WAVES + c["wave"]) * n_tasks
@@ -1709,37 +1711,40 @@ def down_y_unit(c, unit, sl):
     e = local_expert(c, rs.union_expert(tab, c["S"], u))
     nst = d.inter // 128
     block_words = down_scale_words(d)
-    svs = [
-        scale_block_loads(c, a["w2_s"], e * HIDDEN + (task0 + 2 * b) * 16, d.down_scale_cols)
-        for b in range(n_tasks // 2)
-    ]  # fmt: skip
     tasks = [task0 + j for j in range(n_tasks)]
 
     def weights(t):
         return fp4_tile_weights(c, a["w2"], e, HIDDEN, d.inter, t, 0, nst, d.inter_real)
 
-    avs = [weights(t) for t in tasks[:DOWN_Y_PRE_TASKS]]
-    load_mid_rows(c, first, count)
-    avs += [weights(t) for t in tasks[DOWN_Y_PRE_TASKS:]]
+    def issue():
+        return [
+            scale_block_loads(c, a["w2_s"], e * HIDDEN + (task0 + 2 * b) * 16, d.down_scale_cols)
+            for b in range(n_tasks // 2)
+        ], [weights(t) for t in tasks]  # fmt: skip
+
+    svs, avs = load_mid_rows(c, first, count, between=issue)
     for b in range_constexpr(len(svs)):
         scale_block_store(c, svs[b], sl + b * block_words)
     mids = mid_lds_operands(c, count, nst)
+    # every task's chains before any DY store
+    accss = [
+        down_chains(c, tasks[j], sl + j // 2 * block_words, mids, avs[j], down_zero())
+        for j in range(n_tasks)
+    ]  # fmt: skip
     for j in range_constexpr(n_tasks):
-        accs = down_chains(
-            c, tasks[j], sl + j // 2 * block_words, mids, avs[j], down_zero()
-        )
-        down_store_y(c, accs, tasks[j], first, count)
+        down_store_y(c, accss[j], tasks[j], first, count)
     gpu.barrier()
 
 
 @traced
-def load_mid_rows(c, first, count):
+def load_mid_rows(c, first, count, between=None):
     """The MID rows of a slot's picks first .. first + count into LDS rows 0 ..
     of ``dml`` / ``dmsl`` at the ``lds_row`` stride: what ug writes polled
     (tagged pairs) -- a row's words of the real width (two a spec) and its
     real groups' codes (``mid_code_index`` puts a padding group's among them)
     -- and the padding to ``inter`` (ug writes none) zeroed: a zero weight does
-    not mask a NaN byte."""
+    not mask a NaN byte. ``between``: loads issued after the poll's first pass
+    and before its check (``Mailbox.poll``), their values returned."""
     d, tid = c["d"], c["tid"]
     words, real_words = d.mid_words, d.inter_real // 4
     groups, steps = d.inter // 32, d.inter // 128
@@ -1765,7 +1770,10 @@ def load_mid_rows(c, first, count):
         stores.append(
             (c["dmsl"] + (r * lds_row(groups) + p), (tid + THREADS * i < TILE * groups) & (r < count), real)
         )  # fmt: skip
-    got = c["poll"](specs, batch=len(specs))
+    if const_expr(between is not None):
+        got, extra = c["poll"](specs, batch=len(specs), between=between)
+    else:
+        got = c["poll"](specs, batch=len(specs))
     for (at, live, real), v in zip(stores, got):
         if real is None:
             put_lds_live(at, fx.Vector.from_elements(v, fx.Int32), live)
@@ -1778,6 +1786,8 @@ def load_mid_rows(c, first, count):
         at = c["dml"] + (e // pad * lds_row(words) + real_words + e % pad)
         put_lds_live(at, fx.Int32(0), tid + THREADS * i < TILE * pad)
     gpu.barrier()
+    if const_expr(between is not None):
+        return extra
 
 
 def mid_lds_operands(c, count, nst):
@@ -1830,13 +1840,17 @@ def shared_down_unit(c, k):
     bf16 -> SDO [task][token][16 rows] as tagged pairs, the intermediate loaded
     once for them. Every task's weights in flight first; wide units
     (``shared_down_wide``) SHARED_DOWN_AHEAD tasks' at a time, the next issued
-    before this one's MFMAs."""
+    before this one's MFMAs. A task's SDO word is held and stored at the
+    unit's end: a later task's weight wait would else wait for its store's
+    ack (vmcnt counts in issue order; ``down_y_unit``)."""
     s, tid, red, d = c["S"], c["tid"], c["red"], c["d"]
     per = shared_down_tasks(c["rs"])
     tasks = [k * per + j for j in range(per)]
     tiles = token_tiles(s)
     ahead = min(per, SHARED_DOWN_AHEAD) if shared_down_wide(c["rs"]) else per
     shops = [shared_down_loads(c, tasks[j]) for j in range(ahead)]
+    rp, tl = tid % (ROWS // 2), tid // (ROWS // 2)
+    held = []
     for t0, nn in tiles:
         load_smid_tile(c, t0, nn, d.sh_inter // 32)
         for j in range_constexpr(len(tasks)):
@@ -1844,12 +1858,17 @@ def shared_down_unit(c, k):
                 shops.append(shared_down_loads(c, tasks[j + ahead]))
             gemv_fp8_mfmas(c, d.sh_inter, c["sxl"], c["sxsl"], red, shops[j], rows=nn)
             gpu.barrier()
+            word = fx.Int32(0)
             if tid < ROWS * nn // 2:
-                rp, tl = tid % (ROWS // 2), tid // (ROWS // 2)
                 vs = [bf16_round(acc_sum(red, 2 * rp + h, tl)) for h in range(2)]
-                at = (tasks[j] * s + plus(t0, tl)) * ROWS + 2 * rp
-                c["put_bf"](c["sdo"], at, vs)
+                word = bf16_pair(vs[0], vs[1]).bitcast(fx.Int32)
+            held.append((j, t0, nn, word))
             gpu.barrier()
+    for j, t0, nn, word in held:
+        if tid < ROWS * nn // 2:
+            # pair (element ``(task s + t) ROWS + 2 rp``) // 2
+            at = (tasks[j] * s + plus(t0, tl)) * (ROWS // 2) + rp
+            c["put_words"](c["sdo"], at, [word])
 
 
 @traced

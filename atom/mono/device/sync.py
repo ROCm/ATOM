@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
@@ -31,6 +32,24 @@ def _spin(load_all, pending):
         rocdl.s_sleep(POLL_SLEEP_UNITS)
         v = load_all()
     return v
+
+
+@traced
+def _spin_first(load_all, pending, between):
+    """``_spin`` with ``between()`` (other loads) issued after the first pass
+    and before its check: vmcnt counts in issue order, so the first check
+    waits for the first pass alone, not for ``between``'s loads. The first
+    check stays out of the retry loop (a loop phi of a load still in flight
+    waits for every load). -> (values, ``between()``'s result)."""
+    v = load_all()
+    # side-effecting empty asm on both sides of ``between``: the scheduler
+    # moves no load across it (it hoisted the weights above the first pass)
+    llvm.InlineAsmOp(None, [], "", "", has_side_effects=True)
+    extra = between()
+    llvm.InlineAsmOp(None, [], "", "", has_side_effects=True)
+    if pending(v):
+        v = _spin(load_all, pending)
+    return v, extra
 
 
 @traced
@@ -276,23 +295,35 @@ class Mailbox:
             e += 2 * n
         return outs
 
-    def spin(self, a, index, load_all, pending):
+    def spin(self, a, index, load_all, pending, between=None):
         """Re-issue ``load_all`` until ``pending`` clears: a wait in region
         ``a`` (its word ``index``), bounded and named in a debug build's
         report like every pair's (``poll``). A wait on plain words (counts
-        that say themselves when they are in) comes this way too."""
+        that say themselves when they are in) comes this way too. With
+        ``between``: its loads issued after the first pass, before the first
+        check (``_spin_first``; a debug build issues them after the wait) ->
+        (values, its result)."""
+        if const_expr(between is not None and self.diag is None):
+            return _spin_first(load_all, pending, between)
         if const_expr(self.diag is None):
-            return _spin(load_all, pending)
-        rid = self.region_ids.get(a.region, -1)
-        return _spin_bounded(load_all, pending, self.diag, rid, index, self.tag)
+            v = _spin(load_all, pending)
+        else:
+            rid = self.region_ids.get(a.region, -1)
+            v = _spin_bounded(load_all, pending, self.diag, rid, index, self.tag)
+        if const_expr(between is not None):
+            return v, between()
+        return v
 
-    def poll(self, specs, batch=POLL_MAX):
+    def poll(self, specs, batch=POLL_MAX, between=None):
         """Batched poll of pairs ``specs`` = [(Addr, pair index, npairs in {1, 2})],
         each loaded at its own space's scope; two pairs of a dual region at a
         ``Quad`` (``_word``).
 
         All pairs are re-loaded together while any tag is stale, so a batch costs
-        one round trip after its last producer lands. Returns the value words."""
+        one round trip after its last producer lands. Returns the value words;
+        with ``between`` (one batch) also its result, its loads issued after the
+        first pass (``spin``)."""
+        assert between is None or 0 < len(specs) <= batch
         if const_expr(len(specs) == 0):
             return []
         if const_expr(len(specs) > batch):
@@ -326,11 +357,15 @@ class Mailbox:
 
         first = specs[0][1]
         first = first.q * 2 if isinstance(first, Quad) else first
-        v = self.spin(specs[0][0], first, load_all, pending)
+        v = self.spin(specs[0][0], first, load_all, pending, between)
+        if const_expr(between is not None):
+            v, extra = v
         outs, e = [], 0
         for _, _, n in specs:
             outs.append([v[e + 2 * q] for q in range(n)])
             e += 2 * n
+        if const_expr(between is not None):
+            return outs, extra
         return outs
 
 
