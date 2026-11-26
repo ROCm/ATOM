@@ -1946,6 +1946,31 @@ class TestInitialRampFullChunk:
         full = sched._ramp_full_chunk(True, 1, 2, 12, PrefillLimits(16))
         assert full and not sched._ramp_full_chunk(True, 1, 2, 12, PrefillLimits(64))
 
+    def test_schedule_passes_the_decode_reserved_budget_to_the_ramp(self, seq_factory):
+        """Through schedule() with mixed batching and four decodes: the ramp
+        measures fill against the budget left after their reservation."""
+        sched = Scheduler(
+            MockConfig(
+                enable_mixed_prefill_decode=True,
+                max_num_batched_tokens=16,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_seqs=8,
+            )
+        )
+        decodes = [seq_factory(list(range(4 * i, 4 * i + 4))) for i in range(4)]
+        for seq in decodes:
+            sched.add(seq)
+        sched.schedule()
+        for seq in decodes:
+            seq.num_cached_tokens = seq.num_prompt_tokens
+            seq.append_token(99)
+        sched.add(seq_factory(list(range(50, 57))))
+        report = self._report(sched, _RampDelayer())
+        # 7 tokens fill half of the 12 left, not half of 16.
+        assert report["prefill_budget"] == 12
+        assert report["full_chunk"] is True
+
     def test_waiting_prompts_short_of_target_fill(self, seq_factory):
         sched = self._sched()
         sched.add(seq_factory(list(range(10, 30))))

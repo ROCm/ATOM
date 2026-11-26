@@ -1662,8 +1662,9 @@ class Scheduler:
         request into a free seq slot, and fills target_fill of this step's
         prefill budget (`limits.tokens`, after mixed decode reservations) or
         stops because what is left of it cannot take the next request (without
-        chunked prefill whole prompts rarely pack to target_fill). Resumable partials that fill the chunk with no fresh
-        request counted do not: that is one long prompt, not empty slots.
+        chunked prefill whole prompts rarely pack to target_fill). Resumable
+        partials that fill the chunk with no fresh request counted do not:
+        that is one long prompt, not empty slots.
         ``probed_tokens`` is the probe's count where this tick already ran it.
         With no free slot or no waiting request, or a local delayer with no
         decode (it fires anyway), the probe is skipped."""
