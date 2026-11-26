@@ -376,6 +376,7 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
     runner.config.enable_tbo_decode = False
     runner.capture_sizes_np = np.array([1, 2, 4, 8])
     runner._dspark_apply_q_bucket = lambda batch: None
+    runner._mono_blocked_step = lambda batch: False
     runner._tr_hybrid_active = lambda: False
     runner._local_tbo_eligibility = lambda batch: False
     runner.prepare_inputs = lambda *args, **kwargs: None
@@ -467,6 +468,7 @@ def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeyp
     runner.config.enable_tbo_decode = False
     runner.capture_sizes_np = np.array([1, 2, 4, 8])
     runner._dspark_apply_q_bucket = lambda batch: None
+    runner._mono_blocked_step = lambda batch: False
     runner._tr_hybrid_active = lambda: False
     runner._local_tbo_eligibility = lambda batch: False
     monkeypatch.setattr(
