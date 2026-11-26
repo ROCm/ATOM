@@ -542,7 +542,10 @@ def chunk_gated_delta_rule_fwd_h_log2(
             len(chunk_indices),
             prepare_chunk_offsets(cu_seqlens, BT),
         )
-    assert K <= 256, "current kernel does not support head dimension larger than 256."
+    if K > 256:
+        raise ValueError(
+            f"current kernel does not support head dimension larger than 256, got {K}."
+        )
 
     if inplace_final_state:
         if h0_indices is None:

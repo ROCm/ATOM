@@ -176,17 +176,18 @@ def chunk_gla_fwd_o_gk(
         # Same discipline as fla_ops/chunk_o.py:151,176-186: the kernel assumes
         # stride (HV*V, 1) on the (T, V) plane, so a non-contiguous or
         # wrong-dtype buffer would silently corrupt rather than fail.
-        assert o.shape == v.shape, (
-            f"chunk_gla_fwd_o_gk: caller-provided o.shape {tuple(o.shape)} != "
-            f"v.shape {tuple(v.shape)}"
-        )
-        assert o.dtype == v.dtype, (
-            f"chunk_gla_fwd_o_gk: caller-provided o.dtype {o.dtype} != v.dtype "
-            f"{v.dtype}"
-        )
-        assert (
-            o.is_contiguous()
-        ), "chunk_gla_fwd_o_gk: caller-provided o must be contiguous"
+        if o.shape != v.shape:
+            raise ValueError(
+                f"chunk_gla_fwd_o_gk: caller-provided o.shape {tuple(o.shape)} != "
+                f"v.shape {tuple(v.shape)}"
+            )
+        if o.dtype != v.dtype:
+            raise ValueError(
+                f"chunk_gla_fwd_o_gk: caller-provided o.dtype {o.dtype} != v.dtype "
+                f"{v.dtype}"
+            )
+        if not o.is_contiguous():
+            raise ValueError("chunk_gla_fwd_o_gk: caller-provided o must be contiguous")
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * HV)
