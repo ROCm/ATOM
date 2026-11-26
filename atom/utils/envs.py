@@ -238,7 +238,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # allocated before D's report may hold at once. An early request that
     # would cross it waits for D like a gated one. 0 = never skip, 1 = no cap.
     # A finished source D never reaches is released by the worker's lookup
-    # timeout (PREFILL_LOOKUP_TIMEOUT, 60 s), as any chunked source is.
+    # timeout (PREFILL_LOOKUP_TIMEOUT, 60 s), as any chunked source is. The
+    # cap rules out a stall only for a D prompt that fits in P's unpinned
+    # share; a larger one can wait for that timeout, and D then aborts the
+    # pinned request. Fraction <= 1 - largest prompt / P's pool, or
+    # SKIP_GATE=0, rules it out.
     "ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION": lambda: _checked_float_env(
         "ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION",
         "0.5",

@@ -867,6 +867,146 @@ def test_lookup_timeout_breaks_the_opposite_order_cycle(monkeypatch, seq_factory
     assert not p.kv_connector._early_pins
 
 
+@pytest.mark.parametrize(
+    "skip_gate,fraction,a_aborted",
+    [
+        (None, None, True),  # the defaults: SKIP_GATE=1, cap 0.5
+        (False, None, False),  # SKIP_GATE=0: P follows D's order
+        (None, "0.3", False),  # cap <= 1 - 4/6: A cannot skip either
+    ],
+)
+def test_unequal_prompts_under_the_cap_end_in_a_bounded_abort(
+    monkeypatch, seq_factory, skip_gate, fraction, a_aborted
+):
+    """P has 6 pages, D 4. A's prompt takes 3 pages, B's 4. P queues A then
+    B, D admits B then A. At the default cap (half of P's 6 pages) A's 3
+    pages fit, so P pins a finished A before D reached it. D's 4 pages hold
+    B, and P's 3 free pages cannot take B: neither side can admit its other
+    request. The cap rules this out only for a D prompt that fits in P's
+    unpinned share. The worker's lookup timeout (PREFILL_LOOKUP_TIMEOUT,
+    shortened here) cancels A's source: B then runs on both sides and D
+    aborts A on the failed receive. Nothing hangs and both pools end empty.
+    With SKIP_GATE=0, or a cap at most 1 - (largest prompt / P's pool), P
+    follows D's order and both requests finish."""
+    from atom.model_engine.scheduler import ScheduledBatchOutput
+    from atom.model_engine.sequence import SequenceStatus
+    from atom.sampling_params import SamplingParams
+
+    if fraction is None:
+        monkeypatch.delenv("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", fraction)
+    monkeypatch.setattr(mc, "PREFILL_LOOKUP_TIMEOUT", 0.05)
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "0")
+    p = _p_scheduler(monkeypatch, num_blocks=6, skip_gate=skip_gate)
+    d = _d_scheduler(monkeypatch, num_blocks=4)
+
+    def seqs_for(name, prompt):
+        ps = seq_factory(
+            prompt,
+            sampling_params=SamplingParams(max_tokens=1),
+            kv_transfer_params=p_params(name),
+        )
+        ds = seq_factory(
+            prompt,
+            sampling_params=SamplingParams(max_tokens=2),
+            kv_transfer_params=d_params(name),
+        )
+        return ps, ds
+
+    pa, da = seqs_for("early-a", list(range(10)))  # 3 pages
+    pb, db = seqs_for("early-b", list(range(100, 113)))  # 4 pages
+    p.extend([pa, pb])
+    d.extend([db, da])
+    pw, _, _src, destinations = idle_producer()
+    dw = decode_worker(destinations[0])
+    _wire(pw, dw)
+    results = []
+
+    def complete(data, success):
+        results.append((data["transfer_id"], success))
+        dw._record_write_done(
+            data["request_id"],
+            0,
+            0,
+            data["write_nonce"],
+            success=success,
+            handoff=data.get("prefill_handoff"),
+        )
+
+    pw._notify_transfer_result.side_effect = complete
+    finished, started = [], []
+    stalled = False
+    pool = ThreadPoolExecutor(1)
+    pw._send_executor = pool
+    try:
+        for _ in range(300):
+            if db in finished and (da in finished or da.leave_reason == "aborted"):
+                break
+            time.sleep(0.01)
+            d._update_from_kv_xfer_finished(dw.get_finished())
+            out = d.schedule()
+            if out is not None:
+                batch, seqs = out
+                dw.start_load_kv(batch.connector_meta_output)
+                if seqs:
+                    ids = list(seqs)
+                    finished += d.postprocess(
+                        list(seqs.values()),
+                        ScheduledBatchOutput(ids, [(43,)] * len(ids), None, None, None),
+                        batch=batch,
+                    )
+            if dw._write_queue:
+                post_write_requests(dw, monkeypatch)
+            p._update_from_kv_xfer_finished(pw.get_finished())
+            # The cycle: D reached B (B is ready on P) but a finished A still
+            # holds P's pages, and D's pages all hold B.
+            stalled |= (
+                pb.id in p.kv_connector._chunked_ready
+                and str(pa.id) in p.kv_connector._early_pins
+                and p.block_manager.kv.num_free < 4
+                and not da.block_table
+            )
+            out = p.schedule()
+            if out is None:
+                # The engine's idle drain still ships the connector's meta.
+                pw.start_load_kv(p.kv_connector.build_connector_meta())
+                continue
+            batch, seqs = out
+            pw.start_load_kv(batch.connector_meta_output)
+            for sid, seq in seqs.items():
+                if sid not in started:
+                    started.append(sid)
+                state = pw._chunked_prefills[seq.kv_transfer_params["transfer_id"]]
+                publish(state, int(batch.context_lens[0]))
+                pw._dispatch_ready_chunked_requests()
+                p.postprocess(
+                    [seq],
+                    ScheduledBatchOutput([sid], [(42,)], None, None, None),
+                    batch=batch,
+                )
+                pw.start_load_kv(p.kv_connector.build_connector_meta())
+    finally:
+        pool.shutdown(wait=True)
+    assert db in finished and db.kv_transfer_params["first_token_id"] == 42
+    if a_aborted:
+        # P skipped the gate for A under the cap, so the cycle formed.
+        assert stalled and started == [pa.id, pb.id]
+        assert da.status == SequenceStatus.FINISHED and da.leave_reason == "aborted"
+        assert da not in finished
+        assert sorted(results) == [("early-a", False), ("early-b", True)]
+    else:
+        assert not stalled and started == [pb.id, pa.id]
+        assert [s.id for s in finished] == [db.id, da.id]
+        assert da.kv_transfer_params["first_token_id"] == 42
+        assert sorted(results) == [("early-a", True), ("early-b", True)]
+    assert not d.waiting and not d.running
+    assert p.block_manager.kv.num_free == 6
+    assert d.block_manager.kv.num_free == 4
+    assert not p.deferred_free_blocks and not d.deferred_free_blocks
+    assert not p.kv_connector._early_pins
+
+
 def test_late_write_request_before_p_allocation_is_not_expired(monkeypatch):
     """D can reach P's listener while P still queues the request. Registration
     at admission keeps it from being retired as an orphan after the lookup

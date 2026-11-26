@@ -512,6 +512,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # waits for D like a gated one). A finished one D never reaches is
         # cancelled by the worker's lookup timeout (`ChunkedPrefill.source_safe`,
         # PREFILL_LOOKUP_TIMEOUT), whose `pd_source_safe` report releases it.
+        # The cap keeps room only for a D prompt within P's unpinned share: a
+        # larger one waits for that timeout, and D aborts the pinned request.
         self._early_pin_limit = 0.0
         if self._early_skip_gate:
             fraction = envs.ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION
