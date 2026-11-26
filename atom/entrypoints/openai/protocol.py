@@ -428,15 +428,23 @@ class ChatCompletionRequest(BaseModel):
         """True when this request's prompt came as ``prompt_token_ids_b64``."""
         return self._b64_prompt_ids is not None
 
-    def get_prompt_token_ids(self) -> PromptTokenIds | array.array | None:
+    def get_prompt_token_ids(
+        self, media_decode_leg: bool = False
+    ) -> PromptTokenIds | array.array | None:
         """This request's pre-tokenized prompt, or None to render+tokenize.
 
-        An ``array("i")`` when it came as ``prompt_token_ids_b64``."""
-        top = (
-            self._b64_prompt_ids
-            if self._b64_prompt_ids is not None
-            else self.prompt_token_ids
-        )
+        An ``array("i")`` when it came as ``prompt_token_ids_b64``.
+
+        ``media_decode_leg``: a remote-prefill leg whose messages carry media.
+        Its ``prompt_token_ids_b64`` is the client body's, forwarded unchanged,
+        with the image placeholders not expanded; the prompt is the prefill's
+        expanded ids in ``kv_transfer_params``. The b64 ids are not used then,
+        nor compared with those, which would always disagree.
+        """
+        if self._b64_prompt_ids is not None and not media_decode_leg:
+            top = self._b64_prompt_ids
+        else:
+            top = self.prompt_token_ids
         return resolve_prompt_token_ids(top, self.kv_transfer_params)
 
     def get_max_tokens(self) -> int:

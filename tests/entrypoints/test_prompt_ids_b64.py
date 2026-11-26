@@ -161,6 +161,24 @@ class TestRequestModel:
         with pytest.raises(ValueError, match="disagree"):
             bad.get_prompt_token_ids()
 
+    def test_media_decode_leg_takes_the_kv_ids_unchecked(self, b64_on):
+        # The b64 ids are the client's, placeholders not expanded; P's
+        # expanded ids in kv_transfer_params are the prompt.
+        expanded = [101, 9, 9, 9, 102]
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": MESSAGES,
+                PROMPT_TOKEN_IDS_B64: encode([101, 102]),
+                "kv_transfer_params": {
+                    "do_remote_prefill": True,
+                    "prompt_token_ids": expanded,
+                },
+            }
+        )
+        assert req.get_prompt_token_ids(media_decode_leg=True) == expanded
+        with pytest.raises(ValueError, match="disagree"):
+            req.get_prompt_token_ids()
+
 
 class TestEngineInputs:
     def test_sequence_copies_the_array(self):

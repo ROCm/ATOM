@@ -2266,10 +2266,16 @@ async def _chat_completions(
 
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
-        pretokenized = request.get_prompt_token_ids()
+        has_media = _has_multimodal_content(messages)
+        # A media decode leg's client-body b64 ids are not expanded; it runs on
+        # its prefill's ids from kv_transfer_params (`get_prompt_token_ids`).
+        media_decode_leg = has_media and bool(
+            (kv_transfer_params or {}).get("do_remote_prefill")
+        )
+        pretokenized = request.get_prompt_token_ids(media_decode_leg=media_decode_leg)
         # A decode leg takes its prefill's expanded ids; its media went to P.
         # Without P's cache seed its blocks would hash as text: keep the media.
-        is_multimodal = _has_multimodal_content(messages) and not (
+        is_multimodal = has_media and not (
             pretokenized is not None and leaves_media_on_prefill(kv_transfer_params)
         )
         # ATOM_PROMPT_IDS_B64: the caller sent these ids itself, and the PD
@@ -2279,7 +2285,7 @@ async def _chat_completions(
         # A multimodal prefill still echoes: its ids have the image
         # placeholders expanded, which the decode leg needs.
         echo_ids = bool(request.return_token_ids) and not (
-            request.prompt_ids_from_b64() and not is_multimodal
+            request.prompt_ids_from_b64() and not has_media
         )
         if assistant_prefix is not None and (is_multimodal or pretokenized is not None):
             # Only rendered text can be continued.
