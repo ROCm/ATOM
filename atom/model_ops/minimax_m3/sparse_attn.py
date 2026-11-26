@@ -1439,10 +1439,19 @@ def minimax_m3_sparse_attn_decode_asm(
     )
 
 
-@functools.cache
-def _default_plan_task_budget(device) -> int:
-    """Task slots in aiter's default plan, expressed per collapsed KV head."""
-    return 2 * torch.cuda.get_device_properties(device).multi_processor_count
+def _default_plan_budget(q, k_cache) -> int:
+    """The workgroup budget of aiter's default plan for this PA shape (imported on
+    call: only gfx1250 asks, and FlyDSL is optional elsewhere)."""
+    from aiter.ops.flydsl.pa_decode import pa_decode_default_workgroup_budget
+
+    return pa_decode_default_workgroup_budget(
+        q.device,
+        kv_dtype=k_cache.dtype,
+        head_dim=q.shape[-1],
+        block_size=k_cache.shape[3],
+        query_length=1,
+        query_group_size=q.shape[1],
+    )
 
 
 @torch.no_grad()
@@ -1510,7 +1519,7 @@ def sparse_pa_per_row(
         get_gfx_runtime() == "gfx1250"
         and dynamic_partition_plan
         and sparse_bt.shape[-1] * ASM_PAGE_SIZE > context_partition_size
-        and num_seqs < _default_plan_task_budget(q.device)
+        and num_seqs < _default_plan_budget(q_view, k_cache_view)
     )
     # compute_type / scales follow the actual KV-cache dtype (this helper serves
     # both bf16 and fp8); the scale tensor collapses like the cache.

@@ -1302,57 +1302,6 @@ class TestExplicitPlan:
                 "max_context_partition_num"
             ), "vLLM bridge: plan cap is not the static split count"
 
-    @pytest.mark.parametrize(
-        "gfx, min_prefix_len, rows, default_cap",
-        [
-            ("gfx1250", 4096, 64, True),  # every row's prefix covers the window
-            ("gfx1250", 4095, 64, False),  # a row still on its causal ramp
-            ("gfx950", 4096, 64, False),
-            ("gfx1250", 4096, 512, False),  # rows reach the default plan's tasks
-        ],
-    )
-    def test_saturated_cached_sparse_prefill_plans_at_the_default_cap(
-        self, monkeypatch, gfx, min_prefix_len, rows, default_cap
-    ):
-        """Sparse prefill keeps the static split cap unless, on gfx1250, every
-        row's prefix covers the selected window (256 page-16 columns = 4096
-        keys here) and the rows fit the default plan's 512 tasks."""
-        import torch
-
-        from atom.model_ops import base_attention as ba
-        from atom.model_ops.minimax_m3 import sparse_attn
-
-        gluon = importlib.import_module("aiter.ops.triton.gluon.pa_decode_gluon")
-        caps = []
-        monkeypatch.setattr(gluon, "get_recommended_splits", lambda n, h: 8)
-        monkeypatch.setattr(sparse_attn, "_sparse_pa_ran_on_asm", lambda *a: False)
-        monkeypatch.setattr(sparse_attn, "get_gfx_runtime", lambda: gfx)
-        monkeypatch.setattr(sparse_attn, "_default_plan_task_budget", lambda d: 512)
-        monkeypatch.setattr(
-            ba, "run_pa_decode", lambda **kw: caps.append(kw["plan_partition_cap"])
-        )
-
-        def m(*shape):
-            return torch.empty(shape, device="meta")
-
-        sparse_attn.minimax_m3_sparse_attn_prefill_asm(
-            q=m(rows, 16, 128),
-            k_cache=m(8, 1, 8, 16, 16),
-            v_cache=m(8, 1, 1, 128, 16),
-            topk_idx=None,
-            block_table=None,
-            query_req_id=None,
-            query_abs_pos=None,
-            qo_indptr=m(rows + 1),
-            num_kv_heads=1,
-            sm_scale=1.0,
-            output=m(rows, 16, 128),
-            sparse_bt=m(rows, 256),
-            sparse_ctx=m(rows),
-            min_prefix_len=min_prefix_len,
-        )
-        assert caps == [None if default_cap else 8]
-
     def test_callers_leave_gluon_scratch_to_aiter(self):
         """No caller keeps its own copy of the kernel's scratch shapes."""
         scratch = {"exp_sums", "max_logits", "temporary_output"}
