@@ -12,6 +12,7 @@ index lists that build the call from the scheduler's reservations and what
 the forward writes from them.
 """
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -223,7 +224,18 @@ def test_builder_interval_matches_the_block_manager(interval, expected, k3_modul
     )
 
 
-def test_the_builder_hands_the_forward_its_rows(k3_modules):
+@pytest.fixture
+def heads(monkeypatch):
+    """The head re-run's layout: the builder plans no checkpoint split
+    (`test_kda_ckpt_split` covers the blocks it adds)."""
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.model_ops.kimi_k3.kda_ckpt_split",
+        SimpleNamespace(plan_checkpoint_split=lambda targets, batch: None),
+    )
+
+
+def test_the_builder_hands_the_forward_its_rows(k3_modules, heads):
     """`kda_cu` joins the int32 query starts the KDA call is cut by."""
     K3 = k3_modules.builder
     from test_kda_layout_id import builder
@@ -264,7 +276,7 @@ def test_the_builder_hands_the_forward_its_rows(k3_modules):
 
 @pytest.mark.parametrize("tokens", [8192, 32768])
 def test_checkpoint_metadata_transfers_only_small_descriptors(
-    tokens, monkeypatch, k3_modules
+    tokens, monkeypatch, k3_modules, heads
 ):
     builder = SimpleNamespace(
         device="cpu",
@@ -286,7 +298,7 @@ def test_checkpoint_metadata_transfers_only_small_descriptors(
 
 
 def test_finish_prefill_keeps_kda_targets_out_of_gdn_chunk_snapshots(
-    monkeypatch, k3_modules
+    monkeypatch, k3_modules, heads
 ):
     K3 = k3_modules.builder
     from test_kda_layout_id import builder
@@ -547,7 +559,7 @@ def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashKDA needs a GPU")
-def test_a_head_ends_on_the_state_a_forward_ending_there_would(k3_modules):
+def test_a_head_ends_on_the_state_a_forward_ending_there_would(k3_modules, heads):
     """Row 1's checkpoint off FlashKDA's 32-token chunk grid, behind a row
     resuming from a state, the way a mixed step lays them out."""
     attn = k3_modules.model.KimiKDAAttention
