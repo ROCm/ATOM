@@ -5,8 +5,6 @@ from collections import deque
 
 import torch
 
-from atom.utils import hip_copy
-
 
 class _D2HSlot:
     def __init__(self, capacity: int, dtype: torch.dtype):
@@ -68,12 +66,7 @@ class D2HQueue:
                 self.stream.wait_stream(producer)
             else:
                 ready.wait(stream=self.stream)
-            # A plain memcpy: the slot is persistent pinned memory and holds
-            # its source until the copy is waited on (`hip_copy`).
-            if not hip_copy.copy_async(
-                slot.tensor_view, source, hip_copy.D2H, self.stream
-            ):
-                slot.tensor_view.copy_(source, non_blocking=True)
+            slot.tensor_view.copy_(source, non_blocking=True)
             slot.copy_done.record(self.stream)
         slot.source = source
         self._pending.append(slot)

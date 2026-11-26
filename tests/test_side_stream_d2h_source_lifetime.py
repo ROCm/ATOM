@@ -93,8 +93,6 @@ def _forward_done():
 def _processor():
     proc = object.__new__(tokenIDProcessor)
     proc.async_copy_stream = _copy_stream()
-    proc._ids_pinned_ring = [None] * 8
-    proc._ids_pinned_next = 0
     proc._output_request_capacity = BS
     proc.num_spec_tokens = NUM_SPEC
     proc.clean()

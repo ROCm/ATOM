@@ -380,8 +380,6 @@ def test_output_capacity_follows_server_limit_and_warmup_floor(max_num_seqs):
 class _FakeGpuTensor:
     """What send_to_cpu_async sees of a GPU tensor: `.to` makes a host copy."""
 
-    is_cuda = False  # no pinned ring slot: the `.to` copy below
-
     def __init__(self, values):
         self.values = values
 
@@ -401,8 +399,6 @@ def cpu_processor(monkeypatch):
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: mock.MagicMock())
     processor = object.__new__(runner_module.tokenIDProcessor)
     processor.async_copy_stream = mock.Mock()
-    processor._ids_pinned_ring = [None] * 8
-    processor._ids_pinned_next = 0
     processor._output_request_capacity = 4
     processor.num_spec_tokens = 2
     processor.clean()

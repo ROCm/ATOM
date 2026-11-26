@@ -13,7 +13,6 @@ import torch
 
 from atom.model_engine.output_transfer import D2HQueue
 from atom.spec_decode.status import SpecStatusQueue
-from atom.utils import hip_copy
 
 
 @pytest.fixture
@@ -155,7 +154,7 @@ def test_drain_waits_for_every_pending_copy_before_dropping_it(fake_cuda, status
 
 
 @pytest.mark.parametrize("status", [False, True])
-def test_gpu_async_copy_count_and_reuse(monkeypatch, status):
+def test_gpu_async_copy_count_and_reuse(status):
     if os.environ.get("RUN_D2H_GPU_TESTS") != "1":
         pytest.skip("opt-in real asynchronous D2H")
     stream, producer = torch.cuda.Stream(), torch.cuda.Stream()
@@ -184,14 +183,6 @@ def test_gpu_async_copy_count_and_reuse(monkeypatch, status):
         queue.send(source, ready=ready)
     for _ in sources:
         queue.receive()
-    memcpys = []
-    copy_async = hip_copy.copy_async
-
-    def counted(*args):
-        memcpys.append(copy_async(*args))
-        return memcpys[-1]
-
-    monkeypatch.setattr(hip_copy, "copy_async", counted)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU]
     ) as profile:
@@ -199,9 +190,7 @@ def test_gpu_async_copy_count_and_reuse(monkeypatch, status):
             queue.send(source, ready=ready)
         outputs = [queue.receive() for _ in sources]
     op_counts = {event.key: event.count for event in profile.key_averages()}
-    # One plain memcpy a send (every source here is contiguous), no `copy_`.
-    assert memcpys == [True] * len(sources)
-    assert op_counts.get("aten::copy_", 0) == 0
+    assert op_counts.get("aten::copy_", 0) == len(sources)
     assert op_counts.get("aten::empty", 0) == op_counts.get("aten::empty_like", 0) == 0
     for output, source in zip(outputs, sources, strict=True):
         assert_owned_output(output, source.cpu().numpy(), status=status)
