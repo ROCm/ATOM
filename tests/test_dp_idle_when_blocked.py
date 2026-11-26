@@ -621,23 +621,52 @@ def test_sync_reduces_hidden_work_with_the_vote(monkeypatch):
 # ------------------------------- switch ------------------------------------ #
 
 
-@pytest.mark.parametrize(
-    ("env", "delayer", "expected"),
-    [("0", None, False), ("1", None, True), ("1", object(), False)],
+AGGREGATED = SimpleNamespace(kv_transfer_config=None)
+# An offload tier may take `kv_producer` and still run an ordinary engine.
+OFFLOAD_ONLY = SimpleNamespace(
+    kv_transfer_config={"kv_connector": "mooncake_store", "kv_role": "kv_producer"}
 )
-def test_switch(make, monkeypatch, env, delayer, expected):
-    monkeypatch.setenv("ATOM_DP_IDLE_WHEN_BLOCKED", env)
+PREFILL = SimpleNamespace(
+    kv_transfer_config={"kv_connector": "moriio", "kv_role": "kv_producer"}
+)
+DECODE = SimpleNamespace(
+    kv_transfer_config={"kv_connector": "moriio", "kv_role": "kv_consumer"}
+)
+
+
+def _resolve(make, config, delayer=None):
     p = DPEngineCoreProc.__new__(DPEngineCoreProc)
     p.label = "dp0"
     p.scheduler, _ = make()
     p.scheduler.prefill_delayer = delayer
-    assert p._resolve_idle_when_blocked() is expected
+    return p._resolve_idle_when_blocked(config)
 
 
-def test_default_is_off(make, monkeypatch):
-    monkeypatch.delenv("ATOM_DP_IDLE_WHEN_BLOCKED", raising=False)
-    p = DPEngineCoreProc.__new__(DPEngineCoreProc)
-    p.label = "dp0"
-    p.scheduler, _ = make()
-    p.scheduler.prefill_delayer = None
-    assert p._resolve_idle_when_blocked() is False
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [(PREFILL, True), (DECODE, False), (AGGREGATED, False), (OFFLOAD_ONLY, False)],
+)
+@pytest.mark.parametrize("unset", ["delete", "empty"])
+def test_unset_defaults_by_pd_role(make, monkeypatch, config, expected, unset):
+    if unset == "delete":
+        monkeypatch.delenv("ATOM_DP_IDLE_WHEN_BLOCKED", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DP_IDLE_WHEN_BLOCKED", "")
+    assert envs.ATOM_DP_IDLE_WHEN_BLOCKED is None
+    assert _resolve(make, config) is expected
+
+
+@pytest.mark.parametrize("config", [PREFILL, DECODE, AGGREGATED, OFFLOAD_ONLY])
+@pytest.mark.parametrize(("env", "expected"), [("0", False), ("1", True)])
+def test_explicit_value_wins_on_every_role(make, monkeypatch, config, env, expected):
+    monkeypatch.setenv("ATOM_DP_IDLE_WHEN_BLOCKED", env)
+    assert _resolve(make, config) is expected
+
+
+@pytest.mark.parametrize("env", [None, "1"])
+def test_ignored_with_the_prefill_delayer(make, monkeypatch, env):
+    if env is None:
+        monkeypatch.delenv("ATOM_DP_IDLE_WHEN_BLOCKED", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DP_IDLE_WHEN_BLOCKED", env)
+    assert _resolve(make, PREFILL, delayer=object()) is False

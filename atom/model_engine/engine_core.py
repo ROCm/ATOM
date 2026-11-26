@@ -14,6 +14,7 @@ import zmq
 from atom.config import Config
 from atom.distributed.group_agreement import group_max_each
 from atom.kv_transfer.disaggregation import KVOutputAggregator
+from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
@@ -69,6 +70,20 @@ KV_IDLE_DRAIN_INTERVAL_S = 0.001
 BLOCKED_IDLE_SLEEP_S = 0.0005
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
+
+
+def dp_idle_when_blocked(config: Config) -> bool:
+    """Whether `ATOM_DP_IDLE_WHEN_BLOCKED` asks this DP engine to vote only
+    work a pass could forward. An explicit value is used as is, on any role.
+    Unset, it is on only on a P/D prefill instance (`kv_producer`), where an
+    arrival at an idle P otherwise waits out a ~110 ms eager DP dummy behind
+    its own Store lookup; an aggregated server and a decode instance keep the
+    plain vote, as measured. The prefill delayer still turns it off
+    (`DPEngineCoreProc._resolve_idle_when_blocked`)."""
+    enabled = envs.ATOM_DP_IDLE_WHEN_BLOCKED
+    if enabled is None:
+        enabled = disaggregated_kv_role(config) == "kv_producer"
+    return enabled
 
 
 def yield_gil() -> None:
@@ -1129,15 +1144,16 @@ class DPEngineCoreProc(EngineCore):
         self._init_prefill_delayer(config, self.dp_group)
         # `share_cache` routing reads each rank's own prefill backlog.
         self._report_backlog = config.dp_load_balance == "share_cache"
-        self._idle_when_blocked = self._resolve_idle_when_blocked()
+        self._idle_when_blocked = self._resolve_idle_when_blocked(config)
         # Reduced by `_sync_dp_state`: some rank's vote hid unfinished work.
         self._dp_group_hidden_work = False
 
-    def _resolve_idle_when_blocked(self) -> bool:
+    def _resolve_idle_when_blocked(self, config: Config) -> bool:
         """`ATOM_DP_IDLE_WHEN_BLOCKED`: whether this rank reports work to its DP
         group only when a pass could produce a batch (`has_forward_work`).
-        Off with a prefill delayer, whose cadence counts passes."""
-        if not envs.ATOM_DP_IDLE_WHEN_BLOCKED:
+        Defaults by P/D role (`dp_idle_when_blocked`). Off with a prefill
+        delayer, whose cadence counts passes."""
+        if not dp_idle_when_blocked(config):
             return False
         if self.scheduler.prefill_delayer is not None:
             logger.warning(
