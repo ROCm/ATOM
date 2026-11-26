@@ -39,6 +39,7 @@ from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import (
     eplb_append_shared_map_and_record_fused,
+    eplb_gate_permute,
     eplb_map_and_record_fused,
 )
 from atom.model_ops.fused_moe.config import (
@@ -1511,6 +1512,9 @@ def _herd_routing(layer: torch.nn.Module) -> bool:
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
+    # `place_experts` serves ATOM_EPLB_GATE_PERMUTE (`eplb_gate_permute`).
+    eplb_gate_permute_capable = True
+
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
@@ -2192,6 +2196,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layout.num_routed,
                 layer.shared_expert_weight,
             )
+        gate_permute = eplb_gate_permute()
+        if gate_permute is not None:
+            # ATOM_EPLB_GATE_PERMUTE: the gate's rows sit in physical order,
+            # so the routes are physical as they are and nothing remaps them.
+            gate_permute.place(layer, topk_ids)
+            return layer.to_dispatch_space(topk_weights, topk_ids)
         topk_physical = eplb_map_and_record_fused(layer, topk_ids, gathered)
         return layer.to_dispatch_space(topk_weights, topk_physical)
 
@@ -3710,6 +3720,7 @@ class FusedMoE(torch.nn.Module):
         pad_align: int | None = None,
         enable_comm_fused: bool = False,
         mxfp4_fp8_activations: bool = False,
+        enable_eplb: bool = True,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3794,7 +3805,9 @@ class FusedMoE(torch.nn.Module):
             and fuses_mxfp8_shared_into_mxfp4(shared_spec, layer_quant_config)
         )
 
-        eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
+        eplb_enabled = (
+            enable_eplb and self.use_ep and getattr(atom_config, "eplb_enable", False)
+        )
         num_redundant_experts = (
             int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
             if eplb_enabled

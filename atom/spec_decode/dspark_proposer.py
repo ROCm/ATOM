@@ -886,6 +886,13 @@ class DSparkProposer(Drafter):
         label = pass_.label(scheduled_bs, running_bs)
         with record_function(f"propose_dspark[{label} T={num_draft}]"):
             draft_token_ids, confidence = pass_.run(running_bs, **staged)
+        # EPLB's placement of the draft layers (ATOM_EPLB_MTP) samples the
+        # pass where the target sampler took the step.
+        eplb = getattr(self.runner, "_eplb_gate_permute", None)
+        if eplb is not None and eplb.mtp is not None:
+            eplb.mtp.after_draft_replay(
+                (pass_.name, running_bs), scheduled_bs * num_draft
+            )
         draft_token_ids = draft_token_ids[:scheduled_bs, : self.mtp_k]
         # Confidence-scheduled verification. The hardware-aware prefix scheduler
         # consumes the confidence head to pick a per-request verify length

@@ -125,6 +125,7 @@ from atom.model_ops.decode_input_ids import (
     fill_deferred_decode_ids,
 )
 from atom.model_ops.eplb import (
+    eplb_decode_capture,
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
@@ -855,6 +856,8 @@ class ModelRunner:
     # past the target's launch (`prepare_model`).
     verify_head: VerifyHead | None = None
     spec_status_deferred = False
+    # Gate-permute EPLB's runtime, set at init where it is on.
+    _eplb_gate_permute = None
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -1078,7 +1081,11 @@ class ModelRunner:
             # Before warmup's memory profile, so the KV budget counts them.
             self.attn_metadata_builder.build_mixed_prefill_banks()
         self.forward_done_event = torch.cuda.Event()
-        initialize_eplb_runtime(self)
+        # Gate-permute EPLB's runtime (ATOM_EPLB_GATE_PERMUTE), which samples
+        # the decode graphs' replays (`run_model`); None otherwise.
+        self._eplb_gate_permute = getattr(
+            initialize_eplb_runtime(self), "gate_permute", None
+        )
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
@@ -3478,11 +3485,14 @@ class ModelRunner:
                     if self._served is not None:
                         return None
 
-                self.req_graph.replay(
-                    key=request_bucket(
-                        running_bs, forward_context.attn_metadata.max_seqlen_q
-                    )
+                graph_key = request_bucket(
+                    running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
+                self.req_graph.replay(key=graph_key)
+                if self._eplb_gate_permute is not None:
+                    self._eplb_gate_permute.after_decode_replay(
+                        graph_key, context.scheduled_tokens
+                    )
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
                 hidden_states = self.forward_vars["outputs"][:running_tokens]
@@ -4671,9 +4681,10 @@ class ModelRunner:
                         def full_forward(n=running_tokens, pos=model_positions):
                             outputs[:n] = self.model(input_ids[:n], pos)
 
-                        self.req_graph.record(
-                            full_forward, key=request_bucket(bs, max_q_len)
-                        )
+                        graph_key = request_bucket(bs, max_q_len)
+                        # Gate-permute EPLB keeps the recording's top-k ids.
+                        with eplb_decode_capture(graph_key):
+                            self.req_graph.record(full_forward, key=graph_key)
                     torch.cuda.synchronize()
                     # After the sync: the warmup forward's kernels must have
                     # completed before the window closes, or they spill into the

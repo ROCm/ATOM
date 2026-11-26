@@ -1191,6 +1191,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep that expert placement for the rest of the process. Rebalances the
     # balancedness gate skips do not count. 0 (default) = no limit.
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
+    # Gate-permute EPLB / the swap policy: a rebalance planned from fewer
+    # picks than this (prefill and decode, the group's, over the placed
+    # layers) is skipped, and does not count as one. 0 (default) = never.
+    "ATOM_EPLB_MIN_PICKS": lambda: max(0, _int_env("ATOM_EPLB_MIN_PICKS", 0)),
+    # Gate-permute EPLB, diagnostics: rank 0 saves the loads of every
+    # rebalance evaluation as <dir>/window_<seq>.pt.
+    "ATOM_EPLB_DUMP_DIR": lambda: os.getenv("ATOM_EPLB_DUMP_DIR") or None,
+    # Prefill-bearing steps before the first rebalance. Unset = a quarter of
+    # `rebalance_interval`.
+    "ATOM_EPLB_FIRST_REBALANCE_STEPS": lambda: _optional_int_env(
+        "ATOM_EPLB_FIRST_REBALANCE_STEPS", min_value=1
+    ),
+    # DeepSeek-V4.1 under decoder bounded replay: EPLB places every target
+    # layer, the decoder's too (default: the layers before it only).
+    "ATOM_EPLB_ALL_LAYERS": lambda: _flag_env("ATOM_EPLB_ALL_LAYERS"),
+    # Gate-permute EPLB (`atom/model_ops/eplb_gate_permute.py`), R = 0 only:
+    # a rebalance moves the gate's rows with the expert weights, so the router
+    # emits physical ids and no id remap is launched. Load statistics come
+    # from a count launch in prefill passes and from sampled decode replays.
+    "ATOM_EPLB_GATE_PERMUTE": lambda: _flag_env("ATOM_EPLB_GATE_PERMUTE"),
+    # Gate-permute: one decode graph replay in this many is counted.
+    "ATOM_EPLB_DECODE_SAMPLE_EVERY": lambda: (
+        _optional_int_env("ATOM_EPLB_DECODE_SAMPLE_EVERY", min_value=1) or 64
+    ),
+    # Gate-permute EPLB also places the drafter's MoE layers (the DSpark
+    # draft stages of DeepSeek-V4.1), from the identity, on sampled decode
+    # steps alone.
+    "ATOM_EPLB_MTP": lambda: _flag_env("ATOM_EPLB_MTP", "0"),
+    # "shm": experts change rank through files under
+    # /dev/shm/atom_eplb_<uid>_<port> with barriers of the CPU group, and the
+    # loads are summed over the CPU group: EPLB uses no device process group
+    # at all (no redundant experts only). "p2p" (default): device P2P.
+    "ATOM_EPLB_MIGRATE_VIA": lambda: os.getenv("ATOM_EPLB_MIGRATE_VIA", "p2p")
+    .strip()
+    .lower(),
     # --- Structured output ---
     # Hold tool calls to the declared schemas when the tool parser declares a
     # grammar for them (Kimi-K3) and the structured-output backend is available.
