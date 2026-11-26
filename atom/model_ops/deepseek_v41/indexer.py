@@ -17,6 +17,8 @@ import triton.language as tl
 from aiter.ops.topk import top_k_per_row_decode
 from triton.language.extra import libdevice
 
+from .candidate_table import kept_context, lift_candidate_selection
+
 
 def _blocks(width, block_size):
     """Candidate blocks a `width`-column row spans, checking the block is sane."""
@@ -310,11 +312,6 @@ def _block_maxima(logits, visible, maxima, block_size, blocks, tile, packed=None
     return ends
 
 
-# Rows a band may have for `top_k_within_candidates`: its compacted plane is
-# `rows x candidate blocks x block` floats, allocated per band.
-CANDIDATE_TOPK_MAX_ROWS = 1024
-
-
 @triton.jit
 def _gather_candidates_kernel(
     logits,
@@ -334,7 +331,8 @@ def _gather_candidates_kernel(
 
     Candidates are ascending with a `-1` tail and the newest visible block,
     the only partly filled one, is last when kept, so the compacted row is
-    every kept block whole but the last, which runs to the row's end.
+    every kept block whole but the last, which runs to the row's end
+    (`kept_context`, as the candidate table bounds its rows).
     """
     row = tl.program_id(0)
     chunk = tl.program_id(1)
@@ -358,41 +356,49 @@ def _gather_candidates_kernel(
         ids = tl.load(
             candidates + row * candidate_stride + every, every < count, other=-1
         )
-        valid = tl.sum((ids >= 0).to(tl.int32), axis=0)
-        last = tl.max(ids, axis=0)
-        tail = tl.minimum(end - last * BLOCK, BLOCK)
-        tl.store(lengths + row, tl.where(valid > 0, (valid - 1) * BLOCK + tail, 0))
+        tl.store(lengths + row, kept_context(ids, end.to(tl.int32), BLOCK))
 
 
-def top_k_within_candidates(logits, starts, ends, candidates, block_size, out, k):
+_GATHER_CHUNK = 64
+
+
+def candidate_topk_launch(count):
+    """`_gather_candidates_kernel`'s launch constants for `count` candidate
+    blocks a row: its chunks per row and the padded count. Fixed for a
+    layer's run, so a caller with many bands works them out once."""
+    return triton.cdiv(count, _GATHER_CHUNK), triton.next_power_of_2(count)
+
+
+def top_k_within_candidates(
+    logits, starts, ends, candidates, block_size, out, k, plane, lengths, launch=None
+):
     """Each packed row's top-k (`out`, ascending compressed-row ids, `-1`
     padded) taken over the candidate blocks the row just picked off the same
     logits, rather than over its whole row.
 
-    The same selection: every one of a row's top-k scores lies in a block
-    whose best score is at least the k-th, and fewer than `k` blocks can
-    have a best score above it. The row keeps its newest block and its best
-    others by that score, more than `k` blocks in all, so the kept blocks
-    hold every top-k score. Ties at the k-th score resolve alike too: the
-    block pick and the top-k both keep the smallest index first, so the
+    The same selection, for finite scores: every one of a row's top-k scores
+    lies in a block whose best score is at least the k-th, and fewer than `k`
+    blocks can have a best score above it. The row keeps its newest block and
+    its best others by that score, more than `k` blocks in all, so the kept
+    blocks hold every top-k score. Ties at the k-th score resolve alike too:
+    the block pick and the top-k both keep the smallest index first, so the
     blocks holding the earliest tied scores are kept. Kept blocks are
     ascending, so a compacted column order is the row's, and the stable
-    top-k orders its output as it would on the whole row.
+    top-k orders its output as it would on the whole row. (The block maxima
+    skip NaN and cap +inf at the largest finite float, where the whole-row
+    top-k sees the raw values.)
 
     `logits` is the flat packed buffer (row r at `starts[r]`, visible to
     `ends[r]`), `candidates` the rows' `pick_candidate_blocks_packed` output.
+    `plane` (`[rows, count * block_size]` fp32) and `lengths` (`[rows]`
+    int32) are scratch (`ScoreWorkspace.candidate_scratch`); `launch` is
+    `candidate_topk_launch(count)`, worked out here when not given.
     """
-    from .candidate_table import lift_candidate_selection
-
     rows, count = candidates.shape
     assert count > k, "the kept blocks need not hold the whole top-k"
-    plane = torch.empty(
-        rows, count * block_size, dtype=torch.float32, device=logits.device
-    )
-    lengths = torch.empty(rows, dtype=torch.int32, device=logits.device)
+    chunks, padded = candidate_topk_launch(count) if launch is None else launch
     if rows:
-        chunk = 64
-        _gather_candidates_kernel[(rows, triton.cdiv(count, chunk))](
+        _gather_candidates_kernel[(rows, chunks)](
             logits,
             starts,
             ends,
@@ -403,8 +409,8 @@ def top_k_within_candidates(logits, starts, ends, candidates, block_size, out, k
             plane.stride(0),
             count,
             BLOCK=block_size,
-            CHUNK=chunk,
-            COUNT=triton.next_power_of_2(count),
+            CHUNK=_GATHER_CHUNK,
+            COUNT=padded,
         )
     top_k_per_row_decode(
         plane, 1, lengths, out, rows, plane.stride(0), 1, k=k, stable=True

@@ -243,11 +243,22 @@ def _packed_workspace(capacity):
     maxima = torch.full(
         (capacity // PAGE,), float("nan"), dtype=torch.float32, device="cuda"
     )
+    # The compacted candidate plane (`candidate_scratch`): 16 rows of 64
+    # blocks, NaN too.
+    rows, blocks = 16, 64
     workspace = SimpleNamespace(
         packed=True, capacity=capacity, block_rows=PAGE,
         packed_logits=lambda: logits, packed_maxima=lambda: maxima,
+        candidate_rows=rows,
+        _candidate_plane=torch.full(
+            (rows * blocks * PAGE,), float("nan"), device="cuda"
+        ),
+        _candidate_lengths=torch.full((rows,), -7, dtype=torch.int32, device="cuda"),
     )  # fmt: skip
     workspace.pack = lambda *rows: ScoreWorkspace.pack(workspace, *rows)
+    workspace.candidate_scratch = lambda *a: ScoreWorkspace.candidate_scratch(
+        workspace, *a
+    )
     return workspace
 
 
@@ -510,6 +521,8 @@ def test_fp4_packed_candidate_source_takes_its_top_k_inside_its_picks(capacity):
     want, got = score(None), score(packed)
     assert torch.equal(got[0], want[0])
     assert torch.equal(got[1], want[1])
+    # It took the compacted top-k, on the workspace's plane.
+    assert int(workspace._candidate_lengths[0]) >= 0
 
 
 @pytest.mark.parametrize("levels", [0, 3])
@@ -549,7 +562,9 @@ def test_top_k_within_candidates_selects_what_the_whole_row_does(levels):
         -(-width // block) * block,
     )  # fmt: skip
     got = torch.empty(rows, k, dtype=torch.int32, device="cuda")
-    top_k_within_candidates(logits, starts, ends, chosen, block, got, k)
+    plane = torch.full((rows, keep * block), float("nan"), device="cuda")
+    lengths = torch.full((rows,), -7, dtype=torch.int32, device="cuda")
+    top_k_within_candidates(logits, starts, ends, chosen, block, got, k, plane, lengths)
     want = torch.empty_like(got)
     top_k_per_row_decode(
         logits, 1, ends, want, rows, 0, 1, k=k, stable=True,
