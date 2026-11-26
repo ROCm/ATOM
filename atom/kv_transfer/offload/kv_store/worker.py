@@ -60,7 +60,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from functools import partial
@@ -84,6 +84,7 @@ from atom.kv_transfer.offload.kv_store.keys import (
     draft_ranks,
 )
 from atom.kv_transfer.offload.kv_store.pool import (
+    _MIN_WINDOWS_PER_REGION,
     Slot,
     SlotPoolExhausted,
     TransferSlotPool,
@@ -276,6 +277,20 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 "(OFFLOAD_COPY_WORKERS=1)"
             )
         self._sender = Sender(self) if self._save_batch_chunks else None
+        self._load_pipeline = envs.ATOM_STORE_LOAD_PIPELINE
+        if self._load_pipeline not in (0, 1, 2):
+            raise ValueError("ATOM_STORE_LOAD_PIPELINE needs 0, 1 or 2")
+        if self._load_pipeline == 2 and not self.STAGES_ON_FORWARD_STREAM:
+            # A load reported at enqueue is ordered before its readers only
+            # when the unpack runs on the stream they run on.
+            raise ValueError("ATOM_STORE_LOAD_PIPELINE=2 needs copies on the forward stream")
+        # Unpacks one load thread may leave queued while it gets the next
+        # window: its share of the region (`TransferSlotPool.window`) less the
+        # window it acquires, so the threads never wait on each other's slots.
+        share = max(_MIN_WINDOWS_PER_REGION, self.load_workers) // self.load_workers
+        self._unpack_depth = max(0, share - 1) if self._load_pipeline else 0
+        # Every load thread's queued unpacks, for `close` to settle.
+        self._all_pending_unpacks: list[deque] = []
         if self._sender is not None:  # the serial path keeps `_do_save_req` as is
             self._do_save_req = self._do_save_pipelined
         timeout = self._store_cfg.save_abandon_timeout_s
@@ -477,6 +492,9 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             gpu_connector.close()
         pool, self._pool = self._pool, None
         if pool is not None:
+            # The executors are joined: no load thread touches these any more.
+            for pending in self._all_pending_unpacks:
+                self._settle_unpacks(pool, 0, pending)
             pool.close()
         client, self._client = self._client, None
         if client is not None and client_idle:
@@ -492,6 +510,15 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
 
     def set_forward_stream(self, stream: Any) -> None:
         if stream is not None and self.STAGES_ON_FORWARD_STREAM:
+            if (
+                self._load_pipeline == 2
+                and self._forward_stream is not None
+                and stream != self._forward_stream
+            ):
+                raise RuntimeError(
+                    "ATOM_STORE_LOAD_PIPELINE=2 needs one forward stream: a load "
+                    "reported at enqueue is ordered before its readers by that stream"
+                )
             self._forward_stream = stream
 
     def register_kv_caches(
@@ -1043,14 +1070,16 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         )
         failure = detail = None
         windows_run = loaded_chunks = in_place_windows = 0
-        get_ms = unpack_ms = 0.0
+        get_ms = unpack_ms = settle_ms = 0.0
+        # Looked for once before the first get. The look after the last get
+        # (below) is what keeps a mark placed while this load ran from
+        # passing; a look before every get only stopped such a load sooner.
+        refusal = self._load_refusal(client)
+        if refusal is not None:
+            failure, detail = "store_distrusted", refusal
+            windows = []
         for window in windows:
-            # Checked before every get: a save thread may give up a put
-            # while this load runs, and the store may be marked meanwhile.
-            refusal = self._load_refusal(client)
-            if refusal is not None:
-                failure, detail = "store_distrusted", refusal
-                break
+            settle_ms += self._settle_unpacks(pool, self._unpack_depth)
             try:
                 slots = pool.acquire("load", len(window))
             except SlotPoolExhausted as exc:
@@ -1085,14 +1114,16 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 if run is not None:
                     chunk_stride_bytes = pool.slot_stride
             t_unpack0 = time.perf_counter()
+            ticket = None
             try:
                 if run is not None:
-                    self._copy_in_place(
+                    ticket = self._copy_in_place(
                         run,
                         window,
                         req.block_ids,
                         pack=False,
                         chunk_stride_bytes=chunk_stride_bytes,
+                        fence=not self._load_pipeline,
                     )
                     in_place_windows += 1
                 else:
@@ -1103,17 +1134,29 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                         block_ids=req.block_ids,
                     )
             except BaseException:
+                self._settle_unpacks(pool, 0)
                 self._release_once_device_idle(pool, slots)
                 raise
             unpack_ms += (time.perf_counter() - t_unpack0) * 1000
-            # Both paths synchronized before returning: the slots are idle.
-            pool.release(slots)
+            if ticket is None:
+                # Synchronized before returning: the slots are idle.
+                pool.release(slots)
+            else:
+                # Queued on the forward's stream; the slots return once it ran.
+                self._pending_unpacks().append((slots, *ticket))
             loaded_chunks += len(window)
         draft = _DraftTransfer()
         if failure is None:
             failure, detail = self._load_draft_chunks(
                 req, self._draft_chunks_of(req, first, end), draft
             )
+        if self._load_pipeline == 1 or failure is not None:
+            # Reported once the device ran every unpack. With 2 the load is
+            # reported at enqueue: every reader of its blocks (the request's
+            # prefill, a save, the P/D gather behind its ready event) is
+            # ordered after the unpacks on the forward's stream, and only
+            # the slots wait, until the next load or `close` settles them.
+            settle_ms += self._settle_unpacks(pool, 0)
         if failure is None:
             # And once after the last get: a mark placed while a get ran is
             # one the look before it missed, and that get may have read what
@@ -1137,8 +1180,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             logger.info(
                 "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d retrieved=%d "
                 "status=%s chunks=%d windows=%d in_place_windows=%d total_bytes=%d "
-                "get_ms=%.2f unpack_ms=%.2f retrieve_ms=%.2f total_ms=%.2f "
-                "effective_gbps=%.2f" + self._draft_prof(draft, put=False),
+                "get_ms=%.2f unpack_ms=%.2f settle_ms=%.2f retrieve_ms=%.2f "
+                "total_ms=%.2f effective_gbps=%.2f" + self._draft_prof(draft, put=False),
                 self._rank,
                 req.req_id,
                 hbm,
@@ -1151,6 +1194,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 total_bytes,
                 get_ms,
                 unpack_ms,
+                settle_ms,
                 retrieve_ms,
                 (time.perf_counter() - t_total0) * 1000,
                 total_bytes / retrieve_ms / 1e6 if retrieve_ms > 0 else 0.0,
@@ -1270,10 +1314,13 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         windows = _head_first_windows(
             chunks.start, chunks.stop, pool.window("load", self.load_workers)
         )
+        # Once before the draft gets: a mark placed during a target get stops
+        # them; the caller's look after the last get still decides the load.
+        refusal = self._load_refusal(client)
+        if refusal is not None:
+            return "store_distrusted", refusal
         for window in windows:
-            refusal = self._load_refusal(client)
-            if refusal is not None:
-                return "store_distrusted", refusal
+            draft.unpack_ms += self._settle_unpacks(pool, self._unpack_depth)
             try:
                 slots = pool.acquire("load", len(window))
             except SlotPoolExhausted as exc:
@@ -1295,12 +1342,22 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 return "draft_get_failed", problem
             t_unpack0 = time.perf_counter()
             try:
-                self._copy_draft_chunks(slots, window, req.block_ids, pack=False)
+                ticket = self._copy_draft_chunks(
+                    slots,
+                    window,
+                    req.block_ids,
+                    pack=False,
+                    fence=not self._load_pipeline,
+                )
             except BaseException:
+                self._settle_unpacks(pool, 0)
                 self._release_once_device_idle(pool, slots)
                 raise
             draft.unpack_ms += (time.perf_counter() - t_unpack0) * 1000
-            pool.release(slots)
+            if ticket is None:
+                pool.release(slots)
+            else:
+                self._pending_unpacks().append((slots, *ticket))
             draft.chunks += len(window)
             draft.nbytes += self._draft_chunk_bytes * len(window)
         return None, None
@@ -1313,22 +1370,24 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         *,
         pack: bool,
         producer_event: Any = None,
-    ) -> None:
+        fence: bool = True,
+    ) -> Any:
         """Pack `window`'s draft rows into the head of each slot, or restore them;
-        a run of slots restores in one launch at the pool's slot stride."""
+        a run of slots restores in one launch at the pool's slot stride. Returns
+        what `_copy_in_place` returns for that launch, else None (fenced)."""
         codec = self._draft_codec
         strided = not pack and getattr(codec, "supports_strided_restore", False)
         run = self._pool.strided_view(slots) if strided else None
         if run is not None:
-            self._copy_in_place(
+            return self._copy_in_place(
                 run,
                 window,
                 block_ids,
                 pack=False,
                 chunk_stride_bytes=self._pool.slot_stride,
                 codec=codec,
+                fence=fence,
             )
-            return
         stream = self._in_place_stream()
         if producer_event is not None:
             stream.wait_event(producer_event)
@@ -1344,6 +1403,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         for index, slot in enumerate(slots):
             copy(slot.tensor[: self._draft_chunk_bytes], owner, index, stream=stream)
         atom_lmcache_staging.fence_submitted_work(stream)
+        return None
 
     def _draft_prof(self, draft: _DraftTransfer, *, put: bool) -> str:
         """The draft fields a PROF line of a draft rank appends."""
@@ -1391,13 +1451,17 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         producer_event: Any = None,
         chunk_stride_bytes: int | None = None,
         codec: Any = None,
-    ) -> None:
+        fence: bool = True,
+    ) -> Any:
         """Pack ``window``'s KV blocks into ``run``, or unpack it into them.
         With ``chunk_stride_bytes``, ``run`` holds padded Store slots and is
         unpacked in place; each slot's padding is skipped, not read. ``codec``
         is the target's unless given (a draft window's draft codec).
 
-        Returns once the copy is done. A pack is ordered after
+        Returns once the copy is done (None). Without ``fence`` it returns as
+        soon as the copy is queued, with ``(event, owner)``: the event marks
+        its end on the stream, and ``owner`` (the uploaded block ids) must be
+        kept until the event has completed. A pack is ordered after
         ``producer_event`` like the staged pack, so the kernels that produced
         the KV finish first.
         """
@@ -1428,7 +1492,52 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             codec.chunk_major_device_buffer_to_gpu_prepared(
                 run, owner, 0, stream=stream
             )
-        atom_lmcache_staging.fence_submitted_work(stream)
+        if fence:
+            atom_lmcache_staging.fence_submitted_work(stream)
+            return None
+        return self._record_done(stream), owner
+
+    @staticmethod
+    def _record_done(stream: Any) -> Any:
+        """An event at the current end of ``stream``."""
+        done = torch.cuda.Event(blocking=False)
+        done.record(stream)
+        return done
+
+    def _pending_unpacks(self) -> deque:
+        """This load thread's queued unpacks: ``(slots, event, owner)``, oldest first."""
+        pending = getattr(self._in_place_tls, "pending", None)
+        if pending is None:
+            pending = self._in_place_tls.pending = deque()
+            with self._stats_lock:
+                self._all_pending_unpacks.append(pending)
+        return pending
+
+    def _settle_unpacks(
+        self, pool: TransferSlotPool, keep: int, pending: deque | None = None
+    ) -> float:
+        """Return the slots of every queued unpack the device has run, and wait
+        for the oldest ones until at most ``keep`` are left. Milliseconds waited.
+
+        An event that cannot be waited on leaves its slots quarantined.
+        """
+        pending = self._pending_unpacks() if pending is None else pending
+        waited = 0.0
+        while pending:
+            slots, done, _owner = pending[0]
+            if len(pending) <= keep and not done.query():
+                break
+            t0 = time.perf_counter()
+            try:
+                done.synchronize()
+            except Exception:  # noqa: BLE001  # the slots stay out of use
+                logger.exception("%s: a queued unpack did not fence", self.LABEL)
+                pool.quarantine(slots, reason="a queued unpack did not fence")
+            else:
+                pool.release(slots)
+            waited += (time.perf_counter() - t0) * 1000
+            pending.popleft()
+        return waited
 
     # -- distrust -----------------------------------------------------------
     def _refuse_loads(self, why: str) -> bool:
