@@ -1177,7 +1177,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     # Ignored on MegaMoE's MoRI dispatch (MoRI v2 DP+EP, stage 1 not fused)
     # without EPLB, where the shared MLP stays separate: that dispatch gives
-    # wrong output for LOCAL_REPLICA rows (ROCm/aiter#TBD).
+    # wrong output for LOCAL_REPLICA rows (ROCm/aiter#8734).
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
     ),

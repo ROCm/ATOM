@@ -41,7 +41,7 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # EPLB always fuses: its shared expert is an ordinary routed expert.
     # Otherwise it is a LOCAL_REPLICA, fused when the env asks, except on
     # MegaMoE's MoRI dispatch, which gives wrong output for its rows
-    # (ROCm/aiter#TBD); the compact dispatch fuses it.
+    # (ROCm/aiter#8734); the compact dispatch fuses it.
     requested_all2all = getattr(config, "moe_all2all_backend", "auto")
     mori_selected = (
         requested_all2all in {"auto", "mori"}
