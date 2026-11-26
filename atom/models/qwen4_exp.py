@@ -17,7 +17,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from torch import nn
 
 from atom.config import Config, get_current_atom_config
-from atom.distributed.sequence_parallel import SequenceParallel as _SequenceParallel
+from atom.distributed.sequence_parallel import SequenceParallel
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fused_moe.expert_layout import zero_pad_tail
@@ -56,6 +56,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.quant_spec import LayerQuantConfig, will_online_requant
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -752,6 +753,29 @@ class Qwen4ExpLinearAttention(nn.Module):
             return self.out_proj(x, x_scale=x_scale)
         core_attn_out = self.norm(core_attn_out, z)
         return self.out_proj(core_attn_out)
+
+
+class _SequenceParallel(SequenceParallel):
+    """Qwen hyper-connection sharding policy over shared TP row operations."""
+
+    @classmethod
+    def maybe(cls, num_tokens: int) -> "_SequenceParallel | None":
+        """Sharding for a forward of `num_tokens`, or None to stay replicated:
+        no TP, below `ATOM_QWEN4_EXP_SP_MIN_TOKENS`, or under graph capture.
+        The target model adds its own fused-quant floor
+        (`Qwen4ExpModel._sequence_parallel`); the MTP drafter, whose unfused
+        hyper-connections never quantize, uses this gate as is."""
+        min_tokens = envs.ATOM_QWEN4_EXP_SP_MIN_TOKENS
+        if (
+            min_tokens <= 0
+            or num_tokens < min_tokens
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return None
+        return cls(num_tokens, tp_size, get_tensor_model_parallel_rank())
 
 
 class Qwen4ExpDecoderLayer(nn.Module):

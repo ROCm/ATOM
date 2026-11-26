@@ -104,7 +104,6 @@ class _Stub(nn.Module):
 
 @pytest.fixture(autouse=True)
 def stub_block_parts(monkeypatch):
-    monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "0")
     empty_like = torch.empty_like
 
     def poisoned_empty_like(*args, **kwargs):
@@ -194,7 +193,7 @@ def _base_and_op_target(ranks, tokens, target=None):
     return ranks(on_rank)
 
 
-@pytest.mark.parametrize("tokens", [8, 13, 1027])
+@pytest.mark.parametrize("tokens", [8192, 8197])
 def test_row_sharded_pair_sums_to_the_base_pair(ranks, monkeypatch, tokens):
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
     results = _base_and_op_target(ranks, tokens)
@@ -209,7 +208,7 @@ def test_row_sharded_pair_sums_to_the_base_pair(ranks, monkeypatch, tokens):
 
 def test_forward_with_dual_stream_off_takes_the_row_sharded_tail(ranks, monkeypatch):
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
-    tokens = 13
+    tokens = 8197
     for (routed, shared), (summed, zeros), up_rows in _base_and_op_target(
         ranks, tokens, lambda block, x: block.forward(x)
     ):
@@ -225,7 +224,7 @@ def test_forward_with_tbo_enabled_keeps_the_base_pair(
 ):
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
     stub_block_parts.enable_tbo = True
-    tokens = 13
+    tokens = 8197
     for (routed, shared), (routed_out, shared_out), up_rows in _base_and_op_target(
         ranks, tokens, lambda block, x: block.forward(x)
     ):
@@ -234,17 +233,10 @@ def test_forward_with_tbo_enabled_keeps_the_base_pair(
 
 
 @pytest.mark.parametrize(
-    "floor,sharded",
-    [(None, False), ("14", False), ("13", True)],
-    ids=["default-floor", "below-floor", "at-floor"],
+    "tokens,sharded", [(8191, False), (8192, True)], ids=["below-floor", "at-floor"]
 )
-def test_row_floor(ranks, monkeypatch, floor, sharded):
+def test_row_floor(ranks, monkeypatch, tokens, sharded):
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
-    if floor is None:
-        monkeypatch.delenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS")
-    else:
-        monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", floor)
-    tokens = 13
     for (routed, shared), (first, second), up_rows in _base_and_op_target(
         ranks, tokens, lambda block, x: block.forward(x)
     ):
@@ -256,15 +248,15 @@ def test_row_floor(ranks, monkeypatch, floor, sharded):
 @pytest.mark.parametrize(
     "threshold,capturing,tbo_step",
     [
-        ("13", False, False),
-        ("14", False, False),
+        ("8197", False, False),
+        ("8198", False, False),
         ("4", True, False),
         ("4", False, True),
     ],
     ids=["at-threshold", "below-threshold", "graph-capture", "tbo-step"],
 )
 def test_base_pair_kept_bit_for_bit(ranks, monkeypatch, threshold, capturing, tbo_step):
-    tokens = 13
+    tokens = 8197
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", threshold)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     monkeypatch.setattr(ubatching, "tbo_active", lambda: tbo_step)
@@ -432,7 +424,7 @@ def _base_forward(layer, x, bank, add, add2):
 
 
 @pytest.mark.parametrize("layer_num", [4, 5], ids=["block-closes", "mid-block"])
-@pytest.mark.parametrize("tokens", [8, 13, 1027])
+@pytest.mark.parametrize("tokens", [8192, 8197])
 def test_row_sharded_layer_sums_to_the_base(logged, monkeypatch, tokens, layer_num):
     layers = _layers(layer_num)
     inputs = _inputs(tokens)
@@ -476,7 +468,7 @@ def test_row_sharded_layer_sums_to_the_base(logged, monkeypatch, tokens, layer_n
 
 @pytest.mark.parametrize(
     "threshold,capturing,tbo_step",
-    [("13", False, False), ("4", True, False), ("4", False, True)],
+    [("8197", False, False), ("4", True, False), ("4", False, True)],
     ids=["at-threshold", "graph-capture", "tbo-step"],
 )
 @pytest.mark.parametrize("layer_num", [4, 5], ids=["block-closes", "mid-block"])
@@ -487,26 +479,21 @@ def test_base_kernels_launch_in_order(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     monkeypatch.setattr(ubatching, "tbo_active", lambda: tbo_step)
     layers = _layers(layer_num)
-    inputs = _inputs(13)
+    inputs = _inputs(8197)
     base = logged(
         lambda rank: _base_forward(layers[rank], *(x.clone() for x in inputs))
     )
     got = logged(lambda rank: layers[rank](None, *(x.clone() for x in inputs)))
     for (want, want_log), (out, log) in zip(base, got):
         assert log == want_log
-        assert log.count(("all_reduce", 13)) == 3
+        assert log.count(("all_reduce", 8197)) == 3
         assert all(torch.equal(a, b) for a, b in zip(out, want))
 
 
-@pytest.mark.parametrize("floor", [None, "14"], ids=["default-floor", "below-floor"])
-def test_below_row_floor_all_reduces(logged, monkeypatch, floor):
+def test_below_row_floor_all_reduces(logged, monkeypatch):
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
-    if floor is None:
-        monkeypatch.delenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS")
-    else:
-        monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", floor)
     layers = _layers(BLOCK + 1)
-    inputs = _inputs(13)
+    inputs = _inputs(8191)
     base = logged(
         lambda rank: _base_forward(layers[rank], *(x.clone() for x in inputs))
     )
@@ -517,25 +504,21 @@ def test_below_row_floor_all_reduces(logged, monkeypatch, floor):
 
 
 @pytest.mark.parametrize(
-    "tokens,threshold,floor,expected",
+    "tokens,threshold,expected",
     [
-        (8191, None, None, False),
-        (8192, None, None, True),
-        (8192, "8192", None, False),
-        (8193, "8192", None, True),
+        (8191, None, False),
+        (8192, None, True),
+        (8192, "8192", False),
+        (8193, "8192", True),
     ],
 )
 def test_row_gate_intersects_floor_and_strict_stream_threshold(
-    ranks, monkeypatch, tokens, threshold, floor, expected
+    ranks, monkeypatch, tokens, threshold, expected
 ):
-    for name, value in [
-        ("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", threshold),
-        ("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", floor),
-    ]:
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
+    if threshold is None:
+        monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", threshold)
     assert (
         kimi.KimiSparseMoeBlock.takes_row_tail(SimpleNamespace(tp_size=WORLD), tokens)
         is expected

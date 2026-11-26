@@ -16,8 +16,6 @@ _LIB = Library("atom_kimi_column_dataflow_test", "FRAGMENT")
 
 @pytest.fixture(scope="module")
 def modules():
-    if os.getenv("ATOM_TEST_COLUMN_GATHER_DISTRIBUTED") == "1":
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     with atom_without_aiter() as load:
         yield SimpleNamespace(
             model=load("atom.models.kimi_k3.model"),
@@ -731,10 +729,20 @@ def test_gpu_peer_word_layout_and_replay(modules, monkeypatch, tokens, banks, qu
         assert torch.all(owner.epochs[:tokens] == epoch)
 
 
-def test_distributed_column_gather_stress(modules, monkeypatch):
-    """Run with torchrun and an outer timeout; every rank must enter this test."""
-    if os.getenv("ATOM_TEST_COLUMN_GATHER_DISTRIBUTED") != "1":
-        pytest.skip("requires an explicitly coordinated multi-GPU run")
+def test_distributed_column_gather_stress(request, monkeypatch):
+    r"""Select this node on every rank, with an outer timeout::
+
+        timeout 300s torchrun --standalone --nproc-per-node=8 -m pytest -q \
+            tests/models/test_kimi_k3_column_gather.py::test_distributed_column_gather_stress
+    """
+    if (
+        not torch.cuda.is_available()
+        or int(os.getenv("WORLD_SIZE", "1")) <= 1
+        or "LOCAL_RANK" not in os.environ
+    ):
+        pytest.skip("requires a coordinated multi-GPU torchrun launch")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    modules = request.getfixturevalue("modules")
     dist = torch.distributed
     created = not dist.is_initialized()
     if created:

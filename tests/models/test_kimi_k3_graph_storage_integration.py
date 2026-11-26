@@ -244,12 +244,11 @@ def test_row_tail_keeps_capture_and_its_warmup_on_the_same_path(
         "get_forward_context": lambda: SimpleNamespace(in_hipgraph=warming),
         "envs": SimpleNamespace(
             ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0,
-            ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS=8192,
         ),
     }
     _load(
         "atom/models/kimi_k3/model.py",
-        {"KimiSparseMoeBlock"},
+        {"KimiSparseMoeBlock", "_MOE_ROW_SHARD_MIN_TOKENS"},
         namespace,
         {"takes_row_tail"},
     )

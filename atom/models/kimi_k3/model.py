@@ -96,6 +96,9 @@ from atom.utils.region_graph import (
     token_graph,
 )
 
+# Keep the conservative floor: the sharded tail changes BF16 addition order.
+_MOE_ROW_SHARD_MIN_TOKENS = 8192
+
 
 def _text_config(config):
     return getattr(config, "text_config", config)
@@ -717,7 +720,7 @@ class KimiSparseMoeBlock(nn.Module):
         return (
             self.tp_size > 1
             and num_tokens > envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-            and num_tokens >= envs.ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS
+            and num_tokens >= _MOE_ROW_SHARD_MIN_TOKENS
             and not get_forward_context().in_hipgraph
             and not torch.cuda.is_current_stream_capturing()
             and not tbo_active()
