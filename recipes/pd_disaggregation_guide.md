@@ -125,9 +125,14 @@ GPU memory and does not need this setting.
   `ib_hca_count - 1`, skipping missing devices and duplicates.
 - `ib_hca_count` defaults to `8` and must be positive when automatic alternate
   HCA selection is enabled. It is an index range to scan, not a guarantee that
-  eight HCAs will be selected. Automatic selection checks `rdmaN`, then
-  `ionic_N`, for each physical GPU/HCA index; GPU masking is resolved through
-  `HIP_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES`.
+  eight HCAs will be selected. The scan checks `rdmaN`, then `ionic_N`, for
+  each index.
+- The GPU-local HCA is the ACTIVE HCA sharing the GPU's PCIe switch in sysfs,
+  found from the PCI address of the GPU the rank drives, so `*_VISIBLE_DEVICES`
+  masks need no mapping. It is not `rdma<GPU index>`: HIP numbers GPUs in KFD
+  order, not PCI order (HIP GPU 0 of an MI355X node can be bus `0x75`, behind
+  `rdma3`). Where the topology names no single HCA, startup fails and asks for
+  `ib_device`.
 - An explicit `ib_device` in the connector config, or
   `ATOM_MOONCAKE_IB_DEVICE` in the environment, overrides automatic selection.
   Comma-separated lists are trimmed and deduplicated; the first device is used

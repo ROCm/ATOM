@@ -1365,6 +1365,19 @@ def test_requester_device_shares_the_owner_nic_of_its_own_pool(node):
     assert nic.requester_rdma_device(0, cfg) == "rdma3"
 
 
+def test_requester_device_names_its_override_when_the_topology_cannot_tell(
+    tmp_path, monkeypatch
+):
+    pci, ib = _make_node(tmp_path, inactive={"rdma3"})
+    monkeypatch.setattr(nic, "gpu_pci_bdf", lambda index: f"0000:{GPU_BDF[index]}:00.0")
+    real = nic.rail_rdma_device
+    monkeypatch.setattr(
+        nic, "rail_rdma_device", lambda bdf: real(bdf, ib_root=ib, pci_root=pci)
+    )
+    with pytest.raises(ValueError, match=r"cannot tell .*; set mooncake_store\.rdma_"):
+        nic.requester_rdma_device(0, _nic_cfg())
+
+
 def test_parse_device_list():
     assert nic.parse_device_list(" rdma0, ,rdma1,") == ["rdma0", "rdma1"]
     assert nic.parse_device_list("") == []

@@ -62,7 +62,10 @@ def requester_rdma_device(device_index: int, cfg: Any) -> str:
         origin = "mooncake_store.rdma_devices"
     else:
         bdf = gpu_pci_bdf(device_index)
-        device = rail_rdma_device(bdf)
+        try:
+            device = rail_rdma_device(bdf)
+        except ValueError as exc:
+            raise ValueError(f"{exc}; set mooncake_store.rdma_devices") from None
         origin = f"the PCI topology of GPU {device_index} ({bdf})"
     if not (_IB_SYSFS_ROOT / device).exists():
         raise ValueError(f"RDMA device {device!r} from {origin} does not exist")
@@ -143,8 +146,7 @@ def rail_rdma_device(
         found = ", ".join(f"{n}:{s}" for n, s in sorted(closeness.items()))
         raise ValueError(
             f"cannot tell GPU {gpu_bdf}'s NIC from the PCI topology (ACTIVE "
-            f"devices and shared path depth: {found or 'none'}); set "
-            "mooncake_store.rdma_devices"
+            f"devices and shared path depth: {found or 'none'})"
         )
     return closest[0]
 

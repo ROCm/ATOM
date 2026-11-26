@@ -105,6 +105,7 @@ from atom.kv_transfer.disaggregation.types import (
     pair_units,
     produced_no_handoff,
 )
+from atom.kv_transfer.offload.mooncake_store.nic import gpu_pci_bdf, rail_rdma_device
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
 from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
@@ -252,13 +253,21 @@ def _ib_device_exists(device_name: str) -> bool:
     return (_IB_SYSFS_ROOT / device_name).exists()
 
 
-def _auto_select_ib_device(phys_idx: int) -> str:
-    # Older environments expose paired HCAs as rdmaN. Spur MI350 fabric exposes
-    # them as ionic_N, so try ionic_N only when rdmaN is not present.
-    rdma_device = f"rdma{phys_idx}"
+def _auto_select_ib_device(gpu_bdf: str) -> str:
+    """The ACTIVE HCA behind the GPU's PCIe switch (HIP's order is not PCI order)."""
+    try:
+        return rail_rdma_device(gpu_bdf)
+    except ValueError as exc:
+        raise ValueError(f"{exc}; set ib_device or ATOM_MOONCAKE_IB_DEVICE") from None
+
+
+def _numbered_ib_device(index: int) -> str:
+    # Older environments expose HCAs as rdmaN. Spur MI350 fabric exposes them
+    # as ionic_N, so try ionic_N only when rdmaN is not present.
+    rdma_device = f"rdma{index}"
     if _ib_device_exists(rdma_device):
         return rdma_device
-    ionic_device = f"ionic_{phys_idx}"
+    ionic_device = f"ionic_{index}"
     if _ib_device_exists(ionic_device):
         return ionic_device
     return rdma_device
@@ -276,7 +285,7 @@ def _parse_ib_devices(configured_devices: str) -> list[str]:
 def _select_ib_devices(
     protocol: str,
     configured_devices: str,
-    phys_idx: int | None,
+    gpu_bdf: str | None,
     *,
     enable_alternate_hca: bool = False,
     hca_count: int = 8,
@@ -286,16 +295,16 @@ def _select_ib_devices(
         return []
     if configured_devices:
         return _parse_ib_devices(configured_devices)
-    if phys_idx is None:
-        raise ValueError("physical GPU index is required for RDMA device selection")
+    if gpu_bdf is None:
+        raise ValueError("the GPU's PCI address is required for RDMA device selection")
 
-    primary = _auto_select_ib_device(phys_idx)
+    primary = _auto_select_ib_device(gpu_bdf)
     devices = [primary]
     if enable_alternate_hca:
         if hca_count <= 0:
             raise ValueError("ib_hca_count must be a positive integer")
         for idx in range(hca_count):
-            device = _auto_select_ib_device(idx)
+            device = _numbered_ib_device(idx)
             if device not in devices and _ib_device_exists(device):
                 devices.append(device)
     return devices
@@ -386,7 +395,7 @@ def _validate_matched_rails(
 
 
 def _select_ib_device(
-    protocol: str, configured_device: str, phys_idx: int | None
+    protocol: str, configured_device: str, gpu_bdf: str | None
 ) -> str:
     """Resolve the Mooncake device filter without enabling RDMA for TCP.
 
@@ -396,7 +405,7 @@ def _select_ib_device(
     choice. RDMA-family transports retain the existing configured/automatic
     device selection.
     """
-    return ",".join(_select_ib_devices(protocol, configured_device, phys_idx))
+    return ",".join(_select_ib_devices(protocol, configured_device, gpu_bdf))
 
 
 def _configure_mooncake_transport(protocol: str) -> None:
@@ -1164,10 +1173,8 @@ class MooncakeConnector(KVConnectorBase):
         # Determine which RDMA device this TP rank should use. TCP is
         # intentionally initialized with an empty device filter so Mooncake
         # cannot activate an available HCA as an alternate path.
-        # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
-        # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
-        # By default, register only with the local NIC. Alternate-HCA mode
-        # registers a single engine on multiple NICs. On rail-isolated fabrics,
+        # By default, register only with the GPU's PCIe-local NIC. Alternate-HCA
+        # mode registers a single engine on multiple NICs. On rail-isolated fabrics,
         # matched-rail mode instead selects a single-HCA engine per request.
         _configure_mooncake_transport(self.protocol)
         configured_ib_device = kv_transfer_config.get(
@@ -1177,26 +1184,14 @@ class MooncakeConnector(KVConnectorBase):
             kv_transfer_config.get("ib_enable_alternate_hca", False)
         )
         hca_count = int(kv_transfer_config.get("ib_hca_count", 8))
-        phys_idx: int | None = None
+        gpu_bdf: str | None = None
         if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
-            visible_idx = torch.cuda.current_device()
-            # ROCR first, for the reason in numa_utils._physical_index: it
-            # filters before HIP, so a ROCR-only mask must not fall through to
-            # the identity mapping.
-            visible_env = (
-                os.environ.get("ROCR_VISIBLE_DEVICES")
-                or os.environ.get("HIP_VISIBLE_DEVICES")
-                or os.environ.get("CUDA_VISIBLE_DEVICES")
-            )
-            if visible_env:
-                visible_list = [d for d in visible_env.split(",") if d != ""]
-                phys_idx = int(visible_list[visible_idx])
-            else:
-                phys_idx = visible_idx
+            # The GPU this rank drives, whatever *_VISIBLE_DEVICES masks it.
+            gpu_bdf = gpu_pci_bdf(torch.cuda.current_device())
         ib_devices = _select_ib_devices(
             self.protocol,
             configured_ib_device,
-            phys_idx,
+            gpu_bdf,
             enable_alternate_hca=enable_alternate_hca,
             hca_count=hca_count,
         )
@@ -1213,11 +1208,9 @@ class MooncakeConnector(KVConnectorBase):
             logger.info("Mooncake TCP selected; RDMA device selection is disabled")
         elif not configured_ib_device:
             logger.info(
-                "Auto-selecting RDMA devices %s for physical GPU %d "
-                "(visible_idx=%d, tp_rank=%d)",
+                "Auto-selecting RDMA devices %s for GPU %s (tp_rank=%d)",
                 ib_device,
-                phys_idx,
-                visible_idx,
+                gpu_bdf,
                 self.tp_rank,
             )
 
