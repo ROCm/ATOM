@@ -40,7 +40,7 @@ def b64_on(monkeypatch):
 
 @pytest.fixture
 def b64_off(monkeypatch):
-    monkeypatch.delenv("ATOM_PROMPT_IDS_B64", raising=False)
+    monkeypatch.setenv("ATOM_PROMPT_IDS_B64", "0")
 
 
 class TestDecode:
@@ -69,6 +69,24 @@ class TestDecode:
 
 
 class TestRequestModel:
+    def test_default_is_on(self, monkeypatch):
+        monkeypatch.delenv("ATOM_PROMPT_IDS_B64", raising=False)
+        req = ChatCompletionRequest.model_validate(
+            {"messages": MESSAGES, PROMPT_TOKEN_IDS_B64: encode(PROMPT_IDS)}
+        )
+        assert req.prompt_ids_from_b64()
+        assert req.get_prompt_token_ids().tolist() == PROMPT_IDS
+
+    def test_default_without_the_field_is_unchanged(self, monkeypatch):
+        monkeypatch.delenv("ATOM_PROMPT_IDS_B64", raising=False)
+        req = ChatCompletionRequest.model_validate(
+            {"messages": MESSAGES, "prompt_token_ids": PROMPT_IDS}
+        )
+        assert not req.prompt_ids_from_b64()
+        assert req.get_prompt_token_ids() == PROMPT_IDS
+        bare = ChatCompletionRequest.model_validate({"messages": MESSAGES})
+        assert bare.get_prompt_token_ids() is None
+
     def test_off_ignores_the_field_as_before(self, b64_off):
         req = ChatCompletionRequest.model_validate(
             {"messages": MESSAGES, PROMPT_TOKEN_IDS_B64: encode(PROMPT_IDS)}

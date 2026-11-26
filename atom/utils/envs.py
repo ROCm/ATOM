@@ -1394,8 +1394,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read a chat request's `prompt_token_ids_b64` (base64 of uint32 LE, from
     # the exact-tokenizer front's ATOM_FRONT_IDS_B64) instead of a JSON id
     # list, and do not echo those ids back to the PD router (it already sends
-    # the same field to decode). "0": the field is ignored.
-    "ATOM_PROMPT_IDS_B64": lambda: os.getenv("ATOM_PROMPT_IDS_B64", "0") == "1",
+    # the same field to decode). A request without the field is unchanged.
+    # "0": the field is ignored.
+    "ATOM_PROMPT_IDS_B64": lambda: os.getenv("ATOM_PROMPT_IDS_B64", "1") == "1",
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
