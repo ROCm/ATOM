@@ -17,6 +17,7 @@ import httpx
 import pytest
 from PIL import Image
 
+from atom import structured_output
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.images import MAX_IMAGES, NO_FILES_API
 from atom.entrypoints.openai.serving_anthropic import (
@@ -223,9 +224,10 @@ class TestAnthropicTranslation:
                 {"type": "text", "text": "b"},
             ]
         )
+        # Tool results first: they answer the call before this message.
         assert messages == [
-            {"role": "user", "content": "a\nb"},
             {"role": "tool", "tool_call_id": "t1", "content": "x\ny"},
+            {"role": "user", "content": "a\nb"},
         ]
 
 
@@ -374,6 +376,8 @@ class TestResponsesEndpoint:
             seen.append(kwargs["multimodal"])
 
         monkeypatch.setattr(api_server, "_configure_structured_output", configure)
+        # Setup is stubbed; the backend need not be installed.
+        monkeypatch.setattr(structured_output, "available", lambda: True)
         monkeypatch.setattr(
             api_server, "validate_responses_output", lambda *a, **kw: None
         )
@@ -503,8 +507,8 @@ class TestMessagesEndpoint:
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_a_pd_handoff_with_images_is_refused(server, stream):
-    """A prefill leg cannot hand an image request off: 400 on either leg,
-    before anything is fetched."""
+    """Only Chat Completions hands an image request from prefill to decode:
+    Responses and Messages answer one with 400, before anything is fetched."""
     handoff = {"kv_transfer_params": {"do_remote_decode": True}, "stream": stream}
     responses = _responses({"input": _user_image(), **handoff})
     messages = _messages([_base64_image()], **handoff)

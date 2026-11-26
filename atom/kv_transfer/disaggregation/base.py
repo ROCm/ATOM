@@ -19,9 +19,12 @@ Two roles are defined:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+
+if TYPE_CHECKING:
+    from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
 
 
 class KVConnectorBase(ABC):
@@ -83,6 +86,13 @@ class KVConnectorBase(ABC):
     def publish_prefill_chunks(self, batch: Any) -> None:
         """Publish completed prefill chunks; no-op without chunked P/D transfer."""
 
+    def note_state_stages(self, stages: dict) -> None:
+        """The runner just copied these (live slot, transfer slot) pairs on this
+        stream. Only handed to a connector with state transfer slots."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no state transfer slots to stage into"
+        )
+
     def get_finished_recv_blocks(self) -> list[int]:
         """Return block IDs from recently completed receives for GPU memory fence.
 
@@ -91,6 +101,16 @@ class KVConnectorBase(ABC):
         blocks that need a GPU-side read-write cycle to ensure coherence.
         """
         return []
+
+    def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory | None:
+        """Provide the paged KV pool's memory, or None to leave it to the runner.
+
+        A connector that takes the pool over (`atom/kv_transfer/pool`) returns a
+        `KVPoolMemory`: where the bytes come from, how they divide into blocks
+        and when the device has finished writing them. Asked once, before the
+        pool is allocated. Transfer and offload connectors keep None.
+        """
+        return None
 
 
 class KVConnectorSchedulerBase(ABC):
@@ -149,6 +169,13 @@ class KVConnectorSchedulerBase(ABC):
 
     supports_pd_admission = False
 
+    def stage_state_for_send(self, seq: Any, src_slot: int, dst_slot: int) -> None:
+        """Have the workers copy a finished request's state into its transfer
+        slot before its push. Only asked when transfer slots were sized."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no state transfer slots to stage into"
+        )
+
     def pd_receive_block_offset(
         self, seq: Any, num_blocks: int, num_cached_blocks: int
     ) -> int | None:
@@ -173,6 +200,25 @@ class KVConnectorSchedulerBase(ABC):
     def update_state_after_alloc(self, seq: Any) -> None:
         """Update internal state after the scheduler allocates blocks."""
         ...
+
+    def make_block_pool(
+        self,
+        config: Any,
+        num_blocks: int,
+        *,
+        on_evict: Any = None,
+        on_remap: Any = None,
+        cache_policy: str = "lru",
+        protected_ratio: float = 0.5,
+        reserve_null_block: bool = False,
+    ) -> KVBlockPool | None:
+        """Provide the scheduler's block pool, or None for ATOM's own.
+
+        The counterpart of `KVConnectorBase.kv_pool_memory`: a `KVBlockPool`
+        deciding which block a request gets and what is evicted, over memory
+        the worker side provided. Asked once, while `BlockManager` is built.
+        """
+        return None
 
     def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Preserve completions unless the backend consumes chunked P/D metadata."""
