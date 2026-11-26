@@ -268,7 +268,13 @@ class CountingTower(VisionModel):
         return super().get_vision_embeddings(values, grids)
 
 
-EC_PARAMS = {"session": "192.0.2.7:17000", "cache_seed": 9, "rows": 9, "length": 36}
+EC_PARAMS = {
+    "transport": "mooncake",
+    "key": 9,
+    "rows": 9,
+    "dtype": "float32",
+    "mooncake": {"session": "192.0.2.7:17000", "address": 64, "length": 36},
+}
 
 
 def run_chunks(model, cache, data, read, width=4):
@@ -356,62 +362,111 @@ def test_read_rows_get_the_span_row_check():
     assert model.calls == 0
 
 
-def test_runner_builds_one_reader_for_its_first_rows(monkeypatch):
+def _runner(max_model_len=1000, hidden_size=6, kv_transfer_config=None):
+    return SimpleNamespace(
+        ec_readers={},
+        device="cuda:3",
+        config=SimpleNamespace(
+            max_model_len=max_model_len,
+            hf_config=SimpleNamespace(hidden_size=hidden_size),
+            kv_transfer_config=kv_transfer_config,
+        ),
+    )
+
+
+def _read_with(monkeypatch, create_reader, runner, *handles):
+    with atom_without_aiter() as load:
+        ec_transfer = load("atom.ec_transfer")
+        monkeypatch.setattr(ec_transfer, "create_reader", create_reader)
+        model_runner = load("atom.model_engine.model_runner")
+        model_runner_cls = model_runner.ModelRunner
+        runner._ec_reader = model_runner_cls._ec_reader.__get__(runner)
+        return [
+            model_runner_cls.read_image_embeddings(runner, h, 9, torch.bfloat16)
+            for h in handles
+        ]
+
+
+def test_runner_builds_one_reader_per_transport_for_its_first_rows(monkeypatch):
     built = []
 
     class FakeReader:
-        def __init__(self, size_bytes, device, *, max_bytes):
-            built.append((size_bytes, device, max_bytes))
+        def __init__(self):
             self.answers = [torch.ones(2, 3), None]
 
-        def read(self, params, cache_seed, dtype):
-            assert cache_seed == 9 and dtype == torch.bfloat16
+        def get(self, handle, key, dtype):
+            assert key == 9 and dtype == torch.bfloat16
             return self.answers.pop(0)
 
-    runner = SimpleNamespace(
-        ec_reader=None,
-        device="cuda:3",
-        config=SimpleNamespace(
-            max_model_len=1000, hf_config=SimpleNamespace(hidden_size=6)
-        ),
+    def create_reader(transport, size_bytes, device, **options):
+        built.append((transport, size_bytes, device, options))
+        return FakeReader()
+
+    kv = {"ib_device": "rocep139s0"}
+    first, second = _read_with(
+        monkeypatch,
+        create_reader,
+        _runner(kv_transfer_config=kv),
+        {**EC_PARAMS, "rows": 3},
+        {**EC_PARAMS, "rows": 900},
     )
-    with atom_without_aiter() as load:
-        ec_transport = load("atom.kv_transfer.disaggregation.mooncake.ec_transport")
-        monkeypatch.setattr(ec_transport, "EcReader", FakeReader)
-        read = load("atom.model_engine.model_runner").ModelRunner.read_image_embeddings
-        first = read(runner, EC_PARAMS, 9, torch.bfloat16)
-        second = read(runner, {**EC_PARAMS, "length": 9000}, 9, torch.bfloat16)
 
     assert torch.equal(first, torch.ones(2, 3)) and second is None
-    # The first request's rows, growing to rows of `hidden_size` bf16 values
-    # for every token of the longest prompt.
-    assert built == [(36, "cuda:3", 1000 * 6 * 2)]
+    # The first request's rows of `hidden_size` bf16 values, growing to every
+    # token of the longest prompt; the KV connector's HCA options go along.
+    assert built == [
+        (
+            "mooncake",
+            3 * 6 * 2,
+            "cuda:3",
+            {"max_bytes": 1000 * 6 * 2, "kv_transfer_config": kv},
+        )
+    ]
 
 
 def test_runner_reader_never_starts_past_the_longest_prompt(monkeypatch):
     built = []
 
     class FakeReader:
-        def __init__(self, size_bytes, device, *, max_bytes):
-            built.append((size_bytes, max_bytes))
-
-        def read(self, *_args):
+        def get(self, *_args):
             return None
 
-    runner = SimpleNamespace(
-        ec_reader=None,
-        device="cuda:0",
-        config=SimpleNamespace(
-            max_model_len=10, hf_config=SimpleNamespace(hidden_size=6)
-        ),
-    )
-    with atom_without_aiter() as load:
-        ec_transport = load("atom.kv_transfer.disaggregation.mooncake.ec_transport")
-        monkeypatch.setattr(ec_transport, "EcReader", FakeReader)
-        read = load("atom.model_engine.model_runner").ModelRunner.read_image_embeddings
-        read(runner, {**EC_PARAMS, "length": 1 << 30}, 9, torch.bfloat16)
+    def create_reader(transport, size_bytes, device, **options):
+        built.append((size_bytes, options["max_bytes"]))
+        return FakeReader()
 
+    _read_with(
+        monkeypatch,
+        create_reader,
+        _runner(max_model_len=10),
+        {**EC_PARAMS, "rows": 1 << 30},
+    )
     assert built == [(120, 120)]
+
+
+def test_reader_that_cannot_start_falls_back_to_the_tower_once(monkeypatch, caplog):
+    attempts = []
+
+    def create_reader(transport, *_args, **_kwargs):
+        attempts.append(transport)
+        raise RuntimeError("Mooncake is not installed")
+
+    runner = _runner()
+    with caplog.at_level("WARNING", logger="atom"):
+        got = _read_with(monkeypatch, create_reader, runner, EC_PARAMS, EC_PARAMS)
+
+    assert got == [None, None]
+    # Built once: a transport that cannot start is not retried per request.
+    assert attempts == ["mooncake"] and runner.ec_readers == {"mooncake": None}
+    assert "Mooncake is not installed" in caplog.text
+
+
+@pytest.mark.parametrize("handle", [None, "x", {}, {"transport": 3}])
+def test_handle_without_a_transport_runs_the_tower(monkeypatch, handle):
+    def create_reader(*_args, **_kwargs):
+        raise AssertionError("no reader for a handle without a transport")
+
+    assert _read_with(monkeypatch, create_reader, _runner(), handle) == [None]
 
 
 @pytest.mark.parametrize(
@@ -425,10 +480,11 @@ def test_ranks_take_e_rows_only_when_every_read_succeeded(
     agreed = []
 
     class FakeReader:
-        def read(self, *_args):
+        def get(self, *_args):
             return rows if local else None
 
-    runner = SimpleNamespace(ec_reader=FakeReader())
+    runner = SimpleNamespace(ec_readers={"mooncake": FakeReader()})
+    runner._ec_reader = lambda handle, _dtype: runner.ec_readers["mooncake"]
     with atom_without_aiter() as load:
         model_runner = load("atom.model_engine.model_runner")
         monkeypatch.setattr(model_runner, "_forward_cpu_groups", lambda: ("tp", "pcp"))
@@ -448,8 +504,19 @@ def test_ranks_take_e_rows_only_when_every_read_succeeded(
     assert agreed[0][0] == local
 
 
-@pytest.mark.parametrize("ec_params", [None, EC_PARAMS])
-def test_chat_request_puts_ec_params_into_multimodal_data(monkeypatch, ec_params):
+@pytest.mark.parametrize(
+    "ec_params, accept, reaches_engine",
+    [
+        (None, True, False),
+        (EC_PARAMS, True, True),
+        # A client may reach P directly: its handle is dropped unless the
+        # server was started to take them.
+        (EC_PARAMS, False, False),
+    ],
+)
+def test_chat_request_puts_ec_params_into_multimodal_data(
+    monkeypatch, ec_params, accept, reaches_engine
+):
     import asyncio
 
     import httpx
@@ -478,6 +545,7 @@ def test_chat_request_puts_ec_params_into_multimodal_data(monkeypatch, ec_params
         "_get_multimodal_processor": lambda: object(),
         "_prepare_multimodal_inputs": lambda *_args: ([1, 2, 3], payload()),
         "generate_async_multimodal": generate,
+        "accept_ec_transfer_params": accept,
     }.items():
         monkeypatch.setattr(api_server, name, value)
     image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
@@ -494,4 +562,4 @@ def test_chat_request_puts_ec_params_into_multimodal_data(monkeypatch, ec_params
             return await client.post("/v1/chat/completions", json=body)
 
     assert asyncio.run(post()).status_code == 200
-    assert seen[0].get("ec_transfer_params") == ec_params
+    assert seen[0].get("ec_transfer_params") == (ec_params if reaches_engine else None)

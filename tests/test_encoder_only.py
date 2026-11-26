@@ -9,10 +9,8 @@ import base64
 import ctypes
 import io
 import sys
-import types
 from types import SimpleNamespace
 from typing import ClassVar
-from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -21,24 +19,7 @@ from PIL import Image
 from safetensors.torch import save_file
 from torch import nn
 
-# The pool's module imports the KV connector, which imports aiter's parallel
-# state: stub what a CPU runner lacks, as tests/test_ec_transport.py does.
-_stubbed = []
-for _name in ("aiter", "aiter.dist", "aiter.dist.parallel_state"):
-    if _name not in sys.modules:
-        sys.modules[_name] = types.ModuleType(_name)
-        sys.modules[_name].__path__ = []
-        _stubbed.append(_name)
-for _fn in ("get_dp_group", "get_tp_group"):
-    if not hasattr(sys.modules["aiter.dist.parallel_state"], _fn):
-        setattr(sys.modules["aiter.dist.parallel_state"], _fn, MagicMock())
-
-from atom.kv_transfer.disaggregation.mooncake import ec_transport as ec
-from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
-
-if "aiter" in _stubbed:
-    del sys.modules["aiter"]
-
+from atom.ec_transfer import mooncake as ec
 from atom.entrypoints.openai import api_server
 from atom.model_engine import encoder_only
 from atom.model_engine.arg_utils import EngineArgs
@@ -102,9 +83,9 @@ def _encoder():
 def server(monkeypatch):
     """An encoder-only app; the model's processor returns two images' spans."""
     sessions = {}
-    monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
+    monkeypatch.setattr(ec, "MOONCAKE_AVAILABLE", True)
     monkeypatch.setattr(
-        mc, "TransferEngine", lambda: FakeEngine(sessions), raising=False
+        ec, "TransferEngine", lambda: FakeEngine(sessions), raising=False
     )
     monkeypatch.setattr(ec, "get_ip", lambda: "192.0.2.7")
     monkeypatch.setenv("ATOM_MOONCAKE_IB_DEVICE", "rocep139s0")
@@ -130,7 +111,7 @@ def server(monkeypatch):
     )
 
     def make(pool_bytes=1 << 16, encoder=None):
-        pool = ec.EcPool(pool_bytes, "cpu")
+        pool = ec.MooncakeEcWriter(pool_bytes, "cpu")
         server_encoder = encoder_only.EncoderOnly(
             config, encoder or _encoder(), pool, "cpu"
         )
@@ -187,11 +168,12 @@ def test_two_image_request_answers_with_ec_transfer_params(server):
     _conversation, media, data = server.prepared[0]
     assert len(media["image"]) == 2
     assert params["rows"] == sum(count for _, count in SPANS)
-    assert params["cache_seed"] == multimodal_cache_seed(data)
+    assert params["transport"] == "mooncake"
+    assert params["key"] == multimodal_cache_seed(data)
 
     # The pool holds the tower's output for P to read.
-    reader = ec.EcReader(1 << 12, "cpu")
-    rows = reader.read(params, params["cache_seed"], torch.float32)
+    reader = ec.MooncakeEcReader(1 << 12, "cpu")
+    rows = reader.get(params, params["key"], torch.float32)
     assert torch.equal(rows, data["pixel_values"] * 2)
 
 

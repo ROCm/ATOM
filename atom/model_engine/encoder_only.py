@@ -5,8 +5,9 @@
 
 The server builds a model's vision modules alone on one GPU and loads their
 weights, skipping the language model's. Each image request is encoded on one
-thread, in arrival order, into an ``EcPool`` that a prefill server reads; the
-chat handler answers with the pool's ``ec_transfer_params``.
+thread, in arrival order, into an ``atom.ec_transfer`` writer (Mooncake) that
+a prefill server reads; the chat handler answers with the writer's handle as
+``ec_transfer_params``.
 """
 
 import asyncio
@@ -102,7 +103,7 @@ class EncoderOnly:
         self,
         config: Config,
         encoder: nn.Module,
-        pool: Any,
+        pool: Any,  # an atom.ec_transfer.EcWriter
         device: torch.device | str,
     ) -> None:
         self.config = config
@@ -114,7 +115,7 @@ class EncoderOnly:
 
     async def encode(self, data: dict[str, Any]) -> dict[str, Any]:
         """``ec_transfer_params`` for ``data`` as ``_prepare_multimodal_inputs``
-        built it. Raises ``EcPoolFull`` when the pool has no room past its
+        built it. Raises ``EcStoreFull`` when the pool has no room past its
         leases."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._thread, self._encode, data)
@@ -140,7 +141,7 @@ class EncoderOnly:
 def create_encoder_only(config: Config) -> EncoderOnly:
     """Build and load the vision modules on GPU 0, then give the pool what
     ``gpu_memory_utilization`` of the GPU leaves."""
-    from atom.kv_transfer.disaggregation.mooncake.ec_transport import EcPool
+    from atom.ec_transfer import create_writer
 
     arch = config.hf_config.architectures[0]
     build = VISION_BUILDERS.get(arch)
@@ -171,4 +172,6 @@ def create_encoder_only(config: Config) -> EncoderOnly:
             f"{total >> 20} MiB are in use after the vision modules"
         )
     logger.info("Encoder-only: %d MiB embedding pool", pool_bytes >> 20)
-    return EncoderOnly(config, encoder, EcPool(pool_bytes, device), device)
+    return EncoderOnly(
+        config, encoder, create_writer("mooncake", pool_bytes, device), device
+    )
