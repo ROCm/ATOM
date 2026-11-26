@@ -1366,8 +1366,7 @@ class KimiKDAAttention(nn.Module):
         if kda_metadata.num_prefills == 0 and getattr(kda_metadata, "replayssm", False):
             num_seqs = kda_metadata.num_decodes or kda_metadata.num_spec_decodes
         fused = (
-            envs.ATOM_KIMI_K3_KDA_FUSED_DECODE
-            and num_seqs > 0
+            num_seqs > 0
             and (kda_metadata.num_decodes > 0) != (kda_metadata.num_spec_decodes > 0)
             and hd == 128
             and self.conv_kernel_size == 4

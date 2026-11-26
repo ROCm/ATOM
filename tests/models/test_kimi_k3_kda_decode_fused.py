@@ -24,7 +24,6 @@ def modules():
 
 def layer_case(modules, monkeypatch, verify=False, glm=False, hd=128):
     kimi, replay = modules.kimi, modules.replay
-    monkeypatch.delenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", raising=False)
     monkeypatch.setattr(kimi, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(kimi, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -175,7 +174,7 @@ def test_conv_weight_rank_is_rejected_before_kernel_launch(modules, monkeypatch)
 @pytest.mark.parametrize("verify", [False, True], ids=["decode", "verify"])
 def test_fallback_passes_pool_owned_flush_resources(modules, monkeypatch, verify):
     c = layer_case(modules, monkeypatch, verify=verify)
-    monkeypatch.setenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", "0")
+    monkeypatch.setattr(modules.kimi, "get_cu_num", lambda: 5)
     for _ in range(2):
         c.attn._forward_impl(c.hidden)
     assert len(c.calls.split) == 2 and not c.calls.fused
@@ -190,8 +189,6 @@ def test_constructed_layer_routes_views_and_slots_to_real_api(
     modules, monkeypatch, verify, glm
 ):
     c = layer_case(modules, monkeypatch, verify, glm)
-    if verify:
-        monkeypatch.setenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", "1")
     cursor = c.meta.write_pos.clone()
     out = c.attn._forward_impl(c.hidden)
     assert len(c.calls.fused) == 1
@@ -238,7 +235,6 @@ def test_constructed_layer_routes_views_and_slots_to_real_api(
 @pytest.mark.parametrize(
     "reason",
     [
-        "off",
         "wave",
         "arch",
         "classic",
@@ -263,9 +259,7 @@ def test_unsupported_steps_execute_existing_path(modules, monkeypatch, reason):
     c = layer_case(
         modules, monkeypatch, verify=True, hd=64 if reason == "head" else 128
     )
-    if reason == "off":
-        monkeypatch.setenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", "0")
-    elif reason == "wave":
+    if reason == "wave":
         monkeypatch.setattr(modules.kimi, "get_cu_num", lambda: 5)
     elif reason == "arch":
         monkeypatch.setattr(modules.kimi, "get_gfx_runtime", lambda: "gfx1250")
@@ -309,12 +303,11 @@ def test_unsupported_steps_execute_existing_path(modules, monkeypatch, reason):
     torch.testing.assert_close(out, torch.full_like(out, 3))
 
 
-@pytest.mark.parametrize("rank,enabled", [(0, True), (1, True), (0, False)])
-def test_wave_fallback_logs_geometry_once(modules, monkeypatch, caplog, rank, enabled):
+@pytest.mark.parametrize("rank", [0, 1])
+def test_wave_fallback_logs_geometry_once(modules, monkeypatch, caplog, rank):
     c = layer_case(modules, monkeypatch, verify=True)
     c.attn.tp_size, c.attn.tp_rank = 2, rank
     monkeypatch.setattr(modules.kimi, "get_cu_num", lambda: 5)
-    monkeypatch.setenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", "1" if enabled else "0")
     report = modules.kimi._log_kda_wave_fallback
     report.cache_clear()
     try:
@@ -326,7 +319,7 @@ def test_wave_fallback_logs_geometry_once(modules, monkeypatch, caplog, rank, en
         messages = [
             r.getMessage() for r in caplog.records if "one-wave guard" in r.getMessage()
         ]
-        if rank == 0 and enabled:
+        if rank == 0:
             assert messages == [
                 (
                     "Fused KDA uses split fallback: one-wave guard "

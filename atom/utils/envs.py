@@ -834,10 +834,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # always accumulates in fp32.  fp16 over bf16 when narrowing: the state is
     # O(1), so bf16's range buys nothing and its short mantissa costs accuracy.
     "ATOM_GDN_SSM_DTYPE": lambda: os.getenv("ATOM_GDN_SSM_DTYPE", "fp32").lower(),
-    # Fuse the qualified ReplaySSM KDA decode/verify conv, f_b and recurrence.
-    "ATOM_KIMI_K3_KDA_FUSED_DECODE": lambda: (
-        os.getenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", "1").lower() == "1"
-    ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),
