@@ -52,6 +52,11 @@ class _Sized:
         return self._n
 
 
+def _shuffled(t, flag=True):
+    t.is_shuffled = flag
+    return t
+
+
 def _fake_moe(**over):
     gate_w = nn.Parameter(torch.zeros(1, 1))
     gate_w.weight_loader = lambda param, w, *a, **k: None
@@ -59,6 +64,9 @@ def _fake_moe(**over):
         quant_method=_qm(),
         num_fused_shared_experts=0,
         swiglu_limit=7.0,
+        top_k=dm.TOPK,
+        scoring_func="sigmoid",
+        use_ep=False,
         w13_weight=torch.empty(dm.E * 2 * dm.I * dm.H // 2, dtype=torch.uint8),
         w2_weight=torch.empty(dm.E * dm.H * dm.I // 2, dtype=torch.uint8),
         w13_weight_scale=torch.empty(dm.E * 2 * dm.I * dm.H // 32, dtype=torch.uint8),
@@ -68,11 +76,11 @@ def _fake_moe(**over):
         getattr(ex, n).is_shuffled = True
     sh = SimpleNamespace(
         gate_up_proj=SimpleNamespace(
-            weight=torch.empty(2 * dm.I, dm.H, dtype=torch.float8_e4m3fn),
+            weight=_shuffled(torch.empty(2 * dm.I, dm.H, dtype=torch.float8_e4m3fn)),
             weight_scale=torch.empty(2 * dm.I, dm.H // 32, dtype=torch.uint8),
         ),
         down_proj=SimpleNamespace(
-            weight=torch.empty(dm.H, dm.I, dtype=torch.float8_e4m3fn),
+            weight=_shuffled(torch.empty(dm.H, dm.I, dtype=torch.float8_e4m3fn)),
             weight_scale=torch.empty(dm.H, dm.I // 32, dtype=torch.uint8),
         ),
         swiglu_alpha=1.702,
@@ -113,6 +121,14 @@ def test_supported_layer_passes_the_gate():
         lambda m: setattr(m.experts, "swiglu_limit", 6.0),
         lambda m: setattr(m.shared_experts, "swiglu_alpha", 1.0),
         lambda m: setattr(m.experts.w13_weight, "is_shuffled", False),
+        lambda m: setattr(m.shared_experts.gate_up_proj.weight, "is_shuffled", False),
+        lambda m: setattr(m.shared_experts.down_proj.weight, "is_shuffled", False),
+        lambda m: setattr(m.experts, "top_k", 8),
+        lambda m: setattr(m.experts, "scoring_func", "softmax"),
+        lambda m: setattr(m.experts, "use_ep", True),
+        lambda m: setattr(m.shared_experts, "swiglu_limit", None),
+        lambda m: setattr(m.shared_experts, "swiglu_alpha", None),
+        lambda m: setattr(m.experts, "swiglu_limit", None),
         lambda m: setattr(m.experts, "w2_weight", torch.empty(4, dtype=torch.uint8)),
         lambda m: setattr(
             m.shared_experts.down_proj,
@@ -227,3 +243,42 @@ def test_split_layout_probe():
     assert not dm.split_layout_supported(
         SimpleNamespace(get_plan=lambda n, asm=True: n)
     )
+
+
+def test_weight_discard_sleep_drops_the_views_and_keeps_the_default_path(caplog):
+    layer = _dispatch_layer_obj()
+    assert layer.ready
+    layer.release_weight_memory()
+    assert not layer.ready and layer.w13 is None and layer.ss2 is None
+    layer.resume_weight_memory()
+    assert not layer.runs(16)
+    # the memory manager finds the hooks
+    assert hasattr(layer, "resume_weight_memory")
+
+
+def _dispatch_layer_obj():
+    layer = dm.DecodeMoe(_fake_moe(), "sleep")
+    layer.ready = True
+    for n in ("gate", "gate_lines", "bias", "w13", "s13", "w2", "s2", "sw13", "sw2"):
+        setattr(layer, n, torch.zeros(1))
+    layer.ss13 = layer.ss2 = torch.zeros(1)
+    return layer
+
+
+@pytest.mark.parametrize(
+    "rows,chain", [(1, False), (7, False), (8, True), (128, True), (129, False)]
+)
+def test_model_forward_decides_the_fallback_outside_the_op(monkeypatch, rows, chain):
+    from atom.models.minimax_m3 import model as m
+
+    layer = _dispatch_layer_obj()
+    ops = []
+    monkeypatch.setattr(
+        m.decode_moe, "decode_moe_op", lambda x, name: ops.append(rows) or x
+    )
+    moe = SimpleNamespace(
+        decode_moe=layer, default_forward=lambda x: torch.full_like(x, 7)
+    )
+    x = torch.zeros(rows, dm.H, dtype=torch.bfloat16)
+    out = m.MiniMaxM3MoE.forward(moe, x)
+    assert bool(ops) == chain and (chain or bool((out == 7).all()))

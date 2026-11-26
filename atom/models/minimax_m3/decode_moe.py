@@ -238,16 +238,61 @@ class DecodeMoe(nn.Module):
             or tuple(_u8(sh.down_proj.weight_scale).shape) != (H, I // 32)
         ):
             return "shared expert must be MXFP8 [1536, 6144] / [6144, 768] with row-major scales"
+        if not (
+            getattr(sh.gate_up_proj.weight, "is_shuffled", False)
+            and getattr(sh.down_proj.weight, "is_shuffled", False)
+        ):
+            # ATOM_GROUP32_WEIGHT_PRESHUFFLE=0 leaves them row-major; the kernels read (16, 16) preshuffle
+            return "shared expert weights not preshuffled"
+        if getattr(ex, "use_ep", False):
+            return (
+                "expert parallelism (the kernels read all 128 experts, no EP routing)"
+            )
+        if ex.top_k != TOPK or ex.scoring_func != "sigmoid":
+            return f"routing top_k={ex.top_k} scoring_func={ex.scoring_func!r}"
         beta = 1.0 if sh.swiglu_beta is None else sh.swiglu_beta
         swiglu = (sh.swiglu_alpha, sh.swiglu_limit, beta)
         if (
-            any(abs(a - b) > 1e-6 for a, b in zip(swiglu, SWIGLU_OAI))
-            or ex.swiglu_limit != SWIGLU_OAI[1]
+            any(v is None for v in (*swiglu, ex.swiglu_limit))
+            or any(abs(a - b) > 1e-6 for a, b in zip(swiglu, SWIGLU_OAI))
+            or abs(ex.swiglu_limit - SWIGLU_OAI[1]) > 1e-6
         ):
             return f"SwiGLU-OAI {swiglu}"
         if moe.routed_scaling_factor != ROUTED_SCALE:
             return f"routed scale {moe.routed_scaling_factor}"
         return None
+
+    def release_weight_memory(self) -> None:
+        """Weight-discard sleep: the kernel-layout views and copies and the FP32 gate copy pin the old weight
+        storage outside the Parameters, so drop them. The layer then keeps the default MoE path for good (the FP32
+        gate is not a Parameter and cannot be rebuilt after the weights are synced in).
+        """
+        was_ready, self.ready = self.ready, False
+        for n in (
+            "gate",
+            "gate_lines",
+            "bias",
+            "w13",
+            "s13",
+            "w2",
+            "s2",
+            "sw13",
+            "sw2",
+            "ss13",
+            "ss2",
+        ):
+            if hasattr(self, n):
+                setattr(self, n, None)
+        self._gate_fp32 = None
+        if was_ready:
+            logger.warning(
+                "ATOM_M3_DECODE_MOE: %s: weights were discarded by sleep, keeping the default MoE path",
+                self.prefix,
+            )
+
+    def resume_weight_memory(self) -> None:
+        """Nothing to rebuild: the layer stays on the default path (see ``release_weight_memory``)."""
+        self.ready = False
 
     def runs(self, rows: int) -> bool:
         return self.ready and self.rows[0] <= rows <= self.rows[1]

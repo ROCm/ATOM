@@ -369,6 +369,12 @@ class MiniMaxM3MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.decode_moe is None:
             return self.default_forward(hidden_states)
+        # Rows the chain does not serve (or a layer it rejected) are decided here, not inside the opaque custom
+        # op, so Dynamo still traces default_forward's body for them (dynamic-row compilation).
+        if not self.decode_moe.runs(
+            hidden_states.view(-1, hidden_states.shape[-1]).shape[0]
+        ):
+            return self.default_forward(hidden_states)
         orig_shape = hidden_states.shape
         out = decode_moe.decode_moe_op(
             hidden_states.view(-1, orig_shape[-1]), self.decode_moe.prefix
