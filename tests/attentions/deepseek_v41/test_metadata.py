@@ -442,11 +442,6 @@ def test_idle_dp_rank_refreshes_captured_pool_metadata(device):
     torch.testing.assert_close(cache.backing, before, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("cache_dtype", ["fp4", "fp8"])
-@pytest.mark.parametrize(
-    "phase", ["prefill", "single_token_prefill", "decode", "verify"]
-)
-@pytest.mark.parametrize("graph_enabled", [False, True])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_zero_floor_resume_publishes_cached_boundaries(device):
     if device == "cuda" and not torch.cuda.is_available():
@@ -466,6 +461,11 @@ def test_zero_floor_resume_publishes_cached_boundaries(device):
     assert step.swa_cached_until.tolist() == [16, 0]
 
 
+@pytest.mark.parametrize("cache_dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize(
+    "phase", ["prefill", "single_token_prefill", "decode", "verify"]
+)
+@pytest.mark.parametrize("graph_enabled", [False, True])
 @pytest.mark.parametrize("publication", ["unbound", "direct", "packed"])
 def test_prefill_attention_graph_fixes_only_prefill_request_capacity(
     monkeypatch, cache_dtype, phase, graph_enabled, publication
