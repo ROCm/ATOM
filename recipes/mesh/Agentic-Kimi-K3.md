@@ -127,6 +127,9 @@ export ATOM_NUMA_NODE=0,0,0,0,1,1,1,1
 export ATOM_AUTO_NUMA_BIND=0
 export OFFLOAD_PROFILE=1
 export OFFLOAD_GPU_STAGING_CHUNKS=32
+# Decode runs DCP on a per-request-state model (kimi_linear), which chunked
+# P/D cannot serve: keep the legacy answer-after-prefill path.
+export ATOM_PD_EARLY_HANDOFF=0
 
 PREFILL_KV_TRANSFER_CONFIG="{\"kv_connector\":\"multi\",\"connectors\":[{\"kv_connector\":\"mooncake\",\"kv_role\":\"kv_producer\",\"proxy_ip\":\"${ATOM_HOST_IP}\",\"handshake_port\":6301},{\"kv_connector\":\"lmcache_offload\",\"kv_role\":\"offload\"}]}"
 python3 -m atom.entrypoints.openai_server \

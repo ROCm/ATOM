@@ -1138,6 +1138,10 @@ models:
               ATOM_AUTO_NUMA_BIND: "0"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_GPU_STAGING_CHUNKS: "32"
+              # Decode runs DCP on a per-request-state model (kimi_linear),
+              # which chunked P/D cannot serve: keep the legacy relay. Every
+              # TP8+DCP8 cell's prefill env merges this anchor.
+              ATOM_PD_EARLY_HANDOFF: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
 
