@@ -27,7 +27,7 @@ from summarize import day_epoch, profiling_window
 ADM = re.compile(r"PD admission enabled: pending_kv_bytes=(\d+) per D rank")
 TS = re.compile(r"^\[atom (\d\d):(\d\d):(\d\d)\]")
 LOAD = re.compile(r"\[OFFLOAD-LOAD-PROF\] rank=(\d+) .*?status=(\w+).*?total_bytes=(\d+) get_ms=([\d.]+) unpack_ms=([\d.]+) "
-                  r"retrieve_ms=([\d.]+) total_ms=([\d.]+)")
+                  r"(?:settle_ms=[\d.]+ )?retrieve_ms=([\d.]+) total_ms=([\d.]+)")
 PERF_PENDING = re.compile(r'"loads_pending": (\d+)')
 
 
