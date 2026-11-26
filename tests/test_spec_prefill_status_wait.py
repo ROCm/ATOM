@@ -64,6 +64,7 @@ def _batch(*, prefill, final=True, req_ids=(7, 8)):
         total_seqs_num_prefill=2 if prefill else 0,
         req_ids=list(req_ids),
         is_dummy_run=False,
+        is_mixed=False,
         total_tokens_num=12 if prefill else 4,
         has_prefill=prefill,
         num_spec_step=0 if prefill else 1,
