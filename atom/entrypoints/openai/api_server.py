@@ -92,6 +92,7 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
     template_needs_tool_call_argument_strings,
+    template_takes_mid_system,
 )
 from .fim import FimFormat, resolve_fim_format
 from .images import check_chat_images, load_chat_images
@@ -141,6 +142,7 @@ from .serving_anthropic import (
     anthropic_to_openai_tools,
     build_anthropic_response,
     completes_a_tool_call,
+    fold_mid_system,
     read_whole_blocks,
     stream_failure_frames,
     stream_message_delta,
@@ -235,6 +237,9 @@ reasoning_dialect: Any = None
 # (kwarg, off-value) the chat template reads to switch reasoning off, resolved
 # at startup by asking it; None when the template offers no such switch.
 reasoning_toggle: tuple[str, Any, Any] | None = None
+# Whether the chat template takes a system message inside the conversation
+# (`template_takes_mid_system`); resolved at startup.
+mid_system_supported: bool = True
 processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
@@ -1430,11 +1435,14 @@ def _prepare_prompt(
 def _renders_without_mid_system(
     messages, template_kwargs: dict[str, Any], tools
 ) -> bool:
-    """Whether the template takes ``messages`` once every system message other
-    than ``messages[0]`` is dropped: run only after it refused them, to tell a
-    template that wants its system message first from one that failed for
-    another reason."""
-    kept = [m for i, m in enumerate(messages) if i == 0 or m.role != "system"]
+    """Whether the template takes ``messages`` once the system messages inside
+    the conversation (after the first non-system one) are dropped: run only
+    after it refused them, to tell a template that wants its system messages
+    first from one that failed for another reason."""
+    first = next(
+        (i for i, m in enumerate(messages) if m.role != "system"), len(messages)
+    )
+    kept = [m for i, m in enumerate(messages) if i < first or m.role != "system"]
     if len(kept) == len(messages):
         return False
     try:
@@ -2870,6 +2878,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     try:
         # Convert Anthropic messages to OpenAI format
         openai_messages = anthropic_to_openai_messages(request.messages, request.system)
+        if not mid_system_supported:
+            openai_messages = fold_mid_system(openai_messages)
         validate_history_tool_calls(openai_messages)
 
         # Apply chat template
@@ -2947,9 +2957,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 )
             )
         except TemplateError as exc:
-            # A template that only takes a system message first. Claude Code
-            # answers this 400 by resending with those messages folded into
-            # user turns -- so only when they are what the template refused.
+            # A template that only takes system messages first, which the
+            # startup probe let through (mid_system_supported), yet refused on
+            # this request's shape. Claude Code answers this 400 by resending
+            # with them folded into user turns -- so only when they are what
+            # the template refused.
             if await asyncio.to_thread(
                 _renders_without_mid_system,
                 messages,
@@ -3953,10 +3965,11 @@ def _setup_reasoning_and_tools(args) -> None:
     global tool_call_parser_cls, required_tool_channel
     global preserve_tool_call_arguments
     global model_starts_in_reasoning, reasoning_toggle, reasoning_dialect
+    global mid_system_supported
     _template_source = chat_template_source(tokenizer, custom_message_encoder)
+    _plain_probe = render_probe_prompt(tokenizer, custom_message_encoder, tools=False)
     reasoning_dialect, _dialect_stated = resolve_dialect(
-        _template_source,
-        render_probe_prompt(tokenizer, custom_message_encoder, tools=False) or "",
+        _template_source, _plain_probe or ""
     )
     logger.info(
         "Reasoning channel: %s%s",
@@ -3979,6 +3992,13 @@ def _setup_reasoning_and_tools(args) -> None:
             "This chat template has no switch for reasoning, so a request "
             "asking for none cannot stop the model producing it. Any that "
             "arrives is still separated and reported, never discarded."
+        )
+
+    mid_system_supported = template_takes_mid_system(tokenizer, custom_message_encoder)
+    if not mid_system_supported and _plain_probe:
+        logger.info(
+            "The chat template cannot take a system message inside the "
+            "conversation; /v1/messages moves those into user turns."
         )
 
     tools_probe = render_probe_prompt(tokenizer, custom_message_encoder, tools=True)
