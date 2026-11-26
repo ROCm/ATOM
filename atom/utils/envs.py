@@ -29,39 +29,34 @@ from typing import Any
 logger = logging.getLogger("atom")
 
 
+def _checked_float_env(
+    name: str, default: str, valid: Callable[[float], bool], expected: str
+) -> float:
+    """A float that passes `valid`; anything else warns and takes the default."""
+    raw_value = os.getenv(name, default)
+    try:
+        value = float(raw_value)
+        if valid(value):
+            return value
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r: expected %s; using default %s",
+        name,
+        raw_value,
+        expected,
+        default,
+    )
+    return float(default)
+
+
 def _positive_float_env(name: str, default: str) -> float:
-    raw_value = os.getenv(name, default)
-    try:
-        value = float(raw_value)
-        if math.isfinite(value) and value > 0:
-            return value
-    except ValueError:
-        pass
-    logger.warning(
-        "Invalid %s=%r: expected a finite positive number; using default %s",
+    return _checked_float_env(
         name,
-        raw_value,
         default,
+        lambda value: math.isfinite(value) and value > 0,
+        "a finite positive number",
     )
-    return float(default)
-
-
-def _fraction_env(name: str, default: str) -> float:
-    """A number in [0, 1]; anything else warns and takes the default."""
-    raw_value = os.getenv(name, default)
-    try:
-        value = float(raw_value)
-        if 0.0 <= value <= 1.0:
-            return value
-    except ValueError:
-        pass
-    logger.warning(
-        "Invalid %s=%r: expected a number in [0, 1]; using default %s",
-        name,
-        raw_value,
-        default,
-    )
-    return float(default)
 
 
 def _flag_env(name: str, default: str = "0") -> bool:
@@ -247,8 +242,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Safety valve for the skip: the share of P's KV blocks that sources
     # allocated before D's report may hold at once. An early request that
     # would cross it waits for D like a gated one. 0 = never skip, 1 = no cap.
-    "ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION": lambda: _fraction_env(
-        "ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", "0.5"
+    "ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION": lambda: _checked_float_env(
+        "ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION",
+        "0.5",
+        lambda value: 0.0 <= value <= 1.0,
+        "a number in [0, 1]",
     ),
     # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
     # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
