@@ -1397,8 +1397,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # not echo them to the PD router, which already sends the same field to
     # decode; every other request keeps its `return_token_ids` echo. A request
     # without the field is unchanged. Enable on P and D together (a mixed
-    # setup is not supported); both share this default. "0": the field is
-    # ignored.
+    # setup is not supported). Upgrade P and D before a client sends the
+    # field. A P or D that runs an ATOM without this change, or sets it to 0,
+    # makes the pair mixed. "0": the field is ignored.
     "ATOM_PROMPT_IDS_B64": lambda: os.getenv("ATOM_PROMPT_IDS_B64", "1") == "1",
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
