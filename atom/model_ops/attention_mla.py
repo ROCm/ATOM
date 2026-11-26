@@ -703,9 +703,9 @@ def _mla_prefill_core(
 ) -> torch.Tensor:
     """The eager break of `MLAAttention.forward_prefill_split`: the KV-cache
     write and the attention, on every row of the bucket. A pad row belongs to
-    no request (KV slot and batch id -1, past every request's `cu_seqlens`):
-    the kernels skip it and leave its output unwritten, as a decode leaves a
-    padding request's."""
+    no request: the KV write skips its slot (-1), no request's attention
+    reads it (it lies past every request's `cu_seqlens`), and its output rows
+    are don't-care."""
     impl = (
         get_current_atom_config()
         .compilation_config.static_forward_context[layer_name]
@@ -1945,10 +1945,14 @@ class MLAAttention(nn.Module):
         prefill_q: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Legacy single-pass path: gather the full cached+new context into
         k_full / v_full and run one flash_attn. OOMs on long contexts (peak
-        ≈ total_kv × heads × (qk_dim + v_dim) × dtype)."""
+        ≈ total_kv × heads × (qk_dim + v_dim) × dtype).
+
+        ``q_fp8``: the prefill split's ``(q8, q_descale)``, quantized over the
+        step's rows (`forward_prefill_split`); None quantizes Q here."""
         self._check_flydsl_fp8_mha(prefill_q)
         k_full = torch.empty(
             (
@@ -1986,6 +1990,7 @@ class MLAAttention(nn.Module):
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
             causal=True,
+            q_fp8=q_fp8,
         )
         return self.o_proj(output.flatten(start_dim=-2))
 
@@ -3435,9 +3440,10 @@ class MLAAttention(nn.Module):
         prefill_q, k_new, v_new, quant_k_rope = self._new_token_kv(
             prefill_q, k_nope, k_rope
         )
-        # A bucket's pad rows hold whatever the last step left there, not
-        # zeros: the FP8 descales must see the live row count, which every
-        # replay reads in place.
+        # A bucket's pad rows are not zeros (the regions' outputs there are
+        # don't-care): the FP8 descales must see the live row count, which
+        # every replay reads in place. Every FP8 attention of the step takes
+        # these, the cached prefix's too.
         num_rows = pass_scheduled_tokens_gpu(prefill_q.shape[0])
         assert (
             num_rows is not None or not self._flydsl_fp8_mha_ok
@@ -3500,7 +3506,7 @@ class MLAAttention(nn.Module):
             )
         elif attn_metadata.has_cached:
             output = self._forward_prefill_cached_single_pass(
-                prefill_q, kv_cache, attn_metadata
+                prefill_q, kv_cache, attn_metadata, q_fp8=q_fp8
             )
         else:
             output = self._flash_attn_prefill(

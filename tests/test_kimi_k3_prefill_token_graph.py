@@ -169,8 +169,12 @@ def test_the_capture_step_is_a_request_less_dummy_prefill_of_the_bucket():
     [
         (True, "record", True, "split"),
         (False, "record", True, "region"),
-        (True, "replay", False, "region"),  # a forward under a replaying step
-        (True, None, False, "call"),  # an eager prefill: no graph records it
+        (True, "record", False, "region"),  # a decode recording
+        (False, None, True, "region"),  # a whole-forward capture
+        # Nothing records: an eager prefill, and a drafter's eager step under
+        # a replay, which has no recorder for the region to break.
+        (True, "replay", False, "call"),
+        (True, None, False, "call"),
         (False, None, False, "call"),
     ],
 )
@@ -178,7 +182,9 @@ def test_the_attention_op_takes_the_split_its_impl_asks_for(
     monkeypatch, step, use_mla, tr_graph, in_hipgraph, taken
 ):
     step.tr_graph, step.in_hipgraph = tr_graph, in_hipgraph
-    step.context = SimpleNamespace(is_prefill=True, is_dummy_run=False)
+    # A decode recording is the one that does not split.
+    prefill = (tr_graph, in_hipgraph) != ("record", False)
+    step.context = SimpleNamespace(is_prefill=prefill, is_dummy_run=prefill)
     monkeypatch.setattr(
         mla.MLAAttention, "forward_prefill_split", lambda self, *a: ("split", a)
     )
@@ -191,12 +197,26 @@ def test_the_attention_op_takes_the_split_its_impl_asks_for(
     )
     monkeypatch.setattr(base, "_attention_region", lambda *args: ("region", args))
     monkeypatch.setattr(base, "_attention", lambda *args: ("call", args))
+    layers["layer"].impl.forward = lambda **kw: (
+        "call",
+        (
+            kw["query"],
+            kw["q_scale"],
+            kw["k_nope"],
+            kw["k_rope"],
+            kw["positions"],
+            "layer",
+            use_mla,
+            None,
+        ),
+    )
     q, k, v, positions = (torch.zeros(4, 2) for _ in range(4))
+    q_scale = torch.ones(4, 1)  # q_b_proj's ptpc FP8 output scale
     kind, args = base.unified_attention_with_output_base(
-        q, None, k, v, positions, "layer", use_mla, None
+        q, q_scale, k, v, positions, "layer", use_mla, None
     )
     assert kind == taken
-    expected = (q, None, k, v, positions, "layer")
+    expected = (q, q_scale, k, v, positions, "layer")
     if taken != "split":
         expected += (use_mla, None)
     assert len(args) == len(expected)
@@ -233,20 +253,24 @@ def test_a_kda_layer_splits_on_the_forwards_an_mla_layer_does(
     bucket's shape outside the capture. Any other forward a graph records
     runs the mixer as one region; one that none records calls it."""
     model = _kimi_model()
-    layer = SimpleNamespace(_forward_prefill_split=lambda *args: "split")
+    layer = SimpleNamespace(_forward_prefill_split=lambda *args: ("split", args))
     compilation = SimpleNamespace(static_forward_context={"kda": layer})
     monkeypatch.setattr(
         model,
         "get_current_atom_config",
         lambda: SimpleNamespace(compilation_config=compilation),
     )
-    monkeypatch.setattr(model, "_kda", lambda *args: "call")
-    monkeypatch.setattr(model, "_kda_mixer", lambda *args: "region")
+    monkeypatch.setattr(model, "_kda", lambda *args: ("call", args[:2]))
+    monkeypatch.setattr(model, "_kda_mixer", lambda *args: ("region", args[:2]))
     step.tr_graph, step.in_hipgraph = tr_graph, in_hipgraph
     step.context = SimpleNamespace(is_prefill=prefill, is_dummy_run=dummy)
-    eager = tr_graph is None and not in_hipgraph
+    eager = tr_graph != "record" and not in_hipgraph
     taken = "split" if split else "call" if eager else "region"
-    assert model.kda_attention_with_output(torch.zeros(2, 4), None, "kda") == taken
+    # in_proj's per-token FP8 input scale, from the fused input norm.
+    hidden, scale = torch.zeros(2, 4), torch.ones(2, 1)
+    kind, args = model.kda_attention_with_output(hidden, scale, "kda")
+    assert kind == taken
+    assert args[0] is hidden and args[1] is scale
 
 
 def test_kimi_records_its_prefill_buckets_apart_from_its_decode_ones(monkeypatch):
@@ -358,6 +382,22 @@ def _bind(impl, *names):
     return impl
 
 
+def _rope(positions, q_pe, k_pe):
+    """RoPE as the layer applies it: in place on Q's and K's RoPE columns, by
+    position."""
+    turn = positions.to(q_pe.dtype) * 0.25
+    q_pe.add_(turn.view(-1, *[1] * (q_pe.dim() - 1)))
+    k_pe.add_(turn.view(-1, *[1] * (k_pe.dim() - 1)))
+
+
+def _scaled(weight):
+    """A linear layer that applies its per-token input scale, as a ptpc FP8
+    GEMM does."""
+    return lambda x, x_scale=None: nn.functional.linear(
+        x if x_scale is None else x * x_scale, weight
+    )
+
+
 def _dense_impl(prefix_k, prefix_v):
     torch.manual_seed(1)
     weight = torch.randn(HEADS * (NOPE + V_DIM), LORA)
@@ -378,8 +418,8 @@ def _dense_impl(prefix_k, prefix_v):
         dtype=torch.float32,
         layer_num=0,
         qrep_enabled=False,
-        q_proj=lambda x, x_scale=None: x,
-        rotary_emb=lambda positions, q_pe, k_pe: None,
+        q_proj=_scaled(torch.eye(HEADS * (NOPE + ROPE))),
+        rotary_emb=_rope,
         kv_b_proj=lambda x: nn.functional.linear(x, weight),
         o_proj=nn.Identity(),
         _k_scale=None,
@@ -507,13 +547,15 @@ def test_a_padded_split_attends_the_bucket_and_gives_forward_impls_rows(
     rows = 5
     torch.manual_seed(2)
     q, _, k_nope, k_rope, positions, _ = _split_inputs(bucket)
+    q_scale = torch.rand(bucket, 1) + 0.5  # q_b_proj's ptpc FP8 output scale
     prefix_k = torch.randn(10, HEADS, NOPE + ROPE)
     prefix_v = torch.randn(10, HEADS, V_DIM)
 
     impl = _dense_impl(prefix_k, prefix_v)
     eager_cache = _run(monkeypatch, impl, _metadata(path), rows)
+    # RoPE writes K's RoPE columns in place: each forward gets its own copy.
     eager = impl.forward_impl(
-        q[:rows], k_nope[:rows], k_rope[:rows].clone(), positions[:rows]
+        q[:rows], k_nope[:rows], k_rope[:rows].clone(), positions[:rows], q_scale[:rows]
     )
 
     impl = _dense_impl(prefix_k, prefix_v)
@@ -525,9 +567,11 @@ def test_a_padded_split_attends_the_bucket_and_gives_forward_impls_rows(
         return _varlen(**kw)
 
     monkeypatch.setattr(mla, "flash_attn_varlen_func", varlen)
-    # Whatever the last step left in the pad rows reaches no real row.
+    # Whatever the pad rows hold reaches no real row.
     q[rows:], k_nope[rows:], k_rope[rows:] = (float("nan"),) * 3
-    split = impl.forward_prefill_split(q, None, k_nope, k_rope, positions, "layer")
+    split = impl.forward_prefill_split(
+        q, q_scale, k_nope, k_rope.clone(), positions, "layer"
+    )
 
     assert split.shape == (bucket, HEADS * V_DIM)
     assert eager.abs().sum() > 0
@@ -564,44 +608,77 @@ def test_an_fp8_split_needs_the_steps_row_count(monkeypatch, kernels):
         impl.forward_prefill_split(*_split_inputs(8))
 
 
+@pytest.mark.parametrize("path", ["new_only", "chunked", "single_pass"])
 def test_an_fp8_split_quantizes_the_steps_rows_and_attends_on_them(
-    monkeypatch, kernels
+    monkeypatch, kernels, path
 ):
-    """The descales see the live row count alone: on a replay the pad rows
-    hold whatever the last step left there. The region attends with what the
-    recorded head quantized."""
+    """The recorded head quantizes once, over the live row count: the pad rows
+    are not zeros. Every FP8 attention of the step runs on that Q -- the new
+    tokens', a cached chunk's, the single pass over the whole context -- and a
+    chunk's gather takes the head's output descales, K's first."""
     impl = _dense_impl(
-        torch.zeros(10, HEADS, NOPE + ROPE), torch.zeros(10, HEADS, V_DIM)
+        torch.randn(10, HEADS, NOPE + ROPE), torch.randn(10, HEADS, V_DIM)
     )
     impl._flydsl_fp8_mha_ok = True
     live = torch.tensor([5], dtype=torch.int32)
-    _run(monkeypatch, impl, _metadata("new_only", 8), 5, bucket=8, live=live)
-    scales = [torch.tensor([float(i)]) for i in range(5)]
-    quantized, attended = [], []
+    _run(monkeypatch, impl, _metadata(path, 8), 5, bucket=8, live=live)
+    # q, k, v, then a cached chunk's gathered K and V.
+    scales = [torch.tensor([float(i + 1)]) for i in range(5)]
+    quantized, attended, gathered = [], [], []
 
     def quantize(q, k, v, *, k_rope=None, num_rows=None):
-        quantized.append(((q, k, v), num_rows))
-        return (q.clone(), k.clone(), v.clone(), *scales)
+        out = (q.clone(), k.clone(), v.clone(), *scales)
+        quantized.append({"in": (q, k, v), "k_rope": k_rope, "rows": num_rows})
+        quantized[-1]["out"] = out
+        return out
+
+    def quantize_kv(k, v):  # the cached context's own descales
+        return k.clone(), v.clone(), torch.tensor([6.0]), torch.tensor([7.0])
 
     def attend(q8, k8, v8, **kw):
-        attended.append(((q8, k8, v8), kw))
-        return q8.new_zeros(q8.shape[0], HEADS, V_DIM)
+        attended.append({"q8": q8, **kw})
+        out = q8.new_zeros(q8.shape[0], HEADS, V_DIM)
+        if kw.get("return_lse"):
+            return out, torch.zeros(HEADS, q8.shape[0])
+        return out
+
+    def gather(
+        cache, indptr, indices, cu_k, k_out, v_out, *a, kv_out_scales=None, **kw
+    ):
+        gathered.append(kv_out_scales)
+        if kv_out_scales is not None:  # the FP8 gather: its output and descales
+            return k_out, v_out, *kv_out_scales
 
     monkeypatch.setattr(mla, "fused_qkv_per_tensor_quant", quantize)
+    monkeypatch.setattr(mla, "fused_kv_per_tensor_quant", quantize_kv)
     monkeypatch.setattr(mla, "flydsl_flash_attn_fp8_func", attend)
-    split = impl.forward_prefill_split(*_split_inputs(8))
+    impl._gather_cached_kv_b_proj = gather
+    q, q_scale, k_nope, k_rope, positions, name = _split_inputs(8)
+    q[5:], k_nope[5:], k_rope[5:] = 1e4, 1e4, 1e4  # not zeros
+    split = impl.forward_prefill_split(q, q_scale, k_nope, k_rope, positions, name)
 
     assert split.shape == (8, HEADS * V_DIM)
-    ((inputs, num_rows),) = quantized
-    assert num_rows is live
-    assert all(x.shape[0] == 8 for x in inputs)
-    (((q8, k8, v8), kw),) = attended
-    torch.testing.assert_close(q8, inputs[0], rtol=0, atol=0)
-    torch.testing.assert_close(k8, inputs[1], rtol=0, atol=0)
-    torch.testing.assert_close(v8, inputs[2], rtol=0, atol=0)
-    assert kw["q_descale"] is scales[0]
-    assert kw["k_descale"] is scales[1]
-    assert kw["v_descale"] is scales[2]
+    (head,) = quantized
+    assert head["rows"] is live
+    assert all(x.shape[0] == 8 for x in head["in"])
+    # K's RoPE columns join it, roped: K's amax covers both parts.
+    assert head["k_rope"] is not None and head["k_rope"].shape[-1] == ROPE
+    q8, _, _, q_descale = head["out"][:4]
+    assert len(attended) == (2 if path == "chunked" else 1)
+    for call in attended:
+        assert call["q8"] is q8 and call["q_descale"] is q_descale
+    first = attended[0]
+    if path == "single_pass":
+        # The whole context's K and V, quantized on their own.
+        assert gathered == [None]
+        assert (first["k_descale"].item(), first["v_descale"].item()) == (6, 7)
+        return
+    assert first["k_descale"] is scales[1] and first["v_descale"] is scales[2]
+    if path == "chunked":
+        ((gather_k, gather_v),) = gathered
+        assert gather_k is scales[3] and gather_v is scales[4]
+        chunk = attended[1]
+        assert chunk["k_descale"] is scales[3] and chunk["v_descale"] is scales[4]
 
 
 # ---- the KDA split against _forward_impl, with a reference recurrence -------
@@ -628,9 +705,11 @@ def _logged(**arguments):
     }
 
 
-def _kda_layer(model, calls):
+def _kda_layer(model, calls, fused=False):
     """A KDA layer of linear projections whose recurrence kernel (`_run_kda`)
-    is a causal reference logging every input into ``calls``."""
+    is a causal reference logging every input into ``calls``. ``fused``: the
+    per-token FP8 path, f_a quantized with f_b_proj's input and o_norm with
+    o_proj's, each projection applying its scale."""
     torch.manual_seed(3)
     width = KDA_HEADS * KDA_DIM
     w_in = torch.randn(4 * width + KDA_HEADS + KDA_DIM, HIDDEN)
@@ -658,17 +737,38 @@ def _kda_layer(model, calls):
         head_dim=KDA_DIM,
         num_local_heads=KDA_HEADS,
         local_proj_size=width,
-        fuse_f_a_quant=False,
+        fuse_f_a_quant=fused,
         _split_in_proj=False,
         conv_weight=None,
-        in_proj=lambda x, x_scale=None: nn.functional.linear(x, w_in),
-        f_b_proj=lambda x: nn.functional.linear(x, w_f),
-        o_norm=lambda out, gate, is_prefill: out * gate.sigmoid(),
-        o_proj=lambda x: nn.functional.linear(x, w_o),
+        in_proj=_scaled(w_in),
+        f_b_proj=_scaled(w_f),
+        o_norm=_gated_norm(fused),
+        o_proj=_scaled(w_o),
         activation="silu",
         _run_kda=run_kda,
     )
     return layer
+
+
+def _gated_norm(fused):
+    """o_norm's stand-in: ``out`` gated, quantized per token with its scale
+    when ``fused`` (o_proj then takes the pair), plain otherwise."""
+
+    def norm(out, gate, is_prefill):
+        normed = out * gate.sigmoid()
+        if not fused:
+            return normed
+        rows = normed.flatten(-2)
+        scale = rows.abs().amax(-1, keepdim=True) + 1
+        return rows / scale, scale
+
+    return norm
+
+
+def _per_token_quant(x, dtype):
+    """`strided_per_token_quant`'s stand-in: rows over their scale."""
+    scale = x.abs().amax(-1, keepdim=True) + 1
+    return x / scale, scale
 
 
 def _causal_conv(calls):
@@ -684,10 +784,11 @@ def _causal_conv(calls):
 
 def _kda_cache():
     """A KDA layer's cache entry: a random conv and SSM state, the same every
-    call."""
+    call. The conv state as the pool lays it out, ``(width - 1, conv_dim)``
+    a slot (`gdn_attn`), which the layer turns channel-major."""
     random = torch.Generator().manual_seed(5)
     return SimpleNamespace(
-        k_cache=torch.randn(4, 3 * KDA_HEADS * KDA_DIM, 4, generator=random),
+        k_cache=torch.randn(4, 3, 3 * KDA_HEADS * KDA_DIM, generator=random),
         v_cache=torch.randn(4, KDA_HEADS, KDA_DIM, KDA_DIM, generator=random),
     )
 
@@ -725,6 +826,7 @@ def _kda_step(monkeypatch, model, layer, metadata, calls, *, rows=5, dummy=False
     kernels.gather_kda_initial_state = lambda state, slots, has_initial: (
         state[slots] * has_initial[:, None, None, None]
     )
+    kernels.strided_per_token_quant = _per_token_quant
     monkeypatch.setitem(sys.modules, "atom.model_ops.kimi_k3", kernels)
     return cache
 
@@ -761,40 +863,38 @@ def _assert_same_call(got, want, rows, bucket):
         torch.testing.assert_close(other, value, rtol=1e-6, atol=1e-6, msg=name)
 
 
+@pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("bucket", [5, 8])
 def test_a_padded_kda_split_makes_the_kernel_calls_forward_impl_makes(
-    monkeypatch, bucket
+    monkeypatch, bucket, fused
 ):
-    """Every input of the causal conv and the recurrence, the slot the state
-    is read from and the one it is written to included."""
+    """Every input of the causal conv and the recurrence -- the conv state as
+    the conv reads it, the slot the state is read from and the one it is
+    written to -- and every per-token scale the projections take: in_proj's
+    from the input norm, and under ``fused`` f_b_proj's and o_proj's."""
     model = _kimi_model()
     rows = 5
     torch.manual_seed(4)
     hidden = torch.randn(bucket, HIDDEN)
+    scale = torch.rand(bucket, 1) + 0.5
     metadata = _kda_metadata()
 
     eager_calls, split_calls = [], []
-    layer = _kda_layer(model, eager_calls)
+    layer = _kda_layer(model, eager_calls, fused)
     eager_cache = _kda_step(monkeypatch, model, layer, metadata, eager_calls)
-    eager = layer._forward_impl(hidden[:rows].clone(), None)
+    eager = layer._forward_impl(hidden[:rows].clone(), scale[:rows])
 
-    layer = _kda_layer(model, split_calls)
+    layer = _kda_layer(model, split_calls, fused)
     split_cache = _kda_step(monkeypatch, model, layer, metadata, split_calls)
-    # Whatever the last step left in the pad rows reaches no real row.
+    # Whatever the pad rows hold reaches no real row.
     hidden[rows:] = float("nan")
-    split = layer._forward_prefill_split(hidden, None)
+    split = layer._forward_prefill_split(hidden, scale)
 
     assert split.shape == (bucket, HIDDEN)
     assert eager.abs().sum() > 0
     torch.testing.assert_close(split[:rows], eager, rtol=1e-5, atol=1e-5)
-    assert (
-        [n for n, _ in split_calls]
-        == [n for n, _ in eager_calls]
-        == [
-            "conv",
-            "kda",
-        ]
-    )
+    names = [[n for n, _ in calls] for calls in (split_calls, eager_calls)]
+    assert names == [["conv", "kda"]] * 2
     for (_, got), (_, want) in zip(split_calls, eager_calls):
         _assert_same_call(got, want, rows, bucket)
     # The state written where the eager step writes it, from what it read.
@@ -832,7 +932,8 @@ def test_a_live_kda_replay_without_metadata_fails_loudly(monkeypatch):
 def test_a_prefills_conv_map_spans_the_rows_the_step_runs(monkeypatch):
     """A split KDA layer hands the causal conv the whole bucket
     (`_kda_recurrence`); `causal_conv1d_fn` would rebuild a map sized for fewer
-    rows in every layer."""
+    rows in every layer. Through `finish_prefill`, which has the step's
+    width."""
     with _einops(), atom_without_aiter() as load:
         gdn = load("atom.model_ops.attentions.gdn_attn")
     sized = []
@@ -842,16 +943,29 @@ def test_a_prefills_conv_map_spans_the_rows_the_step_runs(monkeypatch):
         return {8: {"num_tokens": num_tokens}}, None, None
 
     monkeypatch.setattr(gdn, "compute_causal_conv1d_metadata", conv_map)
+
+    class Backend:
+        def finish_prefill(self, batch, attn_metadata, running_bs, running_tokens):
+            """The attention metadata's own finish: nothing to add here."""
+
+    builder = object.__new__(type("Builder", (gdn.GDNStateMixin, Backend), {}))
     slots = SimpleNamespace(gpu=torch.arange(4))
-    builder = SimpleNamespace(
+    builder.__dict__.update(
+        model_runner=SimpleNamespace(
+            forward_vars={
+                "non_spec_state_indices": slots,
+                "non_spec_state_indices_in": slots,
+            }
+        ),
         use_spec_decode=False,
         device="cpu",
-        non_spec_state_indices_tensor=slots,
-        non_spec_state_indices_in_tensor=slots,
         _has_state_fork=False,
         replayssm=False,
+        _checkpoint_targets=lambda batch: None,
+        _conv_state_len=lambda: 3,
     )
     batch = SimpleNamespace(
+        block_tables=[[0], [1]],
         total_seqs_num=2,
         total_seqs_num_decode=0,
         total_seqs_num_prefill=2,
@@ -863,14 +977,13 @@ def test_a_prefills_conv_map_spans_the_rows_the_step_runs(monkeypatch):
     attn_metadata = SimpleNamespace(
         cu_seqlens_q=torch.tensor([0, 3, 5, 5]), num_cached_tokens=None
     )
-    for running_tokens in (8, 5, 0):  # a bucket; unpadded; a caller passing none
-        built = gdn.GDNStateMixin.prepare_gdn_metadata(
-            builder,
-            batch,
-            attn_metadata,
-            is_prefill=True,
-            prepare_block_tables=False,
-            running_tokens=running_tokens,
-        )
+    for running_tokens in (8, 5):  # a bucket; unpadded
+        builder.finish_prefill(batch, attn_metadata, 3, running_tokens)
+        built = attn_metadata.gdn_metadata
         assert built.non_spec_query_start_loc.tolist() == [0, 3, 5]
+        assert built.nums_dict[8]["num_tokens"] == running_tokens
+    # A caller that names no width sizes it by the scheduled rows.
+    builder.prepare_gdn_metadata(
+        batch, attn_metadata, is_prefill=True, prepare_block_tables=False
+    )
     assert sized == [8, 5, 5]
