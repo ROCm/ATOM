@@ -621,6 +621,7 @@ class ScheduledBatch:
             "scheduled_spec_decode_tokens",
             "last_block_num_tokens",
             "external_request_ids",
+            "presence_penalties",
         )
     )
     _STATE_FIELDS = frozenset(
@@ -637,6 +638,7 @@ class ScheduledBatch:
             "mrope_position_deltas",
             "multimodal_data",
             "remote_kv_seq_blocks",
+            "presence_resumed",
         )
     )
     _SHARED_FIELDS = frozenset(
@@ -676,6 +678,8 @@ class ScheduledBatch:
             "detailed_sqsq",
             "detailed_sqsk",
             "detailed_sk",
+            "presence_preempted",
+            "presence_rows",
         )
     )
 
@@ -743,6 +747,10 @@ class ScheduledBatch:
         # compact logits and must not be inherited by an attention segment.
         result.logprob_request_indices = None
         result.logprob_rows = None
+        # So do the presence penalty's staged table rows, and the rows the
+        # parent releases (`ModelRunner.prepare_sample`).
+        result.presence_rows = None
+        result.presence_preempted = ()
         result.total_seqs_num = stop - start
         result.total_seqs_num_prefill = max(
             0, min(stop, self.total_seqs_num_prefill) - start

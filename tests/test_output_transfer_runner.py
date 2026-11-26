@@ -514,3 +514,71 @@ def test_an_armed_runner_binds_the_draft_and_arms_the_ratio_verify(
     runner.rejection_sampler.arm_ratio.assert_called_once_with(
         8, 3, 160, torch.bfloat16, "cpu", block=block
     )
+
+
+def test_a_mixed_batch_with_a_presence_penalty_slices_after_prepare_sample():
+    """A mixed batch's attention segments come from `slice_rows` after
+    `prepare_sample` staged the penalty: each segment keeps its rows'
+    penalties and resumed outputs, and the staged table rows and the released
+    ids stay with the parent, which samples."""
+    from atom.model_engine.scheduler import ScheduledBatch
+    from atom.model_engine.sequence import Sequence, SequenceType
+    from atom.model_ops.presence_penalty import PresencePenalties
+    from atom.sampling_params import SamplingParams
+
+    seqs = []
+    for i in range(5):
+        seq = Sequence(
+            list(range(i * 100, i * 100 + 20)),
+            4,
+            SamplingParams(presence_penalty=1.5 if i != 3 else 0.0),
+            has_per_req_cache=True,
+        )
+        seq.type = SequenceType.PREFILL if i < 2 else SequenceType.DECODE
+        seq.block_table = [70 + i]
+        seqs.append(seq)
+    seqs[1].output_tokens.extend([31, 63])  # resumed after a preemption
+    batch = ScheduledBatch(
+        {s.id: s for s in seqs},
+        [8, 8, 1, 1, 1],
+        19,
+        total_tokens_num_prefill=16,
+        total_tokens_num_decode=3,
+        total_seqs_num=5,
+        total_seqs_num_prefill=2,
+        total_seqs_num_decode=3,
+    )
+    batch.presence_preempted = [999]
+    assert batch.is_mixed
+
+    buffers = {
+        name: SimpleNamespace(np=np.zeros(8, dtype), gpu=torch.zeros(8))
+        for name, dtype in (
+            ("temperatures", np.float32),
+            ("top_ks", np.int32),
+            ("top_ps", np.float32),
+        )
+    }
+    host = np.zeros(64, dtype=np.int32)
+    buffers["presence_penalty_rows"] = SimpleNamespace(
+        np=host, gpu=torch.from_numpy(host)
+    )
+    group = sampling_group(buffers)
+    runner = SimpleNamespace(
+        forward_vars=buffers,
+        verify_head=None,
+        presence_penalties=PresencePenalties(70, 4, "cpu"),
+        _verifies_drafts=lambda batch, is_prefill: False,
+    )
+    runner_module.ModelRunner.prepare_sample(runner, batch, group)
+    assert batch.presence_rows is not None
+
+    prefill, decode = batch.slice_rows(0, 2), batch.slice_rows(2, 5)
+    assert prefill.presence_penalties.tolist() == [1.5, 1.5]
+    assert decode.presence_penalties.tolist() == [1.5, 0.0, 1.5]
+    assert list(prefill.presence_resumed) == [seqs[1].id]
+    assert not decode.presence_resumed
+    for segment in (prefill, decode):
+        assert segment.presence_rows is None
+        assert not segment.presence_preempted
+    assert batch.presence_preempted == [999]
