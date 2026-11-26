@@ -706,6 +706,9 @@ class AttentionMetaData:
     sparse_kv_indices: torch.Tensor | None = None
     dcp_sparse_kv_indptr: torch.Tensor | None = None
     dcp_owned_counts: torch.Tensor | None = None
+    # Recorded when a "q" prefill's indexer writes the three above on a side
+    # stream; the layer's sparse MLA waits on it and clears it.
+    index_exchange_done: torch.cuda.Event | None = None
     # A DCP sparse prefill taking the "kv" transport: the step's gathered-KV
     # layout; None takes "q".
     dcp_sparse_prefill_kv: "DcpSparsePrefillKV | None" = None

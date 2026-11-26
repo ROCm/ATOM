@@ -908,6 +908,10 @@ class InputOutputProcessor:
         else:
             prefix_encoding = None
             tokens = prompt_or_tokens
+        # Checked on the tokens, not the text: "" encodes to [BOS] on Llama-3,
+        # which runs, and to nothing on Qwen3 or gpt-oss.
+        if len(tokens) == 0:
+            raise ValueError("The decoder prompt cannot be empty")
         if media_on_prefill:
             # An image prompt's positions never run past its text's, so the
             # delta its prefill hands over is at most 0; decode positions then

@@ -585,6 +585,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        self._sparse_prefill_kv_granularity = (
+            triton.next_power_of_2(self.index_topk_out)
+            if self.is_sparse and self.dcp_world_size > 1
+            else max(self.block_size, 16)
+        )
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self.indexes_by_token_table = indexes_by_token_table(
             self.is_sparse, self.dcp_world_size, self.index_kpool
@@ -603,9 +608,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # gathered width, not the per-rank one. Pad it the same way the module
         # does (mla_dcp_decode_is_persistent picks the width set), so these
         # descriptors always describe the kernel that will actually run.
-        # Only where aiter runs DCP decode persistent (gfx942 lacks the lse
-        # persistent kernel and stays non-persistent, where this metadata is
-        # unused) does it scale by dcp; elsewhere it keeps the per-rank sizing.
+        # Only where aiter reports a persistent kernel with LSE does it scale
+        # by dcp; elsewhere it keeps the per-rank sizing.
         # Target layers only: min_query_heads is the DSpark draft's, and the
         # draft plans its own descriptors (DSparkProposer).
         dcp_persistent = (
@@ -671,9 +675,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # buffers are separate, so size each for its own consumer.
         self.sparse_prefill_num_heads = self.padded_num_attention_heads
         if self.sparse_dcp_metadata_rebuild:
-            self.sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
+            self.sparse_prefill_num_heads, _ = mla_dcp_sparse_prefill_num_heads(
                 self.num_attention_heads,
                 self.dcp_world_size,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
                 persistent=mla_dcp_sparse_prefill_is_persistent(
                     self.dcp_world_size,
                     dcp_persistent,
@@ -2478,8 +2484,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     ) -> None:
         """The persistent sparse prefill's work plan over ``attn_metadata``'s
         query rows, into the ``prefix`` set's buffers; none for the
-        non-persistent DCP sparse prefill, which reads no plan. ``local_heads``:
-        a DCP "kv" prefill, which runs the dcp=1 kernel."""
+        non-persistent "q" prefill, which reads no plan. ``local_heads`` selects
+        a "kv" prefill's dcp=1 plan and ordinary split granularity.
+
+        Native "q" plans hold one work item a row: each owning layer points
+        it at its own keys. Folded plans are rebuilt by each owning layer."""
         if self.dcp_sparse_prefill_nonps and not local_heads:
             return
         work = self._sparse_prefill_work_views(prefix, num_heads)
@@ -2499,7 +2508,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             page_size=self.block_size,
             dtype_q=self.dtype_q,
             dtype_kv=self.dtype_kv,
-            kv_granularity=max(self.block_size, 16),
+            # Only "q" plans are patched to each layer's rank-local ranges.
+            kv_granularity=(
+                max(self.block_size, 16)
+                if local_heads
+                else self._sparse_prefill_kv_granularity
+            ),
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
@@ -3069,7 +3083,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self._sparse_prefill_work_plan(
             attn_metadata,
             prefix,
-            self.padded_num_attention_heads,
+            self.sparse_prefill_num_heads,
             var["sparse_kv_last_page_lens"].gpu[:n_owned],
         )
 
