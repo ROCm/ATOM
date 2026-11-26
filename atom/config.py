@@ -20,6 +20,7 @@ from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.multi.multi_connector import validate_multi_config
 from atom.model_engine.capabilities import pcp_group_size_of
+from atom.model_engine.mixed_budget import prefill_floor
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
@@ -2347,6 +2348,8 @@ class Config:
     stop_token_ids: list[int] = field(default_factory=list)
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
+    # A MoRIIO producer's state transfer slots, sized by the runner.
+    state_transfer_slots: int = field(default=0, init=False)
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
     # FP4 physical layout, resolved before config is sent to scheduler/workers.
@@ -2381,6 +2384,10 @@ class Config:
     # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
     # rebuild, so the floor is what bounds that amplification.
     dynamic_chunking_min_chunk_size: int = 4096
+    # Mix prefill chunks and decode seqs into the same forward pass. DeepSeek-V4
+    # only (`_validate_mixed_prefill_decode` refuses the rest at launch). Off:
+    # the scheduler emits prefill-only or decode-only batches as before.
+    enable_mixed_prefill_decode: bool = False
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -3426,6 +3433,8 @@ class Config:
 
             self.state_replay_tokens = state_replay_tokens(self)
 
+        self._validate_mixed_prefill_decode()
+
     def _check_kv_cache_dtype(self) -> None:
         """Validate FP4 support and report performance guidance before sizing."""
         if self.kv_cache_dtype != "fp4":
@@ -3747,6 +3756,165 @@ class Config:
         )
         self.enable_dynamic_chunking = False
 
+    def _validate_mixed_prefill_decode(self) -> None:
+        """Validate mixed batching capabilities before loading the model."""
+        if not self.enable_mixed_prefill_decode:
+            return
+
+        from atom.kv_transfer.disaggregation.pd_producer import pd_producer_configured
+        from atom.kv_transfer.disaggregation.types import kv_config_has_producer
+        from atom.utils import get_hf_text_config
+        from atom.utils.selector import Family, attn_family
+
+        hf = get_hf_text_config(self.hf_config)
+        family = attn_family(hf)
+        spec = self.speculative_config
+        spec_method = None if spec is None else spec.method
+        cg_mode = self.compilation_config.cudagraph_mode
+        rope_parameters = getattr(hf, "rope_parameters", None) or {}
+        # (is this config affected, what it is, why it cannot run mixed)
+        refusals = [
+            (
+                self.enable_rapidserve,
+                "RapidServe",
+                "its separate prefill/decode schedulers do not form mixed batches",
+            ),
+            (
+                pd_producer_configured(self),
+                "P/D kv_producer",
+                "a prefill-only producer cannot use mixed scheduling or its memory profile",
+            ),
+            (
+                spec is not None and kv_config_has_producer(self.kv_transfer_config),
+                "speculative decoding with kv_producer",
+                "producer scheduling disables verification but mixed profiling uses the configured draft width",
+            ),
+            (
+                self.enable_tbo or self.enable_tbo_decode,
+                "TBO",
+                "mixed microbatch splitting is not enabled; disable both TBO modes",
+            ),
+            # Only the V4 builder implements `prepare_mixed`. Compared by
+            # family, not `is_mla`: V4 is its own family despite its latent
+            # rank, and dense MLA (DeepSeek-V2/V3/R1, Kimi) is not supported.
+            (
+                family != Family.V4,
+                f"the {family} attention family",
+                (
+                    "mixed prefill+decode batching is implemented for "
+                    "DeepSeek-V4 only"
+                ),
+            ),
+            # The same predicate `DeepseekV4Attention.forward` routes on: a
+            # TR_HYBRID V4 layer takes its narrow split order on EVERY forward,
+            # captured or not, and that order has no mixed form -- it hands the
+            # merged carrier to the paged prefill kernel whole, which then fails
+            # on the segment index arrays only the per-segment metadata
+            # carries. Only the FULL path (`forward_impl`) splits a mixed batch.
+            (
+                family == Family.V4
+                and cg_mode is not None
+                and cg_mode.uses_tr_hybrid(),
+                f"--cudagraph-mode {getattr(cg_mode, 'name', cg_mode)} on DeepSeek-V4",
+                (
+                    "a TR_HYBRID V4 layer runs its narrow split order on every "
+                    "forward, which has no mixed form; use FULL (the CLI default), "
+                    "FULL_DECODE_ONLY or NONE"
+                ),
+            ),
+            # Speculative decoding runs mixed only as V4 + DSpark: a prefill row
+            # verifies as a 0-draft spec row and the V4 decode half is the
+            # spec-shaped `prepare_decode` with decode-local rejection counts. See
+            # docs/scheduling_kv_cache_guide.md#mixed-prefill-and-decode-on-deepseek-v4.
+            (
+                spec is not None and not spec.use_dspark(),
+                f"speculative decoding via {spec_method!r}",
+                (
+                    "only DSpark is wired through the mixed split so far; MTP "
+                    "and EAGLE share its data flow but are unvalidated there"
+                ),
+            ),
+            (
+                spec is not None and self.pipeline_parallel_size > 1,
+                "speculative decoding with pipeline parallel",
+                (
+                    "mixed speculative input staging and attention rollback "
+                    "are not wired for PP's undeferred output"
+                ),
+            ),
+            # The decode-first `prefill_budget` holds only while prefill is
+            # chunked: unchunked admission takes the first prompt whole even
+            # past the budget, so it can starve the decode rows it reserved.
+            (
+                not self.enable_chunked_prefill,
+                "chunked prefill off",
+                (
+                    "an unchunked prompt is admitted whole even past the "
+                    "decode-first prefill budget, which then cannot hold"
+                ),
+            ),
+            # Keyed off the same predicate as the runner's `use_mrope`, not off
+            # the family: no V4 checkpoint carries `mrope_section` today, but
+            # the family check alone would admit one. `prepare_prefill` lays
+            # M-RoPE positions over every request in the batch, so a mixed
+            # batch's decode rows would write past the prefill positions.
+            (
+                "mrope_section" in rope_parameters,
+                "M-RoPE",
+                (
+                    "the prefill builder lays M-RoPE positions over the whole "
+                    "mixed batch, decode rows included"
+                ),
+            ),
+            (
+                self.prefill_context_parallel_size > 1,
+                "prefill context parallel",
+                (
+                    "the PCP round-robin query split and its attention reindex "
+                    "run over the whole batch, decode rows included"
+                ),
+            ),
+            (
+                self.decode_context_parallel_size > 1,
+                "decode context parallel",
+                "mixed batching requires decode context parallel size 1",
+            ),
+            (
+                self.eplb_enable,
+                "EPLB",
+                "its prefill load window cannot exclude decode tokens in a mixed step",
+            ),
+        ]
+        blocked = [(what, why) for cond, what, why in refusals if cond]
+        if blocked:
+            raise ValueError(
+                "--enable-mixed-prefill-decode is not supported with "
+                + "; ".join(f"{what} ({why})" for what, why in blocked)
+                + ". Drop the flag, or the feature it conflicts with."
+            )
+
+        # When decode append pages fit, keep 1/8 of the token budget for prefill.
+        # FCFS decode tails can wait for the entire long prefill.
+        if spec is not None and spec.num_speculative_tokens:
+            full_reserve = self.max_num_seqs * (spec.num_speculative_tokens + 1)
+            decode_budget = self.max_num_batched_tokens - prefill_floor(
+                self.max_num_batched_tokens
+            )
+            if full_reserve > decode_budget:
+                logger.warning(
+                    "--enable-mixed-prefill-decode with %d speculative tokens: a "
+                    "full decode set (max_num_seqs=%d) needs %d tokens with "
+                    "--max-num-batched-tokens=%d. The scheduler reserves at "
+                    "least 1/8 of that budget for prefill when decode append "
+                    "pages fit, so some decodes "
+                    "at the FCFS tail may wait until preceding decodes finish "
+                    "or the long prefill ends.",
+                    spec.num_speculative_tokens,
+                    self.max_num_seqs,
+                    full_reserve,
+                    self.max_num_batched_tokens,
+                )
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -3800,6 +3968,9 @@ class Config:
         # share one artifact, as they should.
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
+        # Keep mixed attention dispatch/metadata artifacts separate from runs
+        # that only admit homogeneous batches.
+        factors.append(self.enable_mixed_prefill_decode)
         factors.append(self.index_cache_dtype)
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the

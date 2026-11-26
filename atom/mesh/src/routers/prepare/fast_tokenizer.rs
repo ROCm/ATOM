@@ -43,6 +43,10 @@ const FLAT_PROBE_BYTES: usize = 256 << 10;
 /// again. A `tokenizer.json` that cannot be found or downloaded is not refused.
 pub(crate) const STRICT_REFUSAL: &str = "fastokens cannot encode the prompts of";
 
+/// How the error that a HuggingFace model ID's tokenizer cannot be downloaded
+/// begins: a failure that may pass, unlike a `tokenizer.json` that is not there.
+pub(crate) const DOWNLOAD_FAILURE: &str = "cannot download the tokenizer of";
+
 /// The most text the router tokenizes for one request, by tokenizer.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TokenizeLimits {
@@ -133,7 +137,7 @@ pub(crate) async fn with_fastokens(
 
 /// The `tokenizer.json` the factory loads `source` from: the file itself, the one
 /// in a directory, or the one a HuggingFace model ID downloads.
-async fn tokenizer_json(source: &str) -> Result<PathBuf, String> {
+pub(crate) async fn tokenizer_json(source: &str) -> Result<PathBuf, String> {
     let path = Path::new(source);
     let file = if path.is_file() {
         path.to_path_buf()
@@ -142,7 +146,7 @@ async fn tokenizer_json(source: &str) -> Result<PathBuf, String> {
     } else {
         download_tokenizer_from_hf(source)
             .await
-            .map_err(|error| format!("cannot download the tokenizer of {source}: {error}"))?
+            .map_err(|error| format!("{DOWNLOAD_FAILURE} {source}: {error}"))?
             .join("tokenizer.json")
     };
     if file.is_file() {

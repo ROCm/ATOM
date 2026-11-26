@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from math import inf, isinf
 from time import monotonic
+from typing import Any
 from weakref import WeakKeyDictionary
 
 import numpy as np
@@ -22,8 +23,8 @@ from atom.distributed.kv_events import (
     KVCacheEvent,
 )
 from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
-from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_block_pool import KVBlockPool, make_block_pool
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     checkpoint_copy_ops_per_batch,
@@ -231,6 +232,7 @@ class BlockManager:
         config: Config,
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
+        kv_connector: Any = None,
     ):
         self._min_load_tokens = config.offload_min_load_tokens
         block_size = config.kv_cache_block_size
@@ -254,6 +256,9 @@ class BlockManager:
         # round writes. Set by the scheduler, which knows whether this engine
         # drafts; admission charges for it and `may_append` allocates it.
         self.draft_lookahead = 0
+        # Admission protects the mixed tick's decodes. The scheduler updates
+        # this after P/D promotion and clears it before selecting decodes.
+        self.reserved_decode_blocks = 0
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
@@ -292,13 +297,20 @@ class BlockManager:
         # The compressed KV blocks. Same class the sliding window uses for its
         # own index space — hash eviction has to happen at the same moment in
         # both or a prefix hit could be honoured by one pool and not the other.
-        self.kv = BlockPool(
+        self.kv: KVBlockPool = make_block_pool(
+            config,
             num_blocks,
             on_evict=self._record_evicted,
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
             reserve_null_block=state_runtime.checkpoint_spec is not None,
+            kv_connector=kv_connector,
+        )
+        # Sequences whose prompt chain a content-sharing pool was already asked
+        # for (`_fetch_shared_prefix`), by the seed it was asked under.
+        self._shared_prefix_asked: WeakKeyDictionary[Sequence, int] = (
+            WeakKeyDictionary()
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -313,10 +325,30 @@ class BlockManager:
         # `state_slots_per_req` is what a live request asks for.
         pool_entries: dict = getattr(config, "pool_entries", None) or {}
         pool_per_req: dict = getattr(config, "pool_entries_per_req", None) or {}
-        # Total capacity, kept so callers can tell "all slots busy" (transient)
-        # from "no slots were ever created" (permanent).
+        # Slots live requests can take (transfer slots are carved off below), kept
+        # so callers can tell "all slots busy" from "no slots were ever created".
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        # A P/D producer's transfer slots, sized by the runner past the live ones:
+        # the top of the pool, where a finished request's state waits for its push.
+        self.num_state_transfer_slots = config.state_transfer_slots
+        if self.num_state_transfer_slots:
+            self.num_state_slots -= self.num_state_transfer_slots
+            logger.info(
+                "State pool: %d slots for live requests, %d P/D transfer slots",
+                self.num_state_slots,
+                self.num_state_transfer_slots,
+            )
+        self._free_transfer_slots: deque[int] = deque(
+            range(
+                self.num_state_slots,
+                self.num_state_slots + self.num_state_transfer_slots,
+            )
+        )
+        # Finished requests moved to a transfer slot, and those that kept
+        # their live slot because every transfer slot was taken.
+        self.transfer_slot_moves = 0
+        self.transfer_slots_full = 0
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -414,6 +446,9 @@ class BlockManager:
         self._state_checkpoint_cache: StateCheckpointCache = (
             self.paged_state_checkpoints or self.state
         )
+        if self.num_state_transfer_slots:
+            # `deallocate` then hands a transfer slot back to its own list.
+            self.state.release_many = self._release_live_or_transfer_slots
         # Where a readable backend can snapshot inside a forward; see
         # `midstep_target_ok`. Zero for a backend that cannot.
         self.midstep_grid = state_runtime.transfer.midstep_grid
@@ -598,6 +633,7 @@ class BlockManager:
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
+            block_copies=self.kv.take_block_copies(),
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:
@@ -651,24 +687,22 @@ class BlockManager:
 
         The raise is unreachable through `Scheduler` and the checkpoint cache
         cannot make it reachable: a READY unpinned checkpoint counts as
-        available, and both callers sit behind a pin-aware check in the same
-        pass. `allocate` protects the checkpoint it is about to pin -- the
-        joint boundary when that image is in HBM, otherwise the HBM-hit
-        checkpoint -- and sees the pin taken before the fresh blocks.
-        `may_append` runs only in a pass that scheduled no prefill
-        (`scheduler.py`, `if num_seqs_prefill > 0` returns first), so every
-        pin was already released at the top of that pass -- except for the
-        draft lookahead an admission allocates right after its `allocate`.
-        `can_allocate` charged those blocks (`draft_lookahead_blocks`) against
-        the HBM-hit checkpoint; when a joint needs more, `_fit_joint` charges
-        that same demand plus the private tail against the checkpoint
-        `allocate` will pin. Under contention the reachable outcome is a
-        refused admission, not this.
-
-        That second half rests on prefill and decode never sharing a pass. If
-        the mixed batch that `scheduler.py` has a TODO for lands, `may_append`
-        starts running alongside this pass's pins and the argument has to be
-        redone.
+        available, and each caller sits right behind a pin-aware check that
+        counts the same set. `allocate` protects the checkpoint it is about to
+        pin -- the joint boundary when that image is in HBM, otherwise the
+        HBM-hit checkpoint -- and sees the pin taken before the fresh blocks,
+        and the draft lookahead an admission allocates right after its
+        `allocate` included: `can_allocate` charged those blocks
+        (`draft_lookahead_blocks`) against the HBM-hit checkpoint, and when a
+        joint needs more, `_fit_joint` charges that same demand plus the private
+        tail against the checkpoint `allocate` will pin. `may_append` follows
+        `_has_page_units(append_blocks_needed(...))`. Both ask about the same
+        eligible set (`_is_evictable`:
+        READY, unpinned): pins this pass's prefill admissions took -- a mixed
+        step's -- are outside it for both, and nothing is consumed between the
+        two (the scheduler's decode loop may preempt in between, which only
+        frees). Under contention the reachable outcome is a refused admission
+        or a skipped decode, not this.
         """
         if not self._ensure_page_units(1):
             raise AssertionError("No PAGE unit available for a fresh KV block")
@@ -1230,11 +1264,20 @@ class BlockManager:
         avoiding a second hash pass.
         """
         if probe is None:
-            return self._evaluate(seq, self._admission_walk, record, block_hashes)
+            return self._evaluate(
+                seq,
+                self._admission_walk,
+                record,
+                block_hashes,
+            )
         assert block_hashes is None, "the probe carries its own chain"
         probe.num_new_blocks = None
         probe.num_cached_blocks = self._evaluate(
-            seq, self._admission_walk, record, probe.block_hashes, probe
+            seq,
+            self._admission_walk,
+            record,
+            probe.block_hashes,
+            probe,
         )
         return probe.num_cached_blocks
 
@@ -1258,11 +1301,12 @@ class BlockManager:
             block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
+        reserved = self.reserved_decode_blocks
         if not self.enable_prefix_caching:
             num_new_blocks = self.num_pool_blocks(
                 len(seq)
             ) + self.draft_lookahead_blocks(len(seq))
-            if not self._has_page_units(num_new_blocks):
+            if not self._has_page_units(num_new_blocks + reserved):
                 return -1
             if probe is not None:
                 probe.num_new_blocks = num_new_blocks
@@ -1324,7 +1368,7 @@ class BlockManager:
             protected_hash=protected_hash,
         )
         self._record_checkpoint_end(seq)
-        if not self._has_page_units(num_new_blocks, protected_hash):
+        if not self._has_page_units(num_new_blocks + reserved, protected_hash):
             return -1
         # `record_allocation` re-checks a joint against this demand instead of
         # walking the hit again.
@@ -1335,7 +1379,8 @@ class BlockManager:
         # budget checks; refused probes avoid the extra LMCache hash walk.
         if record:
             self.record_allocation(
-                seq, AdmissionProbe(num_cached_blocks, block_hashes, num_new_blocks)
+                seq,
+                AdmissionProbe(num_cached_blocks, block_hashes, num_new_blocks),
             )
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
@@ -1399,7 +1444,9 @@ class BlockManager:
         if not decision.state_from_hbm and extra == 0:
             return decision
         protected = decision.boundary_hash if decision.state_from_hbm else None
-        if self._has_page_units(num_new_blocks + extra, protected):
+        if self._has_page_units(
+            num_new_blocks + extra + self.reserved_decode_blocks, protected
+        ):
             return decision
         reason = (
             "partial_chunk_no_room"
@@ -1410,6 +1457,8 @@ class BlockManager:
 
     def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
         """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`."""
+        if self.kv.shares_content and self.enable_prefix_caching:
+            self._fetch_shared_prefix(seq)
         prompt = self._prompt_hashes(seq)
         if self.fast_prefix_walk:
             hashes, ids = self._hit_walk(seq, prompt)
@@ -1427,6 +1476,53 @@ class BlockManager:
         return _PrefixWalk(
             seq.num_tokens, seq.cache_seed, self.kv.index_version, hashes, ids
         )
+
+    def _fetch_shared_prefix(self, seq: Sequence) -> None:
+        """Have the pool bring in what other pools hold of `seq`'s prompt.
+
+        Once per sequence and cache seed, before its first walk: the blocks
+        arrive free and indexed, so the walk that follows hits them like any
+        local prefix and `allocate` claims them. Only the part of the chain
+        past the local hit is asked for, and never the last hash block, which
+        the walk does not match either.
+        """
+        if self._shared_prefix_asked.get(seq) == seq.cache_seed:
+            return
+        self._shared_prefix_asked[seq] = seq.cache_seed
+        n = self._n_hash_blocks(seq) - 1
+        if n <= 0:
+            return
+        chain = chained_block_hashes(
+            seq.token_ids, self.hash_block_size, 0, n, seq.cache_seed
+        )
+        get = self.kv.index_get
+        local = 0
+        while local < n and get(chain[local]) is not None:
+            local += 1
+        if local == n:
+            return
+        tokens_of = lambda i: self._hash_block_tokens(seq, local + i)
+        if self.kv.async_fetch:
+            # Copied in the background; the scheduler holds the sequence back
+            # while it is in flight (`shared_prefix_pending`).
+            self.kv.fetch_async(seq.id, chain[local:], tokens_of)
+            return
+        self.kv.fetch(chain[local:], tokens_of)
+
+    def shared_prefix_pending(self, seq: Sequence) -> bool:
+        """Whether `seq` should wait for its prefix to arrive from other pools.
+
+        Starts the copy on the first ask (`_fetch_shared_prefix`, which a
+        walk would otherwise start), so the scheduler can ask before probing.
+        """
+        if not (
+            self.kv.shares_content
+            and self.enable_prefix_caching
+            and self.kv.async_fetch
+        ):
+            return False
+        self._fetch_shared_prefix(seq)
+        return self.kv.fetch_pending(seq.id)
 
     def _admission_walk(self, seq: Sequence) -> _PrefixWalk:
         """The exact probe's walk, kept on the fast walk for `seq`'s `allocate`
@@ -1717,7 +1813,7 @@ class BlockManager:
                 in_use += 1
         demand = probe.num_new_blocks + in_use
         protected = chain[lowered - 1] if lowered else None
-        if not self._has_page_units(demand, protected):
+        if not self._has_page_units(demand + self.reserved_decode_blocks, protected):
             return False
         probe.num_cached_blocks = lowered
         probe.num_new_blocks = demand
@@ -1947,6 +2043,7 @@ class BlockManager:
                 seq,
                 self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
+        self.kv.prepare(self.num_pool_blocks(len(seq)) - len(seq.block_table))
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
         seq.num_cached_tokens = num_cached_blocks * hbs
@@ -3790,30 +3887,60 @@ class BlockManager:
         seq.offload_joint.load_hash = -1
         seq.offload_joint.reset_joint()
 
-    def can_append(
-        self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
-    ) -> bool:
-        """Whether the pool can back what `may_append` takes for this step.
+    def _release_live_or_transfer_slots(self, slots) -> None:
+        """Hand back live slots to the pool, transfer slots to their own list."""
+        for slot in slots or ():
+            if slot >= self.num_state_slots:
+                self._free_transfer_slots.append(slot)
+            elif slot >= 0:
+                self.state.release(slot)
 
-        Sized on `len(seq) + max(num_new_tokens, lookahead)`. A decode step's
-        `num_new_tokens` (`1 + mtp_k`) already exceeds its draft lookahead
-        (`mtp_k - 1`), so the lookahead never raises the bar there; it is
-        passed so the check states what it covers.
+    def move_state_to_transfer_slot(self, seq: Sequence) -> tuple[int, int] | None:
+        """Re-home a finished P/D request's state in a transfer slot.
+
+        Returns ``(src, dst)``: the caller must copy slot ``src`` into ``dst``
+        before the next forward, which may reuse ``src``. None when every
+        transfer slot is taken: the request keeps its live slot.
         """
+        if not self._free_transfer_slots:
+            self.transfer_slots_full += 1
+            return None
+        src = seq.state_slot
+        dst = self._free_transfer_slots.popleft()
+        self.state.release_many(seq.state_slots)
+        seq.state_slots = [dst]
+        self.transfer_slot_moves += 1
+        return src, dst
+
+    def transfer_slot_occupancy(self) -> dict[str, int]:
+        """Transfer slots in use and in total, and the moves made or missed."""
+        total = self.num_state_transfer_slots
+        return {
+            "transfer_slots_total": total,
+            "transfer_slots_used": total - len(self._free_transfer_slots),
+            "transfer_slot_moves": self.transfer_slot_moves,
+            "transfer_slots_full": self.transfer_slots_full,
+        }
+
+    def append_blocks_needed(
+        self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
+    ) -> int:
+        """Free pages needed by the decode admission check, before allocating."""
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
         ebs = self._effective_block_size()
         reach = seq_len + max(num_new_tokens, lookahead)
         needed_blocks = (reach + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        return self._has_page_units(new_blocks_needed)
+        return new_blocks_needed
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0):
         """Allocate every block this step's KV writes land in.
 
         The target writes up to `len(seq) - 1`; the draft round writes
         `lookahead` positions past that (`draft_kv_lookahead`). Checking that
-        the pool has room (`can_append`) is not the same as allocating it: a
+        the pool has room (`_has_page_units(append_blocks_needed(...))`) is not
+        the same as allocating it: a
         position past the last allocated block reads block id 0 from the zeroed
         block-table tail, overwriting the padding block or unrelated live KV.
         """

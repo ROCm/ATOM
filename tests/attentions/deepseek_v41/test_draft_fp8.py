@@ -202,9 +202,9 @@ def test_stages_share_one_source_build_per_draft_round(
     draft.block_size, draft.window_size = 5, 128
     draft.draft_kv_dtype = "fp8" if dtype == "fp8" else "auto"
     draft.draft_src_buffers = DraftSrcBuffers(3, 5)
-    draft.config = SimpleNamespace(hc_mult=4)
+    draft.config = SimpleNamespace(hc_mult=4, dspark_noise_token_id=0)
     draft.rope = None
-    draft._noise_embedding = lambda: draft.embed.weight[0]
+    draft._unbind_embedding()
     draft.mtp = nn.ModuleList([Stage(i) for i in (40, 41, 42)])
     raw = torch.zeros(3, 133, 512, device="cuda", dtype=torch.bfloat16)
     history = quantize_fp8(raw) if dtype == "fp8" else raw

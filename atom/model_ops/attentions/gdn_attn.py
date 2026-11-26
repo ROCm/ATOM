@@ -717,7 +717,8 @@ class GDNStateMixin(PoolRowsMixin):
         Concrete builders splice this into their `sub_pool_specs()` alongside
         whatever paged KV pool they own.
 
-        Sized for in-flight requests and nothing more. A retained checkpoint
+        Sized for in-flight requests, plus the decode snapshot scratch and a
+        P/D producer's transfer slots (`extra_entries`). A retained checkpoint
         sits in a slot `max_num_seqs` left spare, so how many can be kept is
         set by concurrency rather than by how much reuse the traffic has —
         which is why a *lower* max_num_seqs measures a *worse* hit rate on
@@ -742,8 +743,26 @@ class GDNStateMixin(PoolRowsMixin):
             STATE_SLOT_CLASS,
             self.num_state_layers() * per_layer + self._replayssm_bytes_per_slot(),
             entries_per_req=self.slots_per_req(),
-            extra_entries=DECODE_SNAPSHOT_SCRATCH_SLOTS if scratch else 0,
+            extra_entries=(DECODE_SNAPSHOT_SCRATCH_SLOTS if scratch else 0)
+            + self.state_transfer_slots(),
         )
+
+    def state_transfer_slots(self) -> int:
+        """Slots past the live ones where a MoRIIO producer parks a finished
+        request's state until its push (kv-transfer `state_transfer_slots`)."""
+        from atom.kv_transfer.disaggregation.factory import (
+            KVConnectorFactory,
+            requested_state_transfer_slots,
+        )
+
+        cfg = self.model_runner.config.kv_transfer_config or {}
+        # Not under multi: another sub (an offload tier) may read the live slot.
+        if (
+            KVConnectorFactory.connector_name(cfg) != "moriio"
+            or cfg.get("kv_role", "kv_producer") != "kv_producer"
+        ):
+            return 0
+        return requested_state_transfer_slots(cfg)
 
     def slots_per_req(self) -> int:
         """Baseline GDN reserves one extra state slot per speculative token so
@@ -1292,7 +1311,9 @@ class GDNStateMixin(PoolRowsMixin):
         checkpoint path: it exists because moving the pool's boundary has to be
         able to relocate a slot that is in the way, and relocation is a byte
         move whatever mechanism the class uses to checkpoint. A backend
-        declaring `StateTransfer.fork` therefore still owes this method.
+        declaring `StateTransfer.fork` therefore still owes this method. A P/D
+        producer also stages a finished request's state into its transfer slot
+        through it (`ModelRunner._process_kvconnector_output_relocating`).
 
         Under ReplaySSM the records and the cursor travel with the slot. They
         are not an accelerator for the state, they are part of it: the

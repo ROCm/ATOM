@@ -1193,7 +1193,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
     # --- Structured output ---
     # Hold tool calls to the declared schemas when the tool parser declares a
-    # grammar for them (Kimi-K3) and the structured-output extra is installed.
+    # grammar for them (Kimi-K3) and the structured-output backend is available.
     "ATOM_TOOL_CALL_GRAMMAR": lambda: (
         os.getenv("ATOM_TOOL_CALL_GRAMMAR", "0").lower() == "1"
     ),
