@@ -861,7 +861,6 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         attn_metadata.dspark_bt16_rows = rows_bt
         attn_metadata.dspark_ctx_rows = rows_len
 
-
     def _sharded_markov_sample(self) -> bool:
         """Whether the block is sampled off this rank's vocab shard: the ranks
         exchange each position's ``(max, id)`` instead of all-gathering the
