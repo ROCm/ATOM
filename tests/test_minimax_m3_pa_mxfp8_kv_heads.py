@@ -102,7 +102,7 @@ def _call(mods, monkeypatch, *, rows, bucket, kv_heads, mxfp8, reuse=False):
     pa = mods.load("aiter.ops.flydsl.pa_decode")
     monkeypatch.setattr(pa, "pa_decode", lambda *a, **kw: kernel(*a, **kw))
     gluon = mods.load("aiter.ops.triton.gluon.pa_decode_gluon")
-    monkeypatch.setattr(gluon, "get_recommended_splits", lambda *_: 3)
+    monkeypatch.setattr(gluon, "get_recommended_splits", lambda *_a, **_k: 3)
     monkeypatch.setattr(
         mods.base, "_flydsl_prepare_explicit_plan", lambda **kw: seen.update(plan=kw)
     )

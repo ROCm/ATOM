@@ -105,7 +105,7 @@ def _record_pa_decode(monkeypatch):
 
     work_plan_cap = [GFX1250_PLAN]
     monkeypatch.setattr(flydsl_pa, "pa_decode", pa_decode)
-    monkeypatch.setattr(pa_decode_gluon, "get_recommended_splits", lambda *_: 1)
+    monkeypatch.setattr(pa_decode_gluon, "get_recommended_splits", lambda *_a, **_k: 1)
     return launches, work_plan_cap
 
 
@@ -195,7 +195,7 @@ def test_fp8_rows_chunk_only_without_gluon(monkeypatch, gluon):
     monkeypatch.setattr(sparse_attn, "pa_decode_gluon_supports_arch", lambda: gluon)
     monkeypatch.setattr(sparse_attn.envs, "ATOM_PA_FLYDSL", True)
     monkeypatch.setattr(sparse_attn, "_sparse_pa_ran_on_asm", lambda *_: False)
-    monkeypatch.setattr(pa_decode_gluon, "get_recommended_splits", lambda *_: 1)
+    monkeypatch.setattr(pa_decode_gluon, "get_recommended_splits", lambda *_a, **_k: 1)
     calls = []
     monkeypatch.setattr(ba, "run_pa_decode", lambda **kw: calls.append(kw))
     rows, kv = 5, 4
