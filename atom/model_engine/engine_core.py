@@ -1305,14 +1305,7 @@ class DPEngineCoreProc(EngineCore):
                     # so they turn READY (reusable, evictable, storable to the
                     # CPU tier) instead of staying COPYING with their pins
                     # (`BlockManager.complete_previous_checkpoint_batch`).
-                    # Guarded for scheduler doubles without a block manager.
-                    complete_checkpoints = getattr(
-                        getattr(self.scheduler, "block_manager", None),
-                        "complete_previous_checkpoint_batch",
-                        None,
-                    )
-                    if complete_checkpoints is not None:
-                        complete_checkpoints()
+                    self.scheduler.block_manager.complete_previous_checkpoint_batch()
                     blocked = idle_when_blocked and bool(self.scheduler.waiting)
                     if self.has_pending_kv_work() or blocked:
                         # Local RPCs only. Anything that reaches schedule()

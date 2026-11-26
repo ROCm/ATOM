@@ -178,6 +178,9 @@ def _run(intervals, work, commands=None, shutdown_at=32, startup_error=None):
                 ),
                 notify_idle=lambda: None,
             ),
+            block_manager=SimpleNamespace(
+                complete_previous_checkpoint_batch=lambda: None
+            ),
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda e=engine: setattr(e, "cleaned", True),
             close_kv_connector=lambda: None,

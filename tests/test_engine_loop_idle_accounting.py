@@ -93,6 +93,9 @@ class _Engine:
             heartbeat_throughput=lambda now: None,
             is_finished=lambda: self._state is IDLE,
             prefill_delayer=None,
+            block_manager=SimpleNamespace(
+                complete_previous_checkpoint_batch=lambda: None
+            ),
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
             close_kv_connector=lambda: None,
