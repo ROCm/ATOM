@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""MiniMax-M3 native MXFP8 fused all-reduce: eligibility and the helper (CPU)."""
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+"""MiniMax-M3 native MXFP8 fused all-reduce: the gate and the helper (CPU)."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -7,7 +9,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
-from conftest import gpu_stack_import
 
 
 @pytest.fixture
@@ -20,33 +21,29 @@ def mods():
 
 
 def _linear(**kw):
-    base = {"params_dtype": torch.float8_e4m3fn, "native_a8_group_rows": 1}
+    base = {
+        "params_dtype": torch.float8_e4m3fn,
+        "native_a8_group_rows": 1,
+        "runs_bf16": False,
+    }
     return SimpleNamespace(**{**base, **kw})
 
 
 @pytest.mark.parametrize(
-    "kw, eligible",
+    "kw, api, gfx, want",
     [
-        ({}, True),
-        ({"params_dtype": torch.float8_e4m3fnuz}, False),
-        ({"quant": "per_Token"}, False),
-        ({"params_dtype": torch.float4_e2m1fn_x2}, False),
-        ({"native_a8_group_rows": None}, False),
-        ({"runs_bf16": True}, False),
+        ({}, True, "gfx1250", True),
+        ({"native_a8_group_rows": 32}, True, "gfx1250", True),
+        ({}, False, "gfx1250", False),
+        ({}, True, "gfx950", False),
+        ({"params_dtype": torch.float8_e4m3fnuz}, True, "gfx1250", False),
+        ({"params_dtype": torch.float4_e2m1fn_x2}, True, "gfx1250", False),
+        ({"native_a8_group_rows": None}, True, "gfx1250", False),
+        ({"runs_bf16": True}, True, "gfx1250", False),
     ],
 )
-def test_only_native_group32_fp8_linears_consume_mxfp8(kw, eligible):
-    model = gpu_stack_import("atom.models.minimax_m3.model")  # imports FlyDSL
-    quant = getattr(model.QuantType, kw.pop("quant", "per_1x32"))
-    assert model._linear_consumes_mxfp8(_linear(quant_type=quant, **kw)) is eligible
-
-
-@pytest.mark.parametrize(
-    "api, gfx, want",
-    [(True, "gfx1250", True), (False, "gfx1250", False), (True, "gfx950", False)],
-)
-def test_the_fused_op_is_used_where_aiter_has_it_on_gfx1250(
-    mods, monkeypatch, api, gfx, want
+def test_the_fused_op_feeds_only_native_e4m3fn_group32_linears_on_gfx1250(
+    mods, monkeypatch, kw, api, gfx, want
 ):
     ln = mods.layernorm
     op = Mock() if api else None
@@ -54,7 +51,7 @@ def test_the_fused_op_is_used_where_aiter_has_it_on_gfx1250(
         ln, "tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant", op
     )
     monkeypatch.setattr(ln, "get_gfx_runtime", lambda: gfx)
-    assert ln.fused_allreduce_gemma_rms_norm_mxfp8_supported() is want
+    assert ln.fused_allreduce_gemma_rms_norm_mxfp8_supported(_linear(**kw)) is want
 
 
 @pytest.mark.parametrize("tp", [4, 1])

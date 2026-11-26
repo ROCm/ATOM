@@ -162,20 +162,6 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
     )
 
 
-def _linear_consumes_mxfp8(linear: nn.Module) -> bool:
-    """Whether a linear consumes native E4M3 plus row-major group-32 E8M0."""
-    quant_type = getattr(linear, "quant_type", None)
-    quant_type_value = getattr(quant_type, "value", quant_type)
-    return (
-        quant_type_value == QuantType.per_1x32.value
-        # LinearBase sets native_a8_group_rows for native E4M3FN and W4A8 FP4
-        # weights, never FNUZ; the fused op writes E4M3FN for the FP8 ones.
-        and getattr(linear, "params_dtype", None) == torch.float8_e4m3fn
-        and getattr(linear, "native_a8_group_rows", None) is not None
-        and not getattr(linear, "runs_bf16", False)
-    )
-
-
 def _minimax_m3_cos_sin_cache(
     rotary_emb: nn.Module,
     query: torch.Tensor,
@@ -685,8 +671,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # Resolved here, not in forward: the arch probe must stay out of the graph.
-        self.mxfp8_fused_ar = fused_allreduce_gemma_rms_norm_mxfp8_supported()
+        # Fixed at construction, so the arch probe stays out of the graph.
+        self.input_ar_mxfp8 = fused_allreduce_gemma_rms_norm_mxfp8_supported(
+            self.self_attn.qkv_proj
+        )
+        self.post_attention_ar_mxfp8 = (
+            not self.is_moe_layer
+            and fused_allreduce_gemma_rms_norm_mxfp8_supported(self.mlp.gate_up_proj)
+        )
 
     def forward(
         self,
@@ -706,14 +698,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
             not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
         )
-        fuse_input_ar_rmsnorm_mxfp8 = self.mxfp8_fused_ar and _linear_consumes_mxfp8(
-            self.self_attn.qkv_proj
-        )
-        fuse_post_attention_ar_rmsnorm_mxfp8 = (
-            self.mxfp8_fused_ar
-            and not self.is_moe_layer
-            and _linear_consumes_mxfp8(self.mlp.gate_up_proj)
-        )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -723,7 +707,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                     hidden_states, residual, self.input_layernorm
                 )
             )
-        elif fuse_input_ar_rmsnorm_mxfp8:
+        elif self.input_ar_mxfp8:
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_mxfp8_quant(
                     hidden_states,
@@ -755,7 +739,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 )
             )
             hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
-        elif fuse_post_attention_ar_rmsnorm_mxfp8:
+        elif self.post_attention_ar_mxfp8:
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_mxfp8_quant(
                     hidden_states,

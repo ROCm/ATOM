@@ -1091,12 +1091,21 @@ def fused_allreduce_gemma_rms_norm_quant(
     return out_fp8, scale_out, residual_out
 
 
-def fused_allreduce_gemma_rms_norm_mxfp8_supported() -> bool:
-    """aiter's AR + Gemma RMSNorm + MXFP8 op exists and was validated on this arch
-    (its E4M3 / E8M0 bytes equal the separate norm and ``quantize_fp8``)."""
+def fused_allreduce_gemma_rms_norm_mxfp8_supported(linear: nn.Module) -> bool:
+    """Whether aiter's AR + Gemma RMSNorm + MXFP8 op can feed ``linear``: aiter
+    has the op and this is the arch it was validated on (its E4M3 / E8M0 bytes
+    equal the separate norm and ``quantize_fp8``), and ``linear`` reads native
+    E4M3FN with row-major group-32 E8M0 scales.
+
+    Everything read here is fixed when the linear is built: ``LinearBase`` sets
+    ``native_a8_group_rows`` only for native ``per_1x32`` E4M3FN and W4A8 FP4
+    weights (never FNUZ), and the dtype check leaves out the FP4 ones."""
     return (
         tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant is not None
         and get_gfx_runtime() == "gfx1250"
+        and linear.native_a8_group_rows is not None
+        and linear.params_dtype == torch.float8_e4m3fn
+        and not linear.runs_bf16
     )
 
 
