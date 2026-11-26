@@ -528,6 +528,10 @@ mod tests {
             ["deepseek_v4", {"chat_template_kwargs": {"thinking_mode": "auto"}}, null],
             ["deepseek_v32", {"chat_template_kwargs": {"reasoning_effort": "max", "drop_thinking": false}}, {"thinking_mode": "thinking", "drop_thinking": false}],
             ["deepseek_v32", {"thinking": {"type": "disabled"}}, {"thinking_mode": "chat"}],
+            // A Responses request's effort (`responses_to_chat`).
+            ["deepseek_v41", {"chat_template_kwargs": {"thinking_effort": "medium"}}, {"thinking_mode": "thinking", "thinking": true, "reasoning_effort": "high"}],
+            ["kimi_k3", {"chat_template_kwargs": {"thinking_effort": "low"}}, {"thinking": true, "thinking_effort": "low"}],
+            ["deepseek_v4", {"chat_template_kwargs": {"thinking_effort": "high"}}, {"thinking_mode": "thinking"}],
         ]);
         for case in cases.as_array().unwrap() {
             let controls = ChatControls::of_model_type(case[0].as_str().unwrap()).unwrap();

@@ -35,6 +35,42 @@ pub use factory::RouterFactory;
 /// A chat's body as the client sent it (`RouterTrait::sent_chat_body`).
 pub type SentChatBody = std::sync::Arc<serde_json::Map<String, serde_json::Value>>;
 
+/// A Responses request from its JSON body. The typed request fills in a
+/// `medium` effort for a `reasoning` that names none, which the client did not
+/// ask for (and ATOM's `/v1/responses` does not read): it is left unset.
+fn responses_request(body: serde_json::Value) -> serde_json::Result<ResponsesRequest> {
+    let unstated_effort = body
+        .get("reasoning")
+        .and_then(|r| r.as_object())
+        .is_some_and(|r| r.get("effort").is_none_or(|e| e.is_null()));
+    let mut request: ResponsesRequest = serde_json::from_value(body)?;
+    if unstated_effort {
+        if let Some(reasoning) = request.reasoning.as_mut() {
+            reasoning.effort = None;
+        }
+    }
+    Ok(request)
+}
+
+#[cfg(test)]
+mod responses_request_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn an_unstated_effort_stays_unset() {
+        let effort = |reasoning| {
+            let body = json!({"model": "m", "input": "hi", "reasoning": reasoning});
+            let request = responses_request(body).unwrap();
+            serde_json::to_value(request.reasoning.and_then(|r| r.effort)).unwrap()
+        };
+        assert_eq!(effort(json!({"summary": "auto"})), json!(null));
+        assert_eq!(effort(json!({"effort": null})), json!(null));
+        assert_eq!(effort(json!({"effort": "low"})), json!("low"));
+    }
+}
+
 /// Core trait for all router implementations
 ///
 /// This trait provides a unified interface for routing requests,
@@ -75,7 +111,7 @@ pub trait RouterTrait: Send + Sync + Debug {
             ParsedInference::Responses(body) => {
                 use crate::protocols::validated::Normalizable;
                 use validator::Validate;
-                match serde_json::from_value::<ResponsesRequest>(body) {
+                match responses_request(body) {
                     Ok(mut body) => {
                         body.normalize();
                         if let Err(err) = body.validate() {

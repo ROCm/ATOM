@@ -114,7 +114,10 @@ the bottleneck.
   V4.1's refusal of a forced `tool_choice` in thinking mode, V3.2's and V4's
   ports called as ATOM's adapter calls their checkpoints' `encode_messages`,
   and the prompt's text encoded as ATOM encodes it. The gRPC routers keep the
-  chat's body as sent for these models too (`prepare::sent_chat_body`). A
+  chat's body as sent for these models too (`prepare::sent_chat_body`), and
+  their `/v1/responses` renders the chat it builds with `reasoning.effort` as
+  ATOM's `/v1/responses` gives it (`thinking_effort`; an unstated effort stays
+  unset, not the typed request's `medium`). A
   tokenizer llm-tokenizer renders with a built-in encoder, whose `model_type`
   is none of these, is refused at registration. `src/reasoning` adds the `kimi_k3`
   reasoning parser the `reasoning-parser` crate lacks.
