@@ -33,6 +33,7 @@ from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
+    padded_partition_size,
     requantize_with_max_scale,
     shuffle_weights,
 )
@@ -254,10 +255,6 @@ def _zero_pad_tail(param, dim: int, start: int, length: int) -> None:
     other tiles; re-shuffled, they would land in the pad."""
     if length > 0:
         param.data.narrow(dim, start, length).view(torch.uint8).zero_()
-
-
-def padded_partition_size(size: int, align: int | None) -> int:
-    return size if not align else (size + align - 1) // align * align
 
 
 def _zero_k_pad(layer: nn.Module, quant_config, prefix: str) -> None:
