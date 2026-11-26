@@ -97,20 +97,25 @@ def test_sp_support_is_known_from_the_linears_before_the_weights_load(sp):
 
 
 @pytest.mark.parametrize(
-    "env, tp, pp, pcp, dp, wanted",
+    "env, framework, tp, pp, pcp, dp, wanted",
     [
-        (True, 4, 1, 1, 1, True),
-        (False, 4, 1, 1, 1, False),
-        (True, 1, 1, 1, 1, False),
-        (True, 4, 2, 1, 1, False),
-        (True, 4, 1, 2, 1, False),
-        (True, 4, 1, 1, 2, False),
+        (True, "atom", 4, 1, 1, 1, True),
+        (False, "atom", 4, 1, 1, 1, False),
+        (True, "vllm", 4, 1, 1, 1, False),
+        (True, "sglang", 4, 1, 1, 1, False),
+        (True, "atom", 1, 1, 1, 1, False),
+        (True, "atom", 4, 2, 1, 1, False),
+        (True, "atom", 4, 1, 2, 1, False),
+        (True, "atom", 4, 1, 1, 2, False),
     ],
 )
-def test_sp_only_under_pure_tp(load, sp, monkeypatch, env, tp, pp, pcp, dp, wanted):
+def test_sp_only_under_pure_tp_in_atoms_engine(
+    load, sp, monkeypatch, env, framework, tp, pp, pcp, dp, wanted
+):
     """PCP here is AITER's PCP group, which Ulysses SP runs over too."""
     cfg = NS(parallel_config=NS(data_parallel_size=dp))
     parallel_state = load("aiter.dist.parallel_state")
+    monkeypatch.setattr(load("atom.plugin.prepare"), "_CURRENT_FRAMEWORK", framework)
     monkeypatch.setattr(sp.envs, "ATOM_M3_SP_PREFILL", env, raising=False)
     monkeypatch.setattr(sp, "_tp", lambda: NS(world_size=tp))
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: NS(world_size=pp))

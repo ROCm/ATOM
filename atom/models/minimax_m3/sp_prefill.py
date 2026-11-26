@@ -171,17 +171,21 @@ def plan(num_tokens: int, max_tokens: int = SP_MAX_TOKENS) -> SeqShard | None:
 
 
 def _wanted() -> bool:
-    """``ATOM_M3_SP_PREFILL`` under pure TP: no PP, no DP, no PCP group (PCP or
-    Ulysses SP; the MoE chain would skip FusedMoE's PCP gather and reduce)."""
+    """``ATOM_M3_SP_PREFILL`` in ATOM's own engine, under pure TP: no PP, no DP, no
+    PCP group (PCP or Ulysses SP; the MoE chain would skip FusedMoE's PCP gather
+    and reduce). Not under the plugins: vLLM sets no ATOM forward context for M3,
+    so SP would never run and the o_proj copy would only take memory, and under
+    SGLang SP would run on an untested path."""
     from aiter.dist.parallel_state import (
         get_pp_group,
         get_prefill_context_model_parallel_world_size,
     )
 
-    from atom.config import get_current_atom_config
+    from atom.config import get_current_atom_config, is_plugin_mode
 
     return (
         envs.ATOM_M3_SP_PREFILL
+        and not is_plugin_mode()
         and _tp().world_size > 1
         and get_pp_group().world_size == 1
         and get_prefill_context_model_parallel_world_size() == 1
@@ -223,8 +227,9 @@ def attach_o_proj_full(model: nn.Module, quant_config) -> None:
     model._sp_supported = _wanted() and all(_layer_supports_sp(x) for x in layers)
     if envs.ATOM_M3_SP_PREFILL and not model._sp_supported:
         logger.info(
-            "MiniMax-M3 sequence-parallel prefill off: it needs pure TP (TP > 1, "
-            "no PP / DP / PCP) and native MXFP8 attention and dense-MLP linears"
+            "MiniMax-M3 sequence-parallel prefill off: it needs ATOM's own engine "
+            "(not a vLLM / SGLang plugin), pure TP (TP > 1, no PP / DP / PCP) and "
+            "native MXFP8 attention and dense-MLP linears"
         )
     if not model._sp_supported:
         return
