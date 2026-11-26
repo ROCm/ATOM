@@ -296,20 +296,6 @@ def test_fused_support_query_is_owned_by_aiter(single_rank, monkeypatch, support
     for _ in range(40):
         assert model._use_fused_attention(activation, cache, rope) is supported
     assert len(calls) == count, "Both supported and unsupported answers are cached"
-    # Each input to the public capability query invalidates the cached answer.
-    for field, value in (
-        ("cos_cache", torch.empty(16, 48, dtype=torch.float16, device="meta")),
-        ("sin_cache", torch.empty(16, 48, dtype=torch.bfloat16, device="meta")),
-        ("rope_dim", 64),
-    ):
-        setattr(rope, field, value)
-        assert model._use_fused_attention(activation, cache, rope) is supported
-        count += 1
-        assert len(calls) == count
-    activation = torch.empty(1, 2, 256, dtype=torch.float16)
-    assert model._use_fused_attention(activation, cache, rope) is supported
-    count += 1
-    assert len(calls) == count
     for kv_fp8, packed in ((False, False), (True, True)):
         cache.kv_fp8, cache.packed = kv_fp8, packed
         count = len(calls)

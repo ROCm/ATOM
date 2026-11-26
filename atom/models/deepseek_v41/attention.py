@@ -497,19 +497,10 @@ class Attention(nn.Module):
         """
         if not (self.fused_attn and cache.kv_fp8 and not cache.packed):
             return False
-        key = (
-            activation.device,
-            rope.cos_cache.dtype,
-            rope.sin_cache.dtype,
-            rope.rope_dim,
-        )
-        # Cache both answers per layer. Device/RoPE changes require a new
-        # query, while cache layout and the layer switch are checked each call.
-        if (
-            self._fused_attention_support is None
-            or self._fused_attention_support[0] != key
-        ):
-            supported = fused_attention_available(
+        # Device and RoPE metadata are fixed for the lifetime of this layer.
+        # Cache both answers after the first eligible forward.
+        if self._fused_attention_support is None:
+            self._fused_attention_support = fused_attention_available(
                 self.heads,
                 self.head_dim,
                 q_dtype=torch.bfloat16,
@@ -518,8 +509,7 @@ class Attention(nn.Module):
                 rope_dim=rope.rope_dim,
                 device=activation.device,
             )
-            self._fused_attention_support = (key, supported)
-        return self._fused_attention_support[1]
+        return self._fused_attention_support
 
     def _use_a8w4_attention(self, query, cache):
         """The choice precedes RoPE: Q8 production does not rotate BF16 Q."""
