@@ -3020,6 +3020,8 @@ class MoE(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_eplb: bool = True,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3086,6 +3088,7 @@ class MoE(nn.Module):
             pad_align=128,
             enable_comm_fused=True,
             mxfp4_fp8_activations=args.moe_fp8_activations,
+            enable_eplb=enable_eplb,
         )
         self.experts.swiglu_limit = args.swiglu_limit
         self._fuse_shared_into_routed = self.experts.num_fused_shared_experts > 0

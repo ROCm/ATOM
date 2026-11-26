@@ -2099,21 +2099,33 @@ class TestMixedDecodeFirst:
         assert batch.is_mixed, "harness failed to build a mixed batch"
         return batch, p, d
 
-    def test_plan_midstep_runs_for_the_prefill_rows(self, seq_factory):
-        """Its only call site lived inside the skipped fast path."""
+    @pytest.mark.parametrize("readable", [False, True])
+    def test_plan_midstep_runs_for_readable_prefill_rows(self, seq_factory, readable):
+        """Mixed rows keep the cache-capability gate and plan only prefills."""
         sched = self._mixed_sched()
         p, _d = self._arm_mixed(sched, seq_factory)
-        with mock.patch.object(
-            sched.block_manager, "plan_midstep", wraps=sched.block_manager.plan_midstep
-        ) as spy:
+        with (
+            mock.patch.object(
+                type(sched.block_manager),
+                "plans_midstep",
+                new_callable=mock.PropertyMock,
+                return_value=readable,
+            ),
+            mock.patch.object(
+                sched.block_manager,
+                "plan_midstep",
+                wraps=sched.block_manager.plan_midstep,
+            ) as spy,
+        ):
             batch, _ = sched.schedule()
         assert batch.is_mixed, "harness failed to build a mixed batch"
-        assert spy.call_count == batch.total_seqs_num_prefill, (
+        assert spy.call_count == int(readable) * batch.total_seqs_num_prefill, (
             f"plan_midstep called {spy.call_count}x for "
             f"{batch.total_seqs_num_prefill} prefill row(s)"
         )
         # The prefill row, not the decode one.
-        assert spy.call_args[0][0] is p
+        if readable:
+            assert spy.call_args[0][0] is p
 
     def test_is_final_chunk_is_set_and_row_aligned(self, seq_factory):
         sched = self._mixed_sched()
@@ -2133,24 +2145,35 @@ class TestMixedDecodeFirst:
         assert batch.is_final_chunk[-1] is False
 
     @pytest.mark.parametrize("mixed", [False, True])
-    def test_a_pure_prefill_batch_is_settled_with_either_flag(self, seq_factory, mixed):
-        """The gate is about the BATCH's shape, not the feature's state."""
+    @pytest.mark.parametrize("readable", [False, True])
+    def test_a_pure_prefill_batch_is_settled_with_either_flag(
+        self, seq_factory, mixed, readable
+    ):
+        """Both flag states settle final markers and honor cache readability."""
         sched = self._mixed_sched(enable_mixed_prefill_decode=mixed)
         p = seq_factory([10, 11, 12, 13])
         sched.add(p)
-        with mock.patch.object(
-            sched.block_manager, "plan_midstep", wraps=sched.block_manager.plan_midstep
-        ) as spy:
+        with (
+            mock.patch.object(
+                type(sched.block_manager),
+                "plans_midstep",
+                new_callable=mock.PropertyMock,
+                return_value=readable,
+            ),
+            mock.patch.object(
+                sched.block_manager,
+                "plan_midstep",
+                wraps=sched.block_manager.plan_midstep,
+            ) as spy,
+        ):
             batch, _ = sched.schedule()
         assert batch.total_seqs_num_decode == 0, "expected a pure-prefill batch"
-        assert spy.call_count == 1, (
-            "a pure-prefill batch scheduled with the mixed flag ON still owes "
-            "plan_midstep; gating it on the flag skipped it"
-        )
+        assert spy.call_count == int(readable)
         assert batch.is_final_chunk == [True]
 
+    @pytest.mark.parametrize("cut", [0, 1])
     def test_batch_snapshots_midstep_destinations_before_advancing(
-        self, monkeypatch, seq_factory
+        self, monkeypatch, seq_factory, cut
     ):
         sched = self._mixed_sched()
         p, d = self._arm_mixed(sched, seq_factory)
@@ -2159,23 +2182,31 @@ class TestMixedDecodeFirst:
         decode_cached = d.num_cached_tokens
         planned = []
 
-        def plan(seq, start, end):
+        def plan(seq, start, end, **kwargs):
             planned.append((seq.id, start, end))
             seq.has_per_req_cache = True
             seq.state_slots = [41]
-            seq.midstep_reservations = [(42, end, 0)]
+            seq.midstep_reservations = [(42, end - cut, 0)]
+            return end - cut
 
+        monkeypatch.setattr(
+            type(sched.block_manager), "plans_midstep", property(lambda _: True)
+        )
         monkeypatch.setattr(sched.block_manager, "plan_midstep", plan)
         batch, _ = sched.schedule()
         assert batch.is_mixed
         assert batch.req_ids == [p.id, d.id]
         assert planned == [(p.id, 0, 7)]
-        assert batch.state_save_all == [[(42, 7)]]
+        end = 7 - cut
+        assert batch.state_save_all == [[(42, end)]]
+        assert batch.num_scheduled_tokens.tolist() == [end, 1]
+        assert batch.total_tokens_num_prefill == end
+        assert batch.total_tokens_num == end + 1
         assert batch.num_cached_tokens == [0, decode_cached]
-        assert batch.scheduled_tokens[:7].tolist() == list(range(10, 17))
+        assert batch.scheduled_tokens[:end].tolist() == list(range(10, 10 + end))
         assert batch.is_final_chunk == [False, False]
-        assert batch.next_token_ids == [17, -1]
-        assert p.num_cached_tokens == 7 and p.is_partial_prefill
+        assert batch.next_token_ids == [10 + end, -1]
+        assert p.num_cached_tokens == end and p.is_partial_prefill
         assert d.num_cached_tokens == decode_cached and not d.is_partial_prefill
 
     def _finish_prefill(self, sched, batch):
@@ -2243,7 +2274,7 @@ class TestMixedDecodeFirst:
         assert offered == batch.total_tokens_num_prefill == 7
 
     @pytest.mark.parametrize("mixed", [False, True])
-    def test_connector_metadata_precedes_midstep_settlement(
+    def test_connector_metadata_follows_midstep_settlement(
         self, seq_factory, monkeypatch, mixed
     ):
         sched = self._mixed_sched(max_num_seqs=4, enable_mixed_prefill_decode=mixed)
@@ -2263,13 +2294,16 @@ class TestMixedDecodeFirst:
         monkeypatch.setattr(sched, "_note_connector_scheduled_tokens", lambda *a: None)
         plan = sched.block_manager.plan_midstep
 
-        def record_plan(*args):
+        def record_plan(*args, **kwargs):
             events.append("midstep")
-            return plan(*args)
+            return plan(*args, **kwargs)
 
+        monkeypatch.setattr(
+            type(sched.block_manager), "plans_midstep", property(lambda _: True)
+        )
         monkeypatch.setattr(sched.block_manager, "plan_midstep", record_plan)
         batch, _ = sched.schedule()
-        assert events == ["connector", "midstep"]
+        assert events == ["midstep", "connector"]
         assert batch.is_final_chunk == [False]
 
 
