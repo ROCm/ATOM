@@ -68,6 +68,7 @@ jobs:
               - '.github/workflows/atomrl-lumen-gpu-shard.yaml'
             lumen_compat:
               - '.github/scripts/lumen-docker-compat.py'
+              - '.github/scripts/run_lumen_gpu_suite.sh'
             dapo_shard:
               - '.github/workflows/atomrl-dapo-gpu-shard.yaml'
             atomrl_gpu_core:
@@ -77,6 +78,7 @@ jobs:
               - 'atomrl/examples/{DAPO,GRPO,SDDD,harness}/**/*.{py,sh,bash,yaml,yml,toml,json}'
             dapo_gpu_runner:
               - 'atomrl/examples/run.sh'
+              - '.github/scripts/run_atomrl_dapo_gpu_suite.sh'
             dapo_gpu_catalog:
               - 'atomrl/examples/examples.yaml'
             atomrl_gpu_docker:
