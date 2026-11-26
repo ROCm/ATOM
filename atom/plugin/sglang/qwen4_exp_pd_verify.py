@@ -160,7 +160,15 @@ def install_verify_hooks():
     original_send = SchedulerDisaggregationPrefillMixin.send_kv_chunk
     if getattr(original_send, "_atom_flash_verify", False):
         return
-    original_verify = SchedulerDisaggregationDecodeMixin._verify_kv_checksums
+    original_verify = getattr(
+        SchedulerDisaggregationDecodeMixin, "_verify_kv_checksums", None
+    )
+    if original_verify is None:
+        raise RuntimeError(
+            "ATOM_FLASH_PD_VERIFY_DIR requires SGLang's _verify_kv_checksums "
+            "hook, which is unavailable in this runtime. Use the bundled "
+            "SGLang v0.5.22 release image or unset ATOM_FLASH_PD_VERIFY_DIR."
+        )
 
     @functools.wraps(original_send)
     def send(self, req, last_chunk=False, end_idx=None):
