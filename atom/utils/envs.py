@@ -19,6 +19,7 @@ Third-party / dependency env vars (NCCL, torch, HuggingFace, AITER, FLA) are
 documented at the bottom of this file but NOT managed here.
 """
 
+import functools
 import logging
 import math
 import os
@@ -70,13 +71,26 @@ def _preload_mode() -> str:
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _runs_on_gfx950() -> bool:
+    """The GPU this process runs on is MI355X (gfx950); False where it cannot
+    tell (no aiter, no GPU)."""
+    try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        return get_gfx_runtime() == "gfx950"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _graph_side_streams_default() -> str:
     # Off where HIP's pool has more than four hardware queues (HIP's default
-    # is four): the fifth queue is the first on the launch queue's command
-    # processor pipe (queue ids four apart), and a graph branch HIP binds to it
-    # runs several times slower (`graph_records_single_stream`).
+    # is four) on MI355X: there the fifth queue is the first on the launch
+    # queue's command processor pipe (queue ids four apart), and a graph branch
+    # HIP binds to it runs several times slower (`graph_records_single_stream`).
+    # Measured on gfx950 only, so other generations keep their side streams.
     raw = os.getenv("GPU_MAX_HW_QUEUES", "").strip()
-    return "0" if raw.isdigit() and int(raw) > 4 else "1"
+    return "0" if raw.isdigit() and int(raw) > 4 and _runs_on_gfx950() else "1"
 
 
 def _profiler_detail_env(name: str) -> bool:
@@ -1182,7 +1196,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 records every CUDA graph on one stream: the side-stream forks (dual-
     # stream MoE, DeepSeek-V4's compressors, the Engram lookup, `side_stream`
     # regions) run inline in the graph window, its warmup forward included.
-    # Unset, it follows GPU_MAX_HW_QUEUES (`_graph_side_streams_default`).
+    # Unset, it follows GPU_MAX_HW_QUEUES on gfx950 (`_graph_side_streams_default`).
     "ATOM_GRAPH_SIDE_STREAMS": lambda: _flag_env(
         "ATOM_GRAPH_SIDE_STREAMS", _graph_side_streams_default()
     ),

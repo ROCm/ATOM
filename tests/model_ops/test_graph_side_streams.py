@@ -72,13 +72,30 @@ def window(monkeypatch):
 def test_unset_the_switch_follows_the_queue_pool(
     monkeypatch, queues, value, side_streams
 ):
-    """HIP's pool holds four queues by default; a fifth is the first to share
-    the launch queue's command processor pipe. An explicit value wins."""
+    """On MI355X HIP's pool holds four queues by default; a fifth is the first
+    to share the launch queue's command processor pipe. An explicit value
+    wins."""
+    monkeypatch.setattr(envs, "_runs_on_gfx950", lambda: True)
     for name, v in (("GPU_MAX_HW_QUEUES", queues), ("ATOM_GRAPH_SIDE_STREAMS", value)):
         if v is None:
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, v)
+    assert envs.ATOM_GRAPH_SIDE_STREAMS is side_streams
+
+
+@pytest.mark.parametrize(("value", "side_streams"), [(None, True), ("0", False)])
+def test_another_generation_keeps_its_side_streams_unless_told(
+    monkeypatch, value, side_streams
+):
+    """The slow pipe-sharing branch was measured on gfx950 alone: elsewhere a
+    fifth queue changes nothing unless the switch is set."""
+    monkeypatch.setattr(envs, "_runs_on_gfx950", lambda: False)
+    monkeypatch.setenv("GPU_MAX_HW_QUEUES", "5")
+    if value is None:
+        monkeypatch.delenv("ATOM_GRAPH_SIDE_STREAMS", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_GRAPH_SIDE_STREAMS", value)
     assert envs.ATOM_GRAPH_SIDE_STREAMS is side_streams
 
 
