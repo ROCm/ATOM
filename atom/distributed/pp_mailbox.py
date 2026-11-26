@@ -287,8 +287,24 @@ class PPMailbox:
             closed_bank_blocks(end_layer, block_size, total_blocks), aux_cols_out, elem, slots,
         )  # fmt: skip
 
-        # Local memory: the receive ring and its counter page (not on the first
-        # stage); the credit page of the ring this stage writes (not on the last).
+        # Which hops the mailbox serves (both ends on, same host), before any
+        # allocation: a hop between hosts stays on NCCL and gets no ring (a ring
+        # is up to 2 x max_rows x 13 H-wide rows, ~5.7 GiB on Kimi-K3's last
+        # stage, all of it KV cache otherwise).
+        r = group.rank_in_group
+        hosts: list = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            hosts, (socket.gethostname(), use_mailbox), group=group.cpu_group
+        )
+
+        def same_host_mailbox(peer: int) -> bool:
+            return use_mailbox and hosts[peer][1] and hosts[peer][0] == hosts[r][0]
+
+        self.recv_enabled = not first and same_host_mailbox(r - 1)
+        self.send_enabled = not last and same_host_mailbox(r + 1)
+
+        # Local memory: the receive ring and its counter page (a mailbox recv);
+        # the credit page of the ring this stage writes (a mailbox send).
         # Counter pages are fine-grained, polled by the command processor and
         # written by a peer; like every uncached / fine-grained peer page here,
         # never freed (atom/mono/runtime/uncached.py).
@@ -299,16 +315,14 @@ class PPMailbox:
         )
 
         self._ring = self._ring_page = self._credit_page = None
-        if use_mailbox and self.in_layout is not None:
+        if self.recv_enabled:
             self._ring = _alloc_ring(self.in_layout.ring_bytes)
             self._ring_page = allocate_fine_grained(_COUNTER_PAGE)
-        if use_mailbox and self.out_layout is not None:
+        if self.send_enabled:
             self._credit_page = allocate_fine_grained(_COUNTER_PAGE)
         torch.cuda.synchronize(device)
 
         mine = {
-            "host": socket.gethostname(),
-            "use_mailbox": use_mailbox,
             "in_layout": None if self.in_layout is None else asdict(self.in_layout),
             "out_layout": None if self.out_layout is None else asdict(self.out_layout),
             "ring": None if self._ring is None else get_ipc_handle(self._ring),
@@ -321,24 +335,12 @@ class PPMailbox:
         }
         everyone: list = [None] * group.world_size
         torch.distributed.all_gather_object(everyone, mine, group=group.cpu_group)
-        r = group.rank_in_group
         prev = None if first else everyone[r - 1]
         nxt = None if last else everyone[r + 1]
         if nxt is not None and nxt["in_layout"] != mine["out_layout"]:
             raise RuntimeError(
                 f"PP mailbox: stage {r} writes {mine['out_layout']}, stage {r + 1} reads {nxt['in_layout']}"
             )
-
-        def same_host_mailbox(peer) -> bool:
-            return (
-                peer is not None
-                and use_mailbox
-                and peer["use_mailbox"]
-                and peer["host"] == mine["host"]
-            )
-
-        self.send_enabled = same_host_mailbox(nxt)
-        self.recv_enabled = same_host_mailbox(prev)
         self._peer_ring = self._peer_ring_page = self._peer_credit_page = None
         if self.send_enabled:
             self._peer_ring = open_ipc_handle(nxt["ring"])
