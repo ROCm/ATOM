@@ -1,0 +1,132 @@
+diff -ruN a/down.sh b/down.sh
+--- kit/down.sh	2026-11-26 12:35:41.529983712 +0000
++++ kit/down.sh	2026-11-26 12:35:41.538467436 +0000
+@@ -10,5 +10,7 @@
+   sleep 5
+ done
+ docker exec "$CONTAINER" pkill -KILL -f '[a]tom.entrypoints.openai_server|ATOM::' 2> /dev/null
++# A UMBP server (PD_UMBP_GB) frees its DRAM tier only when it exits.
++docker exec "$CONTAINER" pkill -INT -f '[u]mbp_standalone_server' 2> /dev/null
+ sleep 10
+ echo "server in $CONTAINER stopped"
+diff -ruN a/fab_env.sh b/fab_env.sh
+--- kit/fab_env.sh	2026-11-26 12:35:41.529994762 +0000
++++ kit/fab_env.sh	2026-11-26 12:35:41.538432776 +0000
+@@ -15,4 +15,8 @@
+ # replacing the multi pd_up.sh builds (that one has no moriio_backend). Pending a CPU check of the combination.
+ P_KV_LMC='{"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"moriio","moriio_backend":"fabric","moriio_mode":"write","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}'
+ # The same with LMCache's lazy (complement) save policy (branch m31-fabric-lazy; LMCACHE_CHUNK_SIZE must be 128 = the block).
++# P with a MORI-UMBP DRAM tier (PD_UMBP_GB set; ROCm/ATOM zejun/m31-pd-umbp-store): the fabric producer and umbp_store
++# in one multi connector, umbp_store putting a block to this tray's UMBP server when HBM is about to evict it (lazy,
++# chunk = the 128-token block). The server runs in the P container (umbp_server.sh, started by pd_up.sh).
++P_KV_UMBP='{"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"moriio","moriio_backend":"fabric","moriio_mode":"write","handshake_port":6301},{"kv_connector":"umbp_store","kv_role":"offload","kv_connector_extra_config":{"umbp_store.address":"unix:///tmp/umbp/server.sock","umbp_store.chunk_tokens":128,"umbp_store.save_policy":"lazy","umbp_store.lookup_threads":1}}]}'
+ P_KV_LAZY='{"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"moriio","moriio_backend":"fabric","moriio_mode":"write","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload","save_policy":"lazy"}]}'
+diff -ruN a/fab_up.sh b/fab_up.sh
+--- kit/fab_up.sh	2026-11-26 12:35:41.530009282 +0000
++++ kit/fab_up.sh	2026-11-26 12:35:41.538443686 +0000
+@@ -8,6 +8,16 @@
+ CHUNK=${LMC_CHUNK:-}
+ if [ "$R" = p ] && [ "${LAZY:-0}" = 1 ] && [ -n "${PD_LMCACHE_GB:-}" ]; then KV=$P_KV_LAZY; CHUNK=${CHUNK:-128}; fi
+ [ "$R" = p ] && [ -n "$CHUNK" ] && MORE="${MORE:+$MORE }LMCACHE_CHUNK_SIZE=$CHUNK"
++# PD_UMBP_GB (P only): umbp_store over this tray's UMBP server (a DRAM tier of PD_UMBP_GB GiB) instead of LMCache,
++# with the HBM prefix policy the LMCache arms run (SLRU, half protected), so an A/B differs in the tier only.
++# UMBP_MISS_ACCOUNTING=1 (default) logs where each prompt's reusable prefix came from ([OFFLOAD-MISS-ACCOUNT]).
++if [ "$R" = p ] && [ -n "${PD_UMBP_GB:-}" ]; then
++  [ -z "${PD_LMCACHE_GB:-}" ] || { echo "PD_UMBP_GB and PD_LMCACHE_GB are exclusive" >&2; exit 2; }
++  KV=$P_KV_UMBP
++  MORE="${MORE:+$MORE }ATOM_PREFIX_CACHE_POLICY=slru ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5"
++  MORE="$MORE ATOM_OFFLOAD_MISS_ACCOUNTING=${UMBP_MISS_ACCOUNTING:-1}"
++  export PD_UMBP_GB
++fi
+ # AL: the forced DSpark acceptance length of the performance runs (pd_run.sh's perf<N>); AL=0 serves at the real one.
+ AL=${AL:-4.04}
+ # XARGS: more server arguments for this half (e.g. D's --stream-interval 20).
+diff -ruN a/pd_up.sh b/pd_up.sh
+--- kit/pd_up.sh	2026-11-26 12:35:41.530098722 +0000
++++ kit/pd_up.sh	2026-11-26 12:35:41.538457496 +0000
+@@ -51,6 +51,18 @@
+   [ "$have" -ge "$need" ] || { say "LMCACHE_GB=$LMCACHE_GB needs ${need} GiB of host memory, ${have} GiB available"; exit 1; }
+ fi
+ ./prep_container.sh > /dev/null || exit 1
++if [ "$ROLE" = p ] && [ -n "${PD_UMBP_GB:-}" ]; then
++  # The UMBP standalone server umbp_store reaches, in this container (one PID namespace with the workers) on the same
++  # GPUs: its DRAM tier plus 5% and 16 GiB of headroom must be available.
++  need=$((PD_UMBP_GB * 105 / 100 + 16))
++  have=$(awk '/^MemAvailable:/ {print int($2 / 1048576)}' /proc/meminfo)
++  [ "$have" -ge "$need" ] || { say "PD_UMBP_GB=$PD_UMBP_GB needs ${need} GiB of host memory, ${have} GiB available"; exit 1; }
++  mkdir -p "$WORK/logs/$TAG"
++  docker exec -e UMBP_GB="$PD_UMBP_GB" -e GPUS="$GPUS" -e UMBP_HUGEPAGES="${UMBP_HUGEPAGES:-0}" \
++    "$CONTAINER" bash /kit/umbp_server.sh "/logs/$TAG/umbp-server.log" \
++    || { say "the UMBP server did not start: $WORK/logs/$TAG/umbp-server.log"; exit 1; }
++  say "UMBP server up (${PD_UMBP_GB} GiB DRAM): $WORK/logs/$TAG/umbp-server.log"
++fi
+ mkdir -p "$WORK/logs/$TAG"
+ if [ "$KV_CONNECTOR" = mooncake ]; then
+   # As ATOM's K3 / M3 PD recipes, plus ib_device: Mooncake would pick ionic_<GPU index>, and only ionic_0 is up here.
+diff -ruN a/prep_container.sh b/prep_container.sh
+--- kit/prep_container.sh	2026-11-26 12:35:41.530128062 +0000
++++ kit/prep_container.sh	2026-11-26 12:35:41.538477476 +0000
+@@ -28,7 +28,7 @@
+   docker run -d --name "$CONTAINER" --network host --ipc host --group-add video --cap-add SYS_PTRACE \
+     --security-opt seccomp=unconfined --security-opt label=disable \
+     --device /dev/kfd --device /dev/dri --shm-size 64g \
+-    $([ -e /dev/infiniband ] && echo --device /dev/infiniband) --cap-add IPC_LOCK --ulimit memlock=-1 --ulimit nofile=65536:524288 \
++    $([ -e /dev/infiniband ] && echo --device /dev/infiniband) --cap-add IPC_LOCK --cap-add SYS_NICE --ulimit memlock=-1 --ulimit nofile=65536:524288 \
+     "${ib_mounts[@]}" \
+     -v "$MODEL_PATH":"/models/$MODEL":ro -v "$WORK/logs":/logs -v "$PWD":/kit:ro -v "$HF_CACHE":/hf \
+     -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e HF_DATASETS_OFFLINE=1 \
+diff -ruN a/umbp_server.sh b/umbp_server.sh
+--- kit/umbp_server.sh	1970-01-01 00:00:00.000000000 +0000
++++ kit/umbp_server.sh	2026-11-26 12:35:41.540914711 +0000
+@@ -0,0 +1,51 @@
++#!/bin/bash
++# umbp_server.sh <log> (in the prefill container): start this tray's MORI-UMBP standalone server with a DRAM tier for
++# umbp_store, and return once it serves. ATOM's prefill (all PP stages) connects to it at unix://$UMBP_SOCK.
++# The server and the ATOM workers must share this container (one PID namespace) and its GPU list.
++# Env: UMBP_GB (DRAM tier in GiB, required), UMBP_SOCK (/tmp/umbp/server.sock), GPUS (ROCR_VISIBLE_DEVICES, as the
++#   server's; empty = all), UMBP_NUMA (0,1: NUMA nodes the DRAM tier spreads over), UMBP_HUGEPAGES (0; 1 = 2 MiB
++#   pages, reserved beforehand on the host), UMBP_METRICS_PORT (9092; Prometheus), UMBP_READY_S (900).
++set -uo pipefail
++LOG=${1:?usage: umbp_server.sh <log>}
++: "${UMBP_GB:?set UMBP_GB}"
++SOCK=${UMBP_SOCK:-/tmp/umbp/server.sock}
++BIN=$(python3 -c 'import pathlib, mori.umbp; print(pathlib.Path(mori.umbp.__file__).resolve().parents[1] / "umbp_standalone_server")') \
++  || { echo "this image's mori has no UMBP (build it with BUILD_UMBP=ON)" | tee "$LOG"; exit 1; }
++[ -x "$BIN" ] || { echo "no $BIN" | tee "$LOG"; exit 1; }
++pkill -INT -f '[u]mbp_standalone_server' 2> /dev/null && sleep 5
++mkdir -p "$(dirname "$SOCK")"
++rm -f "$SOCK"*
++env_args=(
++  UMBP_DRAM_CAPACITY=$((UMBP_GB * (1 << 30)))
++  UMBP_DRAM_NUMA_NODE="${UMBP_NUMA:-0,1}"
++  UMBP_DRAM_USE_HUGEPAGES="${UMBP_HUGEPAGES:-0}"
++  UMBP_DRAM_PREFAULT_THREADS=16
++  UMBP_SSD_ENABLED=0
++  UMBP_STANDALONE_METRICS_PORT="${UMBP_METRICS_PORT:-9092}"
++  MORI_UMBP_LOG_LEVEL=INFO
++  # Transfer buffers off the mmap path (what ROCm/mori#1048 does in code), for a mori without it.
++  MALLOC_MMAP_THRESHOLD_=33554432 MALLOC_TRIM_THRESHOLD_=1073741824 MALLOC_TOP_PAD_=268435456
++)
++[ -n "${GPUS:-}" ] && env_args+=(ROCR_VISIBLE_DEVICES="$GPUS")
++echo "$(date '+%F %T') umbp_standalone_server unix://$SOCK ${env_args[*]}" > "$LOG"
++setsid nohup env "${env_args[@]}" "$BIN" "unix://$SOCK" >> "$LOG" 2>&1 < /dev/null &
++pid=$!
++# Ready only once a real client connects: the socket comes up before the DRAM tier is prefaulted and registered.
++for _ in $(seq 1 $(( ${UMBP_READY_S:-900} / 5 ))); do
++  kill -0 "$pid" 2> /dev/null || { echo "umbp_standalone_server exited" | tee -a "$LOG"; exit 1; }
++  if [ -S "$SOCK" ] && python3 - "$SOCK" > /dev/null 2>&1 <<'PY'
++import sys
++import mori.umbp as u
++c = u.UMBPConfig(); p = u.UMBPStandaloneProcessConfig()
++p.address = "unix://" + sys.argv[1]; p.auto_start = False; p.startup_timeout_ms = 10000
++c.standalone_process = p
++u.UMBPClient(c)
++PY
++  then
++    echo "$(date '+%F %T') UMBP server ready (pid $pid, ${UMBP_GB} GiB DRAM)" | tee -a "$LOG"
++    exit 0
++  fi
++  sleep 5
++done
++echo "UMBP server not ready in ${UMBP_READY_S:-900} s" | tee -a "$LOG"
++exit 1
