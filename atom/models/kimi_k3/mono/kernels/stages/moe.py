@@ -101,7 +101,7 @@ from atom.mono.device.select import (
     wave_kth,
 )
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import Mailbox, preg, publish, sreg
+from atom.mono.device.sync import POLL_MAX, Mailbox, preg, publish, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.layout import PAIR_BYTES, byte_layout, pair_layout
@@ -125,9 +125,17 @@ REGIONS = (
     "latg",
     "fin",
     "fing",
+    "rlogp",
+    "lsq",
+    "estg",
 )
 # the regions every rank pushes into (every peer's copy)
 PEER_REGIONS = ("rlog", "latq", "latsc", "latr", "latg", "fin", "fing")
+# opt-in peer regions, laid out past every default one (``peer_pairs``): a
+# build without them keeps every offset. RLOGP: the router's K parts
+# (``K2Build.route_parts``); LSQ: the latent norm's sums of squares
+# (``K2Build.ln_sq``).
+EXTRA_PEER = ("rlogp", "lsq")
 
 
 TP = 8
@@ -282,8 +290,19 @@ ABI = KernelAbi(
 )
 
 
-def peer_pairs(s):
-    """The peer regions, pairs: name -> count."""
+def peer_pairs(s, extra=()):
+    """The peer regions, pairs: name -> count; then the ``extra`` ones
+    (``EXTRA_PEER``, in that order)."""
+    more = {
+        # [src rank][part][token][E // TP]: every part's fp32 partial logits
+        "rlogp": TP * R_PARTS * s * (E // TP),
+        # [lnorm task][token]: the owner's sum of squares of the task's columns
+        "lsq": LN_TASKS * s,
+    }
+    return _default_peer_pairs(s) | {k: more[k] for k in EXTRA_PEER if k in extra}
+
+
+def _default_peer_pairs(s):
     return {
         "rlog": TP * s * (E // TP),
         "latq": s * LAT // 8,  # MXFP4 words, 8 latent columns each
@@ -302,12 +321,12 @@ def peer_pairs(s):
     }
 
 
-def peer_layout(s):
-    return pair_layout(peer_pairs(s).items())
+def peer_layout(s, extra=()):
+    return pair_layout(peer_pairs(s, extra).items())
 
 
-def peer_bytes(s):
-    lay = peer_layout(s)
+def peer_bytes(s, extra=()):
+    lay = peer_layout(s, extra)
     return max(o + n for o, n in lay.values())
 
 
@@ -323,6 +342,9 @@ def scratch_layout(key: MoeBuild) -> dict:
         "lmsq": LN_TASKS * s,
         "lnrdy": LN_TASKS * LN_HALVES_MAX,
         "shrdy": UP_TASKS,
+        # past every other region (their offsets stay): a router / latent
+        # task's flag, its x slice multiplied (``K2Build.early_yield``)
+        "estg": R_TASKS + L_TASKS,
     }
     return pair_layout(pairs.items())
 
@@ -431,7 +453,9 @@ def early_out(c, kind, i, q, red, t0=0):
     """Task (i, q) of ``kind`` (0 router, 1 latent, 2 sgu): its 16 rows for
     tokens t0 .. (``red`` holds that token group). The router's parts q > 0
     publish fp32 partials, part 0 adds them in part order and sends the fp32
-    rows to every rank's RLOG; the latent: ``latent_out``; sgu bf16 to SGU."""
+    rows to every rank's RLOG (``route_parts``: every part its partial to
+    every rank's RLOGP, the route adds them); the latent: ``latent_out``;
+    sgu bf16 to SGU."""
     s, tid = c["S"], c["tid"]
     sg = group_rows(s, t0 // TG)
     if const_expr(kind == 1):
@@ -444,6 +468,14 @@ def early_out(c, kind, i, q, red, t0=0):
             v0 = bf16_round(row_sum(red, 2 * rp, t))
             v1 = bf16_round(row_sum(red, 2 * rp + 1, t))
             c["put_bf"](c["sgu"], (t0 + t) * 2 * SI + i * ROWS + 2 * rp, [v0, v1])
+    elif const_expr(c.get("route_parts", False)):
+        if tid < ROWS * sg:
+            r = tid % ROWS
+            t = tid // ROWS
+            v = row_sum(red, r, t)
+            at = ((c["rank"] * R_PARTS + q) * s + t0 + t) * (E // TP) + i * ROWS + r
+            for p in range_constexpr(TP):
+                c["put"](c["peer"]["rlogp"][p], at, v)
     else:
         if tid < ROWS * sg:
             r = tid % ROWS
@@ -599,12 +631,20 @@ def early_compute(c, kind, i, q, ops):
     if const_expr(c.get("xflags") is not None):
         if tid < c["xflags"]:
             c["poll"]([(c["xrdy"], tid, 1)])
+        if const_expr(kind == 2 and c.get("early_yield", False)):  # noqa: SIM102
+            if tid < R_TASKS + L_TASKS:
+                c["poll"]([(c["estg"], tid, 1)])
         gpu.barrier()
     if const_expr(groups(s) > 1):
-        acc = early_units(c, q, klen, [op for sl_ops in ops for op in sl_ops])
+        # ``early_ahead``: the router's and latent's (their weights 28 VGPRs;
+        # the sgu's 112 leave no room for more rows: it spilled)
+        ahead = 1 if kind == 2 else max(1, c.get("early_ahead", 0))
+        acc = early_units(c, q, klen, [op for sl_ops in ops for op in sl_ops], ahead)
         for g in range_constexpr(groups(s)):
             fx.ptr_store(acc[g], red + (wave * 64 + lane) * 4)
             gpu.barrier()
+            if const_expr(g == 0):
+                early_staged(c, kind, i, q)
             early_out(c, kind, i, q, red, TG * g)
         return
     # one token group: its rows staged a slab at a time against the slab's
@@ -626,13 +666,25 @@ def early_compute(c, kind, i, q, ops):
         acc = gemv.mfmas(lane, wave, c["xl"], xrow, n, sg, ops[sl], acc)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
+    early_staged(c, kind, i, q)
     early_out(c, kind, i, q, red, 0)
 
 
-def early_units(c, q, klen, ops):
+@traced
+def early_staged(c, kind, i, q):
+    """``early_yield``: router / latent task (i, q) is past its MFMAs (every
+    wave: behind a barrier), so it reads no more x -> its ESTG flag, which the
+    shared gate/up's tasks wait for before staging theirs."""
+    if const_expr(kind != 2 and c.get("early_yield", False)):
+        first, parts = {0: (0, R_PARTS), 1: (R_TASKS, L_PARTS)}[kind]
+        if c["tid"] == 0:
+            c["put"](c["estg"], first + i * parts + q, 1)
+
+
+def early_units(c, q, klen, ops, ahead=1):
     """``early_compute`` past one token group: ``gemv.staged_units`` over the
-    units -- a column group (``gemv.KGROUP``) of a token group -- with x one
-    unit ahead (``ops``: ``gemv.loads``' entries, one a column group, all in
+    units -- a column group (``gemv.KGROUP``) of a token group -- with x
+    ``ahead`` units ahead (``ops``: ``gemv.loads``' entries, one a column group, all in
     flight already). Column groups in order per token group: ``gemv.mfmas``'
     accumulation order. -> an accumulator a group."""
     tid, lane, wave, G = c["tid"], c["lane"], c["wave"], groups(c["S"])
@@ -672,7 +724,7 @@ def early_units(c, q, klen, ops):
         )
 
     gemv.staged_units(
-        len(units), 1, bufs, lambda u: unit_loads(*units[u]), store, multiply
+        len(units), ahead, bufs, lambda u: unit_loads(*units[u]), store, multiply
     )
     return acc
 
@@ -716,23 +768,41 @@ def stage_route(c, t):
     search over all 896 keys (``wave_kth``), with the same order."""
     lane, wave, red = c["lane"], c["wave"], c["red"]
     a = c["args"]
+    parts = c.get("route_parts", False)
+    per = E // 64
+    batch = per if c.get("batch_polls", False) else POLL_MAX
+    pbias = None
+    if const_expr(parts):
+        # every wave's (wave 0 reads them past the parts' poll's branch)
+        pbias = [ld_f32(a["bias"], lane + 64 * i) for i in range(per)]
+        route_logits(c, t)
     if wave == 0:
         s = c["S"]
-        per = E // 64
-        specs = []
-        for i in range_constexpr(per):
-            e = lane + 64 * i
-            src = e // (E // TP)
-            specs.append(
-                (c["peer"]["rlog_own"], (src * s + t) * (E // TP) + e % (E // TP), 1)
-            )
-        # the bias does not depend on the logits: in flight under the poll
-        bias = [ld_f32(a["bias"], lane + 64 * i) for i in range(per)]
-        got = c["poll"](specs)
+        got = None
+        if const_expr(parts):
+            bias = pbias
+        else:
+            specs = []
+            for i in range_constexpr(per):
+                e = lane + 64 * i
+                src = e // (E // TP)
+                specs.append(
+                    (
+                        c["peer"]["rlog_own"],
+                        (src * s + t) * (E // TP) + e % (E // TP),
+                        1,
+                    )
+                )
+            # the bias does not depend on the logits: in flight under the poll
+            bias = [ld_f32(a["bias"], lane + 64 * i) for i in range(per)]
+            got = c["poll"](specs, batch)
         stamp(c["tl_on"], c["tls"], c["tid"], 14)
         keys, sigs = [], []
         for i in range_constexpr(per):
-            lg = f32_of(got[i][0])
+            if const_expr(parts):
+                lg = fx.ptr_load(red + (R_LOGIT + lane + 64 * i))
+            else:
+                lg = f32_of(got[i][0])
             sg = hw_rcp(fx.Float32(1.0) + hw_exp2(lg * fx.Float32(-LOG2E)))
             sc = sg + bias[i]
             # a NaN logit (a warmup's garbage row) ranks last
@@ -779,10 +849,39 @@ def stage_route(c, t):
 
 
 # The route's words of ``red`` (one wave's): the picks' sigmoids and experts
-# by rank. The candidates: ``rcand`` (``put_key`` entries) and their sigmoids
-# ``rsig``, an LDS region of the stage union.
+# by rank; ``route_parts``: the token's logits past them, every wave's. The
+# candidates: ``rcand`` (``put_key`` entries) and their sigmoids ``rsig``, an
+# LDS region of the stage union.
 R_SIG = 64
 R_EXP = R_SIG + TOPK
+R_LOGIT = 1024
+
+
+@traced
+def route_logits(c, t):
+    """``route_parts``: token t's 896 logits from every rank's four K parts
+    (RLOGP), each added in part order as the router's part 0 adds them ->
+    ``red`` (R_LOGIT + expert). Every wave polls: a thread two experts' parts
+    (one past 896, ``THREADS`` < E), one batch."""
+    s, tid, red = c["S"], c["tid"], c["red"]
+    es = [tid + THREADS * k for k in range(-(-E // THREADS))]
+    specs = []
+    for k in range_constexpr(len(es)):
+        e = fx.min(es[k], E - 1)
+        src = e // (E // TP)
+        for q in range_constexpr(R_PARTS):
+            at = ((src * R_PARTS + q) * s + t) * (E // TP) + e % (E // TP)
+            specs.append((c["peer"]["rlogp_own"], at, 1))
+    got = c["poll"](specs, len(specs))
+    for k in range_constexpr(len(es)):
+        v = f32_of(got[k * R_PARTS][0])
+        for q in range_constexpr(1, R_PARTS):
+            v = v + f32_of(got[k * R_PARTS + q][0])
+        if es[k] < E:
+            fx.ptr_store(v, red + (R_LOGIT + es[k]))
+    gpu.barrier()
+
+
 # Candidates, two a lane: past this many the route takes the radix path.
 ROUTE_CAP = 128
 ROUTE_SLOTS = ROUTE_CAP + BATCH  # ``wave_compact``'s dead tail included
@@ -840,11 +939,19 @@ def load_route(c):
     rt = c["rt"]
     mw = mask_words(s)
     n = s * 2 * TOPK
-    for i in range_constexpr(passes(n)):
-        j = tid + THREADS * i
-        if j < n:
-            v = c["poll"]([(c["route"], j, 1)])[0][0]
-            fx.ptr_store(v, rt["route"] + j)
+    if const_expr(c.get("batch_polls", False) and passes(n) > 1):
+        # every pass's word in one batch (a pass past n polls the last word)
+        js = [tid + THREADS * i for i in range(passes(n))]
+        got = c["poll"]([(c["route"], fx.min(j, n - 1), 1) for j in js], len(js))
+        for i in range_constexpr(len(js)):
+            if js[i] < n:
+                fx.ptr_store(got[i][0], rt["route"] + js[i])
+    else:
+        for i in range_constexpr(passes(n)):
+            j = tid + THREADS * i
+            if j < n:
+                v = c["poll"]([(c["route"], j, 1)])[0][0]
+                fx.ptr_store(v, rt["route"] + j)
     for i in range_constexpr(passes(E * mw)):
         j = tid + THREADS * i
         if j < E * mw:
@@ -897,9 +1004,21 @@ def load_latq(c):
     """Every rank's quantized latent (LATQ words, LATSC codes, ``latent_out``)
     -> LDS: a thread a (token, 32-block), its four words and its code; the
     codes packed four a word (a 128-column step's, block 4 st + b in byte b),
-    so that 64 rows of the latent fit LDS."""
+    so that 64 rows of the latent fit LDS.
+
+    ``latq_first`` builds come here before the route, most CTAs long before
+    the latent lands: the last row's codes alone are waited for first (its
+    token group is quantized last, ``early_compute``), one a thread of two
+    waves -- 112 pairs a CTA spinning, not the first pass's 2560."""
     s, tid = c["S"], c["tid"]
     nblk = s * (LAT // 32)
+    if const_expr(c.get("latq_first", False)):
+        if tid < LAT // 32:
+            c["poll"]([(c["peer"]["latsc_own"], (s - 1) * (LAT // 32) + tid, 1)])
+        gpu.barrier()
+    if const_expr(c.get("latq_batch", False)):
+        load_latq_batched(c)
+        return
     for i in range_constexpr((nblk + THREADS - 1) // THREADS):
         b = fx.min(tid + THREADS * i, nblk - 1)
         t = b // (LAT // 32)
@@ -919,6 +1038,46 @@ def load_latq(c):
                 fx.ptr_store(got[q][0], c["latq"] + (w0 + q))
             if kb % 4 == 0:
                 fx.ptr_store(packed, c["latsc"] + (t * (LAT // 128) + kb // 4))
+    gpu.barrier()
+
+
+# ``latq_batch``: passes a poll (five pairs each, ``POLL_MAX`` bounds the batch)
+LATQ_BATCH = 2
+
+
+def latq_passes(s):
+    """``load_latq``'s 512-block passes at ``s`` rows."""
+    return -(-s * (LAT // 32) // THREADS)
+
+
+@traced
+def load_latq_batched(c):
+    """``load_latq`` with ``LATQ_BATCH`` passes' pairs in one poll: a round
+    trip a batch, not a pass; the same words to the same LDS."""
+    s, tid = c["S"], c["tid"]
+    nblk = s * (LAT // 32)
+    npass = latq_passes(s)
+    for j in range_constexpr(-(-npass // LATQ_BATCH)):
+        n = min(LATQ_BATCH, npass - j * LATQ_BATCH)
+        bs = [fx.min(tid + THREADS * (j * LATQ_BATCH + p), nblk - 1) for p in range(n)]
+        ts = [b // (LAT // 32) for b in bs]
+        kbs = [b % (LAT // 32) for b in bs]
+        w0s = [ts[p] * (LAT // 8) + kbs[p] * 4 for p in range(n)]
+        specs = []
+        for p in range_constexpr(n):
+            specs += [(c["peer"]["latq_own"], w0s[p] + q, 1) for q in range(4)]
+            specs += [(c["peer"]["latsc_own"], ts[p] * (LAT // 32) + kbs[p], 1)]
+        got = c["poll"](specs)
+        if const_expr(j == 0):
+            stamp(c["tl_on"], c["tls"], tid, 17)
+        for p in range_constexpr(n):
+            t, kb, w0 = ts[p], kbs[p], w0s[p]
+            packed = butterfly(got[5 * p + 4][0] << ((kb % 4) * 8), (1, 2))
+            if tid + THREADS * (j * LATQ_BATCH + p) < nblk:
+                for q in range_constexpr(4):
+                    fx.ptr_store(got[5 * p + q][0], c["latq"] + (w0 + q))
+                if kb % 4 == 0:
+                    fx.ptr_store(packed, c["latsc"] + (t * (LAT // 128) + kb // 4))
     gpu.barrier()
 
 
@@ -1568,6 +1727,118 @@ def stage_lnorm(c, j, h=0):
 
 
 @traced
+def stage_lnorm_batched(c, j, h=0):
+    """``stage_lnorm`` of a ``batch_polls`` or ``ln_sq`` build, the same sums:
+    the owner polls every pass's partials in one batch and sends every sum
+    to every rank's LATG, its own included, where every rank (owner too)
+    then reads all its passes in one batch; the sums of squares likewise.
+    ``ln_sq``: the owner sends its sums of squares (of the bf16 sums every
+    rank reads, so the same values) to every rank's LSQ beside LATG, so a
+    rank waits for the owners' pushes alone, not for its own tasks' LMSQ
+    after them."""
+    s, tid, lane, red = c["S"], c["tid"], c["lane"], c["red"]
+    a = c["args"]
+    n = s * 64
+    owner = lat_owner(j) == c["rank"]
+    base = lat_first(c["rank"]) * 128
+    ps = ln_passes(passes(n), ln_halves(s), h)
+    ln_sq = c.get("ln_sq", False)
+    lnw = [
+        fx.Int32(
+            bo.buffer_load(
+                rsrc(a["ln_w"]),
+                (j * 128 + 2 * ((tid + THREADS * i) % 64)) // 2,
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
+        for i in ps
+    ]
+    # a pass's (mine, token, column pair); a pass past n repeats the last token
+    items = []
+    for k in range_constexpr(len(ps)):
+        e = tid + THREADS * ps[k]
+        items.append((e < n, fx.min(e // 64, s - 1), j * 128 + 2 * (e % 64)))
+    if owner:
+        lnorm_owner(c, j, items, base)
+    got = c["poll"](
+        [
+            (c["peer"]["latg_own"], (items[k][1] * LAT + items[k][2]) // 2, 1)
+            for k in range(len(items))
+        ],
+        len(items),
+    )
+    held = []
+    for k in range_constexpr(len(items)):
+        mine, t, col = items[k]
+        lo, hi = bf2_f32(got[k][0])
+        if const_expr(not ln_sq):
+            sq = wave_sum(lo * lo + hi * hi)
+            if mine & (lane == 0):
+                c["put"](c["lmsq"], j * s + t, sq)
+        held.append((mine, t, col, lo, hi))
+    stamp(c["tl_on"], c["tls"], tid, 15)
+    sqs = c["peer"]["lsq_own"] if const_expr(ln_sq) else c["lmsq"]
+    if lane < LN_TASKS:
+        v = c["poll"](
+            [(sqs, lane * s + items[k][1], 1) for k in range(len(items))], len(items)
+        )
+        for k in range_constexpr(len(items)):
+            if items[k][0]:
+                fx.ptr_store(f32_of(v[k][0]), red + (items[k][1] * 32 + lane))
+    gpu.barrier()
+    for k in range_constexpr(len(ps)):
+        mine, t, col, lo, hi = held[k]
+        tot = fx.ptr_load(red + t * 32)
+        for q in range_constexpr(1, LN_TASKS):
+            tot = tot + fx.ptr_load(red + (t * 32 + q))
+        r = hw_rsq(tot * fx.Float32(1.0 / LAT) + fx.Float32(c["ln_eps"]))
+        w0, w1 = bf2_f32(lnw[k])
+        y = (
+            fx.Vector.from_elements([lo * r * w0, hi * r * w1], fx.Float32)
+            .to(fx.BFloat16)
+            .bitcast(fx.Int32)[0]
+        )
+        if mine:
+            bo.buffer_store(
+                y, rsrc(c["ln"]), (t * LAT + col) // 2, cache_modifier=CM_DEV
+            )
+    publish(c["put"], c["lnrdy"], h * LN_TASKS + j, fx.Int32(1), tid == 0)
+    gpu.barrier()
+
+
+@traced
+def lnorm_owner(c, j, items, base):
+    """The owner's half of ``stage_lnorm_batched``: every pass's 8 partials in
+    one poll, each summed in rank order (``sum_partials``' order) -> bf16 ->
+    every rank's LATG; ``ln_sq``: the sum's sum of squares -> every rank's
+    LSQ."""
+    s, lane = c["S"], c["lane"]
+    specs = []
+    for k in range_constexpr(len(items)):
+        t, col = items[k][1], items[k][2]
+        for src in range_constexpr(TP):
+            at = (group_row(src, t, s) * LAT_OWN + col - base) // 2
+            specs.append((c["peer"]["latr_own"], at, 1))
+    ws = c["poll"](specs, len(specs))
+    for k in range_constexpr(len(items)):
+        mine, t, col = items[k]
+        lo, hi = bf2_f32(ws[k * TP][0])
+        for src in range_constexpr(1, TP):
+            plo, phi = bf2_f32(ws[k * TP + src][0])
+            lo = lo + plo
+            hi = hi + phi
+        lo, hi = bf16_round(lo), bf16_round(hi)
+        for p in range_constexpr(TP):
+            c["put_bf"](c["peer"]["latg"][p], t * LAT + col, [lo, hi])
+        if const_expr(c.get("ln_sq", False)):
+            sq = wave_sum(lo * lo + hi * hi)
+            if mine & (lane == 0):
+                for p in range_constexpr(TP):
+                    c["put"](c["peer"]["lsq"][p], j * s + t, sq)
+
+
+@traced
 def run_up(c, bid):
     """Up task j of token group g on CTA 56 g + j: a step's groups side by
     side, on CTAs that wait for the latent norm anyway."""
@@ -1639,9 +1910,33 @@ def final_owner(c, t, col, v0, v1):
 
 @traced
 def stage_reduce(c, j):
-    """Columns 128 j .. of every token group (``reduce_rows``)."""
-    for g in range_constexpr(groups(c["S"])):
-        reduce_rows(group_view(c, g), j)
+    """Columns 128 j .. of every token group (``reduce_rows``; a
+    ``batch_polls`` build past one pass: ``reduce_batched``)."""
+    if const_expr(c.get("batch_polls", False) and passes(c["S"] * 64) > 1):
+        reduce_batched(c, j)
+    else:
+        for g in range_constexpr(groups(c["S"])):
+            reduce_rows(group_view(c, g), j)
+
+
+@traced
+def reduce_batched(c, j):
+    """``reduce_rows`` over the whole step, every pass's FING pair in one
+    poll (a pass past ``s * 64`` items polls the last one): FING and ``out``
+    are [token][HIDDEN] across the groups, so the items are the groups'."""
+    s, tid = c["S"], c["tid"]
+    n = s * 64
+    if j // (UP_N // 128) != c["rank"]:
+        es = [tid + THREADS * i for i in range(passes(n))]
+        ats = []
+        for i in range_constexpr(len(es)):
+            e = fx.min(es[i], n - 1)
+            ats.append(((e // 64) * HIDDEN + j * 128 + 2 * (e % 64)) // 2)
+        got = c["poll"]([(c["peer"]["fing_own"], at, 1) for at in ats], len(ats))
+        for i in range_constexpr(len(es)):
+            if es[i] < n:
+                bo.buffer_store(got[i][0], rsrc(c["args"]["out"]), ats[i])
+    gpu.barrier()
 
 
 @traced
@@ -1684,15 +1979,26 @@ def route_lds(s: int):
     return RouteLds
 
 
-def mask_lds(s: int):
+def mask_lds(s: int, past_ug: bool = False):
     """The experts' token bitmaps: a member of a build's stage union, read by
-    ``load_route`` alone (before ``load_latq`` fills the ug member)."""
+    ``load_route`` alone (before ``load_latq`` fills the ug member; after it,
+    ``past_ug``, from past the ug member's words)."""
 
     @fx.struct
     class MaskLds:
         mask: fx.Array[fx.Int32, E * mask_words(s), 16]
 
-    return MaskLds
+    @fx.struct
+    class MaskPastUgLds:
+        ug: fx.Array[fx.Int32, ug_words(s), 16]
+        mask: fx.Array[fx.Int32, E * mask_words(s), 16]
+
+    return MaskPastUgLds if past_ug else MaskLds
+
+
+def ug_words(s: int) -> int:
+    """``ug_lds``' 32-bit words (each array a multiple of 4: no padding)."""
+    return s * LAT // 8 + s * LAT // 128 + THREADS
 
 
 def ug_lds(s: int):

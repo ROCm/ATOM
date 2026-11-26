@@ -144,9 +144,52 @@ ABI = KernelAbi(
 )
 
 
+# K2's hand-offs between its stages, each the same sums (only the round trips
+# between them move; ``k2b``'s stages keep their original paths for the
+# kernels that do not take them):
+# - every pass's pairs in one poll: the route's RLOG and ROUTE, the AttnRes
+#   and final reduces, lnorm (``k2b.stage_lnorm_batched``)
+# - the router's K parts to every rank's RLOGP, added by the route
+#   (``k2b.route_logits``): no part-to-part hop
+# - lnorm's sums of squares from the owner beside LATG (LSQ): no hop between
+#   a rank's lnorm tasks
+# - up to ``LATQ_FIRST_ROWS`` rows the latent gathered before the route is
+#   waited for (``k2b.load_latq``; the route's bitmaps past the latent's LDS,
+#   ``k2b.mask_lds``)
+# - two of the latent's gather passes a poll (``k2b.load_latq_batched``)
+# - past one token group the router's and latent's x staged ``EARLY_AHEAD``
+#   units ahead of their MFMAs (``k2b.early_units``; the sgu keeps one: it
+#   spilled)
+# - where ``yield_pays``, the shared gate/up stages x once this rank's router
+#   and latent tasks multiplied theirs (ESTG, ``k2b.early_compute``)
+# Measured against K2 without them (8 ranks, K4, C12-weighted): -1.29% K2 for
+# the first four, -0.31% more for the last three.
+#
+# Past this width the latent lands after the route, so gathering it first
+# only delays the route table: S15 0.8% faster with it, S20 0.6% slower.
+LATQ_FIRST_ROWS = 15
+# the router's and latent's x units ahead past one token group (their weights
+# 28 VGPRs; deeper only costs VGPRs)
+EARLY_AHEAD = 3
+
+
+def yield_pays(rows: int) -> bool:
+    """The shared gate/up's x staged after the router's and latent's only
+    within one token group whose x it stages in two slabs or more: with one
+    slab it has no x to hold back, and past one group the router's and
+    latent's units hold its tasks back longer than its x costs them
+    (measured: -0.67 us/layer at S10, 0 at S5, +0.8 at S35 and S45)."""
+    return groups(rows) == 1 and len(gemv.slabs(k2b.HIDDEN, rows)) > 1
+
+
 def peer_layout(s):
-    """K2a's AR and DG regions, then K2b's: name -> (byte offset, bytes)."""
-    pairs = {"ar": k2a.ar_pairs(s), "dg": k2a.dg_pairs(s), **k2b.peer_pairs(s)}
+    """K2a's AR and DG regions, then K2b's (its RLOGP and LSQ past its
+    others, ``k2b.EXTRA_PEER``): name -> (byte offset, bytes)."""
+    pairs = {
+        "ar": k2a.ar_pairs(s),
+        "dg": k2a.dg_pairs(s),
+        **k2b.peer_pairs(s, k2b.EXTRA_PEER),
+    }
     return pair_layout(pairs.items())
 
 
@@ -281,6 +324,8 @@ def build(key: K2Build):
     plain_lay = plain_layout(key)
     play = peer_layout(s)
     RouteLds = k2b.route_lds(s)
+    latq_first = s <= LATQ_FIRST_ROWS
+    early_yield = yield_pays(s)
 
     @fx.struct
     class EarlyLds:
@@ -297,7 +342,7 @@ def build(key: K2Build):
         attn: AttnLds
         ug: k2b.ug_lds(s)
         down: k2b.down_lds(s)
-        rmask: k2b.mask_lds(s)
+        rmask: k2b.mask_lds(s, latq_first)
         rsel: k2b.RouteSelLds
 
     @fx.struct
@@ -359,7 +404,7 @@ def build(key: K2Build):
         bases = peer_bases(peers, TP_)
         own = load_ptr64(peers, rank)
         peer = {}
-        for region in k2b.PEER_REGIONS + ("ar", "dg"):
+        for region in k2b.PEER_REGIONS + ("ar", "dg") + k2b.EXTRA_PEER:
             off = play[region][0]
             peer[region] = [preg(b, off, region) for b in bases]
             peer[region + "_own"] = preg(own, off, region)
@@ -380,6 +425,15 @@ def build(key: K2Build):
             "out_eps": key.out_eps,
             "ln_eps": key.ln_eps,
             "early_paired": key.early_paired,
+            # the hand-offs and front staging below, the same sums each
+            # (``k2b``'s stages keep their original paths without them)
+            "latq_first": latq_first,
+            "batch_polls": True,
+            "route_parts": True,
+            "ln_sq": True,
+            "early_ahead": EARLY_AHEAD,
+            "latq_batch": k2b.latq_passes(s) > 1,
+            "early_yield": early_yield,
             "put": mb.put,
             "put_bf": mb.put_bf,
             "put_words": mb.put_words,
@@ -451,6 +505,8 @@ def build(key: K2Build):
             "shrdy",
         ):
             c[region] = sreg(scratch, lay[region][0], region)
+        if const_expr(early_yield):
+            c["estg"] = sreg(scratch, lay["estg"][0], "estg")
         on, tls = key.timeline, lds.tls.ptr
         stamp_begin(on, tls, tid, TL_POINTS)
         # ---- o_proj on every CTA (``o_slot``)
@@ -486,12 +542,19 @@ def build(key: K2Build):
             stamp(on, tls, tid, 2)
         # ---- the routed experts
         # the route table first: its bitmaps share LDS with the latent
-        # (``k2b.mask_lds``)
+        # (``k2b.mask_lds``); ``latq_first``: the latent, which lands before
+        # the route, gathered while the route is still coming
         enter_stage("k2.ug")
-        nu = k2b.load_route(c)
-        stamp(on, tls, tid, 11)
-        k2b.load_latq(c)
-        stamp(on, tls, tid, 12)
+        if const_expr(latq_first):
+            k2b.load_latq(c)
+            stamp(on, tls, tid, 12)
+            nu = k2b.load_route(c)
+            stamp(on, tls, tid, 11)
+        else:
+            nu = k2b.load_route(c)
+            stamp(on, tls, tid, 11)
+            k2b.load_latq(c)
+            stamp(on, tls, tid, 12)
         k2b.run_ug(c, bid, nu)
         stamp(on, tls, tid, 3)
         # the shared SiTU after ug, on the shared down's CTAs: only the shared
@@ -509,12 +572,12 @@ def build(key: K2Build):
         stamp(on, tls, tid, 4)
         enter_stage("k2.lnorm")
         if (bid >= k2b.LN0) & (bid < k2b.LN0 + k2b.LN_TASKS):
-            k2b.stage_lnorm(c, bid - k2b.LN0)
+            k2b.stage_lnorm_batched(c, bid - k2b.LN0)
         # a wide step's lnorm tasks' second halves on CTAs 0 .., which wait
         # for LN anyway (up's)
         if const_expr(k2b.ln_halves(c["S"]) > 1):  # noqa: SIM102
             if bid < k2b.LN_TASKS:
-                k2b.stage_lnorm(c, bid, 1)
+                k2b.stage_lnorm_batched(c, bid, 1)
         stamp(on, tls, tid, 5)
         enter_stage("k2.up")
         k2b.run_up(c, bid)
