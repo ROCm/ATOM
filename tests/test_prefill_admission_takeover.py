@@ -147,7 +147,7 @@ def test_cost_limit_restored_even_if_partial_resume_raises(
     sched._tick_cost_limit = 1.0
     calls = []
 
-    def resume(seqs, scheduled, tokens, count, batched):
+    def resume(seqs, scheduled, tokens, count, batched, budget):
         calls.append((list(seqs), sched._tick_cost_limit))
         if len(calls) == 1:
             assert sched._tick_cost_limit > 900
@@ -160,9 +160,9 @@ def test_cost_limit_restored_even_if_partial_resume_raises(
     monkeypatch.setattr(sched, "_resume_partial_prefills", resume)
     if fail:
         with pytest.raises(RuntimeError, match="injected"):
-            sched._resume_long_partials([long], {}, [], 0, 0)
+            sched._resume_long_partials([long], {}, [], 0, 0, sched.max_num_batched_tokens)
     else:
-        assert sched._resume_long_partials([long], {}, [], 0, 0) == (0, 0)
+        assert sched._resume_long_partials([long], {}, [], 0, 0, sched.max_num_batched_tokens) == (0, 0)
     assert sched._tick_cost_limit == 1.0
 
 
@@ -197,6 +197,7 @@ def test_dp_cost_ceil_rounds_per_rank_and_preserves_target_room(monkeypatch, cei
             exchange_prefill_costs=True,
         )
         d.should_allow_prefill(
+            prefill_budget=16,
             prefillable=rank < 2,
             pending_tokens=9,
             running_decode_batch=0,
@@ -211,7 +212,7 @@ def test_dp_cost_ceil_rounds_per_rank_and_preserves_target_room(monkeypatch, cei
         sched._balance_min_tokens = 0
         sched._balance_prefill_step(costs[rank])
         assert sched._tick_cost_limit == rounded[0]
-        assert sched._prefill_room(0, 0) == (9 if ceil else 8)
+        assert sched._prefill_room(0, 0, 16) == (9 if ceil else 8)
     assert len(observed) == 3
 
 
@@ -239,12 +240,14 @@ def test_busy_interval_same_across_uneven_ranks(monkeypatch, busy, decode, inter
         tensor[2] = sum(decode)
         tensor[7] = execution[0]  # only rank 0 really prefills; both see its report
         tensor[10] = 0
+        tensor[11] = execution[0]  # and that step was prefill-only (no decode beside it)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
 
     def tick():
         return [
             d.should_allow_prefill(
+                prefill_budget=16,
                 prefillable=True,
                 pending_tokens=16,
                 running_decode_batch=decode[r],

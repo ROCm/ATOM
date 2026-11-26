@@ -1011,6 +1011,7 @@ def test_the_plan_keys_the_compile_cache_only_when_set(tmp_path):
         "max_num_batched_tokens": 16384,
         "kv_cache_dtype": "fp8",
         "speculative_config": None,
+        "enable_mixed_prefill_decode": False,
     }
 
     def key(**kw):
