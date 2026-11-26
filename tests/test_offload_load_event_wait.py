@@ -257,8 +257,9 @@ def test_late_load_rides_the_forward_after_the_bound(
     assert seq.status == WAITING_LOAD
     stats = engine._load_wait
     assert (stats.waits, stats.landed, stats.timed_out, stats.wakes) == (1, 0, 1, 0)
-    # It lands with the forward and is admitted later, as without the hold;
-    # it is not held for again (not a new load).
+    # It lands later and is admitted when its completion is read, as without
+    # the hold; it is not held for again (not a new load).
+    mgr.land(seq.id)
     assert _steps_until_prefill(engine_core, engine, mgr, seq) is not None
     assert engine._load_wait.waits == 1
 
@@ -288,7 +289,7 @@ def test_without_the_hold_the_same_load_prefills_later(
 
 
 def test_cold_engine_never_holds(engine_core, monkeypatch, seq_factory):
-    sched, _, (seq,) = _fire(monkeypatch, seq_factory)
+    sched, _, _ = _fire(monkeypatch, seq_factory)
     engine, mgr = _engine(engine_core, sched, tick_s=0.0, delay=None)
 
     t0 = time.monotonic()
@@ -402,7 +403,7 @@ def test_tradeoff_stops_at_the_token_budget_and_slots(monkeypatch, seq_factory):
     assert started == [last]
     # 5 x 16 tokens ahead fill the 64-token budget: nothing to gain.
     assert sched.load_wait_tradeoff(started)[0] == 0
-    sched2, _, (seq,) = _fire(monkeypatch, seq_factory)
+    sched2, _, _ = _fire(monkeypatch, seq_factory)
     started = sched2.prestart_tier_loads()
     sched2.running = deque(_partial_prefill(1) for _ in range(sched2.max_num_seqs))
     sched2._partial_prefill_count = sched2.max_num_seqs
@@ -452,8 +453,8 @@ def test_no_decode_prefill_only_step_holds(engine_core, monkeypatch, seq_factory
 
 
 def test_forward_time_is_the_tick(engine_core, monkeypatch, seq_factory):
-    sched, _, (seq,) = _fire(monkeypatch, seq_factory)
-    engine, mgr = _engine(engine_core, sched, tick_s=2.0, delay=0, forward_s=0.03)
+    sched, _, _ = _fire(monkeypatch, seq_factory)
+    engine, _ = _engine(engine_core, sched, tick_s=2.0, delay=0, forward_s=0.03)
     _step(engine_core, engine)
     assert 0.03 <= engine._load_wait.tick_s < 0.5
 
@@ -616,8 +617,8 @@ def test_manager_turns_the_doorbell_into_an_event_not_an_answer():
 
     with stubbed_aiter():
         from atom.kv_transfer.disaggregation import KVConnectorOutput
-        from atom.model_engine.async_proc import AsyncIOProcManager
         from atom.kv_transfer.progress_doorbell import KV_PROGRESS_DOORBELL
+        from atom.model_engine.async_proc import AsyncIOProcManager
 
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
