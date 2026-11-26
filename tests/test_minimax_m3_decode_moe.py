@@ -269,6 +269,14 @@ def _dispatch_layer_obj():
     "rows,chain", [(1, False), (7, False), (8, True), (128, True), (129, False)]
 )
 def test_model_forward_decides_the_fallback_outside_the_op(monkeypatch, rows, chain):
+    # `atom.models.minimax_m3.model` pulls in the mono decode kernel chain
+    # (`mono.dispatch` -> ... -> `mono.kernels.index_score`), which bakes a
+    # real aiter-sourced integer (`LUT_ENTRIES`) into an `fx.Array[...]`
+    # class-body annotation evaluated at import time; `atom_without_aiter()`'s
+    # MagicMock stand-ins fail that annotation's int check, so this needs a
+    # real aiter and a live CUDA device, neither of which the CPU CI runner
+    # has (same reasoning as tests/test_minimax_m3_sparse_pa_floor.py).
+    pytest.importorskip("aiter")
     from atom.models.minimax_m3 import model as m
 
     layer = _dispatch_layer_obj()
