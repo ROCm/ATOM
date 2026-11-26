@@ -420,6 +420,7 @@ def test_native_token_graph_replays_different_request_counts(
         live_tokens=width,
         fuse=live_fusion,
         is_prefill=True,
+        start_pos=ring,
     ):
         nonlocal boundary_pointers
         graph_layout = graph_layout and is_prefill
@@ -430,7 +431,9 @@ def test_native_token_graph_replays_different_request_counts(
         batch_ids.fill_(-1)
         if requests:
             positions[:live].copy_(
-                torch.arange(ring, ring + length, device="cuda").repeat(requests)
+                torch.arange(start_pos, start_pos + length, device="cuda").repeat(
+                    requests
+                )
             )
             batch_ids[:live].copy_(
                 torch.arange(requests, device="cuda").repeat_interleave(length)
@@ -445,7 +448,7 @@ def test_native_token_graph_replays_different_request_counts(
         cached = np.broadcast_to(np.asarray(cached_until, dtype=np.int32), (requests,))
         step = BatchStep(
             tuple(
-                RequestSpan(b, ring, b * length, length, order[b])
+                RequestSpan(b, start_pos, b * length, length, order[b])
                 for b in range(requests)
             ),
             positions,
@@ -460,7 +463,7 @@ def test_native_token_graph_replays_different_request_counts(
             prefill_attention_graph=graph_layout,
             prefill_attention_conditional=conditional_graph,
             prefill_window_fusion=fuse and is_prefill,
-            request_floors=np.where(cached > 0, ring // 2, 0).astype(np.int32),
+            request_floors=np.where(cached > 0, start_pos // 2, 0).astype(np.int32),
             request_cached_until=cached,
         )
         # Production graph publication precedes the fused producer. The same
@@ -694,11 +697,19 @@ def test_native_token_graph_replays_different_request_counts(
             (1, False, False, 0, 16),
             (1, False, True, 0, width),
         )
-        for requests, padded, reverse, cached_until, live_tokens, is_prefill in (
-            [(*case, True) for case in replay_cases]
-            # A DPA prefill graph also serves a decoding peer, an idle peer,
-            # then prefill again. The live callback must follow the new step.
-            + (
+        replay_steps = [(*case, True, ring) for case in replay_cases]
+        # Five cache slots, four graph rows, two resumed requests, zero floors:
+        # this failed in the old live callback before attention could launch.
+        replay_steps += [
+            (2, True, False, (16, 0), width, True, 0),
+            (0, False, False, 0, width, True, 0),
+            (1, False, True, 16, width, True, 0),
+        ]
+        replay_steps += [
+            (*case, ring)
+            for case in (
+                # A DPA prefill graph also serves a decoding peer, an idle peer,
+                # then prefill again. The live callback must follow the new step.
                 [
                     (4, False, True, 0, 4, False),
                     (1, False, False, 0, 1, False),
@@ -717,7 +728,16 @@ def test_native_token_graph_replays_different_request_counts(
                 if live_fusion
                 else []
             )
-        ):
+        ]
+        for (
+            requests,
+            padded,
+            reverse,
+            cached_until,
+            live_tokens,
+            is_prefill,
+            start_pos,
+        ) in replay_steps:
             fresh_q, fresh_kv = torch.randn_like(query), torch.randn_like(kv)
             step = prepare(
                 requests,
@@ -726,6 +746,7 @@ def test_native_token_graph_replays_different_request_counts(
                 cached_until=cached_until,
                 live_tokens=live_tokens,
                 is_prefill=is_prefill,
+                start_pos=start_pos,
             )
             live = step.scheduled_tokens
             preparation_calls.clear()
@@ -782,6 +803,7 @@ def test_native_token_graph_replays_different_request_counts(
                 cached_until=cached_until,
                 live_tokens=live_tokens,
                 is_prefill=is_prefill,
+                start_pos=start_pos,
             )
             expected = forward(fresh_q, fresh_kv)
             assert torch.isfinite(got).all()

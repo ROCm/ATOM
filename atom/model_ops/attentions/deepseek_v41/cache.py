@@ -580,7 +580,9 @@ class PagedAttentionCache:
         step.swa_replay_start = step.swa_cached_until = zeros
         if floors is not None:
             step.swa_replay_start = floors
-        elif step.request_floors.any() and not step.decode:
+        elif not step.decode and (
+            step.request_floors.any() or step.request_cached_until.any()
+        ):
             step.swa_replay_start, step.swa_cached_until = upload_numpy(
                 np.stack((step.request_floors, step.request_cached_until)),
                 step.positions.device,

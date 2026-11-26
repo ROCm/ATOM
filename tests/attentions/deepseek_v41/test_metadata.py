@@ -447,6 +447,25 @@ def test_idle_dp_rank_refreshes_captured_pool_metadata(device):
     "phase", ["prefill", "single_token_prefill", "decode", "verify"]
 )
 @pytest.mark.parametrize("graph_enabled", [False, True])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_zero_floor_resume_publishes_cached_boundaries(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required for device metadata publication")
+    geo = V41PoolGeometry(1, (), 32, 4, 512, 32, kv_dtype="fp8", layer_ratios=(0,))
+    cache = PagedAttentionCache(geo, 4, 5, device, max_tokens=8)
+    step = SimpleNamespace(
+        request_floors=np.array([0, 0], dtype=np.int32),
+        request_cached_until=np.array([16, 0], dtype=np.int32),
+        positions=torch.zeros(8, dtype=torch.int32, device=device),
+        decode=False,
+    )
+    cache.publish_replay_layout(step, 4)
+    # A resume from position zero still needs the commit boundary: keeping
+    # the five-row shared zero buffer would overwrite already-cached rows.
+    assert step.swa_replay_start.tolist() == [0, 0]
+    assert step.swa_cached_until.tolist() == [16, 0]
+
+
 @pytest.mark.parametrize("publication", ["unbound", "direct", "packed"])
 def test_prefill_attention_graph_fixes_only_prefill_request_capacity(
     monkeypatch, cache_dtype, phase, graph_enabled, publication
@@ -598,7 +617,9 @@ def test_prefill_replay_boundaries_publish_before_layers(monkeypatch, publicatio
     buffers = builder._prefill_replay_buffers(4, device)
     builder.model_runner = SimpleNamespace(forward_vars=buffers)
     geo = V41PoolGeometry(1, (), 32, 4, 512, 32, kv_dtype="fp8", layer_ratios=(0,))
-    cache = PagedAttentionCache(geo, 4, 4, device, max_tokens=8)
+    # Cache slots can outnumber the graph's request capacity. In particular,
+    # a zero-floor resume must not substitute the larger cache zero buffer.
+    cache = PagedAttentionCache(geo, 4, 5, device, max_tokens=8)
     owner = group = None
     if publication != "unbound":
         owner = PublicationOwner(
@@ -627,6 +648,7 @@ def test_prefill_replay_boundaries_publish_before_layers(monkeypatch, publicatio
     for floors, cached in (
         ([0, 0], [0, 0]),
         ([16], [33]),
+        ([0, 0], [16, 0]),
         ([], []),
         ([0, 16], [0, 34]),
     ):
@@ -641,7 +663,8 @@ def test_prefill_replay_boundaries_publish_before_layers(monkeypatch, publicatio
         )
         assert len(copies) == (2 if group is None else 0)
         requests = tuple(
-            PagedRequest(i, 32, 2 * i, 2, i, (0, 1)) for i in range(len(floors))
+            PagedRequest(i, floor, 2 * i, 2, i, (0, 1))
+            for i, floor in enumerate(floors)
         )
         step = begin_step(
             cache,
