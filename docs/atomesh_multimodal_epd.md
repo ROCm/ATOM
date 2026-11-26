@@ -162,8 +162,10 @@ Any of the following ends with P encoding locally, as in PD:
 - no available encode worker, or a failed encode worker selection,
 - an E error or timeout, including a full pool (E answers 503),
 - an E answer without an `ec_transfer_params` object,
-- on a P rank: a failed read, a changed generation word, a `cache_seed`
-  or dtype mismatch, or embeddings larger than its read buffer.
+- on a P rank: a reader that cannot start (unknown transport, Mooncake
+  missing), a failed read, a changed generation word, a `cache_seed` or
+  dtype mismatch, a malformed handle, or embeddings larger than its read
+  buffer.
 
 The first three are ATOMesh's decision for the whole request. For the
 last, P's ranks agree: if any rank's read fails, every rank encodes (D12).
@@ -418,25 +420,41 @@ carries media (`AtomPairCtx::carries_media`).
   all on the text hot path, to buy batching P does not use. Low confidence:
   see below.
 
-**D11. Embeddings move over Mooncake, and P pulls.** *#3411
-(`atom/kv_transfer/disaggregation/mooncake/ec_transport.py`).*
+**D11. Embeddings move over Mooncake, behind their own interface, and P
+pulls.** *#3411 (`atom/ec_transfer/`, `atom/utils/mooncake_hca.py`).*
 
-How the transfer works:
-- E's `EcPool` registers its pool with a Mooncake TransferEngine. P's
-  `EcReader`, one per TP rank and built on first use, reads with
+The interface (`atom/ec_transfer/base.py`), apart from the KV connector:
+- E's `EcWriter.put(key, rows)` returns a handle, and P's
+  `EcReader.get(handle, key, dtype)` returns the rows or `None`.
+  `create_writer` and `create_reader` pick the backend by name.
+- A handle names its backend: `transport`, `key` (the `cache_seed`),
+  `rows` and `dtype` at the top, the backend's own fields under its name.
+  ATOMesh and the API carry it without reading it, so a second backend
+  changes neither.
+- Mooncake (`atom/ec_transfer/mooncake.py`) is the one backend. It imports
+  nothing from `kv_transfer`; it shares HCA selection with the KV
+  connector through the public `atom/utils/mooncake_hca.py`.
+- Basis: vLLM keeps encoder output transfer in its own `ECConnector`
+  (`vllm/distributed/ec_transfer/`), with Mooncake as one backend; SGLang
+  picks one with `--encoder-transfer-backend`.
+
+How the Mooncake transfer works:
+- E's `MooncakeEcWriter` registers its pool with a Mooncake TransferEngine.
+  P's `MooncakeEcReader`, one per TP rank and built on first use, reads with
   `transfer_sync_read` inside the encode callback, into a registered
   buffer. The buffer starts at the first request's size and grows, at least
   doubling, up to `max_model_len` rows: a buffer that size from the start
   would be 12 GiB at M3.1's 1M context, outside the KV cache's share of the
   GPU. A rank that cannot grow it fails its read, and the ranks fall back
   together (D12).
-- Both open their engine through the KV connector's
-  `mooncake_connector.py: _select_ib_devices`, with
-  `ATOM_MOONCAKE_IB_DEVICE`, now declared in `atom/utils/envs.py`, taking
-  precedence.
+- Both open their engine through `mooncake_hca.select_ib_devices`, as the
+  KV connector does, with `ATOM_MOONCAKE_IB_DEVICE`, now declared in
+  `atom/utils/envs.py`, taking precedence. P's reader also takes its
+  server's `kv_transfer_config` `ib_device`, `ib_enable_alternate_hca` and
+  `ib_hca_count`, so KV and embeddings register on the same HCAs.
 - Acceptance runs name the HCAs. They set `ATOM_MOONCAKE_IB_DEVICE` on E,
   P and D to the HCAs local to each role's GPUs, from a per-node map of
-  GPU to HCA by PCIe switch, together with `MC_DISABLE_HIP=1`. Unconfigured, `_auto_select_ib_device` tries
+  GPU to HCA by PCIe switch, together with `MC_DISABLE_HIP=1`. Unconfigured, `mooncake_hca.auto_select_ib_device` tries
   `rdma<N>` and then `ionic_<N>`. On g15, whose HCAs are named `rocep*`, it
   finds neither and hands Mooncake a missing `rdma<N>`, so Mooncake
   installs only TCP and HIP. In the 1P1D run of D8, the HCAs received 0 GiB
@@ -447,7 +465,7 @@ How the transfer works:
   `None` for a multi-HCA engine (`MooncakeConnector.__init__`).
   The PD and E/P/D runs fail when a role's HCAs moved no RDMA bytes, so a
   run off RDMA cannot pass. A per-rank mapping from GPU to HCA by PCI
-  locality in `_auto_select_ib_device` is the fix if it happens.
+  locality in `mooncake_hca.auto_select_ib_device` is the fix if it happens.
 - Naming the HCAs also puts A4's and A5's KV on the same transport, so A5's
   PD baseline runs on it too.
 
@@ -456,7 +474,7 @@ Why not `ATOM_MOONCAKE_MATCHED_RAILS` (`docs/mooncake_matched_rails.md`):
   Matched rails avoids that with one single-HCA engine per rail.
 - It does not apply here, for two reasons:
   1. It needs a single GPU-local primary HCA per rank. Left unset, that is
-     `_auto_select_ib_device`'s pick, which on a `rocep*` node is the
+     `mooncake_hca.auto_select_ib_device`'s pick, which on a `rocep*` node is the
      missing `rdma<N>` above, so auto mode refuses to start. Set
      explicitly, it is one HCA for every rank of the server.
   2. It covers only the KV connector's P-to-D writes, not E's pool.
@@ -485,32 +503,46 @@ Rejected: an HTTP pull from E's host memory, about 100 lines against about
 
 Low confidence: see below.
 
+Follow-up: P reads inside its forward step (the `embed_multimodal_batch`
+callback), which is what makes RDMA a requirement above. vLLM loads
+encoder output before the forward instead: the scheduler side records what
+a request needs (`update_state_after_alloc`, `build_connector_meta`) and
+the worker starts the load (`start_load_caches`), taking only what has
+arrived. If P fetched while scheduling the request, an HTTP pull would no
+longer sit in the forward step, and Mooncake would be an optimization
+rather than a requirement. The interface above allows that backend without
+changing the handle.
+
 **D12. E keeps an entry for a lease, guarded by a generation word.**
 *#3411 (pool and reader), #3412 (fallback).*
 
-E's pool (`EcPool`):
+E's pool (`MooncakeEcWriter`):
 - An entry is `[generation word | rows]`. E places new rows after the last
   entry, wrapping to the start, and evicts entries oldest-first, but only
   once an entry is older than `ATOM_EC_LEASE_S` (default 60 s, in
   `atom/utils/envs.py` and `docs/environment_variables.md`).
 - When an entry the new rows would overwrite is still inside its lease,
-  the pool is full: `EcPoolFull`, which the encoder-only chat handler
+  the pool is full: `EcStoreFull`, which the encoder-only chat handler
   answers with 503. ATOMesh then falls back to PD for that request (D16).
 - Before writing over evicted entries, E sets their words to 0, a value no
   generation takes. It then writes the rows, and the new entry's
   generation word last. Generations start at a random value, so a stale
   word inside another entry's rows does not match.
 
-P's read (`EcReader.read`): P checks `cache_seed` against its own, reads
-the rows, then rereads the word. A `cache_seed` mismatch, a dtype other
-than the one E stored (`ec_transfer_params` carries it), a failed read, a
-changed word or rows larger than its buffer make it return `None`.
+P's read (`MooncakeEcReader.get`): P checks `cache_seed` against its own,
+reads the rows, then rereads the word. A `cache_seed` mismatch, a dtype
+other than the one E stored (the handle carries it), a malformed handle or
+a generation of 0 (the word of a given-up or never-written entry), a
+failed read, a changed word or rows larger than its buffer make it return
+`None`. A reader that cannot start (`create_reader` raises: unknown
+transport, Mooncake missing, no memory or HCA) is recorded as unavailable
+for that transport, and the rank's verdict is `None` as for a failed read.
 
 P's ranks agree before any of them uses the rows
 (`ModelRunner.read_image_embeddings`). Each rank passes its verdict to
 `atom/distributed/group_agreement.py: group_agree` on its TP group's CPU
 group, then its PCP group's, as `agree_kv_budget` does. If any rank's read
-failed, every rank logs "Image embeddings from ... are unavailable" and
+failed, every rank logs "Image embeddings over ... are unavailable" and
 runs its own tower, which P keeps loaded. E at TP1 and P's ranks need not
 produce bit-identical rows, so mixing E's rows on some ranks with the
 local tower's on others could split the ranks' activations. Every rank
@@ -532,13 +564,19 @@ Rejected:
 **D13. E answers with `ec_transfer_params`, as P answers with
 `kv_transfer_params`.** *#3412; ATOMesh's side in #3409.*
 - E returns a chat completion with no choices and an `ec_transfer_params`
-  object: Mooncake session, `cache_seed`, address, length, generation,
-  rows and dtype (`EcPool.put`, `api_server.py: _encoder_only_response`).
+  object, the handle of D11: `transport`, `key` (`cache_seed`), `rows`,
+  `dtype`, and under `mooncake` the session, address, length and
+  generation (`MooncakeEcWriter.put`, `api_server.py:
+  _encoder_only_response`).
 - ATOMesh copies it into P's body. P's chat path puts it into the
   request's `multimodal_data`, which the scheduler already carries to the
   runner for prefill. A body without it behaves as today.
 - ATOMesh removes any client-supplied `ec_transfer_params` before P, and
   removes E's before D, so only E's output reaches P.
+- P takes `ec_transfer_params` only when started with
+  `--accept-ec-transfer-params`, and drops them otherwise. A handle names
+  memory P reads on the strength of the request alone, so the flag belongs
+  on a P that clients reach only through ATOMesh; E/P/D launches P with it.
 
 This conflicts with the principle "Change public interfaces only when the
 requirement does": `ChatCompletionRequest` gains an optional
@@ -722,8 +760,8 @@ All were taken on g15 with M3.1, at the recipe's launch flags.
 |---|---|---|
 | #3410 | `atom/entrypoints/openai/api_server.py`, `protocol.py`; `atom/model_engine/sequence.py`, `scheduler.py`, `llm_engine.py` | D4, D5, D6 |
 | #3407 | `atom/mesh/src/routers/prepare/inference.rs`, `routers/ingress.rs`, `observability/route_trace.rs`, `core/placement/backend/atom.rs` | D1, D2, D3, D7 |
-| #3411 | `atom/kv_transfer/disaggregation/mooncake/ec_transport.py`; `atom/utils/envs.py` and `docs/environment_variables.md` (`ATOM_EC_LEASE_S`, `ATOM_MOONCAKE_IB_DEVICE`) | D11, D12 |
-| #3412 | `atom/model_engine/encoder_only.py`, `model_runner.py` (the reader's size and the ranks' agreement), `multimodal_runtime.py`, `arg_utils.py`; `atom/config.py`; `atom/entrypoints/openai/api_server.py`, `protocol.py` | D9, D10, D12, D13 |
+| #3411 | `atom/ec_transfer/` (`base.py`, `mooncake.py`); `atom/utils/mooncake_hca.py` and the KV connector's use of it; `atom/utils/envs.py` and `docs/environment_variables.md` (`ATOM_EC_LEASE_S`, `ATOM_MOONCAKE_IB_DEVICE`) | D11, D12 |
+| #3412 | `atom/model_engine/encoder_only.py`, `model_runner.py` (the reader per transport, its size and the ranks' agreement), `multimodal_runtime.py`, `arg_utils.py`; `atom/config.py`; `atom/entrypoints/openai/api_server.py` (`--accept-ec-transfer-params`), `protocol.py` | D9, D10, D12, D13 |
 | #3408 | `atom/mesh/src/cliargs.rs`, `config/`, `core/worker.rs`, `core/worker_registry.rs`, `policies/registry.rs`, `routers/factory.rs` | D15 |
 | #3409 | `atom/mesh/src/routers/http_pd_router.rs`, `routers/ingress.rs` | D13, D15, D16 |
 | #3415 | `.github/benchmark/models_atomesh.yaml`, `.github/scripts/atomesh/pd_matrix.py`, `pd_server_atom.sh`, `pd_submit.sh`; `tests/test_atomesh_pd_matrix.py` | D19 |
