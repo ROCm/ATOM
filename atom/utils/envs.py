@@ -677,6 +677,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 sequence-parallel prefill (atom/models/minimax_m3/sp_prefill.py):
+    # from ATOM_M3_SP_MIN_TOKENS tokens (each TBO micro-batch from
+    # ATOM_M3_SP_MIN_UBATCH_TOKENS) the residual stream is sharded by tokens and
+    # the two per-layer TP all-reduces become an all-to-all + reduce-scatter and
+    # gathers. Costs an unsharded o_proj (~3.1 GB per rank at TP4).
+    "ATOM_M3_SP_PREFILL": lambda: os.getenv("ATOM_M3_SP_PREFILL", "0") == "1",
+    "ATOM_M3_SP_MIN_TOKENS": lambda: int(os.getenv("ATOM_M3_SP_MIN_TOKENS", "4096")),
+    "ATOM_M3_SP_MIN_UBATCH_TOKENS": lambda: int(
+        os.getenv("ATOM_M3_SP_MIN_UBATCH_TOKENS", "8192")
+    ),
+    # SP MoE layers: gather MXFP4 codes + routing and run aiter's FlyDSL MXFP4
+    # prefill chain where it supports the layer (0: gather bf16 rows and call the
+    # layer).
+    "ATOM_M3_SP_FLYDSL_MOE": lambda: os.getenv("ATOM_M3_SP_FLYDSL_MOE", "1") == "1",
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

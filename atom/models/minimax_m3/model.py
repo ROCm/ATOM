@@ -47,6 +47,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
+from atom.models.minimax_m3 import sp_prefill
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
     IntermediateTensors,
@@ -443,6 +444,10 @@ class MiniMaxM3Attention(nn.Module):
             == (QuantType.per_Token, dtypes.fp8),
         )
 
+    def attend(self, positions: torch.Tensor, qkv: torch.Tensor):
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        return self.attn(q, k, v, positions=positions, qkv=qkv)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -450,8 +455,7 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
+        attn_output = self.attend(positions, qkv)
         if isinstance(attn_output, tuple):
             return self.o_proj(*attn_output)
         return self.o_proj(attn_output)
@@ -605,6 +609,12 @@ class MiniMaxM3SparseAttention(nn.Module):
         # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
         # the indexer norm/rope/top-k path, but still compute the packed GEMM.
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
+        attn_output = self.attend(positions, qkv)
+        if isinstance(attn_output, tuple):
+            return self.o_proj(*attn_output)
+        return self.o_proj(attn_output)
+
+    def attend(self, positions: torch.Tensor, qkv: torch.Tensor):
         q, k, v, _, _ = qkv.split(
             [
                 self.q_size,
@@ -615,10 +625,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
-        attn_output = self.attn(q, k, v, positions, qkv=qkv)
-        if isinstance(attn_output, tuple):
-            return self.o_proj(*attn_output)
-        return self.o_proj(attn_output)
+        return self.attn(q, k, v, positions, qkv=qkv)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -740,6 +747,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         reduced here first. That costs one all-reduce per tapped layer per
         target forward, only when a DSpark drafter taps this layer.
         """
+        if isinstance(output, sp_prefill.GatheredLayerOutput):
+            return output[0]
         hidden_states, residual = output[0], output[1]
         if get_tensor_model_parallel_world_size() > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
@@ -785,6 +794,7 @@ class MiniMaxM3Model(nn.Module):
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
         )
+        sp_prefill.attach_o_proj_full(self, quant_config)
 
         if get_pp_group().is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -936,6 +946,15 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             return self._mono.forward(input_ids, positions)
         if self.embed_before_model and inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
+        if intermediate_tensors is None:
+            sp = sp_prefill.plan_model(
+                self.model,
+                input_ids.numel() if inputs_embeds is None else inputs_embeds.shape[0],
+            )
+            if sp is not None:
+                if inputs_embeds is None:
+                    inputs_embeds = self.model.get_input_embeddings(input_ids)
+                return sp_prefill.forward(self.model, positions, inputs_embeds, sp)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
