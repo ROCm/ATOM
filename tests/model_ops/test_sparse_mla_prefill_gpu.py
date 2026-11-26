@@ -19,7 +19,15 @@ def _forward_work_plan(meta, heads, dtype, topk_out):
     from types import SimpleNamespace
 
     from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.attentions.sparse_mla_head_groups import (
+        PERSISTENT_WORK_BUFFERS,
+    )
 
+    forward_vars = {
+        name: value
+        for name, value in vars(meta).items()
+        if name.startswith("sparse_prefill_")
+    }
     builder = SimpleNamespace(
         dcp_sparse_prefill_nonps=False,
         dcp_world_size=8,
@@ -28,13 +36,11 @@ def _forward_work_plan(meta, heads, dtype, topk_out):
         dtype_kv=dtype,
         index_topk_out=topk_out,
         _sparse_prefill_kv_granularity=1 << (topk_out - 1).bit_length(),
-        model_runner=SimpleNamespace(
-            forward_vars={
-                name: value
-                for name, value in vars(meta).items()
-                if name.startswith("sparse_prefill_")
-            }
-        ),
+        model_runner=SimpleNamespace(forward_vars=forward_vars),
+        _sparse_prefill_work_views=lambda prefix, heads: {
+            name: forward_vars[f"{prefix}sparse_prefill_{name}"]
+            for name in PERSISTENT_WORK_BUFFERS
+        },
     )
     AiterMLAMetadataBuilder._sparse_prefill_work_plan(
         builder, meta, "", heads, meta.sparse_kv_last_page_lens
