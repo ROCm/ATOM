@@ -199,6 +199,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # P/D decode side: serve /v1/pd/late_kv/chat/completions, the decode leg of
+    # atomesh's concurrent dispatch (ATOMESH_ATOM_PD_CONCURRENT=1). The router
+    # streams the chat request first and P's kv_transfer_params as a second
+    # line, so D parses the body while P works. 0 = route answers 404 and the
+    # router falls back to its serial relay.
+    "ATOM_PD_LATE_KV": lambda: _flag_env("ATOM_PD_LATE_KV", "0"),
     # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
     # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
     "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
