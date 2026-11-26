@@ -18,9 +18,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-import torch
+import test_moriio_pp_fabric
 from kv_store_test_support import engine_config, use_one_rank
-from test_moriio_pp_fabric import PARTITION, rank_pools, stage_layers, stack  # noqa: F401
+from test_moriio_pp_fabric import PARTITION, rank_pools, stage_layers
 from test_umbp_store_offload import ADDRESS, FakeServer
 
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
@@ -32,6 +32,9 @@ from atom.kv_transfer.offload.umbp_store.worker import UMBPStoreOffloadConnector
 
 BLOCKS = 8
 CHUNK = 256  # umbp_store's default: two 128-token blocks
+
+# The M3.1 PP4 stage stack, a module-scoped fixture of the fabric tests.
+stack = test_moriio_pp_fabric.stack
 
 P_MULTI_UMBP = {
     "kv_connector": "multi",
@@ -106,7 +109,9 @@ def test_every_pp4_stage_publication_is_one_complete_page_codec(stack, stage):
     assert all(r.shard_world == 1 for r in regions)  # no index shard at TP1
     # Every region lies in the stage's one paged pool (the fabric hook's).
     base, end = side.pool.data_ptr(), side.pool.data_ptr() + side.pool.numel()
-    assert all(base <= r.base_addr and r.base_addr + r.total_bytes <= end for r in regions)
+    assert all(
+        base <= r.base_addr and r.base_addr + r.total_bytes <= end for r in regions
+    )
     roles = sorted({str(getattr(r, "semantic_role", "")) for r in regions})
     print(
         f"stage {stage}: layers={len(stage_layers(stage))} draft={last} "
