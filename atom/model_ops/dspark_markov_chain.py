@@ -7,21 +7,21 @@
 ``DSparkMarkovHead.sample_next`` runs the block's K sequential steps as K pairs
 of ``dspark_markov_argmax`` launches, and every step re-reads the whole
 ``markov_w2`` table (V x 256 bf16, 102 MB for a 200K vocabulary). Here one
-launch runs all K steps: one workgroup per CU, each owning a run of 16-id vocab
-tiles; the tiles' W2 rows are copied into LDS (TDM) at the first step and the
-rest stay in registers, so later steps read no W2 from memory. After each step
-the workgroups exchange their (max, id) through tagged 64-bit slots and every
-workgroup reduces them itself.
+launch runs all K steps: aiter's ``markov_argmax_chain``, one workgroup per CU,
+each holding its share of W2 in LDS and registers for the whole chain, so later
+steps read no W2 from memory; after each step the workgroups exchange their
+(max, id) through a workspace and every workgroup reduces them itself.
 
 Numerics: bit-identical to ``dspark_markov_argmax`` -- per tile the same chain
 of eight ``v_wmma_f32_16x16x32_bf16`` its Triton stage 1 emits on gfx1250 (the
 same operands, the same K split across lanes), ``fp32(base) + acc``, lowest id
 on ties.
 
-Served when (``usable``): gfx1250, ONE request (the block's rows are its K
-positions), bf16 logits / tables of rank 256, a vocabulary of whole 16-id
-tiles, K <= 8, and a tile split that fits the device (the launch checks it).
-Anything else keeps the two-stage path.
+Served when (``usable``): ONE request (the block's rows are its K positions),
+K <= 8, bf16 logits / tables of rank 256, and aiter's
+``markov_argmax_chain_supported`` (gfx1250, a vocabulary of whole 16-id tiles
+that fits the CUs). Anything else, or an aiter without the op, keeps the
+two-stage path.
 
 The exchange waits for every workgroup, which holds when the launch has the GPU
 to itself. Its waits are bounded so that a workgroup that never becomes
@@ -32,120 +32,45 @@ step, reads the word without waiting on the device and raises, rather than
 drafting on.
 """
 
-import ctypes
-import fcntl
-import glob
-import hashlib
+import importlib
 import logging
-import os
-import subprocess
-import tempfile
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 
 logger = logging.getLogger("atom")
 
-_SRC = os.path.join(
-    os.path.dirname(__file__), "kernels", "dspark_markov_chain_gfx1250.hip"
-)
 RANK = 256
 MAX_STEPS = 8
-LDS_TILES = 38
-# Return codes of `markov_chain_launch` for a tile split or LDS size this
-# device cannot hold: the one-launch path is never served on it.
-_DOES_NOT_FIT = (-3, -4)
-_lib = None
-_lib_failed = False
+_UNSET = object()
+_op: Any = _UNSET  # aiter.ops.markov_argmax_chain, or None without it
+_failed = False
 _calls = 0
 
 
 class _DeviceState(NamedTuple):
-    slots: torch.Tensor  # [MAX_STEPS * ncta] int64 exchange slots
-    err: torch.Tensor  # [1] int32 error word, bit k: a wait of step k gave up
-    ncta: int
-    err_host: torch.Tensor  # pinned copy of `err`
+    ws: Any  # aiter MarkovArgmaxChainWorkspace: exchange slots + error word
+    err_host: torch.Tensor  # pinned copy of the error word
     err_copied: torch.cuda.Event  # recorded after each copy into `err_host`
 
 
 _state: dict[int, _DeviceState] = {}
 
 
-def _opus_include() -> "str | None":
-    import aiter
-
-    inc = os.path.join(
-        os.path.dirname(os.path.dirname(aiter.__file__)), "csrc", "include"
-    )
-    return inc if os.path.isfile(os.path.join(inc, "opus", "opus.hpp")) else None
-
-
-def _load():
-    """Build (once per source + include, under a file lock: every TP rank
-    imports this) and load the launcher."""
-    global _lib, _lib_failed
-    if _lib is not None or _lib_failed:
-        return _lib
-    try:
-        inc = _opus_include()
-        if inc is None:
-            raise RuntimeError("aiter's opus.hpp not found")
-        rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
-        # Linked against the HIP runtime file itself: a pip ROCm SDK's runtime
-        # directory ships only the versioned soname, which `-lamdhip64` misses.
-        runtimes = sorted(glob.glob(os.path.join(rocm, "lib", "libamdhip64.so*")))
-        if not runtimes:
-            raise RuntimeError(f"no libamdhip64 under {rocm}/lib")
-        with open(_SRC, "rb") as f:
-            src = f.read()
-        key = hashlib.sha1(src + inc.encode() + runtimes[0].encode()).hexdigest()[:16]
-        cache = os.path.join(
-            os.path.expanduser("~"), ".cache", "atom", "dspark_markov_chain"
-        )
-        os.makedirs(cache, exist_ok=True)
-        so = os.path.join(cache, f"markov_chain_{key}.so")
-        with open(os.path.join(cache, ".lock"), "w") as lk:
-            fcntl.flock(lk, fcntl.LOCK_EX)
-            if not os.path.exists(so):
-                hipcc = os.path.join(rocm, "bin", "hipcc")
-                fd, tmp = tempfile.mkstemp(suffix=".so", dir=cache)
-                os.close(fd)
-                cmd = [
-                    hipcc,
-                    "-O3",
-                    "--offload-arch=gfx1250",
-                    "-std=c++17",
-                    "-fPIC",
-                    "-shared",
-                    f"-I{inc}",
-                    _SRC,
-                    "-o",
-                    tmp,
-                    "-no-hip-rt",
-                    f"-Wl,{runtimes[0]}",
-                ]
-                r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                if r.returncode:
-                    os.unlink(tmp)
-                    raise RuntimeError(f"hipcc failed: {r.stderr[-2000:]}")
-                os.replace(tmp, so)
-        lib = ctypes.CDLL(so)
-        lib.markov_chain_launch.restype = ctypes.c_int
-        lib.markov_chain_launch.argtypes = (
-            [ctypes.c_int]
-            + [ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_long]
-            + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
-            + [ctypes.c_void_p, ctypes.c_void_p]
-            + [ctypes.c_int] * 4
-            + [ctypes.c_void_p]
-        )
-        _lib = lib
-    except Exception as e:  # noqa: BLE001 -- any failure keeps the two-stage path
-        _lib_failed = True
-        logger.warning(
-            "DSpark Markov chain kernel unavailable, keeping the two-stage path: %s", e
-        )
-    return _lib
+def _aiter_op():
+    """aiter's ``markov_argmax_chain`` module, or None for an aiter without it."""
+    global _op
+    if _op is _UNSET:
+        try:
+            op = importlib.import_module("aiter.ops.markov_argmax_chain")
+        except ImportError:
+            op = None
+            logger.info(
+                "aiter has no markov_argmax_chain: the DSpark Markov chain keeps "
+                "the two-stage path"
+            )
+        _op = op
+    return _op
 
 
 def usable(
@@ -155,75 +80,55 @@ def usable(
     if base.dim() != 3 or base.shape[0] != 1 or ids.shape != (1, base.shape[1] + 1):
         return False
     K, V = base.shape[1], base.shape[2]
-    dev = base.device
-    if dev.type != "cuda" or not torch.cuda.get_device_properties(
-        dev
-    ).gcnArchName.startswith("gfx1250"):
+    if base.device.type != "cuda" or not 1 <= K <= MAX_STEPS:
         return False
-    if not 1 <= K <= MAX_STEPS or V % 16 or ids.dtype not in (torch.int32, torch.int64):
+    if base.dtype != torch.bfloat16 or base.stride(2) != 1:
         return False
     for w in (w1, w2):
-        if w.dtype != torch.bfloat16 or w.shape != (V, RANK) or not w.is_contiguous():
+        if (
+            w.dtype != torch.bfloat16
+            or w.shape != (V, RANK)
+            or not w.is_contiguous()
+            or w.data_ptr() % 16
+        ):
             return False
-    b = base[0]
-    return (
-        base.dtype == torch.bfloat16
-        and b.stride(1) == 1
-        and b.data_ptr() % 16 == 0
-        and (b.stride(0) * 2) % 16 == 0
-        and _load() is not None
+    if _failed:
+        return False
+    op = _aiter_op()
+    return op is not None and op.markov_argmax_chain_supported(
+        V, RANK, K, id_dtype=ids.dtype, device=base.device
     )
 
 
 def markov_chain_bs1(base, ids, w1, w2) -> "torch.Tensor | None":
     """Drafted ids into ``ids[0, 1:]`` (``ids[0, 0]`` is the anchor) and the
     ``[K, 256]`` W1 rows of the K steps returned; None when not served."""
-    global _lib_failed
+    global _failed
     if not usable(base, ids, w1, w2):
         return None
+    op = _aiter_op()
     dev = base.device
     st = _state.get(dev.index)
-    if st is None:
-        if torch.cuda.is_current_stream_capturing():
-            # The buffers must outlive the graph pool: allocated on an eager call.
-            return None
-        ncta = torch.cuda.get_device_properties(dev).multi_processor_count
-        st = _state[dev.index] = _DeviceState(
-            torch.zeros(MAX_STEPS * ncta, dtype=torch.int64, device=dev),
-            torch.zeros(1, dtype=torch.int32, device=dev),
-            ncta,
-            torch.zeros(1, dtype=torch.int32, pin_memory=True),
-            torch.cuda.Event(),
-        )
-    K = base.shape[1]
-    embeds = torch.empty(K, RANK, dtype=w1.dtype, device=dev)
-    b = base[0]
-    rc = _lib.markov_chain_launch(
-        int(ids.dtype == torch.int64),
-        b.data_ptr(),
-        b.stride(0),
-        ids.data_ptr(),
-        ids.stride(1),
-        w1.data_ptr(),
-        w2.data_ptr(),
-        embeds.data_ptr(),
-        embeds.stride(0),
-        st.slots.data_ptr(),
-        st.err.data_ptr(),
-        b.shape[1],
-        K,
-        LDS_TILES,
-        st.ncta,
-        torch.cuda.current_stream(dev).cuda_stream,
+    if st is not None:
+        return op.markov_argmax_chain(base[0], ids[0], w1, w2, st.ws)
+    if torch.cuda.is_current_stream_capturing():
+        # The workspace must outlive the graph pool: allocated on an eager call.
+        return None
+    st = _DeviceState(
+        op.markov_argmax_chain_workspace(MAX_STEPS, dev),
+        torch.zeros(1, dtype=torch.int32, pin_memory=True),
+        torch.cuda.Event(),
     )
-    if rc in _DOES_NOT_FIT:
-        _lib_failed = True
+    try:
+        # The first launch builds aiter's module (JIT) if it is not prebuilt.
+        embeds = op.markov_argmax_chain(base[0], ids[0], w1, w2, st.ws)
+    except RuntimeError as e:
+        _failed = True
         logger.warning(
-            "DSpark Markov chain kernel declined (rc=%d): two-stage path", rc
+            "DSpark Markov chain kernel unavailable, keeping the two-stage path: %s", e
         )
         return None
-    if rc != 0:
-        raise RuntimeError(f"DSpark Markov chain launch failed: rc={rc}")
+    _state[dev.index] = st
     return embeds
 
 
@@ -247,5 +152,5 @@ def check_errors(every: int = 512) -> None:
                 "this GPU; set ATOM_DSPARK_FUSED_MARKOV_SAMPLE=0 to sample with "
                 "the two-stage path."
             )
-        st.err_host.copy_(st.err, non_blocking=True)
+        st.err_host.copy_(st.ws.err, non_blocking=True)
         st.err_copied.record()

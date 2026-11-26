@@ -2,10 +2,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 """The one-launch DSpark Markov chain serves only its shape (one request,
-K <= 8, bf16 rank-256 tables, gfx1250) and declines the rest without building
-its kernel, so those steps keep the two-stage path; a bounded wait that gave
-up raises at the next check."""
+K <= 8, bf16 rank-256 tables, gfx1250) and declines the rest without asking
+aiter, so those steps keep the two-stage path; an aiter without the op keeps
+it too; a bounded wait that gave up raises at the next check."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -33,13 +34,20 @@ def _args(bs=1, k=K, dtype=torch.bfloat16, rank=chain.RANK):
         _args(rank=128),  # tables of another rank
     ],
 )
-def test_declines_outside_its_shape_without_building(monkeypatch, args):
-    def no_build():
-        raise AssertionError("built the kernel for a shape it does not serve")
+def test_declines_outside_its_shape_without_aiter(monkeypatch, args):
+    def no_aiter():
+        raise AssertionError("asked aiter about a shape it does not serve")
 
-    monkeypatch.setattr(chain, "_load", no_build)
+    monkeypatch.setattr(chain, "_aiter_op", no_aiter)
     assert chain.usable(*args) is False
     assert chain.markov_chain_bs1(*args) is None
+
+
+def test_an_aiter_without_the_op_keeps_the_two_stage_path(monkeypatch):
+    # A None entry in sys.modules makes the import raise ImportError.
+    monkeypatch.setitem(sys.modules, "aiter.ops.markov_argmax_chain", None)
+    monkeypatch.setattr(chain, "_op", chain._UNSET)
+    assert chain._aiter_op() is None
 
 
 def test_check_errors_is_free_before_any_launch(monkeypatch):
