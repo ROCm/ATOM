@@ -224,3 +224,26 @@ class TestManager:
         table = list(a.block_table)
         bm.deallocate(a)  # RUNNING: preemption, it will re-prefill
         assert table[2] in bm.kv._cached and not bm.kv._demoted
+
+
+def test_demotion_boundary_uses_hash_block_size(seq_factory):
+    """Under decode context parallelism one block-table entry spans
+    `hash_block_size` (= block_size * dcp) tokens, not `block_size`: the first
+    generated entry is `num_prompt_tokens // hash_block_size`."""
+    bm = make_bm(32, demote=True)
+    s = start(bm, seq_factory, A_PROMPT)  # 8 prompt tokens
+    decode(bm, s, A_GEN)
+    assert len(s.block_table) == 3
+    bm.hash_block_size = 2 * BS  # as if dcp = 2: the prompt is entry 0 only
+    table = list(s.block_table)
+    calls = []
+    free = bm.kv.free
+
+    def record(block_id, demote=False):
+        calls.append((block_id, demote))
+        free(block_id, demote)
+
+    bm.kv.free = record
+    s.status = SequenceStatus.FINISHED
+    bm.deallocate(s)
+    assert calls == [(table[2], True), (table[1], True), (table[0], False)]

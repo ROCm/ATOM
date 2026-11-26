@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 # Prefill policy while decodes run: ATOM_SCHED_DECODE_PREFILL_CAP and
 # ATOM_SCHED_PREFILL_DUTY (atom/model_engine/scheduler.py, prefill_duty.py).
 from collections import deque
@@ -152,3 +155,85 @@ def test_nonpositive_duty_time_constant_is_rejected_at_startup():
     for bad in ("0", "-1", "nan"):
         with pytest.raises(ValueError):
             _sched(ATOM_SCHED_PREFILL_DUTY=0.5, ATOM_SCHED_PREFILL_DUTY_TAU_S=bad)
+
+
+def test_negative_caps_are_rejected_at_startup():
+    import pytest
+
+    for name in ("ATOM_SCHED_DECODE_PREFILL_CAP", "ATOM_SCHED_IDLE_PREFILL_CAP"):
+        with pytest.raises(ValueError):
+            _sched(**{name: -1})
+        with pytest.raises(ValueError):
+            _sched(**{name: "x"})
+
+
+def test_decode_cap_is_floored_at_one_full_decode_batch():
+    # (spec_k + 1) * max_num_seqs = 4 here: a smaller cap would starve decode.
+    assert _sched(ATOM_SCHED_DECODE_PREFILL_CAP=1)._decode_prefill_cap == 4
+
+
+def test_atomic_prompt_above_the_cap_is_admitted(seq_factory):
+    # An atomic (never chunked) prompt larger than the idle cap used to be
+    # requeued on every tick, with nothing running to change the cap.
+    sched = _sched(ATOM_SCHED_IDLE_PREFILL_CAP=256)
+    seq = seq_factory(list(range(400)))
+    seq.multimodal_data = {}  # no embedding spans: atomic
+    sched.add(seq)
+    batch, _ = sched.schedule()
+    assert batch is not None and batch.total_tokens_num_prefill == 400
+    assert sched.max_num_batched_tokens == 512
+    # A chunkable prompt is still capped.
+    sched = _sched(ATOM_SCHED_IDLE_PREFILL_CAP=256)
+    sched.add(seq_factory(list(range(400))))
+    batch, _ = sched.schedule()
+    assert batch.total_tokens_num_prefill == 256
+
+
+def test_observe_is_fed_by_every_schedule_call(seq_factory):
+    sched = _sched(ATOM_SCHED_PREFILL_DUTY=0.5, ATOM_SCHED_ITL_RISK_MS=5.0)
+    sched.running = deque([_decoding(seq_factory, [1, 2, 3, 4])])
+    with (
+        mock.patch.object(sched._prefill_duty, "observe") as duty_obs,
+        mock.patch.object(sched._itl_risk, "observe") as risk_obs,
+    ):
+        sched.schedule()
+        sched.add(seq_factory(list(range(64))))
+        sched.schedule()
+    assert [c.args[1] for c in duty_obs.call_args_list] == ["d", "p"]
+    assert [c.args[1] for c in risk_obs.call_args_list] == ["d", "p"]
+
+
+def test_local_holds_stay_off_when_the_group_prefills(seq_factory):
+    # With token graphs, the group prefill decision is the delayer's reduce;
+    # the per-rank holds must not veto it (they would turn this rank's decode
+    # into an idle step).
+    sched = _sched(ATOM_SCHED_PREFILL_DUTY=0.5, ATOM_SCHED_FINISH_HOLD_LEFT=8)
+    sched.running = deque([_decoding(seq_factory, [1, 2, 3, 4])])
+    sched.add(seq_factory(list(range(64))))
+    with (
+        mock.patch.object(sched, "_group_prefill_tick", return_value=True),
+        mock.patch.object(sched._prefill_duty, "hold") as duty_hold,
+        mock.patch.object(sched._finish_hold, "hold") as finish_hold,
+    ):
+        sched.schedule()
+    duty_hold.assert_not_called()
+    finish_hold.assert_not_called()
+
+
+def test_disaggregated_prefill_scheduler_warns_about_ignored_flags(caplog):
+    import logging
+
+    from atom.model_engine.scheduler import PrefillScheduler
+
+    cfg = MockConfig(
+        max_num_seqs=4,
+        max_num_batched_tokens=512,
+        max_model_len=4096,
+        num_kvcache_blocks=400,
+        enable_chunked_prefill=True,
+    )
+    env = {"ATOM_SCHED_DECODE_PREFILL_CAP": "128", "ATOM_SCHED_PREFILL_DUTY": "0.5"}
+    with mock.patch.dict("os.environ", env), caplog.at_level(logging.WARNING):
+        PrefillScheduler(cfg)
+    assert "ATOM_SCHED_DECODE_PREFILL_CAP" in caplog.text
+    assert "ATOM_SCHED_PREFILL_DUTY" in caplog.text

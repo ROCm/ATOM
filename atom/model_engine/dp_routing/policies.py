@@ -40,6 +40,16 @@ class LoadPolicy:
 
 
 class SessionPolicy(LoadPolicy):
+    """A session stays on the rank that holds its conversation.
+
+    With `rank_reqs` -- given only when the ranks share their KV pools, so a
+    session's history follows it -- a session whose rank is crowded moves to
+    the emptiest one: its owner runs at least `margin` (a fraction of the mean)
+    more requests than the mean while that one runs at least as many fewer.
+    Under DP-attention every rank waits for the busiest one's step, and the
+    move costs only the copy of its history from the old rank's pool.
+    """
+
     stateful = True
 
     def __init__(
@@ -50,6 +60,8 @@ class SessionPolicy(LoadPolicy):
         prompts: dict,
         rank_count: int,
         parent_ignored: Callable[[], None],
+        rank_reqs: Callable[[], list[int]] | None = None,
+        margin: float = 0.1,
     ) -> None:
         super().__init__(lightest)
         self.select_session = select_session
@@ -57,6 +69,20 @@ class SessionPolicy(LoadPolicy):
         self.prompts = prompts
         self.rank_count = rank_count
         self.parent_ignored = parent_ignored
+        self.rank_reqs = rank_reqs
+        self.margin = margin
+
+    def _relieve(self, owner: int) -> int | None:
+        """The rank a session on crowded `owner` moves to, or None."""
+        reqs = self.rank_reqs()[: self.rank_count]
+        mean = sum(reqs) / len(reqs)
+        slack = max(1.0, self.margin * mean)
+        if reqs[owner] < mean + slack:
+            return None
+        target = min(range(len(reqs)), key=lambda r: (reqs[r], r))
+        if reqs[target] > mean - slack:
+            return None
+        return target
 
     def select(self, seq: Any, explicit_rank: int | None) -> Route:
         session = getattr(seq, "dp_session_id", None)
@@ -75,6 +101,10 @@ class SessionPolicy(LoadPolicy):
                 self.parent_ignored()
         else:
             decision = "affinity_owner_hit_total"
+            target = None if self.rank_reqs is None else self._relieve(owner)
+            if target is not None:
+                owner = target
+                decision = "affinity_spill_total"
         self.owners[session] = owner
         return Route(owner, decision, self.prompts.get(session, 0))
 

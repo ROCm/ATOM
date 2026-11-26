@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 # Flag ATOM_SCHED_FINISH_HOLD_LEFT: hold prefill while a short running
 # request is about to reach max_tokens (atom/model_engine/prefill_finish_hold.py).
 from collections import deque

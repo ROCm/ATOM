@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """Finish-aware prefill hold (``ATOM_SCHED_FINISH_HOLD_LEFT``, opt-in).
 
 Prefill and decode never share a step, so every running decode stalls for the

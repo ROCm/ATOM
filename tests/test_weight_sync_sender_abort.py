@@ -14,6 +14,7 @@ from atom.rollout.weight_sync import load_weights_via_shm
 class _CoreManager:
     def __init__(self):
         self.calls = []
+        self.abort_claimed = False
 
     def broadcast_utility_command_sync(self, cmd, **kwargs):
         self.calls.append((cmd, kwargs))
@@ -24,6 +25,12 @@ class _CoreManager:
 
     def weight_sync_session(self):
         return nullcontext()
+
+    def claim_weight_sync_abort(self):
+        if self.abort_claimed:
+            return False
+        self.abort_claimed = True
+        return True
 
 
 def test_a_sender_that_stops_after_a_nonfinal_bucket_aborts_the_sync():

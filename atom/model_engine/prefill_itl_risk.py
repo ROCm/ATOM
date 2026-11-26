@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """ITL-risk prefill hold (``ATOM_SCHED_ITL_RISK_MS``, default off).
 
 Prefill and decode never share a step, so a prefill step stalls every running

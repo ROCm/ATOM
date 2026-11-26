@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 # Flag ATOM_SCHED_ITL_RISK_MS: hold prefill while its stall would push a
 # running request across the target per-request ITL
 # (atom/model_engine/prefill_itl_risk.py).
@@ -169,3 +172,12 @@ def test_no_hold_without_decode(seq_factory):
     sched.add(seq_factory(list(range(64))))
     batch, _ = sched.schedule()
     assert batch.total_seqs_num_prefill == 1
+
+
+def test_due_is_inclusive_at_theta():
+    # base == theta exactly (1.0 s over 100 gaps, 10 ms): still at risk, since
+    # any stall pushes it above. A `<` instead of `<=` would miss it.
+    g = ItlRiskHold(10.0, 0.3, 31.6, 18.65)
+    g.decode_step_s = 0.012
+    g.tokens_per_step = 4.0
+    assert g.due(1000.0, [_seq(1, 101, 101, 1.0)], 1000)

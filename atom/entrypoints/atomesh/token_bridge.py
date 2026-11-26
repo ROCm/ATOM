@@ -225,7 +225,7 @@ class ChatRenderer:
     def _refuse_unheld_tool_calls(self, tools, tool_choice, opener) -> None:
         """Refuse a chat whose tool calls the OpenAI server would hold to their
         schemas, decided as `configure_tool_call_grammar` decides it (Kimi-K3,
-        with ATOM_TOOL_CALL_GRAMMAR and the structured-output extras): the
+        with ATOM_TOOL_CALL_GRAMMAR and the structured-output backend): the
         bridge carries no grammar yet, and unconstrained K3 can copy an empty
         call out of its history."""
         if not tools or self.tool_parser_cls is None:

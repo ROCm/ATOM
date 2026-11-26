@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """Prefill duty cycle while decodes run (``ATOM_SCHED_PREFILL_DUTY``).
 
 Prefill and decode never share a step, so a running decode makes no progress
