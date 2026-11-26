@@ -34,6 +34,12 @@ and runs on the same host. Against it, this P/D config is better on TTFT mean,
 P50 and P90. The single instance is still slightly better on P99 TTFT, ITL and
 output throughput per GPU. See [Results](#results).
 
+A second, two-node part of this recipe covers the **4P8D AgentX ladder
+(c1-c768, 3600 s per point, 12 GPUs)**: P DEP4 on one node and D on a second
+node (TP8 Mono for c1-c32, DEP8 for c256-c768). Every point's full launch
+configuration and result is in
+[4P8D AgentX ladder](#4p8d-agentx-ladder-c1-c768-3600-s).
+
 ## What changed relative to the earlier 4P4D config
 
 | # | Role | Change | Effect measured on AgentX C256 |
@@ -509,3 +515,269 @@ What the tables show:
   power-of-two GPU count per instance, and atomesh has neither weighted
   routing nor P-instance affinity. A 6:2-style split (P DEP4 + DEP2, D DEP2)
   was measured and lost: ITL rose to 12 ms and TTFT to 2.9 s.
+
+## 4P8D AgentX ladder (c1-c768, 3600 s)
+
+This part is a two-node P/D deployment of DeepSeek-V4.1-Flash-1017 on 12x
+MI355X: one P instance (DEP4, 4 GPUs) on the P node and one D instance
+(8 GPUs) on the D node. It lists, for every point on the measured
+interactivity / throughput curve, the exact launch configuration and result.
+All points were measured with the same software stack, the AgentX scenario,
+a 3600 s benchmark duration, 10 warm-up requests per lane and seed 42.
+
+Axes used below:
+
+- **x = 1000 / P90 ITL** (tokens/s per user, from aiperf's per-request ITL).
+- **y = total tok/s / 12 GPUs** (aiperf total token throughput, input +
+  output with server token counts, divided by all 12 GPUs, P included).
+
+### Points
+
+| Point | Topology (12 GPUs) | D shape | x | y | TTFT mean / P50 / P90 / P99 (ms) | ITL mean / P50 / P90 / P99 (ms) | Requests |
+|---|---|---|---:|---:|---|---|---:|
+| c1 | P DEP4 + D TP8 Mono | `--max-num-seqs 1`, capture `[1]`, poll 4 | 1244.6 | 2,803 | 271 / 208 / 416 / 1,809 | 0.778 / 0.777 / 0.803 / 0.966 | 506 |
+| c2 | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 1049.4 | 3,133 | 261 / 228 / 427 / 1,073 | 0.852 / 0.813 / 0.953 / 1.567 | 568 |
+| c4 | P DEP4 + D TP8 Mono | same as c2 | 1043.8 | 3,811 | 228 / 180 / 402 / 1,053 | 0.838 / 0.811 / 0.958 / 1.449 | 878 |
+| c8 | P DEP4 + D TP8 Mono | same as c2 | 927.6 | 6,135 | 196 / 159 / 341 / 684 | 0.888 / 0.827 / 1.078 / 1.371 | 1,516 |
+| c16 | P DEP4 + D TP8 Mono | same as c2 | 753.8 | 10,661 | 198 / 154 / 356 / 971 | 1.002 / 0.946 / 1.327 / 1.817 | 2,856 |
+| c32 | P DEP4 + D TP8 Mono | same as c2 | 469.6 | 22,664 | 291 / 195 / 401 / 1,296 | 1.433 / 1.252 / 2.130 / 3.474 | 5,226 |
+| c256 | P DEP4 + D DEP8 | MegaMoE, default DEP capture table, 1 API server | 257.7 | 140,077 | 407 / 323 / 666 / 1,942 | 3.696 / 3.713 / 3.880 / 4.443 | 43,463 |
+| c512 | P DEP4 + D DEP8 | MegaMoE, fine capture table, 4 API servers | 203.6 | 252,064 | 1,170 / 689 / 2,110 / 9,448 | 4.588 / 4.604 / 4.913 / 5.639 | 81,508 |
+| c768 | P DEP4 + D DEP8, **Store 1 TiB** | same as c512 | 160.7 | 347,062 | 2,707 / 1,870 / 5,885 / 14,434 | 5.667 / 5.759 / 6.222 / 6.564 | 114,129 |
+
+Every point had 0 request errors and was not cancelled. Compiles inside the
+measurement window (FlyDSL AOT / aiter JIT): 0 on P and D for c1, c2, c8 and
+c256; P 3 (c4), P 8 (c16), D 4 (c32), D 1 (c512), P 1 (c768).
+
+| Point | Total tok/s | Output tok/s | D batch / rank | Mean ISL | Mean OSL | Prefix-cache read |
+|---|---:|---:|---:|---:|---:|---:|
+| c1 | 33,639 | 217 | 1.00 | 239.8K | 1,557 | 98.6% |
+| c2 | 37,600 | 242 | 1.03 | 238.7K | 1,549 | 98.1% |
+| c4 | 45,726 | 310 | 1.06 | 187.8K | 1,284 | 97.7% |
+| c8 | 73,623 | 489 | 1.22 | 175.1K | 1,171 | 98.2% |
+| c16 | 127,934 | 812 | 1.42 | 161.6K | 1,032 | 98.1% |
+| c32 | 271,971 | 1,575 | 2.25 | 187.8K | 1,094 | 97.9% |
+| c256 | 1,680,929 | 11,248 | 5.67 | 151.0K | 1,017 | 97.0% |
+| c512 | 3,024,763 | 21,598 | 13.42 | 144.8K | 1,041 | 96.5% |
+| c768 | 4,164,743 | 29,823 | 22.60 | 142.4K | 1,027 | 96.7% |
+
+Reference: public InferenceX data for B300 (Dynamo, 12 GPUs, c768) is
+x 214 / y 420.2K; the c768 point here reaches 83% of that y at lower x.
+
+### Per-point configuration summary
+
+| Point | P node / D node | Mooncake Store | D `-tp` | D `--max-num-seqs` | D MBT | D capture sizes | D MoE backend | D API servers | D extra env |
+|---|---|---|---:|---:|---:|---|---|---:|---|
+| c1 | g41 / g12 | 256 GiB | 8 (TP, Mono) | 1 | 1024 | `[1]` | standard (Mono) | 1 | `ATOM_MONO_POLL_SLEEP_UNITS=4` |
+| c2-c32 | g41 / g12 | 256 GiB | 8 (TP, Mono) | 64 | 1024 | `MONO_CG64` | standard (Mono) | 1 | `ATOM_MONO_POLL_SLEEP_UNITS=16` |
+| c256 | g15 / g20 | 256 GiB | 8 (DEP8) | 128 | 1024 | `DEP_CG` | mega | 1 | - |
+| c512 | g41 / g12 | 256 GiB | 8 (DEP8) | 128 | 1024 | `DEP_CG_FINE` | mega | 4 | - |
+| c768 | g41 / g20 | **1024 GiB** | 8 (DEP8) | 128 | 1024 | `DEP_CG_FINE` | mega | 4 | - |
+
+The P instance, router, ingress, Store and client are identical on every
+point (the Store capacity aside). Common to all points:
+
+- **EPLB off** on P and D (no `--enable-eplb`).
+- **DSpark 5** (`--method dspark --num-speculative-tokens 5`) with forced
+  acceptance `--spec-decode-acceptance-length 3.51` on P and D.
+- **FP8 KV** (`--kv_cache_dtype fp8`), **FP4 index** (`--index-cache-dtype
+  fp4`), block size 16, `--state-checkpoint-interval-tokens 8192`.
+- **Early handoff on** (`ATOM_PD_EARLY_HANDOFF=1`, single P instance),
+  `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20`, `ATOM_DP_IDLE_WHEN_BLOCKED=1` on P.
+- Prefill delayer off (`ATOM_ENABLE_PREFILL_DELAYER=0`) on P and D.
+- Prompt token ids sent as base64 (`ATOM_PROMPT_IDS_B64=1` on P and D; the
+  ingress sends `prompt_token_ids_b64`).
+- P: 1 API server. P has no `--max-num-batched-tokens` override beyond the
+  common 16384.
+
+Capture tables:
+
+```bash
+P_CG='[1,2,4,8,16,24,32,48,64,96,128]'
+MONO_CG64='[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64]'
+DEP_CG='[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]'
+DEP_CG_FINE='[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,56,64,72,80,96,128]'
+```
+
+### Software stack (identical on P and D, every point)
+
+- **Image**: `rocm/atom-dev:agentx-v41-mega-p2-t1-20261124@sha256:dfab939840610124989d4864fbf7e3e0c5a786ab16c25acfa41c74e939d25d37`.
+- **ATOM**: bind-mounted at `/app/ATOM` on P and D. The tree is
+  `lirzhang/agentx-v41-curves-20261124` @ `5fcdbb6ee` (MegaMoE #3187 T1
+  version, #3772 prestart load wait, #3773 early handoff, T1
+  idle-when-blocked) with 22 commits stacked on top (local tree
+  `de7d8ec1c`): ATOM #3738, #3842 (net diff), #3838, #3839, #3840, #3647,
+  #3186, #2903, #3437, #3639, #3748, #2877, #3854 (base64 prompt ids, two
+  conflicts resolved by hand), and the P/D endpoint-recovery patch (not
+  enabled: `ATOM_PD_ENDPOINT_RECOVERY` unset). #3164 and #3645 were not
+  included.
+- **aiter**: the image's aiter `7ecd46b07` plus ROCm/aiter #8547, #8636,
+  #8171 and #8633, bind-mounted file by file over `/app/aiter-test` (the
+  image's prebuilt `.so` modules are kept):
+  - `aiter/configs/model_configs/dsv41_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv`
+  - `aiter/ops/flydsl/kernels/bmm_a8w8_mxscale_gfx950.py`
+  - `aiter/ops/flydsl/kernels/communication_ops_utils.py`
+  - `aiter/ops/flydsl/kernels/mega_moe/{gemm1,gemm_util,mega_moe_config,mega_moe_large_m,mega_moe_small_m}.py`
+  - `aiter/ops/gemm_op_a8w8.py`
+  - `aiter/ops/mhc.py`
+- **c768 only**: P was pinned with `ROCR_VISIBLE_DEVICES=<UUIDs of GPU 0-3>`
+  instead of `HIP_VISIBLE_DEVICES=0,1,2,3`, with `ATOM_GPU_UUID_ORDER=<UUIDs of
+  GPU 0-7>` and a two-file local patch (`atom/utils/numa_utils.py`,
+  `atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py`) that maps
+  a `GPU-<uuid>` entry back to its physical index for NUMA binding and the
+  matched-rail NIC choice. It selects the same GPUs, NUMA nodes and NICs as
+  the other points; it is not a performance setting.
+- Persistent caches mounted on both nodes: aiter JIT
+  (`/app/aiter-test/aiter/jit`), `/root/.cache/atom`, `/root/.mori`.
+
+### Common environment (P and D)
+
+```bash
+ENV_COMMON=(
+  -e MC_GID_INDEX=1 -e MC_DISABLE_HIP=1 -e MOONCAKE_DISABLE_HIP_DMABUF=1
+  -e ATOM_MOONCAKE_MATCHED_RAILS=auto -e HSA_ENABLE_IPC_MODE_LEGACY=1
+  -e NCCL_IB_DISABLE=0 -e NCCL_DEBUG=WARN -e ATOM_DISABLE_MMAP=true
+  -e ATOM_MONO_ENABLE=1 -e ATOM_DSV41_MOE_FP8_ACTIVATIONS=0
+  -e ATOM_DSPARK_DISABLE_COMPILE=1 -e ATOM_USE_CUSTOM_ALL_GATHER=0
+  -e ATOM_FRONTEND_PREFIX_HASH=1 -e ATOM_DP_SESSION_AFFINITY=0
+  -e MORI_SHMEM_HEAP_SIZE=17179869184 -e PYTHONUNBUFFERED=1
+  -e TRITON_CACHE_DIR=/root/.cache/atom/triton
+  -e ATOM_ENABLE_PREFILL_DELAYER=0 -e ATOM_PROMPT_IDS_B64=1
+  -e MC_NUM_QP_PER_EP=1)
+COMMON_ARGS=(--trust-remote-code --kv_cache_dtype fp8 --block-size 16
+  --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384
+  --method dspark --num-speculative-tokens 5 --spec-decode-acceptance-length 3.51
+  --state-checkpoint-interval-tokens 8192
+  --cudagraph-mode FULL --level 3 --disable-uvicorn-access-log
+  --index-cache-dtype fp4 --attn-prefill-chunk-size 16384
+  --tool-call-parser dsml_v41 --dspark-config '{"confidence_schedule":false}')
+```
+
+Ports (base 30400; c512 and c768 used base 31400 with the same offsets):
+P 30400 (DP master 30402, DP base 30410, handshake 30420), D 30500 (30502,
+30510, 30520), router 30430 / 30431, ingress 30440, Store master 30470,
+metadata 30471, metrics 30472.
+
+### Mooncake Store (P node)
+
+A master plus a Python owner process that mounts `CAPACITY_GIB` x 1 GiB
+segments on NIC `rdma7` (`MC_NUM_QP_PER_EP=1 MC_MAX_MR_SIZE=1073741824
+MC_ENABLE_PARALLEL_REG_MR=0 MC_MAX_CONCURRENT_REG_MR=1`), and checks a
+put/get round-trip before P starts. `CAPACITY_GIB` was **256 for c1-c512 and
+1024 for c768**. Use at least 512 GiB at c768 and above: at c768 with
+256 GiB, LRU eviction after AgentX's 300 s idle gaps raised the uncached
+prompt tokens per request from about 3.3K to 10-11K and P saturated. With
+1 TiB, the Store held 978 of 1024 GiB at the end of the window and returned
+no `OBJECT_NOT_FOUND`. Allocating 1 TiB took about 20 minutes at startup.
+
+### P: DEP4, P node GPUs 0-3 (every point)
+
+```bash
+docker run -d --name atom-P "${DOCKER_COMMON[@]}" "${ENV_COMMON[@]}" \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3 -e ATOM_HOST_IP=$P_IP \
+  -e ATOM_DP_MASTER_PORT=30402 -e ATOM_DP_BASE_PORT=30410 \
+  -e OFFLOAD_LOAD_WORKERS=1 -e ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20 \
+  -e ATOM_PD_EARLY_HANDOFF=1 -e ATOM_DP_IDLE_WHEN_BLOCKED=1 \
+  -e ATOM_KV_OFFLOAD=mooncake_store \
+  -e ATOM_KV_OFFLOAD_EXTRA_CONFIG='{"mooncake_store.local_hostname":"<P_IP>","mooncake_store.protocol":"rdma","mooncake_store.master":"<P_IP>:30470","mooncake_store.metadata":"http://<P_IP>:30471/metadata","mooncake_store.owner_rdma_devices":"rdma7"}' \
+  -e MC_MAX_MR_SIZE=1073741824 -e MC_TCP_BIND_ADDRESS=$P_IP \
+  <ATOM tree, aiter file and cache mounts> \
+  $ATOM_IMAGE python3 -m atom.entrypoints.openai_server \
+  --model $MODEL_PATH --host 0.0.0.0 "${COMMON_ARGS[@]}" \
+  --server-port 30400 -tp 4 --data-parallel-master-ip $P_IP \
+  --data-parallel-master-port 30402 --data-parallel-base-port 30410 \
+  --max-num-seqs 128 \
+  --kv-transfer-config "{\"kv_connector\": \"mooncake\", \"kv_role\": \"kv_producer\", \"proxy_ip\": \"$P_IP\", \"handshake_port\": 30420, \"protocol\": \"rdma\"}" \
+  --cudagraph-capture-sizes "$P_CG" \
+  --enable-dp-attention --enable-expert-parallel --moe-backend mega \
+  --all2all-backend high-throughput --dp-load-balance share_cache \
+  --long-prefill-token-threshold 8192
+```
+
+Expected P startup lines: `MegaMoEV2 mtpr=16384 experts=384 topk=6: staged
+route (compact), small-input capacities (256, 512), large-input route` and
+`[MEGA-CAPACITY] built capacity=16384, ep=4, experts/rank=96`.
+
+### D for c1-c32: TP8 Mono, D node GPUs 0-7
+
+```bash
+docker run -d --name atom-D "${DOCKER_COMMON[@]}" "${ENV_COMMON[@]}" \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 -e ATOM_HOST_IP=$D_IP \
+  -e ATOM_DP_MASTER_PORT=30502 -e ATOM_DP_BASE_PORT=30510 \
+  -e ATOM_DISABLE_MORI_EP=1 \
+  -e ATOM_MONO_POLL_SLEEP_UNITS=$POLL \
+  <ATOM tree, aiter file and cache mounts> \
+  $ATOM_IMAGE python3 -m atom.entrypoints.openai_server \
+  --model $MODEL_PATH --host 0.0.0.0 "${COMMON_ARGS[@]}" \
+  --server-port 30500 -tp 8 --data-parallel-master-ip $D_IP \
+  --data-parallel-master-port 30502 --data-parallel-base-port 30510 \
+  --max-num-seqs $SEQS --max-num-batched-tokens 1024 \
+  --kv-transfer-config "{\"kv_connector\": \"mooncake\", \"kv_role\": \"kv_consumer\", \"proxy_ip\": \"$D_IP\", \"handshake_port\": 30520, \"protocol\": \"rdma\"}" \
+  --cudagraph-capture-sizes "$CG" \
+  --moe-backend standard --all2all-backend none --gpu-memory-utilization 0.65
+# c1:      SEQS=1  CG='[1]'        POLL=4
+# c2-c32:  SEQS=64 CG="$MONO_CG64" POLL=16 (the default)
+```
+
+`--gpu-memory-utilization 0.65` comes after the common 0.9 and wins. Check
+that the D log reports no `declined the` lines for the Mono widths.
+
+### D for c256-c768: DEP8, D node GPUs 0-7
+
+```bash
+docker run -d --name atom-D "${DOCKER_COMMON[@]}" "${ENV_COMMON[@]}" \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 -e ATOM_HOST_IP=$D_IP \
+  -e ATOM_DP_MASTER_PORT=30502 -e ATOM_DP_BASE_PORT=30510 \
+  <ATOM tree, aiter file and cache mounts> \
+  $ATOM_IMAGE python3 -m atom.entrypoints.openai_server \
+  --model $MODEL_PATH --host 0.0.0.0 "${COMMON_ARGS[@]}" \
+  --server-port 30500 -tp 8 --data-parallel-master-ip $D_IP \
+  --data-parallel-master-port 30502 --data-parallel-base-port 30510 \
+  --max-num-seqs 128 --max-num-batched-tokens 1024 \
+  --kv-transfer-config "{\"kv_connector\": \"mooncake\", \"kv_role\": \"kv_consumer\", \"proxy_ip\": \"$D_IP\", \"handshake_port\": 30520, \"protocol\": \"rdma\"}" \
+  --cudagraph-capture-sizes "$CG" \
+  --enable-dp-attention --enable-expert-parallel --moe-backend mega \
+  --all2all-backend high-throughput --dp-load-balance least_requests \
+  $API
+# c256:       CG="$DEP_CG"       API=            (single API server)
+# c512, c768: CG="$DEP_CG_FINE"  API='--api-server-count 4'
+```
+
+Expected D startup lines: `[MEGA-CAPACITY] built capacity=1024, ep=8,
+experts/rank=48` and no `Shared expert fusion: mode=LOCAL_REPLICA`.
+
+### Router, ingress and warm-up
+
+The atomesh router runs on the P node with the same flags as
+[section 4](#4-router-and-encoding-ingress) (`--prefill
+http://<P_IP>:30400 --decode http://<D_IP>:30500`, `cache_aware` for both
+policies, `--atom-pd-rank-mapping-policy none`). The encoding ingress uses
+the settings in section 4 and forwards base64 prompt token ids.
+
+Before each window: a startup gate (32 parallel then 8 serial chat requests
+through the ingress, which also registers every P->D rail), then a P prefill
+pre-warm (38 fresh prefixes and 18 continuations) repeated until no new
+FlyDSL AOT compiles appear. The stack for c2, c8, c16 and c32 also ran a
+900 s c16 AgentX pre-warm with the same trace before its first window; c1
+used the P that had already served those points (only D was restarted).
+
+### AgentX client (every point)
+
+The command of [section 6](#6-agentx-benchmark-c256-900-s) with:
+
+```bash
+  --concurrency $CONC --benchmark-duration 3600 --warmup-requests-per-lane 10 \
+  --random-seed 42
+```
+
+and the same environment, pointed at the ingress (`http://<P_IP>:30440`).
+
+### Ladder caveats
+
+- Forced acceptance 3.51 on every point, as in the single-node part.
+- The c768 point is the only one with a 1 TiB Store; c256 and c512 ran with
+  256 GiB. At c512, rerunning with at least 512 GiB has not been measured.
+- c4, c16, c32, c512 and c768 had a few compiles inside the window (listed
+  under [Points](#points)); the others had none.
+- The low-concurrency points (c1-c32) and c512 ran on one node pair, c256
+  and c768 on two other pairs; all are MI355X nodes of the same type.
