@@ -11,7 +11,11 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.config import _is_minimax_m3_config, kv_cache_torch_dtype
+from atom.config import (
+    FP4_CACHE_DTYPES,
+    _is_minimax_m3_config,
+    kv_cache_torch_dtype,
+)
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
@@ -213,6 +217,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         sparse_cfg = getattr(text_config, "sparse_attention_config", None)
         self._has_sparse_attention = bool(sparse_cfg) and _is_minimax_m3_config(
             hf_config
+        )
+        # Only an FP4 index cache keeps the sparse selection to the rows its metadata
+        # covers (`SparseMHAPagedAttentionImpl._metadata_rows`); the others run every
+        # row of `q`, which a padded token-graph replay fills past the metadata.
+        self._index_fp4 = (
+            getattr(model_runner.config, "index_cache_dtype", None) in FP4_CACHE_DTYPES
         )
         # The backend's own, from the one rule `make_kv_pool` also reads, so a
         # draft resolving here gets it from its own config the same way.
@@ -1275,8 +1285,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         attention) runs inside `unified_attention_with_output_base`, the eager
         region, on the live step's metadata. Padding rows are position 0 with
         no KV slot (`_pad_tokens`), and the sparse prefill zeroes the output
-        rows its metadata does not cover (`_metadata_rows`)."""
-        return self._has_sparse_attention and envs.ATOM_M3_PREFILL_TOKEN_GRAPH
+        rows its metadata does not cover (`_metadata_rows`). That trim exists
+        for the FP4 index caches only: with a BF16 / FP8 index the padded rows
+        would run the selector and the sparse attention on unwritten
+        selection rows, so those keep the eager prefill."""
+        return (
+            self._has_sparse_attention
+            and self._index_fp4
+            and envs.ATOM_M3_PREFILL_TOKEN_GRAPH
+        )
+
+    # A bucket is recorded on one synthetic request of that many rows: it must
+    # fit the block table a ``max_model_len`` request gets
+    # (`ModelRunner._record_tr_graphs`).
+    token_graph_within_model_len = True
 
     def build_for_token_graph_capture(self, tokens: int):
         """A prefill of ``tokens`` rows for recording that token-graph bucket:

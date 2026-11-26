@@ -4603,6 +4603,8 @@ class ModelRunner:
         synthetic prompt: one warmup forward, then one recording forward."""
         builder = self.attn_metadata_builder
         limit = self.warmup_max_tokens()
+        if getattr(builder, "token_graph_within_model_len", False):
+            limit = min(limit, self.config.max_model_len)
         # Largest first: each module's buckets share one pool and one input
         # buffer, which the first recording sizes (`TokenGraph`).
         sizes = sorted(
