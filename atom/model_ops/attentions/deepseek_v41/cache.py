@@ -1070,10 +1070,11 @@ class PagedAttentionCache:
     ):
         """Rotate the query, quantize the KV row, and store it where it can be.
 
-        A decode writes the ring directly. Native quantized prefill graphs
-        snapshot the old ring and commit the new rows in the same producer;
-        their attention reads staging. Other prefill paths leave the commit
-        behind attention, in `write_window`, to preserve its historical reads.
+        A decode writes the ring directly. Fused native quantized prefill
+        snapshots the old ring and commits the new rows in the same producer;
+        attention reads staging, either captured or live for DPA. Other paths
+        leave the commit behind attention, in `write_window`, to preserve its
+        historical reads.
 
         Returns the attention's second source -- BF16 current KV, or for
         A8W8/A8W4 a contiguous pair with batch-local history and current KV -- and
@@ -1117,7 +1118,10 @@ class PagedAttentionCache:
         if (
             quantized_attn
             and window_fp8
-            and getattr(step, "prefill_attention_graph", False)
+            and (
+                getattr(step, "prefill_attention_graph", False)
+                or getattr(step, "prefill_window_fusion", False)
+            )
             and query is not None
             and query_fp8 is not None
             and kv.is_cuda

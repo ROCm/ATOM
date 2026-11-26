@@ -91,6 +91,9 @@ class BatchStep:
     # each token bucket. Only ordinary prefill may capture its quantized
     # attention; plugin, decode/verify, DPA, TBO and bounded replay leave this off.
     prefill_attention_graph: bool = False
+    # Producer fusion is also safe in DPA's live preparation. Unlike captured
+    # attention, it uses the current step's request width and skips decode/idle.
+    prefill_window_fusion: bool = False
     # A bounded-replay forward's `ReplayPlan` (`models.deepseek_v41.
     # bounded_replay`): the rows its decoder ran on, for what else reads the
     # decoder's rows after it (the DSpark draft's window). None where the

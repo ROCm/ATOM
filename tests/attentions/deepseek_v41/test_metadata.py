@@ -472,6 +472,8 @@ def test_prefill_attention_graph_fixes_only_prefill_request_capacity(
     builder.geometry, builder.device, builder.block_size = geo, device, 32
     builder.max_bs = 4
     builder._prefill_attention_graph = graph_enabled
+    # DPA enables producer fusion while leaving the attention graph disabled.
+    builder._prefill_window_fusion = True
     builder.cache = PagedAttentionCache(geo, 4, 4, device, max_tokens=8)
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(4, 8, 2, device, geo)
@@ -552,6 +554,7 @@ def test_prefill_attention_graph_fixes_only_prefill_request_capacity(
         if device == "cuda":
             torch.cuda.synchronize()
         assert step.prefill_attention_graph is (graph_enabled and is_prefill)
+        assert step.prefill_window_fusion is is_prefill
         assert step.decode is (not is_prefill)
         assert step.slots.numel() == capacity
         assert step.cu_seqlens_q.tolist() == (

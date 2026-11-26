@@ -303,18 +303,22 @@ def test_gfx950_preserves_requested_cache_and_attention(
 
 
 @pytest.mark.parametrize(
-    "cache_dtype,a8w4,capture_attention,ratio,group_size",
+    "cache_dtype,a8w4,capture_attention,ratio,group_size,live_fusion",
     [
-        ("bf16", False, False, 0, 1),
-        ("fp8", False, False, 0, 1),
-        ("fp4", False, False, 0, 1),
-        ("fp4", True, False, 0, 1),
-        ("fp8", False, True, 0, 1),
-        ("fp4", True, True, 0, 1),
-        ("fp8", False, True, 2, 1),
-        ("fp4", True, True, 2, 1),
-        ("fp8", False, True, 2, 2),
-        ("fp4", True, True, 2, 2),
+        ("bf16", False, False, 0, 1, False),
+        ("fp8", False, False, 0, 1, False),
+        ("fp4", False, False, 0, 1, False),
+        ("fp4", True, False, 0, 1, False),
+        ("fp8", False, True, 0, 1, False),
+        ("fp4", True, True, 0, 1, False),
+        ("fp8", False, True, 2, 1, False),
+        ("fp4", True, True, 2, 1, False),
+        ("fp8", False, True, 2, 2, False),
+        ("fp4", True, True, 2, 2, False),
+        ("fp8", False, False, 0, 1, True),
+        ("fp4", True, False, 0, 1, True),
+        ("fp8", False, False, 2, 2, True),
+        ("fp4", True, False, 2, 2, True),
     ],
 )
 @pytest.mark.parametrize("capture_batch", ["ordinary", "resumed", "empty"])
@@ -328,6 +332,7 @@ def test_native_token_graph_replays_different_request_counts(
     capture_attention,
     ratio,
     group_size,
+    live_fusion,
     monkeypatch,
 ):
     from types import MethodType
@@ -347,7 +352,7 @@ def test_native_token_graph_replays_different_request_counts(
         pytest.skip("This regression exercises gfx950 OPUS attention")
     monkeypatch.setenv("ATOM_DSV41_A8W4_ATTN", "auto" if a8w4 else "off")
     torch.manual_seed(2989)
-    width, ring, heads = 256, 128, 16
+    width, ring, heads = 256, 128, 64 if live_fusion else 16
     geo = V41PoolGeometry(
         group_size,
         ((0, 2),),
@@ -407,6 +412,8 @@ def test_native_token_graph_replays_different_request_counts(
         reverse=False,
         cached_until=0,
         live_tokens=width,
+        fuse=live_fusion,
+        is_prefill=True,
     ):
         nonlocal boundary_pointers
         length = (live_tokens - (2 if padded else 0)) // requests if requests else 0
@@ -441,8 +448,9 @@ def test_native_token_graph_replays_different_request_counts(
             tables[:batches],
             scheduled_tokens=live,
             max_q_len=length,
-            is_prefill=True,
+            is_prefill=is_prefill,
             prefill_attention_graph=graph_layout,
+            prefill_window_fusion=fuse and is_prefill,
             request_floors=np.where(cached > 0, ring // 2, 0).astype(np.int32),
             request_cached_until=cached,
         )
@@ -555,7 +563,9 @@ def test_native_token_graph_replays_different_request_counts(
     def track_preparation(*args, **kwargs):
         preparation_calls.append(torch.cuda.is_current_stream_capturing())
         result = prepare_window(*args, **kwargs)
-        if cache_dtype == "fp8" or (cache_dtype == "fp4" and a8w4):
+        if not ctx.attn_metadata.step.decode and (
+            cache_dtype == "fp8" or (cache_dtype == "fp4" and a8w4)
+        ):
             source = result[0]
             reserved = ctx.attn_metadata.step.prefill_window_staging
             assert source[0].untyped_storage().data_ptr() == reserved.data_ptr()
@@ -577,6 +587,8 @@ def test_native_token_graph_replays_different_request_counts(
     commit_window = cache.write_window
 
     def track_commit(layer, window_kv, step):
+        if live_fusion and step.prefill_window_fusion:
+            assert window_kv is None, "Fused producer must not write SWA twice"
         commit_calls.append(step)
         return commit_window(layer, window_kv, step)
 
@@ -653,10 +665,12 @@ def test_native_token_graph_replays_different_request_counts(
             assert fused_calls == [True] * group_size
             assert graph_commit_calls == []
         else:
-            assert fused_calls == []
+            assert fused_calls == (
+                [False] * group_size if live_fusion and capture_batch != "empty" else []
+            )
         # Capture can write only 64 tokens/request; this same bucket must
         # later commit all 128 ring rows of a single 256-token request.
-        for requests, padded, reverse, cached_until, live_tokens in (
+        replay_cases = (
             (4, False, False, 0, width),
             (1, False, True, 0, width),
             (0, False, False, 0, width),
@@ -667,6 +681,21 @@ def test_native_token_graph_replays_different_request_counts(
             (1, False, True, ring + width, width),
             (1, False, False, 0, 16),
             (1, False, True, 0, width),
+        )
+        for requests, padded, reverse, cached_until, live_tokens, is_prefill in (
+            [(*case, True) for case in replay_cases]
+            # A DPA prefill graph also serves a decoding peer, an idle peer,
+            # then prefill again. The live callback must follow the new step.
+            + (
+                [
+                    (4, False, True, 0, 4, False),
+                    (0, False, False, 0, 4, False),
+                    (4, False, False, 0, 4, True),
+                    (1, False, False, 0, width, True),
+                ]
+                if live_fusion
+                else []
+            )
         ):
             fresh_q, fresh_kv = torch.randn_like(query), torch.randn_like(kv)
             step = prepare(
@@ -675,6 +704,7 @@ def test_native_token_graph_replays_different_request_counts(
                 reverse=reverse,
                 cached_until=cached_until,
                 live_tokens=live_tokens,
+                is_prefill=is_prefill,
             )
             live = step.scheduled_tokens
             preparation_calls.clear()
@@ -683,7 +713,13 @@ def test_native_token_graph_replays_different_request_counts(
             commit_calls.clear()
             graph_commit_calls.clear()
             index_calls.clear()
+            fused_calls.clear()
             got = graph.replay((fresh_q, fresh_kv)).clone()
+            if live_fusion:
+                assert fused_calls == (
+                    [False] * group_size if requests and is_prefill else []
+                )
+                assert attention_calls == ([False] * group_size if requests else [])
             assert len(commit_calls) == group_size * int(
                 bool(requests) and not capture_attention
             )
@@ -707,10 +743,12 @@ def test_native_token_graph_replays_different_request_counts(
             prepare(
                 requests,
                 graph_layout=False,
+                fuse=False,
                 padded=padded,
                 reverse=reverse,
                 cached_until=cached_until,
                 live_tokens=live_tokens,
+                is_prefill=is_prefill,
             )
             expected = forward(fresh_q, fresh_kv)
             assert torch.isfinite(got).all()
