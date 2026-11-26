@@ -515,6 +515,10 @@ class DSparkDraftModel(nn.Module):
     # the proposer plans. A draft that attends its block another way (MiniMax-
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
+    # Whether `prepare_paged_block_fused` builds this rank's block metadata --
+    # the proposer's positions, slots and lengths and the model's own tables --
+    # in one launch, in place of those and `prepare_paged_block` (no DCP).
+    fuses_block_metadata = False
     # A pool of the draft's own, outside the target's DCP group. None is the
     # generic pool, inside the group.
     kv_pool_spec: ClassVar[DraftKvPoolSpec | None] = None

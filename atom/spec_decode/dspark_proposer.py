@@ -1003,10 +1003,9 @@ class DSparkProposer(Drafter):
         ctx_lens = self._blk_ctx_lens[:running_bs]  # stable
         entry_tokens = self._draft_entry_tokens
         if (
-            not self._draft_is_dcp_sharded
-            and not self.model.block_attention_is_mla
+            self.model.fuses_block_metadata
+            and not self._draft_is_dcp_sharded
             and block_tables.is_cuda
-            and hasattr(self.model, "prepare_paged_block_fused")
         ):
             # Everything below the DCP branch and the model's
             # `prepare_paged_block`, in one launch with the same numbers.

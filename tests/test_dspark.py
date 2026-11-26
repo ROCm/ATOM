@@ -2472,6 +2472,7 @@ def _paged_proposer(
         p.model = types.SimpleNamespace(
             window_size=None,
             block_attention_is_mla=True,
+            fuses_block_metadata=False,
             kv_pool_spec=None,
         )
     n_cols = max_model_len // block_size

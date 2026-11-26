@@ -457,6 +457,9 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         # first call.
         self.max_num_seqs = atom_config.max_num_seqs
         self._bt16 = None
+        # `prepare_paged_block_fused` writes a row per block position, one KV
+        # head per rank; a rank holding several keeps `prepare_paged_block`.
+        self.fuses_block_metadata = self.layers[0].self_attn.num_kv_heads == 1
 
     # ---- drafting entry points (called by the proposer) --------------------
 
