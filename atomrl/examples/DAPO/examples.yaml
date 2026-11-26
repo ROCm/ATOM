@@ -188,8 +188,8 @@ examples:
       checks:
         metrics:
           - {name: rollout_corr/k3_kl, ref: 0.00161, rtol: 0.50}
-          # Pinned-model runs measured 0.686, 0.986 and 1.243 at step 1.
-          - {name: entropy, ref: 0.986, rtol: 0.32}
+          # Pinned-model runs measured 0.602, 0.686, 0.986 and 1.243 at step 1.
+          - {name: entropy, ref: 0.986, rtol: 0.60}
           - {name: rollout_corr/kl, ref: 0.00161, band: 10}
           - {name: rollout_corr/ppl_ratio, info: true}
     full: {config: configs/dapo_qwen3moe_a3b_ray_megatron_verlref_4k_longrun.yaml}
