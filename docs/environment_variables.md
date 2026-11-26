@@ -54,6 +54,7 @@ The nodes trust each other: the engine's store and the workers' reply channels a
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| **ATOM_PP_EARLY_RECV** | bool | 0 | With PP and TP1, receive each stage's tensors on a separate GPU stream, then join the model stream before consumption. Fresh per-call receive storage is retained. This can overlap receive with previously queued compute, once the host reaches receive and tensor metadata arrives. Source data may still be pending, so it can also move communication waiting onto the receiver; model performance is unvalidated. Enabling it with PP and TP>1 raises an error; multi-TP collective ordering is not covered. |
 | **ATOM_PP_MAX_INFLIGHT** | int | 0 | Batches the PP head keeps in flight before it waits for the oldest to return. Every launched batch counts until the last stage completes it, middle prefill chunks included. `0` uses `pipeline_parallel_size`; a negative value is an error. A larger cap keeps the head issuing while a long batch holds the stages ahead of it. Its cost is queueing: batches past the stage count wait on the stages, so each takes longer to return. Kimi-K3's PP8 P/D prefill at C88 sets 16, ~15% more throughput than 8, and 12 was no better than 16. Other models and PP sizes are unmeasured, so the default stays the stage count. |
 
 ## Prefill delayer (TP/DCP and DP attention)

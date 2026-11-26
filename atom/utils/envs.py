@@ -1448,6 +1448,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # Receive on a separate stream so it can overlap a previous PP forward.
+    # TP1 only: multi-TP collective ordering on the side stream is unvalidated.
+    "ATOM_PP_EARLY_RECV": lambda: os.getenv("ATOM_PP_EARLY_RECV", "0") == "1",
     # Batches the PP head keeps in flight, middle prefill chunks included,
     # before it waits for the oldest to come back. At the default (the stage
     # count), one slow batch stalls the head while the stages ahead of it
