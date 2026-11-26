@@ -5,12 +5,14 @@
 linear's E4M3 + E8M0 input in the same aiter launch."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, call
 
 import pytest
 import torch
 
 pytest.importorskip("aiter")
+
+from aiter import dtypes
 
 from atom.model_ops import blockscale, layernorm
 from atom.models.minimax_m3 import model as m3_model
@@ -36,7 +38,8 @@ def test_helper_is_one_aiter_mxfp8_norm(monkeypatch, emit_bf16):
     (values, scales, x, weight, eps), kwargs = fused.call_args
     assert x.shape == (6, 64) and x.data_ptr() == hidden_states.data_ptr()
     assert weight.data_ptr() == norm.weight.data_ptr() and eps == 1e-6
-    assert values.shape == (6, 64)
+    assert values.shape == (6, 64) and values.dtype == dtypes.fp8
+    assert "transpose_scale" not in kwargs  # row-major scales
     assert scales.dtype == torch.float8_e8m0fnu and scales.shape == (6, 2)
     assert kwargs["q_residual"].data_ptr() == residual.data_ptr()
     assert kwargs["group_size"] == 32 and kwargs["gemma_norm"] is True
@@ -113,34 +116,61 @@ def test_helper_is_quantize_fp8_of_its_normed_row(rows):
     assert torch.equal(residual_out2.view(torch.int16), residual_out.view(torch.int16))
 
 
-@pytest.mark.parametrize("flag", ["0", "1"])
-def test_dense_layer_takes_the_mxfp8_norm_only_with_the_flag(monkeypatch, flag):
-    """TP 1, native MXFP8 qkv_proj and gate_up: ATOM_M3_TP1_NORM_MXFP8=1 sends
-    both norms through the one launch and hands its scales on; unset keeps the
-    norm and the linears' own quant."""
+@pytest.mark.parametrize("moe", [False, True])
+@pytest.mark.parametrize(
+    "flag, tp, mxfp8, on",
+    [
+        ("1", 1, True, True),
+        ("0", 1, True, False),
+        ("1", 2, True, False),
+        ("1", 1, False, False),
+    ],
+)
+def test_layer_takes_the_mxfp8_norm_only_at_tp1_with_the_flag(
+    monkeypatch, moe, flag, tp, mxfp8, on
+):
+    """ATOM_M3_TP1_NORM_MXFP8=1 at TP 1 with native MXFP8 consumers: both norms
+    take the one launch; qkv and the dense gate_up get its scales, a MoE layer
+    hands the bf16 row to the router / routed experts and the MXFP8 row to the
+    shared expert. Otherwise both norms keep the two-launch path."""
     monkeypatch.setenv("ATOM_M3_TP1_NORM_MXFP8", flag)
-    monkeypatch.setattr(m3_model, "get_tensor_model_parallel_world_size", lambda: 1)
-    x = torch.zeros(2, 64)
-    one_launch = Mock(return_value=(x, "scale", x))
-    two_launch = Mock(return_value=(x, x))
+    monkeypatch.setattr(m3_model, "get_tensor_model_parallel_world_size", lambda: tp)
+    x, bf16, fp8 = torch.zeros(2, 64), torch.ones(2, 64), torch.full((2, 64), 2.0)
+    one_launch = Mock(
+        side_effect=lambda h, r, norm, emit_bf16=False: (
+            (fp8, "scale", bf16, x) if emit_bf16 else (fp8, "scale", x)
+        )
+    )
+    two_launch = Mock(return_value=(bf16, x))
     monkeypatch.setattr(m3_model, "gemma_rms_norm_mxfp8_quant", one_launch)
     monkeypatch.setattr(m3_model, "fused_allreduce_gemma_rms_norm", two_launch)
-    mxfp8 = SimpleNamespace(native_a8_group_rows=32, runs_bf16=False, quant_type=None)
-    monkeypatch.setattr(m3_model, "_linear_consumes_per_token_fp8", lambda _: False)
-    attn = Mock(return_value=x, qkv_proj=mxfp8)
-    mlp = Mock(return_value=x, gate_up_proj=mxfp8)
+    linear = SimpleNamespace(native_a8_group_rows=32, runs_bf16=not mxfp8)
+    mlp = Mock(return_value=x, gate_up_proj=linear)
+    takes = m3_model.MiniMaxM3MoE.takes_shared_mxfp8_input
+    ffn = Mock(return_value=x, takes_shared_mxfp8_input=lambda: takes(ffn))
+    ffn.shared_experts = mlp
     layer = SimpleNamespace(
-        self_attn=attn,
+        self_attn=Mock(return_value=x, qkv_proj=linear),
         mlp=mlp,
-        is_moe_layer=False,
+        block_sparse_moe=ffn,
+        is_moe_layer=moe,
         input_layernorm="in_norm",
         post_attention_layernorm="post_norm",
     )
 
     m3_model.MiniMaxM3DecoderLayer.forward(layer, None, x, x)
 
-    on = flag == "1"
     assert one_launch.call_count == (2 if on else 0)
     assert two_launch.call_count == (0 if on else 2)
-    assert attn.call_args.kwargs["hidden_states_scale"] == ("scale" if on else None)
-    assert mlp.call_args.kwargs == ({"x_scale": "scale"} if on else {})
+    norms = ["in_norm", "post_norm"]
+    assert [
+        c.args[2] for c in (one_launch if on else two_launch).call_args_list
+    ] == norms
+    scale = "scale" if on else None
+    assert layer.self_attn.call_args.kwargs["hidden_states_scale"] == scale
+    if not on:
+        assert (ffn if moe else mlp).call_args == call(bf16)
+    elif moe:
+        assert ffn.call_args == call(bf16, shared_x=fp8, shared_x_scale="scale")
+    else:
+        assert mlp.call_args == call(fp8, x_scale="scale")
