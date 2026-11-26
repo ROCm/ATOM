@@ -90,8 +90,8 @@ def _rank(rank, world, port, failures):
             ref[:tokens] = parts.float().sum(0)
             ref = ref[rank * local : (rank + 1) * local]
             err = ((got.float() - ref).abs().max() / ref.abs().max()).item()
-            # One bf16 rounding of a sum taken in another order.
-            if err > 8e-3:
+            # One bf16 rounding of a sum taken in another order (NaN fails).
+            if not err <= 8e-3:
                 errors.append(f"reduce-scatter step {step}: rel err {err:.3g}")
         torch.cuda.synchronize()
         col.close()

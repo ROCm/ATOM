@@ -156,7 +156,9 @@ It applies to TP serving on gfx942 only (validated on MI308X) and needs mori
 (4 x TP - 2) x ceil(max_num_batched_tokens / TP) rows x hidden x 2 B of receive
 buffers (16k tokens: ~252 MB at TP2, ~294 MB at TP4). If any TP rank cannot use
 it (a dependency or the preload missing, TP across nodes), every rank logs one
-warning and keeps RCCL.
+warning and keeps RCCL. A failure inside the collective setup of mori or aiter's
+`SdmaComm` (e.g. its buffer allocation) can still block startup until the gloo
+timeout.
 
 ## Optional: bursty prefill on an idle server
 
