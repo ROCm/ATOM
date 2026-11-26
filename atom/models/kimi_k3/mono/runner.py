@@ -131,7 +131,15 @@ def _lean_k1(key: k1.KdaPreBuild) -> k1.KdaPreBuild | None:
     (``KdaPreBuild.gemv_unit``: half the weights in flight, slower where
     ``kda.gemv_staging`` keeps two groups, so only where those do not fit), or
     at one already x a unit less ahead (``x_ahead``: K4's 7 and 9 batches
-    spilled at four). The same sums either way."""
+    spilled at four). One with its weights two units ahead
+    (``kda.gemv_staging``) falls back to the staging it replaced. The same
+    sums either way."""
+    if key.w_ahead > 1:
+        fields = k1.KdaPreBuild.__dataclass_fields__
+        staging = {f: fields[f].default for f in ("gemv_unit", "x_ahead")}
+        return replace(
+            key, w_ahead=1, **{**staging, **k1.gemv_staging(key.tokens, w_ahead=False)}
+        )
     if key.gemv_unit > 1:
         return replace(key, gemv_unit=1)
     if key.x_ahead > 1:

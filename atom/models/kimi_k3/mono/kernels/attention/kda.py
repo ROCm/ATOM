@@ -23,8 +23,9 @@ behind every earlier load):
                         -> q|k|v|g|f_a|beta (PROJ)
     kda tasks           (R x 12 heads x 8 v-chunks) on CTAs 0 ..: inputs that
                         need no hand-off loaded first (metadata, conv window,
-                        state rows, f_b rows), then conv update of the owned
-                        channels (q / k out through QK), f_b MFMA + lower-bound
+                        state rows, f_b rows, ReplaySSM records), then conv
+                        update of the owned channels (a chunk task the whole
+                        head's q / k), f_b MFMA + lower-bound
                         gate, l2norm, the recurrence on 16 state rows (a state a
                         token written), partial norms (ONRM), gated RMSNorm ->
                         core_out
@@ -188,8 +189,9 @@ def head_parts(s: int, qlen: int) -> int:
     are independent; only its output norm sums all of them, so a part
     publishes its chunks' partials (ONRM) and takes the others', as the chunk
     tasks do -- the same sums, in chunk order. Its conv and gates every part
-    computes (no q / k hand-off); the first writes the conv state back once
-    the others have read it (``kda_head_conv_state``). Below 8 rows the
+    computes (no q / k hand-off); each writes its share of the conv state
+    back once every part has read the window (``head_conv_state_late``).
+    Below 8 rows the
     norm's hand-off outweighs the halved recurrence: one part."""
     if s < 8:
         return 1
@@ -284,6 +286,24 @@ class KdaPreBuild:
     # that spilled (``runner._lean_width``)
     x_ahead: int = field(default=1, metadata={"sym": "a"})
     kda0: int = field(default=0, metadata={"sym": "k0"})  # the first KDA task's CTA
+    # column-group units a ``gemv_groups`` unit's weights are issued ahead of
+    # its MFMAs (held in VGPRs meanwhile). One leaves a CTA one unit's weights
+    # in flight, a load round trip a unit: the GEMV past its x a latency chain
+    w_ahead: int = field(default=1, metadata={"sym": "wa"})
+
+
+# fields a build names only off their default, so a serving build's symbol (and
+# LLVM's register choice with it) is the one it had before they existed
+_UNNAMED_DEFAULT = {"w_ahead": 1}
+
+
+def symbol(key: KdaPreBuild) -> str:
+    """``key``'s kernel symbol (``_UNNAMED_DEFAULT``)."""
+    sym = symbol_params(key)
+    for f, off in _UNNAMED_DEFAULT.items():
+        if getattr(key, f) == off:
+            del sym[KdaPreBuild.__dataclass_fields__[f].metadata["sym"]]
+    return kernel_symbol("k3_mono_kda_pre", **sym)
 
 
 ABI = KernelAbi(
@@ -336,7 +356,6 @@ def scratch_layout(key: KdaPreBuild) -> dict:
         "msq": NA * s,
         "xrdy": NA * groups(s),
         "proj": s * NPROJ,
-        "qk": s * NH * 2 * HD,
         "onrm": s * NH * NVCH,
         # a head's readers done with what its writer overwrites (``readers_done``)
         "rdone": s * NH * NVCH,
@@ -772,11 +791,29 @@ def attnres(c, task, sg, on, tls):
     stamp(on, tls, c["tid"], 3)
 
 
-def gemv_staging(s: int) -> dict:
+def gemv_staging(s: int, w_ahead: bool = True) -> dict:
     """``gemv_groups``' staging for an s-row step (``KdaPreBuild.gemv_unit`` /
     ``x_ahead``): from three token groups on, a column group a unit with x
-    four units ahead; else two groups a unit with x one ahead."""
-    return {"gemv_unit": 1, "x_ahead": 4} if groups(s) >= 3 else {}
+    four units ahead; else two groups a unit with x one ahead.
+
+    ``w_ahead``: at two groups whose second holds at most ``W_AHEAD_TAIL``
+    rows, the weights two column groups ahead (off: the staging a lean
+    rebuild falls back to, ``runner._lean_k1``). A wave's
+    loads complete in issue order (vmcnt), so an x load issued after a unit's
+    weights, stored (waited for) ``x_ahead`` - 1 units on, waits for them too:
+    the weights stay in flight their two column groups (2 G units) only with x
+    2 G - 1 ahead, more only costs VGPRs. Only there does that fit them (the
+    short group's x is one 16 B chunk a thread); elsewhere it spills."""
+    g = groups(s)
+    if w_ahead and g == 2 and s - TG <= W_AHEAD_TAIL:
+        return {"gemv_unit": 1, "w_ahead": 2, "x_ahead": 2 * g - 1}
+    return {"gemv_unit": 1, "x_ahead": 4} if g >= 3 else {}
+
+
+# ``gemv_staging``'s w_ahead: a short second group's x is one 16 B chunk a
+# thread up to 4 rows, the only shape where the deeper weights fit; S20-shaped
+# steps (B4 at K4) measured K1 -6.8% (T0, same sums)
+W_AHEAD_TAIL = 4
 
 
 def xu_row(unit):
@@ -825,7 +862,8 @@ def gemv_groups(c, gi):
             gemv_loads(c, rg1, range(i0, i0 + n), paired=True),
         ]
 
-    ops = {0: unit_ops(0)}
+    wa = min(c["w_ahead"], len(kunits))
+    ops = {k: unit_ops(k) for k in range(wa)}
     # every group's slices ready (XRDY, NA a group)
     if c["tid"] < NA * G:
         c["poll"]([(c["xrdy"], c["tid"], 1)])
@@ -841,8 +879,8 @@ def gemv_groups(c, gi):
 
     def multiply(u, buf):
         k, g = units[u]
-        if const_expr(g == 0 and k + 1 < len(kunits)):
-            ops[k + 1] = unit_ops(k + 1)
+        if const_expr(g == 0 and k + wa < len(kunits)):
+            ops[k + wa] = unit_ops(k + wa)
         cu = {**group_view(c, g), "xl": buf, "xrow": row}
         acc0[g] = gemv_slab(cu, ops[k][0], kunits[k][1], acc0[g])
         acc1[g] = gemv_slab(cu, ops[k][1], kunits[k][1], acc1[g])
@@ -938,28 +976,40 @@ def lds_refusal(key: KdaPreBuild) -> str:
     )
 
 
-def replay_stage(c, rp, slot, h):
-    """The CTA's records (``replay_max`` of them) into LDS ``rec``, u / k / g
-    planes of f32, one round trip for all of them."""
+def replay_issue(c, rp, slot, h):
+    """The CTA's records (``replay_max`` of them), loaded with a task's other
+    inputs (``kda_task_inputs``, one round trip for all of them) and held in
+    VGPRs until ``replay_commit``."""
     tid = c["tid"]
     n = replay_max(c["cap"], c["rwin"]) * HD
+    out = []
     for i in range_constexpr(-(-n // THREADS)):
         e = fx.min(tid + THREADS * i, n - 1)
         at = rec_at(c, slot, h, 0) + e
-        fx.ptr_store(ld_bf(rp["rbuf_u"], at), c["rec"] + e)
-        fx.ptr_store(ld_bf(rp["rbuf_k"], at), c["rec"] + (n + e))
-        fx.ptr_store(ld_f32(rp["rbuf_g"], at), c["rec"] + (2 * n + e))
+        u, kk = ld_bf(rp["rbuf_u"], at), ld_bf(rp["rbuf_k"], at)
+        out.append((e, u, kk, ld_f32(rp["rbuf_g"], at)))
+    return out
+
+
+def replay_commit(c, held):
+    """``replay_issue``'s records into LDS ``rec``: u / k / g planes of f32."""
+    n = replay_max(c["cap"], c["rwin"]) * HD
+    for e, u, kk, g in held:
+        fx.ptr_store(u, c["rec"] + e)
+        fx.ptr_store(kk, c["rec"] + (n + e))
+        fx.ptr_store(g, c["rec"] + (2 * n + e))
     gpu.barrier()
 
 
-# A head's tasks share memory one of them overwrites: its conv window (a head
-# split over parts, ``head_parts``: every part reads all 3 HD channels, the
-# first writes them back) and, on a ReplaySSM flush, its k / g records (one
-# task a head rewrites positions 0 .. that every task has just staged). The
-# writer is task 0 of the head; reader r > 0 publishes once it has read both.
+# A head's tasks share memory one of them overwrites on a ReplaySSM flush: its
+# k / g records (one task a head rewrites positions 0 .. that every task has
+# just staged). The writer is task 0 of the head; reader r > 0 publishes once
+# it has read them. (The conv window every task reads is written back after
+# the head's partial norms, which every task publishes past its conv:
+# ``qk_conv_state`` / ``head_conv_state_late``.)
 def readers_done(c, req, h, r, who):
     """Reader ``r`` of head (req, h) done reading (its loads consumed: called
-    after the conv and the replay staging)."""
+    after the replay staging)."""
     publish(c["put"], c["rdone"], (req * NH + h) * NVCH + r, fx.Int32(1), who)
 
 
@@ -976,14 +1026,14 @@ def kda_replay(c, k, h, rows, k0, st):
     """A thread's state rows ``rows`` of head h (columns k0 .. k0 + 3) after
     the slot's h_rec committed records, from the checkpoint's ``st``: the
     records' own recurrence S <- diag(exp g_j) S + u_j k_j, in place, from the
-    records in LDS (``replay_stage``): the state ``_replay_tiles``' closed
+    records in LDS (``replay_commit``): the state ``_replay_tiles``' closed
     form gives (exp C S + sum_j exp(C - C_j) u_j k_j, a GEMM there), each
     thread its own elements. Only the h_rec live records are read (a stale
     one need not be finite)."""
     n = len(rows)
     hmax = replay_max(c["cap"], c["rwin"])
     h_rec = k["h_rec"]
-    replay_stage(c, k["rp"], k["slot0"], h)
+    replay_commit(c, k["rec_held"])
     lu, lk, lg = c["rec"], c["rec"] + hmax * HD, c["rec"] + 2 * hmax * HD
     out = [st[r][e] for r in range(n) for e in range(4)]  # row r col e: 4 r + e
     for j in range(h_rec):
@@ -1019,8 +1069,10 @@ def replay_records(c, k, h, j, row, k0, vn, kv, writes_k):
 
 # ---------------------------------------------------------------- kda
 def kda_stage(c, req, h, ch):
-    """Chunk ch's inputs (``kda_task_inputs``): a thread < 3 VCH owns conv
-    channel (part, 16 ch + d), every thread state row 16 ch + tid / 32."""
+    """Chunk ch's inputs (``kda_task_inputs``): a thread < 2 HD the q / k
+    channel (tid / HD, tid % HD) of the whole head (its own conv of them, no
+    hand-off from the head's other chunks), the next VCH the chunk's v
+    channels; every thread state row 16 ch + tid / 32."""
     return kda_task_inputs(c, req, h, ch, (ch * VCH, VCH), [ch * VCH + c["tid"] // 32])
 
 
@@ -1032,6 +1084,12 @@ def state_late(s: int) -> bool:
     Below 8 rows the gates are too short to cover the state's latency: it
     goes with the other inputs."""
     return s >= 8
+
+
+def task_state_late(c) -> bool:
+    """``state_late`` for this build's tasks: a chunk's one row (8 KB a CTA)
+    goes with the inputs."""
+    return state_late(c["S"]) and c["kda_head"]
 
 
 def state_at(c, slot):
@@ -1061,10 +1119,9 @@ def state_loads(c, k):
 
 
 def fb_loads(c, k):
-    """This wave's f_b rows (``kda_gates``' MFMA A operands) into ``k["fb"]``:
-    with a task's other inputs on a plain decode, after ``kda_gates``' polls
-    on a verify (its f_a poll is L tokens' worth, and in vmcnt order it would
-    wait for the 32 KB)."""
+    """This wave's f_b rows (``kda_gates``' MFMA A operands) into ``k["fb"]``,
+    issued with a task's other inputs (before its polls, so none waits behind
+    the 32 KB in vmcnt order)."""
     k["fb"] = [
         fx.Vector(
             bo.buffer_load(
@@ -1101,9 +1158,15 @@ def kda_task_inputs(c, req, h, m0, channels, rows):
         # ReplaySSM: the state starts at the checkpoint (``kda_replay``)
         k["rp"] = replay_ptrs(c)
         k["slot0"], k["h_rec"], k["flush"], k["rbase"] = replay_slot(c, k["rp"], req)
-    ct = fx.min(tid, 3 * width - 1)
-    part = ct // width
-    chan = part * PROJ + h * HD + c0 + ct % width
+    if const_expr(not c["kda_head"]):
+        # a chunk task: the head's q / k channels, then its own v channels
+        ct = fx.min(tid, 2 * HD + width - 1)
+        part = ct // HD
+        chan = part * PROJ + h * HD + ct % HD + ct // (2 * HD) * c0
+    else:
+        ct = fx.min(tid, 3 * width - 1)
+        part = ct // width
+        chan = part * PROJ + h * HD + c0 + ct % width
     cs = a["conv_st"] + fx.Int64(fx.max(k["slot_c"], 0)) * fx.Int64(a["cs_seq"]) * 2
     co = chan * a["cs_dim"]  # the channel's first entry (bf16 elements)
     k["cs"], k["co"], k["chan"], k["part"] = cs, co, chan, part
@@ -1121,79 +1184,69 @@ def kda_task_inputs(c, req, h, m0, channels, rows):
     k["rows"] = rows
     k["head_offs"] = [(h * HD + r) * HD + k0 for r in rows]
     k["st_base"] = state_at(c, fx.max(k["slot0"], 0))
-    if const_expr(not state_late(c["S"])):
+    if const_expr(not task_state_late(c)):
         state_loads(c, k)
     # f_b: wave w's rows 16 w .. of head h, a lane 64 B of its row
     fr = h * HD + wave * 16 + lane % 16
     fb = (fr * HD + (lane // 16) * 32) // 2
     k["fb_at"] = fb
-    if const_expr(L == 1):
-        fb_loads(c, k)
+    fb_loads(c, k)
     k["aa"] = hw_exp2(ld_f32(a["a_log"], h) * fx.Float32(LOG2E))
     k["dtb"] = [
         ld_f32(a["dt_bias"], h * HD + wave * 16 + 4 * (lane // 16) + i)
         for i in range(4)
     ]
+    if const_expr(c["cap"]):
+        k["rec_held"] = replay_issue(c, k["rp"], k["slot0"], h)
     return k
 
 
 @traced
-def kda_conv(c, k, req, h, ch):
-    """Owned channels: the spec conv update of request ``req``'s L tokens -> new
-    conv state; q / k out through QK, v to LDS."""
+def kda_conv(c, k, req, h):
+    """A chunk task's conv: the whole head's q / k into ``qkl``, the chunk's v
+    into ``vloc``, no hand-off between the head's chunks (each convs the q / k
+    itself). The v channels' conv state here; the q / k ones every chunk of
+    the head reads, so chunk ch writes its own after the head's partial norms
+    (``qk_conv_state``)."""
     L, tid = c["L"], c["tid"]
     stamp(c["on"], c["tls"], tid, 12)
     xs = conv_inputs(c, k, req, h)
-    if tid < 3 * VCH:
-        xv = [f32_of(x[0]) for x in xs]
+    # the tokens kept for ``qk_conv_state``
+    k["xv"] = [f32_of(x[0]) for x in xs]
+    if tid < 2 * HD + VCH:
+        xv = k["xv"]
         stamp(c["on"], c["tls"], tid, 13)
-        conv_state_store(c, k, xv)
+        if k["part"] == 2:
+            conv_state_store(c, k, xv)
         stamp(c["on"], c["tls"], tid, 14)
         outs = conv_tokens(k, xv)
         for j in range_constexpr(L):
             o = outs[j]
             if k["part"] < 2:
-                c["put"](
-                    c["qk"],
-                    ((req * NH + h) * L + j) * 2 * HD
-                    + k["part"] * HD
-                    + ch * VCH
-                    + tid % VCH,
-                    o,
-                )
+                fx.ptr_store(o, c["qkl"] + ((2 * j + k["part"]) * HD + tid % HD))
             if k["part"] == 2:
-                fx.ptr_store(o, c["vloc"] + (j * VCH + tid % VCH))
+                fx.ptr_store(o, c["vloc"] + (j * VCH + tid % HD))
     gpu.barrier()
 
 
 @traced
-def kda_gates(c, k, req, h):
-    """f_a, beta and the head's q / k into LDS (a chunk task polls them here,
-    a head task's conv already did); g1 = f_b f_a by MFMA (a wave 16 rows) ->
-    lower-bound gate -> decay in LDS; q / k l2-normed (q scaled)."""
-    L = c["L"]
-    if const_expr(not c["kda_head"]):
-        chunk_gate_inputs(c, req, h)
-    if const_expr(L > 1):
-        fb_loads(c, k)
-    if const_expr(state_late(c["S"])):
-        state_loads(c, k)
-    if const_expr(not c["kda_head"]):
-        gpu.barrier()
-    gates_compute(c, k, h)
+def qk_conv_state(c, k, ch):
+    """Chunk ch's q / k channels' conv state, once every chunk of
+    the head has read the window (its partial norms, after its conv: polled by
+    ``kda_norm``)."""
+    tid = c["tid"]
+    if (tid < 2 * HD) & (tid % HD // VCH == ch):
+        conv_state_store(c, k, k["xv"])
 
 
 @traced
-def chunk_gate_inputs(c, req, h):
-    """A chunk task's q / k (the head's other chunk tasks' conv), polled into
-    LDS; its f_a and beta came with its own conv's poll."""
-    L, tid = c["L"], c["tid"]
-    n = L * 2 * HD
-    es = [fx.min(tid + THREADS * i, n - 1) for i in range(-(-n // THREADS))]
-    got = c["poll"]([(c["qk"], (req * NH + h) * L * 2 * HD + e, 1) for e in es])
-    for i in range_constexpr(len(es)):
-        if tid + THREADS * i < n:
-            fx.ptr_store(f32_of(got[i][0]), c["qkl"] + es[i])
+def kda_gates(c, k, req, h):
+    """f_a, beta and the head's q / k in LDS (the task's conv put them there);
+    g1 = f_b f_a by MFMA (a wave 16 rows) -> lower-bound gate -> decay in LDS;
+    q / k l2-normed (q scaled)."""
+    if const_expr(task_state_late(c)):
+        state_loads(c, k)
+    gates_compute(c, k, h)
 
 
 def gate_input_specs(c, req, h):
@@ -1266,7 +1319,10 @@ def kda_recur(c, k, req, h, ch):
         stv = kda_replay(c, k, h, k["rows"], (tid % 32) * 4, stv)
         # chunk 0 rewrites the k / g records from 0 on a flush: the head's
         # other chunks must have staged them first
-        readers_done(c, req, h, ch, (tid == 0) & (ch != 0))
+        # off a flush chunk 0 waits for none, and the publish would drain
+        # the task's conv-state stores
+        if k["flush"]:
+            readers_done(c, req, h, ch, (tid == 0) & (ch != 0))
         if (ch == 0) & k["flush"]:
             await_readers(c, req, h, NVCH - 1)
         if k["flush"] & live0:
@@ -1424,10 +1480,13 @@ def kda_head_conv(c, k, req, h):
     f_a and beta in the same poll batch (``gate_input_specs``)."""
     tid = c["tid"]
     xs = conv_inputs(c, k, req, h)
+    if const_expr(c["hparts"] > 1):
+        # the tokens kept for ``head_conv_state_late``
+        k["xv"] = [f32_of(x[0]) for x in xs]
     if tid < 3 * HD:
         xv = [f32_of(x[0]) for x in xs]
-        # one part: the conv state here; several: by the first, once the others
-        # have read their windows (``kda_head_conv_state``)
+        # one part: the conv state here; several: each part its share, once
+        # every part has read the window (``head_conv_state_late``)
         if const_expr(c["hparts"] == 1):
             conv_state_store(c, k, xv)
         d = tid % HD
@@ -1483,21 +1542,30 @@ def conv_state_store(c, k, xv):
 
 
 @traced
-def kda_head_conv_state(c, k, req, h):
-    """A head split over parts (``head_parts``): every part reads the whole
-    conv window, the first writes it back -- after the others have read it
-    (their ``readers_done``) and, on a ReplaySSM flush, staged the head's
-    records the first then rewrites. The step's tokens re-read from PROJ
-    (landed)."""
-    L, tid = c["L"], c["tid"]
-    readers_done(c, req, h, k["m0"] // head_chunks(c), (tid == 0) & (k["m0"] != 0))
-    if k["m0"] == 0:
-        await_readers(c, req, h, c["hparts"] - 1)
-        if tid < 3 * HD:
-            xs = c["poll"](
-                [(c["proj"], (req * L + j) * NPROJ + k["chan"], 1) for j in range(L)]
-            )
-            conv_state_store(c, k, [f32_of(xs[j][0]) for j in range(L)])
+def head_flush_readers(c, k, req, h):
+    """A head split over parts (``head_parts``): on a ReplaySSM flush the
+    first part rewrites the head's k / g records, so it waits until the
+    others have staged them (their ``readers_done``). Off a flush no part
+    waits (the conv state waits for the norm, ``head_conv_state_late``)."""
+    tid = c["tid"]
+    if const_expr(c["cap"]):  # noqa: SIM102
+        if k["flush"]:
+            r = k["m0"] // head_chunks(c)
+            readers_done(c, req, h, r, (tid == 0) & (k["m0"] != 0))
+            if k["m0"] == 0:
+                await_readers(c, req, h, c["hparts"] - 1)
+
+
+@traced
+def head_conv_state_late(c, k):
+    """A head split over parts: the part's share of the head's 3 HD conv
+    channels, once
+    every part has read the window (its partial norms, after its conv:
+    polled by ``kda_head_norm``)."""
+    tid = c["tid"]
+    share = 3 * HD // c["hparts"]
+    if (tid < 3 * HD) & (tid // share == k["m0"] // head_chunks(c)):
+        conv_state_store(c, k, k["xv"])
 
 
 @traced
@@ -1511,7 +1579,7 @@ def kda_head_recur(c, k, req, h):
     if const_expr(c["cap"]):
         stv = kda_replay(c, k, h, k["rows"], (tid % 32) * 4, stv)
     if const_expr(c["hparts"] > 1):
-        kda_head_conv_state(c, k, req, h)
+        head_flush_readers(c, k, req, h)
     if const_expr(c["cap"]):  # noqa: SIM102
         if k["flush"] & live0:
             # the records folded: the checkpoint moves to here
@@ -1592,6 +1660,8 @@ def kda_head_tasks(c, on, tls):
         stamp(on, tls, tid, 10)
         enter_stage("k1.onorm")
         kda_head_norm(c, k, req, h)
+        if const_expr(parts > 1):
+            head_conv_state_late(c, k)
         stamp(on, tls, tid, 11)
 
 
@@ -1610,7 +1680,7 @@ def kda_tasks(c, on, tls):
         k = kda_stage(c, req, h, ch)
         stamp(on, tls, tid, 7)
         enter_stage("k1.conv")
-        kda_conv(c, k, req, h, ch)
+        kda_conv(c, k, req, h)
         stamp(on, tls, tid, 8)
         enter_stage("k1.gates")
         kda_gates(c, k, req, h)
@@ -1620,6 +1690,7 @@ def kda_tasks(c, on, tls):
         stamp(on, tls, tid, 10)
         enter_stage("k1.onorm")
         kda_norm(c, req, h, ch)
+        qk_conv_state(c, k, ch)
         stamp(on, tls, tid, 11)
 
 
@@ -1685,7 +1756,7 @@ def build(key: KdaPreBuild):
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     keyed = key_tuple(key, _SOURCES)
-    name = kernel_symbol("k3_mono_kda_pre", **symbol_params(key))
+    name = symbol(key)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kda_pre(
@@ -1769,6 +1840,7 @@ def build(key: KdaPreBuild):
             "rwin": key.replay_window,
             "unit": key.gemv_unit,
             "x_ahead": key.x_ahead,
+            "w_ahead": key.w_ahead,
             "vloc": kl.vloc.ptr,
             "ol": kl.ol.ptr,
             "onl": kl.onl.ptr,
@@ -1806,7 +1878,7 @@ def build(key: KdaPreBuild):
                 "proj_dbg": proj_dbg,
             },
         }
-        for region in ("part", "wgt", "msq", "xrdy", "proj", "qk", "onrm", "rdone"):
+        for region in ("part", "wgt", "msq", "xrdy", "proj", "onrm", "rdone"):
             c[region] = sreg(scratch, lay[region][0], region)
         on, tls = key.timeline, lds.tls.ptr
         c["on"], c["tls"] = on, tls
