@@ -41,22 +41,45 @@ It differs from 06d only in these. The container env differences show in `refere
 | Launcher ports | +1000 | as main |
 | Nodes A, B | g27, g23 | g52, g27 |
 
-The rest is 06d's, including the lossy settings (see "Previous points"). None of the three changes touches the model's numerics: they move KV and pick NICs.
+The rest is 06d's, including the lossy settings (see "Previous points"). None of the three changes the model's math: they move KV and pick NICs. No accuracy run covered them; the hour checked transport health only (0 errors, no landing drops, Store failures or NIC errors).
 
 **Code.** Three commits on this branch, each one of the hour's `--patch` files applied unchanged, in the hour's order:
 
 | Commit | What it does | Switch (prefill) | On main |
 |---|---|---|---|
-| `198bbb854` Store R1 | A Store load thread queues each window's unpack behind an event and starts the next get at once, instead of waiting for the unpack first | `ATOM_STORE_LOAD_PIPELINE=1` | branch `Jasen/m31-store-load-pipeline`, a later revision with tests |
-| `bda43bdfc` O1 | Each prefill stage sends its KV from a process of its own, `pd-send-ppK`, so the stage's main thread no longer waits on the GIL behind its 16 send threads | `ATOM_PD_SEND_PROCESS=1` | ROCm/ATOM#3864 -> #3865 -> #3866 (drafts) |
-| `d0a2d9d8b` NIC fix | A P/D rank registers on the NIC behind its GPU's PCIe switch, not `rdma<HIP index>` | none, always on; an explicit `ib_device` wins | branch `Jasen/m31-pd-nic-local` |
+| `198bbb854` Store R1 | A Store load thread queues each window's unpack behind an event and starts the next get at once, instead of waiting for the unpack first | `ATOM_STORE_LOAD_PIPELINE=1` | a later revision with tests, branch `Jasen/m31-store-load-pipeline` (`e2b5d15d6`), not on GitHub as of 2026-11-26 |
+| `bda43bdfc` O1 | Each prefill stage sends its KV from a process of its own, `pd-send-ppK`, so the stage's main thread no longer waits on the GIL behind its 16 send threads | `ATOM_PD_SEND_PROCESS=1` | ROCm/ATOM#3864 -> #3865 -> #3866 (drafts). They lack one part of the code that ran: a transfer that failed before it posted any RDMA write is reported as unwritten (`posted`) |
+| `d0a2d9d8b` NIC fix | A P/D rank registers on the NIC behind its GPU's PCIe switch, not `rdma<HIP index>` | none, always on; an explicit `ib_device` wins | ROCm/ATOM#3884 (draft), the same changed lines |
 
 The tree of `d0a2d9d8b` is the hour's snapshot (`76b83860b` + the three patches) plus this directory, which neither the launcher nor the server reads. None of the three touches `.github/`, so the launcher is still 76b83860b's own (see Code). aiter is unchanged: ROCm/aiter `Jasen/m31-agentx-repro` (`c2f06e01`), baked into `rocm/atom-dev:m31-agx-local-c2f06e01`; load or build it as in Image.
 
-**Before the run.** The host prerequisites, model, dataset and image are unchanged from 06d: follow "Before a run" steps 1-5. The NIC fix also needs one ACTIVE NIC behind each prefill GPU's PCIe switch, as on these nodes; without it the prefill refuses to start and names `ib_device` / `ATOM_MOONCAKE_IB_DEVICE`. Then the Store:
-- Prepare host memory with `prep/prep_final.sh`, as for 06d: page-cache pressure, then compaction on each NUMA node. The hour's nodes took three rounds of the same two tools. Node B's free 2 MiB blocks did not grow past 1,130 / 1,047 GiB.
-- Size the owners from probes taken after the prep. `overlays/store_3392_hour.sh` is the hour's plan, an example: it fits nodes with at least the hour's free 2 MiB blocks (g52 1,213 / 1,231 GiB, g27 1,130 / 1,047 GiB) and left 143-554 GiB of them free per NUMA node. `harness/bin/store_plan.py` sizes owners from `node_probe.py` output; the harness runs it on every launch (`store_plan.json`). Write your owners into an overlay like this one, or leave the overlay out to take the automatic plan.
-- Leave room on node A NUMA0 for the four `pd-send-ppK` processes, 3.5-3.7 GiB each. The hour's plan kept 16 GiB for them.
+**Before the run.** The host prerequisites, model, dataset and image are unchanged from 06d: follow "Before a run" steps 1-5. The NIC fix also needs one ACTIVE NIC behind each prefill GPU's PCIe switch, as on these nodes; without it the prefill refuses to start and names `ib_device` / `ATOM_MOONCAKE_IB_DEVICE`. Then the Store, which took about 45 min before the launch (03:01-03:46 UTC).
+
+*Host memory:* three rounds of `prep/prep_hour.sh`. A round runs memory pressure (`evict_cache.py`) and then compaction (the launcher's `compact_huge_pages.py`) on each NUMA node it is given, all in parallel, then probes both nodes with `node_probe.py --drop`, as the harness does, and plans the Store owners (below). The hour's rounds:
+```bash
+export EXTRA_RESERVE=g27:0:400   # the planner's margin for other users' jobs on g27 NUMA0 (see Store owners)
+# 1. All four NUMA nodes: pressure to a 96 GiB floor, then compaction (420 s cap).
+bash $RECIPE/prep/prep_hour.sh g52 g27
+# 2. Node A: pressure to a 24 GiB floor, then compaction; node B: compaction only (600 s cap).
+FLOOR_A=24 FLOOR_B=- TA1=1300 COMPACT_TIMEOUT=600 bash $RECIPE/prep/prep_hour.sh g52 g27
+# 3. Node A: compaction only (300 s cap).
+FLOOR_A=- FLOOR_B=- TA0=1370 TA1=1350 TB0=- TB1=- COMPACT_TIMEOUT=300 bash $RECIPE/prep/prep_hour.sh g52 g27
+```
+- Round 1 is 06d's method with other targets. It left free 2 MiB blocks of 978 / 848 GiB on g52 and 1,130 / 1,047 GiB on g27. On g52 the kernel moved the page cache to its active list instead of reclaiming it, so the pressure reached its floor with 153 / 375 GiB of page cache left.
+- Round 2 took g52 to 1,184 / 1,231 GiB; g27 did not change. A 24 GiB floor reclaims almost all page cache and can swap out other processes' memory. It was safe on g52 only because g52 ran no other users' processes and has about 1.7 TiB of swap. On a node with other users' jobs, keep the 96 GiB floor or no pressure, as for g27.
+- Round 3 took g52 to 1,213 / 1,231 GiB.
+
+*Store owners:* `prep/plan_hour.py`, the hour's planner, ends every round and writes the overlay `<OUT>/store_hour.sh`. After round 3 it gave `overlays/store_3392_hour.sh`: 3,392 GiB, 848 per pool. It sizes 4 equal pools toward 3,776 GiB. Per NUMA node it takes the smallest of five ceilings; all four NUMA nodes ended at SPARE:
+- THP: 0.97 x the free 2 MiB blocks.
+- SPARE: the free 2 MiB blocks minus a margin left free: 266 GiB on node A NUMA0 (250, plus 16 for the four `pd-send-ppK` processes of 3.5-3.7 GiB each), 120 on A NUMA1, 96 on B NUMA0, 160 on B NUMA1.
+- MEM: free memory minus 272, 192, 64 and 192 GiB.
+- LAUNCH: MemTotal - 128 GiB, the launcher's budget check.
+- OWNER: 304 GiB per owner.
+
+`--extra-reserve NODE:NUMA:GiB` (`EXTRA_RESERVE`) lowers SPARE and MEM there. The hour kept 400 GiB on g27 NUMA0, where other users' memory grew by about 190 GiB during the hour, to about 380 GiB.
+- Pass `overlays/store_3392_hour.sh` when the plan's printed ceilings reach its owners: 4 x 224 and 4 x 272 GiB on node A, 4 x 144 and 4 x 208 GiB on node B. Otherwise pass the plan's own `store_hour.sh`. On larger nodes, `PLAN_TOTAL=3392` stops the plan at the hour's size.
+- Do not leave the Store overlay out. The harness then sizes the owners itself (`harness/bin/store_plan.py`) with smaller margins: on the hour's own launch probes that gave 3,648 GiB and would have left about 76 GiB free on g27 NUMA0 (42 GiB of 2 MiB blocks).
+- To probe again without a prep round, run `python3 $RECIPE/harness/bin/node_probe.py --drop /share_nfs/models` on each node, or read `probe-<node>.json` in the run dir of a harness `--dry-run`. Both drop the model's page cache first.
 
 **Launch** from the driver host, with `RECIPE` and `AGX_RUNS` set as in "Before a run"; node A first:
 ```bash
@@ -73,8 +96,9 @@ setsid nohup bash $RECIPE/harness/bin/agx_run.sh \
 - `--commit d0a2d9d8b` is this branch's NIC-fix commit, `[P/D] Mooncake: register on the GPU's PCIe-local NIC, not rdma<HIP index>`. There is no `--patch`. The hour itself ran `--commit 76b83860b` with the three changes as `--patch` files, which gives the same tree.
 - `env/p_env_nochunk_lw2_r1_o1.sh` is 06d's prefill role plus the two switches. The decode role and the tmpdir overlay are 06d's.
 - The hour also had `AGX_PREFLIGHT_WARN_ONLY=1` in front. Its probes found no launcher port taken and no GPU memory in use, so it changed nothing.
-- The automatic plan from the hour's probes (3,648 GiB) was larger than the overlay, so `--keep-model-cache` never stopped the model page-cache droppers. They were stopped outside the harness at 03:56:52, once every pool counted 848 GiB, as Pitfalls describes.
-- It took 1 h 49 min: 5 min of snapshot, probes and cell, 18 min from rank start to serving, 17 min of warmup, the hour, and 9.5 min of drain and summary. Let the lease run at least 2 h 10 min past the launch.
+- The automatic plan from the hour's probes (3,648 GiB) was larger than the overlay, so `--keep-model-cache` never stopped the model page-cache droppers. They were stopped outside the harness at 03:56:52 UTC, once every pool counted 848 GiB, as Pitfalls describes. Do the same: until then they slow the weight load.
+- It took 1 h 49 min: 5 min of snapshot, probes and cell, 18 min from rank start to serving, 17 min of warmup, the hour, and 9.5 min of drain and summary. Let the lease run at least 2 h 10 min past the launch, and extend it before you launch (see "Before a run" step 4); the hour ran `gpool touch -t 2h15m` right before.
+- Read-only samplers ran beside the hour: on node A's host, a 1-s per-thread CPU sampler, `rocm-smi --showpids` every 60 s and `docker stats` every 10 s; from the driver host, a per-node load and memory poll over ssh every 60 s. A reproduction does not need them.
 
 **Check it is the same deployment:**
 ```bash
@@ -95,8 +119,8 @@ python3 $RECIPE/analysis/subwindow.py <run> 1200 3600 12
 Over 0-3600 the hour gave `tok_s_per_gpu` 125717 (the CI tok/s/GPU over the records span, as in `point.txt`), `tail_free_tok_s_per_gpu` 126320, `p90_tpot_ms` 6.55 and `ttft_p50_s` / `ttft_p90_s` 0.81 / 4.19. Over minutes 20-60 (1200-3600) it gave `tok_s_per_gpu` 133240, `tail_free_tok_s_per_gpu` 134230 and `p90_tpot_ms` 6.3. Count the hour as reproduced when its CI tok/s/GPU and minutes 20-60 are within 5% of these, with 06d's health lines (see "How the numbers are computed") and `cap 848.0` on all four Store pools. The "/912" next to it in `reference/hour/point.txt` is the automatic plan that the overlay replaced.
 
 Things to know:
-- Besides the start-up wave of the first ~20 minutes, the hour had a smaller wave at minutes 55-60: the Store hit rose to 0.73 of the prompt, and the prefill queue to 22 on average.
-- g52's rdma0-3 retransmitted 38 GB over the hour (`retx` in `point.txt`), 0.02-0.03% of what they sent, with no errors or CNPs. Node A of 06a and 06d (g27) had 3.1 and 0.9 GB.
+- Besides the start-up wave at minutes 5-10 (the prefill queue was down to 6 by minute 9), the hour had a smaller wave at minutes 55-60: the Store hit rose to 0.73 of the prompt, and the prefill queue to 22 on average.
+- g52's rdma0-3 retransmitted 38 GB over the hour (`retx` in `point.txt`), 0.02-0.03% of what they sent, with no errors or CNPs. Node A of 06a and 06d (g27) had 3.1 and 0.9 GB. This does not make g52 a bad node: at the run's start its lifetime retransmits were 0.06-0.13% of what its NICs had sent, the lowest of the five nodes the campaign measured, among them g27 (0.25-0.40%) and g23 (0.84-1.10%).
 - As for 06a and 06d, other users' containers ran beside it: 3 on node A and 12-13 on node B. Node B's NUMA0 carried their CPU jobs and up to about 380 GiB of their memory.
 
 ## Previous points: 06d and 06a
@@ -117,8 +141,9 @@ requests per lane. "CI" is the launcher's `process_result.py`.
 | Steady part | minutes 20-25: 120,707 tok/s/GPU (126,619 tail-free), 0.84 req/s/GPU, P90 TPOT 6.54 ms, TTFT 1.41 / 4.18 s | minutes 20-60: 126,873 tok/s/GPU, 0.80 req/s/GPU, P90 TPOT 6.42 ms, TTFT 1.70 / 4.37 s |
 
 For comparison, 06a's own first 25 minutes gave 81,052 tok/s/GPU over its
-records span and 90,711 tail-free. The first ~20 minutes of any run are a
-start-up arrival wave that queues on the prefill, so compare a 25-min screen
+records span and 90,711 tail-free. Every run starts with a few trace-idle
+minutes and then an arrival wave that queues on the prefill; it cleared by
+about minute 20 in 06a and by minute 9 in the hour. So compare a 25-min screen
 only with another run's first 25 minutes.
 
 The two points differ only in these settings (compare `reference/06a/docker-rank-0.env`
@@ -249,7 +274,7 @@ Hold both nodes, all 16 GPUs, for the whole run.
 
 The Store has 4 per-NIC pools; pool k uses `rdma k` on both nodes. The owners sit on both NUMA nodes of both nodes. They are THP-backed (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`) and bound to their NUMA node. The CI number counts 12 GPUs: P plus 2 decodes. Never put a decode on node A's rdma0-3; those NICs carry the prefill stages' traffic.
 
-**Host software.** 06a's and 06d's nodes (g27, g23) have the same stack, read with `prep/host_facts.sh` on 2026-11-25. The hour's node A, g52, was not read with it; the team's 2026-10-27 audit found all 32 pit2-p03 nodes it covered, g52 included, on the same versions. They have run since a boot on 2026-08-28, so it also matches the team's 2026-10-27 audit of these nodes, which is where the IFWI version comes from:
+**Host software.** 06a's and 06d's nodes (g27, g23) have the same stack, read with `prep/host_facts.sh` on 2026-11-25. They have run since a boot on 2026-08-28, so it also matches the team's 2026-10-27 audit of these nodes, which is where the IFWI version comes from. The hour's node A, g52, was not read on 2026-11-26: its versions and its boot (2026-08-28 19:23) come from that audit, which found all 32 pit2-p03 nodes it covered on the same versions. The stack:
 - Ubuntu 22.04.5, kernel 6.8.0-60-generic, BIOS 2.0a.
 - Host ROCm 7.2.1 and amdgpu 6.16.13. GPU IFWI 00175784 (113-M355-01-1K1-030A), PM firmware 04.86.16.03, SPX / NPS1.
 - ionic driver 26.03.3.001 with NIC firmware 1.117.5-a-77.
@@ -296,7 +321,7 @@ Each node needs:
 | `env/` | Role env files: `p_env.sh` (06a prefill), `p_env_nochunk.sh` -> `p_env_nochunk_lw2.sh` (06d prefill) -> `p_env_nochunk_lw2_r1_o1.sh` (hour prefill), `d_env.sh` (06a decode), `d_env_akmoe.sh` -> `d_env_akmoe_lmhead.sh` (06d and hour decode) |
 | `overlays/` | Bash files sourced last in each rank env. `tmpdir.sh` (all runs) sets `TMPDIR=/dev/shm`. `store_3392_hour.sh` (hour) and `store_3200_06c.sh` (06d) hold the explicit Store owners; the hour's is an example for nodes like its own. `store_06a_plan.sh` holds 06a's owners, which the run got from its automatic plan. `port_offset_1000.sh` (06d) shifts the launcher ports |
 | `patches/combined_port_offset.patch` | 06d: lets `ATOMESH_COMBINED_PORT_OFFSET` shift the launcher ports (`pd_slurm_job.sh` only) |
-| `prep/` | Store host-memory prep: `prep_store_mem_1p2d.sh` (06a), `prep_final.sh` + `evict_cache.py` (06d), `numa_snapshot.sh`. `host_facts.sh` reads a node's host software, read-only |
+| `prep/` | Store host-memory prep: `prep_store_mem_1p2d.sh` (06a), `prep_final.sh` + `evict_cache.py` (06d), `prep_hour.sh` + `evict_cache.py` and the Store planner `plan_hour.py` (hour), `numa_snapshot.sh`. `host_facts.sh` reads a node's host software, read-only |
 | `analysis/` | `subwindow.py` (slices, tail-free), `closed_loop.py` (req/s/GPU), `pd_balance.py` and `screen_compare.py` (screen vs a base run's first 25 min) |
 | `image/` | The two Dockerfiles; the in-container build scripts `aiter_prebuild_inner_v2.sh` (stage 1) and `c17_aot_prewarm_inner.sh` (pre-warm); the host scripts that run a build on a node, `build_aiter_tree.sh` (stage 1), `build_image_node.sh` (stage 2), `build_csvfix_node.sh` (CSV-fix layer) and `distribute_image.sh` (save and load); `image_fingerprint_inner.sh` (image check) |
 | `reference/hour`, `reference/06a`, `reference/06d` | Each run's `point.txt`, `ci-summary.md` and the env the rank-0 containers got (`docker-rank-0.env`, run token removed). Rank 1 differs only by `ATOMESH_DECODE_ENV_ROCR_VISIBLE_DEVICES=4,5,6,7`. The full run dirs are `p2d-c240-hour-o1-nic-20261126034734` (hour), `p2d-c240-nochunk-cap24-lw2-screen-20261125084047` (06d) and `p2d-c240-20261125032033` (06a) under the campaign's run root on the team share |
@@ -310,13 +335,13 @@ Each node needs:
    export AGX_RUNS=/shared/m31agx-runs     # shared storage
    ```
 3. Check the Prerequisites above. The harness turns a node name like `g27` into the host name `pit2-p03-g27`. Set `AGX_HOST_PREFIX` to change the prefix, or `AGX_HOST_PREFIX=` to pass full host names.
-4. Hold both nodes exclusively for the whole run, prep included. To have the harness check your lease on the team's GPU pool, set `AGX_GPOOL_STATE=<pool>/state.json` and pass `--lease <id>`. Otherwise set `AGX_NO_LEASE_CHECK=1`. With the lease check, the watchdog stops the run 10 min before the shortest lease's estimated end. So let the lease run at least 1 h 30 min (06d) or 2 h 10 min (06a, the hour) past the launch, plus the 10-15 min of prep before it.
+4. Hold both nodes exclusively for the whole run, prep included. To have the harness check your lease on the team's GPU pool, `export AGX_GPOOL_STATE=<pool>/state.json` and pass `--lease <id>`. Otherwise export `AGX_NO_LEASE_CHECK=1`. With the lease check, the watchdog stops the run 10 min before the shortest lease's estimated end. The harness reads that end once, at launch, so extending the lease later does not move it. Let the lease run at least 1 h 30 min (06d) or 2 h 10 min (06a, the hour) past the launch, plus the prep before it: 10-15 min for 06d, about 45 min for the hour.
 5. Load or build the image on both nodes and run its checks (see Image).
 6. **Prepare host memory for the Store.** Store owners need 2 MiB pages bound to their NUMA node. On our nodes, other users' jobs had left up to about 800 GiB of page cache per NUMA node, in files we could not read, so `fadvise` freed nothing. Much of the free memory was fragmented. Without prep, two things can happen:
    - The automatic plan shrinks; one attempt got 2,752 GiB instead of 3,200.
    - The owners compact memory page by page, and the Store start stalls for up to `MOONCAKE_STORE_COMPACT_TIMEOUT` (1,800 s). This looks like a hang.
 
-   Run the prep only on nodes you hold, because it allocates about 1.3 TiB per NUMA node for a few minutes.
+   Run the prep only on nodes you hold, because it allocates about 1.3 TiB per NUMA node for a few minutes. For the hour, follow "Before the run" under "The hour point".
 
    For 06d (memory pressure, then compaction):
    ```bash
@@ -406,6 +431,7 @@ What to compare, with 06d as the example (06a in `reference/06a/point.txt`):
 - **Store:** each of the 4 pools reports 800 GiB (`storeK ... cap 800.0`). The "/928" next to it in 06d's `point.txt` is the automatic plan that the overlay replaced.
 - **Decodes:** `toks/fwd 4.04` (forced acceptance), `ib_device rdma4-7` in the decode logs, running about 23 per decode and KV use about 0.33.
 - **Prefill:** about 51K computed tok/s, prefix hit HBM 0.33 + Store 0.63, and stage busy 0.70 / 0.85 / 0.90 / 0.87.
+- **The hour** (`reference/hour/point.txt`): each pool `cap 848.0`; decodes running about 28.5 each with KV use about 0.43; the prefill at about 51K computed tok/s, prefix hit HBM 0.49 + Store 0.47, stage busy 0.53 / 0.72 / 0.83 / 0.84.
 
 Count a point as reproduced when its CI tok/s/GPU and its steady slice (minutes 20-25 for 06d, 20-60 for 06a) are within 5% of the reference, with the same health lines. The 5% is a working tolerance, not a measured noise band: each point ran once, and the start-up wave is the most variable part. Run a point twice before you read a gap as real.
 
@@ -445,11 +471,11 @@ The reference nodes were not clean. Other users' containers ran beside both runs
   It only warns about other users' containers and never touches them.
 - **Cold start.** A node with a cold page cache loads the weights in up to about 26 min. The first server start on a node also compiles FlyDSL kernels, which are then cached per node and image.
 - **Editing during a run.** Never edit `agx_run.sh` while a driver runs: bash reads the file as it goes.
-- **Leftover snapshot.** If the driver's last step prints `failed to delete .../src/<tag>-<stamp>: Directory not empty`, delete that directory and run `git worktree prune`.
+- **Leftover snapshot.** If the driver's last step prints `failed to delete .../src/<tag>-<stamp>: Directory not empty`, delete that directory and run `git worktree prune`. A preflight refusal (exit 4) leaves the snapshot too: run `git worktree remove --force $AGX_RUNS/src/<tag>-<stamp>`.
 
 ## Changes from the scripts as run
 
-Everything here is a copy of the campaign's harness, role env, overlay, prep, analysis and image files, except the new `prep/host_facts.sh`. Most changes below only make a path relative or overridable, and the others are listed with them. The commands above behave as the runs did, apart from 06d's port settings (see Launch).
+Everything here is a copy of the campaign's harness, role env, overlay, prep, analysis and image files, except the new `prep/host_facts.sh` and `prep/prep_hour.sh`. Most changes below only make a path relative or overridable, and the others are listed with them. The commands above behave as the runs did, apart from 06d's port settings (see Launch).
 
 The changes, by file:
 - **`harness/bin/agx_run.sh`:**
@@ -485,6 +511,8 @@ The changes, by file:
 The hour ran with the campaign's copies of the harness and of 06d's decode role and tmpdir overlay, which differ from the ones here as listed above. Its own files are here with these changes:
 - `env/p_env_nochunk_lw2_r1_o1.sh` is its prefill role with a relative `source` path and a new comment. Sourced, it gives the same env.
 - `overlays/store_3392_hour.sh` is its Store overlay with a new comment and the same two exports.
+- `prep/plan_hour.py` is its Store planner with the license header, a new docstring and a shorter comment line in the overlay it writes; the code is unchanged. On the probes taken after each prep round and at the launch, its printout and plan equal the campaign copy's; after round 3 they give `store_3392_hour.sh`'s exports.
+- `prep/prep_hour.sh` is new. Rounds 1 and 2 ran as two campaign scripts, round 3 by hand. With the knobs in "The hour point", it sends the nodes the same commands as rounds 1 and 2 (round 1's now also print the compaction's exit code) and runs round 3's recorded steps. Its probes skip the image check.
 - Its three `--patch` files are this branch's three code commits.
 
 All other files are unchanged. That includes `watchdog.py`, `scrape.py`, `store_plan.py`, `node_probe.py`, `nic_sampler.sh`, `agx_status.sh`, `docker-wrap/docker`, the overlays, the patch, `evict_cache.py`, `subwindow.py`, `closed_loop.py`, `image/Dockerfile.csvfix`, `image/aiter_prebuild_inner_v2.sh`, `image/c17_aot_prewarm_inner.sh` and `image/image_fingerprint_inner.sh`.
