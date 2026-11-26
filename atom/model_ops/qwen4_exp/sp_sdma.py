@@ -16,9 +16,10 @@ Reduce-scatter: the partial sums are pushed in row chunks, the blocks this rank
 does not own first, and each chunk is reduced as soon as it has landed.
 All-gather: this rank's rows are pushed range by range as they are computed.
 
-Only mori's SDMA queues and signal counters are used. The destinations are HIP
-IPC mappings, not mori's symmetric windows, so hosts whose kernel lacks
-CONFIG_DMABUF_MOVE_NOTIFY work too.
+Setup is aiter's `SdmaComm`: mori's SDMA queue (one per peer) and signal
+counters, plus a same-layout HIP IPC arena on every rank that holds the
+receive buffers (no mori symmetric window, so hosts whose kernel lacks
+CONFIG_DMABUF_MOVE_NOTIFY work too).
 
 Receive buffers are double-buffered: a rank pushes into a slot only after it
 waited for a later transfer every peer issued after consuming that slot, which
@@ -37,7 +38,6 @@ import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from atom.distributed.group_agreement import group_agree
-from atom.mono.runtime.hip_ipc import HipRuntime
 
 logger = logging.getLogger("atom")
 
@@ -51,16 +51,16 @@ def _local_unavailable_reason() -> str | None:
     # gfx942 only: chunking and engine use were measured on MI308X.
     if get_gfx_runtime() != "gfx942":
         return f"enabled on gfx942 only, not {get_gfx_runtime()}"
-    # mori creates no SDMA queue without it; requesting this feature turns it
-    # on unless the user set it explicitly.
-    os.environ.setdefault("MORI_ENABLE_SDMA", "1")
-    if os.environ["MORI_ENABLE_SDMA"].lower() not in ("1", "true", "on", "yes"):
+    # mori creates no SDMA queue without it; SdmaComm sets it during its
+    # setup only, unless the user set it.
+    if os.getenv("MORI_ENABLE_SDMA", "1").lower() not in ("1", "true", "on", "yes"):
         return "MORI_ENABLE_SDMA is disabled"
     try:
         import flydsl.compiler  # noqa: F401
         import mori.cco  # noqa: F401
+        from aiter.ops.communication import SdmaComm  # noqa: F401
     except ImportError as e:
-        return f"cannot import mori / flydsl: {e}"
+        return f"cannot import mori / flydsl / aiter's SdmaComm: {e}"
     # torch's HIP may load ROCm's private libdrm copy; mori links the system one
     # unless the private copy is preloaded, and two copies cannot share the GPU VM.
     with open("/proc/self/maps") as f:
@@ -199,47 +199,17 @@ def _build_kernels(rank: int, world: int):
 
 
 class _MoriSdma:
-    """mori SDMA queue 0 and its signal counters, shared by both collectives.
+    """Puts and waits on mori SDMA queue 0 of a committed `SdmaComm`.
 
     mori's counter for a sender counts every signalled put it sent here on
     queue 0, in issue order. Every rank issues the same sequence of transfers,
     so `received` (puts each peer has sent this rank so far) is the same for
     every peer and is what a wait compares against."""
 
-    def __init__(self, cpu_group: dist.ProcessGroup, device: torch.device):
-        from mori.cco import (
-            GDA_CONNECTION_NONE,
-            CCODevCommRequirements,
-            Communicator,
-            UniqueId,
-        )
-
-        self.rank = dist.get_rank(cpu_group)
-        self.world = dist.get_world_size(cpu_group)
-        # Rank 0 sends its error with the uid, so every rank leaves the
-        # broadcast and raises alike instead of waiting on a uid never sent.
-        uid, err = None, None
-        if self.rank == 0:
-            try:
-                uid = bytes(Communicator.get_unique_id())
-            except Exception as e:  # noqa: BLE001 - every rank must reach the broadcast
-                err = f"mori get_unique_id failed on rank 0: {e}"
-        msg = [(uid, err)]
-        dist.broadcast_object_list(
-            msg, src=dist.get_global_rank(cpu_group, 0), group=cpu_group
-        )
-        uid, err = msg[0]
-        if err is not None:
-            raise RuntimeError(err)
-        self._comm = Communicator.init(
-            self.world, self.rank, UniqueId.from_bytes(uid), per_rank_vmm=64 << 20
-        )
-        reqs = CCODevCommRequirements()
-        reqs.gda_connection_type = GDA_CONNECTION_NONE
-        reqs.gda_signal_count = 0
-        reqs.gda_counter_count = 0
-        reqs.sdma_queue_count = 1
-        self._dev_comm = self._comm.create_dev_comm(reqs)
+    def __init__(self, comm):
+        self.rank = comm.rank
+        self.world = comm.world
+        self._dev_comm = comm.dev_comm
         # 0 when mori was built without BUILD_CCO_SDMA or no peer has SDMA; puts
         # then move no bytes and waits would never return.
         self.queues = self._dev_comm.sdma_num_queue
@@ -382,60 +352,59 @@ class SdmaCollectives:
     then agree on the outcome (`get_sdma_collectives`)."""
 
     def __init__(self, capacity_tokens, hidden, dtype, device, cpu_group):
+        from aiter.ops.communication import SdmaComm
+
         self.rank = rank = dist.get_rank(cpu_group)
         self.world = world = dist.get_world_size(cpu_group)
         self.capacity = -(-capacity_tokens // world)
         self.hidden = hidden
         self.dtype = dtype
         self.error = None
+        self._comm = None
         rs_rows = 2 * (world - 1) * self.capacity
         ag_rows = 2 * world * self.capacity
-        exported = None
+        row_bytes = hidden * dtype.itemsize
+        self.nbytes = (rs_rows + ag_rows) * row_bytes
         try:
-            hip = HipRuntime()
-            # One allocation, so a peer maps exactly one IPC handle per rank.
-            buf = torch.empty(rs_rows + ag_rows, hidden, dtype=dtype, device=device)
-            torch.cuda.synchronize(device)
-            # The caching allocator hands out sub-ranges; handles cover whole blocks.
-            base = hip.get_allocation_base(buf.data_ptr())
-            exported = (hip.get_ipc_handle(base), buf.data_ptr() - base)
-        except (RuntimeError, OSError) as e:  # HIP errors and torch OOM
-            self.error = f"cannot export the SDMA buffer: {e}"
-        handles = [None] * world
-        dist.all_gather_object(handles, exported, group=cpu_group)
-        peers = None
-        if all(h is not None for h in handles):
-            try:
-                peers = {
-                    p: hip.open_ipc_handle(handles[p][0]) + handles[p][1]
-                    for p in range(world)
-                    if p != rank
-                }
-            except RuntimeError as e:
-                self.error = f"cannot map a peer's SDMA buffer: {e}"
-        else:
-            self.error = self.error or "a peer cannot export its SDMA buffer"
+            comm = SdmaComm(group=cpu_group, num_queues=1, device=device)
+            comm.reserve("rs", rs_rows * row_bytes)
+            comm.reserve("ag", ag_rows * row_bytes)
+        except Exception as e:  # noqa: BLE001 - mori / FlyDSL import: agree, fall back
+            self.error = f"mori SDMA setup failed: {e}"
+        # commit() is collective; enter it on every rank or on none.
+        if not group_agree(self.error is None, cpu_group):
+            self.error = self.error or "another TP rank cannot set up SDMA"
             return
         try:
-            self._sdma = _MoriSdma(cpu_group, device)
+            # Raises on every rank alike if mori or the arena fails anywhere.
+            self._comm = comm.commit()
+            self._sdma = _MoriSdma(comm)
             if self._sdma.queues < 1:
                 self.error = "mori set up no SDMA queue (built without BUILD_CCO_SDMA?)"
         except Exception as e:  # noqa: BLE001 - mori / FlyDSL setup: agree, fall back
-            self.error = self.error or f"mori SDMA setup failed: {e}"
+            self.error = f"mori SDMA setup failed: {e}"
         if self.error is not None:
             return
-        row_bytes = hidden * buf.element_size()
         # [slot, source (rank - owner - 1) mod N, row, hidden]
-        self._rs = buf[:rs_rows].view(2, world - 1, self.capacity, hidden)
-        self._rs_peer = peers
+        self._rs = comm.view("rs", (2, world - 1, self.capacity, hidden), dtype)
+        # Peer p's receive buffer, as mapped here.
+        self._rs_peer = {
+            p: comm.arena.base_ptrs[p] + comm.offset("rs")
+            for p in range(world)
+            if p != rank
+        }
         # [slot, row, hidden]
-        self._ag = buf[rs_rows:].view(2, world * self.capacity, hidden)
-        ag_off, slot_bytes = rs_rows * row_bytes, world * self.capacity * row_bytes
+        self._ag = comm.view("ag", (2, world * self.capacity, hidden), dtype)
+        slot_bytes = world * self.capacity * row_bytes
         # [slot, peer]: base address of the peer's all-gather slot (0 for this rank).
         self._ag_tables = torch.tensor(
             [
                 [
-                    peers[p] + ag_off + s * slot_bytes if p != rank else 0
+                    (
+                        comm.arena.base_ptrs[p] + comm.offset("ag") + s * slot_bytes
+                        if p != rank
+                        else 0
+                    )
                     for p in range(world)
                 ]
                 for s in range(2)
@@ -447,6 +416,12 @@ class SdmaCollectives:
         self._ag_slot = 0
         # Sources the copy engine may still read, kept for two sends.
         self._sources = [[], []]
+
+    def close(self) -> None:
+        """Collective: unmap the peers' buffers and free mori's queues."""
+        if self._comm is not None:
+            self._comm.close()
+            self._comm = None
 
     def fits(self, local_rows: int) -> bool:
         return local_rows <= self.capacity
@@ -542,6 +517,8 @@ def get_sdma_collectives(
             reason = collectives.error
         if not group_agree(reason is None, cpu_group):
             reason = reason or "another TP rank cannot use SDMA"
+            if collectives is not None:
+                collectives.close()
             collectives = None
         if collectives is None:
             logger.warning(
@@ -551,8 +528,9 @@ def get_sdma_collectives(
         else:
             logger.info(
                 "Sequence-parallel reduce-scatter / all-gather over SDMA (mori), "
-                "up to %d tokens",
+                "up to %d tokens, %.0f MiB of receive buffers per rank",
                 capacity_tokens,
+                collectives.nbytes / (1 << 20),
             )
         _COLLECTIVES.append(collectives)
     return _COLLECTIVES[0]

@@ -152,9 +152,11 @@ export LD_PRELOAD=/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2:/opt/r
 ```
 
 It applies to TP serving on gfx942 only (validated on MI308X) and needs mori
-(above) and FlyDSL (an aiter dependency). If any TP rank cannot use it (missing
-either, preload missing, TP across nodes), every rank logs one warning and keeps
-RCCL.
+(above), FlyDSL and aiter's `SdmaComm` (ROCm/aiter#6514). Each rank holds
+(4 x TP - 2) x ceil(max_num_batched_tokens / TP) rows x hidden x 2 B of receive
+buffers (16k tokens: ~252 MB at TP2, ~294 MB at TP4). If any TP rank cannot use
+it (a dependency or the preload missing, TP across nodes), every rank logs one
+warning and keeps RCCL.
 
 ## Optional: bursty prefill on an idle server
 
