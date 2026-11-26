@@ -151,7 +151,7 @@ jobs:
             /shared/data/WRH/models \
             /data/models \
             /data/pretrained_model; do
-            if [[ -d "$candidate" && -w "$candidate" ]]; then
+            if [[ -d "$candidate" && ( "$candidate" == /models || -w "$candidate" ) ]]; then
               model_root="$candidate"
               break
             fi

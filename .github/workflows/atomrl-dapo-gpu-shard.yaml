@@ -12,7 +12,7 @@ on:
         description: "Shared data root containing the DAPO models and datasets"
         required: false
         type: string
-        default: /data/atomrl
+        default: /models/atomrl
 
 concurrency:
   group: atomrl-dapo-${{ github.ref }}
@@ -52,7 +52,6 @@ jobs:
       - name: Prepare AtomRL GPU unit models
         run: |
           set -euo pipefail
-          mkdir -p "$DATA_ROOT/hf"
           docker run --rm --network=host \
             -v "$DATA_ROOT:$DATA_ROOT" \
             "$IMAGE_TAG" python \

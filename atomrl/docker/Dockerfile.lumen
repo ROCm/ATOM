@@ -85,7 +85,7 @@ RUN pip install --upgrade "setuptools>=77" setuptools-scm
 # ATOM's inference package does not absorb AtomRL's Ray/OmegaConf dependencies.
 RUN pip install --no-deps -r /workspace/ATOM/atomrl/lumen/requirements.txt && \
     pip install --no-cache-dir "protobuf>=7.36.1" && \
-    pip install datasets "math_verify[antlr4_13_2]" safetensors \
+    pip install datasets "math_verify[antlr4_13_2]" safetensors hf_transfer \
         pytest pytest-xdist && \
     pip install --no-deps 'peft==0.21.2' 'accelerate==1.15.0' && \
     cd /workspace/ATOM && \

@@ -296,4 +296,4 @@ jobs:
     secrets: inherit
     with:
       image_tag: atomrl:dapo-ci
-      data_root: /data/atomrl
+      data_root: /models/atomrl
