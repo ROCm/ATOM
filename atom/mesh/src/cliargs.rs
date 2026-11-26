@@ -496,6 +496,14 @@ pub struct CliArgs {
     #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime", help_heading = "Backend")]
     pub backend: Backend,
 
+    /// Native vLLM HTTP P/D connector; MoRI-IO uses static READ or WRITE peer metadata.
+    #[arg(long, default_value = "mooncake", value_parser = ["mooncake", "moriio-read", "moriio-write"], help_heading = "Backend")]
+    pub vllm_kv_connector: String,
+
+    /// JSON array of HTTP URL, host, handshake_port, notify_port, tp_size and dp_size for MoRIIO WRITE workers.
+    #[arg(long, help_heading = "Backend")]
+    pub vllm_moriio_peers: Option<String>,
+
     // ==================== Control Plane Authentication ====================
     /// API key for worker connections
     #[arg(long, help_heading = "Control Plane Authentication")]
@@ -637,6 +645,23 @@ impl CliArgs {
         builder
             .mode(mode)
             .backend(self.backend.into())
+            .vllm_kv_connector(self.vllm_kv_connector.parse().map_err(|reason| {
+                ConfigError::InvalidValue {
+                    field: "vllm_kv_connector".to_string(),
+                    value: self.vllm_kv_connector.clone(),
+                    reason,
+                }
+            })?)
+            .vllm_moriio_peers(
+                self.vllm_moriio_peers
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| ConfigError::ValidationFailed {
+                        reason: format!("Invalid MoRIIO WRITE peers: {error}"),
+                    })?
+                    .unwrap_or_default(),
+            )
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
             .policy(policy)
             .connection_mode(connection_mode)
@@ -743,6 +768,33 @@ impl CliArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_moriio_write_peer_json_reaches_validated_config() {
+        let peers = r#"[{"url":"http://p:8000","host":"p","handshake_port":6300,"notify_port":6400,"tp_size":1,"dp_size":1},{"url":"http://d:8000","host":"d","handshake_port":6308,"notify_port":6408,"tp_size":1,"dp_size":4}]"#;
+        let mut args = CliArgs::try_parse_from([
+            "atomesh",
+            "--backend",
+            "vllm",
+            "--pd-disaggregation",
+            "--decode",
+            "http://d:8000",
+            "--vllm-kv-connector",
+            "moriio-write",
+            "--vllm-moriio-peers",
+            peers,
+        ])
+        .unwrap();
+        let urls = vec![("http://p:8000".to_string(), None)];
+        let config = args.to_router_config(urls.clone()).unwrap();
+        assert_eq!(
+            config.vllm_kv_connector,
+            crate::config::VllmKvConnector::MoriioWrite
+        );
+        assert_eq!(config.vllm_moriio_peers[1].dp_size, 4);
+        args.vllm_moriio_peers = Some("invalid-json".into());
+        assert!(args.to_router_config(urls).is_err());
+    }
 
     #[test]
     fn route_log_sample_rate_must_be_a_fraction() {
@@ -994,6 +1046,8 @@ impl Default for CliArgs {
             reasoning_parser: None,
             tool_call_parser: None,
             backend: Backend::Sglang,
+            vllm_kv_connector: "mooncake".to_string(),
+            vllm_moriio_peers: None,
             api_key: None,
             tls_cert_path: None,
             tls_key_path: None,

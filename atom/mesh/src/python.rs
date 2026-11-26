@@ -240,6 +240,8 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
     cli_args_dict.set_item("reasoning_parser", cli_args.reasoning_parser)?;
     cli_args_dict.set_item("tool_call_parser", cli_args.tool_call_parser)?;
     cli_args_dict.set_item("backend", cli_args.backend.to_string())?;
+    cli_args_dict.set_item("vllm_kv_connector", cli_args.vllm_kv_connector)?;
+    cli_args_dict.set_item("vllm_moriio_peers", cli_args.vllm_moriio_peers)?;
     cli_args_dict.set_item("api_key", cli_args.api_key)?;
 
     parsed.set_item("cli_args", cli_args_dict)?;

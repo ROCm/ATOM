@@ -1,7 +1,7 @@
 use super::{
     AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigResult, FastokensConfig,
     HealthCheckConfig, MetricsConfig, PolicyConfig, PreparePoolConfig, RetryConfig, RouterConfig,
-    RoutingMode, TokenizerCacheConfig,
+    RoutingMode, TokenizerCacheConfig, VllmKvConnector,
 };
 use crate::core::ConnectionMode;
 
@@ -45,6 +45,16 @@ impl RouterConfigBuilder {
 
     pub fn backend(mut self, backend: BackendType) -> Self {
         self.config.backend = backend;
+        self
+    }
+
+    pub fn vllm_kv_connector(mut self, connector: VllmKvConnector) -> Self {
+        self.config.vllm_kv_connector = connector;
+        self
+    }
+
+    pub fn vllm_moriio_peers(mut self, peers: Vec<super::VllmMoriioPeer>) -> Self {
+        self.config.vllm_moriio_peers = peers;
         self
     }
 

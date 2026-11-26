@@ -1,6 +1,8 @@
 pub mod atom;
 pub mod sglang;
 pub mod vllm;
+pub mod vllm_moriio;
+pub mod vllm_moriio_write;
 
 use std::any::Any;
 

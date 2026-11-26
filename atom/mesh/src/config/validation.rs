@@ -3,6 +3,113 @@ use super::*;
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 
+#[cfg(test)]
+mod moriio_tests {
+    use super::*;
+
+    #[test]
+    fn moriio_write_requires_complete_static_peers_and_keeps_decode_dp_local() {
+        let peer = |url: &str, port, dp| VllmMoriioPeer {
+            url: url.into(),
+            host: "127.0.0.1".into(),
+            handshake_port: port,
+            notify_port: port + 100,
+            tp_size: 1,
+            dp_size: dp,
+        };
+        let valid = RouterConfig {
+            backend: BackendType::Vllm,
+            vllm_kv_connector: VllmKvConnector::MoriioWrite,
+            vllm_moriio_peers: vec![
+                peer("http://p:8000", 6300, 1),
+                peer("http://d:8000", 6400, 4),
+            ],
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://p:8000".into(), None)],
+                decode_urls: vec!["http://d:8000".into()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate_compatibility(&valid).is_ok());
+        let mut missing = valid.clone();
+        missing.vllm_moriio_peers.pop();
+        assert!(ConfigValidator::validate_compatibility(&missing).is_err());
+        for peer_change in [
+            "zero-port",
+            "unknown-url",
+            "prefill-dp",
+            "tp-mismatch",
+            "port-overflow",
+        ] {
+            let mut bad = valid.clone();
+            match peer_change {
+                "zero-port" => bad.vllm_moriio_peers[1].notify_port = 0,
+                "unknown-url" => bad.vllm_moriio_peers[1].url = "http://other:8000".into(),
+                "prefill-dp" => bad.vllm_moriio_peers[0].dp_size = 2,
+                "tp-mismatch" => bad.vllm_moriio_peers[1].tp_size = 2,
+                _ => bad.vllm_moriio_peers[1].notify_port = u16::MAX,
+            }
+            assert!(
+                ConfigValidator::validate_compatibility(&bad).is_err(),
+                "{peer_change}"
+            );
+        }
+        assert_eq!(
+            "moriio-write".parse::<VllmKvConnector>().unwrap(),
+            VllmKvConnector::MoriioWrite
+        );
+    }
+
+    #[test]
+    fn moriio_requires_native_http_static_pd_without_bootstrap() {
+        let valid = RouterConfig {
+            backend: BackendType::Vllm,
+            vllm_kv_connector: VllmKvConnector::MoriioRead,
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://p:8000".into(), None)],
+                decode_urls: vec!["http://d:8000".into()],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate_compatibility(&valid).is_ok());
+        let mut invalid = valid.clone();
+        invalid.backend = BackendType::Atom;
+        assert!(ConfigValidator::validate_compatibility(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.dp_aware = true;
+        assert!(ConfigValidator::validate_compatibility(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.connection_mode = crate::core::ConnectionMode::Grpc { port: None };
+        assert!(ConfigValidator::validate_compatibility(&invalid).is_err());
+        let mut invalid = valid.clone();
+        if let RoutingMode::PrefillDecode {
+            ref mut prefill_urls,
+            ..
+        } = invalid.mode
+        {
+            prefill_urls[0].1 = Some(9000);
+        }
+        assert!(ConfigValidator::validate_compatibility(&invalid).is_err());
+        let mut invalid = valid;
+        if let RoutingMode::PrefillDecode {
+            ref mut decode_urls,
+            ..
+        } = invalid.mode
+        {
+            decode_urls.clear();
+        }
+        assert!(ConfigValidator::validate_compatibility(&invalid).is_err());
+        assert_eq!(
+            RouterConfig::default().vllm_kv_connector,
+            VllmKvConnector::Mooncake
+        );
+    }
+}
+
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         config.resolved_prepare_pool()?;
@@ -328,6 +435,30 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        if config.vllm_kv_connector == VllmKvConnector::MoriioWrite {
+            Self::validate_moriio_write_peers(config)?;
+        } else if !config.vllm_moriio_peers.is_empty() {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "Static MoRI peer metadata is only valid with moriio-write".into(),
+            });
+        }
+        if config.vllm_kv_connector.is_moriio() {
+            let valid_mode = matches!(
+                &config.mode,
+                RoutingMode::PrefillDecode { prefill_urls, decode_urls, .. }
+                    if !prefill_urls.is_empty() && !decode_urls.is_empty()
+                        && prefill_urls.iter().all(|(_, port)| port.is_none())
+            );
+            if config.backend != BackendType::Vllm
+                || config.connection_mode != crate::core::ConnectionMode::Http
+                || config.dp_aware
+                || !valid_mode
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "MoRI-IO requires native vLLM HTTP P/D, internal DP routing, and prefill URLs without Mooncake bootstrap ports".to_string(),
+                });
+            }
+        }
         {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
@@ -365,6 +496,79 @@ impl ConfigValidator {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_moriio_write_peers(config: &RouterConfig) -> ConfigResult<()> {
+        let bad = |reason: &str| ConfigError::IncompatibleConfig {
+            reason: reason.into(),
+        };
+        let RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } = &config.mode
+        else {
+            return Err(bad("MoRIIO WRITE requires P/D worker URLs"));
+        };
+        let expected: std::collections::HashSet<&str> = prefill_urls
+            .iter()
+            .map(|(url, _)| url.trim_end_matches('/'))
+            .chain(decode_urls.iter().map(|url| url.trim_end_matches('/')))
+            .collect();
+        if expected.len() != prefill_urls.len() + decode_urls.len() {
+            return Err(bad("MoRIIO WRITE requires distinct worker URLs"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut tp_size = None;
+        for peer in &config.vllm_moriio_peers {
+            let url = peer.url.trim_end_matches('/');
+            if !expected.contains(url) || !seen.insert(url) {
+                return Err(bad(
+                    "MoRIIO WRITE peer metadata must name each selected worker exactly once",
+                ));
+            }
+            if peer.host.is_empty()
+                || peer.host.contains('/')
+                || peer.host.chars().any(char::is_whitespace)
+                || peer.handshake_port == 0
+                || peer.notify_port == 0
+                || peer.tp_size == 0
+                || peer.dp_size == 0
+            {
+                return Err(bad(
+                    "MoRIIO WRITE peer host, ports and TP/DP sizes must be valid and nonzero",
+                ));
+            }
+            let span = peer
+                .tp_size
+                .checked_mul(peer.dp_size)
+                .filter(|span| *span <= usize::from(u16::MAX))
+                .ok_or_else(|| bad("MoRIIO WRITE peer rank port range is too large"))?;
+            if usize::from(peer.handshake_port) + span - 1 > usize::from(u16::MAX)
+                || usize::from(peer.notify_port) + span - 1 > usize::from(u16::MAX)
+            {
+                return Err(bad("MoRIIO WRITE peer rank ports exceed 65535"));
+            }
+            if tp_size.is_some_and(|size| size != peer.tp_size) {
+                return Err(bad("MoRIIO WRITE currently requires matching P/D TP sizes"));
+            }
+            tp_size = Some(peer.tp_size);
+            if prefill_urls
+                .iter()
+                .any(|(p, _)| p.trim_end_matches('/') == url)
+                && peer.dp_size != 1
+            {
+                return Err(bad(
+                    "MoRIIO WRITE requires prefill DP=1; decode may use a native local DP pool",
+                ));
+            }
+        }
+        if seen != expected {
+            return Err(bad(
+                "MoRIIO WRITE requires static peer metadata for every P/D worker",
+            ));
+        }
         Ok(())
     }
 

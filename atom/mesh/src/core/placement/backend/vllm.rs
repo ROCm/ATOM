@@ -47,6 +47,25 @@ fn downcast(ctx: &PairCtx) -> Result<&VllmPairCtx, AdapterError> {
         .ok_or(AdapterError::CtxTypeMismatch)
 }
 
+pub(super) fn inject_prefill(body: &mut Value, transfer_id: &str) -> Result<(), AdapterError> {
+    let obj = body.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
+    obj.insert(
+        "kv_transfer_params".to_string(),
+        json!({
+            "do_remote_decode": true,
+            "do_remote_prefill": false,
+            "transfer_id": transfer_id,
+        }),
+    );
+    obj.insert("stream".to_string(), Value::Bool(false));
+    obj.insert("max_tokens".to_string(), json!(1));
+    if obj.contains_key("max_completion_tokens") {
+        obj.insert("max_completion_tokens".to_string(), json!(1));
+    }
+    obj.remove("stream_options");
+    Ok(())
+}
+
 impl BackendAdapter for VllmAdapter {
     fn prepare_pair(
         &self,
@@ -84,22 +103,7 @@ impl BackendAdapter for VllmAdapter {
 
     fn inject_prefill_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
         let ctx = downcast(ctx)?;
-        let obj = body.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
-        obj.insert(
-            "kv_transfer_params".to_string(),
-            json!({
-                "do_remote_decode": true,
-                "do_remote_prefill": false,
-                "transfer_id": ctx.transfer_id,
-            }),
-        );
-        obj.insert("stream".to_string(), Value::Bool(false));
-        obj.insert("max_tokens".to_string(), json!(1));
-        if obj.contains_key("max_completion_tokens") {
-            obj.insert("max_completion_tokens".to_string(), json!(1));
-        }
-        obj.remove("stream_options");
-        Ok(())
+        inject_prefill(body, &ctx.transfer_id)
     }
 
     fn inject_decode_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {

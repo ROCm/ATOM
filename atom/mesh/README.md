@@ -204,6 +204,57 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
 
 Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cache transfer).
 
+For native vLLM MoRI-IO READ, select `--backend vllm --vllm-kv-connector moriio-read`
+with `--pd-disaggregation --prefill http://P:8000 --decode http://D:8000`.
+Configure both workers with `MoRIIOConnector`, `read_mode: true`, empty `proxy_ip`,
+and distinct routable handshake/notify listeners. This mode uses static URLs,
+equal TP and DP=1; it does not query Mooncake bootstrap or implement ZMQ discovery.
+The default vLLM connector remains Mooncake.
+
+READ runs prefill non-streaming for one token, then validates and relays its
+`kv_transfer_params` to decode along with the original generation request. The
+worker contract is [vLLM 4fab5a0's explicit READ metadata](https://github.com/vllm-project/vllm/blob/4fab5a07475822c6eaa971dceb2e2220d0446808/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py):
+grouped block IDs, peer engine/address/ports, TP and DP metadata, actual rank
+ownership, and the matching transfer ID. Unknown metadata fields are preserved.
+Missing or invalid metadata fails before decode, with no local-prefill fallback.
+Each request must contain one prompt and request one completion.
+The router assigns both worker request IDs (body and `X-Request-ID`) from its
+transfer ID; session-affinity headers still follow the incoming request.
+
+Deploy one router with static workers and no automatic restart. Verify all workers'
+health and matching READ/TP configuration before sending traffic; the HTTP API
+does not expose the decoder's connector configuration. Worker images must implement
+the linked metadata and abort contract. The router never fabricates a transport
+ACK: vLLM handles consumer abort notifications and producer deferred release.
+Size producer `defer_timeout` to cover decoder admission plus transfer under load.
+Real RDMA, KV layout, offload and speculative decoding require GPU validation.
+
+For native vLLM **MoRI-IO WRITE**, use `--vllm-kv-connector moriio-write` and
+provide `--vllm-moriio-peers` as a JSON array covering every configured HTTP
+worker. Each entry supplies its exact advertised MoRI host, base handshake and
+notify ports, TP size and node-local DP size:
+
+```sh
+atomesh launch --backend vllm --pd-disaggregation \
+  --prefill http://p:8000 --decode http://d:8000 \
+  --vllm-kv-connector moriio-write \
+  --vllm-moriio-peers '[{"url":"http://p:8000","host":"p","handshake_port":6300,"notify_port":6400,"tp_size":1,"dp_size":1},{"url":"http://d:8000","host":"d","handshake_port":6308,"notify_port":6408,"tp_size":1,"dp_size":4}]'
+```
+
+Both workers must use `read_mode: false` and an empty `proxy_ip`. Each HTTP
+worker must own a single-node DP pool; prefill DP must be 1 and P/D TP sizes must
+match. Decode uses its native internal DP load balancing; leave `--dp-aware`
+disabled. Use allocator-provided ports, including space for every PP/TP/DP
+rank, and a worker version supporting PP producers (vLLM #64693) when using PP.
+
+WRITE starts both HTTP legs concurrently with explicit peer metadata and a
+shared router-owned transfer ID. Decode allocates its blocks and reports its
+actual DP rank to prefill; the producer writes KV and the worker completion
+protocol waits for all PP stages. The router does not wait for READ metadata in
+the prefill response or synthesize completion ACKs. Original decode generation,
+tools and streaming fields are preserved. Static workers must remain on the
+declared listeners throughout a run; automatic worker restart is unsupported.
+
 Messages and Responses have no PD adapter: in PD mode `/v1/messages` and
 `/v1/responses` return `501 unsupported_api_topology`. Serve them from regular
 HTTP workers.
