@@ -16,7 +16,7 @@ env:
       local name="$1"; shift
       if out="$("$@" 2>&1)"; then echo "PROBE ${name}: OK $(echo "${out}" | head -c 160)"; else echo "PROBE ${name}: FAIL $(echo "${out}" | head -c 300)"; fi
     }
-    probe reconcile-status gh api graphql -f query='{repository(owner:"ROCm",name:"ATOM"){pullRequests(states:OPEN,baseRefName:"main",first:2){nodes{number labels(first:5){nodes{name}} commits(last:1){nodes{commit{status{contexts{context state}}}}}}}}}'
+    probe reconcile-status gh api graphql -f query='{repository(owner:"ROCm",name:"ATOM"){pullRequest(number:3840){number commits(last:1){nodes{commit{status{contexts{context state}}}}}}}}'
     probe pr-query gh api graphql -f query='{repository(owner:"ROCm",name:"ATOM"){pullRequest(number:3862){number reviewDecision changedFiles labels(first:5){nodes{name}} timelineItems(last:1,itemTypes:[BASE_REF_CHANGED_EVENT]){nodes{__typename}}}}}'
     probe issue-or-pr-on-issue gh api graphql -f query='{repository(owner:"ROCm",name:"ATOM"){d: issueOrPullRequest(number:3871){__typename}}}'
     probe pr-on-issue-number gh api graphql -f query='{repository(owner:"ROCm",name:"ATOM"){d: pullRequest(number:3871){number}}}'
