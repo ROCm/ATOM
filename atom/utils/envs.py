@@ -1001,13 +1001,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # launch (also a MoE layer's separate shared expert) instead of norm +
     # quantize_fp8. Same bytes. Opt-in for A/B.
     "ATOM_M3_TP1_NORM_MXFP8": lambda: _flag_env("ATOM_M3_TP1_NORM_MXFP8"),
-    # Rows up to which ATOM_M3_TP1_NORM_MXFP8 takes the one launch; larger calls
-    # keep the norm + quantize_fp8. MI455X: the one launch is 0.2-1.6 us faster
-    # at 8-192 rows and far slower from 256 rows (aiter's interleaved launch
-    # shape for rows >= CU count: 162 us at 256 rows, 6 ms at 32K).
-    "ATOM_M3_TP1_NORM_MXFP8_MAX_ROWS": lambda: int(
-        os.getenv("ATOM_M3_TP1_NORM_MXFP8_MAX_ROWS", "192")
-    ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
     # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).

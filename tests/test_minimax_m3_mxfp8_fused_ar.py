@@ -146,7 +146,7 @@ def test_single_rank_helper_norms_then_quantizes_by_default(monkeypatch):
     quantize = Mock(return_value=(values, scales))
     monkeypatch.setattr(blockscale, "quantize_fp8", quantize)
 
-    hidden_states, residual = torch.zeros(2, 64, dtype=torch.bfloat16), object()
+    hidden_states, residual = object(), object()
     result = layernorm.fused_allreduce_gemma_rms_norm_mxfp8_quant(
         hidden_states, residual, norm
     )
@@ -154,34 +154,6 @@ def test_single_rank_helper_norms_then_quantizes_by_default(monkeypatch):
     assert result == (values, scales, residual_out)
     norm.assert_called_once_with(hidden_states, residual)
     quantize.assert_called_once_with(normed)
-
-
-def test_single_rank_helper_keeps_two_launches_past_max_rows(monkeypatch):
-    """ATOM_M3_TP1_NORM_MXFP8 past ATOM_M3_TP1_NORM_MXFP8_MAX_ROWS rows (a
-    prefill chunk): the norm, then quantize_fp8; the caller asks no bf16 row."""
-    import aiter.ops.fused_qk_rmsnorm_group_quant as fqk
-
-    monkeypatch.setenv("ATOM_M3_TP1_NORM_MXFP8", "1")
-    monkeypatch.setenv("ATOM_M3_TP1_NORM_MXFP8_MAX_ROWS", "4")
-    monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 1)
-    fused = Mock()
-    monkeypatch.setattr(fqk, "fused_qk_rmsnorm_group_quant", fused)
-    normed, residual_out = object(), object()
-    norm = Mock(return_value=(normed, residual_out))
-    quantize = Mock(return_value=(object(), object()))
-    monkeypatch.setattr(blockscale, "quantize_fp8", quantize)
-    hidden_states = torch.zeros(5, 64, dtype=torch.bfloat16)
-
-    layernorm.fused_allreduce_gemma_rms_norm_mxfp8_quant(hidden_states, object(), norm)
-
-    assert not fused.called
-    quantize.assert_called_once_with(normed)
-    assert layernorm.tp1_norm_mxfp8_one_launch(4)
-    assert not layernorm.tp1_norm_mxfp8_one_launch(5)
-    with pytest.raises(AssertionError):
-        layernorm.fused_allreduce_gemma_rms_norm_mxfp8_quant(
-            hidden_states, object(), norm, emit_bf16=True
-        )
 
 
 @pytest.mark.parametrize("emit_bf16", [False, True])
@@ -228,7 +200,6 @@ def test_single_rank_helper_bytes_are_norm_then_quantize_fp8(monkeypatch, rows):
     gfx1250 switch to the interleaved launch): the one-launch MXFP8 norm writes
     the bytes of the norm followed by quantize_fp8, and the same bf16 row."""
     monkeypatch.setenv("ATOM_M3_TP1_NORM_MXFP8", "1")
-    monkeypatch.setenv("ATOM_M3_TP1_NORM_MXFP8_MAX_ROWS", "1000000")
     monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 1)
     torch.manual_seed(rows)
     # bf16 like the model's weights (aiter wants the weight in the input dtype)
