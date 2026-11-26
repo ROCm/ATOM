@@ -66,6 +66,7 @@ def runtime(monkeypatch):
         events=[],
         instances={},
         layer=_layer(),
+        shared_in=[],
         small_m_mtpr=SMALL_M_MTPR,
         pcp=1,
     )
@@ -118,9 +119,10 @@ def runtime(monkeypatch):
                 )
             state.events.append(("slot", self.rank, layer_slot))
 
-        def forward(self, x, weights, ids, *, mask_invalid_slots, max_tokens):
+        def forward(self, x, weights, ids, *, mask_invalid_slots, max_tokens, **shared):
             # Pad rows are routed to -1, so combine must skip those slots.
             assert mask_invalid_slots is True
+            state.shared_in.append(shared.get("shared_in"))
             if max_tokens is not None and not (
                 x.shape[0] <= max_tokens <= self.capacity
             ):
@@ -678,3 +680,39 @@ def test_fused_route_query_covers_every_instance_built(
     assert not holds_fused or fused
     if num_cu == 256:
         assert holds_fused is fused
+
+
+class _SharedExpert:
+    def __init__(self):
+        self.rows = []
+        weight = SimpleNamespace(weight=torch.ones(4), weight_scale=torch.zeros(1))
+        self.gate_up_proj = self.w2 = weight
+
+    def __call__(self, x):
+        self.rows.append(x.shape[0])
+        return x + 1
+
+
+def test_an_attached_shared_expert_goes_into_the_routed_call(runtime, monkeypatch):
+    """attach_mega_shared_expert: the call's shared_in carries the layer's shared
+    expert weights and its dense run over this call's rows; without it the call
+    passes none."""
+
+    class SharedExpertInput:
+        def __init__(self, x, gate_up, gate_up_scale, down, down_scale, dense):
+            self.weights = (gate_up, gate_up_scale, down, down_scale)
+            self.dense = dense
+
+    monkeypatch.setattr(mega, "_shared_expert_input_cls", lambda: SharedExpertInput)
+    runtime.run(_context(32))
+    assert runtime.shared_in == [None]
+
+    expert = _SharedExpert()
+    layer = _layer()
+    layer._mega_shared_expert = expert
+    runtime.run(_context(32), layer=layer)
+    shared_in = runtime.shared_in[-1]
+    weight = expert.gate_up_proj
+    assert shared_in.weights == (weight.weight, weight.weight_scale) * 2
+    assert torch.equal(shared_in.dense(), torch.ones(32, 8, dtype=torch.bfloat16))
+    assert expert.rows == [32]
