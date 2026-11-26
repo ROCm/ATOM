@@ -36,3 +36,13 @@ claim. Source and observation hashes are recorded separately in manifest.json.
 Use one gpool lease for the test and release after exact job-label cleanup.
 Outputs and host caches use task-owned node-local directories because shared
 home quota is full. The read-only collector retrieves the final artifact by SSH.
+
+The follow-up after L25189d adds a one-line worker candidate: native IOEngine
+binds port0 atomically instead of reusing an already-closed get_open_port probe.
+The earlier run failed with native TCP EADDRINUSE before requests; it did not
+record the conflicting port, so the exact competitor is not proven. The CPU
+test demonstrates the stale-probe race using the real config method and real
+OS sockets. Bounded startup observations record requested and bound ports on
+each rank. GPU startup, actual engine-descriptor advertisement and four-stage
+WRITE completion must validate this candidate. Model kernels, topology,
+offloader and native RDMA worker/QP counts remain fixed.

@@ -16,11 +16,33 @@ _successes = 0
 def _emit(event):
     directory = os.environ.get("ATOMESH_MORI_PROBE_DIR")
     if directory:
-        path = Path(directory) / f"producer-{os.getpid()}.jsonl"
+        prefix = "engine" if event["event"].startswith("engine_") else "producer"
+        path = Path(directory) / f"{prefix}-{os.getpid()}.jsonl"
         with path.open("a", encoding="utf-8") as stream:
             stream.write(
                 json.dumps(dict(event, pid=os.getpid(), time_ns=time.time_ns())) + "\n"
             )
+
+
+def engine_event(worker, started):
+    if not os.environ.get("ATOMESH_MORI_PROBE_DIR"):
+        return
+    try:
+        event = {
+            "event": "engine_started" if started else "engine_bind_requested",
+            "is_producer": worker.is_producer,
+            "pp_rank": worker.pp_rank,
+            "dp_rank": worker.dp_rank,
+            "tp_rank": worker.tp_rank,
+            "host": worker.local_ip,
+            "requested_port": worker.local_kv_port,
+        }
+        if started:
+            desc = worker.moriio_engine.get_engine_desc()
+            event.update(bound_port=desc.port, engine_key=desc.key)
+        _emit(event)
+    except Exception as error:
+        print(f"[DEBUG-mori-port] observation failed: {error!r}", file=sys.stderr)
 
 
 def install(writer_class):

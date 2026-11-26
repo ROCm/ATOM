@@ -252,7 +252,12 @@
   "kv_transport": "moriio",
   "router_arm": "atomesh",
   "moriio_worker": {
-    "context": ".github/benchmark/pr5090-router-ab/diagnostics/moriio-write"
+    "context": ".github/benchmark/pr5090-router-ab/diagnostics/moriio-write",
+    "engine_port_candidate": {
+      "patch_sha256": "94ad3c5965495ff47ae37664a6edcecd3c29771f6a17fb7a50e4784b80f6f54b",
+      "prior_failure_lease": "L25189d",
+      "scope": "atomic native bind(0); positive engine descriptor and rank-port evidence required"
+    }
   },
   "srt_experiment_patch": {
     "path": ".github/benchmark/pr5090-router-ab/diagnostics/moriio-write/srt-atomesh-write.patch",

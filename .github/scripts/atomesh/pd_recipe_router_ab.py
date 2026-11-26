@@ -292,6 +292,44 @@ def verify_kv_transfer(workers, output):
     return record
 
 
+def verify_mori_engines(output):
+    directory = output.parent / "moriio-probe"
+    engines = {}
+    for path in directory.glob("engine-*.jsonl"):
+        for line in path.read_text().splitlines():
+            event = json.loads(line)
+            if event.get("event") == "engine_started":
+                key = (
+                    event["is_producer"],
+                    event["pp_rank"],
+                    event["dp_rank"],
+                    event["tp_rank"],
+                )
+                if key in engines:
+                    raise RuntimeError(f"Duplicate native MoRI engine rank: {key}")
+                engines[key] = event
+    expected = {(True, p, 0, 0) for p in range(4)} | {
+        (False, 0, d, 0) for d in range(4)
+    }
+    endpoints = {(e["host"], e["bound_port"]) for e in engines.values()}
+    passed = (
+        set(engines) == expected
+        and len(endpoints) == 8
+        and all(
+            e["requested_port"] == 0 and 0 < e["bound_port"] < 65536
+            for e in engines.values()
+        )
+    )
+    (output / "mori-engine-ports.json").write_text(
+        json.dumps({"passed": passed, "engines": list(engines.values())}, indent=2)
+        + "\n"
+    )
+    if not passed:
+        raise RuntimeError(
+            "Expected eight distinct native MoRI listener ports for P PP4 and D DP4"
+        )
+
+
 def verify_mori_transfer(output):
     directory = output.parent / "moriio-probe"
     for _ in range(15):
@@ -399,6 +437,8 @@ def benchmark(contract, args):
                 check=False,
                 timeout=30,
             )
+    if contract.get("moriio_worker", {}).get("engine_port_candidate"):
+        verify_mori_engines(output)
     scrape(args.workers, output, "before-probe")
     functional_probe(contract, args.router, output / "functional.json")
     transfer = None

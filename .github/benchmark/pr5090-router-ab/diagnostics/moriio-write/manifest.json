@@ -15,22 +15,26 @@
   },
   "patch_sha256": "b544a3641264f2cae8f65113ad3d9eda7fb5a24ad30fdd618899d4332b029f38",
   "installed_files": {
-    "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py": "b0068d8f39fc5c9d43c49a165f3673333e0bd9c0ddae92b7b6675a8c4eafdd85",
-    "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py": "54006d54dc90a73fd4a19cf10b12f07f5073786244999e9c8b5a7466541c4003",
+    "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py": "dd2ac275439eddcc64f69e723702878054a9e37dc67744f60287d76114739d0d",
+    "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py": "7dfa4cc46c2b2bc98787ca6ac62bbeb1e75c13091107a309e08fec3fed0d4f97",
     "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py": "94ea05d9070f8d6575c53ab81206735149aa96cf84e4a6f291f49a06a19a251a",
-    "atomesh_mori_probe.py": "7344a97d053fc65b1ab9448d637a795f1fbe06483fe1bbf5ce571d7ad8f68bb3",
+    "atomesh_mori_probe.py": "bfde0e3a9b7ad844d0a325c831a1243dd469532e1aa72a6b614393f826f59bf9",
     "vllm/model_executor/kernels/linear/mxfp8/rocm_native.py": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395"
   },
   "context_files": {
-    "atomesh_mori_probe.py": "7344a97d053fc65b1ab9448d637a795f1fbe06483fe1bbf5ce571d7ad8f68bb3",
-    "Dockerfile": "99a5e69929d5b6662b6e5d1e732e44025182b0a07511058ad93902f3f4f09187",
+    "atomesh_mori_probe.py": "bfde0e3a9b7ad844d0a325c831a1243dd469532e1aa72a6b614393f826f59bf9",
+    "Dockerfile": "01263f442ba170c8f5d839c740e128550cbe5e1cc58c392205e4768e9e43e0fe",
+    "engine-port.patch": "94ad3c5965495ff47ae37664a6edcecd3c29771f6a17fb7a50e4784b80f6f54b",
     "pp-production.patch": "b544a3641264f2cae8f65113ad3d9eda7fb5a24ad30fdd618899d4332b029f38",
-    "prepare_worker.py": "a8586062bc041ce2e06a2589bea11e90925a09058b2beac3f5a618563cbeb209",
-    "README.md": "cd1d7f17b187875b5ddcd7ef7ae25ff5d56029761e3179fec14eab0c281d93e7",
+    "prepare_worker.py": "880f9f6ae201badbb16c1e14f1a2efc3c0b2ef00b3ff1eff9b692bf27e53c5cc",
+    "README.md": "4e0a844b2d05aed744871ad4109f5f1ad5250d9d8e5cbd75641370590c7c8fda",
     "srt-atomesh-write.patch": "815d1de295884ff639993003b838a1138b1c26bbec6214e8d3201ea3e2960965",
     "srt-discovery.patch": "734fc861b39c35f2856a0c227f2ef6e3c278b2a9535bd053d8fbb8fd09d5ee3c",
+    "test_engine_port_contract.py": "ae6deb9a5aa8ffb3de6e247724168594d5be281311d9ac0f057a21a6dace3d45",
     "test_pp_contract.py": "3327b802611f55cb62234194ccb2fc4e49865eec0adcc33c5b74c51a813bb45d",
     "test_write_contract.py": "89ad0bed9febd04334a70b5f25bc0370a62776750bf0a42a1e1c161e3a37f176",
     "verify_worker.py": "2ae2b02cb77101d61b7910e06bb2f5367f64fc1aa02315e657fa9816f7d16646"
-  }
+  },
+  "engine_port_patch_sha256": "94ad3c5965495ff47ae37664a6edcecd3c29771f6a17fb7a50e4784b80f6f54b",
+  "engine_port_patch_status": "Local candidate: atomic native bind(0) instead of probe-close-bind. L25189d had EADDRINUSE but did not log the conflicting port. Not an upstream merged fix or confirmed runtime resolution."
 }

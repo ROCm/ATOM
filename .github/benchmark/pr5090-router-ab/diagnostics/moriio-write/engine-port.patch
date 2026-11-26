@@ -1,0 +1,12 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
+@@ -425,7 +425,8 @@
+ 
+         return cls(
+             local_ip=resolve_host_ip(extra_config),
+-            local_kv_port=get_open_port(),
++            # Let the native listener atomically bind an ephemeral port.
++            local_kv_port=0,
+             proxy_ip=extra_config.get("proxy_ip", ""),
+             local_ping_port=get_open_port(),
+             proxy_ping_port=int(extra_config.get("proxy_ping_port", 0)),
