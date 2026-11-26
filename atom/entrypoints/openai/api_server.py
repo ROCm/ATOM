@@ -40,6 +40,8 @@ from fastapi.exception_handlers import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from jinja2 import TemplateError
+from pydantic import ValidationError
+from starlette.requests import ClientDisconnect
 from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
@@ -1991,6 +1993,9 @@ _OPENAI_ERROR_ROUTES = frozenset(
         "/v1/responses",
         "/beta/chat/completions",
         "/beta/completions",
+        # ATOM_PD_LATE_KV's decode leg (PD_LATE_KV_PATH); the router relays
+        # D's errors to the client.
+        "/v1/pd/late_kv/chat/completions",
     }
 )
 
@@ -2144,6 +2149,111 @@ async def beta_chat_completions(
 ):
     """Chat completions plus DeepSeek's beta assistant-prefix completion."""
     return await _chat_completions(request, raw_request)
+
+
+# ---------------------------------------------------------------------------
+# ATOM_PD_LATE_KV: decode leg of the router's concurrent P/D dispatch.
+# ---------------------------------------------------------------------------
+# atomesh (ATOMESH_ATOM_PD_CONCURRENT=1) opens this request at the same time
+# as the prefill leg and streams a two-line body: line 1 is the chat request,
+# line 2 -- sent once P answers -- is `{"kv_transfer_params": {...}}`. D parses
+# and validates line 1 while P parses its own copy, so the large-body ingest
+# leaves the P->D critical path. Nothing reaches the engine before line 2, so
+# a failed prefill (body ends early, or the router drops the connection) never
+# enqueues anything on D. With the flag off the route answers 404, which the
+# router takes as "fall back to the serial relay".
+PD_LATE_KV_PATH = "/v1/pd/late_kv/chat/completions"
+
+
+class _LateKvBody:
+    """Newline-framed reader over a streamed request body."""
+
+    def __init__(self, raw_request: Request):
+        self._chunks = raw_request.stream().__aiter__()
+        self._buf = bytearray()
+        self._eof = False
+
+    async def line(self) -> bytes | None:
+        """The next line without its newline; None once the body is exhausted."""
+        start = 0
+        while True:
+            pos = self._buf.find(b"\n", start)
+            if pos >= 0:
+                line = bytes(self._buf[:pos])
+                del self._buf[: pos + 1]
+                return line
+            if self._eof:
+                return None
+            start = len(self._buf)
+            try:
+                self._buf += await self._chunks.__anext__()
+            except StopAsyncIteration:
+                self._eof = True
+
+    async def rest(self) -> bytes:
+        while not self._eof:
+            try:
+                self._buf += await self._chunks.__anext__()
+            except StopAsyncIteration:
+                self._eof = True
+        return bytes(self._buf)
+
+
+def _parse_late_kv_line(line: bytes) -> dict[str, Any]:
+    try:
+        data = json.loads(line)
+    except ValueError as exc:
+        raise HTTPException(400, f"late-kv line is not JSON: {exc}") from exc
+    kv = data.get("kv_transfer_params") if isinstance(data, dict) else None
+    if not isinstance(kv, dict):
+        raise HTTPException(400, "late-kv line must carry a kv_transfer_params object")
+    return kv
+
+
+@app.post(PD_LATE_KV_PATH, include_in_schema=False)
+async def pd_late_kv_chat_completions(raw_request: Request):
+    """Chat completion whose KV metadata arrives after the request body."""
+    if not envs.ATOM_PD_LATE_KV:
+        raise HTTPException(404, "ATOM_PD_LATE_KV is off")
+    try:
+        request = await _read_late_kv_request(raw_request)
+    except ClientDisconnect:
+        # The router dropped the leg (prefill failed or client left) before
+        # line 2: nothing was enqueued, so there is nothing to clean up.
+        logger.debug("late-kv decode leg disconnected before kv_transfer_params")
+        return Response(status_code=499)
+    return await _chat_completions(request, raw_request)
+
+
+async def _read_late_kv_request(raw_request: Request) -> ChatCompletionRequest:
+    body = _LateKvBody(raw_request)
+    head = await body.line()
+    if head is None:
+        raise HTTPException(400, "late-kv body has no request line")
+    try:
+        payload = json.loads(head)
+    except ValueError as exc:
+        raise HTTPException(400, f"late-kv request line is not JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "late-kv request line must be a JSON object")
+    try:
+        request = ChatCompletionRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors(), body=payload) from exc
+    del payload
+    if request.kv_transfer_params is not None:
+        raise HTTPException(
+            400, "late-kv request line must not carry kv_transfer_params"
+        )
+    # Everything above overlapped with P. Now wait for P's answer.
+    line = await body.line()
+    if line is None:
+        raise HTTPException(400, "late-kv body ended before kv_transfer_params")
+    kv = _parse_late_kv_line(line)
+    if (await body.rest()).strip():
+        raise HTTPException(400, "late-kv body has data after kv_transfer_params")
+    request.kv_transfer_params = kv
+    return request
 
 
 async def _chat_completions(
