@@ -215,8 +215,10 @@ def record_forward(batch, seqs):
     try:
         if batch.is_dummy_run:
             return
+        # Rows are `[prefill | decode]` (a mixed batch carries both).
+        n_prefill = batch.total_seqs_num_prefill
         for i, req_id in enumerate(batch.req_ids):
-            forward(seqs[req_id], is_decode=i < batch.total_seqs_num_decode)
+            forward(seqs[req_id], is_decode=i >= n_prefill)
     except Exception:  # noqa: BLE001 - telemetry must not fail a forward
         _warn_once()
 

@@ -15,7 +15,7 @@ from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import Sequence, leaves_media_on_prefill
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import RequiredChannel, SamplingParams
 from atom.structured_output import is_structured
@@ -876,11 +876,24 @@ class InputOutputProcessor:
             self.structured_admission(
                 sampling_params, kv_transfer_params, multimodal_data is not None
             )
+        # A decode leg whose prefill kept the media (`Sequence`'s own test).
+        media_on_prefill = (
+            kv_transfer_params is not None
+            and multimodal_data is None
+            and leaves_media_on_prefill(kv_transfer_params)
+        )
+        if media_on_prefill and self.config.enable_rapidserve:
+            # RapidServe prefills every request on this GPU, with no media.
+            raise ValueError(
+                "RapidServe cannot serve an image decode leg whose prefill "
+                "kept the image"
+            )
         request_validator = getattr(self.config.hf_config, "validate_request", None)
         if request_validator is not None:
             request_validator(
                 num_draft_tokens=self.num_speculative_tokens,
                 multimodal_data=multimodal_data,
+                media_on_prefill_instance=media_on_prefill,
                 enable_dp_attention=self.config.enable_dp_attention,
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
@@ -895,6 +908,16 @@ class InputOutputProcessor:
         else:
             prefix_encoding = None
             tokens = prompt_or_tokens
+        if media_on_prefill:
+            # An image prompt's positions never run past its text's, so the
+            # delta its prefill hands over is at most 0; decode positions then
+            # stay in [1, max_model_len).
+            delta = kv_transfer_params.get("mrope_position_delta", 0)
+            if not 1 - len(tokens) <= delta <= 0:
+                raise ValueError(
+                    "kv_transfer_params['mrope_position_delta'] must be in "
+                    f"[{1 - len(tokens)}, 0] for a {len(tokens)}-token prompt"
+                )
         mrope_positions = None
         mrope_position_delta = 0
         if multimodal_data is not None:

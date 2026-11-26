@@ -238,6 +238,7 @@ impl PdPlanner for LocalPlanner {
             worker: Arc::clone(&self.worker),
             policy_name: "atom_local",
             binding: None,
+            prefill_tokens: 0,
         })
     }
 }

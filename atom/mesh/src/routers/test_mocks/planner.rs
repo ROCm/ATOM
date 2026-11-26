@@ -81,6 +81,7 @@ impl PdPlanner for MockPdPlanner {
                 worker: worker.clone(),
                 policy_name,
                 binding: None,
+                prefill_tokens: 0,
             }),
             PlannerMode::RepeatPair {
                 prefill,
@@ -94,6 +95,7 @@ impl PdPlanner for MockPdPlanner {
                 decode_policy,
                 prefill_binding: None,
                 decode_binding: None,
+                prefill_tokens: 0,
             }),
             PlannerMode::RepeatErr(e) => Err(e.clone()),
         }

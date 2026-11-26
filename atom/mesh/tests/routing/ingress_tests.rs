@@ -1610,7 +1610,400 @@ async fn tokens_cache_aware_wants_carry_the_special_tokens_in_any_pair() {
                 .unwrap()
                 .unwrap();
             assert_eq!(tokens.as_deref(), Some(want), "kv_events: {kv_events}");
-            assert_eq!(metadata.carries_media, media);
+            assert_eq!(metadata.carries_media(), media);
+        }
+    }
+}
+
+/// A tokenizer.json in `dir` with Qwen2-VL's chat template, which renders every image as
+/// the same `<|image_pad|>`: its path, the source preparation workers load copies from.
+fn qwen2_vl_tokenizer(dir: &std::path::Path) -> String {
+    let template = "{% set image_count = namespace(value=0) %}{% set video_count = namespace(value=0) %}{% for message in messages %}{% if loop.first and message['role'] != 'system' %}<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}<|im_start|>{{ message['role'] }}\n{% if message['content'] is string %}{{ message['content'] }}<|im_end|>\n{% else %}{% for content in message['content'] %}{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}{% set image_count.value = image_count.value + 1 %}{% if add_vision_id %}Picture {{ image_count.value }}: {% endif %}<|vision_start|><|image_pad|><|vision_end|>{% elif content['type'] == 'video' or 'video' in content %}{% set video_count.value = video_count.value + 1 %}{% if add_vision_id %}Video {{ video_count.value }}: {% endif %}<|vision_start|><|video_pad|><|vision_end|>{% elif 'text' in content %}{{ content['text'] }}{% endif %}{% endfor %}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+    // One token a character, the hex digits each their own, so texts that differ in a
+    // hex digit get different tokens.
+    let vocab: serde_json::Map<String, serde_json::Value> = std::iter::once("<unk>".to_string())
+        .chain("0123456789abcdef".chars().map(String::from))
+        .enumerate()
+        .map(|(id, word)| (word, json!(id)))
+        .collect();
+    let tokenizer = json!({"version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "Split", "pattern": {"Regex": "[\\s\\S]"},
+            "behavior": "Isolated", "invert": false},
+        "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "unk_token": "<unk>", "vocab": vocab}});
+    let path = dir.join("tokenizer.json");
+    std::fs::write(&path, tokenizer.to_string()).unwrap();
+    let config = json!({"chat_template": template});
+    std::fs::write(dir.join("tokenizer_config.json"), config.to_string()).unwrap();
+    path.to_str().unwrap().to_owned()
+}
+
+/// `prefix_hash` keys a chat by its templated tokens. Under Qwen2-VL's template, which
+/// renders every image as the same `<|image_pad|>`, two chats that differ only in an image
+/// URL still get different tokens, and the same chat gets the same tokens.
+#[tokio::test]
+async fn chat_tokens_differ_by_image_url_under_a_real_template() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = qwen2_vl_tokenizer(dir.path());
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::PrefixHash {
+            prefix_token_count: 4,
+            load_factor: 1.25,
+        },
+        ..Default::default()
+    };
+    let app = AppContext::from_config(config, 5, pool.handle())
+        .await
+        .unwrap();
+    let source = source.as_str();
+    let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+        Arc::new(crate::tokenizer::HuggingFaceTokenizer::from_file(source).unwrap());
+    // Preparation workers encode with copies they load from the source.
+    app.tokenizer_registry
+        .load("qwen2-vl-id", "m", source, || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    let mut tokens = Vec::new();
+    for url in ["https://x/a.png", "https://x/b.png", "https://x/a.png"] {
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": url}},
+            {"type": "text", "text": "describe"}]}]});
+        let parsed =
+            ParsedInference::parse("/v1/chat/completions", body.to_string().as_bytes()).unwrap();
+        let routing = IngressRouting::new(&app);
+        let (_, prepared) = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .unwrap();
+        tokens.push(prepared.unwrap());
+    }
+    assert_ne!(tokens[0], tokens[1]);
+    assert_eq!(tokens[0], tokens[2]);
+}
+
+/// A batch's nested `image_data` counts the items it holds.
+#[test]
+fn nested_generate_media_counts_the_items_it_holds() {
+    for (image_data, count) in [
+        ("[]", 0),
+        ("[[],[]]", 0),
+        ("[null,[]]", 0),
+        (r#"[["a.png"],["b.png","c.png"]]"#, 3),
+        (r#"[[],["a.png"]]"#, 1),
+    ] {
+        let body = format!(r#"{{"input_ids":[1,2],"image_data":{image_data}}}"#);
+        let metadata = ParsedInference::parse("/generate", body.as_bytes())
+            .unwrap()
+            .metadata_with_text(false);
+        assert_eq!(metadata.media_count, count, "{image_data}");
+        assert_eq!(metadata.carries_media(), count > 0, "{image_data}");
+    }
+}
+
+/// The routing text ATOM backends get starts with one digest of the chat up to its last
+/// media ([`RoutingChat::front`]), which media order changes; vLLM and SGLang get the
+/// in-place digests alone.
+#[test]
+fn atom_routing_text_starts_with_one_digest_of_all_media() {
+    let two = |first: &str, second: &str| {
+        let image = |url: &str| format!(r#"{{"type":"image_url","image_url":{{"url":"{url}"}}}}"#);
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":[{{"type":"text","text":"describe"}},{},{}]}}]}}"#,
+            image(first),
+            image(second)
+        );
+        ParsedInference::parse("/v1/chat/completions", body.as_bytes()).unwrap()
+    };
+    let text = |parsed: &ParsedInference, front: bool| {
+        parsed.routing_metadata(parsed.media_count(), front).0.text
+    };
+    let (ab, ba) = (two("a", "b"), two("b", "a"));
+    // vLLM and SGLang keep the in-place digests alone.
+    assert_eq!(text(&ab, false), ab.metadata().text);
+    assert!(text(&ab, false).starts_with("describe "));
+    let front = ab
+        .routing_metadata(ab.media_count(), true)
+        .1
+        .unwrap()
+        .front
+        .unwrap();
+    assert!(front.starts_with("\u{1}media:"));
+    assert_eq!(text(&ab, true), format!("{front}{}", text(&ab, false)));
+    // Media order is part of the key.
+    assert_ne!(
+        text(&ab, true)[..front.len()],
+        text(&ba, true)[..front.len()]
+    );
+    assert_eq!(text(&ab, true), text(&two("a", "b"), true));
+    // Text-only chats are unchanged.
+    let plain = ParsedInference::parse(
+        "/v1/chat/completions",
+        br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .unwrap();
+    assert!(plain
+        .routing_metadata(plain.media_count(), true)
+        .1
+        .is_none());
+    assert_eq!(text(&plain, true), "hi");
+}
+
+/// ATOM keys every KV block of a media prompt by its media and the text before them
+/// ([`RoutingChat::front`]; DeepSeek-V4.1 also by the prompt's length, which the key does
+/// not see). Under `--backend atom`, two chats that share a text longer than `prefix_hash`'s
+/// token window and differ only in a later image URL get different `prefix_hash` keys, and
+/// `cache_aware` does not place the second by the first; the same URL gets the same key and
+/// is placed with the first. Under `--backend vllm`, whose cache keys a block by the media it
+/// covers, the image past the window leaves the key the text's, and `cache_aware` matches
+/// the shared text.
+#[tokio::test]
+async fn atom_keys_a_media_chat_by_all_its_media_at_the_front() {
+    use crate::{
+        config::BackendType,
+        policies::{CacheAwareConfig, CacheAwarePolicy, PrefixHashConfig, PrefixHashPolicy},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = qwen2_vl_tokenizer(dir.path());
+    let prefix_token_count = 64;
+    let shared = "0123456789abcdef".repeat(2 * prefix_token_count / 16);
+    let chat = |url: &str| {
+        json!({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": shared},
+            {"type": "image_url", "image_url": {"url": url}}]}]})
+    };
+    let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+        .into_iter()
+        .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+        .collect();
+    for backend in [BackendType::Atom, BackendType::Vllm] {
+        let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+        let config = crate::config::RouterConfig {
+            policy: crate::config::PolicyConfig::PrefixHash {
+                prefix_token_count,
+                load_factor: 1.25,
+            },
+            backend,
+            ..Default::default()
+        };
+        let app = AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap();
+        let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+            Arc::new(crate::tokenizer::HuggingFaceTokenizer::from_file(&source).unwrap());
+        app.tokenizer_registry
+            .load("qwen2-vl-id", "m", &source, || async { Ok(tokenizer) })
+            .await
+            .unwrap();
+        let prefix_hash = PrefixHashPolicy::new(PrefixHashConfig {
+            prefix_token_count,
+            load_factor: 1.25,
+        });
+        let cache_aware = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        cache_aware.init_workers(&workers);
+        let mut keys = Vec::new();
+        let mut branches = Vec::new();
+        for url in ["https://x/a.png", "https://x/b.png", "https://x/a.png"] {
+            let parsed =
+                ParsedInference::parse("/v1/chat/completions", chat(url).to_string().as_bytes())
+                    .unwrap();
+            let routing = IngressRouting::new(&app);
+            let (metadata, tokens) = app
+                .prepare_pool
+                .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                    routing.prepare(&parsed, ctx)
+                })
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .unwrap();
+            let tokens = tokens.unwrap();
+            assert!(tokens.len() > prefix_token_count);
+            keys.push(prefix_hash.compute_prefix_hash(&tokens));
+            let info = crate::policies::SelectWorkerInfo {
+                request_text: Some(&metadata.text),
+                ..Default::default()
+            };
+            branches.push(
+                cache_aware
+                    .select_with_decision(&workers, &info)
+                    .await
+                    .1
+                    .branch,
+            );
+        }
+        assert_eq!(keys[0], keys[2], "{backend:?}");
+        assert_eq!(branches[2], "affinity", "{backend:?}");
+        if backend == BackendType::Atom {
+            assert_ne!(keys[0], keys[1]);
+            assert_eq!(branches[1], "relocate");
+        } else {
+            assert_eq!(keys[0], keys[1]);
+            assert_eq!(branches[1], "affinity");
+        }
+    }
+}
+
+/// ATOM keys every KV block of a media prompt by its media's pixels, which an image's
+/// `detail: "low"` changes, and by their token positions, which the text before them sets.
+/// Under `--backend atom`, chats after one long system prompt that differ only in the text
+/// before the same image, in their second image or in a low `detail` get different
+/// `prefix_hash` keys and `cache_aware` places none by another; a later turn after the same
+/// images, text after the last image in its message and `detail: "auto"` keep the key and
+/// are placed with the first. Under `--backend vllm` all of them keep the system prompt's
+/// key and are placed together. DeepSeek-V4.1 also keys every block by the prompt's length,
+/// so on it that later turn shares no block, though its key is one.
+#[tokio::test]
+async fn atom_keys_a_media_chat_by_the_chat_up_to_its_last_media() {
+    use crate::{
+        config::BackendType,
+        policies::{CacheAwareConfig, CacheAwarePolicy, PrefixHashConfig, PrefixHashPolicy},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = qwen2_vl_tokenizer(dir.path());
+    let prefix_token_count = 64;
+    let system = json!({"role": "system", "content": "0123456789abcdef".repeat(8)});
+    let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+    let user = |text: &str, images: &[serde_json::Value]| {
+        let content = [vec![json!({"type": "text", "text": text})], images.to_vec()].concat();
+        json!({"role": "user", "content": content})
+    };
+    let (a, b, c) = (
+        image("https://x/a.png"),
+        image("https://x/b.png"),
+        image("https://x/c.png"),
+    );
+    let detail = |detail: &str| json!({"type": "image_url", "image_url": {"url": "https://x/a.png", "detail": detail}});
+    let (low, auto) = (detail("low"), detail("auto"));
+    // Each chat after the first is compared with the one it names.
+    let chats = [
+        ("first", None, vec![system.clone(), user("1", &[a.clone()])]),
+        (
+            "different text",
+            Some(0),
+            vec![system.clone(), user("22", &[a.clone()])],
+        ),
+        (
+            "later turn",
+            Some(0),
+            vec![
+                system.clone(),
+                user("1", &[a.clone()]),
+                json!({"role": "assistant", "content": "3"}),
+                json!({"role": "user", "content": "4"}),
+            ],
+        ),
+        (
+            "[a,b]",
+            None,
+            vec![system.clone(), user("1", &[a.clone(), b])],
+        ),
+        (
+            "[a,c]",
+            Some(3),
+            vec![system.clone(), user("1", &[a.clone(), c])],
+        ),
+        ("detail", Some(0), vec![system.clone(), user("1", &[low])]),
+        (
+            "detail auto",
+            Some(0),
+            vec![system.clone(), user("1", &[auto])],
+        ),
+        (
+            "text after",
+            Some(0),
+            vec![
+                system.clone(),
+                json!({"role": "user", "content": [
+                    {"type": "text", "text": "1"}, a.clone(), {"type": "text", "text": "x"}]}),
+            ],
+        ),
+    ];
+    let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+        .into_iter()
+        .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+        .collect();
+    for backend in [BackendType::Atom, BackendType::Vllm] {
+        let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+        let config = crate::config::RouterConfig {
+            policy: crate::config::PolicyConfig::PrefixHash {
+                prefix_token_count,
+                load_factor: 1.25,
+            },
+            backend,
+            ..Default::default()
+        };
+        let app = AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap();
+        let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+            Arc::new(crate::tokenizer::HuggingFaceTokenizer::from_file(&source).unwrap());
+        app.tokenizer_registry
+            .load("qwen2-vl-id", "m", &source, || async { Ok(tokenizer) })
+            .await
+            .unwrap();
+        let prefix_hash = PrefixHashPolicy::new(PrefixHashConfig {
+            prefix_token_count,
+            load_factor: 1.25,
+        });
+        let cache_aware = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        cache_aware.init_workers(&workers);
+        let mut keys = Vec::new();
+        for (case, compared, messages) in &chats {
+            let body = json!({"model": "m", "messages": messages}).to_string();
+            let parsed = ParsedInference::parse("/v1/chat/completions", body.as_bytes()).unwrap();
+            let routing = IngressRouting::new(&app);
+            let (metadata, tokens) = app
+                .prepare_pool
+                .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                    routing.prepare(&parsed, ctx)
+                })
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .unwrap();
+            let tokens = tokens.unwrap();
+            assert!(tokens.len() > prefix_token_count);
+            keys.push(prefix_hash.compute_prefix_hash(&tokens));
+            let info = crate::policies::SelectWorkerInfo {
+                request_text: Some(&metadata.text),
+                ..Default::default()
+            };
+            let branch = cache_aware
+                .select_with_decision(&workers, &info)
+                .await
+                .1
+                .branch;
+            let Some(compared) = *compared else { continue };
+            let shared = backend == BackendType::Vllm
+                || matches!(*case, "later turn" | "detail auto" | "text after");
+            assert_eq!(
+                keys[compared] == keys[keys.len() - 1],
+                shared,
+                "{backend:?} {case}"
+            );
+            let placed = if shared { "affinity" } else { "relocate" };
+            assert_eq!(branch, placed, "{backend:?} {case}");
         }
     }
 }
