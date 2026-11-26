@@ -5,7 +5,8 @@ on:
     branches: [main]
     paths:
       - 'atom/mesh/**'
-      - 'atom/model_engine/zmq_protocol/**'  # engine_v1.proto, built by --features atom-engine
+      - 'atom/model_engine/zmq_protocol/**'  # the wire protocol atom/mesh mirrors
+      - 'tests/fixtures/atom_engine/**'  # read by atom/mesh's cargo tests
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
@@ -148,12 +149,11 @@ jobs:
       - name: Run atomesh unit tests
         run: |
           set -euo pipefail
-          # Every unit test in the library, the optional ATOM engine runtime's
-          # included.
+          # Every unit test in the library.
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
-            --profile ci --lib --features atom-engine
+            --profile ci --lib
 
       # The routing integration tests: ingress, the HTTP and PD routers and
       # their placement, through mock workers.
@@ -183,7 +183,7 @@ jobs:
           ATOM_TOKEN_PARITY="${RUNNER_TEMP}/atom_tokens.json" cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
-            --profile ci --lib --features atom-engine -- \
+            --profile ci --lib -- \
             --ignored routers::ingress::token_parity
 
       # The vendored ext-proc protos must match the checksums pinned in

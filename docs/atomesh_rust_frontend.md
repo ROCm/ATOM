@@ -29,11 +29,11 @@ transfers, grammars) is refused, not dropped (see Status).
 
 Two ways to do it were weighed:
 
-| | A: Rust -> LLMEngine / CoreManager (this page) | B: Rust -> EngineCore (`engine_v1`) |
+| | A: Rust -> LLMEngine / CoreManager (this page) | B: Rust -> EngineCore (`zmq_protocol/messages.py`) |
 |---|---|---|
 | Python on the data path | one admission per request (`Sequence`, pickle), one output pass per step | none |
 | CoreManager's features (DP router, prefix_spread / share_cache, session affinity, back-pressure, PP, multi-node, metrics) | all of them, unchanged; P/D's `kv_transfer_params` and structured output are not carried yet (P2, P4) | re-implemented in Rust, or refused |
-| Python changes | a ~200-line adapter | the Core / CoreManager protocol (pickle -> `engine_v1`) |
+| Python changes | a ~200-line adapter | the Core / CoreManager protocol (pickle -> msgspec) |
 | Effect on the OpenAI server | none | it shares the new protocol |
 | Ceiling | the frontend-workers hub's: Python admission and output threads | the EngineCores' |
 
@@ -227,11 +227,17 @@ every endpoint, GSM8K, and a concurrency sweep.
 
 ## Moving to B
 
-Only the backend changes. `events.rs` and the router know nothing of Python:
-a dispatcher that sends `engine_v1` `SubmitBatch` to the EngineCores
-(`atom/mesh/src/atom_engine`) turns their stream and completion frames into
-`SeqEvent`s, aborts through an `engine_v1` abort frame (`Aborter`), and
-replaces `BridgeDispatcher`. What then has to move from Python into Rust is
-what `TokenBridge` delegates today: `SamplingParams` validation, the context
-and pool checks, stop strings to token sequences, the prompt hash chain, and
-CoreManager's DP routing.
+Only the backend changes. `events.rs` and the router know nothing of Python,
+and B's Rust half is in place: `atom/mesh/src/atom_engine` is the client of
+every EngineCore over the msgspec protocol (`zmq_protocol/messages.py`), and
+`routers/atom_bridge/direct` its `Dispatcher`. Each DP rank is a worker that
+mesh's own policies place on -- `round_robin`, `least_requests` and
+`least_tokens` (`policies/dp_load.rs`, CoreManager's ledger), `dp_sticky`
+under session affinity -- unless the request pins `data_parallel_rank`. The
+dispatcher admits the request as `TokenBridge` does (`SamplingParams` values,
+`max_tokens` against the cap and the context, the KV pool, stop strings to
+token sequences) and submits it to its rank's Core.
+
+`launch_mesh(engine_spec=...)` serves that way. The Python half -- the Cores
+speaking msgspec and a launcher that writes their `EngineSpec` -- comes next;
+until then the token bridge is the one served.

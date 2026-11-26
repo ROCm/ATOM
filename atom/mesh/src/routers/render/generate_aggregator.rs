@@ -190,5 +190,8 @@ fn engine_error_to_response(err: EngineError) -> Response {
             error::service_unavailable("engine_connection_failed", r)
         }
         EngineError::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
+        EngineError::Rejected { status, reason } => {
+            error::create_error(status, "engine_rejected", reason)
+        }
     }
 }

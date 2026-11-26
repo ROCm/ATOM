@@ -37,7 +37,7 @@ class TestSequenceCreation:
         assert seq.id == 42
 
     def test_explicit_id_zero_is_kept(self, seq_factory):
-        # engine_v1 clients may assign 0; only None takes the counter's id.
+        # A Rust EngineCore client may assign 0; only None takes the counter's id.
         seq_factory([1])  # the counter is past 0, so it cannot hand out 0
         seq = seq_factory([1, 2], id=0)
         assert seq.id == 0

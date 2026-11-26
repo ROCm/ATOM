@@ -303,7 +303,7 @@ class Sequence:
         if sampling_params is None:
             sampling_params = SamplingParams()
         self.block_size = block_size
-        # 0 is a valid id (engine_v1.proto, REQUESTS); only None takes the counter's.
+        # 0 is a valid id (a Rust client's seq_ids start there); only None takes the counter's.
         self.id = id if id is not None else next(Sequence.counter)
         self.external_request_id = request_id
         self.status = SequenceStatus.WAITING

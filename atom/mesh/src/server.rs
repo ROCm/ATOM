@@ -18,11 +18,12 @@ use axum::{
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::signal;
-use tracing::{debug, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
 use crate::{
     app_context::AppContext,
+    atom_engine::AtomEngine,
     config::{RouterConfig, RoutingMode},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
@@ -769,8 +770,22 @@ async fn serve_with_prepare_pool(
     let handle_clone = handle.clone();
     let app_state_clone = app_state.clone();
     let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
+    let engine = config
+        .atom_bridge_runtime
+        .as_ref()
+        .and_then(|runtime| runtime.direct_engine().cloned());
     signal_tasks.spawn(async move {
-        shutdown_signal().await;
+        tokio::select! {
+            _ = shutdown_signal() => {
+                // The signal reaches the Cores too: their exit is expected now.
+                if let Some(engine) = &engine {
+                    engine.client.begin_shutdown();
+                }
+            }
+            reason = engine_lost(engine.clone()) => {
+                error!("{reason}; starting graceful shutdown");
+            }
+        }
         #[cfg(feature = "ext-proc")]
         if let Some(shutdown) = ext_proc_shutdown {
             shutdown();
@@ -846,6 +861,14 @@ async fn serve_http(
     }
 
     Ok(())
+}
+
+/// Resolves once the ATOM engine loses an EngineCore; never without one.
+async fn engine_lost(engine: Option<Arc<AtomEngine>>) -> String {
+    match engine {
+        Some(engine) => engine.client.wait_lost().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn shutdown_signal() {

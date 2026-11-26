@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use clap::Parser;
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
 
 use crate::{
+    atom_engine::AtomEngine,
     cliargs::{
         filter_decode_args_from, filter_prefill_args_from, parse_decode_args_from,
         parse_prefill_args_from, Backend, Cli, CliArgs, Commands,
@@ -51,11 +52,21 @@ impl PyServerConfig {
     }
 }
 
+/// How long the EngineCores get to report `Stopped` once the server exits.
+const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Serve until shutdown. ATOM standalone hands over its engine one of two
+/// ways: `token_bridge`, Python's `TokenBridge` to its LLMEngine, or
+/// `engine_spec`, the EngineCores it spawned (an `EngineSpec` as JSON). With
+/// the spec, first connect to the Cores it lists, and stop them once the
+/// server has exited; the caller still owns, and reaps, their processes.
+/// Losing a Core shuts the server down and fails this call.
 #[pyfunction]
 #[pyo3(signature = (
     *,
     server_config,
     token_bridge = None,
+    engine_spec = None,
     served_model_name = None,
     default_chat_template_kwargs = None
 ))]
@@ -63,9 +74,15 @@ pub fn launch_mesh(
     py: Python<'_>,
     mut server_config: PyRefMut<'_, PyServerConfig>,
     token_bridge: Option<Bound<'_, PyAny>>,
+    engine_spec: Option<String>,
     served_model_name: Option<String>,
     default_chat_template_kwargs: Option<String>,
 ) -> PyResult<()> {
+    if token_bridge.is_some() && engine_spec.is_some() {
+        return Err(PyRuntimeError::new_err(
+            "pass token_bridge or engine_spec, not both",
+        ));
+    }
     let bridge_runtime = match token_bridge {
         Some(bridge) => {
             let name = served_model_name.ok_or_else(|| {
@@ -81,10 +98,29 @@ pub fn launch_mesh(
     };
 
     let mut server_config = server_config.inner.take().unwrap();
-    server_config.router_config.atom_standalone = bridge_runtime.is_some();
-    server_config.atom_bridge_runtime = bridge_runtime;
-
-    py.detach(move || startup_runtime(server_config))
+    py.detach(move || {
+        // A signal to the launcher (Ctrl-C) ends the wait for the Cores.
+        let interrupted = || Python::attach(|py| py.check_signals().is_err());
+        let engine = engine_spec
+            .map(|spec| AtomEngine::start(&spec, &interrupted).map(Arc::new))
+            .transpose()
+            .map_err(|e| PyRuntimeError::new_err(format!("ATOM engine failed to start: {e}")))?;
+        let runtime = match &engine {
+            Some(engine) => Some(Arc::new(AtomBridgeRuntime::from_engine(Arc::clone(engine)))),
+            None => bridge_runtime,
+        };
+        server_config.router_config.atom_standalone = runtime.is_some();
+        server_config.atom_bridge_runtime = runtime;
+        let served = startup_runtime(server_config);
+        let Some(engine) = engine else {
+            return served;
+        };
+        engine.client.shutdown(ENGINE_SHUTDOWN_TIMEOUT);
+        match engine.client.lost() {
+            Some(reason) => Err(PyRuntimeError::new_err(format!("Atomesh exited: {reason}"))),
+            None => served,
+        }
+    })
 }
 
 fn startup_runtime(server_config: ServerConfig) -> PyResult<()> {
