@@ -63,7 +63,7 @@ def prepare_native_pd_buffers(runner):
         )
     if get_disagg().disaggregation_transfer_backend != "mooncake":
         raise ValueError("Native ATOM Qwen4Exp PD currently requires Mooncake")
-    if get_disagg().disaggregation_enable_kv_checksum:
+    if getattr(get_disagg(), "disaggregation_enable_kv_checksum", False):
         raise ValueError(
             "SGLang's single-index KV checksum cannot cover Native QSA pages "
             "and Mamba slots together. For single-node verification, use "
