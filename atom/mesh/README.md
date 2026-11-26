@@ -242,7 +242,7 @@ atomesh launch --backend vllm --pd-disaggregation \
 ```
 
 Both workers must use `read_mode: false` and an empty `proxy_ip`. Each HTTP
-worker must own a single-node DP pool; prefill DP must be1 and P/D TP sizes must
+worker must own a single-node DP pool; prefill DP must be 1 and P/D TP sizes must
 match. Decode uses its native internal DP load balancing; leave `--dp-aware`
 disabled. Use allocator-provided ports, including space for every PP/TP/DP
 rank, and a worker version supporting PP producers (vLLM #64693) when using PP.

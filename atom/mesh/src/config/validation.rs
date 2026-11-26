@@ -548,7 +548,7 @@ impl ConfigValidator {
             if usize::from(peer.handshake_port) + span - 1 > usize::from(u16::MAX)
                 || usize::from(peer.notify_port) + span - 1 > usize::from(u16::MAX)
             {
-                return Err(bad("MoRIIO WRITE peer rank ports exceed65535"));
+                return Err(bad("MoRIIO WRITE peer rank ports exceed 65535"));
             }
             if tp_size.is_some_and(|size| size != peer.tp_size) {
                 return Err(bad("MoRIIO WRITE currently requires matching P/D TP sizes"));
