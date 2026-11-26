@@ -70,7 +70,48 @@ pub struct PDRouter {
     pub adapter: Arc<dyn BackendAdapter>,
     /// Set when backend == Atom. enrich_decode_kv is ATOM-specific and not on the trait.
     atom_adapter: Option<Arc<AtomAdapter>>,
+    /// ATOMESH_ATOM_PD_CONCURRENT=1: relay-mode chat requests open the D leg
+    /// at the same time as the P leg and send P's KV metadata as a late line.
+    atom_pd_concurrent: bool,
 }
+
+/// D route that accepts a two-line body: the request, then `{"kv_transfer_params": ...}`.
+pub(crate) const ATOM_LATE_KV_PATH: &str = "/v1/pd/late_kv/chat/completions";
+pub(crate) const ATOM_LATE_KV_HEADER: &str = "x-atom-pd-late-kv";
+const ATOM_PD_CONCURRENT_ENV: &str = "ATOMESH_ATOM_PD_CONCURRENT";
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the request already carries prompt IDs, so D needs no echo from P.
+fn body_carries_prompt_ids(body: &Value) -> bool {
+    body.get("prompt_token_ids")
+        .and_then(Value::as_array)
+        .is_some_and(|ids| !ids.is_empty())
+}
+
+/// One newline-terminated JSON line. Compact serde output escapes every
+/// control character inside strings, so the only raw `\n` is the terminator.
+fn json_line(value: &Value) -> Result<bytes::Bytes, serde_json::Error> {
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    Ok(line.into())
+}
+
+fn late_kv_line(kv: &Value) -> Result<bytes::Bytes, serde_json::Error> {
+    json_line(&json!({ "kv_transfer_params": kv }))
+}
+
+static LATE_KV_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl std::fmt::Debug for PDRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -418,6 +459,8 @@ impl PDRouter {
             planner,
             policies,
             adapter,
+            atom_pd_concurrent: matches!(backend, BackendType::Atom)
+                && env_flag(ATOM_PD_CONCURRENT_ENV),
             atom_adapter,
         })
     }
@@ -1079,6 +1122,22 @@ impl PDRouter {
                 )
                 .await;
         }
+        if self.atom_pd_concurrent
+            && context.route == "/v1/chat/completions"
+            && decode_request_json.is_object()
+        {
+            return self
+                .dispatch_atom_late_kv_internal(
+                    headers,
+                    prefill_request_json,
+                    decode_request_json,
+                    context,
+                    placement,
+                    ctx,
+                    correlation_id,
+                )
+                .await;
+        }
         // Take the reserved pair before the first await, including streaming requests.
         // D remains reserved while P runs because this request already selected D.
         let prefill = placement.prefill.clone();
@@ -1263,6 +1322,250 @@ impl PDRouter {
             }
         };
 
+        self.finish_atom_decode_response(res, context, decode, decode_guard)
+            .await
+    }
+
+    /// Relay mode with D dispatched concurrently (ATOMESH_ATOM_PD_CONCURRENT=1).
+    ///
+    /// D gets a streamed two-line body on `ATOM_LATE_KV_PATH`: line 1 is the
+    /// decode request (sent immediately, so D parses it while P parses its
+    /// leg), line 2 is P's enriched `kv_transfer_params` once P answers. A P
+    /// that answers before its prefill completes shrinks the wait to the time
+    /// P needs to pick a DP rank. A D without the route (404) falls back to
+    /// the plain relay request.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_atom_late_kv_internal(
+        &self,
+        headers: Option<&HeaderMap>,
+        mut prefill_request_json: Value,
+        mut decode_request_json: Value,
+        context: PDRequestContext<'_>,
+        placement: Arc<ReservedPair>,
+        ctx: PairCtx,
+        correlation_id: Option<String>,
+    ) -> Response {
+        let Some(atom_adapter) = self.atom_adapter.clone() else {
+            error!("atom_adapter is None but backend == Atom — programming error");
+            return error::internal_error(
+                "atom_adapter_missing",
+                "Internal: ATOM adapter not initialized",
+            );
+        };
+        let prefill = placement.prefill.clone();
+        let decode = placement.decode.clone();
+        let [prefill_guard, decode_guard] = match placement.take_load() {
+            Ok(guards) => guards,
+            Err(response) => return response,
+        };
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
+        }
+        .emit();
+        let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
+
+        // P's answer is the only source of D's KV metadata, as in the serial
+        // relay (which overwrites the field); D rejects a request line that
+        // carries one.
+        if let Some(obj) = decode_request_json.as_object_mut() {
+            obj.remove("kv_transfer_params");
+        }
+        // D already has the prompt IDs in its own body: P need not echo them,
+        // and the router need not parse and forward a second list.
+        if body_carries_prompt_ids(&decode_request_json) {
+            if let Some(obj) = prefill_request_json.as_object_mut() {
+                obj.insert("return_token_ids".to_string(), Value::Bool(false));
+            }
+        }
+        let prefill_post = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                prefill.as_ref(),
+                context.route,
+                prefill_request_json,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(resp) => return resp,
+        };
+
+        let prepared = match decode.prepare_request(decode_request_json).await {
+            Ok(v) => v,
+            Err(e) => {
+                return error::internal_error(
+                    "worker_prepare_request_failed",
+                    format!(
+                        "Failed to prepare worker request for {}: {:?}",
+                        decode.url(),
+                        e
+                    ),
+                )
+            }
+        };
+        let decode_headers = match header_utils::inference_request_headers(
+            headers.unwrap_or(&HeaderMap::new()),
+            context.route,
+            decode.api_key().as_deref(),
+        ) {
+            Ok(h) => h,
+            Err(error) => {
+                decode.record_outcome(false);
+                return error.response(context.route);
+            }
+        };
+        let head = match json_line(&prepared) {
+            Ok(line) => line,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+        drop(prepared);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+        // Capacity 2: the head never blocks.
+        let _ = tx.try_send(Ok(head.clone()));
+        let decode_post = self
+            .client
+            .post(decode.endpoint_url(ATOM_LATE_KV_PATH))
+            .headers(decode_headers.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .header(ATOM_LATE_KV_HEADER, "1")
+            .body(reqwest::Body::wrap_stream(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ));
+
+        let prefill_url = prefill.url().to_string();
+        let prefill_flow = async {
+            let tx = tx;
+            let prefill_guard = prefill_guard;
+            let resp = self
+                .send_worker(prefill_post, prefill.clone(), headers)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "ATOM prefill {} request_id={} failed: {}",
+                        prefill_url, correlation_for_log, e
+                    );
+                    error::bad_gateway(
+                        "prefill_server_error",
+                        format!("Prefill server error: {}", e),
+                    )
+                })?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                error!(
+                    "ATOM prefill {} request_id={} status={} body={}",
+                    prefill_url, correlation_for_log, status, body_text
+                );
+                return Err(error::create_error(
+                    StatusCode::from_u16(status.as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    "prefill_error",
+                    format!("Prefill server error ({}): {}", status, body_text),
+                ));
+            }
+            let prefill_body: Value = resp.json().await.map_err(|e| {
+                error::bad_gateway(
+                    "prefill_parse_error",
+                    format!("Prefill response parse error: {}", e),
+                )
+            })?;
+            drop(prefill_guard);
+            let mut kv = prefill_body
+                .get("kv_transfer_params")
+                .cloned()
+                .ok_or_else(|| {
+                    error::bad_gateway(
+                        "prefill_missing_kv_transfer_params",
+                        "Prefill response missing kv_transfer_params",
+                    )
+                })?;
+            atom_adapter.enrich_decode_kv(&mut kv, &ctx).map_err(|e| {
+                error::internal_error(
+                    "enrich_decode_kv_failed",
+                    format!("Failed to enrich decode kv: {}", e),
+                )
+            })?;
+            AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv);
+            let line = late_kv_line(&kv).map_err(Self::handle_serialization_error)?;
+            // D may already have answered (an error) and closed its body.
+            let _ = tx.send(Ok(line)).await;
+            drop(tx);
+            debug!(
+                "ATOM PD late-kv request_id={} sent kv to decode",
+                correlation_for_log
+            );
+            Ok::<Value, Response>(kv)
+        };
+        let decode_send = self.send_worker(decode_post, decode.clone(), headers);
+        let mut prefill_flow = std::pin::pin!(prefill_flow);
+        let mut decode_send = std::pin::pin!(decode_send);
+
+        // A P failure ends the request at once; dropping the D future aborts
+        // D's half-read body, so D never enqueues it.
+        let (mut kv, decode_result) = tokio::select! {
+            p = &mut prefill_flow => match p {
+                Err(response) => return response,
+                Ok(kv) => (Some(kv), decode_send.await),
+            },
+            d = &mut decode_send => (None, d),
+        };
+
+        let res = match decode_result {
+            Ok(r) => r,
+            Err(e) => {
+                error!(decode_url = %decode.url(), error = %e, "ATOM decode request failed");
+                return error::bad_gateway(
+                    "decode_server_error",
+                    format!("Decode server error: {}", e),
+                );
+            }
+        };
+        let res = if res.status() == StatusCode::NOT_FOUND {
+            // D predates the late-kv route: finish P, then send the plain relay body.
+            if !LATE_KV_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!(
+                    "decode {} has no {}; falling back to relay dispatch",
+                    decode.url(),
+                    ATOM_LATE_KV_PATH
+                );
+            }
+            let _ = res.text().await;
+            let kv = match kv.take() {
+                Some(kv) => kv,
+                None => match prefill_flow.await {
+                    Ok(kv) => kv,
+                    Err(response) => return response,
+                },
+            };
+            let mut body: Value = match serde_json::from_slice(&head[..head.len() - 1]) {
+                Ok(v) => v,
+                Err(e) => return Self::handle_serialization_error(e),
+            };
+            body["kv_transfer_params"] = kv;
+            let post = self
+                .client
+                .post(decode.endpoint_url(context.route))
+                .headers(decode_headers)
+                .json(&body);
+            match self.send_worker(post, decode.clone(), headers).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return error::bad_gateway(
+                        "decode_server_error",
+                        format!("Decode server error: {}", e),
+                    )
+                }
+            }
+        } else {
+            res
+        };
+        events::RequestReceivedEvent {}.emit();
         self.finish_atom_decode_response(res, context, decode, decode_guard)
             .await
     }
@@ -2595,6 +2898,320 @@ mod tests {
         server.abort();
     }
 
+    // --- ATOMESH_ATOM_PD_CONCURRENT (late-kv concurrent dispatch) ---
+
+    #[test]
+    fn late_kv_helpers() {
+        assert!(body_carries_prompt_ids(
+            &json!({"prompt_token_ids": [1, 2]})
+        ));
+        assert!(!body_carries_prompt_ids(&json!({"prompt_token_ids": []})));
+        assert!(!body_carries_prompt_ids(&json!({"prompt_token_ids": null})));
+        assert!(!body_carries_prompt_ids(&json!({"messages": []})));
+        // Newlines inside strings stay escaped: the terminator is the only raw one.
+        let head = json_line(&json!({"messages": [{"content": "a\nb\r\n"}]})).unwrap();
+        assert_eq!(head.iter().filter(|b| **b == b'\n').count(), 1);
+        assert_eq!(*head.last().unwrap(), b'\n');
+        let line = late_kv_line(&json!({"remote_dp_rank": 2})).unwrap();
+        let back: Value = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
+        assert_eq!(back, json!({"kv_transfer_params": {"remote_dp_rank": 2}}));
+        assert!(!env_flag("ATOMESH_TEST_SURELY_UNSET_FLAG_42"));
+    }
+
+    #[derive(Default)]
+    struct LateKvState {
+        prefill_bodies: Vec<Value>,
+        prefill_replied: Option<Instant>,
+        head_at: Option<Instant>,
+        late_hits: usize,
+        plain_hits: usize,
+        kv_seen: bool,
+        plain_bodies: Vec<Value>,
+    }
+    type Shared = Arc<std::sync::Mutex<LateKvState>>;
+
+    async fn serve(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        url
+    }
+
+    /// P mock: answers after `delay_ms` with ATOM early-handoff-style kv params.
+    async fn prefill_mock(state: Shared, delay_ms: u64, status: StatusCode) -> String {
+        serve(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let state = state.clone();
+                async move {
+                    let echo = body["return_token_ids"] == true;
+                    state.lock().unwrap().prefill_bodies.push(body);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    state.lock().unwrap().prefill_replied = Some(Instant::now());
+                    let mut reply = json!({"kv_transfer_params": {
+                        "chunked_transfer": true, "do_remote_prefill": true,
+                        "do_remote_decode": false, "transfer_id": "early-1", "dp_rank": 3}});
+                    if echo {
+                        reply["prompt_token_ids"] = json!([7, 8, 9]);
+                    }
+                    (status, axum::Json(reply))
+                }
+            }),
+        ))
+        .await
+    }
+
+    /// D mock. `late` mounts the two-line route; the plain route is always there.
+    async fn decode_mock(state: Shared, late: bool) -> String {
+        let s1 = state.clone();
+        let mut app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let state = s1.clone();
+                async move {
+                    let mut st = state.lock().unwrap();
+                    st.plain_hits += 1;
+                    st.plain_bodies.push(body.clone());
+                    axum::Json(json!({"plain": body}))
+                }
+            }),
+        );
+        if late {
+            let s2 = state.clone();
+            app = app.route(
+                ATOM_LATE_KV_PATH,
+                axum::routing::post(move |req: Request| {
+                    let state = s2.clone();
+                    async move {
+                        assert_eq!(req.headers()[ATOM_LATE_KV_HEADER], "1");
+                        state.lock().unwrap().late_hits += 1;
+                        let mut stream = req.into_body().into_data_stream();
+                        let mut buf = Vec::new();
+                        let mut head: Option<Value> = None;
+                        while let Some(chunk) = stream.next().await {
+                            let Ok(chunk) = chunk else { break };
+                            buf.extend_from_slice(&chunk);
+                            if head.is_none() {
+                                if let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                                    head = Some(serde_json::from_slice(&buf[..pos]).unwrap());
+                                    state.lock().unwrap().head_at = Some(Instant::now());
+                                    buf.drain(..=pos);
+                                }
+                            }
+                        }
+                        let Some(head) = head else {
+                            return (StatusCode::BAD_REQUEST, axum::Json(json!({})));
+                        };
+                        let text = String::from_utf8(buf).unwrap();
+                        let Some(line) = text.lines().next().filter(|l| !l.is_empty()) else {
+                            return (StatusCode::BAD_REQUEST, axum::Json(json!({"head": head})));
+                        };
+                        state.lock().unwrap().kv_seen = true;
+                        let kv: Value = serde_json::from_str(line).unwrap();
+                        (
+                            StatusCode::OK,
+                            axum::Json(json!({"head": head, "late": kv})),
+                        )
+                    }
+                }),
+            );
+        }
+        serve(app).await
+    }
+
+    fn atom_test_router(prefill_url: &str, concurrent: bool) -> PDRouter {
+        let mut router = create_test_pd_router();
+        let mut info = AtomPrefillInfo::default();
+        info.tp_sizes.insert(prefill_url.to_string(), 1);
+        let a = Arc::new(AtomAdapter::new(Arc::new(info)));
+        router.backend = BackendType::Atom;
+        router.adapter = a.clone();
+        router.atom_adapter = Some(a);
+        router.atom_pd_concurrent = concurrent;
+        router
+    }
+
+    async fn run_atom_pd(
+        router: &PDRouter,
+        prefill_url: &str,
+        decode_url: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        let ctx = router
+            .adapter
+            .prepare_pair(prefill.as_ref(), decode.as_ref())
+            .unwrap();
+        let mut prefill_body = body.clone();
+        let mut decode_body = body;
+        router
+            .adapter
+            .inject_prefill_fields(&mut prefill_body, &ctx)
+            .unwrap();
+        router
+            .adapter
+            .inject_decode_fields(&mut decode_body, &ctx)
+            .unwrap();
+        let placement = router
+            .reserve_pair(
+                PlacementPlan::Pair {
+                    prefill,
+                    decode,
+                    prefill_policy: "round_robin",
+                    decode_policy: "round_robin",
+                },
+                None,
+            )
+            .unwrap();
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            request_text: None,
+            tokens: None,
+            carries_media: false,
+            model_id: None,
+            headers: None,
+        };
+        let response = router
+            .dispatch_atom_relay_internal(
+                None,
+                prefill_body,
+                decode_body,
+                context,
+                placement,
+                ctx,
+                Instant::now(),
+                None,
+            )
+            .await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn late_kv_dispatches_decode_before_prefill_answers() {
+        let state: Shared = Default::default();
+        let p = prefill_mock(state.clone(), 150, StatusCode::OK).await;
+        let d = decode_mock(state.clone(), true).await;
+        let router = atom_test_router(&p, true);
+        // A client-sent kv_transfer_params never reaches D's request line.
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "x\ny"}],
+                          "prompt_token_ids": [1, 2, 3], "max_tokens": 9,
+                          "kv_transfer_params": {"stale": true}});
+        let (status, out) = run_atom_pd(&router, &p, &d, body).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let st = state.lock().unwrap();
+        // D had the full request while P was still working.
+        assert!(st.head_at.unwrap() < st.prefill_replied.unwrap());
+        assert_eq!((st.late_hits, st.plain_hits), (1, 0));
+        // The ids ride in D's own body: P is told not to echo them.
+        assert_eq!(st.prefill_bodies[0]["return_token_ids"], false);
+        assert_eq!(st.prefill_bodies[0]["max_tokens"], 1);
+        assert_eq!(out["head"]["prompt_token_ids"], json!([1, 2, 3]));
+        assert_eq!(out["head"]["max_tokens"], 9);
+        assert!(out["head"].get("kv_transfer_params").is_none());
+        let kv = &out["late"]["kv_transfer_params"];
+        assert_eq!(kv["remote_dp_rank"], 3);
+        assert_eq!(kv["remote_tp_size"], 1);
+        assert_eq!(kv["remote_dp_size"], 1);
+        assert_eq!(kv["transfer_id"], "early-1");
+        assert_eq!(kv["chunked_transfer"], true);
+        assert!(kv.get("prompt_token_ids").is_none());
+    }
+
+    #[tokio::test]
+    async fn late_kv_without_client_ids_keeps_the_echo() {
+        let state: Shared = Default::default();
+        let p = prefill_mock(state.clone(), 10, StatusCode::OK).await;
+        let d = decode_mock(state.clone(), true).await;
+        let router = atom_test_router(&p, true);
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let (status, out) = run_atom_pd(&router, &p, &d, body).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(
+            state.lock().unwrap().prefill_bodies[0]["return_token_ids"],
+            true
+        );
+        assert_eq!(
+            out["late"]["kv_transfer_params"]["prompt_token_ids"],
+            json!([7, 8, 9])
+        );
+    }
+
+    #[tokio::test]
+    async fn late_kv_prefill_failure_never_completes_decode() {
+        let state: Shared = Default::default();
+        let p = prefill_mock(state.clone(), 30, StatusCode::SERVICE_UNAVAILABLE).await;
+        let d = decode_mock(state.clone(), true).await;
+        let router = atom_test_router(&p, true);
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                          "prompt_token_ids": [1]});
+        let (status, _) = run_atom_pd(&router, &p, &d, body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let st = state.lock().unwrap();
+        assert_eq!(st.late_hits, 1);
+        assert!(!st.kv_seen, "D must never receive kv for a failed prefill");
+        assert_eq!(st.plain_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn late_kv_falls_back_to_relay_when_decode_lacks_route() {
+        let state: Shared = Default::default();
+        let p = prefill_mock(state.clone(), 20, StatusCode::OK).await;
+        let d = decode_mock(state.clone(), false).await;
+        let router = atom_test_router(&p, true);
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                          "prompt_token_ids": [4, 5]});
+        let (status, out) = run_atom_pd(&router, &p, &d, body).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let st = state.lock().unwrap();
+        assert_eq!(st.plain_hits, 1);
+        let sent = &st.plain_bodies[0];
+        assert_eq!(sent["prompt_token_ids"], json!([4, 5]));
+        assert_eq!(sent["kv_transfer_params"]["remote_dp_rank"], 3);
+        assert_eq!(sent["kv_transfer_params"]["transfer_id"], "early-1");
+    }
+
+    #[tokio::test]
+    async fn late_kv_off_keeps_the_serial_relay() {
+        let state: Shared = Default::default();
+        let p = prefill_mock(state.clone(), 20, StatusCode::OK).await;
+        let d = decode_mock(state.clone(), true).await;
+        let router = atom_test_router(&p, false);
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                          "prompt_token_ids": [4, 5]});
+        let (status, out) = run_atom_pd(&router, &p, &d, body).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let st = state.lock().unwrap();
+        assert_eq!((st.late_hits, st.plain_hits), (0, 1));
+        // Unchanged default: P is asked to echo and the router carries the ids.
+        assert_eq!(st.prefill_bodies[0]["return_token_ids"], true);
+        assert_eq!(
+            st.plain_bodies[0]["kv_transfer_params"]["prompt_token_ids"],
+            json!([7, 8, 9])
+        );
+    }
+
     pub(super) fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
@@ -2618,6 +3235,7 @@ mod tests {
             policies,
             adapter,
             atom_adapter: None,
+            atom_pd_concurrent: false,
         }
     }
 
