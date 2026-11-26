@@ -2,7 +2,9 @@
 # Tests for atom/utils/envs.py — lazy env var evaluation
 
 import logging
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -477,3 +479,24 @@ def test_otel_version_environment(monkeypatch):
     assert _get_envs().ATOM_TRACE_VERSION == "unknown"
     monkeypatch.setenv("ATOM_TRACE_VERSION", "build-test")
     assert _get_envs().ATOM_TRACE_VERSION == "build-test"
+
+
+@pytest.mark.parametrize(
+    ("value", "gfx", "expected"),
+    [
+        (None, "gfx1250", True),
+        (None, "gfx950", False),
+        ("0", "gfx1250", False),
+        ("1", "gfx950", True),
+    ],
+)
+def test_mori_v2_follows_the_gpu_unless_set(monkeypatch, value, gfx, expected):
+    """mori v1 runs on wave64 only, so gfx1250 takes v2 unless told otherwise."""
+    chip_info = ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx_runtime = lambda: gfx
+    monkeypatch.setitem(sys.modules, "aiter.jit.utils.chip_info", chip_info)
+    if value is None:
+        monkeypatch.delenv("ATOM_MORI_V2", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_MORI_V2", value)
+    assert _get_envs().ATOM_MORI_V2 is expected
