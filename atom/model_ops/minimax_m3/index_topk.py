@@ -875,7 +875,14 @@ def _prefill_narrow_rows_to_aiter(arch, emit, topk, decode_max_q):
     to `topk_per_row_small_k` too. On gfx950 an aiter that carries its one-wave k=16 build
     beats the Triton selector from a few dozen blocks up (aiter#8581); an older one does
     not, which is why the flag stays off by default. Rows it cannot serve (width under k)
-    decline in `_select_with_aiter` and keep the selectors below."""
+    decline in `_select_with_aiter` and keep the selectors below.
+
+    Not id-for-id the Triton selector in every tie: the one-wave build orders -0.0 below
+    +0.0 and ranks a NaN as -inf (`_pack_score_key` gives -0.0 and +0.0 one key and puts a
+    NaN below -inf), and an aiter with only the chunked build may pick any of several
+    equal-scored blocks. Either way the chosen blocks carry the same ranked scores; they can
+    differ in id only when equal scores straddle the top-16 cutoff, and in the order of
+    `sparse_bt`, not in which scores are attended."""
     return (
         envs.ATOM_M3_PREFILL_TOPK_FLYDSL
         and arch == "gfx950"
