@@ -168,8 +168,9 @@ def test_decode(batch, state_dtype, physical_vk):
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("physical_vk", [True])
+@pytest.mark.parametrize("reuse_out", [False, True])
 @requires_gfx942
-def test_decode_graph_mixed_padding(state_dtype, physical_vk):
+def test_decode_graph_mixed_padding(state_dtype, physical_vk, reuse_out):
     q, k, v, a, b, log, bias = inputs(4)
     original = torch.randn(8, 24, 128, 128, device="cuda", dtype=state_dtype) * 0.1
     state = original.clone()
@@ -177,17 +178,21 @@ def test_decode_graph_mixed_padding(state_dtype, physical_vk):
         state = state.transpose(-1, -2).contiguous().transpose(-1, -2)
     reads = torch.tensor([0, 1, 2, -1], device="cuda", dtype=torch.int32)
     writes = torch.tensor([4, 5, 6, -1], device="cuda", dtype=torch.int32)
+    out = torch.full_like(v[0], float("nan")) if reuse_out else None
     for _ in range(3):
-        fly.decode(q, k, v, a, b, state, log, bias, reads, writes)
+        fly.decode(q, k, v, a, b, state, log, bias, reads, writes, out=out)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        result, _ = fly.decode(q, k, v, a, b, state, log, bias, reads, writes)
+        result, _ = fly.decode(q, k, v, a, b, state, log, bias, reads, writes, out=out)
+    if reuse_out:
+        assert result.data_ptr() == out.data_ptr()
     for live in (3, 2, 1, 3):
         ri = list(range(live)) + [-1] * (4 - live)
         wi = list(range(4, 4 + live)) + [-1] * (4 - live)
         reads.copy_(torch.tensor(ri, device="cuda", dtype=torch.int32))
         writes.copy_(torch.tensor(wi, device="cuda", dtype=torch.int32))
         state.copy_(original)
+        result.fill_(float("nan"))
         graph.replay()
         reference = original.clone()
         expected = baseline_decode(
@@ -204,6 +209,7 @@ def test_decode_graph_mixed_padding(state_dtype, physical_vk):
         )
         close(result[:, :live], expected, f"graph live={live}")
         assert torch.count_nonzero(result[:, live:]) == 0
+        assert not torch.signbit(result[:, live:]).any()
         close(state, reference, "graph state")
 
 
@@ -402,11 +408,11 @@ def test_unsupported_device_decode_fallback(monkeypatch):
     torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
 
 
-@pytest.mark.parametrize("missing_ops", [False, True])
+@pytest.mark.parametrize("no_hip", [False, True])
 @pytest.mark.parametrize("lossy_decode", [False, True])
-def test_policy_dependencies_and_lossy(monkeypatch, missing_ops, lossy_decode):
+def test_policy_dependencies_and_lossy(monkeypatch, no_hip, lossy_decode):
     monkeypatch.setattr(fly, "backend", lambda stage: "auto")
-    monkeypatch.setattr(fly, "ops", lambda: None if missing_ops else object())
+    monkeypatch.setattr(fly, "ops", lambda: None if no_hip else object())
     monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: True)
     policy = fly.select_policy(
         allowed=True,
@@ -415,8 +421,8 @@ def test_policy_dependencies_and_lossy(monkeypatch, missing_ops, lossy_decode):
         state=torch.empty(1, 24, 128, 128, device="cuda", dtype=torch.bfloat16),
         activation_dtype=torch.bfloat16,
     )
-    assert policy.prefill == (not missing_ops)
-    assert policy.decode == (not missing_ops and not lossy_decode)
+    assert policy.prefill == (not no_hip)
+    assert policy.decode == (not no_hip and not lossy_decode)
 
 
 @pytest.mark.parametrize("mode", ["replayssm", "unsupported", "disabled", "flydsl"])

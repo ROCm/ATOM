@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# AtomRL as a plugin of other frameworks (verl/README.md, vime/README.md).
+# Each needs its framework's image; the run is skipped where it is absent.
+
+images:
+  verl-plugin:
+    ref: atomrl-verl-plugin:latest
+    atomrl_mount: /workspace/ATOM/atomrl
+    run_args: ["--entrypoint", "", "--tmpfs", "/tmp:exec,size=10g"]
+    build: docker build -f atomrl/examples/plugin/verl/Dockerfile.test -t atomrl-verl-plugin:latest .
+  vime-plugin:
+    ref: atomrl-vime-plugin:latest
+    atomrl_mount: /workspace/ATOM/atomrl
+    build: docker build -f atomrl/examples/plugin/vime/Dockerfile -t atomrl-vime-plugin:latest .
+
+defaults:
+  tier: t1
+  status: unvalidated
+  log_mode: stdout
+  requires:
+    - models/Qwen3-8B-Base
+    - data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
+    - data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet
+  prepare: python3 {examples}/DAPO/tools/prepare_data.py --data-root {data_root} --models Qwen3-8B-Base
+  smoke:
+    steps: 3
+    timeout_min: 60
+    checks: {metrics: [], last_step: false, weight_sync_buckets: false}
+
+examples:
+  - id: verl-plugin-qwen3-8b-vllm
+    title: "verl 0.9 GRPO on Qwen3-8B with the AtomRL FSDP2 engine, vLLM rollout"
+    image: verl-plugin
+    command: >-
+      cd {atomrl} && CONFIG=examples/plugin/verl/qwen3_8b_grpo_fp8.yaml STEPS={steps}
+      LOG={log}.verl bash examples/plugin/verl/run.sh
+
+  - id: vime-plugin-qwen3-8b
+    title: "vime RL on Qwen3-8B with the AtomRL Megatron bridge"
+    image: vime-plugin
+    command: cd {atomrl} && STEPS={steps} LOG={log}.vime bash examples/plugin/vime/run.sh
+    notes: Needs VIME_ROOT in the image (see vime/README.md); pass --env VIME_ROOT=<path>.

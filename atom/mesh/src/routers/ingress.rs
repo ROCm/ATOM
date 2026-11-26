@@ -1,6 +1,6 @@
 //! Shared HTTP proxy contract. The routing view never replaces the original payload.
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, LazyLock},
     time::Instant,
 };
@@ -28,15 +28,18 @@ use crate::{
         ConnectionMode, Worker, WorkerRegistry, WorkerType,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
+    protocols::chat::{ChatCompletionRequest, ChatMessage},
     routers::{
         comm::error::{IngressError, MeshLocalError},
         prepare::{
+            chat_controls::ChatControls,
+            chat_template::{render_chat_messages, template_kwargs},
             fast_tokenizer::TokenizeLimits,
             inference::{InferenceMetadata, InferenceRequest, ParsedInference, RoutingChat},
         },
     },
     server::AppState,
-    tokenizer::TokenizerRegistry,
+    tokenizer::{registry::TokenizerEntry, TokenizerRegistry},
 };
 
 /// What a request's policies do with its tokens.
@@ -637,6 +640,7 @@ pub struct IngressRouting {
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,
     chats_without_template: Arc<RwLock<HashSet<String>>>,
+    chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
     pd: bool,
     tokenize_limits: TokenizeLimits,
     /// ATOM backends get a media chat's routing text and templated prompt
@@ -653,6 +657,7 @@ impl IngressRouting {
             worker_registry: app.worker_registry.clone(),
             tokenizer_registry: app.tokenizer_registry.clone(),
             chats_without_template: app.chats_without_template.clone(),
+            chat_controls: app.chat_controls.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             tokenize_limits: app.tokenize_limits,
             front_media_digest: app.router_config.backend == crate::config::BackendType::Atom,
@@ -905,13 +910,7 @@ impl IngressRouting {
                 return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
             }
             let messages = routed.map_or(&chat.messages, |routed| &routed.messages);
-            let mut prompt = super::prepare::chat_template::process_chat_messages_as(
-                chat,
-                messages,
-                &*entry.tokenizer,
-            )
-            .map_err(IngressError::invalid)?
-            .text;
+            let mut prompt = self.render_chat(&entry, chat, messages)?;
             if let Some(front) = routed.and_then(|routed| routed.front.as_deref()) {
                 prompt.insert_str(0, front);
             }
@@ -935,6 +934,23 @@ impl IngressRouting {
         metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "encode")
             .record(encode_started.elapsed().as_secs_f64());
         Ok(tokens)
+    }
+
+    /// The prompt the router renders `chat` to with `entry`'s template, under
+    /// the reasoning controls of its model where ATOM has its own.
+    fn render_chat(
+        &self,
+        entry: &TokenizerEntry,
+        chat: &ChatCompletionRequest,
+        messages: &[ChatMessage],
+    ) -> Result<String, IngressError> {
+        let controls = self.chat_controls.read().get(&entry.id).copied();
+        match controls {
+            Some(controls) => controls.render(chat, messages, &*entry.tokenizer),
+            None => render_chat_messages(chat, messages, &*entry.tokenizer, &template_kwargs(chat))
+                .map(|rendered| rendered.text),
+        }
+        .map_err(IngressError::invalid)
     }
 }
 

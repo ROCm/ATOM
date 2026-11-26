@@ -1,15 +1,22 @@
-"""End-to-end coverage for the default batched DFLASH verify path.
+"""Forward-path coverage for the batched (non-ReplaySSM) GDN TARGET_VERIFY path.
 
-``test_gdn_target_verify_batched_equiv.py`` compares the two *kernel call
-patterns in isolation. This module drives the real, always-batched
-``SGLangGatedDeltaNet.forward()`` TARGET_VERIFY path and asserts the plugin's
-observable contract:
+With speculative decoding (MTP, DFLASH, ...), TARGET_VERIFY goes through
+ReplaySSM by default; this path runs only with ``ATOM_ENABLE_REPLAYSSM=0``.
+Every test here forces ReplaySSM off.
 
-* ``core_attn_out``
-* ``intermediate_ssm[req, step]`` -- what SGLang's
+``test_gdn_target_verify_batched_equiv.py`` compares the batched call pattern
+with a per-step loop, using its own stand-in calls. This module drives the
+real ``SGLangGatedDeltaNet.forward()`` TARGET_VERIFY path and asserts the
+plugin's observable contract:
+
+* ``core_attn_out`` (pad rows zero)
+* nonzero ``intermediate_ssm[req, step]`` contents for each live request at
+  steps 1..draft-1 (step 0 is host-seeded) -- what SGLang's
   ``fused_mamba_state_scatter_with_mask`` commits from
-* ``intermediate_conv_window[0][req, step]``
+* nonzero ``intermediate_conv_window[0][req, step]`` contents for each live
+  request at steps 1..draft-1
 * the live ``conv`` / ``temporal`` state, which must come back untouched
+* one conv and one SSM kernel call
 
 Run on a GPU; the kernels have no CPU fallback.
 """
@@ -27,6 +34,12 @@ from atom.plugin.sglang.runtime import bind_current_forward_batch
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="GDN kernels require a GPU"
 )
+
+
+@pytest.fixture(autouse=True)
+def _replayssm_off(monkeypatch):
+    monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", "0")
+
 
 # Qwen3.5-397B per-rank GDN shape at TP8.
 NUM_K_HEADS = 16
@@ -90,9 +103,8 @@ def _dedup_conv_window_view(num_slots: int, draft: int) -> torch.Tensor:
 
     One shared [slot, dim, D + K - 2] physical row exposed as an overlapping
     [slot, D, dim, K - 1] view; see MambaPool.__init__ in SGLang's
-    memory_pool.py. Production on ROCm always takes this layout for DFLASH
-    (linear draft chain), so the tests must exercise it rather than the dense
-    fallback.
+    memory_pool.py. GDN target verify on ROCm requires this layout (linear
+    draft chain), so the tests exercise it rather than the dense fallback.
     """
     shared_win = draft + STATE_LEN - 1
     phys = torch.zeros(
@@ -134,16 +146,18 @@ def _make_impl(gen: torch.Generator) -> SGLangGatedDeltaNet:
     return impl
 
 
-def _run_once(bs: int, draft: int):
+def _run_once(bs: int, draft: int, slots=None, flydsl_decode: bool = False):
     gen = torch.Generator(device="cuda")
     gen.manual_seed(20260804)
 
     layer_cache = _make_layer_cache(bs, draft, gen)
     impl = _make_impl(gen)
+    if flydsl_decode:
+        impl.gdn_flydsl_policy = SimpleNamespace(decode=True)
     # Deliberately unsorted, non-contiguous mamba slots.
-    cache_indices = torch.tensor(
-        [5, 2, 9, 17, 1, 13][:bs], device="cuda", dtype=torch.int32
-    )
+    if slots is None:
+        slots = [5, 2, 9, 17, 1, 13][:bs]
+    cache_indices = torch.tensor(slots, device="cuda", dtype=torch.int32)
     linear_backend = SimpleNamespace(
         forward_metadata=SimpleNamespace(mamba_cache_indices=cache_indices),
         req_to_token_pool=SimpleNamespace(
@@ -202,11 +216,16 @@ def _run_once(bs: int, draft: int):
 
 @pytest.mark.parametrize("draft", [4, 8, 16])
 @pytest.mark.parametrize("bs", [1, 3])
-def test_default_batched_path_populates_verify_buffers(bs: int, draft: int):
+def test_batched_path_populates_verify_buffers(bs: int, draft: int):
+    """Both buffers start at zero. Exclude step 0 because forward seeds the
+    SSM state there before the kernel; steps 1.. must be kernel writes."""
     result = _run_once(bs, draft)
     assert result["out"].shape[0] == bs * draft
-    assert result["intermediate_ssm"].shape[:2] == (bs, draft)
-    assert result["intermediate_conv"].shape[:2] == (bs, draft)
+    for name in ("intermediate_ssm", "intermediate_conv"):
+        buf = result[name]
+        assert buf.shape[:2] == (bs, draft)
+        written = buf[:, 1:].flatten(2).abs().amax(-1) > 0
+        assert written.all(), f"{name} has unwritten (req, step) entries"
 
 
 @pytest.mark.parametrize("draft", [4, 8, 16])
@@ -219,7 +238,7 @@ def test_live_state_unchanged_after_verify(draft: int):
     torch.testing.assert_close(result["ssm_live"], result["ssm_before"], rtol=0, atol=0)
 
 
-def test_default_ssm_path_uses_one_kernel_call(monkeypatch):
+def test_batched_ssm_path_uses_one_kernel_call(monkeypatch):
     import atom.plugin.sglang.attention_backend.attention_gdn as gdn_mod
 
     calls = {"n": 0}
@@ -235,8 +254,53 @@ def test_default_ssm_path_uses_one_kernel_call(monkeypatch):
     assert calls["n"] == 1, f"batched SSM should run once, got {calls['n']} calls"
 
 
+@pytest.mark.parametrize(
+    "flydsl_decode", [False, True], ids=["plain_kv", "flydsl_logical_kv"]
+)
+@pytest.mark.parametrize("draft", [4, 16])
+def test_pad_rows_zeroed_and_real_rows_unchanged(monkeypatch, draft, flydsl_decode):
+    """CUDA-graph pad rows (cache index -1) skip the conv, so their q/k/v are
+    whatever `torch.empty` held. Fill them with NaN to make that deterministic;
+    the SSM kernel must still give those rows zeros and leave real rows alone.
+    """
+    import atom.plugin.sglang.attention_backend.attention_gdn as gdn_mod
+
+    real_slots = [5, 2, 9, 17]
+    padded_slots = [5, -1, 9, -1]
+    bs = len(padded_slots)
+    pad_rows = torch.tensor([s < 0 for s in padded_slots], device="cuda")
+    real_rows = ~pad_rows
+
+    real_conv = gdn_mod.causal_conv1d_update
+
+    def conv_with_nan_pads(*args, **kwargs):
+        outs = real_conv(*args, **kwargs)
+        rows_in = kwargs["conv_state_indices_in"].view(-1) < 0
+        for t in outs:
+            t.view(bs, draft, -1)[rows_in] = float("nan")
+        return outs
+
+    monkeypatch.setattr(gdn_mod, "causal_conv1d_update", conv_with_nan_pads)
+    padded = _run_once(bs, draft, slots=padded_slots, flydsl_decode=flydsl_decode)
+    monkeypatch.setattr(gdn_mod, "causal_conv1d_update", real_conv)
+    reference = _run_once(bs, draft, slots=real_slots, flydsl_decode=flydsl_decode)
+
+    out = padded["out"].view(bs, draft, *padded["out"].shape[1:])
+    ref = reference["out"].view(bs, draft, *reference["out"].shape[1:])
+    assert torch.equal(out[pad_rows], torch.zeros_like(out[pad_rows]))
+    assert torch.equal(out[real_rows], ref[real_rows])
+    assert torch.equal(
+        padded["intermediate_ssm"][real_rows], reference["intermediate_ssm"][real_rows]
+    )
+    # Step 0 holds the host seed ssm_states[-1]; the kernel must not write the
+    # pad rows' later steps.
+    pad_steps = padded["intermediate_ssm"][pad_rows][:, 1:]
+    assert torch.equal(pad_steps, torch.zeros_like(pad_steps))
+    torch.testing.assert_close(padded["ssm_live"], padded["ssm_before"], rtol=0, atol=0)
+
+
 # --------------------------------------------------------------------------
-# Batched conv (Step 2): recovering SGLang's physical wide-window buffer
+# Batched conv: recovering SGLang's physical wide-window buffer
 # --------------------------------------------------------------------------
 def _sglang_dedup_conv_window(num_slots: int, draft: int):
     """Replicate SGLang's deduplicated intermediate_conv_window allocation.

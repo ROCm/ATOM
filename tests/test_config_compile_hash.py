@@ -18,6 +18,7 @@ def _hash(**overrides):
         "sequence_parallel_size": 1,
         "dcp_config": None,
         "enable_dp_attention": False,
+        "enable_mixed_prefill_decode": False,
         "index_cache_dtype": None,
         "index_cache_layout": None,
         "hf_config": SimpleNamespace(),
@@ -65,3 +66,7 @@ def test_hash_ignores_settings_that_stay_out_of_the_graph():
     assert _hash(attn_prefill_chunk_size=8192) == base
     assert _hash(kv_cache_block_size=256) == base
     assert _hash(gpu_memory_utilization=0.8) == base
+
+
+def test_hash_changes_with_mixed_prefill_decode():
+    assert _hash(enable_mixed_prefill_decode=True) != _hash()

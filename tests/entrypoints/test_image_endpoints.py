@@ -17,6 +17,7 @@ import httpx
 import pytest
 from PIL import Image
 
+from atom import structured_output
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.images import MAX_IMAGES, NO_FILES_API
 from atom.entrypoints.openai.serving_anthropic import (
@@ -223,9 +224,10 @@ class TestAnthropicTranslation:
                 {"type": "text", "text": "b"},
             ]
         )
+        # Tool results first: they answer the call before this message.
         assert messages == [
-            {"role": "user", "content": "a\nb"},
             {"role": "tool", "tool_call_id": "t1", "content": "x\ny"},
+            {"role": "user", "content": "a\nb"},
         ]
 
 
@@ -374,6 +376,8 @@ class TestResponsesEndpoint:
             seen.append(kwargs["multimodal"])
 
         monkeypatch.setattr(api_server, "_configure_structured_output", configure)
+        # Setup is stubbed; the backend need not be installed.
+        monkeypatch.setattr(structured_output, "available", lambda: True)
         monkeypatch.setattr(
             api_server, "validate_responses_output", lambda *a, **kw: None
         )
