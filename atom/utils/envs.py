@@ -225,8 +225,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request arrives. Does not advertise chunked transfer in /kv_transfer_info, so
     # the router keeps its legacy path. The router releases P's load guard at
     # the early answer and does not see a P failure after it (see the docs
-    # row). Single-node DP only. 0 = off.
-    "ATOM_PD_EARLY_HANDOFF": lambda: _flag_env("ATOM_PD_EARLY_HANDOFF", "0"),
+    # row). Single-node DP only; anything but a Mooncake producer's plain
+    # prefill leg keeps its path. On by default; 0 = the legacy
+    # answer-after-prefill path.
+    "ATOM_PD_EARLY_HANDOFF": lambda: _flag_env("ATOM_PD_EARLY_HANDOFF", "1"),
     # With ATOM_PD_EARLY_HANDOFF on P: an early request may allocate its
     # source and prefill before D's write request arrives (it skips the
     # D-first chunked admission gate), so the router->D hop overlaps P's

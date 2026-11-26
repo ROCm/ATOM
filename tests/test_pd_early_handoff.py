@@ -44,7 +44,7 @@ def make_scheduler_connector(
     if early:
         monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", "1")
     else:
-        monkeypatch.delenv("ATOM_PD_EARLY_HANDOFF", raising=False)
+        monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", "0")
     if skip_gate is None:
         monkeypatch.delenv("ATOM_PD_EARLY_HANDOFF_SKIP_GATE", raising=False)
     else:
@@ -699,6 +699,8 @@ def test_gate_mode_tracks_no_pins(monkeypatch, seq_factory):
         ("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", None, 0.5),
         ("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", "1.5", 0.5),
         ("ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION", "0", 0.0),
+        ("ATOM_PD_EARLY_HANDOFF", None, True),
+        ("ATOM_PD_EARLY_HANDOFF", "0", False),
         ("ATOM_PD_EARLY_HANDOFF_SKIP_GATE", None, True),
         ("ATOM_PD_EARLY_HANDOFF_SKIP_GATE", "0", False),
     ],
