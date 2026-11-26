@@ -3,8 +3,9 @@
 on the CPU, AITER stubbed (`tests/aiter_stub.py`): when a step runs SP (pure TP,
 native MXFP8 linears, token thresholds every TBO micro-batch reads alike), when
 the FlyDSL MXFP4 MoE chain takes the experts, the unsharded o_proj copy and how
-it loads, the chain's warm-up, and the SP forward itself against the regular TP
-forward, its ranks run as threads over emulated collectives."""
+it loads, the chain's warm-up and token bound, and the SP forward itself, the
+regular MoE's and the chain's, against the regular TP forward, its ranks run as
+threads over emulated collectives."""
 
 import builtins
 import functools
@@ -393,6 +394,32 @@ def test_chain_warm_up_retries_a_variant_that_failed(sp, block_m_variants):
     assert ran == [3072]
 
 
+@pytest.fixture
+def chain_limits(monkeypatch):
+    fake = types.ModuleType(CHAIN)
+    fake.MAX_PREFILL_TOKENS = 65536
+    monkeypatch.setitem(sys.modules, CHAIN, fake)
+
+
+def chain_moe_of(hidden, topk):
+    return NS(experts=NS(w2_weight=NS(shape=(256, hidden, 384)), top_k=topk))
+
+
+@pytest.mark.parametrize(
+    "hidden, topk, bound",
+    [(6144, 4, 65536), (8192, 4, 65535), (16384, 8, 16383)],
+    ids=["m3.1-max-prefill-tokens", "h8192-topk4", "h16384-topk8"],
+)
+def test_chain_bound_is_aiters_32bit_offset_assert(
+    sp, chain_limits, hidden, topk, bound
+):
+    def fits(n):  # a4w4_prefill_moe's assert
+        return (n * topk + 1) * hidden * 2 <= 2**32
+
+    assert sp._chain_max_tokens(chain_moe_of(hidden, topk)) == bound
+    assert fits(bound) and (bound == 65536 or not fits(bound + 1))
+
+
 # Which steps run SP, and their token shards
 
 
@@ -454,12 +481,37 @@ def test_tbo_decision_needs_every_micro_batch_context(sp, tp4, run_as):
         sp.plan(9000)
 
 
+def test_sp_stays_within_the_chains_bound(
+    sp, load, tp4, run_as, chain_limits, monkeypatch
+):
+    """At H 8192 / top-k 4 the chain takes up to 65535 tokens: a larger step, or
+    a TBO step with a micro-batch that large, runs the regular forward."""
+    monkeypatch.setattr(sp, "_flydsl_moe_ok", lambda moe: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    prefill = NS(context=NS(is_prefill=True))
+    forward_context = load("atom.utils.forward_context")
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: prefill)
+    layers = [torch.nn.Module(), torch.nn.Module()]
+    for i, x in enumerate(layers):
+        x.is_moe_layer, x.block_sparse_moe = i == 1, chain_moe_of(8192, 4)
+    model = NS(layers=layers, start_layer=0, end_layer=2, _sp_supported=True)
+    run_as(None)
+    assert sp.plan_model(model, 65536) is None
+    assert sp.plan_model(model, 65535).num_tokens == 65535
+    for tokens, runs_sp in [((65536, 9000), False), ((65535, 9000), True)]:
+        for ctx in tbo_ring(*tokens):
+            run_as(ctx)
+            n = ctx.forward_context.context.running_tokens
+            assert (sp.plan_model(model, n) is not None) is runs_sp
+
+
 # The SP forward against the regular TP forward. Each rank is a thread running
 # `forward` on its own replica, the collectives emulated on `_Coll`'s byte views;
 # the quants pass float32 rows through, so the two forwards differ only in the
 # order of their sums.
 
 WORLD, HIDDEN, HEAD_DIM, INTER, EXPERTS = 4, 64, 32, 16, 2
+CHAIN_EXPERTS, TOPK = 4, 2
 
 
 class Ranks:
@@ -577,6 +629,108 @@ class Moe:
         return sum(weights[:, [e]] * mlp(x) for e, mlp in enumerate(self.experts))
 
 
+def select_experts(experts, x, logits):
+    return torch.softmax(logits, dim=-1).topk(TOPK, dim=-1)
+
+
+def routed(x, ids, weights, experts):
+    """Each row through its top-k of these `Mlp` slices, weighted."""
+    out = torch.zeros_like(x)
+    for e, mlp in enumerate(experts):
+        for j in range(ids.shape[1]):
+            picked = ids[:, j] == e
+            out[picked] += weights[picked, j, None] * mlp(x[picked])
+    return out
+
+
+class ChainMoe:
+    """A MoE layer the chain takes: top-k experts, scaled, and a shared expert;
+    called, the regular path's TP partial. Its MXFP4 weights are placeholders,
+    `ChainKernel` runs the `Mlp` slices."""
+
+    routed_scaling_factor = 2.5
+
+    def __init__(self, gate, experts, shared_experts, kernel):
+        self.gate, self.mlps, self.shared_experts = (
+            Linear(gate),
+            experts,
+            shared_experts,
+        )
+        n = len(experts)
+        self.experts = NS(
+            w13_weight=torch.empty((n, 2 * INTER, HIDDEN // 2), dtype=torch.uint8),
+            w2_weight=torch.empty((n, HIDDEN, INTER // 2), dtype=torch.uint8),
+            w13_weight_scale=None,
+            w2_weight_scale=None,
+            top_k=TOPK,
+            quant_method=NS(select_experts=select_experts),
+        )
+        kernel.experts[id(self.experts.w13_weight)] = experts
+
+    def __call__(self, x):
+        weights, ids = select_experts(self.experts, x, self.gate(x))
+        scaled = self.routed_scaling_factor * routed(x, ids, weights, self.mlps)
+        return scaled + self.shared_experts(x)
+
+
+class ChainKernel:
+    """aiter#8699's prefill module, recording its calls. `mxfp4_quant` writes the
+    index of each row among the gathered rows into its codes and keeps the row,
+    so `a4w4_prefill_moe` reads exactly the rows of the codes it gets."""
+
+    def __init__(self, ranks, max_prefill_tokens):
+        self.ranks, self.rows, self.experts, self.calls = ranks, {}, {}, []
+        self.lock = threading.Lock()
+        self.module = types.ModuleType(CHAIN)
+        self.module.__dict__.update(
+            MIN_PREFILL_TOKENS=16,
+            BM256_FROM_TOKENS=112,
+            MAX_PREFILL_TOKENS=max_prefill_tokens,
+            block_m_for=lambda n: 256 if n >= 112 else 128,
+            mxfp4_quant=self.mxfp4_quant,
+            a4w4_prefill_moe=self.a4w4_prefill_moe,
+        )
+
+    def mxfp4_quant(self, x, q_out, scale_out):
+        rows, hidden = x.shape
+        first = self.ranks.local.rank * rows
+        codes = torch.zeros((rows, hidden // 2), dtype=torch.uint8)
+        codes.view(torch.int32)[:, 0] = torch.arange(first, first + rows)
+        with self.lock:
+            self.rows.update(zip(range(first, first + rows), x.clone()))
+        return codes, torch.full((rows, hidden // 32), 127, dtype=torch.uint8)
+
+    def a4w4_prefill_moe(
+        self,
+        x_quant,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        *,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        out=None,
+    ):
+        index = x_quant[0].view(torch.int32)[:, 0].tolist()
+        x = torch.stack([self.rows[i] for i in index])
+        y = routed(x, topk_ids, topk_weights, self.experts[id(w13)])
+        call = NS(
+            rank=self.ranks.local.rank,
+            index=index,
+            ids=topk_ids.clone(),
+            weights=topk_weights.clone(),
+            shape=(hidden_size, intermediate_size, num_experts),
+            warm_up=out is None,
+        )
+        with self.lock:
+            self.calls.append(call)
+        return y if out is None else out.copy_(y)
+
+
 class RankAttention:
     """This rank's head, causal over every token."""
 
@@ -592,9 +746,10 @@ class RankAttention:
         return torch.softmax(scores, dim=-1) @ v
 
 
-def replicas(kinds, aux_layers):
-    """Each rank's replica of a model with these layers ("dense" / "moe"): norms,
-    gates and o_proj replicated, heads and intermediates one slice per rank."""
+def replicas(kinds, aux_layers, kernel=None):
+    """Each rank's replica of a model with these layers ("dense" / "moe" /
+    "chain", the chain's `ChainKernel`): norms, gates and o_proj replicated,
+    heads and intermediates one slice per rank."""
     gen = torch.Generator().manual_seed(0)
 
     def w(*shape):
@@ -610,11 +765,14 @@ def replicas(kinds, aux_layers):
             "o_proj": w(HIDDEN, WORLD * HEAD_DIM),
             "qkv": [w(3 * HEAD_DIM, HIDDEN) for _ in range(WORLD)],
         }
-        if kind == "moe":
-            p["gate"] = w(EXPERTS, HIDDEN)
-            p["experts"] = list(zip(*(mlp_slices() for _ in range(EXPERTS))))
-        else:
+        if kind == "dense":
             p["mlp"] = mlp_slices()
+        else:
+            n = EXPERTS if kind == "moe" else CHAIN_EXPERTS
+            p["gate"] = w(n, HIDDEN)
+            p["experts"] = list(zip(*(mlp_slices() for _ in range(n))))
+        if kind == "chain":
+            p["shared_expert"] = mlp_slices()
         shared.append(p)
     final_norm = Norm(gen)
     models = []
@@ -624,13 +782,19 @@ def replicas(kinds, aux_layers):
             layer = torch.nn.Module()
             layer.self_attn = RankAttention(p["qkv"][rank], p["o_proj"], rank)
             layer.input_layernorm, layer.post_attention_layernorm = p["norms"]
-            layer.is_moe_layer = kind == "moe"
-            if layer.is_moe_layer:
-                experts = [Mlp(*e) for e in p["experts"][rank]]
-                layer.block_sparse_moe = Moe(p["gate"], experts)
-                layer._sp_flydsl_moe = False
-            else:
+            layer.is_moe_layer = kind != "dense"
+            layer._sp_flydsl_moe = kind == "chain"
+            if kind == "dense":
                 layer.mlp = Mlp(*p["mlp"][rank])
+            else:
+                experts = [Mlp(*e) for e in p["experts"][rank]]
+                layer.block_sparse_moe = (
+                    Moe(p["gate"], experts)
+                    if kind == "moe"
+                    else ChainMoe(
+                        p["gate"], experts, Mlp(*p["shared_expert"][rank]), kernel
+                    )
+                )
             layers.append(layer)
         models.append(
             NS(
@@ -679,6 +843,36 @@ def tp_forward(models, embeddings):
     return x, after
 
 
+def sp_forward(sp, monkeypatch, models, ranks, embeddings):
+    """`forward` of every rank's replica at once -> the ranks' outputs. New
+    buffers start as 0xFF bytes (NaN): a region read before it is written shows."""
+    coll = EmulatedColl(sp, ranks)
+    empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        out = empty(*args, **kwargs)
+        out.view(torch.uint8).fill_(255)
+        return out
+
+    monkeypatch.setattr(torch, "empty", poisoned_empty)
+    monkeypatch.setattr(sp, "_FP8", torch.float32)
+    monkeypatch.setattr(sp, "_quant", lossless_quant)
+    monkeypatch.setattr(sp, "_run_phase", lambda fn: fn(coll))
+    num_tokens, align = len(embeddings), sp._ROW_ALIGN
+    rows = (num_tokens + WORLD - 1) // WORLD
+    rows = (rows + align - 1) // align * align
+
+    def rank_forward(rank):
+        shard = sp.SeqShard(num_tokens, rows, WORLD, rank)
+        return sp.forward(models[rank], torch.arange(num_tokens), embeddings, shard)
+
+    return ranks.run(rank_forward)
+
+
+def embeddings_of(num_tokens):
+    return torch.randn(num_tokens, HIDDEN, generator=torch.Generator().manual_seed(1))
+
+
 @pytest.mark.parametrize(
     "num_tokens", [100, 70], ids=["short-last-shard", "a-rank-of-padding-only"]
 )
@@ -691,23 +885,8 @@ def test_sp_forward_matches_the_tp_forward(sp, monkeypatch, num_tokens):
         m.layers[1].register_forward_hook(
             lambda layer, args, out, rank=rank: hooked.__setitem__(rank, out)
         )
-    ranks = Ranks()
-    coll = EmulatedColl(sp, ranks)
-    monkeypatch.setattr(sp, "_FP8", torch.float32)
-    monkeypatch.setattr(sp, "_quant", lossless_quant)
-    monkeypatch.setattr(sp, "_run_phase", lambda fn: fn(coll))
-    embeddings = torch.randn(
-        num_tokens, HIDDEN, generator=torch.Generator().manual_seed(1)
-    )
-    align = sp._ROW_ALIGN
-    rows = (num_tokens + WORLD - 1) // WORLD
-    rows = (rows + align - 1) // align * align
-
-    def rank_forward(rank):
-        shard = sp.SeqShard(num_tokens, rows, WORLD, rank)
-        return sp.forward(models[rank], torch.arange(num_tokens), embeddings, shard)
-
-    outputs = ranks.run(rank_forward)
+    embeddings = embeddings_of(num_tokens)
+    outputs = sp_forward(sp, monkeypatch, models, Ranks(), embeddings)
     hidden, after = tp_forward(models, embeddings)
     close = functools.partial(torch.testing.assert_close, rtol=1e-4, atol=1e-5)
     for rank, (h, aux) in enumerate(outputs):
@@ -717,3 +896,51 @@ def test_sp_forward_matches_the_tp_forward(sp, monkeypatch, num_tokens):
         close(aux[1], after[1])
         assert isinstance(hooked[rank], sp.GatheredLayerOutput)
         close(hooked[rank][0], after[1])
+
+
+@pytest.mark.parametrize(
+    "num_tokens, max_prefill_tokens, warm_ups",
+    [(100, 65536, [16, 112]), (70, 100, [16])],
+    ids=["short-last-shard", "a-rank-of-padding-only-past-the-bm256-bound"],
+)
+def test_sp_forward_through_the_moe_chain(
+    sp, monkeypatch, num_tokens, max_prefill_tokens, warm_ups
+):
+    """Dense, then MoE through the chain (routed scaling 2.5, a shared expert):
+    the kernel gets every token's codes and routing, in order; the warm-up runs
+    each BLOCK_M the step and the chain's bound allow; the partial is the regular
+    path's, to bf16 (the kernel's output)."""
+    ranks = Ranks()
+    kernel = ChainKernel(ranks, max_prefill_tokens)
+    monkeypatch.setitem(sys.modules, CHAIN, kernel.module)
+    monkeypatch.setattr(sp, "_chain_warm", set())
+    partials, moe_chain = {}, sp._moe_chain
+
+    def record_partial(shard, moe, inp):
+        partials[shard.rank] = moe_chain(shard, moe, inp)
+        return partials[shard.rank]
+
+    monkeypatch.setattr(sp, "_moe_chain", record_partial)
+    models = replicas(("dense", "chain"), aux_layers=(), kernel=kernel)
+    embeddings = embeddings_of(num_tokens)
+    outputs = sp_forward(sp, monkeypatch, models, ranks, embeddings)
+    bf16_close = functools.partial(torch.testing.assert_close, rtol=1.6e-2, atol=1e-2)
+    hidden, _ = tp_forward(models, embeddings)
+    for h in outputs:
+        bf16_close(h, hidden)
+
+    assert [len(c.index) for c in kernel.calls if c.warm_up] == warm_ups
+    calls = sorted((c for c in kernel.calls if not c.warm_up), key=lambda c: c.rank)
+    assert [c.rank for c in calls] == list(range(WORLD))
+    x = torch.stack([kernel.rows[i] for i in range(num_tokens)])
+    weights, ids = select_experts(None, x, models[0].layers[1].block_sparse_moe.gate(x))
+    for rank, call in enumerate(calls):
+        assert call.index == list(range(num_tokens))
+        assert call.shape == (HIDDEN, INTER, CHAIN_EXPERTS)
+        assert torch.equal(call.ids.long(), ids)
+        torch.testing.assert_close(call.weights, weights)
+        partial = partials[rank]
+        bf16_close(
+            partial[:num_tokens].float(), models[rank].layers[1].block_sparse_moe(x)
+        )
+        assert not partial[num_tokens:].any()

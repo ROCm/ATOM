@@ -146,7 +146,7 @@ def _ubatch_token_range() -> tuple[int, int]:
     return min(tokens.values()), max(tokens.values())
 
 
-def plan(num_tokens: int) -> SeqShard | None:
+def plan(num_tokens: int, max_tokens: int = SP_MAX_TOKENS) -> SeqShard | None:
     from atom.utils.tbo.ubatching import tbo_active
 
     world = _tp().world_size
@@ -156,10 +156,10 @@ def plan(num_tokens: int) -> SeqShard | None:
         smallest, largest = _ubatch_token_range()
         if (
             smallest < max(SP_MIN_UBATCH_TOKENS, _CHAIN_MIN_TOKENS)
-            or largest > SP_MAX_TOKENS
+            or largest > max_tokens
         ):
             return None
-    elif not max(SP_MIN_TOKENS, _CHAIN_MIN_TOKENS) <= num_tokens <= SP_MAX_TOKENS:
+    elif not max(SP_MIN_TOKENS, _CHAIN_MIN_TOKENS) <= num_tokens <= max_tokens:
         return None
     rows = (num_tokens + world - 1) // world
     rows = (rows + _ROW_ALIGN - 1) // _ROW_ALIGN * _ROW_ALIGN
@@ -270,25 +270,31 @@ def plan_model(model: nn.Module, num_tokens: int) -> SeqShard | None:
     ctx = get_forward_context()
     if ctx is None or ctx.context is None or not ctx.context.is_prefill:
         return None
-    sp = plan(num_tokens)
-    if sp is None:
-        return None
     layers = model.layers[model.start_layer : model.end_layer]
     if not hasattr(layers[0], "_sp_flydsl_moe"):
+        if plan(num_tokens) is None:
+            return None
         # The first SP-sized step: hooks are in place and the experts processed.
         model._sp_supported = not any(x._forward_pre_hooks for x in layers)
         for x in layers:
             x._sp_flydsl_moe = x.is_moe_layer and _flydsl_moe_ok(x.block_sparse_moe)
+        chains = [x.block_sparse_moe for x in layers if x._sp_flydsl_moe]
+        model._sp_max_tokens = min(
+            [SP_MAX_TOKENS] + [_chain_max_tokens(m) for m in chains]
+        )
         logger.info(
             "MiniMax-M3 sequence-parallel prefill (from %d tokens, TBO micro-batches "
-            "from %d): %s; FlyDSL MXFP4 MoE chain on %d of %d MoE layers",
+            "from %d, up to %d): %s; FlyDSL MXFP4 MoE chain on %d of %d MoE layers",
             SP_MIN_TOKENS,
             SP_MIN_UBATCH_TOKENS,
+            model._sp_max_tokens,
             "on" if model._sp_supported else "off (forward pre-hooks)",
-            sum(x._sp_flydsl_moe for x in layers),
+            len(chains),
             sum(x.is_moe_layer for x in layers),
         )
-    return sp if model._sp_supported else None
+        if not model._sp_supported:
+            return None
+    return plan(num_tokens, model._sp_max_tokens)
 
 
 class GatheredLayerOutput(tuple):
@@ -398,6 +404,18 @@ def _flydsl_moe_ok(moe) -> bool:
     return why is None
 
 
+def _chain_max_tokens(moe) -> int:
+    """The largest step the chain takes for ``moe``: aiter's MAX_PREFILL_TOKENS,
+    and the 32-bit offsets into its bf16 partial sums, ``(tokens * topk + 1) *
+    hidden * 2`` bytes (`a4w4_prefill_moe`)."""
+    from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill import (
+        MAX_PREFILL_TOKENS,
+    )
+
+    hidden, topk = moe.experts.w2_weight.shape[1], moe.experts.top_k
+    return min(MAX_PREFILL_TOKENS, (2**32 // (2 * hidden) - 1) // topk)
+
+
 def _route(moe, x: torch.Tensor) -> torch.Tensor:
     """Top-k of this rank's rows, packed ``[ids | weights as int32]``."""
     experts = moe.experts
@@ -475,10 +493,11 @@ _chain_warm_lock = threading.Lock()
 _chain_warm: set[tuple[int, ...]] = set()
 
 
-def _warm_chain(chain, shape: tuple[int, ...], padded: int) -> None:
-    """Run each BLOCK_M variant of the chain once, on the first step with the rows
-    for it: aiter compiles one per ``block_m_for`` (below ``BM256_FROM_TOKENS``
-    tokens and from it), so no later step compiles mid-serve."""
+def _warm_chain(chain, shape: tuple[int, ...], limit: int) -> None:
+    """Run each BLOCK_M variant of the chain once, on the first step that can
+    (``limit``: its rows, capped by the chain's bound): aiter compiles one per
+    ``block_m_for`` (below ``BM256_FROM_TOKENS`` tokens and from it), so no later
+    step compiles mid-serve."""
     from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill import (
         BM256_FROM_TOKENS,
         MIN_PREFILL_TOKENS,
@@ -488,7 +507,7 @@ def _warm_chain(chain, shape: tuple[int, ...], padded: int) -> None:
     with _chain_warm_lock:
         for n in (MIN_PREFILL_TOKENS, BM256_FROM_TOKENS):
             key = (*shape, block_m_for(n))
-            if key not in _chain_warm and n <= padded:
+            if key not in _chain_warm and n <= limit:
                 chain(n, None)
                 _chain_warm.add(key)
 
@@ -523,7 +542,8 @@ def _moe_chain(sp: SeqShard, moe, inp: FfnInput) -> torch.Tensor:
             out=out,
         )
 
-    _warm_chain(chain, (hidden, inter, num_experts, k), sp.padded)
+    limit = min(sp.padded, _chain_max_tokens(moe))
+    _warm_chain(chain, (hidden, inter, num_experts, k), limit)
     out = torch.empty((sp.padded, hidden), dtype=torch.bfloat16, device=q.device)
     chain(t, out[:t])
     out[t:].zero_()
@@ -551,7 +571,7 @@ def _ffn_out_phase(sp: SeqShard, model, partial, residual, nxt, want_full):
     hidden = partial.shape[1]
     dev = partial.device
     full = (
-        torch.empty((sp.padded, hidden), dtype=partial.dtype, device=dev)
+        torch.empty((sp.padded, hidden), dtype=residual.dtype, device=dev)
         if want_full
         else None
     )
@@ -562,7 +582,7 @@ def _ffn_out_phase(sp: SeqShard, model, partial, residual, nxt, want_full):
             (sp.padded, hidden // 32), dtype=torch.float8_e8m0fnu, device=dev
         )
     else:
-        codes = torch.empty((sp.padded, hidden), dtype=partial.dtype, device=dev)
+        codes = torch.empty((sp.padded, hidden), dtype=residual.dtype, device=dev)
 
     def run(coll):
         h = torch.empty((sp.rows, hidden), dtype=partial.dtype, device=dev)
