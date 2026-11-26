@@ -126,27 +126,61 @@ def ix_peer_offset(max_rows: int) -> int:
     return -(-k2.peer_bytes(max_rows) // 256) * 256
 
 
+def _lean_k1(key: k1.KdaPreBuild) -> k1.KdaPreBuild | None:
+    """A spilled K1 build with fewer VGPRs: a column group a GEMV unit
+    (``KdaPreBuild.gemv_unit``: half the weights in flight, slower where
+    ``kda.gemv_staging`` keeps two groups, so only where those do not fit), or
+    at one already x a unit less ahead (``x_ahead``: K4's 7 and 9 batches
+    spilled at four). The same sums either way."""
+    if key.gemv_unit > 1:
+        return replace(key, gemv_unit=1)
+    if key.x_ahead > 1:
+        return replace(key, x_ahead=key.x_ahead - 1)
+    return None
+
+
+def _lean_k2(key: k2.K2Build) -> k2.K2Build | None:
+    """A spilled K2 build with the sgu early weights unpaired
+    (``K2Build.early_paired``: K4's 5 and 11 batches spilled paired). The same
+    operands either way."""
+    return replace(key, early_paired=False) if key.early_paired else None
+
+
+def _lean_keys(launchers: dict, spilled: list, lean) -> dict:
+    """``{key: lean(key)}`` of the spilled ``launchers`` that have one."""
+    out = {key: lean(key) for key, f in launchers.items() if f in spilled}
+    return {key: to for key, to in out.items() if to is not None}
+
+
 def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
-    """``built`` with each K1 build whose launcher spilled staged a column group
-    a GEMV unit (``KdaPreBuild.gemv_unit``): half the weights in flight, slower
-    where ``kda.gemv_staging`` keeps two groups, so only where those do not fit.
-    None when no spilled launcher is such a K1 build (a K2 or indexer spill, or
-    a K1 at one group a unit already): there is nothing leaner to build."""
-    lean = {
-        key: replace(key, gemv_unit=1)
-        for key, launcher in built.k1_launchers.items()
-        if launcher in spilled and key.gemv_unit > 1
-    }
-    if not lean:
+    """``built`` with each K1 / K2 build whose launcher spilled swapped for its
+    leaner build (``_lean_k1`` / ``_lean_k2``). None when no spilled launcher
+    has one (an indexer spill, or K1 / K2 builds lean already): there is
+    nothing leaner to build."""
+    k1_lean = _lean_keys(built.k1_launchers, spilled, _lean_k1)
+    k2_lean = _lean_keys(built.k2_launchers, spilled, _lean_k2)
+    if not k1_lean and not k2_lean:
         return None
-    k1_keys = {layer: lean.get(key, key) for layer, key in built.k1_keys.items()}
+
+    def swapped(keys, launchers, lean, build):
+        keys = {layer: lean.get(key, key) for layer, key in keys.items()}
+        return keys, {
+            key: build(key) if key in lean.values() else launchers[key]
+            for key in set(keys.values())
+        }
+
+    k1_keys, k1_launchers = swapped(
+        built.k1_keys, built.k1_launchers, k1_lean, k1.build
+    )
+    k2_keys, k2_launchers = swapped(
+        built.k2_keys, built.k2_launchers, k2_lean, k2.build
+    )
     return replace(
         built,
         k1_keys=k1_keys,
-        k1_launchers={
-            key: k1.build(key) if key in lean.values() else built.k1_launchers[key]
-            for key in set(k1_keys.values())
-        },
+        k1_launchers=k1_launchers,
+        k2_keys=k2_keys,
+        k2_launchers=k2_launchers,
     )
 
 

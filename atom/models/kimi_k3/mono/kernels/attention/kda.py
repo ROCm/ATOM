@@ -280,7 +280,8 @@ class KdaPreBuild:
     gemv_unit: int = field(default=2, metadata={"sym": "u"})
     # units a ``gemv_groups`` unit's x is loaded ahead of its MFMAs (held in
     # VGPRs meanwhile): x was just written by other CTAs, so one unit ahead
-    # left its L2 / MALL latency exposed every unit
+    # left its L2 / MALL latency exposed every unit. A unit less for a build
+    # that spilled (``runner._lean_width``)
     x_ahead: int = field(default=1, metadata={"sym": "a"})
     kda0: int = field(default=0, metadata={"sym": "k0"})  # the first KDA task's CTA
 
