@@ -319,6 +319,10 @@ def test_gfx950_preserves_requested_cache_and_attention(
         ("fp4", True, False, 0, 1, True),
         ("fp8", False, False, 2, 2, True),
         ("fp4", True, False, 2, 2, True),
+        ("fp8", False, True, 0, 1, True),
+        ("fp4", True, True, 0, 1, True),
+        ("fp8", False, True, 2, 2, True),
+        ("fp4", True, True, 2, 2, True),
     ],
 )
 @pytest.mark.parametrize("capture_batch", ["ordinary", "resumed", "empty"])
@@ -353,6 +357,7 @@ def test_native_token_graph_replays_different_request_counts(
     monkeypatch.setenv("ATOM_DSV41_A8W4_ATTN", "auto" if a8w4 else "off")
     torch.manual_seed(2989)
     width, ring, heads = 256, 128, 64 if live_fusion else 16
+    conditional_graph = capture_attention and live_fusion
     geo = V41PoolGeometry(
         group_size,
         ((0, 2),),
@@ -361,6 +366,7 @@ def test_native_token_graph_replays_different_request_counts(
         512,
         128,
         kv_dtype=cache_dtype,
+        speculative_tokens=5 if conditional_graph else 0,
         layer_ratios=(ratio,),
         index_topk=4,
     )
@@ -416,6 +422,7 @@ def test_native_token_graph_replays_different_request_counts(
         is_prefill=True,
     ):
         nonlocal boundary_pointers
+        graph_layout = graph_layout and is_prefill
         length = (live_tokens - (2 if padded else 0)) // requests if requests else 0
         live = length * requests
         order = (0, 3, 1, 4) if reverse else (4, 1, 3, 0)
@@ -449,7 +456,9 @@ def test_native_token_graph_replays_different_request_counts(
             scheduled_tokens=live,
             max_q_len=length,
             is_prefill=is_prefill,
+            tentative=not is_prefill and length > 1,
             prefill_attention_graph=graph_layout,
+            prefill_attention_conditional=conditional_graph,
             prefill_window_fusion=fuse and is_prefill,
             request_floors=np.where(cached > 0, ring // 2, 0).astype(np.int32),
             request_cached_until=cached,
@@ -537,6 +546,8 @@ def test_native_token_graph_replays_different_request_counts(
     for name in (
         "_prepare_attention",
         "_prepare_attention_live",
+        "_prepare_prefill_conditional",
+        "_attend_prefill_conditional",
         "_attention_inputs",
         "_prefill_indices_live",
         "_attend_prefill_graph",
@@ -689,6 +700,15 @@ def test_native_token_graph_replays_different_request_counts(
             + (
                 [
                     (4, False, True, 0, 4, False),
+                    (1, False, False, 0, 1, False),
+                    *(
+                        [
+                            (4, False, False, 0, 24, False),
+                            (2, False, True, 0, 12, False),
+                        ]
+                        if conditional_graph
+                        else []
+                    ),
                     (0, False, False, 0, 4, False),
                     (4, False, False, 0, 4, True),
                     (1, False, False, 0, width, True),
@@ -717,11 +737,17 @@ def test_native_token_graph_replays_different_request_counts(
             got = graph.replay((fresh_q, fresh_kv)).clone()
             if live_fusion:
                 assert fused_calls == (
-                    [False] * group_size if requests and is_prefill else []
+                    [False] * group_size
+                    if requests and is_prefill and not capture_attention
+                    else []
                 )
-                assert attention_calls == ([False] * group_size if requests else [])
+                assert attention_calls == (
+                    [False] * group_size
+                    if requests and not (capture_attention and is_prefill)
+                    else []
+                )
             assert len(commit_calls) == group_size * int(
-                bool(requests) and not capture_attention
+                bool(requests) and not (capture_attention and is_prefill)
             )
             assert all(s is step for s in commit_calls)
             assert graph_commit_calls == []
@@ -731,9 +757,15 @@ def test_native_token_graph_replays_different_request_counts(
                 assert len(selection_calls) == 1 and selection_calls[0] is step
             assert (
                 preparation_calls
-                == ([False] if live_preparation and requests else []) * group_size
+                == (
+                    [False]
+                    if requests
+                    and (live_preparation or (conditional_graph and not is_prefill))
+                    else []
+                )
+                * group_size
             )
-            if capture_attention:
+            if capture_attention and is_prefill:
                 assert attention_calls == []
             planes = ring_planes()
             committed = tuple(p.clone() for p in planes)

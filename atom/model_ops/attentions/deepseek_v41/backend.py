@@ -229,8 +229,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 0 < tokens <= model_runner.warmup_max_tokens()
                 for tokens in envs.ATOM_TOKEN_GRAPH_SIZES
             )
-            # Mixed DPA steps can replay prefill graphs on decoding peers.
-            and not model_runner.config.enable_dp_attention
             and not model_runner.config.enable_tbo
             and not self._decoder_replays
             and (
@@ -242,9 +240,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             model_runner.forward_vars.update(
                 self._prefill_replay_buffers(self.max_bs, self.device)
             )
-        # DPA keeps attention live: a token graph can serve a decoding or idle
-        # peer. Its live preparation can still fuse the prefill producer using
-        # this forward's request width and already-published ring boundaries.
+        self._prefill_attention_conditional = (
+            self._prefill_attention_graph and model_runner.config.enable_dp_attention
+        )
+        # DPA can also fuse preparation without attention capture (for example
+        # enforce_eager), using the live width and published ring boundaries.
         self._prefill_window_fusion = self._prefill_attention_graph or (
             model_runner.config.enable_dp_attention
             and model_runner.config.plugin_config is None
@@ -940,6 +940,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             ),
         )
         step.prefill_attention_graph = prefill_graph
+        step.prefill_attention_conditional = getattr(
+            self, "_prefill_attention_conditional", False
+        )
         step.prefill_window_fusion = (
             getattr(self, "_prefill_window_fusion", False)
             and is_prefill

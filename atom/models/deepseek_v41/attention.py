@@ -32,6 +32,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
+from atom.model_ops.attentions.deepseek_v41.planes import prefill_window_views
 from atom.model_ops.attentions.deepseek_v41.score_planner import score_layout
 from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
 from atom.model_ops.deepseek_v41.compressor import Compressor
@@ -56,7 +57,7 @@ from atom.model_ops.linear import (
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 from atom.utils import envs, forward_context
-from atom.utils.region_graph import eager_region, forks, join_stream
+from atom.utils.region_graph import conditional_region, eager_region, forks, join_stream
 
 from .config import AttentionMode
 from .layers import converted_linear_config, native_quant_config
@@ -75,6 +76,16 @@ def _live_rows():
     """`_live_step` plus bounded replay's query rows."""
     metadata = forward_context.get_forward_context().attn_metadata
     return {**_live_step(), "queries": metadata.queries}
+
+
+def _prefill_graph_active():
+    """A host-only branch, evaluated against this rank's live forward."""
+    metadata = forward_context.get_forward_context().attn_metadata
+    return (
+        metadata.step.prefill_attention_graph
+        and not metadata.step.decode
+        and metadata.queries is None
+    )
 
 
 def _log_woa_quant_path(fused: bool, why: str, *, final: bool = True) -> None:
@@ -552,7 +563,12 @@ class Attention(nn.Module):
             and prepared is not None
             and (cache.kv_fp8 or prepared[0])
         ):
-            output = self._attend_prefill_graph(query, cache, step, prepared)
+            if step.prefill_attention_conditional:
+                output = self._attend_prefill_conditional(
+                    query, cache, step, prepared, queries
+                )
+            else:
+                output = self._attend_prefill_graph(query, cache, step, prepared)
         else:
             output = self._attend(query, cache, step, queries, prepared)
         return self._project_out(
@@ -576,6 +592,22 @@ class Attention(nn.Module):
         ):
             a8w4 = self._use_a8w4_attention(query, cache)
             if cache.kv_fp8 or a8w4:
+                if step.prefill_attention_conditional:
+                    query_fp8 = cache.query_fp8(query, a8w4=a8w4)
+                    source, _ = prefill_window_views(
+                        step, cache.geometry.head_dim, cache.geometry.ring_slots
+                    )
+                    self._prepare_prefill_conditional(
+                        query,
+                        kv_normed,
+                        query_fp8,
+                        cache,
+                        step,
+                        rope,
+                        queries,
+                        a8w4=a8w4,
+                    )
+                    return a8w4, query_fp8, source, None
                 return self._attention_inputs(
                     query, kv_normed, cache, step, rope, queries, a8w4=a8w4
                 )
@@ -591,6 +623,23 @@ class Attention(nn.Module):
         return self._attention_inputs(
             query, kv_normed, cache, step, rope, queries, a8w4=a8w4
         )
+
+    @conditional_region(condition=_prefill_graph_active, live=_live_rows)
+    def _prepare_prefill_conditional(
+        self, query, kv_normed, query_fp8, cache, step, rope, queries, *, a8w4
+    ):
+        if not step.prefill_attention_graph or step.decode or queries is not None:
+            self._prepare_attention_live(query, kv_normed, cache, step, rope, queries)
+            return
+        cache.rope_quant_window(
+            self.spec.layer_id, query, kv_normed, rope, step, query_fp8, a8w4=a8w4
+        )
+
+    @conditional_region(condition=_prefill_graph_active, live=_live_rows)
+    def _attend_prefill_conditional(self, query, cache, step, prepared, queries):
+        if not step.prefill_attention_graph or step.decode or queries is not None:
+            return self._attend(query, cache, step, queries, prepared=None)
+        return self._attend_prefill_graph(query, cache, step, prepared)
 
     @eager_region(live=_live_rows)
     def _prepare_attention_live(self, query, kv_normed, cache, step, rope, queries):

@@ -48,6 +48,7 @@ from atom.utils.graph_holders import register_graph_holder
 __all__ = [
     "ReqGraph",
     "TokenGraph",
+    "conditional_region",
     "eager_region",
     "forks",
     "graph_pool",
@@ -105,6 +106,19 @@ class _EagerStep:
             target.copy_(result)
 
 
+class _ConditionalStep:
+    """Replay the recorded region, or call its live branch into the same output."""
+
+    def __init__(self, condition, segments, fallback):
+        self.condition, self.segments, self.fallback = condition, segments, fallback
+
+    def __call__(self):
+        if self.condition():
+            self.segments.replay()
+        else:
+            self.fallback()
+
+
 class _Segments:
     """A recorded forward: a list of zero-argument steps and the output the
     last one leaves behind."""
@@ -115,7 +129,12 @@ class _Segments:
 
     @property
     def num_segments(self) -> int:
-        return sum(isinstance(s, _SegmentReplay) for s in self._steps)
+        return sum(
+            s.segments.num_segments
+            if isinstance(s, _ConditionalStep)
+            else int(isinstance(s, _SegmentReplay))
+            for s in self._steps
+        )
 
     def replay(self):
         for step in self._steps:
@@ -196,6 +215,29 @@ class _Recorder:
             self._pending.setdefault(stream, []).append((args, kwargs, delivered))
         return delivered
 
+    def conditional(self, fn, args, kwargs, condition, live):
+        self.end()
+        _local.recorder = None
+        try:
+            if not condition():
+                raise RuntimeError("A conditional region must record its graph branch")
+            segments, output = _record_segments(fn, *args, pool=self._pool, **kwargs)
+            if output is not None and not isinstance(output, torch.Tensor):
+                raise TypeError("A conditional region returns a tensor or None")
+        finally:
+            _local.recorder = self
+        bound = inspect.signature(fn).bind(*args, **kwargs)
+        fallback = _EagerStep(
+            fn,
+            {k: _weak(v) for k, v in bound.arguments.items()},
+            live,
+            None,
+            None if output is None else weak_ref_tensor(output),
+        )
+        self._steps.append(_ConditionalStep(condition, segments, fallback))
+        self.begin()
+        return output
+
     @staticmethod
     def _deliver(result, args, kwargs):
         """The tensor the next segment reads the region's result from, which a
@@ -251,6 +293,33 @@ def _record_segments(fn: Callable, *args, pool=None, **kwargs) -> tuple[_Segment
         raise
     finally:
         _local.recorder = None
+
+
+def conditional_region(
+    condition: Callable[[], bool],
+    live: Callable[[], dict[str, Any]],
+):
+    """Record a main-stream region whose live alternative runs different work.
+
+    Capture must enter the graph branch. At replay, a host-only condition
+    chooses its recorded segments or calls the same function with live state.
+    Both branches must write equivalent downstream inputs; a returned tensor
+    is copied into the recorded output if needed. Side streams started inside
+    the region must join there. Collectives must stay outside the region when
+    peers may choose different branches.
+    """
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            recorder = _recorder()
+            if recorder is not None:
+                return recorder.conditional(fn, args, kwargs, condition, live)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
 
 
 def eager_region(

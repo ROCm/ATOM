@@ -89,8 +89,11 @@ class BatchStep:
     prefill_window_staging: torch.Tensor | None = None
     # Native token-graph preparation publishes a fixed request capacity for
     # each token bucket. Only ordinary prefill may capture its quantized
-    # attention; plugin, decode/verify, DPA, TBO and bounded replay leave this off.
+    # attention; plugin, decode/verify, TBO and bounded replay leave this off.
     prefill_attention_graph: bool = False
+    # DPA graphs can serve decoding peers. Only these attention regions switch
+    # to their live branch; the surrounding projections/collectives still replay.
+    prefill_attention_conditional: bool = False
     # Producer fusion is also safe in DPA's live preparation. Unlike captured
     # attention, it uses the current step's request width and skips decode/idle.
     prefill_window_fusion: bool = False
