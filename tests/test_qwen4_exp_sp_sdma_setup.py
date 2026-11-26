@@ -17,6 +17,19 @@ from conftest import gpu_stack_import
 WORLD = 2
 
 
+def _fake_mori(fail: str) -> types.ModuleType:
+    class Communicator:
+        @staticmethod
+        def get_unique_id():
+            if fail == "uid":
+                raise RuntimeError("no bootstrap interface")
+            return b"uid"
+
+    cco = types.ModuleType("mori.cco")
+    cco.Communicator = Communicator
+    return cco
+
+
 def _fake_comm_module(fail: str, events: list) -> types.ModuleType:
     class SdmaComm:
         def __init__(self, *, group, num_queues, device):
@@ -30,8 +43,12 @@ def _fake_comm_module(fail: str, events: list) -> types.ModuleType:
             pass
 
         def commit(self):
+            # As aiter's: rank 0 gets the uid, then broadcasts it.
             events.append("commit")
-            dist.barrier(group=self._group)
+            from mori.cco import Communicator
+
+            uid = [Communicator.get_unique_id() if self.rank == 0 else None]
+            dist.broadcast_object_list(uid, src=0, group=self._group)
             queues = 0 if fail == "queues" and self.rank == 1 else 1
             self.dev_comm = types.SimpleNamespace(sdma_num_queue=queues)
             return self
@@ -62,6 +79,8 @@ def _rank(rank, port, fail, results):
     )
     events = []
     sys.modules["aiter.ops.communication"] = _fake_comm_module(fail, events)
+    sys.modules["mori"] = types.ModuleType("mori")
+    sys.modules["mori.cco"] = _fake_mori(fail)
     from atom.model_ops.qwen4_exp import sp_sdma
 
     sp_sdma._local_unavailable_reason = lambda: None
@@ -88,6 +107,8 @@ def _port():
         ("init", []),
         # Rank 1 got no SDMA queue: every rank frees its committed setup.
         ("queues", ["commit", "close"]),
+        # Rank 0 cannot get mori's uid: nobody enters the uid broadcast.
+        ("uid", []),
     ],
 )
 def test_one_rank_failing_falls_back_on_all(monkeypatch, fail, events):

@@ -369,6 +369,13 @@ class SdmaCollectives:
             comm = SdmaComm(group=cpu_group, num_queues=1, device=device)
             comm.reserve("rs", rs_rows * row_bytes)
             comm.reserve("ag", ag_rows * row_bytes)
+            if rank == 0:
+                # commit() calls this on rank 0 only, before its uid broadcast:
+                # a failure there would leave the peers in the broadcast. It
+                # only probes a free port (no state kept), so try it first.
+                from mori.cco import Communicator
+
+                Communicator.get_unique_id()
         except Exception as e:  # noqa: BLE001 - mori / FlyDSL import: agree, fall back
             self.error = f"mori SDMA setup failed: {e}"
         # commit() is collective; enter it on every rank or on none.
