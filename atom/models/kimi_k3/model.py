@@ -37,6 +37,7 @@ from atom.model_ops.fla_ops.fused_sigmoid_gating import (
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_sigmoid_gating_delta_rule,
 )
+from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -62,6 +63,7 @@ from atom.models.deepseek_v2 import (
     Indexer,
     indexer_projection_fusable,
 )
+from atom.models.kimi_k3.mono.plan import kda_metadata as step_kda_metadata
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -70,11 +72,16 @@ from atom.models.utils import (
     maybe_prefix,
     pp_holds_embedding,
 )
+from atom.plugin.prepare import is_plugin_mode
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.utils.region_graph import eager_region, token_graph
+from atom.utils.region_graph import (
+    eager_region,
+    prefill_token_graph_capture,
+    token_graph,
+)
 
 
 def _text_config(config):
@@ -177,7 +184,8 @@ def _is_e8m0_blockscale(
     quant_config: QuantizationConfig | None, quant_type: QuantType
 ) -> bool:
     """Whether a per_1x128 consumer runs E8M0 block scales (same test as
-    LinearBase). FP32-scale fused producers stand down for it."""
+    LinearBase). The MLA q/kv norm then emits E8M0 scales; the FP32-scale o_proj
+    producer stands down."""
     return (
         quant_config is not None
         and quant_type.value == QuantType.per_1x128.value
@@ -447,7 +455,11 @@ class KimiSparseMoeBlock(nn.Module):
         self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
         if self.shared_experts is not None and self.alt_stream is not None:
             tbo_active = get_current_atom_config().enable_tbo
-            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
+            if (
+                envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+                and not tbo_active
+                and self.experts.allows_concurrent_shared_stream
+            ):
                 self._use_dual_stream = True
         if self._use_dual_stream:
             # Register self so `maybe_dual_stream_split_forward` can look this module up
@@ -846,14 +858,16 @@ class KimiFullAttention(nn.Module):
             mla_modules=mla_modules,
             prefix=prefix,
         )
+        # Prefill token graphs record the MLA head (`forward_prefill_split`);
+        # ATOM's own graphs only, a plugin's host records its own way.
+        if not is_plugin_mode():
+            self.attn.impl.split_prefill_recording = True
 
         qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
-        self.fuse_qknorm_quant = qknorm_dtype in (
-            dtypes.fp8,
-            dtypes.fp4x2,
-        ) and not _is_e8m0_blockscale(quant_config, qknorm_type)
+        self.qknorm_e8m0_scale = _is_e8m0_blockscale(quant_config, qknorm_type)
+        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
         self.qknorm_quant_type_value = (
             qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
@@ -931,6 +945,7 @@ class KimiFullAttention(nn.Module):
             quant_type=self.qknorm_quant_type_value,
             output_unquantized_inp1=False,
             transpose_scale=True,
+            e8m0_scale=self.qknorm_e8m0_scale,
         )
         if self.indexer is not None:
             # Projection weights retain checkpoint precision; the indexer owns
@@ -988,7 +1003,6 @@ def _kda_attention_with_output_fake(
     gen_fake=_kda_attention_with_output_fake,
     mutates_args=[],
 )
-@eager_region()
 def kda_attention_with_output(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor | None,
@@ -1002,11 +1016,58 @@ def kda_attention_with_output(
     trace through it, so the whole mixer is wrapped in a custom op — inductor
     treats it as opaque and the piecewise backend splits the graph here,
     exactly as the GDN path does via aiter.linear_attention_with_output_base.
+
+    A prefill token-graph recording breaks only around the recurrence
+    (`_kda_recurrence`): the projections, the gated norm and ``o_proj`` with
+    its all-reduce are sized by the bucket alone, so they land in the graph.
+    The capture's warmup forward runs the same split, as an MLA layer's does
+    (`prefill_token_graph_capture`), so they first run at the bucket's shape
+    outside the capture. Otherwise the mixer is one region (`_kda_mixer`) on a
+    recording or inside a graph capture, and a plain call when nothing
+    records, a drafter's eager step under a replay included.
     """
+    fwd_ctx = get_forward_context()
+    if fwd_ctx.tr_graph != "record" and not fwd_ctx.in_hipgraph:
+        return _kda(hidden_states, hidden_states_scale, layer_name)
+    if prefill_token_graph_capture():
+        self = get_current_atom_config().compilation_config.static_forward_context[
+            layer_name
+        ]
+        return self._forward_prefill_split(hidden_states, hidden_states_scale)
+    return _kda_mixer(hidden_states, hidden_states_scale, layer_name)
+
+
+def _kda(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor | None,
+    layer_name: str,
+) -> torch.Tensor:
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
     return self._forward_impl(hidden_states, hidden_states_scale)
+
+
+# The whole KDA mixer as one TR-graph break.
+_kda_mixer = eager_region()(_kda)
+
+
+@eager_region()
+def _kda_recurrence(
+    mixed_qkv: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """A prefill's causal conv and KDA recurrence, ``[T, heads, head_dim]``:
+    the TR-graph break of a split KDA layer, whose launches follow each
+    request's rows and state slots. It runs every row of the bucket: the KDA
+    metadata names the requests' rows and slots alone, so the kernels skip the
+    pad rows past them, and the output rows there are don't-care."""
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self._live_prefill_recurrence(mixed_qkv, gate, beta)
 
 
 class KimiKDAAttention(nn.Module):
@@ -1271,6 +1332,20 @@ class KimiKDAAttention(nn.Module):
             state_v_first=True,
         )
 
+    def _prefill_kda(self, q, k, v, gate, beta, initial, ckpt):
+        """Run prefill with the interior checkpoint heads described by ``ckpt``.
+
+        A head rides the same call as one more sequence: the kernel keeps only
+        final states, and one `cu_seqlens` a step is what its host-side cache
+        holds. Returns the rows' output and final states, then the heads'.
+        """
+        num_rows, num_tokens = initial.shape[0], q.shape[1]
+        tokens, cu = ckpt["kda_tokens"], ckpt["kda_cu"]
+        q, k, v, gate, beta = (x.index_select(1, tokens) for x in (q, k, v, gate, beta))
+        initial = initial.index_select(0, ckpt["kda_rows"])
+        out, state = self._run_kda(q, k, v, gate, beta, initial, cu, True)
+        return out[:, :num_tokens], state[:num_rows], state[num_rows:]
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
         # per-token quant; carry the scale through the opaque splitting custom op
@@ -1405,20 +1480,37 @@ class KimiKDAAttention(nn.Module):
             initial = gather_kda_initial_state(
                 ssm_state, state_indices_in, kda_metadata.has_initial_state
             )
-            kda_out, last_state = self._run_kda(
-                q,
-                k,
-                v,
-                gate,
-                beta,
-                initial,
-                query_start_loc,
-                True,
-            )
+            ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
+            if ckpt is not None and "kda_tokens" in ckpt:
+                kda_out, last_state, head_states = self._prefill_kda(
+                    q, k, v, gate, beta, initial, ckpt
+                )
+            else:
+                kda_out, last_state = self._run_kda(
+                    q, k, v, gate, beta, initial, query_start_loc, True
+                )
+                head_states = last_state
             # last_state already has ssm_state's dtype (fla preserves the
             # initial_state dtype; the gathered initial is allocated as such),
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
+            if ckpt is not None:
+                write_state_checkpoints(
+                    head_states,
+                    ssm_state,
+                    mixed_qkv,
+                    conv_state,
+                    ckpt["rows"],
+                    ckpt["slots"],
+                    ckpt["offs"],
+                    ckpt["is_end"],
+                    ckpt["runtime"],
+                    query_start_loc,
+                    query_start_loc,
+                    chunk_size=1,
+                    conv_state_len=kda_metadata.ssm_conv_state_len,
+                    h_rows=ckpt["h_rows"],
+                )
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.
             assert kda_out.dtype == fused_in.dtype, (
@@ -1602,6 +1694,193 @@ class KimiKDAAttention(nn.Module):
             o_fp8, o_scale = normed
             return self.o_proj(o_fp8, x_scale=o_scale)
         return self.o_proj(rearrange(normed, "t h d -> t (h d)"))
+
+    # ---- The prefill split's steps (`_forward_prefill_split`): those of
+    # `_forward_impl`'s prefill, apart so a token-graph recording can break
+    # around the recurrence. `_forward_impl` keeps them inline: the plugins call
+    # it directly, outside the op, and would pay for every call.
+
+    def _state(self, fwd_ctx):
+        """This layer's conv and SSM state, the conv state channel-major as the
+        causal conv reads it."""
+        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        conv_state = cache.k_cache
+        if conv_state.size(1) != self.local_proj_size * 3:
+            conv_state = conv_state.transpose(-1, -2)
+        return conv_state, cache.v_cache
+
+    def _recurrence_gate_beta(self, gate: torch.Tensor, beta: torch.Tensor):
+        """``gate`` [T, heads * head_dim] and ``beta`` [T, heads] as the
+        recurrence takes them: [1, T, heads, head_dim] and [1, T, heads]."""
+        return (
+            rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim),
+            beta.unsqueeze(0),
+        )
+
+    def _project_in(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The mixer's input projections, ``[T, ...]`` each and sized by the
+        rows alone: ``(mixed_qkv, out_gate, beta, gate)``."""
+        # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
+        # part. `out_gate` is the KDA output gate `_project_out`'s o_norm
+        # consumes (computed here so it rides the same GEMM instead of a
+        # separate one after the recurrence). in_proj's weight was grown in
+        # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
+        # so this single unquantized call emits all six; f_b_proj stays a
+        # separate GEMM because it consumes f_a's output, not hidden_states.
+        lp = self.local_proj_size
+        nlh = self.num_local_heads
+        hd = self.head_dim
+        fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
+        # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
+        # row stride N_fused). Both causal-conv consumers read the token stride
+        # from the tensor itself — causal_conv1d_fn uses x.stride(1) after
+        # transpose (channel-last: stride(0)==1), and causal_conv1d_update only
+        # requires x.stride(1)==1 (feature-contiguous, which the slice preserves).
+        mixed_qkv = fused_in[..., : 3 * lp]
+        out_gate = fused_in[..., 3 * lp : 4 * lp]
+        # beta is widened to fp32 inside _run_kda (see the note there): the KDA
+        # delta-rule write strength must stay fp32 for accuracy.
+        beta = fused_in[..., 4 * lp : 4 * lp + nlh]
+        # f_a feeds a second GEMM (f_b_proj) and is a column slice of the fused
+        # output, so it needs a unit row stride rather than the fused N_fused one.
+        # Under a per-token FP8 f_b_proj that copy would be followed by a quant
+        # of the same [T, head_dim]; strided_per_token_quant does the gather AND the
+        # quant in one kernel, so only the quantized result is ever written.
+        # Otherwise the plain contiguous copy runs and f_b_proj quantizes (or
+        # not) exactly as before.
+        f_a_view = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd]
+        if self.fuse_f_a_quant:
+            from atom.model_ops.kimi_k3 import strided_per_token_quant
+
+            f_a, f_a_scale = strided_per_token_quant(f_a_view, dtypes.fp8)
+            gate = self.f_b_proj(f_a, x_scale=f_a_scale)
+        else:
+            # Not .contiguous(): it returns a one-row view as is (size-1 dims
+            # ignore strides), handing the GEMM the fused row stride, which
+            # the gfx950 FlyDSL bf16 path rejects. A fresh buffer is aligned.
+            f_a = torch.empty(
+                f_a_view.shape, dtype=f_a_view.dtype, device=f_a_view.device
+            )
+            gate = self.f_b_proj(f_a.copy_(f_a_view))
+        return mixed_qkv, out_gate, beta, gate
+
+    def _prefill_recurrence(
+        self, mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state
+    ) -> torch.Tensor:
+        """A prefill's causal conv and chunked recurrence, reading and writing
+        each request's conv/ssm state slots: ``[T, heads, head_dim]``.
+        ``gate`` is ``[1, T, heads, head_dim]``, ``beta`` ``[1, T, heads]``."""
+        conv_weights = self.conv_weight
+        state_indices = kda_metadata.non_spec_state_indices_tensor
+        state_indices_in = kda_metadata.non_spec_state_indices_in_tensor
+        if state_indices_in is None:
+            state_indices_in = state_indices
+        query_start_loc = kda_metadata.non_spec_query_start_loc
+        q, k, v = causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            conv_weights,
+            None,
+            activation=self.activation,
+            conv_states=conv_state,
+            has_initial_state=kda_metadata.has_initial_state,
+            cache_indices=state_indices,
+            cache_indices_in=state_indices_in,
+            query_start_loc=query_start_loc,
+            k_dim_size=self.local_proj_size,
+            v_dim_size=self.local_proj_size,
+            metadata=kda_metadata,
+        )
+        q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
+        k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
+        v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
+        # Fused masked gather: ssm_state[state_indices] with fresh
+        # sequences (~has_initial_state) written as zeros in one pass,
+        # replacing the gather + separate zero-write.
+        from atom.model_ops.kimi_k3 import gather_kda_initial_state
+
+        initial = gather_kda_initial_state(
+            ssm_state, state_indices_in, kda_metadata.has_initial_state
+        )
+        kda_out, last_state = self._run_kda(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            initial,
+            query_start_loc,
+            True,
+        )
+        # last_state already has ssm_state's dtype (fla preserves the
+        # initial_state dtype; the gathered initial is allocated as such),
+        # so no .to() cast is needed.
+        ssm_state[state_indices] = last_state
+        # `_kda_recurrence` returns this tensor itself, and `_project_out`'s
+        # o_norm reads it (on a replay, the copy the region's step makes).
+        assert kda_out.dtype == mixed_qkv.dtype, (
+            "o_norm reads the KDA output in the projections' dtype: got "
+            f"{kda_out.dtype} vs {mixed_qkv.dtype}"
+        )
+        assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
+        return kda_out.squeeze(0)
+
+    def _project_out(self, out: torch.Tensor, out_gate: torch.Tensor) -> torch.Tensor:
+        """A prefill's gated output norm and ``o_proj`` (its all-reduce
+        included)."""
+        normed = self.o_norm(
+            out,
+            rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim),
+            is_prefill=True,
+        )
+        # A fused per-token quant makes o_norm return (quantized, scale); feed it
+        # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
+        if isinstance(normed, tuple):
+            o_fp8, o_scale = normed
+            return self.o_proj(o_fp8, x_scale=o_scale)
+        return self.o_proj(rearrange(normed, "t h d -> t (h d)"))
+
+    def _forward_prefill_split(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """A prefill token-graph recording of the mixer: everything but the
+        recurrence (`_kda_recurrence`) is recorded at the bucket's rows."""
+        mixed_qkv, out_gate, beta, gate = self._project_in(
+            hidden_states, hidden_states_scale
+        )
+        out = _kda_recurrence(mixed_qkv, gate, beta, self.layer_name)
+        return self._project_out(out, out_gate)
+
+    def _live_prefill_recurrence(
+        self,
+        mixed_qkv: torch.Tensor,
+        gate: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        """`_prefill_recurrence` for `_kda_recurrence`, on the live step's
+        metadata and state: ``[T, heads, head_dim]``. The recording's dummy
+        prefill touches no state and hands back zeros, as
+        `MLAAttention._prefill_attend` does; a live step without KDA metadata
+        is a bug, not a step to skip."""
+        fwd_ctx = get_forward_context()
+        if fwd_ctx.context.is_dummy_run:
+            return mixed_qkv.new_zeros(
+                (mixed_qkv.shape[0], self.num_local_heads, self.head_dim)
+            )
+        kda_metadata = step_kda_metadata(fwd_ctx)
+        assert (
+            kda_metadata is not None
+        ), f"{self.layer_name}: a live KDA prefill replay has no KDA metadata"
+        conv_state, ssm_state = self._state(fwd_ctx)
+        gate, beta = self._recurrence_gate_beta(gate, beta)
+        return self._prefill_recurrence(
+            mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state
+        )
 
 
 class KimiDecoderLayer(nn.Module):
@@ -1861,7 +2140,10 @@ class KimiDecoderLayer(nn.Module):
         return mixed
 
 
-@token_graph
+# Per phase: a prefill recording splits the MLA and KDA layers around their
+# regions, a decode one (TR_HYBRID) runs each as one region, and a decode
+# bucket is recorded first at the shapes a prefill bucket of its rows has.
+@token_graph(per_phase=True)
 @support_torch_compile
 class KimiLinearModel(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):

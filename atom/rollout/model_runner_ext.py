@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import inspect
 import logging
@@ -8,10 +9,9 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-from aiter import init_dist_env
-from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method
 
+from atom.distributed.pp_comm import init_pp_aware_dist_env
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.rollout.capabilities import CapabilityProviderMixin
@@ -93,18 +93,8 @@ class RLHFModelRunner(
             padded,
         )
 
-    def postprocess(
-        self,
-        batch: ScheduledBatch,
-        logits: torch.Tensor,
-        temperatures: torch.Tensor,
-        top_ks: int | torch.Tensor | None,
-        top_ps: float | torch.Tensor | None,
-        all_greedy: bool,
-        hidden_states: torch.Tensor,
-        needs_independent_noise: bool = False,
-    ) -> ScheduledBatchOutput:
-        """Mask the padding tail of the vocabulary before sampling.
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The logits with the padding tail of the vocabulary masked.
 
         A checkpoint whose embedding matrix is padded up to a friendlier width
         -- Qwen3 rounds 151665 real tokens up to 151936 -- leaves the tail rows
@@ -114,30 +104,25 @@ class RLHFModelRunner(
         decode. Training frameworks mask them on their side; a rollout engine
         that does not disagrees with the trainer over exactly those positions.
 
-        This covers the decode sampling path, which is every token a colocated
-        rollout generates. Two other places reach a sampler without coming
-        through here, and are NOT covered:
-
-        * ``ModelRunner.prefill_forward`` samples the first token itself, for
-          the disaggregated prefill worker to hand to a decode engine.
-        * ``compute_argmax_token`` is greedy over a TP-SHARDED vocab, reducing
-          each rank's shard to ``(max, global_idx)``. Masking it needs the shard
-          offset, so it belongs with that reduction rather than here; a drafter
-          proposing a tail id is then rejected by the verify step above, but the
-          argmax a verify step compares against comes from the same function.
+        Every sampled and verified id comes from these logits: decode
+        sampling, the first token ``prefill_forward`` samples, and the verify
+        (no verify head picks over the padded shards, ``_bind_verify_head``).
+        A drafter's proposals (``compute_argmax_token``, greedy over a
+        TP-sharded vocab) are not masked; a tail id proposed is rejected by
+        the verify.
         """
+        logits = super().compute_logits(hidden_states)
         if self._true_vocab_size > 0 and logits.shape[-1] > self._true_vocab_size:
             logits[..., self._true_vocab_size :] = float("-inf")
-        return super().postprocess(
-            batch,
-            logits,
-            temperatures,
-            top_ks,
-            top_ps,
-            all_greedy,
-            hidden_states,
-            needs_independent_noise=needs_independent_noise,
-        )
+        return logits
+
+    def _bind_verify_head(self) -> None:
+        """No verify head where the vocabulary tail is masked: a head picks
+        over the padded shards, and its ids stand in for the masked logits."""
+        if self._true_vocab_size > 0:
+            self.verify_head = None
+            return
+        super()._bind_verify_head()
 
     def _setup_device_and_distributed(self, rank: int, config):
         """Override to set up DP-isolated NCCL worlds.
@@ -181,14 +166,16 @@ class RLHFModelRunner(
             config.parallel_config.data_parallel_master_ip,
             dp_port,
         )
-        init_dist_env(
-            config.tensor_parallel_size,
-            rankID=rank,
+        init_pp_aware_dist_env(
+            tensor_model_parallel_size=config.tensor_parallel_size,
+            pipeline_model_parallel_size=1,
+            global_rank=rank,
+            world_size=config.tensor_parallel_size,
             backend="nccl",
             distributed_init_method=distributed_init_method,
-            data_parallel_size=1,
-            data_parallel_rank=0,
             local_rank=local_device_rank,
+            data_parallel_size=1,
+            disable_custom_all_reduce=config.disable_custom_all_reduce,
         )
 
         # DP is handled at the EngineCore level (DPEngineCoreProc), not
@@ -196,21 +183,6 @@ class RLHFModelRunner(
         # sync_dp_metadata) sees dp_size=1 and skips cross-DP collectives that
         # would fail on the isolated process group.
         config.parallel_config.data_parallel_size = 1
-
-        # aiter's init_dist_env creates a signal tensor on device=rankID
-        # (TP rank). When DP isolation remaps devices, recreate it on
-        # the correct device.
-        if config.tensor_parallel_size > 1:
-            tp_grp = get_tp_group()
-            ca_comm = tp_grp.device_communicator.ca_comm
-            signal = torch.zeros(
-                config.tensor_parallel_size * 64,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            ca_comm.signal = signal
-            ca_comm.register_input_buffer(signal)
-            ca_comm.buffer = ca_comm._pool["input"].tensor
 
     _extract_mode: bool = False
 
@@ -349,7 +321,7 @@ class RLHFModelRunner(
         self,
         input_ids: torch.Tensor,
         batch: ScheduledBatch | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if not self._extract_mode:
             return super().run_model(input_ids, batch)
 
@@ -379,10 +351,9 @@ class RLHFModelRunner(
                     else:
                         hidden_states = result
                         captured = {}
-                logits = self.model.compute_logits(hidden_states)
                 self._captured_hidden_states = captured
                 self._captured_last_hidden_states = hidden_states.detach()
-                return logits, hidden_states
+                return hidden_states
 
         return super().run_model(input_ids, batch)
 

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+FROM lumen/llama2:latest
+
+WORKDIR /workspace/ATOM/atomrl/lumen
+
+# Build context is the ATOM repository root. Lumen is installed only through
+# the unified ATOM distribution.
+COPY . /workspace/ATOM
+RUN cd /workspace/ATOM && LUMEN_BUILD_EXTENSIONS=1 pip install --no-build-isolation --no-deps -e .
+
+# AITER: reinstall the pinned official source. Lumen calls the Triton modules
+# upstream AITER provides (renamed and refactored), and
+# their dependencies reach into jit/core.py and the Triton config utilities, so
+# copying a few files onto the base image's older aiter no longer works.
+#
+# The old tree goes first: COPY only adds files, and aiter loads any .so already
+# sitting in aiter/jit/ instead of building it, so modules prebuilt against the
+# old sources (and files upstream has since removed) would otherwise survive.
+# PREBUILD_KERNELS=1 then rebuilds the CK modules against the new sources, as
+# the base image did; JIT-compiling them on first call SIGSEGVs inside
+# mp.spawn subprocesses. aiter's setup.py also installs the flydsl it pins.
+ARG AITER_REPOSITORY=https://github.com/ROCm/aiter.git
+ARG AITER_SHA=ff745fb09d669f40cf81d15d3e7598b61fe2a61c
+RUN rm -rf /opt/aiter && \
+    git clone "${AITER_REPOSITORY}" /opt/aiter && \
+    cd /opt/aiter && \
+    git checkout --detach "${AITER_SHA}" && \
+    git submodule update --init --recursive && \
+    PREBUILD_KERNELS=1 pip install -e .

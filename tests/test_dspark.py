@@ -954,8 +954,9 @@ def _stub_forward_context(*, scheduled_bs, target_bs):
     # `prepare_decode` publishes the ring slots at the PADDED batch, so the stub
     # does too -- the block slices to that length and nothing stages it.
     attn_metadata = types.SimpleNamespace(
+        is_mixed=False,
         state_slot_out=torch.arange(max(target_bs, scheduled_bs), dtype=torch.int32)
-        + 100
+        + 100,
     )
     return types.SimpleNamespace(context=context, attn_metadata=attn_metadata)
 

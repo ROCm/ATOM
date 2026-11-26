@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The hi path's host work of a decode round: the decode round its install gives V4.1's metadata builder
 (``model_engine.model_hooks.DecodeRound``, ``DeepseekV41MetadataBuilder.use_decode_round``).
 
@@ -13,12 +14,12 @@ One object (``HiRound``) answers every point the builder asks a decode round at:
   step's sampling rows for the verify head (``HiLayers.set_head_sampling``);
 - ``laid_out`` after it (the device round's advance);
 - ``committed`` before a served step's speculative commit, at the anchors the runner commits: True when they are the
-  in-graph verdict's (``post_verify``: the runner took the forward's head output, and the kernel committed them),
-  which also hands the device round the verdict its next step advances from.
+  in-graph verify's (``post_verify``: the runner took its outputs, and the kernel committed them),
+  which also hands the device round the spec status its next step advances from.
 
 ``HiDecodeModel.forward``, Engram staging and the DSpark proposer read the builder's decision
-(``served_by_round``), so they agree on every step. ``ModelRunner`` calls none of it: it takes the forward's head
-output (``HiDecodeModel.compute_head``) and asks the builder whether to defer its status wait.
+(``served_by_round``), so they agree on every step. ``ModelRunner`` calls none of it: it only asks the builder
+whether to defer its status wait.
 """
 
 from __future__ import annotations
@@ -76,9 +77,8 @@ class HiRound(DecodeRound):
 
     def _publish_sampling(self, batch) -> None:
         """A served step's rows' (T, top_p) for the verify head, request by request on its rows
-        (``HiLayers.set_head_sampling``: staged only when they changed). The runner takes the head's ids where they
-        stand for the step (``ModelRunner._head_ids_serve``: every row greedy, or sampled from T / top-p alone); a step
-        whose rows are all greedy (a capture's too) costs the first test only."""
+        (``HiLayers.set_head_sampling``: staged only when they changed); a step whose rows are all greedy (a
+        capture's too) costs the first test only."""
         temperatures = getattr(batch, "temperatures", None)
         if temperatures is None or not temperatures.any():
             if self.rows_sampling:
