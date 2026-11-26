@@ -1460,9 +1460,9 @@ class LinearBase(nn.Module):
                         self.weight_scale.data
                     )
             if getattr(self, "_qkv_chain", False):
-                if getattr(self.weight, "is_shuffled", False):
-                    from atom.model_ops.minimax_m3 import qkv_chain
+                from atom.model_ops.minimax_m3 import qkv_chain
 
+                if getattr(self.weight, "is_shuffled", False):
                     self._qkv_chain_scale = qkv_chain.chain_weight_scale(
                         self.weight_scale.data
                     )

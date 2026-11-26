@@ -49,7 +49,19 @@ def _set(value):
 
 
 def enabled() -> bool:
-    return bool(envs.ATOM_M3_QKV_CHAIN) and available()
+    """The flag is on, aiter has the kernels, and the GPU is gfx950 (the only arch the chain kernel supports)."""
+    return bool(envs.ATOM_M3_QKV_CHAIN) and available() and _is_gfx950()
+
+
+@functools.cache
+def _is_gfx950() -> bool:
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx() == "gfx950"
+    except Exception:  # noqa: BLE001
+        # no GPU / aiter probe failure: keep the existing path
+        return False
 
 
 @functools.cache
@@ -147,14 +159,10 @@ def aiter_features() -> str:
             "qkv_chain_split_insert",
         )
         have = [n for n in names if hasattr(k, n)]
-    except Exception as e:  # log-only probe, never raises into the step
+    except Exception as e:  # noqa: BLE001 - log-only probe, never raises into the step
         return f"unavailable ({type(e).__name__})"
-    try:
-        import aiter.ops.flydsl.kernels.mxfp8_quant_shuffled  # noqa: F401
-
+    if importlib.util.find_spec("aiter.ops.flydsl.kernels.mxfp8_quant_shuffled"):
         have.append("mxfp8_quantize_shuffled")
-    except Exception:
-        pass
     return ",".join(have) or "none"
 
 
@@ -200,7 +208,13 @@ def take(m: int) -> bool:
     """
     from atom.utils.forward_context import get_forward_context
 
-    c = get_forward_context().context
+    fctx = get_forward_context()
+    # TR_HYBRID record/replay of a token graph: the capture runs the quantizer without the Python hand-off (record
+    # has forward_mode None, only ForwardContext.tr_graph marks it)
+    if getattr(fctx, "tr_graph", None) is not None:
+        _count("token_graph")
+        return False
+    c = fctx.context
     if c is None or c.is_prefill:
         _count("prefill")
         return False
