@@ -292,6 +292,43 @@ def verify_kv_transfer(workers, output):
     return record
 
 
+def verify_mori_transfer(output):
+    directory = output.parent / "moriio-probe"
+    for _ in range(15):
+        transfers = {}
+        for path in directory.glob("producer-*.jsonl"):
+            for line in path.read_text().splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    event.get("event") == "completed_native_write"
+                    and event.get("all_succeeded")
+                    and event.get("bytes", 0) > 0
+                    and event["submitted_statuses"] == event["completed_statuses"]
+                ):
+                    transfers.setdefault(event["transfer_id"], {})[event["pp_rank"]] = (
+                        event
+                    )
+        complete = [rows for rows in transfers.values() if set(rows) == {0, 1, 2, 3}]
+        if complete:
+            break
+        time.sleep(1)
+    record = {
+        "transport": "moriio-write",
+        "proof": "positive-byte native writes completed by all four PP stages for the same transfer",
+        "complete_transfers": len(complete),
+        "transferred_bytes": sum(
+            event["bytes"] for rows in complete for event in rows.values()
+        ),
+        "passed": bool(complete),
+    }
+    (output / "kv-transfer.json").write_text(json.dumps(record, indent=2) + "\n")
+    assert complete, "No completed positive-byte MoRI WRITE from all four PP stages"
+    return record
+
+
 def validate_client_contract(contract):
     # AgentX 1.0.14 requires this window even for runs marked diagnostic_only.
     if not contract.get("functional_only") and contract["duration"] < 900:
@@ -364,11 +401,13 @@ def benchmark(contract, args):
             )
     scrape(args.workers, output, "before-probe")
     functional_probe(contract, args.router, output / "functional.json")
-    transfer = (
-        verify_kv_transfer(args.workers, output)
-        if contract.get("functional_only") or contract.get("verify_pd")
-        else None
-    )
+    transfer = None
+    if contract.get("functional_only") or contract.get("verify_pd"):
+        transfer = (
+            verify_mori_transfer(output)
+            if contract.get("kv_transport") == "moriio"
+            else verify_kv_transfer(args.workers, output)
+        )
     cancellation_probe(
         contract, args.router, args.workers, output / "cancellation.json"
     )

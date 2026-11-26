@@ -10,7 +10,6 @@ import shlex
 from pathlib import Path
 
 import yaml
-
 from pd_recipe_router_ab import validate_client_contract
 
 
@@ -107,7 +106,7 @@ def configurations(
         },
         "engine": {
             "type": "vllm",
-            "connector": "mooncake",
+            "connector": contract.get("kv_transport", "mooncake"),
             "set_visible_devices": True,
         },
         "roles": roles,

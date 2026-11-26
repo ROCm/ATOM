@@ -1,0 +1,23 @@
+--- a/src/srtctl/frontends/vllm_router.py
++++ b/src/srtctl/frontends/vllm_router.py
+@@ -134,7 +134,9 @@
+ 
+         # A single global Router expansion cannot express later pools' DP-rank offsets.
+         # Match node_local_data_parallel_size: any multi-node pool disables expansion.
+-        expansions = {1} if has_multinode_pools else set(expansion_by_mode.values())
++        expansions = (
++            {1} if has_multinode_pools or config.backend.discovers_workers() else set(expansion_by_mode.values())
++        )
+         if len(expansions) > 1:
+             detail = ", ".join(f"{mode}={size}" for mode, size in expansion_by_mode.items())
+             raise ValueError(
+@@ -299,7 +301,8 @@
+         normalized_frontend_args = {str(key).replace("_", "-") for key in frontend_args}
+         managed_args: list[str] = []
+ 
+-        local_dp_size = node_local_data_parallel_size(config, backend_processes)
++        # Discovery records carry each pool's own DP size.
++        local_dp_size = 1 if self.discovers_workers(backend) else node_local_data_parallel_size(config, backend_processes)
+         configured_dp_size = frontend_args.get(
+             "intra-node-data-parallel-size",
+             frontend_args.get("intra_node_data_parallel_size"),

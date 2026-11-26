@@ -57,7 +57,8 @@ for name in ("core/docker.py", "core/launcher.py", "core/runtime.py", "core/sche
     actual = (installed / name).read_bytes()
     assert actual == (source / "src/srtctl" / name).read_bytes(), name
     files[name] = hashlib.sha256(actual).hexdigest()
-(output / "srt-runtime.json").write_text(json.dumps({"source_sha": (output / "source-sha.txt").read_text().strip(), "installed_hashes": files, "python": sys.version}, indent=2))
+patch = output / "srt-experiment-patch.json"
+(output / "srt-runtime.json").write_text(json.dumps({"source_sha": (output / "source-sha.txt").read_text().strip(), "experiment_patch": json.loads(patch.read_text()) if patch.exists() else None, "installed_hashes": files, "python": sys.version}, indent=2))
 PY
 if [[ -n "${GPOOL_LEASE:-}" ]]; then
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_gpool_guard.py" router-compile

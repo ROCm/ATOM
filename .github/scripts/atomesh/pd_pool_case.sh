@@ -21,6 +21,7 @@ case "${case_name}" in
   pp4-dep4-te5840-patched) contract_file=single-node-pp4-dep4-te5840-patched.json; budget=75m ;;
   pp4-dep4-te5840-natural) contract_file=single-node-pp4-dep4-te5840-natural.json; budget=75m ;;
   pp4-dep4-te5840-long) contract_file=single-node-pp4-dep4-te5840-long.json; budget=120m ;;
+  pp4-dep4-moriio-write) contract_file=single-node-pp4-dep4-moriio-write.json; budget=90m ;;
   *) exit 2 ;;
 esac
 export REPO_ROOT="${3:?checkout path}"
@@ -48,7 +49,7 @@ finish_pool_test() {
   # ROCm can retain VRAM briefly after the last container exits.
   for attempt in {1..13}; do
     release_rc=0
-    output=$("${gpool}" release "${GPOOL_LEASE}" --note "M3.1 ${case_name} ATOMesh69ed5e7 workload_rc=${rc} cleanup_rc=${cleanup_rc}" 2>&1) || release_rc=$?
+    output=$("${gpool}" release "${GPOOL_LEASE}" --note "M3.1 ${case_name} workload_rc=${rc} cleanup_rc=${cleanup_rc}" 2>&1) || release_rc=$?
     printf '%s\n' "${output}" >> "${RUN_DIR}/gpool-release.log" || log_rc=1
     [[ "${release_rc}" == 3 && "${attempt}" -lt 13 ]] || break
     sleep 10
@@ -98,7 +99,9 @@ exit 127
 EOF
 chmod +x "${RUN_DIR}/bin/nvcc"
 export ATOMESH_ROUTER_BUILD_TIMEOUT_SECONDS=1500
-if [[ "${case_name}" == pp4-dep4-te5840-* ]]; then
+if [[ "${case_name}" == pp4-dep4-moriio-write ]]; then
+  timeout --kill-after=120s "${budget}" python3 .github/scripts/atomesh/pd_moriio_write.py
+elif [[ "${case_name}" == pp4-dep4-te5840-* ]]; then
   timeout --kill-after=120s "${budget}" python3 .github/scripts/atomesh/pd_mooncake_rebuild.py
 elif [[ "${case_name}" == pp4-dep4-timeout ]]; then
   timeout --kill-after=120s "${budget}" python3 .github/scripts/atomesh/pd_timeout_probe.py

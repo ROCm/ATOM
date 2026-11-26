@@ -17,6 +17,17 @@ git -C "${runtime}/source" fetch --depth=1 origin "${source_sha}"
 git -C "${runtime}/source" checkout --detach "${source_sha}"
 [[ "$(git -C "${runtime}/source" rev-parse HEAD)" == "${source_sha}" ]]
 printf '%s\n' "${source_sha}" > "${runtime}/source-sha.txt"
+python3 - "${SRT_FUNCTIONAL_CONTRACT}" "${runtime}/source" "${RUN_DIR}" <<'PY'
+import hashlib, json, pathlib, shutil, subprocess, sys
+contract = json.load(open(sys.argv[1]))
+if spec := contract.get("srt_experiment_patch"):
+    patch = pathlib.Path(spec["path"])
+    assert hashlib.sha256(patch.read_bytes()).hexdigest() == spec["sha256"]
+    subprocess.run(["git", "apply", "--check", str(patch.resolve())], cwd=sys.argv[2], check=True)
+    subprocess.run(["git", "apply", str(patch.resolve())], cwd=sys.argv[2], check=True)
+    shutil.copyfile(patch, pathlib.Path(sys.argv[3]) / "srt-experiment.patch")
+    (pathlib.Path(sys.argv[3]) / "srt-experiment-patch.json").write_text(json.dumps(spec, indent=2))
+PY
 router_sha="$(python3 - "${SRT_FUNCTIONAL_CONTRACT:?}" <<'PY'
 import json, re, sys
 contract = json.load(open(sys.argv[1]))

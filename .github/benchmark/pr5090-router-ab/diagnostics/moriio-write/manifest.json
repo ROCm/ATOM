@@ -1,0 +1,33 @@
+{
+  "base_image": "vllm/vllm-openai-rocm:minimax-m31-flash-75bc8cf1@sha256:f8e8ab239e5edb7c3070c5802fc7fc0cbb889513bf81183dfc98ce1c77e1dfe1",
+  "module_dir": "vllm/distributed/kv_transfer/kv_connector/v1/moriio",
+  "upstream_pr": "https://github.com/vllm-project/vllm/pull/64693",
+  "upstream_head": "55bfa8efe95d0f593bc9da0bf27738288e568d97",
+  "base_files": {
+    "moriio_connector.py": "d89278b5749176941a692ea710e6d12eec4479ea742484d62f43670d0446b4b7",
+    "moriio_common.py": "b14418194b379d89d24ceebf167942e4a4e51c2c5f7f3727f08ad95d8643f600",
+    "moriio_engine.py": "4be40dc98e3944488895b13006f8e41f2323b8d3c5dc5f55e99c9097ae0b38c4"
+  },
+  "upstream_patched_files": {
+    "moriio_connector.py": "b0068d8f39fc5c9d43c49a165f3673333e0bd9c0ddae92b7b6675a8c4eafdd85",
+    "moriio_common.py": "54006d54dc90a73fd4a19cf10b12f07f5073786244999e9c8b5a7466541c4003",
+    "moriio_engine.py": "b5e11cfd11282f98f78c12c3b50f95e355fc151cca71b75841cd05af08426384"
+  },
+  "patch_sha256": "b544a3641264f2cae8f65113ad3d9eda7fb5a24ad30fdd618899d4332b029f38",
+  "installed_files": {
+    "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py": "b0068d8f39fc5c9d43c49a165f3673333e0bd9c0ddae92b7b6675a8c4eafdd85",
+    "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py": "54006d54dc90a73fd4a19cf10b12f07f5073786244999e9c8b5a7466541c4003",
+    "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py": "94ea05d9070f8d6575c53ab81206735149aa96cf84e4a6f291f49a06a19a251a",
+    "atomesh_mori_probe.py": "7344a97d053fc65b1ab9448d637a795f1fbe06483fe1bbf5ce571d7ad8f68bb3",
+    "vllm/model_executor/kernels/linear/mxfp8/rocm_native.py": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395"
+  },
+  "context_files": {
+    "atomesh_mori_probe.py": "7344a97d053fc65b1ab9448d637a795f1fbe06483fe1bbf5ce571d7ad8f68bb3",
+    "Dockerfile": "a8b39c9fa61a759667b0de6652a9a3a415bd6d726946b3aca44f6c9ae6d8f3e8",
+    "pp-production.patch": "b544a3641264f2cae8f65113ad3d9eda7fb5a24ad30fdd618899d4332b029f38",
+    "prepare_worker.py": "6bfaa6f9b1f1b6054b651aa7d2e0b42ec4f5997f99777d0e5023b3062c401504",
+    "srt-discovery.patch": "734fc861b39c35f2856a0c227f2ef6e3c278b2a9535bd053d8fbb8fd09d5ee3c",
+    "test_pp_contract.py": "3327b802611f55cb62234194ccb2fc4e49865eec0adcc33c5b74c51a813bb45d",
+    "verify_worker.py": "2ae2b02cb77101d61b7910e06bb2f5367f64fc1aa02315e657fa9816f7d16646"
+  }
+}

@@ -1,0 +1,338 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
+index 2668c1370b6b..9815e7c19771 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
+@@ -20,6 +20,7 @@
+     KVConnectorMetadata,
+ )
+ from vllm.distributed.parallel_state import (
++    get_pipeline_model_parallel_rank,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+ )
+@@ -146,6 +147,9 @@ class MoRIIOAgentMetadata(
+     # Tokens per block of each attention layer. Hybrid models size attention
+     # blocks to the recurrent-state page, which depends on the TP size.
+     attention_block_sizes: dict[str, int] = {}
++    # Layer name -> index of its first region in kv_caches_base_addr. Peers can
++    # register different layers (a pipeline stage holds a slice of them).
++    layer_base_addr_index: dict[str, int] = {}
+ 
+ 
+ class RoleManager:
+@@ -233,8 +237,18 @@ def get_moriio_mode(kv_transfer_config: KVTransferConfig) -> MoRIIOMode:
+         return MoRIIOMode.WRITE
+ 
+ 
+-def get_port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
+-    return (dp_rank) * tp_size + tp_rank
++def get_port_offset(
++    dp_rank: int,
++    tp_rank: int,
++    tp_size: int = 1,
++    pp_rank: int = 0,
++    pp_stride: int = 0,
++) -> int:
++    return pp_rank * pp_stride + dp_rank * tp_size + tp_rank
++
++
++def get_pp_port_stride(tp_size: int, dp_size: int) -> int:
++    return tp_size * dp_size
+ 
+ 
+ def fold_local_rank(global_dp_rank: int, dp_size_local: int) -> int:
+@@ -305,12 +319,27 @@ class MoRIIOConfig:
+     transfer_timeout: float
+     defer_timeout: float
+     recv_abort_timeout: float
++    pp_rank: int = 0
++    pp_size: int = 1
++    # Port distance between the same worker of consecutive pipeline stages.
++    pp_port_stride: int = 0
++    port_offset: int = 0
+     read_mode: bool = False
+     qp_per_transfer: int = 1
+     post_batch_size: int = -1
+     num_workers: int = 1
+     backend: str = "rdma"
+ 
++    def later_stage_notify_ports(self) -> list[int]:
++        """Notify ports of this worker's counterparts in the later pipeline
++        stages, to which the first stage forwards the decode's messages."""
++        if self.pp_rank != 0:
++            return []
++        return [
++            self.notify_port + stage * self.pp_port_stride
++            for stage in range(1, self.pp_size)
++        ]
++
+     @classmethod
+     def from_vllm_config(cls, vllm_config: VllmConfig) -> "MoRIIOConfig":
+         # Port Configuration:
+@@ -354,7 +383,14 @@ def from_vllm_config(cls, vllm_config: VllmConfig) -> "MoRIIOConfig":
+         dp_rank = fold_local_rank(pc.data_parallel_rank, pc.data_parallel_size_local)
+         base_notify_port = int(extra_config["notify_port"])
+         tp_size = get_tensor_model_parallel_world_size()
+-        port_offset = get_port_offset(dp_rank, tp_rank)
++        pp_size = pc.pipeline_parallel_size
++        pp_rank = get_pipeline_model_parallel_rank() if pp_size > 1 else 0
++        pp_port_stride = get_pp_port_stride(
++            tp_size, pc.data_parallel_size_local or pc.data_parallel_size
++        )
++        port_offset = get_port_offset(
++            dp_rank, tp_rank, pp_rank=pp_rank, pp_stride=pp_port_stride
++        )
+         backend = str(extra_config.get("backend", "rdma")).lower()
+         if backend not in ("rdma", "xgmi"):
+             raise ValueError(
+@@ -403,6 +439,10 @@ def from_vllm_config(cls, vllm_config: VllmConfig) -> "MoRIIOConfig":
+             # per-pod port folding, not for routing.
+             dp_size=pc.data_parallel_size,
+             tp_size=tp_size,
++            pp_rank=pp_rank,
++            pp_size=pp_size,
++            pp_port_stride=pp_port_stride,
++            port_offset=port_offset,
+             read_mode=get_moriio_mode(kv_transfer_config) == MoRIIOMode.READ,
+             qp_per_transfer=int(extra_config.get("qp_per_transfer", 1)),
+             post_batch_size=int(extra_config.get("post_batch_size", -1)),
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+index fd5bcf04a2c3..ad15b6918369 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+@@ -307,6 +307,27 @@ def __init__(
+             + str(self.kv_transfer_config.kv_connector_extra_config["handshake_port"])
+         )
+         self.mode = get_moriio_mode(self.kv_transfer_config)
++        parallel_config = vllm_config.parallel_config
++        if parallel_config.pipeline_parallel_size > 1 and (
++            self.mode != MoRIIOMode.WRITE
++            or self.kv_transfer_config.kv_role != "kv_producer"
++        ):
++            raise NotImplementedError(
++                "MoRIIOConnector supports pipeline_parallel_size > 1 only on "
++                "the producer in WRITE mode, got kv_role="
++                f"{self.kv_transfer_config.kv_role!r} in {self.mode.value} mode"
++            )
++        if (
++            parallel_config.pipeline_parallel_size > 1
++            and parallel_config.nnodes_within_dp > 1
++        ):
++            # The first stage forwards the decode's allocations and releases
++            # to the other stages on its own host.
++            raise NotImplementedError(
++                "MoRIIOConnector with pipeline_parallel_size > 1 requires all "
++                "pipeline stages on one node, got "
++                f"{parallel_config.nnodes_within_dp} nodes"
++            )
+         self._transfers_mamba_state = any(
+             group.enable_kv_transfer and _is_mamba_group_spec(group.kv_cache_spec)
+             for group in kv_cache_config.kv_cache_groups
+@@ -1839,6 +1860,20 @@ def __init__(
+         self._local_rank = get_world_group().local_rank
+         self.tp_rank = self.moriio_config.tp_rank
+         self.dp_rank = self.moriio_config.dp_rank
++        self.pp_rank = self.moriio_config.pp_rank
++        self.pp_size = self.moriio_config.pp_size
++        cache_config = vllm_config.cache_config
++        if (
++            self.pp_size > 1
++            and cache_config.get_resolved_kv_cache_layout().is_block_outermost
++        ):
++            # A block-outermost block packs every layer this worker holds, so
++            # its stride differs from the decode's when a stage holds a subset.
++            raise NotImplementedError(
++                "MoRIIOConnector with pipeline_parallel_size > 1 requires a "
++                "layer-outermost KV cache layout, got "
++                f"{cache_config.kv_cache_layout}"
++            )
+ 
+         self.local_ip = self.moriio_config.local_ip
+         self.local_kv_port = self.moriio_config.local_kv_port
+@@ -1876,6 +1911,9 @@ def __init__(
+             f"{self.moriio_config.local_ip}:{self.moriio_config.handshake_port}:"
+             f"tp{self.tp_rank}:dp{self.dp_rank}"
+         )
++        if self.pp_size > 1:
++            # MoRI peers address engines by this key; stages need distinct keys.
++            engine_suffix += f":pp{self.pp_rank}"
+         self.moriio_engine = IOEngine(
+             f"{role}:{engine_suffix}",
+             IOEngineConfig(
+@@ -1917,6 +1955,11 @@ def __init__(
+             num_workers=self.moriio_config.num_workers,
+         )
+         self.moriio_wrapper.notify_port = self.moriio_config.notify_port
++        # The decode notifies the first stage only, as it would a pipeline-free
++        # producer, and the first stage hands each message to the later ones.
++        self.moriio_wrapper.stage_notify_ports = (
++            self.moriio_config.later_stage_notify_ports()
++        )
+         self.local_kv_cache_metadata: list[bytes] = []
+         self.local_kv_cache_size: list[int] = []
+         self.layer_name_to_local_kv_cache_metadata: dict[str, list[bytes]] = {}
+@@ -1941,8 +1984,7 @@ def __init__(
+         self._remote_agents: dict[EngineId, set[str]] = {}
+ 
+         self.side_channel_port: int = (
+-            self.moriio_config.handshake_port
+-            + get_port_offset(self.dp_rank, self.tp_rank)
++            self.moriio_config.handshake_port + self.moriio_config.port_offset
+         )
+         self.engine_id: EngineId = engine_id
+ 
+@@ -2525,7 +2567,24 @@ def _remote_layer_mr_offset(
+     ) -> int:
+         if not self.kv_layer_mr_offset or not remote_engine_id:
+             return 0
+-        idx = self.layer_base_addr_index[layer_name]
++        if remote_moriio_meta.layer_base_addr_index:
++            idx = remote_moriio_meta.layer_base_addr_index.get(layer_name)
++            if idx is None:
++                raise MoRIIOError(
++                    f"peer {remote_engine_id} registered no KV cache for layer "
++                    f"{layer_name}"
++                )
++        elif len(remote_moriio_meta.kv_caches_base_addr) == self.num_regions:
++            # Older peers send no index; equal region counts are taken to mean
++            # the same layers in the same order.
++            idx = self.layer_base_addr_index[layer_name]
++        else:
++            raise MoRIIOError(
++                f"peer {remote_engine_id} registered "
++                f"{len(remote_moriio_meta.kv_caches_base_addr)} KV cache regions, "
++                f"this worker {self.num_regions}, and does not advertise where "
++                "each layer starts; run the same vLLM version on both sides"
++            )
+         metas = self.layer_name_to_remote_kv_cache_metadata.get(
+             remote_engine_id, {}
+         ).get(layer_name)
+@@ -2816,6 +2875,7 @@ def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+                 for name, layout in self.mamba_state_layouts.items()
+             },
+             attention_block_sizes=self.attention_block_sizes,
++            layer_base_addr_index=self.layer_base_addr_index,
+         )
+         ready_event = threading.Event()
+         self._moriio_handshake_listener_t = threading.Thread(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py
+index d43d6b2c5199..a707460ff03d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py
+@@ -628,6 +628,7 @@ def _finalize_if_complete(
+ 
+         # Send completion notification
+         for (remote_ip, remote_port), num_writers in notify_targets.items():
++            num_writers *= self.worker.pp_size
+             self.worker.moriio_wrapper.send_notify(
+                 transfer_id,
+                 remote_ip,
+@@ -635,7 +636,12 @@ def _finalize_if_complete(
+                 message_type="write_done",
+                 # The consumer rank has its KV once every writer reported.
+                 message_fields=(
+-                    {"num_writers": num_writers} if num_writers != 1 else None
++                    {
++                        "num_writers": num_writers,
++                        "sender": [self.worker.pp_rank, self.worker.tp_rank],
++                    }
++                    if num_writers != 1
++                    else None
+                 ),
+             )
+         # mark request as done, then we can free the blocks
+@@ -746,13 +752,17 @@ def __init__(
+         self.transfer_status: list[Any] = []
+         self.remote_engine_ip: str | None = None
+         self.notify_port: int | None = None
++        # Notify ports of the same worker in the later pipeline stages; set on
++        # the first stage of a pipeline-parallel producer only.
++        self.stage_notify_ports: list[int] = []
++        self._stage_socks: dict[int, zmq.Socket] = {}
+         self.lock = threading.Lock()
+         self.done_req_ids: list[MoRIIOTransferAck] = []
+         self.done_remote_allocate_req_dict: dict[TransferId, RemoteAllocInfo] = {}
+         self.done_write_cache_req_ids: list[str] = []
+         self.failed_write_cache_req_ids: list[str] = []
+-        # write_done messages received per transfer whose writers are not all in.
+-        self._write_done_counts: dict[TransferId, int] = {}
++        # Writers that sent write_done, per transfer whose writers are not all in.
++        self._write_done_senders: dict[TransferId, set[Any]] = {}
+         self._terminal_transfer_ids: OrderedDict[TransferId, None] = OrderedDict()
+         self._transfer_timeout = transfer_timeout
+         self.notify_thread: threading.Thread | None = None
+@@ -1010,6 +1020,7 @@ def _async_wait():
+                 while True:
+                     try:
+                         identity, msg = sock.recv_multipart()
++                        self._forward_to_stages(msg)
+                         self._handle_message(msg)
+                     except Exception as e:
+                         logger.error("Error processing message: %s", e)
+@@ -1020,6 +1031,25 @@ def _async_wait():
+         )
+         self.notify_thread.start()
+ 
++    def _forward_to_stages(self, msg: bytes) -> None:
++        """Hand a message from the decode to the later pipeline stages.
++
++        Every stage holds its own blocks of the transfer, so each needs the
++        allocation and the release. Runs on the notify listener thread, which
++        owns these sockets.
++        """
++        for port in self.stage_notify_ports:
++            sock = self._stage_socks.get(port)
++            if sock is None:
++                sock = make_zmq_socket(
++                    ctx=zmq.Context.instance(),
++                    path=make_zmq_path("tcp", "127.0.0.1", port),
++                    socket_type=zmq.DEALER,
++                    bind=False,
++                )
++                self._stage_socks[port] = sock
++            sock.send(msg)
++
+     def _handle_message(self, msg: bytes):
+         """Handles incoming messages from remote nodes."""
+         # Handles incoming remote messages:
+@@ -1101,19 +1131,28 @@ def _handle_write_done_message(self, data: dict):
+         )
+         transfer_id = data["transfer_id"]
+         num_writers = int(data.get("num_writers", 1))
++        sender = data.get("sender")
+         with self.lock:
+-            received = self._write_done_counts.get(transfer_id, 0) + 1
+-            if received < num_writers:
+-                self._write_done_counts[transfer_id] = received
++            if self._is_transfer_terminal_locked(transfer_id):
+                 return
+-            self._write_done_counts.pop(transfer_id, None)
++            senders = self._write_done_senders.setdefault(transfer_id, set())
++            # Older peers do not name themselves; each of their messages counts.
++            senders.add(tuple(sender) if sender is not None else object())
++            if len(senders) < num_writers:
++                return
++            del self._write_done_senders[transfer_id]
++            self._mark_transfer_terminal_locked(transfer_id)
+             self.done_write_cache_req_ids.append(transfer_id)
+ 
+     def _handle_write_failed_message(self, data: dict):
+         assert get_role() != ROLE.PRODUCER, "Only decode can get WRITE failure messages"
+         transfer_id = data["transfer_id"]
+         with self.lock:
+-            self._write_done_counts.pop(transfer_id, None)
++            # The other stages still report after the first failure.
++            if self._is_transfer_terminal_locked(transfer_id):
++                return
++            self._write_done_senders.pop(transfer_id, None)
++            self._mark_transfer_terminal_locked(transfer_id)
+             self.failed_write_cache_req_ids.append(transfer_id)
+ 
+     def _handle_release_message(self, data: dict):
+@@ -1240,3 +1279,6 @@ def shutdown(self):
+             except Exception as e:
+                 logger.warning("Error closing ZMQ socket for path %s: %s", path, e)
+         self.paths.clear()
++        for sock in self._stage_socks.values():
++            sock.close(linger=0)
++        self._stage_socks.clear()
