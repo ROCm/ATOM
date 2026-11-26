@@ -57,6 +57,8 @@ def register_backends(factory) -> None:
         # NVFP4 pages are self-contained (data and e4m3 scales inline, the global K/V
         # scale 1.0), so they move as opaque per-block bytes.
         moves_nvfp4_pages=True,
+        # The PAGE namespace hashes the draft KV dtype: another dtype never reads back.
+        moves_own_dtype_draft=True,
     )
 
     factory.register(
@@ -98,4 +100,6 @@ def register_backends(factory) -> None:
         copies_whole_block_regions=True,
         # PAGE units move whole, under a namespace that hashes both cache dtypes.
         moves_nvfp4_pages=True,
+        # Its namespace builds on the PAGE namespace, which hashes the draft KV dtype.
+        moves_own_dtype_draft=True,
     )
