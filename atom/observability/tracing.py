@@ -160,10 +160,9 @@ def bind_sequences(seqs, *, unsupported=None):
                 )
                 _unbind(seq)
                 continue
-            seq._atom_trace_carrier = dict(request["carrier"])
-            seq._atom_trace_model = request["model"]
-            seq._atom_trace_request_id = request.get("request_id")
-            seq._atom_trace_timing = None
+            adopt_context(
+                seq, request["carrier"], request["model"], request.get("request_id")
+            )
         except Exception:  # noqa: BLE001 - an untraced request still runs
             _unbind(seq)
             _warn_once()
@@ -173,6 +172,27 @@ def _unbind(seq):
     # Also safe if an already-bound sequence is passed through again.
     seq.__dict__.pop("_atom_trace_carrier", None)
     seq.__dict__.pop("_atom_trace_timing", None)
+
+
+def wire_context(seq):
+    """`(carrier, model, request_id)` that `bind_sequences` bound to `seq`,
+    for the engine wire protocol to carry; None when `seq` is not traced."""
+    carrier = getattr(seq, "_atom_trace_carrier", None)
+    if not carrier:
+        return None
+    return (
+        carrier,
+        getattr(seq, "_atom_trace_model", "unknown"),
+        getattr(seq, "_atom_trace_request_id", None),
+    )
+
+
+def adopt_context(seq, carrier, model, request_id):
+    """Bind a context `wire_context` sent to the engine's own sequence."""
+    seq._atom_trace_carrier = dict(carrier)
+    seq._atom_trace_model = model
+    seq._atom_trace_request_id = request_id
+    seq._atom_trace_timing = None
 
 
 def set_request_id(request_id):

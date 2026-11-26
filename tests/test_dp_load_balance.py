@@ -9,7 +9,6 @@
 # here works on the CPU-only / mocked CI runner without any sys.modules stub;
 # conftest.py supplies the atom.* / zmq stubs the import chain needs.
 
-import pickle
 from threading import Event, Lock, Thread
 
 import pytest
@@ -20,12 +19,16 @@ from atom.model_engine.engine_core_mgr import (
     DP_LB_STRATEGIES,
     CoreManager,
 )
+from atom.model_engine.sequence import Sequence
+from atom.model_engine.zmq_protocol.codec import decode_input
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
-class _FakeSeq:
-    """Minimal stand-in for Sequence: routing only reads id/num_prompt_tokens."""
+class _FakeSeq(Sequence):
+    """A `Sequence` of `num_prompt_tokens` placeholder tokens: routing reads
+    id / num_prompt_tokens, and a dispatch encodes it as it would a real one
+    (an int id, then)."""
 
     def __init__(
         self,
@@ -35,13 +38,14 @@ class _FakeSeq:
         dp_session_id=None,
         dp_parent_session_id=None,
     ):
-        self.id = seq_id
-        self.num_prompt_tokens = num_prompt_tokens
-        self.prompt_hash_chain = None
-        self.dp_session_id = dp_session_id
-        self.dp_parent_session_id = dp_parent_session_id
-        if data_parallel_rank is not None:
-            self.data_parallel_rank = data_parallel_rank
+        super().__init__(
+            [1] * num_prompt_tokens,
+            16,
+            id=seq_id,
+            data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
+        )
 
 
 def _make_mgr(
@@ -411,13 +415,13 @@ def test_dispatch_sends_explicit_hint_to_exact_engine_rank():
     mgr._rank_reqs = [0, 0, 0, 10]
     mgr._rank_tokens = [0, 0, 0, 10_000]
 
-    seq = _FakeSeq("sticky", num_prompt_tokens=100, data_parallel_rank=3)
+    seq = _FakeSeq(7, num_prompt_tokens=100, data_parallel_rank=3)
     mgr._dispatch_to_dp_ranks([seq])
 
     assert [len(sock.messages) for sock in mgr.input_sockets] == [0, 0, 0, 1]
-    request_type, dispatched = pickle.loads(mgr.input_sockets[3].messages[0][1])
+    request_type, dispatched = decode_input(mgr.input_sockets[3].messages[0][1])
     assert request_type.name == "ADD"
-    assert [item.id for item in dispatched] == [seq.id]
+    assert [item.seq_id for item in dispatched] == [seq.id]
 
 
 def test_invalid_hint_still_supported_via_add_request_validation():
@@ -485,7 +489,7 @@ def test_send_failure_rolls_back_undispatched_charge():
     # NOT successfully handed off were charged but will never emit a finished
     # output to release them. Dispatch must roll those back so routing does not
     # skew permanently; already-sent ranks keep their (legitimate) charge.
-    # dispatch pickles (EngineCoreRequestType.ADD, seqs) with the real enum.
+    # dispatch encodes (EngineCoreRequestType.ADD, seqs) with the real enum.
     class _FakeSocket:
         def __init__(self, fail=False):
             self.fail = fail
@@ -561,7 +565,6 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
 
 
 def test_concurrent_store_dispatch_accounts_in_socket_send_order():
-    import pickle
     import time
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
@@ -570,16 +573,17 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
     mgr = _make_mgr(1, strategy="share_cache")
+    FIRST, SECOND = 1, 2
 
     mgr._prefix_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 100)
     first_sent, second_started = Event(), Event()
     order = []
 
     def send(_rank, payload):
-        _, seqs = pickle.loads(payload)
-        sid = seqs[0].id
+        _, items = decode_input(payload)
+        sid = items[0].seq_id
         order.append(("send", sid))
-        if sid == "first":
+        if sid == FIRST:
             first_sent.set()
             assert second_started.wait(2)
             # Give the concurrent caller a chance to send while the first
@@ -598,20 +602,20 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
     def second():
         assert first_sent.wait(2)
         second_started.set()
-        mgr._dispatch_to_dp_ranks([_FakeSeq("second", 20, data_parallel_rank=0)])
+        mgr._dispatch_to_dp_ranks([_FakeSeq(SECOND, 20, data_parallel_rank=0)])
 
     with ThreadPoolExecutor(2) as pool:
         a = pool.submit(
-            mgr._dispatch_to_dp_ranks, [_FakeSeq("first", 10, data_parallel_rank=0)]
+            mgr._dispatch_to_dp_ranks, [_FakeSeq(FIRST, 10, data_parallel_rank=0)]
         )
         b = pool.submit(second)
         a.result(timeout=5)
         b.result(timeout=5)
     assert order == [
-        ("send", "first"),
-        ("account", "first"),
-        ("send", "second"),
-        ("account", "second"),
+        ("send", FIRST),
+        ("account", FIRST),
+        ("send", SECOND),
+        ("account", SECOND),
     ]
     assert [charge for _, charge in mgr._backlog.unseen[0]] == [10, 20]
 

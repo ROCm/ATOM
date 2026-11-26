@@ -19,7 +19,6 @@ thread reads off `self`, both managers must provide.
 
 import ast
 import pathlib
-import pickle
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -29,6 +28,8 @@ import zmq
 from atom.config import KVEventsConfig
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.zmq_protocol.codec import encode_output
+from atom.model_engine.zmq_protocol.messages import Completion
 
 MODULE_PATH = pathlib.Path(CoreManager.__module__.replace(".", "/") + ".py")
 SOURCE = pathlib.Path(__file__).resolve().parent.parent / MODULE_PATH
@@ -127,7 +128,7 @@ class OutputThreadStateTest(unittest.TestCase):
         thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
         thread.start()
         try:
-            sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+            sender.send(encode_output(EngineCoreRequestType.SHUTDOWN))
             thread.join(timeout=3)
             self.assertFalse(thread.is_alive())
             self.assertEqual(observed, [False])
@@ -154,9 +155,9 @@ class OutputThreadStateTest(unittest.TestCase):
             thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
             thread.start()
             try:
-                seqs = [SimpleNamespace(id=7)]
-                sender.send(pickle.dumps((EngineCoreRequestType.ADD, seqs)))
-                sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+                seqs = [Completion(seq_id=7)]
+                sender.send(encode_output(EngineCoreRequestType.ADD, seqs))
+                sender.send(encode_output(EngineCoreRequestType.SHUTDOWN))
                 thread.join(timeout=3)
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(

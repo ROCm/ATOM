@@ -12,12 +12,23 @@ from typing import Any
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
+from atom.model_engine.admission import (
+    check_prompt,
+    check_sampling,
+    mrope_for,
+    num_draft_tokens,
+    validate_for_model,
+)
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
-from atom.model_engine.sequence import Sequence, leaves_media_on_prefill
-from atom.multimodal.registry import get_mrope_input_positions
-from atom.sampling_params import RequiredChannel, SamplingParams
+from atom.model_engine.sequence import (
+    PER_REQ_CACHE_MODEL_TYPES,
+    Sequence,
+    media_cache_seed,
+)
+from atom.multimodal.registry import uses_mrope
+from atom.sampling_params import EngineChannel, RequiredChannel, SamplingParams
 from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     WorkerGrammarPreflight,
@@ -237,23 +248,28 @@ class LLMEngine:
             request_id_iter = itertools.repeat(None)
 
         reqs = []
-        for prompt, sampling_param, callback, mm_data, request_id in zip(
-            prompt_or_tokens_list,
-            sampling_params_iter,
-            stream_callback_iter,
-            mm_data_iter,
-            request_id_iter,
-        ):
-            fanout = self.io_processor.preprocess_fanout(
-                prompt,
-                sampling_param,
-                stream_callback=callback,
-                multimodal_data=mm_data,
-                parent_request_id=request_id,
-            )
-            reqs.extend(fanout)
-        self.core_mgr.keep_finished_outputs = True
-        self.core_mgr.add_request(reqs)
+        try:
+            for prompt, sampling_param, callback, mm_data, request_id in zip(
+                prompt_or_tokens_list,
+                sampling_params_iter,
+                stream_callback_iter,
+                mm_data_iter,
+                request_id_iter,
+            ):
+                fanout = self.io_processor.preprocess_fanout(
+                    prompt,
+                    sampling_param,
+                    stream_callback=callback,
+                    multimodal_data=mm_data,
+                    parent_request_id=request_id,
+                )
+                reqs.extend(fanout)
+            self.core_mgr.keep_finished_outputs = True
+            self.core_mgr.add_request(reqs)
+        except BaseException:
+            # Left registered, they would keep generate() waiting for good.
+            self.io_processor.forget([req.id for req in reqs])
+            raise
 
     def step(self) -> list[Sequence]:
         seqs = self.core_mgr.get_output()
@@ -691,10 +707,8 @@ class InputOutputProcessor:
         self.structured_admission = None
         self.requests = {}
         # The one channel `tool_choice="required"` holds this engine's requests
-        # to (`_engine_channel`): as the server's format named it, and as built
-        # from that once with every id this engine stops on held back.
-        self._format_channel: RequiredChannel | None = None
-        self._required_channel: RequiredChannel | None = None
+        # to (`_engine_channel`); the EngineCore holds its own the same way.
+        self._channel = EngineChannel(config)
         self.segment_tokenizer = SegmentTokenizer.maybe_create(
             tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
         )
@@ -706,14 +720,8 @@ class InputOutputProcessor:
         self._external_to_internal: dict[str, int] = {}
         self._internal_to_external: dict[int, str] = {}
         self.has_per_req_cache = False
-        self.num_speculative_tokens = 0
-        if (
-            hasattr(self.config, "speculative_config")
-            and self.config.speculative_config is not None
-        ):
-            self.num_speculative_tokens = (
-                self.config.speculative_config.num_speculative_tokens
-            )
+        self.num_speculative_tokens = num_draft_tokens(config)
+        self.uses_mrope = uses_mrope(config)
         if self.config.hf_config.model_type in self._per_req_cache_model_types():
             self.has_per_req_cache = True
         # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
@@ -735,18 +743,7 @@ class InputOutputProcessor:
         registered here. Adding a new stateful-attention model means
         adding its model_type to this set.
         """
-        return frozenset(
-            {
-                "qwen3_next",
-                "qwen3_5_text",
-                "qwen3_5_moe_text",
-                "kimi_linear",
-                "glm5_next_text",
-                "deepseek_v4",
-                "deepseek_v41_text",
-                "qwen4_exp_text",
-            }
-        )
+        return PER_REQ_CACHE_MODEL_TYPES
 
     def preprocess(
         self,
@@ -799,17 +796,9 @@ class InputOutputProcessor:
         Built once, from the first required request, and shared by every
         later one. A request naming a different channel is refused here, at
         admission, where it fails alone; the engine loop batches every
-        request together and holds one channel.
+        request together and holds one channel (`EngineChannel`).
         """
-        if self._required_channel is None:
-            held = channel.ending_on(self.config.end_token_ids)
-            self._format_channel, self._required_channel = channel, held
-        elif channel != self._format_channel and channel != self._required_channel:
-            raise ValueError(
-                'this engine already holds tool_choice="required" requests to '
-                "another channel; a server resolves one tool-call format"
-            )
-        return self._required_channel
+        return self._channel.hold(channel)
 
     def encode_prompt(
         self, prompt: str, *, multimodal: bool = False
@@ -860,42 +849,25 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
-        sampling_params.validate_logprob_options(
+        # What the EngineCore checks again (`admission.check_sampling`).
+        check_sampling(
             self.config,
+            sampling_params,
             kv_transfer=kv_transfer_params,
             multimodal=multimodal_data is not None,
         )
         if is_structured(sampling_params):
-            if sampling_params.required_channel is not None:
-                raise ValueError(
-                    "A request cannot carry both a structured-output grammar "
-                    "(json_schema or structured_tool_format) and a required_channel"
-                )
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
             self.structured_admission(
                 sampling_params, kv_transfer_params, multimodal_data is not None
             )
-        # A decode leg whose prefill kept the media (`Sequence`'s own test).
-        media_on_prefill = (
-            kv_transfer_params is not None
-            and multimodal_data is None
-            and leaves_media_on_prefill(kv_transfer_params)
+        validate_for_model(
+            self.config,
+            num_draft_tokens=self.num_speculative_tokens,
+            multimodal_data=multimodal_data,
+            kv_transfer=kv_transfer_params,
         )
-        if media_on_prefill and self.config.enable_rapidserve:
-            # RapidServe prefills every request on this GPU, with no media.
-            raise ValueError(
-                "RapidServe cannot serve an image decode leg whose prefill "
-                "kept the image"
-            )
-        request_validator = getattr(self.config.hf_config, "validate_request", None)
-        if request_validator is not None:
-            request_validator(
-                num_draft_tokens=self.num_speculative_tokens,
-                multimodal_data=multimodal_data,
-                media_on_prefill_instance=media_on_prefill,
-                enable_dp_attention=self.config.enable_dp_attention,
-            )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
         if isinstance(prompt_or_tokens, str):
@@ -908,28 +880,12 @@ class InputOutputProcessor:
         else:
             prefix_encoding = None
             tokens = prompt_or_tokens
-        # Checked on the tokens, not the text: "" encodes to [BOS] on Llama-3,
-        # which runs, and to nothing on Qwen3 or gpt-oss.
-        if len(tokens) == 0:
-            raise ValueError("The decoder prompt cannot be empty")
-        if media_on_prefill:
-            # An image prompt's positions never run past its text's, so the
-            # delta its prefill hands over is at most 0; decode positions then
-            # stay in [1, max_model_len).
-            delta = kv_transfer_params.get("mrope_position_delta", 0)
-            if not 1 - len(tokens) <= delta <= 0:
-                raise ValueError(
-                    "kv_transfer_params['mrope_position_delta'] must be in "
-                    f"[{1 - len(tokens)}, 0] for a {len(tokens)}-token prompt"
-                )
-        mrope_positions = None
-        mrope_position_delta = 0
-        if multimodal_data is not None:
-            mrope_positions, mrope_position_delta = get_mrope_input_positions(
-                self.config,
-                tokens,
-                multimodal_data,
-            )
+        check_prompt(
+            tokens, kv_transfer=kv_transfer_params, multimodal_data=multimodal_data
+        )
+        mrope_positions, mrope_position_delta = mrope_for(
+            self.config, tokens, multimodal_data, uses_mrope=self.uses_mrope
+        )
 
         stop_token_sequences = []
         if sampling_params.stop_strings:
@@ -962,6 +918,8 @@ class InputOutputProcessor:
                 f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
             )
 
+        # The media's content hash, once for every sibling.
+        cache_seed = media_cache_seed(multimodal_data)
         seqs: list[Sequence] = []
         for i in range(n):
             cb = (
@@ -986,6 +944,7 @@ class InputOutputProcessor:
                 data_parallel_rank=data_parallel_rank,
                 dp_session_id=dp_session_id,
                 dp_parent_session_id=dp_parent_session_id,
+                cache_seed=cache_seed,
             )
             seq.arrive_time = time.time()
             seqs.append(seq)
@@ -1071,3 +1030,11 @@ class InputOutputProcessor:
 
     def has_pending_requests(self):
         return len(self.requests) > 0
+
+    def forget(self, seq_ids) -> None:
+        """Drop requests that will never finish here (their add failed)."""
+        for seq_id in seq_ids:
+            self.requests.pop(seq_id, None)
+            external_request_id = self._internal_to_external.pop(seq_id, None)
+            if external_request_id is not None:
+                self._external_to_internal.pop(external_request_id, None)

@@ -1,21 +1,20 @@
 # SPDX-License-Identifier: MIT
 """Successor credit corrections across unsent, unseen and reported work."""
 
-import pickle
-
 import pytest
 from test_dp_load_balance import _chain_seq, _make_mgr, _note_charged, _route
 
 from atom.kv_transfer.offload.tier import OffloadTierProfile
 from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.zmq_protocol.codec import decode_input
 
 
 def _pair(stage):
     mgr = _make_mgr(2, strategy="share_cache")
     mgr._prefix_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 512)
     sent = []
-    mgr._send_request = lambda rank, data: sent.append((rank, pickle.loads(data)))
+    mgr._send_request = lambda rank, data: sent.append((rank, decode_input(data)))
     producer = _chain_seq(1, 100000)
     follower = _chain_seq(2, 110000)
     producer.data_parallel_rank = follower.data_parallel_rank = 0

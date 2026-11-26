@@ -26,7 +26,7 @@ import math
 import struct
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -129,6 +129,9 @@ class ChunkKind(enum.Enum):
 # engine polls KV progress every millisecond (KV_IDLE_DRAIN_INTERVAL_S), so the
 # reconciler no-ops until this interval has passed.
 _SAVE_RECONCILE_INTERVAL_S = 5.0
+
+# How long an abort for a not-yet-admitted id waits for its sequence.
+UNMATCHED_ABORT_TTL_S = 30.0
 
 # Release attempts a deferred request may fail after its save was abandoned
 # before `_reconcile_stalled_deferred_saves` calls it wedged. The reclaimer
@@ -1197,6 +1200,12 @@ class Scheduler:
         self.prefill_delayer: PrefillDelayer | None = None
         # requests added since the previous schedule, the delayer's to weigh
         self._arrived_requests = 0
+        # Aborts for ids not admitted yet -> when they arrived. A client's
+        # Abort can be handled before the Submit it follows (utilities run
+        # before inputs each tick, and the two ride different sockets), so it
+        # is held for `UNMATCHED_ABORT_TTL_S` and applied on admission.
+        # Oldest first, so the expired ones are always at the front.
+        self._unmatched_aborts: OrderedDict[int, float] = OrderedDict()
         self._local_prefill_coalescing = False
         self._inflight_prefix_wait: dict[int, int] = {}
         # Tier loads started early, and the skip reasons of those not started.
@@ -2095,6 +2104,10 @@ class Scheduler:
             self._register_connector_admission(seq)
         self.waiting.extend(seqs)
         self._arrived_requests += len(seqs)
+        if self._unmatched_aborts:
+            for seq in seqs:
+                if self._unmatched_aborts.pop(seq.id, None) is not None:
+                    self.abort_request(seq.id)
 
     def _register_connector_admission(self, seq: Sequence) -> None:
         # Register every logical P request, including those behind a capacity
@@ -3794,7 +3807,21 @@ class Scheduler:
             if seq.id == req_id:
                 seq.status = SequenceStatus.ABORTED
                 return True
+        self._remember_unmatched_abort(req_id)
         return False
+
+    def _remember_unmatched_abort(self, req_id) -> None:
+        """Hold an abort `extend` may still need; one for a sequence that has
+        already finished expires unused."""
+        now = time.monotonic()
+        aborts = self._unmatched_aborts
+        # Held in arrival order, so expiring stops at the first live one:
+        # O(1) amortized, where a scan of every hold costs O(held) per miss,
+        # and every rank but the request's own misses each abort.
+        while aborts and now - aborts[next(iter(aborts))] > UNMATCHED_ABORT_TTL_S:
+            aborts.popitem(last=False)
+        aborts[req_id] = now
+        aborts.move_to_end(req_id)
 
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.
@@ -6870,6 +6897,9 @@ class DecodeScheduler(Scheduler):
                 if seq.id == req_id:
                     seq.status = SequenceStatus.ABORTED
                     return True
+            # Held for `extend` as the base scheduler holds it: the abort may
+            # have overtaken its Submit.
+            self._remember_unmatched_abort(req_id)
         return False
 
     def get_request_counts(self) -> tuple[int, int]:

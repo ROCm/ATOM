@@ -1221,6 +1221,7 @@ def _intake(hf_config=None, *, num_draft_tokens=0, rapidserve=False):
         ),
         num_speculative_tokens=num_draft_tokens,
         block_size=16,
+        uses_mrope=False,
         has_per_req_cache=False,
         requests={},
         _external_to_internal={},

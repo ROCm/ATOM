@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import array
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -11,6 +12,28 @@ from typing import Any, NamedTuple
 import numpy as np
 
 from atom.sampling_params import UNCONSTRAINED, SamplingParams
+
+logger = logging.getLogger("atom")
+
+# The model_types whose sequences need a per-request stateful buffer outside
+# the paged KV pool (`Sequence.has_per_req_cache`): BlockManager reserves them
+# a per-req cache slot. Read wherever a `Sequence` is built (the frontend's
+# `InputOutputProcessor`, the Core's `admission.AdmissionContext`)
+# and by ModelRunner's startup check that a builder declaring a per-request
+# state sub-pool is listed here. A new stateful-attention model adds its
+# model_type.
+PER_REQ_CACHE_MODEL_TYPES = frozenset(
+    {
+        "qwen3_next",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        "kimi_linear",
+        "glm5_next_text",
+        "deepseek_v4",
+        "deepseek_v41_text",
+        "qwen4_exp_text",
+    }
+)
 
 
 def new_token_ids(token_ids=()) -> array.array:
@@ -271,6 +294,36 @@ class OffloadJointRecord:
         self.hbm_hit_tokens = 0
 
 
+def _cache_hit_count(value, num_prompt_tokens: int) -> int:
+    """A client's (or P/D peer's) `prefix_cache_hit_tokens`, as a count the
+    scheduler and the output stream can take: 0 for one that is not an int in
+    `[0, num_prompt_tokens]`."""
+    if type(value) is int and 0 <= value <= num_prompt_tokens:
+        return value
+    logger.warning(
+        "ignoring prefix_cache_hit_tokens %r: not a count of the %d prompt tokens",
+        value,
+        num_prompt_tokens,
+    )
+    return 0
+
+
+def media_cache_seed(multimodal_data: dict | None, known: int | None = None) -> int:
+    """The content identity of a prompt's media: -1 for a text prompt, else
+    the seed `multimodal_data` carries, else `known` (a client's hash of the
+    same media), else its hash."""
+    if multimodal_data is None:
+        return -1
+    seed = multimodal_data.get("cache_seed")
+    if seed is None:
+        seed = known
+    if seed is None:
+        from atom.model_engine.multimodal_runtime import multimodal_cache_seed
+
+        seed = multimodal_cache_seed(multimodal_data)
+    return seed
+
+
 class Sequence:
     counter = count()
     # True only for a decode leg whose prefill kept the media, set in __init__.
@@ -297,13 +350,15 @@ class Sequence:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        cache_seed: int | None = None,
     ):
         # Built here rather than as a default argument: one instance shared by
         # every defaulting Sequence would be a mutable default in all but name.
         if sampling_params is None:
             sampling_params = SamplingParams()
         self.block_size = block_size
-        # 0 is a valid id (a Rust client's seq_ids start there); only None takes the counter's.
+        # 0 is a valid id (`messages.SubmitItem.seq_id`); only None takes
+        # the counter's.
         self.id = id if id is not None else next(Sequence.counter)
         self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
@@ -320,13 +375,7 @@ class Sequence:
         self.multimodal_data = multimodal_data
         self.multimodal_cache_ready = False
         # Immutable content identity survives payload release and preemption.
-        self.cache_seed = -1
-        if multimodal_data is not None:
-            from atom.model_engine.multimodal_runtime import multimodal_cache_seed
-
-            self.cache_seed = multimodal_data.get("cache_seed")
-            if self.cache_seed is None:
-                self.cache_seed = multimodal_cache_seed(multimodal_data)
+        self.cache_seed = media_cache_seed(multimodal_data, cache_seed)
         self.mrope_positions = mrope_positions
         self.mrope_position_delta = mrope_position_delta
         if (
@@ -560,13 +609,9 @@ class Sequence:
         # kv_transfer params
         self.kv_transfer_params = kv_transfer_params
         self.kv_transfer_params_output = None
-        if kv_transfer_params:
-            self.prefix_cache_hit_tokens = kv_transfer_params.get(
-                "prefix_cache_hit_tokens", 0
-            )
-
-        self.prefix_cache_hit_tokens = (kv_transfer_params or {}).get(
-            "prefix_cache_hit_tokens", 0
+        self.prefix_cache_hit_tokens = _cache_hit_count(
+            (kv_transfer_params or {}).get("prefix_cache_hit_tokens", 0),
+            len(token_ids),
         )
 
         # accepted tokens for spec decode

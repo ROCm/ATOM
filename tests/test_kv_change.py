@@ -7,7 +7,6 @@ index. Refused, it runs nothing and leaves what was running as it was.
 """
 
 import contextlib
-import pickle
 import queue
 import threading
 import time
@@ -43,6 +42,7 @@ from atom.model_engine.scheduler import (
     Scheduler,
 )
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.zmq_protocol.codec import decode_input
 from atom.sampling_params import SamplingParams
 
 
@@ -403,7 +403,7 @@ def _wired(schedulers, runners=None):
     ]
 
     def send(dp_rank, payload, copy=False):
-        _, body = pickle.loads(payload)
+        _, body = decode_input(payload)
         body = dict(body)
         pending = queue.Queue()
         pending.put_nowait((body.pop("cmd"), body))
@@ -682,7 +682,7 @@ def _pipeline(sched, *, stage_runs=True):
     stage.pull_and_process_input_queue = stop.is_set
 
     def send(engine_index, payload, copy=False):
-        _, body = pickle.loads(payload)
+        _, body = decode_input(payload)
         body = dict(body)
         cmd = body.pop("cmd")
         if engine_index == 1:

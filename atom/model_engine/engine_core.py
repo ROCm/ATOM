@@ -16,6 +16,7 @@ from atom.distributed.group_agreement import group_max_each
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
+from atom.model_engine.admission import AdmissionContext, build_sequence
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.dp_sync_gate import MAX_DP_SYNC_INTERVAL, DPSyncGate
 from atom.model_engine.dynamic_chunking import (
@@ -28,7 +29,6 @@ from atom.model_engine.engine_utility import (
     ask_what_runners_cannot_take,
 )
 from atom.model_engine.prefill_backlog import prefill_backlog
-from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
     Sequence,
@@ -37,6 +37,12 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
+from atom.model_engine.zmq_protocol.codec import (
+    decode_input,
+    encode_output,
+    rejected,
+    rejection_code,
+)
 from atom.observability import tracing
 from atom.structured_output import is_structured
 from atom.utils import (
@@ -105,6 +111,12 @@ def publish_idle_state_work(scheduler) -> None:
     scheduler._publish_state_stores()
 
 
+# The input-queue item `(INGEST_REJECTED, n)`: n requests of one batch were
+# rejected at admission, in queue order with the batch's admitted ones, so
+# the reported ingest count covers every request the CoreManager sent.
+INGEST_REJECTED = "INGEST_REJECTED"
+
+
 class EngineCore:
     # This process's name, for the title and every GC log line. A class
     # attribute because it is per-process state and each engine is spawned into
@@ -143,6 +155,8 @@ class EngineCore:
         self._generation_paused = False
         self.input_address = input_address
         self.output_address = output_address
+        # What the input thread builds admitted sequences with.
+        self._admission = AdmissionContext(config)
         # Control traffic arrives on its own socket so CoreManager can keep the
         # request socket single-writer; see CoreManager._send_request.
         self.control_address = config.parallel_config.control_address
@@ -903,13 +917,14 @@ class EngineCore:
     def pull_and_process_input_queue(self):
         recv_reqs = []
         credit_updates = []
+        rejected = 0
         while not self.input_queue.empty():
             seqs = self.input_queue.get_nowait()
-            if (
-                isinstance(seqs, tuple)
-                and seqs[0] == EngineCoreRequestType.DP_PREFIX_CREDIT
-            ):
-                credit_updates.extend(seqs[1])
+            if isinstance(seqs, tuple):
+                if seqs[0] == EngineCoreRequestType.DP_PREFIX_CREDIT:
+                    credit_updates.extend(seqs[1])
+                elif seqs[0] == INGEST_REJECTED:
+                    rejected += seqs[1]
                 continue
             for seq in seqs:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
@@ -919,7 +934,7 @@ class EngineCore:
         if len(recv_reqs) > 0:
             logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
-            self._ingested_seqs += len(recv_reqs)
+        self._ingested_seqs += len(recv_reqs) + rejected
         self._apply_prefix_credit_updates(credit_updates)
         return False
 
@@ -971,6 +986,28 @@ class EngineCore:
             # The scheduler's own prefetch still sends these lookups.
             logger.warning(f"{self.label}: offering tier lookups failed", exc_info=True)
 
+    def _admit(self, items, received_at: float) -> tuple[list, int]:
+        """Build the submitted requests' sequences (`admission.build_sequence`).
+
+        A request whose sequence cannot be built is refused back to its
+        client rather than dropped, so nothing waits on it; the rest of its
+        batch is admitted as usual.
+        """
+        seqs = []
+        refused = []
+        for item in items:
+            try:
+                seqs.append(build_sequence(item, self._admission))
+            except Exception as exc:
+                # Refused below; the batch-mates still run.
+                logger.exception(f"{self.label}: rejecting request {item.seq_id}")
+                refused.append(
+                    rejected(item, f"{type(exc).__name__}: {exc}", rejection_code(exc))
+                )
+        if refused:
+            self.output_queue.put_nowait(("REJECTED", refused))
+        return seqs, len(refused)
+
     def process_input_sockets(self, input_address: str, control_address: str):
         """Input IO thread, serving both the request and control sockets.
 
@@ -1004,8 +1041,7 @@ class EngineCore:
                     obj = sock.recv(copy=False)
                     received_at = time.perf_counter()
                     try:
-                        # ADD may carry the seqs' shipped prompt chains third.
-                        request_type, reqs, *chains = pickle.loads(obj)
+                        request_type, reqs = decode_input(obj)
                     except Exception:
                         # This thread is the only way requests reach the engine,
                         # so letting it die strands every later request: the
@@ -1019,17 +1055,22 @@ class EngineCore:
                         )
                         continue
                     if request_type == EngineCoreRequestType.ADD:
-                        attach_shipped_chains(reqs, *chains)
-                        tracing.enqueue_many(reqs, received_at=received_at)
-                        for req in reqs:
-                            SchedulerMetrics.enqueue(req, received_at=received_at)
-                        req_ids = [req.id for req in reqs]
-                        logger.debug(
-                            f"{self.label}: input get {request_type} {req_ids}"
-                        )
-                        self.input_queue.put_nowait(reqs)
-                        self._kv_progress_event.set()
-                        self._offer_tier_lookups(reqs)
+                        reqs, refused = self._admit(reqs, received_at)
+                        if reqs:
+                            tracing.enqueue_many(reqs, received_at=received_at)
+                            for req in reqs:
+                                SchedulerMetrics.enqueue(req, received_at=received_at)
+                            req_ids = [req.id for req in reqs]
+                            logger.debug(
+                                f"{self.label}: input get {request_type} {req_ids}"
+                            )
+                            self.input_queue.put_nowait(reqs)
+                            self._kv_progress_event.set()
+                            self._offer_tier_lookups(reqs)
+                        if refused and self._report_backlog:
+                            # Counted on the engine thread, in queue order
+                            # with the batch's admitted requests.
+                            self.input_queue.put_nowait((INGEST_REJECTED, refused))
                     elif request_type == EngineCoreRequestType.DP_PREFIX_CREDIT:
                         self.input_queue.put_nowait((request_type, reqs))
                         self._kv_progress_event.set()
@@ -1037,6 +1078,18 @@ class EngineCore:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
+                        self._has_pending_utility = True
+                        self._kv_progress_event.set()
+                    elif request_type == EngineCoreRequestType.ABORT:
+                        # A client that pickles nothing (atomesh) sends aborts
+                        # as ids: the same command CoreManager sends.
+                        for req_id in reqs:
+                            self.utility_queue.put_nowait(
+                                (
+                                    "abort_request",
+                                    {"cmd": "abort_request", "req_id": req_id},
+                                )
+                            )
                         self._has_pending_utility = True
                         self._kv_progress_event.set()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
@@ -1060,39 +1113,45 @@ class EngineCore:
                 if isinstance(item, tuple) and item[0] == "STREAM":
                     # Send stream outputs
                     stream_outputs = item[1]
-                    obj = pickle.dumps((EngineCoreRequestType.STREAM, stream_outputs))
+                    obj = encode_output(EngineCoreRequestType.STREAM, stream_outputs)
                     socket.send(obj)
                     continue
 
                 if isinstance(item, tuple) and item[0] == "READY":
                     # Send READY signal to indicate EngineCore is fully initialized
-                    obj = pickle.dumps((EngineCoreRequestType.READY, item[1]))
+                    obj = encode_output(EngineCoreRequestType.READY, item[1])
                     socket.send(obj)
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
 
                 if isinstance(item, tuple) and item[0] == "METRICS":
-                    obj = pickle.dumps((EngineCoreRequestType.METRICS, item[1]))
+                    obj = encode_output(EngineCoreRequestType.METRICS, item[1])
                     socket.send(obj)
                     continue
 
                 if isinstance(item, tuple) and item[0] == "PREFILL_BACKLOG":
-                    obj = pickle.dumps((EngineCoreRequestType.PREFILL_BACKLOG, item[1]))
+                    obj = encode_output(EngineCoreRequestType.PREFILL_BACKLOG, item[1])
                     socket.send(obj)
                     continue
 
                 if isinstance(item, tuple) and item[0] == "DP_REUSE":
-                    obj = pickle.dumps((EngineCoreRequestType.DP_REUSE, item[1]))
+                    obj = encode_output(EngineCoreRequestType.DP_REUSE, item[1])
                     socket.send(obj)
                     continue
 
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
                     # Send utility command response back to CoreManager
                     response_data = item[1]
-                    serialized_obj = pickle.dumps(
-                        (EngineCoreRequestType.UTILITY_RESPONSE, response_data)
+                    serialized_obj = encode_output(
+                        EngineCoreRequestType.UTILITY_RESPONSE, response_data
                     )
                     socket.send(serialized_obj)
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "REJECTED":
+                    # Requests refused at admission end as finished ones do.
+                    obj = encode_output(EngineCoreRequestType.ADD, item[1])
+                    socket.send(obj)
                     continue
 
                 # Regular finished sequences
@@ -1102,11 +1161,11 @@ class EngineCore:
                 ]
                 num_valid = len(valid_seqs)
                 if num_valid > 0:
-                    obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
+                    obj = encode_output(EngineCoreRequestType.ADD, valid_seqs)
                     socket.send(obj)
                     logger.info(f"{self.label}: output send {num_valid} reqs")
                 if len(valid_seqs) != len(seqs):
-                    socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+                    socket.send(encode_output(EngineCoreRequestType.SHUTDOWN))
                     logger.debug(
                         f"{self.label}: output send {EngineCoreRequestType.SHUTDOWN}"
                     )

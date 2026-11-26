@@ -86,6 +86,11 @@ Key entry points:
   proposer and the model's forward all read
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Structured output: `atom/structured_output/` — request validation, schema compilation, grammar state and asynchronous token/mask transfers
+- Engine wire protocol (CoreManager <-> EngineCore): `atom/model_engine/zmq_protocol/` —
+  msgpack through msgspec; `messages.py` is the spec (and the rules a change
+  keeps), `codec.py` encodes it, `atom/mesh/src/atom_engine/wire.rs` mirrors it;
+  cross-language fixtures in `tests/fixtures/atom_engine/`. The Core admits
+  each request again (`atom/model_engine/admission.py`)
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
 - Pipeline parallel: `atom/model_engine/pp_engine_core.py` (head / downstream stage
