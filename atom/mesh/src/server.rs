@@ -41,7 +41,7 @@ use crate::{
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
-        atom_bridge::AtomBridgeRuntime,
+        atom_bridge::{self, AtomBridgeRuntime},
         comm::{conversations, parse, tokenize},
         ingress::EndpointSpec,
         router_manager::RouterManager,
@@ -103,6 +103,23 @@ async fn sink_handler() -> Response {
 
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_server_info(req).await
+}
+
+/// The OpenAI server's `/kv_transfer_info`, which the Atomesh router reads of
+/// a P/D worker: served by ATOM standalone's Rust frontend only.
+async fn kv_transfer_info(State(state): State<Arc<AppState>>) -> Response {
+    match &state.context.atom_bridge_runtime {
+        Some(runtime) => atom_bridge::kv_transfer_info(runtime).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// The OpenAI server's `/server_info` (dp-aware discovery): ATOM standalone only.
+async fn server_info(State(state): State<Arc<AppState>>) -> Response {
+    match &state.context.atom_bridge_runtime {
+        Some(runtime) => atom_bridge::server_info(runtime).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -412,7 +429,9 @@ pub fn build_app(
         .get(app_state.clone())
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
-        .route("/get_server_info", get(get_server_info));
+        .route("/get_server_info", get(get_server_info))
+        .route("/kv_transfer_info", get(kv_transfer_info))
+        .route("/server_info", get(server_info));
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()

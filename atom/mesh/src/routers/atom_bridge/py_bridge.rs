@@ -32,8 +32,17 @@ use crate::{
 
 /// One sequence's share of an engine step, as `TokenBridge` pushes it:
 /// `(key, sibling_index, new_token_ids, finished, finish_reason,
-/// num_cached_tokens)`.
-type StepOutput = (u64, u32, Vec<u32>, bool, Option<String>, u32);
+/// num_cached_tokens, handoff)`, the last a finished prefill's
+/// `kv_transfer_params` as JSON.
+type StepOutput = (
+    u64,
+    u32,
+    Vec<u32>,
+    bool,
+    Option<String>,
+    u32,
+    Option<String>,
+);
 
 /// Where the engine's steps arrive. Python builds one, gives it to its
 /// `TokenBridge`, and Rust finds it there (`AtomBridgeRuntime`).
@@ -53,10 +62,11 @@ impl StepSink {
 
     /// One engine step: a `StepOutput` per request that moved.
     fn push(&self, outputs: Vec<StepOutput>) {
-        for (key, index, token_ids, finished, reason, cached_tokens) in outputs {
+        for (key, index, token_ids, finished, reason, cached_tokens, handoff) in outputs {
             let finish = finished.then_some(SeqFinish {
                 reason,
                 cached_tokens,
+                handoff,
             });
             self.registry.deliver(
                 key,
@@ -141,9 +151,24 @@ impl BridgeRequest {
             Some(StringOrArray::String(s)) => vec![s.clone()],
             Some(StringOrArray::Array(v)) => v.clone(),
         };
+        // A decode runs the prompt its prefill ran, not its own render of it.
+        let token_ids = match &extras.prompt_token_ids {
+            Some(ids) => {
+                if **ids != payload.token_ids {
+                    debug!(
+                        request_id = %payload.request_id,
+                        prefill = ids.len(),
+                        rendered = payload.token_ids.len(),
+                        "decode submits its prefill's prompt, which differs from its own render"
+                    );
+                }
+                ids.to_vec()
+            }
+            None => payload.token_ids.clone(),
+        };
         Ok(Self {
             request_id: payload.request_id.clone(),
-            token_ids: payload.token_ids.clone(),
+            token_ids,
             temperature: payload.sampling.temperature,
             top_p: payload.sampling.top_p,
             top_k: payload.sampling.top_k,
@@ -171,6 +196,7 @@ impl BridgeRequest {
         params.set_item("dp_session_id", &extras.dp_session_id)?;
         params.set_item("dp_parent_session_id", &extras.dp_parent_session_id)?;
         params.set_item("chat", &extras.chat_json)?;
+        params.set_item("kv_transfer_params", &extras.kv_transfer_params)?;
         Ok(params)
     }
 }
@@ -236,6 +262,10 @@ impl Dispatcher for BridgeDispatcher {
         let bridge = Arc::clone(&self.bridge);
         let request_id = request.request_id.clone();
         let prompt_tokens = request.token_ids.len() as u32;
+        let returned = request.extras.returned.clone();
+        if let Some(returned) = returned.as_ref().filter(|r| r.wants_prompt_token_ids()) {
+            let _ = returned.prompt_token_ids.set(request.token_ids.clone());
+        }
 
         let siblings = tokio::task::spawn_blocking(move || submit(&bridge, key, &request, &stage))
             .await
@@ -244,14 +274,17 @@ impl Dispatcher for BridgeDispatcher {
             })??;
 
         debug!(key, %request_id, prompt_tokens, siblings, "Submitted to the token bridge");
-        Ok(TokenHandle::new(SeqEventSource::new(
-            events,
-            admission,
-            request_id,
-            prompt_tokens,
-            siblings,
-            started_at,
-        )))
+        Ok(TokenHandle::new(
+            SeqEventSource::new(
+                events,
+                admission,
+                request_id,
+                prompt_tokens,
+                siblings,
+                started_at,
+            )
+            .returning(returned),
+        ))
     }
 }
 

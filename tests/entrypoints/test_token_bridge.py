@@ -5,6 +5,7 @@
 OpenAI server's, a request's sequences through CoreManager, its outputs back
 to Rust once per step, and abort."""
 
+import json
 import threading
 import types
 
@@ -199,7 +200,7 @@ def test_a_steps_outputs_reach_rust_in_one_push_and_a_finish_cleans_up():
     assert bridge.sink.pushes == []  # buffered until the step's flush
     bridge.engine.core_mgr._flush_stream_batch_fn()
     assert bridge.sink.pushes == [
-        [(7, 0, [11], False, None, 0), (7, 1, [21], True, "eos", 3)]
+        [(7, 0, [11], False, None, 0, None), (7, 1, [21], True, "eos", 3, None)]
     ]
     assert bridge._seq_ids[7] == [a.id]
     assert b.id not in bridge.engine.io_processor.requests
@@ -250,6 +251,38 @@ def test_a_submit_admission_refuses_never_reaches_core_manager():
         bridge.submit(7, [1, 2, 3, 4], {})
     assert bridge.engine.added == [] and bridge._seq_ids == {}
     assert bridge.engine.io_processor.requests == {}
+
+
+# ── P/D ───────────────────────────────────────────────────────────────────
+
+
+def test_a_pd_leg_reaches_the_engine_and_a_prefill_hands_its_kv_back():
+    bridge = _bridge()
+    sent = {"do_remote_decode": True, "transfer_id": "x"}
+    bridge.submit(7, [1, 2], {"kv_transfer_params": json.dumps(sent)})
+    assert bridge.engine.kwargs["kv_transfer_params"] == sent
+    (seq,) = bridge.engine.added[0]
+    handoff = {"remote_host": "10.0.0.1", "dp_rank": 1}
+    for finished in (False, True):
+        out = _output(seq, [9], finished=finished, reason="max_tokens")
+        out.kv_transfer_params_output = handoff
+        seq.callback(out)
+    bridge._flush()
+    (step,) = bridge.sink.pushes
+    assert [o[6] for o in step] == [None, json.dumps(handoff)]
+
+
+def test_a_chunked_receive_this_decode_cannot_take_never_reaches_the_engine():
+    """As `_validate_chunked_receive`: refused (400) before it is enqueued,
+    so the router cancels the prefill waiting on it."""
+    bridge = _bridge()
+    bridge.engine.config = types.SimpleNamespace(
+        tensor_parallel_size=2, pipeline_parallel_size=1
+    )
+    sent = {"chunked_transfer": True, "do_remote_prefill": True, "remote_tp_size": 4}
+    with pytest.raises(ValueError, match="D TP a multiple of positive P TP"):
+        bridge.submit(7, [1, 2], {"kv_transfer_params": json.dumps(sent)})
+    assert bridge.engine.added == [] and bridge._seq_ids == {}
 
 
 # ── the prompt ────────────────────────────────────────────────────────────

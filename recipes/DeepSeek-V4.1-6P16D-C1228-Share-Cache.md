@@ -226,6 +226,12 @@ python3 "$ENCODER_SCRIPT" --model "$MODEL_PATH" \
 `ENCODER_SCRIPT` must name the frozen implementation or an independently
 validated equivalent. It is not a script supplied by public ATOM main.
 
+Untested alternative: start every P and D instance with
+`USE_ATOMESH_ENTRYPOINTS=1` (ATOM standalone with the Rust frontend), which
+renders and tokenizes each leg in Rust as ATOM renders it, and send AgentX's
+chats to the router directly. The router command above is unchanged. This
+has no GPU result for this deployment; see `docs/atomesh_rust_frontend.md`.
+
 ## AgentX command
 
 Use an AIPerf build supporting the AgentX scenario and the flags below. Record

@@ -9,6 +9,12 @@
 //!
 //! Python starts it from `atom/entrypoints/atomesh/server.py` with
 //! `USE_ATOMESH_ENTRYPOINTS=1`; see `docs/atomesh_rust_frontend.md`.
+//!
+//! It serves a P/D leg behind the Atomesh router as the OpenAI server does:
+//! a chat's or completion's `kv_transfer_params` go to the engine, a decode
+//! submits the prompt its prefill ran, and the response carries a prefill's
+//! handoff back (`Returned`); `kv_transfer_info` / `server_info` answer the
+//! router's registration.
 
 pub(crate) mod events;
 pub mod py_bridge;
@@ -19,14 +25,17 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use pyo3::prelude::*;
 use serde_json::{json, Map, Value};
 
-use self::{events::EventRegistry, py_bridge::BridgeDispatcher};
+use self::{
+    events::{EventRegistry, Returned},
+    py_bridge::BridgeDispatcher,
+};
 use crate::{
     app_context::AppContext,
     core::{
@@ -107,11 +116,57 @@ impl AtomBridgeRuntime {
             end_token_ids,
         })
     }
+
+    /// `GET /kv_transfer_info`, as the OpenAI server answers it
+    /// (`pd_handoff.kv_transfer_info`): the engine's P/D role, its TP and DP
+    /// sizes, and a chunked prefill's endpoint.
+    async fn kv_transfer_info(&self) -> Result<Value, String> {
+        let bridge = Arc::clone(&self.bridge);
+        let info = tokio::task::spawn_blocking(move || {
+            Python::attach(|py| {
+                bridge
+                    .bind(py)
+                    .call_method0("kv_transfer_info")?
+                    .extract::<String>()
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        serde_json::from_str(&info).map_err(|e| e.to_string())
+    }
+}
+
+/// `GET /kv_transfer_info`.
+pub(crate) async fn kv_transfer_info(runtime: &AtomBridgeRuntime) -> Response {
+    match runtime.kv_transfer_info().await {
+        Ok(info) => Json(info).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+/// `GET /server_info`, as the OpenAI server answers it: the router's
+/// dp-aware discovery reads `dp_size` here.
+pub(crate) async fn server_info(runtime: &AtomBridgeRuntime) -> Response {
+    match runtime.kv_transfer_info().await {
+        Ok(info) => Json(json!({
+            "model_id": runtime.served_model_name,
+            "served_model_name": runtime.served_model_name,
+            "tp_size": info["tp_size"],
+            "dp_size": info["dp_size"],
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
 }
 
 /// The keys `RequestExtras::read` looks for, as they appear in a JSON body:
 /// a body naming none of them is not parsed again.
-const RAW_KEYS: [&[u8]; 2] = [b"\"data_parallel_rank\"", b"\"kv_transfer_params\""];
+const RAW_KEYS: [&[u8]; 3] = [
+    b"\"data_parallel_rank\"",
+    b"\"kv_transfer_params\"",
+    b"\"return_token_ids\"",
+];
 
 tokio::task_local! {
     /// What a request carries besides its typed body, for the dispatcher.
@@ -141,6 +196,14 @@ pub(crate) struct RequestExtras {
     /// The chat's body as JSON, for `TokenBridge.submit` to check its tool
     /// calls against the grammar (`checks_tool_call_grammar`).
     pub chat_json: Option<String>,
+    /// A P/D leg's `kv_transfer_params` as JSON, for `TokenBridge.submit`,
+    /// without the prompt ids a prefill handed its decode (`prompt_token_ids`).
+    pub kv_transfer_params: Option<String>,
+    /// The prompt a decode's prefill ran, which the decode submits in place
+    /// of its own render, as the OpenAI server does.
+    pub prompt_token_ids: Option<Arc<Vec<u32>>>,
+    /// What the response carries back besides its render.
+    pub returned: Option<Arc<Returned>>,
 }
 
 /// The session headers, in the OpenAI server's order of preference.
@@ -168,10 +231,10 @@ impl RequestExtras {
     }
 
     /// The extras of a request: its session headers, and the body fields the
-    /// typed request drops -- a chat's whole body with `keeps_chat_body`. A P/D
-    /// request -- `kv_transfer_params`, or `/generate`'s bootstrap fields -- is
-    /// refused: the transfer is not carried to the engine, and served plainly
-    /// its peer waits for nothing.
+    /// typed request drops -- a chat's whole body with `keeps_chat_body`, a
+    /// P/D leg's `kv_transfer_params`. A `/generate` P/D request is refused:
+    /// its response (a list) has no place for a prefill's handoff, and served
+    /// plainly its peer waits for nothing.
     fn read(request: &InferenceEnvelope, keeps_chat_body: bool) -> Result<Self, Response> {
         let (dp_session_id, dp_parent_session_id) = session_ids(&request.headers);
         let mut extras = Self {
@@ -196,8 +259,30 @@ impl RequestExtras {
         let raw = serde_json::from_slice::<Map<String, Value>>(&request.body)
             .map_err(|e| error::bad_request("invalid_request", e.to_string()))?;
         let field = |name: &str| raw.get(name).filter(|v| !v.is_null());
-        if field("kv_transfer_params").is_some() {
-            return Err(pd_refused());
+        if let Some(sent) = field("kv_transfer_params") {
+            if matches!(request.parsed, ParsedInference::Generate(_)) {
+                return Err(pd_refused());
+            }
+            let mut params = sent.as_object().cloned().ok_or_else(|| {
+                error::bad_request("invalid_request", "kv_transfer_params must be an object")
+            })?;
+            if let Some(ids) = params.remove("prompt_token_ids").filter(|v| !v.is_null()) {
+                extras.prompt_token_ids = Some(Arc::new(prompt_token_ids(&ids)?));
+            }
+            // Its handoff goes in the response body, which a stream has not.
+            if params.get("do_remote_decode") == Some(&Value::Bool(true))
+                && field("stream") == Some(&Value::Bool(true))
+            {
+                return Err(error::bad_request(
+                    "invalid_request",
+                    "a prefill leg (do_remote_decode) is served without streaming",
+                ));
+            }
+            extras.kv_transfer_params = Some(Value::Object(params).to_string());
+        }
+        let return_token_ids = field("return_token_ids") == Some(&Value::Bool(true));
+        if extras.kv_transfer_params.is_some() || return_token_ids {
+            extras.returned = Some(Arc::new(Returned::new(return_token_ids)));
         }
         if let Some(rank) = field("data_parallel_rank") {
             extras.data_parallel_rank =
@@ -226,9 +311,61 @@ fn requests_pd_bootstrap(body: &GenerateRequest) -> bool {
 fn pd_refused() -> Response {
     error::bad_request(
         "pd_unsupported",
-        "P/D (kv_transfer_params, bootstrap fields) is not supported by the ATOM Rust \
-         frontend yet; serve P/D workers with the OpenAI server (USE_ATOMESH_ENTRYPOINTS=0)",
+        "P/D over /generate (kv_transfer_params, bootstrap fields) is not supported by the \
+         ATOM Rust frontend; send P/D legs to /v1/chat/completions or /v1/completions",
     )
+}
+
+/// `kv_transfer_params.prompt_token_ids`, as `resolve_prompt_token_ids` takes it.
+fn prompt_token_ids(ids: &Value) -> Result<Vec<u32>, Response> {
+    ids.as_array()
+        .filter(|ids| !ids.is_empty())
+        .and_then(|ids| {
+            ids.iter()
+                .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+                .collect()
+        })
+        .ok_or_else(|| {
+            error::bad_request(
+                "invalid_request",
+                "kv_transfer_params['prompt_token_ids'] must be a non-empty list of token ids",
+            )
+        })
+}
+
+/// `response` with what `returned` holds, at the top of its JSON body, as the
+/// OpenAI server writes it: a prefill's `kv_transfer_params` and, asked for,
+/// the `prompt_token_ids` it ran. A stream or an error is left as it is.
+async fn attach(returned: &Returned, response: Response) -> Response {
+    let handoff = returned.kv_transfer_params.get();
+    let ids = returned.prompt_token_ids.get();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if !response.status().is_success() || !is_json || (handoff.is_none() && ids.is_none()) {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let body = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(body) => body,
+        Err(e) => return error::internal_error("response_read_failed", e.to_string()),
+    };
+    let Ok(Value::Object(mut object)) = serde_json::from_slice::<Value>(&body) else {
+        return Response::from_parts(parts, Body::from(body));
+    };
+    if let Some(handoff) = handoff {
+        match serde_json::from_str(handoff) {
+            Ok(handoff) => object.insert("kv_transfer_params".into(), handoff),
+            Err(e) => return error::internal_error("invalid_kv_transfer_params", e.to_string()),
+        };
+    }
+    if let Some(ids) = ids {
+        object.insert("prompt_token_ids".into(), json!(ids));
+    }
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(Value::Object(object).to_string()))
 }
 
 /// Every request goes to the one local engine; CoreManager picks its DP rank.
@@ -379,10 +516,11 @@ impl RouterTrait for AtomBridgeRouter {
             Ok(extras) => extras,
             Err(response) => return response,
         };
+        let returned = extras.returned.clone();
         let (uri, headers, parsed, metadata) = request.into_native_parts();
         let headers = Some(&headers);
         let model = metadata.model.as_deref();
-        REQUEST_EXTRAS
+        let response = REQUEST_EXTRAS
             .scope(extras, async move {
                 match parsed {
                     ParsedInference::Chat(body) => self.route_chat(headers, &body, model).await,
@@ -402,7 +540,11 @@ impl RouterTrait for AtomBridgeRouter {
                     }
                 }
             })
-            .await
+            .await;
+        match returned {
+            Some(returned) => attach(&returned, response).await,
+            None => response,
+        }
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
@@ -573,19 +715,112 @@ mod tests {
         map
     }
 
-    #[tokio::test]
-    async fn an_encoder_rendered_chat_keeps_the_fields_its_typed_body_drops() {
+    /// An app, and the prepare pool it parses on (closed when dropped).
+    async fn app() -> (
+        crate::core::prepare_pool::PreparePoolRuntime,
+        Arc<AppContext>,
+    ) {
         let pool = crate::core::prepare_pool::PreparePoolRuntime::new(
             crate::config::RouterConfig::default()
                 .resolved_prepare_pool()
                 .unwrap(),
         )
         .unwrap();
-        let app = Arc::new(
-            AppContext::from_config(Default::default(), 5, pool.handle())
-                .await
-                .unwrap(),
+        let app = AppContext::from_config(Default::default(), 5, pool.handle())
+            .await
+            .unwrap();
+        (pool, Arc::new(app))
+    }
+
+    async fn extras(app: &Arc<AppContext>, path: &str, body: Value) -> Result<RequestExtras, u16> {
+        let request = InferenceEnvelope::parse(
+            path.parse().unwrap(),
+            headers(&[("content-type", "application/json")]),
+            serde_json::to_vec(&body).unwrap().into(),
+            app,
+        )
+        .await
+        .unwrap();
+        RequestExtras::read(&request, false).map_err(|r| r.status().as_u16())
+    }
+
+    #[tokio::test]
+    async fn a_pd_legs_handoff_is_read_and_a_decode_takes_its_prefills_prompt() {
+        let (_pool, app) = app().await;
+        let chat = |kv: Value, extra: Value| {
+            let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            body["kv_transfer_params"] = kv;
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+        let path = "/v1/chat/completions";
+        let decode = json!({"do_remote_prefill": true, "prompt_token_ids": [5, 6]});
+        let read = extras(&app, path, chat(decode, json!({"stream": true})))
+            .await
+            .unwrap();
+        assert_eq!(read.prompt_token_ids.as_deref(), Some(&vec![5, 6]));
+        assert_eq!(
+            read.kv_transfer_params.as_deref(),
+            Some(r#"{"do_remote_prefill":true}"#)
         );
+        let prefill = json!({"do_remote_decode": true});
+        let read = extras(
+            &app,
+            path,
+            chat(prefill.clone(), json!({"return_token_ids": true})),
+        )
+        .await
+        .unwrap();
+        assert!(read.returned.unwrap().wants_prompt_token_ids());
+        // Refused: a streamed prefill (its handoff has nowhere to go), prompt
+        // ids that are not ids, and P/D over /generate.
+        for (path, body) in [
+            (path, chat(prefill, json!({"stream": true}))),
+            (path, chat(json!({"prompt_token_ids": [-1]}), json!({}))),
+            ("/generate", json!({"text": "hi", "kv_transfer_params": {}})),
+        ] {
+            assert_eq!(extras(&app, path, body).await.unwrap_err(), 400);
+        }
+    }
+
+    /// A prefill's response, as the Atomesh router reads it into its decode's
+    /// request (`AtomAdapter::carry_prompt_token_ids`).
+    #[tokio::test]
+    async fn a_prefills_response_carries_what_the_router_hands_its_decode() {
+        use crate::core::placement::backend::atom::AtomAdapter;
+        let returned = Returned::new(true);
+        returned.prompt_token_ids.set(vec![1, 2, 3]).unwrap();
+        returned
+            .kv_transfer_params
+            .set(r#"{"remote_host":"h","dp_rank":1}"#.into())
+            .unwrap();
+        let response = attach(
+            &returned,
+            Json(json!({"id": "c", "choices": []})).into_response(),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], "c");
+        let mut decode_kv = body["kv_transfer_params"].clone();
+        assert_eq!(decode_kv["remote_host"], "h");
+        assert_eq!(
+            AtomAdapter::carry_prompt_token_ids(&body, &mut decode_kv),
+            3
+        );
+        assert_eq!(decode_kv["prompt_token_ids"], json!([1, 2, 3]));
+        // An error, or a stream, is left as it is.
+        let error = attach(&returned, error::bad_request("x", "y")).await;
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_encoder_rendered_chat_keeps_the_fields_its_typed_body_drops() {
+        let (_pool, app) = app().await;
         let body = serde_json::json!({
             "model": "m",
             "messages": [

@@ -11,6 +11,10 @@ from Python is this, and only this:
   structured admission -- whatever the engine does with a prompt) and
   ``CoreManager.add_request`` (DP routing, P/D, back-pressure).
 * ``abort`` stops what a request left running.
+* A P/D leg's ``kv_transfer_params`` go to the engine with its prompt, and a
+  prefill's handoff (``kv_transfer_params_output``) comes back with its
+  finish, for the Atomesh router to hand to decode; ``kv_transfer_info`` is
+  what the router reads of this worker at registration (``pd_handoff``).
 * Each engine step's tokens go back to Rust in one ``StepSink.push`` from
   CoreManager's output thread, the way the frontend workers' hub flushes a
   step per worker (``frontend_workers.py``).
@@ -43,12 +47,18 @@ from atom.entrypoints.openai.chat_encoders import (
     render_probe_prompt,
 )
 from atom.entrypoints.openai.model_capabilities import deployment_metadata
+from atom.entrypoints.openai.pd_handoff import (
+    chunked_receive_refusal,
+    is_chunked_receive,
+    kv_transfer_info,
+)
 from atom.entrypoints.openai.protocol import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
     ChatCompletionRequest,
+    check_media_handoff,
 )
 from atom.entrypoints.openai.reasoning import template_opens_reasoning_implicitly
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
@@ -195,6 +205,7 @@ class TokenBridge:
         if params.get("chat"):
             self._format.refuse_unheld_tool_calls(json.loads(params["chat"]), token_ids)
         sampling = self._sampling_params(params)
+        kv_transfer_params = self._kv_transfer_params(params.get("kv_transfer_params"))
         # The session lineage the OpenAI server reads from the same headers
         # (`_get_dp_session_affinity_ids`), and only with the same switch.
         affinity = envs.ATOM_DP_SESSION_AFFINITY
@@ -202,6 +213,7 @@ class TokenBridge:
             token_ids,
             sampling,
             stream_callbacks=[self._callback(key, i) for i in range(sampling.n)],
+            kv_transfer_params=kv_transfer_params,
             parent_request_id=params.get("request_id"),
             data_parallel_rank=params.get("data_parallel_rank"),
             dp_session_id=params.get("dp_session_id") if affinity else None,
@@ -238,6 +250,10 @@ class TokenBridge:
                     logger.debug("abort_request(%s): %s", seq_id, exc)
             self._forget(seq_ids)
 
+    def kv_transfer_info(self) -> str:
+        """``GET /kv_transfer_info``, as JSON."""
+        return json.dumps(kv_transfer_info(self.engine.config))
+
     def is_healthy(self) -> bool:
         return bool(self.engine.core_mgr.is_healthy())
 
@@ -264,6 +280,7 @@ class TokenBridge:
                     bool(request_output.finished),
                     request_output.finish_reason,
                     request_output.num_cached_tokens or 0,
+                    _handoff(request_output),
                 )
             )
             if request_output.finished:
@@ -305,6 +322,20 @@ class TokenBridge:
     # ------------------------------------------------------------------
     # Admission
     # ------------------------------------------------------------------
+
+    def _kv_transfer_params(self, sent: str | None) -> dict[str, Any] | None:
+        """A P/D leg's handoff as JSON, refused as the OpenAI server refuses
+        it (`_validate_kv_transfer_params`) before it is enqueued. Rust has
+        taken the prompt's ids out of it (they are the prompt it submits)."""
+        if not sent:
+            return None
+        params = json.loads(sent)
+        if is_chunked_receive(params):
+            refusal = chunked_receive_refusal(params, self.engine.config)
+            if refusal is not None:
+                raise ValueError(refusal)
+        check_media_handoff(params, self._max_model_len)
+        return params
 
     def _sampling_params(self, params: dict[str, Any]) -> SamplingParams:
         max_tokens = params.get("max_tokens")
@@ -362,3 +393,11 @@ class TokenBridge:
 
 def _or(value: Any, default: Any) -> Any:
     return default if value is None else value
+
+
+def _handoff(request_output: Any) -> str | None:
+    """A finished prefill's handoff for its decode, as JSON; None otherwise."""
+    if not request_output.finished:
+        return None
+    handoff = getattr(request_output, "kv_transfer_params_output", None)
+    return json.dumps(handoff) if handoff else None
