@@ -28,6 +28,7 @@ NUM_WARPS = [2, 4, 8, 16]
         "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
         "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "SNAPSHOT": lambda args: args["snap_idx"] is not None,
     }
 )
 @triton.autotune(
@@ -53,6 +54,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     ht,
     cu_seqlens,
     chunk_offsets,
+    h_snap,
+    snap_idx,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -66,6 +69,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    SNAPSHOT: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -174,6 +178,35 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 b_h4.to(h.dtype.element_ty),
                 mask=(_p_h4_0[:, None] < (K)) & (_p_h4_1[None, :] < (V)),
             )
+        # `h` narrows the fp32 recurrence to the input dtype. A boundary named
+        # in `snap_idx` is also stored at `h_snap`'s dtype, unnarrowed.
+        if SNAPSHOT:
+            i_s = tl.load(snap_idx + boh + i_t)
+            if i_s >= 0:
+                p_s = h_snap + ((i_s * H + i_h) * K * V).to(tl.int64)
+                tl.store(
+                    p_s + _p_h1_0[:, None] * (V) + _p_h1_1[None, :] * (1),
+                    b_h1.to(h_snap.dtype.element_ty),
+                    mask=(_p_h1_0[:, None] < (K)) & (_p_h1_1[None, :] < (V)),
+                )
+                if K > 64:
+                    tl.store(
+                        p_s + _p_h2_0[:, None] * (V) + _p_h2_1[None, :] * (1),
+                        b_h2.to(h_snap.dtype.element_ty),
+                        mask=(_p_h2_0[:, None] < (K)) & (_p_h2_1[None, :] < (V)),
+                    )
+                if K > 128:
+                    tl.store(
+                        p_s + _p_h3_0[:, None] * (V) + _p_h3_1[None, :] * (1),
+                        b_h3.to(h_snap.dtype.element_ty),
+                        mask=(_p_h3_0[:, None] < (K)) & (_p_h3_1[None, :] < (V)),
+                    )
+                if K > 192:
+                    tl.store(
+                        p_s + _p_h4_0[:, None] * (V) + _p_h4_1[None, :] * (1),
+                        b_h4.to(h_snap.dtype.element_ty),
+                        mask=(_p_h4_0[:, None] < (K)) & (_p_h4_1[None, :] < (V)),
+                    )
 
         _p_w_0 = (i_t * BT) + tl.arange(0, BT)
         _p_w_1 = (0) + tl.arange(0, 64)
@@ -363,6 +396,7 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    state_snapshots: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -408,6 +442,8 @@ def chunk_gated_delta_rule_fwd_h(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        h_snap=state_snapshots[1] if state_snapshots is not None else None,
+        snap_idx=state_snapshots[0] if state_snapshots is not None else None,
         T=T,
         H=H,
         Hg=Hg,

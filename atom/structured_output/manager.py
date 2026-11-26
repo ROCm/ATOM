@@ -26,12 +26,24 @@ def structured_stop_token_ids(config, tokenizer=None):
 def tokenizer_fingerprint(tokenizer, stop_token_ids):
     """Identify the actual token mapping/decoder and effective termination IDs."""
     backend = getattr(tokenizer, "backend_tokenizer", None)
-    if backend is None:
-        raise ValueError("Structured output requires a serializable fast tokenizer")
-    payload = {
-        "tokenizer": json.loads(backend.to_str()),
-        "stops": sorted(stop_token_ids),
-    }
+    encoding = getattr(tokenizer, "model", None)
+    if backend is not None:
+        mapping = json.loads(backend.to_str())
+    elif hasattr(encoding, "_mergeable_ranks"):
+        # A slow tiktoken tokenizer: its encoding is the token mapping.
+        ranks = hashlib.sha256()
+        for token, rank in sorted(
+            encoding._mergeable_ranks.items(), key=lambda x: x[1]
+        ):
+            ranks.update(rank.to_bytes(4, "little") + token)
+        mapping = {
+            "tiktoken": ranks.hexdigest(),
+            "special": sorted(encoding._special_tokens.items()),
+            "pattern": encoding._pat_str,
+        }
+    else:
+        raise ValueError("Structured output requires a serializable tokenizer")
+    payload = {"tokenizer": mapping, "stops": sorted(stop_token_ids)}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -242,7 +254,11 @@ class StructuredOutput:
         starts = lengths.cumsum() - lengths
         plan, pieces, offset = {}, [], 0
         for i in requests:
-            if batch.is_final_chunk is not None and not batch.is_final_chunk[i]:
+            if (
+                i < batch.total_seqs_num_prefill
+                and batch.is_final_chunk is not None
+                and not batch.is_final_chunk[i]
+            ):
                 continue
             start, count = int(starts[i]), int(lengths[i])
             rows = target[start : start + count].tolist()
@@ -321,7 +337,11 @@ class StructuredOutput:
         rows = []
         for i, update in batch.structured_requests.items():
             req_id = batch.req_ids[i]
-            final = batch.is_final_chunk is None or batch.is_final_chunk[i]
+            final = (
+                i >= batch.total_seqs_num_prefill
+                or batch.is_final_chunk is None
+                or batch.is_final_chunk[i]
+            )
             branch_rows, start, size = (
                 plan.get(i, ([], 0, 0)) if metadata else ([i], 0, 0)
             )

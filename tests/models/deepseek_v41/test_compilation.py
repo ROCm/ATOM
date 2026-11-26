@@ -26,7 +26,7 @@ from atom.utils.backends import VllmBackend
 
 class Step:
     def __init__(self, rows, shift, empty=False):
-        self.width = rows
+        self.running_tokens = rows
         self.shift = shift
         self.requests = [] if empty else [object()]
         self.selected = {"stale": True}
@@ -199,7 +199,9 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
                 forward_context.ForwardContext(
                     attn_metadata=metadata,
                     no_compile_layers=config.compilation_config.static_forward_context,
-                    context=SimpleNamespace(is_draft=False, ubatch_token_offset=0),
+                    context=SimpleNamespace(
+                        is_draft=False, ubatch_token_offset=0, ubatch_token_order=None
+                    ),
                 ),
             )
             tokens = torch.arange(rows, device="cuda", dtype=torch.int64)
@@ -234,10 +236,19 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm mHC")
 @pytest.mark.parametrize("mode", ["pre", "post_pre"])
-@pytest.mark.parametrize("backend", ["triton", "hip", "hip_quant"])
-def test_mhc_guard_outputs_and_input_alias(mode, backend):
+@pytest.mark.parametrize("backend", ["triton", "hip", "hip_quant", "asm"])
+def test_mhc_guard_outputs_and_input_alias(mode, backend, monkeypatch, request):
     from atom.model_ops.deepseek_v41 import mhc_pre_delayed as mhc
 
+    # Pin the backend: on gfx942 `auto` sends post seams to the ASM seam, so
+    # `triton` must force Triton, and an exported `triton` must not skip `asm`.
+    monkeypatch.setenv(
+        "ATOM_DSV41_MHC_BACKEND", "triton" if backend == "triton" else "auto"
+    )
+    # The env is pinned per case; clear before and after so no result cached
+    # under this case's env reaches a later test in the session.
+    mhc.use_asm_seam.cache_clear()
+    request.addfinalizer(mhc.use_asm_seam.cache_clear)
     device = "cuda"
     rows, hc, hidden = 6, 4, 5120
     residual = torch.randn(1, rows, hc, hidden, device=device, dtype=torch.bfloat16)
@@ -253,7 +264,11 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend):
         "post_mult": 2.0,
         "norm_eps": 1e-6,
     }
-    if backend != "triton":
+    if backend == "asm" and mode == "pre":
+        pytest.skip("seams without a post never take the ASM seam")
+    if backend == "asm" and not mhc.use_asm_seam(hc, hidden):
+        pytest.skip("AITER's ASM seam does not run here")
+    if backend in ("hip", "hip_quant"):
         arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         if arch not in ("gfx950", "gfx1250"):
             pytest.skip("ATOM HIP Mega-MHC requires gfx950 or gfx1250")
@@ -298,6 +313,37 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         else:
             assert all(torch.isfinite(out).all() for out in outputs)
+        if backend == "asm":
+            import aiter
+
+            r, post_mix, comb = (
+                kwargs[k].view(rows, *kwargs[k].shape[2:])
+                for k in ("sublayer_output", "post_mix", "combination")
+            )
+            seam = aiter.mhc_fused_post_pre_delayed(
+                residual[0],
+                fn,
+                scale,
+                base,
+                kwargs["rms_eps"],
+                kwargs["hc_eps"],
+                kwargs["hc_eps"],
+                kwargs["post_mult"],
+                kwargs["sinkhorn_iters"],
+                pre[0],
+                r,
+                post_mix,
+                comb,
+            )
+            expected = (
+                seam[0],
+                aiter.rms_norm(seam[3], norm, kwargs["norm_eps"]),
+                seam[4],
+                seam[1].view(rows, hc),
+                seam[2],
+            )
+            for actual, want in zip(outputs, expected):
+                assert torch.equal(actual[0], want)
         torch.library.opcheck(
             torch.ops.aiter.v41_mhc_pre_delayed.default,
             args,
@@ -314,7 +360,10 @@ def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeyp
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
     from atom.utils.forward_context import AttnState
-    from tests.attentions.deepseek_v41.helpers import metadata_buffers
+    from tests.attentions.deepseek_v41.helpers import (
+        metadata_buffers,
+        stage_query_layout,
+    )
     from tests.attentions.deepseek_v41.test_runtime_contract import (
         _attach_uncompiled_backbone,
     )
@@ -328,23 +377,25 @@ def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeyp
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(2, 8, 4, "cuda", geo)
     )
+    # An idle DP rank schedules nothing; its 8 rows are all padding.
     batch = SimpleNamespace(
-        is_dummy_run=True,
+        is_dummy_run=False,
         is_final_chunk=None,
         replaying={},
         state_slots_committed=[],
-        req_ids=(-1,),
-        num_scheduled_tokens=(8,),
-        context_lens=(8,),
-        total_seqs_num=1,
-        total_tokens_num=8,
+        req_ids=[],
+        num_scheduled_tokens=(),
+        context_lens=(),
+        total_seqs_num=0,
+        total_tokens_num=0,
     )
-    metadata, positions = builder.prepare_prefill(batch, 2, batch.total_tokens_num)
+    stage_query_layout(builder, (), 2, 8)
+    metadata, positions = builder.prepare_prefill(batch, 2, 8)
     metadata.engram_embeddings = Rows()
     step = metadata.step
     assert step.requests == () and step.is_prefill and not step.decode
     assert metadata.state == AttnState.PREFILL_PREFIX
-    assert step.width == 8 and torch.all(step.batch_ids == -1)
+    assert step.running_tokens == 8 and torch.all(step.batch_ids == -1)
     builder.cache.backing.fill_(57)
     before = builder.cache.backing.clone()
 
@@ -373,7 +424,9 @@ def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeyp
         forward_context.ForwardContext(
             attn_metadata=metadata,
             no_compile_layers={"v41.layers.0": (model.layers[0], None)},
-            context=SimpleNamespace(is_draft=False, ubatch_token_offset=0),
+            context=SimpleNamespace(
+                is_draft=False, ubatch_token_offset=0, ubatch_token_order=None
+            ),
         ),
     )
     output = model(torch.zeros(8, dtype=torch.int32, device="cuda"), positions)

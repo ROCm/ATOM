@@ -1,4 +1,7 @@
 name: ATOM vLLM Benchmark
+# Scheduled runs are titled "(scheduled MI355)" so atom-nightly-deadline.yaml
+# stops them at 09:00 Beijing time.
+run-name: "${{ github.event_name == 'schedule' && format('{0} (scheduled MI355)', github.workflow) || github.workflow }}"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.repository }}-${{ github.event_name }}-${{ github.ref_name }}
@@ -7,8 +10,15 @@ concurrency:
 
 on:
   schedule:
-    # Mon/Wed/Fri at 23:30 Beijing (15:30 UTC).
-    - cron: '30 15 * * 1,3,5'
+    # Mon-Sat at 23:30 Beijing (15:30 UTC); the cron weekday is the Beijing
+    # weekday. One cron a night: WEEKLY_SCHEDULE (load-models) runs each
+    # scheduled model on one night a week.
+    - cron: '30 15 * * 1'
+    - cron: '30 15 * * 2'
+    - cron: '30 15 * * 3'
+    - cron: '30 15 * * 4'
+    - cron: '30 15 * * 5'
+    - cron: '30 15 * * 6'
   workflow_dispatch:
     inputs:
       benchmark_client:
@@ -31,112 +41,96 @@ on:
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_2:
         description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_3:
         description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_4:
         description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_5:
         description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_6:
         description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_7:
         description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_8:
         description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -146,9 +140,9 @@ on:
         type: string
         default: "1024,1024;1024,8192;8192,1024"
       concurrency_values:
-        description: "Benchmark concurrency values. Use comma-separated values from 4,8,16,32,64,128,256,512. The workflow will benchmark exactly the values you provide."
+        description: "Benchmark concurrency values. Use comma-separated values from 4,8,16,32,64,128,256,512. The workflow will benchmark exactly the values you provide. The default matches the SGLang benchmark's."
         type: string
-        default: "4,8,16,32,64,128,256,512"
+        default: "4,8,16,32,64"
       random_range_ratios:
         description: "Benchmark random range ratios. Use comma-separated values like 0.8,1.0."
         type: string
@@ -502,7 +496,7 @@ jobs:
         id: parse-benchmark-params
         env:
           ISL_OSL_PAIRS: ${{ inputs.isl_osl_pairs || '1024,1024;1024,8192;8192,1024' }}
-          CONCURRENCY_VALUES: ${{ inputs.concurrency_values || '4,8,16,32,64,128,256,512' }}
+          CONCURRENCY_VALUES: ${{ inputs.concurrency_values || '4,8,16,32,64' }}
           RANDOM_RANGE_RATIOS: ${{ inputs.random_range_ratios || '0.8' }}
         run: |
           set -euo pipefail
@@ -624,6 +618,7 @@ jobs:
       - id: load
         env:
           BENCHMARK_GROUP: ${{ inputs.benchmark_group || 'none' }}
+          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
           MODEL_SLOT_1: ${{ inputs.model_slot_1 || 'none' }}
           MODEL_SLOT_2: ${{ inputs.model_slot_2 || 'none' }}
           MODEL_SLOT_3: ${{ inputs.model_slot_3 || 'none' }}
@@ -675,21 +670,38 @@ jobs:
                   m for m in variants if str(m.get("display", "")) in displays
               ]
 
+          # The models the vLLM plugin PR CI (atom-vllm-test.yaml) gates on,
+          # under the same display names.
           BENCHMARK_DISPLAYS = {
-              "DeepSeek-V3.2 FP8 PTPC TP4",
-              "DeepSeek-V3.2 FP8 PTPC MTP TP4",
-              "DeepSeek-V4-Pro TP8",
-              "Kimi-K3 TP8",
-              "GLM-5.2-MXFP4 TP4",
-              "GLM-5.2-MXFP4-MTP TP4",
+              "DeepSeek-V4-Flash TP4",
+              "MiniMax-M3-MXFP4 EAGLE3 TP4",
+              "Kimi-K3 DSpark DCP8 TP8",
+              "DeepSeek-V4.1-Flash DSpark TP4",
+              "GLM-5.3-Flash kpool MTP prefix-cache TP4",
               "Qwen3.5-397B-A17B-MXFP4 TP4",
-              "MiniMax-M3-MXFP4 TP4",
+          }
+
+          # Each scheduled model runs on one night a week, keyed by that
+          # night's cron.
+          WEEKLY_SCHEDULE = {
+              "30 15 * * 1": ("Mon", {"DeepSeek-V4-Flash TP4"}),
+              "30 15 * * 2": ("Tue", {"DeepSeek-V4.1-Flash DSpark TP4"}),
+              "30 15 * * 3": ("Wed", {"Kimi-K3 DSpark DCP8 TP8"}),
+              "30 15 * * 4": ("Thu", {"MiniMax-M3-MXFP4 EAGLE3 TP4"}),
+              "30 15 * * 5": ("Fri", {"Qwen3.5-397B-A17B-MXFP4 TP4"}),
+              "30 15 * * 6": ("Sat", {"GLM-5.3-Flash kpool MTP prefix-cache TP4"}),
           }
 
           if event == "schedule":
-              selected_group = "ALL"
-              selected = select_by_display(all_variants, BENCHMARK_DISPLAYS)
-              missing = BENCHMARK_DISPLAYS - {
+              schedule_cron = os.environ.get("SCHEDULE_CRON", "")
+              if schedule_cron not in WEEKLY_SCHEDULE:
+                  raise SystemExit(f"No weekly benchmark night for cron {schedule_cron!r}.")
+              # selected_group also names a manual run's group (ALL), so a
+              # scheduled night's group is "<night> weekly", not the bare day.
+              night, tonight = WEEKLY_SCHEDULE[schedule_cron]
+              selected_group = f"{night} weekly"
+              selected = select_by_display(all_variants, tonight)
+              missing = tonight - {
                   str(m.get("display", "")) for m in selected
               }
               if missing:
@@ -822,26 +834,17 @@ jobs:
               excluded_pairs = set(model.get("excluded_input_output_pairs", []))
               model_params = []
               seen = set()
-              extra_concurrency = (128, 256)
 
               for param in params:
-                  base_params = [param]
+                  variants = [param]
                   if is_aw_model:
-                      base_params = []
+                      variants = []
                       for input_length, output_length in aw_pairs:
                           aw_param = dict(param)
                           aw_param["input_length"] = input_length
                           aw_param["output_length"] = output_length
                           aw_param["random_range_ratio"] = "0.0"
-                          base_params.append(aw_param)
-
-                  variants = []
-                  for base_param in base_params:
-                      variants.append(base_param)
-                      for concurrency in extra_concurrency:
-                          variant = dict(base_param)
-                          variant["concurrency"] = concurrency
-                          variants.append(variant)
+                          variants.append(aw_param)
 
                   for variant in variants:
                       key = (
@@ -1066,6 +1069,7 @@ jobs:
       DASHBOARD_MODEL_NAME: ${{ matrix.model.dashboard_model || '' }}
       MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
       MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
+      DRAFT_MODEL_PATH: ${{ matrix.model.draft_model_path || '' }}
       OOT_EXTRA_ARGS: ${{ matrix.model.extra_args }}
       BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
       RESULT_PREFIX: ${{ matrix.model.prefix }}
@@ -1281,6 +1285,24 @@ jobs:
               echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
               exit 1
             fi
+            # A separate draft checkpoint (EAGLE3, DSpark) is referenced from
+            # the speculative config as /models/<hf id>, as in the PR CI.
+            if [ -n "${DRAFT_MODEL_PATH}" ]; then
+              draft_id="${DRAFT_MODEL_PATH#/models/}"
+              echo "Checking cache and lock-protected download for draft model /models/${draft_id}"
+              if ! $CONTAINER_ENGINE exec \
+                -e HF_TOKEN="${HF_TOKEN:-}" \
+                -e MODEL_ID="${draft_id}" \
+                -e TARGET_DIR="/models/${draft_id}" \
+                -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+                -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+                -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+                -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+                "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+                echo "Draft model download failed for '${draft_id}'. Aborting."
+                exit 1
+              fi
+            fi
           else
             echo "/models directory not mounted; skipping model download"
           fi
@@ -1314,6 +1336,19 @@ jobs:
           else
             echo "OOT_RESOLVED_MODEL_PATH=${MODEL_SOURCE_PATH}" >> "$GITHUB_ENV"
             echo "Using model id: ${MODEL_SOURCE_PATH}"
+            if [ -n "${DRAFT_MODEL_PATH}" ]; then
+              # No /models mount: point the speculative config at the draft's
+              # hub id so vLLM fetches it itself.
+              source .github/scripts/plugin_ci/cache_model.sh
+              draft_id="${DRAFT_MODEL_PATH#/models/}"
+              rewritten_args="$(plugin_ci_rewrite_extra_args "${OOT_EXTRA_ARGS}" "${draft_id}" "${draft_id}")"
+              {
+                echo "OOT_SERVE_EXTRA_ARGS<<OOT_SERVE_EXTRA_ARGS_EOF"
+                echo "${rewritten_args}"
+                echo "OOT_SERVE_EXTRA_ARGS_EOF"
+              } >> "$GITHUB_ENV"
+              echo "Using draft model id: ${draft_id}"
+            fi
           fi
 
       - name: Prepare benchmark client in container
@@ -1342,7 +1377,7 @@ jobs:
           $CONTAINER_ENGINE exec \
             -e OOT_MODEL_NAME="${MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
-            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e OOT_EXTRA_ARGS="${OOT_SERVE_EXTRA_ARGS:-${OOT_EXTRA_ARGS}}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
@@ -1355,6 +1390,10 @@ jobs:
         id: run_benchmark_client
         timeout-minutes: 360
         continue-on-error: true
+        # Each case's client runs under .github/scripts/supervise_client.sh
+        # (when the benchmarked ATOM source has it), which stops it with exit
+        # 1 (server hang) or 2 (server fault) instead of letting one wedged
+        # case use up this step's 360 min.
         run: |
           set -euo pipefail
           TRUST_REMOTE_CODE_ARG=""
@@ -1443,7 +1482,15 @@ jobs:
                   -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
                   "$CONTAINER_NAME" bash -lc "
                     set -euo pipefail
-                    PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
+                    # Stops the client early (exit 1 hang / 2 fault) if the server wedges.
+                    # A benchmarked ATOM source older than the script runs it unsupervised.
+                    SUPERVISE=()
+                    if [ -f .github/scripts/supervise_client.sh ]; then
+                      SUPERVISE=(bash .github/scripts/supervise_client.sh vllm \"/tmp/${RESULT_FILENAME}.client.log\" 340 --)
+                    else
+                      echo '::warning::.github/scripts/supervise_client.sh is not in the benchmarked ATOM source; running the client without hang detection.'
+                    fi
+                    PYTHONDONTWRITEBYTECODE=1 \"\${SUPERVISE[@]}\" python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
                       --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
                       --backend=vllm \
                       --base-url=http://127.0.0.1:8000 \
@@ -1473,7 +1520,15 @@ jobs:
                   -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
                   "$CONTAINER_NAME" bash -lc "
                     set -euo pipefail
-                    vllm bench serve \
+                    # Stops the client early (exit 1 hang / 2 fault) if the server wedges.
+                    # A benchmarked ATOM source older than the script runs it unsupervised.
+                    SUPERVISE=()
+                    if [ -f .github/scripts/supervise_client.sh ]; then
+                      SUPERVISE=(bash .github/scripts/supervise_client.sh vllm \"/tmp/${RESULT_FILENAME}.client.log\" 340 --)
+                    else
+                      echo '::warning::.github/scripts/supervise_client.sh is not in the benchmarked ATOM source; running the client without hang detection.'
+                    fi
+                    \"\${SUPERVISE[@]}\" vllm bench serve \
                       --backend vllm \
                       --base-url http://127.0.0.1:8000 \
                       --endpoint /v1/completions \

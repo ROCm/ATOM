@@ -232,6 +232,7 @@ def bind_layer(block, cfg: V4Config) -> BoundLayer:
     from aiter.ops.flydsl.moe_common import GateMode
 
     from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+        FP4_GFX950_OPUS,
         FP4_GFX950_PRESHUFFLE,
     )
     from atom.mono.runtime.consensus import MonoUnsupported
@@ -464,7 +465,8 @@ def bind_layer(block, cfg: V4Config) -> BoundLayer:
         idx = attn.indexer
         if (
             not idx._indexer_fp4
-            or idx.indexer_layout != FP4_GFX950_PRESHUFFLE
+            or idx.indexer_layout not in (FP4_GFX950_PRESHUFFLE, FP4_GFX950_OPUS)
+            or idx.indexer_layout != cfg.indexer_layout
             or idx.index_topk != cfg.index_topk
         ):
             raise MonoUnsupported(

@@ -6,20 +6,9 @@ on:
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
     types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'atom/plugin/**'
-      - 'atom/mesh/**'
-      - '.github/benchmark/models_atomesh.yaml'
-      - '.github/scripts/atomesh/**'
-      - '.github/workflows/atomesh-*.yaml'
-      - '.github/workflows/atom-vllm-*.yaml'
-      - '.github/workflows/atom-sglang-*.yaml'
-      - '.github/benchmark/oot_models_accuracy.json'
-      - '.github/benchmark/sglang_models_accuracy.json'
-      - 'LICENSE'
-      - '.gitignore'
+    # Do not use paths-ignore here. The required gate must be published for
+    # every PR; ci-gate below keeps the old path-ignore behavior for expensive
+    # jobs.
   pull_request_review:
     types: [submitted]
   schedule:
@@ -42,7 +31,12 @@ concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
   # Approval runs queue behind existing work. Other reviews get their own
   # group so they cannot replace a pending approval run in GitHub's queue.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}
+  # Likewise every label event except the one that opens the gate -- adding
+  # ci:atom, or ci:full to a PR without ci:atom (check_label_event in the gate
+  # script) -- so an unrelated label can never cancel running heavy CI. The
+  # ci-gate and gate jobs' names repeat this test; keep all three in sync with
+  # CI_GATE_LABELS.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))) && format('-noop-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
 
 env:
@@ -55,7 +49,10 @@ env:
 
 jobs:
   ci-gate:
-    name: Check Heavy CI Gate
+    # A no-op label run (the -noop- concurrency group above) is named apart from
+    # its first job on, so an approval can tell it from the PR group's runs
+    # when it looks for a pending run it replaced (CI_GATE_NOOP_JOB).
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))) && 'Check Heavy CI Gate (no-op label)' || 'Check Heavy CI Gate' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -64,6 +61,8 @@ jobs:
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       reason: ${{ steps.gate.outputs.reason }}
+      decidable: ${{ steps.gate.outputs.decidable }}
+      smoke_requested: ${{ steps.gate.outputs.smoke_requested }}
       pr_check_takeover: ${{ steps.gate.outputs.pr_check_takeover }}
     steps:
       - name: Checkout ATOM repo
@@ -74,13 +73,20 @@ jobs:
         env:
           CI_GATE_WORKFLOW: atom-test.yaml
           CI_GATE_PR_CHECK_JOB: Offline inference smoke test
+          CI_GATE_NOOP_JOB: Check Heavy CI Gate (no-op label)
           CI_GATE_LABELS: ci:full,ci:atom
           CI_GATE_PATHS_IGNORE: |
             **/*.md
             docs/**
+            .claude/**
+            atomrl/**
+            .github/workflows/atomrl-*.yaml
             atom/plugin/**
             atom/mesh/**
+            .github/benchmark/models_atomesh.yaml
+            .github/scripts/atomesh/**
             .github/workflows/atomesh-*.yaml
+            .github/workflows/atom-review-bot*.yml
             .github/scripts/atomesh_*.sh
             .github/dashboard/atomesh_*.html
             .github/workflows/atom-vllm-*.yaml
@@ -188,8 +194,8 @@ jobs:
     # a crash, not wrong text, so there is no golden file to keep per model --
     # and one small model exercises that code path as well as thirteen do.
     # Do not publish a same-named skipped check over a previous smoke failure.
-    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'Offline inference smoke test' || 'Offline smoke not requested' }}
-    runs-on: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
+    name: ${{ needs.ci-gate.outputs.smoke_requested == 'true' && 'Offline inference smoke test' || 'Offline smoke not requested' }}
+    runs-on: ${{ needs.ci-gate.outputs.smoke_requested == 'true' && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
       CONTAINER_NAME: atom_smoke_test
@@ -199,7 +205,7 @@ jobs:
       # the offline entrypoint completes, so it keeps the small model and its
       # settings regardless of what the accuracy matrix tracks.
       SMOKE_EXTRA_ARGS: --kv_cache_dtype fp8 --gpu-memory-utilization 0.3
-      SMOKE_REQUESTED: ${{ github.event_name != 'pull_request_review' || needs.ci-gate.outputs.pr_check_takeover == 'true' }}
+      SMOKE_REQUESTED: ${{ needs.ci-gate.outputs.smoke_requested }}
     steps:
       - name: Kill stale containers
         if: env.SMOKE_REQUESTED == 'true'
@@ -556,10 +562,46 @@ jobs:
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
+
+            # A speculative-decoding case also needs its draft checkpoint. Left
+            # as a Hub id, the server fetches it on every launch into the
+            # throwaway container's HF cache, and that fetch goes through
+            # hf-xet, which intermittently stalls: the same ~5 GiB file took
+            # 5s on most runs and 118s, 250s and 836s on others, all of it
+            # spent silently inside "Waiting for ATOM server to be ready".
+            # Cache it under /models next to the target instead, so the launch
+            # reads a local directory and never touches the network.
+            draft_id="$(printf '%s\n' "${MODEL_EXTRA_ARGS}" | sed -nE 's/.*--draft-model[ =]+([^ ]+).*/\1/p')"
+            if [[ "${draft_id}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+              draft_dir="/models/${draft_id}"
+              echo "draft model '${draft_id}' found in extraArgs, checking cache and lock-protected download for ${draft_dir}"
+              # Xet is off for this one download: over plain HTTP the file
+              # lands in ~30s every time, which is what a one-off cache fill
+              # wants. A stall here would otherwise sit until the timeout.
+              if docker exec \
+                -e HF_TOKEN="${HF_TOKEN:-}" \
+                -e HF_HUB_DISABLE_XET=1 \
+                -e MODEL_ID="${draft_id}" \
+                -e TARGET_DIR="${draft_dir}" \
+                -e MODEL_DOWNLOAD_TIMEOUT="${DRAFT_MODEL_DOWNLOAD_TIMEOUT}" \
+                -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+                -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+                -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+                "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+                echo "DRAFT_MODEL_ID=${draft_id}" >> "$GITHUB_ENV"
+                echo "DRAFT_MODEL_DIR=${draft_dir}" >> "$GITHUB_ENV"
+              else
+                # Not fatal: the server can still fetch the draft itself, as it
+                # did before this cache existed.
+                echo "::warning::Could not cache draft model '${draft_id}' under ${draft_dir}; the server will download it at launch."
+              fi
+            fi
           else
             echo "container /models directory not found, skipping model download"
           fi
         env:
+          MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
+          DRAFT_MODEL_DOWNLOAD_TIMEOUT: "10m"
           MODEL_DOWNLOAD_TIMEOUT: "30m"
           MODEL_LOCK_WAIT_SECONDS: "1800"
           MODEL_LOCK_POLL_INTERVAL: "30"
@@ -636,9 +678,17 @@ jobs:
           else
             model_path="${{ matrix.model_path }}"
           fi
+          # Point --draft-model at the copy "Download models" cached under
+          # /models, so the launch does not download it from the Hub again.
+          launch_args="${MODEL_EXTRA_ARGS}"
+          if [ -n "${DRAFT_MODEL_ID:-}" ] && docker exec "$CONTAINER_NAME" test -f "${DRAFT_MODEL_DIR}/config.json"; then
+            launch_args="${launch_args/--draft-model ${DRAFT_MODEL_ID}/--draft-model ${DRAFT_MODEL_DIR}}"
+            launch_args="${launch_args/--draft-model=${DRAFT_MODEL_ID}/--draft-model=${DRAFT_MODEL_DIR}}"
+            echo "Using cached draft model: ${DRAFT_MODEL_DIR}"
+          fi
           # Pipe via stdin so container bash parses shell quoting in extraArgs
           # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
-          echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
+          echo ".github/scripts/atom_test.sh launch $model_path $launch_args" | \
             docker exec \
               -e ATOM_DEBUG_DEVICE_MAPPING="${ATOM_DEBUG_DEVICE_MAPPING}" \
               -i "$CONTAINER_NAME" bash -l
@@ -782,6 +832,40 @@ jobs:
           docker rm "$CONTAINER_NAME" || true
           # Remove the pre-built image to free disk space on the runner
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
+
+  atom-test-gate:
+    name: ${{ ((github.event_name != 'pull_request_review' && !(github.event.action == 'labeled' && !(github.event.label.name == 'ci:atom' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:atom'))))) || needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'ATOM Test Gate' || 'ATOM Test Gate not requested' }}
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs:
+      - ci-gate
+      - check-signal
+      - download_aiter_wheel
+      - load-test-models
+      - offline-smoke-test
+      - atom-test
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Evaluate ATOM test gate
+        uses: ./.github/actions/evaluate-test-gate
+        with:
+          gate-name: ATOM Test Gate
+          suite-name: ATOM accuracy tests
+          should-run: ${{ needs.ci-gate.outputs.should_run }}
+          decidable: ${{ needs.ci-gate.outputs.decidable }}
+          reason: ${{ needs.ci-gate.outputs.reason }}
+          ci-gate-result: ${{ needs.ci-gate.result }}
+          optional-results: |
+            offline-smoke-test=${{ needs.offline-smoke-test.result }}
+          required-results: |
+            check-signal=${{ needs.check-signal.result }}
+            download_aiter_wheel=${{ needs.download_aiter_wheel.result }}
+            load-test-models=${{ needs.load-test-models.result }}
+            atom-test=${{ needs.atom-test.result }}
 
   # ---------- Push accuracy data to benchmark dashboard ----------
   accuracy-dashboard:

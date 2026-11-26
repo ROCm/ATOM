@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
-import importlib.util
 import itertools
 import logging
 import time
@@ -15,11 +15,13 @@ from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import Sequence, leaves_media_on_prefill
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import RequiredChannel, SamplingParams
+from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     WorkerGrammarPreflight,
+    require_available,
     validate_execution_options,
 )
 from atom.utils import envs
@@ -40,141 +42,60 @@ def load_tokenizer(model: str, trust_remote_code: bool = False):
     return tokenizer
 
 
+def prepare_config(model, tokenizer=None, **kwargs):
+    """The Config an engine's processes run with, and its tokenizer."""
+    config_fields = {field.name for field in fields(Config)}
+    config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+    data_parallel_size = kwargs.get("data_parallel_size", 1)
+    data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
+    config = Config(model, **config_kwargs)
+    tokenizer = tokenizer or load_tokenizer(config.model, config.trust_remote_code)
+    config.bos_token_id = tokenizer.bos_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    stop_token_ids = set(config.stop_token_ids)
+    # separate eos_token_id from stop_token_ids
+    stop_token_ids.discard(config.eos_token_id)
+    config.stop_token_ids = list(stop_token_ids)
+    # Legacy path only: callers that pass DP topology as loose kwargs
+    # instead of a ParallelConfig. When a parallel_config was supplied it
+    # is already authoritative, and overwriting it here would reset a
+    # multi-node topology back to a single local rank.
+    if "parallel_config" not in config_kwargs:
+        config.parallel_config.data_parallel_size = data_parallel_size
+        if data_parallel_master_port is not None:
+            config.parallel_config.data_parallel_master_port = data_parallel_master_port
+    # Config validated SP before the legacy DP kwargs above landed.
+    if (
+        config.sequence_parallel_size > 1
+        and config.parallel_config.data_parallel_size != 1
+    ):
+        raise ValueError("Ulysses SP currently requires data_parallel_size=1")
+    # PCP and DP-attention together are unverified. The refusal's original
+    # cause, a DP all-gather of the hash-routing input ids sized for the
+    # un-split token count, is gone: the MoE now routes before its DP
+    # gather, on rank-local ids.
+    if config.enable_dp_attention and config.pipeline_parallel_size > 1:
+        raise ValueError(
+            "--enable-dp-attention and pipeline-parallel (pp>1) "
+            "cannot be used together."
+        )
+    if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
+        raise ValueError(
+            "prefill_context_parallel_size > 1 (-pcp) combined with "
+            "--enable-dp-attention is not supported yet (may be supported "
+            "in a future release): the combination is unverified. For "
+            "now, disable one of them (use -tp N -pcp M without "
+            "DP-attention, or -dp N --enable-dp-attention without -pcp)."
+        )
+    return config, tokenizer
+
+
 class LLMEngine:
 
     def __init__(self, model, tokenizer=None, **kwargs):
-        config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        data_parallel_size = kwargs.get("data_parallel_size", 1)
-        data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
-        config = Config(model, **config_kwargs)
+        config, self.tokenizer = prepare_config(model, tokenizer, **kwargs)
         self.config = config
-        self.tokenizer = tokenizer or load_tokenizer(
-            config.model, config.trust_remote_code
-        )
-        config.bos_token_id = self.tokenizer.bos_token_id
-        config.eos_token_id = self.tokenizer.eos_token_id
-        stop_token_ids = set(config.stop_token_ids)
-        # separate eos_token_id from stop_token_ids
-        stop_token_ids.discard(config.eos_token_id)
-        config.stop_token_ids = list(stop_token_ids)
-        # Legacy path only: callers that pass DP topology as loose kwargs
-        # instead of a ParallelConfig. When a parallel_config was supplied it
-        # is already authoritative, and overwriting it here would reset a
-        # multi-node topology back to a single local rank.
-        if "parallel_config" not in config_kwargs:
-            config.parallel_config.data_parallel_size = data_parallel_size
-            if data_parallel_master_port is not None:
-                config.parallel_config.data_parallel_master_port = (
-                    data_parallel_master_port
-                )
         self.data_parallel_size = config.parallel_config.data_parallel_size
-        # TBO's two concurrent ubatches are supported by the mori EP
-        # dispatch/combine path. The EP collective fallback instead issues
-        # full DP all-gather/reduce-scatter operations from both ubatch streams;
-        # those streams can enter the collectives in opposite order and hang.
-        # Keep the fallback usable by serializing it until it has dedicated
-        # per-ubatch communicators, analogous to the PCP/TP guard below.
-        mori_ep_enabled = (
-            getattr(config, "moe_all2all_backend", "auto") in {"auto", "mori"}
-            and not envs.ATOM_DISABLE_MORI_EP
-            and importlib.util.find_spec("mori") is not None
-        )
-        if (
-            config.enable_dp_attention
-            and config.enable_expert_parallel
-            and config.enable_tbo
-            and not mori_ep_enabled
-        ):
-            logger.warning(
-                "Disabling TBO for the DP-attention + EP collective fallback: "
-                "concurrent all-gather/reduce-scatter ubatches can deadlock. "
-                "Use mori EP or run the fallback without --enable-tbo."
-            )
-            config.enable_tbo = False
-            config.enable_tbo_decode = False
-        # PCP and DP-attention together are unverified. The refusal's original
-        # cause, a DP all-gather of the hash-routing input ids sized for the
-        # un-split token count, is gone: the MoE now routes before its DP
-        # gather, on rank-local ids.
-        if config.enable_dp_attention and config.pipeline_parallel_size > 1:
-            raise ValueError(
-                "--enable-dp-attention and pipeline-parallel (pp>1) "
-                "cannot be used together."
-            )
-        if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
-            raise ValueError(
-                "prefill_context_parallel_size > 1 (-pcp) combined with "
-                "--enable-dp-attention is not supported yet (may be supported "
-                "in a future release): the combination is unverified. For "
-                "now, disable one of them (use -tp N -pcp M without "
-                "DP-attention, or -dp N --enable-dp-attention without -pcp)."
-            )
-        # PCP + TBO prefill: supported via coordinated splitting.
-        # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
-        # per-request ubatch split are unverified).
-        if config.prefill_context_parallel_size > 1 and config.enable_tbo:
-            # TBO overlaps compute with the attn<->MoE PCP collectives, which
-            # only exist in MoE merge mode (ATOM_PCP_MOE_MERGE=1). With
-            # ATOM_PCP_MOE_MERGE=0, MoE runs on each rank's 1/W token shard
-            # with NO extra comm between attn and MoE, so TBO has nothing
-            # to overlap and only adds ubatch-splitting overhead. Force it off.
-            if not envs.ATOM_PCP_MOE_MERGE:
-                logger.warning(
-                    "Disabling TBO because ATOM_PCP_MOE_MERGE=0: in this "
-                    "situation it runs MoE on each rank's 1/W token shard with "
-                    "no extra attn<->MoE communication, so TBO has nothing to "
-                    "overlap and only adds overhead."
-                )
-                config.enable_tbo = False
-                config.enable_tbo_decode = False
-            elif config.tensor_parallel_size > 1:
-                # Cross-communicator (PCP x TP) RCCL deadlock:
-                # under TBO the PCP collectives (comm_stream) run concurrently
-                # and UNORDERED with the TP-group all_reduces (compute_stream,
-                # from attention wo_b / MoE RowParallelLinear). On the TPxPCP
-                # rank grid with large collectives this forms a cross-rank
-                # circular wait -> hang (reproduced MI355 TP4PCP2/TP2PCP4 merge
-                # +TBO, 64k/c32). Serialized (non-TBO single stream) is fine, and
-                # TP=1 has no TP communicator so it cannot form the cycle. Only
-                # TP=1 + PCP keeps TBO; TP>1 falls back to non-TBO.
-                logger.warning(
-                    "Disabling TBO: prefill_context_parallel_size > 1 (-pcp) "
-                    "with tensor_parallel_size > 1 (-tp) hangs under TBO due to "
-                    "a PCP<->TP cross-communicator RCCL deadlock (concurrent "
-                    "unordered collectives on comm/compute streams; see "
-                    "PCP_TBO.md 14.4). TBO with PCP is only supported at -tp 1 "
-                    "(e.g. -tp 1 -pcp 8)."
-                )
-                config.enable_tbo = False
-                config.enable_tbo_decode = False
-            elif config.enable_tbo_decode:
-                raise ValueError(
-                    "prefill_context_parallel_size > 1 (-pcp) combined with "
-                    "--enable-tbo all (decode TBO) is not supported yet. "
-                    "Use --enable-tbo (prefill only) with -pcp."
-                )
-            # Under PCP, TBO prefill uses a request-boundary split (the
-            # non-default TBO split mode; never token-midpoint split), so
-            # ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored.
-            if config.enable_tbo and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
-                logger.warning(
-                    "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
-                    "prefill uses request-boundary balanced grouping."
-                )
-            # TBO stripes positions per request group, the draft prefill split
-            # the batch as one sequence: their shards disagree. Keyed on config,
-            # so runs that would never reach TBO are refused too.
-            if config.enable_tbo and config.speculative_config is not None:
-                raise ValueError(
-                    "prefill_context_parallel_size > 1 (-pcp) with speculative "
-                    "decoding is not supported under TBO: TBO's PCP prefill "
-                    "splits per request group, which the draft model's global "
-                    "round-robin query split does not match. Drop --enable-tbo, "
-                    "or run without a draft model. Note -tp > 1 already "
-                    "disables TBO under PCP (see above), so this only affects "
-                    "-tp 1 (e.g. -tp 1 -pcp 8)."
-                )
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
@@ -212,8 +133,9 @@ class LLMEngine:
             self.core_mgr.close()
 
     def prepare_structured_request(self, params, kv_transfer=None, multimodal=False):
-        if params.json_schema is None:
+        if not is_structured(params):
             return
+        require_available()
         validate_execution_options(
             self.config,
             params,
@@ -339,6 +261,16 @@ class LLMEngine:
 
     def is_finished(self):
         return not self.io_processor.has_pending_requests()
+
+    def reset_prefix_cache(self) -> bool:
+        """Drop all rank-local KV/prefix-cache state.
+
+        The collective is an engine implementation detail.  Exposing the
+        operation here keeps integrations from reaching through ``core_mgr``
+        or inventing their own worker RPC for a cache reset.
+        """
+        self.core_mgr.broadcast_utility_command_sync("clear_kv_cache")
+        return True
 
     def generate(
         self,
@@ -511,6 +443,7 @@ class LLMEngine:
                 "checkpoints_orphaned",
                 "demands_recorded",
                 "demands_declined_no_room",
+                "demands_dropped_at_grid_hit",
                 "chunks_cut_for_demand",
                 # Both cut counters or neither: their ratio is what separates a
                 # placement that converges from one that pays per request, and
@@ -630,6 +563,7 @@ class LLMEngine:
             "checkpoints_orphaned",
             "demands_recorded",
             "demands_declined_no_room",
+            "demands_dropped_at_grid_hit",
             "chunks_cut_for_demand",
             "chunks_cut_for_end",
         )
@@ -681,6 +615,8 @@ class LLMEngine:
             "prompt_tokens": summed("prompt_tokens"),
             "generation_tokens": summed("generation_tokens"),
             "preemptions": summed("preemptions"),
+            "requests_deferred_free": summed("requests_deferred_free"),
+            "kv_blocks_deferred_free": summed("kv_blocks_deferred_free"),
             "kv_blocks_used": kv_used,
             "kv_blocks_free": summed("kv_blocks_free"),
             "kv_blocks_total": kv_total,
@@ -929,17 +865,35 @@ class InputOutputProcessor:
             kv_transfer=kv_transfer_params,
             multimodal=multimodal_data is not None,
         )
-        if sampling_params.json_schema is not None:
+        if is_structured(sampling_params):
+            if sampling_params.required_channel is not None:
+                raise ValueError(
+                    "A request cannot carry both a structured-output grammar "
+                    "(json_schema or structured_tool_format) and a required_channel"
+                )
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
             self.structured_admission(
                 sampling_params, kv_transfer_params, multimodal_data is not None
+            )
+        # A decode leg whose prefill kept the media (`Sequence`'s own test).
+        media_on_prefill = (
+            kv_transfer_params is not None
+            and multimodal_data is None
+            and leaves_media_on_prefill(kv_transfer_params)
+        )
+        if media_on_prefill and self.config.enable_rapidserve:
+            # RapidServe prefills every request on this GPU, with no media.
+            raise ValueError(
+                "RapidServe cannot serve an image decode leg whose prefill "
+                "kept the image"
             )
         request_validator = getattr(self.config.hf_config, "validate_request", None)
         if request_validator is not None:
             request_validator(
                 num_draft_tokens=self.num_speculative_tokens,
                 multimodal_data=multimodal_data,
+                media_on_prefill_instance=media_on_prefill,
                 enable_dp_attention=self.config.enable_dp_attention,
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
@@ -954,6 +908,16 @@ class InputOutputProcessor:
         else:
             prefix_encoding = None
             tokens = prompt_or_tokens
+        if media_on_prefill:
+            # An image prompt's positions never run past its text's, so the
+            # delta its prefill hands over is at most 0; decode positions then
+            # stay in [1, max_model_len).
+            delta = kv_transfer_params.get("mrope_position_delta", 0)
+            if not 1 - len(tokens) <= delta <= 0:
+                raise ValueError(
+                    "kv_transfer_params['mrope_position_delta'] must be in "
+                    f"[{1 - len(tokens)}, 0] for a {len(tokens)}-token prompt"
+                )
         mrope_positions = None
         mrope_position_delta = 0
         if multimodal_data is not None:
@@ -979,6 +943,14 @@ class InputOutputProcessor:
             sampling_params = replace(
                 sampling_params,
                 required_channel=self._engine_channel(sampling_params.required_channel),
+            )
+        # forced acceptance (``--spec-decode-acceptance-length``) decides each
+        # draft by its configured rates: every row is a greedy pick, whatever
+        # the request's sampling
+        spec = getattr(self.config, "speculative_config", None)
+        if spec is not None and spec.synthetic_acceptance_rates is not None:
+            sampling_params = replace(
+                sampling_params, temperature=0.0, top_k=-1, top_p=1.0
             )
 
         if stream_callbacks is not None and len(stream_callbacks) != n:

@@ -7,7 +7,9 @@ The native codec streams PAGE units in ordinal order, with regions inside
 each unit. Every ordinal gets its own engine block-id list while aliasing the
 original PAGE allocation. No Active SLOT or extra state allocation is exposed.
 LMCache imports stay behind ``engine_group_infos`` so layout validation and
-copy-plan tests run without a GPU or LMCache's native extension.
+copy-plan tests run without a GPU or LMCache's native extension. Every worker
+that registers this layout, and the scheduler naming its namespace, asks
+`stores_state_images` whether saves carry images.
 """
 
 from __future__ import annotations
@@ -72,6 +74,18 @@ class NativeStateMPLayout:
         if len(set(ids)) != len(ids):
             raise ValueError("native checkpoint unit IDs must be distinct")
         return ids
+
+    def transfer_block_ids(
+        self, pages: Sequence[int], unit_ids: Sequence[int], count: int
+    ) -> list[list[int]]:
+        """One block-id list per engine group for a transfer of `count` chunks.
+
+        PAGE engine group 0 names `pages`. Image ordinal ``j`` names its unit
+        at the final chunk and the server's null block (``-1``) before it:
+        earlier chunks have PAGE only, and a boundary image is indivisible, so
+        all its ordinal groups are present at exactly the same final chunk.
+        """
+        return [list(pages)] + [[-1] * (count - 1) + [unit] for unit in unit_ids]
 
 
 def _positive_int(name: str, value: Any) -> int:
@@ -206,8 +220,27 @@ def build_native_state_mp_layout(
     )
 
 
+def stores_state_images(replay_tokens: int) -> bool:
+    """Whether native-state saves carry a state image: only without a bounded
+    replay (`replay_tokens`, 0 when off).
+
+    With one (DeepSeek-V4, ATOM_DSV4_STATE_REPLAY) the replay rebuilds the
+    state from the PAGE KV, so saves store that alone, the layout registers no
+    image group, and LMCache's own hit is the PAGE KV's extent. Without one a
+    save must carry its image: nothing could resume from PAGE alone, and for a
+    state with no bounded receptive field (Kimi-K3's KDA, GDN) no replay could
+    stand in for it. The scheduler and every worker ask with the one replay
+    length the engine runs, `Config.state_replay_tokens` (set once on the
+    engine's config, which a `multi` connector copies to its offload leg as
+    is), and register under the namespace their answer names
+    (`_model_namespace`).
+    """
+    return not replay_tokens
+
+
 __all__ = [
     "NativeStateMPKernelGroup",
     "NativeStateMPLayout",
     "build_native_state_mp_layout",
+    "stores_state_images",
 ]

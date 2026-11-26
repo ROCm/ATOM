@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Symmetric peer memory for in-kernel TP reductions."""
 
 from __future__ import annotations
@@ -7,7 +8,8 @@ from __future__ import annotations
 import torch
 from typing_extensions import Self
 
-from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
+from atom.distributed.group_agreement import group_agree
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.hip_ipc import (
     close_ipc_handle,
     get_allocation_base,
@@ -17,6 +19,7 @@ from atom.mono.runtime.hip_ipc import (
 from atom.mono.runtime.uncached import (
     DeviceBytes,
     alloc_uncached,
+    fine_grained_bytes,
     ipc_heap,
     uncached_bytes,
 )
@@ -33,7 +36,7 @@ class PeerBuffer:
 
     The constructor is collective over ``group`` (the handle exchange, then an
     agreement that every rank mapped every peer): every rank must reach it, so a
-    runner reaches it only after ``tp_agree``. A failed mapping on any rank raises
+    runner reaches it only after ``group_agree``. A failed mapping on any rank raises
     ``MonoUnsupported`` on all of them.
     """
 
@@ -74,7 +77,7 @@ class PeerBuffer:
                         addresses.append(base)
             except RuntimeError as err:  # every rank must still reach the agreement
                 failure = err
-            if not tp_agree(failure is None, group):
+            if not group_agree(failure is None, group):
                 self.close()
                 raise MonoUnsupported(
                     f"peer memory handshake failed on {'this' if failure else 'another'}"
@@ -117,30 +120,30 @@ class PeerBuffer:
 # ---------------------------------------------------------------------------
 
 
-class SymmetricPeerBuffer:
-    """Allocate one symmetric buffer and exchange its address with every rank.
+class PeerView:
+    """Every rank's address of a device allocation each rank holds, exchanged
+    over HIP IPC (``addresses``, int64, indexed by rank): ``make_local()``
+    gives this rank's address (anywhere inside its allocation), its failure
+    reported to every rank. ``what`` names the memory in a refusal.
 
-    Remote HIP IPC mappings are closed by :meth:`close`. The local allocation is
-    uncached memory viewed by ``storage``, kept until the process exits
-    (``uncached``).
+    Remote HIP IPC mappings are closed by :meth:`close`; the local memory is
+    whoever made it's.
     """
 
-    def __init__(self, nbytes: int, rank: int = 0, npes: int = 1, group=None):
-        if nbytes <= 0:
-            raise ValueError(f"nbytes must be positive, got {nbytes}")
+    def __init__(self, make_local, rank: int = 0, npes: int = 1, group=None,
+                 what: str = "peer memory"):  # fmt: skip
         if not 0 <= rank < npes:
             raise ValueError(f"rank must be in [0, {npes}), got {rank}")
-        device = None
         self.rank = rank
         self.npes = npes
         self.group = group
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        device = self.device
         self._remote_bases: list[int] = []
         self._safety_barrier_complete = False
 
         if npes == 1:
-            device = torch.device("cuda", torch.cuda.current_device())
-            self.storage = uncached_bytes(nbytes, device)
-            self.local_address = self.storage.data_ptr()
+            self.local_address = make_local()
             addresses = [self.local_address]
         else:
             import torch.distributed as dist
@@ -148,9 +151,7 @@ class SymmetricPeerBuffer:
             local_error = None
             mine = None
             try:
-                device = torch.device("cuda", torch.cuda.current_device())
-                self.storage = uncached_bytes(nbytes, device)
-                self.local_address = self.storage.data_ptr()
+                self.local_address = make_local()
                 base = get_allocation_base(self.local_address)
                 mine = (get_ipc_handle(base), self.local_address - base)
             except Exception as error:  # noqa: BLE001 - reported to every rank below
@@ -170,9 +171,7 @@ class SymmetricPeerBuffer:
                 # failed IPC export here must disable mono, not take the server
                 # down with it. The old PeerBuffer raised MonoUnsupported for
                 # the same reason.
-                raise MonoUnsupported(
-                    f"symmetric peer allocation/export failed: {detail}"
-                )
+                raise MonoUnsupported(f"{what} allocation/export failed: {detail}")
 
             addresses = []
             open_error = None
@@ -205,10 +204,9 @@ class SymmetricPeerBuffer:
                         pass
                 self._remote_bases.clear()
                 detail = "; ".join(f"rank {peer}: {error}" for peer, error in failed)
-                raise MonoUnsupported(f"symmetric peer open failed: {detail}")
+                raise MonoUnsupported(f"{what} open failed: {detail}")
 
             dist.barrier(group=group)
-        assert device is not None
         self.addresses = torch.tensor(addresses, dtype=torch.int64, device=device)
 
     def close(self) -> None:
@@ -219,7 +217,7 @@ class SymmetricPeerBuffer:
         """
 
         if not self._safety_barrier_complete:
-            torch.cuda.synchronize(self.storage.device)
+            torch.cuda.synchronize(self.device)
             if self.npes > 1:
                 import torch.distributed as dist
 
@@ -248,3 +246,32 @@ class SymmetricPeerBuffer:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
+
+
+class SymmetricPeerBuffer(PeerView):
+    """Allocate one symmetric buffer and exchange its address with every rank.
+
+    Remote HIP IPC mappings are closed by :meth:`close`. The local allocation is
+    uncached memory viewed by ``storage``, kept until the process exits
+    (``uncached``).
+    """
+
+    def __init__(
+        self,
+        nbytes: int,
+        rank: int = 0,
+        npes: int = 1,
+        group=None,
+        fine_grained: bool = False,
+    ):
+        if nbytes <= 0:
+            raise ValueError(f"nbytes must be positive, got {nbytes}")
+
+        def allocate() -> int:
+            device = torch.device("cuda", torch.cuda.current_device())
+            self.storage = (fine_grained_bytes if fine_grained else uncached_bytes)(
+                nbytes, device
+            )
+            return self.storage.data_ptr()
+
+        super().__init__(allocate, rank, npes, group, "symmetric peer")

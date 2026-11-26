@@ -584,6 +584,7 @@ mod c_regular_planning {
                 tokens: Some(&[1u32, 2, 3]),
                 headers: None,
                 stream: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -602,6 +603,25 @@ mod c_regular_planning {
     }
 
     #[tokio::test]
+    async fn test_single_charges_the_prompt_only_when_streaming() {
+        let src = MockWorkerSource::new().add_worker(make_regular_http("http://m1-w:8000", "m1"));
+        let planner = make_planner(src, MockPolicySource::new());
+        let tokens = [1u32, 2, 3];
+        for (stream, charged) in [(true, 3), (false, 0)] {
+            let descriptor = RequestDescriptor {
+                stream,
+                ..make_descriptor(Some("m1"), None, Some(&tokens), None)
+            };
+            match planner.plan(&descriptor).await.unwrap() {
+                PlacementPlan::Single { prefill_tokens, .. } => {
+                    assert_eq!(prefill_tokens, charged, "stream={stream}");
+                }
+                other => panic!("expected Single, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_grpc_single_worker_excludes_http() {
         let src = MockWorkerSource::new()
             .add_worker(make_regular_http("http://h:8000", "m"))
@@ -616,6 +636,7 @@ mod c_regular_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -639,6 +660,7 @@ mod c_regular_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -713,11 +735,11 @@ mod d_pd_planning {
 
     use http::HeaderMap;
 
-    use super::super::planner::DefaultPlanner;
+    use super::super::planner::{idx2idx, DefaultPlanner, Idx2Idx};
     use super::super::test_support::*;
     use super::super::traits::{PdPlanner, PolicySource, WorkerSource};
     use super::super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
-    use crate::core::WorkerType;
+    use crate::core::{DPAwareWorkerBuilder, Worker, WorkerType};
     use crate::policies::{LoadBalancingPolicy, RandomPolicy, RoundRobinPolicy};
 
     fn make_planner(src: MockWorkerSource, policies: MockPolicySource) -> DefaultPlanner {
@@ -745,6 +767,222 @@ mod d_pd_planning {
                 Some(8998),
             ))
             .add_worker(make_decode_grpc(&format!("http://{}-d:8000", model), model))
+    }
+
+    fn dp_worker(base_url: &str, dp_rank: usize, worker_type: WorkerType) -> Arc<dyn Worker> {
+        let builder = DPAwareWorkerBuilder::new_with_type(base_url, dp_rank, 2, worker_type);
+        Arc::new(builder.model_id("m").build())
+    }
+
+    fn prefill_url(plan: PlacementPlan) -> String {
+        match plan {
+            PlacementPlan::Pair { prefill, .. } => prefill.url().to_string(),
+            other => panic!("expected Pair, got {:?}", other),
+        }
+    }
+
+    fn prefill() -> WorkerType {
+        WorkerType::Prefill {
+            bootstrap_port: None,
+        }
+    }
+
+    #[test]
+    fn test_idx2idx_moves_keeps_or_reports_a_dp_size_mismatch() {
+        let decode = |rank| dp_worker("http://d", rank, WorkerType::Decode);
+        let prefill_rank_0 = dp_worker("http://p", 0, prefill());
+        let move_to = |decode: Arc<dyn Worker>| idx2idx(prefill_rank_0.as_ref(), decode.as_ref());
+        assert_eq!(move_to(decode(1)), Idx2Idx::Move(1));
+        assert_eq!(move_to(decode(0)), Idx2Idx::Keep);
+        let wider = DPAwareWorkerBuilder::new_with_type("http://d", 3, 4, WorkerType::Decode);
+        let wider: Arc<dyn Worker> = Arc::new(wider.model_id("m").build());
+        assert_eq!(move_to(wider), Idx2Idx::OutOfRange { rank: 3, size: 2 });
+        let at_size = DPAwareWorkerBuilder::new_with_type("http://d", 2, 4, WorkerType::Decode);
+        let at_size: Arc<dyn Worker> = Arc::new(at_size.model_id("m").build());
+        assert_eq!(move_to(at_size), Idx2Idx::OutOfRange { rank: 2, size: 2 });
+        let no_dp = make_prefill_http("http://q:8000", "m", None);
+        assert_eq!(idx2idx(no_dp.as_ref(), decode(1).as_ref()), Idx2Idx::Keep);
+    }
+
+    #[tokio::test]
+    async fn test_idx2idx_selects_decode_first_and_prefill_on_its_rank() {
+        let workers = [
+            dp_worker("http://p", 0, prefill()),
+            dp_worker("http://p", 1, prefill()),
+            dp_worker("http://d", 1, WorkerType::Decode),
+        ];
+        let source = workers
+            .iter()
+            .fold(MockWorkerSource::new(), |source, worker| {
+                source.add_worker(worker.clone())
+            });
+        let planner =
+            make_planner(source, MockPolicySource::new()).with_prefill_on_decode_rank(true);
+        let descriptor = make_descriptor(Some("m"), None, None, None);
+
+        for _ in 0..4 {
+            let plan = planner.plan(&descriptor).await.unwrap();
+            assert_eq!(prefill_url(plan), "http://p@1");
+        }
+        // Without a healthy prefill on the decode's rank, any prefill is a candidate.
+        workers[1].set_healthy(false);
+        let plan = planner.plan(&descriptor).await.unwrap();
+        assert_eq!(prefill_url(plan), "http://p@0");
+    }
+
+    /// Prefill instances p1 and p2 and decode instance d, each on DP ranks 0 and 1, planned
+    /// decode first with `prefill_policy`.
+    struct Idx2IdxCluster {
+        planner: DefaultPlanner,
+        prefills: [Arc<dyn Worker>; 4],
+        decodes: [Arc<dyn Worker>; 2],
+    }
+
+    const ALL: &[usize] = &[0, 1, 2, 3];
+
+    impl Idx2IdxCluster {
+        fn new(prefill_policy: Arc<dyn LoadBalancingPolicy>) -> Self {
+            let prefills = [("p1", 0), ("p1", 1), ("p2", 0), ("p2", 1)]
+                .map(|(host, rank)| dp_worker(&format!("http://{host}"), rank, prefill()));
+            let decodes = [0, 1].map(|rank| dp_worker("http://d", rank, WorkerType::Decode));
+            let source = prefills
+                .iter()
+                .chain(&decodes)
+                .fold(MockWorkerSource::new(), |source, worker| {
+                    source.add_worker(worker.clone())
+                });
+            let policies = MockPolicySource::new().with_prefill(prefill_policy);
+            let planner = make_planner(source, policies).with_prefill_on_decode_rank(true);
+            Self {
+                planner,
+                prefills,
+                decodes,
+            }
+        }
+
+        /// The prefill planned for `text` with only decode rank `decode_rank` and the
+        /// prefills at `healthy` available.
+        async fn place(
+            &self,
+            text: &str,
+            headers: Option<&HeaderMap>,
+            decode_rank: usize,
+            healthy: &[usize],
+        ) -> Arc<dyn Worker> {
+            for (rank, decode) in self.decodes.iter().enumerate() {
+                decode.set_healthy(rank == decode_rank);
+            }
+            for (idx, prefill) in self.prefills.iter().enumerate() {
+                prefill.set_healthy(healthy.contains(&idx));
+            }
+            let descriptor = make_descriptor(Some("m"), Some(text), None, headers);
+            match self.planner.plan(&descriptor).await.unwrap() {
+                PlacementPlan::Pair { prefill, .. } => prefill,
+                other => panic!("expected Pair, got {:?}", other),
+            }
+        }
+    }
+
+    fn cache_aware_idx2idx() -> Idx2IdxCluster {
+        let cache_aware = Arc::new(crate::policies::CacheAwarePolicy::new());
+        let cluster = Idx2IdxCluster::new(cache_aware.clone());
+        cache_aware.init_workers(&cluster.prefills);
+        cluster
+    }
+
+    /// `cache_aware` keeps a tenant on another rank: turn 2 returns to the prefill that
+    /// holds its prefix although the decode moved in between and the holder has load.
+    #[tokio::test]
+    async fn test_idx2idx_cache_aware_keeps_other_rank_tenants() {
+        let text = "a session's growing conversation ".repeat(64);
+        let cluster = cache_aware_idx2idx();
+
+        let turn1 = cluster.place(&text, None, 0, &[2]).await;
+        assert_eq!(turn1.url(), "http://p2@0");
+        cluster.prefills[2].increment_load();
+        cluster.place(&text, None, 1, ALL).await;
+        let turn2 = cluster.place(&text, None, 0, ALL).await;
+        assert_eq!(turn2.url(), "http://p2@0");
+    }
+
+    /// A prefix another rank's worker placed first is credited to the candidate sharing it,
+    /// rather than relocated by load.
+    #[tokio::test]
+    async fn test_idx2idx_cache_aware_credits_the_candidate_sharing_a_prefix() {
+        let system = "a shared system prompt ".repeat(32);
+        let ask = |question: &str| format!("{system}{question}");
+        let cluster = cache_aware_idx2idx();
+
+        // p1@1 places the shared prefix first, then p2@0 holds it too.
+        cluster.place(&ask("question a"), None, 1, &[1]).await;
+        cluster.place(&ask("question c"), None, 0, &[2]).await;
+        cluster.prefills[2].increment_load();
+        let shared = cluster.place(&ask("question b"), None, 0, ALL).await;
+        assert_eq!(shared.url(), "http://p2@0");
+    }
+
+    /// Round-robin on both pools still reaches every prefill: each rank's prefill
+    /// candidates keep their own position instead of moving in step with the decode's.
+    #[tokio::test]
+    async fn test_idx2idx_round_robin_reaches_every_prefill() {
+        let cluster = Idx2IdxCluster::new(Arc::new(RoundRobinPolicy::new()));
+        let descriptor = make_descriptor(Some("m"), None, None, None);
+
+        let mut placed = std::collections::HashMap::new();
+        for _ in 0..8 {
+            let url = prefill_url(cluster.planner.plan(&descriptor).await.unwrap());
+            *placed.entry(url).or_insert(0) += 1;
+        }
+        assert_eq!(placed.len(), 4, "{placed:?}");
+        assert!(placed.values().all(|&requests| requests == 2), "{placed:?}");
+    }
+
+    /// A session pinned to a prefill off the decode's rank is rebound by the planner.
+    #[tokio::test]
+    async fn test_idx2idx_dp_sticky_rebinds_to_the_decode_rank() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let dp_sticky = Arc::new(crate::policies::DpStickyPolicy::new());
+        let cluster = Idx2IdxCluster::new(dp_sticky.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", http::HeaderValue::from_static("session-1"));
+
+        for (decode_rank, pinned) in [(0, "http://p1@0"), (1, "http://p1@1")] {
+            let prefill = cluster
+                .place("", Some(&headers), decode_rank, &[0, 1])
+                .await;
+            assert_eq!(prefill.url(), pinned);
+            dp_sticky.on_dispatch("prefill", Some(&headers), &prefill);
+        }
+        let changes: Vec<_> = handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("mesh_session_worker_change_total{"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            changes,
+            [r#"mesh_session_worker_change_total{pool="prefill",reason="rebind"} 1"#]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pair_charges_the_prefill_worker_whether_or_not_streaming() {
+        let planner = make_planner(one_p_one_d_http("m"), MockPolicySource::new());
+        let tokens = [1u32, 2, 3, 4];
+        for stream in [true, false] {
+            let descriptor = RequestDescriptor {
+                stream,
+                ..make_descriptor(Some("m"), None, Some(&tokens), None)
+            };
+            match planner.plan(&descriptor).await.unwrap() {
+                PlacementPlan::Pair { prefill_tokens, .. } => {
+                    assert_eq!(prefill_tokens, 4, "stream={stream}");
+                }
+                other => panic!("expected Pair, got {:?}", other),
+            }
+        }
     }
 
     #[tokio::test]
@@ -777,6 +1015,7 @@ mod d_pd_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -890,6 +1129,7 @@ mod d_pd_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1371,6 +1611,7 @@ mod f_atom_adapter {
             prefill_dp_size: 2,
             prefill_dp_rank: Some(1),
             decode_dp_rank: None,
+            carries_media: false,
         });
         let mut p = json!({"prompt": [1, 2, 3], "stream": true, "max_tokens": 10});
         let mut d = p.clone();
@@ -1536,6 +1777,7 @@ mod f_atom_adapter {
             prefill_dp_size: 4,
             prefill_dp_rank: Some(2),
             decode_dp_rank: Some(2),
+            carries_media: false,
         });
         let mut kv = json!({});
         adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
@@ -1590,6 +1832,7 @@ mod f_atom_adapter {
             prefill_dp_size: 1,
             prefill_dp_rank: None,
             decode_dp_rank: None,
+            carries_media: false,
         });
         let mut kv = json!({});
         let err = adapter.enrich_decode_kv(&mut kv, &ctx).unwrap_err();
@@ -2148,6 +2391,7 @@ mod h_integration {
             tokens: Some(&tokens),
             headers: Some(&headers),
             stream: false,
+            ..Default::default()
         };
 
         for _ in 0..2 {
@@ -2164,6 +2408,188 @@ mod h_integration {
                 call.headers.as_ref().and_then(|h| h.get("x-trace")),
                 Some(&"abc".parse().unwrap())
             );
+        }
+    }
+}
+
+mod i_route_metrics {
+    use std::sync::Arc;
+
+    use super::super::planner::DefaultPlanner;
+    use super::super::policy_apply::apply_policy;
+    use super::super::test_support::*;
+    use super::super::traits::{PdPlanner, PolicySource, WorkerSource};
+    use super::super::types::PlacementError;
+    use crate::core::Worker;
+    use crate::policies::PolicyFactory;
+
+    const POLICIES: [&str; 6] = [
+        "random",
+        "round_robin",
+        "dp_sticky",
+        "power_of_two",
+        "cache_aware",
+        "prefix_hash",
+    ];
+
+    fn unhealthy(worker: Arc<dyn Worker>) -> Arc<dyn Worker> {
+        worker.set_healthy(false);
+        worker
+    }
+
+    /// Sum of the samples of `metric` whose labels include every one of `labels`.
+    fn total(rendered: &str, metric: &str, labels: &[&str]) -> f64 {
+        rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with(metric) && labels.iter().all(|label| line.contains(label))
+            })
+            .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn every_policy_records_one_decision_per_selection() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let candidates = [
+            make_regular_http("http://w1:8000", "m"),
+            make_regular_http("http://w2:8000", "m"),
+        ];
+        let tokens = [1, 2, 3];
+        let descriptor = make_descriptor(Some("m"), Some("hello"), Some(&tokens), None);
+
+        for name in POLICIES {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            apply_policy(&candidates, policy.as_ref(), &descriptor, None)
+                .await
+                .unwrap();
+        }
+
+        let rendered = handle.render();
+        for name in POLICIES {
+            let labels = [r#"pool="regular""#, &format!("policy=\"{name}\"")];
+            for metric in [
+                "mesh_route_branch_total{",
+                "mesh_route_selected_worker_active_requests_count{",
+            ] {
+                assert_eq!(
+                    total(&rendered, metric, &labels),
+                    1.0,
+                    "{name} {metric}\n{rendered}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_selection_without_healthy_candidates_counts_once_in_its_pool() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let candidates = [
+            unhealthy(make_prefill_http("http://p1:8000", "m", None)),
+            unhealthy(make_prefill_http("http://p2:8000", "m", None)),
+        ];
+        let tokens = [1, 2, 3];
+        let descriptor = make_descriptor(Some("m"), Some("hello"), Some(&tokens), None);
+
+        for name in POLICIES {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            let err = apply_policy(&candidates, policy.as_ref(), &descriptor, None)
+                .await
+                .unwrap_err();
+            assert_eq!(err, PlacementError::PolicyReturnedNone, "{name}");
+        }
+
+        let rendered = handle.render();
+        for name in POLICIES {
+            let policy = format!("policy=\"{name}\"");
+            let failure = [
+                r#"pool="prefill""#,
+                policy.as_str(),
+                r#"branch="no_healthy_workers""#,
+            ];
+            let branches = "mesh_route_branch_total{";
+            assert_eq!(
+                total(&rendered, branches, &failure),
+                1.0,
+                "{name}\n{rendered}"
+            );
+            assert_eq!(
+                total(&rendered, branches, &[&policy]),
+                1.0,
+                "{name}\n{rendered}"
+            );
+            let samples = "mesh_route_selected_worker_active_requests_count{";
+            assert_eq!(
+                total(&rendered, samples, &[&policy]),
+                0.0,
+                "{name}\n{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pool_without_candidates_counts_once_as_no_healthy_workers() {
+        let cases = [
+            (
+                "regular",
+                MockWorkerSource::new()
+                    .add_worker(unhealthy(make_regular_http("http://r1:8000", "m")))
+                    .add_worker(unhealthy(make_regular_http("http://r2:8000", "m"))),
+                PlacementError::NoAvailableWorkers,
+            ),
+            (
+                "prefill",
+                MockWorkerSource::new()
+                    .add_worker(unhealthy(make_prefill_http("http://p:8000", "m", None)))
+                    .add_worker(make_decode_http("http://d:8000", "m")),
+                PlacementError::NoAvailableWorkers,
+            ),
+            (
+                "decode",
+                MockWorkerSource::new()
+                    .add_worker(make_prefill_http("http://p:8000", "m", None))
+                    .add_worker(unhealthy(make_decode_http("http://d:8000", "m"))),
+                PlacementError::NoAvailableWorkers,
+            ),
+            (
+                "prefill",
+                MockWorkerSource::new().add_worker(make_decode_http("http://d:8000", "m")),
+                PlacementError::NoPrefillWorkers,
+            ),
+            (
+                "decode",
+                MockWorkerSource::new().add_worker(make_prefill_http("http://p:8000", "m", None)),
+                PlacementError::NoDecodeWorkers,
+            ),
+        ];
+
+        for (pool, workers, expected) in cases {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            let planner = DefaultPlanner::new(
+                Arc::new(workers) as Arc<dyn WorkerSource>,
+                Arc::new(MockPolicySource::new()) as Arc<dyn PolicySource>,
+            );
+
+            let err = planner
+                .plan(&make_descriptor(Some("m"), None, None, None))
+                .await
+                .unwrap_err();
+            assert_eq!(err, expected, "{pool}");
+            let rendered = handle.render();
+            let branches: Vec<_> = rendered
+                .lines()
+                .filter(|line| line.starts_with("mesh_route_branch_total{"))
+                .collect();
+            let line = format!(
+                r#"mesh_route_branch_total{{pool="{pool}",policy="round_robin",branch="no_healthy_workers"}} 1"#
+            );
+            assert_eq!(branches, [line.as_str()], "{expected:?}");
         }
     }
 }

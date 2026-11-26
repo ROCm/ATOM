@@ -17,7 +17,7 @@ from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
-from atom.model_engine.sequence import Sequence, SequenceStatus
+from atom.model_engine.sequence import Sequence, SequenceStatus, new_block_table
 
 
 @pytest.fixture
@@ -28,8 +28,14 @@ def clock(monkeypatch):
 
 
 def batch(seqs, decode=0, dummy=False):
+    prefill = list(seqs.values())[: len(seqs) - decode]
     return SimpleNamespace(
-        req_ids=list(seqs), total_seqs_num_decode=decode, is_dummy_run=dummy
+        req_ids=list(seqs),
+        total_seqs_num_prefill=len(seqs) - decode,
+        total_tokens_num_prefill=sum(seq.num_prompt_tokens for seq in prefill),
+        num_cached_tokens=[0] * len(seqs),
+        total_seqs_num_decode=decode,
+        is_dummy_run=dummy,
     )
 
 
@@ -73,20 +79,24 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
     monkeypatch.setattr(engine_core, "time", timer)
     monkeypatch.setattr(pp_engine_core, "time", timer)
     proc = SimpleNamespace(
+        _report_backlog=False,
         label="test",
         utility_queue=None,
         kv_transfer_enabled=False,
         _is_rl_weights_offloaded=True,
-        _is_idle_rl_weights_offloaded=lambda: True,
+        _is_engine_held=lambda: True,
+        _report_held_kv_work=lambda: None,
         _drain_kv_work_at_exit=lambda: None,
         pull_and_process_input_queue=lambda: now[0] >= 2 * interval,
         _sync_dp_state=lambda unfinished, shutdown, offloaded: (False, shutdown, True),
+        _validate_dp_sync_interval=lambda interval: interval,
         runner_mgr=SimpleNamespace(call_func=lambda *args, **kwargs: None),
         scheduler=SimpleNamespace(
             heartbeat_throughput=lambda _: None,
             is_finished=lambda: True,
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
+            close_kv_connector=lambda: None,
             # Both loops park the window while the weights are offloaded,
             # which is the state this test drives them through.
             engine_stats=SimpleNamespace(note_idle=lambda _: None),
@@ -159,6 +169,7 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
         ),
     )
     engine = core.EngineCore.__new__(core.EngineCore)
+    engine._kv_progress_event = core.threading.Event()
     engine.label = "metrics-test"
     engine.input_queue = Queue()
     engine.process_input_sockets("input", "control")
@@ -181,7 +192,9 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
 )
 def test_transfer_ignores_failed_and_offload_loads(clock, is_pd, succeeded, expected):
     metrics = SchedulerMetrics()
-    seq = SimpleNamespace(id=3, kv_transfer_params={"do_remote_prefill": is_pd})
+    seq = SimpleNamespace(
+        id=3, kv_transfer_params={"do_remote_prefill": is_pd}, num_prompt_tokens=4
+    )
     metrics.enqueue(seq)
     metrics.start_kv_wait(seq)
     clock[0] += 0.25
@@ -198,7 +211,7 @@ def test_transfer_ignores_failed_and_offload_loads(clock, is_pd, succeeded, expe
 
 def test_batch_counts_request_rows_and_ignores_dummy_prefill_and_empty(clock):
     metrics = SchedulerMetrics()
-    seqs = {i: SimpleNamespace(id=i) for i in range(5)}
+    seqs = {i: SimpleNamespace(id=i, num_prompt_tokens=4) for i in range(5)}
     for seq in seqs.values():
         metrics.enqueue(seq)
     metrics.record_forward(batch(seqs, decode=5, dummy=True), seqs)
@@ -220,7 +233,7 @@ def test_scheduler_abort_releases_pending_metric_state(clock):
     )
     scheduler.add(seq)
     scheduler._count_inflight_load(seq)
-    scheduler._reject_aborted_waiting(seq)
+    scheduler._finish_rejected_waiting(seq)
     scheduler._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_recving={seq.id})
     )
@@ -309,6 +322,39 @@ def test_pool_partition_and_waiting_queue_exclusion():
     assert snapshot["scheduler_metrics"]["waiting"] == 0
     assert snapshot["scheduler_metrics"]["waiting_kv"] == 1
     pool.free(used.block_id)
+
+
+def test_deferred_free_counts_shared_blocks_once():
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.llm_engine import LLMEngine
+
+    ranks = {}
+    # Finished P/D sources awaiting their send. Rank 0's two share a prefix
+    # block, so they hold 5 physical blocks; rank 1's one holds 3.
+    for rank, tables in enumerate(([[3, 4], [3, 5, 6, 7]], [[1, 2, 9]])):
+        scheduler = Scheduler(MockConfig())
+        handler = EngineUtilityHandler(None, Queue(), scheduler=scheduler)
+        assert handler.collect_metrics()["kv_blocks_deferred_free"] == 0
+        scheduler.deferred_free_blocks = {
+            seq_id: SimpleNamespace(block_table=new_block_table(table))
+            for seq_id, table in enumerate(tables)
+        }
+        ranks[rank] = handler.collect_metrics()
+    assert ranks[0]["requests_deferred_free"] == 2
+    assert ranks[0]["kv_blocks_deferred_free"] == 5
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(latest_metrics=ranks, get_dp_router_statistics=dict)
+    )
+    stats = LLMEngine.get_metrics_statistics(engine)
+    assert stats["requests_deferred_free"] == 3
+    assert stats["kv_blocks_deferred_free"] == 8
+    exporter, _, _ = create_metrics_exporter()
+    exporter.update(stats)
+    values = samples(exporter)
+    assert values[("atom:requests_deferred_free", ())] == 3
+    assert values[("atom:kv_cache_blocks_deferred_free", ())] == 8
 
 
 def test_cache_tiers_preserve_admitted_reuse_through_snapshots():
@@ -460,6 +506,7 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
     proposals = iter([(scheduled, seqs)])
     proc = PPEngineCoreProc.__new__(PPEngineCoreProc)
     proc.pp_size = 1
+    proc.pp_max_inflight = 1
     proc.kv_transfer_enabled = False
     proc._in_flight = deque()
     proc.scheduler = SimpleNamespace(
@@ -501,13 +548,14 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
     second = Sequence(list(range(20)), block_size=4, request_id="second")
     first.type = second.type = SequenceType.PREFILL
     first.num_cached_tokens, second.num_cached_tokens = 4, 8
-    seqs = {seq.id: seq for seq in (decode, first, second)}
+    # A mixed batch is `[prefill | decode]`, as the scheduler builds it.
+    seqs = {seq.id: seq for seq in (first, second, decode)}
     for seq in seqs.values():
         metrics.enqueue(seq)
     monkeypatch.setattr("atom.metrics.scheduler.time.time", lambda: 100.25)
     scheduled = ScheduledBatch(
         seqs,
-        [1, 3, 4],
+        [3, 4, 1],
         8,
         total_tokens_num_decode=1,
         total_tokens_num_prefill=7,
@@ -568,10 +616,12 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
         _is_preemptable=lambda seq: True,
         total_preemptions=0,
         _partial_prefill_count=1,
-        spec_decode_local=False,
+        use_spec=False,
         _connector_release_stalled_save=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
+        _behind_settled_resumes=lambda: 0,
+        pd_admission=None,
     )
     assert Scheduler.preempt(owner, first)
     metrics.enqueue(first)
@@ -612,13 +662,14 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     for i in (1, 2):
         metrics.enqueue(seqs[i])
     monkeypatch.setattr("atom.metrics.scheduler.time.time", lambda: 100.25)
+    # `[prefill | decode]`: request 3's prefill row, then 1 and 2 decoding.
     mixed = SimpleNamespace(
-        req_ids=[1, 2, 3],
+        req_ids=[3, 1, 2],
         is_dummy_run=False,
         total_seqs_num_decode=2,
         total_seqs_num_prefill=1,
         total_tokens_num_prefill=50,
-        context_lens=[1000, 9000, 300, 999999],
+        context_lens=[300, 1000, 9000, 999999],
     )
     metrics.record_forward(mixed, seqs)
     first = metrics.decode_request_context_tokens.collect()[0].samples
@@ -638,10 +689,12 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     owner = SimpleNamespace(
         _is_preemptable=lambda seq: True,
         total_preemptions=0,
-        spec_decode_local=False,
+        use_spec=False,
         _connector_release_stalled_save=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
+        _behind_settled_resumes=lambda: 0,
+        pd_admission=None,
     )
     assert Scheduler.preempt(owner, seqs[1])
     metrics.enqueue(seqs[1])
@@ -700,3 +753,91 @@ def test_large_batch_contexts_have_finite_buckets_through_exposition(
     assert values[(f"atom:{phase}_context_tokens_bucket", bucket_labels)] == 1
     assert values[(f"atom:{phase}_context_tokens_sum", labels)] == total
     assert values[(f"atom:{phase}_context_tokens_count", labels)] == 1
+
+
+@pytest.mark.parametrize("request_context_enabled", [False, True])
+def test_a_real_mixed_step_records_each_rows_own_metric(
+    request_context_enabled, monkeypatch
+):
+    """A mixed batch the scheduler really builds, recorded by a real
+    `SchedulerMetrics`: the single-chunk prefill lands in the prefill metrics
+    and each decode row's context in the decode ones. Aggregate metrics remain
+    available with per-request context gauges either disabled or enabled."""
+    from prometheus_client import CollectorRegistry
+
+    from atom.observability import tracing
+    from atom.sampling_params import SamplingParams
+
+    sched = Scheduler(
+        MockConfig(
+            enable_mixed_prefill_decode=True,
+            num_kvcache_blocks=20,
+            max_num_seqs=4,
+            max_num_batched_tokens=256,
+        )
+    )
+    decodes = [
+        Sequence(list(range(n)), 4, sampling_params=SamplingParams()) for n in (6, 10)
+    ]
+    for seq in decodes:
+        sched.add(seq)
+    sched.schedule()
+    for seq in decodes:
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        seq.append_token(99)
+    prefill = Sequence(list(range(10, 23)), 4, sampling_params=SamplingParams())
+    sched.add(prefill)
+    batch, _ = sched.schedule()
+    assert batch.is_mixed and batch.req_ids == [
+        prefill.id,
+        *(seq.id for seq in decodes),
+    ]
+
+    registry = CollectorRegistry()
+    metrics = SchedulerMetrics(
+        registry=registry, request_context_enabled=request_context_enabled
+    )
+    for seq in (prefill, *decodes):
+        seq.queue_timing = None
+        metrics.enqueue(seq)
+    for seq in decodes:
+        seq.queue_timing.prefill_observed = True
+    seqs = {seq.id: seq for seq in (prefill, *decodes)}
+    metrics.record_forward(batch, seqs)
+    traced = []
+    monkeypatch.setattr(tracing, "_ENABLED", True)
+    monkeypatch.setattr(
+        tracing, "forward", lambda seq, *, is_decode: traced.append((seq, is_decode))
+    )
+    tracing.record_forward(batch, seqs)
+    assert traced == [(prefill, False), *((seq, True) for seq in decodes)]
+
+    def value(name, **labels):
+        labels = {"dp_rank": "0", "engine_role": "default", **labels}
+        return registry.get_sample_value(name, labels)
+
+    # The 13-token prompt is the request whose prefill is measured...
+    assert value("atom:prefill_request_tokens_count") == 1
+    assert value("atom:prefill_request_tokens_sum") == 13
+    assert value("atom:prefill_context_tokens_sum") == 13
+    # The two decode contexts contribute 7 + 11 tokens, excluding prefill.
+    assert value("atom:decode_context_tokens_sum") == 18
+    assert value("atom:decode_batch_size_sum") == 2
+    assert all(seq.queue_timing.decode_context_observed for seq in decodes)
+    assert not prefill.queue_timing.decode_context_observed
+    gauges = {
+        (s.name, s.labels["sequence_id"]): s.value
+        for metric in registry.collect()
+        for s in metric.samples
+        if s.name.endswith("request_context_tokens")
+    }
+    if request_context_enabled:
+        assert gauges == {
+            **{
+                ("atom:decode_request_context_tokens", str(seq.id)): len(seq)
+                for seq in decodes
+            },
+            ("atom:prefill_request_context_tokens", str(prefill.id)): 13,
+        }
+    else:
+        assert gauges == {}

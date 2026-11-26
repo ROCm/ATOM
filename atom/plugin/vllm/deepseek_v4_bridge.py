@@ -1367,6 +1367,9 @@ def _plan_deepseek_v4_state_checkpoint_ops(model, md, common_attn_metadata) -> N
         block=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
         is_target=getattr(model, "_atom_v4_is_target", False),
         name="DeepSeek-V4",
+        # The first-token positions `_build_dsv4_metadata` derives, exact under
+        # MTP; the input batch's V2 count is an optimistic upper bound.
+        starts=np.asarray(md.chunk_start_per_seq_cpu[:rows], dtype=np.int64),
     )
 
 

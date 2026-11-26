@@ -68,6 +68,14 @@ class MessageEncoderAdapter:
     prepare_kwargs: KwargsPreparer = _identity_kwargs
     preserve_content: bool = False
     reasoning_rules: ReasoningRules | None = None
+    # The encoder module's own message processing, when it has one
+    # (DeepSeek-V4.1's `process_image_messages`: joins a content list's text
+    # blocks and refuses image placeholder tokens). Text this server places
+    # after the render -- an assistant prefix -- goes through it as the
+    # rendered messages do.
+    process_image_messages: Callable[[list[dict]], tuple[list[dict], list]] | None = (
+        field(default=None, compare=False)
+    )
 
     def __call__(self, messages: list[dict], **kwargs: Any) -> str:
         """Render, passing on only the kwargs this encoder can take.
@@ -155,6 +163,7 @@ def build_message_encoder_adapter(
     accepts_from: MessageEncoder | None = None,
     defaults: dict[str, Any] | None = None,
     model_type: str | None = None,
+    process_image_messages: Callable | None = None,
 ) -> MessageEncoderAdapter:
     """Build an adapter registered for ``module_name`` or an identity adapter.
 
@@ -177,4 +186,5 @@ def build_message_encoder_adapter(
         source_path=source_path,
         accepts=_accepted_kwargs(accepts_from or encoder),
         defaults=dict(defaults or {}),
+        process_image_messages=process_image_messages,
     )

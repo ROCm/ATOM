@@ -21,6 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from .images import NO_FILES_API
 from .protocol import openai_stop_reason
 from .sse import event_frame
 
@@ -172,12 +173,13 @@ def _normalize_input_items(items: list, all_tools: list) -> list:
                 }
             )
         elif item_type == "custom_tool_call_output":
+            output = item.get("output")
             normalized.append(
                 {
                     "type": "function_call_output",
                     "id": item.get("id"),
                     "call_id": _string_field(item, "call_id"),
-                    "output": _value_as_text(item.get("output")),
+                    "output": output if _has_image(output) else _value_as_text(output),
                 }
             )
         elif item_type == "tool_search_call":
@@ -370,9 +372,7 @@ def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
         item_type = item.get("type")
         if item_type in (None, "message") and "role" in item:
             messages.append(
-                _role_message(
-                    item.get("role") or "user", _content_text(item.get("content"))
-                )
+                _role_message(item.get("role") or "user", _content(item.get("content")))
             )
         elif item_type == "function_call":
             call_id = item.get("call_id") or item.get("id") or ""
@@ -397,7 +397,7 @@ def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": _value_as_text(item.get("output")),
+                        "content": _tool_output(item.get("output")),
                     }
                 )
         elif item_type == "function_call_output":
@@ -405,7 +405,7 @@ def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
                 {
                     "role": "tool",
                     "tool_call_id": item.get("call_id") or item.get("id") or "",
-                    "content": _value_as_text(item.get("output")),
+                    "content": _tool_output(item.get("output")),
                 }
             )
         elif item_type == "reasoning":
@@ -418,19 +418,55 @@ def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
             )
         elif "role" in item:
             messages.append(
-                _role_message(
-                    item.get("role") or "user", _content_text(item.get("content"))
-                )
+                _role_message(item.get("role") or "user", _content(item.get("content")))
             )
     if not messages:
         raise ValueError("Request must contain at least one message")
     return messages
 
 
-def _role_message(role: str, text: str) -> dict:
+def _role_message(role: str, content: str | list[dict]) -> dict:
     if role in ("user", "assistant", "system"):
-        return {"role": role, "content": text}
-    return {"role": "user", "content": text}
+        return {"role": role, "content": content}
+    return {"role": "user", "content": content}
+
+
+def _has_image(content: Any) -> bool:
+    return isinstance(content, list) and any(
+        isinstance(part, dict) and part.get("type") == "input_image" for part in content
+    )
+
+
+def _content(content: Any) -> str | list[dict]:
+    """``content`` as text, or as chat content parts when it carries an image:
+    a request without images renders as it did."""
+    if not _has_image(content):
+        return _content_text(content)
+    parts = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "input_image":
+            parts.append(_image_part(part))
+        elif text := _content_text([part]):
+            parts.append({"type": "text", "text": text})
+    return parts
+
+
+def _tool_output(output: Any) -> str | list[dict]:
+    """A tool's output as the tool message's content: chat content parts when
+    it carries an image, else the text it always was."""
+    return _content(output) if _has_image(output) else _value_as_text(output)
+
+
+def _image_part(part: dict) -> dict:
+    """An ``input_image`` as the chat ``image_url`` part; the server checks it
+    with every other image (``images.check_chat_images``)."""
+    if part.get("file_id") is not None:
+        raise ValueError(NO_FILES_API)
+    url, detail = part.get("image_url"), part.get("detail")
+    if isinstance(url, dict):  # the chat shape, which clients send here too
+        url, detail = url.get("url"), url.get("detail", detail)
+    source = {"url": url} if detail is None else {"url": url, "detail": detail}
+    return {"type": "image_url", "image_url": source}
 
 
 def _content_text(content: Any) -> str:

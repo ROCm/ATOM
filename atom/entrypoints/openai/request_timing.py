@@ -82,6 +82,14 @@ def get_stream_timing() -> RequestTiming | None:
     return None
 
 
+def skip_first_token() -> None:
+    """This request generates nothing (``max_tokens: 0``): record no time to
+    first token for it, whatever text its response carries."""
+    timing = _request_timing.get()
+    if timing is not None:
+        timing.recorded = True
+
+
 def record_nonstream_first_token() -> None:
     """Record an internal token arrival; a buffered response has no SSE event."""
     timing = _request_timing.get()
@@ -110,6 +118,8 @@ class RequestTimingMiddleware:
                 "/v1/completions",
                 "/v1/messages",
                 "/v1/responses",
+                "/beta/chat/completions",
+                "/beta/completions",
             }
         ):
             await self.app(scope, receive, send)

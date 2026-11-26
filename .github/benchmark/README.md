@@ -169,6 +169,11 @@ The flat accuracy catalogs — `models_accuracy.json`, `oot_models_accuracy.json
   eval budget. If omitted, the eval budget is 30 minutes. The native ATOM step
   also launches the server, so its timeout is the larger of this value and 60
   minutes; the atomesh step times out at this value alone.
+- **Weekly night**: every `nightly` entry of `oot_models_accuracy.json` needs
+  `nightly_weekday` (`Mon` … `Sun`). The vLLM nightly accuracy run that starts
+  at 00:00 Beijing time on that weekday validates the case, so each case runs
+  once a week. `validate_catalog.py` (semantic rule) fails a PR that adds a
+  nightly entry without one; the workflow refuses such an entry too.
 - **Known drift (tolerated for now)**: `extraArgs` vs `extra_args` and
   `accuracy_threshold` vs `accuracy_test_threshold` are both accepted; the schema
   documents the current reality. Normalizing these (and their consumers) is a
@@ -233,12 +238,12 @@ python .github/scripts/catalog.py --cells .github/benchmark/models.json   # prev
 
 ## V4 AgentX P/D without offload
 
-The `DeepSeek-V4-Pro-0813` **weekly** suite runs on the existing TW schedule:
-Friday 16:00 UTC (Saturday 00:00 Beijing time). It covers seven independent
-concurrencies, **1, 2, 16, 32, 128, 192, and 256**, each with fresh services on
-two eight-GPU nodes (1P1D, TP8 with DPA).
+The `DeepSeek-V4-Pro-0813` **weekly** suite is manual dispatch only; it has no
+scheduled run. It covers seven independent concurrencies, **1, 2, 16, 32, 128,
+192, and 256**, each with fresh services on two eight-GPU nodes (1P1D, TP8 with
+DPA).
 
-To dispatch manually, select **Atomesh Benchmark** (`atomesh-benchmark.yaml`),
+To dispatch it, select **Atomesh Benchmark** (`atomesh-benchmark.yaml`),
 `suite=weekly`, `model_names=DeepSeek-V4-Pro-0813`, and
 `run_model_benchmark=true`. Leave `benchmark_concurrency` empty to preserve the
 per-case service sizing and routing settings. To run one concurrency, set

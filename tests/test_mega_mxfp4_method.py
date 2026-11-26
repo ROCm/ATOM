@@ -17,28 +17,33 @@ def test_mega_method_is_mxfp4_specialization():
     assert issubclass(moe_mod.MegaMxfp4MoEMethod, moe_mod.Mxfp4MoEMethod)
 
 
+@pytest.mark.parametrize("sp", [False, True])
 @pytest.mark.parametrize("backend_name", ["standard", "mega"])
-def test_mxfp4_method_selection(monkeypatch, backend_name):
+def test_mxfp4_method_selection(monkeypatch, backend_name, sp):
     standard_method = object()
     mega_method = object()
     config = SimpleNamespace(moe_backend=backend_name)
     monkeypatch.setattr(moe_mod, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(moe_mod, "sp_is_enabled", lambda: sp)
     monkeypatch.setattr(moe_mod, "Mxfp4MoEMethod", lambda *_args: standard_method)
     monkeypatch.setattr(moe_mod, "MegaMxfp4MoEMethod", lambda *_args: mega_method)
 
     selected = moe_mod._make_mxfp4_moe_method(object(), object())
 
-    assert selected is (mega_method if backend_name == "mega" else standard_method)
+    # Under SP, `mega` is SP MegaMoE over the standard method's weights.
+    use_mega = backend_name == "mega" and not sp
+    assert selected is (mega_method if use_mega else standard_method)
+    if sp:
+        # Nor does it hold the layer to the EP backend's requirements.
+        moe_mod.FusedMoE._validate_moe_backend(SimpleNamespace(quant_method=selected))
 
 
-@pytest.mark.parametrize("fp8_activations", [False, True])
-def test_fp8_activations_interleave_without_the_env_flag(monkeypatch, fp8_activations):
-    # aiter's A8W4 kernels read interleaved gate/up rows only, so a layer that
-    # asks for MXFP8 activations must get that layout whatever the env says.
+def _mxfp4_method(monkeypatch, gfx, fp8_activations):
+    """An Mxfp4MoEMethod on `gfx` with ATOM_MOE_GU_ITLV off."""
     monkeypatch.setattr(
         moe_mod, "get_current_atom_config", lambda: SimpleNamespace(eplb_enable=False)
     )
-    monkeypatch.setattr(moe_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(moe_mod, "get_gfx", lambda: gfx)
     monkeypatch.setattr(moe_mod.envs, "is_set", lambda _name: True)
     monkeypatch.setattr(moe_mod.envs, "ATOM_USE_TRITON_MOE", False)
     monkeypatch.setattr(moe_mod.envs, "ATOM_MOE_GU_ITLV", False)
@@ -52,14 +57,30 @@ def test_fp8_activations_interleave_without_the_env_flag(monkeypatch, fp8_activa
         in_dtype=torch.bfloat16,
         hidden_dim=256,
     )
+    return moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
 
-    method = moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
+
+@pytest.mark.parametrize("fp8_activations", [False, True])
+def test_fp8_activations_interleave_without_the_env_flag(monkeypatch, fp8_activations):
+    # aiter's A8W4 kernels read interleaved gate/up rows only, so a layer that
+    # asks for MXFP8 activations must get that layout whatever the env says.
+    method = _mxfp4_method(monkeypatch, "gfx950", fp8_activations)
 
     assert method.fp8_activations is fp8_activations
     assert method.is_guinterleave is fp8_activations
     # Routed rows that move between ranks travel in the MXFP8 the experts take.
     wire = method.routed_rows_wire
     assert (wire is not None and wire.dtype == moe_mod.dtypes.fp8) is fp8_activations
+
+
+@pytest.mark.parametrize("fp8_activations", [False, True])
+def test_gfx1250_interleaves_without_the_env_flag(monkeypatch, fp8_activations):
+    # aiter's gfx1250 fused_moe rejects the separated gate/up layout, so every
+    # MXFP4 layer there gets interleaved rows, MXFP8 activations or not.
+    method = _mxfp4_method(monkeypatch, "gfx1250", fp8_activations)
+
+    assert method.is_gfx1250 is True
+    assert method.is_guinterleave is True
 
 
 @pytest.mark.parametrize(
@@ -106,6 +127,7 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch, fp8_activati
     monkeypatch.setattr(moe_mod, "fused_moe", fake_fused_moe)
     method = object.__new__(moe_mod.Mxfp4MoEMethod)
     method.fused_experts = None
+    method.use_flydsl_herd = False
     method.quant_type = "mxfp4"
     method.is_guinterleave = True
     method.fp8_activations = fp8_activations

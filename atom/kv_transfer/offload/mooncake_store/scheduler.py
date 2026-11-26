@@ -3,12 +3,11 @@
 
 """Scheduler side of the native Mooncake Store offload.
 
-The policy -- what to save and when, whether a hit is worth loading, early
-block release, exact operation completions -- is all
-:class:`ChunkedOffloadSchedulerBase`'s. This module answers the one question it
-asks a transport, how much of a prompt the Store holds, and shapes the requests
-the workers receive: each carries the prompt's chunk digests, which name the
-Store objects, instead of the prompt's token ids.
+The policy, the digest-carrying requests and the paced save retries are the
+store-agnostic :class:`KVStoreOffloadScheduler`'s. This module answers the one
+question it asks a transport, how much of a prompt the Store holds, from the
+masters of its pools, minding the Store's taint marker, and renews the read
+leases a load relies on.
 """
 
 from __future__ import annotations
@@ -16,18 +15,26 @@ from __future__ import annotations
 import functools
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from atom.kv_transfer.disaggregation.types import LoadOperationId, SaveOperationId
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload._offload_common import (
-    max_pending_saves,
-    validated_kv_role,
+from atom.kv_transfer.offload._offload_common import validated_kv_role
+from atom.kv_transfer.offload.kv_store import scheduler as _store_scheduler
+from atom.kv_transfer.offload.kv_store.scheduler import (  # noqa: F401  # re-exported
+    _LOOKUP_STATS_INTERVAL_S,
+    KVStoreOffloadScheduler,
+    StoreLookupBase,
+    monotonic_clock_id,
+    prompt_chunk_hashes,
 )
-from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
-from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
+from atom.kv_transfer.offload.lookup_client import LookupPinStatus
+from atom.kv_transfer.offload.metadata import LoadSpec
 from atom.kv_transfer.offload.mooncake_store import client as store_client
+from atom.kv_transfer.offload.mooncake_store.async_lookup import (
+    AsyncStoreLookup,
+    DaemonExecutor,
+)
 from atom.kv_transfer.offload.mooncake_store.config import (
     MooncakeStoreOffloadConfig,
     StorePool,
@@ -37,12 +44,9 @@ from atom.kv_transfer.offload.mooncake_store.config import (
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
     STORE_TAINT_KEY,
-    chain_seed,
-    chunk_digest,
-    chunk_hash_chain,
-    rank_key_prefix,
     store_namespace,
 )
+from atom.model_engine.sequence import SequenceStatus
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -60,80 +64,20 @@ _LOOKUP_BACKOFF_S = 10.0
 _LOOKUP_BACKOFF_FACTOR = 10.0
 # Seconds between two warnings about one pool's failing lookups.
 _LOOKUP_WARNING_INTERVAL_S = 60.0
-# Seconds between two `[OFFLOAD-LOOKUP-STATS]` lines.
-_LOOKUP_STATS_INTERVAL_S = 60.0
 # A hit older than this is looked up again right before its load is
 # dispatched. Only the lookup's read lease (10 s by default) keeps the chunks
 # from eviction, and a request can wait far longer than that for KV blocks.
 _LOOKUP_REUSE_S = 1.0
-# After a failed save the base retries, no save is emitted for this long,
-# doubled for each further such failure in a row up to `_SAVE_RETRY_MAX_S`. A
-# stored save ends the pause and starts the doubling over, whenever it reports.
-# The base retries a failed save on the next step, and a failure that repeats
-# -- a full Store, a master that is down, a stage whose save slots are all
-# quarantined -- would otherwise re-pack the request's unsaved range on every
-# PP stage every step.
-_SAVE_RETRY_BASE_S = 1.0
-_SAVE_RETRY_MAX_S = 30.0
-# Names the boot a CLOCK_MONOTONIC reading is from; see `monotonic_clock_id`.
-_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
-
-
-@functools.cache
-def monotonic_clock_id() -> str | None:
-    """Which CLOCK_MONOTONIC ``time.monotonic()`` reads here: this boot's ID.
-
-    Every process of one boot of a host reads the same CLOCK_MONOTONIC, which no
-    wall-clock step moves; another host's counts from another origin. None when
-    the kernel does not say (`require_monotonic_clock_id`).
-    """
-    try:
-        with open(_BOOT_ID_PATH) as boot_id:
-            return boot_id.read().strip() or None
-    except OSError:
-        return None
+# Store lookups an arrival batch may queue at once (`offer_lookups`).
+_MAX_OFFERS_PER_BATCH = 64
 
 
 def require_monotonic_clock_id() -> str:
-    """`monotonic_clock_id`, or a refusal to start without one.
+    """The boot ID the saves are timed on, or a refusal to start without one.
 
-    A worker reads a save's dispatch stamp only on the clock the stamp names,
-    and treats any other as one it cannot place (the save then reads nothing):
-    without a boot ID every save would fail on its deadline, with no other sign
-    than a rate-limited warning.
-
-    Raises:
-        RuntimeError: The kernel does not name this boot.
+    See :func:`atom.kv_transfer.offload.kv_store.scheduler.require_monotonic_clock_id`.
     """
-    clock = monotonic_clock_id()
-    if clock is None:
-        raise RuntimeError(
-            f"the Mooncake Store offload cannot read the boot ID in {_BOOT_ID_PATH}, "
-            "which names the clock its saves are timed on; without it every save "
-            "would store nothing"
-        )
-    return clock
-
-
-def prompt_chunk_hashes(seq: Any, chunk_tokens: int) -> bytes:
-    """Digests of every full chunk of ``seq``'s prompt, hashed once per sequence.
-
-    Kept on the sequence (``_mooncake_store_chunk_hashes``): its prompt never
-    changes, and lookups, saves and loads of it all need the same chain.
-    """
-    num_prompt = int(seq.num_prompt_tokens)
-    expected = (num_prompt // int(chunk_tokens)) * DIGEST_BYTES
-    cached = getattr(seq, "_mooncake_store_chunk_hashes", None)
-    if isinstance(cached, bytes) and len(cached) == expected:
-        return cached
-    hashes = chunk_hash_chain(
-        seq.token_ids,
-        chunk_tokens,
-        num_tokens=num_prompt,
-        seed=chain_seed(getattr(seq, "cache_seed", None)),
-    )
-    seq._mooncake_store_chunk_hashes = hashes
-    return hashes
+    return _store_scheduler.require_monotonic_clock_id("the Mooncake Store offload")
 
 
 class _PoolLookups:
@@ -141,21 +85,23 @@ class _PoolLookups:
 
     Its client is opened on the first lookup that asks it. A pool that cannot
     be reached, or fails a lookup, is not asked until ``paused_until``: every
-    call to it blocks the scheduler thread, and the other pools answer
-    meanwhile. A pool found to carry the taint marker is ``tainted`` for good
+    call to it holds the lookup worker, and the other pools answer meanwhile. A pool found to carry the taint marker is ``tainted`` for good
     and holds nothing for the lookups from then on.
     """
 
-    __slots__ = ("client", "paused_until", "pool", "tainted")
+    __slots__ = ("client", "executor", "paused_until", "pool", "tainted")
 
     def __init__(self, pool: StorePool) -> None:
         self.pool = pool
         self.client: store_client.MooncakeStoreClient | None = None
+        # Its own daemon worker when several pools are asked at once
+        # (`_StoreLookup._exists_on`); None for a single pool.
+        self.executor: DaemonExecutor | None = None
         self.paused_until = 0.0
         self.tainted = False
 
 
-class _StoreLookup:
+class _StoreLookup(StoreLookupBase):
     """The chunked scheduler's lookup client, answered by the Store's masters.
 
     A hit is the prefix every rank holds: per rank, the run of chunks present
@@ -179,9 +125,8 @@ class _StoreLookup:
 
     A pool's Store client is opened on the first lookup that asks it, not at
     construction: every PP stage builds a scheduler, and only the head ever
-    schedules. A lookup blocks the scheduler thread, so a pool the scheduler
-    cannot reach, or that fails a lookup, is not asked for a while
-    (``_RECONNECT_INTERVAL_S``, ``_LOOKUP_BACKOFF_S``).
+    schedules. A pool the scheduler cannot reach, or that fails a lookup, is
+    not asked for a while (``_RECONNECT_INTERVAL_S``, ``_LOOKUP_BACKOFF_S``).
     """
 
     def __init__(
@@ -192,33 +137,19 @@ class _StoreLookup:
         world: int,
         chunk_tokens: int,
     ) -> None:
+        super().__init__(namespace=namespace, world=world, chunk_tokens=chunk_tokens)
         self._cfg = cfg
-        self._namespace = namespace
-        self._world = int(world)
-        self._chunk_tokens = int(chunk_tokens)
         # Exact while every server on these pools puts each rank on the same
         # NIC; see the offload README for what a different placement costs.
         self._pools = [_PoolLookups(pool) for pool in cfg.store_masters()]
-        # Several pools are asked at once; the executor starts no thread until
-        # the first lookup.
-        self._executor = (
-            ThreadPoolExecutor(
-                max_workers=len(self._pools),
-                thread_name_prefix="mooncake-store-lookup",
-            )
-            if len(self._pools) > 1
-            else None
-        )
+        # Several pools are asked at once, each on a daemon worker of its own:
+        # a master RPC that hangs must not keep the engine process alive at
+        # exit, as a `ThreadPoolExecutor` worker would (it is joined then).
+        if len(self._pools) > 1:
+            for index, pool in enumerate(self._pools):
+                pool.executor = DaemonExecutor(f"mooncake-store-lookup-{index}")
         # Per pool master: when its next warning may be logged.
         self._next_warning_at: dict[str, float] = {}
-        # Answered lookups; those where the ranks held prefixes of different
-        # lengths; and the rank objects past the shared prefix they found,
-        # present but unusable while another rank lacks the chunk -- evicted,
-        # failed, or still being written by a slower stage.
-        self.lookups = 0
-        self.uneven_lookups = 0
-        self.stranded_objects = 0
-        self._next_stats_at = time.monotonic() + _LOOKUP_STATS_INTERVAL_S
 
     def lookup(self, seq: Any, lookup_id: str | None = None) -> int | None:
         """Tokens of ``seq``'s prompt prefix the Store holds on every rank.
@@ -226,29 +157,23 @@ class _StoreLookup:
         None, not 0, when the Store did not answer -- no pool reached, or the
         keys no pool answered decide the hit: the scheduler retries a
         non-answer later, where a 0 would be remembered as a miss.
+
+        Store keys chain from `Sequence.cache_seed`, the source of the media
+        salt, so the lookup takes no salt argument.
         """
         started = time.perf_counter()
         hashes = prompt_chunk_hashes(seq, self._chunk_tokens)
         chunks = len(hashes) // DIGEST_BYTES
         if not chunks:
             return 0
-        # Every rank's keys share the chunks' digests: each is hex-encoded once.
-        digests = [chunk_digest(hashes, index).hex() for index in range(chunks)]
-        keys = []
-        for rank in range(self._world):
-            prefix = rank_key_prefix(self._namespace, rank, self._world)
-            keys += [prefix + digest for digest in digests]
+        keys = self._rank_keys(hashes, 0, chunks)
         merged = self._ask(keys)
         if merged is None:
             return None
         # Per rank, the run of chunks from chunk 0 some pool holds: at least
         # `held` (an unanswered key counts as absent), at most `bound` (as
         # present).
-        held, bound = [], []
-        for rank in range(self._world):
-            shard = merged[rank * chunks : (rank + 1) * chunks]
-            held.append(next((i for i, code in enumerate(shard) if code != 1), chunks))
-            bound.append(next((i for i, code in enumerate(shard) if code == 0), chunks))
+        held, bound = self._rank_prefixes(merged, chunks)
         hit_chunks = min(held)
         if min(bound) != hit_chunks:
             logger.debug(
@@ -287,16 +212,31 @@ class _StoreLookup:
         pools = self._pools_to_ask() if first < last else []
         if not pools:
             return 0
-        digests = [chunk_digest(hashes, index).hex() for index in range(first, last)]
-        keys = []
-        for rank in range(self._world):
-            prefix = rank_key_prefix(self._namespace, rank, self._world)
-            keys += [prefix + digest for digest in digests]
+        keys = self._rank_keys(hashes, first, last)
         answers = [a for a in self._exists_on(pools, keys) if a is not None]
         return sum(1 for codes in zip(*answers) if 1 in codes)
 
+    # The two below serve only the asynchronous renewal (ATOM_STORE_ASYNC_RENEW).
+    def renew_key_snapshot(self, seq: Any, start: int, end: int) -> tuple[str, ...]:
+        """Snapshot keys on the scheduler thread before background renewal."""
+        # `renew`'s range math, repeated so that `renew` stays main's code.
+        hashes = prompt_chunk_hashes(seq, self._chunk_tokens)
+        first = int(start) // self._chunk_tokens
+        last = min(int(end) // self._chunk_tokens, len(hashes) // DIGEST_BYTES)
+        return tuple(self._rank_keys(hashes, first, last))
+
+    def renew_keys(self, keys: tuple[str, ...]) -> int:
+        answers = self._ask(list(keys)) if keys else None
+        return sum(1 for code in answers or () if code == 1)
+
     def clear_lookup_status(self, lookup_id: str) -> None:
         """Nothing to release: a Store read lease expires by itself."""
+
+    def close(self) -> None:
+        """Stop the pool workers; one inside a hung RPC is a daemon thread."""
+        for pool in self._pools:
+            if pool.executor is not None:
+                pool.executor.shutdown()
 
     def _ask(self, keys: list[str]) -> list[int | None] | None:
         """Per key: 1 if a pool holds it, 0 if a pool answered and none holds
@@ -348,8 +288,8 @@ class _StoreLookup:
         asked = [STORE_TAINT_KEY, *keys]
         asked_at = time.monotonic()
         futures = (
-            [self._executor.submit(pool.client.exists, asked) for pool in pools]
-            if self._executor is not None
+            [pool.executor.submit(pool.client.exists, asked) for pool in pools]
+            if all(pool.executor is not None for pool in pools)
             else None
         )
         answers: list[list[int] | None] = []
@@ -443,23 +383,6 @@ class _StoreLookup:
         )
         return True
 
-    def _count_lookup(self, stranded: int) -> None:
-        """Count an answered lookup, logging the totals once a minute."""
-        self.lookups += 1
-        if stranded:
-            self.uneven_lookups += 1
-            self.stranded_objects += stranded
-        now = time.monotonic()
-        if now < self._next_stats_at:
-            return
-        self._next_stats_at = now + _LOOKUP_STATS_INTERVAL_S
-        logger.info(
-            "[OFFLOAD-LOOKUP-STATS] lookups=%d uneven_lookups=%d stranded_objects=%d",
-            self.lookups,
-            self.uneven_lookups,
-            self.stranded_objects,
-        )
-
     def _warn(
         self, pool: _PoolLookups, message: str, *args: Any, exc_info: Any = None
     ) -> None:
@@ -472,12 +395,12 @@ class _StoreLookup:
         logger.warning("Mooncake Store offload: " + message, *args, exc_info=exc_info)
 
 
-class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
+class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
     """Chunked offload scheduling with the Mooncake Store as the tier."""
 
-    # Workers publish one source-safe group per chunk once its GPU pack is
-    # done (the block GPU connector), separately from the store terminal.
-    _supports_early_block_release = True
+    LABEL = "Mooncake Store offload"
+    # It answers `lookup_ready`, so the scheduler may start its loads early.
+    supports_early_load = True
 
     def __init__(self, config: Any) -> None:
         kvc = getattr(config, "kv_transfer_config", {}) or {}
@@ -487,62 +410,68 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         require_monotonic_clock_id()
         world = offcfg.lmcache_replica_world_size(config)
         namespace = store_namespace(config, cfg.chunk_tokens)
-        self._store_cfg = cfg
-        self._namespace = namespace
         # time.monotonic() of each request's last lookup; see `_ensure_lookup_pin`.
         self._looked_up_at: dict[str, float] = {}
-        # Failed saves since the last stored one, and when saves may resume.
-        self._failed_saves_in_a_row = 0
-        self._saves_paused_until = 0.0
+        self._async_renew = envs.ATOM_STORE_ASYNC_RENEW
+        self.cancels_undispatched_loads = self._async_renew
         super().__init__(
             config,
-            chunk_size=cfg.chunk_tokens,
-            lookup_client=_StoreLookup(
-                cfg, namespace=namespace, world=world, chunk_tokens=cfg.chunk_tokens
+            store_cfg=cfg,
+            namespace=namespace,
+            world=world,
+            lookup_client=AsyncStoreLookup(
+                _StoreLookup(
+                    cfg, namespace=namespace, world=world, chunk_tokens=cfg.chunk_tokens
+                )
             ),
+            endpoint="masters=" + ",".join(pool.master for pool in cfg.store_masters()),
         )
-        extra = kvc.get("kv_connector_extra_config", kvc) or {}
-        # Unbounded unless asked for, in the connector config or through
-        # OFFLOAD_MAX_PENDING_SAVES: one save per request is in flight at most
-        # either way.
-        asked = (
-            "max_pending_saves" in extra or envs.OFFLOAD_MAX_PENDING_SAVES is not None
-        )
-        self._max_pending_saves = (
-            max_pending_saves(kvc, envs.OFFLOAD_COPY_WORKERS) if asked else None
-        )
-        logger.info(
-            "Mooncake Store offload scheduler: namespace=%s world=%d chunk=%d "
-            "masters=%s max_pending_saves=%s abandon_timeout=%.0fs",
-            namespace,
-            world,
-            cfg.chunk_tokens,
-            ",".join(pool.master for pool in cfg.store_masters()),
-            self._max_pending_saves,
-            cfg.save_abandon_timeout_s,
+        if self._async_renew:
+            # Bound only with the flag: without it these are the class's.
+            self._pending_loads: dict[str, Any] = {}
+            self._renew_before_load = self._renew_before_load_async
+            self._clear_pending_load = self._clear_pending_load_async
+            self.build_connector_meta = self._build_connector_meta_async
+            self.has_pending_work = self._has_pending_work_async
+        # The Store reads whole chunks into fresh blocks, so an HBM hit that
+        # ends inside a chunk is lowered to the chunk floor
+        # (`BlockManager.lower_hit_to_chunk`). The registry holds the flag, one
+        # source for this and the DP router's tier profile.
+        self.lowers_hbm_hit_to_chunk = KVConnectorFactory.lowers_hbm_hit_to_chunk(
+            "mooncake_store"
         )
 
-    def _lookup_token_ids(self, seq: Any) -> Any:
-        """The sequence itself: the lookup hashes its prompt once per sequence.
+    def offer_lookups(self, seqs):
+        # Called on arrival after tokenization, before admission/prefill.
+        if not self._do_load:
+            return
+        offered = 0
+        for seq in seqs:
+            # Not a request that left WAITING meanwhile, and a bounded number per
+            # arrival batch: the rest reach their lookup through the scheduler's
+            # own prefetch (`prefetch_lookups`), as the queue drains.
+            if offered >= _MAX_OFFERS_PER_BATCH:
+                break
+            if self._lookup_wanted(seq) and self._lookup_client.submit_if(
+                seq, str(seq.id), lambda seq=seq: seq.status == SequenceStatus.WAITING
+            ):
+                offered += 1
 
-        Copying a long prompt into a list on every lookup would cost more than
-        the lookup (`prompt_chunk_hashes`).
-        """
-        return seq
-
-    def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
-        # A prompt too short to load from the Store, whatever it holds, is not
-        # asked about: no hit is longer than the prompt less a token, floored
-        # to a chunk (`_loadable_hit`), and no shorter one reaches the load
-        # threshold. The lookup would block the scheduler thread for nothing.
-        num_prompt = int(seq.num_prompt_tokens)
-        if self._loadable_hit(num_prompt, num_prompt) < self._min_load_tokens:
-            return 0
+    def _lookup_starting(self, sid: str) -> None:
         # Stamped before asking: the lease runs from the master's answer.
         self._looked_up_at[sid] = time.monotonic()
-        return super()._fresh_tier_lookup(seq, sid)
 
-    def _ensure_lookup_pin(self, seq: Any, sid: str, spec: LoadSpec) -> bool:
+    def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
+        hit = super()._fresh_tier_lookup(seq, sid)
+        # An answer the asynchronous lookup took earlier is as old as its query.
+        started = self._lookup_client.query_started(sid)
+        if started is not None and started < self._looked_up_at.get(sid, started):
+            self._looked_up_at[sid] = started
+        return hit
+
+    def _ensure_lookup_pin(
+        self, seq: Any, sid: str, spec: LoadSpec
+    ) -> bool | LookupPinStatus:
         """Renew the read leases of what a load reads; the load always goes ahead.
 
         The base trusts a hit it still holds from this request's lookup, a
@@ -574,6 +503,14 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             if spec.transfer_end_tokens is None
             else spec.transfer_end_tokens
         )
+        return self._renew_before_load(seq, sid, start, end)
+
+    def _renew_before_load(self, seq: Any, sid: str, start: int, end: int) -> bool:
+        """Renew the leases of tokens ``[start, end)`` now, on this thread.
+
+        With ``ATOM_STORE_ASYNC_RENEW`` ``__init__`` binds
+        ``_renew_before_load_async`` instead.
+        """
         held = self._lookup_client.renew(seq, start, end)
         logger.debug(
             "[OFFLOAD-LOOKUP] seq=%s renewed the leases of tokens [%d, %d): the "
@@ -589,93 +526,96 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         super()._clear_pending_load(sid)
         self._looked_up_at.pop(sid, None)
 
-    def _may_emit_save(self) -> bool:
-        if time.monotonic() < self._saves_paused_until:
-            return False
-        cap = self._max_pending_saves
-        return cap is None or len(self._save_inflight) < cap
+    def _renew_before_load_async(
+        self, seq: Any, sid: str, start: int, end: int
+    ) -> bool | LookupPinStatus:
+        """`_renew_before_load` with ``ATOM_STORE_ASYNC_RENEW`` (bound in ``__init__``).
 
-    def _store_finished(self, operation: SaveOperationId, *, succeeded: bool) -> None:
-        if succeeded:
-            # Saves run concurrently, so this one may report after another
-            # failed and paused them: the Store takes saves again.
-            self._failed_saves_in_a_row = 0
-            self._saves_paused_until = 0.0
-        super()._store_finished(operation, succeeded=succeeded)
-
-    def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> bool:
-        """Pace the retry the base sets up; see `_SAVE_RETRY_BASE_S`.
-
-        A save the base retires instead (its request finished, or its ID was
-        reused) has nothing to pace, and pauses no other request's saves.
+        The renewal runs on the renewal executor
+        (``AsyncStoreLookup.renew_async``). While it has not finished and was
+        submitted less than its timeout ago (queued or running) the load stays
+        parked and is retried next step (``PENDING``), so its GET goes out one
+        or more steps later than on the synchronous path. A fresh hit (the
+        caller returns before this), a rejected submission, or a new submission while an earlier renewal is
+        still stuck (``renewal_busy``) dispatches in the same step; a renewal
+        already queued behind a hung RPC stays parked until its own timeout.
+        ``renew_parked`` counts the polls while parked (the idle drain polls
+        every 1 ms, so it is not a step count). Any other outcome (finished,
+        timed out, error, cancelled, rejected, busy) dispatches the get exactly
+        as the synchronous path does (zero held keys included: the get
+        validates residency); each fallback reason is counted as
+        ``renew_fallback_<reason>``. Cancellation before dispatch retires the
+        renewal and the reservation without worker work. Once dispatch has
+        handed the blocks to workers, cleanup waits for their terminal report
+        so it cannot release blocks still used by DMA.
         """
-        if not super()._retry_or_retire_failed_save(operation):
-            return False
-        self._failed_saves_in_a_row += 1
-        pause = min(
-            _SAVE_RETRY_MAX_S,
-            _SAVE_RETRY_BASE_S * 2 ** min(self._failed_saves_in_a_row - 1, 16),
+        # The keys of `[start, end)` never change for one request: they are
+        # built only when the renewal is submitted, not on each retry.
+        state = self._lookup_client.renew_async(
+            sid,
+            (start, end),
+            functools.partial(
+                self._lookup_client.backend.renew_key_snapshot, seq, start, end
+            ),
         )
-        self._saves_paused_until = max(
-            self._saves_paused_until, time.monotonic() + pause
-        )
+        if state == "pending":
+            self._perf_bump("renew_parked")
+            return LookupPinStatus.PENDING
+        if state != "ready":
+            self._perf_bump(f"renew_fallback_{state}")
+            n = self._perf_counters[f"renew_fallback_{state}"]
+            # The lookup logs an "error" itself, at most once a minute; the
+            # counter counts every one.
+            if state != "error" and (n == 1 or n % 100 == 0):
+                logger.warning(
+                    "Mooncake Store renewal for %s: %s; dispatching the load "
+                    "anyway (%d so far)",
+                    sid,
+                    state,
+                    n,
+                )
         return True
 
-    def _build_save_request(
-        self,
-        seq: Any,
-        saved: int,
-        aligned: int,
-        operation: SaveOperationId,
-        block_ids: list[int],
-        is_last_prefill: bool,
-    ) -> LMCacheReqMeta:
-        """Save chunks ``[saved, aligned)``: the digests of ``[0, aligned)``.
+    def _build_connector_meta_async(self):
+        """The class's build, then the loads left ``PENDING`` wait for the next.
 
-        No token ids: every PP stage receives each request, and the digests
-        are all the worker needs to name its objects. The dispatch time starts
-        the workers' source read deadline where the reclaim clock starts, on
-        the same CLOCK_MONOTONIC (the reclaim stamps the save just after).
+        ``_reqs_need_recv`` is emptied by every build; a load whose renewal has
+        not finished is put back, so it keeps reporting work
+        (``has_pending_work``) and is retried on the next build.
         """
-        hashes = prompt_chunk_hashes(seq, self.chunk_size)
-        return LMCacheReqMeta(
-            req_id=seq.id,
-            token_ids=[],
-            block_ids=block_ids,
-            save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
-            is_last_prefill=is_last_prefill,
-            save_operation=operation,
-            chunk_hashes=hashes[: (aligned // self.chunk_size) * DIGEST_BYTES],
-            dispatched_at=time.monotonic(),
-            dispatch_clock=monotonic_clock_id(),
-        )
+        self._pending_loads.clear()
+        meta = type(self).build_connector_meta(self)
+        if self._pending_loads:
+            self._reqs_need_recv.update(self._pending_loads)
+            self._pending_loads.clear()
+        return meta
 
-    def _build_load_request(
-        self,
-        seq: Any,
-        load_spec: LoadSpec,
-        load_operation: LoadOperationId,
-        transfer_end: int,
-    ) -> LMCacheReqMeta:
-        """Load ``[hbm, transfer_end)``: the digests of ``[0, transfer_end)``."""
-        hashes = prompt_chunk_hashes(seq, self.chunk_size)
-        return LMCacheReqMeta(
-            req_id=seq.id,
-            token_ids=[],
-            block_ids=list(seq.block_table),
-            load_spec=load_spec,
-            load_operation=load_operation,
-            chunk_hashes=hashes[: (transfer_end // self.chunk_size) * DIGEST_BYTES],
-        )
+    def _has_pending_work_async(self) -> bool:
+        """The class's, plus loads handed to workers and not yet reported.
 
-    def save_abandon_timeout_s(self) -> float:
-        """Seconds a deferred save may sit before the engine reclaims it.
-
-        A setting of this connector (``mooncake_store.save_abandon_timeout_s``)
-        rather than a pin timeout: the workers stop reading a save's source
-        blocks well before it runs out (see the worker's source read deadline).
+        With the flag a parked load's GET can go out from an idle or shutdown
+        drain build; it leaves `_reqs_need_recv` then, so without this the
+        drain could stop polling before the load's terminal report.
         """
-        return self._store_cfg.save_abandon_timeout_s
+        return type(self).has_pending_work(self) or bool(self._active_load_operations)
+
+    def _clear_pending_load_async(self, sid: str) -> None:
+        self._lookup_client.cancel_renewal(sid)
+        type(self)._clear_pending_load(self, sid)
+
+    def cancel_undispatched_load(self, seq: Any) -> bool:
+        sid = str(seq.id)
+        if (
+            self._load_lifecycles.get(sid) is not seq
+            or self._reqs_need_recv.get(sid) is not seq
+        ):
+            return False
+        # Workers never got this load: `build_connector_meta` drops a load
+        # from `_reqs_need_recv` in the same call that hands it to workers, so
+        # one still there is undispatched. A running renewal retains immutable
+        # keys, not these blocks.
+        self.cancel_pending_load(seq)
+        return True
 
 
 __all__ = [

@@ -226,10 +226,6 @@ def test_k3_required_call_needs_tools_to_call():
 # would notice.
 
 
-class _Submitted(Exception):
-    """Raised by a stub engine once it holds the request's sampling params."""
-
-
 def _k3_chat(tool_choice):
     return {
         "model": "m",
@@ -275,38 +271,97 @@ def test_openai_chat_endpoint_hands_the_channel_to_sampling(monkeypatch, tool_ch
     assert sampling_params.required_channel == expected
 
 
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("tool_choice", ["required", "auto"])
-def test_atomesh_chat_endpoints_hand_the_channel_to_sampling(
-    monkeypatch, stream, tool_choice
-):
-    standalone = pytest.importorskip(
-        "atom.entrypoints.atomesh.atom_standalone_service", exc_type=ImportError
-    )
-    seen = []
+def _chat_with_grammar(monkeypatch, body, text="hello"):
+    """Run a K3 chat request with ATOM_TOOL_CALL_GRAMMAR=1; return what was
+    sampled and what was prepared for the grammar."""
+    import asyncio
 
-    def submit(_prompt, sampling_params, *_args, **_kw):
+    from atom.entrypoints.openai import api_server
+    from atom.entrypoints.openai.protocol import ChatCompletionRequest
+
+    pytest.importorskip("llguidance")
+    seen, prepared = [], []
+
+    async def generate(_prompt, sampling_params, _request_id, **_kw):
         seen.append(sampling_params)
-        raise _Submitted
+        yield {
+            "text": text,
+            "finish_reason": "eos",
+            "num_tokens_input": 1,
+            "num_tokens_output": 1,
+        }
 
-    service = standalone.AtomStandaloneService.__new__(standalone.AtomStandaloneService)
-    service.model_name = "m"
-    service.default_chat_template_kwargs = {}
-    service.custom_message_encoder = None
-    service.tool_parser_cls = KimiK3Parser
-    service.required_tool_channel = K3_CHANNEL
-    service.tokenizer = K3Tokenizer()
-    service.engine_service = types.SimpleNamespace(generate=submit, start_stream=submit)
-    monkeypatch.setattr(standalone, "apply_chat_template", lambda *a, **k: "prompt")
-
-    entry = (
-        service.start_chat_completions_stream if stream else service.chat_completions
+    monkeypatch.setenv("ATOM_TOOL_CALL_GRAMMAR", "1")
+    monkeypatch.setattr(api_server, "model_name", "m")
+    monkeypatch.setattr(api_server, "_request_logger", None)
+    monkeypatch.setattr(api_server, "default_chat_template_kwargs", {})
+    monkeypatch.setattr(api_server, "reasoning_toggle", None)
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", KimiK3Parser)
+    monkeypatch.setattr(api_server, "required_tool_channel", K3_CHANNEL)
+    monkeypatch.setattr(api_server, "tokenizer", K3Tokenizer())
+    monkeypatch.setattr(api_server, "apply_chat_template", lambda *a, **k: "prompt")
+    monkeypatch.setattr(api_server, "generate_async", generate)
+    monkeypatch.setattr(api_server, "synthetic_token_text", None)
+    monkeypatch.setattr(
+        api_server, "_get_engine_config", lambda: types.SimpleNamespace()
     )
-    with pytest.raises(_Submitted):
-        entry(_k3_chat(tool_choice))
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        types.SimpleNamespace(
+            prepare_structured_request=lambda params, *_: prepared.append(params)
+        ),
+    )
+    asyncio.run(api_server.chat_completions(ChatCompletionRequest(**body), None))
     (sampling_params,) = seen
-    expected = K3_CHANNEL if tool_choice == "required" else None
-    assert sampling_params.required_channel == expected
+    return sampling_params, prepared
+
+
+@pytest.mark.parametrize("tool_choice", ["required", "auto"])
+def test_chat_tool_call_grammar_replaces_the_channel(monkeypatch, tool_choice):
+    from atom.structured_output.validation import TOOL_CALL_GRAMMAR_SCHEMA
+
+    params, prepared = _chat_with_grammar(monkeypatch, _k3_chat(tool_choice))
+    assert params.json_schema == TOOL_CALL_GRAMMAR_SCHEMA
+    assert params.required_channel is None
+    assert prepared == [params]
+
+
+def test_chat_tool_call_grammar_holds_message_declared_tools(monkeypatch):
+    body = _k3_chat({"type": "function", "function": {"name": "dyn"}})
+    dynamic = [{"type": "function", "function": {"name": "dyn", "parameters": {}}}]
+    body["messages"] = [{"role": "user", "content": "hi", "tools": dynamic}]
+    params, _ = _chat_with_grammar(monkeypatch, body)
+    import json
+
+    grammar = json.loads(params.structured_tool_format)["grammar"]
+    assert 'tool=\\"dyn\\"' in grammar
+
+
+def test_chat_with_a_response_format_takes_no_tool_call_grammar(monkeypatch):
+    from atom.entrypoints.openai import api_server
+
+    async def configure(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(api_server, "configure_request", configure)
+    body = {**_k3_chat("auto"), "response_format": {"type": "json_object"}}
+    params, prepared = _chat_with_grammar(monkeypatch, body, text="{}")
+    assert params.json_schema is None and prepared == []
+
+
+@pytest.mark.parametrize("required", [True, False])
+def test_atomesh_hands_the_channel_to_sampling(required):
+    """The Rust frontend marks a chat's `tool_choice: "required"`; the token
+    bridge holds that request, and only that one, to the channel."""
+    from atom.entrypoints.atomesh.token_bridge import TokenBridge
+
+    bridge = TokenBridge.__new__(TokenBridge)
+    bridge._output_limit = None
+    bridge._required_channel = K3_CHANNEL
+    sampling_params = bridge._sampling_params({"tool_choice_required": required})
+    assert sampling_params.required_channel == (K3_CHANNEL if required else None)
 
 
 # ── the state machine ────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import yaml
+from atomesh_workflow_helpers import load_workflow, workflow_step
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,14 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class NightlyImageSelectionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        workflow = yaml.safe_load(
-            (ROOT / ".github/workflows/atomesh-benchmark.yaml").read_text()
-        )
-        script = next(
-            step["run"]
-            for step in workflow["jobs"]["load-config"]["steps"]
-            if step.get("id") == "image"
-        )
+        script = workflow_step(load_workflow(), "image")
         cls.python = script.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
         tree = ast.parse(cls.python)
         function = next(

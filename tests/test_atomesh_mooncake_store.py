@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -475,6 +476,39 @@ done
             [["", str(192 * GIB), "50000"]],
         )
 
+    def test_pools_count_the_decode_owners_of_every_decode_owner_node(self):
+        owners = {
+            "MOONCAKE_STORE_OWNERS": "0:64",
+            "MOONCAKE_STORE_DECODE_OWNERS": "0:32:rdma0;1:16:rdma4",
+        }
+        for layout, placement, n_decode, nodes in (
+            ("multi_node", "", "2", 2),
+            # Two decode-only nodes; the decode beside the prefill adds none.
+            ("packed_nodes", "prefill_nodes=(0); decode_nodes=(0 1 1 2)\n", "4", 2),
+            ("packed_nodes", "prefill_nodes=(0); decode_nodes=(0 1 1)\n", "3", 1),
+        ):
+            with self.subTest(layout=layout, placement=placement):
+                result = self.run_shell(
+                    placement
+                    + "plan_mooncake_store_pools\n"
+                    + 'echo "${mooncake_pool_capacity[*]}"\n',
+                    **owners,
+                    ATOMESH_PD_WORKER_LAYOUT=layout,
+                    xP="1",
+                    yD=n_decode,
+                )
+                self.assertEqual(result.stdout.split(), [str((64 + 48 * nodes) * GIB)])
+        # A multi-node decode worker starts the owners on each of its nodes.
+        result = self.run_shell(
+            'plan_mooncake_store_pools\necho "${mooncake_pool_capacity[*]}"\n',
+            **owners,
+            ATOMESH_PD_WORKER_LAYOUT="multi_node",
+            xP="1",
+            yD="2",
+            DECODE_NODES_PER_WORKER="2",
+        )
+        self.assertEqual(result.stdout.split(), [str((64 + 48 * 4) * GIB)])
+
     def test_per_nic_pools_number_the_nics_of_both_nodes_alike(self):
         # Each node lists its owners in its own order; a decode node reads the
         # settings from their prefill-prefixed copies.
@@ -580,8 +614,9 @@ done
         for env in (
             {"ATOMESH_PD_WORKER_LAYOUT": "single_node", "xP": "1"},
             {"ATOMESH_PD_WORKER_LAYOUT": "multi_node", "xP": "2"},
-            # Every decode node would start the owners the pools count once.
-            {"ATOMESH_PD_WORKER_LAYOUT": "multi_node", "xP": "1", "yD": "2"},
+            # Only multi_node and packed_nodes count the nodes that start them.
+            {"ATOMESH_PD_WORKER_LAYOUT": "decode_single_node", "xP": "1"},
+            {"ATOMESH_PD_WORKER_LAYOUT": "prefill_single_node", "xP": "1"},
         ):
             with self.subTest(env=env):
                 result = self.run_shell(
@@ -591,13 +626,96 @@ done
                     **env,
                 )
                 self.assertIn("needs the decode on nodes of its own", result.stderr)
+        # A prefill worker's second node starts masters no decode owner joins.
+        for n_decode in ("1", "2"):
+            with self.subTest(prefill_nodes_per_worker="2", n_decode=n_decode):
+                result = self.run_shell(
+                    "check_mooncake_store_settings\n",
+                    expect_rc=2,
+                    **decode_owners,
+                    ATOMESH_PD_WORKER_LAYOUT="multi_node",
+                    xP="1",
+                    yD=n_decode,
+                    PREFILL_NODES_PER_WORKER="2",
+                )
+                self.assertIn("prefill nodes_per_worker, here 2", result.stderr)
+        for n_decode, decode_nodes_per_worker in (("1", "1"), ("2", "1"), ("1", "2")):
+            self.run_shell(
+                "check_mooncake_store_settings\n",
+                **decode_owners,
+                ATOMESH_PD_WORKER_LAYOUT="multi_node",
+                xP="1",
+                yD=n_decode,
+                DECODE_NODES_PER_WORKER=decode_nodes_per_worker,
+            )
+        # Packed nodes: the decode-only node is every node but the prefill's.
+        for placement, n_prefill, n_decode in (
+            # Every decode shares the prefill's node.
+            ("prefill_nodes=(0); decode_nodes=(0)", "1", "1"),
+            ("prefill_nodes=(0 0); decode_nodes=(1 1)", "2", "2"),
+        ):
+            with self.subTest(placement=placement):
+                result = self.run_shell(
+                    f"{placement}\ncheck_mooncake_store_settings\n",
+                    expect_rc=2,
+                    **decode_owners,
+                    ATOMESH_PD_WORKER_LAYOUT="packed_nodes",
+                    xP=n_prefill,
+                    yD=n_decode,
+                )
+                self.assertIn("needs the decode on nodes of its own", result.stderr)
+        for placement, n_decode in (
+            ("prefill_nodes=(0); decode_nodes=(0 1)", "2"),
+            ("prefill_nodes=(0); decode_nodes=(0 1 1)", "3"),
+            ("prefill_nodes=(0); decode_nodes=(0 1 1 2)", "4"),
+        ):
+            with self.subTest(placement=placement):
+                self.run_shell(
+                    f"{placement}\ncheck_mooncake_store_settings\n",
+                    **decode_owners,
+                    ATOMESH_PD_WORKER_LAYOUT="packed_nodes",
+                    xP="1",
+                    yD=n_decode,
+                )
+
+    def test_packed_decode_owners_start_once_off_the_prefill_node(self):
+        port = self.master_port
+        (self.root / "segments").write_text(f"{port} {64 * GIB}\n")
+        store_env = {
+            "NODE0_ADDR": HOST,
+            "host_ip": "127.0.0.2",
+            "ATOMESH_PD_WORKER_LAYOUT": "packed_nodes",
+            "MOONCAKE_STORE": "0",
+            "ATOMESH_PREFILL_ENV_MOONCAKE_STORE": "1",
+            "ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS": "0:64:rdma4",
+            "ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS": "0:32:rdma5;1:32:rdma6",
+        }
+        # The prefill's node: its decode worker leaves the Store to the prefill.
         self.run_shell(
-            "check_mooncake_store_settings\n",
-            **decode_owners,
-            ATOMESH_PD_WORKER_LAYOUT="multi_node",
-            xP="1",
-            yD="1",
+            "prefill_nodes=(0); decode_nodes=(0 1 1)\n"
+            "start_mooncake_store_decode_owners\n",
+            NODE_RANK="0",
+            **store_env,
         )
+        self.assertEqual(self.store_calls("mooncake_client"), [])
+        # The other node: two decode workers, one set of owners.
+        self.run_shell(
+            f"""
+setsid python3 /scripts/numa_exec.py 0 mooncake_master --rpc_port={port} \
+  >/dev/null 2>&1 &
+prefill_nodes=(0); decode_nodes=(0 1 1)
+start_mooncake_store_decode_owners
+start_mooncake_store_decode_owners
+stop_mooncake_store
+""",
+            NODE_RANK="1",
+            **store_env,
+        )
+        owners = self.store_calls("mooncake_client")
+        self.assertEqual(len(owners), 2)
+        for device in ("rdma5", "rdma6"):
+            (call,) = [c for c in owners if f"--device_names={device} " in f"{c} "]
+            self.assertIn(f" --master_server_address={HOST}:{port} ", f"{call} ")
 
     def test_per_nic_store_gives_each_nic_a_master_and_each_stage_its_pool(self):
         port = self.master_port
@@ -764,6 +882,133 @@ stop_mooncake_store
         self.assertEqual(len(self.store_calls("mooncake_client")), 2)
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
+
+    def test_a_decode_node_allows_for_the_other_decode_nodes_compaction(self):
+        # The other decode node mounts its owners 5 s after this one: past the
+        # 2 s wait, inside the 10 s allowed for its one NUMA node.
+        port = self.master_port
+        (self.root / "segments").write_text(f"{port} {8 * GIB}\n")
+        result = self.run_shell(
+            f"""
+setsid python3 /scripts/numa_exec.py 0 mooncake_master --rpc_port={port} \
+  >/dev/null 2>&1 &
+(
+  for _ in $(seq 150); do
+    [[ "$(wc -l < "${{STUB_DIR}}/segments")" -ge 2 ]] && break
+    sleep 0.2
+  done
+  sleep 5
+  echo "{port} {8 * GIB}" >> "${{STUB_DIR}}/segments"
+) >/dev/null 2>&1 &
+start_mooncake_store_decode_owners
+stop_mooncake_store
+""",
+            NODE_RANK="1",
+            NODE0_ADDR=HOST,
+            host_ip="127.0.0.2",
+            ATOMESH_PD_WORKER_LAYOUT="multi_node",
+            xP="1",
+            yD="2",
+            MOONCAKE_STORE="0",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE="1",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS="0:8:rdma0",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="2",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="10",
+        )
+        self.assertIn("decode owners mounted", result.stdout)
+        self.assertEqual(len(self.store_calls("mooncake_client")), 1)
+
+    def test_the_prefill_node_stops_waiting_once_the_decode_node_failed(self):
+        # The decode node's owners failed to mount and its launcher exited 1:
+        # the prefill node fails within seconds rather than when its wait times
+        # out. A node that exited 0, its own rank's file, and an rc still being
+        # written (rank-rc-1.tmp, there across two polls) do not stop it.
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        (run_dir / "rank-rc-2").write_text("0\n")
+        started = time.monotonic()
+        result = self.run_shell(
+            """
+(
+  for _ in $(seq 150); do
+    [[ "$(wc -l < "${STUB_DIR}/segments" 2>/dev/null)" -ge 1 ]] && break
+    sleep 0.2
+  done
+  sleep 2
+  echo 1 > "${RUN_DIR}/rank-rc-1.tmp"
+  sleep 5
+  mv "${RUN_DIR}/rank-rc-1.tmp" "${RUN_DIR}/rank-rc-1"
+) >/dev/null 2>&1 &
+start_mooncake_store
+""",
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+            MOONCAKE_STORE_OWNERS="0:8",
+            MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
+            MOONCAKE_STORE_WAIT_TIMEOUT="30",
+            MOONCAKE_STORE_COMPACT_TIMEOUT="30",
+        )
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("another node's launcher exited (rank-rc-1=1)", result.stderr)
+        self.assertNotIn("rank-rc-1.tmp", result.stderr)
+        for pid in self.stub_pids():
+            self.assertFalse(self.alive(pid), pid)
+
+    def test_a_wait_for_a_server_stops_once_another_node_failed(self):
+        # A decode node waits up to WAIT_SERVER_TIMEOUT for the router of a
+        # prefill node whose Store failed to start.
+        source = SERVER_SCRIPT.read_text()
+        wait_http = "wait_http() {" + source.split("wait_http() {")[1].split("\n}\n")[0]
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        result = self.run_shell(
+            wait_http + '\n}\nwait_http "http://127.0.0.1:9/health" router 600\n',
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+            NODE_RANK="1",
+        )
+        self.assertIn(
+            "router: another node's launcher exited (rank-rc-0=1)", result.stderr
+        )
+
+    def test_a_wait_for_a_server_reports_its_own_failure_first(self):
+        # This node's server exited 7 and another node's launcher 1: the wait
+        # exits with the server's rc, not on the peer's.
+        source = SERVER_SCRIPT.read_text()
+        wait_http = "wait_http() {" + source.split("wait_http() {")[1].split("\n}\n")[0]
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        result = self.run_shell(
+            wait_http
+            + "\n}\n(exit 7) &\npid=$!\nsleep 1\n"
+            + 'wait_http "http://127.0.0.1:9/health" server 600 "${pid}"\n',
+            expect_rc=7,
+            RUN_DIR=str(run_dir),
+            NODE_RANK="1",
+        )
+        self.assertIn("server process exited before becoming ready rc=7", result.stderr)
+        self.assertNotIn("another node's launcher exited", result.stderr)
+
+    def test_the_store_wait_reports_its_own_failure_first(self):
+        # An owner of this node failed to mount and another node's launcher
+        # exited 1: the wait shows the owner's log, not the peer's rc.
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-1").write_text("1\n")
+        log = self.root / "logs" / "owner.log"
+        log.write_text("E1114 Failed to mount segment\n")
+        result = self.run_shell(
+            f'mooncake_store_logs=("{log}")\nwait_for_mooncake_store owners 30 false\n',
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+        )
+        self.assertIn("E1114 Failed to mount segment", result.stderr)
+        self.assertIn(f"mooncake-store owners: see {log}", result.stderr)
+        self.assertNotIn("another node's launcher exited", result.stderr)
 
     def test_a_wait_timeout_with_a_leading_zero_waits_that_many_seconds(self):
         # Bash arithmetic would read 0600 as octal, 384 s, and refuse 0900

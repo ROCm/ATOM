@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Debug aid (``ATOM_MONO_CHECK``, eager only): each layer's K1, K2a and K2b
 outputs against the original modules run on the same inputs, logged on rank 0."""
 
@@ -19,11 +20,9 @@ from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.v4_kernels.indexer_weights import scale_indexer_weights
 from atom.model_ops.v4_kernels.paged_decode import _sparse_attn_v4_paged_decode_triton
 from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.kernels import attention as attention_kernel
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
-from atom.models.deepseek_v41.mono.kernels.dims import HEAD_TILE
 from atom.mono.runtime.compare import compare
 
 logger = logging.getLogger("atom")
@@ -37,6 +36,18 @@ def _bad_rows(name, got, ref):
     """The rows (tokens) where ``got`` and ``ref`` differ."""
     bad = (got.float() != ref.float()).flatten(1).any(dim=1)
     return f"{name} rows {bad.nonzero().flatten().tolist()}"
+
+
+def check_index_score(runner, indexer, cache, step):
+    """Run the reference scorer on K1's outputs with its weight contract."""
+    weights, scale = runner.iw, 1.0
+    if runner.index_fp4:
+        # K1 folds the scale into FP32 weights; OPUS wants unscaled BF16.
+        scale = indexer.weights_scale
+        weights = (weights / scale).to(torch.bfloat16)
+    indexer.score_quantized(
+        runner.index_query(), weights, cache, step, weight_scale=scale
+    )
 
 
 def _mailbox(runner, layout, region, rows):
@@ -174,7 +185,11 @@ def check_front(runner, layer_id, block, state, rope, cache, step, res_out, gate
         runner.ring_rel.long()
         + cache.geometry.window(layer_id, cache.num_pages).ring_start
     )
-    ring = cache.pool[rows.clamp_min(0)]
+    ring = (
+        pack_rows(*(p[rows.clamp_min(0)] for p in cache.ring_view(layer_id)))
+        if cache.kv_fp8
+        else cache.pool[rows.clamp_min(0)]
+    )
     if cache.kv_fp8:
         qat = pack_rows(values, scales)
     parts = [
@@ -198,11 +213,15 @@ def decode_keys(cache, spec, step):
     selection, then its window (``cache.attention_indices`` hands a BF16
     decode's window over as rows of the layer's ring, made pool rows here)."""
     prefix, pptr, window, wptr = cache.attention_indices(spec, step)
-    start = cache.geometry.window(spec.layer_id, cache.num_pages).ring_start
+    start = (
+        cache.main_view(spec.kv_owner)[0].shape[0]
+        if cache.kv_fp8
+        else cache.geometry.window(spec.layer_id, cache.num_pages).ring_start
+    )
     pb, wb = pptr.tolist(), wptr.tolist()
     rows = [
         torch.cat([prefix[pb[t] : pb[t + 1]], window[wb[t] : wb[t + 1]] + start])
-        for t in range(step.width)
+        for t in range(step.running_tokens)
     ]
     counts = torch.tensor([0] + [len(r) for r in rows], device=pptr.device)
     return torch.cat(rows), counts.cumsum(0).to(pptr.dtype)
@@ -224,7 +243,13 @@ def _key_set_rows(runner, spec, keys, cache):
             n_sel = ip.selected(int(runner.bounds[owner][t]))
             rows = runner.irow[owner][t, :n_sel].tolist()
         rows += [
-            base + window.ring_start + (first + k) % window.ring_slots
+            base
+            + (
+                cache.main_view(spec.kv_owner)[0].shape[0]
+                if cache.kv_fp8
+                else window.ring_start
+            )
+            + (first + k) % window.ring_slots
             for k in range(count)
         ]
         if sorted(rows) != sorted(prefix[indptr[t] : indptr[t + 1]]):
@@ -232,57 +257,49 @@ def _key_set_rows(runner, spec, keys, cache):
     return f"key rows {bad}"
 
 
+def _gather_key_rows(main, window, ids):
+    """Pack only the selected rows, preserving interleaved source order."""
+    is_main = ids < main[0].shape[0]
+    main_ids = ids[is_main].long()
+    window_ids = (ids[~is_main] - main[0].shape[0]).long()
+    selected = []
+    for data, ring in zip(main, window):
+        rows = data.new_empty((ids.numel(), data.shape[-1]))
+        rows[is_main] = data[main_ids]
+        rows[~is_main] = ring[window_ids]
+        selected.append(rows)
+    return pack_rows(*selected)
+
+
 def _attention_ref(runner, block, keys, cache):
-    """The original sparse decode over the mono attention's keys, ``ORDER_ROWS``
-    rows and a 16-head tile at a time: its reduce order follows the rows and
-    heads of a call (``kernels.attention``), and the mono attention keeps that
-    call's at every width and TP size. A short last call repeats its last row,
-    and a ragged tile's dead heads its last live head, as the mono attention's
-    do. On an FP8 pool the mono attention's QK multiplies the MXFP8 key rows by
-    q quantized to MXFP8, and its PV reads the rows dequantized: the same
-    values as BF16 (exact), so this dequantizes q and a call's key rows (a
-    BF16 pool of their own) and differs from it by the sums' order alone."""
+    """The original sparse decode over the mono attention's keys, as the
+    original path calls it: the mono attention differs from it by the sums'
+    order alone (``kernels.attention``). On an FP8 pool the mono attention's QK
+    multiplies the MXFP8 key rows by q quantized to MXFP8, and its PV reads the
+    rows dequantized: the same values as BF16 (exact), so this dequantizes q
+    and the key rows (a BF16 pool of their own)."""
     prefix, indptr = keys
-    t = attention_kernel.ORDER_ROWS
     q = runner.q.flatten(0, 1)
+    ids, pool = prefix, cache.pool
     if cache.kv_fp8:
         q = quantize_fp8(q, dequantize=True)
-    rows, heads = q.shape[:2]
-    tiles = runner.dims.head_tiles.count
-    padded = torch.arange(tiles * HEAD_TILE, device=q.device).clamp(max=heads - 1)
-    q, sink = q[:, padded], block.attn.attn_sink[padded]
-    bounds = indptr.tolist()
-    out = []
-    for i in range(0, rows, t):
-        n = min(t, rows - i)
-        # the call's rows, the last one repeated up to t
-        picks = [i + min(r, n - 1) for r in range(t)]
-        ids = torch.cat([prefix[bounds[r] : bounds[r + 1]] for r in picks])
-        lens = [bounds[r + 1] - bounds[r] for r in picks]
-        ptr = torch.tensor([0] + lens, device=indptr.device).cumsum(0)
-        pool = cache.pool
-        if cache.kv_fp8:
-            dim = q.shape[-1]
-            key_rows = cache.pool[ids.long()]
-            pool = dequantize_rows(
-                key_rows[:, :dim].view(FP8_DTYPE), key_rows[:, dim:]
-            ).bfloat16()
-            ids = torch.arange(ids.numel(), device=ids.device, dtype=ids.dtype)
-        call = [
-            _sparse_attn_v4_paged_decode_triton(
-                q[picks, h : h + HEAD_TILE].contiguous(),
-                pool,
-                ids,
-                ptr.to(indptr.dtype),
-                sink[h : h + HEAD_TILE].contiguous(),
-                block.attn.softmax_scale,
-                block_h=HEAD_TILE,
-                kv_splits=attention_kernel.SPLITS,
-            )
-            for h in range(0, tiles * HEAD_TILE, HEAD_TILE)
-        ]
-        out.append(torch.cat(call, dim=1)[:n])
-    return torch.cat(out)[:, :heads].reshape(runner.q.shape)
+        dim = q.shape[-1]
+        main = cache.main_view(block.attn.spec.kv_owner)
+        window = cache.ring_view(block.attn.spec.layer_id)
+        key_rows = _gather_key_rows(main, window, ids)
+        pool = dequantize_rows(
+            key_rows[:, :dim].view(FP8_DTYPE), key_rows[:, dim:]
+        ).bfloat16()
+        ids = torch.arange(ids.numel(), device=ids.device, dtype=ids.dtype)
+    out = _sparse_attn_v4_paged_decode_triton(
+        q.contiguous(),
+        pool,
+        ids,
+        indptr,
+        block.attn.attn_sink,
+        block.attn.softmax_scale,
+    )
+    return out.reshape(runner.q.shape)
 
 
 def check_post(runner, block, keys, residual, gates, rope, cache, step):

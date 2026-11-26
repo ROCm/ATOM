@@ -58,9 +58,9 @@ build stops the server (`ATOM_MONO_ENABLE=0` then serves the deployment Native).
 
 ## Validate
 
-- Unit tests: `tests/test_qwen38_mono_plan.py` (CPU, runs in CI: deployment refusals, served steps, metadata
-  puts, pool and expert layout checks), `tests/test_qwen38_mono_prep.py` and `tests/test_qwen38_mono_ple.py` (GPU:
-  verify prep and draft metadata, the PLE table lookup).
+- Unit tests: `tests/test_qwen38_mono.py`. Its CPU half runs in CI (deployment refusals, served steps, metadata puts,
+  pool and expert layout checks, the fallback draft's attention path); its GPU half (the verify prep and draft
+  metadata launches, the PLE table lookup) skips without a GPU or Triton.
 - Kernels: compile the 16 programs (target `delta` / `qsa` and draft `mtp` S4 / S1, batches 1-4) on MI355X SPX and
   compare normalized ISA, resources and stage lists with the accepted build.
 - Service: same-card Native -> Mono -> Native with fixed prompts; the GPU trace must contain the `flash_delta` and

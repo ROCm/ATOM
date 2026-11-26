@@ -77,9 +77,9 @@ No CUDA graph capture or replay. Every forward pass launches kernels individuall
 
 ### TR_HYBRID (value: 1)
 
-Token graphs and request graphs mixed, for every step alike. The compiled forward is recorded as a `TokenGraph` (`atom/utils/region_graph.py`) per token bucket: one bucket per `bs * q` the capture loop visits, which any decode step padded to that many rows replays, whatever its requests. The compiled pieces are recorded inline; the recording breaks only at the split ops declared `@eager_region` -- the ones whose launches depend on host data (the attention / mixer ops of most models). Those run eagerly between the graph's segments, reading the live step's metadata, and hand their result to the next segment at the address it was recorded reading. A region whose launches a request bucket fixes is where a `ReqGraph` joins the mix; no model records one there yet.
+Token graphs and request graphs mixed, for every step alike. The compiled forward is recorded as a `TokenGraph` (`atom/utils/region_graph.py`) per token bucket: one bucket per `bs * q` the capture loop visits, which any decode step padded to that many rows replays, whatever its requests. The compiled pieces are recorded inline; the recording breaks only where a split op calls an `@eager_region` -- the work whose launches depend on host data (the attention / mixer of most models). Those run eagerly between the graph's segments, reading the live step's metadata, and hand their result to the next segment at the address it was recorded reading. A region whose launches a request bucket fixes is where a `ReqGraph` joins the mix; no model records one there yet.
 
-A split op (`mark_spliting_op`) is a compile boundary only; it is a graph break only if also declared `@eager_region`. DeepSeek-V4's compressor launch (`v4_attn_compress_launch`) is a split op recorded inline: its plan is sized by the token count. It runs ahead of the Q/KV projections and forks the compressors onto side streams, as FULL does, so the projections overlap them; `_sparse_attention` joins them before the first eager region, so fork and join land in one recorded segment. Its only break is the FP4 indexer's logits (`_fp4_band_logits` in `atom/model_ops/indexer/score.py`), whose launch is planned from the step's sequences; the bands, the FP8 launch and the top-k follow the rows alone and are recorded.
+A split op (`mark_spliting_op`) is a compile boundary only; it is a graph break only where it calls an `@eager_region`. The attention op calls its region on every recorded forward; on a prefill token-graph recording, Kimi-K3's MLA and KDA layers call theirs around the attention and the recurrence alone. DeepSeek-V4's compressor launch (`v4_attn_compress_launch`) is a split op recorded inline: its plan is sized by the token count. It runs ahead of the Q/KV projections and forks the compressors onto side streams, as FULL does, so the projections overlap them; `_sparse_attention` joins them before the first eager region, so fork and join land in one recorded segment. Its only break is the FP4 indexer's logits (`_fp4_band_logits` in `atom/model_ops/indexer/score.py`), whose launch is planned from the step's sequences; the bands, the FP8 launch and the top-k follow the rows alone and are recorded.
 
 ### FULL (value: 2)
 
@@ -165,14 +165,26 @@ request_bucket(running_bs, max_seqlen_q) == (running_bs, draft_num)
   decoding.
 
 Under TBO decode (`--enable-tbo all`), a bucket that splits
-(`decode_bucket_splits`: `running_bs > 2`) is recorded as a TBO graph: its two
-microbatches cut at the bucket (`decode_ubatch_request_ranges(running_bs)`),
-every DP rank recording the same split. A decode step that replays it lays
-each microbatch's attention metadata out for that split
-(`ForwardMode.ubatch_split_bs`), whatever each rank scheduled into the bucket.
-A split decode no recording serves -- off the ladder, under `--enforce-eager`,
-or under TR_HYBRID, whose token graphs have no split recording -- runs eagerly,
-its microbatches cut from the scheduled requests.
+(`decode_bucket_splits`: `running_bs > 2`, every such bucket even) is recorded
+as a TBO graph: its two microbatches each take half the bucket's requests and
+half its running tokens (`cut_decode_ubatches`), every DP rank recording the
+same halves. A step is cut once, on the shape `ForwardMode.decide` settled
+(`ModelRunner._cut_ubatches`; a prefill's there too): the first microbatch
+takes the first half of the bucket's requests that this rank scheduled, the
+second the rest, refused if a half's requests' tokens overflow it. The step's
+packed tokens are gathered into the halves, each microbatch's own first, and
+its outputs scattered back (`decode_ubatch_token_order`, published with the
+token inputs; the order and each microbatch's scheduled tokens on the device
+reach the wrapper on the step's metadata). Each microbatch's metadata,
+its work buffers included, is built with the step's before the replay
+(`finish_ubatch_decode`), as a whole decode's is; the recording reads its
+addresses. A split decode no recording
+serves -- off the ladder, under `--enforce-eager`, or under TR_HYBRID, whose
+token graphs have no split recording -- runs eagerly, cut the same way.
+TBO is refused at startup on a linear-attention hybrid (GDN / KDA), whose state
+metadata a microbatch does not get, and decode TBO with speculative decoding on a
+sparse MLA model or under DCP, whose verify runs per-token metadata a
+microbatch does not build (`Config._check_tbo_support`).
 
 ### Graph pool sharing
 
@@ -211,12 +223,17 @@ def run_model(self, input_ids):
         graph_key = request_bucket(
             context.running_bs, forward_context.attn_metadata.max_seqlen_q
         )
-        logits = self._decode_graph(graph_key)()  # ReqGraph.replay
+        self._decode_graph(graph_key)()  # ReqGraph.replay
         num_tokens = context.batch_size * max_q_len
         hidden_states = self.forward_vars["outputs"][:num_tokens]
 
-    return self.model.compute_logits(hidden_states), hidden_states
+    return hidden_states
 ```
+
+A decode graph records the forward alone: the head (a verify head's ids or
+the logits, `ModelRunner.run_lm_head`) runs after it, eagerly, on the forward's
+stream, so a model whose head is not graph-safe (a sampling launch, a head
+with its own peer buffers) still replays its forward from a graph.
 
 Key decisions:
 - **Prefill**: Always eager (variable sequence lengths make CUDA graphs impractical).
@@ -316,11 +333,11 @@ For TR_HYBRID token graphs, `ForwardMode.decide` settles whether the step runs a
 
 A model declares its recording unit with `@token_graph` (`atom/utils/region_graph.py`), independently of `@support_torch_compile`, so a token graph does not depend on torch.compile. The unit is the outermost module whose forward holds all the step's per-token work: DeepSeek-V4 marks `DeepseekV4ForCausalLM`, whose DP-attention `input_ids` gather feeds the hash MoE, and V4.1 marks its three stages (`_Backbone`, `_EarlyLayers`, `_LateLayers`). Every other target model marks its compiled `*Model`.
 
-A recording serves prefill and decode steps of its token count alike, so a decode bucket recorded at capture is not recorded again for prefill. It counts as a phase's bucket only once that phase's record pass asked for it, though: `TokenGraph.captured_sizes("prefill" | "decode")` are the buckets a step of that phase pads to, so a model that records only decode buckets (DeepSeek-V4 under TR_HYBRID) reports no prefill bucket, and its scheduler sends no dummy prefill. A unit whose forward records different work in each phase declares `@token_graph(per_phase=True)` and is recorded once per phase. V4.1's stages are per phase: a decode forward computes no `kv` for the attention region a prefill reads. Drafters are not marked: each records its own passes as `DraftGraph`s (`atom/spec_decode/draft_graph.py`) in either graph mode.
+A recording serves prefill and decode steps of its token count alike, so a decode bucket recorded at capture is not recorded again for prefill. It counts as a phase's bucket only once that phase's record pass asked for it, though: `TokenGraph.captured_sizes("prefill" | "decode")` are the buckets a step of that phase pads to, so a model that records only decode buckets (DeepSeek-V4 under TR_HYBRID) reports no prefill bucket, and its scheduler never gives a decode up for an idle step in a peer's prefill. A unit whose forward records different work in each phase declares `@token_graph(per_phase=True)` and is recorded once per phase. V4.1's stages are per phase: a decode forward computes no `kv` for the attention region a prefill reads. Drafters are not marked: each records its own passes as `DraftGraph`s (`atom/spec_decode/draft_graph.py`) in either graph mode.
 
 Every recording (`TokenGraph.record`, and through it `ReqGraph` and `DraftGraph`) first waits out the NCCL watchdog (`atom/distributed/nccl_watchdog.py:drain_nccl_works`). A collective recorded into the graph joins its NCCL stream into the capture, and a watchdog poll of an eager collective still pending on that stream fails with `hipErrorCapturedEvent` and invalidates the capture; `torch.cuda.synchronize()` alone does not prevent it.
 
-aiter's custom collectives keep their registered (direct-read) capture path inside token graphs, as under FULL: each recorded collective reads its peers' inputs at the addresses the recording gave them, which a segment's pool holds fixed, and the kernels' closing barrier keeps a rank from overwriting an input before every peer has read it. A recording's collectives are thus sized by its bucket, so under DP attention every rank of a step some rank prefills -- an idle rank's dummy prefill included, and without the prefill delayer a decoding rank too -- replays the prefill bucket holding the group's largest row count (`ForwardMode._pad_to_token_graph`); ranks on different buckets, or one running eagerly beside a replay, would hang. A decoding rank keys its lookup under the prefill phase (`region_graph._phase`) and runs its own decode in the attention regions. The copy-in path the removed PIECEWISE mode forced cost one device-to-device copy per collective (about 0.9 ms per DeepSeek-V4-Flash DP decode step).
+aiter's custom collectives keep their registered (direct-read) capture path inside token graphs, as under FULL: each recorded collective reads its peers' inputs at the addresses the recording gave them, which a segment's pool holds fixed, and the kernels' closing barrier keeps a rank from overwriting an input before every peer has read it. A recording's collectives are thus sized by its bucket, so under DP attention every rank of a step some rank prefills -- a rank with no request, which runs the group's prefill phase, included, and without the prefill delayer a decoding rank too -- replays the prefill bucket holding the group's largest row count (`ForwardMode._pad_to_token_graph`); ranks on different buckets, or one running eagerly beside a replay, would hang. A decoding rank keys its lookup under the prefill phase (`region_graph._phase`) and runs its own decode in the attention regions. The copy-in path the removed PIECEWISE mode forced cost one device-to-device copy per collective (about 0.9 ms per DeepSeek-V4-Flash DP decode step).
 
 ## Compiler backend
 

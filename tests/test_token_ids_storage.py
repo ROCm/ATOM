@@ -37,7 +37,7 @@ import numpy as np
 import pytest
 from conftest import MockConfig
 
-from atom.distributed.kv_events import BlockStored
+from atom.distributed.kv_events import MEDIUM_GPU, BlockStored
 from atom.entrypoints.openai.serving_chat import build_chat_response
 from atom.entrypoints.openai.serving_completion import build_completion_response
 from atom.model_engine.block_manager import BlockManager, _make_block_stored
@@ -184,6 +184,9 @@ def test_a_kv_event_refuses_to_carry_an_array():
                 parent_block_hash=None,
                 token_ids=new_token_ids(tokens),
                 block_size=4,
+                lora_id=None,
+                medium=MEDIUM_GPU,
+                lora_name=None,
             )
         )
 

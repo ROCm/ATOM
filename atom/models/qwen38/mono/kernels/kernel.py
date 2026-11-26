@@ -5,6 +5,7 @@
 from dataclasses import dataclass, field
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.models.qwen38.mono.kernels.compile import (
     ResourceError,
@@ -137,11 +138,12 @@ class MonoKernel:
         bufs.launched.add(layer)
         if torch.cuda.is_current_stream_capturing():
             bufs.captured = True
-        self.launcher(
+        _run_compiled(
+            self.launcher,
             bufs.step.data_ptr(),
             layer,
             table.data_ptr(),
             bufs.scratch.data_ptr(),
             0,  # (the kernel's timeline argument: no timeline)
-            stream=stream or torch.cuda.current_stream(),
+            stream or torch.cuda.current_stream(),
         )

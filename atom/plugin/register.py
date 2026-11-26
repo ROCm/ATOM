@@ -52,6 +52,7 @@ _ATOM_SUPPORTED_MODELS = _LazyModelRegistry(
         "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGenerationTextOnly",
         "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGenerationTextOnly",
         "Qwen4ExpForConditionalGeneration": "atom.models.qwen4_exp:Qwen4ExpForConditionalGeneration",
+        "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.runtime:DeepseekV41RuntimeModel",
     }
 )
 
@@ -107,6 +108,9 @@ def _register_custom_attention_to_sglang() -> None:
     from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
         ATOMDeepseekV4BackendForSgl,
     )
+    from atom.plugin.sglang.attention_backend.deepseek_v41_backend import (
+        ATOMDeepseekV41BackendForSgl,
+    )
     from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
         ATOMAttnBackendForSgl,
     )
@@ -117,6 +121,7 @@ def _register_custom_attention_to_sglang() -> None:
     from atom.plugin.sglang.attention_backend.kimi_k3_backend import (
         ATOMKimiK3BackendForSgl,
     )
+    from atom.plugin.sglang.deepseek_v41_bridge import is_deepseek_v41_config
     from atom.plugin.sglang.kimi_k3_bridge import is_kimi_k3_config
     from atom.plugin.sglang.runtime import is_glm52_dsa_config
 
@@ -142,6 +147,10 @@ def _register_custom_attention_to_sglang() -> None:
     def create_atom_backend(runner):
         hf_config = runner.model_config.hf_config
         arches = getattr(hf_config, "architectures", None) or []
+        # Before the V4 check: SGLang renames V4.1 to DeepseekV4ForCausalLM.
+        if is_deepseek_v41_config(hf_config):
+            logger.info("Use ATOMDeepseekV41BackendForSgl (aiter backend choice)")
+            return ATOMDeepseekV41BackendForSgl(runner)
         if any("DeepseekV4" in str(arch) for arch in arches):
             logger.info(
                 "Use ATOMDeepseekV4BackendForSgl for DeepSeek-V4 through SGLang aiter backend choice"
@@ -158,6 +167,9 @@ def _register_custom_attention_to_sglang() -> None:
 
     @register_attention_backend("dsv4")
     def create_dsv4_backend(runner):
+        if is_deepseek_v41_config(runner.model_config.hf_config):
+            logger.info("Create ATOMDeepseekV41BackendForSgl (dsv4 backend choice)")
+            return ATOMDeepseekV41BackendForSgl(runner)
         logger.info(
             "Create ATOMDeepseekV4BackendForSgl through SGLang dsv4 backend choice"
         )
@@ -981,10 +993,11 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     getattr(self, "draft_runner", None)
                 ):
                     self.cuda_graph_runner = None
-                # The Flash drafter also takes this plugin-built draft-extend
-                # runner (its [3, N] mRoPE input is staged on replay by
-                # stage_draft_graph_mrope); SGLang's own HIP gate only admits
-                # aiter multi-step / DSV4 / DSA backends.
+                # The Flash drafter also uses a draft-extend graph (its [3, N]
+                # mRoPE input is staged on replay by stage_draft_graph_mrope).
+                # Keep a runner SGLang already captured (0.5.22+ admits
+                # QwenSparseAttnBackend to its HIP capture); build one only
+                # when SGLang did not.
                 supports_plugin_graph = _is_dsv4_or_glm52_nextn_runner(
                     getattr(self, "draft_runner", None)
                 ) or _is_qwen4_exp_nextn_runner(getattr(self, "draft_runner", None))
@@ -1031,8 +1044,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     self.cuda_graph_runner_for_draft_extend = (
                         EAGLEDraftExtendCudaGraphRunner(self)
                     )
-                elif supports_plugin_graph:
-                    self.cuda_graph_runner_for_draft_extend = None
             except Exception as exc:
                 logger.warning(
                     "Failed to enable draft-extend cuda graph in ATOM plugin: %s",

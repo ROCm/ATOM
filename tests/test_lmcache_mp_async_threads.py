@@ -10,7 +10,13 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from test_lmcache_mp import _config, _WorkerAdapter, fake_lmcache_modules  # noqa: F401
+from test_lmcache_mp import (  # noqa: F401
+    _config,
+    _install_salt_adapters,
+    _SaltKey,
+    _WorkerAdapter,
+    fake_lmcache_modules,
+)
 from test_lmcache_mp_async_lookup import CHUNK, _Adapter, _Client, _Future
 
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
@@ -25,6 +31,8 @@ from atom.kv_transfer.offload.mp import transfer_thread
 from atom.kv_transfer.offload.mp import worker as mp_worker
 from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
 from atom.model_engine.sequence import SequenceStatus
+from tests.lmcache_mp_support import bare_mp_scheduler
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 
 
 def _wait_until(predicate, timeout=5.0):
@@ -82,6 +90,28 @@ def test_driver_sends_and_answers_an_offered_lookup_without_a_pump():
         assert len(fake.lookups) == 1
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("salt", ["11", ""])
+def test_offered_and_submitted_lookups_key_under_the_prompts_salt(monkeypatch, salt):
+    class AtomMPSchedulerAdapter(_Adapter):
+        def __init__(self, **_kwargs):
+            super().__init__(_PerRequestClient(chunks=1))
+
+        def _create_key(self, token_ids, start, end, request_id, worker_id):
+            return _SaltKey(request_id)
+
+    _install_salt_adapters(monkeypatch, scheduler_base=AtomMPSchedulerAdapter)
+    adapter = mp_scheduler._make_scheduler_adapter(_config())
+    client = _driven_client(adapter)
+    configs = {"request_configs": {"lmcache.tag.cache_salt": salt}} if salt else {}
+    try:
+        assert client.offer("offered", lambda: list(range(8)), **configs)
+        assert client.submit(list(range(8)), "submitted", **configs)
+        assert _wait_until(lambda: len(adapter._client.lookups) == 2)
+    finally:
+        client.close()
+    assert [key.cache_salt for key, _ in adapter._client.lookups] == [salt, salt]
 
 
 def test_driver_keeps_answered_plus_in_flight_lookups_within_the_window():
@@ -201,9 +231,7 @@ def test_offer_is_a_noop_without_a_driver():
 def test_scheduler_offers_only_waiting_requests_to_the_driver():
     adapter = _Adapter(_PerRequestClient(chunks=1))
     client = _driven_client(adapter)
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
+    sched = bare_mp_scheduler()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -291,6 +319,99 @@ def test_transfer_thread_reraises_a_failed_submission_on_the_caller():
         with pytest.raises(RuntimeError, match="duplicate operation"):
             thread.raise_error()
         thread.raise_error()  # reported once
+    finally:
+        thread.close(5.0)
+
+
+def test_an_asked_round_polls_before_the_rest_of_the_queue():
+    """A backlog of submissions must not hold back a finished load's report
+    or a fence: the round asked for runs after the submission in progress."""
+    order = []
+    gate = threading.Event()
+    running = threading.Event()
+
+    def first():
+        running.set()
+        gate.wait(5.0)
+        order.append("first")
+
+    thread = transfer_thread._TransferThread(
+        "mp-transfer-test", poll=lambda _thread: order.append("poll")
+    )
+    try:
+        thread.submit(first)
+        assert running.wait(5.0)
+        thread.submit(order.append, "second")
+        thread.submit(order.append, "third")
+        thread.look(0)
+        gate.set()
+        assert thread.drain(5.0)
+        after = order[order.index("first") :]
+        assert after[:2] == ["first", "poll"]
+    finally:
+        thread.close(5.0)
+
+
+def test_a_failed_poll_round_stops_the_polling(caplog):
+    """The failure is raised on the forward thread; another round would only
+    fail and log again, every `_IDLE_POLL_S`, until the engine stepped."""
+    rounds = []
+
+    def poll(_thread):
+        rounds.append(1)
+        raise RuntimeError("transfer deadline")
+
+    thread = transfer_thread._TransferThread("mp-transfer-test", poll=poll)
+    try:
+        assert thread.wait_round(thread.request_round(), 5.0)
+        assert not thread.wait_round(thread.request_round(), 5.0)
+        assert len(rounds) == 1
+        assert caplog.text.count("transfer poll failed") == 1
+        # Raised on every call: nothing else would report what is left.
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="transfer deadline"):
+                thread.raise_error()
+    finally:
+        thread.close(5.0)
+
+
+def test_the_polling_timer_runs_only_while_transfers_are_in_flight():
+    """Idle, a rank's thread waits for a submission or a request; with a
+    transfer in flight it polls on its own, for a rank that stopped stepping."""
+    in_flight = [False]
+    rounds = []
+
+    def poll(_thread):
+        rounds.append(1)
+        return in_flight[0]
+
+    thread = transfer_thread._TransferThread("mp-transfer-test", poll=poll)
+    try:
+        assert thread.wait_round(thread.request_round(), 5.0)
+        time.sleep(4 * transfer_thread._IDLE_POLL_S)
+        assert len(rounds) == 1
+        in_flight[0] = True
+        target = thread.request_round()
+        assert thread.wait_round(target + 2, 5.0)
+    finally:
+        thread.close(5.0)
+
+
+def test_a_handed_back_future_is_dropped_once_nothing_else_holds_it():
+    """One LMCache still references stays queued: its last reference would
+    otherwise be dropped by LMCache's next submission, on the transfer
+    thread."""
+    thread = transfer_thread._TransferThread(
+        "mp-transfer-test", poll=lambda _thread: None
+    )
+    try:
+        lmcache = [object()]
+        ident = id(lmcache[0])
+        thread.hand_back(lmcache[0])
+        assert thread.take_returned() == []
+        lmcache.clear()
+        assert [id(future) for future in thread.take_returned()] == [ident]
+        assert thread.take_returned() == []
     finally:
         thread.close(5.0)
 
@@ -471,9 +592,7 @@ def _same_step_scheduler():
     client = mp_lookup._MPLookupClient(
         adapter, config=_config(), timeout=1.0, poll_interval=0.01
     )
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
+    sched = bare_mp_scheduler()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -504,7 +623,7 @@ def test_save_of_a_chunk_is_emitted_in_the_step_that_computes_it():
     # This step's forward computes tokens [0, 10) of the 16-token prompt.
     sched.note_scheduled_tokens({seq.id: seq}, [10])
     (save,) = _saves(sched.build_connector_meta())
-    assert len(save.token_ids) == 2 * CHUNK  # chunk floor of 10
+    assert len(_shipped_tokens(save)) == 2 * CHUNK  # chunk floor of 10
     assert save.after_forward
     assert not save.is_last_prefill
     # Nothing was computed before this step: the frontier came from the note.
@@ -519,7 +638,7 @@ def test_save_covering_only_earlier_steps_is_not_held_for_the_forward():
     # A decode-like step that computes nothing past the next chunk boundary.
     sched.note_scheduled_tokens({seq.id: seq}, [1])
     (save,) = _saves(sched.build_connector_meta())
-    assert len(save.token_ids) == 8
+    assert len(_shipped_tokens(save)) == 8
     assert not save.after_forward
 
 

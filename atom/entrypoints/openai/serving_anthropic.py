@@ -17,6 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from .images import NO_FILES_API
 from .reasoning import ReasoningChannel
 from .sse import event_frame
 from .tool_parser import ToolCallStreamParser
@@ -74,6 +75,136 @@ def _block_field(block: dict, key: str) -> Any:
     return value
 
 
+_IMAGES_NOT_HERE = "images are allowed in user messages and tool results only, not in "
+
+
+def _has_image(blocks: Any) -> bool:
+    return isinstance(blocks, list) and any(
+        isinstance(block, dict) and block.get("type") == "image" for block in blocks
+    )
+
+
+def _parts(blocks: list) -> list[dict]:
+    """Text and image blocks as chat content parts, in their order."""
+    parts = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            parts.append({"type": "text", "text": _block_field(block, "text")})
+        elif block.get("type") == "image":
+            parts.append(_image_part(block))
+    return parts
+
+
+def _image_part(block: dict) -> dict:
+    """An ``image`` block as the chat ``image_url`` part; the server checks it
+    with every other image (``images.check_chat_images``)."""
+    source = block.get("source")
+    kind = source.get("type") if isinstance(source, dict) else None
+    if kind == "base64":
+        media_type, data = source.get("media_type"), source.get("data")
+        if not isinstance(media_type, str) or not isinstance(data, str):
+            raise ValueError("a base64 image source requires media_type and data")
+        url = f"data:{media_type};base64,{data}"
+    elif kind == "url":
+        url = source.get("url")
+    elif kind == "file":
+        raise ValueError(NO_FILES_API)
+    else:
+        raise ValueError("an image block needs a base64 or url source")
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _system_text(content: Any, where: str) -> str:
+    """A system prompt, string or text blocks, as the string a template takes."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    if _has_image(content):
+        raise ValueError(_IMAGES_NOT_HERE + where)
+    text_parts = []
+    for b in content:
+        if isinstance(b, dict) and b.get("type") == "text":
+            text = _block_field(b, "text")
+            if text.startswith("x-anthropic-billing-header"):
+                continue
+            text_parts.append(text)
+    return "\n".join(text_parts)
+
+
+def anthropic_context_length_message(
+    prompt_tokens: int, max_tokens: int, limit: int
+) -> str:
+    """An over-long request in the Anthropic API's wording, which Claude Code
+    reads: the first form makes it compact the conversation, the second retry
+    with a smaller ``max_tokens``."""
+    if prompt_tokens >= limit:
+        return f"prompt is too long: {prompt_tokens} tokens > {limit - 1} maximum"
+    return (
+        f"input length and `max_tokens` exceed context limit: {prompt_tokens} + "
+        f"{max_tokens} > {limit}, decrease input length or `max_tokens` and try again"
+    )
+
+
+def fold_mid_system(messages: list[dict]) -> list[dict]:
+    """System messages after the conversation has started, moved into user
+    turns: what Claude Code itself falls back to, for a template that cannot
+    take them (``template_takes_mid_system``).
+
+    Each joins the next user message when one follows (past any tool results,
+    which must stay right after the call they answer), else the user message
+    right before it, else becomes a user message of its own. The next one is
+    preferred because joining the previous one would, for a reminder between
+    an assistant reply and the next user turn, leave two user turns in a row.
+    """
+    result: list[dict] = []
+    pending: list[str] = []
+
+    def flush_back() -> None:
+        if result and result[-1]["role"] == "user":
+            last = result[-1]
+            result[-1] = {
+                **last,
+                "content": _with_text(last["content"], pending, before=False),
+            }
+        else:
+            result.append({"role": "user", "content": "\n\n".join(pending)})
+        pending.clear()
+
+    started = False
+    for message in messages:
+        role = message["role"]
+        if role == "system" and started:
+            pending.append(message["content"])
+            continue
+        started = started or role != "system"
+        if pending and role == "user":
+            message = {
+                **message,
+                "content": _with_text(message["content"], pending, before=True),
+            }
+            pending.clear()
+        elif pending and role != "tool":
+            flush_back()
+        result.append(message)
+    if pending:
+        flush_back()
+    return result
+
+
+def _with_text(content: Any, texts: list[str], *, before: bool) -> Any:
+    """``content`` (a string or chat parts) with ``texts`` added as text."""
+    if isinstance(content, list):
+        parts = [{"type": "text", "text": text} for text in texts]
+        return [*parts, *content] if before else [*content, *parts]
+    joined = "\n\n".join(texts)
+    if not content:
+        return joined
+    return f"{joined}\n\n{content}" if before else f"{content}\n\n{joined}"
+
+
 def anthropic_to_openai_messages(
     messages: list[AnthropicMessage],
     system: Any | None = None,
@@ -83,18 +214,9 @@ def anthropic_to_openai_messages(
 
     # System message
     if system:
-        if isinstance(system, str):
-            result.append({"role": "system", "content": system})
-        elif isinstance(system, list):
-            text_parts = []
-            for b in system:
-                if b.get("type") == "text":
-                    text = _block_field(b, "text")
-                    if text.startswith("x-anthropic-billing-header"):
-                        continue
-                    text_parts.append(text)
-            if text_parts:
-                result.append({"role": "system", "content": "\n".join(text_parts)})
+        text = _system_text(system, "the system prompt")
+        if text:
+            result.append({"role": "system", "content": text})
 
     for msg in messages:
         role = msg.role
@@ -104,6 +226,8 @@ def anthropic_to_openai_messages(
             if isinstance(content, str):
                 result.append({"role": "assistant", "content": content})
             elif isinstance(content, list):
+                if _has_image(content):
+                    raise ValueError(_IMAGES_NOT_HERE + "assistant messages")
                 text_parts = []
                 reasoning_parts = []
                 tool_calls = []
@@ -147,7 +271,9 @@ def anthropic_to_openai_messages(
                             text_parts.append(_block_field(block, "text"))
                         elif block.get("type") == "tool_result":
                             tool_content = block.get("content", "")
-                            if isinstance(tool_content, list):
+                            if _has_image(tool_content):
+                                tool_content = _parts(tool_content)
+                            elif isinstance(tool_content, list):
                                 tool_content = "\n".join(
                                     b.get("text", "")
                                     for b in tool_content
@@ -157,14 +283,33 @@ def anthropic_to_openai_messages(
                                 {
                                     "role": "tool",
                                     "tool_call_id": _block_field(block, "tool_use_id"),
-                                    "content": str(tool_content),
+                                    "content": (
+                                        tool_content
+                                        if isinstance(tool_content, list)
+                                        else str(tool_content)
+                                    ),
                                 }
                             )
-                if text_parts:
-                    result.append({"role": "user", "content": "\n".join(text_parts)})
+                # Tool results first: they answer the call just before them,
+                # and Anthropic puts them first in the message too. Text after
+                # them (Claude Code adds reminders there) went first, leaving
+                # a user turn between a tool call and its result.
                 result.extend(tool_results)
+                if _has_image(content):
+                    result.append({"role": "user", "content": _parts(content)})
+                elif text_parts:
+                    result.append({"role": "user", "content": "\n".join(text_parts)})
+        elif role == "system":
+            # Mid-conversation system messages (Claude Code sends reminders
+            # this way). str() of a block list put its Python repr in the prompt.
+            text = _system_text(content, "system messages")
+            if text:
+                result.append({"role": "system", "content": text})
         else:
-            result.append({"role": role, "content": str(content) if content else ""})
+            raise ValueError(
+                f'Unexpected role "{role}": messages take "user", "assistant" '
+                f'and "system"'
+            )
 
     return result
 

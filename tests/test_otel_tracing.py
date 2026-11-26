@@ -58,11 +58,11 @@ def sequence(number=7, **kwargs):
     )
 
 
-def scope(flags="01", headers=True):
+def scope(flags="01", headers=True, path="/v1/completions"):
     return {
         "type": "http",
         "method": "POST",
-        "path": "/v1/completions",
+        "path": path,
         "headers": (
             [
                 (b"traceparent", f"00-{TRACE_ID}-{PARENT_ID}-{flags}".encode()),
@@ -88,6 +88,16 @@ def execute(app, **kwargs):
             scope(**kwargs), no_receive, no_send
         )
     )
+
+
+@pytest.mark.parametrize("path", ["/beta/completions", "/beta/chat/completions"])
+def test_beta_routes_are_traced(spans, clock, path):
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    execute(app, path=path)
+    assert [s.name for s in spans.get_finished_spans()] == ["atom.request"]
 
 
 @pytest.mark.parametrize("flags", ["00", "01"])

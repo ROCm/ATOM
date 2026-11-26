@@ -365,6 +365,23 @@ class ToolCallParser(ABC):
         return None
 
     @classmethod
+    def tool_call_grammar(
+        cls, functions: list[dict], *, required: bool, starts_in_reasoning: bool
+    ) -> str | None:
+        """A Lark (llguidance) grammar for the rest of the assistant message
+        that holds this format's calls to ``functions``; None leaves the output
+        unconstrained.
+
+        ``functions`` are the function objects the request lets the model
+        call; ``required`` means it must call one; ``starts_in_reasoning``
+        says whether the prompt opened the reasoning channel. Applied to a chat
+        request that declares tools and no response format when
+        ATOM_TOOL_CALL_GRAMMAR=1 (`structured_output.validation.
+        configure_tool_call_grammar`). None for every format but Kimi-K3.
+        """
+        return None
+
+    @classmethod
     def opens_region(cls, marker: str) -> bool:
         """Does this marker hand the rest of the stream to this format?
 

@@ -18,15 +18,18 @@ from types import SimpleNamespace
 import pytest
 from test_state_checkpoint import (
     BLOCK,
+    DEFAULT_STATE_RUNTIME,
     MIN_FORK,
+    PAGED_COPY_RUNTIME,
     PAGED_COPY_SPEC,
     PROMPT,
     demand_config,
     make_block_manager,
+    make_scheduler,
     stateful_seq,
 )
 
-from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.state_runtime import (
     StateRuntime,
     StateTransfer,
@@ -60,6 +63,55 @@ def admitted(bm, tokens=PROMPT):
     seq = stateful_seq(list(tokens))
     bm.allocate(seq, bm.can_allocate(seq))
     return seq
+
+
+@pytest.mark.parametrize("advance", [False, True])
+@pytest.mark.parametrize(
+    "runtime,readable,chunk",
+    [
+        (StateRuntime(), False, 44),
+        (DEFAULT_STATE_RUNTIME, False, 36),
+        (PAGED_COPY_RUNTIME, False, 40),
+        (FORK_RUNTIME, True, 44),
+        (PAGED_RUNTIME, True, 44),
+    ],
+)
+def test_schedule_plans_only_readable_midstep_caches(
+    runtime, readable, chunk, advance, monkeypatch
+):
+    sched = make_scheduler(
+        demand_config(state_checkpoint_interval_tokens=-1, pool_entries={"state": 8}),
+        state_runtime=runtime,
+    )
+    sched.advance_on_schedule = advance
+    seqs = [stateful_seq([t + i * 1000 for t in PROMPT]) for i in range(2)]
+    for seq in seqs:
+        sched.add(seq)
+    bm = sched.block_manager
+    assert bm.plans_midstep is readable
+    plans = type(bm).plans_midstep.fget
+    checks = []
+
+    def checked(manager):
+        checks.append(manager)
+        return plans(manager)
+
+    monkeypatch.setattr(type(bm), "plans_midstep", property(checked))
+    plan = bm.plan_midstep
+    planned = []
+
+    def record(seq, start, end, **kwargs):
+        planned.append(seq)
+        return plan(seq, start, end, **kwargs)
+
+    monkeypatch.setattr(bm, "plan_midstep", record)
+    batch, active = sched.schedule()
+    assert list(active.values()) == seqs
+    assert batch.num_scheduled_tokens.tolist() == [chunk, chunk]
+    assert batch.total_tokens_num_prefill == 2 * chunk
+    assert checks == [bm]
+    assert planned == (seqs if readable else [])
+    assert all(bool(seq.midstep_reservations) is readable for seq in seqs)
 
 
 # ── the shared predicate ─────────────────────────────────────────────────────
@@ -160,6 +212,62 @@ class TestMidstepTargets:
     def test_misaligned_lists_raise(self):
         with pytest.raises(RuntimeError):
             midstep_checkpoint_targets([0, 1], [0, 0], [64, 64], [5], [[]], 16, 64, 3)
+
+    def test_interior_targets_get_one_snapshot_row_each(self):
+        """The snapshot plan an fp32 pool (Qwen4Exp) runs the chunk kernel with.
+
+        Rows of 200, 77 and 333 tokens chunk at offsets 0, 4 and 6. Each
+        interior target's boundary, `chunk_offsets[row] + off // 64`, names
+        its own snapshot row, which is also the row the writer reads for it;
+        end targets take no snapshot and are read from the runtime slot.
+        """
+        import torch
+
+        from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
+
+        targets = midstep_checkpoint_targets(
+            state_rows=[0, 1, 2],
+            num_cached_tokens=[0, 0, 0],
+            num_scheduled_tokens=[200, 77, 333],
+            runtime_slots=[0, 1, 2],
+            saves=[[(3, 64), (4, 128), (5, 200)], [(6, 64)], [(7, 192), (8, 333)]],
+            num_slots=16,
+            grid=64,
+            min_offset=3,
+        )
+        rows, _slots, offs, is_end, _runtime = (list(c) for c in zip(*targets))
+        chunk_offsets = torch.tensor([0, 4, 6, 12])
+        snap_idx, h_rows, n = interior_state_snapshots(
+            torch.tensor(rows),
+            torch.tensor(offs),
+            [not e for e in is_end],
+            chunk_offsets,
+            (200 + 77 + 333) // 64 + 3 + 1,
+            64,
+        )
+        assert n == 4
+        assert h_rows.tolist() == [0, 1, -1, 2, 3, -1]
+        expected = [-1] * snap_idx.numel()
+        for chunk, row in ((1, 0), (2, 1), (5, 2), (9, 3)):
+            expected[chunk] = row
+        assert snap_idx.tolist() == expected
+
+    def test_a_forward_with_only_end_targets_takes_no_snapshot(self):
+        import torch
+
+        from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
+
+        snap_idx, h_rows, n = interior_state_snapshots(
+            torch.tensor([0, 1]),
+            torch.tensor([200, 77]),
+            [False, False],
+            torch.tensor([0, 4, 6]),
+            8,
+            64,
+        )
+        assert n == 0
+        assert h_rows.tolist() == [-1, -1]
+        assert snap_idx.tolist() == [-1] * 8
 
     def test_scheduled_batch_carries_the_rows(self):
         stateless = stateful_seq(list(range(8)))
@@ -358,7 +466,7 @@ class TestPagedMidstep:
         bm = self.bm(pool_entries={"state": 2})
         seq = admitted(bm)
         bm.plan_midstep(seq, 0, 40)
-        assert [p for _s, p, _h in seq.midstep_reservations] == [32]
+        assert [p for _s, p, _h in seq.midstep_reservations] == [40]
         assert bm.paged_state_checkpoints.checkpoints_dropped == 1
 
     def test_stores_beyond_the_copy_budget_wait_for_the_next_batch(self):
@@ -409,3 +517,102 @@ class TestPagedMidstep:
         )
         backends.AttentionMetadataBuilder._checkpoint_staging(builder)
         assert sized == [7 * 3 * 2]  # budget x spans per copy
+
+
+class TestPagedAnchorFallback:
+    @pytest.mark.parametrize("advance", [False, True])
+    @pytest.mark.parametrize("mixed", [False, True])
+    def test_shared_pool_exhaustion_keeps_all_anchors(self, advance, mixed):
+        runtime = StateRuntime(
+            transfer=StateTransfer.copy(
+                PAGED_COPY_SPEC.layout_id,
+                readable_midstep=True,
+                midstep_grid=1,
+                midstep_min_offset=3,
+            ),
+            checkpoint_spec=PAGED_COPY_SPEC,
+        )
+        sched = make_scheduler(
+            demand_config(
+                max_num_seqs=6,
+                max_num_batched_tokens=512,
+                pool_entries={"state": 10},
+                state_checkpoint_interval_tokens=-1,
+                enable_mixed_prefill_decode=mixed,
+            ),
+            state_runtime=runtime,
+        )
+        sched.advance_on_schedule = advance
+        sched.drafter_needs_next_token = True
+        seqs = [stateful_seq([t + 1000 * i for t in PROMPT]) for i in range(6)]
+        for seq in seqs:
+            sched.add(seq)
+        bm = sched.block_manager
+        coord = bm.paged_state_checkpoints
+        first, active1 = sched.schedule()
+        assert list(active1.values()) == seqs  # Admission owns the first six slots.
+        assert first.num_scheduled_tokens.tolist() == [44] * 4 + [40] * 2
+        assert first.total_tokens_num == first.total_tokens_num_prefill == 256
+        assert first.is_final_chunk == [True] * 4 + [False] * 2
+        assert first.next_token_ids == [-1] * 4 + [4040, 5040]
+        assert first.state_maintenance_ops.checkpoint_stores == ()
+        runtime_slots = [seq.state_slot for seq in seqs]
+        scratch_slots = [s for seq in seqs for s, _p, _h in seq.midstep_reservations]
+        assert len(scratch_slots) == 4
+        assert set(scratch_slots).isdisjoint(runtime_slots)
+        assert bm.state.num_free() == 0
+        assert [seq.midstep_reservations for seq in seqs[4:]] == [[], []]
+        sched.mark_pp_inflight(first)
+
+        def retire(batch, active):
+            sched.postprocess(
+                list(active.values()),
+                ScheduledBatchOutput([], [], None, None, None, is_deferred_out=True),
+                batch=batch,
+            )
+
+        if not advance:
+            retire(first, active1)
+        # With schedule-time advancement this suffix is issued before the
+        # anchor batch retires. Its boundary copy must already be staged.
+        second, active2 = sched.schedule()
+        assert set(active2) == {seq.id for seq in seqs[4:]}
+        assert second.num_cached_tokens == [40, 40]
+        assert second.num_scheduled_tokens.tolist() == [4, 4]
+        assert second.total_tokens_num == 8
+        assert second.is_final_chunk == [True, True]
+        assert second.next_token_ids == [-1, -1]
+        stores = list(second.state_maintenance_ops.checkpoint_stores)
+        fallback_stores = [op for op in stores if op.src_slot in runtime_slots]
+        assert {op.src_slot for op in fallback_stores} == set(runtime_slots[4:])
+        assert all(op.scratch_slot == -1 for op in fallback_stores)
+        if advance:
+            retire(first, active1)
+        retire(second, active2)
+        bm.complete_previous_state_batch()
+        stores.extend(bm.take_state_maintenance_ops().checkpoint_stores)
+        bm.complete_previous_state_batch()
+        assert len(stores) == 6
+        assert coord.checkpoints_dropped == 0
+        assert bm.chunks_cut_for_end == 2
+        assert bm.state.num_free() == 4  # Only borrowed scratch was released.
+        assert [seq.state_slot for seq in seqs] == runtime_slots
+        for seq in seqs:
+            h = seq.block_hashes[40 // BLOCK - 1]
+            assert coord.store.contains(h)
+            assert bm.can_allocate(stateful_seq(list(seq.token_ids))) == 40 // BLOCK
+
+    def test_an_existing_anchor_does_not_force_another_cut(self):
+        bm = TestPagedMidstep().bm(pool_entries={"state": 2})
+        seq = admitted(bm)
+        bm.plan_midstep(seq, 0, 44)
+        bm.hash_blocks(seq, 44)
+        assert bm.state.num_free() == 0
+        assert bm.plan_midstep(seq, 0, 44) == 44
+
+    def test_a_forbidden_cut_keeps_an_atomic_forward_whole(self):
+        bm = TestPagedMidstep().bm(pool_entries={"state": 1})
+        seq = admitted(bm)
+        assert bm.plan_midstep(seq, 0, 44, cut_floor=44) == 44
+        assert seq.midstep_reservations == []
+        assert bm.chunks_cut_for_end == 0

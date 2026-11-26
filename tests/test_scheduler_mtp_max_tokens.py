@@ -8,6 +8,7 @@ import pytest
 from conftest import MockConfig
 
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.sequence import SequenceType
 from atom.sampling_params import SamplingParams
 from tests.logprob_helpers import token_logprob
 
@@ -49,6 +50,8 @@ class TestMTPMaxTokens:
                 num_rejected=np.asarray([0]),
                 num_bonus=np.asarray([0]),
                 draft_token_ids=np.asarray([[20, 21, 22]]),
+                # pp=1 output is deferred (drafts + lagging provisional run).
+                is_deferred_out=True,
                 logprobs=(
                     {
                         seq.id: [
@@ -170,6 +173,130 @@ class TestMTPMaxTokens:
         assert emitted.output_tokens == [10, 11]
 
 
+class TestUndeferredSpecPlaceholders:
+    """PP output is undeferred: every step leaves ONE run of `mtp_k + 1`.
+
+    `verify_ctx_lens` shifts by 1 under undeferred output only because of this:
+    the verify window starts `mtp_k + 1` placeholders back from the end, no
+    matter how many drafts the previous step rejected.
+    """
+
+    mtp_k = 3
+
+    def _scheduler(self, **config):
+        sched = Scheduler(
+            MockConfig(
+                pipeline_parallel_size=2,
+                **config,
+                speculative_config=SimpleNamespace(
+                    num_speculative_tokens=self.mtp_k,
+                    use_dspark=lambda: True,
+                ),
+                num_kvcache_blocks=64,
+            )
+        )
+        assert not sched.is_deferred_out and sched.use_spec
+        return sched
+
+    def _step(self, sched, seq, tokens, num_rejected, stream_queue=None):
+        batch, seqs = sched.schedule()
+        return sched.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[tuple(tokens)],
+                num_rejected=np.asarray([num_rejected]),
+                num_bonus=np.asarray([0]),
+                draft_token_ids=np.asarray([[7] * self.mtp_k]),
+                is_deferred_out=False,
+            ),
+            stream_output_queue=stream_queue,
+            batch=batch,
+        )
+
+    def _assert_one_full_run(self, sched, seq):
+        width = self.mtp_k + 1
+        tail = seq.token_ids[-width - 1 :]
+        assert list(tail[1:]) == [sched.eos_token_id] * width
+        assert tail[0] != sched.eos_token_id
+        assert seq.num_placeholder_tokens == width
+
+    def _prefilled(self, sched, seq_factory, max_tokens=64):
+        seq = seq_factory(
+            [1, 2, 3, 4],
+            sampling_params=SamplingParams(max_tokens=max_tokens, ignore_eos=True),
+        )
+        sched.add(seq)
+        # The prefill step scores no drafts: one sampled token.
+        self._step(sched, seq, [100], num_rejected=0)
+        self._assert_one_full_run(sched, seq)
+        return seq
+
+    @pytest.mark.parametrize("num_rejected", range(mtp_k + 1))
+    def test_every_reject_count_leaves_one_full_run(self, seq_factory, num_rejected):
+        sched = self._scheduler()
+        seq = self._prefilled(sched, seq_factory)
+        accepted = self.mtp_k + 1 - num_rejected
+        real_before = seq.num_tokens - seq.num_placeholder_tokens
+        self._step(sched, seq, range(200, 200 + accepted), num_rejected)
+        self._assert_one_full_run(sched, seq)
+        assert seq.num_tokens - seq.num_placeholder_tokens == real_before + accepted
+
+    def test_mixed_steps_never_grow_or_shrink_the_run(self, seq_factory):
+        sched = self._scheduler()
+        seq = self._prefilled(sched, seq_factory)
+        for step, num_rejected in enumerate([0, self.mtp_k, 1, self.mtp_k, 2]):
+            accepted = self.mtp_k + 1 - num_rejected
+            self._step(sched, seq, range(10 * step, 10 * step + accepted), num_rejected)
+            self._assert_one_full_run(sched, seq)
+
+    def test_cap_truncates_an_all_accepted_step(self, seq_factory):
+        # 1 token from prefill + 4 accepted against max_tokens=3.
+        sched = self._scheduler()
+        seq = self._prefilled(sched, seq_factory, max_tokens=3)
+        stream_queue = mock.Mock()
+        finished = self._step(
+            sched, seq, [10, 11, 12, 13], num_rejected=0, stream_queue=stream_queue
+        )
+        assert len(finished) == 1
+        assert finished[0].leave_reason == "max_tokens"
+        assert finished[0].num_completion_tokens == 3
+        emitted = stream_queue.put_nowait.call_args.args[0][0][1]
+        assert emitted.output_tokens == [10, 11]
+
+    def test_middle_chunk_gets_no_placeholders_once_its_final_chunk_is_scheduled(
+        self, seq_factory
+    ):
+        # pp=2: the final chunk is scheduled while the middle one is in flight,
+        # flipping the live `is_partial_prefill`. The middle chunk's
+        # postprocess must still leave the seq without placeholders.
+        sched = self._scheduler(max_num_batched_tokens=16)
+        assert sched.advance_on_schedule
+        seq = seq_factory(
+            list(range(1, 33)),
+            sampling_params=SamplingParams(max_tokens=64, ignore_eos=True),
+        )
+        sched.add(seq)
+        middle, middle_seqs = sched.schedule()
+        assert not middle.is_final_chunk[0]
+        sched.schedule()
+        assert not seq.is_partial_prefill
+        sched.postprocess(
+            list(middle_seqs.values()),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(5,)],
+                num_rejected=np.asarray([0]),
+                num_bonus=np.asarray([0]),
+                draft_token_ids=np.asarray([[7] * self.mtp_k]),
+                is_deferred_out=False,
+            ),
+            batch=middle,
+        )
+        assert seq.num_placeholder_tokens == 0
+        assert seq.num_tokens == 32
+
+
 @pytest.mark.parametrize("injected", [False, True])
 def test_bad_logprobs_do_not_terminate_sibling_requests(seq_factory, injected):
     sched = Scheduler(MockConfig(num_kvcache_blocks=64))
@@ -206,3 +333,72 @@ def test_bad_logprobs_do_not_terminate_sibling_requests(seq_factory, injected):
     outputs = dict(queue.put_nowait.call_args.args[0])
     assert outputs[bad.id].finish_reason == "logprob_error"
     assert outputs[good.id].output_tokens == [11]
+
+
+class TestDecodeBoundaryFiling:
+    """A deferred seq that ran files step 0 of that forward; otherwise its slot
+    still holds the window that sampled, so it files that window's last token."""
+
+    def _filed(self, seq_factory, ran, deferred=True, accepted=4):
+        mtp = TestMTPMaxTokens()
+        sched = mtp._scheduler()
+        seq = mtp._prefill(
+            sched,
+            seq_factory(
+                [1, 2, 3, 4],
+                sampling_params=SamplingParams(max_tokens=64, ignore_eos=True),
+            ),
+        )
+        seq.type = SequenceType.DECODE
+        filed = []
+
+        def record(s, committed, next_forward_tokens=0, *, snapshot_step):
+            filed.append((committed, snapshot_step))
+
+        sched.block_manager.hash_decode_blocks = record
+        seq.num_placeholder_tokens = sched.mtp_k
+        for token in (87, 88, 89, 90, 91, 92, 93):
+            seq.append_token(token)
+        # No `batch`, as RapidServe's decode engine calls it: `seqs` alone
+        # names the batch just run.
+        sched.postprocess(
+            [seq] if ran else [],
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[tuple(range(5, 5 + accepted))],
+                num_rejected=np.asarray([sched.mtp_k + 1 - accepted]),
+                num_bonus=np.asarray([0]),
+                draft_token_ids=np.asarray([[20, 21, 22]]),
+                is_deferred_out=deferred,
+            ),
+        )
+        return filed, seq.num_finalized_tokens
+
+    def test_a_scheduled_batch_counts_its_forward(self, seq_factory):
+        """What a filed checkpoint is checked against at the drain."""
+        mtp = TestMTPMaxTokens()
+        seq = mtp._prefill(mtp._scheduler(), seq_factory([1, 2, 3, 4]))
+        assert seq.num_forwards == 1
+        Scheduler._consume_first_decode({seq.id: seq})  # RapidServe's decode build
+        assert seq.num_forwards == 2
+
+    @pytest.mark.parametrize("accepted", [1, 4])
+    def test_a_seq_that_ran_names_step_0_of_that_forward(self, seq_factory, accepted):
+        (filed,), n = self._filed(seq_factory, ran=True, accepted=accepted)
+        assert filed == (n, 0) == (4 + accepted, 0)
+
+    @pytest.mark.parametrize("accepted", [1, 4])
+    def test_a_seq_that_did_not_run_names_its_last_accepted_token(
+        self, seq_factory, accepted
+    ):
+        (filed,), n = self._filed(seq_factory, ran=False, accepted=accepted)
+        assert filed == (n - 1, accepted - 1) == (3 + accepted, accepted - 1)
+
+    @pytest.mark.parametrize("accepted", [1, 4])
+    def test_undeferred_output_names_its_last_accepted_token(
+        self, seq_factory, accepted
+    ):
+        (filed,), n = self._filed(
+            seq_factory, ran=True, deferred=False, accepted=accepted
+        )
+        assert filed == (n - 1, accepted - 1) == (6 + accepted, accepted - 1)

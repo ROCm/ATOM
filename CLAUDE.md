@@ -45,6 +45,45 @@ Key entry points:
 - Server: `atom/entrypoints/openai_server.py`
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
 - Models: `atom/models/` — registered in `atom/models/registry.py:support_model_arch_dict`
+- Verify head and deferred status: `ModelRunner.run_model` returns the
+  forward's hidden states (a decode graph records the forward alone); the head
+  runs after it, eagerly, on the forward's stream (`ModelRunner.run_lm_head` ->
+  `LmHeadOutput`, handed to `postprocess`): a verify head's token ids where they
+  stand for the step, else `ModelRunner.compute_logits` (a lossless drafter's
+  sampled step and a masked rollout vocabulary take the logits). The verify head
+  (`atom/model_ops/verify_head.py` `VerifyHead`, bound by
+  `ModelRunner._bind_verify_head`: the model's own `verify_head`, else for a
+  drafted model whose `ParallelLMHead.logits_are_head` the shared mono LM head
+  launch (`atom/mono/lm_head`) in front of ATOM's Triton `ArgmaxVerifyHead`):
+  `sample_token_ids(hidden)` a verify's output ids and
+  spec status (`verify_ids.VerifyOutput`), `samples_step(batch, spec, rows)`
+  whether they stand for the step of `rows` forward rows (`samples`,
+  `draws_top_p(rows)`: the rows it draws), `ids_agree` whether every TP rank's
+  are alike. The verify from a head's ids, exact match
+  or forced acceptance: `atom/model_ops/verify_ids.py` (`IdVerifiers`); a
+  vocab-sharded head's picks (`ShardedPicks`, ATOM's and the V4.1 mono LM
+  head's): a temperature row's id a Gumbel-max draw (`verify_ids.HeadDraw`; the
+  mono head's by `atom/mono/device/race.py`), within its top-p in the mono head
+  (`atom/mono/lm_head/top_p.py`: the set within each rank's K largest,
+  `top_p_candidates`, sorted by the wave bitonic networks of
+  `atom/mono/device/bitonic.py`; past them hi's two-level scan, `top_p_scan`;
+  the slices both read, `top_p_logits`); forced
+  acceptance admits every request greedy (`LLMEngine`); an attention builder may
+  say a step consumes the previous verdict on the device
+  (`AttentionMetadataBuilder.consumes_device_verdict`: the runner then takes
+  the speculative status after the target's launch) or stages the step before
+  that status and restages what it moves once taken
+  (`settles_spec_status` / `take_spec_status`)
+- Peer embedding: `atom/model_ops/peer_embedding.py` — a vocab-parallel
+  embedding read from each row's owner rank's shard (HIP IPC), one launch;
+  `shared_peer_embedding` one mapping an embedding and group (a DSpark draft
+  shares its target's)
+- Model hooks: `atom/model_engine/model_hooks.py` — `DecodeRound`, the part of a
+  step a model's install hands DeepSeek-V4.1's metadata builder
+  (`DeepseekV41MetadataBuilder.use_decode_round`); `DecodeRound.service` is the
+  step's one routing decision (`AttentionMetaData.served_by_round`,
+  `RoundService`) that the builder, its cache, Engram staging, the DSpark
+  proposer and the model's forward all read
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Structured output: `atom/structured_output/` — request validation, schema compilation, grammar state and asynchronous token/mask transfers
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
@@ -54,6 +93,12 @@ Key entry points:
   `atom/model_engine/dynamic_chunking.py` (latency model, pure) and
   `dynamic_chunking_worker.py` (startup sweep and runtime timing in the runner),
   sized by `Scheduler._dynamic_chunk_limit`
+- Ulysses sequence parallel (`-sp`, on the PCP rank dimension):
+  `atom/distributed/ulysses_sp.py` (the SP group, the token shard / gather and
+  the QKV exchange), `group_agreement.py` (verdicts every rank of a CPU group
+  takes alike); the model runs on a rank's token range through `atom/utils/sp_wrapper.py`; the
+  attention and its head gather in `atom/model_ops/sp_attention.py`, and the MXFP4 MoE
+  through AITER MegaMoE in `atom/model_ops/fused_moe/sp_mega_moe.py`
 - Mono decode (fused per-layer decode kernels): the shared mechanisms in `atom/mono/`
   (`runtime/`: TP consensus and a runner's bind-then-agree construction
   (`consensus.bind_agreed`), peer memory and its owned buffer (`lifecycle`),
@@ -62,18 +107,38 @@ Key entry points:
   lazy runner (`route`), debug wait reports, kernel argument tables, compile-only
   builds and their traced hand-offs (`compile.trace` / `compile.check_traced`),
   the refusals every model shares (`deployment`), check-mode
-  comparison (`compare`); `plan/`: the execution model and task placement, build
+  comparison (`compare`), the dual-copy scratch's calibration (`numa`: which
+  copy, one per I/O die, each XCD reads; hi's `dual` runs it on its own
+  probe); `plan/`: the execution model and task placement, build
   keys, a TP rank's share of the widths (`shard`: a model's `Dims` and its TP
   refusal), mailbox region layout (`layout`), int / traced arithmetic (`arith`)
   and the hand-off contract a trace is held to (`check.check`); `device/`: the tagged
   mailbox and its `publish`, the TP group's peer bases and all-reduce sum
-  (`ranks`), FP8 / MX codes, FP4 tile loads and the scaled MFMA (`mx`) and wave
-  / math primitives), a model's
+  (`ranks`), FP8 / MX codes, FP4 tile loads and the scaled MFMA (`mx`), a CTA's
+  dual copy (`numa`) and wave / math primitives), a model's
   kernels in `atom/models/<model>/mono/kernels/` (MiniMax-M3; DeepSeek-V4.1 and
   Kimi-K3, both wrapped after load through
   `models.registry.mono_decode_installers`; V4.1's per-step cell decisions live in
   `deepseek_v41/mono/{index,attention,moe}_plan.py`, each called by both the
-  kernel and its CPU I3 test. Kimi-K3 runs K1 (the attention seam through
+  kernel and its CPU I3 test; its dual-copy regions in `numa_plan.py`; K1 and
+  K2 of a layer in one launch (`kernels/layer.py`), a column-sharded residual's
+  gather (`kernels/col_gather.py`), and the launches beside the layers, each
+  falling back to the original path where not built (`compress_launch`,
+  `engram_launch`, `head_launch`, `draft_ctx_launch`; `head_launch` binds the
+  shared mono LM head over V4.1's norm and head). The shared mono LM head
+  (`atom/mono/lm_head/`): a vocab-parallel bf16 head's picks in one launch
+  (`kernel`: an optional final RMSNorm, the shard's dot (`dot`), each row's
+  greedy id or temperature draw over every TP rank (`argmax`), a top-p row's
+  draw within its top-p (`top_p`: `top_p_candidates`, else `top_p_scan`)), its hand-offs
+  tagged with the verify launch count so nothing zeroes its own peer buffer
+  between launches; `head` binds it as V4.1's head and, for any drafted model
+  whose head is a `ParallelLMHead` (`ModelRunner._bind_verify_head`,
+  `bind_verify_head`), in front of ATOM's Triton picks. On gfx1250, V4.1's whole DSpark decode step is one
+  persistent FlyDSL kernel a rank (`deepseek_v41/mono/gfx1250/`: a target launch
+  through sampling and verification, then a draft launch), which ModelRunner
+  is offered through `atom/mono/runtime/step_override.py`; it reads the
+  production MoE's experts in place, and `tests/test_deepseek_v41_gfx1250.py`
+  is its CPU test. Kimi-K3 runs K1 (the attention seam through
   the KDA recurrence) and K2 (`o_proj` + the latent MoE) on its KDA layers, on
   a plain decode or a uniform speculative verify of at most 64 rows (16-row
   token groups past 16), with or without ReplaySSM. The MLA layers keep
@@ -98,24 +163,42 @@ Key entry points:
   implementations side by side — `PeerBuffer` (aiter's heap) and
   `SymmetricPeerBuffer` (HIP directly, GLM-5.2's) — because they are different
   implementations rather than two copies, and merging them is a GPU behaviour
-  change, not a move; both allocate through `runtime/uncached.py`, as do every
-  model's step scratch buffers (uncached device memory: a hand-off's polls
-  never hit a stale cache line). Qwen3.8-Flash-Next's kernels (`qwen38/mono/`, beside
+  change, not a move; both allocate through `runtime/uncached.py`, as do the
+  other models' step scratch buffers (uncached device memory: a hand-off's polls
+  never hit a stale cache line). DeepSeek-V4.1's high-interactivity monokernels
+  (below) keep a third, their own: the hi programs' peer groups
+  (`deepseek_v41/mono/hi/runtime/peer.py`, `PeerGroup`) and uncached scratch
+  arenas (`hi/runtime/uncached.py`, a block retired and reused, never freed), both
+  over `runtime/hip_ipc.py`. Qwen3.8-Flash-Next's kernels (`qwen38/mono/`, beside
   the single-file `qwen4_exp.py`) are whole-layer programs composed from FlyDSL stages
   (`kernels/blocks/`, `kernels/recipe.py`); its MTP drafter is wrapped at install like
   V4.1's (`draft_model.MonoDraftModel`). Where a model ships a
   `mono/contract.py` with a `__main__` (DeepSeek-V4.1, MiniMax-M3), check its
-  hand-offs without a GPU with `FLYDSL_RUNTIME_ENABLE_CACHE=0 ARCH=gfx950
-  python -m atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
+  hand-offs without a GPU with `ARCH=gfx950 python -m
+  atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
   per-step input check only, and Kimi-K3 ships neither it nor a `check.py`
-  yet)
+  yet). DeepSeek-V4.1 also has the high-interactivity monokernels
+  (`ATOM_DSV41_MONO_HI`, on by default where `deepseek_v41/mono/hi_gate.py`
+  says they serve: MI355X, TP2, TP4 or TP8, DSpark; at TP8 the shared expert's K
+  is padded in place, 288 -> 320, until ROCm/aiter#7967): one persistent FlyDSL launch a layer
+  (the runtime in `deepseek_v41/mono/hi/`), the host hook in `hi_runner.py` /
+  `hi_compose.py` / `hi_dispatch.py`, its verify head (`HiVerifyHead`: the
+  in-graph verify, `round/post_verify.py`) and its decode round in
+  `round/` (`HiRound`)
 - Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
   `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
   and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`
 
 ## Critical Rules
 
-- **Change `@support_torch_compile` decorated model files with care** — edits are allowed, but debug/instrumentation code inside traced functions breaks Dynamo tracing even with `--enforce-eager`. Instrument at call sites instead (e.g., `ModelRunner.run_model()`, `EagleProposer.propose()`, `DSparkProposer.propose()`), know which functions are traced before editing, and run the compiled path afterwards. `deepseek_v4_dspark.py` carries a COMPILE BOUNDARY block at the top naming exactly which functions are traced — read it before touching that file
+- **A source file's header is these three lines, the ATOM line included** (every
+  new file gets all three):
+  ```
+  # SPDX-License-Identifier: MIT
+  # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+  # Copyright (c) 2026 ATOM Project Contributors
+  ```
+- **Change `@support_torch_compile` decorated model files with care** — edits are allowed, but debug/instrumentation code inside traced functions breaks Dynamo tracing even with `--enforce-eager`. Instrument at call sites instead (e.g., `ModelRunner.run_model()`, `EagleProposer._propose()`, `DSparkProposer._propose()`; `Drafter.propose()` is only the template that calls them), know which functions are traced before editing, and run the compiled path afterwards. `deepseek_v4_dspark.py` carries a COMPILE BOUNDARY block at the top naming exactly which functions are traced — read it before touching that file
 - **Multiprocessing must use `spawn`** — `fork` causes CUDA re-initialization crashes
 - **Set `AITER_LOG_LEVEL=WARNING` before starting server** — suppresses aiter kernel log flooding
 - **Clear compile cache before server restart:** `rm -rf /root/.cache/atom/*` — stale cache causes silent failures after code changes

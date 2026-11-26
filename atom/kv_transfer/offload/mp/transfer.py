@@ -22,6 +22,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveCompletionId,
     SaveOperationId,
     SaveSourceGroupId,
+    req_id_of,
 )
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
@@ -135,7 +136,7 @@ def _terminal_future_result(future: Any | None) -> tuple[bool, Any]:
 def _transfer_operation_id(kind: str, completion: Any) -> str:
     """Return a stable LMCache handle ID for one ATOM completion generation."""
 
-    request_id = getattr(completion, "req_id", completion)
+    request_id = req_id_of(completion)
     generation = getattr(completion, "generation", None)
     if generation is None:
         return f"{kind}:{request_id}"

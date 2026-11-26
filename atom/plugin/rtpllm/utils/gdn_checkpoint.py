@@ -236,6 +236,7 @@ def install_rtp_gdn_checkpoint_writer() -> None:
         chunk_size,
         conv_state_len,
         h_vk=False,
+        h_rows=None,
     ):
         if not is_rtpllm():
             return original(
@@ -252,7 +253,10 @@ def install_rtp_gdn_checkpoint_writer() -> None:
                 cu_seqlens,
                 chunk_size,
                 conv_state_len,
+                h_rows=h_rows,
             )
+        if h_rows is not None:
+            raise NotImplementedError("RTP GDN checkpoints take no state snapshots")
         return write_rtp_gdn_checkpoints(
             h,
             state,

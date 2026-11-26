@@ -10,6 +10,7 @@ from atom.mono.plan.build_key import source_digest
 
 SOURCE_PATHS = (
     "mono/device",
+    "mono/polling.py",
     "models/deepseek_v4/mono/config.py",
     "models/deepseek_v4/mono/kernels",
     "models/deepseek_v4/mono/sources.py",

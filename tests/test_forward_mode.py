@@ -36,9 +36,12 @@ def _batch(*, seqs, tokens=None, prefill_tokens=0, q=1):
     total = seqs * q if tokens is None else tokens
     return types.SimpleNamespace(
         total_seqs_num=seqs,
+        total_seqs_num_prefill=seqs if prefill_tokens else 0,
         total_tokens_num=total,
         total_tokens_num_prefill=prefill_tokens,
         total_tokens_num_decode=0 if prefill_tokens else total,
+        num_scheduled_tokens=np.full(seqs, q, dtype=np.int32),
+        has_prefill=bool(prefill_tokens),
         # Not a real ScheduledBatch field any more -- kept so `_decide` can pass
         # this stub's per-seq length the way `prepare_model` passes the shrink's.
         max_seqlen_q=q,
@@ -238,21 +241,23 @@ def test_tbo_survives_having_no_peer_to_ask():
     produces -- so `--enable-tbo` was a dead switch on every TP-only deployment,
     silently, and PCP+TBO (which is always dp==1) could never fire at all.
     """
-    on = _decide(tbo_on=True, local_tbo=(True, True, 4, 4))
+    prefill = _batch(seqs=2, tokens=8, prefill_tokens=8)
+    on = _decide(prefill, tbo_on=True, local_tbo=(True, True, 4, 4))
     assert on.tbo_collective_active
 
     # Both bits are required: reaching the min-token bar is not enough if the
     # batch cannot be split, and vice versa.
     for local in ((True, False, 4, 4), (False, True, 4, 4)):
-        assert not _decide(tbo_on=True, local_tbo=local).tbo_collective_active
-    assert not _decide(tbo_on=False, local_tbo=(True, True, 4, 4)).tbo_collective_active
+        assert not _decide(prefill, tbo_on=True, local_tbo=local).tbo_collective_active
+    off = _decide(prefill, tbo_on=False, local_tbo=(True, True, 4, 4))
+    assert not off.tbo_collective_active
 
 
 def test_a_peer_that_cannot_split_vetoes_tbo_for_the_group(monkeypatch):
     """With peers the answer is theirs, not ours -- the reduction decides."""
-    _fake_sync(monkeypatch, peer_tokens=8, peer_bs=8)
+    _fake_sync(monkeypatch, peer_tokens=8, peer_bs=2, peer_prefill=True)
     mode = _decide(
-        _batch(seqs=8, q=1),
+        _batch(seqs=2, tokens=8, prefill_tokens=8),
         dp_size=2,
         dp_group=object(),
         tbo_on=True,
@@ -294,6 +299,32 @@ def test_a_prefill_step_runs_its_own_rows(monkeypatch):
     )
     assert mode.is_prefill and not mode.running_tokens_are_unified
     assert mode.running_tokens == 100
+
+
+def test_an_idle_rank_runs_the_groups_phase_on_one_token(monkeypatch):
+    """A rank with no request has no phase of its own: beside a prefilling
+    peer it prefills, on one token (two with TBO, `sync_dp_metadata`)."""
+    _fake_sync(monkeypatch, peer_tokens=700, peer_bs=2, peer_prefill=True)
+    running = np.zeros(2, dtype=np.int32)
+    mode = _decide(
+        _batch(seqs=0, tokens=0, q=1),
+        dp_size=2,
+        dp_group=object(),
+        running_tokens_per_dp_rank=running,
+    )
+    assert mode.is_prefill and mode.scheduled_tokens == 0
+    assert mode.running_tokens == 1 and running.tolist() == [1, 700]
+
+
+def test_a_group_without_a_request_forwards_one_padding_request():
+    """Every rank idle and nothing recorded (`--enforce-eager`): the group
+    still runs one row, not zero."""
+    mode = _decide(
+        _batch(seqs=0, tokens=0, q=1),
+        capture_sizes=np.array([0], dtype=np.int32),
+        enforce_eager=True,
+    )
+    assert mode.running_bs == 1 and mode.running_tokens == 1
 
 
 def test_the_variable_length_path_runs_this_rank_alone_in_both_units(monkeypatch):
@@ -517,7 +548,6 @@ def _graph_sync(across, prefill, tbo=False, eager=False):
         max_bs_across_dp=1,
         any_rank_needs_eager=eager,
         tbo_collective_active=tbo,
-        ub_max_tokens_across_dp=None,
         ub_tokens_across_dp=None,
         prefill_across_dp=tuple(bool(p) for p in prefill),
     )
@@ -530,7 +560,7 @@ def _bucket(sync):
     """The step's bucket and the running table it settles in place, on a
     step graphable unless the group needs eager or splits into TBO."""
     graphable = not (sync.any_rank_needs_eager or sync.tbo_collective_active)
-    running = np.full(len(sync.scheduled_tokens_per_dp_rank), -1, dtype=np.int32)
+    running = sync.scheduled_tokens_per_dp_rank.copy()
     with mock.patch.object(
         TokenGraph,
         "captured_sizes",
@@ -586,47 +616,80 @@ def test_no_token_graph_when_a_rank_refuses_or_exceeds_the_largest_bucket():
 # TBO decode: which batch a split step's micro-batches are cut from.          #
 # --------------------------------------------------------------------------- #
 
-SPLIT = (True, True, 2, 3)  # this rank can split, and it is worth splitting
+
+def _split_bs(mode):
+    """The request bucket a split decode is cut at, None unsplit."""
+    splits = mode.tbo_collective_active and not mode.is_prefill
+    return mode.running_bs if splits else None
 
 
-def test_without_tbo_recordings_a_split_decode_runs_eagerly_on_its_requests():
-    mode = _decide(_batch(seqs=5, q=1), tbo_on=True, local_tbo=SPLIT)
+def test_without_tbo_recordings_a_split_decode_runs_eagerly_on_the_bucket():
+    """An eager split cuts the group's `running_bs` too, as every rank runs it."""
+    mode = _decide(_batch(seqs=5, q=1), tbo_on=True, tbo_decode=True)
     assert mode.tbo_collective_active and not mode.use_cudagraph
-    assert mode.ubatch_split_bs == 5
+    assert _split_bs(mode) == 8
 
 
 def test_a_split_decode_replays_its_bucket_recorded_split():
     """The bucket's recording cut its micro-batches at the bucket, so the step
-    lays them out there, not at the 5 requests it scheduled."""
+    is cut there, not at the 5 requests it scheduled."""
     mode = _decide(
-        _batch(seqs=5, q=1), tbo_on=True, local_tbo=SPLIT, tbo_decode_graphs=True
+        _batch(seqs=5, q=1), tbo_on=True, tbo_decode=True, tbo_decode_graphs=True
     )
-    assert mode.use_cudagraph and mode.running_bs == 8
-    assert mode.ubatch_split_bs == 8
+    assert mode.use_cudagraph and _split_bs(mode) == 8
 
 
-def test_a_replayed_bucket_that_splits_is_split_whatever_this_rank_decided():
-    """Every rank replays the group's bucket; a rank whose own batch could not
-    split runs the same split recording as its peers."""
-    mode = _decide(_batch(seqs=3, q=1), tbo_on=True, tbo_decode_graphs=True)
-    assert not mode.tbo_collective_active and mode.use_cudagraph
-    assert mode.running_bs == 4 and mode.ubatch_split_bs == 4
+def test_a_replayed_bucket_that_splits_is_split_whatever_this_rank_scheduled():
+    """Every rank replays the group's bucket split, however few requests it
+    scheduled into it: the config and the bucket decide."""
+    mode = _decide(
+        _batch(seqs=3, q=1), tbo_on=True, tbo_decode=True, tbo_decode_graphs=True
+    )
+    assert mode.use_cudagraph and _split_bs(mode) == 4
+
+
+def test_a_split_decode_off_the_ladder_runs_an_even_bucket():
+    """Off the ladder (no recording holds it) the bucket is still even, as
+    every rung is under decode TBO: 5 requests split 3 + 3."""
+    mode = _decide(
+        _batch(seqs=5, q=1),
+        capture_sizes=np.asarray([0], dtype=np.int32),
+        tbo_on=True,
+        tbo_decode=True,
+    )
+    assert not mode.use_cudagraph and _split_bs(mode) == 6
 
 
 def test_a_bucket_too_small_to_split_replays_whole():
-    mode = _decide(_batch(seqs=2, q=1), tbo_on=True, tbo_decode_graphs=True)
-    assert mode.use_cudagraph and mode.ubatch_split_bs is None
+    mode = _decide(
+        _batch(seqs=2, q=1), tbo_on=True, tbo_decode=True, tbo_decode_graphs=True
+    )
+    assert mode.use_cudagraph and _split_bs(mode) is None
+
+
+def test_a_decode_a_peer_prefills_beside_is_not_split(monkeypatch):
+    """A decode splits only when every rank decodes: a prefilling peer runs
+    other collectives per micro-batch."""
+    _fake_sync(monkeypatch, peer_tokens=700, peer_bs=2, peer_prefill=True)
+    mode = _decide(
+        _batch(seqs=5, q=1),
+        dp_size=2,
+        dp_group=object(),
+        tbo_on=True,
+        tbo_decode=True,
+    )
+    assert _split_bs(mode) is None
 
 
 def test_eager_or_prefill_tbo_does_not_replay_a_split_recording():
     eager = _decide(
         _batch(seqs=5, q=1),
         tbo_on=True,
-        local_tbo=SPLIT,
+        tbo_decode=True,
         tbo_decode_graphs=True,
         enforce_eager=True,
     )
-    assert not eager.use_cudagraph and eager.ubatch_split_bs == 5
+    assert not eager.use_cudagraph and _split_bs(eager) == 8
     prefill = _decide(
         _batch(seqs=3, tokens=900, prefill_tokens=900),
         tbo_on=True,
@@ -634,4 +697,4 @@ def test_eager_or_prefill_tbo_does_not_replay_a_split_recording():
         tbo_decode_graphs=True,
     )
     assert prefill.tbo_collective_active and not prefill.req_graphs
-    assert prefill.ubatch_split_bs is None
+    assert _split_bs(prefill) is None

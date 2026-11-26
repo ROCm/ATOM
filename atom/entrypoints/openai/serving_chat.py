@@ -194,6 +194,17 @@ def validate_history_tool_calls(messages: Any) -> None:
                 )
 
 
+def validate_stream_options(stream: bool | None, stream_options: Any) -> None:
+    """``stream_options`` only with ``stream=true``; ``include_usage`` a boolean."""
+    if stream_options is None:
+        return
+    if stream is not True:
+        raise ValueError("stream_options requires stream=true")
+    include_usage = stream_options.get("include_usage")
+    if include_usage is not None and type(include_usage) is not bool:
+        raise ValueError("stream_options.include_usage must be a boolean")
+
+
 def validate_chat_request(request: ChatCompletionRequest) -> None:
     """Validate tool / tool_choice / response_format shape before dispatch.
 
@@ -202,12 +213,7 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
     """
     if request.top_logprobs is not None and not request.logprobs:
         raise ValueError("top_logprobs requires logprobs=true")
-    if request.stream_options is not None:
-        if request.stream is not True:
-            raise ValueError("stream_options requires stream=true")
-        include_usage = request.stream_options.get("include_usage")
-        if include_usage is not None and type(include_usage) is not bool:
-            raise ValueError("stream_options.include_usage must be a boolean")
+    validate_stream_options(request.stream, request.stream_options)
     validate_tool_list(request.tools)
     messages = request.messages if request.messages is not None else request.prompt
     _validate_message_tools(messages)

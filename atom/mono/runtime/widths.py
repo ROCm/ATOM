@@ -6,8 +6,9 @@ import logging
 
 import torch.distributed as dist
 
+from atom.distributed.group_agreement import group_agree
 from atom.mono.runtime.compile import compile_kernels, kernel_names, scratch_bytes
-from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
+from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
 
@@ -52,10 +53,12 @@ class WidthBuilds:
         built, scratch = self._compiled(width, lambda: self._build(width))
         spilled = [launcher for launcher, n in scratch.items() if n]
         # any rank's spill sends every rank through the lean rebuild together,
-        # if every rank has a leaner build (``lean`` None: nothing to swap)
-        if self._lean is not None and not tp_agree(not spilled, self._group):
-            lean = self._lean(built, spilled) if spilled else built
-            if tp_agree(lean is not None, self._group):
+        # if every rank has a leaner build (``lean`` None: nothing to swap),
+        # each leaving out the kernels any rank's spilled: one structure
+        if self._lean is not None and not group_agree(not spilled, self._group):
+            spilled = self._spilled_anywhere(scratch)
+            lean = self._lean(built, spilled)
+            if group_agree(lean is not None, self._group):
                 logger.info(
                     "%s: %s need scratch, rebuilt lean",
                     self._what,
@@ -64,7 +67,7 @@ class WidthBuilds:
                 built, scratch = self._compiled(width, lambda: lean)
         if built is not None and not self._scratch_free(scratch):
             built = None
-        if not tp_agree(built is not None, self._group):
+        if not group_agree(built is not None, self._group):
             self._refused.add(width)
             return False
         self._built[width] = built
@@ -90,7 +93,7 @@ class WidthBuilds:
             )
             built = None
         # every rank's share in FlyDSL's disk cache before any rank reads it
-        if not tp_agree(built is not None, self._group):
+        if not group_agree(built is not None, self._group):
             return None, {}
         try:
             launchers = compile_kernels(kernels)
@@ -100,6 +103,18 @@ class WidthBuilds:
                 "%s: loading the width-%d kernels failed", self._what, width
             )
             return None, {}
+
+    def _spilled_anywhere(self, scratch: dict) -> list:
+        """This rank's launchers at the places (in build order, every rank's
+        alike) where any rank's spilled: a rank's own builds may differ in
+        their constants (a per-rank NUMA copy word), not in their order."""
+        places = {i for i, n in enumerate(scratch.values()) if n}
+        if self._group is not None:
+            every = [None] * dist.get_world_size(self._group)
+            dist.all_gather_object(every, places, group=self._group)
+            places = set().union(*every)
+        launchers = list(scratch)
+        return [launchers[i] for i in sorted(places)]
 
     def _share(self, kernels: list) -> list:
         """This rank's share of a width's kernels to compile first (rank r:

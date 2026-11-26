@@ -19,6 +19,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     SaveOperationId,
     SaveSourceGroupId,
+    req_id_of,
 )
 
 
@@ -134,7 +135,7 @@ class PPKVAggregator:
         )
 
     def _save_is_abandoned(self, operation) -> bool:
-        return str(getattr(operation, "req_id", operation)) in self._abandoned_saves
+        return req_id_of(operation) in self._abandoned_saves
 
     def forget(self, rid: ReqId) -> None:
         """Retire a request's saves after the scheduler abandons them.
@@ -155,7 +156,7 @@ class PPKVAggregator:
             self._abandoned_saves.popitem(last=False)
 
         def _owned_by(completion) -> bool:
-            return str(getattr(completion, "req_id", completion)) == sid
+            return req_id_of(completion) == sid
 
         for key in [k for k in self._saving if _owned_by(k)]:
             self._saving.pop(key, None)

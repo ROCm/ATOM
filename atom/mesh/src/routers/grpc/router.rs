@@ -19,10 +19,8 @@ use crate::{
     core::{is_retryable_status, RetryExecutor, WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, MeshMetrics},
     protocols::{
-        chat::ChatCompletionRequest,
-        completion::CompletionRequest,
-        generate::GenerateRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
+        chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+        responses::ResponsesRequest,
     },
     routers::{
         comm::error,
@@ -262,12 +260,17 @@ impl RouterTrait for GrpcRouter {
         &self,
         _headers: Option<&HeaderMap>,
         response_id: &str,
-        _params: &ResponsesGetParams,
+        _query: Option<&str>,
     ) -> Response {
         get_response_impl(&self.responses_context, response_id).await
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        response_id: &str,
+        _query: Option<&str>,
+    ) -> Response {
         cancel_response_impl(&self.responses_context, response_id).await
     }
 

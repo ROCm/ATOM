@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Request spans shared by CSA2 paging, compression and Engram staging."""
 
 from collections.abc import Mapping
@@ -9,7 +11,7 @@ from typing import NamedTuple, Protocol
 import numpy as np
 import torch
 
-from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
+from atom.model_ops.attentions.token_layout.batch_ids import build_query_layout
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
@@ -43,10 +45,9 @@ class BatchStep:
     Every tensor here spans the forward's own width -- `running_tokens` rows
     and `running_bs` requests -- and not the scheduled batch, because a
     captured graph replays the width it was captured at whatever the batch
-    turns out to be. The tail past `scheduled` is padding: a token there
-    carries batch id -1, which is what the scatters bail on. Query padding is
-    zero-length except for an idle rank's dummy query segment: sampling and
-    DSpark retain that segment while cache metadata still contains no requests.
+    turns out to be. The tail past `scheduled_tokens` is padding: a token
+    there carries batch id -1, which is what the scatters bail on, and a
+    padding request has zero query length.
     """
 
     requests: tuple[RequestSpan, ...]
@@ -55,8 +56,8 @@ class BatchStep:
     slots: torch.Tensor
     batch_ids: torch.Tensor
     block_tables: torch.Tensor
-    # Tokens the requests own, against `width` rows the forward runs.
-    scheduled: int = 0
+    # Tokens the requests own, against `running_tokens` rows the forward runs.
+    scheduled_tokens: int = 0
     # Rows per request this forward runs -- the CUDAGraph query bucket, not
     # the longest request in the batch. A ragged verify step whose longest
     # request is shorter still replays the bucket's graph, so every shape
@@ -74,9 +75,17 @@ class BatchStep:
     candidate_blocks: dict[int, object] = field(default_factory=dict)
     # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
     # launch wrote for the whole run.
-    group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
+    group_indices: dict[int | tuple[int, str], tuple[torch.Tensor, ...]] = field(
+        default_factory=dict
+    )
     # A split decode's window rows (`indices.build_window_rows`), every layer's.
     window_rows: torch.Tensor | None = None
+    # One layer's live Q/KV preparation, consumed after the side-stream join.
+    attention_inputs: tuple | None = None
+    # Reusable raw storage for one layer's live SWA history/current-KV source.
+    # The serving cache binds the parent's; TBO gives each child its own.
+    # Keep this across begin_forward: only its live views depend on the step.
+    prefill_window_staging: torch.Tensor | None = None
     # A bounded-replay forward's `ReplayPlan` (`models.deepseek_v41.
     # bounded_replay`): the rows its decoder ran on, for what else reads the
     # decoder's rows after it (the DSpark draft's window). None where the
@@ -87,6 +96,9 @@ class BatchStep:
     # addresses for every such step. None where no replay can run.
     decoder: object | None = None
     indptrs: dict[int, tuple] = field(default_factory=dict)
+    # A8W4 separates CSA/SWA even when the same step also uses the BF16
+    # adapter (for example, an ASM query shape outside its supported range).
+    a8w4_indptrs: dict[int, tuple] = field(default_factory=dict)
     # ratio -> [width] int32: compressed rows each query row may see. Worked
     # out on the host, where `positions` is staged and where RoPE takes its
     # own, so this adds no second source of truth.
@@ -157,14 +169,16 @@ class BatchStep:
         self.selected.clear()
         self.candidates.clear()
         self.indptrs = {}
+        self.a8w4_indptrs = {}
         self.tiles.clear()
         self.candidate_blocks.clear()
         self.group_indices.clear()
         self.window_rows = None
+        self.attention_inputs = None
         self.replay = None
 
     @property
-    def width(self):
+    def running_tokens(self):
         return self.positions.numel()
 
     @property
@@ -195,6 +209,38 @@ def visible_buffer_name(ratio):
     return f"v41_index_visible_{ratio}"
 
 
+def stage_positions(requests, buffers, cu, lengths, running_tokens, ratios, planners):
+    """Stage what a step's rows owe their positions: the positions, each
+    ratio's visible counts, and the planners' tables laid out over them.
+    Returns ``(starts, planner rows, planner host data)``."""
+    scheduled_bs, scheduled_tokens = len(requests), int(lengths.sum())
+    positions = buffers["positions"]
+    starts = np.asarray([span.position for span in requests], dtype=positions.np.dtype)
+    prefill_positions(
+        np.arange(scheduled_tokens, dtype=positions.np.dtype),
+        starts,
+        cu[: scheduled_bs + 1],
+        lengths,
+        out=positions.np[:scheduled_tokens],
+    )
+    positions.np[scheduled_tokens:running_tokens] = 0
+    for ratio in ratios:
+        # Padding rows hold position 0 and earn that position's count; the
+        # scorer reaches them with no visible columns either way. Written
+        # through the destination, which narrows serving's int64 positions to
+        # the int32 the scorer reads and spares an expression's temporaries.
+        visible = buffers[visible_buffer_name(ratio)].np[:running_tokens]
+        np.add(positions.np[:running_tokens], 1, out=visible)
+        np.floor_divide(visible, ratio, out=visible)
+    # Planners read the rows staged above and publish with them.
+    planned, planned_host = {}, {}
+    for planner in planners:
+        plan = planner(buffers, running_tokens)
+        planned.update(plan.rows)
+        planned_host.update(plan.host)
+    return starts, planned, planned_host
+
+
 def prepare_batch_step(
     requests,
     device,
@@ -212,7 +258,6 @@ def prepare_batch_step(
     ratios=(),
     publication_group=None,
     query_prefix_ready=False,
-    query_prefix_republish_reason=None,
     planners=(),
 ):
     """Stage request metadata using the same persistent buffers/layout as V4.
@@ -224,6 +269,8 @@ def prepare_batch_step(
     padding sentinel and block-table stride stays fixed across steps.
     `planners` are called as `planner(buffers, running_tokens)` once the rows
     are staged, return a `StepPlan`, and need the serving buffers.
+    With ``publication_group`` the step is only counted into it: the caller
+    publishes the group before any GPU use.
     """
     scheduled_bs = len(requests)
     lengths = np.asarray([span.length for span in requests], dtype=np.int32)
@@ -267,43 +314,26 @@ def prepare_batch_step(
     tables = block_table_state(buffers["block_tables"]).prepare(
         block_tables, pad_to=running_bs, page_limit=page_limit
     )
+    # The serving buffers' query metadata (`cu_seqlens_q`, the token map) is
+    # the step's own (`prepare_query_metadata`): ``query_prefix_ready``. A row
+    # domain's and an isolated caller's are built here.
     cu = buffers["cu_seqlens_q"]
-    if not query_prefix_ready:
-        if cu._publication is not None:
-            # Reject unannounced rewrites before touching the pinned prefix.
-            # Explicit compaction may reacquire it after token assembly.
-            cu._publication.acquire_write(
-                republish_reason=query_prefix_republish_reason
-            )
-        cu.np[0] = 0
-        np.cumsum(lengths, out=cu.np[1 : scheduled_bs + 1])
-        cu.np[scheduled_bs + 1 : running_bs + 1] = scheduled_tokens
-    positions = buffers["positions"]
-    starts = np.asarray([span.position for span in requests], dtype=positions.np.dtype)
-    prefill_positions(
-        np.arange(scheduled_tokens, dtype=positions.np.dtype),
-        starts,
-        cu.np[: scheduled_bs + 1],
-        lengths,
-        out=positions.np[:scheduled_tokens],
-    )
-    positions.np[scheduled_tokens:running_tokens] = 0
-    for ratio in ratios:
-        # Padding rows hold position 0 and earn that position's count; the
-        # scorer reaches them with no visible columns either way. Written
-        # through the destination, which narrows serving's int64 positions to
-        # the int32 the scorer reads and spares an expression's temporaries.
-        visible = buffers[visible_buffer_name(ratio)].np[:running_tokens]
-        np.add(positions.np[:running_tokens], 1, out=visible)
-        np.floor_divide(visible, ratio, out=visible)
     batches = buffers["batch_id_per_q_token"]
-    build_batch_ids(lengths, pad_to=running_tokens, out=batches.np)
-    # Planners read the rows staged above and publish with them.
-    planned, planned_host = {}, {}
-    for planner in planners:
-        plan = planner(buffers, running_tokens)
-        planned.update(plan.rows)
-        planned_host.update(plan.host)
+    if not query_prefix_ready:
+        for staged in (cu, batches):
+            staged.acquire_write()
+        build_query_layout(
+            lengths,
+            running_bs,
+            running_tokens,
+            cu_seqlens_q=cu.np,
+            batch_ids=batches.np,
+        )
+    else:
+        del required["batch_id_per_q_token"]
+    starts, planned, planned_host = stage_positions(
+        requests, buffers, cu.np, lengths, running_tokens, ratios, planners
+    )
     required.update(planned)
     if state_slot_out is None:
         # Isolated eager cache callers have no metadata builder. Serving passes
@@ -320,15 +350,20 @@ def prepare_batch_step(
         # (`ub{i}_positions`, ...); find them by the parent's names. Members
         # staged by the builder (plans, state slots, Engram rows) keep their
         # counts in this combined publication.
-        members = {}
-        for name, count in required.items():
-            i = publication_group.indices.get(f"{buffer_prefix}{name}")
-            if i is not None:
-                publication_group.counts[i] = count
-                members[name] = publication_group.members[i]
-        tables.publish(
-            running_bs if "block_tables" in members else None, group=publication_group
+        members = {
+            name: publication_group.members[publication_group.indices[key]]
+            for name in required
+            if (key := f"{buffer_prefix}{name}") in publication_group.indices
+        }
+        publication_group.set_counts(
+            {
+                f"{buffer_prefix}{name}": required[name]
+                for name in members
+                if name != "block_tables"
+            }
         )
+        if "block_tables" in members:
+            tables.stage(running_bs, publication_group)
         published = {
             name: member.destination[: required[name]]
             for name, member in members.items()
@@ -339,18 +374,18 @@ def prepare_batch_step(
             for name, count in required.items()
             if name not in ("block_tables", "cu_seqlens_q")
         }
-    if "cu_seqlens_q" in published:
-        # The group published it with the rest of the step (a TBO microbatch's
-        # `ub{i}_` group holds its own copy).
-        published["cu_seqlens_q"] = cu.gpu[: running_bs + 1]
-    else:
-        published["cu_seqlens_q"] = (
-            cu.gpu[: running_bs + 1]
-            if query_prefix_ready
-            else cu.copy_to_gpu(
-                running_bs + 1, republish_reason=query_prefix_republish_reason
+    # The query metadata no group carried: already published, or built above.
+    for name, staged, count in (
+        ("cu_seqlens_q", cu, running_bs + 1),
+        ("batch_id_per_q_token", batches, running_tokens),
+    ):
+        if name in published:
+            # A TBO microbatch's `ub{i}_` group published its own copy.
+            published[name] = staged.gpu[:count]
+        else:
+            published[name] = (
+                staged.gpu[:count] if query_prefix_ready else staged.copy_to_gpu(count)
             )
-        )
     if "block_tables" not in published:
         published["block_tables"] = tables.publish(running_bs)
     return BatchStep(
@@ -360,7 +395,7 @@ def prepare_batch_step(
         state_slot_out[:running_bs],
         published["batch_id_per_q_token"],
         published["block_tables"],
-        scheduled=scheduled_tokens,
+        scheduled_tokens=scheduled_tokens,
         max_q_len=(
             max((span.length for span in requests), default=0)
             if max_q_len is None

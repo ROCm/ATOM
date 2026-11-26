@@ -7,15 +7,15 @@ on:
       - 'atom/mesh/**'
       - '.github/workflows/atomesh-accuracy-validation.yaml'
       - '.github/scripts/accuracy_to_dashboard.py'
+      - '.github/scripts/atomesh_pd_accuracy.sh'
       - '.github/benchmark/models_accuracy.json'
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'atom/mesh/**'
-      - '.github/workflows/atomesh-accuracy-validation.yaml'
-      - '.github/scripts/accuracy_to_dashboard.py'
-      - '.github/benchmark/models_accuracy.json'
+    types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
+    # Do not use paths here. The required gate must be published for every PR;
+    # ci-gate below keeps the old path filter behavior for expensive jobs.
+  pull_request_review:
+    types: [submitted]
   schedule:
     # Nightly at 00:00 Beijing time (16:00 UTC)
     - cron: '0 16 * * *'
@@ -34,8 +34,14 @@ on:
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # Approval runs queue behind existing work. Other reviews get their own group
+  # so they cannot replace a pending approval run in GitHub's queue.
+  # Likewise every label event except the one that opens the gate -- adding
+  # ci:mesh, or ci:full to a PR without ci:mesh (check_label_event in the gate
+  # script) -- so an unrelated label can never cancel running heavy CI. The
+  # gate job's name repeats this test; keep both in sync with CI_GATE_LABELS.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && !(github.event.label.name == 'ci:mesh' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:mesh'))) && format('-noop-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
 
 env:
   ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
@@ -46,8 +52,39 @@ env:
   AITER_GIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_branch || 'main' }}
 
 jobs:
+  ci-gate:
+    name: Check Heavy CI Gate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
+      decidable: ${{ steps.gate.outputs.decidable }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Check approval and label gate
+        id: gate
+        env:
+          CI_GATE_WORKFLOW: atomesh-accuracy-validation.yaml
+          CI_GATE_LABELS: ci:full,ci:mesh
+          CI_GATE_PATHS_INCLUDE: |
+            atom/mesh/**
+            .github/workflows/atomesh-accuracy-validation.yaml
+            .github/scripts/accuracy_to_dashboard.py
+            .github/scripts/atomesh_pd_accuracy.sh
+            .github/benchmark/models_accuracy.json
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash ./.github/scripts/check_heavy_ci_gate.sh
+
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
+    needs: [ci-gate]
     name: Check Pre Checkin Signal
     runs-on: ubuntu-latest
     permissions:
@@ -64,10 +101,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
+          CHECK_SIGNAL_EVENT_NAME: ${{ github.event.pull_request && 'pull_request' || github.event_name }}
+          CHECK_SIGNAL_HEAD_REF: ${{ github.event.pull_request.head.ref || github.head_ref || github.ref_name }}
+          CHECK_SIGNAL_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
   download_aiter_wheel:
-    if: ${{ needs.check-signal.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
-    needs: [check-signal]
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' }}
+    needs: [ci-gate, check-signal]
     name: Download aiter wheel
     runs-on: ubuntu-latest
     steps:
@@ -86,6 +126,8 @@ jobs:
           retention-days: 7
 
   load-test-models:
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
+    needs: [ci-gate]
     name: Load test model configs
     runs-on: ubuntu-latest
     outputs:
@@ -105,44 +147,61 @@ jobs:
           current = level_map.get(event, "pr")
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
-          # NOTE: Meta-Llama-3-8B-Instruct was this whitelist's only "pr" entry
-          # and has been removed from models_accuracy.json, so atomesh
-          # standalone currently validates nothing on a pull request. Promoting
-          # a replacement changes what every atomesh PR pays for, so it is left
-          # to the job owner rather than decided here.
+          # Each "pr" model runs on every ATOMesh pull request the heavy CI gate
+          # opens, and that PR's ATOMesh Accuracy Gate fails without one.
           atomesh_levels = {
               "DeepSeek-R1-0528": "main",
-              "gpt-oss-120b": "nightly",
+              "gpt-oss-120b": "pr",
           }
-          filtered = [m for m in models if atomesh_levels.get(m["model_name"], "skip") in allowed]
+          # These also run 1P1D on one node: an ATOM prefill and decode server
+          # behind the ATOMesh PD router (.github/scripts/atomesh_pd_accuracy.sh).
+          atomesh_pd_levels = {"gpt-oss-120b": "pr"}
+          cases = [
+              m | {"serving": serving}
+              for m in models
+              for serving, levels in (("standalone", atomesh_levels), ("1p1d", atomesh_pd_levels))
+              if levels.get(m["model_name"], "skip") in allowed
+          ]
+          # A 1P1D case starts two servers and the router within the accuracy
+          # step's time limit.
+          for case in cases:
+              if case["serving"] == "1p1d":
+                  case["accuracy_timeout_minutes"] = case.get("accuracy_timeout_minutes", 30) + 15
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"models_json={json.dumps(filtered)}\n")
-          print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
-          print(f"{'Model':<45} {'Atomesh':<10} {'ATOM':<10} {'Runner'}")
-          print("-" * 80)
+              f.write(f"models_json={json.dumps(cases)}\n")
+          print(f"Event={event} level={current}: {len(cases)} cases from {len(models)} models")
+          print(f"{'Model':<45} {'Atomesh':<10} {'1P1D':<10} {'ATOM':<10} {'Runner'}")
+          print("-" * 90)
           for m in models:
-              enabled = "✓" if m in filtered else "·"
+              enabled = "✓" if any(c["model_name"] == m["model_name"] for c in cases) else "·"
               print(
                   f"  {enabled} {m['model_name']:<43} "
                   f"{atomesh_levels.get(m['model_name'],'skip'):<10} "
+                  f"{atomesh_pd_levels.get(m['model_name'],'skip'):<10} "
                   f"{m.get('test_level','?'):<10} {m['runner']}"
               )
           PY
 
   atomesh-test:
-    needs: [download_aiter_wheel, load-test-models]
-    name: Accuracy
+    needs: [ci-gate, download_aiter_wheel, load-test-models]
+    name: Accuracy (${{ matrix.model_name }}${{ matrix.serving == '1p1d' && ', 1P1D' || '' }})
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.load-test-models.outputs.models_json) }}
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+        include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
+    # On a pull request an empty model list must skip the job: a matrix
+    # without entries fails the run before any job starts. On push and
+    # nightly an empty list still fails the run.
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' && (!github.event.pull_request || needs.load-test-models.outputs.models_json != '[]') }}
     runs-on: ${{ matrix.runner }}
 
     env:
       CONTAINER_NAME: atomesh_test_${{ strategy.job-index }}
       USE_ATOMESH_ENTRYPOINTS: 1
       ATOM_SERVER_PORT: 8000
+      # Names this case's artifacts and dashboard row. The gate and the dashboard
+      # hold a 1P1D case to its model's threshold and baseline.
+      ACCURACY_NAME: ${{ matrix.model_name }}${{ matrix.serving == '1p1d' && '-1p1d' || '' }}
 
     steps:
       - name: Kill all Docker containers and clean up workspace
@@ -411,6 +470,7 @@ jobs:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
           ACCURACY_TIMEOUT_MINUTES: ${{ matrix.accuracy_timeout_minutes || 30 }}
+          SERVING: ${{ matrix.serving }}
         run: |
           set -euo pipefail
           echo ""
@@ -420,9 +480,23 @@ jobs:
           else
             model_path="${{ matrix.model_path }}"
           fi
+          launch=".github/scripts/atom_test.sh launch"
+          if [ "$SERVING" = "1p1d" ]; then
+            launch="bash .github/scripts/atomesh_pd_accuracy.sh"
+            # Stream each side's log into this step as it is written, each line
+            # prefixed with its side. The streams stop when the step exits.
+            stream() {
+              docker exec "$CONTAINER_NAME" sh -c \
+                "tail -n +1 -F /tmp/$2 2>/dev/null | sed -u 's/^/[$1] /'" &
+            }
+            stream prefill atom_prefill.log
+            stream decode atom_decode.log
+            stream router atom_server.log
+            trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+          fi
           # Pipe via stdin so container bash parses shell quoting in extraArgs
           # (e.g. single-quoted JSON in --default-chat-template-kwargs) naturally.
-          echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
+          echo "$launch $model_path $MODEL_EXTRA_ARGS" | \
             docker exec -i "$CONTAINER_NAME" bash -l
           echo ""
           echo "========== Running accuracy test =========="
@@ -437,7 +511,8 @@ jobs:
           " 2>&1 | tee atom_accuracy_output.txt
       
       - name: Dump server log
-        if: always()
+        # A 1P1D case streams its logs while it runs.
+        if: always() && matrix.serving != '1p1d'
         run: |
           docker exec "$CONTAINER_NAME" cat /tmp/atom_server.log 2>/dev/null || true
 
@@ -494,21 +569,21 @@ jobs:
           result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
           score=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file" 2>/dev/null || echo "N/A")
 
-          echo "Accuracy Test Summary for ${{ matrix.model_name }} (threshold: ${threshold}, score: ${score}):" >> $GITHUB_STEP_SUMMARY
+          echo "Accuracy Test Summary for ${ACCURACY_NAME} (threshold: ${threshold}, score: ${score}):" >> $GITHUB_STEP_SUMMARY
           awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
       - name: Upload output
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.model_name }}_atom_test_output.txt
+          name: ${{ env.ACCURACY_NAME }}_atom_test_output.txt
           path: atom_test_output.txt
 
       - name: Upload accuracy results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: accuracy-${{ matrix.model_name }}
+          name: accuracy-${{ env.ACCURACY_NAME }}
           path: accuracy_test_results/*.json
           if-no-files-found: ignore
 
@@ -526,6 +601,37 @@ jobs:
           docker rm "$CONTAINER_NAME" || true
           # Remove the pre-built image to free disk space on the runner
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
+
+  atomesh-accuracy-gate:
+    name: ${{ ((github.event_name != 'pull_request_review' && !(github.event.action == 'labeled' && !(github.event.label.name == 'ci:mesh' || (github.event.label.name == 'ci:full' && !contains(github.event.pull_request.labels.*.name, 'ci:mesh'))))) || needs.ci-gate.outputs.should_run == 'true') && 'ATOMesh Accuracy Gate' || 'ATOMesh Accuracy Gate not requested' }}
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs:
+      - ci-gate
+      - check-signal
+      - download_aiter_wheel
+      - load-test-models
+      - atomesh-test
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Evaluate ATOMesh accuracy gate
+        uses: ./.github/actions/evaluate-test-gate
+        with:
+          gate-name: ATOMesh Accuracy Gate
+          suite-name: ATOMesh accuracy tests
+          should-run: ${{ needs.ci-gate.outputs.should_run }}
+          decidable: ${{ needs.ci-gate.outputs.decidable }}
+          reason: ${{ needs.ci-gate.outputs.reason }}
+          ci-gate-result: ${{ needs.ci-gate.result }}
+          required-results: |
+            check-signal=${{ needs.check-signal.result }}
+            download_aiter_wheel=${{ needs.download_aiter_wheel.result }}
+            load-test-models=${{ needs.load-test-models.result }}
+            atomesh-test=${{ needs.atomesh-test.result }}
 
   # ---------- Publish Atomesh accuracy data for the mocker benchmark dashboard ----------
   publish-atomesh-accuracy-data:

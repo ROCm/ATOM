@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
+
+import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_runtime import StateTransfer
+from atom.model_engine.state_runtime import StateTransfer, midstep_rerun_rows
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
@@ -16,7 +18,8 @@ from atom.model_ops.glm5_next.geometry import (
     pooled_path_enabled,
     speculative_kpool_history_size,
 )
-from atom.utils import envs
+from atom.utils import CpuGpuBuffer, envs
+from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_mla import (
     MLA_ROWS,
@@ -24,10 +27,18 @@ from .aiter_mla import (
     aligned_index_cache_dim,
 )
 from .backends import AttentionBackend
-from .gdn_attn import LINEAR_STATE_ROWS, GDNStateMixin
+from .gdn_attn import LINEAR_STATE_ROWS, GDNStateMixin, slot_indexed_caches
 from .pool_layout.page_unit_geometry import PageUnitGeometryMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
+from .token_layout.slots import slot_mapping
 from .triton_mla import TritonMLAMetadataBuilder
+
+# A scratch slot is held from scheduling until the batch after its forward has
+# issued the store, so two steps' checkpoints are out at once.
+# This adds room for two targets per step, not two prefills: one prefill can
+# need both a rung and an anchor. Other free runtime slots are also available.
+# A full shared pool drops optional targets and cuts at an unbacked anchor.
+MIDSTEP_SCRATCH_SLOTS = 4
 
 
 class KimiMLAGDNBackend(AttentionBackend):
@@ -49,6 +60,26 @@ class KimiMLAGDNBackend(AttentionBackend):
 class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
+        self._declare_draft_ctx_slots(model_runner)
+
+    def _declare_draft_ctx_slots(self, model_runner) -> None:
+        """A draft that declares a pool of its own stores every token of the
+        target forward at that pool's entry size. Under DCP that is not what
+        the target's slots address (DCP-filtered, `block_size` tokens), so it
+        gets slots of its own; at DCP 1 it writes through the target's."""
+        drafter = getattr(model_runner, "drafter", None)
+        spec = getattr(getattr(drafter, "model", None), "kv_pool_spec", None)
+        if spec is not None and spec.needs_own_ctx_slots(model_runner.config):
+            model_runner.forward_vars["draft_ctx_slots"] = CpuGpuBuffer(
+                self.max_num_batched_tokens,
+                dtype=torch.int64,
+                device=self.device,
+                publication_group="draft_ctx_slots",
+            )
+
+    def spec_honours_state_fork(self) -> bool:
+        # K3's KDA forward reads the fork table; glm5_next's does not.
+        return self.model_runner.hf_text_config.model_type == "kimi_linear"
 
     def _module_kinds(self, module) -> tuple:
         """Two row spaces: the MLA pool's rows, and the KDA state slots.
@@ -78,7 +109,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         TP-replicated even though the MLA KV beside it is.
         """
         transfer = super().get_kv_transfer_tensors()
-        if transfer is None or not self._uses_paged_checkpoints():
+        # Under PP an op names every stage's image at once, which a per-stage
+        # LMCache MP worker cannot store; it keeps refusing K3 there.
+        if (
+            transfer is None
+            or not self._uses_paged_checkpoints()
+            or self.model_runner.config.pipeline_parallel_size > 1
+        ):
             return self._with_kda_disagg_regions(transfer)
         spec = self.model_runner.state_runtime.checkpoint_spec
         if spec is None:
@@ -140,42 +177,215 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 f"{model_type} disaggregated serving requires the mooncake or "
                 f"moriio connector, but kv_connector={connector!r} is configured. "
                 "Only those two move the slot-indexed KDA recurrent state; any "
-                f"other connector would move the {len(self.mla_idx_by_layer)} "
-                "full-attention layers and silently drop the state of the other "
-                f"{len(self.kda_idx_by_layer)}."
+                "other connector would move the full-attention layers and "
+                "silently drop the state of the KDA layers."
             )
 
-        if getattr(config, "pipeline_parallel_size", 1) > 1:
-            # `_consumer_region_map` shifts a stage's regions onto the peer's
-            # list group-major over `num_hidden_layers`. The slot regions below
-            # are group-major over the KDA layers only, a shorter axis, so the
-            # shift would land them on the wrong peer regions -- writing one
-            # layer's state over another's rather than failing.
+        if connector == "moriio":
+            # MoRIIO reads none of the placement the Mooncake path below
+            # publishes for a PP stage's MLA rows and KDA slots.
+            if config.pipeline_parallel_size > 1:
+                raise NotImplementedError(
+                    f"{model_type} disaggregated serving over moriio does not "
+                    "support pipeline parallelism (pipeline_parallel_size="
+                    f"{config.pipeline_parallel_size}). Use the mooncake "
+                    "connector, or run the P and D instances with PP=1."
+                )
+            tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
+            return tensors
+
+        if config.pipeline_parallel_size > 1 and self.model_runner.has_mla_indexer:
+            # A PP stage places its MLA rows and KDA slots by layer; a sparse
+            # MLA model's indexer regions have no such placement.
             raise NotImplementedError(
                 f"{model_type} disaggregated serving does not support pipeline "
-                f"parallelism (pipeline_parallel_size="
-                f"{config.pipeline_parallel_size}): the KDA state regions are "
-                "keyed by KDA layer index, which `_consumer_region_map` cannot "
-                "align across stages. Run the P and D instances with PP=1."
+                "parallelism with a sparse MLA indexer (pipeline_parallel_size="
+                f"{config.pipeline_parallel_size}). Run the P and D instances "
+                "with PP=1."
             )
 
         tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
+        tensors.slot_region_tp_segments = self._kda_slot_tp_segments(
+            len(tensors.slot_regions)
+        )
+        tensors.slot_region_tp_replicated = [False] * len(tensors.slot_regions)
+        if self.replayssm and tensors.slot_regions:
+            tensors.slot_region_tp_replicated[-1] = True
+        # Only a decode at a larger TP reads the split, but the layout is the
+        # model's and fixed by now: refuse here, on every deployment, rather
+        # than on the first mixed-TP transfer.
+        undescribed = [
+            idx
+            for idx, (segments, replicated) in enumerate(
+                zip(tensors.slot_region_tp_segments, tensors.slot_region_tp_replicated)
+            )
+            if segments is None and not replicated
+        ]
+        if undescribed:
+            raise RuntimeError(
+                f"{model_type} slot regions {undescribed} have no TP split: "
+                "`_kda_slot_tp_segments` does not recognise their unit layout "
+                "(a conv unit is linear_conv_kernel_dim - 1 + num_spec rows of "
+                "[q | k | v]), which a decode at another TP needs"
+            )
+        if config.pipeline_parallel_size > 1:
+            # Without explicit indices, `consumer_region_indices` puts a
+            # stage's region for layer l of group g at peer index
+            # g * (peer regions / groups) + start_layer + l. The MLA rows and
+            # KDA slots are each numbered over their own kind only, so that
+            # placement would write one layer's KV or state over another's.
+            mla, slots = self._pp_consumer_region_indices(
+                len(tensors.block_regions), len(tensors.slot_regions)
+            )
+            tensors.block_region_consumer_indices = mla
+            tensors.slot_region_consumer_indices = slots
         return tensors
+
+    def _kda_slot_tp_segments(self, num_regions: int) -> list[tuple[int, ...] | None]:
+        """How each KDA slot region's unit splits over TP ranks.
+
+        A conv unit is `W` rows of `[q | k | v]`, each run as wide as its conv
+        is built on this rank, an SSM unit is `(heads, dv, dk)` and a
+        ReplaySSM record unit `(heads, cache_len, d)`, all sharded by
+        contiguous head blocks, so a peer at k times this TP holds the same
+        k-th of every q, k and v run and of the head axis. A conv unit not
+        shaped as above is left undescribed, and `get_kv_transfer_tensors`
+        refuses it. ReplaySSM's cursor, the last region, is the same on every
+        rank; `slot_region_tp_replicated` says so.
+
+        Units are read off the shapes of `slot_indexed_caches`, the caches
+        `state_slot_regions` publishes, not a slot: a PP stage that holds no
+        KDA layer has caches with a zero layer axis.
+        """
+        runner = self.model_runner
+        hf = runner.config.hf_config
+        segments: list[tuple[int, ...] | None] = [None] * num_regions
+        caches = slot_indexed_caches(runner, self.replayssm)
+        conv_cache = caches[0]
+        n_kda = conv_cache.shape[0]
+        width, channels = conv_cache.shape[2:]
+        # As `_state_shape_for_runner` sized it: from the runner's count, which
+        # a drafter's `mtp_k` (`self.num_spec`) can differ from.
+        expected_width = hf.linear_conv_kernel_dim - 1 + runner.num_spec_tokens
+        # How wide `KimiKDAAttention` builds each of its q, k and v convs on a
+        # rank. A row that is not three such runs is not split by guessing.
+        run = (
+            hf.linear_num_key_heads // get_tp_group().world_size
+        ) * hf.linear_key_head_dim
+        if width == expected_width and channels == 3 * run:
+            run_bytes = run * conv_cache.element_size()
+            for i in range(min(n_kda, num_regions)):
+                segments[i] = (run_bytes,) * (3 * width)
+        for group, cache in enumerate(caches[1:], start=1):
+            unit = math.prod(cache.shape[2:]) * cache.element_size()
+            for i in range(group * n_kda, min((group + 1) * n_kda, num_regions)):
+                segments[i] = (unit,)
+        return segments
+
+    def _pp_consumer_region_indices(
+        self, num_block_regions: int, num_slot_regions: int
+    ) -> tuple[list[int], list[int]]:
+        """This stage's MLA and KDA regions, placed in a PP=1 peer's lists.
+
+        Each row is placed by its module's own layer number: the peer numbers
+        its MLA rows over the full-attention layers and its slots over the KDA
+        layers, group by group (conv, SSM, then ReplaySSM's records and its
+        one cursor), the same order `state_slot_regions` publishes here.
+
+        Only dense MLA rows are placed, as Kimi-K3 has: `get_kv_transfer_tensors`
+        refuses a sparse MLA model (`has_mla_indexer`, e.g. `glm5_next_text`)
+        under PP before this.
+        """
+        runner = self.model_runner
+        num_hidden_layers = runner.config.hf_config.num_hidden_layers
+        full = sorted(set(runner.full_attention_layers))
+        if not full:
+            raise RuntimeError(
+                "PP disaggregation needs the hybrid's full-attention layer "
+                "list to place this stage's rows; it is empty"
+            )
+        mla_pos = {layer: i for i, layer in enumerate(full)}
+        kda_pos = {
+            layer: i
+            for i, layer in enumerate(
+                layer for layer in range(num_hidden_layers) if layer not in mla_pos
+            )
+        }
+
+        def place(kind: str, positions: dict, drafts_from: int | None) -> list[int]:
+            rows = self.pool_rows.get(kind, {})
+            placed = [-1] * len(rows)
+            drafts = 0
+            for module, row in rows.items():
+                layer = module.layer_num
+                if layer in positions:
+                    placed[row] = positions[layer]
+                elif drafts_from is not None and layer >= num_hidden_layers:
+                    placed[row] = drafts_from + drafts
+                    drafts += 1
+                else:
+                    raise RuntimeError(
+                        f"PP disaggregation cannot place {kind} row {row}: "
+                        f"layer {layer} is not one of the model's "
+                        f"{len(positions)} layers of that kind"
+                    )
+            return placed
+
+        mla = place(MLA_ROWS, mla_pos, len(full))
+        if len(mla) != num_block_regions:
+            raise RuntimeError(
+                f"{num_block_regions} PAGE regions published for {len(mla)} "
+                "MLA rows; PP disaggregation places one region per row"
+            )
+        kda = place(LINEAR_STATE_ROWS, kda_pos, None)
+        # Counted from the caches, not from the regions: a stage without a
+        # KDA layer publishes no per-layer group, only ReplaySSM's cursor.
+        groups = len(slot_indexed_caches(runner, self.replayssm))
+        cursor = int(bool(self.replayssm))
+        if num_slot_regions != groups * len(kda) + cursor:
+            raise RuntimeError(
+                f"{num_slot_regions} slot regions over {len(kda)} KDA rows "
+                f"(replayssm={self.replayssm}) are not {groups} per-layer "
+                f"groups of {len(kda)} plus {cursor} cursor"
+            )
+        slots = [g * len(kda_pos) + pos for g in range(groups) for pos in kda]
+        if cursor:
+            slots.append(groups * len(kda_pos))
+        return mla, slots
+
+    # Every PP stage scatters its own layers' state into the unit ids the head
+    # names; `ModelRunner._agree_pipeline_checkpoint_spec` sizes them.
+    paged_checkpoints_span_pipeline = True
 
     def _uses_paged_checkpoints(self) -> bool:
         """Whether this run keeps checkpoints as PAGE images rather than slots.
 
-        Off under pipeline parallelism and RapidServe, which `get_num_blocks`
-        *raises* on when the transfer copies. Answering yes there would turn
-        "K3 under PP keeps no state cache" into "K3 under PP does not start".
+        Off under RapidServe, which `get_num_blocks` *raises* on when the
+        transfer copies. Answering yes there would turn "K3 under RapidServe
+        keeps no state cache" into "K3 under RapidServe does not start".
 
         One predicate for both `state_transfer` and `state_spec`, because the
         two disagreeing would size a pool for one mechanism and run the other.
         """
-        config = self.model_runner.config
-        return not (
-            config.pipeline_parallel_size > 1
-            or getattr(config, "enable_rapidserve", False)
+        return not getattr(self.model_runner.config, "enable_rapidserve", False)
+
+    def _reads_midstep(self) -> bool:
+        """Whether a checkpoint inside a prefill forward is written in it.
+
+        `chunk_kimi_delta_attn` returns only the final state, so K3's forward
+        re-runs each interior target's head instead (`_checkpoint_targets`);
+        GLM-5.3's linear attention writes none. Without it the scheduler cuts
+        the prefill at every checkpoint, and a prompt pays a second step for
+        its prompt-end anchor. Not under PP: the scratch slot is handed back two
+        scheduler passes after its forward, which no midstep path has checked
+        against a deeper pipeline (Qwen's keeps PAGE off under PP).
+        """
+        runner = self.model_runner
+        return (
+            self._uses_paged_checkpoints()
+            and runner.hf_text_config.model_type == "kimi_linear"
+            and self._decode_image_is_conv_and_ssm()
+            and runner.config.pipeline_parallel_size == 1
         )
 
     def state_transfer(self) -> StateTransfer:
@@ -186,21 +396,15 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         127 ordinary KV blocks — 0.112% of the paged pool — drawn from the same
         free list as everything else, and evicted by the same LRU.
 
-        Not midstep-readable, for want of plumbing rather than of state: KDA
-        goes through aiter's `chunk_kimi_delta_attn`, whose returned tuple
-        carries only the final state. The per-chunk `h` an interior checkpoint
-        would be sliced out of *is* computed — by the same
-        `chunk_gated_delta_rule_fwd_h` the GDN path uses — and then dropped
-        before the return. Exposing it is what this backend would need to
-        answer `True`. `PagedStateCheckpointCoordinator` says `False` for its
-        own reasons, so the two agree meanwhile.
+        Midstep-readable on grid 1 (`_reads_midstep`): the re-run ends a head
+        at any token, and the conv window needs `conv_kernel - 1` of the
+        forward's tokens before the target.
 
-        Dtype-safe by construction, which a checkpoint cut from `h` would not
-        be here — `_state_dtypes` gives kimi_linear a v side of its own dtype
-        (`ATOM_GDN_SSM_DTYPE`). An image is copied slot to slot with no kernel
-        output in between, so it round-trips exactly whatever that dtype is.
-        Both dtypes are named in the layout id, so a build that changed either
-        cannot read another's images.
+        Interior SSM images use the head re-run's final state, converted by
+        the shared checkpoint writer to the pool dtype (`ATOM_GDN_SSM_DTYPE`).
+        End targets copy the settled runtime state. PAGE storage and restore
+        preserve those slot bytes exactly. Both pool dtypes are named in the
+        layout id, so a build that changed either cannot read another's images.
         """
         if not self._uses_paged_checkpoints():
             return StateTransfer.fork(1)
@@ -236,7 +440,48 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             f":spec={self.num_spec}"
             ":carry=all"
         )
-        return StateTransfer.copy(layout_id)
+        if not self._reads_midstep():
+            return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
+        return StateTransfer.copy(
+            layout_id,
+            decode_keep=self._decode_keep(),
+            readable_midstep=True,
+            midstep_grid=1,
+            midstep_min_offset=self._conv_state_len(),
+        )
+
+    def _checkpoint_targets(self, batch) -> dict | None:
+        """This step's midstep checkpoints, as `midstep_rerun_rows` device
+        tensors for the KDA forward to write them from."""
+        if not any(batch.state_save_all):
+            return None
+        found = self._midstep_targets(batch, 1)
+        if not found:
+            return None
+        rows = midstep_rerun_rows(found, batch.num_scheduled_tokens)
+        head_ranges = rows.pop("head_ranges", ())
+        # One small metadata transfer; token-sized ranges are built on the device.
+        packed = torch.tensor(
+            [value for values in rows.values() for value in values],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        result, offset = {}, 0
+        for name, values in rows.items():
+            result[name] = packed[offset : offset + len(values)]
+            offset += len(values)
+        if head_ranges:
+            result["kda_tokens"] = torch.cat(
+                [torch.arange(sum(batch.num_scheduled_tokens), device=self.device)]
+                + [
+                    torch.arange(start, start + length, device=self.device)
+                    for start, length in head_ranges
+                ]
+            )
+        return result
+
+    def _needs_chunk_checkpoint_snapshots(self) -> bool:
+        return False
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN
@@ -330,6 +575,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
         return total // layers, layers
 
+    def _decode_image_is_conv_and_ssm(self) -> bool:
+        # By the model's kpool, not this stage's planes: under PP only the
+        # stages with indexer layers hold a tail.
+        return self._kpool_size() <= 1
+
     def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
         """KDA planes plus the partial kpool keys needed to resume exactly."""
         shapes = super()._checkpoint_plane_shapes()
@@ -350,16 +600,25 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         Widening the existing entry rather than declaring a second class keeps
         one slot id per request: the tail must be addressed by exactly the
         index KDA's state is, or a request would read another's partial pool.
+
+        Midstep checkpoints are written into scratch slots borrowed from this
+        pool, which otherwise holds exactly one slot per admitted request:
+        with every request in, there would be none to borrow.
         """
         base = super().state_spec()
-        extra = self._kpool_tail_bytes()
-        if not extra:
-            return base
+        cfg = self.model_runner.config
+        scratch = (
+            MIDSTEP_SCRATCH_SLOTS
+            if self._reads_midstep()
+            and cfg.enable_prefix_caching
+            and self._checkpoint_interval() != 0
+            else 0
+        )
         return state_pool(
             base.name,
-            base.entry_bytes + extra,
+            base.entry_bytes + self._kpool_tail_bytes(),
             entries_per_req=base.entries_per_req,
-            extra_entries=base.extra_entries,
+            extra_entries=base.extra_entries + scratch,
         )
 
     def allocate_per_req_cache(self, entries: dict[str, int]) -> dict:
@@ -416,16 +675,18 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             }
         return out
 
-    def _page_unit_index_cache(self) -> torch.Tensor | None:
-        """The indexer key cache a PAGE unit owns a region of, or `None`.
+    def _page_unit_index_cache(self) -> tuple[torch.Tensor, ...]:
+        """The indexer planes a PAGE unit owns, including FP4 scales.
 
         Read through the same predicate `sub_pool_specs` prices with, so the
         two cannot disagree: a unit owns index-cache bytes exactly when the
         pool was priced with them.
         """
-        if not self.model_runner.has_mla_indexer:
-            return None
-        return None if self.kv_pool.index is None else self.kv_pool.index.view("index")
+        if not self.model_runner.has_mla_indexer or self.kv_pool.index is None:
+            return ()
+        return tuple(
+            self.kv_pool.index.view(field.name) for field in self.kv_pool.index.fields
+        )
 
     def build_kv_cache_tensor(self, module):
         from atom.config import KVCacheTensor
@@ -457,6 +718,8 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             row = self.pool_rows[MLA_ROWS][module]
             kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
             module.max_model_len = runner.config.max_model_len
+            index_cache = None
+            index_scale = None
             if runner.has_mla_indexer and getattr(module, "indexer", None) is not None:
                 # The module's own global layer number, not the bind
                 # ordinal: the map is keyed globally, and on a non-first PP
@@ -469,14 +732,20 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 index_cache = self.kv_pool.layer(
                     "index", runner.index_cache_layer_map[module.layer_num]
                 )
-                # Flat row view: `indexer_k_quant_and_cache` addresses a
-                # slot as a single row id, and the pooled writer computes that
-                # id from the block table itself.
-                module.indexer.k_cache.kv_cache[0] = index_cache.view(
-                    index_cache.shape[0] * index_cache.shape[1],
-                    1,
-                    runner.aligned_index_dim,
-                )
+                assert module.indexer._indexer_fp4 == self._indexer_fp4
+                if self._indexer_fp4:
+                    index_scale = self.kv_pool.layer(
+                        "index_scale", runner.index_cache_layer_map[module.layer_num]
+                    )
+                    module.indexer.k_cache.kv_cache[0] = index_cache
+                    module.indexer.k_cache.kv_cache_scale = index_scale
+                else:
+                    # FP8 addresses each slot as a flat row; FP4 stays packed.
+                    module.indexer.k_cache.kv_cache[0] = index_cache.view(
+                        index_cache.shape[0] * index_cache.shape[1],
+                        1,
+                        runner.aligned_index_dim,
+                    )
                 # kpool: this layer's slice of the per-request tail buffer,
                 # bound here for the same reason the index cache is -- the
                 # indexer has no other route to a runner-owned tensor.
@@ -492,51 +761,136 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 v_cache=None,
                 k_scale=None,
                 v_scale=None,
+                index_cache=index_cache,
+                index_scale=index_scale,
             )
 
         return None
 
-    def prepare_prefill(
-        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
-    ):
-        attn_metadata, positions = super().prepare_prefill(
-            batch, running_bs, running_tokens
+    def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
+        # The draft's slots go up with either phase's attention metadata
+        # (`stage_prefill` / `stage_decode`).
+        members = super().h2d_group_members()
+        if "draft_ctx_slots" in self.model_runner.forward_vars:
+            for phase in ("prefill_metadata", "decode_metadata"):
+                members[phase] = members.get(phase, ()) + ("draft_ctx_slots",)
+        return members
+
+    def stage_prefill(self, batch, running_bs, running_tokens, group):
+        built = super().stage_prefill(batch, running_bs, running_tokens, group)
+        scheduled_bs = batch.total_seqs_num_prefill
+        self._stage_draft_ctx_slots(
+            batch, batch.num_scheduled_tokens[:scheduled_bs], running_tokens, group
         )
-        if batch.block_tables == []:
-            attn_metadata.gdn_metadata = None
-            return attn_metadata, positions
-        attn_metadata.gdn_metadata = self.prepare_gdn_metadata(
-            batch,
-            attn_metadata,
+        return built
+
+    def stage_decode(self, batch, running_bs, running_tokens, max_seqlen_q, group):
+        built = super().stage_decode(
+            batch, running_bs, running_tokens, max_seqlen_q, group
+        )
+        _, lengths, _ = self.decode_spans(batch)
+        self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
+        return built
+
+    @property
+    def supports_token_graph(self) -> bool:
+        """Every launch outside the model's eager regions -- the KDA recurrence
+        and the MLA prefill core -- is sized by the token count alone, so a
+        prefill may pad to a recorded token-graph bucket. The regions
+        (`_kda_recurrence`, `attention_mla._mla_prefill_core`) run the whole
+        bucket too. A pad row belongs to no request: its batch id and KV slot
+        are -1, it lies past every request's `cu_seqlens` (a padding request
+        there is zero long), and the KDA metadata names the requests' rows and
+        state slots alone. Their kernels skip it.
+
+        Not under DP: a decoding or idle rank would replay the prefill
+        recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
+        prefill alone. Only while the model opted every MLA layer of its own
+        into the prefill split (`MLAAttention.split_prefill_recording`, which
+        Kimi-K3 sets) and each can take it
+        (`MLAAttention.prefill_split_supported`: no sparse layer, PCP or
+        ``ATOM_USE_TRITON_GEMM``). Any other layer would run as one region,
+        which cannot serve a padded bucket: `forward_impl` takes no live row
+        count, so its FP8 prefill attention would quantize the bucket's pad
+        rows with the step's. A sparse layer's DSA indexer is besides no
+        eager region and returns on the recording's dummy step, so a replay
+        would attend with a stale top-k. So no model on this builder with a
+        sparse MLA layer records: Kimi-K3.1, whose layers opt in but all carry
+        a DSA indexer, and GLM-5.3-Flash, whose layers are all sparse and opt
+        nothing in. A drafter's layers, numbered past the target's
+        (`layer_offset`), do not count: the recording runs the target alone."""
+        config = self.model_runner.config
+        if config.parallel_config.data_parallel_size != 1:
+            return False
+        target_layers = config.hf_config.num_hidden_layers
+        sfc = config.compilation_config.static_forward_context
+        target_mla = [
+            impl
+            for module in sfc.values()
+            if isinstance(impl := getattr(module, "impl", None), MLAAttention)
+            and impl.layer_num < target_layers
+        ]
+        return bool(target_mla) and all(
+            impl.split_prefill_recording and impl.prefill_split_supported()
+            for impl in target_mla
+        )
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A request-less prefill of ``tokens`` rows for recording that
+        token-graph bucket. A dummy step: its regions hand back zeros of their
+        output's shape and touch no KV or state -- a replay runs them on the
+        live step -- and the segments need only its shape."""
+        if not 0 < tokens <= self.model_runner.config.max_num_batched_tokens:
+            raise ValueError(
+                f"token-graph bucket {tokens} exceeds max_num_batched_tokens"
+            )
+        positions = self.model_runner.forward_vars["positions"].gpu[:tokens]
+        positions.zero_()
+        context = Context(
+            positions=positions,
             is_prefill=True,
-            prepare_block_tables=False,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
         )
-        return attn_metadata, positions
+        return AttentionMetaData(max_seqlen_q=tokens, max_seqlen_k=tokens), context
 
-    def prepare_decode(
-        self,
-        batch: ScheduledBatch,
-        running_bs: int,
-        running_tokens: int,
-        max_seqlen_q: int,
-    ):
-        attn_metadata, positions = super().prepare_decode(
-            batch, running_bs, running_tokens, max_seqlen_q
+    def _stage_draft_ctx_slots(
+        self, batch, seqlens_q: np.ndarray, rows: int, group
+    ) -> None:
+        """The draft's own slot for each scheduled token, `-1` out to `rows`,
+        the width the target's `slot_mapping` goes up at, counted into
+        ``group``.
+
+        Runs after the target's staging, whose host positions and packed
+        block table it reads. No DCP filter, as the draft stores every token,
+        and `entry_tokens` per block id.
+        """
+        var = self.model_runner.forward_vars
+        buf = var.get("draft_ctx_slots")
+        if buf is None or batch.is_dummy_run:
+            return
+        n = int(seqlens_q.sum())
+        buf.np[n:rows] = -1
+        if batch.block_tables:
+            slot_mapping(
+                var["positions"].np[:n],
+                seqlens_q,
+                var["block_tables"].np,
+                self.model_runner.draft_kv_builder.kv_pool.entry_tokens,
+                out=buf.np[:n],
+                scratch=self.token_axis_scratch,
+            )
+        else:
+            buf.np[:n] = -1
+        group.set_count(buf, rows)
+
+    def build_for_cudagraph_capture(self, bs: int, *, decode_ubatch_slices=None):
+        attn_metadata, context = super().build_for_cudagraph_capture(
+            bs, decode_ubatch_slices=decode_ubatch_slices
         )
-        self._attach_gdn_decode_metadata(
-            batch,
-            attn_metadata,
-            prepare_block_tables=False,
-        )
-        return attn_metadata, positions
-
-    def _capture_needs_nonempty_kv(self, max_q_len: int) -> bool:
-        # Kimi's dense MLA warmup needs a page even with page_size=1.
-        # The parent owns the single upload, including DCP + MTP capture.
-        return True
-
-    def build_for_cudagraph_capture(self, bs: int):
-        attn_metadata, context = super().build_for_cudagraph_capture(bs)
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
         return attn_metadata, context
 

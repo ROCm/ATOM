@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """K2 ``layer_post``: K2a (``attn_post``) and K2b (``moe``) of one layer in one
 launch -- the attention output to the MoE's reduced output.
 
 K2b's stages follow K2a's on every CTA. A K2a launch ended at its norm and K2b
 started over from x (``ffn_normed``); here the norm's CTAs publish each token's
 row instead (device-scope stores, the load counter drained, then the token's
-flag in XRDY), and xq and the router wait for it and read it at device scope:
-the buffer is every layer's, so a plain load could hit this XCD's L2 copy of
-the previous layer's.
+flag in XRDY), and xq waits for it and reads it at device scope: the buffer
+is every layer's, so a plain load could hit this XCD's L2 copy of the
+previous layer's. Where its tasks fit past the seam's CTAs
+(``RouteShape.router_reads_seam``) the router does not wait for the norm: it
+normalizes its own K part from the seam's LIN (``seam_dot_norm``).
 
 A token-parallel launch (``tok_par``) has each rank's norm publish its own
 tokens' rows here and push them to every other rank's XG (peer buffer); a
@@ -46,6 +49,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_post import (
     run_attn_post,
     run_gates,
 )
+from atom.models.deepseek_v41.mono.kernels.attn_pre import shard_seam
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.models.deepseek_v41.mono.kernels.index_score import await_candidates
@@ -88,6 +92,7 @@ class LayerPostBuild:
     index_bound_max: int = 0
     # the index plane is FP4 (``AttnPostBuild.index_fp4``)
     index_fp4: bool = False
+    index_mfma: bool = False
     experts: int = EXPERTS
     topk: int = TOPK
     # the TP size: every width a rank holds (``Dims``)
@@ -109,15 +114,37 @@ class LayerPostBuild:
     moe_tp: int = 1
     # the pool's rows are MXFP8 (``AttnPostBuild.kv_fp8``)
     kv_fp8: bool = False
+    # the regions kept in two copies (``AttnPostBuild.numa``), K2a's and K2b's
+    numa: str = ""
+    # the residual column-sharded (``attn_pre.shard_seam``): seam F folds this
+    # rank's columns, the MoE output reduce-scattered to its column owners
+    shard: bool = False
+    # the attention's keys include a selection (``AttnPostBuild.attn_sel``)
+    attn_sel: bool = True
+    # a request's rows one block each row sees whole (``AttnPostBuild.block_rows``)
+    block_rows: int = 0
+    # ``AttnPostBuild.staged_answer``
+    staged_answer: bool = False
+
+    def __post_init__(self):
+        assert not (
+            self.shard and (self.tok_par or self.dp_ranks > 1)
+        ), "a seam is sharded by columns or rows"
 
     @property
     def dp_ranks(self) -> int:
-        """DP attention's ranks (1: none)."""
-        return self.ep * self.moe_tp
+        """DP attention's ranks (1: none; expert parallel at attention TP > 1
+        is over the TP ranks, every rank's rows the same)."""
+        return self.ep * self.moe_tp if self.tp == 1 else 1
 
     @property
     def moe_tokens(self) -> int:
         return self.tokens * self.dp_ranks
+
+    @property
+    def index_split(self) -> bool:
+        """Its K2a's (``AttnPostBuild.index_split``)."""
+        return self.halves()[0].index_split
 
     def halves(self):
         """(K2a's build key, K2b's). K2b's scratch starts at ``moe_base``, where
@@ -126,11 +153,16 @@ class LayerPostBuild:
             tokens=self.tokens,
             index_bound_max=self.index_bound_max,
             index_fp4=self.index_fp4,
+            index_mfma=self.index_mfma,
             tp=self.tp,
             timeline=self.timeline,
             diag_off=self.diag_off,
             tok_par=self.tok_par,
             kv_fp8=self.kv_fp8,
+            numa=self.numa,
+            attn_sel=self.attn_sel,
+            block_rows=self.block_rows,
+            staged_answer=self.staged_answer,
         )
         moe_diag = self.diag_off - moe_base(key_a) if self.diag_off >= 0 else -1
         key_b = MoeBuild(
@@ -143,6 +175,9 @@ class LayerPostBuild:
             ug_groups=self.ug_groups,
             ep=self.ep,
             dp_attention=self.moe_tp > 1,
+            numa=self.numa,
+            after_seam=not self.tok_par and self.moe_tp == 1,
+            own_routes=self.tok_par,
         )
         return key_a, key_b
 
@@ -158,8 +193,9 @@ def moe_base(key_a) -> int:
 _K2A = k2a.ABI.names[: k2a.ABI.names.index("scratch")]
 _K2B = [n for n in k2b.ABI.names[: k2b.ABI.names.index("scratch")] if n != "x"]
 ABI = KernelAbi(
-    (*_K2A, *_K2B, "scratch", "sym", "peers", "rank", "layer", "moe_layer", "tl")
-)
+    (*_K2A, *_K2B, "scratch", "numa_word", "sym", "peers", "rank", "layer",
+     "moe_layer", "tl")
+)  # fmt: skip
 
 
 def scratch_layout(key: LayerPostBuild) -> dict[str, tuple[int, int]]:
@@ -184,6 +220,17 @@ def publish_x(ca, cb, t):
     """Token t's ``normed`` row, written at device scope by this CTA's norm, is
     readable by every CTA: the stores drained, then its flag."""
     publish(cb["put"], cb["xrdy"], t, 1, ca["tid"] == 0)
+
+
+def seam_dot_norm(ca) -> dict:
+    """What K2b's router normalizes its own K part from (``router_x_normed``):
+    K2a's seam LIN and LSSQ, polled at K2a's tag, and the FFN norm weight."""
+    return {
+        "poll": ca["poll"],
+        "lin": ca["lin"],
+        "lssq": ca["lssq"],
+        "w": ca["args"]["attn_w"],
+    }
 
 
 # a row's bf16 pairs two at a time: a 16-byte store of (word, tag) x 2
@@ -271,9 +318,11 @@ def build_layer_post(key: LayerPostBuild):
 
     name = kernel_symbol(
         "v41_layer_post", s=s, e=rs.experts, k=rs.topk, tl=int(timeline),
-        ix=int(key.index_bound_max > 0), i4=int(key.index_fp4), tpar=int(key.tok_par),
+        ix=int(key.index_bound_max > 0), i4=int(key.index_fp4),
+        im=int(key.index_mfma), tpar=int(key.tok_par), sh=int(key.shard),
         **({"ep": key.ep} if key.ep > 1 else {}),
         **({"mtp": key.moe_tp} if key.moe_tp > 1 else {}),
+        **({"sa": 1} if key.staged_answer else {}),
     )  # fmt: skip
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -283,8 +332,9 @@ def build_layer_post(key: LayerPostBuild):
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32,
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
-        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
-        q: Int64, pool: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
+        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, ixsel: Int64,
+        sbound: Int64,
+        q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
         qk_scale: Int32, pos: Int64, cos: Int64, sin: Int64, woa: Int64, woa_s: Int64,
@@ -294,9 +344,9 @@ def build_layer_post(key: LayerPostBuild):
         normed: Int64,
         gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
-        qoff: Int64,
-        scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
-        moe_layer: Int32, tl: Int64,
+        queue_words: Int64,
+        scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
+        layer: Int32, moe_layer: Int32, tl: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -317,16 +367,17 @@ def build_layer_post(key: LayerPostBuild):
         args_a = attn_post_args(
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
-            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
-            q, pool, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
+            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, ixsel, sbound,
+            q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed_a,
         )  # fmt: skip
         args_b = moe_args(
             normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
-            qoff,
+            queue_words,
         )  # fmt: skip
+        args_a["numa_word"] = args_b["numa_word"] = numa_word
         ca = attn_post_context(
             key_a, s, lds_a, mailbox(layer, scratch, key.diag_off, layout),
             bases_a, layout_a, scratch,
@@ -336,9 +387,12 @@ def build_layer_post(key: LayerPostBuild):
         cb = moe_context(
             sm, rs, lds_b, mailbox(moe_layer, scratch, key.diag_off, layout),
             bases, layout_b, scratch,
-            args_b, rank, sym,
+            args_b, rank, sym, key_b.numa,
         )  # fmt: skip
         cb["x_cm"], cb["x_ready"] = CM_DEV, True
+        if const_expr(key.shard):
+            shard_seam(ca, ca["peer"], bases, sym, key.tp, "pmixgf")
+            cb["shard_f"] = True
         if const_expr(dpa):
             # one peer layout for both halves: the launch's MoE rows
             ca["peer"] = cb["peer"]
@@ -351,6 +405,8 @@ def build_layer_post(key: LayerPostBuild):
             after_norm = lambda t: publish_x_tok_par(ca, cb, t)
         else:
             after_norm = lambda t: publish_x(ca, cb, t)
+        if const_expr(rs.router_reads_seam):
+            cb["dot_norm"] = seam_dot_norm(ca)
         tls = stamps.tls.ptr
         stamp_begin(timeline, tls, tid, TL_POINTS)
         # the FFN gate, the next layer's, after the stages the MoE waits on
@@ -372,8 +428,9 @@ def build_layer_post(key: LayerPostBuild):
         itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32,
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
-        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
-        q: Int64, pool: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
+        ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, ixsel: Int64,
+        sbound: Int64,
+        q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
         qk_scale: Int32, pos: Int64, cos: Int64, sin: Int64, woa: Int64, woa_s: Int64,
@@ -383,21 +440,21 @@ def build_layer_post(key: LayerPostBuild):
         normed: Int64,
         gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
-        qoff: Int64,
-        scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
-        moe_layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
+        queue_words: Int64,
+        scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
+        layer: Int32, moe_layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         layer_post(
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
-            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
-            q, pool, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
+            isel, icand, ilift, iprod, ibmax, bstride, icout, irow, ixsel, sbound,
+            q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed,
-            gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, qoff,
-            scratch, sym, peers, rank, layer, moe_layer, tl,
+            gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, queue_words,
+            scratch, numa_word, sym, peers, rank, layer, moe_layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(layer_post, launch)

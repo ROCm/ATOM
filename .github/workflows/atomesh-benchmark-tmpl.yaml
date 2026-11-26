@@ -33,6 +33,9 @@ env:
 jobs:
   benchmark:
     name: c=${{ join(matrix.concurrency, ',') }}
+    # Defense-in-depth: current callers do not send PRs to this runner.
+    # Keep forked PRs off ATOMesh self-hosted runners if that changes later.
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
     # Configs run in parallel, so this covers waiting in the Slurm queue; the
     # Slurm job's own --time (runner.time_limit) bounds the run itself.
@@ -212,6 +215,9 @@ jobs:
           ATOMESH_BUILD_MESH: ${{ (inputs.atom_source == 'mounted' || matrix.benchmark.kind == 'aiperf_agentic') && 'true' || 'false' }}
           ATOMESH_MESH_BUILD_PROFILE: release
           ATOMESH_ATOM_SOURCE: ${{ inputs.atom_source }}
+          # Manual runs kill whatever still holds the GPUs of their nodes, even
+          # on Spur, which may co-schedule other users' jobs there.
+          ATOMESH_KILL_GPU_HOLDERS: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
           CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
           RESULT_DIR: atomesh-results
           SLURM_SUBMIT_RUNNER: ${{ matrix.runner.slurm_submit_runner }}

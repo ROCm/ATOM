@@ -9,6 +9,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
+from atom.config import get_current_atom_config
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
@@ -20,6 +21,7 @@ from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.engram.device.layer import EngramOp
 from atom.model_ops.engram.device.staging import EngramStagedRows
+from atom.model_ops.indexer.layout import NATURAL
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
@@ -33,7 +35,7 @@ from atom.utils.forward_context import get_forward_context
 
 from .attention import Attention
 from .config import build_attention_topology
-from .layers import native_quant_config
+from .layers import converted_linear_config, converted_linear_spec
 from .moe import MoE
 
 
@@ -50,6 +52,7 @@ class Block(nn.Module):
         alt_stream: torch.cuda.Stream | None = None,
         compress_stream: torch.cuda.Stream | None = None,
         index_stream: torch.cuda.Stream | None = None,
+        enable_eplb: bool = True,
     ):
         super().__init__()
         self.layer_name = f"v41.layers.{spec.layer_id}"
@@ -64,6 +67,7 @@ class Block(nn.Module):
             prefix=f"{prefix}.ffn",
             quant_config=moe_quant_config,
             alt_stream=alt_stream,
+            enable_eplb=enable_eplb,
         )
         # Weights only: each norm runs inside its seam (`pre_delayed`).
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -105,7 +109,7 @@ class Block(nn.Module):
                 width,
                 hc,
                 config.rms_norm_eps,
-                quant_config=native_quant_config(),
+                quant_config=converted_linear_config(config),
             )
 
     def process_weights_after_loading(self):
@@ -117,8 +121,13 @@ class Block(nn.Module):
                 f"hc_{sublayer}_fn_packed",
                 pack_mhc_fn(getattr(self, f"hc_{sublayer}_fn")),
             )
+        # Only a native group32 `wqkv_a` reads MXFP8; a per-channel one
+        # quantizes its input per token.
         self.hc_fuse_quant = (
-            self.hc_attn_fn_packed is not None and fuse_quant_supported()
+            self.hc_attn_fn_packed is not None
+            and fuse_quant_supported()
+            and self.attn.wqkv_a.native_a8_group_rows is not None
+            and not self.attn.wqkv_a.runs_bf16
         )
 
     def attention_forward(self, normed, cache, step, rope):
@@ -247,7 +256,9 @@ class DeepseekV41ForCausalLM(nn.Module):
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
-    def __init__(self, config, *, max_length, online_quant_config=None):
+    def __init__(
+        self, config, *, max_length, online_quant_config=None, eplb_layer_end=None
+    ):
         super().__init__()
         group = get_tp_group()
         config.validate_parallelism(group.world_size, group.world_size)
@@ -258,9 +269,16 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         # One shared configuration owns all expert source/online quantization
         # rules. Native attention and Engram projections own their A8 layouts.
+        # Shared experts keep the converted spec; online patterns may convert
+        # the routed experts.
         self.moe_quant_config = make_v4_quant_config(
-            config, online_quant_config=online_quant_config
+            config,
+            online_quant_config=online_quant_config,
+            shared_expert_spec=converted_linear_spec(config),
+            online_routed_experts=True,
         )
+        # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
+        self.quant_config = self.moe_quant_config
         # A stream earns a hardware queue only where two branches are live at
         # once -- overlapping lifetimes, not independent data. One per model
         # rather than per layer, because layers do not overlap.
@@ -289,6 +307,9 @@ class DeepseekV41ForCausalLM(nn.Module):
                 alt_stream=self.alt_stream,
                 compress_stream=self.compress_stream,
                 index_stream=self.index_stream,
+                # Unplaced decoder layers keep the non-EPLB expert layout;
+                # weight allocation must not include their unused replicas.
+                enable_eplb=eplb_layer_end is None or spec.layer_id < eplb_layer_end,
             )
             for spec in self.topology
         )
@@ -307,6 +328,23 @@ class DeepseekV41ForCausalLM(nn.Module):
             beta_fast=scaling["beta_fast"],
             beta_slow=scaling["beta_slow"],
         )
+        # gfx1250 FP4 indexer: the folded weights_proj quant kernel reads one
+        # [max_pos, rope_dim] cos|sin table. Build it here, once, so it is sized
+        # into the memory profile rather than allocated lazily mid-decode (after
+        # KV sizing). An Indexer exists only on FULL/REINDEX layers, which are
+        # never ratio 0, and those layers take global_rope. Window layers do
+        # not. Only when the fold can run (NATURAL => gfx1250).
+        if (
+            envs.ATOM_DSV41_FUSE_WEIGHTS_PROJ
+            and get_current_atom_config().index_cache_layout == NATURAL
+        ):
+            self.global_rope.register_buffer(
+                "cos_sin_cache",
+                torch.cat(
+                    (self.global_rope.cos_cache, self.global_rope.sin_cache), dim=-1
+                ).contiguous(),
+                persistent=False,
+            )
 
     @property
     def model(self):

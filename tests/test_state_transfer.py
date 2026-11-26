@@ -7,6 +7,7 @@ import pickle
 import pytest
 
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+from atom.model_engine.state_cache import KEEP_NONE, KEEP_SNAPSHOT
 from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
@@ -21,6 +22,8 @@ def test_wire_round_trip_keeps_the_complete_capability():
         StateTransfer.none(),
         StateTransfer.fork(7),
         StateTransfer.copy("layout-v2"),
+        StateTransfer.copy("layout-v2", decode_keep=KEEP_NONE),
+        StateTransfer.copy("layout-v2", decode_keep=KEEP_SNAPSHOT),
     )
 
     for transfer in transfers:
@@ -43,6 +46,13 @@ def test_invalid_kind_token_and_layout_combinations_are_rejected():
     for args in invalid:
         with pytest.raises(ValueError):
             StateTransfer(*args)
+
+
+def test_only_a_copy_builds_decode_snapshots():
+    with pytest.raises(ValueError, match="decode snapshots"):
+        StateTransfer("fork", 1, decode_keep=KEEP_SNAPSHOT)
+    with pytest.raises(ValueError, match="decode keep"):
+        StateTransfer.copy("layout-v1", decode_keep=True)
 
 
 def test_copy_factory_requires_a_non_empty_layout():

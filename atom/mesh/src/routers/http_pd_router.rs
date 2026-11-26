@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -8,29 +8,26 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{
-        header::{AUTHORIZATION, CONTENT_TYPE},
-        HeaderMap, HeaderValue, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use dashmap::DashSet;
 use futures_util::StreamExt;
 
 #[cfg(test)]
+#[path = "../../tests/routing/http_pd_load_tests.rs"]
 mod load_tests;
 
 use memchr::memmem;
 use reqwest::Client;
-use serde::Serialize;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
-use crate::routers::prepare::inference::{InferenceMetadata, InferenceRequest};
+use crate::routers::prepare::inference::InferenceMetadata;
 
 use crate::{
     config::types::{AtomPdRankMappingPolicy, BackendType, RetryConfig},
     core::{
-        is_retryable_status,
         placement::{
             backend::{
                 atom::{AtomAdapter, AtomPrefillInfo},
@@ -38,7 +35,7 @@ use crate::{
                 vllm::{VllmAdapter, VllmPrefillInfo},
                 BackendAdapter, PairCtx,
             },
-            planner::DefaultPlanner,
+            planner::{idx2idx, DefaultPlanner, Idx2Idx},
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
             traits::PdPlanner,
             types::{PlacementPlan, Protocol, RequestDescriptor},
@@ -50,9 +47,6 @@ use crate::{
         metrics::{metrics_labels, MeshMetrics},
     },
     policies::PolicyRegistry,
-    protocols::{
-        chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
-    },
     routers::{
         comm::{
             error, header_utils,
@@ -72,6 +66,7 @@ pub struct PDRouter {
     pub backend: BackendType,
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
     pub planner: Arc<dyn PdPlanner>,
+    policies: Arc<PolicyRegistryAdapter>,
     pub adapter: Arc<dyn BackendAdapter>,
     /// Set when backend == Atom. enrich_decode_kv is ATOM-specific and not on the trait.
     atom_adapter: Option<Arc<AtomAdapter>>,
@@ -284,28 +279,28 @@ impl Drop for PrefillTask {
 
 #[derive(Clone)]
 struct PDRequestContext<'a> {
-    route: &'static str,
+    route: &'a str,
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<&'a str>,
+    tokens: Option<&'a [u32]>,
+    media_count: usize,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
 }
 
 impl<'a> PDRequestContext<'a> {
-    fn from_metadata(
-        metadata: &'a InferenceMetadata,
-        headers: Option<&HeaderMap>,
-        model: Option<&'a str>,
-    ) -> Self {
+    fn from_metadata(metadata: &'a InferenceMetadata, headers: Option<&HeaderMap>) -> Self {
         Self {
             route: metadata.route,
             batch_size: metadata.batch_size,
             is_stream: metadata.stream,
             return_logprob: metadata.return_logprob,
             request_text: Some(&metadata.text),
-            model_id: model.or_else(|| metadata.model.as_deref().filter(|model| !model.is_empty())),
+            tokens: None,
+            media_count: metadata.media_count,
+            model_id: metadata.model.as_deref().filter(|model| !model.is_empty()),
             headers: headers.cloned().map(Arc::new),
         }
     }
@@ -404,10 +399,14 @@ impl PDRouter {
             }
         };
 
-        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
-            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
-            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
-        ));
+        let policies = Arc::new(PolicyRegistryAdapter::new(policy_registry.clone()));
+        let planner: Arc<dyn PdPlanner> = Arc::new(
+            DefaultPlanner::new(
+                Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
+                policies.clone(),
+            )
+            .with_prefill_on_decode_rank(ctx.router_config.prefill_on_decode_rank()),
+        );
 
         Ok(PDRouter {
             worker_registry,
@@ -417,6 +416,7 @@ impl PDRouter {
             backend,
             atom_pd_rank_mapping_policy: ctx.router_config.atom_pd_rank_mapping_policy,
             planner,
+            policies,
             adapter,
             atom_adapter,
         })
@@ -432,6 +432,7 @@ impl PDRouter {
             decode,
             prefill_policy,
             decode_policy,
+            prefill_tokens,
         } = plan
         else {
             return Err(error::internal_error(
@@ -439,6 +440,9 @@ impl PDRouter {
                 "PD execution requires a pair",
             ));
         };
+        // Under idx2idx the planner selects decode first, and a prefill idx2idx keeps unless
+        // none is available, when this keeps the selected one too. It moves a prefill only
+        // if health or membership changed since planning.
         let prefill = if matches!(self.backend, BackendType::Atom) {
             self.apply_atom_pd_rank_mapping_policy(prefill, &decode)
         } else {
@@ -457,7 +461,7 @@ impl PDRouter {
         }
         Ok(Arc::new(ReservedPair {
             load: parking_lot::Mutex::new(Some([
-                WorkerLoadGuard::new(prefill.clone(), headers),
+                WorkerLoadGuard::new(prefill.clone(), headers).with_prefill_tokens(prefill_tokens),
                 WorkerLoadGuard::new(decode.clone(), headers),
             ])),
             canceled: tokio::sync::watch::channel(false).0,
@@ -473,9 +477,11 @@ impl PDRouter {
         headers: &HeaderMap,
         body: Value,
         metadata: &InferenceMetadata,
+        path: &str,
         placement: Arc<ReservedPair>,
     ) -> Response {
-        let context = PDRequestContext::from_metadata(metadata, Some(headers), None);
+        let mut context = PDRequestContext::from_metadata(metadata, Some(headers));
+        context.route = path;
         self.execute_reserved(Some(headers), body, context, placement)
             .await
     }
@@ -496,32 +502,30 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: &Arc<dyn Worker>,
     ) -> Arc<dyn Worker> {
-        let (Some(prefill_dp_size), Some(decode_dp_rank)) = (prefill.dp_size(), decode.dp_rank())
-        else {
-            debug!(
-                "ATOM PD rank mapping policy=idx2idx skipped: prefill={} prefill_dp_size={:?} decode={} decode_dp_rank={:?}",
-                prefill.url(),
-                prefill.dp_size(),
-                decode.url(),
-                decode.dp_rank()
-            );
-            return prefill;
+        let decode_dp_rank = match idx2idx(prefill.as_ref(), decode.as_ref()) {
+            Idx2Idx::Move(rank) => rank,
+            Idx2Idx::Keep => {
+                debug!(
+                    "ATOM PD rank mapping policy=idx2idx keeps prefill={} decode={}",
+                    prefill.url(),
+                    decode.url()
+                );
+                return prefill;
+            }
+            Idx2Idx::OutOfRange { rank, size } => {
+                // A deployment fault rather than a request's: warn once per prefill.
+                static WARNED: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+                if WARNED.insert(prefill.base_url().to_string()) {
+                    warn!(
+                        "ATOM PD rank mapping policy=idx2idx: decode rank {} is outside prefill {} dp_size {}, so its ranks are not mapped; check the prefill and decode DP sizes",
+                        rank,
+                        prefill.base_url(),
+                        size
+                    );
+                }
+                return prefill;
+            }
         };
-
-        if decode_dp_rank >= prefill_dp_size {
-            warn!(
-                "ATOM PD rank mapping policy=idx2idx skipped: decode rank {} is outside prefill dp_size {} (prefill={}, decode={})",
-                decode_dp_rank,
-                prefill_dp_size,
-                prefill.url(),
-                decode.url()
-            );
-            return prefill;
-        }
-
-        if prefill.dp_rank() == Some(decode_dp_rank) {
-            return prefill;
-        }
 
         let mapped_url = format!("{}@{}", prefill.base_url(), decode_dp_rank);
         match self.worker_registry.get_by_url(&mapped_url) {
@@ -731,16 +735,13 @@ impl PDRouter {
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
-    async fn dispatch_pd<T: Serialize + Clone>(
+    async fn dispatch_pd(
         &self,
         headers: Option<&HeaderMap>,
-        original_request: &T,
+        request: Value,
         context: PDRequestContext<'_>,
+        planner: &dyn PdPlanner,
     ) -> Response {
-        let request = match serde_json::to_value(original_request) {
-            Ok(value) => value,
-            Err(error) => return Self::handle_serialization_error(error),
-        };
         let endpoint = route_to_endpoint(context.route);
         let observation = crate::observability::request::RequestMetrics::new(
             metrics_labels::ROUTER_HTTP,
@@ -749,13 +750,13 @@ impl PDRouter {
             context.route,
             context.is_stream,
         );
-        let response = RetryExecutor::execute_response_with_retry(
+        let attempts = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             |_attempt| {
                 let request = request.clone();
                 let context = context.clone();
                 async move {
-                    let placement = match self.plan_pd_pair(&context).await {
+                    let placement = match self.plan_pd_pair(&context, planner).await {
                         Ok(pair) => pair,
                         Err(response) => return response,
                     };
@@ -763,7 +764,7 @@ impl PDRouter {
                         .await
                 }
             },
-            |response, _| is_retryable_status(response.status()),
+            |response, _| super::http_router::should_retry_inference(context.route, response),
             |delay, attempt| {
                 MeshMetrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
                 MeshMetrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
@@ -779,25 +780,29 @@ impl PDRouter {
                     endpoint,
                 );
             },
-        )
-        .await;
-        observation.wrap_response(response)
+        );
+        let (response, estimate) = crate::observability::route_trace::estimated(attempts).await;
+        // Decode returns the response, but its cached tokens are the ones prefill reused.
+        observation
+            .reconcile(metrics_labels::WORKER_PREFILL, estimate)
+            .wrap_response(response)
     }
 
     async fn plan_pd_pair(
         &self,
         context: &PDRequestContext<'_>,
+        planner: &dyn PdPlanner,
     ) -> Result<Arc<ReservedPair>, Response> {
         let descriptor = RequestDescriptor {
             model_id: context.model_id,
             protocol: Some(Protocol::Http),
             text: context.request_text.as_deref(),
-            tokens: None,
+            tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
+            media_count: context.media_count,
         };
-        let plan = self
-            .planner
+        let plan = planner
             .plan(&descriptor)
             .await
             .map_err(|error| placement_err_to_response(error, context.model_id))?;
@@ -813,7 +818,12 @@ impl PDRouter {
     ) -> Response {
         let prefill = placement.prefill.clone();
         let decode = placement.decode.clone();
-        let ctx = match self.adapter.prepare_pair(prefill.as_ref(), decode.as_ref()) {
+        let pair = self.adapter.prepare_pair_with_media(
+            prefill.as_ref(),
+            decode.as_ref(),
+            context.media_count,
+        );
+        let ctx = match pair {
             Ok(ctx) => ctx,
             Err(error) => return Self::handle_serialization_error(error),
         };
@@ -920,12 +930,13 @@ impl PDRouter {
         let prefill_url_for_log = prefill.url().to_string();
         let prefill_worker = prefill.clone();
         let prefill_router = self.clone();
+        let prefill_headers = headers.cloned();
         let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
         let mut canceled = placement.canceled.subscribe();
         let work = async move {
             let _prefill_guard = prefill_guard;
             match prefill_router
-                .send_worker(prefill_post, prefill_worker)
+                .send_worker(prefill_post, prefill_worker, prefill_headers.as_ref())
                 .await
             {
                 Ok(res) => {
@@ -954,6 +965,7 @@ impl PDRouter {
                 }
             }
         };
+        let work = crate::observability::route_trace::carry(work);
         let prefill_task = PrefillTask(Some(tokio::spawn(async move {
             tokio::select! {
                 biased;
@@ -983,7 +995,7 @@ impl PDRouter {
             Ok(req) => req,
             Err(resp) => return resp,
         };
-        let decode_result = self.send_worker(decode_post, decode.clone()).await;
+        let decode_result = self.send_worker(decode_post, decode.clone(), headers).await;
         events::RequestReceivedEvent {}.emit();
 
         let res = match decode_result {
@@ -1106,7 +1118,9 @@ impl PDRouter {
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
-        let prefill_result = self.send_worker(prefill_post, prefill.clone()).await;
+        let prefill_result = self
+            .send_worker(prefill_post, prefill.clone(), headers)
+            .await;
         let prefill_resp = match prefill_result {
             Ok(r) => r,
             Err(e) => {
@@ -1166,9 +1180,10 @@ impl PDRouter {
         // P has completed its work; D's output stream must not keep P loaded.
         drop(prefill_guard);
 
+        // ATOM's prefill answers without a handoff as `"kv_transfer_params": null`.
         let mut kv_params = match prefill_body.get("kv_transfer_params").cloned() {
-            Some(v) => v,
-            None => {
+            Some(v) if !v.is_null() => v,
+            _ => {
                 error!(
                     "ATOM prefill {} request_id={} response missing kv_transfer_params",
                     prefill.url(),
@@ -1236,7 +1251,7 @@ impl PDRouter {
             Ok(req) => req,
             Err(resp) => return resp,
         };
-        let decode_result = self.send_worker(decode_post, decode.clone()).await;
+        let decode_result = self.send_worker(decode_post, decode.clone(), headers).await;
         events::RequestReceivedEvent {}.emit();
 
         let res = match decode_result {
@@ -1313,7 +1328,7 @@ impl PDRouter {
         let results = tokio::try_join!(
             async {
                 let response = self
-                    .send_worker(p, prefill.clone())
+                    .send_worker(p, prefill.clone(), headers)
                     .await
                     .map_err(|e| error::bad_gateway("prefill_server_error", e.to_string()))?;
                 if !response.status().is_success() {
@@ -1332,7 +1347,7 @@ impl PDRouter {
             },
             async {
                 let response = self
-                    .send_worker(d, decode.clone())
+                    .send_worker(d, decode.clone(), headers)
                     .await
                     .map_err(|e| error::bad_gateway("decode_server_error", e.to_string()))?;
                 events::RequestReceivedEvent {}.emit();
@@ -1543,7 +1558,9 @@ impl PDRouter {
         // before we await a potentially stalled error body below.
         let results = tokio::try_join!(
             async {
-                let result = self.send_worker(prefill_request, prefill.clone()).await;
+                let result = self
+                    .send_worker(prefill_request, prefill.clone(), headers)
+                    .await;
                 let result = match result {
                     Ok(res) if !res.status().is_success() => {
                         return Err(DispatchError::Prefill(res, prefill_guard));
@@ -1559,7 +1576,7 @@ impl PDRouter {
             },
             async {
                 let res = self
-                    .send_worker(decode_request, decode.clone())
+                    .send_worker(decode_request, decode.clone(), headers)
                     .await
                     .map_err(|e| {
                         error!(decode_url = %decode.url(), error = %e, "Decode request failed");
@@ -1822,11 +1839,40 @@ impl PDRouter {
         &self,
         request: reqwest::RequestBuilder,
         worker: Arc<dyn Worker>,
+        headers: Option<&HeaderMap>,
     ) -> Result<WorkerResponse, reqwest::Error> {
-        let policy = match worker.worker_type() {
-            crate::core::WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
-            _ => self.policy_registry.get_decode_policy(),
+        let policy = self.dispatch(&worker, headers);
+        Self::send(request, worker, policy).await
+    }
+
+    /// Runs the dispatch hooks right before the request is sent to `worker`,
+    /// and returns the policy that owns it.
+    fn dispatch(
+        &self,
+        worker: &Arc<dyn Worker>,
+        headers: Option<&HeaderMap>,
+    ) -> Arc<dyn crate::policies::LoadBalancingPolicy> {
+        let (pool, policy) = match worker.worker_type() {
+            crate::core::WorkerType::Prefill { .. } => (
+                metrics_labels::WORKER_PREFILL,
+                self.policy_registry.get_prefill_policy(),
+            ),
+            _ => (
+                metrics_labels::WORKER_DECODE,
+                self.policy_registry.get_decode_policy(),
+            ),
         };
+        // Only a request that is actually sent moves the session.
+        policy.on_dispatch(pool, headers, worker);
+        crate::observability::route_trace::record_dispatch(pool, worker);
+        policy
+    }
+
+    async fn send(
+        request: reqwest::RequestBuilder,
+        worker: Arc<dyn Worker>,
+        policy: Arc<dyn crate::policies::LoadBalancingPolicy>,
+    ) -> Result<WorkerResponse, reqwest::Error> {
         let mut outcome = WorkerOutcome {
             worker: Some(worker),
             policy,
@@ -1848,7 +1894,7 @@ impl PDRouter {
         &self,
         client: &Client,
         worker: &dyn Worker,
-        route: &'static str,
+        route: &str,
         json_request: Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
@@ -1869,28 +1915,23 @@ impl PDRouter {
             )
         })?;
 
+        // Resolve credentials for each PD worker with the same rules as regular ingress.
+        let headers = header_utils::inference_request_headers(
+            headers.unwrap_or(&HeaderMap::new()),
+            route,
+            worker.api_key().as_deref(),
+        )
+        .map_err(|error| {
+            // This worker's key is bad; another worker's may not be.
+            worker.record_outcome(false);
+            error.response(route)
+        })?;
         let mut request = client
             .post(worker.endpoint_url(route))
+            .headers(headers)
             .json(&prepared_request);
         if connection_close {
             request = request.header("Connection", "close");
-        }
-        let api_key = worker.api_key();
-        if let Some(headers) = headers {
-            for (name, value) in headers.iter() {
-                // bearer_auth appends, so omit client credentials when the worker has its own.
-                if name == AUTHORIZATION && api_key.is_some() {
-                    continue;
-                }
-                if header_utils::should_forward_request_header(name.as_str()) {
-                    if let Ok(val) = value.to_str() {
-                        request = request.header(name, val);
-                    }
-                }
-            }
-        }
-        if let Some(key) = api_key {
-            request = request.bearer_auth(key);
         }
         Ok(request)
     }
@@ -2082,37 +2123,33 @@ impl RouterTrait for PDRouter {
             .await
     }
 
-    async fn route_generate(
+    async fn route_inference(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
+        request: super::ingress::InferenceEnvelope,
+        app: &Arc<crate::app_context::AppContext>,
     ) -> Response {
-        let metadata = body.metadata();
-        let context = PDRequestContext::from_metadata(&metadata, headers, model_id);
-        self.dispatch_pd(headers, body, context).await
-    }
-
-    async fn route_chat(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let metadata = body.metadata();
-        let context = PDRequestContext::from_metadata(&metadata, headers, model_id);
-        self.dispatch_pd(headers, body, context).await
-    }
-
-    async fn route_completion(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let metadata = body.metadata();
-        let context = PDRequestContext::from_metadata(&metadata, headers, model_id);
-        self.dispatch_pd(headers, body, context).await
+        let route = request.metadata.route;
+        let routing = super::ingress::IngressRouting::new(app);
+        let placement = match request
+            .prepare_placement(app, &routing, self.policies.clone())
+            .await
+        {
+            Ok(placement) => placement,
+            Err(err) => return err.response(route),
+        };
+        let metadata = &placement.metadata;
+        let (uri, headers, body) = match placement.request.into_pd_parts() {
+            Ok(parts) => parts,
+            Err(err) => return err.response(metadata.route),
+        };
+        let mut context = PDRequestContext::from_metadata(metadata, Some(&headers));
+        context.route = uri
+            .path_and_query()
+            .map(|v| v.as_str())
+            .unwrap_or(metadata.route);
+        context.tokens = placement.tokens.as_deref();
+        self.dispatch_pd(Some(&headers), body, context, &placement.planner)
+            .await
     }
 
     fn router_type(&self) -> &'static str {
@@ -2127,17 +2164,19 @@ mod tests {
         placement::backend::sglang::SglangAdapter, BasicWorkerBuilder, DPAwareWorkerBuilder,
         WorkerType,
     };
+    use crate::protocols::chat::ChatCompletionRequest;
+    use crate::routers::prepare::inference::InferenceRequest;
 
     #[derive(Debug, Default)]
     struct CompletionPolicy(std::sync::Mutex<Vec<bool>>);
     #[async_trait::async_trait]
     impl crate::policies::LoadBalancingPolicy for CompletionPolicy {
-        async fn select_worker(
+        async fn select_with_decision(
             &self,
             _: &[Arc<dyn Worker>],
             _: &crate::policies::SelectWorkerInfo<'_>,
-        ) -> Option<usize> {
-            Some(0)
+        ) -> (Option<usize>, crate::policies::RouteDecision) {
+            (Some(0), crate::policies::RouteDecision::branch("first"))
         }
         fn on_request_complete(&self, _: &str, success: bool) {
             self.0.lock().unwrap().push(success);
@@ -2195,7 +2234,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0; 4096];
-                socket.read(&mut request).await.unwrap();
+                assert!(socket.read(&mut request).await.unwrap() > 0);
                 socket
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
@@ -2211,7 +2250,7 @@ mod tests {
                     .build(),
             );
             let response = router
-                .send_worker(router.client.get(&url), worker.clone())
+                .send_worker(router.client.get(&url), worker.clone(), None)
                 .await
                 .unwrap();
             assert_eq!(worker.circuit_breaker().total_successes(), 0);
@@ -2281,6 +2320,8 @@ mod tests {
                 is_stream: false,
                 return_logprob: false,
                 request_text: None,
+                tokens: None,
+                media_count: 0,
                 model_id: None,
                 headers: None,
             };
@@ -2291,6 +2332,7 @@ mod tests {
                         decode: decode.clone(),
                         prefill_policy: "round_robin",
                         decode_policy: "round_robin",
+                        prefill_tokens: 0,
                     },
                     None,
                 )
@@ -2332,25 +2374,23 @@ mod tests {
     #[cfg(feature = "ext-proc")]
     #[tokio::test]
     async fn http_retries_replan_but_reserved_execution_never_replans_or_counts_twice() {
-        use crate::core::placement::types::PlacementError;
+        use crate::core::prepare_pool::PreparePoolRuntime;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        struct CountingPlanner {
-            inner: Arc<dyn PdPlanner>,
-            calls: AtomicUsize,
-        }
-        #[async_trait::async_trait]
-        impl PdPlanner for CountingPlanner {
-            async fn plan(
-                &self,
-                request: &RequestDescriptor<'_>,
-            ) -> Result<PlacementPlan, PlacementError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                self.inner.plan(request).await
-            }
-        }
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
+        // Every plan reserves its pair once, so prefill selections count plans.
+        let plans = || -> u64 {
+            handle
+                .render()
+                .lines()
+                .filter(|line| {
+                    line.starts_with("mesh_worker_selection_total{")
+                        && line.contains("worker_type=\"prefill\"")
+                })
+                .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+                .sum()
+        };
         let calls = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2367,7 +2407,29 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+        let pool = PreparePoolRuntime::new(
+            crate::config::RouterConfig::default()
+                .resolved_prepare_pool()
+                .unwrap(),
+        )
+        .unwrap();
+        let config = crate::config::RouterConfig {
+            policy: crate::config::PolicyConfig::RoundRobin,
+            mode: crate::config::RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        let app_context = Arc::new(
+            crate::app_context::AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
         let mut router = create_test_pd_router();
+        router.worker_registry = app_context.worker_registry.clone();
         router.retry_config.max_retries = 2;
         router.retry_config.initial_backoff_ms = 1;
         let prefill: Arc<dyn Worker> = Arc::new(
@@ -2384,19 +2446,24 @@ mod tests {
         );
         router.worker_registry.register(prefill.clone());
         router.worker_registry.register(decode.clone());
-        let planner = Arc::new(CountingPlanner {
-            inner: router.planner.clone(),
-            calls: AtomicUsize::new(0),
-        });
-        router.planner = planner.clone();
-        let request: CompletionRequest =
-            serde_json::from_value(json!({"model": UNKNOWN_MODEL_ID, "prompt": "test"})).unwrap();
-        let response = router.route_completion(None, &request, None).await;
+        let body = json!({"model": UNKNOWN_MODEL_ID, "prompt": "test"});
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let request = super::super::ingress::InferenceEnvelope::parse(
+            "/v1/completions".parse().unwrap(),
+            headers,
+            serde_json::to_vec(&body).unwrap().into(),
+            &app_context,
+        )
+        .await
+        .unwrap();
+        let metadata = request.metadata.execution_metadata();
+        let response = router.route_inference(request, &app_context).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        assert_eq!(planner.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(plans(), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert_eq!((prefill.load(), decode.load()), (0, 0));
         let pair = router
@@ -2406,24 +2473,20 @@ mod tests {
                     decode: decode.clone(),
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_tokens: 0,
                 },
                 None,
             )
             .unwrap();
-        let metadata = request.metadata().execution_metadata();
         let response = router
-            .execute_placement(
-                &HeaderMap::new(),
-                serde_json::to_value(&request).unwrap(),
-                &metadata,
-                pair,
-            )
+            .execute_placement(&HeaderMap::new(), body, &metadata, metadata.route, pair)
             .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        assert_eq!(planner.calls.load(Ordering::SeqCst), 2);
+        // The manual reservation above is the only additional plan.
+        assert_eq!(plans(), 3);
         assert_eq!(calls.load(Ordering::SeqCst), 6);
         assert_eq!((prefill.load(), decode.load()), (0, 0));
         let rendered = handle.render();
@@ -2436,14 +2499,120 @@ mod tests {
         server.abort();
     }
 
+    #[derive(Debug)]
+    struct EstimatingPolicy;
+    #[async_trait::async_trait]
+    impl crate::policies::LoadBalancingPolicy for EstimatingPolicy {
+        async fn select_with_decision(
+            &self,
+            _: &[Arc<dyn Worker>],
+            _: &crate::policies::SelectWorkerInfo<'_>,
+        ) -> (Option<usize>, crate::policies::RouteDecision) {
+            let decision = crate::policies::RouteDecision {
+                estimated_hit_ratio: Some(0.5),
+                ..crate::policies::RouteDecision::branch("affinity")
+            };
+            (Some(0), decision)
+        }
+        fn name(&self) -> &'static str {
+            "estimating-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn pd_cached_tokens_are_reconciled_against_the_prefill_estimate() {
+        use crate::core::prepare_pool::PreparePoolRuntime;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let usage = r#"{"usage":{"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+        let app = axum::Router::new()
+            .fallback(move || async move { ([(CONTENT_TYPE, "application/json")], usage) });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let pool = PreparePoolRuntime::new(
+            crate::config::RouterConfig::default()
+                .resolved_prepare_pool()
+                .unwrap(),
+        )
+        .unwrap();
+        let config = crate::config::RouterConfig {
+            mode: crate::config::RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        let app_context = Arc::new(
+            crate::app_context::AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
+        let mut router = create_test_pd_router();
+        router.worker_registry = app_context.worker_registry.clone();
+        router
+            .policy_registry
+            .set_prefill_policy(Arc::new(EstimatingPolicy));
+        router.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/prefill"))
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8001),
+                })
+                .build(),
+        ));
+        router.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/decode"))
+                .worker_type(WorkerType::Decode)
+                .build(),
+        ));
+        let body = json!({"model": UNKNOWN_MODEL_ID, "prompt": "test"});
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let request = super::super::ingress::InferenceEnvelope::parse(
+            "/v1/completions".parse().unwrap(),
+            headers,
+            serde_json::to_vec(&body).unwrap().into(),
+            &app_context,
+        )
+        .await
+        .unwrap();
+
+        let response = router.route_inference(request, &app_context).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+
+        let rendered = handle.render();
+        for line in [
+            r#"mesh_route_cache_tokens_total{pool="prefill",kind="prompt"} 100"#,
+            r#"mesh_route_cache_tokens_total{pool="prefill",kind="cached"} 40"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="estimated"} 50"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="actual"} 40"#,
+        ] {
+            assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+        }
+        assert!(!rendered.contains(r#"pool="decode",kind="#), "{rendered}");
+        server.abort();
+    }
+
     pub(super) fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
+        let policies = Arc::new(PolicyRegistryAdapter::new(policy_registry.clone()));
         let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
             Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
-            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
+            policies.clone(),
         ));
         let adapter: Arc<dyn BackendAdapter> = Arc::new(SglangAdapter);
 
@@ -2455,6 +2624,7 @@ mod tests {
             backend: BackendType::Sglang,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
             planner,
+            policies,
             adapter,
             atom_adapter: None,
         }
@@ -2544,19 +2714,117 @@ mod tests {
                     decode: decode_rank_5.clone(),
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_tokens: 7,
                 },
                 None,
             )
             .unwrap();
         assert_eq!(pair.prefill.url(), "http://prefill@5");
         assert_eq!(pair.prefill.dp_rank(), Some(5));
-        assert_eq!(prefill_rank_2.load(), 0);
+        assert_eq!(
+            (prefill_rank_2.load(), prefill_rank_2.prefill_tokens()),
+            (0, 0)
+        );
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (1, 1));
+        // The prefill charge lands on the rank the request runs on.
+        assert_eq!(prefill_rank_5.prefill_tokens(), 7);
         let execution = pair.clone();
         drop(pair);
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (1, 1));
         drop(execution);
         assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (0, 0));
+        assert_eq!(prefill_rank_5.prefill_tokens(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_session_worker_change_follows_the_mapped_prefill_rank() {
+        use crate::policies::{DpStickyPolicy, LoadBalancingPolicy, SelectWorkerInfo};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let mut router = create_test_pd_router();
+        router.backend = BackendType::Atom;
+        router.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
+        let prefill_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+        router
+            .policy_registry
+            .set_prefill_policy(prefill_policy.clone());
+        let prefill: Vec<_> = [2, 5]
+            .into_iter()
+            .map(|rank| {
+                let worker = create_test_dp_worker(
+                    "http://prefill",
+                    rank,
+                    8,
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                    true,
+                );
+                router.worker_registry.register(worker.clone());
+                worker
+            })
+            .collect();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("session-1"));
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().fallback(|| async { "{}" }))
+                .await
+                .unwrap();
+        });
+        let changes = || -> Vec<String> {
+            handle
+                .render()
+                .lines()
+                .filter(|line| line.starts_with("mesh_session_worker_change_total{"))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        // The session stays pinned to prefill rank 2; idx2idx runs it on the decode rank.
+        for decode_rank in [5, 5, 2] {
+            assert_eq!(prefill_policy.select_worker(&prefill, &info).await, Some(0));
+            let decode =
+                create_test_dp_worker("http://decode", decode_rank, 8, WorkerType::Decode, true);
+            let pair = router
+                .reserve_pair(
+                    PlacementPlan::Pair {
+                        prefill: prefill[0].clone(),
+                        decode,
+                        prefill_policy: "dp_sticky",
+                        decode_policy: "round_robin",
+                        prefill_tokens: 0,
+                    },
+                    Some(&headers),
+                )
+                .unwrap();
+            assert_eq!(pair.prefill.dp_rank(), Some(decode_rank));
+            assert!(changes().is_empty(), "a reservation sends nothing");
+            router
+                .send_worker(
+                    router.client.get(&url),
+                    pair.prefill.clone(),
+                    Some(&headers),
+                )
+                .await
+                .unwrap()
+                .drain()
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            changes(),
+            [r#"mesh_session_worker_change_total{pool="prefill",reason="rank_mapping"} 1"#]
+        );
+        server.abort();
     }
 
     #[test]
@@ -2819,6 +3087,8 @@ mod tests {
             is_stream: false,
             return_logprob: false,
             request_text: None,
+            tokens: None,
+            media_count: 0,
             model_id: Some("m"),
             headers: Some(Arc::new(headers)),
         };

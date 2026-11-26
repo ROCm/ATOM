@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
+from atom.plugin.vllm.kv_transfer.plugin_schedulers import PluginDenseScheduler
 from atom.plugin.vllm.kv_transfer.seq_view import SeqViewRegistry
 
 connector_mod = pytest.importorskip(
@@ -39,7 +39,7 @@ def _adapter(monkeypatch, calls, *, min_load):
         lambda _config=None: SimpleNamespace(chunk_size=CHUNK),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    scheduler = DenseOffloadScheduler(
+    scheduler = PluginDenseScheduler(
         SimpleNamespace(
             kv_transfer_config={"kv_role": "kv_consumer"},
             kv_cache_block_size=16,
@@ -62,14 +62,18 @@ def _adapter(monkeypatch, calls, *, min_load):
     adapter._scheduler = scheduler
     adapter._seqs = SeqViewRegistry()
     adapter._promised_loads = {}
+    adapter._detach_after_alloc, adapter._finished_withdrawals = {}, []
     adapter._requests = {}
     adapter._kda_planner = None
+    adapter._v41_planner = None
     adapter._attn_group_id = 0
     return adapter
 
 
 def _request(req_id: str = "r0", ntok: int = 150_000):
-    return SimpleNamespace(request_id=req_id, prompt_token_ids=list(range(ntok)))
+    return SimpleNamespace(
+        request_id=req_id, prompt_token_ids=list(range(ntok)), num_tokens=ntok
+    )
 
 
 def _end_of_step(adapter):
@@ -81,14 +85,14 @@ def _end_of_step(adapter):
     result that was always there.
 
     The adapter's own `build_connector_meta` wraps the inner one and feeds the
-    result to `_check_promised_loads`; that watchdog is the only thing that ages
+    result to `_settle_promised_loads`; that watchdog is the only thing that ages
     `_promised_loads`, so a step that skips it cannot tell a promise held for
     one step from one held forever. Calling the inner build plus the watchdog
     reproduces that pair without standing up a whole `scheduler_output`.
     """
 
     inner = adapter._scheduler.build_connector_meta()
-    adapter._check_promised_loads(inner)
+    adapter._settle_promised_loads(inner)
 
 
 def test_a_declined_request_stuck_in_waiting_is_looked_up_twice_in_64_steps():
@@ -179,9 +183,11 @@ def test_a_repeatedly_answered_promise_does_not_cry_wolf(caplog):
                 _end_of_step(adapter)
 
     assert "cannot be released" not in caplog.text
-    # One, not zero: the last step re-promised and the watchdog then aged that
-    # promise once. It never gets further than that, which is the point.
-    assert adapter._promised_loads == {"r0": 1}
+    # Nothing is left: the request was never parked, so each step's promise is
+    # dropped at that step's end rather than aged. Re-answering no longer has
+    # to reset a counter for this to hold -- see
+    # `test_an_unparked_promise_is_dropped_even_if_never_asked_again`.
+    assert adapter._promised_loads == {}
 
 
 def test_admission_spends_the_memo():

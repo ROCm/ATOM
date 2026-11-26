@@ -395,7 +395,7 @@ def test_small_prefill_head_groups_refresh_graph_metadata(
     from atom.model_ops.attention_mla import MLAAttention
     from atom.model_ops.attentions.sparse_mla_head_groups import (
         MAX_HEAD_GROUP_ROWS,
-        MLA_WORK_NAMES,
+        PERSISTENT_WORK_BUFFERS,
         SparsePrefillHeadGroups,
     )
 
@@ -436,8 +436,6 @@ def test_small_prefill_head_groups_refresh_graph_metadata(
                 SparsePrefillHeadGroups("cuda") if allow_groups else None
             ),
             "_sparse_prefill_kv_granularity": 2048,
-            "sparse_kv_indices_buffer": indices,
-            "dcp_sparse_kv_indptr_buffer": ptr,
         }.items():
             setattr(attn, name, value)
         sizes = get_mla_metadata_info_v1(
@@ -445,7 +443,7 @@ def test_small_prefill_head_groups_refresh_graph_metadata(
         )
         work = {
             f"sparse_prefill_{name}": torch.empty(shape, dtype=dtype, device="cuda")
-            for name, (shape, dtype) in zip(MLA_WORK_NAMES, sizes)
+            for name, (shape, dtype) in zip(PERSISTENT_WORK_BUFFERS, sizes)
         }
         meta = SimpleNamespace(
             cu_seqlens_q=torch.tensor([0, rows], dtype=torch.int32, device="cuda"),
@@ -457,6 +455,8 @@ def test_small_prefill_head_groups_refresh_graph_metadata(
                 rows + 1, dtype=torch.int32, device="cuda"
             ),
             sparse_kv_indptr=ptr,
+            sparse_kv_indices=indices,
+            dcp_sparse_kv_indptr=ptr,
             sparse_kv_last_page_lens=torch.ones(rows, dtype=torch.int32, device="cuda"),
             **work,
         )

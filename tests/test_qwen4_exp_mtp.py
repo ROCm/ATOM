@@ -11,14 +11,19 @@ import torch
 pytest.importorskip("triton")
 pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
 
+from atom.model_ops.attentions import qwen4_exp_attn
 from atom.model_ops.qwen4_exp.ops.ple import advance_ngram_state, dilated_causal_conv1d
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_compressed_slots,
     qsa_draft_decode_metadata,
+    qsa_expand_block_indices,
+    qsa_paged_mqa_logits,
+    qsa_select_paged_groups,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
 )
+from atom.spec_decode.draft_graph import StagedInput
 
 
 def test_qwen_mtp_does_not_import_deepseek_when_pcp_disabled(monkeypatch):
@@ -244,6 +249,20 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
 
+    class Group:
+        """The decode group, as far as the MRoPE planes are concerned."""
+
+        def __init__(self):
+            self.counts = []
+
+        def set_count(self, buffer, count):
+            self.counts.append((buffer, count))
+
+        def publish(self):
+            for buffer, count in self.counts:
+                buffer.gpu.view(-1)[:count] = buffer.cpu.view(-1)[:count]
+            self.counts = []
+
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     cpu = torch.full((3, 32), -999, dtype=torch.int64)
     gpu = torch.full_like(cpu, -777)
@@ -251,23 +270,34 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
         config=SimpleNamespace(max_model_len=8192),
         use_mrope=True,
         forward_vars={
-            "mrope_positions": SimpleNamespace(cpu=cpu, np=cpu.numpy(), gpu=gpu)
+            "mrope_positions": SimpleNamespace(cpu=cpu, np=cpu.numpy(), gpu=gpu),
+            "cu_seqlens_q": SimpleNamespace(np=np.zeros(33, dtype=np.int32)),
+        },
+        h2d_groups={
+            "decode_metadata": Group(),
+            "mrope": SimpleNamespace(check_writable=lambda: None),
         },
         _mrope_positions_view=lambda n: gpu.as_strided((3, n), (n, 1)),
     )
-    builder._build_qsa_metadata = lambda *args, **kwargs: None
-    builder._build_ple_metadata = lambda *args, **kwargs: None
+    for name in ("_stage_qsa", "_stage_ple", "_finish_qsa", "_finish_ple"):
+        setattr(builder, name, lambda *args, **kwargs: None)
     width = k + 1
 
-    def prepare(self, batch, running_bs, running_tokens, max_seqlen_q):
+    def stage(self, batch, running_bs, running_tokens, max_seqlen_q, group):
         return (
             SimpleNamespace(max_seqlen_q=max_seqlen_q),
             self._build_mrope_decode_positions(
-                batch, batch.context_lens, max_seqlen_q, running_tokens=running_tokens
+                batch,
+                batch.context_lens,
+                group,
+                running_tokens=running_tokens,
             ),
         )
 
-    monkeypatch.setattr(GDNAttentionMetadataBuilder, "prepare_decode", prepare)
+    monkeypatch.setattr(GDNAttentionMetadataBuilder, "stage_decode", stage)
+    monkeypatch.setattr(
+        GDNAttentionMetadataBuilder, "finish_decode", lambda *args: None
+    )
     # Shrinking requests must not expose the previous batch's axis/tail data.
     for scheduled in (4, 3, 1):
         tokens = scheduled * width
@@ -277,17 +307,51 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
         )
         batch = SimpleNamespace(
             total_tokens_num_decode=tokens,
+            total_seqs_num_decode=scheduled,
+            num_scheduled_tokens=np.full(scheduled, width, dtype=np.int32),
             context_lens=ends,
             req_ids=tuple(range(scheduled)),
             mrope_position_deltas={},
         )
         _, positions = builder.prepare_decode(batch, 4, 4 * width, width)
         reference = torch.from_numpy(expected)
-        torch.testing.assert_close(positions, reference)
-        assert positions.stride(0) == 4 * width
+        # The running tokens, the scheduled ones first and zeros after.
+        assert positions.shape == (3, 4 * width) and positions.stride(0) == 4 * width
+        torch.testing.assert_close(positions[:, :tokens], reference)
         graph_positions = builder.model_runner._mrope_positions_view(4 * width)
         torch.testing.assert_close(graph_positions[:, :tokens], reference)
         assert not graph_positions[:, tokens:].count_nonzero()
+
+
+@pytest.mark.parametrize("opted_in", [True, False])
+def test_mrope_draft_graph_declares_positions_with_the_batch_at_axis_1(opted_in):
+    """Qwen3.8's MTP head declares its steps 1+ with `[3, bs]` positions; an
+    MRoPE draft model that has not opted in still declares no pass."""
+    from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
+    from atom.spec_decode.eagle_proposer import EagleProposer
+
+    proposer = SimpleNamespace(
+        runner=SimpleNamespace(use_mrope=True),
+        mtp_k=3,
+        speculative_config=SimpleNamespace(
+            draft_model_hf_config=SimpleNamespace(hidden_size=8, hc_count=2)
+        ),
+        model=object.__new__(Qwen4ExpMTP) if opted_in else SimpleNamespace(),
+        dtype=torch.bfloat16,
+        _step_forward=lambda *a, **kw: None,
+        _step_head=lambda *a, **kw: None,
+        _step_warmup_inputs=lambda *a, **kw: None,
+    )
+    graphs = EagleProposer._declare_draft_graphs(proposer)
+    if not opted_in:
+        assert graphs == () and proposer.step is None
+        return
+    (graph,) = graphs
+    assert graph.inputs["positions"] == StagedInput(
+        shape=(3,), dtype=torch.int64, batch_dim=1
+    )
+    assert graph.inputs["hidden_states"].shape == (2, 8)
+    assert proposer._reuse_step_buffers
 
 
 def test_draft_qsa_view_drops_only_graph_padding():
@@ -315,6 +379,36 @@ def test_draft_qsa_view_drops_only_graph_padding():
         assert getattr(draft, name).data_ptr() == getattr(metadata, name).data_ptr()
     assert draft.block_tables is metadata.block_tables
     assert draft.seq_lens is metadata.seq_lens
+
+
+def test_qsa_prefill_pages_only_the_scheduled_requests(monkeypatch):
+    """A prefill of fewer requests than its `running_bs` uploads a block table
+    of `running_bs` rows for the drafter; QSA pages through the scheduled
+    requests' rows alone, one a sequence length (#3160)."""
+    monkeypatch.setattr(qwen4_exp_attn, "qsa_compressed_slots", lambda *args: None)
+    running_bs, num_reqs, num_tokens = 16, 14, 40
+    builder = object.__new__(qwen4_exp_attn.Qwen4ExpMetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(hf_config=SimpleNamespace(indexer_compress_ratio=4)),
+        forward_vars={
+            "qsa_token_to_req": SimpleNamespace(gpu=torch.zeros(64, dtype=torch.int32)),
+            "qsa_logical_positions": SimpleNamespace(
+                gpu=torch.zeros(64, dtype=torch.int64)
+            ),
+            "qsa_compressed_slots": torch.zeros(64, dtype=torch.int64),
+        },
+    )
+    attn_metadata = SimpleNamespace(
+        block_tables=torch.zeros(running_bs, 8, dtype=torch.int32),
+        slot_mapping=torch.zeros(64, dtype=torch.int64),
+        context_lens=torch.ones(running_bs, dtype=torch.int32),
+        max_seqlen_k=8,
+    )
+
+    qsa = builder._finish_qsa(attn_metadata, num_reqs, num_tokens)
+
+    assert qsa.block_tables.shape[0] == qsa.seq_lens.numel() == num_reqs
+    assert qsa.block_tables.data_ptr() == attn_metadata.block_tables.data_ptr()
 
 
 def test_draft_allocation_profile_does_not_require_qsa_pools():
@@ -596,3 +690,180 @@ def test_qsa_verification_is_causal_and_matches_individual_queries(k, start):
         torch.testing.assert_close(
             batched[row : row + 1], reference, rtol=0.001, atol=0.001
         )
+
+
+def _qsa_index_batch(prefixes, query_lens, seed, block=64, ratio=4):
+    """Index queries and a paged compressed-key cache for prefill chunks with
+    the given prefixes, on non-consecutive pages."""
+    device = "cuda"
+    gen = torch.Generator(device=device).manual_seed(seed)
+    seq_lens = [p + q for p, q in zip(prefixes, query_lens)]
+    pages_per_req = [-(-s // block) for s in seq_lens]
+    width = max(pages_per_req)
+    pool = torch.randperm(sum(pages_per_req) + width, device=device, generator=gen)
+    tables = pool[: len(seq_lens) * width].view(len(seq_lens), width).to(torch.int32)
+    positions = torch.cat(
+        [torch.arange(p, p + q, device=device) for p, q in zip(prefixes, query_lens)]
+    )
+    requests = torch.cat(
+        [
+            torch.full((q,), r, dtype=torch.int32, device=device)
+            for r, q in enumerate(query_lens)
+        ]
+    )
+    lengths = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    index_q = torch.randn(
+        positions.numel(), 4, 128, dtype=torch.bfloat16, device=device, generator=gen
+    )
+    compressed = torch.randn(
+        pool.numel(),
+        block // ratio,
+        1,
+        128,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=gen,
+    )
+    return index_q, compressed, tables, requests, positions, lengths, max(seq_lens)
+
+
+def _require_flydsl_scorer(allow_flydsl):
+    if not allow_flydsl:
+        return
+    pytest.importorskip("flydsl")
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx942":
+        pytest.skip("the FlyDSL index scorer is built for gfx942")
+
+
+_QSA_BATCHES = {
+    # A prefixed chunk and a fresh request; 2503 rows do not split evenly.
+    "2503-rows": ((5000, 0), (1500, 1003)),
+    # The smallest sharded forward (> HC_QUANT_ROWS_MAX): TP4 gives 257-row
+    # shards, TP8 129-row shards.
+    "1025-rows": ((6000,), (1025,)),
+}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("calls", ["shard", "half-shard", "200-rows"])
+@pytest.mark.parametrize("allow_flydsl", [False, True], ids=["triton", "flydsl"])
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("batch", list(_QSA_BATCHES))
+def test_qsa_row_sharded_selection_matches_whole_batch(batch, tp, allow_flydsl, calls):
+    """Sequence-parallel prefill selects each rank's rows and gathers the
+    groups before expanding. The whole batch is scored in one call, which
+    takes the >256-row scorer (FlyDSL in serving prefill, else Triton MFMA).
+    The shards take that scorer too when they exceed 256 rows: in one call
+    ("shard") or chunked in two ("half-shard": TP2 / TP4 at 2503 rows and
+    TP2 at 1025 rows stay above 256 per call). Smaller calls ("200-rows",
+    129-row TP8 shards, other half shards) take the stacked <=256-row scorer. The scorers' logits differ in the last FP32 bits only (see
+    `test_qsa_index_scorers_agree_on_visible_logits`), so the selection is
+    expected to match unless a top-k boundary is tied that closely."""
+    _require_flydsl_scorer(allow_flydsl)
+    ratio, budget = 4, 2048
+    index_q, compressed, tables, requests, positions, lengths, max_seq = (
+        _qsa_index_batch(*_QSA_BATCHES[batch], seed=7)
+    )
+    rows = positions.numel()
+    common = {
+        "token_topk": budget,
+        "compress_ratio": ratio,
+        "max_seq_len": max_seq,
+        "allow_flydsl": allow_flydsl,
+    }
+    whole = qsa_select_paged_tokens(
+        index_q, compressed, tables, requests, positions, lengths, **common
+    )
+
+    # The scored width, as `qsa_select_paged_groups` bounds it.
+    columns = min(
+        tables.shape[1] * compressed.shape[1],
+        1 << ((max_seq + ratio - 1) // ratio - 1).bit_length(),
+    )
+    chunk = -(-rows // tp)
+    rows_per_call = {"shard": None, "half-shard": -(-chunk // 2), "200-rows": 200}
+    per_call = rows_per_call[calls]
+    workspace = (
+        {} if per_call is None else {"logits_workspace_bytes": per_call * columns * 4}
+    )
+    shards = []
+    for rank in range(tp):
+        local = slice(rank * chunk, min((rank + 1) * chunk, rows))
+        groups, output_width = qsa_select_paged_groups(
+            index_q[local],
+            compressed,
+            tables,
+            requests[local],
+            positions[local],
+            lengths,
+            **workspace,
+            **common,
+        )
+        shards.append(
+            torch.nn.functional.pad(groups, (0, 0, 0, chunk - groups.shape[0]))
+        )
+    gathered = torch.cat(shards)[:rows]
+    sharded = qsa_expand_block_indices(
+        gathered,
+        positions,
+        lengths,
+        requests,
+        ratio,
+        budget,
+        output_width=output_width,
+    )
+    assert sharded.shape == whole.shape
+    assert torch.equal(sharded, whole)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("allow_flydsl", [False, True], ids=["triton", "flydsl"])
+def test_qsa_index_scorers_agree_on_visible_logits(allow_flydsl):
+    """Which scorer a row gets depends on the row count of its call (stacked
+    up to 256 rows, FlyDSL / Triton MFMA above), so row sharding can move a
+    row across that boundary. The scorers must agree on every visible logit
+    up to FP32 rounding; only a top-k tie that close can then select
+    differently."""
+    _require_flydsl_scorer(allow_flydsl)
+    ratio = 4
+    index_q, compressed, tables, requests, positions, lengths, max_seq = (
+        _qsa_index_batch(*_QSA_BATCHES["2503-rows"], seed=11)
+    )
+    rows = positions.numel()
+    columns = min(
+        tables.shape[1] * compressed.shape[1],
+        1 << ((max_seq + ratio - 1) // ratio - 1).bit_length(),
+    )
+
+    def score(rows_per_call):
+        logits, visible = [], []
+        for start in range(0, rows, rows_per_call):
+            part = slice(start, min(start + rows_per_call, rows))
+            starts = torch.empty(
+                part.stop - start, dtype=torch.int32, device=index_q.device
+            )
+            out, ends = qsa_paged_mqa_logits(
+                index_q[part],
+                compressed,
+                tables,
+                requests[part],
+                positions[part],
+                lengths,
+                ratio,
+                max_columns=columns,
+                row_starts=starts,
+                allow_flydsl=allow_flydsl,
+            )
+            col = torch.arange(out.shape[1], device=out.device)[None]
+            logits.append(out)
+            visible.append((col >= starts[:, None]) & (col < ends[:, None]))
+        return torch.cat(logits), torch.cat(visible)
+
+    large, large_visible = score(rows)  # FlyDSL or Triton MFMA
+    stacked, stacked_visible = score(256)
+    assert torch.equal(large_visible, stacked_visible)
+    torch.testing.assert_close(
+        stacked[stacked_visible], large[large_visible], rtol=0, atol=1e-5
+    )

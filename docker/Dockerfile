@@ -444,7 +444,8 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="v0.3.14-rc1"
+# Same Mooncake commit as docker/atom_release.dockerfile.
+ARG MOONCAKE_COMMIT="206d6340a8b578f44519ccef90bdbfe8483d0231"
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
 # [MC 1/4] Clone
@@ -551,11 +552,14 @@ RUN pip install rocm-trace-lite && \
 ARG CACHEBUST=1
 # Optional Cargo features; ext-proc is excluded unless explicitly requested.
 ARG ATOM_MESH_FEATURES=""
+# The vLLM OOT stage pins llguidance <1.8 and downgrades it; there vLLM's own
+# structured output serves. ATOM's native backend needs 1.9.1.
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
 RUN pip show atom || true
+RUN python -c "import llguidance, re2; from importlib.metadata import version; print('structured output: llguidance', version('llguidance'))"
 
 RUN pip install --no-cache-dir msgpack msgspec quart
 

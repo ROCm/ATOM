@@ -39,7 +39,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 from .op import exp
 
@@ -438,6 +438,18 @@ def _replayssm_commit_kernel(
     tl.store(write_pos + slot, base + tl.load(num_accepted + i_n))
 
 
+def seed_forked_slots(ckpt: torch.Tensor, fork_slots: torch.Tensor | None) -> None:
+    """Copy a state fork's source checkpoint onto its write slot.
+
+    The kernels read and write `slot_idx` only, and a fork's write slot must
+    hold the base its records fold onto. The builder parks that slot's cursor
+    at -1, so nothing is folded over it. `fork_slots` is the builder's int64
+    `[2, F]` (write, source) pairs, so this indexes without a host sync.
+    """
+    if fork_slots is not None:
+        ckpt[fork_slots[0]] = ckpt[fork_slots[1]]
+
+
 def replayssm_commit(
     write_pos: torch.Tensor,
     slot_idx: torch.Tensor,
@@ -512,8 +524,10 @@ def _replayssm_materialize_kernel(
     stride_bufg_pos: tl.constexpr,
     stride_bufg_hv: tl.constexpr,
     DOT_MODE: tl.constexpr,
+    IS_KDA: tl.constexpr,
 ):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    # Rows on axis 0: layers x sequences x heads outgrows axis 1's limit.
+    i_nh, i_v = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     if i_n >= N:
         return
@@ -537,10 +551,14 @@ def _replayssm_materialize_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     mask_k = o_k < K
     mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
 
-    p_src = ckpt + src * stride_ckpt_slot + i_hv * K * V
-    b_s0 = tl.load(p_src + o_k[:, None] * V + o_v[None, :], mask=mask_h, other=0.0).to(
+    mask_h = mask_k[:, None] & mask_v[None, :]
+    # A [K, V] tile either way; KDA keeps the state transposed as [V, K].
+    if IS_KDA:
+        off = i_hv * K * V + o_k[:, None] + o_v[None, :] * K
+    else:
+        off = i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+    b_s0 = tl.load(ckpt + src * stride_ckpt_slot + off, mask=mask_h, other=0.0).to(
         tl.float32
     )
     b_kw, b_ru, b_decay = _replay_tiles_kmajor(
@@ -567,15 +585,11 @@ def _replayssm_materialize_kernel(
         V,
         BK,
         BH,
-        False,
+        IS_KDA,
     )
     b_h = b_s0 * b_decay[:, None] + _replay_dot(b_kw, b_ru, True, DOT_MODE)
-    p_dst = ckpt + dst * stride_ckpt_slot + i_hv * K * V
-    tl.store(
-        p_dst + o_k[:, None] * V + o_v[None, :],
-        b_h.to(p_dst.dtype.element_ty),
-        mask=mask_h,
-    )
+    p_dst = ckpt + dst * stride_ckpt_slot + off
+    tl.store(p_dst, b_h.to(p_dst.dtype.element_ty), mask=mask_h)
 
 
 def replayssm_materialize(
@@ -590,7 +604,8 @@ def replayssm_materialize(
     max_query_len: int,
 ) -> None:
     """Write the state after verify step ``step_idx[i]`` of ``slot_idx[i]``
-    into checkpoint slot ``dst_idx[i]`` (GDN, scalar gate).
+    into checkpoint slot ``dst_idx[i]``. GDN (scalar gate, ``[HV, K, V]``) or
+    KDA (per-channel gate, a 4-D ``buf_g``, transposed ``[HV, V, K]``).
 
     Call after the verify forward and before :func:`replayssm_commit` for that
     step: the rebuild re-derives the forward's append offset from the cursor
@@ -599,7 +614,8 @@ def replayssm_materialize(
     round-trip.  The source slot's checkpoint and records are only read.
 
     Args:
-        ckpt: ``[num_slots, HV, K, V]`` contiguous checkpoint pool
+        ckpt: ``[num_slots, HV, K, V]`` (KDA ``[num_slots, HV, V, K]``)
+            contiguous checkpoint pool
         buf_k / buf_u / buf_g: this layer's record buffers
         write_pos: ``[num_slots]`` int32 cursor, not yet advanced for this step
         slot_idx: ``[N]`` live slot of each sequence
@@ -612,9 +628,10 @@ def replayssm_materialize(
         return
     if not ckpt.is_contiguous():
         raise ValueError("replayssm_materialize requires a contiguous checkpoint")
-    if buf_g.ndim != 3:
-        raise ValueError("replayssm_materialize supports the scalar-gate GDN ring")
-    _, HV, K, V = ckpt.shape
+    is_kda = buf_g.ndim == 4
+    # The records name the head dims; the checkpoint's axis order is layout.
+    HV, K, V = ckpt.shape[1], buf_k.shape[-1], buf_u.shape[-1]
+    assert ckpt[0, 0].numel() == K * V, "checkpoint and records disagree on K, V"
     cap = buf_k.shape[2]
     assert flush_threshold_ok(cap, max_query_len)
     BK = triton.next_power_of_2(K)
@@ -624,7 +641,7 @@ def replayssm_materialize(
     # The forward's replay tile: `base + step + 1` never exceeds
     # `cap - max_query_len` (see the flush policy above).
     BH = max(16, triton.next_power_of_2(cap - max_query_len))
-    _replayssm_materialize_kernel[(NV, n * HV)](
+    _replayssm_materialize_kernel[(n * HV, NV)](
         ckpt=ckpt,
         buf_k=buf_k,
         buf_u=buf_u,
@@ -653,6 +670,7 @@ def replayssm_materialize(
         stride_bufg_pos=buf_g.stride(2),
         stride_bufg_hv=buf_g.stride(1),
         DOT_MODE=_replay_dot_mode(buf_u.dtype),
+        IS_KDA=is_kda,
         num_warps=1,
         num_stages=3,
     )
@@ -1342,11 +1360,30 @@ def _serial_launch_config(
     where BV=64 stays best; num_stages is flat either way.
 
     The small-batch rule is gated to gfx950, the only architecture it was
-    measured on. Other targets (gfx942, gfx1250) keep the large-batch config
-    until tests/bench_replayssm_decode.py shows BV=16 winning there too.
+    measured on. The gfx1250 ladder below is gated to the one shape it was
+    measured on; other shapes and gfx942 keep the large-batch config.
     """
     if not is_kda and max_query_len > 1 and N * HV <= 768 and get_gfx() == "gfx950":
         return min(triton.next_power_of_2(V), 16), 1, 3
+    if (
+        not is_kda
+        and HV == 48
+        and V == 128
+        and max_query_len == 4
+        and get_gfx_runtime() == "gfx1250"
+    ):
+        # gfx1250, Qwen3.8 H=16 HV=48 K=V=128 T=4, cold state, CUDA graph,
+        # us at BV=64 -> chosen BV: bs1 9.3 -> 6.6 (BV16), bs4 9.5 -> 8.3
+        # (BV16), bs8 10.5 -> 10.5 (BV64), bs16 20.6 -> 18.7 (BV32), bs48
+        # 49.3 -> 43.7 (BV32), bs128 128.7 -> 113.1 (BV32). num_warps=2 is
+        # slower at every size.
+        if N * HV <= 192:
+            bv = 16
+        elif N * HV <= 384:
+            bv = 64
+        else:
+            bv = 32
+        return min(triton.next_power_of_2(V), bv), 1, 3
     return min(triton.next_power_of_2(V), 64), 1, 3
 
 
@@ -1369,6 +1406,7 @@ def replayssm_gated_delta_rule(
     is_kda: bool = False,
     route: str = "auto",
     o: torch.Tensor | None = None,
+    fork_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ReplaySSM forward for one linear-attention layer.
 
@@ -1390,6 +1428,8 @@ def replayssm_gated_delta_rule(
         o: optional contiguous ``[T_tot, HV, V]`` destination (e.g. a slice of
             the layer's output buffer); the kernel writes into it directly
             instead of a fresh tensor, saving the caller a device copy.
+        fork_slots: a state fork's (write, source) slot pairs, see
+            :func:`seed_forked_slots`.
 
     Returns:
         ``o`` of shape ``[1, T_tot, HV, V]`` -- same leading-batch convention
@@ -1397,6 +1437,7 @@ def replayssm_gated_delta_rule(
         replacement at the call sites in ``attention_gdn.py``.
     """
     assert q.shape[0] == 1, "varlen layout expected (B == 1)"
+    seed_forked_slots(ckpt, fork_slots)
     _, T_tot, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     N = cu_seqlens.numel() - 1
@@ -1698,8 +1739,8 @@ def _replayssm_kda_fwd_kernel(
     p_k = k + (bos * H + i_h) * K + o_k
     p_v = v + (bos * HV + i_hv) * V + o_v
     p_o = o + (bos * HV + i_hv) * V + o_v
-    p_a = a + (bos * HV + i_hv) * K + o_k
-    p_b = b + bos * HV + i_hv
+    p_a = a + bos * stride_a_token + i_hv * K + o_k
+    p_b = b + bos * stride_b_token + i_hv
     p_A_log = A_log + i_hv
     p_dt_bias = dt_bias + i_hv * K + o_k
 
@@ -1778,6 +1819,7 @@ def replayssm_sigmoid_gating_delta_rule(
     scale: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     lower_bound: float | None = None,
+    fork_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ReplaySSM for the KDA (Kimi-K3) linear-attention layer.
 
@@ -1786,9 +1828,11 @@ def replayssm_sigmoid_gating_delta_rule(
     the pool holds one checkpoint per request instead of one state per
     speculative token.  See the module docstring for the algebra.
 
-    ``o`` may be passed to write the output in place (K3 does this).
+    ``o`` may be passed to write the output in place (K3 does this);
+    ``fork_slots`` as in :func:`replayssm_gated_delta_rule`.
     """
     assert q.shape[0] == 1, "varlen layout expected (B == 1)"
+    seed_forked_slots(ckpt, fork_slots)
     _, T_tot, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     N = cu_seqlens.numel() - 1
@@ -1813,7 +1857,12 @@ def replayssm_sigmoid_gating_delta_rule(
     # short buffer pads rather than shrinks.
     BH = max(16, triton.next_power_of_2(cap - max_query_len))
 
-    q, k, v, a, b = (x.contiguous() for x in (q, k, v, a, b))
+    q, k, v = (x.contiguous() for x in (q, k, v))
+    # Column views need no copy when each token's head/channel row is dense.
+    if a.stride(-1) != 1 or a.stride(-2) != K:
+        a = a.contiguous()
+    if b.stride(-1) != 1:
+        b = b.contiguous()
     out = q.new_empty(1, T_tot, HV, V) if o is None else o.unsqueeze(0)
 
     _replayssm_kda_fwd_kernel[(NV, N * HV)](

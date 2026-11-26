@@ -3,8 +3,14 @@
 Flash uses `qwen4_exp` / `Qwen4ExpForConditionalGeneration`. Target and MTP
 compute run through Native ATOM `Qwen4Exp` and `Qwen4ExpMTP`; the plugin
 adapts SGLang scheduling, QSA KV pools, PLE state and HC hidden storage.
-It requires the Native Flash implementation in this tree and SGLang 0.5.17.
-The recognition patch supplies Flash config registration for that version.
+Run this recipe inside the ATOM SGLang release Docker image with its bundled
+ATOM, SGLang, and AITER. The
+[release image definition](../../docker/sglang_release.dockerfile) currently
+pins SGLang v0.5.22. This integration requires SGLang 0.5.20 or
+newer; upstream recognizes `qwen4_exp`, and the recognition patch adds only
+the MTP draft-arch and HC-width adapters.
+The bundled AITER must include [ROCm/aiter#8083](https://github.com/ROCm/aiter/pull/8083)
+(`db870a851` or later), which provides the QSA support queries used by ATOM.
 
 `Qwen4ExpForConditionalGeneration` is 48 layers: 36 Gated-DeltaNet and 12 QSA
 (query-sparse, 2048-token budget) attention layers, 4-stream
@@ -43,7 +49,6 @@ python -m sglang.launch_server \
   --sampling-defaults openai
 ```
 
-SGLang and ATOM must both be installed or available on `PYTHONPATH`.
 The target and draft share the same checkpoint, including its `mtp.*` weights.
 Flash MTP supports one QSA draft layer and top-k 1; separate draft checkpoints
 and other speculative algorithms are rejected. For eager comparison, replace
@@ -57,6 +62,76 @@ curl http://127.0.0.1:8000/generate \
   -H 'Content-Type: application/json' \
   -d '{"text":"The result of 17 + 25 is", "sampling_params":{"temperature":0,"top_k":1,"top_p":1,"max_new_tokens":64}}'
 ```
+
+## MI308X pure TP2 / TP4 with BF16 MTP
+
+For the `Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16` checkpoint on gfx942, use
+`--ep-size 1`. ATOM keeps the logical expert shard at 320 (TP2) or 160
+(TP4), and stores it at 320 or 192 respectively. Both the FP8 target and
+BF16 MTP fuse the shared expert into slot 512, so AITER sees 513 experts
+and top-k 11. The target and draft retain their checkpoint dtypes.
+
+The 64-aligned layout and BF16 MTP fusion are limited to gfx942 with 80 CU,
+TP2/TP4, EP disabled and DP1, hidden size 2560, and routed/shared intermediate
+size 640. They require the fused 513-expert/top-k-11 layout and runtime CT
+PTPC FP8 or BF16 weights. Other configurations retain the previous policy;
+this guard does not query AITER's tuned-row coverage.
+
+Run the following inside the release container. Leave `AITER_CONFIG_FMOE`
+unset so AITER discovers the tuning tables automatically:
+
+```bash
+export MODEL_PATH=/models/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16
+export CUDA_VISIBLE_DEVICES=0,1
+export HIP_VISIBLE_DEVICES=0,1
+export GPU_ARCHS=gfx942
+export SGLANG_PLUGINS=atom_sglang
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models
+export SGLANG_USE_AITER=1
+
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" --trust-remote-code \
+  --host 127.0.0.1 --port 8000 --tp-size 2 --ep-size 1 \
+  --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 \
+  --context-length 32768 --max-running-requests 8 \
+  --mem-fraction-static 0.95 --disable-radix-cache \
+  --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 8 \
+  --mamba-radix-cache-strategy extra_buffer --max-mamba-cache-size 80 \
+  --mamba-ssm-dtype float32 \
+  --speculative-algorithm EAGLE --speculative-num-steps 2 \
+  --speculative-num-draft-tokens 3 --speculative-eagle-topk 1 \
+  --speculative-use-rejection-sampling
+```
+
+For TP4, expose four GPUs in both visibility variables and use
+`--tp-size 4 --ep-size 1`. TP4 expert padding adds about 5.64 GiB per rank
+for the 48 FP8 target layers, plus about 240 MiB for the BF16 draft layer;
+include that storage in the memory budget.
+
+With `AITER_CONFIG_FMOE` unset, AITER automatically merges its default MoE
+table with `aiter/configs/model_configs/*tuned_fmoe*.csv`, including this
+model's FP8 PTPC and BF16 tables. Explicit CSV overrides are for debugging;
+leave them unset for normal serving. The tables contain FlyDSL, ASM and
+CK entries, so a successful dispatch means the selected row's actual
+kernel runs. Check that the logs show `gfx942`, 80 CU, physical intermediate
+320/192, 513 experts and top-k 11, with FP8/per-token for target and BF16/no
+quantization for draft. A `ck kernel not found` warning is a failed tuned
+dispatch even if inference continues with a fallback.
+
+CK instances must also have been **generated for gfx942**. A mixed-arch
+prebuild can embed gfx942 code objects while its Python code generator chose
+the gfx950 instance list. In that case, setting `GPU_ARCHS` at runtime does
+not replace the installed module: rebuild the affected BF16 and FP8 CK MoE
+modules with `GPU_ARCHS=gfx942` and use a separate `AITER_JIT_DIR` to keep
+the original installation intact. Do not change the CSV kernel names to
+match the incorrect prebuild.
+
+ATOM applies this weight alignment in its model/method layer;
+`AITER_MOE_PADDING_SIZE` alone does not enable it. Graph token padding is
+handled separately from the expert intermediate padding. For correctness
+comparisons, keep the speculative horizon, sampling parameters, SSM dtype,
+cache settings and prompt template the same across runs.
 
 ## Long-context high-throughput serving (no MTP)
 
@@ -115,12 +190,16 @@ gated behind environment variables:
   combine into the next mix.
 * shared expert: routed through the fused MoE as expert 512 (top-k + 1),
   scoring with sigmoid.
-* batch-1 MoE: routing and experts in two Triton kernels.
+* batch-1 MoE: the scoped gfx942/80 CU pure TP2/TP4 setup (EP1, DP1) uses
+  AITER for both CT PTPC FP8 and BF16. Outside it, `moe_decode_single_token`
+  remains available for compatible fused FP8 experts with per-channel scales
+  and intermediate width 320; other calls use their normal FusedMoE path.
 * QSA indexer scoring: matrix cores for prefill, CUDA cores for decode-sized
   batches.
 
-The MTP drafter's single layer runs unfused (separate `mix`/`combine`) and
-keeps a standalone shared expert.
+The MTP drafter's single layer keeps separate HC `mix`/`combine` operations.
+For the MI308X pure TP2/TP4 configuration above, its BF16 shared expert is
+fused into the MoE; other MTP layouts retain the standalone shared expert.
 
 ## Optional: quantized prefill all-reduce (lossy)
 
@@ -130,6 +209,75 @@ RCCL. AITER's quick all-reduce with INT6 codes halves that
 message size, so decode all-reduces stay exact. It perturbs prefill
 activations (max ~3% of a tensor's range per reduction), so validate accuracy
 on the target workload before enabling it.
+
+## Optional: bursty prefill on an idle server
+
+When several requests reach an idle server at once and their prefill takes
+more than one batch, overlap scheduling launches the next prefill batch before
+it processes the results of the previous one. The first batch's requests then
+get their first token only after the next batch has also run. To process each
+prefill batch's results before the next prefill batch launches, add one
+variable to the MTP command in [Text serving with MTP](#text-serving-with-mtp)
+and keep all of its flags:
+
+```bash
+export SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=1
+```
+
+* It only changes back-to-back prefill (extend) batches. Decode and
+  target-verify batches keep overlap scheduling. Unlike
+  `--disable-overlap-schedule`, decode stays asynchronous.
+* It helps only when prefill batches run back to back, for example a burst
+  that does not fit in one batch. A short request that arrives alone sees no
+  change.
+* SGLang notes that this setting may slightly hurt throughput. Every pair of
+  back-to-back prefill batches loses overlap, including the chunks of one
+  long prompt. Measure steady-load throughput on the target workload before
+  enabling it.
+* The recv-skipper settings (`--scheduler-recv-interval` with
+  `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_*`) can also gather a burst into one
+  batch. They are not recommended here: the window counts scheduler
+  iterations rather than time, so its length depends on the host and the load.
+
+Measurements retained from the upstream recipe used the TP2/EP2 command in
+[Text serving with MTP](#text-serving-with-mtp) on 2x MI308X (gfx942), ROCm
+7.2.4, SGLang v0.5.22. The default was run twice, before and after the switch,
+to show run-to-run drift. Burst TTFT in ms, median / mean / P99, for N requests sent
+together to an idle server:
+
+| Prompt | N | Default | Default, repeat | Switch on |
+|---|---|---|---|---|
+| 2048 | 1 | 233 / 238 / 269 | 229 / 240 / 293 | 228 / 230 / 242 |
+| 2048 | 2 | 453 / 455 / 464 | 477 / 474 / 505 | 344 / 343 / 460 |
+| 2048 | 4 | 585 / 585 / 590 | 613 / 614 / 646 | 587 / 498 / 591 |
+| 2048 | 8 | 1003 / 1001 / 1018 | 1046 / 1045 / 1102 | 1000 / 907 / 1017 |
+| 4096 | 1 | 275 / 282 / 314 | 282 / 292 / 330 | 274 / 274 / 277 |
+| 4096 | 2 | 538 / 539 / 543 | 549 / 552 / 571 | 411 / 410 / 552 |
+| 4096 | 4 | 947 / 950 / 978 | 950 / 971 / 1027 | 948 / 780 / 951 |
+| 4096 | 8 | 1813 / 1731 / 1836 | 1868 / 1785 / 1913 | 1159 / 1299 / 1834 |
+
+In every wave the first request of the burst was admitted alone (splits
+`1+1`, `1+3`, `1+7`, and `1+4+3` for 4096 x 8). The switch returns
+that request after its own batch instead of after the next one. When the
+median request falls in the second batch (N=4, and 2048 x 8), only the mean
+improves. P99 is set by the last batch. With the switch it is within or below
+the range of the two default runs.
+
+Steady-load output throughput in tok/s, mean of 4 runs (`bench_serving`
+random, 128 prompts, `--max-concurrency 8`). Request rates inf and 2 were run
+twice each; the concurrency cap holds both at the same achieved 1.0 / 1.3
+req/s, so they are pooled:
+
+| Input / output | Default | Default, repeat | Switch on |
+|---|---|---|---|
+| 2048 / 512 | 512 | 509 | 503 |
+| 6144 / 256 | 331 | 342 | 336 |
+
+In the 2048 / 512 runs at request rate 2, the switch was 2-5% lower (mean 487
+vs 498-515 for the two default runs; single runs 472.5 / 502.3 vs 513.5 /
+516.9 / 507.8 / 488.0). The other runs were within noise. Median ITL is
+9.7-9.8 ms in all runs. GSM8K (5-shot, chat, 200 questions): 0.98 / 0.985
+default, 0.99 with the switch.
 
 ## Benchmark
 
@@ -142,10 +290,9 @@ python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30080 \
 
 ## Boundaries
 
-- Use BF16 KV and page size 64. TP greater than 1 without EP is validated only
-  for the PTPC checkpoint without MTP (the long-context configuration above,
-  TP2/EP1); otherwise use EP, as the MTP configuration does, because the
-  expert intermediate width is 640.
+- Use BF16 KV and page size 64. Pure TP2/TP4 with BF16 MTP uses the gfx942
+  configuration above. Other platforms, expert quantization formats and TP
+  sizes are outside that configuration's validation scope.
 - Leave PLE embeddings in Native ATOM; do not enable PLE embedding offload.
   The memory fraction above leaves room for plugin-owned QSA indexer caches.
 - Validation covers text requests, concurrent mixed lengths, long prompts,
@@ -153,6 +300,8 @@ python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30080 \
   graph replay. It does not establish
   multimodal MTP, radix caching, performance gains, or correctness at other
   parallel sizes and speculative horizons.
-- On a SGLang upgrade, review recognition and MTP EntryClass mapping separately.
-  Upstream Flash recognition does not replace Native ATOM compute or the
-  plugin's graph padding and post-draft metadata refresh contracts.
+- When updating the release image, review recognition and MTP EntryClass
+  mapping separately. Upstream Flash recognition does not replace Native ATOM
+  compute or the plugin's graph padding and post-draft metadata refresh contracts. Also check
+  that `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP`, an internal SGLang
+  scheduler variable, still exists and keeps the same meaning.

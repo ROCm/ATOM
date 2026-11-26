@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """A step's beginning (``DESIGN_v3`` I1), one launch: every mailbox buffer
 zeroed, then the peer fence -- no rank pushes a step's first pair into a peer's
 buffer before that peer has zeroed it.
@@ -37,14 +38,16 @@ from atom.mono.device.ops import (
 from atom.mono.device.sync import DIAG_TICKS
 from atom.mono.plan.build_key import key_tuple, source_digest
 from atom.mono.plan.execution import BLOCKS, THREADS
+from atom.mono.polling import POLL_SLEEP_UNITS
 
 _CURRENT_STREAM = fx.Stream(None)
 
 # int64 epoch slots at a peer buffer's tail, one a source rank
 FENCE_SLOTS = 8
 FENCE_BYTES = FENCE_SLOTS * 8
-# a runner's scratch buffers a step zeroes, at most (its peer data besides)
-MAX_SCRATCH = 2
+# the scratch ranges a step zeroes, at most (its peer data besides): a
+# runner's buffers whole, or the parts of them its step's width uses
+MAX_SCRATCH = 4
 # a lane zeroes 16 B a store: every buffer's size is a multiple
 ZERO_ALIGN = 16
 # the step begin's own int64 words (``state``): its epoch, a debug build's
@@ -102,7 +105,7 @@ def _wait_arrived(state, e):
         return ballot(bad) != 0
 
     while late():
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(POLL_SLEEP_UNITS)
 
 
 @traced
@@ -126,13 +129,13 @@ def _fence(peers, fence_off, rank, state, e, tp, debug):
     seen = seen_now()
     if const_expr(not debug):
         while ballot(seen < e) != 0:
-            rocdl.s_sleep(1)
+            rocdl.s_sleep(POLL_SLEEP_UNITS)
             seen = seen_now()
     else:
         t0 = memrealtime()
         late = fx.Int32(0)
         while (ballot(seen < e) != 0) & (late == 0):
-            rocdl.s_sleep(1)
+            rocdl.s_sleep(POLL_SLEEP_UNITS)
             seen = seen_now()
             late = (memrealtime() - t0 > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
         if (tid < tp) & (seen < e):
@@ -155,17 +158,18 @@ def _build(key: StepBeginBuild):
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def step_begin(
-        s0: Int64, n0: Int64, s1: Int64, n1: Int64,
-        peers: Int64, fence_off: Int64, rank: Int32, state: Int64,
+        s0: Int64, n0: Int64, s1: Int64, n1: Int64, s2: Int64, n2: Int64,
+        s3: Int64, n3: Int64, peers: Int64, peer_n: Int64, fence_off: Int64,
+        rank: Int32, state: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane0, stride = bid * THREADS + tid, BLOCKS * THREADS
         # this step's epoch: CTA 0 stores it only once every CTA flagged
         e = _ld64(rsrc(state), EPOCH) + 1
-        # the peer data first, at system scope: in memory before the epoch
-        # announces it to a peer
-        _zero(load_ptr64(peers, rank), fence_off, lane0, stride, CM_SYS)
+        # the peer data first (``peer_n`` of it: what the step uses), at system
+        # scope: in memory before the epoch announces it to a peer
+        _zero(load_ptr64(peers, rank), peer_n, lane0, stride, CM_SYS)
         rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
         if (bid != 0) & (tid == 0):
@@ -180,37 +184,46 @@ def _build(key: StepBeginBuild):
             _fence(peers, fence_off, rank, state, e, tp, debug)
         _zero(s0, n0, lane0, stride)
         _zero(s1, n1, lane0, stride)
+        _zero(s2, n2, lane0, stride)
+        _zero(s3, n3, lane0, stride)
 
     @launcher(name)
     def launch(
-        s0: Int64, n0: Int64, s1: Int64, n1: Int64,
-        peers: Int64, fence_off: Int64, rank: Int32, state: Int64,
-        stream: fx.Stream = _CURRENT_STREAM,
+        s0: Int64, n0: Int64, s1: Int64, n1: Int64, s2: Int64, n2: Int64,
+        s3: Int64, n3: Int64, peers: Int64, peer_n: Int64, fence_off: Int64,
+        rank: Int32, state: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
-        step_begin(s0, n0, s1, n1, peers, fence_off, rank, state).launch(
-            grid=(BLOCKS,), block=(THREADS,), stream=stream
-        )
+        step_begin(
+            s0, n0, s1, n1, s2, n2, s3, n3, peers, peer_n, fence_off, rank, state
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch
 
 
-def step_begin(scratch, peers, state: torch.Tensor, debug: bool) -> None:
-    """Zero ``scratch`` (at most MAX_SCRATCH tensors) and the data region of
-    ``peers`` (a ``PeerBuffer``), then the fence: one launch on the current
-    stream (a graph records it). ``state``: STATE_WORDS int64, zero at first."""
-    assert len(scratch) <= MAX_SCRATCH
-    # the peer data's size is its fence slots' offset
-    sizes = [peers.bytes.nbytes] + [b.nbytes for b in scratch]
+def step_begin(scratch, peers, state: torch.Tensor, debug: bool, extents=None) -> None:
+    """Zero the scratch and the data region of ``peers`` (a ``PeerBuffer``),
+    then the fence: one launch on the current stream (a graph records it).
+    ``scratch``: tensors zeroed whole; ``extents``: instead, (the peer data's
+    bytes to zero from its start, [(address, bytes), ..] of scratch ranges) --
+    what a step of one width uses, every range it may find a stale pair in.
+    At most MAX_SCRATCH ranges. ``state``: STATE_WORDS int64, zero at first."""
+    if extents is None:
+        extents = (peers.bytes.nbytes, [(b.data_ptr(), b.nbytes) for b in scratch])
+    peer_n, ranges = extents
+    assert len(ranges) <= MAX_SCRATCH and peer_n <= peers.bytes.nbytes
+    sizes = [peer_n] + [n for _, n in ranges]
     assert all(n % ZERO_ALIGN == 0 for n in sizes), sizes
     args = []
-    for b in scratch:
-        args += [b.data_ptr(), b.nbytes]
-    args += [0, 0] * (MAX_SCRATCH - len(scratch))
+    for at, n in ranges:
+        args += [at, n]
+    args += [0, 0] * (MAX_SCRATCH - len(ranges))
     _run_compiled(
         _build(StepBeginBuild(peers.addresses.numel(), debug)),
         *args,
         peers.addresses.data_ptr(),
+        peer_n,
+        # the peer data's size is its fence slots' offset
         peers.bytes.nbytes,
         peers.rank,
         state.data_ptr(),

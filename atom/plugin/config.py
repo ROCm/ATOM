@@ -388,8 +388,9 @@ def _vllm_kv_transfer_config(config: Any) -> dict:
     # defaults alone (`kv_load_failure_policy`, an empty extra-config) made
     # this return a truthy dict -- which every reader takes as "a transport is
     # configured". That is what this docstring has always promised not to do,
-    # and the readers are not all V4.1's: `qwen4_exp_attn` refuses outright on
-    # a truthy value, and `EngineCore` sets `kv_transfer_enabled` from one.
+    # and the readers are not all V4.1's: `qwen4_exp_attn` checks a truthy value
+    # against its offload rules (and refuses it under RapidServe), and
+    # `EngineCore` sets `kv_transfer_enabled` from one.
     if not translated.get("kv_connector"):
         return {}
     return translated
@@ -461,11 +462,11 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
     vllm_enable_dbo = getattr(vllm_parallel_config, "enable_dbo", False)
 
-    # DeepSeek-V4.1's pool is either unpacked bf16 or ATOM's packed fp4; it has
-    # no fp8 variant and no "auto". The chosen dtype fixes the proxy layer's
-    # page size, so it has to be resolved here -- before Config.__post_init__
-    # runs the V4.1 runtime gate on it -- rather than left as vLLM's spelling.
+    # Normalize V4.1's BF16/FP8/FP4 pool dtype before Config admission.
+    # Proxy sizing and KV transport use the same spelling normalization;
+    # explicit FP4 remains FP4 on all supported head counts.
     kv_cache_dtype = vllm_cache_config.cache_dtype
+    kv_transfer_config = _vllm_kv_transfer_config(config)
     from atom.plugin.vllm.deepseek_v41_bridge import (
         is_deepseek_v41_vllm_config,
         v41_kv_cache_dtype,
@@ -473,6 +474,13 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
     if is_deepseek_v41_vllm_config(config):
         kv_cache_dtype = v41_kv_cache_dtype(config)
+        # A naming boundary, not a workaround. V4.1's transport is a vLLM
+        # connector, gated by vLLM name in `enforce_deepseek_v41_constraints`
+        # and handed its own view of the config by vLLM. The model's validator
+        # resolves names through ATOM's connector registry, where every vLLM
+        # name is unknown, and `atom/models` carries no vLLM knowledge, so it
+        # is not given one.
+        kv_transfer_config = {}
 
     return Config(
         model=vllm_model_config.model,
@@ -491,8 +499,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         # vLLM's KV transport, carried across so a model's own
         # `validate_runtime_config` can gate on it. Without this the gate reads
         # an empty dict in plugin mode and admits every connector silently --
-        # the check passes because it was never asked the question.
-        kv_transfer_config=_vllm_kv_transfer_config(config),
+        # the check passes because it was never asked the question. V4.1 is
+        # the exception above: its gate is the platform's.
+        kv_transfer_config=kv_transfer_config,
         port=None,
         torch_profiler_dir=None,
         compilation_config=vllm_compilation_config,
@@ -726,6 +735,19 @@ def _generate_atom_config_from_sglang_config(config: Any):
     atom_kv_cache_dtype = server_args.kv_cache_dtype
     if str(atom_kv_cache_dtype).startswith("fp8"):
         atom_kv_cache_dtype = "fp8"
+    atom_index_cache_dtype = atom_kv_cache_dtype
+
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        is_deepseek_v41_config,
+        sglang_v41_kv_cache_dtype,
+    )
+
+    if is_deepseek_v41_config(sgl_model_config.hf_config):
+        # ATOM owns the pool, in the format the operator named (the raw
+        # value: SGLang resolves "auto" in its own bags); the index plane is
+        # not the main pool's format (None: Config's FP8 default).
+        atom_kv_cache_dtype = sglang_v41_kv_cache_dtype(server_args.kv_cache_dtype)
+        atom_index_cache_dtype = None
 
     atom_speculative_config = _build_atom_speculative_config_from_sglang(
         server_args, sgl_model_config.hf_config
@@ -749,7 +771,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         enforce_eager=True,
         parallel_config=sgl_parallel_config,
         kv_cache_dtype=atom_kv_cache_dtype,
-        index_cache_dtype=atom_kv_cache_dtype,
+        index_cache_dtype=atom_index_cache_dtype,
         enable_prefix_caching=False,
         port=None,
         torch_profiler_dir=None,

@@ -11,10 +11,15 @@ pytest.importorskip("aiter")
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.model_ops.engram.device.staging import EngramRowsView
 from atom.utils.forward_context import Context, ForwardContext, _forward_context_local
-from atom.utils.tbo.ubatch_splitting import UBatchSlice, _split_prefill_token_midpoint
+from atom.utils.tbo.ubatch_splitting import (
+    NUM_TBO_UBATCHES,
+    UBatchSlice,
+    cut_prefill_ubatches,
+)
 from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
-from tests.attentions.deepseek_v41.helpers import metadata_buffers
+from tests.attentions.deepseek_v41.helpers import metadata_buffers, stage_query_layout
 
 
 def attach_ubatch_buffers(builder, max_tokens):
@@ -23,6 +28,19 @@ def attach_ubatch_buffers(builder, max_tokens):
     runner's forward_vars and each microbatch's indptrs."""
     builder.max_num_batched_tokens = max_tokens
     builder.model_runner.forward_vars.update(builder._ubatch_step_buffers())
+    builder._ubatch_prefill_window_staging = [
+        (
+            torch.empty(
+                (4 * builder.geometry.ring_slots + max_tokens)
+                * builder.geometry.window_row_bytes,
+                dtype=torch.uint8,
+                device=builder.device,
+            )
+            if builder.geometry.window_fp8
+            else None
+        )
+        for _ in range(NUM_TBO_UBATCHES)
+    ]
     builder._ubatch_indptrs = [
         {
             ratio: tuple(
@@ -31,11 +49,11 @@ def attach_ubatch_buffers(builder, max_tokens):
             )
             for ratio in builder.geometry.layer_ratios
         }
-        for _ in range(builder._NUM_TBO_UBATCHES)
+        for _ in range(NUM_TBO_UBATCHES)
     ]
 
 
-def make_parent(device, lengths=(10, 4), starts=(3, 8), replaying=None):
+def make_builder(device, kv_dtype="bf16"):
     geo = V41PoolGeometry(
         4,
         ((0, 2), (2, 1)),
@@ -45,6 +63,7 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8), replaying=None):
         32,
         layer_ratios=(0, 1, 2),
         index_topk=4,
+        kv_dtype=kv_dtype,
     )
     cache = PagedAttentionCache(geo, 8, 4, device, max_tokens=32)
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
@@ -54,6 +73,23 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8), replaying=None):
         forward_vars=metadata_buffers(4, 32, 4, device, geo)
     )
     attach_ubatch_buffers(builder, 32)
+    builder.engram = None
+    return builder
+
+
+def make_parent(
+    device,
+    lengths=(10, 4),
+    starts=(3, 8),
+    replaying=None,
+    parts=None,
+    builder=None,
+    kv_dtype="bf16",
+):
+    """A prefill step of ``lengths`` requests at ``starts``, cut into
+    micro-batches ``parts`` (`AttentionMetaData.ubatches`), on ``builder`` or a
+    fresh one."""
+    builder = make_builder(device, kv_dtype) if builder is None else builder
     batch = SimpleNamespace(
         is_dummy_run=False,
         is_final_chunk=None,
@@ -66,19 +102,64 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8), replaying=None):
         total_tokens_num=sum(lengths),
         total_seqs_num=len(lengths),
     )
-    # The runner publishes the query prefix before the public builder entry.
-    cu = builder.model_runner.forward_vars["cu_seqlens_q"]
-    cu.np[0] = 0
-    for i, length in enumerate(lengths):
-        cu.np[i + 1] = cu.np[i] + length
-    cu.copy_to_gpu(len(lengths) + 1)
-    builder.engram = None
-    parent, _ = builder.prepare_prefill(batch, len(lengths), batch.total_tokens_num)
-    parent.engram_embeddings = {
-        layer: torch.arange(sum(lengths) * 4, device=device).view(1, -1, 4) + layer
-        for layer in (1, 3)
-    }
+    stage_query_layout(builder, lengths, len(lengths), sum(lengths))
+    parent, _ = builder.prepare_prefill(
+        batch, len(lengths), batch.total_tokens_num, ubatch_slices=parts
+    )
+    attach_engram(
+        parent,
+        {
+            layer: torch.arange(sum(lengths) * 4, device=device).view(1, -1, 4) + layer
+            for layer in (1, 3)
+        },
+    )
     return builder, parent
+
+
+@pytest.mark.parametrize("kv_dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_prefill_children_keep_disjoint_staging_across_layers_and_forwards(
+    kv_dtype, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from atom.model_ops.attentions.deepseek_v41.planes import prefill_window
+
+    builder, parent = make_parent(device, kv_dtype=kv_dtype)
+    parts = (
+        UBatchSlice(slice(0, 1), slice(0, 7)),
+        UBatchSlice(slice(0, 2), slice(7, 14)),
+    )
+    pointers = [s.data_ptr() for s in builder._ubatch_prefill_window_staging]
+    assert len(set(pointers + [parent.step.prefill_window_staging.data_ptr()])) == 3
+    for _ in range(2):
+        _, parent = make_parent(device, builder=builder, parts=parts)
+        children = parent.ubatches
+        for layer in range(4):
+            saved = None
+            for i, child in enumerate(children):
+                child.step.begin_forward()
+                assert child.step.prefill_window_staging.data_ptr() == pointers[i]
+                source, tail = prefill_window(
+                    parent.cache.ring_view(layer),
+                    child.step,
+                    builder.geometry.ring_slots,
+                )
+                for plane in tail:
+                    plane.fill_(17 + i + layer)
+                if i == 0:
+                    first = source
+                    saved = tuple(plane.clone() for plane in source)
+                else:
+                    for actual, expected in zip(first, saved):
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def attach_engram(parent, rows):
+    """What `prepare_model_inputs` hangs on a step and its micro-batches."""
+    parent.engram_embeddings = rows
+    for child in parent.ubatches or ():
+        child.engram_embeddings = EngramRowsView(rows, child.parent_tokens)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -86,26 +167,30 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8), replaying=None):
 def test_prefill_slices_keep_absolute_positions_and_independent_plans(device, cut):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("GPU required")
-    builder, parent = make_parent(device)
-    steps = []
+    parts = (
+        UBatchSlice(slice(0, 1 if cut <= 10 else 2), slice(0, cut)),
+        UBatchSlice(slice(0 if cut < 10 else 1, 2), slice(cut, 14)),
+    )
+    builder = make_builder(device)
+    # The parent's step buffers the micro-batches must leave alone, as the
+    # parent alone stages them.
+    make_parent(device, builder=builder)
     before = {
         name: value.gpu.clone()
         for name, value in builder.model_runner.forward_vars.items()
+        if not name.startswith(("ub0_", "ub1_"))
     }
-    for i, (start, end, rs) in enumerate(
-        (
-            (0, cut, slice(0, 1 if cut <= 10 else 2)),
-            (cut, 14, slice(0 if cut < 10 else 1, 2)),
-        )
-    ):
-        part = UBatchSlice(rs, slice(start, end))
-        child = builder.build_ubatch_prefill_metadata(
-            parent, part, rs.stop - rs.start, i
+    _, parent = make_parent(device, parts=parts, builder=builder)
+    steps = []
+    for part, child in zip(parts, parent.ubatches):
+        rs, (start, end) = part.request_slice, (
+            part.token_slice.start,
+            part.token_slice.stop,
         )
         steps.append(child.step)
         assert child.cache is parent.cache
         assert child.step.swa_replay_start is parent.step.swa_replay_start
-        assert child.step.width == end - start
+        assert child.step.running_tokens == end - start
         torch.testing.assert_close(
             child.step.positions, parent.step.positions[start:end]
         )
@@ -176,9 +261,15 @@ def test_prefill_children_publish_independent_packed_score_plans(device):
     )
     from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
 
-    builder, parent = make_parent(device)
+    builder = make_builder(device)
     workspace = ScoreWorkspace(
-        replace(builder.geometry, index_fp4=True, index_dim=128, index_block_rows=8),
+        replace(
+            builder.geometry,
+            index_fp4=True,
+            index_dim=128,
+            index_block_rows=8,
+            index_layout="preshuffle",
+        ),
         32,
         4,
         device,
@@ -186,14 +277,18 @@ def test_prefill_children_publish_independent_packed_score_plans(device):
     )
     builder.add_step_planner(ScorePlanner(workspace, (1, 2), 32))
     attach_ubatch_buffers(builder, 32)
-    parent.cache.workspace = workspace
+    builder.cache.workspace = workspace
     parts = (
         UBatchSlice(slice(0, 1), slice(0, 7)),
         UBatchSlice(slice(0, 2), slice(7, 14)),
     )
-    first = builder.build_ubatch_prefill_metadata(parent, parts[0], 1, 0)
-    snapshots = {name: rows.clone() for name, rows in first.step.planned.items()}
-    second = builder.build_ubatch_prefill_metadata(parent, parts[1], 2, 1)
+    # The first micro-batch's plans on their own, then beside the second's.
+    _, alone = make_parent(device, parts=parts[:1], builder=builder)
+    snapshots = {
+        name: rows.clone() for name, rows in alone.ubatches[0].step.planned.items()
+    }
+    _, parent = make_parent(device, parts=parts, builder=builder)
+    first, second = parent.ubatches
     for name, expected in snapshots.items():
         torch.testing.assert_close(first.step.planned[name], expected)
         assert (
@@ -250,9 +345,11 @@ def test_kv_release_keeps_persistent_ubatch_buffers_for_rebind(device):
         total_tokens_num=14,
         total_seqs_num=2,
     )
-    parent, _ = builder.prepare_prefill(batch, 2, batch.total_tokens_num)
     part = UBatchSlice(slice(0, 2), slice(7, 14))
-    child = builder.build_ubatch_prefill_metadata(parent, part, 2, 0)
+    parent, _ = builder.prepare_prefill(
+        batch, 2, batch.total_tokens_num, ubatch_slices=(part,)
+    )
+    [child] = parent.ubatches
     torch.testing.assert_close(child.step.positions, parent.step.positions[7:14])
     assert child.cache is builder.cache
     assert {
@@ -343,16 +440,13 @@ def test_narrowed_tile_rows_stay_compact_and_within_their_microbatch():
 def test_prefill_microbatches_keep_workspace_tiles_across_layer_interleaving():
     from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
 
-    builder, parent = make_parent("cuda")
+    builder = make_builder("cuda")
     workspace = ScoreWorkspace(builder.geometry, 32, 4, "cuda")
-    parent.cache.workspace = workspace
-    parts = _split_prefill_token_midpoint(2, [10, 4], 2, None)
-    children = [
-        builder.build_ubatch_prefill_metadata(
-            parent, part, part.request_slice.stop - part.request_slice.start, i
-        )
-        for i, part in enumerate(parts)
-    ]
+    builder.cache.workspace = workspace
+    _, parent = make_parent(
+        "cuda", parts=cut_prefill_ubatches(2, [10, 4], 14), builder=builder
+    )
+    children = parent.ubatches
     for ratio in (1, 2):
         first = parent.cache.unit_tiles(children[0].step, ratio)
         expected = first.clone()
@@ -377,8 +471,8 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
     from atom.model_ops.engram.device.hashing import engram_row_indices_reference
     from atom.utils.forward_context import get_forward_context
     from atom.utils.tbo.ubatching import (
+        _tbo_yield_and_switch_from_compute_to_comm,
         tbo_switch_to_compute_sync,
-        tbo_yield_and_switch_from_compute_to_comm,
     )
     from tests.model_ops.engram.test_hash_bounds import build, tiny_config
     from tests.model_ops.engram.test_overlap import (
@@ -388,7 +482,8 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
         make_step,
     )
 
-    builder, parent = make_parent("cuda", lengths=(9, 5))
+    slices = cut_prefill_ubatches(2, [9, 5], 14)
+    builder, parent = make_parent("cuda", lengths=(9, 5), parts=slices)
     mapping = build(tiny_config())
     staging, _backing = make_staging(mapping)
     engram_step = make_step(staging.uva.hash_tables, 32, verify=False)
@@ -408,7 +503,7 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
             step.selected[0] = ids.clone()
             # Alternate workers twice while the earlier layer's state lives.
             for _ in range(2):
-                tbo_yield_and_switch_from_compute_to_comm()
+                _tbo_yield_and_switch_from_compute_to_comm()
                 copy = ids.clone()
                 tbo_switch_to_compute_sync()
             rows = ctx.attn_metadata.engram_embeddings.get(mapping.config.layer_ids[-1])
@@ -416,7 +511,6 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
 
     wrapper = UBatchWrapper(Model(), builder)
     ids = torch.arange(14, device="cuda", dtype=torch.int32)
-    slices = _split_prefill_token_midpoint(2, [9, 5], 2, None)
     for seed in (7, 31):
         _, tokens, histories, masks = make_batch(mapping, [9, 5], seed)
         fill_step(engram_step, tokens, histories, masks, starts=(3, 8))
@@ -433,7 +527,7 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
         )
         expected = expected + ids.float()[:, None] * 2
         calls.clear()
-        parent.engram_embeddings = rows
+        attach_engram(parent, rows)
         ctx = ForwardContext(
             attn_metadata=parent,
             no_compile_layers={},
@@ -470,16 +564,20 @@ def test_resumed_prefill_keeps_its_replay_layout_in_each_microbatch(rebuilds):
 
     # Request 0 runs positions 3..12 and resumed at 8; request 1 does not
     # replay. The cut at 7 splits request 0 across both microbatches.
-    builder, parent = make_parent(
-        "cuda", replaying={0: Replay(until=8, rebuilds=rebuilds, history_ids=())}
+    parts = (
+        UBatchSlice(slice(0, 1), slice(0, 7)),
+        UBatchSlice(slice(0, 2), slice(7, 14)),
+    )
+    _, parent = make_parent(
+        "cuda",
+        replaying={0: Replay(until=8, rebuilds=rebuilds, history_ids=())},
+        parts=parts,
     )
     cached = 0 if rebuilds else 8
     assert parent.step.request_floors.tolist() == [3, 0]
     assert parent.step.request_cached_until.tolist() == [cached, 0]
-    for i, (start, end, rs) in enumerate(((0, 7, slice(0, 1)), (7, 14, slice(0, 2)))):
-        child = builder.build_ubatch_prefill_metadata(
-            parent, UBatchSlice(rs, slice(start, end)), rs.stop - rs.start, i
-        )
+    for part, child in zip(parts, parent.ubatches):
+        rs = part.request_slice
         step = child.step
         floors = parent.step.request_floors[rs].tolist()
         until = parent.step.request_cached_until[rs].tolist()
@@ -501,29 +599,31 @@ def test_resumed_prefill_keeps_its_replay_layout_in_each_microbatch(rebuilds):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_microbatch_steps_are_freed_when_the_forward_returns(monkeypatch):
+def test_microbatch_steps_are_freed_with_their_step(monkeypatch):
     """Each microbatch's attention metadata, and so its step and every GPU
-    tensor memoized on it, is released when the forward returns -- not left
-    to Python's cycle collector, which runs on object counts and never sees
-    GPU memory. The TBO contexts point at each other (`partner`); holding
-    their forward contexts through that cycle leaked one step per forward
-    until the GPU ran out on long prefills."""
+    tensor memoized on it, is released with the step's metadata that holds it
+    (`AttentionMetaData.ubatches`) -- not left to Python's cycle collector,
+    which runs on object counts and never sees GPU memory. The TBO contexts
+    point at each other (`partner`); holding their forward contexts through
+    that cycle leaked one step per forward until the GPU ran out on long
+    prefills."""
     import gc
     import weakref
 
     from atom.utils.forward_context import get_forward_context
     from atom.utils.tbo.ubatching import (
+        _tbo_yield_and_switch_from_compute_to_comm,
         tbo_switch_to_compute_sync,
-        tbo_yield_and_switch_from_compute_to_comm,
     )
 
-    builder, parent = make_parent("cuda", lengths=(9, 5))
+    slices = cut_prefill_ubatches(2, [9, 5], 14)
+    builder, parent = make_parent("cuda", lengths=(9, 5), parts=slices)
     seen = []
 
     class Model(torch.nn.Module):
         def forward(self, ids, positions, inputs_embeds=None):
             seen.append(weakref.ref(get_forward_context().attn_metadata))
-            tbo_yield_and_switch_from_compute_to_comm()
+            _tbo_yield_and_switch_from_compute_to_comm()
             out = ids.float()[:, None].clone()
             tbo_switch_to_compute_sync()
             return out
@@ -542,7 +642,7 @@ def test_microbatch_steps_are_freed_when_the_forward_returns(monkeypatch):
             scheduled_tokens=14,
             running_tokens=14,
         ),
-        ubatch_slices=_split_prefill_token_midpoint(2, [9, 5], 2, None),
+        ubatch_slices=slices,
     )
     monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
     gc.collect()
@@ -551,9 +651,12 @@ def test_microbatch_steps_are_freed_when_the_forward_returns(monkeypatch):
         wrapper(ids, parent.step.positions)
         torch.cuda.synchronize()
         assert len(seen) == 2
+        # Not through `monkeypatch`, which would hold the step to restore it.
+        _forward_context_local.ctx = None
+        del ctx, parent
         assert all(
             ref() is None for ref in seen
-        ), "microbatch metadata outlived the forward"
+        ), "microbatch metadata outlived its step"
     finally:
         gc.enable()
 
@@ -566,13 +669,14 @@ def test_microbatch_failing_on_the_comm_stream_still_fences_buffer_reuse(
     `switch_to_compute_sync`. The wrapper still orders the comm stream before
     later compute-stream work, which is where the next forward republishes
     the microbatch buffers."""
-    from atom.utils.tbo.ubatching import tbo_yield_and_switch_from_compute_to_comm
+    from atom.utils.tbo.ubatching import _tbo_yield_and_switch_from_compute_to_comm
 
-    builder, parent = make_parent("cuda", lengths=(9, 5))
+    slices = cut_prefill_ubatches(2, [9, 5], 14)
+    builder, parent = make_parent("cuda", lengths=(9, 5), parts=slices)
 
     class Model(torch.nn.Module):
         def forward(self, ids, positions, inputs_embeds=None):
-            tbo_yield_and_switch_from_compute_to_comm()
+            _tbo_yield_and_switch_from_compute_to_comm()
             raise RuntimeError("collective failed")
 
     wrapper = UBatchWrapper(Model(), builder)
@@ -589,7 +693,7 @@ def test_microbatch_failing_on_the_comm_stream_still_fences_buffer_reuse(
             scheduled_tokens=14,
             running_tokens=14,
         ),
-        ubatch_slices=_split_prefill_token_midpoint(2, [9, 5], 2, None),
+        ubatch_slices=slices,
     )
     monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
     waits = []
@@ -613,7 +717,11 @@ def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 
     torch.manual_seed(37)
-    builder, parent = make_parent("cuda")
+    parts = [
+        UBatchSlice(slice(0, 1 if cut <= 10 else 2), slice(0, cut)),
+        UBatchSlice(slice(0 if cut < 10 else 1, 2), slice(cut, 14)),
+    ]
+    builder, parent = make_parent("cuda", parts=parts)
     cache = parent.cache
     query = torch.randn(14, 8, 512, device="cuda", dtype=torch.bfloat16) * 0.1
     kv = torch.randn(1, 14, 512, device="cuda", dtype=torch.bfloat16)
@@ -647,15 +755,11 @@ def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
     expected = attend(parent.step, 0, 14)
     final_window = cache.state.view("window").clone()
     cache.backing.copy_(before)
-    parts = [
-        UBatchSlice(slice(0, 1 if cut <= 10 else 2), slice(0, cut)),
-        UBatchSlice(slice(0 if cut < 10 else 1, 2), slice(cut, 14)),
-    ]
     from atom.utils.forward_context import get_forward_context
     from atom.utils.tbo.ubatching import (
+        _tbo_yield_and_switch_from_compute_to_comm,
         tbo_current_ubatch_id,
         tbo_switch_to_compute_sync,
-        tbo_yield_and_switch_from_compute_to_comm,
     )
 
     order = []
@@ -671,7 +775,7 @@ def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
             order.append((index, "write_window"))
             # Match the production boundary: attention writes its window before
             # FFN yields to the other worker. GPU launches remain asynchronous.
-            tbo_yield_and_switch_from_compute_to_comm()
+            _tbo_yield_and_switch_from_compute_to_comm()
             torch.cuda._sleep(2_000_000)
             tbo_switch_to_compute_sync()
             return output
@@ -731,7 +835,8 @@ def test_dp_moe_original_schedule_preserves_outputs(
     from atom.utils.forward_context import get_forward_context
     from atom.utils.tbo.ubatching import tbo_active, tbo_current_ubatch_id
 
-    builder, parent = make_parent("cuda")
+    slices = cut_prefill_ubatches(2, [10, 4], 14)
+    builder, parent = make_parent("cuda", parts=slices)
     calls = []
     width = 5120 if stress_lifetime else 1
     config = SimpleNamespace(
@@ -781,7 +886,7 @@ def test_dp_moe_original_schedule_preserves_outputs(
         quant_method=SimpleNamespace(
             select_experts=select_experts, routed_rows_wire=None
         ),
-        _run_experts=lambda hidden, weights, ids, x_scale, gathered: (
+        _run_experts=lambda hidden, weights, ids, x_scale, gathered, **kw: (
             experts(x=hidden, topk_weights=weights, topk_ids=ids)
         ),
         reduce_results=False,
@@ -877,7 +982,7 @@ def test_dp_moe_original_schedule_preserves_outputs(
             scheduled_tokens=14,
             running_tokens=14,
         ),
-        ubatch_slices=_split_prefill_token_midpoint(2, [10, 4], 2, None),
+        ubatch_slices=slices,
     )
     monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
     model = Model(config)
@@ -910,10 +1015,11 @@ def test_dp_moe_original_schedule_preserves_outputs(
 
 
 @pytest.mark.parametrize("parent_unified", [False, True])
-def test_prefill_microbatch_uses_existing_dp_padding(monkeypatch, parent_unified):
-    from atom.model_ops import moe
-
-    builder, parent = make_parent("cpu")
+def test_prefill_microbatch_runs_its_own_tokens(monkeypatch, parent_unified):
+    """A prefill micro-batch runs its slice's tokens, gathered across DP the
+    way its step is: by every rank's count when the step is ragged."""
+    slices = cut_prefill_ubatches(2, [10, 4], 14)
+    builder, parent = make_parent("cpu", parts=slices)
     ctx = ForwardContext(
         attn_metadata=parent,
         no_compile_layers={},
@@ -927,36 +1033,17 @@ def test_prefill_microbatch_uses_existing_dp_padding(monkeypatch, parent_unified
             running_tokens=14,
             running_tokens_are_unified=parent_unified,
         ),
-        ubatch_slices=_split_prefill_token_midpoint(2, [10, 4], 2, None),
-        ub_max_tokens_across_dp=(11, 12),
+        ubatch_slices=slices,
     )
     wrapper = UBatchWrapper(torch.nn.Identity(), builder, dp_gather_scatter=True)
-    counts = wrapper._compute_ub_running_tokens(ctx, 2, 2, 4, torch.device("cpu"))
-    assert counts == [11, 12]
-    # The collective itself is exercised in the multi-GPU integration run.
-    # Here retain its padded height so real unpadding must drop the tail.
-    monkeypatch.setattr(
-        moe, "get_dp_group", lambda: SimpleNamespace(reduce_scatter_tensor=lambda x: x)
-    )
     for i, part in enumerate(ctx.ubatch_slices):
-        child = wrapper._make_ubatch_context(
-            ctx,
-            part,
-            part.request_slice.stop - part.request_slice.start,
-            i,
-            ub_running_tokens=counts[i],
-        )
-        assert child.context.running_tokens_are_unified
-        assert child.context.running_tokens == counts[i]
-        assert child.attn_metadata.step.width == child.context.scheduled_tokens == 7
-        monkeypatch.setattr(_forward_context_local, "ctx", child, raising=False)
-        hidden = torch.arange(7, dtype=torch.float32)[:, None]
-        padded, local_tokens = moe.pad_for_all_gather(hidden)
-        assert padded.shape == (counts[i], 1)
-        torch.testing.assert_close(padded[:7], hidden)
-        padded[7:] = float("nan")
-        torch.testing.assert_close(
-            moe.reduce_scatter_with_unpadding(padded, local_tokens), hidden
+        child = wrapper._make_ubatch_context(ctx, part, i, ctx.context.positions, None)
+        assert child.context.running_tokens_are_unified == parent_unified
+        assert (
+            child.attn_metadata.step.running_tokens
+            == child.context.running_tokens
+            == child.context.scheduled_tokens
+            == 7
         )
 
 
@@ -990,11 +1077,11 @@ def test_tbo_children_do_not_replay_late_layer_tails(monkeypatch, ubatch_idx):
     from atom.models.deepseek_v41.bounded_replay import replayable
     from atom.utils.tbo import ubatching
 
-    builder, metadata = make_parent("cpu")
     slices = [
         UBatchSlice(slice(0, 1), slice(0, 5)),
         UBatchSlice(slice(0, 2), slice(5, 14)),
     ]
+    builder, metadata = make_parent("cpu", parts=slices)
     parent = ForwardContext(
         attn_metadata=metadata,
         context=Context(
@@ -1010,15 +1097,15 @@ def test_tbo_children_do_not_replay_late_layer_tails(monkeypatch, ubatch_idx):
     wrapper = UBatchWrapper(torch.nn.Identity(), builder)
     part = slices[ubatch_idx]
     child = wrapper._make_ubatch_context(
-        parent, part, part.request_slice.stop, ubatch_idx=ubatch_idx
+        parent, part, ubatch_idx, parent.context.positions, None
     )
     assert child.ubatch_slices is None
     step = child.attn_metadata.step
     # only a whole prefill's step carries a decoder plan, never a child's
-    assert step.decoder is None and replayable(child, step.width) is False
+    assert step.decoder is None and replayable(child, step.running_tokens) is False
     # given one, the worker context still keeps the child on every row
     step.decoder = object()
-    width = step.width
+    width = step.running_tokens
     assert replayable(child, width) is True
     monkeypatch.setitem(
         ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), ubatch_idx
@@ -1026,16 +1113,7 @@ def test_tbo_children_do_not_replay_late_layer_tails(monkeypatch, ubatch_idx):
     assert replayable(child, width) is False
 
 
-def test_tbo_rejects_compacted_scheduler_rows_before_slicing():
-    builder, parent = make_parent("cpu", lengths=(0, 4))
-    assert parent.scheduler_rows == (1,)
-    with pytest.raises(ValueError, match="uncompacted scheduler"):
-        builder.build_ubatch_prefill_metadata(
-            parent, UBatchSlice(slice(0, 1), slice(0, 4)), 1
-        )
-
-
-@pytest.mark.parametrize("backend,expected", [("none", 0), ("v4", 0), ("v41", -1)])
+@pytest.mark.parametrize("backend,expected", [("none", 0), ("v4", -1), ("v41", -1)])
 def test_tbo_communication_priority_is_backend_owned(monkeypatch, backend, expected):
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
@@ -1086,7 +1164,8 @@ def test_tbo_preserves_v4_forward_signature(monkeypatch):
     torch.testing.assert_close(context.context.input_ids, ids)
 
 
-def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp4", "fp8"])
+def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch, kv_dtype):
     import json
     from pathlib import Path
 
@@ -1101,8 +1180,9 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
         config=SimpleNamespace(
             hf_config=hf,
             speculative_config=None,
-            kv_cache_dtype="bf16",
+            kv_cache_dtype=kv_dtype,
             index_cache_dtype="fp4",
+            index_cache_layout="preshuffle",
             enable_tbo=True,
             load_dummy=True,
             gpu_memory_utilization=0.75,
@@ -1136,6 +1216,19 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
                 for pair in indptrs.values()
                 for t in pair
             )
+            staging = [
+                self._prefill_window_staging,
+                *self._ubatch_prefill_window_staging,
+            ]
+            if kv_dtype == "bf16":
+                assert staging == [None, None, None]
+            else:
+                assert len({t.data_ptr() for t in staging}) == 3
+                expected = (
+                    2 * self.geometry.ring_slots + 16
+                ) * self.geometry.window_row_bytes
+                assert all(t.numel() == expected for t in staging)
+                used += sum(t.numel() for t in staging)
             monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: used)
             total = self.geometry.paged_bytes * 100
             monkeypatch.setattr(

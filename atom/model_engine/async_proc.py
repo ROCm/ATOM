@@ -29,6 +29,7 @@ import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
 
+from atom.config import local_device_index
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
 from atom.model_engine.block_table_codec import (
     FORWARD_RPC,
@@ -40,13 +41,16 @@ from atom.model_engine.collective_rpc import (
     UTILITY_MANAGED_RUNNER_METHODS,
     RpcPayload,
     RpcResult,
+    WeightReloadRefused,
     checked_timeout,
     is_plain_rpc_value,
 )
 from atom.utils import (
     envs,
     get_mp_context,
+    get_open_port,
     get_open_zmq_ipc_path,
+    get_tcp_uri,
     init_exit_handler,
     make_zmq_socket,
     resolve_obj_by_qualname,
@@ -97,6 +101,8 @@ class AsyncIOProc:
         rpc_output_addr: Optional ZMQ endpoint for generic collective-RPC
             replies. Every rank owns one, unlike the primary channel which
             only rank 0 has, so the caller can prove all ranks answered.
+        is_remote: This rank runs on another node than the engine
+            (tp_multinode.py) and reads the broadcast queue over TCP.
     """
 
     # Function names whose output goes to the KV channel instead of primary
@@ -113,6 +119,7 @@ class AsyncIOProc:
         all_ranks_barrier=None,
         *args,
         rpc_output_addr: str | None = None,
+        is_remote: bool = False,
         **kwargs,
     ):
         # Bind this worker's lifetime to its parent EngineCore: if the parent
@@ -144,19 +151,12 @@ class AsyncIOProc:
         # Auto-detects the GPU's local node by default; gated by
         # ATOM_NUMA_BIND. Must run before any large allocation / native
         # (mooncake) thread spawn so the mask is inherited by child threads and
-        # first-touch lands memory locally. The node-local GPU index is
-        # dp_local_rank*tp_size+tp_rank (engine_core_mgr GPU assignment).
+        # first-touch lands memory locally. The GPU is the one ModelRunner
+        # picks (`local_device_index`).
         # Best-effort: any failure here is logged and skipped rather than
         # taking the worker down, hence the blanket except.
         try:
-            cfg = args[0]
-            # Node-local: this indexes a GPU on THIS machine. The global rank
-            # would run off the end of a later node's device list.
-            dp_local_rank = cfg.parallel_config.data_parallel_rank_local
-            if dp_local_rank is None:
-                dp_local_rank = cfg.parallel_config.data_parallel_rank
-            gpu = dp_local_rank * cfg.tp_world_size + rank
-            numa_bind_to_node(gpu, label)
+            numa_bind_to_node(local_device_index(args[0], rank), label)
         except Exception as e:  # noqa: BLE001 - binding is an optimization
             # NUMA binding only affects locality, never correctness, so any
             # failure (missing libnuma, restricted cpuset, odd topology) must
@@ -178,6 +178,10 @@ class AsyncIOProc:
         self.rpc_queue: queue.Queue | None = None
 
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
+        if is_remote:
+            from atom.model_engine.tp_multinode import await_release
+
+            await_release(self.rpc_broadcast_mq)
         import atexit
 
         atexit.register(self._cleanup_shared_memory)
@@ -399,7 +403,11 @@ class AsyncIOProc:
         try:
             value = func(*call_args, **call_kwargs)
         except Exception as exc:  # noqa: BLE001 - reported to the caller instead
-            return self._failure(payload, f"{type(exc).__name__}: {exc}")
+            return self._failure(
+                payload,
+                f"{type(exc).__name__}: {exc}",
+                refused_before_writing=isinstance(exc, WeightReloadRefused),
+            )
         if not is_plain_rpc_value(value):
             return self._failure(
                 payload,
@@ -409,9 +417,16 @@ class AsyncIOProc:
             )
         return RpcResult(payload.request_id, self.rank, value=value)
 
-    def _failure(self, payload: RpcPayload, error: str) -> RpcResult:
+    def _failure(
+        self, payload: RpcPayload, error: str, *, refused_before_writing: bool = False
+    ) -> RpcResult:
         """This rank's reply to *payload* when the call could not succeed."""
-        return RpcResult(payload.request_id, self.rank, error=error)
+        return RpcResult(
+            payload.request_id,
+            self.rank,
+            error=error,
+            refused_before_writing=refused_before_writing,
+        )
 
     def get_func(self):
         method_name, *args = self.rpc_broadcast_mq.dequeue()
@@ -450,6 +465,9 @@ class AsyncIOProcManager:
         *args: Additional arguments forwarded to the runner constructor.
     """
 
+    # The TP ranks on other nodes (tp_multinode.RemoteRanks), if any.
+    remote_ranks = None
+
     # The public collective_rpc runs only these.
     _PUBLIC_RPC_METHODS: ClassVar[frozenset[str]] = COLLECTIVE_RPC_METHODS
     # Names the engine's wire protocol owns, which even the utility handler's
@@ -464,11 +482,24 @@ class AsyncIOProcManager:
     )
 
     def __init__(
-        self, finalizer, proc_num: int, runner: str, *args, on_worker_failure=None
+        self,
+        finalizer,
+        proc_num: int,
+        runner: str,
+        *args,
+        local_proc_num: int | None = None,
+        on_worker_failure=None,
+        kv_progress_event: threading.Event | None = None,
     ):
         self.parent_finalizer = finalizer
         self.on_worker_failure = on_worker_failure
+        self.kv_progress_event = kv_progress_event
         self.proc_num = proc_num
+        # Ranks from local_proc_num on run on other nodes (tp_multinode.py) and
+        # reach this node over TCP.
+        self.local_proc_num = proc_num if local_proc_num is None else local_proc_num
+        n_remote = proc_num - self.local_proc_num
+        host = args[0].parallel_config.data_parallel_master_ip if n_remote else None
 
         io_addrs = [get_open_zmq_ipc_path(), get_open_zmq_ipc_path()]
         self.procs: list[multiprocessing.Process] = []
@@ -477,7 +508,10 @@ class AsyncIOProcManager:
         self.label = f"AsyncIOProcManager({self.runner_label})"
 
         self.rpc_broadcast_mq = MessageQueue(
-            proc_num, proc_num, max_chunk_bytes=16 * 1024 * 1024
+            proc_num,
+            self.local_proc_num,
+            max_chunk_bytes=16 * 1024 * 1024,
+            connect_ip=host,
         )
         self._block_table_encoder = BlockTableDeltaEncoder()
         scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
@@ -486,12 +520,14 @@ class AsyncIOProcManager:
         import atexit
 
         atexit.register(self._cleanup_shared_memory)
-        self.all_ranks_barrier = ctx.Barrier(proc_num)
+        # A multiprocessing barrier cannot reach another node; barrier RPCs are
+        # refused instead (see _collective_rpc).
+        self.all_ranks_barrier = None if n_remote else ctx.Barrier(proc_num)
         init_exit_handler(self)
 
         # KV output aggregation infrastructure
         self.kv_output_aggregator: KVOutputAggregator | None = None
-        self.kv_output_addrs = [get_open_zmq_ipc_path() for _ in range(proc_num)]
+        self.kv_output_addrs = [self._reply_addr(i, host) for i in range(proc_num)]
         self.kv_outputs_queues: list[queue.Queue] = [
             queue.Queue() for _ in range(proc_num)
         ]
@@ -499,7 +535,7 @@ class AsyncIOProcManager:
         self.kv_output_threads: list[threading.Thread] = []
 
         # Generic collective-RPC reply channels, one per rank
-        self.rpc_output_addrs = [get_open_zmq_ipc_path() for _ in range(proc_num)]
+        self.rpc_output_addrs = [self._reply_addr(i, host) for i in range(proc_num)]
         self.rpc_outputs_queues: list[queue.Queue] = [
             queue.Queue() for _ in range(proc_num)
         ]
@@ -509,7 +545,7 @@ class AsyncIOProcManager:
         # rank -> exit code, written by the monitor before it tears down.
         self._dead_ranks: dict[int, int | None] = {}
 
-        for i in range(proc_num):
+        for i in range(self.local_proc_num):
             label = f"ModelRunner{i}/{proc_num}"
             # Only rank 0 gets the primary output address
             addrs = [None, io_addrs[1]] if i == 0 else [None, None]
@@ -568,7 +604,35 @@ class AsyncIOProcManager:
             t.start()
             self.rpc_output_threads.append(t)
 
+        if n_remote:
+            from atom.model_engine.tp_multinode import (
+                RemoteRanks,
+                release_remote_readers,
+            )
+
+            self.remote_ranks = RemoteRanks(
+                args[0],
+                {
+                    "proc_num": proc_num,
+                    "local_proc_num": self.local_proc_num,
+                    "handle": scheduler_output_handle,
+                    "runner": runner,
+                    "args": args,
+                    "kv_output_addrs": self.kv_output_addrs,
+                    "rpc_output_addrs": self.rpc_output_addrs,
+                },
+            )
         self.monitor_procs()
+        if n_remote:
+            release_remote_readers(
+                self.rpc_broadcast_mq, n_remote, lambda: self.still_running
+            )
+
+    def _reply_addr(self, rank: int, host: str | None) -> str:
+        """Where `rank` sends its replies: IPC from this node, TCP from another."""
+        if rank < self.local_proc_num:
+            return get_open_zmq_ipc_path()
+        return get_tcp_uri(host, get_open_port())
 
     def exit(self):
         if not self.still_running:
@@ -582,6 +646,8 @@ class AsyncIOProcManager:
                 proc.join(timeout=max(deadline - time.monotonic(), 0))
         shutdown_all_processes(self.procs, allowed_seconds=1)
         self.procs = []
+        if self.remote_ranks is not None:
+            self.remote_ranks.close()
         self.output_thread.join(timeout=1)
         for thread in self.kv_output_threads:
             thread.join(timeout=0.5)
@@ -639,6 +705,8 @@ class AsyncIOProcManager:
                 obj = output_socket.recv(copy=False)
                 obj = pickle.loads(obj)
                 self.kv_outputs_queues[worker_id].put_nowait(obj)
+                if self.kv_progress_event is not None:
+                    self.kv_progress_event.set()
         finally:
             output_socket.close(linger=0)
             logger.debug(f"{self.label}: kv output thread {worker_id} exit")
@@ -752,6 +820,18 @@ class AsyncIOProcManager:
                 f"so no TP rank ran it"
             )
             return [
+                RpcResult(
+                    payload.request_id, rank, error=error, refused_before_writing=True
+                )
+                for rank in range(self.proc_num)
+            ]
+
+        if payload.barrier and self.local_proc_num < self.proc_num:
+            error = (
+                f"cannot run barrier RPC {func_name!r}: the TP ranks on other "
+                f"nodes share no barrier with this one"
+            )
+            return [
                 RpcResult(payload.request_id, rank, error=error)
                 for rank in range(self.proc_num)
             ]
@@ -767,7 +847,12 @@ class AsyncIOProcManager:
                     f"broken; restart the runner manager"
                 )
                 return [
-                    RpcResult(payload.request_id, rank, error=error)
+                    RpcResult(
+                        payload.request_id,
+                        rank,
+                        error=error,
+                        refused_before_writing=True,
+                    )
                     for rank in range(self.proc_num)
                 ]
             self.rpc_broadcast_mq.enqueue((func_name, payload))
@@ -985,19 +1070,36 @@ class AsyncIOProcManager:
 
         def monitor_engine_cores():
             sentinels = [proc.sentinel for proc in procs]
-            died = multiprocessing.connection.wait(sentinels)
+            remote = self.remote_ranks
+            # Ranks on other nodes report through the store, not a sentinel.
+            while not (
+                died := multiprocessing.connection.wait(
+                    sentinels, timeout=None if remote is None else remote.poll_s
+                )
+            ):
+                mgr = self_ref()
+                if mgr is None or not mgr.still_running:
+                    return
+                if failure := remote.failure():
+                    break
             _self = self_ref()
             if not _self or not _self.keep_monitoring:
                 return
-            dead_proc = next(proc for proc in procs if proc.sentinel == died[0])
-            dead_proc.join(timeout=5)
-            # Before exit() empties self.procs and stops every other rank, so
-            # a collective_rpc in flight can still name the one that died.
-            _self._dead_ranks[procs.index(dead_proc)] = dead_proc.exitcode
-            logger.error(
-                f"{self.label}: [{dead_proc.name}] proc died unexpectedly "
-                f"(exitcode={dead_proc.exitcode}), shutting down.",
-            )
+            if died:
+                dead_proc = next(proc for proc in procs if proc.sentinel == died[0])
+                dead_proc.join(timeout=5)
+                # Before exit() empties self.procs and stops every other rank,
+                # so a collective_rpc in flight can still name the one that died.
+                _self._dead_ranks[procs.index(dead_proc)] = dead_proc.exitcode
+                logger.error(
+                    f"{self.label}: [{dead_proc.name}] proc died unexpectedly "
+                    f"(exitcode={dead_proc.exitcode}), shutting down.",
+                )
+            else:
+                logger.error(
+                    f"{self.label}: TP ranks on another node stopped ({failure}), "
+                    "shutting down."
+                )
             # Notify the frontend before exit() can block draining GPU work.
             # A live EngineCore process alone does not imply healthy runners.
             try:

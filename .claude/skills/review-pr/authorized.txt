@@ -1,0 +1,109 @@
+# atom-bot trigger allowlist -- only the GitHub logins here may use `atom-bot review`.
+# One login per line (case-insensitive). '#' starts a comment. Edit this file (a maintainer
+# commit) to change who is allowed -- version-controlled and auditable. Reviews run on a
+# shared box; keep it curated.
+#
+# Contents (built 2026-10-29), the union of three rosters, 88 logins:
+#
+#  1. The team's maintained reviewer roster, 42 people, eight of them on the ATOM review
+#     rota. Listed first because it is the only source that states who reviews ATOM as a
+#     fact rather than inferring it from behaviour: the PR mining in source 2 missed a
+#     reviewer who is on the rota but whose reviews do not appear in that window, and a
+#     list built from PR data alone would have locked them out of the bot.
+#  2. ATOM: everyone who authored or reviewed one of the last 300 merged ROCm/ATOM PRs:
+#       gh pr list --repo ROCm/ATOM --state merged --limit 300 --json reviews,author \
+#         --jq '[(.[].reviews[].author.login),(.[].author.login)]|unique|.[]'
+#  3. aiter: aiter's own allowlist as of c1c482e00. The two bots share a box and largely
+#     a team.
+#
+# Bots excluded throughout (copilot-pull-request-reviewer, github-actions,
+# github-advanced-security). Trimming this is a one-line PR if the shared box needs
+# tighter access.
+amd-ruitang3
+amitkumar-amd
+aoli26
+avininjamay8
+azaidy
+Bernard-Liu
+binding7012
+Boss2002n
+brunomazzottiamd
+coderfeli
+damien-lejeune
+demonsan
+Dewei-Wang-sh
+fangche123
+fsx950223
+ganyi1996ppo
+gbyu-amd
+GwilliamHu
+gyohuangxin
+HaonanWang98
+haoyangli0109
+i-chaochen
+IvanShan177
+jamesETsmith
+Jasen2201
+JiaoliangYu
+jiayyu
+JohnQinAMD
+junhaha666
+junna2016
+junyyang-amd
+k50112113
+kaiyang-1
+karverma-amd
+kliuae-amd
+kvnloo
+lcskrishna
+leo-automation
+linsun12
+lirui927
+mengfei-jiang
+MengqingCao
+MHYangAMD
+mjkvaak-amd
+mohbasit
+msaffari-amd
+nidal567
+NidhoggD1
+onil-gunawardana-amd
+PerryZhang01
+peterjunpark
+Phi-C
+poznano-amd
+qichu-yun
+ruanjm
+samremes
+shay-li77
+shengnxu
+simondanielsson
+srinivamd
+ssharma4-amd
+TennyWang1223
+tjtanaavllm
+valarLip
+venkat1361
+vgokhale
+vpietila-amd
+wanzhenchn
+whx-sjtu
+wuhuikx
+XiaobingSuper
+xiaofei-zheng
+xysheng-AMD
+xytpai
+yanboshao
+yhl-amd
+yifehuan
+yitingw1
+Yuechguo
+yzhou103
+zejunchen-zejun
+ZhangLirong-amd
+zhangxinyuanliuhengyu
+ZhiweiYan-96
+zhuyuhua-v
+ZLkanyo009
+zovonoir
+zufayu

@@ -168,6 +168,8 @@ class GatedDeltaNet(nn.Module):
     ):
         """Update speculative convolution state using the native cache layout."""
         spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor
+        spec_state_indices_in = gdn_metadata.spec_state_indices_in_tensor
+        nsd = gdn_metadata.num_spec_decodes
         return causal_conv1d_update(
             mixed_qkv_spec,
             conv_state,
@@ -176,9 +178,12 @@ class GatedDeltaNet(nn.Module):
             self.num_v_heads * self.head_v_dim // self.tp_size,
             self.conv1d.bias,
             self.activation,
-            conv_state_indices=spec_state_indices_tensor[:, 0][
-                : gdn_metadata.num_spec_decodes
-            ],
+            conv_state_indices=spec_state_indices_tensor[:nsd, 0],
+            conv_state_indices_in=(
+                None
+                if spec_state_indices_in is None
+                else spec_state_indices_in[:nsd, 0]
+            ),
             num_accepted_tokens=num_accepted_tokens,
             query_start_loc=gdn_metadata.spec_query_start_loc,
             # The verify window, which sizes the conv rollback window
@@ -428,6 +433,7 @@ class GatedDeltaNet(nn.Module):
                     is_kda=False,
                     route=gdn_metadata.replayssm_route,
                     o=(core_attn_out[: query_spec.shape[1]] if spec_only else None),
+                    fork_slots=gdn_metadata.replayssm_fork_slots,
                 )
                 last_recurrent_state = None
             else:
@@ -459,13 +465,15 @@ class GatedDeltaNet(nn.Module):
         wrote_core_attn_out = False
         if gdn_metadata.num_prefills > 0:
             ckpt = gdn_metadata.ssm_checkpoints
+            # A pool at another dtype than `h` takes its interior targets from
+            # snapshots that `GDNStateMixin.finish_prefill` plans and the chunk
+            # kernel stores unnarrowed, which FlyDSL prefill does not produce.
+            h_snap = None
+            if ckpt is not None and "snap_idx" in ckpt:
+                h_snap = ssm_state.new_empty((ckpt["num_snaps"], *ssm_state.shape[1:]))
             flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
             use_flydsl_prefill = False
-            if (
-                flydsl_policy is not None
-                and flydsl_policy.prefill
-                and not use_replayssm
-            ):
+            if flydsl_policy is not None and flydsl_policy.prefill and h_snap is None:
                 from atom.model_ops.fla_ops.gdn_flydsl import (
                     prefill,
                     prefill_supported,
@@ -536,6 +544,9 @@ class GatedDeltaNet(nn.Module):
                     keep_intermediate_states=(
                         ckpt is not None or gdn_metadata.keep_intermediate_states
                     ),
+                    state_snapshots=(
+                        (ckpt["snap_idx"], h_snap) if h_snap is not None else None
+                    ),
                 )
             # Init cache
             ssm_state.index_copy_(
@@ -583,7 +594,7 @@ class GatedDeltaNet(nn.Module):
                 # above) and shares `slots` with the SSM half, so the two
                 # always describe the same token position.
                 write_state_checkpoints(
-                    h,
+                    h if h_snap is None else h_snap,
                     ssm_state,
                     mixed_qkv_non_spec,
                     conv_state,
@@ -596,6 +607,7 @@ class GatedDeltaNet(nn.Module):
                     non_spec_query_start_loc,
                     CHUNK_SIZE,
                     gdn_metadata.ssm_conv_state_len,
+                    h_rows=None if h_snap is None else ckpt["h_rows"],
                 )
         elif gdn_metadata.num_decodes > 0 and use_replayssm:
             nd = gdn_metadata.num_decodes
@@ -616,6 +628,7 @@ class GatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
                 is_kda=False,
                 route=gdn_metadata.replayssm_route,
+                fork_slots=gdn_metadata.replayssm_fork_slots,
             )
             last_recurrent_state = None
         elif gdn_metadata.num_decodes > 0:

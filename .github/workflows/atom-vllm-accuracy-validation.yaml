@@ -1,8 +1,13 @@
 name: ATOM vLLM Nightly
+# Scheduled runs are titled "(scheduled MI355)" so atom-nightly-deadline.yaml
+# stops them at 09:00 Beijing time.
+run-name: "${{ github.event_name == 'schedule' && format('{0} (scheduled MI355)', github.workflow) || github.workflow }}"
 
 on:
   schedule:
-    # Nightly at 00:00 Beijing time (16:00 UTC on the previous day)
+    # Nightly at 00:00 Beijing time (16:00 UTC on the previous day). Each
+    # nightly case runs once a week, on the Beijing weekday its catalog entry
+    # names in `nightly_weekday`.
     - cron: '0 16 * * *'
   workflow_dispatch:
     # Manual runs use GitHub Actions' built-in branch dropdown ("Use workflow
@@ -537,6 +542,8 @@ jobs:
           if not isinstance(raw_models, list):
               raise SystemExit("OOT accuracy model catalog must be a JSON list.")
 
+          WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
           required_fields = {
               "model_name",
               "model_path",
@@ -580,6 +587,11 @@ jobs:
                   raise SystemExit(
                       f"OOT accuracy model {model['model_name']!r} has invalid priority "
                       f"{model['priority']!r}; expected P0, P1, or P2."
+                  )
+              if model["test_level"] == "nightly" and model.get("nightly_weekday") not in WEEKDAYS:
+                  raise SystemExit(
+                      f"OOT accuracy model {model['model_name']!r} needs nightly_weekday, "
+                      f"one of {', '.join(WEEKDAYS)}: the Beijing weekday it runs on."
                   )
               if "lm_eval_num_fewshot" in model:
                   model["lm_eval_num_fewshot"] = int(model["lm_eval_num_fewshot"])
@@ -679,6 +691,14 @@ jobs:
 
           if event == "schedule":
               run_date = beijing_now.date().isoformat()
+              # Each nightly case runs once a week, on its nightly_weekday.
+              run_weekday = WEEKDAYS[beijing_now.weekday()]
+              selected = [m for m in selected if m["nightly_weekday"] == run_weekday]
+              print(
+                  f"{run_weekday} nightly cases: "
+                  + ", ".join(m["model_name"] for m in selected),
+                  file=sys.stderr,
+              )
           else:
               run_date = ""
 
@@ -873,7 +893,6 @@ jobs:
         id: validation-window
         env:
           SCHEDULED_BEIJING_DATE: ${{ needs.prepare-oot-image.outputs.scheduled_beijing_date }}
-          MIN_REMAINING_MINUTES: "150"
         run: |
           if [ "${GITHUB_EVENT_NAME}" != "schedule" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
@@ -888,28 +907,17 @@ jobs:
           beijing_tz = timezone(timedelta(hours=8))
           now = datetime.now(timezone.utc).astimezone(beijing_tz)
           scheduled_date = os.environ.get("SCHEDULED_BEIJING_DATE", "")
-          min_remaining_minutes = int(os.environ.get("MIN_REMAINING_MINUTES", "150"))
           current_date = now.date().isoformat()
-          end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
-          remaining_minutes = int((end_of_day - now).total_seconds() // 60)
 
-          should_run = (
-              current_date == scheduled_date
-              and remaining_minutes >= min_remaining_minutes
-          )
+          should_run = current_date == scheduled_date
           print(f"should_run={'true' if should_run else 'false'}")
           print(f"current_beijing_date={current_date}")
-          print(f"remaining_minutes={remaining_minutes}")
-          if current_date != scheduled_date:
+          if should_run:
+              print("reason=same Beijing day as the scheduled run")
+          else:
               print(
                   f"reason=scheduled date {scheduled_date} no longer matches current Beijing date {current_date}"
               )
-          elif remaining_minutes < min_remaining_minutes:
-              print(
-                  f"reason=only {remaining_minutes} Beijing-day minutes remain, below required {min_remaining_minutes}"
-              )
-          else:
-              print("reason=same Beijing day with enough time remaining")
           PY
 
           echo "Validation window check:"
@@ -1076,7 +1084,11 @@ jobs:
               set -euo pipefail
               python3 - <<'"'"'PY'"'"'
           import os
+          import sys
           from pathlib import Path
+
+          sys.path.insert(0, "/workspace/.github/scripts")
+          from check_model_dir import incomplete_reason
 
           model_path = os.environ["MODEL_PATH"].strip().strip("/")
           normalized = model_path.rstrip("/")
@@ -1183,8 +1195,11 @@ jobs:
               seen.add(candidate)
               path = Path(candidate)
               if (path / "config.json").is_file():
-                  print(f"FOUND_LOCAL_MODEL={candidate}")
-                  raise SystemExit(0)
+                  reason = incomplete_reason(path)
+                  if reason is None:
+                      print(f"FOUND_LOCAL_MODEL={candidate}")
+                      raise SystemExit(0)
+                  print(f"Skipping incomplete local model {candidate}: {reason}")
 
           print("LOCAL_MODEL_NOT_FOUND")
           print("Checked candidates:")
@@ -1235,19 +1250,29 @@ jobs:
                   use_model_lock="false"
                 fi
 
+                model_dir_is_complete() {
+                  python3 /workspace/.github/scripts/check_model_dir.py "$MODEL_DIR"
+                }
+
                 download_model() {
                   if [ -f "$MODEL_DIR/config.json" ]; then
-                    echo "Model directory exists without a completion marker under ${MODEL_DIR}; validating download"
+                    echo "Model directory exists without a complete download under ${MODEL_DIR}; resuming download"
                   else
                     echo "Model not found under ${MODEL_DIR}; downloading model"
                   fi
 
                   rm -f "$completion_flag"
                   hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
+                  # Mark first so the check validates the downloaded shards rather
+                  # than the unmarked-directory heuristics; unmark if it fails.
                   touch "$completion_flag"
+                  if ! model_dir_is_complete; then
+                    rm -f "$completion_flag"
+                    exit 1
+                  fi
                 }
 
-                if [ -f "$completion_flag" ]; then
+                if [ -f "$completion_flag" ] && model_dir_is_complete; then
                   echo "Model already exists under ${MODEL_DIR}; skip download"
                 elif [ "$use_model_lock" != "true" ]; then
                   echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
@@ -1263,7 +1288,7 @@ jobs:
                     exit 1
                   fi
 
-                  if [ -f "$completion_flag" ]; then
+                  if [ -f "$completion_flag" ] && model_dir_is_complete; then
                     echo "Model became available under ${MODEL_DIR} while waiting for the lock; skip download"
                   else
                     download_model

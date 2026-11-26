@@ -7,7 +7,6 @@ rows read are the checkpoint's, bit for bit). Chosen at construction, before che
 deployment (``config.config_refusal``, TP1); otherwise the model keeps ATOM's own embedding.
 """
 
-import ctypes
 import functools
 import logging
 import threading
@@ -18,61 +17,10 @@ import triton.language as tl
 from torch import nn
 
 from atom.model_ops.engram import host_memory
+from atom.model_ops.engram.host_memory import device_address
 from atom.model_ops.utils import atom_parameter
 
 logger = logging.getLogger("atom")
-
-
-def pin_rows(sources):
-    """Copy with ATOM's exact-size HIP allocator; never register a file mapping.
-
-    Main's public pin_rows lacks F's explicit copy override. Reuse its allocator,
-    leases and chunked copy without changing Engram's allocation policy.
-    """
-    allocator = host_memory._host_allocator()
-    if allocator is None:
-        return None
-    leases = []
-    try:
-        out = host_memory._copy(allocator, sources, leases)
-    except Exception:
-        logger.warning("Mono PLE: host shard copy failed", exc_info=True)
-        out = None
-    if out is None:
-        for lease in leases:
-            lease.release()
-    return out
-
-
-@functools.cache
-def _hip_device_pointer():
-    # The runtime `host_memory` page-locks with: another one does not know
-    # its allocations.
-    hip = host_memory._hip_runtime()
-    if hip is None:
-        return None
-    try:
-        fn = hip.hipHostGetDevicePointer
-    except AttributeError:
-        return None
-    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
-    return fn
-
-
-def device_address(host_address: int) -> int:
-    """Where the device reaches page-locked host memory at `host_address`.
-
-    Not always the host address: memory registered in place
-    (`hipHostRegister`) is mapped at a different device address, and a kernel
-    handed the host one faults. Identity where there is no HIP runtime.
-    """
-    fn = _hip_device_pointer()
-    if fn is None:
-        return host_address
-    out = ctypes.c_void_p()
-    if fn(ctypes.byref(out), host_address, 0) != 0 or not out.value:
-        raise RuntimeError(f"no device address for host memory at {host_address:#x}")
-    return out.value
 
 
 class MonoPleHostTable:
@@ -82,17 +30,6 @@ class MonoPleHostTable:
     (`host_memory.pin_rows`), so the table is never whole anywhere and never
     in HBM. `shard_bases` then gives, per shard, the address of its first
     global row for the device to read over UVA.
-
-    Always copied, whatever `ATOM_ENGRAM_UVA_COPY` says: the shards share
-    safetensors files with other weights, and registering part of a file
-    mapping in place makes ordinary host-to-device copies from the rest of
-    that mapping fail (`hipErrorInvalidValue`, or a GPU memory fault). The
-    registered pages would also be private copies (the mapping is
-    `MAP_PRIVATE`), so registering would not share them across processes.
-    And the kernel reads a shard from one base address, while in-place
-    registrations of adjacent, unaligned shards share their boundary pages
-    (`host_memory._PageRuns`): a shard then spans device ranges that are
-    mapped apart.
 
     One shard that cannot be page-locked moves the table to `device` -- the
     rows already pinned are copied over -- and the addresses point there
@@ -144,7 +81,7 @@ class MonoPleHostTable:
             )
         hbm = self._hbm
         if hbm is None:
-            pinned = pin_rows([rows.contiguous()])
+            pinned = host_memory.pin_rows([rows.contiguous()])
             with self._lock:
                 if pinned is not None and self._hbm is None:
                     self._rows[shard] = (row_start, pinned[0])
@@ -201,7 +138,11 @@ class MonoPleHostTable:
                 address += (first - self.vocab_start) * row_bytes
             else:
                 row_start, pinned = self._rows[shard]
-                address = device_address(pinned.data_ptr())
+                # (not always the host address: HIP may map page-locked host
+                # memory at another device address, and a kernel handed the
+                # host one faults; the host address where there is no HIP
+                # runtime to ask)
+                address = device_address(pinned.data_ptr(), identity_without_hip=True)
                 address -= (row_start - first) * row_bytes
             bases[shard] = address
         return bases

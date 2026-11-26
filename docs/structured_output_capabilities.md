@@ -1,8 +1,15 @@
 # Structured output and deployment discovery
 
 The native Chat and Responses endpoints support JSON output constraints through
-the optional `atom[structured-output]` dependency. This is separate from the
+llguidance and RE2, which the base install includes. This is separate from the
 SGLang plugin's structured-output implementation.
+
+The backend needs exactly the llguidance release ATOM pins (1.9.1), plus
+`google-re2` and `jsonschema`. Without them (ATOM installed with `--no-deps`), or with another
+llguidance release (the vLLM plugin image pins `<1.8`), structured output is
+off: requests that ask for it get a 400 naming what it needs,
+`ATOM_TOOL_CALL_GRAMMAR=1` leaves tool calls unconstrained, and `/v1/models`
+omits `structured_output`.
 
 ## Code organization
 
@@ -16,6 +23,7 @@ multi-backend interfaces.
 | `__init__.py` | Lightweight entry points used by the API preflight and model runner. |
 | `manager.py` | Worker admission, cached compilation, committed and speculative grammar state, and prepare/apply/commit ordering. |
 | `backend_guidance.py` | llguidance compiler and matcher adapter. |
+| `dsml_grammar.py` | DSML tool-call grammar for beta strict function tools. |
 | `schema.py` | Offline reference resolution, bounded RE2 validation, exact constraint lowering and shared expansion budgets. |
 | `validation.py` | Chat/Responses format and final answer validation, tool/reasoning adapters, and admission-time worker RPC/cache. |
 | `utils.py` | Reusable packed mask buffers, H2D kernel dispatch, and owned asynchronous token D2H snapshots. |
@@ -79,7 +87,7 @@ preventing an executor task from enqueueing after cancellation cleanup.
 Only local references are allowed, including references reached transitively
 through a local pointer into an otherwise literal `const` or `enum` value.
 Every runtime validator also disables external resource retrieval. Schema regexes
-use the non-backtracking RE2 evaluator from the optional `google-re2` dependency
+use the non-backtracking RE2 evaluator from the `google-re2` dependency
 for candidate filtering and final validation, including property-name matching.
 Each compiled regex has a 2 MiB memory limit; patterns are limited to 262,144
 characters and the cache retains at most 32 compiled expressions. Unsupported
@@ -155,8 +163,8 @@ With a DSML parser, normal function tools can accompany Chat `response_format`
 or Responses `text.format`. The grammar admits the parser's canonical function
 envelope or a schema-conforming answer. Required/named choices select the tool
 branch; `tool_choice="none"` selects JSON text. Function-only turns have no
-response text to validate; subsequent text answers remain constrained. This is
-not beta strict-tool argument validation. Other tool parser formats, pipeline parallelism, P/D handoff,
+response text to validate; subsequent text answers remain constrained. Other
+tool parser formats, pipeline parallelism, P/D handoff,
 multimodal input, custom stop strings, and `ignore_eos` remain unsupported with
 constraints. Synthetic forced acceptance is also rejected. No image
 implementation is included.
@@ -209,6 +217,75 @@ must distinguish enabled-request overhead from disabled-request regression and
 compare matching generated outputs. Production and broader-topology qualification
 remain separate tasks.
 
+## Strict function tools (beta)
+
+On `/beta/chat/completions`, a function with `"strict": true` has its
+arguments constrained by its `parameters` schema, with or without
+`response_format`. `/v1/chat/completions` keeps ignoring `strict`.
+
+Strict tools are constrained decoding, so a request with them is refused with
+HTTP 400 wherever `response_format` is (see above): with a tool parser other
+than DSML, pipeline parallelism, P/D handoff, images, custom stop strings,
+`ignore_eos`, relaxed MTP, or logprobs under speculative decoding. Without
+`response_format`, the error starts with `strict function tools:`, so the
+client can tell which part of its request asked for the grammar.
+
+The schema is checked before enqueue and refused with HTTP 400 where it breaks
+DeepSeek's rules or asks for what the grammar cannot hold:
+
+- every object lists all its properties in `required` and sets
+  `additionalProperties: false`, and `patternProperties` is refused, so the
+  arguments carry exactly the declared keys;
+- every schema gives its type (or a `$ref`, `anyOf`, `oneOf`, `allOf`, `enum`
+  or `const`), and every array its `items`;
+- `minLength`, `maxLength`, `minItems` and `maxItems` are refused, and a
+  `format` must be one of DeepSeek's five: `email`, `hostname`, `ipv4`, `ipv6`,
+  `uuid`;
+- the top of `parameters` holds only its properties, definitions and
+  annotations, and neither the tool's name nor a parameter's contains `"` or
+  `<`: the DSML tags carry them unescaped, so the parser would read a name up
+  to its quote, or a tag inside it;
+- definitions live at the top, under DeepSeek's `$def` (read as `$defs`),
+  `$defs` or `definitions`, and every `$ref` points into them, at a schema
+  held to these same rules (not into a `default`, say). Each parameter
+  is compiled on its own, where `#` would name the parameter; `$id`, `$anchor`
+  and dynamic references are refused for the same reason. A draft-07
+  `$schema`, as OpenAI's zod helpers write, is read as 2020-12.
+
+A strict tool is checked off the event loop. The last 256 distinct tools under
+64 KiB are remembered, so an agent resending its tools is not checked again.
+
+The grammar is the DSML envelope itself (`dsml_grammar.py`): parameters appear
+once each, in declared order. A string is written raw (`string="true"`), as
+the encoder writes it: a plain string, a string `enum`/`const` (behind a
+`$ref` too), and the string side of a nullable one. Every other value,
+patterned and formatted strings included, is a `string="false"` JSON value
+under its own JSON grammar, carrying the definitions it references. The answer
+and every parameter share one expansion budget, and the grammar may not grow
+past twice the size of the tool schemas (or 1 MiB). Whitespace around the
+answer and the calls is free; inside a call it is allowed only where the
+encoder writes line breaks. Neither the free text before the calls nor a raw
+value may contain what the tool parser reads as the start of a call, the end
+of a value or another call, with or without the DSML marker, so the parser
+reads them back as written. A non-strict function's body is free but for
+another call or the call's end, in either spelling. A string inside a JSON
+value is not held to this: the parser cuts the value short at such a tag, as
+it does on `/v1`. The cut value usually fails the validation below; one its
+schema still takes (a nullable string written as JSON, say) goes out cut
+short.
+
+Parsed arguments are validated against their schema again before success is
+reported (formats are the grammar's to enforce), and every call must name one
+of the request's functions. They must be standard JSON too: the parser reads
+a number past a double's range as infinity, which no JSON can carry. A
+streamed reply holds its frames from the first tool call on until then, so a
+call that fails is never sent: the stream ends with a
+`structured_output_error`, as a non-streamed reply fails. Nor is a call whose
+choice never finished, so was never checked: the stream ended in an error
+first, and only that error goes out. The reply is read literally, as under
+`response_format`. The thinking-mode refusal of
+required/named `tool_choice` still applies.
+
 ## Model discovery
 
 `/v1/models` reports deployment limits rather than copying a hosted model card:
@@ -219,6 +296,9 @@ remain separate tasks.
 - DSpark advertises text input, even if the checkpoint also declares vision.
 - Text output and the configured model's supported effort levels are exposed.
 - Unknown capabilities are omitted rather than inferred from a served alias.
+- `structured_output` is present only when the backend is installed:
+  `{"backend": "llguidance", "formats": ["json_object", "json_schema"]}`. A
+  request can still be refused at admission on a topology that cannot run it.
 
 The V4.1 adapter advertises `low`, `high`, and `max` thinking effort. The output
 cap is also bounded by its 393,216-token API limit. Returning model metadata does

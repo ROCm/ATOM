@@ -532,8 +532,9 @@ def test_window_lens_count_the_positions_this_rank_owns(
         [1, max_seqlen_q, 97, 128, 129, world * interleave * 3 + 1, 1024],
         dtype=np.int64,
     )
+    positions = (seq_lens[:, None] - max_seqlen_q + np.arange(max_seqlen_q)).ravel()
     for rank in range(world):
-        got = get_dcp_local_window_lens(seq_lens, max_seqlen_q, world, rank, interleave)
+        got = get_dcp_local_window_lens(positions, world, rank, interleave)
         want = [
             _owned_before(ctx - max_seqlen_q + 1 + j, rank, world, interleave)
             for ctx in seq_lens
@@ -549,7 +550,7 @@ def test_one_query_per_sequence_reproduces_the_per_request_lengths(world, interl
     seq_lens = np.array([1, 63, 64, 65, 4096], dtype=np.int64)
     for rank in range(world):
         assert list(
-            get_dcp_local_window_lens(seq_lens, 1, world, rank, interleave)
+            get_dcp_local_window_lens(seq_lens - 1, world, rank, interleave)
         ) == list(get_dcp_local_seq_lens(seq_lens, world, rank, interleave))
 
 
@@ -563,7 +564,7 @@ def test_window_lens_advance_only_on_the_rank_that_owns_the_new_token():
     world, q, ctx = 4, 4, 1000
     per_rank = np.stack(
         [
-            get_dcp_local_window_lens(np.array([ctx]), q, world, r, 1)
+            get_dcp_local_window_lens(np.arange(ctx - q, ctx), world, r, 1)
             for r in range(world)
         ]
     )
@@ -577,14 +578,18 @@ def _publish(bs, q, world, cols=6, is_sparse=True, kpool=1):
     block_tables = torch.arange(bs * cols, dtype=torch.int32, device=DEV).reshape(
         bs, cols
     )
+    batch_ids = torch.arange(bs, dtype=torch.int32, device=DEV).repeat_interleave(q)
     stub = SimpleNamespace(
         indexes_by_token_table=indexes_by_token_table(is_sparse, world, kpool),
         _token_block_tables_gpu=torch.zeros(
             bs * q, cols, dtype=torch.int32, device=DEV
         ),
+        model_runner=SimpleNamespace(
+            forward_vars={"batch_id_per_q_token": SimpleNamespace(gpu=batch_ids)}
+        ),
     )
     meta = SimpleNamespace(block_tables=block_tables, token_block_tables=None)
-    AiterMLAMetadataBuilder._publish_token_block_tables(stub, meta, bs, q)
+    AiterMLAMetadataBuilder._build_token_block_tables(stub, meta, len(batch_ids), q)
     return meta
 
 
@@ -625,8 +630,8 @@ def test_every_backend_answers_the_draft_s_dcp_table_publish():
     here would reach the verify step."""
     from atom.model_ops.attentions import backends
 
-    base = backends.CommonAttentionBuilder._publish_token_block_tables
-    assert AiterMLAMetadataBuilder._publish_token_block_tables is not base
+    base = backends.CommonAttentionBuilder._build_token_block_tables
+    assert AiterMLAMetadataBuilder._build_token_block_tables is not base
     metadata = SimpleNamespace()
     base(object(), metadata, 4, 1)
     assert not vars(metadata)

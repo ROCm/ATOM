@@ -22,6 +22,9 @@ on:
 jobs:
   sglang-model-accuracy:
     name: SGLANG Model Accuracy (${{ matrix.model_name }})
+    # Defense-in-depth: current callers are schedule/workflow_dispatch only.
+    # Keep forked PRs off these self-hosted runners if a PR caller is added later.
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(inputs.model_matrix_json) }}
@@ -157,34 +160,8 @@ jobs:
           MODEL_PATH="${{ matrix.model_path }}"
 
           model_dir_is_complete() {
-            local model_dir="$1"
-            [ -f "${model_dir}/config.json" ] || return 1
-            MODEL_DIR="${model_dir}" python3 - <<'PY'
-          import json
-          import os
-          import sys
-          from pathlib import Path
-
-          model_dir = Path(os.environ["MODEL_DIR"])
-          index_path = model_dir / "model.safetensors.index.json"
-          if not index_path.exists():
-              sys.exit(0)
-
-          try:
-              weight_map = json.loads(index_path.read_text()).get("weight_map", {})
-          except Exception as exc:
-              print(f"Invalid safetensors index under {model_dir}: {exc}")
-              sys.exit(1)
-
-          expected = {Path(path).name for path in weight_map.values()}
-          present = {path.name for path in model_dir.glob("*.safetensors")}
-          missing = sorted(expected - present)
-          if missing:
-              shown = ", ".join(missing[:10])
-              suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
-              print(f"Missing safetensors shards under {model_dir}: {shown}{suffix}")
-              sys.exit(1)
-          PY
+            [ -f "$1/config.json" ] || return 1
+            python3 "${GITHUB_WORKSPACE}/.github/scripts/check_model_dir.py" "$1"
           }
 
           cache_roots=(
@@ -402,34 +379,8 @@ jobs:
           fi
 
           model_dir="${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
-          if $CONTAINER_ENGINE exec \
-            -e MODEL_DIR="$model_dir" \
-            "$CONTAINER_NAME" \
-            bash -lc '
-              set -euo pipefail
-              [ -f "$MODEL_DIR/config.json" ]
-              python3 - <<'"'"'PY'"'"'
-          import json
-          import os
-          import sys
-          from pathlib import Path
-
-          model_dir = Path(os.environ["MODEL_DIR"])
-          index_path = model_dir / "model.safetensors.index.json"
-          if not index_path.exists():
-              sys.exit(0)
-
-          weight_map = json.loads(index_path.read_text()).get("weight_map", {})
-          expected = {Path(path).name for path in weight_map.values()}
-          present = {path.name for path in model_dir.glob("*.safetensors")}
-          missing = sorted(expected - present)
-          if missing:
-              shown = ", ".join(missing[:10])
-              suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
-              print(f"Missing safetensors shards under {model_dir}: {shown}{suffix}")
-              sys.exit(1)
-          PY
-            '; then
+          if $CONTAINER_ENGINE exec "$CONTAINER_NAME" \
+            python3 /workspace/.github/scripts/check_model_dir.py "$model_dir"; then
             echo "Resolved local model path: ${model_dir}"
             echo "SGLANG_MODEL_AVAILABLE_LOCALLY=true" >> "$GITHUB_ENV"
             echo "SGLANG_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
@@ -466,41 +417,25 @@ jobs:
                 fi
 
                 model_dir_is_complete() {
-                  [ -f "$MODEL_DIR/config.json" ] || return 1
-                  python3 - <<'"'"'PY'"'"'
-          import json
-          import os
-          import sys
-          from pathlib import Path
-
-          model_dir = Path(os.environ["MODEL_DIR"])
-          index_path = model_dir / "model.safetensors.index.json"
-          if not index_path.exists():
-              sys.exit(0)
-
-          weight_map = json.loads(index_path.read_text()).get("weight_map", {})
-          expected = {Path(path).name for path in weight_map.values()}
-          present = {path.name for path in model_dir.glob("*.safetensors")}
-          missing = sorted(expected - present)
-          if missing:
-              shown = ", ".join(missing[:10])
-              suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
-              print(f"Model under {model_dir} is missing safetensors shards: {shown}{suffix}")
-              sys.exit(1)
-          PY
+                  python3 /workspace/.github/scripts/check_model_dir.py "$MODEL_DIR"
                 }
 
                 download_model() {
                   if [ -f "$MODEL_DIR/config.json" ]; then
-                    echo "Model directory exists without a completion marker under ${MODEL_DIR}; validating download"
+                    echo "Model directory exists without a complete download under ${MODEL_DIR}; resuming download"
                   else
                     echo "Model not found under ${MODEL_DIR}; downloading model"
                   fi
 
                   rm -f "$completion_flag"
                   hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
-                  model_dir_is_complete
+                  # Mark first so the check validates the downloaded shards rather
+                  # than the unmarked-directory heuristics; unmark if it fails.
                   touch "$completion_flag"
+                  if ! model_dir_is_complete; then
+                    rm -f "$completion_flag"
+                    exit 1
+                  fi
                 }
 
                 if [ -f "$completion_flag" ]; then

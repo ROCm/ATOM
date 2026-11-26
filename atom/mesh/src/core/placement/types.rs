@@ -19,6 +19,14 @@ pub struct RequestDescriptor<'a> {
     pub tokens: Option<&'a [u32]>,
     pub headers: Option<&'a HeaderMap>,
     pub stream: bool,
+    /// Media items in the request, as ingress counted them.
+    pub media_count: usize,
+}
+
+impl RequestDescriptor<'_> {
+    pub fn carries_media(&self) -> bool {
+        self.media_count > 0
+    }
 }
 
 #[derive(Debug)]
@@ -26,12 +34,16 @@ pub enum PlacementPlan {
     Single {
         worker: Arc<dyn Worker>,
         policy_name: &'static str,
+        /// Prompt tokens charged to `worker` until its prefill finishes.
+        prefill_tokens: usize,
     },
     Pair {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         prefill_policy: &'static str,
         decode_policy: &'static str,
+        /// Prompt tokens charged to `prefill` until its prefill finishes.
+        prefill_tokens: usize,
     },
 }
 

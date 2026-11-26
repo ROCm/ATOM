@@ -93,12 +93,40 @@ def deepseek_v41_state_reserve_blocks(vllm_config) -> int:
 
     Zero for any model that is not DeepSeek-V4.1 on the plugin path, which is
     what makes the patch safe to install unconditionally for the process.
+
+    Also zero when `paged_state_checkpoint` is on: its `usable_blocks` already
+    withholds the same tail, out of the same allocation, and withholding it
+    here as well charges the pool for it twice. That does not fail, it just
+    shrinks the pool -- and a pool too small for one request is a livelock,
+    not an error.
     """
     from atom.plugin.vllm.deepseek_v41_bridge import (
         v41_proxy_state_reserve_blocks,
     )
 
+    if _state_checkpoints_own_the_tail(vllm_config):
+        return 0
     return v41_proxy_state_reserve_blocks(vllm_config)
+
+
+def _state_checkpoints_own_the_tail(vllm_config) -> bool:
+    """Whether `paged_state_checkpoint` is withholding the STATE tail this run.
+
+    Imported lazily and guarded: this module runs before ATOM's attention
+    stack on configurations where the checkpoint mechanism is not importable
+    at all, and there the answer is simply no.
+    """
+    try:
+        from atom.plugin.vllm.paged_state_checkpoint import (
+            adapter_for_config,
+            state_checkpoints_on,
+        )
+
+        return bool(state_checkpoints_on(adapter_for_config(vllm_config), vllm_config))
+    except ImportError:
+        # Absence means the mechanism is not on. Anything else surfaces:
+        # answering no would reserve the STATE tail twice, which can livelock.
+        return False
 
 
 def _how_to_fit(vllm_config) -> str:

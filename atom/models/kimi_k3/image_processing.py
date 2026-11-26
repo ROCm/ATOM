@@ -55,6 +55,9 @@ def build_kimi_k3_inputs(
     chunked like text and its embeddings are encoded once per request (see
     ``multimodal_runtime``); without spans a prompt longer than
     ``--max-num-batched-tokens`` could never be scheduled.
+
+    Images reach the processor in their decoded mode, so its own
+    ``media_proc_cfg.transparent_bg_config`` fill applies to transparent ones.
     """
     multimodal_config = getattr(atom_config, "multimodal_config", None)
     if multimodal_config is None:

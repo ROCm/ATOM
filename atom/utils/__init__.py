@@ -105,7 +105,8 @@ def set_device_control_env_var(config: "Config", local_dp_rank: int):
 
     Making it set a real ``HIP_VISIBLE_DEVICES`` was tried and reverted. The
     mask renumbers devices in the child (``cuda:0`` becomes the first *visible*
-    GPU), but ``ModelRunner._setup_device_and_distributed`` independently
+    GPU), but ``ModelRunner._setup_device_and_distributed`` (by default
+    ``init_model_env`` in model_setup.py; the rollout runner overrides it)
     computes an ABSOLUTE index -- ``local_dp_rank * tp_size + rank`` -- and
     selects ``cuda:{that}``. The two offsets compound: with ``-dp 4 -tp 2``,
     DP rank 1 would get a mask of "2,3" (two visible devices) and then ask for
@@ -737,6 +738,12 @@ class CpuGpuBuffer:
                     "numpy array, so call CpuGpuBuffer with with_numpy=False"
                 )
             self.np = self.cpu.numpy()
+
+    def acquire_write(self) -> None:
+        """Claim the host source before writing it: a bound buffer waits for
+        its last publication's upload; an unbound one has nothing to wait for."""
+        if self._publication is not None:
+            self._publication.acquire_write()
 
     def copy_to_gpu(
         self, n: int | None = None, *, republish_reason: str | None = None

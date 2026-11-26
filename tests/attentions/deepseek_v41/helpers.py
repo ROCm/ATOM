@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 from dataclasses import dataclass
 
+import numpy as np
+
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.model_ops.attentions.token_layout.batch_ids import build_query_layout
 
 
 def geometry(config, block=32):
@@ -27,6 +30,21 @@ def geometry(config, block=32):
         ),
         index_topk=config.index_topk,
     )
+
+
+def stage_query_layout(builder, lengths, running_bs, running_tokens):
+    """What the runner publishes before a builder entry
+    (`prepare_query_metadata`): `cu_seqlens_q` and the token map."""
+    var = builder.model_runner.forward_vars
+    build_query_layout(
+        np.asarray(lengths, dtype=np.int32),
+        running_bs,
+        running_tokens,
+        cu_seqlens_q=var["cu_seqlens_q"].np,
+        batch_ids=var["batch_id_per_q_token"].np,
+    )
+    var["cu_seqlens_q"].copy_to_gpu(running_bs + 1)
+    var["batch_id_per_q_token"].copy_to_gpu(running_tokens)
 
 
 def metadata_buffers(batch_size, tokens, blocks, device="cpu", geometry=None):
@@ -171,7 +189,7 @@ def publish_decoder(cache, step, block_tables, running_bs=None):
     """``step`` with its decoder plan at ``running_bs`` (its requests by
     default), from a builder whose buffers hold every request's window."""
     running_bs = running_bs or max(len(block_tables), 1)
-    capacity = max(step.width, running_bs * cache.geometry.window_size)
+    capacity = max(step.running_tokens, running_bs * cache.geometry.window_size)
     blocks = max((len(row) for row in block_tables), default=1)
     publish = decoder_publisher(
         cache, running_bs, capacity, blocks, step.positions.device

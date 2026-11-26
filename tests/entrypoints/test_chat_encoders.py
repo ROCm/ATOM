@@ -8,7 +8,7 @@ import pathlib
 import pytest
 from jinja2 import TemplateError
 
-from atom.entrypoints.atomesh import atom_standalone_service
+from atom.entrypoints.atomesh import token_bridge
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.chat_encoder_adapters import (
     build_message_encoder_adapter,
@@ -21,7 +21,10 @@ from atom.entrypoints.openai.chat_encoders import (
     chat_template_source,
     render_probe_prompt,
     resolve_reasoning_toggle,
+    template_needs_tool_call_argument_strings,
+    template_takes_mid_system,
 )
+from atom.entrypoints.openai.protocol import ChatMessage
 from atom.entrypoints.openai.tool_parser.registry import resolve_tool_call_parser
 
 
@@ -205,7 +208,7 @@ class TestChatTemplateSource:
         """Both entry points asked `getattr(tokenizer, "chat_template", None)`
         directly, which is the shape that answers False for a whole class of
         model. Neither body is reachable from a unit test."""
-        for module in (api_server, atom_standalone_service):
+        for module in (api_server, token_bridge):
             src = pathlib.Path(module.__file__).read_text()
             assert "template_opens_reasoning_implicitly(" in src
             assert "chat_template_source(" in src, f"{module.__name__} reads it raw"
@@ -333,7 +336,7 @@ class TestResolveReasoningToggle:
         # an effort level, validated against the dialects' own vocabulary --
         # and is not what the resolved toggle answers.
         _TOGGLE_NAMES = {name for name, _, _ in REASONING_TOGGLES}
-        src = inspect.getsource(api_server.chat_completions)
+        src = inspect.getsource(api_server._chat_completions)
         tree = ast.parse(textwrap.dedent(src))
         hardcoded = [
             n.slice.value
@@ -380,12 +383,80 @@ class TestAModelWithNoChatTemplateStillBoots:
         assert render_probe_prompt(self.NoTemplate(), None, tools=True) is None
 
     @pytest.mark.parametrize(
-        "probe",
+        "probe, expected",
         [
-            lambda t: resolve_reasoning_toggle(t, None),
-            lambda t: resolve_tool_call_parser(None, t, None),
+            (lambda t: resolve_reasoning_toggle(t, None), None),
+            (lambda t: resolve_tool_call_parser(None, t, None), None),
+            (lambda t: template_needs_tool_call_argument_strings(t, None), False),
+            (lambda t: template_takes_mid_system(t, None), False),
         ],
-        ids=["reasoning", "tool-parser"],
+        ids=["reasoning", "tool-parser", "tool-call-arguments", "mid-system"],
     )
-    def test_neither_startup_probe_raises(self, probe):
-        assert probe(self.NoTemplate()) is None
+    def test_no_startup_probe_raises(self, probe, expected):
+        assert probe(self.NoTemplate()) is expected
+
+
+class TestToolCallArgumentStrings:
+    """DeepSeek-R1/V3's template concatenates history tool-call arguments as a
+    string, so ATOM's default of parsing them into a mapping raised
+    ``TypeError`` on every turn after a tool call."""
+
+    CONCAT = (
+        "{% for m in messages %}{% for t in m.get('tool_calls', []) %}"
+        "{{ 'json\\n' + t['function']['arguments'] }}{% endfor %}{% endfor %}"
+    )
+    ITERATE = (
+        "{% for m in messages %}{% for t in m.get('tool_calls', []) %}"
+        "{% for k, v in t['function']['arguments'].items() %}{{ k }}={{ v }}"
+        "{% endfor %}{% endfor %}{% endfor %}"
+    )
+
+    class Tok:
+        def __init__(self, source: str):
+            from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+            self.chat_template = source
+            self.template = ImmutableSandboxedEnvironment().from_string(source)
+
+        def apply_chat_template(self, messages, **kwargs):
+            return self.template.render(messages=messages)
+
+    def test_a_template_that_concatenates_arguments_gets_strings(self):
+        assert template_needs_tool_call_argument_strings(self.Tok(self.CONCAT), None)
+
+    def test_a_template_that_iterates_arguments_keeps_the_mapping(self):
+        assert not template_needs_tool_call_argument_strings(
+            self.Tok(self.ITERATE), None
+        )
+
+    def test_a_template_that_refuses_both_forms_keeps_the_mapping(self):
+        refuses_both = (
+            "{% for m in messages %}{% for t in m.get('tool_calls', []) %}"
+            "{{ t['function']['arguments'] + 1 }}{% endfor %}{% endfor %}"
+        )
+        assert not template_needs_tool_call_argument_strings(
+            self.Tok(refuses_both), None
+        )
+
+    def test_a_chat_message_history_renders_only_with_strings(self):
+        msg = ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": '{"a": 1}'},
+                }
+            ],
+        )
+        tok = self.Tok(self.CONCAT)
+        with pytest.raises(TypeError):
+            apply_chat_template(tok, None, [msg], preserve_tool_call_arguments=False)
+        out = apply_chat_template(tok, None, [msg], preserve_tool_call_arguments=True)
+        assert '{"a": 1}' in out
+
+    def test_a_custom_encoder_is_not_probed(self):
+        assert not template_needs_tool_call_argument_strings(
+            self.Tok(self.CONCAT), object()
+        )

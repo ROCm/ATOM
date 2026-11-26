@@ -37,10 +37,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CORE = ROOT / "atom/models/deepseek_v41/attention.py"
 PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 
-# sha256 of core's `Attention.forward` and `_attend`, comments and blank
-# lines stripped.
-CORE_PREPARE_DIGEST = "6e6ba60ac60f4825"
-CORE_FORWARD_DIGEST = "efcc7dbf2f688954"
+# sha256 of core's attention forward/preparation helpers, comments and blank
+# lines stripped. vLLM keeps preparation inside its existing attention break;
+# native TokenGraph's fixed/live placement does not change the copied math.
+CORE_PREPARE_DIGEST = "9aa3c02a741f9b0b"
+CORE_FORWARD_DIGEST = "fbae6fa2bb0e58d0"
 
 
 @pytest.fixture
@@ -222,8 +223,7 @@ def test_plugin_quantized_qkv_preserves_bf16_auxiliary_readers(
 
 def _core_forward() -> str:
     """The source of the attention half the plugin copies: `Attention.forward`
-    and `_attend`, the region it attends in, by AST rather than by text
-    markers.
+    and its preparation/attention helpers, by AST rather than text markers.
 
     A "next def" marker would have nothing to find after the class's last
     method -- and a marker that silently matches to end-of-file would fold
@@ -238,7 +238,13 @@ def _core_forward() -> str:
     lines = src.split("\n")
     return "\n".join(
         line.rstrip()
-        for name in ("forward", "_attend")
+        for name in (
+            "forward",
+            "_prepare_attention",
+            "_prepare_attention_live",
+            "_attention_inputs",
+            "_attend",
+        )
         for fn in cls.body
         if isinstance(fn, ast.FunctionDef) and fn.name == name
         for line in lines[fn.lineno - 1 : fn.end_lineno]
@@ -293,7 +299,7 @@ def test_core_prepare_has_not_moved_under_its_copy():
     reader makes that class of change silent instead, so it is pinned.
     """
     body = _core_prepare()
-    assert len(body.split(NEWLINE)) > 80, "the _prepare marker matched too little"
+    assert len(body.split(NEWLINE)) > 60, "the _prepare marker matched too little"
     digest = hashlib.sha256(body.encode()).hexdigest()[:16]
     assert digest == CORE_PREPARE_DIGEST, (
         "`DeepseekV41MetadataBuilder._prepare` has changed. The vLLM plugin "
@@ -327,11 +333,14 @@ def test_the_copy_still_covers_both_dispatch_arms():
             ("forward_hidden",),
             "e5d8ebd181754862",
         ),
+        # Core's `start` / `join` skip the lookup on a step the model's decode
+        # round serves (`EngramStep.served_by_round`); not ported: the plugin's
+        # runner has no decode round, so its steps are never served by one.
         (
             "atom/model_ops/engram/device/staging.py",
             "EngramStaging",
             ("start", "consume", "join"),
-            "7d1dcc8553e48b9d",
+            "660c71d18d001564",
         ),
     ],
 )
