@@ -1,8 +1,33 @@
-# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-24 points
+# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-25 points
 
 How to reproduce the numbers below: the exact code, the settings, the run, and how each number is computed.
 They are 10-minute measurement points, not official results (see [What these numbers are](#what-these-numbers-are)).
 
+## 2026-11-25: GDN verify occupancy, MoE expert lookup, wide router/shared scheduling at c256-c1024
+
+`agentic_20261125.env` on top of the 11-01 to 11-24 env files. Code: `alizaidy/gfx1250-qwen-support` (ATOM dc4686e99, aiter
+7ec8ef5c9) plus, all opt-in and bitwise: the GDN verify register replay with the FP32 flush and a relaxed split-form ticket
+(`AITER_GDN_VERIFY_LDS_OPT=2`, `AITER_GDN_VERIFY_TICKET_RELAXED`, with `ATOM_GDN_VERIFY_GROUPED_REPLAY`), the grouped-MoE
+expert lookup in one memory round trip (`AITER_MOE_EXPERT_VEC`), the wide router + shared-expert kernel's per-XCD weight
+prefetch and late counter use (`AITER_ROUTER_SHARED_PREFETCH`, `_LATE_USE`), and the grouped-MoE bucket-512 stage-1 tile
+back to 32x256x128 (config; the 11-24 32x256x512 tile was 3.6 us per call slower in the served c1024 profile). The GPU
+driver was loaded as on previous days (`mtype_local=0 ip_block_mask=0xcff`); every configuration warmed first.
+
+| point | 11-24 recipe (+ bucket-512 config) | + 11-25 bundle | change | accuracy (bundle) |
+|---|---:|---:|---:|---|
+| c1024 | 172.8 (171.9 before the config fix) | **175.6** | +1.6% (+2.2% with the config) | 0.5669 |
+| c384 | 450.4 | **462.4** | +2.7% | 0.5647 |
+| c64 (bundle + ATOM step cuts) | 1222.2 | 1196.2 | -2.1% (not set) | 0.5624 |
+
+Notes:
+- The bundle is set at c256-c1024 (measured at c384 and c1024). At c64 the same kernels plus the ATOM step cuts
+  (`ATOM_MTP_ADVANCE_IN_SELECT`, `ATOM_PRESENCE_IN_SAMPLER`, `ATOM_PROLOGUE_EARLY_PACK`, `ATOM_PROLOGUE_FILL_FUSED`,
+  `ATOM_SKIP_VERIFY_KV_INDICES`) measured -2.1% in one pair (c64 moves 1-2% run to run); not set until the cause is known.
+- GDN verify `LDS_OPT=1` (BF16 checkpoint flush) is a further 5-8% on the kernel but changes checkpoint bits; not used.
+- Kernel-level gains: GDN verify -17% at c1024 / -11% at c384 shapes, MoE -0.7..-1.9 us per layer, wide router/shared
+  -13.5% at c384 rows / -5% at c1024 rows. The e2e gain is smaller than these predicted (about 1x the GPU time saved).
+- `ATOM_MIXED_STEP=1` (mixed prefill + decode steps, numerical) is in the code, default off, not set: its served A/B is
+  pending. In the LLMEngine closed-batch bench it is 0.9% (c384-like) to 1.4% (c1024-like) faster.
 ## 2026-11-24: low-concurrency decode bundle at c64, XCD rotation at c1024
 
 `agentic_20261124.env` on top of the 11-01 to 11-23 env files. Code: `alizaidy/gfx1250-qwen-support` (ATOM 21f211740, aiter
