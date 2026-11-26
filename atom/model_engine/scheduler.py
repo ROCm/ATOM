@@ -3325,6 +3325,10 @@ class Scheduler:
                     and not seq.midstep_reservations
                 ):
                     self.block_manager.checkpoint_when_scheduled(seq, planned_end)
+        # Anchors a forward runs past within the slack are copied right after it.
+        for i, seq in enumerate(scheduled_seqs.values()):
+            end = seq.num_cached_tokens + int(num_scheduled_tokens[i])
+            self.block_manager.checkpoint_after_forward(seq, end)
 
         total_tokens_num_prefill = sum(num_scheduled_tokens)
         if self._tick_cost_limit < math.inf:
@@ -4378,6 +4382,13 @@ class Scheduler:
         ):
             self._checkpoint_holds[seq.id] = start + chunk
         return chunk
+
+    def _keep_finished_state(self, seq: Sequence) -> None:
+        """A finished request's state for its next turn
+        (`BlockManager.keep_finished_state`). Not a P/D request's: the producer
+        hands its state on and the decode never resumes from its own."""
+        if not (seq.kv_transfer_params or {}).get("transfer_id"):
+            self.block_manager.keep_finished_state(seq)
 
     def _checkpoint_room(self, seq: Sequence, finished: bool) -> int:
         """Tokens the forward after this one carries, for `hash_decode_blocks`.
@@ -6023,8 +6034,10 @@ class Scheduler:
                         seq._deferred_save_at = time.monotonic()
                         self.deferred_free_blocks[seq.id] = seq
                 else:
+                    self._keep_finished_state(seq)
                     self.block_manager.deallocate(seq)
             else:
+                self._keep_finished_state(seq)
                 self.block_manager.deallocate(seq)
             if self.pd_admission is not None:
                 # A request aborted after promotion but before its first batch

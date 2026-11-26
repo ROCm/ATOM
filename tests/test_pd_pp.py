@@ -771,6 +771,9 @@ def _queue_only_consumer():
     conn._write_request_error = None
     conn._verified_producers = set()
     conn._has_slot_regions = False
+    conn._slot_region_tp_segments = None
+    conn._slot_region_tp_replicated = None
+    conn.tp_size = 1
     conn._staging_slots = mc.SlotPool()
     return mc, conn
 
@@ -870,6 +873,22 @@ def test_consumer_refuses_a_producer_with_other_slot_sizes(monkeypatch):
         assert conn2._post_queued_write_requests()
     assert sent == [[b"r0"], [b"r1"]]
     assert sock.send_multipart.call_count == 2
+
+    # A TP4 consumer of a head-split slot takes a quarter of a TP1 producer's.
+    _, conn3 = _queue_only_consumer()
+    conn3.__dict__.update(
+        _has_slot_regions=True,
+        _slot_regions=[(0, 2048)],
+        _slot_region_tp_segments=[(2048,)],
+        _slot_region_tp_replicated=[False],
+        tp_size=4,
+        _decoder=conn._decoder,
+        zmq_context=conn.zmq_context,
+        _send_on_socket=lambda addr, parts: sent.append(parts),
+    )
+    conn3._enqueue_write_requests([("tcp://p:1", [b"r2"])])
+    assert conn3._post_queued_write_requests()
+    assert sent[-1] == [b"r2"]
 
 
 def test_mooncake_tcp_disables_rdma_device_even_when_configured():
@@ -1208,7 +1227,7 @@ def _make_transfer_connector(prefill_data, captured):
     conn.done_sending = set()
     conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
     conn._execute_block_slot_transfer = (
-        lambda request, target, src, dst, data, req_id, *, engine=None: captured.append(
+        lambda request, target, src, dst, data, req_id, *, engine=None, **_: captured.append(
             (request, target, src, dst, data, req_id, engine)
         )
         or True
@@ -2654,7 +2673,7 @@ def test_concurrent_pd_requests_keep_their_selected_engine(has_slot_data, matche
         conn._rail_pool = SimpleNamespace(get=engines.__getitem__)
     barrier = threading.Barrier(2)
 
-    def transfer(data, target, *_args, engine=None):
+    def transfer(data, target, *_args, engine=None, **_):
         # Both selections must finish before either write. Mutating the
         # connector's shared engine here would send a request on the wrong rail.
         barrier.wait(timeout=10)
@@ -2771,3 +2790,19 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
     )
     staging_stream.synchronize.assert_called_once()
     conn._index_staging_slots.release.assert_called_once_with(3)
+
+
+def test_a_tp1_producer_slot_is_the_head_split_regions_k_times_wider():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    mine = [1146880, 1146880, 64]
+    segments = [(32768,) * 35, (32768,) * 35, (64,)]
+    replicated = [False, False, True]
+    assert mc.producer_slot_bps(mine, segments, replicated, 4, 1) == [
+        4587520,
+        4587520,
+        64,
+    ]
+    assert mc.producer_slot_bps(mine, segments, replicated, 4, 4) == mine
+    assert mc.producer_slot_bps(mine, None, None, 4, 1) == mine

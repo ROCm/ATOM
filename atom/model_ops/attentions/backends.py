@@ -1693,12 +1693,14 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         the LM head runs every running token, and `postprocess` cuts back to
         the scheduled ones, the one place it does.
         """
-        # Run state maintenance on the compute stream before the forward.
+        # Run state maintenance on the compute stream before the forward, on
+        # whichever builder owns the state (a draft's, `state_builder`).
         state_ops = batch.state_maintenance_ops
+        owner = getattr(self.model_runner, "state_builder", self)
         if state_ops.relocations:
-            self.relocate_state_slots(state_ops.relocations)
+            owner.relocate_state_slots(state_ops.relocations)
         if state_ops.checkpoint_stores or state_ops.checkpoint_restores:
-            self.execute_paged_state_copies(
+            owner.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
         if state_ops.block_copies:
@@ -1713,6 +1715,9 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             built = self.prepare_decode(
                 batch, running_bs, running_tokens, max_seqlen_q, ubatch_slices
             )
+        if owner is not self:
+            # Its step addressing reads the positions and rows staged above.
+            owner.stage_step(batch, running_bs, running_tokens)
         attn_metadata = built[0]
         if attn_metadata.batch_id_per_q_token is None:
             # Published with the query prefix (`prepare_query_metadata`).

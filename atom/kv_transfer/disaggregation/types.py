@@ -483,11 +483,20 @@ class KVTransferTensors:
         return pages
 
     def merge_pages(self, other: KVTransferTensors) -> None:
-        """Append another contributor's PAGE units (a draft's own pool).
+        """Append another contributor's PAGE units (a draft's own pool), or its
+        per-request slot regions (a draft window kept as state).
 
         Replication is a whole-PAGE declaration: one sharded contributor makes
         the combined object sharded even when this one alone is replicated.
         """
+        if other.slot_regions:
+            if self.slot_regions:
+                raise ValueError("two contributors publish per-request state")
+            self.slot_regions = list(other.slot_regions)
+            self.num_slots = other.num_slots
+            self.slot_region_consumer_indices = other.slot_region_consumer_indices
+            self.slot_region_tp_segments = other.slot_region_tp_segments
+            self.slot_region_tp_replicated = other.slot_region_tp_replicated
         if not other.pages:
             return
         self.pages.extend(other.pages)

@@ -156,7 +156,7 @@ def test_the_runner_copies_staged_state_before_the_connector_sees_it():
     )
     plain = lift(MODEL_RUNNER, "ModelRunner", "process_kvconnector_output", scope)
     runner = types.SimpleNamespace(
-        attn_metadata_builder=types.SimpleNamespace(
+        state_builder=types.SimpleNamespace(
             relocate_state_slots=lambda pairs: calls.append(("copy", pairs))
         ),
     )
@@ -241,7 +241,7 @@ def test_the_runner_sizes_from_the_builder_and_warns_when_unsized():
         if isinstance(node, ast.Assign)
         and ast.unparse(node.targets[0]) == "config.state_transfer_slots"
     ]
-    assert assigned == ["self.attn_metadata_builder.state_transfer_slots()"]
+    assert assigned == ["self.state_builder.state_transfer_slots()"]
     warned = [
         [ast.unparse(arg) for arg in node.args]
         for node in ast.walk(sizing)

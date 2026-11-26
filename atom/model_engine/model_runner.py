@@ -1072,6 +1072,8 @@ class ModelRunner:
             else None
         )
         self._served = None
+        # Every builder exists from here on, so the state owner is settled.
+        self._state_owner_settled = True
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         if config.enable_mixed_prefill_decode:
@@ -1821,6 +1823,36 @@ class ModelRunner:
             specs += self.draft_kv_builder.sub_pool_specs()
         return specs
 
+    @property
+    def state_builder(self):
+        """The builder that owns the per-request state: the target's, unless a
+        draft keeps its KV as per-request state of its own (`DraftKvBuilder`
+        declaring a STATE class). Both declaring one is refused. Resolved once
+        the target's builder exists, as every step's `build` asks."""
+        cached = self.__dict__.get("_state_builder")
+        if cached is not None:
+            return cached
+        owner = self._resolve_state_builder()
+        if self.__dict__.get("_state_owner_settled"):
+            self._state_builder = owner
+        return owner
+
+    def _resolve_state_builder(self):
+        draft = getattr(self, "draft_kv_builder", None)
+        if draft is None or not any(
+            spec.pool is Pool.STATE for spec in draft.sub_pool_specs()
+        ):
+            return self.attn_metadata_builder
+        if any(
+            spec.pool is Pool.STATE
+            for spec in self.attn_metadata_builder.sub_pool_specs()
+        ):
+            raise RuntimeError(
+                "the target and its draft both declare per-request state; one "
+                "state slot per request cannot hold both"
+            )
+        return draft
+
     def _state_pool_names(self) -> list[str]:
         """The per-request STATE classes the attached builders declare.
 
@@ -1939,7 +1971,7 @@ class ModelRunner:
     ) -> PagedStateCheckpointSpec:
         """This worker's own checkpoint geometry, before any PP agreement."""
         # None means the backend has not narrowed its image: carry it all.
-        narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+        narrowed = self.state_builder.checkpoint_image_bytes()
         return PagedStateCheckpointSpec(
             page_unit_bytes=published_page_unit_bytes(self.attn_metadata_builder),
             slot_bytes=slot_bytes,
@@ -1948,7 +1980,7 @@ class ModelRunner:
         )
 
     def _agree_pipeline_checkpoint_spec(
-        self, spec: PagedStateCheckpointSpec | None
+        self, spec: PagedStateCheckpointSpec | None, transfer=None
     ) -> PagedStateCheckpointSpec:
         """Put every PP stage's checkpoint images on one set of unit ids.
 
@@ -1981,15 +2013,19 @@ class ModelRunner:
             group=pp.cpu_group,
         )
         stateless = [i for i, entry in enumerate(stages) if entry is None]
-        if stateless:
+        # A rebuildable window (`StateTransfer.rebuild_tokens`) may sit on some
+        # stages only: the others take the joint units and copy nothing.
+        window_state = transfer is not None and transfer.rebuild_tokens > 0
+        if stateless and (not window_state or len(stateless) == len(stages)):
             raise RuntimeError(
                 f"PP stages {stateless} of {len(stages)} hold no recurrent "
                 "state, so they cannot keep PAGE-backed state checkpoints; "
                 "give every stage a linear-attention layer "
                 "(VLLM_PP_LAYER_PARTITION)"
             )
-        units = max(entry[3] for entry in stages)
-        op_bytes = sum(entry[1] for entry in stages)
+        stateful = [entry for entry in stages if entry is not None]
+        units = max(entry[3] for entry in stateful)
+        op_bytes = sum(entry[1] for entry in stateful)
         digest = hashlib.sha256(repr(stages).encode()).hexdigest()[:16]
         layout_id = f"pp{len(stages)}-joint:{digest}"
         logger.info(
@@ -1997,22 +2033,32 @@ class ModelRunner:
             "(per stage %s), op_bytes=%d, layout=%s",
             len(stages),
             units,
-            [entry[3] for entry in stages],
+            [0 if entry is None else entry[3] for entry in stages],
             op_bytes,
             layout_id,
         )
+        if spec is None:
+            # This stage holds none of the joint image.
+            return PagedStateCheckpointSpec(
+                page_unit_bytes=published_page_unit_bytes(self.attn_metadata_builder),
+                slot_bytes=0,
+                image_bytes=0,
+                layout_id=layout_id,
+                pipeline_units=units,
+                pipeline_op_bytes=op_bytes,
+            )
         return spec.for_pipeline(layout_id, units, op_bytes)
 
     def _state_runtime_for_plan(self, plan: PoolPlan) -> StateRuntime:
         config = self.config
         # Keep runtime state metadata out of Config.
-        transfer = self.attn_metadata_builder.state_transfer()
+        transfer = self.state_builder.state_transfer()
         uses_paged_state = transfer.copies
         if (
             uses_paged_state
             and config.pipeline_parallel_size > 1
             and not getattr(
-                self.attn_metadata_builder, "paged_checkpoints_span_pipeline", False
+                self.state_builder, "paged_checkpoints_span_pipeline", False
             )
         ):
             raise RuntimeError(
@@ -2047,7 +2093,9 @@ class ModelRunner:
             if is_pp:
                 # Every stage joins, a stateless one with None: raising before
                 # the collective would leave its peers waiting in it.
-                checkpoint_spec = self._agree_pipeline_checkpoint_spec(local_spec)
+                checkpoint_spec = self._agree_pipeline_checkpoint_spec(
+                    local_spec, transfer
+                )
                 transfer = dataclasses.replace(
                     transfer, paged_layout_id=checkpoint_spec.layout_id
                 )
@@ -2212,7 +2260,7 @@ class ModelRunner:
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
         # Read by BlockManager (shipped below) and by a producer's connector.
-        config.state_transfer_slots = self.attn_metadata_builder.state_transfer_slots()
+        config.state_transfer_slots = self.state_builder.state_transfer_slots()
         warn_unsized_state_transfer_slots(
             config.kv_transfer_config, config.state_transfer_slots
         )
@@ -2232,7 +2280,8 @@ class ModelRunner:
                 checkpoint_spec.page_unit_bytes,
                 checkpoint_spec.slot_bytes,
                 checkpoint_spec.image_bytes,
-                100.0 * checkpoint_spec.image_bytes / checkpoint_spec.slot_bytes,
+                # A PP stage holding none of a joint image has no slot.
+                100.0 * checkpoint_spec.image_bytes / (checkpoint_spec.slot_bytes or 1),
                 checkpoint_spec.units_per_checkpoint,
                 checkpoint_spec.layout_id,
             )
@@ -2440,15 +2489,19 @@ class ModelRunner:
         # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
         # attentions it returns an empty dict (no-op). Values are setattr'd
         # on `self` so model layers can access them as `model_runner.<name>`.
-        per_req_state = self.attn_metadata_builder.allocate_per_req_cache(
-            self.pool_plan.entries
-        )
-        for name, value in per_req_state.items():
-            setattr(self, name, value)
+        # The state owner allocates it; the target always gets the call, as a
+        # stateless one answers with nothing.
+        builders = [self.attn_metadata_builder]
+        if self.state_builder is not self.attn_metadata_builder:
+            builders.append(self.state_builder)
+        for builder in builders:
+            per_req_state = builder.allocate_per_req_cache(self.pool_plan.entries)
+            for name, value in per_req_state.items():
+                setattr(self, name, value)
         # The pools are reachable through `self` only now, which is the
         # earliest the builder can touch its own addresses — and the last
-        # moment before a request could.
-        self.attn_metadata_builder.warmup_per_req_cache()
+        # moment before a request could. Only the owner warms its state copies.
+        self.state_builder.warmup_per_req_cache()
 
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,
@@ -2467,7 +2520,7 @@ class ModelRunner:
             # The tier is built inside `register_kv_caches` and needs
             # `state_entry_views` to name the bytes it packs. This is the only
             # place the builder and the connector are both in scope.
-            transfer_tensors.state_backend = self.attn_metadata_builder
+            transfer_tensors.state_backend = self.state_builder
         if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
             transfer_tensors.merge_pages(
                 self.draft_kv_builder.get_kv_transfer_tensors()
@@ -2481,7 +2534,7 @@ class ModelRunner:
             transfer_tensors.set_block_count(num_kvcache_blocks)
         if (
             self._kv_pool_memory().shares_blocks
-            and not self.attn_metadata_builder.state_transfer().replays
+            and not self.state_builder.state_transfer().replays
         ):
             # Another rank's block carries PAGE only; without bounded replay a
             # hit would need a STATE checkpoint it lacks.
@@ -3969,6 +4022,12 @@ class ModelRunner:
                 hidden_states,
                 batch.next_token_ids,
             )
+        # Images of boundaries this forward ran past, its rows now written.
+        state_ops = batch.state_maintenance_ops
+        if state_ops is not None and state_ops.checkpoint_stores_after:
+            self.state_builder.execute_paged_state_copies(
+                state_ops.checkpoint_stores_after, ()
+            )
         # Every KV write of this forward is enqueued; sampling is not needed.
         self._kv_after_forward()
         if pp_non_last or self._is_pure_middle_chunk(batch):
@@ -4073,7 +4132,7 @@ class ModelRunner:
             if stages:
                 # Ahead of the next forward on this stream, which may reuse
                 # the live slots these copies read.
-                self.attn_metadata_builder.relocate_state_slots(list(stages.values()))
+                self.state_builder.relocate_state_slots(list(stages.values()))
                 connector.note_state_stages(stages)
             connector.start_load_kv(connector_meta_output)
 
@@ -5057,7 +5116,7 @@ class RapidServeModelRunner(ModelRunner):
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
         # prefill.
         if self.config.disagg_is_decode:
-            transfer = self.attn_metadata_builder.state_transfer()
+            transfer = self.state_builder.state_transfer()
             if transfer.copies:
                 raise RuntimeError(
                     "PAGE-backed state checkpoints do not yet support RapidServe "

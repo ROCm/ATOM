@@ -90,6 +90,7 @@ def _producer(pages, mem, heads, partition, rank, monkeypatch):
         _unit_plans={},
         _slot_regions=[],
         _swa_block_regions=[],
+        _gather_slot=None,
         _fp4_index_layout=False,
         _num_local_layers=len(pages),
         tp_size=4 // heads,
@@ -119,14 +120,27 @@ def _request(theirs, bases, rank):
     return msgpack.loads(msgpack.dumps(request))
 
 
+def _slot_request(request):
+    """A state-slot consumer's request: its PAGE bases under the slot key."""
+    request.update(
+        consumer_block_base_addrs=request.pop("consumer_base_addrs"),
+        consumer_slot_base_addrs=[],
+        consumer_slot_bps=[],
+        dst_slot_index=0,
+    )
+    return request
+
+
 @pytest.mark.parametrize("heads", [1, 4])
 @pytest.mark.parametrize("rank, partition", [(0, (2, 2, 2, 2)), (3, (3, 2, 2, 1))])
 @pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("slot", [False, True])
 def test_stage_fills_each_tp4_rank_with_its_head(
-    heads, rank, partition, draft, monkeypatch
+    heads, rank, partition, draft, slot, monkeypatch
 ):
     """`heads` 4 is a TP1 stage, cut by head; 1 is a TP4 stage, copied whole.
-    The last stage also holds the MTP row and, with `draft`, a draft pool."""
+    The last stage also holds the MTP row and, with `draft`, a draft pool.
+    With `slot` the request also carries per-request state (a draft window)."""
     mem, src_ids, dst_ids = _Memory(), [3, 1], [0, 2]
     theirs = stage_pages([*range(LAYERS), MTP], 1, draft=draft)
     layers, _, _ = stage_layers(partition, rank)
@@ -137,13 +151,20 @@ def test_stage_fills_each_tp4_rank_with_its_head(
     for consumer_rank in range(4):
         bases = [mem.add(4 * p.region.unit_bytes, False) for p in theirs]
         consumers.append({p.unit_spec: (b, p) for p, b in zip(theirs, bases)})
-        assert producer._execute_block_transfer(
-            _request(theirs, bases, consumer_rank),
-            "consumer",
-            src_ids,
-            dst_ids,
-            f"req-{consumer_rank}",
-        )
+        request = _request(theirs, bases, consumer_rank)
+        if slot:
+            assert producer._execute_block_slot_transfer(
+                _slot_request(request),
+                "consumer",
+                src_ids,
+                dst_ids,
+                {"slot_index": 0},
+                f"req-{consumer_rank}",
+            )
+        else:
+            assert producer._execute_block_transfer(
+                request, "consumer", src_ids, dst_ids, f"req-{consumer_rank}"
+            )
     for page, base in zip(ours, producer.kv_caches_base_addr):
         src = mem.at(base, 4 * page.region.unit_bytes).reshape(4, -1)
         runs = page.head_major_runs
@@ -243,16 +264,26 @@ def test_a_producer_that_may_not_cut_heads_is_refused(slot, monkeypatch):
     _refused(producer, request, mem, "needs a TP1 producer", slot)
 
 
-def test_the_state_slot_path_refuses_a_head_cut(monkeypatch):
-    """GDN hybrids' state slots are TP-sharded and never cut by head."""
+def test_a_head_cut_with_slots_no_segment_cuts_is_refused(monkeypatch):
+    """GDN hybrids' state slots are TP-sharded without segments: a TP1 slot
+    cannot be cut for a TP4 consumer, so nothing is written."""
     mem = _Memory()
     layers, _, _ = stage_layers((2, 2, 2, 2), 1)
     producer = _producer(stage_pages(layers, 4), mem, 4, (2, 2, 2, 2), 1, monkeypatch)
+    producer._slot_regions = [(mem.add(4096, True), 1024)]
+    producer._slot_region_consumer_indices = [0]
     theirs = stage_pages([*range(LAYERS), MTP], 1)
     request = _request(
         theirs, [mem.add(4 * p.region.unit_bytes, False) for p in theirs], 0
     )
-    _refused(producer, request, mem, "state slots", slot=True)
+    with pytest.raises(RuntimeError, match="State slot size mismatch"):
+        request = _slot_request(request)
+        request.update(consumer_slot_base_addrs=[mem.add(1024, False)])
+        request.update(consumer_slot_bps=[256])
+        producer._execute_block_slot_transfer(
+            request, "consumer", [0], [0], {"slot_index": 0}, "slot"
+        )
+    assert mem.writes == 0
 
 
 class _Layer:

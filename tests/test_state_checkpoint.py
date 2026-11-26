@@ -5080,13 +5080,13 @@ class TestResumeHash:
     def test_the_joint_boundary_wins_then_a_replay_then_the_hit(self, monkeypatch):
         bm = _paged_bm()
         seq = _seq()
-        assert bm._state_resume_hash(seq, 77, 2) == 77
-        assert bm._state_resume_hash(seq, -1, 2) == 2
-        assert bm._state_resume_hash(seq, -1, -1) == -1
+        assert bm._state_resume_hash(seq, 77, 16, 2, 8) == 77
+        assert bm._state_resume_hash(seq, -1, 0, 2, 8) == 2
+        assert bm._state_resume_hash(seq, -1, 0, -1, 0) == -1
         monkeypatch.setattr(bm, "state_replay_tokens", 8)
         seq.replays_hit = True
-        assert bm._state_resume_hash(seq, -1, 2) == -1, "a replay restores none"
-        assert bm._state_resume_hash(seq, 77, 2) == 77
+        assert bm._state_resume_hash(seq, -1, 0, 2, 8) == -1, "a replay restores none"
+        assert bm._state_resume_hash(seq, 77, 16, 2, 8) == 77
 
     def test_the_hold_judges_the_hash_allocate_then_loads(
         self, offload_clock, monkeypatch

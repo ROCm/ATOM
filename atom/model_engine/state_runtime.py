@@ -61,6 +61,12 @@ class StateTransfer:
     #: What a decode boundary keeps; see `StateCache.decode_keep`. A snapshot
     #: is built in a scratch slot the coordinator lends the store.
     decode_keep: str = KEEP_SETTLED
+    #: Copy only. Tokens before a request's end from which a forward rewrites
+    #: every state row a reader takes, so a hit that far back needs no image.
+    rebuild_tokens: int = 0
+    #: Copy only. Tokens a forward may run past a checkpoint boundary and still
+    #: hold that boundary's state, so the prefill chunk is not cut there.
+    trailing_slack: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.fork_tokens, int) or isinstance(self.fork_tokens, bool):
@@ -73,7 +79,12 @@ class StateTransfer:
             raise ValueError("only a copy transfer builds decode snapshots")
         if self.kind in (NONE, REPLAY) and self.readable_midstep:
             raise ValueError(f"{self.kind} transfer has no state to read midstep")
-        for name in ("midstep_grid", "midstep_min_offset"):
+        for name in (
+            "midstep_grid",
+            "midstep_min_offset",
+            "rebuild_tokens",
+            "trailing_slack",
+        ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise TypeError(f"{name} must be a non-negative integer")
@@ -81,6 +92,8 @@ class StateTransfer:
             raise ValueError("a midstep-readable transfer must declare its grid")
         if not self.readable_midstep and (self.midstep_grid or self.midstep_min_offset):
             raise ValueError("midstep geometry on a transfer that is not readable")
+        if self.kind != COPY and (self.rebuild_tokens or self.trailing_slack):
+            raise ValueError("only a copy transfer rebuilds or trails a boundary")
         if self.kind == COPY:
             if self.fork_tokens != 0:
                 raise ValueError("copy transfer cannot bind successor tokens")
@@ -133,6 +146,8 @@ class StateTransfer:
         midstep_grid: int = 0,
         midstep_min_offset: int = 0,
         decode_keep: str = KEEP_SETTLED,
+        rebuild_tokens: int = 0,
+        trailing_slack: int = 0,
     ) -> "StateTransfer":
         return cls(
             COPY,
@@ -141,6 +156,8 @@ class StateTransfer:
             midstep_grid=midstep_grid,
             midstep_min_offset=midstep_min_offset,
             decode_keep=decode_keep,
+            rebuild_tokens=rebuild_tokens,
+            trailing_slack=trailing_slack,
         )
 
     def to_wire(self) -> dict[str, str | int | bool | None]:
@@ -152,6 +169,8 @@ class StateTransfer:
             "midstep_grid": self.midstep_grid,
             "midstep_min_offset": self.midstep_min_offset,
             "decode_keep": self.decode_keep,
+            "rebuild_tokens": self.rebuild_tokens,
+            "trailing_slack": self.trailing_slack,
         }
 
     @classmethod
@@ -166,6 +185,8 @@ class StateTransfer:
             "midstep_grid",
             "midstep_min_offset",
             "decode_keep",
+            "rebuild_tokens",
+            "trailing_slack",
         }
         if set(wire) != expected:
             raise ValueError(
@@ -180,6 +201,8 @@ class StateTransfer:
             midstep_grid=wire["midstep_grid"],  # type: ignore[arg-type]
             midstep_min_offset=wire["midstep_min_offset"],  # type: ignore[arg-type]
             decode_keep=wire["decode_keep"],  # type: ignore[arg-type]
+            rebuild_tokens=wire["rebuild_tokens"],  # type: ignore[arg-type]
+            trailing_slack=wire["trailing_slack"],  # type: ignore[arg-type]
         )
 
     @property
@@ -274,6 +297,9 @@ class StateMaintenanceOps:
     # (source, destination) paged blocks whose whole content is copied before
     # the batch: a private block demoted into the shared part of a split pool.
     block_copies: tuple[tuple[int, int], ...] = ()
+    # Images of boundaries the batch's forward runs past, copied right after
+    # that forward: ready at the next schedule, however long the engine idles.
+    checkpoint_stores_after: tuple[CheckpointStoreOp, ...] = ()
 
     @property
     def empty(self) -> bool:
@@ -282,6 +308,7 @@ class StateMaintenanceOps:
             or self.checkpoint_stores
             or self.checkpoint_restores
             or self.block_copies
+            or self.checkpoint_stores_after
         )
 
 
