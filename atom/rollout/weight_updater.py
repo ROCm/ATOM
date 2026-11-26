@@ -14,6 +14,7 @@ from atom.model_loader.weight_names import (
     shared_expert_prefixes,
     shared_expert_slot_name,
 )
+from atom.model_ops.fused_moe.expert_layout import zero_unpacked_expert_padding
 from atom.rollout.reload_policy import (
     FP8_REQUANTISERS,
     ReloadPolicyMixin,
@@ -583,9 +584,8 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
     ) -> None:
         """Write a whole fused expert buffer sent under ATOM's own name.
 
-        Checks support, writes through the fence, and registers every expert
-        slice for the relayout -- the same three obligations as the per-expert
-        route, reached by a different name.
+        Checks support, writes through the fence, clears padding, and registers
+        every expert slice for the relayout, as the per-expert route does.
 
         ``w13_weight`` and ``w2_weight`` are real parameters of the FusedMoE,
         so a trainer that mirrors ATOM's state dict rather than the
@@ -620,6 +620,13 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
                 f"shard, not the global tensor -- or one tensor per expert."
             )
         self._copy_into_param(param, tensor.to(device=self.device, dtype=param.dtype))
+        # Whole-buffer copies bypass the loaders' tail clearing. Only this
+        # buffer is row-major now; its unwritten counterpart may still be shuffled.
+        zero_unpacked_expert_padding(
+            param.data if param_name == "w13_weight" else None,
+            param.data if param_name == "w2_weight" else None,
+            module.intermediate_size_per_partition,
+        )
         # One tensor covers every expert, so every slice of the buffer is new.
         arrived = self._expert_relayout_pending.setdefault((module, param_name), {})
         for expert_id in range(param.shape[0]):

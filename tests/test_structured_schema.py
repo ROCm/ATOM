@@ -23,7 +23,7 @@ Draft202012Validator = pytest.importorskip("jsonschema").Draft202012Validator
 
 @pytest.fixture(autouse=True)
 def _structured_output_installed(monkeypatch):
-    # These test the schema rules; whether the extra is installed is
+    # These test the schema rules; whether the backend is installed is
     # tests/entrypoints/test_structured_output_availability.py's concern.
     monkeypatch.setattr(structured_output, "available", lambda: True)
 

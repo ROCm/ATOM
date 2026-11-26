@@ -37,7 +37,12 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
-    render_chat_messages(request, tokenizer, &template_kwargs(request))
+    render_chat_messages(
+        request,
+        &request.messages,
+        tokenizer,
+        &template_kwargs(request),
+    )
 }
 
 /// The template kwargs `process_chat_messages` renders `request` with.
@@ -61,9 +66,11 @@ pub(crate) fn template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     combined_template_kwargs
 }
 
-/// `process_chat_messages` with `template_kwargs` as the template kwargs.
+/// `process_chat_messages` with `messages` in place of the request's own and
+/// `template_kwargs` as the template kwargs.
 pub(crate) fn render_chat_messages(
     request: &ChatCompletionRequest,
+    messages: &[ChatMessage],
     tokenizer: &dyn Tokenizer,
     template_kwargs: &HashMap<String, Value>,
 ) -> Result<ProcessedMessages, String> {
@@ -83,7 +90,7 @@ pub(crate) fn render_chat_messages(
     };
 
     let content_format = hf_tokenizer.chat_template_content_format();
-    let mut transformed_messages = process_content_format(&request.messages, content_format)?;
+    let mut transformed_messages = process_content_format(messages, content_format)?;
 
     process_tool_call_arguments(&mut transformed_messages)?;
 

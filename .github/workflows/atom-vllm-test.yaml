@@ -180,12 +180,10 @@ jobs:
               ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1
             lm_eval_num_fewshot: 20
             accuracy_test_threshold: 0.91
-            # The gate that actually guards the draft. Verification is lossless,
-            # so accuracy stays put when the draft head breaks; measured 0.4729
-            # overall on this recipe, against 0.008 when the target's LM head
-            # was not shared into the draft and 0.02 when the aux hidden states
-            # were the wrong quantity. 0.35 sits well clear of both.
-            mtp_accept_threshold: 0.35
+            # The two full baseline runs measured 47.29% and 47.05% acceptance.
+            # Use the lower rate minus 1.5 percentage points, rounded to 0.1
+            # as in #1557. Keep this in sync with oot_models_accuracy.json.
+            mtp_accept_threshold: 0.456
             # Per position, which the overall rate alone cannot see: a draft
             # that still lands its first token and nothing after it keeps a
             # respectable overall number. Measured 0.7785/0.6243/0.4299/
