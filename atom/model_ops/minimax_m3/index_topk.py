@@ -2472,6 +2472,16 @@ def minimax_m3_index_topk_decode(
         "attention metadata builder."
     )
     batch = seq_lens.shape[0]
+    if batch * max_query_len > total_q:
+        # Non-unified eager DP decode (a peer rank runs a prefill chunk larger than the
+        # biggest token-graph bucket): seq_lens / block_table are padded to the group
+        # running_bs while idx_q holds only this rank's rows. Launching on the padded
+        # batch writes score / topk_idx rows past total_q.
+        batch = total_q // max_query_len
+        seq_lens = seq_lens[:batch]
+        block_table = block_table[:batch]
+        if n_valid_column_per_row is not None and n_valid_column_per_row.shape[0] > total_q:
+            n_valid_column_per_row = n_valid_column_per_row[:total_q]
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
     topk_idx = torch.empty(
