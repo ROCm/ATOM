@@ -1586,6 +1586,7 @@ class Indexer(nn.Module):
         # the q latent it is handed comes quantized with a scale (the owner's
         # fused q norm + quant for q_b_proj); set by the owning attention
         self.quantized_q = False
+        self.exchange_stream = None
         if external_k_weights and pcp_is_enabled():
             raise ValueError(
                 "External indexer projections require PCP1: the PCP op "
