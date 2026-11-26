@@ -276,6 +276,7 @@ def _builder(monkeypatch, plan, nonps):
     b.padded_num_attention_heads = 16
     b.sparse_prefill_num_heads = 64
     b.block_size = 1
+    b._sparse_prefill_kv_granularity = 2048
     b.dtype_q = b.dtype_kv = torch.float8_e4m3fn
     b.model_runner = SimpleNamespace(
         forward_vars={f"sparse_prefill_{n}": n for n in PERSISTENT_WORK_BUFFERS}
@@ -316,6 +317,17 @@ def test_a_q_step_keeps_its_plan(monkeypatch, nonps, planned):
     b._dcp_sparse_prefill_step(None, md, "", 3)
     assert md.dcp_sparse_prefill_kv is None
     assert seen == [("plan", 7, 3)] + planned
+
+
+@pytest.mark.parametrize("kv", [False, True])
+def test_each_transport_keeps_its_plan_granularity(monkeypatch, kv):
+    b, md, _ = _builder(monkeypatch, object() if kv else None, False)
+    seen = {}
+    monkeypatch.setattr(
+        aiter_mla, "get_mla_metadata_v1", lambda *a, **kw: seen.update(kw)
+    )
+    b._dcp_sparse_prefill_step(None, md, "", 3)
+    assert seen["kv_granularity"] == (16 if kv else 2048)
 
 
 def test_a_kv_step_plans_into_its_prefix_buffers(monkeypatch):
@@ -416,6 +428,7 @@ def test_the_work_buffers_fit_a_kv_steps_plan(mode):
 
 def _viewer(prefix_tokens, local=48, gathered=128):
     b = _work_sizer("auto", local, gathered)
+    b._sparse_prefill_kv_granularity = 2048
     b._sparse_prefill_work_view_cache = {}
     b.max_num_batched_tokens = prefix_tokens[""]
     b._ubatch_tokens = lambda: prefix_tokens["ub0_"]
@@ -717,6 +730,7 @@ def _kv_attention():
     a.kv_cache_dtype = "fp8"
     a.scale = 1.0
     a._q_scale = a._k_scale = torch.ones(1)
+    a._absorb_q_pack_enabled = False
     a.dcp_sparse_prefill_persistent = False
     a.sparse_dcp_metadata_rebuild = True
     a.dcp_persistent_supported = True
@@ -800,7 +814,9 @@ def test_a_sparse_prefill_takes_the_transport_its_plan_names(monkeypatch, kv):
     a = _kv_attention()
     a.dcp_group = object()
     a.dcp_sparse_prefill_num_heads = 64
-    md = SimpleNamespace(dcp_sparse_prefill_kv=object() if kv else None)
+    md = SimpleNamespace(
+        dcp_sparse_prefill_kv=object() if kv else None, index_exchange_done=None
+    )
     q, cache = torch.zeros(2, 16, D), torch.empty(1)
     with pytest.raises(_Stop):
         attention_mla.MLAAttention._dcp_sparse_prefill(a, q, cache, md)
@@ -825,7 +841,9 @@ def test_a_kv_prefill_projects_only_this_ranks_heads(monkeypatch, kv, env, group
         "get_forward_context",
         lambda: SimpleNamespace(
             attn_metadata=SimpleNamespace(
-                run_sparse=True, dcp_sparse_prefill_kv=object() if kv else None
+                run_sparse=True,
+                dcp_sparse_prefill_kv=object() if kv else None,
+                dtype_q=torch.float8_e4m3fn,
             ),
             context=SimpleNamespace(is_dummy_run=False, is_prefill=True),
             kv_cache_data={"layer_0": SimpleNamespace(k_cache=None)},
@@ -871,7 +889,10 @@ def test_a_kv_prefill_indexes_rows_of_the_gathered_kv(monkeypatch, kv):
     topk = object()
     monkeypatch.setattr(f, "score_topk", lambda *a, out, **kw: topk)
     indexer = SimpleNamespace(
-        _indexer_fp4=False, use_nope_cache_fusion=False, _index_cache_layout=None
+        _indexer_fp4=False,
+        use_nope_cache_fusion=False,
+        _index_cache_layout=None,
+        exchange_stream=None,
     )
     monkeypatch.setattr(
         f,

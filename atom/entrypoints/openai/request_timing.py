@@ -120,6 +120,8 @@ class RequestTimingMiddleware:
                 "/v1/responses",
                 "/beta/chat/completions",
                 "/beta/completions",
+                # ATOM_PD_LATE_KV decode leg (api_server.PD_LATE_KV_PATH).
+                "/v1/pd/late_kv/chat/completions",
             }
         ):
             await self.app(scope, receive, send)

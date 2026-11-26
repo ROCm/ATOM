@@ -150,6 +150,8 @@ def test_decode_images_get_spare_slots_only_where_they_are_built(
             config=SimpleNamespace(
                 enable_prefix_caching=prefix_caching,
                 state_checkpoint_interval_tokens=interval,
+                kv_cache_block_size=4,
+                decode_context_parallel_size=1,
             )
         ),
         state_transfer=lambda: transfer,
@@ -159,6 +161,7 @@ def test_decode_images_get_spare_slots_only_where_they_are_built(
         _replayssm_bytes_per_slot=lambda: 0,
         slots_per_req=lambda: 1,
     )
+    builder._checkpoint_interval = _builder_cls()._checkpoint_interval.__get__(builder)
     spec = _builder_cls().state_spec(builder)
     assert spec.extra_entries == (DECODE_SNAPSHOT_SCRATCH_SLOTS if spare else 0)
 

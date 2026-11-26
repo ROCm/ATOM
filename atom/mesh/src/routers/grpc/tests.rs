@@ -71,6 +71,7 @@ mod b_execute_chat {
                     request_id: "req-test".to_string(),
                     weight_version: None,
                     cached_tokens: 0,
+                    timing: None,
                 },
             }),
         ]
@@ -300,6 +301,7 @@ mod c_execute_generate {
                     request_id: "req-test".to_string(),
                     weight_version: None,
                     cached_tokens: 0,
+                    timing: None,
                 },
             }),
         ]
@@ -411,6 +413,7 @@ mod d_execute_for_responses {
                     request_id: "req-test".to_string(),
                     weight_version: None,
                     cached_tokens: 0,
+                    timing: None,
                 },
             }),
         ]
@@ -513,6 +516,7 @@ mod e_metrics_labels {
                 request_id: "req-test".to_string(),
                 weight_version: None,
                 cached_tokens: 0,
+                timing: None,
             },
         })]
     }

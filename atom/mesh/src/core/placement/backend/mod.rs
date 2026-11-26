@@ -18,6 +18,17 @@ pub trait BackendAdapter: Send + Sync {
         decode: &dyn Worker,
     ) -> Result<PairCtx, AdapterError>;
 
+    /// [`Self::prepare_pair`] for a request with `media_count` media items, as
+    /// ingress counted them, for a backend whose transfer depends on media.
+    fn prepare_pair_with_media(
+        &self,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+        _media_count: usize,
+    ) -> Result<PairCtx, AdapterError> {
+        self.prepare_pair(prefill, decode)
+    }
+
     fn inject_prefill_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError>;
 
     fn inject_decode_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError>;

@@ -90,7 +90,15 @@ def execute(app, **kwargs):
     )
 
 
-@pytest.mark.parametrize("path", ["/beta/completions", "/beta/chat/completions"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/beta/completions",
+        "/beta/chat/completions",
+        # ATOM_PD_LATE_KV decode leg (api_server.PD_LATE_KV_PATH).
+        "/v1/pd/late_kv/chat/completions",
+    ],
+)
 def test_beta_routes_are_traced(spans, clock, path):
     async def app(scope, receive, send):
         await send({"type": "http.response.start", "status": 200})

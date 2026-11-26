@@ -13,6 +13,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DP_RANK",
     "ATOM_DP_RANK_LOCAL",
     "ATOM_DP_SIZE",
+    "ATOM_DP_SYNC_INTERVAL",
     "ATOM_DP_MASTER_IP",
     "ATOM_DP_MASTER_PORT",
     "ATOM_DP_BASE_PORT",
@@ -71,6 +72,28 @@ def _get_envs():
     from atom.utils import envs
 
     return envs
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, 1),
+        ("1", 1),
+        ("16", 16),
+        ("0", 1),
+        ("-5", 1),
+        ("bad", None),
+        ("", None),
+        ("1.5", None),
+        ("99", 99),  # past 16: rejected by every rank together (startup)
+    ],
+)
+def test_dp_sync_interval_env(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("ATOM_DP_SYNC_INTERVAL", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DP_SYNC_INTERVAL", raw)
+    assert _get_envs().ATOM_DP_SYNC_INTERVAL == expected
 
 
 class TestEnvsDefaults:
