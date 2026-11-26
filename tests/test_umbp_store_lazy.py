@@ -490,6 +490,7 @@ def test_a_requests_reusable_prefix_is_split_by_where_it_came_from(
         "r",
         digests,
         prompt_tokens=6 * BLOCK,
+        servable_tokens=5 * BLOCK,
         hbm_tokens=hbm * BLOCK,
         tier_hit_tokens=held * BLOCK,
         load_tokens=load * BLOCK,
@@ -500,7 +501,9 @@ def test_a_requests_reusable_prefix_is_split_by_where_it_came_from(
     }
 
 
-def test_a_failed_load_moves_its_tokens_to_not_loaded():
+def test_a_prompts_last_chunk_no_source_serves_is_new():
+    # All four chunks were computed before, but a prefill computes at least
+    # the prompt's last token: the last chunk is new, not a miss.
     acct = _accountant()
     digests = _digests(_seq(4))
     acct.computed(digests)
@@ -508,6 +511,29 @@ def test_a_failed_load_moves_its_tokens_to_not_loaded():
         "r",
         digests,
         prompt_tokens=4 * BLOCK,
+        servable_tokens=3 * BLOCK,
+        hbm_tokens=BLOCK,
+        tier_hit_tokens=4 * BLOCK,
+        load_tokens=2 * BLOCK,
+    )
+    assert acct.totals == {
+        "new": BLOCK,
+        "hbm": BLOCK,
+        "tier": 2 * BLOCK,
+        "tier_not_loaded": 0,
+        "evicted": 0,
+    }
+
+
+def test_a_failed_load_moves_its_tokens_to_not_loaded():
+    acct = _accountant()
+    digests = _digests(_seq(5))
+    acct.computed(digests[:4])
+    acct.admitted(
+        "r",
+        digests,
+        prompt_tokens=5 * BLOCK,
+        servable_tokens=4 * BLOCK,
         hbm_tokens=BLOCK,
         tier_hit_tokens=4 * BLOCK,
         load_tokens=3 * BLOCK,
@@ -556,3 +582,36 @@ def test_the_scheduler_accounts_an_admitted_request(server, monkeypatch):
     seq.num_hashed_tokens = 6 * BLOCK
     sched.request_finished(seq)
     assert acct.reusable_chunks(digests) == 6
+
+
+@pytest.mark.parametrize(
+    ("hbm_chunks", "floor_chunks", "tier_chunks", "not_loaded_chunks"),
+    [
+        (2, 1, 3, 0),  # the dispatch loads from the HBM hit on
+        (4, 2, 0, 1),  # what is left past the HBM hit is under the floor
+    ],
+)
+def test_the_tier_share_is_what_the_dispatch_loads_past_the_hbm_hit(
+    server, monkeypatch, hbm_chunks, floor_chunks, tier_chunks, not_loaded_chunks
+):
+    monkeypatch.setenv("ATOM_OFFLOAD_MISS_ACCOUNTING", "1")
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", str(floor_chunks * BLOCK))
+    config = _config(extra=_extra(save_policy="eager"))
+    sched = make_umbp_store_scheduler(config)
+    acct = sched._miss_accounting
+    seq = _seq(6)
+    digests = _digests(seq)
+    acct.computed(digests)  # an earlier prompt computed all six chunks
+    _store(server, config, seq, range(6))  # and the tier still holds them
+    # The lookup runs before the allocation finds the HBM hit.
+    seq.num_cached_tokens = 0
+    assert sched.get_num_new_matched_tokens(seq) == (5 * BLOCK, True)
+    seq.num_cached_tokens = hbm_chunks * BLOCK
+    sched.update_state_after_alloc(seq)
+    assert acct.totals == {
+        "new": BLOCK,  # the last chunk: a prefill computes it again
+        "hbm": hbm_chunks * BLOCK,
+        "tier": tier_chunks * BLOCK,
+        "tier_not_loaded": not_loaded_chunks * BLOCK,
+        "evicted": 0,
+    }

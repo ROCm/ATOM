@@ -22,8 +22,11 @@ are a leading run, found by binary search: that run is the request's
   loaded (under the load floor, or the load failed);
 * ``evicted``: neither held them;
 
-and the rest of the prompt is ``new``. The tier's part is what its load
-reported, so a load that fails moves its tokens to ``tier_not_loaded``.
+and the rest of the prompt is ``new``. That includes a prompt's last chunk
+when the prompt ends on a chunk boundary: a prefill computes at least the
+prompt's last token, so no source serves that chunk, however often it was
+computed before. The tier's part is what its load brings, so a load that
+fails moves its tokens to ``tier_not_loaded``.
 Counted totals are logged once a minute (``[OFFLOAD-MISS-ACCOUNT]``) and
 returned with the scheduler's statistics. Off unless
 ``ATOM_OFFLOAD_MISS_ACCOUNTING=1``: the digest set costs about 100 bytes a
@@ -94,15 +97,22 @@ class MissAccountant:
         digests: list,
         *,
         prompt_tokens: int,
+        servable_tokens: int,
         hbm_tokens: int,
         tier_hit_tokens: int,
         load_tokens: int,
     ) -> None:
-        """Classify a request at admission. `tier_hit_tokens` is the lookup's
-        answer counted from the prompt's head (0 for none), `load_tokens` the
-        tokens its load will bring (0 when it loads nothing)."""
+        """Classify a request at admission. `servable_tokens` is the most of
+        the prompt any source can serve (the prompt less a token, floored to a
+        chunk); `tier_hit_tokens` is the lookup's answer counted from the
+        prompt's head (0 for none); `load_tokens` the tokens its load will
+        bring (0 when it loads nothing)."""
         chunk = self.chunk_tokens
-        reusable = min(self.reusable_chunks(digests) * chunk, int(prompt_tokens))
+        reusable = min(
+            self.reusable_chunks(digests) * chunk,
+            max(0, int(servable_tokens)),
+            int(prompt_tokens),
+        )
         hbm = min(max(0, int(hbm_tokens)), reusable)
         tier = min(max(0, int(load_tokens)), max(0, reusable - hbm))
         held = min(max(0, int(tier_hit_tokens)), reusable)

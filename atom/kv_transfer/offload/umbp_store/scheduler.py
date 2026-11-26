@@ -13,6 +13,7 @@ it is), and no cross-client taint marker (see :mod:`.taint`).
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
@@ -486,12 +487,20 @@ class UMBPStoreOffloadScheduler(KVStoreOffloadScheduler):
         spec = self._load_specs.get(sid)
         load = 0
         if spec is not None and spec.can_load:
-            load = int(spec.lmcache_cached_tokens) - int(spec.hbm_cached_tokens)
+            # What the dispatch will load. The spec still starts at the HBM
+            # frontier of the lookup, before the allocation found the HBM hit;
+            # the dispatch decides on a spec moved to that hit, so decide on a
+            # copy here.
+            loads, _reason, _hbm, _end, need, _chunk = self._decide_load_after_alloc(
+                seq, copy.copy(spec)
+            )
+            load = need if loads else 0
         prompt = int(seq.num_prompt_tokens)
         accounting.admitted(
             sid,
             self._prompt_digests(seq, prompt),
             prompt_tokens=prompt,
+            servable_tokens=self._loadable_hit(prompt, prompt),
             hbm_tokens=int(seq.num_cached_tokens),
             tier_hit_tokens=int(tier_hit),
             load_tokens=load,
