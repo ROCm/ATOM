@@ -1378,9 +1378,12 @@ impl PDRouter {
         if let Some(obj) = decode_request_json.as_object_mut() {
             obj.remove("kv_transfer_params");
         }
-        // D already has the prompt IDs in its own body: P need not echo them,
-        // and the router need not parse and forward a second list.
-        if body_carries_prompt_ids(&decode_request_json) {
+        // A text-only request whose body already has the prompt IDs: D uses
+        // them as is, so P need not echo them and the router need not forward
+        // a second list. A media request keeps the echo: P may expand its
+        // placeholders into IDs that differ from the client's, and D must
+        // check the client's against P's.
+        if !context.carries_media && body_carries_prompt_ids(&decode_request_json) {
             if let Some(obj) = prefill_request_json.as_object_mut() {
                 obj.insert("return_token_ids".to_string(), Value::Bool(false));
             }
@@ -3045,6 +3048,7 @@ mod tests {
         prefill_url: &str,
         decode_url: &str,
         body: Value,
+        carries_media: bool,
     ) -> (StatusCode, Value) {
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(prefill_url)
@@ -3090,7 +3094,7 @@ mod tests {
             return_logprob: false,
             request_text: None,
             tokens: None,
-            carries_media: false,
+            carries_media,
             model_id: None,
             headers: None,
         };
@@ -3126,7 +3130,7 @@ mod tests {
         let body = json!({"model": "m", "messages": [{"role": "user", "content": "x\ny"}],
                           "prompt_token_ids": [1, 2, 3], "max_tokens": 9,
                           "kv_transfer_params": {"stale": true}});
-        let (status, out) = run_atom_pd(&router, &p, &d, body).await;
+        let (status, out) = run_atom_pd(&router, &p, &d, body, false).await;
         assert_eq!(status, StatusCode::OK, "{out}");
         let st = state.lock().unwrap();
         // D had the full request while P was still working.
@@ -3154,12 +3158,35 @@ mod tests {
         let d = decode_mock(state.clone(), true).await;
         let router = atom_test_router(&p, true);
         let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
-        let (status, out) = run_atom_pd(&router, &p, &d, body).await;
+        let (status, out) = run_atom_pd(&router, &p, &d, body, false).await;
         assert_eq!(status, StatusCode::OK, "{out}");
         assert_eq!(
             state.lock().unwrap().prefill_bodies[0]["return_token_ids"],
             true
         );
+        assert_eq!(
+            out["late"]["kv_transfer_params"]["prompt_token_ids"],
+            json!([7, 8, 9])
+        );
+    }
+
+    #[tokio::test]
+    async fn late_kv_media_request_keeps_the_echo_with_client_ids() {
+        // P may expand image placeholders into ids that differ from the
+        // client's, so D must get P's ids to check the client's against.
+        let state: Shared = Default::default();
+        let p = prefill_mock(state.clone(), 10, StatusCode::OK).await;
+        let d = decode_mock(state.clone(), true).await;
+        let router = atom_test_router(&p, true);
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": [
+                              {"type": "image_url", "image_url": {"url": "data:,"}}]}],
+                          "prompt_token_ids": [1, 2, 3]});
+        let (status, out) = run_atom_pd(&router, &p, &d, body, true).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let st = state.lock().unwrap();
+        assert_eq!((st.late_hits, st.plain_hits), (1, 0));
+        assert_eq!(st.prefill_bodies[0]["return_token_ids"], true);
+        assert_eq!(out["head"]["prompt_token_ids"], json!([1, 2, 3]));
         assert_eq!(
             out["late"]["kv_transfer_params"]["prompt_token_ids"],
             json!([7, 8, 9])
@@ -3174,7 +3201,7 @@ mod tests {
         let router = atom_test_router(&p, true);
         let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
                           "prompt_token_ids": [1]});
-        let (status, _) = run_atom_pd(&router, &p, &d, body).await;
+        let (status, _) = run_atom_pd(&router, &p, &d, body, false).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let st = state.lock().unwrap();
@@ -3191,7 +3218,7 @@ mod tests {
         let router = atom_test_router(&p, true);
         let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
                           "prompt_token_ids": [4, 5]});
-        let (status, out) = run_atom_pd(&router, &p, &d, body).await;
+        let (status, out) = run_atom_pd(&router, &p, &d, body, false).await;
         assert_eq!(status, StatusCode::OK, "{out}");
         let st = state.lock().unwrap();
         assert_eq!(st.plain_hits, 1);
@@ -3209,7 +3236,7 @@ mod tests {
         let router = atom_test_router(&p, false);
         let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
                           "prompt_token_ids": [4, 5]});
-        let (status, out) = run_atom_pd(&router, &p, &d, body).await;
+        let (status, out) = run_atom_pd(&router, &p, &d, body, false).await;
         assert_eq!(status, StatusCode::OK, "{out}");
         let st = state.lock().unwrap();
         assert_eq!((st.late_hits, st.plain_hits), (0, 1));
