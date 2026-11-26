@@ -28,6 +28,7 @@ depends on queue position. Both properties are tested here: the tail placement
 
 from types import SimpleNamespace
 
+import pytest
 from conftest import MockConfig
 
 from atom.model_engine.prefill_delayer import PrefillDecision
@@ -71,13 +72,16 @@ class TestSkippedPartialPrefillGoesToTail:
             )
         )
 
-    def test_skipped_partial_requeued_at_tail_not_head(self, seq_factory):
+    @pytest.mark.parametrize("partial_first", [False, True])
+    def test_skipped_partial_requeued_at_tail_not_head(
+        self, seq_factory, partial_first
+    ):
         sched = self._make_sched(mtp_k=3)
 
         s_decode = seq_factory([1, 2, 3, 4])  # will finish prefill -> decode-ready
         s_partial = seq_factory([5, 6, 7, 8])  # stays mid-prefill (partial)
-        sched.add(s_decode)
-        sched.add(s_partial)
+        for seq in ([s_partial, s_decode] if partial_first else [s_decode, s_partial]):
+            sched.add(seq)
         sched.schedule()  # prefill pass
 
         # s_decode finished its prompt and sampled its first token.

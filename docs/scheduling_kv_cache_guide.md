@@ -1,12 +1,13 @@
 # ATOM scheduling & KV cache guide
 
-ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache block management to drive LLM inference on AMD ROCm/HIP GPUs. This guide covers the scheduling algorithm, batch construction, block-level KV cache management, prefix caching, postprocessing, speculative decoding integration, and sequence lifecycle.
+ATOM (AiTer Optimized Model) uses a prefill-first scheduler by default (mixed off) with paged KV cache block management to drive LLM inference on AMD ROCm/HIP GPUs. This guide covers the scheduling algorithm, batch construction, block-level KV cache management, prefix caching, postprocessing, speculative decoding integration, and sequence lifecycle.
 
 ## Quick reference
 
-| Class | File | Purpose |
+| Component | File | Purpose |
 |---|---|---|
 | `Scheduler` | `atom/model_engine/scheduler.py` | Orchestrates prefill/decode scheduling, preemption, and postprocessing |
+| `profile_mixed_memory` | `atom/model_engine/mixed_profile.py` | Mixed attention workspace profiling before KV sizing |
 | `EngineStats` | `atom/model_engine/engine_stats.py` | MTP acceptance, prefix-cache hit, and throughput statistics |
 | `ScheduledBatch` | `atom/model_engine/scheduler.py` | Immutable snapshot of a scheduled batch sent to the model runner |
 | `ScheduledBatchOutput` | `atom/model_engine/scheduler.py` | Holds sampled token IDs and draft token IDs returned from forward pass |
@@ -25,13 +26,13 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 | `max_num_seqs` | 512 | Maximum sequences in a single batch |
 | `max_num_batched_tokens` | 16384 | Maximum tokens scheduled in a single step |
 | `kv_cache_block_size` | 16 | Tokens per KV cache block (must be multiple of 16, or 1; exactly 64 for the FP4 sparse indexer) |
-| `enable_prefix_caching` | `False` | Enable hash-based prefix block sharing |
+| `enable_prefix_caching` | `True` | Enable hash-based prefix block sharing |
 | `scheduler_delay_factor` | 0.0 | Delay factor for batching prompt requests (0 = no delay) |
 | `gpu_memory_utilization` | 0.9 | Fraction of GPU memory for KV cache |
 
 ## Scheduling algorithm
 
-The scheduler implements a **prefill-first** policy: all waiting (prefill) requests are scheduled before any running (decode) requests. The entry point is `Scheduler.schedule()`, which returns a `(ScheduledBatch, dict[int, Sequence])` tuple or `None` if both queues are empty.
+The scheduler implements a **prefill-first** policy by default (mixed off): all waiting (prefill) requests are scheduled before any running (decode) requests. The entry point is `Scheduler.schedule()`, which returns a `(ScheduledBatch, dict[int, Sequence])` tuple or `None` if both queues are empty.
 
 ### Scheduler initialization
 
@@ -75,13 +76,17 @@ delayer whether this tick allows prefill. It then selects work in three phases:
    their completion; ready offload resumes retain their existing allocations.
    Local checkpoint waiters permit a bounded scan for independent work and
    retain their relative FIFO order. See the [delayer settings](environment_variables.md#prefill-delayer-tpdcp-and-dp-attention).
-3. If no prefill was selected, schedule decode from `running`. `can_append`
+3. If no prefill was selected, or mixed prefill/decode is enabled, schedule
+   decode from `running` within the remaining token and request budgets. `_has_page_units(append_blocks_needed(...))`
    checks extension capacity; pressure can preempt a running request back to
    `waiting`. `may_append` reserves the selected tokens, including speculative
-   tokens when enabled. Partial prefills skipped by the delayer return to the
-   tail of `running`.
+   tokens when enabled. With mixed disabled, partial prefills skipped by the
+   delayer return to the tail of `running`; mixed scheduling preserves their
+   previous positions, including on ticks with no admitted prefill.
 
-Prefill batches return without decode mixing. A waiting cancellation is removed
+By default, prefill batches return without decode mixing. With
+`--enable-mixed-prefill-decode`, admitted decode rows follow the prefill rows in
+the same batch. A waiting cancellation is removed
 on the abort event rather than waiting for admission to reach it. In-flight
 transfers retain their resources until their terminal notification; running
 cancellations finish through postprocess.
@@ -109,7 +114,7 @@ A new prefill is scheduled only when the earliest waiting request has waited lon
 
 ### Preemption
 
-When a decode step cannot extend a sequence's KV cache (no free blocks), the scheduler preempts the **last** running sequence:
+When a decode step cannot extend a sequence's KV cache, the scheduler scans the running queue from the tail for a preemptable request. Connector-pinned requests are skipped. If no queued victim can release space, the current decode may preempt itself. With mixed scheduling, a settled waiting KV owner is considered before a running victim only when it arrived no earlier than that victim. Waiting owners are ordered by arrival time, with waiting-tail order breaking ties. If there is no running victim, the comparison uses the current decode before it preempts itself. In-flight transfers and protected waiting owners remain excluded. Mixed prefill admission and continuation preserve the decode page reservation; insufficient capacity skips their execution without blocking transfer completion or changing surviving requests' queue order.
 
 ```python
 def preempt(self, seq: Sequence) -> bool:
@@ -367,7 +372,7 @@ That number, `successor_room`, is mutability quantified. A rolling state (GDN re
 
 **A store takes what its image needs and nothing more.** `begin_store` asks for `units_per_checkpoint`, and `ensure_free_units` spends checkpoints only for the shortfall — free units come first, and `pop` hands out never-used blocks before cached ones, so a store reaches for the cache only once the pool has nothing spare. A store whose units are not reachable is dropped and counted in `checkpoints_dropped`, and it is dropped *before* evicting anything: eviction gives up only after it has emptied the cache, so an unreachable request would destroy the cache on its way to refusing.
 
-**There is no floor held back for live KV, and there cannot usefully be one.** `_fresh_block` raises when the pool is dry and nothing is evictable, so it is worth stating why the cache cannot take it there. A READY unpinned checkpoint is *already* available to live KV — `has_available_units` counts it and `ensure_free_units` will spend it — so the size of the cache is not the variable. What competes is the unevictable set, a checkpoint that is `COPYING` or held by a restore pin, and that set is confined to one pass: `schedule` publishes the previous batch's stores and releases its pins before it allocates anything, and this batch's stores are taken at batch construction, after every allocation. The one overlap is `allocate`, which pins a restore and then asks for fresh blocks in the same pass — and its own `can_allocate` counted that pin, protecting the checkpoint it is about to take and skipping the pins earlier admissions took. `may_append` never overlaps at all: the decode loop runs only in a pass that scheduled no prefill, so its pins were released at the top of it. Under contention the reachable outcome is therefore a refused admission, which the next pass retries, and never the raise. A floor would not improve on that in any case: live KV's demand is unbounded and legitimate — `allocate` takes a whole prompt's blocks, up to `max_model_len` of them — so no reserved quantity can promise it a block. *(The decode half of this rests on prefill and decode never sharing a pass; the mixed batch the scheduler has a TODO for would need the argument redone.)*
+**There is no floor held back for live KV, and there cannot usefully be one.** `_fresh_block` raises when the pool is dry and nothing is evictable, so it is worth stating why the cache cannot take it there. A READY unpinned checkpoint is *already* available to live KV — `has_available_units` counts it and `ensure_free_units` will spend it — so the size of the cache is not the variable. What competes is the unevictable set, a checkpoint that is `COPYING` or held by a restore pin, and that set is confined to one pass: `schedule` publishes the previous batch's stores and releases its pins before it allocates anything, and this batch's stores are taken at batch construction, after every allocation. The one overlap is `allocate`, which pins a restore and then asks for fresh blocks in the same pass — and its own `can_allocate` counted that pin, protecting the checkpoint it is about to take and skipping the pins earlier admissions took. `may_append` follows `_has_page_units(append_blocks_needed(...))`, and the two ask about the same eligible set (`_is_evictable`): pins a mixed step's prefill admissions took earlier in the pass are outside it for both, and nothing is consumed between them -- the decode loop may preempt in between, which only frees. Under contention the reachable outcome is therefore a refused admission or a skipped decode, which the next pass retries, and never the raise. A floor would not improve on that in any case: live KV's demand is unbounded and legitimate — `allocate` takes a whole prompt's blocks, up to `max_model_len` of them — so no reserved quantity can promise it a block. *(The decode half used to rest on prefill and decode never sharing a pass; under mixed batching they do, and the argument above is the one that holds.)*
 
 **Eligibility and eviction policy are separate.** `_is_evictable` says whether a checkpoint may be spent — READY, unpinned, not the one the caller is protecting — and is the single rule `has_available_units` and `ensure_free_units` share. `_next_victim` says which eligible one to spend first, and is the only place the policy lives: least recently used today, one method to replace for another. `has_available_units` asks whether the eligible set reaches a count, which the order it is walked in cannot change -- only how soon the loop gets there -- so a new policy can change which checkpoint is spent and never what the gate answers. The refusal for an unreachable count sits in `ensure_free_units` itself rather than in a caller, because the bare loop gives up only after it has emptied the cache.
 
@@ -482,8 +487,9 @@ def record_allocation(self, seq: Sequence, num_cached_blocks: int,
                       block_hashes: list[int]) -> None:
     """Commit the joint boundary after the scheduler accepts the fit probe."""
 
-def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
-    """Check capacity for the selected decode extension."""
+def append_blocks_needed(self, seq: Sequence, num_new_tokens: int = 1,
+                         lookahead: int = 0) -> int:
+    """Page demand for the selected decode extension."""
 ```
 
 `can_allocate` checks the full per-request state-slot reservation and PAGE-unit
@@ -514,8 +520,9 @@ a hash the walk read leaves the index or is remapped, or the hash at its first
 miss is published (`ATOM_PREFIX_WALK_MEMO` lists every trigger), and runs the
 same evaluation on every call, so it returns what `can_allocate` would. `allocate` revalidates only the ids it claims.
 
-`can_append` checks whether the next decode extension needs additional blocks,
-including speculative tokens and the active cache layout.
+Decode checks `_has_page_units(append_blocks_needed(...))`, using the same
+demand calculation as mixed admission, including speculative lookahead and
+the active cache layout.
 
 ### May-append (decode extension)
 
@@ -831,8 +838,125 @@ def num_tokens(self, value):
 |---|---|
 | `atom/model_engine/scheduler.py` | `Scheduler`, `ScheduledBatch`, `ScheduledBatchOutput` — scheduling algorithm, postprocessing |
 | `atom/model_engine/engine_stats.py` | `EngineStats` — speculative-decode acceptance, prefix-cache hit, and throughput statistics |
+| `atom/model_engine/mixed_profile.py` | Real mixed attention workspace profiling before KV sizing |
 | `atom/model_engine/block_manager.py` | `Block`, `BlockManager` — paged KV cache block pool, allocation/deallocation, prefix caching with xxhash64 |
 | `atom/model_engine/sequence.py` | `Sequence`, `SequenceStatus`, `SequenceType` — request lifecycle, token management, timing |
 | `atom/model_engine/request.py` | `RequestOutput` — streaming output dataclass with `request_id`, `output_tokens`, `finished`, `finish_reason` |
 | `atom/config.py` | `Config` — scheduling-related fields (`max_num_seqs`, `max_num_batched_tokens`, `kv_cache_block_size`, `enable_prefix_caching`, `scheduler_delay_factor`), `SpeculativeConfig` |
 | `atom/sampling_params.py` | `SamplingParams` — `temperature`, `max_tokens`, `ignore_eos`, `stop_strings` |
+
+## Mixed prefill and decode on DeepSeek V4
+
+`--enable-mixed-prefill-decode` packs a batch as `[prefill | decode]`.
+The feature requires chunked prefill and supports DSpark.
+Other attention families, chunked prefill off, M-RoPE, TBO (including decode
+TBO), PCP, DCP, EPLB, TR_HYBRID graph modes, speculative methods other than
+DSpark, and speculative decoding with pipeline parallelism are rejected at
+startup. RapidServe and P/D producer transports also reject the flag. For
+speculative decoding, any `kv_producer` role (including offload and nested
+MultiConnector entries) is refused using the scheduler's producer predicate:
+profiling must not size a speculative workload that the scheduler disables.
+Save-only offload without speculation remains eligible; its scheduler and
+profile both use one token per decode row. Other backend compatibility checks
+still apply. A lossless draft that would otherwise arm is also rejected with mixed
+scheduling. Merely setting `ATOM_SPEC_LOSSLESS_SAMPLING` does not reject a model
+that keeps greedy drafting or has no drafter; its existing fallback remains.
+Expert parallelism alone does not enable EPLB.
+
+### Scheduling
+
+Prefill and decode share `max_num_batched_tokens`. A decode row costs
+`mtp_k + 1` (the scheduler's effective speculative width) tokens, including speculative verification. The
+scheduler reserves that demand for running decodes. When their append pages
+fit, at least one eighth of the token budget remains for prefill progress;
+otherwise the prefill budget is zero. At high decode load,
+decode admission follows FCFS order. Tail requests may wait until earlier
+decodes finish or the long prefill ends; this policy does not rotate them.
+
+Mixed scheduling separates transfer completion from prefill execution. Before
+selecting any chunk, it resolves ready P/D receives and adds their first-decode
+demand to the existing decodes' reservation, even when the prefill budget is
+zero. Requests that have no running slot retain their KV ownership and remain
+eligible for pressure reclamation once their transfer is complete. Offload
+completion instead makes a suffix prefill eligible; it does not skip that
+prefill. Parked-transfer counts describe lifecycle accounting, not the presence
+of admissible prefill work.
+
+The scheduler snapshots existing decodes once, extends the snapshot for those
+P/D promotions, and finalizes the budget before early loads, the delayer,
+pending/cost/head probes, or actual admission. Partial prefills are excluded
+from decode demand; completed prefills awaiting first decode are included.
+New admission preserves the reserved append pages, including speculative
+lookahead. This reservation does not allocate pages and covers only the current
+tick. BlockManager holds the reservation before completion prioritization,
+updates it after P/D promotion, and clears it when admission finishes. The
+outer scheduling entry also clears it on early return or exception. Each
+subsequent chunk therefore checks the current demand again.
+
+If available page capacity, including reclaimable checkpoints, cannot cover
+that demand, the prefill budget is zero. Continuation and new admission skip
+chunk sizing and execution; transfer completion and decode scheduling continue.
+Pressure reclamation considers settled waiting owners as well as running
+requests, comparing arrival time before reclaiming a waiting owner ahead of a
+running victim. Skipping a partial prefill preserves its position for subsequent
+ticks. Reclaiming an offload resume also clears its parked accounting,
+early-load entry and completed-load flags before readmission. The one-eighth
+prefill token floor applies only when the page-capacity check passes.
+
+### Attention execution
+
+Dense and indexer projections, QK normalization, RoPE, and the output projection
+run on the combined token tensor. The indexer consumes the intact quantized
+Q-latent scale layout before its token-major outputs are sliced. The attention
+tail dispatches the prefill and decode segments to their respective compressors,
+indexer scoring, and sparse kernels.
+The combined QK/RoPE kernel fuses decode SWA stores. Prefill tokens carry a
+negative store mask, so their window is written only after prefill attention
+has consumed the preceding chunk's KV.
+BF16 attention writes each segment's output into its consumed query slice;
+FP8 attention allocates a separate BF16 output buffer.
+
+`ScheduledBatch.slice_rows` owns the distinction between request fields,
+token fields, request-keyed maps, and filtered state/page rows. It rejects
+unclassified fields rather than passing parent data through to a segment.
+The V4 builder passes resolved rejection counts explicitly to decode
+preparation, which calls `verify_ctx_lens` with decode-local counts even
+when DSpark shrinks the query width to one. The V4 carrier
+owns segment boundaries and a sampled-token row map shared by the LM head,
+draft verification, and anchor settlement; Context does not duplicate them.
+
+DSpark confidence scheduling on a mixed step computes and records verify lengths
+only for decode requests. Prefill rows do not consume the decode throughput
+budget; their drafts retain full width until their first decode proposal.
+
+V4 owns separate publication banks for prefill metadata and decode metadata.
+Each bank has its own host sources, device destinations, and H2D ownership.
+They are allocated before memory profiling and follow forward-slot reuse.
+The common builder exposes query lengths and decode spans. On a mixed step,
+the runner publishes decode-local query metadata in the main bank; V4 publishes
+the prefill spans independently in its private bank.
+
+### Startup memory profiling
+
+Dummy warmup does not exercise V4 attention because KV has not been bound.
+Mixed startup therefore binds a temporary KV pool and runs real forwards
+before the serving pool is sized. It samples prefill-heavy, balanced, and
+decode-heavy shapes within the configured token and sequence limits, at
+short contexts, then with one prefill request and one decode request at the
+maximum valid context. The remaining histories stay short, bounding logical
+KV work instead of multiplying the context limit by maximum concurrency.
+Both sweeps retain the full scheduled token and sequence shapes; the persistent
+decode logits workspace is already included in the memory baseline.
+DSpark covers both full-width verification and q=1, retaining the full draft
+width in both cases. Allocator caches are retained across the sampled shapes.
+
+Old history can share a read-only zero page during this allocation profile;
+current writes use private pages and state slots. Temporary KV bindings are
+released before allocating the serving pool. The budget uses the measured
+allocation/cache high-water mark with temporary KV subtracted, along with
+the non-PyTorch and safety allowances. The graph estimate is saved from
+ordinary warmup before the eager mixed sweep; mixed workspace is counted
+once, without increasing graph-pool estimates. The sweep returns its peak
+and non-PyTorch usage to a single final KV budget calculation. There is no fixed
+5% mixed reserve. The sampled peak is configuration-dependent; it does not
+prove that every future allocator fragmentation pattern is bounded.

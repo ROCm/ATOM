@@ -160,7 +160,7 @@ P/D requests (`kv_transfer_params`, or `/generate`'s bootstrap fields: served
 plainly, the peer would wait for a transfer that never comes), a chat whose
 tool calls the OpenAI server would hold to their schemas (Kimi-K3's
 tool-call grammar, with `ATOM_TOOL_CALL_GRAMMAR` and the structured-output
-extras; unconstrained, K3 can copy an empty call out of its history),
+backend; unconstrained, K3 can copy an empty call out of its history),
 streaming with `n > 1`, logprobs,
 `stop_token_ids`, structured output (`response_format` `json_object` /
 `json_schema`, `regex`, `ebnf`, `json_schema`), `return_hidden_states`, and

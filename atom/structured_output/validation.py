@@ -19,7 +19,7 @@ logger = logging.getLogger("atom")
 
 
 def require_available():
-    """A 400 naming the extra, before any schema check imports llguidance or RE2."""
+    """A 400 naming the backend, before any schema check imports llguidance or RE2."""
     if not structured_output.available():
         raise ValueError(structured_output.UNAVAILABLE)
 
@@ -728,7 +728,7 @@ async def configure_tool_call_grammar(
     """Hold the tool calls of a request without a response format to the
     declared schemas, when the parser declares a grammar for them.
 
-    Admission never fails because of it: without the optional dependency, on
+    Admission never fails because of it: without the backend, on
     a deployment or request that cannot run a grammar, with a schema that does
     not pass the safety checks, or when preparation fails or times out, the
     output stays unconstrained. A grammar error during decoding fails the

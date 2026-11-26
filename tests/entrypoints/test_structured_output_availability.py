@@ -8,6 +8,7 @@ older one for vLLM's own backend, so an installed llguidance is not enough.
 """
 
 import asyncio
+import json
 import pathlib
 import re
 import sys
@@ -70,13 +71,27 @@ def test_llguidance_without_package_metadata_is_unavailable(probe):
     assert probe(ALL, llguidance_version=None) is False
 
 
-def test_the_pin_matches_the_extra():
+def _pyproject_list(key):
     # tomllib is 3.11+; the project supports 3.10.
     pyproject = pathlib.Path(__file__).parents[2] / "pyproject.toml"
-    extra = re.search(
-        r"^structured-output = (.*)$", pyproject.read_text(), re.MULTILINE
+    match = re.search(rf"^{key} = (\[.*\])$", pyproject.read_text(), re.MULTILINE)
+    return None if match is None else json.loads(match[1])
+
+
+def test_the_base_install_carries_the_pinned_backend():
+    base = _pyproject_list("dependencies")
+    assert base is not None, "dependencies is not a one-line list; update the parser"
+    assert f"llguidance=={structured_output.LLGUIDANCE_VERSION}" in base
+    assert any(dep.startswith("google-re2") for dep in base)
+
+
+def test_the_refusal_names_the_pin_without_an_install_command():
+    assert (
+        f"llguidance=={structured_output.LLGUIDANCE_VERSION}"
+        in structured_output.UNAVAILABLE
     )
-    assert f'"llguidance=={structured_output.LLGUIDANCE_VERSION}"' in extra[1]
+    # An install hint would upgrade llguidance past the vLLM image's <1.8 pin.
+    assert "pip install" not in structured_output.UNAVAILABLE
 
 
 @pytest.mark.parametrize("installed", [True, False])
@@ -91,7 +106,7 @@ def test_models_lists_it_only_when_available(monkeypatch, installed):
 
 @pytest.fixture
 def without_backend(monkeypatch):
-    """`rocm/atom-dev` without the extra: no llguidance and no RE2."""
+    """An environment without llguidance and RE2 (ATOM installed --no-deps)."""
     monkeypatch.setattr(structured_output, "available", lambda: False)
     monkeypatch.setitem(sys.modules, "llguidance", None)
     monkeypatch.setitem(sys.modules, "re2", None)
@@ -123,7 +138,7 @@ PATTERN_SCHEMA = {
 def test_a_format_is_refused_before_its_checks_need_the_backend(
     without_backend, fmt, responses
 ):
-    with pytest.raises(ValueError, match=r"atom\[structured-output\]"):
+    with pytest.raises(ValueError, match=re.escape(structured_output.UNAVAILABLE)):
         validation.schema_from_format(fmt, responses=responses)
 
 
@@ -133,7 +148,7 @@ def test_a_text_format_does_not_need_it(without_backend):
 
 def test_a_strict_tool_is_refused_before_its_checks_need_the_backend(without_backend):
     tool = {"function": {"name": "f", "strict": True, "parameters": PATTERN_SCHEMA}}
-    with pytest.raises(ValueError, match=r"atom\[structured-output\]"):
+    with pytest.raises(ValueError, match=re.escape(structured_output.UNAVAILABLE)):
         validation.strict_tool_schemas([tool])
 
 
@@ -146,5 +161,5 @@ def test_the_offline_engine_refuses_too(without_backend):
     from atom.model_engine.llm_engine import LLMEngine
 
     params = NS(json_schema='{"type": "object"}', structured_tool_format=None)
-    with pytest.raises(ValueError, match=r"atom\[structured-output\]"):
+    with pytest.raises(ValueError, match=re.escape(structured_output.UNAVAILABLE)):
         LLMEngine.prepare_structured_request(NS(config=None), params)

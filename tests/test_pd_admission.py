@@ -372,7 +372,7 @@ def test_decode_reserve_counts_the_draft_lookahead_once(
     sched.schedule()
     # A receives its two prompt blocks; its lookahead block waits for its
     # first decode. A first decode takes 8 tokens past the prompt (T0, 3
-    # verify slots, then `can_append`'s 4-token reach), so A and B each
+    # verify slots, then `append_blocks_needed`'s 4-token reach), so A and B each
     # reserve two more blocks however little B has left: B is admitted with
     # none to spare in the larger pool and deferred in the smaller. Charging
     # B's lookahead now, or reserving it on top of the growth, defers the 8-

@@ -40,20 +40,21 @@ class StructuredRequest:
         return update
 
 
-# The llguidance release the backend is written against, as pinned by the
-# `structured-output` extra in pyproject.toml (a test keeps the two equal).
+# The llguidance release the backend is written against, as pinned in
+# pyproject.toml's dependencies (a test keeps the two equal).
 LLGUIDANCE_VERSION = "1.9.1"
 
 UNAVAILABLE = (
-    "structured output needs the optional dependencies: "
-    f'pip install "atom[structured-output]" (llguidance=={LLGUIDANCE_VERSION})'
+    f"structured output needs llguidance=={LLGUIDANCE_VERSION}, google-re2 and "
+    "jsonschema, which ATOM installs; this environment is missing one or has "
+    "another llguidance (the vLLM image pins <1.8)"
 )
 
 
 @cache
 def available():
-    """Whether the optional `atom[structured-output]` dependencies are installed,
-    with the llguidance release the backend is written against."""
+    """Whether llguidance (the release the backend is written against),
+    jsonschema and RE2 are installed."""
     if not all(
         find_spec(name) is not None for name in ("llguidance", "jsonschema", "re2")
     ):

@@ -13,7 +13,10 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use super::chat_template::{render_chat_messages, template_kwargs};
-use crate::{protocols::chat::ChatCompletionRequest, tokenizer::traits::Tokenizer};
+use crate::{
+    protocols::chat::{ChatCompletionRequest, ChatMessage},
+    tokenizer::traits::Tokenizer,
+};
 
 /// A model whose chats ATOM renders under reasoning controls of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,11 +34,12 @@ impl ChatControls {
         }
     }
 
-    /// The prompt `request` renders to with `tokenizer`, its effort and mode
-    /// taken as ATOM takes them.
+    /// The prompt `request` with `messages` in place of its own renders to with
+    /// `tokenizer`, its effort and mode taken as ATOM takes them.
     pub(crate) fn render(
         self,
         request: &ChatCompletionRequest,
+        messages: &[ChatMessage],
         tokenizer: &dyn Tokenizer,
     ) -> Result<String, String> {
         let mut kwargs = template_kwargs(request);
@@ -45,7 +49,7 @@ impl ChatControls {
                 deepseek_v41_mode(&mut kwargs)?;
             }
         }
-        Ok(render_chat_messages(request, tokenizer, &kwargs)?.text)
+        Ok(render_chat_messages(request, messages, tokenizer, &kwargs)?.text)
     }
 }
 
@@ -204,8 +208,9 @@ mod tests {
             ),
         ] {
             let parsed = chat(&fields);
+            let request = parsed.chat().unwrap();
             let prompt = ChatControls::DeepseekV41
-                .render(parsed.chat().unwrap(), &*tokenizer)
+                .render(request, &request.messages, &*tokenizer)
                 .unwrap();
             let end = format!("<｜Assistant｜>{prefill}");
             assert!(prompt.ends_with(&end), "{fields}: {prompt}");
