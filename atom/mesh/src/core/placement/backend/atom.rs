@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use serde_json::{json, Value};
 use tracing::warn;
@@ -9,16 +9,74 @@ use super::super::types::AdapterError;
 use super::{BackendAdapter, PairCtx};
 use crate::core::Worker;
 
+/// Router kill switch for early handoff; anything but "0" (or unset) keeps it on.
+pub const EARLY_HANDOFF_ENV: &str = "ATOMESH_ATOM_PD_EARLY_HANDOFF";
+
+/// The early-handoff wire contract version this router speaks.
+pub const EARLY_HANDOFF_VERSION: u64 = 1;
+
+static EARLY_HANDOFF_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| early_handoff_enabled_from(std::env::var(EARLY_HANDOFF_ENV).ok().as_deref()));
+
+pub fn early_handoff_enabled_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+/// What a decode's `/kv_transfer_info` says about receiving a chunked transfer
+/// from a prefill that answered early (`chunked_receive`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomChunkedReceive {
+    /// D-local verdict: covers PP=1 and DCP-decode constraints.
+    pub accepts: bool,
+    pub tp_size: usize,
+}
+
+impl AtomChunkedReceive {
+    /// Parse a decode's `/kv_transfer_info`; None for anything but a v1
+    /// `chunked_receive` from a `kv_consumer` (that decode stays on the legacy relay).
+    pub fn from_kv_transfer_info(data: &Value) -> Option<Self> {
+        if data.get("kv_role").and_then(Value::as_str) != Some("kv_consumer") {
+            return None;
+        }
+        let receive = data.get("chunked_receive")?;
+        if receive.get("version").and_then(Value::as_u64) != Some(EARLY_HANDOFF_VERSION) {
+            return None;
+        }
+        Some(Self {
+            accepts: receive.get("accepts").and_then(Value::as_bool)?,
+            tp_size: receive
+                .get("tp_size")
+                .and_then(Value::as_u64)
+                .filter(|tp| *tp >= 1)? as usize,
+        })
+    }
+}
+
+/// Whether a prefill's `/kv_transfer_info` offers a v1 early handoff.
+pub fn offers_early_handoff(data: &Value) -> bool {
+    data.get("early_handoff")
+        .and_then(|v| v.get("version"))
+        .and_then(Value::as_u64)
+        == Some(EARLY_HANDOFF_VERSION)
+}
+
 #[derive(Default)]
 pub struct AtomPrefillInfo {
     pub tp_sizes: HashMap<String, usize>,
     pub chunked_transfer: HashMap<String, Value>,
+    /// Prefill URLs (worker and base) that offer a v1 early handoff.
+    pub early_handoff: HashSet<String>,
+    /// Decode URLs (worker and base) with a v1 `chunked_receive`. A decode
+    /// missing here never gets an early-handoff prefill.
+    pub decode_receive: HashMap<String, AtomChunkedReceive>,
 }
 
 impl std::fmt::Debug for AtomPrefillInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AtomPrefillInfo")
             .field("prefill_count", &self.tp_sizes.len())
+            .field("early_handoff_prefills", &self.early_handoff.len())
+            .field("decode_receive_count", &self.decode_receive.len())
             .finish()
     }
 }
@@ -26,11 +84,47 @@ impl std::fmt::Debug for AtomPrefillInfo {
 #[derive(Debug)]
 pub struct AtomAdapter {
     pub prefill_info: Arc<AtomPrefillInfo>,
+    early_handoff_enabled: bool,
 }
 
 impl AtomAdapter {
     pub fn new(prefill_info: Arc<AtomPrefillInfo>) -> Self {
-        Self { prefill_info }
+        Self {
+            prefill_info,
+            early_handoff_enabled: *EARLY_HANDOFF_ENABLED,
+        }
+    }
+
+    /// Override the `ATOMESH_ATOM_PD_EARLY_HANDOFF` kill switch.
+    pub fn with_early_handoff(mut self, enabled: bool) -> Self {
+        self.early_handoff_enabled = enabled;
+        self
+    }
+
+    /// Whether this request's prefill may answer before its prefill ends
+    /// (early handoff, wire contract v1). Router-chunked prefills keep their
+    /// own path; a decode that did not say it accepts a chunked receive, or
+    /// whose TP is not a multiple of the prefill's, keeps the legacy relay.
+    pub fn early_handoff(&self, body: &Value, pair: &AtomPairCtx) -> bool {
+        let info = &self.prefill_info;
+        if !self.early_handoff_enabled
+            || !Self::can_chunk_request(body, pair.carries_media)
+            || info.chunked_transfer.contains_key(&pair.prefill_url)
+            || !info.early_handoff.contains(&pair.prefill_url)
+        {
+            return false;
+        }
+        let Some(prefill_tp) = info
+            .tp_sizes
+            .get(&pair.prefill_url)
+            .copied()
+            .filter(|tp| *tp >= 1)
+        else {
+            return false;
+        };
+        info.decode_receive
+            .get(&pair.decode_url)
+            .is_some_and(|d| d.accepts && d.tp_size % prefill_tp == 0)
     }
 
     /// Requests with media take the response relay: decode needs the prompt
@@ -111,6 +205,7 @@ pub struct AtomPairCtx {
     pub prefill_url: String,
     pub prefill_dp_size: usize,
     pub prefill_dp_rank: Option<usize>,
+    pub decode_url: String,
     pub decode_dp_rank: Option<usize>,
     pub carries_media: bool,
 }
@@ -132,7 +227,7 @@ impl BackendAdapter for AtomAdapter {
     fn prepare_pair_with_media(
         &self,
         prefill: &dyn Worker,
-        _decode: &dyn Worker,
+        decode: &dyn Worker,
         media_count: usize,
     ) -> Result<PairCtx, AdapterError> {
         Ok(Box::new(AtomPairCtx {
@@ -140,7 +235,8 @@ impl BackendAdapter for AtomAdapter {
             prefill_url: prefill.url().to_string(),
             prefill_dp_size: prefill.dp_size().unwrap_or(1),
             prefill_dp_rank: prefill.dp_rank(),
-            decode_dp_rank: _decode.dp_rank(),
+            decode_url: decode.url().to_string(),
+            decode_dp_rank: decode.dp_rank(),
             carries_media: media_count > 0,
         }))
     }
@@ -152,6 +248,7 @@ impl BackendAdapter for AtomAdapter {
                 .prefill_info
                 .chunked_transfer
                 .contains_key(&pair.prefill_url);
+        let early_handoff = self.early_handoff(body, pair);
         let obj = body.as_object_mut().ok_or(AdapterError::BodyNotObject)?;
         obj.insert(
             "kv_transfer_params".to_string(),
@@ -163,6 +260,10 @@ impl BackendAdapter for AtomAdapter {
         if chunked {
             obj["kv_transfer_params"]["chunked_transfer"] = json!(true);
             obj["kv_transfer_params"]["transfer_id"] = json!(pair.transfer_id);
+        } else if early_handoff {
+            // P may answer with the handoff right after DP dispatch; the
+            // relay then holds P's load until P reports the prefill's end.
+            obj["kv_transfer_params"]["early_handoff"] = json!(true);
         }
         obj.insert("stream".to_string(), Value::Bool(false));
         obj.insert("max_tokens".to_string(), json!(1));
