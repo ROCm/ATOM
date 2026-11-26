@@ -75,6 +75,9 @@ from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region, token_graph
 
+# Keep the conservative floor: the sharded tail changes BF16 addition order.
+_MOE_ROW_SHARD_MIN_TOKENS = 8192
+
 
 def _text_config(config):
     return getattr(config, "text_config", config)
@@ -447,7 +450,6 @@ class KimiSparseMoeBlock(nn.Module):
         # provides its own overlap, so the two are mutually exclusive.
         self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
         self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
-        self._row_shard_min_tokens = envs.ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS
         tbo_active = get_current_atom_config().enable_tbo
         self._use_dual_stream = (
             self.shared_experts is not None
@@ -607,7 +609,7 @@ class KimiSparseMoeBlock(nn.Module):
         return (
             self.tp_size > 1
             and num_tokens > self._dual_stream_token_threshold
-            and num_tokens >= self._row_shard_min_tokens
+            and num_tokens >= _MOE_ROW_SHARD_MIN_TOKENS
             and not torch.cuda.is_current_stream_capturing()
             and not tbo_active()
         )

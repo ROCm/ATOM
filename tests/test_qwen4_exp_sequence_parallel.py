@@ -75,14 +75,6 @@ def ranks(monkeypatch):
         "get_tensor_model_parallel_world_size",
         lambda: getattr(local, "world", 1),
     )
-    monkeypatch.setattr(
-        sequence_parallel, "get_tensor_model_parallel_rank", lambda: local.rank
-    )
-    monkeypatch.setattr(
-        sequence_parallel,
-        "get_tensor_model_parallel_world_size",
-        lambda: getattr(local, "world", 1),
-    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     def run(world, fn):
