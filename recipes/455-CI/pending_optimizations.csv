@@ -12,7 +12,7 @@ minimax-m3,https://github.com/ROCm/ATOM/pull/3611,,M3 opts into the fused native
 minimax-m3,https://github.com/ROCm/ATOM/pull/3619,,dense and shared-expert SwiGLU fused with the MXFP8 quant
 minimax-m3,https://github.com/ROCm/aiter/pull/8364,,"the routed MoE's A1 quant also writes the shared expert's MXFP8 input, with ATOM#3630"
 minimax-m3,https://github.com/ROCm/ATOM/pull/3630,,"shared-expert input from the routed MoE quant, opt-in, with aiter#8364"
-minimax-m3,https://github.com/ROCm/aiter/pull/8365,,"NVFP4 PA decode writes o_proj's MXFP8 input, with ATOM#3634"
+minimax-m3,https://github.com/ROCm/aiter/pull/8365,,"NVFP4 PA decode writes o_proj's MXFP8 input, with ATOM#3634 (draft)"
 minimax-m3,https://github.com/ROCm/ATOM/pull/3634,,"NVFP4 sparse attention writes o_proj's MXFP8 input, opt-in; stacked on ATOM#2744 (draft)"
 minimax-m3,https://github.com/ROCm/ATOM/pull/3640,,"shared expert on a second stream, overlapped with the routed MoE (draft)"
 minimax-m3,https://github.com/ROCm/ATOM/pull/2744,,FP4 index cache and NVFP4 sparse KV cache
@@ -40,3 +40,4 @@ deepseek-v4.1-flash,https://github.com/ROCm/ATOM/pull/3144,,"gfx1250 MoE IOD wei
 deepseek-v4.1-flash,https://github.com/ROCm/aiter/pull/7668,,"gfx1250 mx32 GEMM software-pipelined K loop, DSv4.1 rows use it; DSV4.1 image gfx1250-atom-dsv41-pd-20261119"
 deepseek-v4.1-flash,https://github.com/ROCm/aiter/pull/7667,,"gfx1250 batched MXFP8 GEMM fused-quant epilogue from the accumulators, under aiter#7668; DSV4.1 image gfx1250-atom-dsv41-pd-20261119"
 glm-5.2,https://github.com/ROCm/aiter/pull/6998,,"wave32 (gfx1250) in the FlyDSL DCP decode top-k merge, for GLM-5.2 DCP (LLM-Booster#267); the CI recipe runs TP4 without DCP"
+qwen-35b-a3b,https://github.com/ROCm/ATOM/pull/3447,,"presence_penalty on decode and speculative-verify rows; the other Qwen work will stack on it (Vinayak, 2026-11-26)"
