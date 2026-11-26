@@ -53,7 +53,7 @@ import hashlib, importlib.util, json, pathlib, sys
 source, output = map(pathlib.Path, sys.argv[1:])
 installed = pathlib.Path(importlib.util.find_spec("srtctl").origin).parent
 files = {}
-for name in ("core/docker.py", "core/launcher.py", "core/runtime.py", "core/schema.py", "backends/vllm.py", "frontends/atomesh.py", "frontends/vllm_router.py"):
+for name in ("core/docker.py", "core/launcher.py", "core/runtime.py", "core/schema.py", "backends/vllm.py", "frontends/base.py", "frontends/atomesh.py", "frontends/vllm_router.py"):
     actual = (installed / name).read_bytes()
     assert actual == (source / "src/srtctl" / name).read_bytes(), name
     files[name] = hashlib.sha256(actual).hexdigest()

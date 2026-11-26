@@ -91,6 +91,8 @@ check = (out / "runtime-check.txt").read_text()
 assert image["Id"] == image_id
 assert image["Config"]["Labels"]["io.atomesh.router.source"] == m["commit"]
 assert check.split()[0] == m["binary_sha256"] and "moriio-read" in check
+if c.get("kv_transport") == "moriio":
+    assert "moriio-write" in check and "--vllm-moriio-peers" in check
 m.update(image_id=image_id, base_image=c["router_images"]["atomesh"], runtime_verified=True)
 (out / "runtime.json").write_text(json.dumps(m, indent=2) + "\n")
 print("[router-build] verified " + image_id + " source=" + m["commit"])

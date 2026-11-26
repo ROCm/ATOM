@@ -16,7 +16,7 @@ def main():
     contract = json.loads(
         (repo / os.environ["ATOMESH_ENV_ATOMESH_PR5090_CONTRACT"]).read_text()
     )
-    assert contract["kv_transport"] == "moriio" and contract["router_arm"] == "baseline"
+    assert contract["kv_transport"] == "moriio" and contract["router_arm"] == "atomesh"
     context = repo / contract["moriio_worker"]["context"]
     manifest = json.loads((context / "manifest.json").read_text())
     assert manifest["base_image"] == contract["image"]

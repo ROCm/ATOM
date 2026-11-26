@@ -23,11 +23,14 @@
   },
   "context_files": {
     "atomesh_mori_probe.py": "7344a97d053fc65b1ab9448d637a795f1fbe06483fe1bbf5ce571d7ad8f68bb3",
-    "Dockerfile": "a8b39c9fa61a759667b0de6652a9a3a415bd6d726946b3aca44f6c9ae6d8f3e8",
+    "Dockerfile": "99a5e69929d5b6662b6e5d1e732e44025182b0a07511058ad93902f3f4f09187",
     "pp-production.patch": "b544a3641264f2cae8f65113ad3d9eda7fb5a24ad30fdd618899d4332b029f38",
-    "prepare_worker.py": "6bfaa6f9b1f1b6054b651aa7d2e0b42ec4f5997f99777d0e5023b3062c401504",
+    "prepare_worker.py": "a8586062bc041ce2e06a2589bea11e90925a09058b2beac3f5a618563cbeb209",
+    "README.md": "cd1d7f17b187875b5ddcd7ef7ae25ff5d56029761e3179fec14eab0c281d93e7",
+    "srt-atomesh-write.patch": "815d1de295884ff639993003b838a1138b1c26bbec6214e8d3201ea3e2960965",
     "srt-discovery.patch": "734fc861b39c35f2856a0c227f2ef6e3c278b2a9535bd053d8fbb8fd09d5ee3c",
     "test_pp_contract.py": "3327b802611f55cb62234194ccb2fc4e49865eec0adcc33c5b74c51a813bb45d",
+    "test_write_contract.py": "89ad0bed9febd04334a70b5f25bc0370a62776750bf0a42a1e1c161e3a37f176",
     "verify_worker.py": "2ae2b02cb77101d61b7910e06bb2f5367f64fc1aa02315e657fa9816f7d16646"
   }
 }

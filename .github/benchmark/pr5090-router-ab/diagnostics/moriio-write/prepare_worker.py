@@ -27,6 +27,7 @@ subprocess.run(
     ["python3", str(control / "test_pp_contract.py"), str(before), str(source)],
     check=True,
 )
+subprocess.run(["python3", str(control / "test_write_contract.py"), str(source)], check=True)
 engine = source / "moriio_engine.py"
 text = engine.read_text()
 needle = "        self.worker.moriio_wrapper.waiting_for_transfer_complete(transfer_statuses)\n"

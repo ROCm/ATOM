@@ -261,5 +261,6 @@
     "path": ".github/benchmark/pr5090-router-ab/diagnostics/moriio-write/srt-discovery.patch",
     "sha256": "734fc861b39c35f2856a0c227f2ef6e3c278b2a9535bd053d8fbb8fd09d5ee3c",
     "reason": "Discovery carries role-specific DP sizes; do not impose a uniform static DP expansion."
-  }
+  },
+  "deprecated": "Cancelled before allocation: user requires ATOMesh. Use single-node-pp4-dep4-atomesh-moriio-write.json."
 }

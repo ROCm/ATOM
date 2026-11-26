@@ -21,7 +21,7 @@ case "${case_name}" in
   pp4-dep4-te5840-patched) contract_file=single-node-pp4-dep4-te5840-patched.json; budget=75m ;;
   pp4-dep4-te5840-natural) contract_file=single-node-pp4-dep4-te5840-natural.json; budget=75m ;;
   pp4-dep4-te5840-long) contract_file=single-node-pp4-dep4-te5840-long.json; budget=120m ;;
-  pp4-dep4-moriio-write) contract_file=single-node-pp4-dep4-moriio-write.json; budget=90m ;;
+  pp4-dep4-atomesh-moriio-write) contract_file=single-node-pp4-dep4-atomesh-moriio-write.json; budget=90m ;;
   *) exit 2 ;;
 esac
 export REPO_ROOT="${3:?checkout path}"
@@ -99,7 +99,7 @@ exit 127
 EOF
 chmod +x "${RUN_DIR}/bin/nvcc"
 export ATOMESH_ROUTER_BUILD_TIMEOUT_SECONDS=1500
-if [[ "${case_name}" == pp4-dep4-moriio-write ]]; then
+if [[ "${case_name}" == pp4-dep4-atomesh-moriio-write ]]; then
   timeout --kill-after=120s "${budget}" python3 .github/scripts/atomesh/pd_moriio_write.py
 elif [[ "${case_name}" == pp4-dep4-te5840-* ]]; then
   timeout --kill-after=120s "${budget}" python3 .github/scripts/atomesh/pd_mooncake_rebuild.py
