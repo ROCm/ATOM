@@ -3,11 +3,15 @@
 on the CPU, AITER stubbed (`tests/aiter_stub.py`): when a step runs SP (pure TP,
 native MXFP8 linears, token thresholds every TBO micro-batch reads alike), when
 the FlyDSL MXFP4 MoE chain takes the experts, the unsharded o_proj copy and how
-it loads, and the chain's warm-up."""
+it loads, the chain's warm-up, and the SP forward itself against the regular TP
+forward, its ranks run as threads over emulated collectives."""
 
 import builtins
+import functools
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace as NS
 from unittest import mock
 
@@ -90,21 +94,25 @@ def test_sp_support_is_known_from_the_linears_before_the_weights_load(sp):
 
 
 @pytest.mark.parametrize(
-    "env, tp, pp, dp, wanted",
+    "env, tp, pp, pcp, dp, wanted",
     [
-        (True, 4, 1, 1, True),
-        (False, 4, 1, 1, False),
-        (True, 1, 1, 1, False),
-        (True, 4, 2, 1, False),
-        (True, 4, 1, 2, False),
+        (True, 4, 1, 1, 1, True),
+        (False, 4, 1, 1, 1, False),
+        (True, 1, 1, 1, 1, False),
+        (True, 4, 2, 1, 1, False),
+        (True, 4, 1, 2, 1, False),
+        (True, 4, 1, 1, 2, False),
     ],
 )
-def test_sp_only_under_pure_tp(load, sp, monkeypatch, env, tp, pp, dp, wanted):
+def test_sp_only_under_pure_tp(load, sp, monkeypatch, env, tp, pp, pcp, dp, wanted):
+    """PCP here is AITER's PCP group, which Ulysses SP runs over too."""
     cfg = NS(parallel_config=NS(data_parallel_size=dp))
+    parallel_state = load("aiter.dist.parallel_state")
     monkeypatch.setattr(sp.envs, "ATOM_M3_SP_PREFILL", env, raising=False)
     monkeypatch.setattr(sp, "_tp", lambda: NS(world_size=tp))
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: NS(world_size=pp))
     monkeypatch.setattr(
-        load("aiter.dist.parallel_state"), "get_pp_group", lambda: NS(world_size=pp)
+        parallel_state, "get_prefill_context_model_parallel_world_size", lambda: pcp
     )
     monkeypatch.setattr(load("atom.config"), "get_current_atom_config", lambda: cfg)
     assert bool(sp._wanted()) is wanted
@@ -444,3 +452,268 @@ def test_tbo_decision_needs_every_micro_batch_context(sp, tp4, run_as):
     run_as(ring[0])
     with pytest.raises(AssertionError):
         sp.plan(9000)
+
+
+# The SP forward against the regular TP forward. Each rank is a thread running
+# `forward` on its own replica, the collectives emulated on `_Coll`'s byte views;
+# the quants pass float32 rows through, so the two forwards differ only in the
+# order of their sums.
+
+WORLD, HIDDEN, HEAD_DIM, INTER, EXPERTS = 4, 64, 32, 16, 2
+
+
+class Ranks:
+    """`WORLD` ranks as threads; each collective an exchange through shared slots."""
+
+    def __init__(self):
+        self.barrier = threading.Barrier(WORLD)
+        self.slots = [None] * WORLD
+        self.local = threading.local()
+
+    def exchange(self, mine):
+        self.slots[self.local.rank] = mine
+        self.barrier.wait()
+        everyone = list(self.slots)
+        self.barrier.wait()
+        return everyone
+
+    def run(self, fn):
+        """``fn(rank)`` on every rank at once; a rank's error, not the others'
+        broken barrier, is raised."""
+
+        def body(rank):
+            self.local.rank = rank
+            try:
+                return fn(rank)
+            except BaseException:
+                self.barrier.abort()
+                raise
+
+        with ThreadPoolExecutor(WORLD) as pool:
+            futures = [pool.submit(body, rank) for rank in range(WORLD)]
+        errors = [f.exception() for f in futures if f.exception() is not None]
+        if errors:
+            broken = threading.BrokenBarrierError
+            raise next((e for e in errors if not isinstance(e, broken)), errors[0])
+        return [f.result() for f in futures]
+
+
+class EmulatedColl:
+    """`_Coll`'s three collectives over `Ranks.exchange`."""
+
+    def __init__(self, sp, ranks):
+        self.u8, self.ranks = sp._u8, ranks
+
+    def all_gather(self, outs, ins):
+        everyone = self.ranks.exchange([i.contiguous() for i in ins])
+        for j, o in enumerate(outs):
+            self.u8(o).copy_(torch.cat([self.u8(e[j]) for e in everyone]))
+
+    def reduce_scatter(self, out, x):
+        everyone = self.ranks.exchange(x)
+        rank, rows = self.ranks.local.rank, out.shape[0]
+        out.copy_(
+            functools.reduce(
+                torch.add, [e[rank * rows : (rank + 1) * rows] for e in everyone]
+            )
+        )
+
+    def all_to_all(self, outs, ins):
+        everyone = self.ranks.exchange([x.contiguous() for x in ins])
+        rank = self.ranks.local.rank
+        for j, o in enumerate(outs):
+            ob = self.u8(o)
+            n = ob.numel() // WORLD
+            for r in range(WORLD):
+                ob[r * n : (r + 1) * n] = self.u8(everyone[r][j])[
+                    rank * n : (rank + 1) * n
+                ]
+
+
+def lossless_quant(x):
+    """float32 codes, E8M0 scales of 1 (`_FP8` is float32 alongside)."""
+    scales = torch.full((x.shape[0], x.shape[1] // 32), 127, dtype=torch.uint8)
+    return x.float().contiguous(), scales.view(torch.float8_e8m0fnu)
+
+
+class Norm:
+    """RMSNorm; with a residual the fused add + norm -> (normed, sum)."""
+
+    def __init__(self, gen):
+        self.weight = 1 + 0.1 * torch.randn(HIDDEN, generator=gen)
+
+    def forward_cuda(self, x, residual=None):
+        s = x if residual is None else x + residual
+        out = s * torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + 1e-6) * self.weight
+        return out if residual is None else (out, s)
+
+
+class Linear:
+    def __init__(self, weight):
+        self.weight = weight
+
+    def __call__(self, x, x_scale=None):
+        return x @ self.weight.T
+
+
+class Mlp:
+    """This rank's slice of the intermediate: a TP partial."""
+
+    def __init__(self, up, down):
+        self.up, self.down = up, down
+
+    def __call__(self, x, x_scale=None):
+        return torch.nn.functional.silu(x @ self.up.T) @ self.down.T
+
+
+class Moe:
+    """Softmax-gated `Mlp` slices: a TP partial, as `MiniMaxM3MoE` returns it."""
+
+    def __init__(self, gate, experts):
+        self.gate, self.experts = gate, experts
+
+    def __call__(self, x):
+        weights = torch.softmax(x @ self.gate.T, dim=-1)
+        return sum(weights[:, [e]] * mlp(x) for e, mlp in enumerate(self.experts))
+
+
+class RankAttention:
+    """This rank's head, causal over every token."""
+
+    def __init__(self, qkv, o_proj, rank):
+        self.qkv_proj = Linear(qkv)
+        self.o_proj = Linear(o_proj[:, rank * HEAD_DIM : (rank + 1) * HEAD_DIM])
+        self.o_proj_full = Linear(o_proj)
+
+    def attend(self, positions, qkv):
+        q, k, v = qkv.split(HEAD_DIM, dim=-1)
+        future = torch.ones(len(q), len(q), dtype=torch.bool).triu(1)
+        scores = (q @ k.T / HEAD_DIM**0.5).masked_fill(future, float("-inf"))
+        return torch.softmax(scores, dim=-1) @ v
+
+
+def replicas(kinds, aux_layers):
+    """Each rank's replica of a model with these layers ("dense" / "moe"): norms,
+    gates and o_proj replicated, heads and intermediates one slice per rank."""
+    gen = torch.Generator().manual_seed(0)
+
+    def w(*shape):
+        return torch.randn(*shape, generator=gen) / shape[-1] ** 0.5
+
+    def mlp_slices():
+        return [(w(INTER, HIDDEN), w(HIDDEN, INTER)) for _ in range(WORLD)]
+
+    shared = []
+    for kind in kinds:
+        p = {
+            "norms": (Norm(gen), Norm(gen)),
+            "o_proj": w(HIDDEN, WORLD * HEAD_DIM),
+            "qkv": [w(3 * HEAD_DIM, HIDDEN) for _ in range(WORLD)],
+        }
+        if kind == "moe":
+            p["gate"] = w(EXPERTS, HIDDEN)
+            p["experts"] = list(zip(*(mlp_slices() for _ in range(EXPERTS))))
+        else:
+            p["mlp"] = mlp_slices()
+        shared.append(p)
+    final_norm = Norm(gen)
+    models = []
+    for rank in range(WORLD):
+        layers = torch.nn.ModuleList()
+        for kind, p in zip(kinds, shared):
+            layer = torch.nn.Module()
+            layer.self_attn = RankAttention(p["qkv"][rank], p["o_proj"], rank)
+            layer.input_layernorm, layer.post_attention_layernorm = p["norms"]
+            layer.is_moe_layer = kind == "moe"
+            if layer.is_moe_layer:
+                experts = [Mlp(*e) for e in p["experts"][rank]]
+                layer.block_sparse_moe = Moe(p["gate"], experts)
+                layer._sp_flydsl_moe = False
+            else:
+                layer.mlp = Mlp(*p["mlp"][rank])
+            layers.append(layer)
+        models.append(
+            NS(
+                layers=layers,
+                start_layer=0,
+                end_layer=len(layers),
+                aux_hidden_state_layers=aux_layers,
+                norm=final_norm,
+            )
+        )
+    return models
+
+
+def tp_forward(models, embeddings):
+    """The regular TP forward of the replicas: o_proj and FFN partials summed
+    over the ranks before the next fused add + norm -> the final hidden state and
+    the residual stream after each layer."""
+    first, n = models[0], len(models[0].layers)
+
+    def all_reduce(module_of, x):
+        return functools.reduce(torch.add, [module_of(m)(x) for m in models])
+
+    def attention(i):
+        return lambda m: (
+            lambda x: m.layers[i].self_attn.o_proj(
+                m.layers[i].self_attn.attend(None, m.layers[i].self_attn.qkv_proj(x))
+            )
+        )
+
+    def ffn(i):
+        return lambda m: (
+            m.layers[i].block_sparse_moe
+            if m.layers[i].is_moe_layer
+            else m.layers[i].mlp
+        )
+
+    x, residual = first.layers[0].input_layernorm.forward_cuda(embeddings), embeddings
+    after = []
+    for i in range(n):
+        o = all_reduce(attention(i), x)
+        x, residual = first.layers[i].post_attention_layernorm.forward_cuda(o, residual)
+        f = all_reduce(ffn(i), x)
+        norm = first.layers[i + 1].input_layernorm if i + 1 < n else first.norm
+        x, residual = norm.forward_cuda(f, residual)
+        after.append(residual)
+    return x, after
+
+
+@pytest.mark.parametrize(
+    "num_tokens", [100, 70], ids=["short-last-shard", "a-rank-of-padding-only"]
+)
+def test_sp_forward_matches_the_tp_forward(sp, monkeypatch, num_tokens):
+    """Dense, MoE through the regular-MoE fallback, dense; the DSpark taps (aux
+    layers 0 and 2) and a forward hook on layer 1 read the gathered states."""
+    models = replicas(("dense", "moe", "dense"), aux_layers=(0, 2))
+    hooked = [None] * WORLD
+    for rank, m in enumerate(models):
+        m.layers[1].register_forward_hook(
+            lambda layer, args, out, rank=rank: hooked.__setitem__(rank, out)
+        )
+    ranks = Ranks()
+    coll = EmulatedColl(sp, ranks)
+    monkeypatch.setattr(sp, "_FP8", torch.float32)
+    monkeypatch.setattr(sp, "_quant", lossless_quant)
+    monkeypatch.setattr(sp, "_run_phase", lambda fn: fn(coll))
+    embeddings = torch.randn(
+        num_tokens, HIDDEN, generator=torch.Generator().manual_seed(1)
+    )
+    align = sp._ROW_ALIGN
+    rows = (num_tokens + WORLD - 1) // WORLD
+    rows = (rows + align - 1) // align * align
+
+    def rank_forward(rank):
+        shard = sp.SeqShard(num_tokens, rows, WORLD, rank)
+        return sp.forward(models[rank], torch.arange(num_tokens), embeddings, shard)
+
+    outputs = ranks.run(rank_forward)
+    hidden, after = tp_forward(models, embeddings)
+    close = functools.partial(torch.testing.assert_close, rtol=1e-4, atol=1e-5)
+    for rank, (h, aux) in enumerate(outputs):
+        close(h, hidden)
+        assert len(aux) == 2
+        torch.testing.assert_close(aux[0], embeddings, rtol=0, atol=0)
+        close(aux[1], after[1])
+        assert isinstance(hooked[rank], sp.GatheredLayerOutput)
+        close(hooked[rank][0], after[1])

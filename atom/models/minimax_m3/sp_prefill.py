@@ -170,8 +170,12 @@ def plan(num_tokens: int) -> SeqShard | None:
 
 
 def _wanted() -> bool:
-    """``ATOM_M3_SP_PREFILL`` under pure TP: no PP, no DP."""
-    from aiter.dist.parallel_state import get_pp_group
+    """``ATOM_M3_SP_PREFILL`` under pure TP: no PP, no DP, no PCP group (PCP or
+    Ulysses SP; the MoE chain would skip FusedMoE's PCP gather and reduce)."""
+    from aiter.dist.parallel_state import (
+        get_pp_group,
+        get_prefill_context_model_parallel_world_size,
+    )
 
     from atom.config import get_current_atom_config
 
@@ -179,6 +183,7 @@ def _wanted() -> bool:
         envs.ATOM_M3_SP_PREFILL
         and _tp().world_size > 1
         and get_pp_group().world_size == 1
+        and get_prefill_context_model_parallel_world_size() == 1
         and get_current_atom_config().parallel_config.data_parallel_size == 1
     )
 
@@ -218,7 +223,7 @@ def attach_o_proj_full(model: nn.Module, quant_config) -> None:
     if envs.ATOM_M3_SP_PREFILL and not model._sp_supported:
         logger.info(
             "MiniMax-M3 sequence-parallel prefill off: it needs pure TP (TP > 1, "
-            "no PP / DP) and native MXFP8 attention and dense-MLP linears"
+            "no PP / DP / PCP) and native MXFP8 attention and dense-MLP linears"
         )
     if not model._sp_supported:
         return
