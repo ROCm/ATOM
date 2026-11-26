@@ -1175,8 +1175,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
-    # Ignored for MoRI v2 DP+EP: its gather transport does not implement the
-    # LOCAL_REPLICA routing contract, so the shared MLP stays separate there.
+    # Ignored for MoRI v2 DP+EP without EPLB, where the shared MLP stays
+    # separate: MegaMoE's v2 gather gives wrong output for LOCAL_REPLICA rows
+    # (ROCm/aiter#TBD).
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
     ),
