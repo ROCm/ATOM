@@ -48,6 +48,9 @@ class FinishHold:
         if not due:
             self._since = None
             return False
+        if self.max_hold_s <= 0:
+            self._since = None
+            return False
         if self._since is None:
             self._since = now
         elif now - self._since >= self.max_hold_s:

@@ -247,3 +247,28 @@ def test_demotion_boundary_uses_hash_block_size(seq_factory):
     s.status = SequenceStatus.FINISHED
     bm.deallocate(s)
     assert calls == [(table[2], True), (table[1], True), (table[0], False)]
+
+
+def test_pool_without_demote_argument_disables_the_policy(monkeypatch):
+    # Connector pools (UMBP) implement free(block_id) only; the policy must be
+    # switched off at init, not raise TypeError when a request finishes.
+    from atom.model_engine import block_manager as bmod
+
+    class NoDemotePool(BlockPool):
+        def free(self, block_id):
+            super().free(block_id)
+
+    monkeypatch.setenv("ATOM_PREFIX_DEMOTE_DECODE", "1")
+    monkeypatch.setattr(
+        bmod,
+        "make_block_pool",
+        lambda config, num_blocks, **kw: NoDemotePool(
+            num_blocks, on_evict=kw["on_evict"]
+        ),
+    )
+    bm = BlockManager(
+        MockConfig(
+            num_kvcache_blocks=16, kv_cache_block_size=BS, enable_prefix_caching=True
+        )
+    )
+    assert bm.demote_generated is False

@@ -2653,6 +2653,17 @@ class Scheduler:
             # requeue it on every tick (a head-of-line stall), so the budget
             # never drops below the head waiter's size.
             cap = max(cap, min(self.waiting[0].num_tokens, full))
+        if cap and self._partial_prefill_count:
+            # A running stateful prefill resumes from `replay_start`, below its
+            # cached tokens: the budget has to cover that replay plus one hash
+            # block of forward progress, or `_partial_prefill_chunk` returns 0
+            # on every capped tick and the prefill never finishes.
+            for seq in self.running:
+                if seq.is_partial_prefill:
+                    resume = seq.num_cached_tokens
+                    start = self.block_manager.replay_start(seq, resume, hit=False)
+                    need = resume - start + self.block_manager.hash_block_size
+                    cap = max(cap, min(need, full))
         try:
             if cap:
                 self.max_num_batched_tokens = cap

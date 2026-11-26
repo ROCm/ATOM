@@ -73,6 +73,9 @@ class PrefillDuty:
         ):
             self._hold_since = None
             return False
+        if self.max_hold_s <= 0:
+            self._hold_since = None
+            return False
         if self._hold_since is None:
             self._hold_since = now
         elif now - self._hold_since >= self.max_hold_s:

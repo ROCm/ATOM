@@ -237,3 +237,29 @@ def test_disaggregated_prefill_scheduler_warns_about_ignored_flags(caplog):
         PrefillScheduler(cfg)
     assert "ATOM_SCHED_DECODE_PREFILL_CAP" in caplog.text
     assert "ATOM_SCHED_PREFILL_DUTY" in caplog.text
+
+
+def test_capped_stateful_prefill_budget_covers_the_replay(seq_factory):
+    # A forward that finishes a stateful prompt starts `min_final_prefill_rows`
+    # before its end (`replay_start`), so with a cap near that size the next
+    # chunk ended at or below `resume` and `_partial_prefill_chunk` returned 0
+    # on every capped tick. The tick's budget must cover replay + one block.
+    sched = _sched(ATOM_SCHED_IDLE_PREFILL_CAP=128)
+    seq = seq_factory(list(range(200)))
+    seq.status = SequenceStatus.RUNNING
+    seq.num_cached_tokens = 128
+    seq.is_partial_prefill = True
+    sched.running = deque([seq])
+    sched._partial_prefill_count = 1
+    seen = []
+    with (
+        mock.patch.object(sched.block_manager, "replay_start", return_value=0),
+        mock.patch.object(
+            sched,
+            "_schedule",
+            side_effect=lambda: seen.append(sched.max_num_batched_tokens),
+        ),
+    ):
+        sched.schedule()
+    assert seen == [128 + sched.block_manager.hash_block_size]
+    assert sched.max_num_batched_tokens == 512

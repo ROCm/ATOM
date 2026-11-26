@@ -62,3 +62,12 @@ def test_max_hold_releases():
     assert d.hold(t0, decoding=True)
     assert d.hold(t0 + 0.4, decoding=True)
     assert not d.hold(t0 + 0.6, decoding=True)
+
+
+def test_zero_max_hold_never_holds():
+    d = PrefillDuty(target=0.1, tau_s=10.0, max_hold_s=0.0)
+    for i in range(6):
+        d.observe(float(i), "p")
+    assert d.share() > d.target
+    assert not d.hold(10.0, True)
+    assert not d.hold(10.1, True)

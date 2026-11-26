@@ -115,3 +115,10 @@ def test_no_hold_without_decode(seq_factory):
     sched.add(seq_factory(list(range(64))))
     batch, _ = sched.schedule()
     assert batch.total_seqs_num_prefill == 1
+
+
+def test_zero_max_hold_never_holds():
+    fh = FinishHold(tokens_left=64, max_hold_s=0.0, max_tokens_cap=400)
+    assert not fh.hold(10.0, True)
+    assert not fh.hold(10.1, True)
+    assert fh.holds == 0

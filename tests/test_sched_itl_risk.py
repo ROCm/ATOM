@@ -181,3 +181,10 @@ def test_due_is_inclusive_at_theta():
     g.decode_step_s = 0.012
     g.tokens_per_step = 4.0
     assert g.due(1000.0, [_seq(1, 101, 101, 1.0)], 1000)
+
+
+def test_zero_max_hold_never_holds():
+    g = ItlRiskHold(5.0, 0.0, 31.6, 18.65)
+    assert not g.hold(10.0, True)
+    assert not g.hold(10.1, True)
+    assert g.holds == 0
