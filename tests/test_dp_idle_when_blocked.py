@@ -26,6 +26,13 @@ with stubbed_aiter():
     from atom.model_engine import engine_core as ec
     from atom.model_engine.engine_core import DPEngineCoreProc
 
+from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.page_unit_checkpoint import (
+    COPYING,
+    READY,
+    PagedStateCheckpointCoordinator,
+    PagedStateCheckpointSpec,
+)
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
 from atom.utils import envs
@@ -405,6 +412,48 @@ def test_deferred_frees_alone(make, monkeypatch, enabled):
         assert events == ["dummy"] * 5 + ["exit"]  # a DP dummy per pass
 
 
+def test_idle_pass_completes_the_last_batchs_page_checkpoints(make, monkeypatch):
+    """The last forward issued a PAGE checkpoint copy and a restore; only
+    deferred sends remain, so no `schedule()` runs to complete them. The idle
+    pass must, before its drain: the copy turns READY (findable, evictable,
+    nominated for the CPU tier) and the restore's pin goes back."""
+    s, _ = make(conn=False)
+    coordinator = PagedStateCheckpointCoordinator(
+        BlockPool(20),
+        PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25),
+        enabled=True,
+    )
+    s.block_manager.paged_state_checkpoints = coordinator
+    store = coordinator.store
+    # Already READY: the restore source the last batch read.
+    assert store.begin_store(202, src_slot=1) is not None
+    store.complete_inflight()
+    restored = store.hash_to_checkpoint[202]
+    assert coordinator.begin_restore(202, dst_slot=4)
+    # The last batch's ops, as `take_checkpoint_ops` began them for it.
+    assert store.begin_store(101, src_slot=3) is not None
+    copy = next(c for c, r in store.records.items() if r.prefix_hash == 101)
+    _, restores = coordinator.take_checkpoint_ops()
+    assert len(restores) == 1
+    assert store.records[copy].state == COPYING
+    assert store.records[restored].pin_count == 1
+
+    s.deferred_free_blocks[1] = object()  # its KV is still being sent
+    loop = Loop(
+        s, enabled=True, shutdown_at=3, script={3: s.deferred_free_blocks.clear}
+    )
+    at_drain = []
+    loop.proc._advance_idle_kv_transfer = lambda *a, **k: at_drain.append(
+        (store.records[copy].state, store.records[restored].pin_count)
+    )
+    loop.run(monkeypatch)
+
+    assert at_drain == [(READY, 0)] * 3  # completed before the first drain
+    assert store.lookup(101) >= 0
+    # Idempotent: the idle passes after the first complete nothing twice.
+    assert store.records[copy].state == READY
+
+
 def test_on_still_runs_dummies_for_a_busy_peer(make, monkeypatch):
     # Lockstep: a peer's forward needs this rank's dummy whatever it votes.
     s, _ = make(conn=False)
@@ -670,3 +719,19 @@ def test_ignored_with_the_prefill_delayer(make, monkeypatch, env):
     else:
         monkeypatch.setenv("ATOM_DP_IDLE_WHEN_BLOCKED", env)
     assert _resolve(make, PREFILL, delayer=object()) is False
+
+
+@pytest.mark.parametrize(("env", "warned"), [(None, False), ("", False), ("1", True)])
+def test_delayer_warns_only_for_an_explicit_setting(make, monkeypatch, env, warned):
+    # The delayer is on by default with DP > 1: the role default alone, which
+    # it turns off on every rank, must not warn on every rank.
+    if env is None:
+        monkeypatch.delenv("ATOM_DP_IDLE_WHEN_BLOCKED", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DP_IDLE_WHEN_BLOCKED", env)
+    warnings = []
+    monkeypatch.setattr(ec.logger, "warning", lambda *a, **k: warnings.append(a))
+    assert _resolve(make, PREFILL, delayer=object()) is False
+    assert bool(warnings) is warned
+    if warned:
+        assert "ATOM_ENABLE_PREFILL_DELAYER=0" in warnings[0][0]

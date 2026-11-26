@@ -300,8 +300,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unset: the engine then turns it on only on a P/D prefill instance
     # (`kv_producer`) and leaves it off on an aggregated server and a decode
     # instance (`engine_core.dp_idle_when_blocked`); an explicit 0/1 is used
-    # as is, on any role. Ignored with the prefill delayer on; DP=1 never reads
-    # it (no DP group to vote with).
+    # as is, on any role. Needs ATOM_ENABLE_PREFILL_DELAYER=0: the delayer is
+    # on by default with DP > 1 and turns this off (warning only when it was
+    # set explicitly). DP=1 never reads it (no DP group to vote with).
     "ATOM_DP_IDLE_WHEN_BLOCKED": lambda: _optional_flag_env(
         "ATOM_DP_IDLE_WHEN_BLOCKED"
     ),

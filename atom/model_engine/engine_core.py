@@ -1152,14 +1152,19 @@ class DPEngineCoreProc(EngineCore):
         """`ATOM_DP_IDLE_WHEN_BLOCKED`: whether this rank reports work to its DP
         group only when a pass could produce a batch (`has_forward_work`).
         Defaults by P/D role (`dp_idle_when_blocked`). Off with a prefill
-        delayer, whose cadence counts passes."""
+        delayer, whose cadence counts passes: it needs
+        `ATOM_ENABLE_PREFILL_DELAYER=0`. The delayer is on by default with DP,
+        so the role default alone stays quiet; only an explicit setting that
+        the delayer overrides is warned about."""
         if not dp_idle_when_blocked(config):
             return False
         if self.scheduler.prefill_delayer is not None:
-            logger.warning(
-                "%s: ATOM_DP_IDLE_WHEN_BLOCKED ignored with the prefill delayer on",
-                self.label,
-            )
+            if envs.ATOM_DP_IDLE_WHEN_BLOCKED is not None:
+                logger.warning(
+                    "%s: ATOM_DP_IDLE_WHEN_BLOCKED ignored with the prefill "
+                    "delayer on (set ATOM_ENABLE_PREFILL_DELAYER=0)",
+                    self.label,
+                )
             return False
         logger.info("%s: ATOM_DP_IDLE_WHEN_BLOCKED on", self.label)
         return True
@@ -1294,6 +1299,20 @@ class DPEngineCoreProc(EngineCore):
                     self.scheduler.engine_stats.note_idle(now)
                     if self.scheduler.prefill_delayer is not None:
                         self.scheduler.prefill_delayer.notify_idle()
+                    # The PAGE checkpoint copies the last batch issued complete
+                    # in the next `schedule()`, which an idle pass never runs:
+                    # finish them here, before the drain publishes state work,
+                    # so they turn READY (reusable, evictable, storable to the
+                    # CPU tier) instead of staying COPYING with their pins
+                    # (`BlockManager.complete_previous_checkpoint_batch`).
+                    # Guarded for scheduler doubles without a block manager.
+                    complete_checkpoints = getattr(
+                        getattr(self.scheduler, "block_manager", None),
+                        "complete_previous_checkpoint_batch",
+                        None,
+                    )
+                    if complete_checkpoints is not None:
+                        complete_checkpoints()
                     blocked = idle_when_blocked and bool(self.scheduler.waiting)
                     if self.has_pending_kv_work() or blocked:
                         # Local RPCs only. Anything that reaches schedule()
