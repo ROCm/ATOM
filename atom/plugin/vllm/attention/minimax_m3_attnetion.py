@@ -91,7 +91,8 @@ def _index_cache_torch_dtype(kv_cache_dtype: str) -> torch.dtype:
 
     NOT vLLM's ``kv_cache_dtype_str_to_dtype``: its ``fp8 -> torch.uint8`` would
     make a kernel that branches on ``dtype.is_fp8()`` dot bf16 against uint8.
-    ``fp8`` and ``fp8_e4m3`` pass; anything else (``auto``, ``bf16``) is refused,
+    Any fp8 variant (``fp8``, ``fp8_e4m3``, ``fp8_e5m2``: the check is
+    ``startswith("fp8")``) passes; anything else (``auto``, ``bf16``) is refused,
     since no scorer serves a bf16 index cache.
     """
     if str(kv_cache_dtype).startswith("fp8"):

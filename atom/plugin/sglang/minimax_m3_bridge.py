@@ -277,7 +277,8 @@ def _atom_m3_index_dtype(owner: Any) -> torch.dtype:
     """ATOM index dtype for MiniMax-M3: fp8, or a refusal naming the flag.
 
     Runs from `configure`, before weights load; the SGLang side of the refusal
-    in `aiter_attention._index_cache_spec`, with the same message.
+    in `aiter_attention._index_cache_spec`. Both use the same message builder
+    (`index_cache_must_be_fp8`) with a different flag name.
     """
 
     fallback = getattr(owner, "model_dtype", torch.bfloat16)
