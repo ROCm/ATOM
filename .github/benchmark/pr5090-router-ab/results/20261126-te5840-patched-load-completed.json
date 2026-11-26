@@ -1,0 +1,81 @@
+{
+  "lease": "Lf1b699",
+  "node": "g27",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "harness_sha": "8e1c42075e26e75d8a372c38bef59d9db4b0be5d",
+  "candidate_pr": "https://github.com/kvcache-ai/Mooncake/pull/5840",
+  "candidate_head": "8babd5a9b3ecfe0df78379ca0f1f143a391edd44",
+  "engine_sha256": "3c8196c03d57a4cf10c83b5ec681f62a0851646f7b005939709e329df2c41511",
+  "connector_sha256": "45e05e355bba98ec51783ba0fc0a5267f7ef3a60e427444c3df075eed0ce8997",
+  "vllm_kernel_sha256": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395",
+  "sender_workers": 10,
+  "async_sender_tasks": 20,
+  "native_deadlines": "unchanged/unset",
+  "warmup": {
+    "completed": 884,
+    "cancelled": 0,
+    "errors": 0,
+    "elapsed_s": 366.12
+  },
+  "profiling": {
+    "requested_window_s": 900,
+    "sent": 3064,
+    "completed": 3062,
+    "cancelled_at_grace_end": 2,
+    "errors": 0,
+    "elapsed_with_grace_s": 930.0
+  },
+  "phase_notices": [
+    "22:46:04.036 NOTICE   Phase warmup (warmup) started | target: 884 requests (runner.py:600)",
+    "22:52:08.350 NOTICE   Phase warmup (warmup) sending complete | sent=884, completed=881, in_flight=3 | sessions: sent=82, completed=25 (runner.py:1047)",
+    "22:52:10.154 NOTICE   Phase warmup (warmup) complete | completed=884, cancelled=0, errors=0 | sessions: completed=25, cancelled=0 | elapsed=366.12s (runner.py:1170)",
+    "22:52:10.269 NOTICE   Phase profiling (profiling) started | phase_index=0 | profiling_index=0 | target: 900.0s duration (runner.py:600)",
+    "23:07:10.270 NOTICE   Phase profiling (profiling) sending complete | sent=3,064, completed=3,039, in_flight=25 | sessions: sent=93, completed=29 | timeout_triggered=True (runner.py:1047)",
+    "23:07:40.270 NOTICE   Phase profiling (profiling) complete | completed=3,062, cancelled=2, errors=0 | sessions: completed=29, cancelled=0 | elapsed=930.00s | grace_period_timeout=True (runner.py:1170)"
+  ],
+  "failed_native_writes": 0,
+  "kv_transfer": {
+    "metric": "vllm:mooncake_bytes_transferred_sum",
+    "prefill_before": 0.0,
+    "prefill_after": 101376000.0,
+    "transferred_bytes_delta": 101376000.0,
+    "passed": true
+  },
+  "disconnect_pending_requests": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "exit_codes": {
+    "pool-workload.rc": 0,
+    "pool-exit.rc": 0,
+    "gpool-release.rc": 0
+  },
+  "srt_remaining_containers": [],
+  "outer_cleanup_containers": [],
+  "release_note": "released Lf1b699 (g27:0-7, held 40m)",
+  "archive_sha256": "9916dbd96102362c4c51fe1c852cb6f8aaf272d932883fc9c203ca687a93fbb4",
+  "interpretation": "Sender10 candidate completed the original warmup and900s sending window with zero native write failures. Two requests were cancelled at the configured30s drain limit; this is distinct from native transfer timeouts. The unpatched baseline was on g23, so causality requires an unpatched reversal on g27, followed by natural P device-order validation. No new SA performance point.",
+  "shutdown_error": {
+    "message": "AsyncLLM output_handler failed: EngineDeadError",
+    "time_utc": "2026-11-25T23:08:03Z",
+    "context": "Logged during SIGTERM cleanup after benchmark success at23:08:03; separate from zero native transfer failures during workload.",
+    "preserved": true
+  }
+}
