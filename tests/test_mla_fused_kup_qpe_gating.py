@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 # Gating of the fused MLA decode kernel (ATOM_MLA_FUSED_KUP_QPE): default off,
 # and every unsupported case falls back to the existing two-kernel path.
 

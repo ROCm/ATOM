@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """MLA decode K-up (BF16 absorb) + q_pe RoPE + shuffled KV-cache write in one
 persistent Gluon kernel for gfx1250.
 

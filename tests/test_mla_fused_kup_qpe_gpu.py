@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Byte-exact comparisons against the two production calls, on gfx1250.
 
 Run with pytest on the ROCm host. CPU CI reports these as pending/skipped;
