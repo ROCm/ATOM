@@ -14,6 +14,7 @@ Port of vLLM #63491 (``vllm/models/minimax_m3/amd/sp_prefill.py``).
 """
 
 import logging
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -131,29 +132,34 @@ class SeqShard:
         return out
 
 
-def _smallest_ubatch_tokens(num_tokens: int) -> int:
-    """This micro-batch's token count, or its partner's when smaller: both take
-    one path, so both must decide on the same number."""
+def _ubatch_token_range() -> tuple[int, int]:
+    """The smallest and largest token counts of this step's micro-batches, read
+    from all of their forward contexts: every micro-batch takes one path, so every
+    one must decide on the same numbers."""
     from atom.utils.tbo.ubatching import _get_current_tbo_context
 
-    partner = _get_current_tbo_context().partner
-    if partner is None or partner.forward_context is None:
-        return num_tokens
-    other = partner.forward_context.context.running_tokens
-    return min(num_tokens, int(other))
+    ctx, tokens = _get_current_tbo_context(), {}
+    while id(ctx) not in tokens:
+        assert ctx is not None and ctx.forward_context is not None, ctx
+        tokens[id(ctx)] = ctx.forward_context.context.running_tokens
+        ctx = ctx.partner
+    return min(tokens.values()), max(tokens.values())
 
 
 def plan(num_tokens: int) -> SeqShard | None:
     from atom.utils.tbo.ubatching import tbo_active
 
     world = _tp().world_size
-    if world == 1 or num_tokens == 0 or num_tokens > SP_MAX_TOKENS:
+    if world == 1 or num_tokens == 0:
         return None
     if tbo_active():
-        smallest = _smallest_ubatch_tokens(num_tokens)
-        if smallest < max(SP_MIN_UBATCH_TOKENS, _CHAIN_MIN_TOKENS):
+        smallest, largest = _ubatch_token_range()
+        if (
+            smallest < max(SP_MIN_UBATCH_TOKENS, _CHAIN_MIN_TOKENS)
+            or largest > SP_MAX_TOKENS
+        ):
             return None
-    elif num_tokens < max(SP_MIN_TOKENS, _CHAIN_MIN_TOKENS):
+    elif not max(SP_MIN_TOKENS, _CHAIN_MIN_TOKENS) <= num_tokens <= SP_MAX_TOKENS:
         return None
     rows = (num_tokens + world - 1) // world
     rows = (rows + _ROW_ALIGN - 1) // _ROW_ALIGN * _ROW_ALIGN
@@ -202,8 +208,9 @@ def _layer_supports_sp(layer: nn.Module) -> bool:
 def attach_o_proj_full(model: nn.Module, quant_config) -> None:
     """With ``ATOM_M3_SP_PREFILL``, where every layer of ``model`` can run SP,
     give each attention an unsharded copy of its o_proj (``o_proj_full``, +3.1 GB
-    per rank at TP4) whose parameters load with the sharded ones. Anywhere else
-    no copy is made and SP stays off."""
+    per rank at TP4) whose parameters load with the sharded ones (and are recorded
+    loaded through ``weight_loader_fanout``). Anywhere else no copy is made and SP
+    stays off."""
     from atom.model_ops.linear import ReplicatedLinear
 
     layers = model.layers[model.start_layer : model.end_layer]
@@ -225,17 +232,25 @@ def attach_o_proj_full(model: nn.Module, quant_config) -> None:
             quant_config=quant_config,
             prefix=o_proj.prefix,
         )
-        for name, p in o_proj.named_parameters(recurse=False):
-            fp = getattr(full, name, None)
+        params = dict(o_proj.named_parameters(recurse=False))
+        full_params = dict(full.named_parameters(recurse=False))
+        if params.keys() != full_params.keys():
+            raise ValueError(
+                f"{o_proj.prefix}: o_proj has parameters {sorted(params)}, "
+                f"its unsharded copy {sorted(full_params)}"
+            )
+        for name, p in params.items():
+            fp = full_params[name]
             loader = getattr(p, "weight_loader", None)
-            if fp is None or loader is None or not hasattr(fp, "weight_loader"):
-                continue
+            if loader is None or not hasattr(fp, "weight_loader"):
+                raise ValueError(f"{o_proj.prefix}.{name}: no weight_loader to chain")
 
             def both(param, loaded, *args, _loader=loader, _fp=fp):
                 _loader(param, loaded, *args)
                 _fp.weight_loader(_fp, loaded)
 
             p.weight_loader = both
+            p.weight_loader_fanout = (fp,)
         attn.o_proj_full = full
 
 
@@ -450,8 +465,27 @@ def _post_attention_phase(sp: SeqShard, layer, attn_output, residual):
     return inp, residual
 
 
-_CHAIN_WARM_UP_TOKENS = (4096, 16384, 32768)
-_chain_warmed = False
+_chain_warm_lock = threading.Lock()
+# (hidden, intermediate, experts, topk, BLOCK_M) of the chain variants that have run
+_chain_warm: set[tuple[int, ...]] = set()
+
+
+def _warm_chain(chain, shape: tuple[int, ...], padded: int) -> None:
+    """Run each BLOCK_M variant of the chain once, on the first step with the rows
+    for it: aiter compiles one per ``block_m_for`` (below ``BM256_FROM_TOKENS``
+    tokens and from it), so no later step compiles mid-serve."""
+    from aiter.ops.flydsl.kernels.minimax_m3_moe_prefill.moe_mxfp4.prefill import (
+        BM256_FROM_TOKENS,
+        MIN_PREFILL_TOKENS,
+        block_m_for,
+    )
+
+    with _chain_warm_lock:
+        for n in (MIN_PREFILL_TOKENS, BM256_FROM_TOKENS):
+            key = (*shape, block_m_for(n))
+            if key not in _chain_warm and n <= padded:
+                chain(n, None)
+                _chain_warm.add(key)
 
 
 def _moe_chain(sp: SeqShard, moe, inp: FfnInput) -> torch.Tensor:
@@ -461,13 +495,13 @@ def _moe_chain(sp: SeqShard, moe, inp: FfnInput) -> torch.Tensor:
         a4w4_prefill_moe,
     )
 
-    global _chain_warmed
     t = sp.num_tokens
     experts = moe.experts
     w13, w2 = experts.w13_weight, experts.w2_weight
     k = inp.routing.shape[1] // 2
     q, s = inp.fp4
     assert t >= MIN_PREFILL_TOKENS, t
+    hidden, inter, num_experts = w2.shape[1], w2.shape[2] * 2, w13.shape[0]
 
     def chain(n: int, out: torch.Tensor | None) -> torch.Tensor:
         return a4w4_prefill_moe(
@@ -478,18 +512,14 @@ def _moe_chain(sp: SeqShard, moe, inp: FfnInput) -> torch.Tensor:
             experts.w2_weight_scale,
             inp.routing[:n, k:].view(torch.float32),
             inp.routing[:n, :k],
-            hidden_size=w2.shape[1],
-            intermediate_size=w2.shape[2] * 2,
-            num_experts=w13.shape[0],
+            hidden_size=hidden,
+            intermediate_size=inter,
+            num_experts=num_experts,
             out=out,
         )
 
-    if not _chain_warmed:
-        _chain_warmed = True
-        for n in _CHAIN_WARM_UP_TOKENS:
-            if n <= sp.padded and n != t:
-                chain(n, None)
-    out = torch.empty((sp.padded, w2.shape[1]), dtype=torch.bfloat16, device=q.device)
+    _warm_chain(chain, (hidden, inter, num_experts, k), sp.padded)
+    out = torch.empty((sp.padded, hidden), dtype=torch.bfloat16, device=q.device)
     chain(t, out[:t])
     out[t:].zero_()
     if moe.routed_scaling_factor != 1.0:
