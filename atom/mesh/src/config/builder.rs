@@ -53,6 +53,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn vllm_moriio_peers(mut self, peers: Vec<super::VllmMoriioPeer>) -> Self {
+        self.config.vllm_moriio_peers = peers;
+        self
+    }
+
     // ==================== Routing Mode ====================
 
     pub fn regular_mode(mut self, worker_urls: Vec<String>) -> Self {

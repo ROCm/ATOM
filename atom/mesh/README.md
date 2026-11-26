@@ -229,6 +229,32 @@ ACK: vLLM handles consumer abort notifications and producer deferred release.
 Size producer `defer_timeout` to cover decoder admission plus transfer under load.
 Real RDMA, KV layout, offload and speculative decoding require GPU validation.
 
+For native vLLM **MoRI-IO WRITE**, use `--vllm-kv-connector moriio-write` and
+provide `--vllm-moriio-peers` as a JSON array covering every configured HTTP
+worker. Each entry supplies its exact advertised MoRI host, base handshake and
+notify ports, TP size and node-local DP size:
+
+```sh
+atomesh launch --backend vllm --pd-disaggregation \
+  --prefill http://p:8000 --decode http://d:8000 \
+  --vllm-kv-connector moriio-write \
+  --vllm-moriio-peers '[{"url":"http://p:8000","host":"p","handshake_port":6300,"notify_port":6400,"tp_size":1,"dp_size":1},{"url":"http://d:8000","host":"d","handshake_port":6308,"notify_port":6408,"tp_size":1,"dp_size":4}]'
+```
+
+Both workers must use `read_mode: false` and an empty `proxy_ip`. Each HTTP
+worker must own a single-node DP pool; prefill DP must be1 and P/D TP sizes must
+match. Decode uses its native internal DP load balancing; leave `--dp-aware`
+disabled. Use allocator-provided ports, including space for every PP/TP/DP
+rank, and a worker version supporting PP producers (vLLM #64693) when using PP.
+
+WRITE starts both HTTP legs concurrently with explicit peer metadata and a
+shared router-owned transfer ID. Decode allocates its blocks and reports its
+actual DP rank to prefill; the producer writes KV and the worker completion
+protocol waits for all PP stages. The router does not wait for READ metadata in
+the prefill response or synthesize completion ACKs. Original decode generation,
+tools and streaming fields are preserved. Static workers must remain on the
+declared listeners throughout a run; automatic worker restart is unsupported.
+
 Messages and Responses have no PD adapter: in PD mode `/v1/messages` and
 `/v1/responses` return `501 unsupported_api_topology`. Serve them from regular
 HTTP workers.
