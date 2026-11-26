@@ -83,6 +83,7 @@ def _published() -> tuple[dict[str, bytes], str]:
         decode_context_parallel_size=1,
         # What `Config` resolves; `BlockManager` reads it at construction.
         offload_min_load_tokens=8192,
+        state_transfer_slots=0,
         kv_events_config=SimpleNamespace(enable=True),
     )
 

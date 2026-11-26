@@ -7,6 +7,25 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
+from atom.plugin.sglang import deepseek_v41_envs
+from atom.plugin.sglang.deepseek_v41_bridge import (
+    ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE,
+    DEEPSEEK_V41_ARCH,
+    GRAPH_METADATA_ATTR,
+    align_atom_config_with_sglang,
+    build_deepseek_v41_forward_metadata,
+    is_deepseek_v41_config,
+    log_deepseek_v41_runtime,
+    refuse_fp4ptpc_without_online_quant,
+    refuse_fp8_kv_without_backend,
+    refuse_unsupported_sglang_features,
+    sglang_radix_cache_enabled,
+)
+from atom.plugin.sglang.deepseek_v41_radix import (
+    expand_v41_forward_inputs,
+    install_deepseek_v41_radix,
+)
+
 GLM52_DSA_ARCH = "GlmMoeDsaForCausalLM"
 GLM52_DSA_MODEL_TYPE = "glm_moe_dsa"
 
@@ -62,6 +81,12 @@ class SGLangModelAdapterSpec:
     install_adapters: Callable[[Any], None] | None = None
     bind_cache_views: Callable[[Any, Any], None] | None = None
     build_forward_metadata: Callable[[Any, Any, Any], Any] | None = None
+    # (forward_batch, input_ids, positions, input_embeds) -> None, or the
+    # (input_ids, positions, output_rows) the ATOM model runs instead for this
+    # forward, ``output_rows`` being SGLang's rows of its output
+    # (`SGLangPluginRuntime`). For rows ATOM executes that SGLang's batch does
+    # not hold, such as DeepSeek-V4.1's fused radix replay.
+    expand_forward_inputs: Callable[[Any, Any, Any, Any], Any] | None = None
 
 
 def _build_kimi_k3_forward_metadata(
@@ -86,6 +111,59 @@ def _build_glm52_dsa_forward_metadata(
     from atom.plugin.sglang.runtime.forward_context import _build_glm52_dsa_metadata
 
     return _build_glm52_dsa_metadata(atom_config, forward_batch, positions)
+
+
+def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
+    del model_arch
+    refuse_unsupported_sglang_features()
+    refuse_fp4ptpc_without_online_quant(atom_config)
+    refuse_fp8_kv_without_backend(atom_config)
+    align_atom_config_with_sglang(atom_config)
+    # One V4.1 PAGE per SGLang page; Config picked native's 128.
+    atom_config.kv_cache_block_size = ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE
+    # Decoder SWA bounded replay: on as natively, unless
+    # ATOM_SGLANG_V41_DECODER_REPLAY turns it off; decided before the runtime
+    # model builds its replay stages. Unlike native, the prefill output here
+    # depends on where SGLang cuts a prompt: a resumed chunk shorter than the
+    # window computes every row (`deepseek_v41_bridge.v41_extend_replays`).
+    if not deepseek_v41_envs.ATOM_SGLANG_V41_DECODER_REPLAY:
+        atom_config.enable_decoder_swa_bounded_replay = False
+    # Encoder replay rebuilds the state below a prefix hit: on exactly when
+    # SGLang's radix cache is (`deepseek_v41_radix`, which it installs). The
+    # rows below a hit ride in the step's forward as one span from P - R, at
+    # least the window long, so the decoder replay above treats it as any span.
+    radix = sglang_radix_cache_enabled()
+    atom_config.enable_encoder_swa_bounded_replay = radix
+    if radix:
+        # A step's rows plus its hits' replay rows: SGLang charges each hit's
+        # R to the budget after admitting it, so a step runs at most R rows
+        # past its chunk.
+        atom_config.max_num_batched_tokens += install_deepseek_v41_radix(
+            window=atom_config.hf_config.sliding_window
+        )
+    # The remap other adapters get from prepare_model, as native applies it.
+    from atom.plugin.register import _ATOM_SUPPORTED_MODELS
+    from atom.plugin.sglang.prepare import _remap_quant_config_for_sglang_plugin
+
+    _remap_quant_config_for_sglang_plugin(
+        atom_config, _ATOM_SUPPORTED_MODELS[DEEPSEEK_V41_ARCH]
+    )
+
+
+def _build_deepseek_v41_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    # ATOM's metadata comes off the batch and pools alone; ``positions``
+    # describes the same rows as the inputs the bridge stages (SGLang's, or a
+    # fused radix replay's widened ones).
+    del atom_config, positions
+    # A decode-graph capture's step, staged by the backend outside the
+    # captured region (both warmups and the capture run on it); SGLang stages
+    # every capture's batch before running it.
+    metadata = getattr(forward_batch, GRAPH_METADATA_ATTR, None)
+    if metadata is not None:
+        return metadata
+    return build_deepseek_v41_forward_metadata(forward_batch)
 
 
 def _build_deepseek_v4_forward_metadata(
@@ -532,6 +610,14 @@ MODEL_ADAPTER_SPECS = {
         bind_cache_views=_bind_deepseek_v4_cache_views,
         build_forward_metadata=_build_deepseek_v4_forward_metadata,
     ),
+    # Resolved by model_type (`resolve_model_arch_spec`): SGLang renames it.
+    DEEPSEEK_V41_ARCH: SGLangModelAdapterSpec(
+        uses_context_only_forward=True,
+        prepare_config=_prepare_deepseek_v41_config,
+        install_adapters=log_deepseek_v41_runtime,
+        build_forward_metadata=_build_deepseek_v41_forward_metadata,
+        expand_forward_inputs=expand_v41_forward_inputs,
+    ),
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
         prepare_config=_prepare_minimax_m3_config,
@@ -577,6 +663,7 @@ MODEL_ARCH_SPECS = {
         "MiniMaxM3SparseForConditionalGeneration",
         "LlamaForCausalLMEagle3",
         "DeepseekV4ForCausalLM",
+        DEEPSEEK_V41_ARCH,
     )
 }
 
@@ -586,7 +673,10 @@ def get_model_arch_spec(model_arch: str) -> SGLangModelAdapterSpec:
 
 
 def resolve_model_arch_spec(config: Any) -> tuple[str, SGLangModelAdapterSpec]:
-    """Resolve an adapter by exact architecture, then stable model family."""
+    """Resolve an adapter: DeepSeek-V4.1 by its model type first (SGLang
+    renames it to V4), then the exact architecture, then the model type."""
+    if is_deepseek_v41_config(config):
+        return DEEPSEEK_V41_ARCH, MODEL_ADAPTER_SPECS[DEEPSEEK_V41_ARCH]
 
     architectures = getattr(config, "architectures", None) or []
     for architecture in architectures:
@@ -603,3 +693,18 @@ def resolve_model_arch_spec(config: Any) -> tuple[str, SGLangModelAdapterSpec]:
 
     model_arch = str(architectures[0]) if architectures else ""
     return model_arch, get_model_arch_spec(model_arch)
+
+
+# Where `cached_model_arch_spec` keeps its answer on an ATOM config.
+_ADAPTER_MEMO = "_atom_sglang_model_adapter"
+
+
+def cached_model_arch_spec(atom_config: Any) -> tuple[str, SGLangModelAdapterSpec]:
+    """`resolve_model_arch_spec` of ``atom_config.hf_config``, kept on the
+    ATOM config: every eager forward of every plugin model asks this."""
+    hf_config = atom_config.hf_config
+    memo = atom_config.__dict__.get(_ADAPTER_MEMO)
+    if memo is None or memo[0] is not hf_config:
+        memo = (hf_config, *resolve_model_arch_spec(hf_config))
+        setattr(atom_config, _ADAPTER_MEMO, memo)
+    return memo[1], memo[2]

@@ -375,7 +375,7 @@ def test_speculative_schema_logprobs_refused_instead_of_wrong_distribution():
     validate_execution_options(config, params)
 
 
-"""Keep optional structured-output dependencies off ordinary engine imports."""
+"""Keep the structured-output backend off ordinary engine imports."""
 
 
 def test_package_entry_points_do_not_load_backend_or_gpu_helpers():

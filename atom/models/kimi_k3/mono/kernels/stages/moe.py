@@ -174,19 +174,22 @@ TAGS = 258  # mailbox tags a step: a launch's ``layer`` + 1 (K2's 129 .. 256)
 # (``run_sdown``). Their own buffer: the scratch every launch shares holds
 # other kernels' words at any offset, and a count must start from zero.
 QUEUES = ("ug", "sdown")
-QUEUE_BYTES = -(-len(QUEUES) * TAGS * 4 // 16) * 16  # step zeroing's 16 B stores
+# a queue's words, a tag each: one region a queue, so a launch's words sit in
+# separate cache lines, not one its CTAs' atomics on both contend for
+QUEUE_REGION = TAGS * 4
+QUEUE_BYTES = -(-len(QUEUES) * QUEUE_REGION // 16) * 16  # step zeroing's 16 B stores
 
 
 def queue_offset(layer: int) -> int:
-    """The byte offset of the launch ``layer``'s words in the queue buffer
-    (``queue.tag_offset``): the launch is handed the queue there, so its
-    kernel adds constants only."""
-    return queue.tag_offset(layer, len(QUEUES))
+    """The byte offset of the launch ``layer``'s word in the first queue's
+    region (``queue.tag_offset``): the launch is handed the queue there, so
+    its kernel adds constants only (queue i's ``i * QUEUE_REGION`` on)."""
+    return queue.tag_offset(layer)
 
 
 def queue_word(c, name):
     """Queue ``name``'s word of this launch (``queue_offset``)."""
-    return queue.word(c["queue"] + fx.Int64(QUEUES.index(name) * 4))
+    return queue.word(c["queue"] + fx.Int64(QUEUES.index(name) * QUEUE_REGION))
 
 
 def max_u(s: int) -> int:

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2026 ATOM Project Contributors
 
 """The fused DSpark draft-KV tail against the op chain it replaces.
 
@@ -8,19 +9,16 @@ fused-GEMM output into the three stages' quantized target keys: a per-stage
 RMSNorm, a cat, a RoPE and a quantize, each re-reading the 512-wide row from
 HBM to hand it to the next. `fused_draft_kv_tail` is those ten in one launch.
 
-Bit-exactness is not claimed and is not achievable from Triton -- the fp32
-sum-of-squares reduction tree and `rsqrt`'s approximation differ from the HIP
-kernel's -- and the fused kernel additionally rounds *less*: the op chain lands
-in bf16 three times on the way to the FP8 store (aiter's `rmsnorm2d_fwd`
-rounds `x * rstd` before applying `w`, then again on its store, then RoPE
-stores for `quantize_fp8` to read back) where the fused one carries fp32
-throughout. So the assertion here is the weaker, true one the MLA context
-kernel's test makes: build an fp64 reference of the same chain, and where the
-two GPU paths disagree, require the fused value to be the one nearer fp64.
+The fused kernel rounds where the chain does (the norm's bf16 store, RoPE's
+bf16 store, then the QAT), so the two store the same codes. Not every one:
+the fp32 sum-of-squares reduction tree and `rsqrt`'s approximation differ from
+the HIP kernel's, and an element whose bf16 rounding sits on that last-ulp
+difference lands one code over -- swept at about 1 in 1M.
 
-The fp64 reference reuses the rope's own `cos_cache` / `sin_cache` rather than
-rebuilding the frequencies, because reusing them is exactly what the kernel
-contract promises -- YaRN scaling and cache dtype have to come along.
+The fp64 reference (the layout test's) reuses the rope's own `cos_cache` /
+`sin_cache` rather than rebuilding the frequencies, because reusing them is
+exactly what the kernel contract promises -- YaRN scaling and cache dtype have
+to come along.
 """
 
 import pytest
@@ -91,17 +89,16 @@ def _stored(keys, *, packed):
     if not packed:
         return keys.double()
     values, scales = keys
-    # The E8M0 cast is exact, unlike `torch.ldexp` on gfx950 (see
-    # tests/models/deepseek_v41/test_dspark_context_norm_quant.py).
+    # The E8M0 cast is exact; `torch.ldexp` on gfx950 (torch 2.10 / ROCm
+    # 7.2.4) comes out an ulp low for some exponents.
     scale = scales.view(torch.float8_e8m0fnu).double()
     return values.double() * scale.repeat_interleave(32, dim=-1)
 
 
 @pytest.mark.parametrize("packed", [True, False])
 @pytest.mark.parametrize("width", [1, 37, 384])
-def test_ctx_kv_tail_beats_op_chain_against_fp64(packed, width):
+def test_ctx_kv_tail_stores_the_op_chains_codes(packed, width):
     kv, norm_weight, positions, rope = _inputs(width, seed=width)
-    reference = _reference(kv, norm_weight, positions, rope)
 
     fused = _stored(
         fused_draft_kv_tail(
@@ -123,55 +120,13 @@ def test_ctx_kv_tail_beats_op_chain_against_fp64(packed, width):
 
     assert fused.shape == (STAGES, width, DIM)
 
-    # Both paths run the same quantizer, so a disagreement is its *input*
-    # differing by the roundings the fused path does not do. About 3.4% of
-    # elements disagree -- E4M3's three mantissa bits flip far more readily
-    # than the bf16 store the MLA precedent measured at 1 in 5M -- and the
-    # claim is that the fused side of each is the one nearer fp64.
-    #
-    # Not quite every one, and the exception is worth naming rather than
-    # tolerancing away. Swept over widths 1..1024 x 3 seeds (7.3M elements),
-    # 7 elements -- 1 in 1M -- come out nearer under the op chain. All 7 are
-    # *straddles*: the two paths pick the two adjacent E4M3 codes on either
-    # side of the reference, and there the chain's happens to be the closer
-    # one. Which side of a code boundary a value lands on is decided by the
-    # ~1e-7 the fp32 reduction tree and rsqrt move it, which is exactly what
-    # this kernel does not claim to reproduce. So: never worse by more than
-    # one code, and -- the statement with no exceptions -- never worse per
-    # quantization group, which is the unit a scale is actually chosen over.
+    # Swept over widths 1..1024 x 3 seeds (6.7M elements): 5 differ, each by
+    # one E4M3 code (relative 2 ** -3 at most). A missed bf16 rounding point
+    # moves about 2 % of codes, a wrong weight or rotation nearly all of them.
     differs = fused != chain
-    fused_error = (fused - reference).abs()
-    chain_error = (chain - reference).abs()
-    worse = differs & (fused_error > chain_error)
-    straddles = (torch.minimum(fused, chain) <= reference) & (
-        reference <= torch.maximum(fused, chain)
-    )
-    assert (worse & ~straddles).sum() == 0, (
-        f"{(worse & ~straddles).sum().item()} of {differs.sum().item()} "
-        "disagreements move AWAY from the fp64 reference by more than the "
-        "code boundary they sit on"
-    )
-    grouped = (STAGES, width, DIM // 32, 32)
-    fused_group = fused_error.reshape(grouped).pow(2).mean(-1).sqrt()
-    chain_group = chain_error.reshape(grouped).pow(2).mean(-1).sqrt()
-    # The margin absorbs fp64 ties, which do occur: the sibling kernel's sweep
-    # turned up 3 groups in 724k that differ by 0.000% of the chain's RMS.
-    regressed = fused_group > chain_group * (1 + 1e-6)
-    assert regressed.sum() == 0, (
-        f"{regressed.sum().item()} quantization groups are measurably further "
-        "from the fp64 reference under the fusion"
-    )
-
-    def _relative_rms(stored):
-        return (stored - reference).pow(2).mean().sqrt() / reference.pow(
-            2
-        ).mean().sqrt()
-
-    assert _relative_rms(fused) <= _relative_rms(chain)
-    # E4M3 rounds to 3 mantissa bits, so a correct store sits inside a half ULP
-    # (2 ** -4) of the exact value; anything systematically wrong -- a missed
-    # rotation, the wrong stage's norm weight -- is an order of magnitude out.
-    assert _relative_rms(fused) < 2.0**-4
+    assert differs.sum() <= max(1, differs.numel() // 100_000)
+    step = (fused - chain).abs()[differs] / chain.abs()[differs]
+    assert (step <= 2.0**-3).all()
 
 
 @pytest.mark.parametrize("packed", [True, False])

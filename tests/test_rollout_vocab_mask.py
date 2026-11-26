@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2026 ATOM Project Contributors
 
 """`Config.true_vocab_size`: the padding tail of a padded vocabulary.
 
@@ -88,18 +89,27 @@ def test_the_default_masks_nothing_and_checks_nothing():
 
 
 def _postprocess(monkeypatch, true_vocab_size, logits):
-    seen = {}
-
-    def _capture(self, batch, passed_logits, *args, **kwargs):
-        seen["logits"] = passed_logits
-        return "sentinel"
-
-    monkeypatch.setattr(ModelRunner, "postprocess", _capture)
+    """The logits every sampling path takes (``compute_logits``), the model's
+    being ``logits``."""
+    monkeypatch.setattr(ModelRunner, "compute_logits", lambda self, hidden: logits)
     runner = object.__new__(RLHFModelRunner)
     runner._true_vocab_size = true_vocab_size
-    result = runner.postprocess(None, logits, None, None, None, True, None)
-    assert result == "sentinel"
-    return seen["logits"]
+    return runner.compute_logits(None)
+
+
+def test_a_masked_vocabulary_binds_no_verify_head(monkeypatch):
+    """A verify head picks over the padded shards: no ids of it may stand in
+    for the masked logits."""
+    monkeypatch.setattr(
+        ModelRunner,
+        "_bind_verify_head",
+        lambda self: setattr(self, "verify_head", "bound"),
+    )
+    for true_vocab_size, expected in ((151665, None), (0, "bound")):
+        runner = object.__new__(RLHFModelRunner)
+        runner._true_vocab_size = true_vocab_size
+        runner._bind_verify_head()
+        assert runner.verify_head == expected
 
 
 def test_the_padding_tail_is_the_only_thing_masked(monkeypatch):

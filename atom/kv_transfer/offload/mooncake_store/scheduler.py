@@ -12,6 +12,7 @@ leases a load relies on.
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from typing import Any
@@ -27,6 +28,7 @@ from atom.kv_transfer.offload.kv_store.scheduler import (  # noqa: F401  # re-ex
     monotonic_clock_id,
     prompt_chunk_hashes,
 )
+from atom.kv_transfer.offload.lookup_client import LookupPinStatus
 from atom.kv_transfer.offload.metadata import LoadSpec
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.async_lookup import (
@@ -45,6 +47,7 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     store_namespace,
 )
 from atom.model_engine.sequence import SequenceStatus
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -212,6 +215,19 @@ class _StoreLookup(StoreLookupBase):
         keys = self._rank_keys(hashes, first, last)
         answers = [a for a in self._exists_on(pools, keys) if a is not None]
         return sum(1 for codes in zip(*answers) if 1 in codes)
+
+    # The two below serve only the asynchronous renewal (ATOM_STORE_ASYNC_RENEW).
+    def renew_key_snapshot(self, seq: Any, start: int, end: int) -> tuple[str, ...]:
+        """Snapshot keys on the scheduler thread before background renewal."""
+        # `renew`'s range math, repeated so that `renew` stays main's code.
+        hashes = prompt_chunk_hashes(seq, self._chunk_tokens)
+        first = int(start) // self._chunk_tokens
+        last = min(int(end) // self._chunk_tokens, len(hashes) // DIGEST_BYTES)
+        return tuple(self._rank_keys(hashes, first, last))
+
+    def renew_keys(self, keys: tuple[str, ...]) -> int:
+        answers = self._ask(list(keys)) if keys else None
+        return sum(1 for code in answers or () if code == 1)
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         """Nothing to release: a Store read lease expires by itself."""
@@ -396,6 +412,8 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
         namespace = store_namespace(config, cfg.chunk_tokens)
         # time.monotonic() of each request's last lookup; see `_ensure_lookup_pin`.
         self._looked_up_at: dict[str, float] = {}
+        self._async_renew = envs.ATOM_STORE_ASYNC_RENEW
+        self.cancels_undispatched_loads = self._async_renew
         super().__init__(
             config,
             store_cfg=cfg,
@@ -408,6 +426,13 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
             ),
             endpoint="masters=" + ",".join(pool.master for pool in cfg.store_masters()),
         )
+        if self._async_renew:
+            # Bound only with the flag: without it these are the class's.
+            self._pending_loads: dict[str, Any] = {}
+            self._renew_before_load = self._renew_before_load_async
+            self._clear_pending_load = self._clear_pending_load_async
+            self.build_connector_meta = self._build_connector_meta_async
+            self.has_pending_work = self._has_pending_work_async
         # The Store reads whole chunks into fresh blocks, so an HBM hit that
         # ends inside a chunk is lowered to the chunk floor
         # (`BlockManager.lower_hit_to_chunk`). The registry holds the flag, one
@@ -444,7 +469,9 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
             self._looked_up_at[sid] = started
         return hit
 
-    def _ensure_lookup_pin(self, seq: Any, sid: str, spec: LoadSpec) -> bool:
+    def _ensure_lookup_pin(
+        self, seq: Any, sid: str, spec: LoadSpec
+    ) -> bool | LookupPinStatus:
         """Renew the read leases of what a load reads; the load always goes ahead.
 
         The base trusts a hit it still holds from this request's lookup, a
@@ -476,6 +503,14 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
             if spec.transfer_end_tokens is None
             else spec.transfer_end_tokens
         )
+        return self._renew_before_load(seq, sid, start, end)
+
+    def _renew_before_load(self, seq: Any, sid: str, start: int, end: int) -> bool:
+        """Renew the leases of tokens ``[start, end)`` now, on this thread.
+
+        With ``ATOM_STORE_ASYNC_RENEW`` ``__init__`` binds
+        ``_renew_before_load_async`` instead.
+        """
         held = self._lookup_client.renew(seq, start, end)
         logger.debug(
             "[OFFLOAD-LOOKUP] seq=%s renewed the leases of tokens [%d, %d): the "
@@ -490,6 +525,97 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
     def _clear_pending_load(self, sid: str) -> None:
         super()._clear_pending_load(sid)
         self._looked_up_at.pop(sid, None)
+
+    def _renew_before_load_async(
+        self, seq: Any, sid: str, start: int, end: int
+    ) -> bool | LookupPinStatus:
+        """`_renew_before_load` with ``ATOM_STORE_ASYNC_RENEW`` (bound in ``__init__``).
+
+        The renewal runs on the renewal executor
+        (``AsyncStoreLookup.renew_async``). While it has not finished and was
+        submitted less than its timeout ago (queued or running) the load stays
+        parked and is retried next step (``PENDING``), so its GET goes out one
+        or more steps later than on the synchronous path. A fresh hit (the
+        caller returns before this), a rejected submission, or a new submission while an earlier renewal is
+        still stuck (``renewal_busy``) dispatches in the same step; a renewal
+        already queued behind a hung RPC stays parked until its own timeout.
+        ``renew_parked`` counts the polls while parked (the idle drain polls
+        every 1 ms, so it is not a step count). Any other outcome (finished,
+        timed out, error, cancelled, rejected, busy) dispatches the get exactly
+        as the synchronous path does (zero held keys included: the get
+        validates residency); each fallback reason is counted as
+        ``renew_fallback_<reason>``. Cancellation before dispatch retires the
+        renewal and the reservation without worker work. Once dispatch has
+        handed the blocks to workers, cleanup waits for their terminal report
+        so it cannot release blocks still used by DMA.
+        """
+        # The keys of `[start, end)` never change for one request: they are
+        # built only when the renewal is submitted, not on each retry.
+        state = self._lookup_client.renew_async(
+            sid,
+            (start, end),
+            functools.partial(
+                self._lookup_client.backend.renew_key_snapshot, seq, start, end
+            ),
+        )
+        if state == "pending":
+            self._perf_bump("renew_parked")
+            return LookupPinStatus.PENDING
+        if state != "ready":
+            self._perf_bump(f"renew_fallback_{state}")
+            n = self._perf_counters[f"renew_fallback_{state}"]
+            # The lookup logs an "error" itself, at most once a minute; the
+            # counter counts every one.
+            if state != "error" and (n == 1 or n % 100 == 0):
+                logger.warning(
+                    "Mooncake Store renewal for %s: %s; dispatching the load "
+                    "anyway (%d so far)",
+                    sid,
+                    state,
+                    n,
+                )
+        return True
+
+    def _build_connector_meta_async(self):
+        """The class's build, then the loads left ``PENDING`` wait for the next.
+
+        ``_reqs_need_recv`` is emptied by every build; a load whose renewal has
+        not finished is put back, so it keeps reporting work
+        (``has_pending_work``) and is retried on the next build.
+        """
+        self._pending_loads.clear()
+        meta = type(self).build_connector_meta(self)
+        if self._pending_loads:
+            self._reqs_need_recv.update(self._pending_loads)
+            self._pending_loads.clear()
+        return meta
+
+    def _has_pending_work_async(self) -> bool:
+        """The class's, plus loads handed to workers and not yet reported.
+
+        With the flag a parked load's GET can go out from an idle or shutdown
+        drain build; it leaves `_reqs_need_recv` then, so without this the
+        drain could stop polling before the load's terminal report.
+        """
+        return type(self).has_pending_work(self) or bool(self._active_load_operations)
+
+    def _clear_pending_load_async(self, sid: str) -> None:
+        self._lookup_client.cancel_renewal(sid)
+        type(self)._clear_pending_load(self, sid)
+
+    def cancel_undispatched_load(self, seq: Any) -> bool:
+        sid = str(seq.id)
+        if (
+            self._load_lifecycles.get(sid) is not seq
+            or self._reqs_need_recv.get(sid) is not seq
+        ):
+            return False
+        # Workers never got this load: `build_connector_meta` drops a load
+        # from `_reqs_need_recv` in the same call that hands it to workers, so
+        # one still there is undispatched. A running renewal retains immutable
+        # keys, not these blocks.
+        self.cancel_pending_load(seq)
+        return True
 
 
 __all__ = [

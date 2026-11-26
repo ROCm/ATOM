@@ -67,6 +67,7 @@ def _moe_model(dtype=torch.bfloat16, **module_attrs):
         requires_grad=False,
     )
     experts.weight_loader = lambda *a, **k: None
+    experts.intermediate_size_per_partition = INTERMEDIATE
     experts.expert_map = None
     experts.num_redundant_experts = 0
     for name, value in module_attrs.items():

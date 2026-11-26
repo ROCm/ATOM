@@ -8,20 +8,21 @@ import triton.language as tl
 
 
 @triton.jit
-def gather_strided_units(
+def gather_unit_words(
     src,
     indices,
     dst,
-    SRC_WORDS: tl.constexpr,
-    DST_WORDS: tl.constexpr,
-    FIRST: tl.constexpr,
-    STRIDE: tl.constexpr,
-    WIDTH: tl.constexpr,
+    src_offsets,
+    src_words,
+    dst_words,
     BLOCK: tl.constexpr,
 ):
+    """Program ``(u, b)`` fills block ``b`` of ``BLOCK`` words of output unit ``u``,
+    word ``w`` from word ``src_offsets[w]`` of source unit ``indices[u]``."""
     unit = tl.program_id(0)
     word = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = word < dst_words
     block_id = tl.load(indices + unit).to(tl.int64)
-    src_offset = block_id * SRC_WORDS + FIRST + word // WIDTH * STRIDE + word % WIDTH
-    value = tl.load(src + src_offset, mask=word < DST_WORDS)
-    tl.store(dst + unit * DST_WORDS + word, value, mask=word < DST_WORDS)
+    offset = tl.load(src_offsets + word, mask=mask)
+    value = tl.load(src + block_id * src_words + offset, mask=mask)
+    tl.store(dst + unit * dst_words + word, value, mask=mask)
