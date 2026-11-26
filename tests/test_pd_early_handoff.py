@@ -36,11 +36,11 @@ def make_scheduler_connector(
     early,
     enable=False,
     skip_gate=None,
-    num_kvcache_blocks=None,
+    num_kvcache_blocks=100,
 ):
     """`skip_gate`: None leaves ATOM_PD_EARLY_HANDOFF_SKIP_GATE at its
     default (on), else sets it. `num_kvcache_blocks`: P's pool, which the
-    cap on early sources is a share of (None: unsized, no cap)."""
+    cap on early sources is a share of."""
     if early:
         monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", "1")
     else:
@@ -61,9 +61,8 @@ def make_scheduler_connector(
         parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
         kv_cache_block_size=4,
         decode_context_parallel_size=1,
+        num_kvcache_blocks=num_kvcache_blocks,
     )
-    if num_kvcache_blocks is not None:
-        config.num_kvcache_blocks = num_kvcache_blocks
     return mc.MooncakeConnectorScheduler(config)
 
 
@@ -598,6 +597,18 @@ def test_cap_sends_early_requests_past_it_through_the_gate(
     _ack(p, a)  # D reached A: its source no longer waits on D.
     assert a.id not in p._early_pins
     assert p.admission_ready(b)
+
+
+def test_cap_needs_a_sized_pool(monkeypatch):
+    """The cap is a share of `num_kvcache_blocks`, which the engine sets
+    before it builds the scheduler. An unsized pool is refused rather than
+    turning the cap off; without the skip the pool size is not read."""
+    with pytest.raises(ValueError, match="num_kvcache_blocks=-1"):
+        make_scheduler_connector(monkeypatch, True, early=True, num_kvcache_blocks=-1)
+    make_scheduler_connector(
+        monkeypatch, True, early=True, skip_gate=False, num_kvcache_blocks=-1
+    )
+    make_scheduler_connector(monkeypatch, True, early=False, num_kvcache_blocks=-1)
 
 
 def test_cap_counts_only_sources_allocated_before_d(monkeypatch, seq_factory):

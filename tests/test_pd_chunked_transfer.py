@@ -466,6 +466,7 @@ def scheduler_connector(
             parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
             kv_cache_block_size=4,
             decode_context_parallel_size=dcp_size,
+            num_kvcache_blocks=100,
         )
     )
 
@@ -2216,6 +2217,7 @@ def test_a_preempted_producer_request_rejected_on_readmission_hands_nothing_off(
             parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
             kv_cache_block_size=4,
             decode_context_parallel_size=1,
+            num_kvcache_blocks=100,
         )
     )
     seq = seq_factory(

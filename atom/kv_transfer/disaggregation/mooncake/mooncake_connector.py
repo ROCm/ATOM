@@ -472,11 +472,6 @@ def _receive_block_offset(
 
 
 class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
-    # Whether early-handoff requests may skip the D-first gate. Every use of
-    # the skip's state (`_early_pins`) is behind it, so with the skip off
-    # nothing below changes.
-    _early_skip_gate = False
-
     def __init__(self, config: Config) -> None:
         kv_transfer_config = config.kv_transfer_config
         self.is_producer = (
@@ -504,19 +499,32 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.enable_chunked_transfer = (
             kv_transfer_config.get("enable_chunked_transfer", False) or early_handoff
         )
+        # Whether early-handoff requests may skip the D-first gate. Every use
+        # of the skip's state (`_early_pins`) is behind it, so with the skip
+        # off nothing below changes.
         self._early_skip_gate = bool(
             early_handoff and envs.ATOM_PD_EARLY_HANDOFF_SKIP_GATE
         )
         # Safety valve for the skip. A source allocated before D's report
         # waits on D; were P's pool full of them while D's pages hold requests
         # P cannot admit, each side would wait on the other. So such sources
-        # may hold at most this share of P's pool (past it, an early request
+        # may hold at most this many of P's blocks (past it, an early request
         # waits for D like a gated one), and a finished one D has not reached
         # within the pin timeout is cancelled.
-        self._early_pin_fraction = envs.ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION
         self._early_pin_timeout_s = envs.ATOM_PD_EARLY_HANDOFF_PIN_TIMEOUT_S
-        # Read when needed: the engine sizes the pool before the scheduler.
-        self._config = config
+        self._early_pin_limit = 0.0
+        if self._early_skip_gate:
+            fraction = envs.ATOM_PD_EARLY_HANDOFF_MAX_PINNED_FRACTION
+            # The engine sizes the pool before it builds the scheduler.
+            num_blocks = config.num_kvcache_blocks
+            if num_blocks <= 0:
+                raise ValueError(
+                    "ATOM_PD_EARLY_HANDOFF_SKIP_GATE needs a sized KV pool "
+                    f"(num_kvcache_blocks={num_blocks})"
+                )
+            self._early_pin_limit = (
+                math.inf if fraction >= 1.0 else fraction * num_blocks
+            )
         # Early requests allocated before D's report, by request id:
         # [sequence, pinned pages, deadline once its prefill finished].
         self._early_pins: dict[ReqId, list] = {}
@@ -993,14 +1001,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def _early_pin_room(self, seq: Sequence) -> bool:
         """Whether `seq`'s prompt fits under the cap on sources allocated
         before D's report."""
-        if self._early_pin_fraction >= 1.0:
-            return True
-        num_blocks = getattr(self._config, "num_kvcache_blocks", -1)
-        if not isinstance(num_blocks, int) or num_blocks <= 0:
-            return True  # Pool not sized (no engine): nothing to cap against.
         pinned = sum(pages for _, pages, _ in self._early_pins.values())
         pages = -(-seq.num_prompt_tokens // (self.block_size * self.dcp_size))
-        return pinned + pages <= self._early_pin_fraction * num_blocks
+        return pinned + pages <= self._early_pin_limit
 
     def _release_early_pin(self, seq: Sequence) -> None:
         """Cancel a finished early source that D has not reached in time.
