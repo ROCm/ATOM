@@ -498,13 +498,16 @@ def test_native_token_graph_replays_different_request_counts(
         if ratio and step.requests:
             # Fresh storage on every forward, like a live scorer. The captured
             # MLA must read the newly built CSR, not capture's scorer tensor.
-            step.selected[0] = (
-                (
-                    torch.arange(4, device="cuda", dtype=torch.int32)[None, :]
-                    + (step.slots[0] * 4)
-                )
-                .expand(width, 4)
-                .contiguous()
+            # The CSR scan reserves min(visible, topk) entries per live row.
+            # Match the scorer's causal count even when a replay starts at 0.
+            visible = (step.positions[:, None] + 1) // ratio
+            columns = torch.arange(4, device="cuda", dtype=torch.int32)[None, :]
+            first = torch.minimum(step.slots[0] * 4, (visible - 4).clamp_min(0))
+            valid = (columns < visible) & (step.batch_ids[:, None] >= 0)
+            step.selected[0] = torch.where(valid, first + columns, -1).contiguous()
+            assert torch.equal(
+                (step.selected[0] >= 0).sum(-1),
+                torch.where(step.batch_ids >= 0, visible[:, 0].clamp_max(4), 0),
             )
 
     selection_calls = []
@@ -807,14 +810,16 @@ def test_native_token_graph_replays_different_request_counts(
             )
             expected = forward(fresh_q, fresh_kv)
             assert torch.isfinite(got).all()
+            case_context = (
+                f"{requests=}, {padded=}, {reverse=}, {cached_until=}, "
+                f"{live_tokens=}, {is_prefill=}, {start_pos=}"
+            )
             torch.testing.assert_close(
                 got[:, :live],
                 expected[:, :live],
                 rtol=0.03,
                 atol=0.02,
-                msg=lambda message, requests=requests: (
-                    f"{requests} requests: {message}"
-                ),
+                msg=lambda message, case=case_context: f"{case}: {message}",
             )
             for actual, plane in zip(committed, planes):
                 torch.testing.assert_close(actual, plane, rtol=0, atol=0)
