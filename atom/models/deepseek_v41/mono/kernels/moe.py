@@ -54,6 +54,7 @@ Stages, with TP4's task counts:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
@@ -134,6 +135,7 @@ from atom.mono.device.ops import (
     launcher,
     ld_f32,
     lds_bytes,
+    permlane_swap,
     popcount,
     readlane,
     row_sum,
@@ -576,8 +578,169 @@ def stage_route(c, t):
     gpu.barrier()
 
 
-@traced
+# a step's picks at most for ``load_route_wave``: one a lane of wave 0
+WAVE_ROUTE_PICKS = 64
+
+
+def wave_route(rs) -> bool:
+    """Whether ``load_route`` builds the table on wave 0 (``load_route_wave``):
+    every pick a lane of one wave, under TP (no expert parallel)."""
+    return rs.ep == 1 and rs.picks <= WAVE_ROUTE_PICKS
+
+
 def load_route(c, tab):
+    """The route table in LDS ``tab`` (``RouteShape``): ``load_route_wave`` for
+    a step's picks a lane of one wave, else ``load_route_bitmaps``. Both lay
+    out the same words the kernel reads."""
+    if const_expr(wave_route(c["rs"])):
+        load_route_wave(c, tab)
+    else:
+        load_route_bitmaps(c, tab)
+
+
+def _dpp(x, ctrl):
+    """DPP ``ctrl`` of x (every row and bank; a lane reading outside its row
+    takes 0: no lane here uses such a value)."""
+    return fx.Int32(update_dpp_i32(fx.Int32(0), x, ctrl, 0xF, 0xF, True))
+
+
+def _swap_min_max(x, off):
+    """(min, max) of x and lane ``lane ^ off``'s x, off 16 or 32: a
+    v_permlane*_swap gives a lane its own value and its partner's."""
+    a, b = permlane_swap(off, x, x)
+    return fx.min(a, b), fx.max(a, b)
+
+
+def _wave_sort(x, lane, size):
+    """The wave's i32 keys sorted ascending in lane order within each run of
+    ``size`` (32 or 64) lanes: a bitonic network in its flip form, every
+    compare ascending (a block's first step compares lane i with i ^ (k - 1),
+    the lower lane keeping the min, then the half-cleaners i ^ j). Partners by
+    DPP within a row (quad perms, row mirrors, row shifts) and the permlane
+    swaps across rows: no LDS, no barrier."""
+    k = 2
+    while k <= size:
+        low = (lane & (k // 2)) == 0
+        if k == 2:
+            p = _dpp(x, 0xB1)  # lane ^ 1
+        elif k == 4:
+            p = _dpp(x, 0x1B)  # quad mirror: lane ^ 3
+        elif k == 8:
+            p = _dpp(x, 0x141)  # half-row mirror: lane ^ 7
+        else:
+            p = _dpp(x, 0x140)  # row mirror: lane ^ 15
+            if k >= 32:
+                a, b = permlane_swap(16, p, p)
+                p = ((lane & 16) != 0).select(a, b)  # lane ^ 31
+            if k == 64:
+                a, b = permlane_swap(32, p, p)
+                p = ((lane & 32) != 0).select(a, b)  # lane ^ 63
+        x = low.select(fx.min(x, p), fx.max(x, p))
+        j = k // 4
+        while j >= 1:
+            low = (lane & j) == 0
+            if j >= 16:
+                mn, mx = _swap_min_max(x, j)
+            elif j >= 4:
+                # the lower lane's partner j above it (row_shl), the upper's
+                # j below (row_shr)
+                mn = fx.min(x, _dpp(x, 0x100 + j))
+                mx = fx.max(x, _dpp(x, 0x110 + j))
+            else:
+                p = _dpp(x, 0xB1 if j == 1 else 0x4E)  # lane ^ 1, lane ^ 2
+                mn, mx = fx.min(x, p), fx.max(x, p)
+            x = low.select(mn, mx)
+            j //= 2
+        k *= 2
+    return x
+
+
+@traced
+def load_route_wave(c, tab):
+    """``load_route_bitmaps``' table for a step's picks a lane of wave 0
+    (``wave_route``), with one barrier: wave 0 polls the picks' ids, a pick a
+    lane, wave 1 their weights (every route word in one batch, as there), and
+    wave 0 alone lays out the rest from its lanes.
+
+    The picks' keys (expert, pick) sorted ascending (``_wave_sort``) are the
+    pick order, a slot's picks by token ascending as the bitmaps' ranks give
+    them (a token picks an expert once): lane r holds the pick at position r.
+    A slot starts where the expert changes; its slot is the starts below it
+    (a ballot), and U, the slots' first positions and, past one token tile,
+    their pick tiles follow from the starts' ballots. Each expert of U gets its
+    slot (``RouteShape.expert_slot0``); the other experts' entries, and the
+    token bitmaps, are read by ``load_route_bitmaps`` alone, and not written."""
+    s, wave = c["S"], c["wave"]
+    # tid and lane afresh: the lane masks and addresses built on them stay
+    # here, not hoisted out of the ug loop into registers held across stages
+    tid = fresh(c["tid"])
+    lane = tid & 63
+    rs = c["rs"]
+    topk = rs.topk
+    n = s * topk
+    assert wave_route(rs) and 2 * WAVE_ROUTE_PICKS <= THREADS
+    # thread tid's route word: wave 0 lane p pick p's id, wave 1 lane p its
+    # weight (a lane past the picks the last pick's); past wave 1 the last
+    # word, re-read and not stored (``load_route_bitmaps``' poll's)
+    pk = fx.min(lane, n - 1)
+    word = pk // topk * (2 * topk) + pk % topk
+    word = (tid < 64).select(
+        word, (tid < 128).select(word + topk, fx.Int32(2 * n - 1))
+    )
+    copy_at = c["bid"] % ROUTE_COPIES * (2 * n)
+    got = c["poll"]([(c["route_src"], copy_at + word, 1)])
+    if (tid < 128) & (lane < n):
+        fx.ptr_store(got[0][0], tab + word)
+    if wave == 0:
+        mine = lane < n
+        # (expert, pick) keys, past the picks above every key
+        key = mine.select(got[0][0] * 64 + lane, fx.Int32(rs.experts * 64))
+        key = _wave_sort(key, lane, 32 if n <= 32 else 64)
+        e, pick = key >> 6, key & 63
+        # the previous position's expert (DPP wave_shr:1; lane 0 takes none)
+        e_prev = _dpp(key, 0x138) >> 6
+        start = mine & ((lane == 0) | (e != e_prev))
+        starts = ballot(start)
+        n_u = popcount(starts)
+        below = lanes_below(starts, lane)
+        slot = start.select(below, below - 1)
+        if mine:
+            fx.ptr_store(pick, tab + (rs.order0 + lane))
+            fx.ptr_store(slot, tab + (2 * rs.picks + 1 + rs.max_u + pick))
+        if start:
+            fx.ptr_store(e, tab + (2 * n + 1 + slot))
+            fx.ptr_store(lane, tab + (rs.first0 + slot))
+            fx.ptr_store(slot, tab + (rs.expert_slot0 + e))
+        if lane == 0:
+            fx.ptr_store(n_u, tab + 2 * n)
+            # the picks of U: every pick under TP
+            fx.ptr_store(fx.Int32(n), tab + (rs.first0 + n_u))
+        if const_expr(rs.multi):
+            # a slot's picks run to its last position: the next start's below,
+            # or the last pick
+            last = (starts >> 1) | (fx.Int64(1) << (n - 1))
+            count = fx.Int32(fmath.cttz(last >> fx.Int64(lane))) + 1
+            tiles = mplan.pick_tiles(count)
+            # the slots' pick tiles below each start: a slot's 1 + its tiles
+            # past each further TILE picks
+            tf = below
+            total = n_u
+            for t in range_constexpr(1, rs.slot_tiles):
+                more = ballot(start & (tiles > t))
+                tf = tf + lanes_below(more, lane)
+                total = total + popcount(more)
+            if start:
+                fx.ptr_store(tf, tab + (rs.tile_first0 + slot))
+                for j in range_constexpr(rs.slot_tiles):
+                    if j < tiles:
+                        fx.ptr_store(slot, tab + (rs.tile_slot0 + tf + j))
+            if lane == 0:
+                fx.ptr_store(total, tab + (rs.tile_first0 + n_u))
+    gpu.barrier()
+
+
+@traced
+def load_route_bitmaps(c, tab):
     """Every token's (ids, weights) into LDS ``tab``, then the union U of the ids
     (ascending): tab[2 S topk ..] = |U|, the experts of U, each (t, k)'s slot in
     U, each expert's slot, the picks in slot order (a slot's ascending) and each
