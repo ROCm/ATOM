@@ -42,6 +42,7 @@ def _applies_case(rows, hidden):
     [
         ({}, True),
         ({"env": "0"}, False),  # ATOM_DSV41_MHC_ROWS=0 keeps the backend
+        ({"backend": "triton"}, False),  # forces Triton, gfx942 included
         ({"rows": ROWS_MIN - 1}, False),  # decode and short chunks
         ({"hidden": 768}, False),  # hidden not a multiple of 512
         ({"w_preshuffle_bf16": True}, False),  # packed BF16 fn: HIP backend
@@ -55,6 +56,7 @@ def test_rows_seam_applies(change, expected, monkeypatch, mhc):
     """applies() with the arch probe and the hipcc build stubbed."""
     rows_mod = mhc.mhc_rows_gfx942
     monkeypatch.setenv("ATOM_DSV41_MHC_ROWS", change.get("env", "1"))
+    monkeypatch.setenv("ATOM_DSV41_MHC_BACKEND", change.get("backend", "auto"))
     monkeypatch.setattr(rows_mod, "_arch_ok", lambda: True)
     kernels = change.get("kernels", (object(), {}))
     monkeypatch.setattr(rows_mod, "_kernels", lambda: kernels)
@@ -151,8 +153,6 @@ def test_rows_seam_matches_triton_seam(rows, with_post, monkeypatch, request):
     barely."""
     from atom.model_ops.deepseek_v41 import mhc_pre_delayed as mhc
 
-    monkeypatch.setenv("ATOM_DSV41_MHC_BACKEND", "triton")
-    mhc.use_asm_seam.cache_clear()
     request.addfinalizer(mhc.use_asm_seam.cache_clear)
     torch.manual_seed(7)
     hidden, dev = 5120, "cuda"
@@ -174,11 +174,16 @@ def test_rows_seam_matches_triton_seam(rows, with_post, monkeypatch, request):
     args = (residual, pre, fn, scale, base, norm_weight)
 
     monkeypatch.setenv("ATOM_DSV41_MHC_ROWS", "1")
+    monkeypatch.setenv("ATOM_DSV41_MHC_BACKEND", "auto")
     assert mhc.mhc_rows_gfx942.applies(
         residual, fn, norm_weight, post_kw.get("sublayer_output"), False, False
     )
     got = mhc.v41_mhc_pre_delayed(*args, **_common(), **post_kw)
-    monkeypatch.setenv("ATOM_DSV41_MHC_ROWS", "0")
+    monkeypatch.setenv("ATOM_DSV41_MHC_BACKEND", "triton")
+    mhc.use_asm_seam.cache_clear()
+    assert not mhc.mhc_rows_gfx942.applies(
+        residual, fn, norm_weight, post_kw.get("sublayer_output"), False, False
+    )
     want = mhc.v41_mhc_pre_delayed(*args, **_common(), **post_kw)
 
     n_bf16 = 2 if with_post else 1  # new residual (with a post) and normed

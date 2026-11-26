@@ -46,7 +46,9 @@ class Hip:
                 f"{what} failed: {rc} ({self.lib.hipGetErrorString(rc).decode()})"
             )
 
-    def launch(self, fn, grid, args):
+    def launch(self, fn, grid, block, args):
+        """1-D launch on torch's current stream; `block` must be the kernel's
+        __launch_bounds__ and `grid` sized for it."""
         size = ctypes.c_size_t(ctypes.sizeof(args))
         extra = (ctypes.c_void_p * 5)(
             1,
@@ -62,7 +64,7 @@ class Hip:
                 grid,
                 1,
                 1,
-                256,
+                block,
                 1,
                 1,
                 0,

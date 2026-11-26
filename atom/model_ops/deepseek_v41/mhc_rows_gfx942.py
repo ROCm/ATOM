@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""gfx942 delayed mHC seam for prefill row counts (off: ATOM_DSV41_MHC_ROWS=0).
+"""gfx942 delayed mHC seam for prefill row counts (off: ATOM_DSV41_MHC_ROWS=0
+or ATOM_DSV41_MHC_BACKEND=triton).
 
 The Triton seam is a split-K GEMM whose programs read 64-128 B of each row per
 load; on MI308X that runs far below bandwidth. SGLang's gfx942 boundary splits
@@ -27,6 +28,8 @@ logger = logging.getLogger(__name__)
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mhc_rows_gfx942.hip")
 _HC = 4
 _MIX = 24
+# __launch_bounds__ of every kernel in mhc_rows_gfx942.hip
+_BLOCK = 256
 # Below this many rows (decode, short chunks) the Triton seam is as fast.
 _MIN_ROWS = 1024
 # hipBLASLt on MI308X, K = 20480: N padded to 64 wins below this many rows,
@@ -112,6 +115,7 @@ def applies(
     ).shape
     if (
         not envs.ATOM_DSV41_MHC_ROWS
+        or envs.ATOM_DSV41_MHC_BACKEND == "triton"
         or rows < _MIN_ROWS
         or w_preshuffle_bf16
         or fuse_quant
@@ -192,7 +196,8 @@ def pre_delayed_rows(
         norm_eps,
     )
     kernel = "mhc_rows_gfx942_post" if with_post else "mhc_rows_gfx942_nopost"
-    hip.launch(fns[kernel], (rows + 3) // 4, args)
+    rows_per_block = _BLOCK // 64  # one wave per row
+    hip.launch(fns[kernel], (rows + rows_per_block - 1) // rows_per_block, _BLOCK, args)
 
     copies = new_residual.view(rows, hc_mult * hidden)
     hilo = _hilo(hc_fn)
@@ -226,5 +231,8 @@ def pre_delayed_rows(
         hc_eps,
         post_mult,
     )
-    hip.launch(fns["mhc_gates_rows_gfx942"], (rows + 255) // 256, gargs)
+    # one thread per row
+    hip.launch(
+        fns["mhc_gates_rows_gfx942"], (rows + _BLOCK - 1) // _BLOCK, _BLOCK, gargs
+    )
     return new_residual.view_as(residual), normed, pre, post, comb
