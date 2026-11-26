@@ -1148,6 +1148,10 @@ def test_prefill_selection_through_aiter_matches_the_definition(
         block_page_stride=8, n_valid_column_per_row=bounds, pages_per_block=8,
     )  # fmt: skip
     assert served == [True], "aiter declined: the Triton fallback served the rows"
+    # No block may be read twice (equal-score ties must still pick distinct blocks);
+    # -1 padding may repeat.
+    ids = torch.sort(topk_idx, dim=-1).values
+    assert not ((ids[..., 1:] == ids[..., :-1]) & (ids[..., 1:] >= 0)).any()
     assert torch.equal(
         _selected_values(score, bounds, INIT, LOCAL, topk_idx),
         _selected_values(
