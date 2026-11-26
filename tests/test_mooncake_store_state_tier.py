@@ -506,6 +506,36 @@ def test_two_state_tier_hosts_under_multi_are_refused():
         state_offload.state_tier_capability(_k3_config(kv_transfer_config=kvc))
 
 
+def _windowed(monkeypatch, windowed=True):
+    """An M3 model whose DSpark draft keeps its window as per-request state."""
+    from atom.spec_decode import draft_window as dw
+
+    window = dw.DraftWindow(
+        window=40, read_page=4, lookahead=4, block_size=4, anchor_margin=8
+    )
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "m3")
+    monkeypatch.setattr(dw, "draft_window", lambda _c: window if windowed else None)
+
+
+@pytest.mark.parametrize("windowed", [True, False])
+def test_m3_hosts_a_store_state_tier_only_for_a_draft_window(monkeypatch, windowed):
+    from atom.kv_transfer.offload.mooncake_store.config import store_state_tier
+
+    _windowed(monkeypatch, windowed)
+    config = _config(kv_transfer_config=_store_kvc())
+    assert store_state_tier(config) is windowed
+    capability = state_offload.state_tier_capability(config)
+    assert capability.hosts_state_tier is windowed
+
+
+def test_m3_draft_window_state_stays_off_lmcache(monkeypatch):
+    _windowed(monkeypatch)
+    config = _config(
+        kv_transfer_config={"kv_connector": "lmcache_offload", "kv_role": "offload"}
+    )
+    assert not state_offload.state_tier_capability(config).hosts_state_tier
+
+
 def test_a_stage_holding_no_state_answers_every_image_whole():
     codec = store_k3.NullStateCodec()
     released = []

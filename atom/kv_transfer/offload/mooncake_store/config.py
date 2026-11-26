@@ -185,8 +185,12 @@ def parse_mooncake_store_config(
 
 def store_state_tier(config: Any) -> bool:
     """Whether this model's Store objects come with checkpoint images of its
-    per-request state (Kimi-K3's KDA state)."""
-    return offcfg.select_offload_layout(config) == "kimi_k3"
+    per-request state: Kimi-K3's KDA state, or a draft window kept as state
+    (`spec_decode.draft_window`) beside M3's PAGEs."""
+    from atom.spec_decode.draft_window import draft_window
+
+    layout = offcfg.select_offload_layout(config)
+    return layout == "kimi_k3" or (layout == "m3" and draft_window(config) is not None)
 
 
 def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> None:

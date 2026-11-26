@@ -152,6 +152,16 @@ def draft_kv_builder(model_runner, draft_hf, model):
     # A way to build it, not the pool: how many rows it has is the walk's to
     # say, and this runs from the proposer's `__init__` -- `build_drafter`
     # still running, `runner.drafter` not yet set, nothing to walk.
+    from atom.spec_decode.draft_window import draft_window
+
+    window = draft_window(model_runner.config)
+    if window is not None:
+        # A sliding-window draft keeps only its window, as per-request state.
+        from atom.spec_decode.draft_window_state import DraftWindowStateBuilder
+
+        return DraftWindowStateBuilder(
+            model_runner, make_pool, window, block_size=block_size, kv_scale=kv_scale
+        )
     return DraftKvBuilder(
         model_runner, make_pool, block_size=block_size, kv_scale=kv_scale
     )

@@ -40,6 +40,8 @@ def _proposer(module, writes):
         vocab_size=100,
     )
     p.aux_for = lambda hidden: [hidden, hidden]
+    # No draft window kept as state: no ring slots among the forward vars.
+    p.runner = SimpleNamespace(forward_vars={})
     bufs = {
         "anchor_ids": torch.full((4,), -1, dtype=torch.int64),
         "anchor_positions": torch.full((4,), -1, dtype=torch.int64),

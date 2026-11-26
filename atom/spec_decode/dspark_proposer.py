@@ -756,7 +756,11 @@ class DSparkProposer(Drafter):
         if taps is None:
             return
         spec = self.model.kv_pool_spec
-        if spec is not None and spec.needs_own_ctx_slots(self.config):
+        ring_slots = self.runner.forward_vars.get("draft_ring_slots")
+        if ring_slots is not None:
+            # A draft window kept as per-request state: its rows go to the ring.
+            slot_mapping = ring_slots.gpu[:num_rows]
+        elif spec is not None and spec.needs_own_ctx_slots(self.config):
             ctx_slots = self.runner.forward_vars.get("draft_ctx_slots")
             if ctx_slots is None:
                 raise RuntimeError(
@@ -997,7 +1001,11 @@ class DSparkProposer(Drafter):
             # `_bound_draft_k_cache`.
             return
 
-        block_tables = self.runner.forward_vars["block_tables"].gpu[:running_bs]
+        # A draft window kept as per-request state reads its ring through a
+        # table of the same shape (`DraftWindowStateBuilder.stage_step`).
+        block_tables = self.runner.forward_vars.get(
+            "draft_block_tables", self.runner.forward_vars["block_tables"]
+        ).gpu[:running_bs]
         slots = self._blk_slots[: running_bs * T].view(running_bs, T)  # stable
         # Each request's KV spans [0, anchor] (context) ++ the T block rows.
         ctx_lens = self._blk_ctx_lens[:running_bs]  # stable

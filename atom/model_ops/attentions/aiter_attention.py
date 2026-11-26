@@ -36,6 +36,7 @@ from .backends import (
 )
 from .mha_kv_pool import MhaKvPool
 from .pool_layout.entry_arena import EntryField, carve
+from .pool_layout.layer_major_page_unit_geometry import layer_major_page_unit_bytes
 from .pool_layout.pool_rows import KvGeometry
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 from .token_layout.batch_ids import build_cu_seqlens
@@ -406,6 +407,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     def _paged_entry_bytes(self) -> int:
         """What one scheduler block costs, over every pool this model needs."""
         return sum(pool.entry_bytes for pool in self._declare_kv_pools().values())
+
+    def checkpoint_page_unit_bytes(self) -> int:
+        """Bytes one block publishes, its fields without their alignment: the
+        unit a draft's per-request state stores its checkpoints in."""
+        return layer_major_page_unit_bytes(self._declare_kv_pools().values())
 
     def _module_kinds(self, module) -> tuple:
         """A KV row keyed by the module's own geometry, and an indexer row.

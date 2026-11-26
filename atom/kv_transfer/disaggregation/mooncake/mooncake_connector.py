@@ -492,6 +492,9 @@ def _receive_block_offset(
 
 
 class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
+    # A draft window kept as state (`__init__`): it receives its blocks as a delta.
+    _window_state = False
+
     def __init__(self, config: Config) -> None:
         kv_transfer_config = config.kv_transfer_config
         self.is_producer = (
@@ -509,6 +512,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.block_size = config.kv_cache_block_size
         self.dcp_size = config.decode_context_parallel_size
         self.hash_block_size = self.block_size * self.dcp_size
+        from atom.spec_decode.draft_window import draft_window
+
+        self._window_state = draft_window(config) is not None
         self.enable_chunked_transfer = kv_transfer_config.get(
             "enable_chunked_transfer", False
         )
@@ -558,7 +564,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # A full transfer still pairs blocks at this ratio: the producer
         # checks its source count against the destination count by it.
         factor = self.dcp_size // geometry[1]
-        if seq.has_per_req_cache:
+        if seq.has_per_req_cache and not self._window_state:
             return 0, factor
         return num_cached_blocks, factor
 
@@ -566,7 +572,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         params = seq.kv_transfer_params or {}
         if self.is_producer or not params.get("do_remote_prefill"):
             return None
-        if seq.has_per_req_cache:
+        if seq.has_per_req_cache and not self._window_state:
             # Lifting this also needs `PdAdmissionController.commit` to
             # re-measure the receive after `allocate` instead of charging the
             # pre-allocation probe.

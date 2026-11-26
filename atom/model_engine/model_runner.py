@@ -1026,7 +1026,9 @@ class ModelRunner:
         # never assign them a slot, and the builder will silently read
         # tensor[-1] on first decode. Catch the misconfiguration up front
         # rather than producing wrong outputs at inference time.
-        if self._state_pool_names():
+        from atom.spec_decode.draft_window import draft_window
+
+        if self._state_pool_names() and draft_window(self.config) is None:
             from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
 
             mt = self.config.hf_config.model_type
@@ -1072,6 +1074,7 @@ class ModelRunner:
             else None
         )
         self._served = None
+        self._declare_draft_window_state()
         # Every builder exists from here on, so the state owner is settled.
         self._state_owner_settled = True
         self._init_forward_vars_ring()
@@ -1822,6 +1825,22 @@ class ModelRunner:
         if hasattr(self, "draft_kv_builder"):
             specs += self.draft_kv_builder.sub_pool_specs()
         return specs
+
+    def _declare_draft_window_state(self) -> None:
+        """Declare a draft window kept as state on every PP stage (no bytes where
+        the draft is not), before the forward variables are cloned."""
+        from atom.spec_decode.draft_window import draft_window
+        from atom.spec_decode.draft_window_state import DraftWindowStateBuilder
+
+        window = draft_window(self.config)
+        if window is None:
+            return
+        builder = getattr(self, "draft_kv_builder", None)
+        if builder is None:
+            builder = self.draft_kv_builder = DraftWindowStateBuilder(
+                self, None, window
+            )
+        builder.declare_step_buffers(self.forward_vars)
 
     @property
     def state_builder(self):
