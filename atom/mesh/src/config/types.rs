@@ -703,6 +703,7 @@ mod tests {
             }
         }
     }
+
     #[test]
     fn prepare_pool_defaults_overrides_and_legacy_config_deserialization() {
         let config = RouterConfig::default();

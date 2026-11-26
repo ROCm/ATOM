@@ -94,8 +94,12 @@ fn json_line(value: &Value) -> Result<bytes::Bytes, serde_json::Error> {
     Ok(line.into())
 }
 
-fn late_kv_line(kv: &Value) -> Result<bytes::Bytes, serde_json::Error> {
-    json_line(&json!({ "kv_transfer_params": kv }))
+/// Line 2 of a late-kv body. Takes `kv` by value and moves it into a one-entry
+/// object, so P's echoed `prompt_token_ids` are serialized in place, not copied.
+fn late_kv_line(kv: Value) -> Result<bytes::Bytes, serde_json::Error> {
+    let mut line = serde_json::Map::with_capacity(1);
+    line.insert("kv_transfer_params".to_string(), kv);
+    json_line(&Value::Object(line))
 }
 
 /// The serial relay's decode body, rebuilt from the two late-kv lines.
@@ -1462,7 +1466,7 @@ impl PDRouter {
                 )
                 .await
             {
-                Ok(kv) => late_kv_line(&kv).map_err(Self::handle_serialization_error),
+                Ok(kv) => late_kv_line(kv).map_err(Self::handle_serialization_error),
                 Err(response) => Err(response),
             };
             // D may already have answered (an error) and closed its body.
@@ -2924,7 +2928,7 @@ mod tests {
         let head = json_line(&json!({"messages": [{"content": "a\nb\r\n"}]})).unwrap();
         assert_eq!(head.iter().filter(|b| **b == b'\n').count(), 1);
         assert_eq!(*head.last().unwrap(), b'\n');
-        let line = late_kv_line(&json!({"remote_dp_rank": 2})).unwrap();
+        let line = late_kv_line(json!({"remote_dp_rank": 2})).unwrap();
         let back: Value = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
         assert_eq!(back, json!({"kv_transfer_params": {"remote_dp_rank": 2}}));
         // The 404 fallback's body: line 1's request with line 2's params.
@@ -2933,6 +2937,23 @@ mod tests {
             serde_json::from_slice::<Value>(&body).unwrap(),
             json!({"model": "m", "kv_transfer_params": {"remote_dp_rank": 2}})
         );
+    }
+
+    #[test]
+    fn late_kv_line_bytes_match_the_json_macro() {
+        // Moving kv into a one-entry object must not change the wire bytes.
+        let kv = json!({
+            "remote_dp_rank": 2,
+            "remote_engine_id": "p-0",
+            "prompt_token_ids": (0..1000).collect::<Vec<u32>>(),
+            "nested": {"z": [1.5, null, true], "a": "x\ny\"\u{1}"},
+        });
+        let expected = json_line(&json!({ "kv_transfer_params": kv.clone() })).unwrap();
+        assert_eq!(late_kv_line(kv).unwrap(), expected);
+        for kv in [json!(null), json!({}), json!([1, 2]), json!("s")] {
+            let expected = json_line(&json!({ "kv_transfer_params": kv.clone() })).unwrap();
+            assert_eq!(late_kv_line(kv).unwrap(), expected);
+        }
     }
 
     #[derive(Default)]
