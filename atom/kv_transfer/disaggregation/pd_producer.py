@@ -89,23 +89,31 @@ def disaggregated_kv_role(config) -> str | None:
     shape: the blob arrives as user-supplied CLI JSON, and a caller running at
     config time must degrade rather than take the process down.
     """
-    transfer_config = getattr(config, "kv_transfer_config", None)
-    if not isinstance(transfer_config, dict) or not transfer_config:
-        return None
-    entries = [transfer_config]
-    nested = transfer_config.get("connectors")
-    if isinstance(nested, (list, tuple)):
-        entries += [entry for entry in nested if isinstance(entry, dict)]
-    for entry in entries:
-        name = entry.get("kv_connector", _DEFAULT_BACKEND)
-        if not isinstance(name, str):
-            continue
-        if name.strip().casefold() not in PD_TRANSFER_BACKENDS:
-            continue
+    for entry in pd_transfer_entries(getattr(config, "kv_transfer_config", None)):
         role = entry.get("kv_role", "kv_producer")
         if role in ("kv_producer", "kv_consumer"):
             return role
     return None
+
+
+def pd_transfer_entries(transfer_config) -> list[dict]:
+    """The entries of ``transfer_config`` (``multi``'s included) whose
+    connector is a P/D transfer backend, by the rules of
+    :func:`disaggregated_kv_role`. Each builds a P/D side whatever its
+    ``kv_role``: the connectors read anything but ``kv_producer`` as the
+    consumer."""
+    if not isinstance(transfer_config, dict) or not transfer_config:
+        return []
+    entries = [transfer_config]
+    nested = transfer_config.get("connectors")
+    if isinstance(nested, (list, tuple)):
+        entries += [entry for entry in nested if isinstance(entry, dict)]
+    out = []
+    for entry in entries:
+        name = entry.get("kv_connector", _DEFAULT_BACKEND)
+        if isinstance(name, str) and name.strip().casefold() in PD_TRANSFER_BACKENDS:
+            out.append(entry)
+    return out
 
 
 def pd_producer_configured(config) -> bool:

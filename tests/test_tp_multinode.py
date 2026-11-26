@@ -129,6 +129,7 @@ def test_the_engine_serves_its_store_to_other_nodes_for_cross_node_tp(
         enable_dp_attention=False,
         tensor_parallel_size=8,
         is_multinode_tp=multinode_tp,
+        external_engine_client=False,
     )
     manager = CoreManager.__new__(CoreManager)
     manager.label = "test"

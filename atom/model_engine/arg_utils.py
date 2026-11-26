@@ -16,7 +16,10 @@ from atom.config import (
     ParallelConfig,
     SpeculativeConfig,
 )
-from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.factory import (
+    KVConnectorFactory,
+    parse_kv_transfer_config,
+)
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_ops.indexer.layout import MFMA, NATURAL, PRESHUFFLE
@@ -79,7 +82,7 @@ def compose_kv_offload_config(kv_transfer_config: str, offload: dict | None) -> 
     """
     if offload is None:
         return kv_transfer_config
-    transfer = json.loads(kv_transfer_config or "{}")
+    transfer = parse_kv_transfer_config(kv_transfer_config)
     if not transfer:
         return json.dumps(offload)
     is_multi = _connector_name(transfer) == "multi"
@@ -1092,15 +1095,22 @@ class EngineArgs:
             del kwargs["data_parallel_base_port"]
         return ParallelConfig(**kwargs)
 
-    def create_engine(self, tokenizer=None) -> LLMEngine:
+    def create_engine(
+        self, tokenizer=None, *, external_engine_client: bool = False
+    ) -> LLMEngine:
         """Create and return an LLMEngine instance with the configured parameters.
 
         A node whose TP slice starts past rank 0 (--tensor-parallel-rank) has no
         engine to create: it runs its TP workers for the engine on another node
         and exits the process with their status once they stop.
+
+        `external_engine_client` is set by the atomesh standalone launcher, whose
+        Rust runtime is the EngineCores' client; the CLI does not expose it.
         """
         if self.tensor_parallel_rank > 0:
             from atom.model_engine.tp_multinode import serve_remote_tp_ranks
 
             raise SystemExit(serve_remote_tp_ranks(self))
-        return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
+        kwargs = self._get_engine_kwargs()
+        kwargs["external_engine_client"] = external_engine_client
+        return LLMEngine(self.model, tokenizer=tokenizer, **kwargs)

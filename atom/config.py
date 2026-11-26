@@ -2398,6 +2398,9 @@ class Config:
     # Queue finished sequences on outputs_queue; only its readers turn it on
     # (LLMEngine.add_request for step / generate, and asyncio_mode).
     keep_finished_outputs: bool = False
+    # Another process (the atomesh Rust runtime) is the EngineCores' client:
+    # CoreManager spawns them and reaps them, but never connects.
+    external_engine_client: bool = False
     mark_trace: bool = False
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
@@ -2985,14 +2988,11 @@ class Config:
         if hasattr(self, "kv_transfer_config") and isinstance(
             self.kv_transfer_config, str
         ):
-            import json
+            from atom.kv_transfer.disaggregation.factory import (
+                parse_kv_transfer_config,
+            )
 
-            try:
-                self.kv_transfer_config = json.loads(self.kv_transfer_config)
-            except json.JSONDecodeError:
-                import ast
-
-                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+            self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
         if (
             isinstance(self.kv_transfer_config, dict)
             and str(self.kv_transfer_config.get("kv_connector", "")).strip().casefold()

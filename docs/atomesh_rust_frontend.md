@@ -238,6 +238,15 @@ dispatcher admits the request as `TokenBridge` does (`SamplingParams` values,
 `max_tokens` against the cap and the context, the KV pool, stop strings to
 token sequences) and submits it to its rank's Core.
 
-`launch_mesh(engine_spec=...)` serves that way. The Python half -- the Cores
-speaking msgspec and a launcher that writes their `EngineSpec` -- comes next;
-until then the token bridge is the one served.
+`launch_mesh(engine_spec=...)` serves that way, and the standalone launcher
+takes it with `--engine-dispatch direct` (the default stays `bridge`). The
+EngineCores speak the msgspec protocol to any client; with an external one,
+CoreManager spawns and reaps them but never connects
+(`Config.external_engine_client`), and `atom/entrypoints/atomesh/engine_spec.py`
+writes their `EngineSpec`: the deployment's output cap, the required tool-call
+channel and the ids that end an output, decided as `TokenBridge` decides them.
+Direct dispatch has no Python to render in, so it refuses at startup, before
+the weights load, a model whose chat prompt is rendered in Python
+(`ChatRenderer.needed`: DeepSeek-V4's message encoder, Kimi-K3's code
+template), a P/D worker and a DP placement Rust does not have (`share_cache`,
+`prefix_spread`); CoreManager refuses PP, multi-node and RapidServe.

@@ -3,8 +3,9 @@
 This module intentionally mirrors the engine/tokenizer initialization used by
 ``atom.entrypoints.openai.api_server``. The Rust side serves the OpenAI API
 (``AtomBridgeRouter``): it renders, tokenizes, detokenizes and parses, and
-hands token ids to this engine through ``TokenBridge``
-(docs/atomesh_rust_frontend.md).
+hands token ids to this engine through ``TokenBridge``, or with
+``--engine-dispatch direct`` to the EngineCores themselves, which this process
+only spawns and reaps (``engine_spec``; docs/atomesh_rust_frontend.md).
 """
 
 from __future__ import annotations
@@ -105,6 +106,29 @@ def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
     engine_args = EngineArgs.from_cli_args(args)
     engine = engine_args.create_engine(tokenizer=tokenizer)
     return engine, tokenizer
+
+
+def initialize_direct_engine(args: argparse.Namespace) -> Any:
+    """The engine whose EngineCores Rust is the client of; the token bridge's
+    `ChatRenderer`, which decides what the spec says of the model. A model
+    direct dispatch cannot serve is refused before its weights load."""
+    from atom.entrypoints.atomesh.engine_spec import check_direct_tokenizer
+    from atom.entrypoints.atomesh.token_bridge import ChatRenderer
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.model_engine.llm_engine import load_tokenizer
+
+    global engine, tokenizer
+
+    logger.info("Loading tokenizer from %s...", args.model)
+    tokenizer = load_tokenizer(args.model, args.trust_remote_code)
+    renderer = ChatRenderer(tokenizer, args.model, args.tool_call_parser)
+    check_direct_tokenizer(renderer, args.model)
+
+    logger.info("Initializing EngineCores for model %s...", args.model)
+    engine = EngineArgs.from_cli_args(args).create_engine(
+        tokenizer=tokenizer, external_engine_client=True
+    )
+    return renderer
 
 
 def initialize_token_bridge(atomesh_runner: Any, args: argparse.Namespace) -> Any:
@@ -285,6 +309,17 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
         help=TOOL_CALL_PARSER_HELP,
     )
     parser.add_argument(
+        "--engine-dispatch",
+        choices=("bridge", "direct"),
+        default="bridge",
+        help=(
+            "How the Rust frontend reaches the engine: through the token bridge "
+            "to this process's LLMEngine, or straight to the EngineCores "
+            "(text models with a Jinja chat template; no P/D, PP, multi-node, "
+            "RapidServe or prefix-routed DP placement)."
+        ),
+    )
+    parser.add_argument(
         "--default-chat-template-kwargs",
         type=json_object_arg,
         default=None,
@@ -332,15 +367,24 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
 
 def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
     standalone_args = parse_standalone_args(raw_args)
+    engine_args = standalone_args.engine_args
+    direct = engine_args.engine_dispatch == "direct"
+    if direct:
+        from atom.entrypoints.atomesh.engine_spec import check_direct_args
+
+        check_direct_args(engine_args)
     parsed_args = atomesh_runner.parse_from(standalone_args.mesh_args)
     cli_args = parsed_args["cli_args"]
-    initialize_engine(standalone_args.engine_args)
-    parser_args = rust_frontend_parser_args(
-        standalone_args.engine_args, standalone_args.mesh_args
-    )
+    if direct:
+        renderer = initialize_direct_engine(engine_args)
+    else:
+        initialize_engine(engine_args)
+    parser_args = rust_frontend_parser_args(engine_args, standalone_args.mesh_args)
     if parser_args:
         parsed_args = atomesh_runner.parse_from(standalone_args.mesh_args + parser_args)
-    token_bridge = initialize_token_bridge(atomesh_runner, standalone_args.engine_args)
+    token_bridge = (
+        None if direct else initialize_token_bridge(atomesh_runner, engine_args)
+    )
 
     # This frontend is the api_server's counterpart -- same tokenizer, same
     # per-request accumulators -- but it builds its engine itself and never
@@ -351,14 +395,49 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
 
     print("\033[32mATOM starting...\033[0m")
     print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")
+    if direct:
+        serve_direct(
+            atomesh_runner,
+            parsed_args,
+            renderer,
+            served_model_name(engine_args),
+            standalone_args.default_chat_template_kwargs,
+        )
+        return
     atomesh_runner.launch_mesh(
         server_config=parsed_args["server_config"],
         token_bridge=token_bridge,
-        served_model_name=served_model_name(standalone_args.engine_args),
+        served_model_name=served_model_name(engine_args),
         default_chat_template_kwargs=json.dumps(
             standalone_args.default_chat_template_kwargs
         ),
     )
+
+
+def serve_direct(
+    atomesh_runner: Any,
+    parsed_args: dict[str, Any],
+    renderer: Any,
+    served_name: str,
+    default_chat_template_kwargs: dict[str, Any],
+) -> None:
+    """Serve the EngineCores from Rust until it exits, then reap them."""
+    from atom.entrypoints.atomesh.engine_spec import build_engine_spec
+
+    try:
+        spec = build_engine_spec(
+            engine,
+            tokenizer,
+            renderer,
+            served_name,
+            default_chat_template_kwargs,
+        )
+        atomesh_runner.launch_mesh(
+            server_config=parsed_args["server_config"], engine_spec=spec
+        )
+    finally:
+        # Rust has stopped the EngineCores by now, or died trying.
+        engine.close()
 
 
 def _with_atom_backend(mesh_args: list[str]) -> list[str]:
