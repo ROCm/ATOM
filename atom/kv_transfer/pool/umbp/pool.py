@@ -644,6 +644,10 @@ class UmbpPoolMemory(KVPoolMemory):
     The existing IPC path adopts an ordinary torch allocation.
     """
 
+    # NativeL1Memory uses torch.empty in a scoped torch.cuda.MemPool. MORI
+    # supplies its backing allocation; Torch's caching allocator still tracks
+    # allocated bytes, as it does for IPC's torch.zeros. The opt-in FABRIC GPU
+    # accounting test checks this contract on the deployed Torch runtime.
     counted_by_torch = True
     shares_blocks = True
 
@@ -811,6 +815,10 @@ class UmbpPoolMemory(KVPoolMemory):
         self._wake.set()
         if self._watcher is not None:
             # Keep IPC's bounded shutdown; FABRIC requires a drained reporter.
+            # MORI L1Client::Commit sets a 120-second gRPC deadline. Let an
+            # in-flight call return (or time out) before native close; a join
+            # timeout is not proof that the reporter has stopped using KV.
+            # The later GPU synchronization and Detach have their own waits.
             self._watcher.join(timeout=None if self._native_memory is not None else 1.0)
         if self._native_memory is not None:
             self._native_memory.close()

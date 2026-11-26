@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """CPU checks of real ATOM completion quarantine and Commit reporter threads."""
 
 import array
@@ -225,6 +226,66 @@ def test_close_stops_reporter_and_is_idempotent(
     if state == "retrying":
         assert len(attempts) >= 3
         assert all(b - a >= 0.008 for a, b in pairwise(attempts))
+
+
+@pytest.mark.parametrize("owner", ["fabric"], indirect=True)
+@pytest.mark.parametrize("commit_fails", [False, True])
+def test_fabric_close_waits_for_inflight_commit(owner, monkeypatch, commit_fails):
+    memory, _ = owner
+    entered_commit = threading.Event()
+    finish_commit = threading.Event()
+    entered_join = threading.Event()
+    errors = []
+
+    def commit(*_):
+        entered_commit.set()
+        assert finish_commit.wait(5), "test did not release the blocked Commit"
+        if commit_fails:
+            # Simulate the native client's gRPC deadline expiring, without
+            # making a CPU regression wait for the real 120-second deadline.
+            raise RuntimeError("Commit deadline exceeded")
+
+    def detach():
+        assert finish_commit.is_set()
+        assert not memory._watcher.is_alive()
+
+    memory._client.commit.side_effect = commit
+    memory._native_memory.close.side_effect = detach
+    memory.writes_issued()
+    assert entered_commit.wait(2)
+    join_reporter = memory._watcher.join
+
+    def join(*args, **kwargs):
+        entered_join.set()
+        return join_reporter(*args, **kwargs)
+
+    monkeypatch.setattr(memory._watcher, "join", join)
+
+    def close():
+        try:
+            memory.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    closer = threading.Thread(target=close, daemon=True)
+    closer.start()
+    try:
+        assert entered_join.wait(2)
+        assert closer.is_alive()
+        memory._native_memory.close.assert_not_called()
+        assert not memory._closed and memory._mapped_base == 0x1000
+        with pytest.raises(RuntimeError, match="memory is closing"):
+            memory.writes_issued()
+    finally:
+        finish_commit.set()
+        closer.join(timeout=2)
+
+    assert not closer.is_alive() and not errors
+    assert not memory._watcher.is_alive()
+    # Once stopping begins, a failed Commit is not retried before Detach.
+    memory._client.commit.assert_called_once()
+    memory._native_memory.close.assert_called_once()
+    assert memory._closed and memory._mapped_base is None
 
 
 @pytest.mark.parametrize("owner", ["fabric"], indirect=True)

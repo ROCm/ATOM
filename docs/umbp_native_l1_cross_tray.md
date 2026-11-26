@@ -16,12 +16,18 @@ completion; it does not implement the FABRIC memory lifecycle.
 
 This change is based directly on ATOM `main`; the base connector from
 [#3482](https://github.com/ROCm/ATOM/pull/3482) is already merged. The
-2026-11-25 alignment uses:
+2026-11-25 integrated validation used:
 
 | Repository | Source | Commit |
 | --- | --- | --- |
-| ATOM | `main` | `031d4da2671e72b724b41111edf979ce62e615c0` |
-| MORI | [#1074](https://github.com/ROCm/mori/pull/1074) | `36c430bab74b724843f78a4fbbec76c349155b93` |
+| ATOM base | `main` | `031d4da2671e72b724b41111edf979ce62e615c0` |
+| ATOM adapter | [#3828](https://github.com/ROCm/ATOM/pull/3828) | `e1178843de1bb919527145075167b48d36059105` |
+| MORI native L1 | [#1074](https://github.com/ROCm/mori/pull/1074) | `ef41bf906732f5ee9e1b2d45ea4d5ced299f6d2d` |
+
+MORI documentation snapshot `256630648a6fb37124edc7e31a99222003d13396`
+contains the same validated production implementation, with subsequent changes
+limited to deployment and validation documentation. These results do not cover
+a later ATOM `main` merge or subsequent adapter changes.
 
 FABRIC runtime requires the companion MORI #1074 native L1 cross-tray change.
 **MORI #1045 alone is insufficient.** Install the companion
@@ -45,7 +51,7 @@ Both trays need the matching native L1 MORI build, including:
   FABRIC copy kernel. This is a pure L1 service; no standalone tier server is
   needed. The gRPC endpoint is control traffic; KV bytes go through FABRIC.
 
-Use the existing ATOM model/455 options, adding this connector configuration:
+Use the existing ATOM model and parallelism options, adding this connector configuration:
 
 ```json
 {
@@ -84,6 +90,36 @@ Existing local deployments keep the default `transport: "ipc"` behavior. Native 
 restrictions remain, including one runner per engine rank and attention TP=1;
 attention tensor parallelism within a rank is unsupported.
 
+The FABRIC arena uses `torch.empty` inside a scoped PyTorch `MemPool` backed by
+MORI's pluggable allocator; it does not replace the process-global allocator.
+The campaign's PyTorch source revision
+[`c9ab2693`](https://github.com/pytorch/pytorch/blob/c9ab269368d46a826d64705192fef55594c8b698/c10/cuda/CUDACachingAllocator.cpp#L1832)
+records these allocations in the caching allocator's aggregate allocated-byte
+statistics. This supports keeping `counted_by_torch = True` for the runner's
+allocation-mismatch diagnostic. The dedicated 2026-11-26 measurement confirmed
+that `torch.cuda.memory_stats()["allocated_bytes.all.current"]` increased by
+exactly 67,108,864 bytes for each 64 MiB IPC and FABRIC allocation on both
+j07-16 and j07-14. All four cases passed with zero accounting error on the
+tested PyTorch runtime.
+
+On an idle FABRIC-capable GPU, with the matching MORI package and extension,
+run the opt-in accounting regression:
+
+```bash
+RUN_UMBP_FABRIC_GPU_TESTS=1 python -m pytest -q -s \
+  tests/test_umbp_fabric_memory_gpu.py
+```
+
+It compares ordinary IPC and FABRIC allocations of 64 MiB after warming the
+zeroing paths, records the runtime and before/after counters, and checks the
+runner's 3% tolerance. It requires no L1 service or peer and skips by default.
+
+The test image required `LD_PRELOAD=/opt/rocm/lib/libamd_smi.so.27` to align
+AMD-SMI loading with the host library. Before this environment correction,
+AMD-SMI and PyTorch reported zero GPUs while HIP reported four. Afterwards all
+three agreed, and each owner retained a single SDK core HIP/HSA runtime. This
+is an environment requirement of that image, not an override of device counts.
+
 ## Completion and shutdown
 
 The scheduler reserves destination slots before submitting a background fetch.
@@ -96,8 +132,13 @@ and stops serving instead of turning the error into a cache miss. This is
 deliberately conservative, including RPC failures where the reply was lost.
 
 The UMBP helper retains the KV tensor and its allocator before sending Attach.
-On normal shutdown, the connector stops its progress reporter and calls the
-helper's `close()` before the runner releases KV views. The helper synchronizes
+On normal shutdown, the connector stops and joins its progress reporter before
+calling the helper's `close()`, while the runner still retains its KV views.
+FABRIC must wait for an in-flight Commit to finish before closing native memory.
+MORI's `L1Client::Commit()` sets a 120-second gRPC deadline, so that RPC is
+bounded; this is not a bound on the entire shutdown, which also includes GPU
+synchronization and Detach. A short reporter join followed by arena release
+would not establish safe completion. The helper synchronizes
 owner GPU work and requires a confirmed Detach after remote reads and local
 writes have drained. An unconfirmed close raises `L1MemoryInDoubtError` and
 keeps the allocation retained inside UMBP; it does not authorize freeing or
@@ -108,9 +149,13 @@ wait for requests, peer reads, and owner writes to finish. Keep the L1 services
 and peer owners alive until each pool's Detach is confirmed; only then stop
 services or containers. A timeout or worker exit is not a completion proof.
 
-The current ATOM process controller does not guarantee that an owner remains
-alive after a failed or timed-out Detach: exception and shutdown-timeout paths
-can still terminate workers. The helper's Python references protect memory
+The current ATOM process controller uses `ATOM_SHUTDOWN_TIMEOUT_S` (default
+5 seconds) as a shared worker-exit deadline, after which it can terminate
+workers. This is shorter than an in-flight Commit's RPC deadline. Configure
+enough time for a coordinated normal drain, but increasing the timeout does not
+guarantee that an owner remains alive after a failed or timed-out Detach:
+exception and shutdown-timeout paths can still terminate workers. The helper's
+Python references protect memory
 only while its process lives. There is no automatic recovery from unknown
 completion, owner death, or an uncoordinated service restart; the coordinator
 must preserve affected owners and drain peers before teardown.
@@ -124,36 +169,58 @@ restart before exhausting it.
 
 ## Validation scope
 
-The 2026-11-25 alignment to `main` passed 414 pool, connector, scheduler,
-lifecycle, multi-connector and DP-routing tests, with one intentional native
-fault-injection skip. The native tests used a fresh `mori_umbp_l1` build from
-MORI `36c430ba`. GPU transfers and model inference were not rerun for this
-alignment; the results below describe the earlier PR revision.
+The completed 2026-11-25 campaign on j07-16 ↔ j07-14 used the exact ATOM
+`e1178843` and MORI `ef41bf90` revisions above. The
+[published MORI validation record](https://github.com/ROCm/mori/blob/256630648a6fb37124edc7e31a99222003d13396/docs/umbp/native-l1-cross-tray.md#ownership-and-shutdown)
+summarizes the cross-tray results:
 
-The 2026-11-23 run on g13-12 ↔ g13-10 used ATOM `3e37722ad` and MORI
-`965a6061`. It passed 134 ATOM
-pool/connector/lifecycle tests (one intentional native fault-injection skip).
-The capacity regression exercises real startup prompt limits and scheduler
-watermarks for full sharing, partial sharing and a private reserved null block.
-The matching MORI build passed 57 C++ tests, copy planner, 19 keep-copies peer
-tests and 12 Python helper tests.
+| Layer | Result |
+| --- | --- |
+| ATOM pool/connector/scheduler/lifecycle/DP tests | 471 passed, two existing skips; dedicated UMBP scheduler and native lifecycle tests ran |
+| MORI native tests | 81 C++ cases with default `KEEP_COPIES=1`, 69 pool/peer cases with `KEEP_COPIES=0`, 12 Python helper cases, and copy-planner checks passed |
+| GPU import orders | Native-first and IO-first both passed using one compatible HIP runtime |
+| Native cross-tray copies | 32 directed GPU paths, 128 full-arena byte comparisons plus three smokes, 52 confirmed Detaches, and 28 owner processes exited successfully |
+| Real ATOM adapter | Eight bidirectional GPU paths, 16 full/partial prefix checks, Event/Commit, payload/suffix/guards, source-arena checks, physical slot reuse, and 16 confirmed Detaches |
+| Real model | 11 HTTP requests; three remotely reused prefixes matched local reuse, and one unseeded miss matched a cold request |
 
-Real GPUs passed all 32 directed paths (160 cases), both import orders and
-16 GPU Event/Commit cases. DeepSeek-V4.1-Flash Fetch-off/on on the same consumer
-matched inputs, complete output text and token counts for all 64 requests per
-arm including warmup. All 16 measured remote hits confirmed 96 slots /
-18,309,120 bytes copied each; true misses and local-hot requests had no remote
-copy. Each node ran attention DP4/TP1 and MoE EP4, without cross-node TP.
-Baseline, shared consumer and publisher each confirmed normal Detach.
+Native coverage included prefixes crossing the 128-key window, reversed
+destination slots, the full 844-slot arena, and a missing key within a prefix.
+The ATOM adapter copied 4,000 slots / 16,532,000 bytes in total. The two ATOM
+skips were the intentionally fake-only native copy-failure injection and an
+existing scheduler test module with an obsolete import path.
 
-The test image `rocm/fw-bringup-mlperf:gfx1250-atom-20261116` needed the two
-Python modules from AITER #7416 (`11db23cc1d6f`) and the capability-query patch
-from #8086 (`ff2f0ce274e7`) for this newer ATOM base. Its existing gfx1250
-kernels were preserved. This greedy workload does not validate fused stochastic
-sampling, which requires additional gfx1250 configuration in that image.
+The model used DeepSeek-V4.1-Flash, attention DP4/TP1, MoE EP4, eager execution,
+BF16 KV, FP8 index, and block size 128. Each tray ran its own model replica;
+TP/EP collectives were local. Model sharing was tested in one direction,
+j07-14 → j07-16. Remote reuse of 512/1536/2304 cached tokens matched the
+corresponding local reuse in output token IDs, full text, finish reason, and
+usage. The unseeded DP3 request had zero remote copies and matched the source's
+cold request. Remote model copies totaled 34 pages / 12,577,280 bytes.
+All eight model owners confirmed Detach and empty service stats.
 
-The earlier 2026-11-22 bases also passed slot reuse and a ten-minute bidirectional
-soak. These are bounded workload and normal-shutdown results, not full model
-quality or crash-recovery guarantees. An earlier GSM8K truncation remains
-unresolved and also reproduced with Fetch disabled. Saturated model throughput
-and topologies beyond the tested two trays have not been established.
+The model comparison preserves ATOM's existing bounded-replay semantics;
+prefix reuse can differ from cold prefill. These finite correctness checks do
+not establish model quality, TTFT, throughput, physical link bandwidth,
+saturation, long-term stability, crash recovery, or additional topologies.
+Existing AITER destructor exceptions were retained in the logs, alongside
+independently confirmed L1 Detach and resource cleanup.
+
+The 2026-11-26 review follow-up tested a frozen working tree based on ATOM
+`e1178843`, with local adapter comments, allocation/layout and shutdown
+regressions, and documentation corrections. Its CPU suite passed 454 cases;
+two opt-in GPU cases and one existing fake-only copy-failure case were skipped
+in that CPU run. The two GPU cases were then run on each tray and all four
+passed, as described in the accounting section above.
+
+The real ATOM adapter regression also passed all eight bidirectional GPU
+paths, 16 full/partial prefix and complete-arena guard checks, eight real
+Event/Commit fences, clear/slot reuse, and 16 confirmed Detaches. It copied
+4,000 slots / 16,532,000 bytes. Raw owner replies, the loaded adapter/helper/
+extension hashes, and service copy counters were independently checked. All
+16 owners exited successfully; all 16 services exited and both test ports
+were clear before the dedicated empty containers were stopped.
+
+This follow-up validates allocation accounting and adapter functionality.
+It did not repeat the model or native GPU matrix from the earlier campaign,
+and the saved load baseline was busy. It does not establish performance or
+bandwidth under idle conditions.
