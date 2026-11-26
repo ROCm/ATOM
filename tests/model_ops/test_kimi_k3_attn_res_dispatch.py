@@ -167,10 +167,7 @@ def test_close_dispatch_and_fake_metadata(monkeypatch, ops, add, quant):
     assert seen[0][0][9] == 1 and seen[0][1] == {"close_block": True}
 
 
-@pytest.mark.parametrize("strided", [False, True])
-def test_close_launch_writes_original_bank_without_prefix_allocation(
-    monkeypatch, ops, strided
-):
+def test_close_launch_writes_original_bank_without_prefix_allocation(monkeypatch, ops):
     seen = []
 
     class Kernel:
@@ -178,7 +175,7 @@ def test_close_launch_writes_original_bank_without_prefix_allocation(
             return lambda *args, **kwargs: seen.append((args, kwargs))
 
     monkeypatch.setattr(ops, "_attn_res_fused_kernel", Kernel(), raising=False)
-    bank = torch.ones(4, 5, 16)[1:3, 1:4, :: 2 if strided else 1]
+    bank = torch.ones(4, 5, 16)[1:3, 1:4]
     x = torch.ones(2, bank.shape[-1])
     _, _, prefix = ops._apply_attn_res_impl(
         x, bank, torch.ones(x.shape[-1]), 1e-6, x, num_blocks=1, close_block=True
@@ -243,11 +240,11 @@ def test_close_mutation_survives_compiled_calls_and_bank_views(ops):
     compiled = torch.compile(run, backend="aot_eager", fullgraph=True, dynamic=True)
     for tokens in (2, 5, 2):
         storage = torch.full((tokens + 2, 5, 16), -7.0)
-        bank = storage[1:-1, 1:4, ::2]
+        bank = storage[1:-1, 1:4, :8]
         prefix = torch.arange(tokens * 8).view(tokens, 8).float()
         add = torch.full_like(prefix, 0.5)
         expected = storage.clone()
-        expected[1:-1, 2, ::2] = prefix + add
+        expected[1:-1, 2, :8] = prefix + add
         result = compiled(prefix, bank, add)
         assert torch.equal(result, 2 * (prefix + add))
         assert torch.equal(storage, expected)

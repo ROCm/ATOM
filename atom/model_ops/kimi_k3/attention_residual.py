@@ -236,7 +236,7 @@ def _pick_attn_res_config(tokens: int):
 
 def _apply_attn_res_impl(
     prefix_sum: torch.Tensor,  # [T, H]
-    block_residual: torch.Tensor,  # [T, B, H]; by stride, H unit-stride or copied
+    block_residual: torch.Tensor,  # [T, B, H]; by stride, H unit-stride
     score_weight: torch.Tensor,  # [H] (norm_weight * proj_weight, precomputed)
     eps: float,
     add_hidden: torch.Tensor | None = None,  # [T, H], folded: prefix += add_hidden
@@ -293,13 +293,8 @@ def _apply_attn_res_impl(
     if quant and not out_norm:
         raise ValueError("quant_dtype requires out_norm_weight")
     fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
-    # The active prefix is read by stride; a wider bank needs no
-    # slice or copy when H is unit-stride.
-    br = (
-        block_residual
-        if block_residual.stride(-1) == 1
-        else block_residual[:, :B].contiguous()
-    )
+    if block_residual.stride(-1) != 1:
+        raise ValueError("block_residual must have unit stride in the hidden dimension")
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
     y = torch.empty(
@@ -327,7 +322,7 @@ def _apply_attn_res_impl(
         else _pick_attn_res_config(T)
     )
     _attn_res_fused_kernel[(T,)](
-        br,
+        block_residual,
         ps,
         sw,
         y,
@@ -343,8 +338,8 @@ def _apply_attn_res_impl(
         float(out_eps),
         fp8_max,
         1.0 / fp8_max,
-        br.stride(0),
-        br.stride(1),
+        block_residual.stride(0),
+        block_residual.stride(1),
         ps.stride(0),
         y.stride(0),
         hs.stride(0),

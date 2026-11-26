@@ -98,7 +98,7 @@ def test_offset_slices_match_their_copies(tokens):
 
 @torch.inference_mode()
 def test_the_kernel_reads_the_bank_in_place(monkeypatch):
-    # what the guard is for: the launch gets the slice itself, not a copy of it
+    # The launch gets the slice itself, not a copy of it.
     kernel = attention_residual._attn_res_fused_kernel
     launched = []
 
@@ -117,30 +117,17 @@ def test_the_kernel_reads_the_bank_in_place(monkeypatch):
     assert launched == [(view.data_ptr(), view.stride())]
 
 
-@torch.inference_mode()
-def test_strided_hidden_dim_is_still_copied():
-    x = _inputs(8, 20261030)
-    # [T, H, B] storage viewed as [T, B, H]: the hidden dim is not unit-stride
-    bank = x["bank"].transpose(1, 2).contiguous().transpose(1, 2)
-    assert bank.stride(-1) != 1
-    _assert_bitwise(
-        _call(x, bank, 2, True, False), _call(x, bank.contiguous(), 2, True, False)
-    )
-
-
 @pytest.mark.parametrize(
-    "tokens,adds,quant,strided",
+    "tokens,adds,quant",
     [
-        (1, 0, False, False),
-        (4096, 2, False, False),
-        (16, 1, True, False),
-        (16, 2, True, True),
+        (1, 0, False),
+        (4096, 2, False),
+        (16, 1, True),
+        (16, 2, True),
     ],
 )
 @torch.inference_mode()
-def test_close_block_matches_copy_and_replays(
-    tokens, adds, quant, strided, record_property
-):
+def test_close_block_matches_copy_and_replays(tokens, adds, quant, record_property):
     from torch._inductor import metrics
 
     from atom.model_ops.kimi_k3.attention_residual import apply_attn_res
@@ -148,12 +135,12 @@ def test_close_block_matches_copy_and_replays(
     torch.cuda.reset_peak_memory_stats()
     x = _inputs(tokens, 20261124 + tokens)
     storage = torch.full(
-        (tokens + 2, BANK + 2, HIDDEN * (2 if strided else 1)),
+        (tokens + 2, BANK + 2, HIDDEN),
         -7,
         dtype=torch.bfloat16,
         device="cuda",
     )
-    bank = storage[1:-1, 1:-1, :: 2 if strided else 1]
+    bank = storage[1:-1, 1:-1]
     bank.copy_(x["bank"])
     blocks = 3
 
@@ -179,7 +166,7 @@ def test_close_block_matches_copy_and_replays(
     add2 = x["adds"][1] if adds == 2 else None
     want = _call(x, bank, adds, True, quant, blocks)
     expected = storage.clone()
-    expected[1:-1, 1 + blocks, :: 2 if strided else 1].copy_(want[-1])
+    expected[1:-1, 1 + blocks].copy_(want[-1])
 
     def check(result):
         output, prefix = result
@@ -192,10 +179,9 @@ def test_close_block_matches_copy_and_replays(
     reset_bank()
     generated_before = metrics.generated_kernel_count
     check(compiled(x["prefix"], bank, add, add2))
-    if not strided:
-        # The custom op is one external launch. An Inductor-generated copy
-        # would reintroduce the full-bank materialization this path avoids.
-        assert metrics.generated_kernel_count == generated_before
+    # The custom op is one external launch. An Inductor-generated copy
+    # would reintroduce the full-bank materialization this path avoids.
+    assert metrics.generated_kernel_count == generated_before
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
