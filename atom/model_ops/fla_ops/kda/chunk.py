@@ -143,6 +143,14 @@ def chunk_kda(
         )
     if inplace_final_state and h0_indices is None:
         raise ValueError("inplace_final_state requires h0_indices.")
+    if h0_indices is not None and initial_state is None:
+        raise ValueError("h0_indices requires initial_state (the slot cache).")
+    if h0_indices is not None and output_final_state and not inplace_final_state:
+        # The kernel indexes ht by the cache slot; a dense (N, ...) final_state
+        # is not addressable that way.
+        raise ValueError(
+            "h0_indices with output_final_state requires inplace_final_state."
+        )
     if inplace_final_state and not output_final_state:
         raise ValueError("inplace_final_state requires output_final_state.")
     if has_initial_state is not None and h0_indices is None:

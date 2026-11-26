@@ -190,7 +190,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_log2(
             # A fresh sequence starts from zeros; skip the load.
             has_h0 = tl.load(has_initial_state + i_n) != 0
             valid_h0 = valid_h0 & has_h0
-        i_state_base = i_slot * stride_state_slot + (i_h * K * V).to(tl.int64)
+        # Clamp so a padded row never forms a pointer before the cache; the
+        # loads/stores stay masked by valid_slot.
+        i_state_base = tl.where(valid_slot, i_slot, 0) * stride_state_slot + (
+            i_h * K * V
+        ).to(tl.int64)
         if USE_INITIAL_STATE:
             h0 = h0 + i_state_base
         if STORE_FINAL_STATE:
@@ -581,6 +585,13 @@ def chunk_gated_delta_rule_fwd_h_log2(
             raise ValueError(
                 f"h0_indices has {h0_indices.shape[0]} entries but there are {N} "
                 f"sequences."
+            )
+    if h0_indices is not None:
+        if initial_state is None:
+            raise ValueError("h0_indices requires initial_state (the slot cache).")
+        if output_final_state and not inplace_final_state:
+            raise ValueError(
+                "h0_indices with output_final_state requires inplace_final_state."
             )
     if has_initial_state is not None:
         if h0_indices is None:
