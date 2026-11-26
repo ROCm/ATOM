@@ -72,6 +72,10 @@ pub struct RouterConfig {
     pub atom_standalone: bool,
     #[serde(default)]
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
+    /// ATOM PD relay: open D's leg together with P's and send P's KV metadata
+    /// late (`--atom-pd-concurrent`; D needs `ATOM_PD_LATE_KV=1`).
+    #[serde(default)]
+    pub atom_pd_concurrent: bool,
 
     pub policy: PolicyConfig,
     pub host: String,
@@ -538,6 +542,7 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             atom_standalone: false,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
+            atom_pd_concurrent: false,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,
@@ -619,6 +624,12 @@ impl RouterConfig {
             )
     }
 
+    /// Whether the HTTP PD router dispatches an ATOM relay's decode leg
+    /// concurrently with prefill: `--atom-pd-concurrent` on the ATOM backend.
+    pub fn atom_pd_concurrent_dispatch(&self) -> bool {
+        matches!(self.backend, BackendType::Atom) && self.atom_pd_concurrent
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
@@ -692,7 +703,6 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn prepare_pool_defaults_overrides_and_legacy_config_deserialization() {
         let config = RouterConfig::default();
