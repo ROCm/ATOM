@@ -53,9 +53,11 @@ class WidthBuilds:
         built, scratch = self._compiled(width, lambda: self._build(width))
         spilled = [launcher for launcher, n in scratch.items() if n]
         # any rank's spill sends every rank through the lean rebuild together,
-        # if every rank has a leaner build (``lean`` None: nothing to swap)
+        # if every rank has a leaner build (``lean`` None: nothing to swap),
+        # each leaving out the kernels any rank's spilled: one structure
         if self._lean is not None and not group_agree(not spilled, self._group):
-            lean = self._lean(built, spilled) if spilled else built
+            spilled = self._spilled_anywhere(scratch)
+            lean = self._lean(built, spilled)
             if group_agree(lean is not None, self._group):
                 logger.info(
                     "%s: %s need scratch, rebuilt lean",
@@ -101,6 +103,18 @@ class WidthBuilds:
                 "%s: loading the width-%d kernels failed", self._what, width
             )
             return None, {}
+
+    def _spilled_anywhere(self, scratch: dict) -> list:
+        """This rank's launchers at the places (in build order, every rank's
+        alike) where any rank's spilled: a rank's own builds may differ in
+        their constants (a per-rank NUMA copy word), not in their order."""
+        places = {i for i, n in enumerate(scratch.values()) if n}
+        if self._group is not None:
+            every = [None] * dist.get_world_size(self._group)
+            dist.all_gather_object(every, places, group=self._group)
+            places = set().union(*every)
+        launchers = list(scratch)
+        return [launchers[i] for i in sorted(places)]
 
     def _share(self, kernels: list) -> list:
         """This rank's share of a width's kernels to compile first (rank r:

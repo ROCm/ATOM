@@ -819,9 +819,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             seq.kv_transfer_params_output = None
             return
 
-        prefill_block_ids = list(seq.block_table)
+        # On D the live table, only copied into the output below; P queues a
+        # list of its own.
+        prefill_block_ids = seq.block_table
         if self.is_producer:
-            prefill_block_ids = self._prompt_block_ids(seq, prefill_block_ids)
+            prefill_block_ids = self._prompt_block_ids(seq, list(prefill_block_ids))
 
         # Claim iff we will send: the same `do_remote_decode` gate that fills
         # `_reqs_need_save`.
@@ -996,8 +998,9 @@ class _UnitPlan:
     """Where a producer's PAGE regions land on one consumer rank."""
 
     cmap: list[int]
-    # Per region, when cutting heads: (consumer block bytes, slice rows).
-    cuts: list[tuple[int, np.ndarray]] | None
+    # Per region, when cutting heads: (consumer block bytes, slice rows, their
+    # staged gather).
+    cuts: list[tuple[int, np.ndarray, GatherLayout]] | None
     num_consumer_regions: int = 0
 
 
@@ -1244,7 +1247,7 @@ class MooncakeConnector(KVConnectorBase):
         self._block_region_roles: list[str | None] = []
         # Per PAGE region: its head runs, and its spec where the backend names
         # its units (MHA); `_unit_layout` is the three packed for a producer.
-        self._block_head_major_runs: tuple[tuple[int, int] | None, ...] = ()
+        self._block_head_major_runs: tuple[tuple[int, tuple[int, ...]] | None, ...] = ()
         self._block_unit_specs: tuple[PageUnitSpec, ...] | None = None
         self._unit_layout: bytes | None = None
         self._unit_plans: dict[tuple, _UnitPlan] = {}
@@ -3204,7 +3207,8 @@ class MooncakeConnector(KVConnectorBase):
         """Pair our units with consumer rank `rank` of `tp` by spec, and cut
         heads where that rank holds fewer than we do."""
         specs = [PageUnitSpec(*unit[:5]) for unit in layout]
-        runs = [None if unit[5] is None else tuple(unit[5]) for unit in layout]
+        # msgpack hands back lists; head runs compare as `(heads, widths)` tuples.
+        runs = [None if u[5] is None else (u[5][0], tuple(u[5][1])) for u in layout]
         widths = [unit[6] for unit in layout]
         end = None
         if self.pp_rank < self.pp_size - 1:
@@ -3225,15 +3229,13 @@ class MooncakeConnector(KVConnectorBase):
                 f"DCP; got producer TP {self.tp_size} DCP {self.dcp_size}, "
                 f"consumer TP {tp} DCP {dcp}"
             )
-        cuts = [
-            (
-                widths[c],
-                consumer_head_slices(
-                    ours[i][1], widths[c], ours[i][0], runs[c], rank, tp, str(specs[c])
-                ),
+        cuts = []
+        for i, c in enumerate(cmap):
+            rows = consumer_head_slices(
+                ours[i][1], widths[c], ours[i][0], runs[c], rank, tp, str(specs[c])
             )
-            for i, c in enumerate(cmap)
-        ]
+            gather = GatherLayout.from_slices(ours[i][1], widths[c], rows)
+            cuts.append((widths[c], rows, gather))
         return _UnitPlan(cmap, cuts, len(specs))
 
     def _consumer_dcp_plan(
@@ -3386,7 +3388,7 @@ class MooncakeConnector(KVConnectorBase):
             role = self._block_region_roles[region_idx]
             if plan.cuts is not None:
                 # Write this consumer's heads of every head-major run.
-                dst_bpb, cuts = plan.cuts[region_idx]
+                dst_bpb, cuts, _ = plan.cuts[region_idx]
                 src = source_blocks[:, None] * bpb + cuts[:, 0]
                 dst = destination_blocks[:, None] * dst_bpb + cuts[:, 1]
                 if not batch.add(
@@ -3503,15 +3505,8 @@ class MooncakeConnector(KVConnectorBase):
         return self._check_staging_sources(
             page_transfer_plan(
                 [
-                    PlannedRegion(
-                        region,
-                        consumer,
-                        bases[consumer],
-                        GatherLayout.from_slices(
-                            self._per_block_bytes_list[region], dst_bytes, rows
-                        ),
-                    )
-                    for region, (consumer, (dst_bytes, rows)) in enumerate(
+                    PlannedRegion(region, consumer, bases[consumer], gather)
+                    for region, (consumer, (_, _, gather)) in enumerate(
                         zip(plan.cmap, plan.cuts)
                     )
                 ],

@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """A DP step on which this rank scheduled no request.
 
 The rank still forwards its running rows for its peers' collectives, the LM
@@ -86,7 +88,7 @@ def test_postprocess_samples_nothing_without_a_request(monkeypatch):
     out = runner.postprocess(
         batch=batch,
         # The running rows the LM head emitted; none of them is scheduled.
-        logits=torch.zeros(2, 8),
+        lm_head_output=mod.LmHeadOutput(None, torch.zeros(2, 8)),
         temperatures=torch.ones(0),
         top_ks=None,
         top_ps=None,

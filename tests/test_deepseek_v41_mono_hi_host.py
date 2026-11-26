@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The V4.1 mono hi hook's host-side glue (``ATOM_DSV41_MONO_HI``), on stand-ins for ATOM's runner, token processor,
 sampler, metadata builder, cache and proposer: no GPU, no hi, no aiter. The device-side advance runs in the
 Triton interpreter; the parts that load a module with Triton kernels (the device round, the post-verify) skip without
@@ -644,29 +645,40 @@ def no_aiter_sampler(monkeypatch):
             monkeypatch.setitem(sys.modules, "atom.model_ops.rejection_sampler", fake)
 
 
-def test_the_post_verify_is_the_forwards_head_output(no_aiter_sampler):
+def test_the_post_verify_is_the_steps_token_ids(no_aiter_sampler):
     """A width's fixed outputs, laid out as the served step lays its rows out (B requests of ``rq`` rows: ``rq - 1``
-    drafts and a bonus row each), are the forward's head output (``HiLayers.head_output``: output ids [B, rq],
-    verdict [3, B]) exactly when this forward ran the post-verify at that width; else None (the logits).
+    drafts and a bonus row each), are the step's token ids (``HiLayers.token_ids``: output ids [B, rq], spec status
+    [3, B]) exactly when the round served the step, a verify of every request's full span at a width the post-verify
+    launched at; else None (the logits).
     """
     from atom.models.deepseek_v41.mono import hi_runner
     from atom.models.deepseek_v41.mono.round import post_verify
 
     split = {6: (1, 6), 12: (2, 6)}
     pv = post_verify.PostVerify((6, 12), split, torch.device("cpu"))
-    assert pv.bufs[12]["target"].tolist() == [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
-    assert pv.bufs[12]["bonus"].tolist() == [5, 11]
-    assert pv.bufs[12]["cu"].tolist() == [5, 10]
-    out, verdict = pv.output(12)
-    assert out is pv.bufs[12]["out"] and out.shape == (2, 6)
-    assert verdict is pv.bufs[12]["verdict"] and verdict.shape == (3, 2)
+    assert pv.bufs[12].target.tolist() == [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
+    assert pv.bufs[12].bonus.tolist() == [5, 11]
+    assert pv.bufs[12].cu.tolist() == [5, 10]
+    verified = pv.output(12)
+    assert verified.token_ids is pv.bufs[12].out and verified.token_ids.shape == (2, 6)
+    assert verified.spec_status is pv.bufs[12].spec_status
+    assert verified.spec_status.shape == (3, 2)
     hook = object.__new__(hi_runner.HiLayers)
-    hook.pv, hook.verified = pv, 0
-    assert hook.head_output(12) is None  # (no post-verify this forward)
-    hook.verified = 12
-    assert hook.head_output(12) == (out, verdict) and hook.head_output(6) is None
+    hook.pv, hook.split = pv, split
+
+    def step(served=True, max_q_len=6):
+        return SimpleNamespace(
+            served_by_round=served, step=SimpleNamespace(max_q_len=max_q_len)
+        )
+
+    assert hook.token_ids(step(), 12) is None  # (the post-verify never launched)
+    pv.launched.add(12)
+    assert hook.token_ids(step(), 12) == verified
+    assert hook.token_ids(step(), 6) is None
+    assert hook.token_ids(step(served=False), 12) is None
+    assert hook.token_ids(step(max_q_len=4), 12) is None
     hook.pv = None
-    assert hook.head_output(12) is None
+    assert hook.token_ids(step(), 12) is None
 
 
 def test_post_verify_skips_the_commit_at_its_own_anchors(no_aiter_sampler):
@@ -683,7 +695,7 @@ def test_post_verify_skips_the_commit_at_its_own_anchors(no_aiter_sampler):
         pending = SimpleNamespace(staged_on_device=True, step=step)
         return SimpleNamespace(cache=SimpleNamespace(pending=pending), step=step)
 
-    verdict = pv.bufs[12]["verdict"]
+    verdict = pv.bufs[12].spec_status
     m = md()
     # a width the forward never ran the kernel at
     assert not pv.committed(m, verdict[2]) and m.cache.pending is not None
