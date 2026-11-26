@@ -1,0 +1,77 @@
+---
+description: First-principles code generation guidelines for Lumen
+globs: lumen/**/*.py
+alwaysApply: false
+---
+
+# First-Principles Code Generation
+
+When generating code for Lumen, always reason from first principles — decompose the problem to its fundamental truths, then build the solution upward. Never copy-paste patterns blindly or code by analogy.
+
+## Core Discipline
+
+1. **Clarify the problem before writing code.** State what the code must achieve in one sentence. If you cannot, the problem is not yet understood.
+2. **Identify the constraints.** For GPU kernels: memory bandwidth, register pressure, wave occupancy, data layout. For Python modules: API contract, backward compatibility, composability.
+3. **Derive the solution from constraints**, not from "how others did it." Each design choice (tiling size, scaling strategy, dispatch order) must trace back to a hardware fact or a mathematical property.
+4. **Eliminate unnecessary abstraction.** Add a layer only when it removes duplication across ≥2 call sites or encapsulates a non-obvious invariant. Premature abstraction obscures the reasoning chain.
+
+## Lumen-Specific Guidelines
+
+### Quantization Code
+
+- Start from the numeric format spec (e.g., E4M3 range, MXFP8 shared-exponent semantics). Derive clamping bounds, scaling formulas, and rounding rules from the spec — do not hard-code magic numbers without a traceable formula.
+- When choosing between per-tensor, per-channel, or block scaling, justify the choice by the accuracy-vs-performance trade-off for the target hardware (gfx94x / gfx950).
+
+### Kernel Code (Triton / CUDA)
+
+- Reason about the roofline: is the operation compute-bound or memory-bound? Size the tile and pipeline depth accordingly.
+- Prefer explicit data movement (shared memory staging, register reuse) over relying on compiler heuristics. Make the memory access pattern visible in the code structure.
+- Every `tl.load` / `tl.store` should have a clear reason for its mask, stride, and eviction policy.
+
+### Module & Op Code
+
+- An `nn.Module` wraps state; a stateless function goes in `lumen/ops/`. Do not mix concerns.
+- Backend dispatch order (ASM → CK → Triton) exists because lower-level backends are faster when available. New ops must follow this fallback chain and include a lazy probe.
+
+### Autograd Functions
+
+- Save only what backward truly needs on `ctx`. Derive recomputable intermediates in backward rather than stashing them.
+- Document the gradient formula in the docstring — the math is the specification.
+
+## Anti-Patterns to Reject
+
+```python
+# BAD: magic number with no derivation
+scale = 448.0
+
+# GOOD: derived from FP8 E4M3 max representable value
+FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+scale = amax / FP8_E4M3_MAX
+```
+
+```python
+# BAD: abstraction without justification
+class QuantScaleManager(ABC):
+    ...  # only one subclass exists
+
+# GOOD: plain function until a second strategy appears
+def compute_delayed_scale(amax_history: Tensor, fp8_max: float) -> Tensor:
+    ...
+```
+
+```python
+# BAD: copying another framework's API shape without understanding why
+def forward(self, inp, weight, bias=None, **te_kwargs):
+    ...
+
+# GOOD: API shaped by Lumen's own requirements
+def forward(self, inp: Tensor, *, quant_config: QuantConfig) -> Tensor:
+    ...
+```
+
+## Checklist Before Submitting Generated Code
+
+- [ ] Can I explain every constant and every branch by pointing to a hardware fact, a math property, or a documented requirement?
+- [ ] Have I removed any layer that exists "just in case"?
+- [ ] Does the code path degrade gracefully (fallback backends, clear error messages) when assumptions break?
+- [ ] Is the performance-critical path free of Python-level overhead (no per-token Python loops, no redundant tensor copies)?

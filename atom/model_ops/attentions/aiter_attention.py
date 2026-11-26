@@ -1129,18 +1129,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
-            # The FP4 scorer takes its batch off the rows of idx_q, which a DP step
-            # can make more or fewer than `running_bs * q`; `_sparse_decode` slices q /
-            # idx_q to this batch. The other index caches keep the padded batch.
-            index_bs = running_bs
-            if "" in self._index_scorers:  # an FP4 (MXFP4 / NVFP4) index cache
-                index_bs = min(running_bs, running_tokens // max_seqlen_q)
-                if index_bs < batch.total_seqs_num_decode:
-                    raise ValueError(
-                        f"FP4 index decode: {running_tokens} rows of {max_seqlen_q} "
-                        f"query tokens do not cover the {batch.total_seqs_num_decode} "
-                        "scheduled requests"
-                    )
+            # A DP or packed (DSpark token-bucket) step can hand this rank more or
+            # fewer rows than `running_bs * q` (`ForwardMode`): for every index cache
+            # the decode metadata is the requests the rows cover, and `_sparse_decode`
+            # slices q / idx_q to it.
+            index_bs = min(running_bs, running_tokens // max_seqlen_q)
+            if index_bs < batch.total_seqs_num_decode:
+                raise ValueError(
+                    f"sparse index decode: {running_tokens} rows of {max_seqlen_q} "
+                    f"query tokens do not cover the {batch.total_seqs_num_decode} "
+                    "scheduled requests"
+                )
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables[:index_bs],
                 attn_metadata.context_lens[:index_bs],

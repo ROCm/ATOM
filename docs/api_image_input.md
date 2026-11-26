@@ -48,8 +48,36 @@ way.
 
 A `file_id` and a `file` source are refused, as there is no Files API, and so
 is an image anywhere else (`system`, `assistant`), or with `kv_transfer_params`:
-a PD prefill cannot hand an image request off. A request without images
-renders as before.
+only Chat Completions hands an image request from prefill to decode (below).
+A request without images renders as before.
+
+## Prefill/decode handoff
+
+Over P/D, Chat Completions serves an image request with the image loaded on
+the prefill instance (P) only:
+
+1. P's request carries `return_token_ids: true` and `kv_transfer_params` with
+   `do_remote_decode: true`. Its response returns `prompt_token_ids`, the
+   prompt with the image placeholders expanded, and in `kv_transfer_params`
+   the image's `cache_seed` and the prompt's `mrope_position_delta`.
+2. The decode instance (D) takes the same messages with P's
+   `kv_transfer_params`, `do_remote_prefill: true`, `cache_seed`,
+   `mrope_position_delta` and `prompt_token_ids` among them. It runs on those
+   ids and does not load the image: `cache_seed` keys its prefix cache as P's
+   did, and the delta places its decode positions where P's prompt ended.
+
+Without `prompt_token_ids` or `cache_seed`, D loads and processes the image
+itself. `cache_seed` must be an integer in `[0, 2**64)` and
+`mrope_position_delta` an integer no larger in magnitude than the model's
+context length, on every endpoint, or the request is HTTP 400; D reads them
+only together with `do_remote_prefill` and `cache_seed`, and then also refuses
+a delta outside `[1 - len(prompt_token_ids), 0]`. Such a D request
+cannot fall back to a local prefill, as it has no image to prefill: when it
+would (D has no KV connector, its receive failed, or the KV it received is
+gone after a preemption or a KV change), it finishes with an `unschedulable`
+reason. A RapidServe server, which prefills every request itself, refuses it
+with HTTP 400, and so does DeepSeek-V4.1 running DSpark, as for any image
+request.
 
 ## Public URLs
 
