@@ -605,6 +605,14 @@ class CoreManager:
                 "two mappings have not been reconciled across nodes."
             )
 
+        if config.external_engine_client and (
+            multinode or config.is_multinode_tp or pp_size > 1
+        ):
+            raise ValueError(
+                "An external engine client supports neither multi-node data or "
+                "tensor parallelism nor pipeline parallelism yet."
+            )
+
         rank_assignments = layout_engines(config)
         local_engine_count = len(rank_assignments) * pp_size
 
@@ -713,6 +721,35 @@ class CoreManager:
                     )
                     info["process"].start()
                     self.engine_core_processes.append(info["process"])
+
+                if config.external_engine_client:
+                    # The Cores' client is another process (atom/mesh's
+                    # atom_engine): it binds these addresses and serves them.
+                    # This manager only reaps the processes, in close().
+                    self.engine_endpoints = [
+                        {
+                            "dp_rank": info["dp_rank"],
+                            "pid": info["process"].pid,
+                            "input": info["addresses"]["input_address"],
+                            "control": info["addresses"]["control_address"],
+                            "output": info["addresses"]["output_address"],
+                        }
+                        for info in processes_info
+                    ]
+                    self._finalizer = weakref.finalize(self, self.close)
+                    self.async_output_queue = None
+                    self._output_handler_task = None
+                    self._asyncio_mode = False
+                    # No socket of this manager's is ever opened.
+                    self.ctx.destroy(linger=0)
+                    if self._bp_depth > 0:
+                        logger.warning(
+                            "%s: ATOM_DP_DISPATCH_DEPTH=%d has no effect with an "
+                            "external engine client, which places requests itself",
+                            self.label,
+                            self._bp_depth,
+                        )
+                    return
 
                 if not self.is_coordinator:
                     # A worker node hosts engines but owns no router: the
@@ -2684,6 +2721,10 @@ class DisaggCoreManager(CoreManager):
 
         import torch
 
+        if config.external_engine_client:
+            raise ValueError(
+                "An external engine client does not support rapidserve yet."
+            )
         if torch.multiprocessing.get_start_method(allow_none=True) is None:
             torch.multiprocessing.set_start_method("spawn", force=False)
 
