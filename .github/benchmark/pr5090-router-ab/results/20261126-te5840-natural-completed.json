@@ -1,0 +1,85 @@
+{
+  "lease": "L534f66",
+  "node": "g27",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "harness_sha": "91b09c71a493d21cc5e2f093189ee91b8e5e3d66",
+  "candidate_pr": "https://github.com/kvcache-ai/Mooncake/pull/5840",
+  "candidate_head": "8babd5a9b3ecfe0df78379ca0f1f143a391edd44",
+  "engine_sha256": "3c8196c03d57a4cf10c83b5ec681f62a0851646f7b005939709e329df2c41511",
+  "connector_sha256": "45e05e355bba98ec51783ba0fc0a5267f7ef3a60e427444c3df075eed0ce8997",
+  "vllm_kernel_sha256": "8b37de120025193185b248bf344acd2c783d0eb8ffdbfd73035ecfcdd0a0f395",
+  "natural_prefill_order": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "device_order_log": [
+    "[PP-DEVICE-PROBE] HIP_VISIBLE_DEVICES=0,1,2,3"
+  ],
+  "sender_workers": 10,
+  "async_sender_tasks": 20,
+  "native_deadlines": "unchanged/unset",
+  "roles_argv_env_equal_to_prior_patched": true,
+  "warmup": {
+    "completed": 884,
+    "cancelled": 0,
+    "errors": 0,
+    "elapsed_s": 363.82
+  },
+  "profiling": {
+    "requested_window_s": 900,
+    "sent": 3056,
+    "completed": 3054,
+    "cancelled_at_grace_end": 2,
+    "errors": 0,
+    "elapsed_with_grace_s": 930.0
+  },
+  "phase_notices": [
+    "05:54:52.123 NOTICE   Phase warmup (warmup) started | target: 884 requests (runner.py:600)",
+    "06:00:54.545 NOTICE   Phase warmup (warmup) sending complete | sent=884, completed=870, in_flight=14 | sessions: sent=82, completed=25 (runner.py:1047)",
+    "06:00:55.946 NOTICE   Phase warmup (warmup) complete | completed=884, cancelled=0, errors=0 | sessions: completed=25, cancelled=0 | elapsed=363.82s (runner.py:1170)",
+    "06:00:56.058 NOTICE   Phase profiling (profiling) started | phase_index=0 | profiling_index=0 | target: 900.0s duration (runner.py:600)",
+    "06:15:56.060 NOTICE   Phase profiling (profiling) sending complete | sent=3,056, completed=3,022, in_flight=34 | sessions: sent=93, completed=28 | timeout_triggered=True (runner.py:1047)",
+    "06:16:26.059 NOTICE   Phase profiling (profiling) complete | completed=3,054, cancelled=2, errors=0 | sessions: completed=28, cancelled=0 | elapsed=930.00s | grace_period_timeout=True (runner.py:1170)"
+  ],
+  "failed_native_writes": 0,
+  "kv_transfer": {
+    "metric": "vllm:mooncake_bytes_transferred_sum",
+    "prefill_before": 0.0,
+    "prefill_after": 101376000.0,
+    "transferred_bytes_delta": 101376000.0,
+    "passed": true
+  },
+  "disconnect_pending_requests": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "exit_codes": {
+    "pool-workload.rc": 0,
+    "pool-exit.rc": 0,
+    "gpool-release.rc": 0
+  },
+  "srt_remaining_containers": [],
+  "outer_cleanup_containers": [],
+  "release_note": "released L534f66 (g27:0-7, held 40m)",
+  "archive_sha256": "bcfbef92769325adbe6b6006db3580707c58c6206d16abb2019e66cc64b5f446",
+  "interpretation": "On g27, the PR5840 producer fixes the reproduced sender10 PP3 native timeout within the verified C80 warmup+900s window, including natural P GPU order. No worker reduction, timeout extension or GPU remap required. Longer3600s regression remains outstanding; this is not an SA performance submission."
+}
