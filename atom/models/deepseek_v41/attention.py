@@ -563,12 +563,7 @@ class Attention(nn.Module):
             and prepared is not None
             and (cache.kv_fp8 or prepared[0])
         ):
-            if step.prefill_attention_conditional:
-                output = self._attend_prefill_conditional(
-                    query, cache, step, prepared, queries
-                )
-            else:
-                output = self._attend_prefill_graph(query, cache, step, prepared)
+            output = self._attend_prefill_graph(query, cache, step, prepared)
         else:
             output = self._attend(query, cache, step, queries, prepared)
         return self._project_out(
@@ -639,7 +634,7 @@ class Attention(nn.Module):
     def _attend_prefill_conditional(self, query, cache, step, prepared, queries):
         if not step.prefill_attention_graph or step.decode or queries is not None:
             return self._attend(query, cache, step, queries, prepared=None)
-        return self._attend_prefill_graph(query, cache, step, prepared)
+        return self._attend_prefill_captured(query, cache, step, prepared)
 
     @eager_region(live=_live_rows)
     def _prepare_attention_live(self, query, kv_normed, cache, step, rope, queries):
@@ -680,6 +675,13 @@ class Attention(nn.Module):
         cache._index_group(self.spec, step, first, 1, a8w4=a8w4, out=(prefix, extend))
 
     def _attend_prefill_graph(self, query, cache, step, prepared):
+        if step.prefill_attention_conditional:
+            return self._attend_prefill_conditional(
+                query, cache, step, prepared, queries=None
+            )
+        return self._attend_prefill_captured(query, cache, step, prepared)
+
+    def _attend_prefill_captured(self, query, cache, step, prepared):
         """Capture quantized MLA; fused preparation already committed its ring."""
         a8w4, query_fp8, kv, window_kv = prepared
         buffers, fill = cache.prefill_graph_buffers(self.spec, step, a8w4=a8w4)

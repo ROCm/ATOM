@@ -551,6 +551,7 @@ def test_native_token_graph_replays_different_request_counts(
         "_attention_inputs",
         "_prefill_indices_live",
         "_attend_prefill_graph",
+        "_attend_prefill_captured",
         "_attend",
     ):
         setattr(owner, name, MethodType(getattr(Attention, name), owner))
