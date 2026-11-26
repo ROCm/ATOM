@@ -584,7 +584,7 @@ mod c_regular_planning {
                 tokens: Some(&[1u32, 2, 3]),
                 headers: None,
                 stream: false,
-                carries_media: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -636,7 +636,7 @@ mod c_regular_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -660,7 +660,7 @@ mod c_regular_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1015,7 +1015,7 @@ mod d_pd_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1129,7 +1129,7 @@ mod d_pd_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1611,6 +1611,7 @@ mod f_atom_adapter {
             prefill_dp_size: 2,
             prefill_dp_rank: Some(1),
             decode_dp_rank: None,
+            carries_media: false,
         });
         let mut p = json!({"prompt": [1, 2, 3], "stream": true, "max_tokens": 10});
         let mut d = p.clone();
@@ -1776,6 +1777,7 @@ mod f_atom_adapter {
             prefill_dp_size: 4,
             prefill_dp_rank: Some(2),
             decode_dp_rank: Some(2),
+            carries_media: false,
         });
         let mut kv = json!({});
         adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
@@ -1830,6 +1832,7 @@ mod f_atom_adapter {
             prefill_dp_size: 1,
             prefill_dp_rank: None,
             decode_dp_rank: None,
+            carries_media: false,
         });
         let mut kv = json!({});
         let err = adapter.enrich_decode_kv(&mut kv, &ctx).unwrap_err();
@@ -2388,7 +2391,7 @@ mod h_integration {
             tokens: Some(&tokens),
             headers: Some(&headers),
             stream: false,
-            carries_media: false,
+            ..Default::default()
         };
 
         for _ in 0..2 {

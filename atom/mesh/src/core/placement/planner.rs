@@ -192,6 +192,7 @@ impl DefaultPlanner {
 #[async_trait]
 impl PdPlanner for DefaultPlanner {
     async fn plan(&self, req: &RequestDescriptor<'_>) -> Result<PlacementPlan, PlacementError> {
+        route_trace::record_media_count(req.media_count);
         let conn_mode = self.connection_mode(req);
 
         if let Some(m) = req.model_id {
