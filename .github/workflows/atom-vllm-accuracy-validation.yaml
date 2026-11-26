@@ -435,9 +435,30 @@ env:
   AITER_COMMIT: "HEAD"
 
 jobs:
+  authorize:
+    # Its own job: the image build below takes a self-hosted runner.
+    name: Authorize manual run
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Authorize manual run
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: |
+          allowed="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" \
+            --jq '.user.permissions.admin or .user.permissions.maintain')"
+          if [ "${allowed}" != "true" ]; then
+            echo "::error::A manual run of ${GITHUB_WORKFLOW} needs the maintain or admin role; ${ACTOR} has neither. Ask a maintainer to trigger it."
+            exit 1
+          fi
+
   # ---------- OOT full validation path (schedule / workflow_dispatch) ----------
   prepare-oot-image:
     name: Prepare validation image
+    needs: [authorize]
     runs-on: build-only-atom
     permissions:
       actions: read

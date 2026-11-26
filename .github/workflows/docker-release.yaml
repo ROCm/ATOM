@@ -101,6 +101,18 @@ jobs:
     outputs:
       lines: ${{ steps.lines.outputs.lines }}
     steps:
+      - name: Authorize manual run
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: |
+          allowed="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" \
+            --jq '.user.permissions.admin or .user.permissions.maintain')"
+          if [ "${allowed}" != "true" ]; then
+            echo "::error::A manual run of ${GITHUB_WORKFLOW} needs the maintain or admin role; ${ACTOR} has neither. Ask a maintainer to trigger it."
+            exit 1
+          fi
       - name: Resolve lines
         id: lines
         run: |
