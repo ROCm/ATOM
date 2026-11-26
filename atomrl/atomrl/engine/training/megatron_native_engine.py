@@ -74,6 +74,22 @@ def _te_attention_backend(ec) -> str | None:
     return None if name == "auto" else name
 
 
+def _allow_rocm_te_recipes() -> None:
+    """Let Megatron's FP8 extra-state unpickler load ROCm TE's recipe objects.
+
+    megatron-core's SafeUnpickler lists NVIDIA TE's recipe classes. ROCm TE's
+    ``Format`` holds ``_FormatHelperFP8`` and ``_FormatMaxVals`` instead, so any
+    FP8 module's extra state -- read on every weight export, e.g. Qwen3-30B-A3B's
+    grouped experts -- was refused.
+    """
+    from megatron.core.safe_globals import SafeUnpickler
+    from transformer_engine.common import recipe
+
+    names = ("_FormatHelperFP8", "_FormatMaxVals", "MXFP4BlockScaling")
+    extra = {(recipe.__name__, n) for n in names if hasattr(recipe, n)}
+    SafeUnpickler._SAFE_CLASSES = SafeUnpickler._SAFE_CLASSES | extra
+
+
 def _mem_diag_on() -> bool:
     return os.environ.get("ATOMRL_MEM_DIAG") == "1"
 
@@ -678,6 +694,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         if fp8_kwargs:
             self._check_fp8_usable(fp8_kwargs, tfcfg)
+            _allow_rocm_te_recipes()
             if str(fp8_kwargs.get("fp8_recipe", "")).lower() == "blockwise":
                 self._check_te_supports_blockwise()
             if self._rank() == 0:
@@ -1771,11 +1788,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
             torch.tensor(local_offsets, dtype=torch.int32, device=tokens.device)
             * self._cp
         )
-        full_lens = [
-            (local_offsets[i + 1] - local_offsets[i]) * self._cp
-            for i in range(len(ids_list))
-        ]
-        mx = max(full_lens) if full_lens else 0
+        mx = self._packed_max_seqlen(local_offsets, self._cp)
         psp = PackedSeqParams(
             cu_seqlens_q=cu,
             cu_seqlens_kv=cu,

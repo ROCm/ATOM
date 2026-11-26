@@ -106,3 +106,42 @@ def test_megatron_rope_rejects_the_real_sequence_only_max():
     freqs = torch.randn(buggy_mx, 1, 1, 8)
     with pytest.raises(RuntimeError, match=r"size of tensor a \(16\).*tensor b \(4\)"):
         _apply_rotary_pos_emb_thd(t, cu, freqs, cp_group=_CP())
+
+
+def test_pipelined_forward_covers_its_pad_bin(monkeypatch):
+    """_pp_forward_model hands Megatron a max_seqlen that covers the FP8 pad bin.
+
+    A microbatch of one 4-token sequence under FP8's 16-token alignment gets a
+    12-token pad bin; with the pad left out of max_seqlen the first Qwen3-30B-A3B
+    FP8 training step failed with "size of tensor a (16) ... tensor b (4)".
+    """
+    import sys
+    from types import SimpleNamespace
+
+    import megatron.core
+
+    # Stand-ins, so other tests' megatron stubs in sys.modules do not matter: the
+    # test is about what this engine hands Megatron, not Megatron itself.
+    mpu = SimpleNamespace(get_context_parallel_rank=lambda: 0)
+    monkeypatch.setattr(megatron.core, "parallel_state", mpu, raising=False)
+    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", mpu)
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.packed_seq_params",
+        SimpleNamespace(PackedSeqParams=lambda **kw: SimpleNamespace(**kw)),
+    )
+    eng = object.__new__(MegatronNativeEngine)
+    eng._cp, eng._tp, eng._sp = 1, 1, False
+    eng._r3_enabled = False
+    eng._pad_logged = True
+    monkeypatch.setattr(eng, "_token_align", lambda: 16)
+    seen = {}
+
+    def model(input_ids, position_ids, attention_mask, packed_seq_params):
+        seen["psp"] = packed_seq_params
+        seen["tokens"] = int(input_ids.shape[-1])
+
+    eng._pp_forward_model(model, {"ids_list": [torch.ones(4, dtype=torch.long)]})
+    cu = seen["psp"].cu_seqlens_q.tolist()
+    assert cu == [0, 4, 16] and seen["tokens"] == 16
+    assert seen["psp"].max_seqlen_q == 12
