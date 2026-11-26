@@ -1,6 +1,5 @@
 model,link,label,note
 kimi-k3,https://github.com/ROCm/ATOM/pull/2894,,gfx1250 Kimi-K3 monokernel (draft); LLM-Booster#384
-kimi-k3,https://github.com/ROCm/ATOM/pull/2942,,record Kimi-K3 prefill as token graphs; LLM-Booster#398
 kimi-k3,https://github.com/ROCm/ATOM/pull/3503,,fuse the KDA o_norm into the decode recurrence (draft; ATOM#3461 is the same change on a K3 branch); LLM-Booster#549
 kimi-k3,https://github.com/ROCm/aiter/pull/7876,,wave-per-head MLA reduce for wave32 decode with few splits per tile; LLM-Booster#543
 kimi-k3,https://github.com/ROCm/aiter/pull/7937,,gfx1250 Lamport two-shot custom all-reduce replaces the LL two-shot; LLM-Booster#399
@@ -33,8 +32,6 @@ deepseek-r1,https://github.com/ROCm/ATOM/pull/3403,,"scheduler prefill initial r
 deepseek-r1,https://github.com/ROCm/aiter/pull/7332,,"gfx1250 IOD-local MoE weight placement and EP4 a4w4 grouped MoE rows; DSR1 image gfx1250-atom-20261123-dsr1, 11-17 best commit"
 deepseek-v4-pro,https://github.com/ROCm/ATOM/pull/3753,,"wo_b's input quant fused into wo_a's GEMM epilogue on gfx1250, with aiter#8505 (draft); DS PR list 2026-11-24"
 deepseek-v4-pro,https://github.com/ROCm/aiter/pull/8505,,"gfx1250 batched MXFP8 GEMM writes wo_a's output as FP8 with scales, for ATOM#3753; stacked on aiter#8312, #7587 and #6628 (all draft); DS PR list 2026-11-24"
-deepseek-v4.1-flash,https://github.com/ROCm/ATOM/pull/3535,,"fold the indexer weights_proj into the FP4 query quant, with the merged aiter#8244; DSV4.1 endpoints daily report 2026-11-20, c32 about +3%"
-deepseek-v4.1-flash,https://github.com/ROCm/ATOM/pull/2877,,"DSpark lossless draft: four launches per draft position up to 16 rows (gfx950 and gfx1250); DS PR list 2026-11-24"
 deepseek-v4.1-flash,https://github.com/ROCm/aiter/pull/7332,,"gfx1250 EP4 A4W4 grouped MoE decode rows retuned; DS PR list 2026-11-24"
 deepseek-v4.1-flash,https://github.com/ROCm/ATOM/pull/3144,,"gfx1250 MoE IOD weight preshuffle, with aiter#7332; DSV4.1 image gfx1250-atom-dsv41-pd-20261119"
 deepseek-v4.1-flash,https://github.com/ROCm/aiter/pull/7668,,"gfx1250 mx32 GEMM software-pipelined K loop, DSv4.1 rows use it; DSV4.1 image gfx1250-atom-dsv41-pd-20261119"
