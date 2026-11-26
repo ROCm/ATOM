@@ -196,3 +196,136 @@ def test_integrated_mode_does_not_touch_model_or_pools(monkeypatch):
         lambda: SimpleNamespace(disaggregation_mode="null"),
     )
     prepare_native_pd_buffers(SimpleNamespace())
+
+
+@pytest.fixture
+def native_pd_hooks(monkeypatch):
+    from sglang.srt.disaggregation import decode, prefill, utils
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    from atom.plugin.sglang.qwen4_exp_pd import install_qwen4_exp_pd_patch
+
+    # Exercise the installed initializer without allocating/capturing GPU graphs.
+    def eager_init(self, capture_decode_cuda_graph=True):
+        assert self.server_args.disable_cuda_graph
+        self.eager_initialized = True
+
+    monkeypatch.setattr(ModelRunner, "init_cuda_graphs", eager_init)
+    # The installer updates aliases imported by the two PD queue modules.
+    # Track all of them so the fixture restores them after each test.
+    for module in (utils, prefill, decode):
+        monkeypatch.setattr(module, "setup_state_kv_args", module.setup_state_kv_args)
+    monkeypatch.delenv("ATOM_FLASH_PD_VERIFY_DIR", raising=False)
+    install_qwen4_exp_pd_patch()
+    return SimpleNamespace(utils=utils, prefill=prefill, decode=decode)
+
+
+@pytest.mark.parametrize("entry", ["utils", "prefill", "decode"])
+def test_native_pd_registration_refuses_skipped_initialization(native_pd_hooks, entry):
+    args = empty_args()
+    args.state_types = [StateType.MAMBA]
+    setup = getattr(native_pd_hooks, entry).setup_state_kv_args
+    with pytest.raises(RuntimeError, match="target QSA buffers were not prepared"):
+        setup(args, SimpleNamespace(), total_kv_layers=48)
+    # Refuse before the original setup clears/registers any state descriptors.
+    assert args.state_types == [StateType.MAMBA]
+
+
+@pytest.mark.parametrize("entry", ["prefill", "decode"])
+def test_native_pd_registration_accepts_prepared_target(native_pd_hooks, entry):
+    args = empty_args()
+    pool = page_pool(2, [3], 0)
+    getattr(native_pd_hooks, entry).setup_state_kv_args(args, pool, total_kv_layers=48)
+    assert args.state_types == [StateType.QSA_COMPRESSED]
+    assert args.state_data_ptrs == [[t.data_ptr() for t in pool._atom_pd_qsa[0]]]
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_disabled_graph_startup_prepares_qsa_and_ple(
+    native_pd_hooks, monkeypatch, role
+):
+    from sglang.srt import runtime_context
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(
+        runtime_context,
+        "get_disagg",
+        lambda: SimpleNamespace(
+            disaggregation_mode=role, disaggregation_transfer_backend="mooncake"
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_context, "get_memory", lambda: SimpleNamespace(disable_radix_cache=True)
+    )
+    monkeypatch.setattr(
+        runtime_context, "get_parallel", lambda: SimpleNamespace(pp_size=1)
+    )
+    monkeypatch.setattr(bridge, "_server_args", lambda: SimpleNamespace(page_size=64))
+    monkeypatch.setattr(bridge, "_is_capturing", lambda: False)
+
+    # Tiny CPU buffers go through the real Native QSA binding, PLE allocation,
+    # Mamba sibling registration, and SGLang state descriptor builder.
+    mamba = object.__new__(MambaPool)
+    mamba.mamba_cache = SimpleNamespace(
+        conv=[torch.zeros(1, 5, 2, 3)], temporal=torch.zeros(1, 5, 2, 4, 4)
+    )
+    mamba.mamba_layer_ids = [0]
+    mamba.conv_slice_axis = 0
+    mamba.conv_shard_groups = None
+    req_pool = object.__new__(HybridReqToTokenPool)
+    req_pool.mamba_pool = mamba
+    layer = SimpleNamespace(is_qsa_attention=True, layer_num=3)
+    layer.bind_caches = lambda *buffers: setattr(layer, "bound", buffers)
+    native = SimpleNamespace(
+        modules=lambda: [layer], parameters=lambda: iter([torch.zeros(1)])
+    )
+    wrapper = type(
+        "Wrapper", (), {"__module__": "atom.plugin.sglang.models.qwen4_exp"}
+    )()
+    wrapper._atom_lm = native
+    wrapper.atom_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="qwen4_exp_text",
+            hidden_size=4,
+            hc_count=2,
+            ngram_size=3,
+            ple_conv_kernel_size=4,
+            ple_layer_ids=[2],
+            eos_token_id=9,
+            indexer_head_dim=8,
+            indexer_compress_ratio=4,
+        ),
+        torch_dtype=torch.bfloat16,
+    )
+    kv = (torch.zeros(128, 1, 4), torch.zeros(128, 1, 4))
+    pool = SimpleNamespace(size=64, page_size=64, get_kv_buffer=lambda _: kv)
+    runner = object.__new__(ModelRunner)
+    runner.model = wrapper
+    runner.token_to_kv_pool = pool
+    runner.req_to_token_pool = req_pool
+    runner.server_args = SimpleNamespace(disable_cuda_graph=True)
+    worker = object.__new__(TpModelWorker)
+    worker._model_runner = runner
+    worker.model_runner_list = [runner]
+
+    # Use the real scheduler -> TP worker -> patched ModelRunner call chain.
+    Scheduler.init_all_cuda_graphs(SimpleNamespace(tp_worker=worker, draft_worker=None))
+    assert runner.eager_initialized
+    ple = req_pool._atom_pd_ple
+    assert ple in mamba._slot_siblings
+    assert ple.conv is native._atom_ple_conv_state
+    assert ple.ngram is native._atom_ple_ngram_state
+    assert layer.bound[2].data_ptr() == pool._atom_pd_qsa[0][0].data_ptr()
+
+    args = empty_args()
+    getattr(native_pd_hooks, role).setup_state_kv_args(
+        args, pool, total_kv_layers=48, req_to_token_pool=req_pool
+    )
+    assert args.state_types == [StateType.MAMBA, StateType.QSA_COMPRESSED]
+    assert args.state_data_ptrs[0][-2:] == [ple.conv.data_ptr(), ple.ngram.data_ptr()]
+    assert args.state_data_ptrs[1] == [t.data_ptr() for t in pool._atom_pd_qsa[0]]

@@ -122,6 +122,8 @@ def append_native_qsa_state(kv_args, pool, draft_pool, total_kv_layers):
     from sglang.srt.disaggregation.utils import append_state_component
 
     if not hasattr(pool, "_atom_pd_qsa"):
+        # Non-Native callers may use this helper. The Native Flash setup
+        # wrapper below rejects an unprepared target before reaching here.
         return
     tensors, layer_ids = pool._atom_pd_qsa
     tensors, layer_ids = list(tensors), list(layer_ids)
@@ -174,6 +176,7 @@ def install_qwen4_exp_pd_patch():
 
     @functools.wraps(original_graphs)
     def init_cuda_graphs(self, *args, **kwargs):
+        # SGLang calls this initializer even when graph capture is disabled.
         prepare_native_pd_buffers(self)
         return original_graphs(self, *args, **kwargs)
 
@@ -189,6 +192,14 @@ def install_qwen4_exp_pd_patch():
         total_kv_layers=None,
         req_to_token_pool=None,
     ):
+        # Installed only while constructing a Native Flash model. Do not let
+        # a skipped initializer register SGLang's unused QSA buffers instead.
+        if not hasattr(token_to_kv_pool, "_atom_pd_qsa"):
+            raise RuntimeError(
+                "Native ATOM Qwen4Exp PD target QSA buffers were not prepared. "
+                "ModelRunner.init_cuda_graphs() must prepare Native state before "
+                "PD registration, including when CUDA graph capture is disabled."
+            )
         original_setup(
             kv_args,
             token_to_kv_pool,
