@@ -690,9 +690,7 @@ def test_worker_lookup_timeout_releases_a_finished_pin(monkeypatch, seq_factory)
     assert not p.kv_connector.admission_ready(b)  # 3 + 3 pages > half of 6.
     p._update_from_kv_xfer_finished(
         KVConnectorOutput(
-            connector_completions={
-                mc.ConnectorCompletion("pd_source_safe", a.id, True)
-            }
+            connector_completions={mc.ConnectorCompletion("pd_source_safe", a.id, True)}
         )
     )
     assert not p.kv_connector._early_pins
