@@ -24,6 +24,13 @@ from atom.mono.plan.trace import Space, note
 from atom.mono.polling import POLL_SLEEP_UNITS
 
 POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
+# a stale-only poll's buffer records (``Mailbox.poll(stale_only=True)``):
+# a lane's settled spec loads at word STALE_WORD, past them -- out of range, so
+# no memory access and zeros -- its stale specs in range (a mailbox region is
+# far smaller)
+STALE_RECORDS = 1 << 30
+STALE_WORD = (1 << 29) - 4
+assert STALE_WORD * 4 >= STALE_RECORDS
 
 
 @traced
@@ -34,6 +41,23 @@ def _spin(load_all, pending):
     while pending(v):
         rocdl.s_sleep(POLL_SLEEP_UNITS)
         v = load_all()
+    return v
+
+
+@traced
+def _spin_stale(load_all, load_stale, pending, merge):
+    """``_spin`` re-loading only each lane's stale specs: a pass's loads
+    of a spec whose tags matched are masked out of range (no memory access)
+    and its words kept, a tagged pair once current staying so for the layer
+    (the same words, the same tag checks). The retry's loads all issue before
+    any merge reads one (in-order vmcnt: a merge between them would wait for
+    each in turn)."""
+    v = load_all()
+    while pending(v):
+        rocdl.s_sleep(POLL_SLEEP_UNITS)
+        w = load_stale(v)
+        rocdl.sched_barrier(0)
+        v = merge(v, w)
     return v
 
 
@@ -417,7 +441,7 @@ class Mailbox:
             return v, between()
         return v
 
-    def poll(self, specs, batch=POLL_MAX, between=None):
+    def poll(self, specs, batch=POLL_MAX, between=None, stale_only=False):
         """Batched poll of pairs ``specs`` = [(Addr, pair index, npairs in {1, 2})],
         each loaded at its own space's scope; two pairs of a dual region at a
         ``Quad`` (``_word``).
@@ -460,7 +484,59 @@ class Mailbox:
 
         first = specs[0][1]
         first = first.q * 2 if isinstance(first, Quad) else first
-        v = self.spin(specs[0][0], first, load_all, pending, between)
+        if const_expr(stale_only):
+            # one batch whose retries re-load each lane's stale specs
+            # alone (``_spin_stale``): the router's LIN / LSSQ poll
+            assert between is None and self.diag is None and len(specs) <= batch
+            srs = [rsrc(b, STALE_RECORDS) for b in bases]
+            at = [_pair_word(a, i, n) for a, i, n in specs]
+            ends = list(itertools.accumulate(2 * n for _, _, n in specs))
+
+            def stale(v, k):
+                # spec k's pairs not all at this launch's tag (``pending``'s
+                # test, a spec at a time)
+                e = ends[k] - 2 * specs[k][2]
+                bad = v[e + 1] != tag
+                for q in range_constexpr(1, specs[k][2]):
+                    bad = bad | (v[e + 2 * q + 1] != tag)
+                return bad
+
+            def load_masked(live):
+                # ``live[k]``: spec k loaded in range where true, else at
+                # STALE_WORD (dropped); None: in range
+                words = []
+                for k in range_constexpr(len(specs)):
+                    n = specs[k][2]
+                    off = at[k]
+                    if const_expr(live[k] is not None):
+                        off = live[k].select(off, fx.Int32(STALE_WORD))
+                    w = fx.Vector(
+                        bo.buffer_load(
+                            srs[k], off, vec_width=2 * n, dtype=T.i32,
+                            cache_modifier=cms[k],
+                        )
+                    )  # fmt: skip
+                    words += [w[e] for e in range(2 * n)]
+                return fx.Vector.from_elements(words, fx.Int32)
+
+            def load_first():
+                return load_masked([None] * len(specs))
+
+            def load_stale(v):
+                return load_masked([stale(v, k) for k in range(len(specs))])
+
+            def merge(v, w):
+                # a stale spec's words from this pass, a settled one's kept
+                words = []
+                for k in range_constexpr(len(specs)):
+                    bad = stale(v, k)
+                    e0 = ends[k] - 2 * specs[k][2]
+                    words += [bad.select(w[e], v[e]) for e in range(e0, ends[k])]
+                return fx.Vector.from_elements(words, fx.Int32)
+
+            v = _spin_stale(load_first, load_stale, pending, merge)
+        else:
+            v = self.spin(specs[0][0], first, load_all, pending, between)
         if const_expr(between is not None):
             v, extra = v
         outs, e = [], 0

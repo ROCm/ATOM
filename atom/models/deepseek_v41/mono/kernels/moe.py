@@ -432,7 +432,9 @@ def router_x_normed(c, part, g0, per, tiles):
     for u, col in zip(us, cols):
         tok = fx.min(plus(g0, u // ROUTER_UNITS), s - 1)
         specs.append((dn["lin"], Quad((tok * HIDDEN + col) // 4), 2))
-    got = dn["poll"](specs)
+    # a retry re-loads only a lane's stale specs: past the first pass the
+    # 48 router CTAs' 2.2 MB a pass shrinks to the pairs still outstanding
+    got = dn["poll"](specs, stale_only=True)
     per_tok = len(lssq_specs(dn["lssq"], 0, lane))
     for k in range_constexpr(waves_tokens):
         r = lin_rstd(lane, got[k * per_tok : (k + 1) * per_tok])
