@@ -41,6 +41,8 @@ from atom.model_ops.deepseek_v41.paged_scoring import (
     score_topk_quantized,
 )
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+from atom.model_ops.indexer.layout import _MAX_FUSED_PROJECT_ROWS, NATURAL
+from atom.model_ops.indexer.query import project_query_fp4
 from atom.model_ops.layernorm import (
     DualRMSNormBF16,
     DualRMSNormMXFP8,
@@ -106,6 +108,9 @@ class Indexer(nn.Module):
             quant_config=converted_linear_config(config),
         )
         self.weights_proj = ReplicatedLinear(config.hidden_size, self.heads, bias=False)
+        # Read the fuse flag once: `project` runs it under `@eager_region`, so
+        # an `os.getenv` there would cost ~1.5us every step.
+        self.fuse_weights_proj = envs.ATOM_DSV41_FUSE_WEIGHTS_PROJ
         if spec.mode == AttentionMode.FULL:
             self.wk = ReplicatedLinear(config.head_dim, self.head_dim, bias=False)
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
@@ -141,9 +146,10 @@ class Indexer(nn.Module):
         The query is left on the grid its reader rounds it to. The published
         model FP4-rounds both sides whatever it holds; the FP8 scorer quantizes
         the query itself, so rounding first would round twice, and on the FP4
-        plane one kernel rotates and quantizes it (`quantize_query_fp4`). `qr`
-        arrives quantized, so this GEMM reuses that pair rather than quantizing
-        the tensor a second time.
+        plane one kernel rotates and quantizes it (`quantize_query_fp4`, or
+        `project_query_fp4` on the gfx1250 NATURAL plane, which also folds in
+        the `weights_proj` projection). `qr` arrives quantized, so this GEMM
+        reuses that pair rather than quantizing the tensor a second time.
 
         Apart from `score` so that a compressor's join has somewhere to sit
         that is neither before this nor after the plane is read.
@@ -152,13 +158,30 @@ class Indexer(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        weights = self.weights_proj(hidden)[0]
         if cache.geometry.index_fp4:
             units = cache.index_units[self.spec.kv_owner]
+            # `query.shape` is read only after the layout test. MFMA and
+            # PRESHUFFLE never fuse, and that Size read is measurable on every
+            # FP4 step. `fuse_weights_proj` is set once in `__init__`.
+            if (
+                self.fuse_weights_proj
+                and units.layout == NATURAL
+                and 0 < query.shape[1] <= _MAX_FUSED_PROJECT_ROWS
+            ):
+                # The query's RoPE + MXFP4 quant launch also projects the head
+                # weights, folding `weights_proj` into it rather than running it
+                # as a separate GEMM. The scorer still folds `weights_scale`
+                # (see score_quantized), so the fused weights stay raw
+                # (weights_scale=1.0 here).
+                return project_query_fp4(
+                    query[0], rope, positions, hidden[0], self.weights_proj.weight
+                )
+            weights = self.weights_proj(hidden)[0]
             return (
                 quantize_query_fp4(query[0], rope, positions, layout=units.layout),
                 weights,
             )
+        weights = self.weights_proj(hidden)[0]
         return rope(query, positions)[0], weights
 
     def score(self, query, weights, cache, step):

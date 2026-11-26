@@ -401,13 +401,18 @@ def test_the_pending_work_probe_counts_a_replay_wider_than_the_budget():
     """The local prefill probe asks admission's question; a replay that cannot
     pass its hit this step is still work, not the end of the queue."""
     engine, _ = _engine_with_a_replayed_head(budget=4)
-    assert engine._local_prefill_pending_work() == (True, 4)
+    assert engine._local_prefill_pending_work(limits=engine._prefill_limits()) == (
+        True,
+        4,
+    )
 
 
 def test_the_cost_estimate_starts_a_replayed_head_where_admission_does():
     engine, _ = _engine_with_a_replayed_head(budget=64)
     # 15 rows from the replay's start (25), not 8 from the hit (32).
-    assert engine._estimate_prefill_chunk_cost() == engine._chunk_cost(32 - REPLAY, 15)
+    assert engine._estimate_prefill_chunk_cost(
+        limits=engine._prefill_limits()
+    ) == engine._chunk_cost(32 - REPLAY, 15)
 
 
 def test_a_late_publish_keeps_to_the_replay_it_was_scheduled_with():
@@ -457,10 +462,21 @@ def test_a_continued_replay_counts_the_long_prefill_cap_from_its_hit():
     seq.replay = Replay(32, True, (), 32 - REPLAY)
     seq.num_cached_tokens = 28  # an earlier chunk ended inside the replay
     chunk = Scheduler._partial_prefill_chunk(
-        engine, seq, 28, 28, 0, cap_from=max(28, seq.replay_until)
+        engine,
+        seq,
+        28,
+        28,
+        0,
+        cap_from=max(28, seq.replay_until),
+        budget=engine.max_num_batched_tokens,
     )
     assert chunk == 32 + 3 - 28
-    assert Scheduler._partial_prefill_chunk(engine, seq, 28, 28, 0) == 3
+    assert (
+        Scheduler._partial_prefill_chunk(
+            engine, seq, 28, 28, 0, budget=engine.max_num_batched_tokens
+        )
+        == 3
+    )
 
 
 def test_a_replay_past_the_prompt_demands_nothing():
@@ -616,7 +632,7 @@ def test_a_finished_load_is_sized_as_a_resume_without_rewalking_its_hit():
     bm.can_allocate_memoized = lambda s: walks.append(s) or real(s)
     engine._prioritize_ready_remote_kv_requests()
     assert seq.status == SequenceStatus.WAITING and seq.num_cached_tokens == 36
-    assert engine._local_prefill_pending_work()[0]
-    engine._estimate_prefill_chunk_cost()
+    assert engine._local_prefill_pending_work(limits=engine._prefill_limits())[0]
+    engine._estimate_prefill_chunk_cost(limits=engine._prefill_limits())
     assert not walks
     assert seq.replays_hit

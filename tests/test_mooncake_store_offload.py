@@ -4987,7 +4987,13 @@ def test_scheduler_binds_the_cancelling_abort_only_for_such_a_connector(
     import atom.utils.forward_context as fc
 
     connector = (
-        None if flag is None else SimpleNamespace(cancels_undispatched_loads=flag)
+        None
+        if flag is None
+        else SimpleNamespace(
+            cancels_undispatched_loads=flag,
+            # Keeps ATOM's own pool, as `KVConnectorSchedulerBase` does.
+            make_block_pool=lambda *args, **kwargs: None,
+        )
     )
     monkeypatch.setattr(fc, "get_kvconnector", lambda role, config: connector)
     engine = Scheduler(MockConfig(num_kvcache_blocks=8, max_model_len=64))
