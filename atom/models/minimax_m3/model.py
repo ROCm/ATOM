@@ -627,7 +627,7 @@ class MiniMaxM3SparseAttention(nn.Module):
 
     def _attn_qout(self) -> bool:
         """ATOM_M3_ATTN_QOUT: the attention writes o_proj's MXFP8 input (needs the aiter ``quant_out`` and a
-        native MXFP8 o_proj that does not run BF16, and no TR_HYBRID token graphs); decided once, at the first
+        native MXFP8 o_proj that does not run BF16, no TR_HYBRID token graphs and no Ulysses SP); decided once, at the first
         trace."""
         ok = getattr(self, "_qout_ok", None)
         if ok is None:
@@ -645,6 +645,9 @@ class MiniMaxM3SparseAttention(nn.Module):
                 and not _uses_tr_hybrid_graph()
                 and self.attn.impl.kv_cache_dtype == "nvfp4"
                 and self.attn.impl.indexer_cp_group is None
+                # Ulysses SP: gather_heads consumes the BF16 output after the head
+                # exchange, which the parked codes/scales do not take part in.
+                and getattr(self.attn, "sp_columns", None) is None
             )
             if ok:
                 self.attn.impl._qout_enabled = True

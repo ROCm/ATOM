@@ -80,7 +80,7 @@ def test_aiter_supports(monkeypatch):
     attn_qout.aiter_supports.cache_clear()
 
 
-def _qout_layer(monkeypatch, *, runs_bf16=False, mode=None):
+def _qout_layer(monkeypatch, *, runs_bf16=False, mode=None, sp_columns=None):
     """A MiniMaxM3SparseAttention stand-in that reaches ``_attn_qout`` with every other gate open."""
     pytest.importorskip("aiter")
     from atom.models.minimax_m3 import model as m3
@@ -96,7 +96,7 @@ def _qout_layer(monkeypatch, *, runs_bf16=False, mode=None):
     )
     layer = SimpleNamespace(
         o_proj=SimpleNamespace(native_a8_group_rows=4, runs_bf16=runs_bf16),
-        attn=SimpleNamespace(impl=impl),
+        attn=SimpleNamespace(impl=impl, sp_columns=sp_columns),
     )
     return m3.MiniMaxM3SparseAttention._attn_qout(layer), impl
 
@@ -124,3 +124,9 @@ def test_attn_qout_allowed_under_full_graph(monkeypatch):
 
     ok, _ = _qout_layer(monkeypatch, mode=CUDAGraphMode.FULL_DECODE_ONLY)
     assert ok
+
+
+def test_attn_qout_refused_under_ulysses_sp(monkeypatch):
+    """The head exchange (gather_heads) only carries the BF16 output, so the codes cannot follow it."""
+    ok, impl = _qout_layer(monkeypatch, sp_columns=object())
+    assert not ok and not impl._qout_enabled
