@@ -131,6 +131,22 @@ def _alloc_ring(nbytes: int) -> int:
     return p.value
 
 
+def _hop_group(ranks: list[int], hop: int, rank_in_group: int):
+    """The two-rank gloo group of fabric hop ``hop`` (stages ``hop``, ``hop + 1``),
+    created by those two ranks alone; None on every other rank.
+
+    With the default group bound to a device (eager NCCL init), torch has every
+    rank outside a new group join an ``ncclCommSplit`` for it, which the gloo
+    group's own members never join: in an 8-rank selftest (e15-07 + e15-05,
+    11-27) the six other ranks segfaulted there. ``use_local_synchronization``
+    keeps them out of the call altogether (the group is named from its ranks)."""
+    if rank_in_group not in (hop, hop + 1):
+        return None
+    return torch.distributed.new_group(
+        [ranks[hop], ranks[hop + 1]], backend="gloo", use_local_synchronization=True
+    )
+
+
 def _stream(stream: torch.cuda.Stream) -> ctypes.c_void_p:
     return ctypes.c_void_p(stream.cuda_stream)
 
@@ -312,22 +328,29 @@ class PPMailbox:
         from atom.distributed import pp_fabric
 
         r = group.rank_in_group
-        why_not_fabric = "off"
-        if use_mailbox and fabric is not None:
-            why_not_fabric = pp_fabric.probe_fabric(device)  # local; None: usable
-        gathered: list = [None] * group.world_size
-        torch.distributed.all_gather_object(
-            gathered,
-            (socket.gethostname(), use_mailbox, why_not_fabric is None, why_not_fabric),
-            group=group.cpu_group,
-        )
-        stages = [pp_fabric.StageEnd(h, m, f) for h, m, f, _ in gathered]
         # A fabric hop builds a two-rank group, which every rank of the default
         # group must create: only when the PP group is the whole world.
         fabric_allowed = (
             fabric is not None
             and torch.distributed.get_world_size() == group.world_size
         )
+        hosts: list = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            hosts, socket.gethostname(), group=group.cpu_group
+        )
+        # Only the two ends of a hop between hosts set mori up: no other rank
+        # can use it.
+        fabric_ends = pp_fabric.fabric_hop_ends(hosts) if fabric_allowed else set()
+        why_not_fabric = "off"
+        if use_mailbox and r in fabric_ends:
+            why_not_fabric = pp_fabric.probe_fabric(device)  # local; None: usable
+        gathered: list = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            gathered,
+            (use_mailbox, why_not_fabric is None, why_not_fabric),
+            group=group.cpu_group,
+        )
+        stages = [pp_fabric.StageEnd(h, m, f) for h, (m, f, _) in zip(hosts, gathered)]
         kinds = pp_fabric.plan_hop_transports(stages, fabric_allowed)
         self.recv_kind = None if first else kinds[r - 1]
         self.send_kind = None if last else kinds[r]
@@ -378,28 +401,25 @@ class PPMailbox:
         if self.recv_kind == "ipc":
             self._peer_credit_page = open_ipc_handle(prev["credit_page"])
 
-        # "fabric" hops: every rank creates every such hop's two-rank group, in
-        # hop order (new_group is collective over the world); the hop's two ends
-        # then map each other's buffer. If either end cannot, both keep NCCL.
+        # "fabric" hops: the hop's two ends create its two-rank group (no other
+        # rank takes part) and map each other's buffer. If either end cannot,
+        # both keep NCCL.
         self._fabric_in = self._fabric_out = None
         for h, kind in enumerate(kinds):
-            if kind != "fabric":
+            pair = _hop_group(group.ranks, h, r) if kind == "fabric" else None
+            if pair is None:
                 continue
-            pair = torch.distributed.new_group(
-                [group.ranks[h], group.ranks[h + 1]], backend="gloo"
-            )
-            if r in (h, h + 1):
-                hop = pp_fabric.FabricHop(
-                    role="send" if r == h else "recv",
-                    layout=self.out_layout if r == h else self.in_layout,
-                    group=pair, device=device, options=fabric,
-                )  # fmt: skip
-                if r == h:
-                    self._fabric_out = hop if hop.ok else None
-                    self.send_kind = "fabric" if hop.ok else "nccl"
-                else:
-                    self._fabric_in = hop if hop.ok else None
-                    self.recv_kind = "fabric" if hop.ok else "nccl"
+            hop = pp_fabric.FabricHop(
+                role="send" if r == h else "recv",
+                layout=self.out_layout if r == h else self.in_layout,
+                group=pair, device=device, options=fabric,
+            )  # fmt: skip
+            if r == h:
+                self._fabric_out = hop if hop.ok else None
+                self.send_kind = "fabric" if hop.ok else "nccl"
+            else:
+                self._fabric_in = hop if hop.ok else None
+                self.recv_kind = "fabric" if hop.ok else "nccl"
 
         self.send_enabled = self.send_kind in ("ipc", "fabric")
         self.recv_enabled = self.recv_kind in ("ipc", "fabric")
@@ -437,8 +457,8 @@ class PPMailbox:
             "".join(", " + x for x in rings),
         )  # fmt: skip
         if r == 0 and fabric is not None:
-            for s, (_, _, ok, why) in enumerate(gathered):
-                if not ok:
+            for s, (_, ok, why) in enumerate(gathered):
+                if s in fabric_ends and not ok:
                     logger.warning(
                         "PP mailbox: fabric hops unavailable on stage %d: %s", s, why
                     )
