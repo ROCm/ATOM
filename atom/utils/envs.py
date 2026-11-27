@@ -1544,7 +1544,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
-    # Default on (0 turns it off). Offload load wait without a hold
+    # Default on (0 turns it off). Offload load wait, the doorbell part
     # (`atom/kv_transfer/offload/load_wait.py`): each step of the
     # single-engine and DP loops runs the early tier load ahead of schedule()
     # and ships its loads, workers ring a doorbell when a load job ends, and
@@ -1554,13 +1554,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_LOAD_EVENT_WAIT": lambda: _flag_env(
         "ATOM_OFFLOAD_LOAD_EVENT_WAIT", "1"
     ),
-    # Default off. With ATOM_OFFLOAD_LOAD_EVENT_WAIT, also hold the step for
-    # the loads it started while the trade pays (`LoadWaitState.budget_s`,
-    # at most one forward). The bound is rank-local but its cost lands on
-    # every DP peer: enable only once it is group-aware, or after measuring it
-    # with the prefill delayer on and in 4P8D.
+    # Default on (0 turns it off). With ATOM_OFFLOAD_LOAD_EVENT_WAIT, also
+    # hold the step for the loads it started while the trade pays
+    # (`LoadWaitState.budget_s`: tick * gain / (cost * dp_size), at most one
+    # forward, ~0 while decodes run). The DP peers the hold delays are charged
+    # through cost * dp_size.
     "ATOM_OFFLOAD_LOAD_WAIT_HOLD": lambda: _flag_env(
-        "ATOM_OFFLOAD_LOAD_WAIT_HOLD", "0"
+        "ATOM_OFFLOAD_LOAD_WAIT_HOLD", "1"
     ),
     # Minimum external-tier hit worth loading, in tokens. None when unset: each
     # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
