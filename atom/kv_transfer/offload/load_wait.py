@@ -307,10 +307,12 @@ class OffloadLoadWait:
         self._seen_rings = progress_doorbell.rings()
         return time.monotonic()
 
-    def _collect_answer_after(self, rung_at: float) -> bool:
+    def _collect_answer_after(self, rung_at: float) -> tuple[bool, bool]:
         """Apply the outstanding completion answer if it is in (which requests
-        the next) and ship what it released; True when the answer applied was
-        requested after `rung_at`, so it holds the completion that rang."""
+        the next) and ship what it released. Returns `(answered, fresh)`:
+        an answer was applied, and it was requested after `rung_at`, so it
+        holds the completion that rang. An older answer can still have landed
+        loads (it may hold completions that rang before or with this ring)."""
         engine = self._engine
         asked_at = self._asked_at
         now = time.monotonic()
@@ -320,7 +322,7 @@ class OffloadLoadWait:
             self._asked_at = now
         # A load parked on its lease renewal leaves as soon as it is free.
         self._ship_connector_meta()
-        return answered and asked_at >= rung_at
+        return answered, answered and asked_at >= rung_at
 
     def _fetch_fresh_answer(self) -> None:
         """A load ended since the last answer (an unread doorbell): fetch one
@@ -336,7 +338,7 @@ class OffloadLoadWait:
         while True:
             # Cleared before the poll: an answer arriving after it wakes the wait.
             event.clear()
-            if self._collect_answer_after(rung_at):
+            if self._collect_answer_after(rung_at)[1]:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
@@ -370,8 +372,16 @@ class OffloadLoadWait:
                 self.state.wakes += 1
             # Cleared before the poll: an answer arriving after it wakes the wait.
             event.clear()
-            if self._collect_answer_after(rung_at):
+            answered, fresh = self._collect_answer_after(rung_at)
+            if fresh:
                 rung_at = None
+                continue
+            if answered:
+                # An answer requested before the ring can already hold every
+                # started load's completion: re-check `pending` before waiting
+                # for the next one (one query round trip). The ring stays
+                # unread until a fresh answer, so a load still pending is
+                # waited for exactly as before.
                 continue
             # The outstanding answer (or the one just requested) is still out.
             event.wait(max(0.0, deadline - time.monotonic()))

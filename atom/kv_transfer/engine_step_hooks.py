@@ -5,7 +5,8 @@
 
 A step hook has two methods: `before_schedule()`, called ahead of every
 `schedule()` of the engine loop, and `on_forward_done(seconds)`, called after
-every real forward with its wall time. The engine knows nothing else of them.
+every real or DP dummy forward with its wall time. The engine knows nothing
+else of them.
 """
 
 from __future__ import annotations

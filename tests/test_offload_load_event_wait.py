@@ -249,6 +249,68 @@ def test_hold_ends_on_the_doorbell_not_at_its_bound(
     assert _stats(engine).wakes == 1
 
 
+class _LateReplyMgr(_Mgr):
+    """A worker that reaches each completion query late: an answer's snapshot
+    is taken when it is collected (so a query requested before a ring can
+    carry the completion that rang), and each new query is answered only
+    after `reply_s`."""
+
+    def __init__(self, *args, reply_s, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reply_s = reply_s
+        self.ready_at = 0.0
+
+    def _request(self):
+        self.pending = (time.monotonic(), set())
+        self.ready_at = time.monotonic() + self.reply_s
+        timer = threading.Timer(self.reply_s, self.progress_event.set)
+        timer.start()
+        self.timers.append(timer)
+
+    def collect(self):
+        if self.pending is not None:
+            if time.monotonic() < self.ready_at:
+                self.calls.append("poll")
+                return None
+            with self.lock:
+                snapshot = set(self.landed)
+                self.landed -= snapshot
+            self.pending = (self.pending[0], snapshot)
+        return super().collect()
+
+
+def test_an_older_answer_that_lands_every_load_ends_the_hold_at_once(
+    engine_core, monkeypatch, seq_factory
+):
+    """A query requested before the ring can already finish every started
+    load. The hold re-checks the loads after applying it instead of waiting
+    one more query round trip (here 0.5 s) for an answer requested after the
+    ring."""
+    sched, _, (seq,) = _fire(monkeypatch, seq_factory)
+    engine, _ = _engine(engine_core, sched, tick_s=2.0, delay=0)
+    mgr = _LateReplyMgr(sched, engine._wake_event, delay=0, reply_s=0.5)
+    engine.runner_mgr = mgr
+    engine._collect_kv_transfer_progress = mgr.collect
+    try:
+        # The query left with the last forward and its answer is in, but the
+        # worker reached it only after the load below landed.
+        mgr.pending = (time.monotonic(), set())
+        mgr.ready_at = 0.0
+
+        t0 = time.monotonic()
+        _step(engine_core, engine)
+        elapsed = time.monotonic() - t0
+
+        assert mgr.forwards == [[seq.id]]  # this step's forward
+        assert elapsed < 0.25  # not the next answer's 0.5 s round trip
+        stats = _stats(engine)
+        assert (stats.waits, stats.landed, stats.timed_out) == (1, 1, 0)
+        held = mgr.calls[: mgr.calls.index("forward")]
+        assert held.count("poll") == 1  # no poll for the next answer
+    finally:
+        mgr.stop()
+
+
 def test_late_load_rides_the_forward_after_the_bound(
     engine_core, monkeypatch, seq_factory
 ):
