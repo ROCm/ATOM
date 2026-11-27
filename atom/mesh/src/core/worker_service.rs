@@ -235,7 +235,9 @@ impl WorkerService {
             );
         }
 
-        config.dp_aware = self.router_config.dp_aware;
+        config.dp_aware = self.router_config.dp_aware
+            && !(self.router_config.dp_aware_prefill_only
+                && config.worker_type.as_deref() == Some("decode"));
 
         let worker_url = config.url.clone();
         let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);

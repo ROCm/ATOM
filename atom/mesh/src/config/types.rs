@@ -85,6 +85,10 @@ pub struct RouterConfig {
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     pub dp_aware: bool,
+    /// With `dp_aware`, address DP ranks on the prefill pool only: a decode worker stays
+    /// one worker, and its engine places each request on a rank.
+    #[serde(default)]
+    pub dp_aware_prefill_only: bool,
     /// Follow the KV cache events each worker reports at `/kv_event_sources`.
     #[serde(default)]
     pub kv_events: bool,
@@ -590,6 +594,7 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
+            dp_aware_prefill_only: false,
             kv_events: false,
             mooncake_admin_port: default_mooncake_admin_port(),
             kv_storage_deadline_ms: default_kv_storage_deadline_ms(),

@@ -422,7 +422,10 @@ impl JobQueue {
                         health_failure_threshold: router_config.health_check.failure_threshold,
                         disable_health_check: router_config.health_check.disable_health_check,
                         max_connection_attempts: router_config.health_check.success_threshold * 10,
-                        dp_aware: router_config.dp_aware,
+                        // A decode worker stays one worker under
+                        // `dp_aware_prefill_only`: its engine picks the rank.
+                        dp_aware: router_config.dp_aware
+                            && !(router_config.dp_aware_prefill_only && worker_type == "decode"),
                     };
 
                     let job = Job::AddWorker {

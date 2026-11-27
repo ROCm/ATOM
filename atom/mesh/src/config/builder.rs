@@ -374,6 +374,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn dp_aware_prefill_only(mut self, enable: bool) -> Self {
+        self.config.dp_aware_prefill_only = enable;
+        self
+    }
+
     pub fn kv_events(mut self, enable: bool) -> Self {
         self.config.kv_events = enable;
         self
