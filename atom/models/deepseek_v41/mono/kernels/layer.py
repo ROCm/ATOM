@@ -356,8 +356,7 @@ def build_layer(key: LayerBuild):
         tls = alloc.allocate(Stamps).peek().tls.ptr
         smem = alloc.allocate(Parts)
         lds = {n: getattr(smem, n).peek() for n in members}
-        bases = peer_bases(peers, rs.dims.ranks)
-        args_1 = attn_pre_args(
+        k1_args = lambda: attn_pre_args(  # noqa: E731
             k1_res_in, k1_pend, k1_post_in, k1_comb_in, k1_pre_in, k1_hc_fn,
             k1_hc_scale, k1_hc_base, k1_attn_w, k1_wqkv, k1_wqkv_s, k1_qn_w, k1_kvn_w,
             k1_wqb, k1_wqb_s, k1_cos, k1_sin, k1_pos, k1_ring, k1_ring_scale,
@@ -365,6 +364,21 @@ def build_layer(key: LayerBuild):
             k1_normed, k1_qr_out, k1_qrs_out, k1_aux, k1_iq_w, k1_iq_ws, k1_iw_w,
             k1_iq_out, k1_iqs_out, k1_iw_out, ibound,
         )  # fmt: skip
+
+        # the seam A slice unit's first loads before any peer table's
+        # (their readfirstlanes waited on them, the slice's loads after:
+        # a cold round trip in series on every slice's path). At TP8 only (no
+        # gain measured at TP4, whose kernel sits near the VGPR cap). Only where
+        # it prefetches are K1's args made ahead of the tables: every other
+        # build traces as before
+        entry_pre, args_1 = None, None
+        prefetch = pre.shard and pre.slice_x8 and pre.fold and pre.tp == 8
+        if const_expr(prefetch):
+            args_1 = k1_args()
+            entry_pre = k1.slice_entry_prefetch(args_1, s, pre.tp, bid, rank)
+        bases = peer_bases(peers, rs.dims.ranks)
+        if const_expr(not prefetch):
+            args_1 = k1_args()
         args_1["kvrow"] = kvrow
         args_a = attn_post_args(
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
@@ -456,7 +470,7 @@ def build_layer(key: LayerBuild):
         run_attn_pre(
             c1, co1, pre, tls, 0, lds["k1_iw"].nbl.ptr, gates=False,
             after_norm=None if comp is None else lambda: compress_stage(cp.project, cc),
-            q_apart=key.q_apart,
+            q_apart=key.q_apart, entry_pre=entry_pre,
         )  # fmt: skip
         if const_expr(comp is not None):
             compress_stage(cp.plan_rows, cc)

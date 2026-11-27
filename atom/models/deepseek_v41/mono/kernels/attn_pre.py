@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
@@ -555,6 +556,21 @@ def from_lane(v, k: int):
     return v
 
 
+# the entry prefetch of a CTA without a slice unit loads at these
+# elements, past every buffer's records (bytes 0x7FFFFFF0): out of range, no
+# memory access, zeros it never reads
+PTB_OOB_WORD = (1 << 29) - 4  # an i32 / f32 element
+PTB_OOB_HALF = (1 << 30) - 8  # a bf16 element
+
+
+def _ld_live(ptr, nbytes, i, live, dtype, oob):
+    """Element ``i`` of a ``nbytes`` buffer, at ``oob`` (out of range)
+    where ``live`` is false: ``ld_i32`` / ``ld_f32`` / ``ld_bf``'s load."""
+    return bo.buffer_load(
+        rsrc(ptr, nbytes), live.select(i, fx.Int32(oob)), vec_width=1, dtype=dtype
+    )
+
+
 def slice_direct_loads(c, c0, q):
     """Thread q's inputs: lane group q / split's (row, columns c0 + 2 ..),
     every stream's residual pair (a word); its own streams' comb columns,
@@ -574,6 +590,43 @@ def slice_direct_loads(c, c0, q):
     post = [ld_f32(a["post_in"], t * HC + o[j]) for j in own]
     pre = [ld_f32(a["pre_in"], t * HC + o[j]) for j in own]
     return res, cm, post, pre
+
+
+def slice_direct_loads_live(c, c0, q, live):
+    """``slice_direct_loads`` for the entry prefetch
+    (``slice_entry_prefetch``): the loads out of range where ``live`` is
+    false (each buffer's resource sized to its S rows), and the pair's two
+    ``pend`` values too (``pend_value``'s, from ``pend``)."""
+    a = c["args"]
+    s = c["S"]
+    split = slice_split(s)
+    g = q % split
+    p = q // split
+    t = p // (COLS // 2)
+    col = c0 + 2 * (p % (COLS // 2))
+    own = range(HC // split)
+    o = [g * (HC // split) + j for j in own]
+    i32 = lambda name, i, n: fx.Int32(  # noqa: E731
+        _ld_live(a[name], n, i, live, T.i32, PTB_OOB_WORD)
+    )
+    f32 = lambda name, i, n: fx.Float32(  # noqa: E731
+        _ld_live(a[name], n, i, live, T.f32, PTB_OOB_WORD)
+    )
+    bf = lambda name, i, n: fx.Float32(  # noqa: E731
+        fx.BFloat16(_ld_live(a[name], n, i, live, T.bf16, PTB_OOB_HALF))
+    )
+    res = [
+        i32("res_in", ((t * HC + h) * HIDDEN + col) // 2, s * HC * HIDDEN * 2)
+        for h in range(HC)
+    ]  # fmt: skip
+    cm = [
+        [f32("comb_in", (t * HC + h) * HC + o[j], s * HC * HC * 4) for h in range(HC)]
+        for j in own
+    ]  # fmt: skip
+    post = [f32("post_in", t * HC + o[j], s * HC * 4) for j in own]
+    pre = [f32("pre_in", t * HC + o[j], s * HC * 4) for j in own]
+    pend = [bf("pend", t * HIDDEN + col + d, s * HIDDEN * 2) for d in range(2)]
+    return res, cm, post, pre, pend
 
 
 @traced
@@ -599,9 +652,15 @@ def slice_direct_pair(c, task, q, got, wn0=None):
         t = p // (COLS // 2)
         cc = 2 * (p % (COLS // 2))
         col = c0 + cc
-        res, cm, post, pre = got
+        # the statements in their earlier order where pend is not prefetched:
+        # the seam F slice's (and every non-prefetching build's) code unchanged
+        res, cm, post, pre = got[:4]
         r = [[bf_lo(w), bf_hi(w)] for w in res]
-        pend = [pend_value(c, t, col + d, cc + d) for d in range(2)]
+        if const_expr(len(got) == 5):
+            # pend prefetched with the rows (``slice_entry_prefetch``)
+            pend = got[4]
+        else:
+            pend = [pend_value(c, t, col + d, cc + d) for d in range(2)]
         new = []
         for j in range_constexpr(own):
             o = g * own + j
@@ -741,6 +800,71 @@ def slice_fn_loads(c, task):
     return fns
 
 
+def slice_fn_loads_live(c, task, live):
+    """``slice_fn_loads`` for the entry prefetch: out of range where ``live``
+    is false (``_ld_live``)."""
+    a = c["args"]
+    c0 = task * COLS
+    fns = []
+    for i in range_constexpr(MIX * KT // THREADS):
+        e = c["tid"] + THREADS * i
+        j = e // KT
+        o = (e % KT) // COLS
+        at = j * K_MIX + o * HIDDEN + c0 + e % COLS
+        fns.append(fx.Float32(
+            _ld_live(a["hc_fn"], MIX * K_MIX * 4, at, live, T.f32, PTB_OOB_WORD)
+        ))  # fmt: skip
+    return fns
+
+
+def slice_wns(c, c0, live):
+    """A ``slice_x8`` direct slice's norm weights of each round's columns
+    (``stage_slice``'s), for the entry prefetch: out of range where ``live``
+    is false."""
+    s, tid = c["S"], c["tid"]
+    last0 = slice_direct_threads(s) - 1
+    split0 = slice_split(s)
+    wns = []
+    for r in range_constexpr(slice_direct_rounds(s)):
+        q = fx.min(plus(tid, THREADS * r), last0)
+        col = c0 + 2 * (q // split0 % (COLS // 2))
+        wns.append([
+            fx.Float32(fx.BFloat16(_ld_live(
+                c["args"]["attn_w"], HIDDEN * 2, col + d, live, T.bf16, PTB_OOB_HALF
+            )))
+            for d in range(2)
+        ])  # fmt: skip
+    return wns
+
+
+def slice_entry_prefetch(args, s, tp, bid, rank):
+    """The layer kernel's seam A slice unit's first loads (sharded,
+    ``slice_x8``, folding), issued at the kernel's entry, before its peer
+    tables' loads (``peer_bases``, ``x8_dst``) whose readfirstlanes waited on
+    them and only then let the slice's go out: a cold round trip in series
+    on every slice's path. In issue order as ``stage_slice`` issues them --
+    the norm weights, the mix weights, the rows (and ``pend``, which the fold
+    loaded) -- for its task (``run_attn_pre``'s: unit ``bid``, task ``rank
+    own + unit % own``); a CTA without a slice unit loads them out of range.
+    -> ((fns, rows), wns): ``stage_slice``'s ``pre`` and ``wns``."""
+    tid = fx.thread_idx.x
+    own = SLICES // tp
+    units = own * tp
+    unit = first_task(bid, 0)
+    live = unit < units
+    task = rank * own + fx.min(unit, units - 1) % own
+    c0 = task * COLS
+    c = {"args": args, "S": s, "tid": tid}
+    wns = slice_wns(c, c0, live)
+    fns = slice_fn_loads_live(c, task, live)
+    rows = slice_direct_loads_live(
+        c, c0, fx.min(tid, slice_direct_threads(s) - 1), live
+    )  # fmt: skip
+    # side-effecting empty asm: no pass sinks these loads past the tables'
+    llvm.InlineAsmOp(None, [], "", "", has_side_effects=True)
+    return (fns, rows), wns
+
+
 # a slice of at most this many rows holds its weights through K2a's wait as
 # well; wider, those registers spill
 SLICE_FN_EARLY_MAX = 24
@@ -780,7 +904,7 @@ def store_fns(c, fns):
 
 
 @traced
-def stage_slice(c, task, pre=None):
+def stage_slice(c, task, pre=None, wns=None):
     """R_new, the layer input and the partial projections of hidden columns
     32 task .. +32, all four streams, every token. ``pre``: its weights and
     first loads, already issued (``slice_prefetch``)."""
@@ -788,11 +912,10 @@ def stage_slice(c, task, pre=None):
     c0 = task * COLS
     direct = slice_direct(c)
     slice_x8 = c.get("slice_x8", False)
-    wns = None
-    if const_expr(slice_x8 and direct):
+    if const_expr(slice_x8 and direct and wns is None):
         # the norm weights of each round's columns, which no wait decides, out
         # before the slice's own loads: at the quantization they were a load
-        # on every slice's path
+        # on every slice's path (or issued at the kernel's entry: ``wns``)
         last0 = slice_direct_threads(s) - 1
         split0 = slice_split(s)
         wns = []
@@ -2169,7 +2292,8 @@ def _index_quant(c, key, bid, tasks):
 
 @traced
 def run_attn_pre(
-    c, co, key, tls, tl0, nbl, gates=True, after_norm=None, q_apart=False
+    c, co, key, tls, tl0, nbl, gates=True, after_norm=None, q_apart=False,
+    entry_pre=None,
 ):  # fmt: skip
     """K1's stages, in order, on context ``c`` (``co``: the own-rows view of a
     token-parallel build, else ``c``); ``timeline`` stamps from point ``tl0`` +
@@ -2206,7 +2330,12 @@ def run_attn_pre(
             c["x8_dst"] = preg(load_ptr64(c["x8_peers"], c["dst"]), 0, "x8g")
         task = c["rank"] * own + unit % own
         if unit < units:
-            stage_slice(co, task)
+            if const_expr(entry_pre is not None):
+                # its first loads issued at the kernel's entry, before
+                # the peer tables' (``slice_entry_prefetch``: the same task)
+                stage_slice(co, task, entry_pre[0], wns=entry_pre[1])
+            else:
+                stage_slice(co, task)
             if const_expr(fused):
                 # the layer kernel's attention seam reads this task's R_new columns
                 publish(c["put"], c["sdone"], task, 1,
