@@ -52,6 +52,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
+from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, preg
 from atom.models.deepseek_v41.mono.kernels.mhc_cols import (
     collapsed8,
     seam_mixes,
@@ -76,7 +77,7 @@ from atom.mono.device.ops import (
 )
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import Mailbox, preg, publish
+from atom.mono.device.sync import publish
 from atom.mono.lm_head import argmax as va
 from atom.mono.lm_head.dot import (
     KSTEP,

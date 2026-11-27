@@ -92,6 +92,7 @@ from atom.models.deepseek_v41.mono.kernels.dims import (
     SHARED_INTER,
     UG_PART,
 )
+from atom.models.deepseek_v41.mono.kernels.mailbox import preg, region_addrs
 from atom.models.deepseek_v41.mono.kernels.moe_shape import (
     SORT_NETS,
     MoeBuild,
@@ -101,6 +102,7 @@ from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.red import acc_sum
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
+from atom.models.deepseek_v41.mono.kernels.wave_max import wave_max_key
 from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device import queue, route
 from atom.mono.device.mx import (
@@ -114,7 +116,6 @@ from atom.mono.device.mx import (
     rcp_pow2,
     scale_index,
 )
-from atom.mono.device.numa import region_addrs
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
@@ -145,9 +146,9 @@ from atom.mono.device.ops import (
     uniform,
 )
 from atom.mono.device.ranks import peer_bases, sum_partials
-from atom.mono.device.select import KEY_LEAST, f32_key, wave_max_key
+from atom.mono.device.select import KEY_LEAST, f32_key
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import Quad, preg, publish
+from atom.mono.device.sync import Quad, publish
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, LDS_BYTES, THREADS, WAVES, first_task
 from atom.mono.plan.layout import pair_layout

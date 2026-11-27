@@ -1759,7 +1759,7 @@ def _replicated_consumed(c, r, split):
             for dst in dsts:
                 c["put"](dst, index, value)
         else:
-            dst = preg(pick([a.value for a in dsts], src), 0, "rdone", fresh=False)
+            dst = preg(pick([a.value for a in dsts], src), 0, "rdone")
             c["put"](dst, index, value)
 
     publish(acknowledge, c["prdone"], r * world + c["rank"], fx.Int32(1), tid == 0)

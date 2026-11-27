@@ -77,6 +77,8 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
 from atom.models.deepseek_v41.mono.kernels.index_query import (
     scratch_pairs as indexer_pairs,
 )
+from atom.models.deepseek_v41.mono.kernels.lds_rows import rows_to_lds_together
+from atom.models.deepseek_v41.mono.kernels.mailbox import preg, region_addrs
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR, code_round, fp8_value
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.red import acc_sum, acc_word
@@ -95,7 +97,6 @@ from atom.mono.device.mx import (
     pow2,
     rcp_pow2,
 )
-from atom.mono.device.numa import region_addrs
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
@@ -117,14 +118,13 @@ from atom.mono.device.ops import (
     ld_f32,
     ld_i32,
     load_ptr64,
-    rows_to_lds_together,
     rsrc,
     traced,
     xshfl,
 )
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import POLL_MAX, Quad, preg, publish
+from atom.mono.device.sync import POLL_MAX, Quad, publish
 from atom.mono.plan.arith import sel
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task

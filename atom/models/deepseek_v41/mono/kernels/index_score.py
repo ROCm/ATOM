@@ -48,6 +48,7 @@ from flydsl.expr.typing import Int32, T
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.index_query import await_queries
 from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4, sload4
+from atom.models.deepseek_v41.mono.kernels.mailbox import preg
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.kernels.topk import (
     radix_select,
@@ -68,7 +69,7 @@ from atom.mono.device.ops import (
     uniform,
 )
 from atom.mono.device.select import key_bits, order_key
-from atom.mono.device.sync import POLL_MAX, preg, publish
+from atom.mono.device.sync import POLL_MAX, publish
 from atom.mono.plan.arith import pick, sel
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
 from atom.mono.plan.trace import enter_stage

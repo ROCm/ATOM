@@ -47,6 +47,7 @@ from flydsl.expr.typing import Int32, Int64, T
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.dims import HEAD_DIM, HIDDEN, kvrow_scale0
 from atom.models.deepseek_v41.mono.kernels.index_query import FP4_MIN_AMAX, _e2m1
+from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, sreg
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, rcp_pow2
@@ -69,7 +70,7 @@ from atom.mono.device.ops import (
     xshfl,
 )
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import Mailbox, publish, sreg
+from atom.mono.device.sync import publish
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.layout import pair_layout

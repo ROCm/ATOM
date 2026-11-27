@@ -35,6 +35,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from atom.models.deepseek_v41.mono.kernels.dims import HC, HIDDEN, Dims
+from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, preg
 from atom.models.deepseek_v41.mono.kernels.mhc_cols import (
     collapsed8,
     seam_mixes,
@@ -51,7 +52,6 @@ from atom.mono.device.ops import (
     words4,
 )
 from atom.mono.device.ranks import peer_bases
-from atom.mono.device.sync import Mailbox, preg
 from atom.mono.plan.arith import pick
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES

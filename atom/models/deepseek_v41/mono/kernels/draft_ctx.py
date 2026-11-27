@@ -45,6 +45,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     lds_row,
 )
 from atom.models.deepseek_v41.mono.kernels.dims import HIDDEN, KV_DIM, Dims
+from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, preg, sreg
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.sources import SOURCES
@@ -64,7 +65,7 @@ from atom.mono.device.ops import (
     xshfl,
 )
 from atom.mono.device.ranks import peer_bases
-from atom.mono.device.sync import Mailbox, preg, publish, sreg
+from atom.mono.device.sync import publish
 from atom.mono.plan.arith import pick
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES

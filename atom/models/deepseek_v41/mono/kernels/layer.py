@@ -69,6 +69,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     run_attn_pre,
     shard_seam,
 )
+from atom.models.deepseek_v41.mono.kernels.code_warm import warm_code
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
 from atom.models.deepseek_v41.mono.kernels.dims import HIDDEN, KV_DIM, Dims
 from atom.models.deepseek_v41.mono.kernels.index_query import IQ_GROUPS, iq_in_place
@@ -79,6 +80,7 @@ from atom.models.deepseek_v41.mono.kernels.layer_post import (
     publish_x_tok_par,
     seam_dot_norm,
 )
+from atom.models.deepseek_v41.mono.kernels.mailbox import fresh_s32, fresh_s64
 from atom.models.deepseek_v41.mono.kernels.moe import (
     moe_args,
     moe_context,
@@ -94,11 +96,9 @@ from atom.mono.device.ops import (
     rsrc,
     traced,
     uniform,
-    warm_code,
 )
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp_begin, stamp_flush
-from atom.mono.device.sync import fresh_s32, fresh_s64
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.layout import pair_layout
@@ -376,7 +376,7 @@ def build_layer(key: LayerBuild):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         warm_layer_code(warm, tid, bid)
-        # the scratch regions' base a value of its own (``sync.fresh_s64``), not
+        # the scratch regions' base a value of its own (``mailbox.fresh_s64``), not
         # a part of the merged kernarg load a compressing build reloads whole
         scratch = fresh_s64(scratch)
         # the kernarg tail's other late-read scalars too: no merged 8- / 4-dword

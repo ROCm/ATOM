@@ -21,15 +21,7 @@ against each other. Two forms of the narrowing:
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 
-from atom.mono.device.ops import (
-    ballot,
-    butterfly,
-    lanes_below,
-    popcount,
-    traced,
-    update_dpp_i32,
-    xred,
-)
+from atom.mono.device.ops import ballot, butterfly, lanes_below, popcount, traced
 from atom.mono.plan.execution import WAVES
 
 INT_MIN = -(2**31)
@@ -150,22 +142,6 @@ def compact(cand, counter, cap, entries, floor):
 # ---------------------------------------------------------------- one wave
 # A wave's entries: each lane holds a list of 32-bit keys (signed order), entry
 # i of lane l is the wave's entry l + 64 i, which is also its tie order.
-
-
-def wave_max_key(v):
-    """The wave's max of the i32 key v, in every lane: the row's by rotations
-    8, 4, 2, 1 (an integer max takes a DPP operand in its one instruction, and
-    a rotation reads no lane outside the row: no lane keeps an old value),
-    then the rows' by the permlane swaps. An exact max: the value
-    ``butterfly(v, (32, 16, 8, 4, 2, 1), fx.max)`` gives, in fewer
-    instructions."""
-    for r in (8, 4, 2, 1):
-        v = fx.max(
-            v, fx.Int32(update_dpp_i32(fx.Int32(0), v, 0x120 + r, 0xF, 0xF, True))
-        )
-    for off in (16, 32):
-        v = xred(v, off, fx.max)
-    return v
 
 
 def f32_key(v):

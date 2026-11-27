@@ -224,14 +224,12 @@ def run_fixture(args):
 
     # Every K1 argument is a pointer or scalar: the buffers below, or 0 for the
     # index, peer and unused fields of this non-token-parallel K1 (ring_scale is
-    # 0 for the bf16 ring, as in the runner; ibound is the index's, numa_word
-    # picks a dual region's copy and this build keeps none). A new ABI field
-    # that is neither fails here, not in the watchdog loop. The FP8 weights are
-    # filled with 0x38.
+    # 0 for the bf16 ring, as in the runner). A new ABI field that is neither
+    # fails here, not in the watchdog loop. The FP8 weights are filled with 0x38.
     zeros = {
         "pend", "post_in", "comb_in", "ring_scale", "ring_off", "aux", "iq_w",
-        "iq_ws", "iw_w", "iq_out", "iqs_out", "iw_out", "ibound", "numa_word",
-        "sym", "peers", "rank", "layer", "tl",
+        "iq_ws", "iw_w", "iq_out", "iqs_out", "iw_out", "sym", "peers", "rank",
+        "layer", "tl",
     }  # fmt: skip
     bufs = {}
     for name, n, dtype, value in [
