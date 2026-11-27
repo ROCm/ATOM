@@ -7,6 +7,7 @@ CPU only: plugins are stand-in entry points, tensors are CPU tensors, and the
 graph state a CUDA-graph capture would report is patched in.
 """
 
+import inspect
 import json
 import sys
 import types
@@ -1029,10 +1030,11 @@ def test_model_runner_configures_the_host_before_building():
     source = (REPO_ROOT / "atom/model_engine/model_runner.py").read_text(
         encoding="utf-8"
     )
-    configure = source.index("plugin_host.configure(")
-    build = source.index("self.model = get_model(", configure)
-    assert source.index("config.plugin_source", configure) < build
-    assert source.index("arm=config.plugin_arm", configure) < build
+    configure = source.index("plugin_host.configure_runner(config)")
+    assert configure < source.index("self.model = get_model(", configure)
+    # the runner passes its Config: the plan and the arm are read from it there
+    runner = inspect.getsource(host.configure_runner)
+    assert "plugin_source" in runner and "plugin_arm" in runner
 
 
 # -- V4.1 seams --------------------------------------------------------------------
