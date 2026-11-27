@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::kv_storage::OffloadReport;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct KvEventSource {
     /// The ZMQ PUB endpoint; a wildcard host stands for the worker's own.
     pub endpoint: String,
@@ -22,9 +22,57 @@ pub struct KvEventSource {
     /// The store the engine offloads KV to, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offload: Option<OffloadReport>,
+    /// The shared device pool the rank's blocks live in, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_pool: Option<KvPoolReport>,
+}
+
+/// The device pool of a rank whose engine shares it, as ATOM reports its `umbp_pool`
+/// connector: the ranks whose pools are in one group of one UMBP server copy the prefix
+/// they miss from each other's pools before they compute it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct KvPoolReport {
+    pub backend: String,
+    /// The UMBP server, as the engine reaches it on its node.
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub group: String,
+    /// The share of the rank's blocks in the shared pool; the rest stay private.
+    #[serde(default = "whole")]
+    pub share_ratio: f64,
+    /// Whether the rank copies in what the other pools of its group hold.
+    #[serde(default = "always")]
+    pub fetch: bool,
+}
+
+fn whole() -> f64 {
+    1.0
+}
+
+fn always() -> bool {
+    true
 }
 
 impl KvEventSource {
+    /// The share group of the rank: its node, UMBP server and group. Only a rank that copies
+    /// in what its group shares is in one.
+    pub(crate) fn share_group(&self) -> Option<String> {
+        let pool = self.kv_pool.as_ref()?;
+        let shares = pool.backend == "umbp_pool" && pool.fetch && !pool.group.is_empty();
+        // A rank publishes on its own node, an IPC endpoint on the router's.
+        let node = (self.endpoint.strip_prefix("tcp://"))
+            .and_then(|bound| bound.rsplit_once(':'))
+            .map_or("", |(host, _)| host);
+        shares.then(|| format!("{node}|{}|{}", pool.address, pool.group))
+    }
+
+    /// Whether the rank keeps some of its blocks private: its group then copies from it
+    /// only those it reports in the shared tier, `GPU_SHARED`.
+    pub(crate) fn shares_part(&self) -> bool {
+        (self.kv_pool.as_ref()).is_some_and(|pool| pool.share_ratio < 1.0)
+    }
+
     /// The source as a router reaches it for the worker at `worker_url`.
     fn resolve(mut self, worker_url: &str) -> Self {
         let host = Url::parse(worker_url)
@@ -168,5 +216,57 @@ mod tests {
         let one = |rank: &str, block_size| json!({rank: {"endpoint": "tcp://*:1", "block_size": block_size}});
         assert!(sources(one("rank0", 16)).is_err());
         assert!(sources(one("0", 0)).is_err());
+    }
+
+    /// Ranks share a group on one node, server and group, and only while they copy in their
+    /// group's, whether they share all their blocks or part of them.
+    #[test]
+    fn ranks_share_a_group_on_one_node_server_and_group() {
+        let source = |endpoint: &str, worker: &str, pool| {
+            let source = json!({"0": {"endpoint": endpoint, "block_size": 16, "kv_pool": pool}});
+            let sources = parse(serde_json::from_value(source).unwrap(), worker).unwrap();
+            sources.into_values().next().unwrap()
+        };
+        let group =
+            |endpoint: &str, worker: &str, pool| source(endpoint, worker, pool).share_group();
+        let pool = json!({"backend": "umbp_pool", "address": "unix:///tmp/umbp-l1/server.sock",
+            "group": "atom-5f0e3c9a2b7d41e6"});
+        let here = group("tcp://*:5557", "http://10.1.2.3:8000", pool.clone());
+        assert_eq!(
+            here.as_deref(),
+            Some("10.1.2.3|unix:///tmp/umbp-l1/server.sock|atom-5f0e3c9a2b7d41e6")
+        );
+        assert_ne!(
+            group("tcp://*:5557", "http://10.1.2.4:8000", pool.clone()),
+            here
+        );
+        assert_eq!(
+            group("tcp://10.1.2.3:5558", "http://node-7:8000", pool.clone()),
+            here
+        );
+        assert!(group("ipc:///tmp/kv_0", "http://10.1.2.3:8000", pool.clone()).is_some());
+        let altered = |field: &str, value: serde_json::Value| {
+            let mut pool = pool.clone();
+            pool[field] = value;
+            group("tcp://*:5557", "http://10.1.2.3:8000", pool)
+        };
+        assert_ne!(altered("group", json!("atom-other")), here);
+        assert_eq!(altered("share_ratio", json!(0.5)), here);
+        for (field, value) in [
+            ("backend", json!("lmcache")),
+            ("group", json!("")),
+            ("fetch", json!(false)),
+        ] {
+            assert_eq!(altered(field, value), None, "{field}");
+        }
+        let part = |ratio| {
+            let pool = json!({"backend": "umbp_pool", "group": "g", "share_ratio": ratio});
+            source("tcp://*:5557", "http://10.1.2.3:8000", pool).shares_part()
+        };
+        assert_eq!((part(json!(0.5)), part(json!(1.0))), (true, false));
+        assert_eq!(
+            group("tcp://*:5557", "http://10.1.2.3:8000", json!(null)),
+            None
+        );
     }
 }

@@ -203,9 +203,12 @@ class KVBlockPool(ABC):
         """Whether a background copy for `owner` is still in flight."""
         return False
 
-    def poll_fetches(self) -> None:
+    def poll_fetches(self) -> list[tuple[Hashable, list[int]]]:
         """Index what finished background copies brought in. Once per
-        scheduling pass, before any prefix walk."""
+        scheduling pass, before any prefix walk. For each owner whose copy
+        finished: which of the hashes it asked for are now indexed, by their
+        position among them."""
+        return []
 
     def take_block_copies(self) -> tuple[tuple[int, int], ...]:
         """Whole-block copies (source id, destination id) the batch being

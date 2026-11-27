@@ -302,6 +302,7 @@ impl AppContextBuilder {
             if let Some(storage) = &kv_storage {
                 monitor.read_stores(storage.clone(), router_config.kv_storage_weight);
             }
+            monitor.share_pools(router_config.kv_share_weight);
             policy_registry.set_kv_events(monitor.clone());
         }
         let tokenize_limits = TokenizeLimits::new(&router_config);
