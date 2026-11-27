@@ -442,6 +442,109 @@ t "a card carrying the measured coverage passes" \
 t "a coverage label with nothing after it is refused" \
   "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
 
+# Only two of check_prompts.py's checks are drift. run_one reported every
+# refusal as "prompts drifted" and sent the output that named the real one to /dev/null,
+# so the owner was told to regenerate files that were fine. aiter#8255's review aborted
+# that way on 2026-11-19 against prompts that matched SKILL.md verbatim.
+_flow_msg() {  # <python snippet that makes check_prompts fail> -> what run_one would say
+  r=$(mktemp -d); d="$r/.claude/skills/review-pr"
+  mkdir -p "$d" "$r/.github/workflows"
+  cp -r "$S"/. "$d/" 2>/dev/null
+  cp "$S/../../../.github/workflows/atom-review-bot.yml" "$r/.github/workflows/" 2>/dev/null
+  python3 -c "$1" "$d"
+  # The block run here is extracted from run_one.sh, not a copy of it: a test that
+  # reimplements the thing it guards passes whatever run_one.sh does.
+  blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
+  # run_one.sh is `set -euo pipefail`; a harness without it is a different shell, and the
+  # difference is load-bearing here (a grep that matches nothing aborts the script).
+  SKILL="$d" bash -c "set -euo pipefail
+fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
+$blk" 2>/dev/null
+  rm -rf "$r"
+}
+# These stand-ins model an early crash, before any ❌ was printed. An empty reason is the
+# very thing this block exists to remove, so it falls back to the last output line.
+_flow_raw() {  # <python body for a stand-in check_prompts> -> what run_one would say
+  d=$(mktemp -d); printf '%s\n' "$1" > "$d/check_prompts.py"
+  blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
+  # run_one.sh is `set -euo pipefail`; a harness without it is a different shell, and the
+  # difference is load-bearing here (a grep that matches nothing aborts the script).
+  # The block's headline behaviour is the dump: it keeps check_prompts' output instead of
+  # discarding it. A harness that sends stderr to /dev/null cannot see that, so deleting
+  # the dump kept the suite green. FLOW_ERR makes it readable without a third harness --
+  # the pin test above counts the harnesses by their `set -euo pipefail` line.
+  SKILL="$d" bash -c "set -euo pipefail
+fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
+$blk" 2>"${FLOW_ERR:-/dev/null}"
+  rm -rf "$d"
+}
+# The two harnesses above hand-copy run_one.sh's shell options. If run_one gains or loses
+# one, they silently go on testing a shell that no longer exists -- which is how the grep
+# abort above survived a green suite. Pin them to the real line.
+t "the harness runs the block under run_one's own shell options" \
+  "$(grep -c '^set -euo pipefail$' "$S/run_one.sh")$(grep -c 'bash -c "set -euo pipefail$' "$S/selftest.sh")" "12"
+
+t "a crash with a message reports the message" \
+  "$(_flow_raw 'import sys
+print("Traceback: boom", file=sys.stderr)
+raise SystemExit(1)' | grep -c 'Traceback: boom')" "1"
+t "and a crash with no output still says something" \
+  "$(_flow_raw 'raise SystemExit(7)' | grep -c 'run it by hand')" "1"
+# The two halves of the headline behaviour: the notice quotes at most the first three ❌,
+# and the whole output -- context lines and the ❌ past the third included -- is kept on
+# stderr instead of going to /dev/null. Neither was covered, so deleting the dump or
+# narrowing `grep -m3` to `-m1` left the suite green.
+_FOUR_BAD='print("check_prompts: 14 checks")
+print("❌ one")
+print("❌ two")
+print("❌ three")
+print("❌ four")
+raise SystemExit(1)'
+_flow_err=$(mktemp)
+t "the notice quotes the first three ❌ lines" \
+  "$(FLOW_ERR="$_flow_err" _flow_raw "$_FOUR_BAD")" \
+  "check_prompts.py refused: ❌ one;❌ two;❌ three"
+t "and the output the notice dropped is kept on stderr" \
+  "$(grep -c -e 'check_prompts: 14 checks' -e '❌ four' "$_flow_err")" "2"
+rm -f "$_flow_err"
+# preflight.sh carries a hand-copy of that fallback, and an owner runs preflight when
+# paged -- the one moment the reason has to be there. It had no coverage at all, so the
+# empty reason this change removes could come back in the copy while run_one's original
+# stayed pinned by the cases above. Same treatment: extracted between its own markers and
+# run, never reimplemented here.
+_pf_gate() {  # <python body for a stand-in check_prompts> -> what preflight would print
+  d=$(mktemp -d); printf '%s\n' "$1" > "$d/check_prompts.py"
+  blk=$(sed -n '/# >>> preflight-prompt-gate/,/# <<< preflight-prompt-gate/p' "$S/preflight.sh")
+  # preflight.sh is `set -uo pipefail` -- NOT -e, unlike run_one. The difference is the
+  # whole point of extracting rather than copying: pipefail is what makes the no-match
+  # grep fail, and the absence of -e is what keeps the script alive to use the fallback.
+  S="$d" ok=0 bad=0 bash -c "set -uo pipefail
+$blk" 2>/dev/null
+  rm -rf "$d"
+}
+t "preflight says something when check_prompts prints nothing" \
+  "$(_pf_gate 'raise SystemExit(7)' | grep -c 'no output; run it by hand')" "1"
+t "and preflight names the check that actually refused" \
+  "$(_pf_gate 'print("\u274c ATOM_RUN_BUDGET=9300s does not fit the review job'"'"'s 9000s cap")
+raise SystemExit(1)' | awk '/ATOM_RUN_BUDGET=9300s/{n++} tolower($0)~/drift/{d++} END{print n+0 ":" d+0}')" "1:0"
+# The harness above hand-copies preflight's shell options, as the two run_one harnesses do
+# for run_one's. Pin it to the real line for the same reason.
+t "the preflight harness runs under preflight's own shell options" \
+  "$(grep -c '^set -uo pipefail$' "$S/preflight.sh")$(grep -c 'bash -c "set -uo pipefail$' "$S/selftest.sh")" "11"
+t "a drifted prompt is reported as drift" \
+  "$(_flow_msg '
+import pathlib,sys
+p = pathlib.Path(sys.argv[1], "prompts/worker.md")
+p.write_text(p.read_text().replace("**Output rules (strictly enforced):**", "**Output rules:**", 1))
+' | grep -c DRIFTED)" "1"
+t "and a refusal that is not drift is not called drift" \
+  "$(_flow_msg '
+import pathlib,sys
+p = pathlib.Path(sys.argv[1], "check_prompts.py")
+p.write_text(p.read_text().replace("def check_fail_classes():",
+    "def check_fail_classes():\n    print(\"\\u274c run budget fits the job cap: FORCED\"); return 1\n    # o", 1))
+' | awk '/refused: ❌ run budget fits the job cap: FORCED/{n++} tolower($0)~/drift/{d++} END{print n+0 ":" d+0}')" "1:0"
+
 # `[diff-too-large]` (GitHub refusing a diff over 20000 lines) writes no coverage line,
 # so the card has to supply one and it has to say BEYOND ONE PASS.
 _cov_raw() {  # <full rules.txt, or MISSING> <card coverage line or -> problem kind or ok
@@ -574,7 +677,7 @@ _drift_outside_a_repo() {
   ( cd /tmp && python3 "$t/.claude/skills/review-pr/check_prompts.py" >/dev/null 2>&1; echo $? )
   rm -rf "$t"
 }
-t "the drift check runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
+t "check_prompts runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
 
 
 # ATOM_AGENT_TIMEOUT and ATOM_RUN_BUDGET are coupled and nothing else enforces it. A review

@@ -26,13 +26,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 0          # check_prompts.py resolves the repo root via git
+          # No fetch-depth: this lane reads no history. It was 0 for check_prompts.py,
+          # which used to resolve the repo root via git and no longer calls git at all.
           persist-credentials: false
 
       - name: Install test deps
         run: python3 -m pip install --quiet pytest jsonschema
 
-      - name: Prompts have not drifted from SKILL.md
+      - name: check_prompts passes
         run: python3 .claude/skills/review-pr/check_prompts.py
 
       - name: MAPPING.md matches the deriver
