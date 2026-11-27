@@ -57,8 +57,6 @@ export AITER_LOG_LEVEL=WARNING
 CAPTURE_SIZES="[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,48,64,128]"
 EXTRA_ARGS=()
 export ATOM_ENABLE_PREFILL_DELAYER=1
-# Keep the tuned intervals below: the initial ramp would release ahead of them.
-export ATOM_PREFILL_INITIAL_RAMP=0
 case "$TP/$CONC" in
   2/1|4/1)  export ATOM_PREFILL_DECODE_INTERVAL=1000000
             CAPTURE_SIZES="[1,2]"; EXTRA_ARGS+=(--max-num-seqs 2) ;;
