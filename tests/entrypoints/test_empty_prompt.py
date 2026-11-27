@@ -31,6 +31,7 @@ def engine(monkeypatch):
     proc.requests = {}
     proc.has_per_req_cache = False
     proc.num_speculative_tokens = 0
+    proc._greedy_ids_only = False
     state = SimpleNamespace(io_processor=proc, submitted=[])
     state.core_mgr = SimpleNamespace(add_request=state.submitted.append)
     monkeypatch.setattr(api_server, "engine", state)
