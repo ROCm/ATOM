@@ -9,8 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-from atom.model_ops.kimi_k3.flash_kda_tuning import balanced_chunks_per_seg
+# `atom.model_ops.kimi_k3` binds AITER kernels at import; the CPU job has no AITER.
+with atom_without_aiter() as load:
+    balanced_chunks_per_seg = load(
+        "atom.model_ops.kimi_k3.flash_kda_tuning"
+    ).balanced_chunks_per_seg
 
 H, V = 12, 128
 PACKAGE = "aiter.ops.triton._triton_kernels.kimi_delta_attn"
