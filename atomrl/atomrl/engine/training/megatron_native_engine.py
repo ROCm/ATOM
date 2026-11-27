@@ -47,8 +47,10 @@ from atomrl.engine.training.bridges.gpt import (
     non_expert_hf_to_megatron,
 )
 from atomrl.engine.training.megatron_base_engine import (
+    _ON_POLICY_STATS,
     MegatronBaseEngine,
     moe_dispatcher_kwargs,
+    on_policy_metrics,
 )
 from atomrl.engine.training.model_registry import (
     MODEL_REGISTRY,
@@ -72,6 +74,19 @@ def _te_attention_backend(ec) -> str | None:
     if name is None and torch.version.hip and importlib.util.find_spec("flash_attn"):
         return "fused"
     return None if name == "auto" else name
+
+
+def _freeze_moe_router(module: torch.nn.Module) -> None:
+    """Keep every MoE router at its initial weights (NeMo-RL's GRPO default).
+
+    Called before the DDP wrap, so a frozen router gets no grad buffer and no
+    optimizer state; the weight export still sends it.
+    """
+    frozen = [p for n, p in module.named_parameters() if ".mlp.router." in n]
+    if not frozen:
+        raise ValueError("freeze_moe_router: the model has no MoE router")
+    for p in frozen:
+        p.requires_grad_(False)
 
 
 def _allow_rocm_te_recipes() -> None:
@@ -772,6 +787,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
             average_in_collective=True,
             bucket_size=(int(_bucket) if _bucket else None),
         )
+        if bool(ec.get("freeze_moe_router", False)):
+            _freeze_moe_router(self.module)
         self._ddp = DDP(config=tfcfg, ddp_config=ddp_cfg, module=self.module)
 
         opt_kwargs = {}
@@ -821,7 +838,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         wd = float(oc.get("weight_decay", 0.1))
         self.lr_scheduler = OptimizerParamScheduler(
             self.optimizer,
-            init_lr=0.0,
+            init_lr=float(oc.get("lr_warmup_init", 0.0)),
             max_lr=base_lr,
             min_lr=base_lr,
             lr_warmup_steps=warmup,
@@ -2069,6 +2086,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         loss_agg_mode = _cfg("loss_agg_mode", "token-mean")
         global_batch_size = meta.get("global_batch_size") or batch.batch_size * dp
+        # Entropy for the skipped old-log-prob pass; not reconstructed under CP.
+        want_entropy = bool(_cfg("force_on_policy_ratio", False)) and self._cp == 1
         t = batch.tensors
         seqs = t["input_ids"]
         am = t.get("attention_mask")
@@ -2113,6 +2132,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
                     "ppo_kl_tok": 0.0,
                     "rc_kl_sum": 0.0,
                     "rc_kl_tok": 0.0,
+                    **dict.fromkeys(_ON_POLICY_STATS, 0.0),
                 }
                 for k, (r, start, _L) in enumerate(mb["rows"]):
                     token_lp, _ = self._cp_row_logprob_entropy(
@@ -2123,6 +2143,14 @@ class MegatronNativeEngine(MegatronBaseEngine):
                         want_entropy=False,
                     )
                     token_lp = token_lp.view(1, -1)
+                    token_ent = None
+                    if want_entropy:
+                        local = logits[
+                            layouts[k]["local_start"] : layouts[k]["local_end"]
+                        ]
+                        token_ent = self._row_entropy_nograd(
+                            local[:-1], mb["ids_list"][k][1:]
+                        )
                     loss, stats = self._row_policy_loss(
                         t,
                         r,
@@ -2134,6 +2162,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                         dp,
                         loss_agg_mode,
                         global_batch_size,
+                        token_ent=token_ent,
+                        in_loss_is=meta.get("in_loss_rollout_is"),
                     )
                     if loss is None:
                         continue
@@ -2144,6 +2174,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
                     agg["ppo_kl_tok"] += stats["ppo_kl_tok"]
                     agg["rc_kl_sum"] += stats["rc_kl_sum"]
                     agg["rc_kl_tok"] += stats["rc_kl_tok"]
+                    for key in _ON_POLICY_STATS:
+                        agg[key] += stats[key]
                 if bin_loss is None:
                     bin_loss = logits.sum() * 0.0
                 # Megatron's two-value loss contract applies ``*cp/num_mb``.
@@ -2198,6 +2230,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         # Aggregate metrics on the last stage (where losses were computed).
         loss_accum = ppo_kl_sum = ppo_kl_tok = rc_kl_sum = rc_kl_tok = 0.0
+        on_policy_sums = dict.fromkeys(_ON_POLICY_STATS, 0.0)
         n_rows = 0
         for agg in losses:
             loss_accum += agg["loss"]
@@ -2206,6 +2239,8 @@ class MegatronNativeEngine(MegatronBaseEngine):
             ppo_kl_tok += agg["ppo_kl_tok"]
             rc_kl_sum += agg["rc_kl_sum"]
             rc_kl_tok += agg["rc_kl_tok"]
+            for key in _ON_POLICY_STATS:
+                on_policy_sums[key] += agg[key]
         metrics = {
             "loss": loss_accum / max(1, n_rows),
             "lr": lr,
@@ -2217,6 +2252,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         if rc_kl_tok > 0:
             metrics["rollout_corr_kl_sum"] = rc_kl_sum
             metrics["rollout_corr_kl_tok"] = rc_kl_tok
+        metrics.update(on_policy_metrics(on_policy_sums))
 
         from atomrl.engine.training.megatron_base_engine import _GAP_ROWS, _gap_dump_dir
 

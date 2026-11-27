@@ -15,6 +15,7 @@ import shutil
 import sys
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -387,6 +388,7 @@ class AtomActorWorker(BaseWorker):
                 "moe_router_bias_update_rate": meg_cfg.get(
                     "moe_router_bias_update_rate", None
                 ),
+                "freeze_moe_router": meg_cfg.get("freeze_moe_router", False),
                 "moe_token_dispatcher_type": meg_cfg.get(
                     "moe_token_dispatcher_type", "alltoall"
                 ),
@@ -502,6 +504,7 @@ class AtomActorWorker(BaseWorker):
             "weight_decay": float(policy.get("weight_decay", 0.01)),
             "clip_grad": float(policy.get("max_grad_norm", 1.0)),
             "lr_warmup_steps": int(policy.get("lr_warmup_steps", 10)),
+            "lr_warmup_init": float(policy.get("lr_warmup_init", 0.0)),
             "lr_warmup_steps_ratio": float(policy.get("warmup_ratio", 0.0)),
         }
         for key in ("adam_beta1", "adam_beta2", "adam_eps"):
@@ -534,6 +537,17 @@ class AtomActorWorker(BaseWorker):
             self._device,
         )
 
+    def snapshot_reference_weights(self) -> None:
+        """Keep the current (initial) weights as the reference policy that
+        ``compute_log_probs`` uses when the batch asks for ``reference_policy``."""
+        snapshot = getattr(self._engine, "snapshot_reference_weights", None)
+        if snapshot is None:
+            raise NotImplementedError(
+                f"{type(self._engine).__name__} holds no reference policy; "
+                "controller.ray.ref_in_actor needs a Megatron engine."
+            )
+        snapshot()
+
     def compute_log_probs(self, batch: DataProto) -> DataProto:
         """Return per-token log-probs (and optionally entropy) for the policy.
 
@@ -554,9 +568,17 @@ class AtomActorWorker(BaseWorker):
         if "input_ids" not in batch.tensors:
             raise KeyError("batch must contain 'input_ids'")
 
+        reference = bool(batch.meta.get("reference_policy", False))
+        if reference and not hasattr(self._engine, "reference_weights"):
+            raise NotImplementedError(
+                f"{type(self._engine).__name__} holds no reference policy; "
+                "controller.ray.ref_in_actor needs a Megatron engine."
+            )
+
         # Megatron backend owns its own (GPTModel) forward + logprob path.
         if hasattr(self._engine, "engine_compute_log_probs"):
-            out = self._engine.engine_compute_log_probs(batch)
+            with self._engine.reference_weights() if reference else nullcontext():
+                out = self._engine.engine_compute_log_probs(batch)
             src = getattr(self._engine, "is_mp_src_rank_with_outputs", None)
             if src is not None and not src():
                 return DataProto(meta=dict(batch.meta))

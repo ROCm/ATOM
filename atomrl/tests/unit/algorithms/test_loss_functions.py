@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from atomrl.algorithms.loss_functions import (
     agg_loss,
@@ -11,6 +12,8 @@ from atomrl.algorithms.loss_functions import (
     entropy_bonus,
     kl_penalty,
     policy_gradient_loss,
+    reference_kl_loss,
+    reference_kl_tokens,
 )
 
 
@@ -96,6 +99,76 @@ def test_kl_penalty_nonneg() -> None:
     ref = torch.tensor([[0.5, 0.5]])
     kl = kl_penalty(logp, ref)
     assert float(kl) >= 0.0
+
+
+def _nemo_rl_kl(logprobs, ref, kl_type, input_clamp=20.0, output_clamp=10.0):
+    """The KL term of NeMo-RL v0.8's GRPO loss written out from its definition
+    (clamped log-ratio, estimator, on-policy weight exp(logp - logp.detach())
+    detached where the clamp binds, clamped product): what the loss is held to."""
+    weights = torch.exp(logprobs - logprobs.detach())
+    logr = ref - logprobs
+    logr_clamped = logr.clamp(min=-input_clamp, max=input_clamp)
+    weights = torch.where(logr == logr_clamped, weights, weights.detach())
+    logr = logr_clamped
+    if kl_type == "k1":
+        kl = -logr
+    elif kl_type == "k2":
+        kl = torch.square(logr) / 2
+    else:
+        kl = torch.exp(logr) - 1 - logr
+    return (weights * kl).clamp(min=-output_clamp, max=output_clamp)
+
+
+@pytest.mark.parametrize(
+    ("kl_penalty_name", "nemo_type"),
+    [("kl", "k1"), ("mse", "k2"), ("k3", "k3"), ("low_var_kl", "k3")],
+)
+def test_reference_kl_matches_nemo_rl_in_value_and_gradient(
+    kl_penalty_name, nemo_type
+) -> None:
+    torch.manual_seed(0)
+    base = torch.randn(3, 7) * 3
+    ref = torch.randn(3, 7) * 3
+    ref[0, 0] = base[0, 0] + 25.0  # past the input clamp
+    ref[1, 1] = base[1, 1] - 25.0
+    ours_lp = base.clone().requires_grad_(True)
+    theirs_lp = base.clone().requires_grad_(True)
+
+    ours = reference_kl_tokens(ours_lp, ref, kl_penalty_name)
+    theirs = _nemo_rl_kl(theirs_lp, ref, nemo_type)
+    ours.sum().backward()
+    theirs.sum().backward()
+
+    torch.testing.assert_close(ours, theirs)
+    torch.testing.assert_close(ours_lp.grad, theirs_lp.grad)
+
+
+def test_reference_kl_carries_the_score_function_gradient() -> None:
+    """d/dlogp of w * k3 with w = exp(logp - logp.detach()) is k3 + dk3/dlogp;
+    without the weight only the second term would remain."""
+    logp = torch.tensor([[-1.0, -2.0]], requires_grad=True)
+    ref = torch.tensor([[-1.5, -1.0]])
+    reference_kl_tokens(logp, ref, "k3").sum().backward()
+    logr = ref - logp.detach()
+    k3 = torch.exp(logr) - 1 - logr
+    dk3 = 1 - torch.exp(logr)
+    torch.testing.assert_close(logp.grad, k3 + dk3)
+
+
+def test_reference_kl_loss_is_normalized_like_the_policy_loss() -> None:
+    logp = torch.tensor([[-1.0, -2.0, -0.5]])
+    ref = torch.tensor([[-1.5, -1.0, -0.5]])
+    mask = torch.tensor([[1.0, 1.0, 0.0]])
+    loss = reference_kl_loss(
+        logp, ref, mask=mask, kl_type="k3", dp_size=2, batch_num_tokens=8
+    )
+    per_token = reference_kl_tokens(logp, ref, "k3")
+    torch.testing.assert_close(loss, (per_token * mask).sum() / 8 * 2)
+
+
+def test_reference_kl_refuses_an_unknown_estimator() -> None:
+    with pytest.raises(ValueError, match="abs"):
+        reference_kl_tokens(torch.zeros(1, 1), torch.zeros(1, 1), "abs")
 
 
 def test_entropy_bonus() -> None:

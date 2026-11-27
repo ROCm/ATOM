@@ -271,6 +271,8 @@ class RLTrainer:
         self._ray_cluster: RayCluster | None = None
         self._actor_wg: RayWorkerGroup | None = None
         self._ref_wg: RayWorkerGroup | None = None
+        self._ref_in_actor = False
+        self._in_loss_rollout_is: dict[str, Any] | None = None
         self._actor_mp: int = 1  # Megatron model-parallel size (TP*PP*CP)
         self._actor_dp_size: int = (
             0  # data-parallel size (0 => not queried; fallback below)
@@ -304,6 +306,14 @@ class RLTrainer:
 
     def setup(self) -> None:
         """Initialize models, optimizer, dataset, and algorithm."""
+        if not self._use_ray_controller and getattr(
+            self.config.algorithm, "force_on_policy_ratio", False
+        ):
+            raise ValueError(
+                "algorithm.force_on_policy_ratio is implemented on the Ray "
+                "controller path only (controller.ray.enabled); this path would "
+                "ignore it and still run the old-log-prob forward."
+            )
         model_name = self.config.policy.model_name
         if not model_name:
             raise ValueError("config.policy.model_name is required.")
@@ -896,6 +906,12 @@ class RLTrainer:
         results = self._ray_vllm_engine.generate_tokens(expanded, sp)
         return self._assemble_ray_rollout(results)
 
+    def _max_prompt_length(self) -> int:
+        """Prompt tokens kept for the rollout (``policy.max_prompt_length``)."""
+        max_total = int(self.config.policy.max_total_sequence_length)
+        cap = int(getattr(self.config.policy, "max_prompt_length", 0) or 0)
+        return min(cap, max_total) if cap > 0 else min(max_total // 2, 1024)
+
     def _ray_rollout_prompt_ids(self, prompts: list[str]) -> list[list[int]]:
         """Token ids the Ray rollout sends for each prompt.
 
@@ -907,10 +923,7 @@ class RLTrainer:
         HF-tokenized ids (add_special_tokens=False, matching verl's
         apply_chat_template(tokenize=True)) makes response length match verl.
         """
-        max_prompt_len = min(
-            int(self.config.policy.max_total_sequence_length) // 2,
-            1024,
-        )
+        max_prompt_len = self._max_prompt_length()
         return [
             list(
                 self._tokenizer(
@@ -1546,6 +1559,18 @@ class RLTrainer:
             )
 
         use_ref = kl_coeff > 0.0
+        self._ref_in_actor = bool(use_ref and getattr(ray_cfg, "ref_in_actor", False))
+        if self._ref_in_actor:
+            backend = str(self.config.policy.training_backend).replace("-", "_")
+            if backend != "megatron_native":
+                raise ValueError(
+                    "controller.ray.ref_in_actor runs the reference forward through "
+                    f"the actor's Megatron model; policy.training_backend={backend!r}"
+                )
+            if ray_cfg.fuse_actor_ref:
+                raise ValueError(
+                    "controller.ray.ref_in_actor and fuse_actor_ref are exclusive."
+                )
         if ray_cfg.fuse_actor_ref and use_ref:
             if ref_workers != actor_workers:
                 raise ValueError(
@@ -1591,6 +1616,9 @@ class RLTrainer:
                 forward_only=(os.environ.get("ATOMRL_FORWARD_ONLY_INIT", "0") == "1"),
             )
             self._actor_wg.setup_dispatch_collect_info()
+            if self._ref_in_actor:
+                # Before _try_resume_ray_checkpoint: the reference is the initial model.
+                self._actor_wg.call_all("snapshot_reference_weights")
 
         # Megatron model-parallel (TP/PP/CP): the actor world is a
         # DP x (TP,PP,CP) mesh. All model-parallel members of one DP shard must
@@ -1612,7 +1640,7 @@ class RLTrainer:
 
         self._try_resume_ray_checkpoint()
 
-        if use_ref and self._ref_wg is None:
+        if use_ref and self._ref_wg is None and not self._ref_in_actor:
             ref_pool = self._ray_cluster.create_pool(
                 ref_pool_name,
                 num_gpus=max(1, ref_workers),
@@ -2139,7 +2167,7 @@ class RLTrainer:
         self, prompts: list[str]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize prompts to input_ids and attention_mask."""
-        max_prompt_len = min(self.config.policy.max_total_sequence_length // 2, 1024)
+        max_prompt_len = self._max_prompt_length()
         encoding = self._tokenizer(
             prompts,
             padding=True,
@@ -2473,7 +2501,7 @@ class RLTrainer:
             expanded_prompts,
             padding=True,
             truncation=True,
-            max_length=min(1024, self.config.policy.max_total_sequence_length // 2),
+            max_length=self._max_prompt_length(),
             return_tensors="pt",
         )
         prompt_lengths = prompt_encoding["attention_mask"].sum(dim=1).tolist()
@@ -2770,7 +2798,7 @@ class RLTrainer:
         drops the per-call reward and sample log lines, for callers that score
         one prompt group at a time.
         """
-        from atomrl.rewards.math_reward import compute_math_reward
+        from atomrl.rewards.math_verify_reward import score_math_responses
 
         N = int(sequences.shape[0])
         responses: list[str] = []
@@ -2784,7 +2812,9 @@ class RLTrainer:
                 response_lengths.append(int(response_ids.numel()))
                 text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
                 responses.append(text)
-            rewards_t, details = compute_math_reward(responses, gts_expanded)
+            rewards_t, details = score_math_responses(
+                responses, gts_expanded, getattr(self.config, "reward", None)
+            )
             rewards = rewards_t.to(self._device)
             accs = torch.tensor(
                 [1.0 if d["acc"] else 0.0 for d in details],
@@ -3408,9 +3438,11 @@ class RLTrainer:
         for gt in ground_truths:
             expanded_gts.extend([gt] * num_generations)
 
-        from atomrl.rewards.math_reward import compute_math_reward
+        from atomrl.rewards.math_verify_reward import score_math_responses
 
-        rewards, details = compute_math_reward(responses, expanded_gts)
+        rewards, details = score_math_responses(
+            responses, expanded_gts, getattr(self.config, "reward", None)
+        )
 
         accuracy = sum(1 for d in details if d["acc"]) / max(1, len(details))
         logger.info("Reward: accuracy=%.4f, mean=%.4f", accuracy, rewards.mean().item())
@@ -3455,7 +3487,17 @@ class RLTrainer:
         """
         _B, _S = attention_mask.shape
         mask = attention_mask.clone()
+        policy = getattr(getattr(self, "config", None), "policy", None)
+        fills = (
+            int(policy.max_total_sequence_length)
+            if int(getattr(policy, "max_prompt_length", 0) or 0) > 0
+            else None
+        )
         for i, plen in enumerate(prompt_lengths):
+            if fills is not None and plen >= fills:
+                # No room for a response: NeMo-RL leaves the sample out of the loss.
+                mask[i] = 0
+                continue
             # Find where actual tokens start (first 1 in attention_mask)
             actual_start = int(
                 (attention_mask[i] == 1).nonzero(as_tuple=True)[0][0].item()
@@ -4668,8 +4710,11 @@ class RLTrainer:
         attention_mask: torch.Tensor | None = None,
         rollout_routed_experts: torch.Tensor | None = None,
         rollout_routing: list[Any] | None = None,
+        reference: bool = False,
     ):
         meta = {"calculate_entropy": True} if want_entropy else {}
+        if reference:
+            meta["reference_policy"] = True
         # verl-aligned packed forward on the worker needs the temperature (for
         # logits.div_) and a per-GPU token budget for chunking the flat forward.
         meta["temperature"] = float(
@@ -4822,6 +4867,34 @@ class RLTrainer:
                 metrics[f"{prefix}/k3_kl"] = float(k3.mean())
             start = end
         return metrics
+
+    @staticmethod
+    def _token_mult_prob_error(
+        old_log_probs: torch.Tensor,
+        rollout_log_probs: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> dict[str, float]:
+        """NeMo-RL's ``token_mult_prob_error``: mean of exp(|logp_train - logp_rollout|).
+
+        Same frame and width handling as ``_mismatch_by_response_position``.
+        """
+        width = min(
+            old_log_probs.shape[-1],
+            rollout_log_probs.shape[-1],
+            response_mask.shape[-1],
+        )
+        mask = response_mask[..., :width].bool()
+        tokens = int(mask.sum().item())
+        if not tokens:
+            return {}
+        delta = (
+            rollout_log_probs[..., :width].float() - old_log_probs[..., :width].float()
+        )
+        return {
+            "rollout_corr/token_mult_prob_error": float(
+                torch.exp(delta[mask].abs()).mean()
+            )
+        }
 
     @staticmethod
     def _r3_verify_old_vs_rollout(
@@ -5049,6 +5122,47 @@ class RLTrainer:
         """verl-style 1-based global step for logs/checkpoints/W&B."""
         return int(step) + 1
 
+    def _check_force_on_policy_ratio(self) -> bool:
+        """Whether ``algorithm.force_on_policy_ratio`` is on; refuse it where the
+        old log-probs would be needed before the training forward exists.
+
+        Rollout IS stays: the training forward forms its weights from its own
+        detached log-probs, as NeMo-RL does, so they are not needed earlier;
+        ``_in_loss_rollout_is`` carries the settings to it."""
+        self._in_loss_rollout_is = None
+        if not getattr(self.config.algorithm, "force_on_policy_ratio", False):
+            return False
+        from atomrl.algorithms.rollout_correction import (
+            _resolve_rollout_correction_config,
+        )
+
+        rc = self.config.quantization.rollout_correction
+        backend = str(self.config.policy.training_backend).replace("-", "_")
+        refused = []
+        if backend != "megatron_native":
+            refused.append(f"policy.training_backend={backend!r}")
+        if rc.rollout_is and rc.rollout_is_batch_normalize:
+            refused.append("rollout_correction.rollout_is_batch_normalize")
+        if rc.rollout_rs:
+            refused.append(f"rollout_correction.rollout_rs={rc.rollout_rs!r}")
+        if rc.bypass_mode:
+            refused.append("rollout_correction.bypass_mode")
+        if _resolve_rollout_correction_config(self.config).enabled:
+            refused.append("rollout_correction.enabled")
+        if refused:
+            raise ValueError(
+                "algorithm.force_on_policy_ratio takes the old log-probs from the "
+                "megatron_native training forward, so nothing may need them "
+                "before it; unsupported here: " + ", ".join(refused)
+            )
+        if rc.rollout_is:
+            self._in_loss_rollout_is = {
+                "rollout_is": rc.rollout_is,
+                "rollout_is_threshold": rc.rollout_is_threshold,
+                "rollout_is_seq_reduction": rc.rollout_is_seq_reduction,
+            }
+        return True
+
     def _train_with_ray_controller(self) -> None:
         """Ray worker orchestration path (no torch.distributed collectives)."""
         if self._algorithm is None or self._actor_wg is None:
@@ -5057,6 +5171,7 @@ class RLTrainer:
             raise RuntimeError(
                 "Ray controller path requires an ATOM or ray_http rollout engine."
             )
+        force_on_policy = self._check_force_on_policy_ratio()
 
         for cb in self.callbacks:
             cb.on_train_begin(self)
@@ -5183,6 +5298,9 @@ class RLTrainer:
                         "[step=%d] bypass_mode (ray): using rollout_log_probs as old_log_probs",
                         step,
                     )
+            elif force_on_policy:
+                # The training forward supplies them (and the entropy).
+                old_log_probs, entropy_full = None, None
             else:
                 old_log_probs, entropy_full = self._compute_log_probs_with_worker_group(
                     self._actor_wg,
@@ -5194,15 +5312,25 @@ class RLTrainer:
                 )
             old_log_prob_time = time.time() - old_log_prob_t0
             ref_t0 = time.time()
-            if self._ref_wg is not None:
+            if self._ref_in_actor:
+                ref_log_probs = self._compute_log_probs_with_worker_group(
+                    self._actor_wg,
+                    sequences,
+                    role="actor",
+                    attention_mask=seq_mask,
+                    reference=True,
+                )
+            elif self._ref_wg is not None:
                 ref_log_probs = self._compute_log_probs_with_worker_group(
                     self._ref_wg,
                     sequences,
                     role="ref",
                     attention_mask=seq_mask,
                 )
-            else:
+            elif old_log_probs is not None:
                 ref_log_probs = torch.zeros_like(old_log_probs)
+            else:
+                ref_log_probs = None
 
             ref_time = time.time() - ref_t0
             reward_t0 = time.time()
@@ -5226,11 +5354,13 @@ class RLTrainer:
             tensors = {
                 "input_ids": sequences,
                 "attention_mask": seq_mask,
-                "old_log_probs": old_log_probs,
-                "ref_log_probs": ref_log_probs,
                 "rewards": rewards,
                 "response_mask": response_mask,
             }
+            if old_log_probs is not None:
+                tensors["old_log_probs"] = old_log_probs
+            if ref_log_probs is not None:
+                tensors["ref_log_probs"] = ref_log_probs
             if rollout_lp is not None:
                 tensors["rollout_log_probs"] = rollout_lp
             batch = DataProto(
@@ -5261,6 +5391,8 @@ class RLTrainer:
                 # filter_groups selection and the DP split reindex it with the rows
                 ragged=rollout_ragged,
             )
+            if force_on_policy and self._in_loss_rollout_is:
+                batch.meta["in_loss_rollout_is"] = dict(self._in_loss_rollout_is)
             batch.check_consistency()
 
             adv_t0 = time.time()
@@ -5311,6 +5443,14 @@ class RLTrainer:
                     _rlp_ray,
                     response_mask,
                 )
+            if (
+                _rlp_ray is not None
+                and old_log_probs is not None
+                and not (_bypass_ray and rollout_lp is not None)
+            ):
+                _position_mismatch_metrics.update(
+                    self._token_mult_prob_error(old_log_probs, _rlp_ray, response_mask)
+                )
             adv_time = time.time() - adv_t0
 
             if use_ray_rollout:
@@ -5344,6 +5484,18 @@ class RLTrainer:
             _pt = metrics.pop("ppo_kl_tok", None)
             if _ps is not None and _pt:
                 metrics["ppo_kl"] = _ps / max(_pt, 1e-6)
+            # force_on_policy_ratio: what the skipped old-log-prob pass reports
+            # and the importance weights formed in the loss; the reference KL.
+            for _src, _dst in (
+                ("tmpe", "rollout_corr/token_mult_prob_error"),
+                ("ent", "entropy"),
+                ("ris", "rollout_corr/rollout_is_mean"),
+                ("refkl", "ref_kl"),
+            ):
+                _s = metrics.pop(f"{_src}_sum", None)
+                _t = metrics.pop(f"{_src}_tok", None)
+                if _s is not None and _t:
+                    metrics[_dst] = _s / _t
             self._finalize_mismatch_metrics(metrics)
 
             if _rc_metrics_ray:
@@ -5672,7 +5824,7 @@ class RLTrainer:
             return {}
         label_step = (self.global_step if step is None else step) + 1
 
-        from atomrl.rewards.math_reward import compute_math_reward
+        from atomrl.rewards.math_verify_reward import score_math_responses
 
         cap = int(getattr(self.config.eval, "num_samples", 0) or 0)
         num_samples = len(self._val_dataset)
@@ -5771,7 +5923,9 @@ class RLTrainer:
                 responses.append(
                     self._tokenizer.decode(response_ids, skip_special_tokens=True)
                 )
-            rewards_t, details = compute_math_reward(responses, ground_truths)
+            rewards_t, details = score_math_responses(
+                responses, ground_truths, getattr(self.config, "reward", None)
+            )
 
             all_scores.extend(rewards_t.tolist())
             all_acc.extend([1.0 if d["acc"] else 0.0 for d in details])
