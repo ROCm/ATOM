@@ -40,7 +40,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # sha256 of core's attention forward/preparation helpers, comments and blank
 # lines stripped. vLLM keeps preparation inside its existing attention break;
 # native TokenGraph's fixed/live placement does not change the copied math.
-CORE_PREPARE_DIGEST = "1f897780d89a3205"
+CORE_PREPARE_DIGEST = "9aa3c02a741f9b0b"
 CORE_FORWARD_DIGEST = "fbae6fa2bb0e58d0"
 
 
@@ -336,11 +336,13 @@ def test_the_copy_still_covers_both_dispatch_arms():
         # Core's `start` / `join` skip the lookup on a step the model's decode
         # round serves (`EngramStep.served_by_round`); not ported: the plugin's
         # runner has no decode round, so its steps are never served by one.
+        # The single-stream recording (`graph_records_single_stream`) needs no
+        # port either: the plugin calls core's `start` / `join` themselves.
         (
             "atom/model_ops/engram/device/staging.py",
             "EngramStaging",
             ("start", "consume", "join"),
-            "74eade6acaa9b896",
+            "d4d021d4c16388f1",
         ),
     ],
 )

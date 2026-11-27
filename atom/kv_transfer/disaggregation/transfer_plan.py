@@ -170,7 +170,7 @@ def build_transfer_plan(
                 layout.source_region,
                 layout.target_region,
                 layout.target_base,
-                GatherLayout(width, width, 0, width, width),
+                GatherLayout(width, width, ((0, width),)),
             )
         )
     return TransferPlan(

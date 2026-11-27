@@ -22,13 +22,20 @@ Completion protocol, per worker and operation:
   of the save has finished -- a failed put, a pool with no slot left, the
   source read deadline -- also claims the source quiescent and reports the
   chunks it never read as source-safe, so the scheduler may retry at once and
-  every PP stage reports the same per-chunk set. An exception from the GPU
-  copy claims neither: it propagates, and ``_guard`` reports the failure
-  without the quiescent claim.
+  every PP stage reports the same per-chunk set. On the serial path an
+  exception from the GPU copy claims neither: it propagates, and ``_guard``
+  reports the failure without the quiescent claim. A pipelined save instead
+  first waits for its native puts, then, only if a fresh device fence proves
+  the source idle, claims the source quiescent and reports source-safe every
+  chunk below the lowest one read (on the staged path that can repeat a group
+  already reported before a later one raised; the aggregators drop repeats).
 * A chunk the store already holds when a save reaches its window is neither
   read nor put: it is source-safe at once and counts as stored, so a save
   whose every chunk was held ends in a success like any other.
-* A load ends in exactly one of done or failed, all-or-nothing.
+* A load ends in exactly one of done or failed, all-or-nothing. Where PP
+  stages push (``stages_push_load_terminals``), that terminal goes to the PP
+  head's kv_status socket as it lands, or to this stage's poll when the head's
+  pipe is full; a load that raises still reports through the poll (``_guard``).
 * A slot returns to the pool only once no GPU or store access can still reach
   it. One a store transfer or a GPU copy may still reach is quarantined for
   good, and the pool's memory then outlives the worker (``pool.close``).
@@ -50,12 +57,21 @@ import logging
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from functools import partial
 from typing import Any
 
 import torch
 
-from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
+from atom.distributed.pp_transport import (
+    PPKVStatusPusher,
+    stages_push_load_terminals,
+)
+from atom.kv_transfer.disaggregation.types import (
+    KVConnectorOutput,
+    SaveOperationId,
+    SaveSourceGroupId,
+)
 from atom.kv_transfer.offload import atom_lmcache_staging
 from atom.kv_transfer.offload._block_gpu_connector import (
     _DEFAULT_GPU_STAGING_BYTES,
@@ -70,6 +86,12 @@ from atom.kv_transfer.offload.kv_store.pool import (
     SlotPoolExhausted,
     TransferSlotPool,
     pool_allocation_bytes,
+)
+from atom.kv_transfer.offload.kv_store.save_pipeline import (
+    MAX_BATCH_CHUNKS,
+    Sender,
+    SettlementTransaction,
+    StreamStopped,
 )
 from atom.kv_transfer.offload.kv_store.scheduler import (
     monotonic_clock_id,
@@ -117,6 +139,24 @@ def _tail_first_windows(start: int, end: int, size: int) -> list[range]:
         windows.append(range(low, high))
         high = low
     return windows
+
+
+def _stream_chunks(
+    segments: Iterable[tuple[range, bool, list[str], float | None]],
+    batch_chunks: int,
+    reserve: Callable[[], None],
+) -> Iterator[tuple[range, bool, list[str], float | None]]:
+    """Split each segment into batches, highest first, reusing its lookup.
+
+    ``reserve`` runs before each batch the store does not hold is yielded.
+    """
+    for segment, held, keys, lookup_ms in segments:
+        for run in _tail_first_windows(segment.start, segment.stop, batch_chunks):
+            if not held:
+                reserve()
+            offset = run.start - segment.start
+            yield run, held, keys[offset : offset + len(run)], lookup_ms
+            lookup_ms = None
 
 
 def _head_first_windows(start: int, end: int, size: int) -> list[range]:
@@ -172,6 +212,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         self._gpu_connector: BlockGPUConnector | None = None
         self._namespace: str | None = None
         self._world = 1
+        # Where load terminals go instead of this stage's KV poll, if anywhere.
+        self._load_terminal_pusher: PPKVStatusPusher | None = None
         self._chunk_bytes = 0
         self._stats_lock = threading.Lock()
         # Whether one-run windows are copied in place; see `register_kv_caches`.
@@ -186,6 +228,19 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         # Why this worker loads nothing from the store any more, once it does
         # not: its own put (`_distrust_store`) or the backend's mark of it.
         self._store_distrusted: str | None = None
+        batch = self._save_batch_chunks = envs.ATOM_STORE_SAVE_BATCH_CHUNKS
+        if not 0 <= batch <= MAX_BATCH_CHUNKS:
+            raise ValueError(f"ATOM_STORE_SAVE_BATCH_CHUNKS needs 0-{MAX_BATCH_CHUNKS}")
+        if batch and self.save_workers > 1:
+            # `Sender.preparing` is one flag for the worker: a second save
+            # thread would leak a credit or trip `assert self.preparing`.
+            raise ValueError(
+                "ATOM_STORE_SAVE_BATCH_CHUNKS needs one save thread "
+                "(OFFLOAD_COPY_WORKERS=1)"
+            )
+        self._sender = Sender(self) if self._save_batch_chunks else None
+        if self._sender is not None:  # the serial path keeps `_do_save_req` as is
+            self._do_save_req = self._do_save_pipelined
         timeout = self._store_cfg.save_abandon_timeout_s
         self._source_read_window_s = timeout - min(
             _MAX_SOURCE_READ_MARGIN_S, timeout / 5
@@ -275,7 +330,10 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         raise NotImplementedError
 
     def _settle_put(
-        self, pool: TransferSlotPool, slots: list[Slot], answer: Any
+        self,
+        pool: TransferSlotPool | SettlementTransaction,
+        slots: list[Slot],
+        answer: Any,
     ) -> str | None:
         """Release or quarantine a put's slots; why it failed, None if stored."""
         raise NotImplementedError
@@ -330,8 +388,35 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         )
 
     def close(self) -> None:
-        """Join the executors, then release the GPU connector, pool and client."""
+        """Join the executors, then release the GPU connector, pool and client.
+
+        With the save pipeline the sender first gets a bounded wait to drain.
+        Saves still queued, and the running one at its next batch, then end
+        as failed (``StreamStopped``); batches already submitted are still put.
+        The executors are joined either way, which waits for every save to
+        drain its puts -- a native put that never returns blocks here, as on
+        main. A sender that had not drained gets a second bounded wait; only a
+        lookup queued ahead for a window its save never reached can still be
+        there. If it is, the GPU connector, pool and client all stay open and
+        ``_stop_client_users`` is skipped (``ModelRunner.exit`` calls
+        ``close`` once).
+        """
+        drained = True
+        if self._sender is not None:
+            for executor in (self._save_executor, self._load_executor):
+                executor.shutdown(wait=False)
+            drained = self._sender.close()
         super().close()
+        # The load threads are joined: no terminal is still on its way out.
+        pusher, self._load_terminal_pusher = self._load_terminal_pusher, None
+        if pusher is not None:
+            pusher.close()
+        if not drained and not self._sender.close():
+            logger.warning(
+                "%s: the save sender is still busy; resources stay open",
+                self.LABEL,
+            )
+            return
         # A backend's own call still inside the client keeps it open: closing
         # it would pull it from under the call.
         client_idle = self._stop_client_users()
@@ -367,6 +452,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         rank, world = pp_aware_rank_and_world(self._config, _tp_group())
         self._rank = rank
         self._world = world
+        self._load_terminal_pusher = self._open_load_terminal_pusher()
         # Scheduler blocks, threaded from the model runner. MLA stores its KV
         # token-major, so the codec cannot infer the count from shape[0].
         # The dense codec reads kv_caches. M3 and V4.1 read the PAGE region map.
@@ -544,7 +630,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         Per run: its chunks, whether the store holds them, their keys and the
         milliseconds the lookup took, on a window's first run only (None on
         the rest). One
-        lookup per window, made when the save reaches it. Another request's
+        lookup per window, made when the save reaches it (under the pipeline
+        the ``Lookahead`` client queues it one window earlier). Another request's
         save often stored a prefix already -- the scheduler's lookup counts
         only the prefix every rank holds, so a save starts below what this
         rank has -- and putting it again would pack and send bytes the store
@@ -575,6 +662,41 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 yield run, run_held, keys[offset : offset + len(run)], lookup_ms
                 lookup_ms = None
 
+    def _do_save_pipelined(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
+        """`_do_save_req` with the sender: on a failure, drain its native work first."""
+        sender = self._sender
+        sender.begin_request(req)
+        try:
+            KVStoreOffloadConnector._do_save_req(
+                self, req, producer_event=producer_event
+            )
+        except BaseException as exc:  # drain native work first
+            sender.release_preparing()
+            sender.drain_request(req)
+            if not isinstance(exc, Exception):
+                raise
+            self._warn_rate_limited(
+                "save:stream_exception",
+                "%s: a pipelined save failed (%r), req=%s; native work has drained",
+                self.LABEL,
+                exc,
+                req.req_id,
+                exc_info=True,
+            )
+            try:
+                _synchronize(self._registered()[0].device)
+            except Exception:  # noqa: BLE001  # a failed fence cannot free the source
+                self._record_save_failure(req, source_quiescent=False)
+            else:
+                start = int(req.save_spec.skip_leading_tokens) // self.chunk_size
+                end = len(req.chunk_hashes or b"") // DIGEST_BYTES
+                read_from = sender.read_from(req)
+                self._abort_save(
+                    req, range(start, end if read_from is None else read_from)
+                )
+        finally:
+            sender.forget_request(req)
+
     def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
@@ -594,88 +716,115 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         # The lowest chunk handed to the GPU or found held so far; [start,
         # read_from) is unread.
         read_from = end
+        sender = self._sender
         failure = detail = None
         segments_run = put_bytes = in_place_segments = 0
         windows_reached = put_chunks = held_chunks = 0
         pack_ms = put_ms = exists_ms = 0.0
         t_store0 = time.perf_counter()
-        for segment, held, keys, lookup_ms in self._save_segments(client, req, windows):
-            if lookup_ms is not None:  # the first segment of a window
-                windows_reached += 1
-                exists_ms += lookup_ms
-            if held:
-                # Already in the store: neither read nor put, and source-safe
-                # at once, highest first like the rest.
-                self._chunks_source_safe(req.save_operation, reversed(segment))
-                read_from = segment.start
-                held_chunks += len(segment)
-                continue
-            try:
-                slots = pool.acquire("save", len(segment))
-            except SlotPoolExhausted as exc:
-                failure, detail = "pool_exhausted", str(exc)
-                break
-            # Checked after the wait for slots, right before the GPU read.
-            if deadline is not None and time.monotonic() >= deadline:
-                pool.release(slots)
-                failure = "source_read_deadline"
-                detail = (
-                    f"queued past {self._source_read_window_s:.0f}s, after which "
-                    "the scheduler may reclaim the source blocks"
-                )
-                break
-            segments_run += 1
-            run = pool.contiguous_view(slots) if self._in_place else None
-            t_pack0 = time.perf_counter()
-            try:
-                if run is not None:
-                    self._copy_in_place(
-                        run,
-                        segment,
-                        req.block_ids,
-                        pack=True,
-                        producer_event=producer_event,
+        segments = self._save_segments(
+            client if sender is None else sender.lookahead(req, windows),
+            req,
+            windows,
+        )
+        if sender is not None:
+            segments = _stream_chunks(
+                segments, self._save_batch_chunks, partial(sender.reserve, req)
+            )
+        try:
+            for segment, held, keys, lookup_ms in segments:
+                if lookup_ms is not None:  # the first segment of a window
+                    windows_reached += 1
+                    exists_ms += lookup_ms
+                if held:
+                    # Already in the store: neither read nor put, and source-safe
+                    # at once, highest first like the rest.
+                    self._chunks_source_safe(req.save_operation, reversed(segment))
+                    read_from = segment.start
+                    held_chunks += len(segment)
+                    continue
+                try:
+                    slots = pool.acquire("save", len(segment))
+                except SlotPoolExhausted as exc:
+                    failure, detail = "pool_exhausted", str(exc)
+                    break
+                # Checked after the wait for slots, right before the GPU read.
+                if deadline is not None and time.monotonic() >= deadline:
+                    pool.release(slots)
+                    failure = "source_read_deadline"
+                    detail = (
+                        f"queued past {self._source_read_window_s:.0f}s, after which "
+                        "the scheduler may reclaim the source blocks"
                     )
-                else:
-                    with gpu_connector.track_save_source(req.save_operation):
-                        gpu_connector.batched_from_gpu(
-                            slots,
-                            [index * chunk for index in segment],
-                            [(index + 1) * chunk for index in segment],
-                            block_ids=req.block_ids,
+                    break
+                segments_run += 1
+                run = pool.contiguous_view(slots) if self._in_place else None
+                t_pack0 = time.perf_counter()
+                try:
+                    if run is not None:
+                        self._copy_in_place(
+                            run,
+                            segment,
+                            req.block_ids,
+                            pack=True,
                             producer_event=producer_event,
                         )
-            except BaseException:
-                self._release_once_device_idle(pool, slots)
-                raise
-            pack_ms += (time.perf_counter() - t_pack0) * 1000
-            # Both paths return after their final stream sync: no GPU work of
-            # this segment still reads the source or writes the slots.
-            read_from = segment.start
-            if run is not None:
-                in_place_segments += 1
-                # Highest first, as the block GPU connector reports them.
-                self._chunks_source_safe(req.save_operation, reversed(segment))
-            t_put0 = time.perf_counter()
-            try:
-                answer = self._put_chunks(client, req, segment, keys, slots)
-            except CallRefused as exc:
-                # Refused before the store had the call: nothing was sent.
-                pool.release(slots)
-                failure, detail = "put_refused", str(exc)
-                break
-            except Exception as exc:  # noqa: BLE001  # reported below
-                pool.quarantine(slots, reason="a put raised")
-                self._distrust_store(f"a put raised {exc!r}")
-                failure, detail = "put_raised", repr(exc)
-                break
-            put_ms += (time.perf_counter() - t_put0) * 1000
-            put_chunks += len(slots)
-            problem = self._settle_put(pool, slots, answer)
-            if problem is not None:
-                failure, detail = "put_failed", problem
-                break
-            put_bytes += self._chunk_bytes * len(slots)
+                    else:
+                        with gpu_connector.track_save_source(req.save_operation):
+                            gpu_connector.batched_from_gpu(
+                                slots,
+                                [index * chunk for index in segment],
+                                [(index + 1) * chunk for index in segment],
+                                block_ids=req.block_ids,
+                                producer_event=producer_event,
+                            )
+                except BaseException:
+                    self._release_once_device_idle(pool, slots)
+                    raise
+                pack_ms += (time.perf_counter() - t_pack0) * 1000
+                # Both paths return after their final stream sync: no GPU work of
+                # this segment still reads the source or writes the slots.
+                read_from = segment.start
+                if run is not None:
+                    in_place_segments += 1
+                    # Highest first, as the block GPU connector reports them.
+                    self._chunks_source_safe(req.save_operation, reversed(segment))
+                if sender is not None:
+                    sender.submit(req, segment, keys, slots)
+                    continue
+                t_put0 = time.perf_counter()
+                try:
+                    answer = self._put_chunks(client, req, segment, keys, slots)
+                except CallRefused as exc:
+                    # Refused before the store had the call: nothing was sent.
+                    pool.release(slots)
+                    failure, detail = "put_refused", str(exc)
+                    break
+                except Exception as exc:  # noqa: BLE001  # reported below
+                    pool.quarantine(slots, reason="a put raised")
+                    self._distrust_store(f"a put raised {exc!r}")
+                    failure, detail = "put_raised", repr(exc)
+                    break
+                put_ms += (time.perf_counter() - t_put0) * 1000
+                put_chunks += len(slots)
+                problem = self._settle_put(pool, slots, answer)
+                if problem is not None:
+                    failure, detail = "put_failed", problem
+                    break
+                put_bytes += self._chunk_bytes * len(slots)
+        except StreamStopped as exc:  # the sender closed, or an earlier put failed
+            failure, detail = "stream_stopped", str(exc)
+        finally:
+            if sender is not None:
+                sender.note_read_from(req, read_from)
+        if sender is not None:
+            sender.release_preparing()
+            completed = sender.drain_request(req)
+            put_ms = completed.native_ms
+            put_chunks = completed.returned_chunks
+            put_bytes = self._chunk_bytes * completed.stored_chunks
+            if completed.problem is not None and failure in (None, "stream_stopped"):
+                failure, detail = completed.kind, completed.problem
         with self._stats_lock:
             self._save_counts["put_chunks"] += put_chunks
             self._save_counts["held_chunks"] += held_chunks
@@ -717,8 +866,9 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 failure or "ok",
             )
         self._maybe_log_store_stats()
-        # The terminal goes last: anything raising before it leaves `_guard` to
-        # report the one failure, never a second terminal after a first.
+        # The terminal goes last: anything raising before it leaves one report
+        # of the failure (`_guard` serially, `_do_save_pipelined` with the pipeline),
+        # never a second terminal after a first.
         if failure is None:
             self._record_store_terminal(req, True)
         else:
@@ -745,6 +895,29 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 SaveSourceGroupId(operation, ((index * chunk, (index + 1) * chunk),))
             )
 
+    def _open_load_terminal_pusher(self) -> PPKVStatusPusher | None:
+        """A PUSH to the PP head's kv_status socket, where stages push (else None)."""
+        if not stages_push_load_terminals(self._config):
+            return None
+        pc = self._config.parallel_config
+        return PPKVStatusPusher(pc.pipeline_parallel_rank, pc.pp_kv_status_addr)
+
+    def _report_load_terminal(self, req: LMCacheReqMeta, ok: bool) -> None:
+        """A load's one terminal: pushed to the PP head when a pusher is open and
+        takes it, else kept for this stage's next KV poll (`get_finished`)."""
+        completion = self._load_completion_id(req)
+        with self._lock:
+            if not ok:
+                self._record_load_error_blocks(req)
+            pusher = self._load_terminal_pusher
+            if pusher is not None and pusher.try_send(
+                KVConnectorOutput(finished_loading={completion})
+                if ok
+                else KVConnectorOutput(failed_loading={completion})
+            ):
+                return
+            (self._done_load if ok else self._failed_load).add(completion)
+
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
         assert ls is not None
@@ -753,8 +926,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         lmc = int(ls.lmcache_cached_tokens)
         t_total0 = time.perf_counter()
         if lmc <= hbm:
-            with self._lock:
-                self._done_load.add(self._load_completion_id(req))
+            self._report_load_terminal(req, ok=True)
             return
         chunk = self.chunk_size
         end_tokens = (
@@ -778,9 +950,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 chunk,
                 problem,
             )
-            with self._lock:
-                self._failed_load.add(self._load_completion_id(req))
-                self._record_load_error_blocks(req)
+            self._report_load_terminal(req, ok=False)
             return
 
         pool, client, gpu_connector = self._registered()
@@ -898,12 +1068,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             )
         self._maybe_log_store_stats()
         # Last, for the reason `_do_save_req` gives.
-        with self._lock:
-            if failure is None:
-                self._done_load.add(self._load_completion_id(req))
-            else:
-                self._failed_load.add(self._load_completion_id(req))
-                self._record_load_error_blocks(req)
+        self._report_load_terminal(req, ok=failure is None)
 
     # -- in-place copies ---------------------------------------------------
     def _in_place_stream(self) -> torch.cuda.Stream:
@@ -1013,7 +1178,9 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         pool.release(slots)
 
     # -- observability -----------------------------------------------------
-    def _warn_rate_limited(self, kind: str, message: str, *args: Any) -> None:
+    def _warn_rate_limited(
+        self, kind: str, message: str, *args: Any, exc_info: bool = False
+    ) -> None:
         """At most one warning of ``kind`` per interval, counting the rest."""
         now = time.monotonic()
         with self._stats_lock:
@@ -1022,7 +1189,12 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 return
             self._next_warning_at[kind] = now + _WARNING_INTERVAL_S
             suppressed = self._suppressed_warnings.pop(kind, 0)
-        logger.warning(message + " (%d more since the last warning)", *args, suppressed)
+        logger.warning(
+            message + " (%d more since the last warning)",
+            *args,
+            suppressed,
+            exc_info=exc_info,
+        )
 
     def _maybe_log_store_stats(self) -> None:
         client, pool = self._client, self._pool

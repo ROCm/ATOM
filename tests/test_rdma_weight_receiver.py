@@ -4,7 +4,7 @@
 """The RDMA weight receiver: the wire format, and keeping every rank in step.
 
 The wire format is frozen by the sender
-(``lumenrl.engine.inference.rdma_weight_transfer``) and is reproduced here from
+(``atomrl.engine.inference.rdma_weight_transfer``) and is reproduced here from
 its own constants rather than copied by eye, so a drift on either side shows up
 as a test failure instead of a 61 GB transfer that decodes to garbage.
 
@@ -31,13 +31,9 @@ with stubbed_aiter():
         UTILITY_MANAGED_RUNNER_METHODS,
         WeightReloadRefused,
     )
+    from atom.rollout import rdma_protocol
     from atom.rollout.capabilities import CapabilityProviderMixin
-    from atom.rollout.rdma_weight_receiver import (
-        _CMD_BUCKET,
-        _CMD_END,
-        _HEADER_WORDS,
-        _decode_frame,
-    )
+    from atom.rollout.rdma_weight_receiver import _decode_frame
     from atom.rollout.weight_updater import WeightUpdaterMixin
 
 
@@ -74,11 +70,12 @@ def test_the_caller_waits_for_a_stream_as_long_as_the_engines_do():
 
 
 def test_the_command_and_header_constants_match_the_sender():
-    """These three numbers are the contract. LumenRL's sender hardcodes the
-    same values; a change on either side silently corrupts every transfer."""
-    assert _CMD_END == 0
-    assert _CMD_BUCKET == 1
-    assert _HEADER_WORDS == 4  # command, metadata_bytes, payload_bytes, version
+    """The sender and receiver share these three public wire constants."""
+    assert rdma_protocol.CMD_END == 0
+    assert rdma_protocol.CMD_BUCKET == 1
+    assert (
+        rdma_protocol.HEADER_WORDS == 4
+    )  # command, metadata_bytes, payload_bytes, version
 
 
 def _encode(entries_and_bytes):
@@ -327,9 +324,11 @@ def _frames(buckets, version=1):
 
     frames = []
     for meta, payload in buckets:
-        header = [_CMD_BUCKET, meta.numel(), payload.numel(), version]
+        header = [rdma_protocol.CMD_BUCKET, meta.numel(), payload.numel(), version]
         frames += [torch.tensor(header, dtype=torch.int64), meta, payload]
-    frames.append(torch.tensor([_CMD_END, 0, 0, version], dtype=torch.int64))
+    frames.append(
+        torch.tensor([rdma_protocol.CMD_END, 0, 0, version], dtype=torch.int64)
+    )
     return frames
 
 
@@ -543,7 +542,7 @@ def test_a_frame_that_cannot_be_allocated_for_fails_at_its_header(
     leaves no step to keep."""
     import torch
 
-    bad = torch.tensor([_CMD_BUCKET, metadata_bytes, payload_bytes, 1])
+    bad = torch.tensor([rdma_protocol.CMD_BUCKET, metadata_bytes, payload_bytes, 1])
     trainer = _Trainer([bad, *_frames(_three_buckets())])
     runner = _Runner()
     allocated = []
@@ -580,7 +579,12 @@ def test_an_allocation_that_fails_anyway_is_out_of_step_too(monkeypatch):
 
 @pytest.mark.parametrize(
     "header",
-    [[9, 3, 5, 1], [9, 0, 0, 1], [_CMD_BUCKET, 0, 5, 1], [_CMD_BUCKET, 3, 0, 1]],
+    [
+        [9, 3, 5, 1],
+        [9, 0, 0, 1],
+        [rdma_protocol.CMD_BUCKET, 0, 5, 1],
+        [rdma_protocol.CMD_BUCKET, 3, 0, 1],
+    ],
     ids=["unknown", "unknown-without-sizes", "no-metadata", "no-payload"],
 )
 def test_a_header_that_frames_no_bucket_breaks_the_stream_off(monkeypatch, header):
@@ -605,7 +609,7 @@ def test_an_end_marker_carrying_sizes_is_not_a_clean_finish(monkeypatch):
     import torch
 
     frames = _frames(_three_buckets())
-    frames[-1] = torch.tensor([_CMD_END, 5, 7, 1], dtype=torch.int64)
+    frames[-1] = torch.tensor([rdma_protocol.CMD_END, 5, 7, 1], dtype=torch.int64)
     runner = _Runner()
 
     with pytest.raises(RuntimeError, match="end marker"):
@@ -659,7 +663,7 @@ def test_a_rank_that_breaks_off_still_votes(monkeypatch):
     with pytest.raises(receiver.RDMAStreamOutOfStep):
         _receive(
             monkeypatch,
-            _Trainer([torch.tensor([_CMD_BUCKET, -1, 8, 1])]),
+            _Trainer([torch.tensor([rdma_protocol.CMD_BUCKET, -1, 8, 1])]),
             _Runner(),
             agree=agree,
         )
@@ -1057,7 +1061,7 @@ def test_a_refused_stream_keeps_the_version_the_engine_committed(monkeypatch):
 
 
 def _join(send, group_name):
-    """``init_rdma_weight_group`` through the engine, as LumenRL calls it."""
+    """``init_rdma_weight_group`` through the engine, as AtomRL calls it."""
     return send(
         "collective_rpc",
         method="init_rdma_weight_group",
@@ -1261,7 +1265,7 @@ def test_a_rank_out_of_step_leaves_the_group(monkeypatch):
     stream on the same group would be read out of step from its first header."""
     import torch
 
-    trainer = _Trainer([torch.tensor([_CMD_BUCKET, -1, 8, 1])])
+    trainer = _Trainer([torch.tensor([rdma_protocol.CMD_BUCKET, -1, 8, 1])])
     worker = _joined_worker(monkeypatch, trainer)
     (group,) = [g.group for g in worker._rdma_groups.values()]
 

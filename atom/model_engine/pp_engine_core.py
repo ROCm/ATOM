@@ -9,7 +9,10 @@ import queue
 import time
 from collections import deque
 
-from atom.distributed.pp_transport import PPStageTransport
+from atom.distributed.pp_transport import (
+    PPStageTransport,
+    stages_push_load_terminals,
+)
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
@@ -19,6 +22,7 @@ from atom.model_engine.engine_core import (
     HELD_POLL_S,
     EngineCore,
     publish_idle_state_work,
+    yield_gil,
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.observability import tracing
@@ -52,6 +56,8 @@ class PPEngineCoreProc(EngineCore):
             kv_status_addr=getattr(pc, "pp_kv_status_addr", ""),
         )
         self._in_flight: deque = deque()
+        # Stage load terminals land any time: the head also polls between launches.
+        self._stages_push_load_terminals = stages_push_load_terminals(config)
         self._pending_prefix_hash: deque = deque()
         bm = self.scheduler.block_manager
         # Deferring used to be off under SWA: the sliding window published its
@@ -102,8 +108,12 @@ class PPEngineCoreProc(EngineCore):
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
                     self._run_then_publish_kv_events(self._pp_head_step)
-                elif self.has_pending_kv_work():
-                    self._run_then_publish_kv_events(self._advance_idle_kv_transfer)
+                else:
+                    if self.has_pending_kv_work():
+                        self._run_then_publish_kv_events(self._advance_idle_kv_transfer)
+                    else:
+                        self._wait_for_input()
+                    yield_gil()
         finally:
             self._drain_kv_work_at_exit()
             try:
@@ -213,6 +223,12 @@ class PPEngineCoreProc(EngineCore):
             self.scheduler.mark_pp_inflight(scheduled_batch)
             self._in_flight.append((scheduled_batch, seqs, needs_output))
             launched += 1
+            if self._stages_push_load_terminals and (
+                len(self._in_flight) < self.pp_max_inflight
+            ):
+                # Before the next schedule(): take the reports that landed during
+                # the forward RPC, so a request loaded meanwhile can join.
+                self._poll_kv_transfer_progress()
 
         # Flush deferred send when idle — otherwise it dangles until next forward.
         if launched == 0:
@@ -368,8 +384,9 @@ class PPEngineCoreProc(EngineCore):
         self.pp_transport.send_metadata(batch)
 
     def _poll_kv_transfer_progress(self):
-        """Aggregate KV transfer status from local TP workers AND downstream
-        PP stages, then feed the result to the scheduler.
+        """Aggregate KV transfer status from local TP workers AND the kv_status
+        socket (downstream stages' polls; where stages push, every stage's load
+        terminals), then feed the result to the scheduler.
 
         For non-offload fields (finished_sending, finished_recving, etc.) the
         head's own TP-aggregated output goes directly to the scheduler — those
@@ -377,7 +394,7 @@ class PPEngineCoreProc(EngineCore):
 
         For offload fields (finished_loading, failed_loading, finished_saving)
         the head's output is fed into :class:`PPKVAggregator` together with
-        downstream stages' reports, and only globally-complete items reach the
+        the kv_status reports, and only globally-complete items reach the
         scheduler.
         """
         if not self.kv_transfer_enabled:
@@ -445,9 +462,10 @@ class PPEngineCoreProc(EngineCore):
         if not offload_local.is_empty():
             self._ingest_and_release(offload_local, 0)
 
-        # Ingest downstream PP stages' offload output.
-        for pp_rank, downstream_output in pp_messages:
-            self._ingest_and_release(downstream_output, pp_rank)
+        # Ingest the kv_status reports: downstream stages' polls, and pushed
+        # load terminals, stage 0's included.
+        for pp_rank, stage_output in pp_messages:
+            self._ingest_and_release(stage_output, pp_rank)
 
     def _ingest_and_release(self, output: KVConnectorOutput, pp_rank: int):
         result = self._pp_kv_aggregator.ingest(pp_rank, output)

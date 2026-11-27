@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Graph-replayable Engram lookup and TP reassembly beside early layers.
 
 A private collective instance isolates side-stream synchronization/scratch
@@ -12,20 +14,28 @@ import os
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from unittest.mock import patch
 
 import torch
 
 from atom.model_ops.engram.device.hashing import (
     EngramBatch,
-    engram_compress,
     engram_cursor_rows,
     engram_snapshot,
-    engram_snapshot_indices,
 )
-from atom.model_ops.engram.device.uva import uva_gather_into
+from atom.model_ops.engram.device.uva import UvaGather
 
 logger = logging.getLogger(__name__)
+# the caching allocator's settings, either spelling (HIP reads both)
+ALLOC_CONF_ENVS = ("PYTORCH_HIP_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+
+
+def _expandable_segments() -> bool:
+    """Whether the caching allocator maps expandable segments: memory no IPC
+    handle exports."""
+    return any(
+        "expandable_segments:True" in os.environ.get(name, "")
+        for name in ALLOC_CONF_ENVS
+    )
 
 
 @dataclass(frozen=True)
@@ -70,18 +80,27 @@ class EngramStaging:
         self.step = None
         # the step `start` left to the model (`EngramStep.served_by_round`)
         self._served = False
-        self.flat = {
-            layer: torch.empty(
-                host.max_num_tokens,
-                host.local_heads * host.prefetcher._tables[layer].head_dim,
-                dtype=host.buffers[layer].gpu.dtype,
-                device=host.device,
-            )
-            for layer in host.layer_ids
-        }
-
+        # the step `start` looked up on the compute stream (no fork to close)
+        self._inline = False
+        widths = {host.prefetcher._tables[layer].head_dim for layer in host.layer_ids}
+        if len(widths) != 1:
+            raise ValueError(f"Engram layers of different head dims {sorted(widths)}")
+        # a rank's looked-up row of a layer (its heads)
+        self.local_width = host.local_heads * widths.pop()
+        dtype = host.buffers[host.layer_ids[0]].gpu.dtype
+        # every layer's looked-up rows of a step in one block from its start,
+        # [layer, row, local_width] (`_rows`): the one all-gather's input
+        self.lookup = torch.empty(
+            len(host.layer_ids) * host.max_num_tokens * self.local_width,
+            dtype=dtype,
+            device=host.device,
+        )
+        self.gather = UvaGather(
+            [host.prefetcher._tables[layer] for layer in host.layer_ids], host.device
+        )
+        # the all-gather's output, alike [layer, row, embed_width] (`_gathered`)
+        self.gathered = None
         self.collective = None
-        self.gathered = {}
         self._init_collective()
         self.fallback_done = (
             {layer: torch.cuda.Event() for layer in host.layer_ids}
@@ -94,12 +113,16 @@ class EngramStaging:
         group = host._tp_group
         if group is None:
             return
-        # The last-dimension kernel supports these TP sizes and 16-byte packs.
-        # Keep the original main-stream path for other configurations.
-        first = host.layer_ids[0]
-        local_width = host.local_heads * host.prefetcher._tables[first].head_dim
-        itemsize = host.buffers[first].gpu.element_size()
-        if group.world_size not in (2, 4, 8) or local_width * itemsize % 16:
+        # The last-dimension kernel supports these TP sizes and 16-byte packs;
+        # its output is a layer's rows in place only when the ranks' heads
+        # tile the embedding exactly. Keep the original main-stream path for
+        # other configurations.
+        itemsize = self.lookup.element_size()
+        if (
+            group.world_size not in (2, 4, 8)
+            or self.local_width * itemsize % 16
+            or self.local_width * group.world_size != host.embed_width
+        ):
             logger.warning(
                 "engram: side-stream TP gather unsupported; using main stream"
             )
@@ -107,35 +130,86 @@ class EngramStaging:
         from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
         # Sharing TP GPU state would race barrier flags and scratch against
-        # main-stream all-reduce. Only reuse the CPU bootstrap group.
-        # AITER exports pool handles with offset zero. Use its raw hipMalloc
-        # pool so even small allocations have an exportable allocation base.
-        # Scope this to initialization; do not change the model communicator.
-        with patch.dict(os.environ, {"AITER_CUSTOM_AR_RAW_INPUT_POOL": "1"}):
-            collective = CustomAllreduce(
-                group.cpu_group,
-                host.device,
-                max_size=max(1024 * 1024, host.max_num_tokens * local_width * itemsize),
-            )
+        # main-stream all-reduce. Only reuse the CPU bootstrap group. Its input
+        # is `lookup`, registered once (peers read it in place: no copy into
+        # the communicator's own pool, which stays at its smallest).
+        collective = CustomAllreduce(group.cpu_group, host.device, max_size=1 << 20)
         if collective.disabled:
             logger.warning("engram: private TP gather unavailable; using main stream")
             return
-        self.collective = collective
-        for layer in host.layer_ids:
-            full_width = local_width * group.world_size
-            self.gathered[layer] = (
-                host.buffers[layer].gpu
-                if full_width == host.embed_width
-                else torch.empty(
-                    host.max_num_tokens,
-                    full_width,
-                    dtype=host.buffers[layer].gpu.dtype,
-                    device=host.device,
-                )
+        # only IPC registers a buffer peers read in place: VMM registers a
+        # copy made now, symm_mem registers nothing; and IPC exports no
+        # expandable-segment allocation (ROCm/aiter#4921), which every rank's
+        # environment says alike (an export failing on one rank alone would
+        # leave the others waiting in the handle exchange)
+        if collective._use_vmm or collective._use_symm_mem or _expandable_segments():
+            logger.warning(
+                "engram: private TP gather needs the IPC transport and a "
+                "non-expandable allocation; using main stream"
             )
+            return
+        collective.register_input_buffer(self.lookup)
+        self.collective = collective
+        self.gathered = torch.empty(
+            len(host.layer_ids) * host.max_num_tokens * host.embed_width,
+            dtype=self.lookup.dtype,
+            device=host.device,
+        )
         logger.info(
             "engram: hash/UVA/TP gather on one side stream with private IPC state"
         )
+
+    def _rows(self, width):
+        """Every layer's looked-up rows of a ``width``-row step, [layer, row,
+        local_width]: a block from `lookup`'s start, whatever the width (the
+        address the collective registered)."""
+        n = len(self.host.layer_ids)
+        return self.lookup[: n * width * self.local_width].view(
+            n, width, self.local_width
+        )
+
+    def _gathered(self, width):
+        """Every layer's gathered rows of a ``width``-row step, [layer, row,
+        embed_width] (`_rows` gathered along the last dim)."""
+        n, embed = len(self.host.layer_ids), self.host.embed_width
+        return self.gathered[: n * width * embed].view(n, width, embed)
+
+    def embeddings(self, width):
+        """Each layer's embedding rows of a ``width``-row step, where the
+        lookup leaves them: the all-gather's output under the private
+        collective, else the host buffers."""
+        if self.collective is not None:
+            gathered = self._gathered(width)
+            return {layer: gathered[i] for i, layer in enumerate(self.host.layer_ids)}
+        return {layer: buf.gpu[:width] for layer, buf in self.host.buffers.items()}
+
+    def _lookup(self, width, stream=None):
+        """Every layer's rows looked up from their hashed ids (`_snapshot`'s),
+        on the current stream, ``stream`` (default: the side stream; the
+        compute stream when `start` does not fork), then reassembled over TP
+        by one all-gather where the private collective serves; each layer's
+        `done` recorded once its rows are complete."""
+        host = self.host
+        stream = self.stream if stream is None else stream
+        rows = self._rows(width)
+        self.gather(
+            self.uva.row_ids[:, :width],
+            rows.view(len(host.layer_ids), width, host.local_heads, -1),
+            head_start=host.head_start,
+            local_heads=host.local_heads,
+            total_heads=host.total_heads,
+        )
+        if self.collective is None:
+            for i, layer in enumerate(host.layer_ids):
+                if host._tp_group is None:
+                    host.buffers[layer].gpu[:width].copy_(rows[i])
+                self.done[layer].record(stream)
+        if self.collective is not None:
+            self.collective.all_gather_reg(
+                rows, out=self._gathered(width), dim=rows.dim() - 1
+            )
+            for layer in host.layer_ids:
+                self.done[layer].record(stream)
 
     def prepare(self, step, width):
         """Name the forward's inputs (`EngramStep`); `start` launches on them."""
@@ -145,19 +219,12 @@ class EngramStaging:
         return EngramStagedRows(self, width)
 
     def _snapshot(self, width):
-        """Compressed ids, then the lookbacks the hashes read (and a verify
-        step's cursor candidates): before the cursor advance, they alias."""
+        """One launch: the compressed ids, the lookbacks (and a verify step's
+        cursor candidates) before the cursor advance, they alias, and every
+        layer's row ids hashed from them (`uva.row_ids`, `_lookup`'s)."""
         step, tables = self.step, self.uva.hash_tables
-        compressed = self.compressed[:width]
-        engram_compress(
-            tables,
-            step.input_ids[:width],
-            dead_mask=step.dead[:width],
-            out=compressed,
-            live=step.live,
-        )
         batch = EngramBatch(
-            compressed=compressed,
+            compressed=self.compressed[:width],
             batch_ids=step.batch_ids[:width],
             cu_seqlens=step.cu_seqlens,
             history=step.cursor[:, 1:],
@@ -170,6 +237,8 @@ class EngramStaging:
             cursor_positions=step.positions,
             cursor_out=step.candidates,
             live=step.live,
+            compress=(step.input_ids[:width], step.dead[:width]),
+            rows=(self.host.layer_ids, self.uva.row_ids[:, :width]),
         )
 
     def _advance_cursor(self, width):
@@ -188,67 +257,45 @@ class EngramStaging:
             )
 
     def start(self, width):
+        from atom.utils.forward_context import graph_records_single_stream
+
         # A step whose model looks the rows up itself: only the cursor advance
         # (no snapshot, no side stream), and `join` waits on nothing.
         self._served = self.step.served_by_round
+        self._inline = False
         if self._served:
             self._advance_cursor(width)
             return
         host = self.host
         self._snapshot(width)
         compute = torch.cuda.current_stream(host.device)
+        if graph_records_single_stream():
+            # A graph window kept on one stream (ATOM_GRAPH_SIDE_STREAMS): the
+            # lookup runs inline after the cursor advance, which reads the
+            # snapshot too, and `join` has no fork to close.
+            self._inline = True
+            self._advance_cursor(width)
+            self._lookup(width, compute)
+            return
         # Get the parent BEFORE entering the guard: waiting on ourselves
         # would neither order the inputs nor join the graph capture.
         self.stream.wait_stream(compute)
         # past the fork: the side stream reads the snapshot, not the cursor
         self._advance_cursor(width)
         with torch.cuda.stream(self.stream):
-            for layer in host.layer_ids:
-                ids = engram_snapshot_indices(
-                    self.uva.hash_tables,
-                    layer,
-                    self.snapshot[:width],
-                    self.uva.row_ids[:width],
-                )
-                table = host.prefetcher._tables[layer]
-                uva_gather_into(
-                    table,
-                    ids,
-                    self.flat[layer][:width].view(
-                        width, host.local_heads, table.head_dim
-                    ),
-                    head_start=host.head_start,
-                    local_heads=host.local_heads,
-                    total_heads=host.total_heads,
-                )
-                if self.collective is not None:
-                    out = self.gathered[layer][:width]
-                    # Use the communicator's pre-registered input pool. Direct
-                    # external registration in AITER assumes a zero IPC offset,
-                    # which is invalid for caching-allocator suballocations.
-                    self.collective.all_gather_unreg(
-                        self.flat[layer][:width], out=out, dim=1
-                    )
-                    if self.gathered[layer] is not host.buffers[layer].gpu:
-                        host.buffers[layer].gpu[:width].copy_(
-                            out[:, : host.embed_width]
-                        )
-                elif host._tp_group is None:
-                    host.buffers[layer].gpu[:width].copy_(self.flat[layer][:width])
-                # Ready means the complete embedding, including TP reassembly.
-                self.done[layer].record(self.stream)
+            self._lookup(width)
 
     def consume(self, layer, width):
         host = self.host
         torch.cuda.current_stream(host.device).wait_event(self.done[layer])
         if host._tp_group is not None and self.collective is None:
-            out = self.flat[layer][:width]
+            out = self._rows(width)[host.layer_ids.index(layer)]
             out = host._tp_group.all_gather(out, use_custom=True, dim=1)
             out = out[:, : host.embed_width]
             host.buffers[layer].gpu[:width].copy_(out)
 
     def join(self):
-        if self._served:
+        if self._served or self._inline:
             return
         # Close the fork even if a partial forward did not consume every layer.
         torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
@@ -263,8 +310,8 @@ class EngramStagedRows(dict):
 
     def __init__(self, staging, width):
         super().__init__(
-            (layer, buffer.gpu[:width].unsqueeze(0))
-            for layer, buffer in staging.host.buffers.items()
+            (layer, rows.unsqueeze(0))
+            for layer, rows in staging.embeddings(width).items()
         )
         self.staging, self.width = staging, width
         self._fallback_ready = set()

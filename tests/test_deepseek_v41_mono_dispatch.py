@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Which deployments and which steps the DeepSeek-V4.1 mono decode takes."""
 
 from types import SimpleNamespace
@@ -34,7 +35,18 @@ _HF = {
     "index_n_heads": 32,
     "index_head_dim": 128,
     "fp4ptpc": False,
+    # V4.1-Flash's: the candidate producer (layer 20) at ratio 1
+    "compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+    "candidate_source_layer_id": 20,
+    "engram_layer_ids": [1, 14],
 }
+
+
+def _hf_with(name: str, value) -> SimpleNamespace:
+    """V4.1-Flash's config with ``name`` set to ``value``."""
+    hf = dict(_HF)
+    hf[name] = value
+    return SimpleNamespace(**hf)
 
 
 # DP attention over 2 ranks with expert parallel, as a worker sees it once
@@ -59,6 +71,7 @@ def _atom_config(**overrides):
         "prefill_context_parallel_size": 1,
         "enable_tbo": False,
         "enable_tbo_decode": False,
+        "eplb_enable": False,
         "compilation_config": SimpleNamespace(level=0, cudagraph_mode=_Mode(False)),
         "kv_cache_dtype": "bf16",
         "index_cache_dtype": "fp8",
@@ -124,6 +137,7 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
         ({"is_multinode_tp": True}, "TP group spans nodes"),
         ({"enable_tbo": True}, "TBO"),
         ({"enable_tbo_decode": True}, "TBO"),
+        ({**_DPA, "eplb_enable": True}, "EPLB"),
         (
             {
                 "compilation_config": SimpleNamespace(
@@ -151,20 +165,30 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
             "a verify of more than 48 rows",
         ),
         (
-            {"hf_config": SimpleNamespace(**{**_HF, "index_topk": 1024})},
+            {"hf_config": _hf_with("index_topk", 1024)},
             "attention keys",
         ),
         (
-            {"hf_config": SimpleNamespace(**{**_HF, "candidate_topk_blocks": 1024})},
+            {"hf_config": _hf_with("engram_layer_ids", [0, 14])},
+            "an Engram layer 0",
+        ),
+        (
+            {"hf_config": _hf_with("candidate_topk_blocks", 1024)},
             "indexer shape",
         ),
         (
-            {"hf_config": SimpleNamespace(**{**_HF, "index_n_heads": 64})},
+            {"hf_config": _hf_with("index_n_heads", 64)},
             "indexer shape",
         ),
         (
-            {"hf_config": SimpleNamespace(**{**_HF, "fp4ptpc": True})},
+            {"hf_config": _hf_with("fp4ptpc", True)},
             "FP4PTPC checkpoint's per-channel FP8 linears",
+        ),
+        (
+            # a producer whose ratio's FULL rows split would wait for its
+            # blocks' scores on the other ranks for good
+            {"hf_config": _hf_with("candidate_source_layer_id", 2)},
+            "a candidate producer at a ratio whose rows split",
         ),
     ],
 )
@@ -228,15 +252,14 @@ def test_plugin_mode_is_refused(native, monkeypatch):
 
 
 def _context(monkeypatch, *, prefill=False, ubatch=None, **step_fields):
-    step = SimpleNamespace(
-        **{
-            "decode": True,
-            "tentative": True,
-            "requests": [object()],
-            "running_tokens": 6,
-            **step_fields,
-        }
-    )
+    fields = {
+        "decode": True,
+        "tentative": True,
+        "requests": [object()],
+        "running_tokens": 6,
+    }
+    fields.update(step_fields)
+    step = SimpleNamespace(**fields)
     fwd = SimpleNamespace(
         context=SimpleNamespace(is_prefill=prefill),
         ubatch_slices=ubatch,
@@ -248,19 +271,19 @@ def _context(monkeypatch, *, prefill=False, ubatch=None, **step_fields):
 
 def test_verify_step_is_routed(monkeypatch):
     _context(monkeypatch)
-    assert dispatch.step_supported(torch.zeros(6, dtype=torch.int64), None)
+    assert dispatch.step_supported(6)
 
 
 def test_plain_decode_step_is_routed(monkeypatch):
     # no drafter: a token a request, not a tentative verify
     _context(monkeypatch, tentative=False, requests=[object()] * 3, running_tokens=3)
-    assert dispatch.step_supported(torch.zeros(3, dtype=torch.int64), None)
+    assert dispatch.step_supported(3)
 
 
 def test_ragged_verify_step_is_routed(monkeypatch):
     # requests verifying 2, 4 and 1 + 5 tokens: 12 rows, split unevenly
     _context(monkeypatch, requests=[object()] * 3, running_tokens=12)
-    assert dispatch.step_supported(torch.zeros(12, dtype=torch.int64), None)
+    assert dispatch.step_supported(12)
 
 
 @pytest.mark.parametrize(
@@ -276,7 +299,7 @@ def test_ragged_verify_step_is_routed(monkeypatch):
 )
 def test_other_steps_keep_the_original_model(monkeypatch, tokens, kwargs):
     _context(monkeypatch, **kwargs)
-    assert not dispatch.step_supported(torch.zeros(tokens, dtype=torch.int64), None)
+    assert not dispatch.step_supported(tokens)
 
 
 @pytest.mark.parametrize(
@@ -287,8 +310,7 @@ def test_the_target_is_routed_by_its_rows_alone(monkeypatch, tokens, routed):
     # split into requests is read
     monkeypatch.setattr(dispatch, "MAX_ROWS", 12)
     _context(monkeypatch, running_tokens=tokens, requests=[object()])
-    ids = torch.zeros(tokens, dtype=torch.int64)
-    assert dispatch.step_supported(ids, None) is routed
+    assert dispatch.step_supported(tokens) is routed
 
 
 class _DraftRunner:
@@ -362,19 +384,29 @@ def test_explicit_fp8_draft_bypasses_hi_and_mono(monkeypatch, draft_dtype, reque
 
 def test_embeddings_or_images_keep_the_original_model(monkeypatch):
     fwd = _context(monkeypatch)
-    ids = torch.zeros(6, dtype=torch.int64)
-    assert not dispatch.step_supported(ids, torch.zeros(6, 8))
+    assert not dispatch.step_supported(6, embeds=True)
     fwd.attn_metadata.image_mask = torch.zeros(6, dtype=torch.bool)
-    assert not dispatch.step_supported(ids, None)
+    assert not dispatch.step_supported(6)
 
 
 def test_refused_deployment_is_not_wrapped(native, monkeypatch):
     model = torch.nn.Linear(2, 2)
     assert (
-        dispatch.install_mono_decode(model, _atom_config(tensor_parallel_size=16), None)
+        dispatch.install_mono_decode(
+            model, _atom_config(tensor_parallel_size=16), None, metadata_builder=None
+        )
         is model
     )
-    wrapped = dispatch.install_mono_decode(model, _atom_config(), None)
+    # the runner's staging buffers ATOM's mono install reads
+    staged = {
+        "outputs": None,
+        "temperatures": SimpleNamespace(gpu=None),
+        "top_ps": SimpleNamespace(gpu=None),
+    }
+    builder = SimpleNamespace(model_runner=SimpleNamespace(forward_vars=staged))
+    wrapped = dispatch.install_mono_decode(
+        model, _atom_config(), None, metadata_builder=builder
+    )
     assert isinstance(wrapped, dispatch.MonoDecodeModel)
     # attributes the runner never overrides pass through to the wrapped model
     assert wrapped.in_features == 2
@@ -390,11 +422,17 @@ def _v41_config():
 
 class _Block(torch.nn.Module):
     # the deployed routed experts: A8W4 (gate / up interleaved, MXFP8 activations)
-    def __init__(self, table, mode, *, interleaved=True, fp8_activations=True):
+    def __init__(
+        self, table, mode, *, interleaved=True, fp8_activations=True, kept=None
+    ):
         super().__init__()
         self.attn = SimpleNamespace(spec=SimpleNamespace(layer_id=2, mode=mode))
+        # ``kept``: the routed experts' tensors the MoE keeps apart from the
+        # parameters (MegaMoE's copies); else it reads the parameters
         method = SimpleNamespace(
-            is_guinterleave=interleaved, fp8_activations=fp8_activations
+            is_guinterleave=interleaved,
+            fp8_activations=fp8_activations,
+            routed_expert_copies=lambda experts: dict(kept or {}),
         )
         self.ffn = SimpleNamespace(experts=SimpleNamespace(quant_method=method))
         self.table = table
@@ -461,7 +499,8 @@ def test_a_weight_off_the_table_is_refused():
         ("attn.wq_b.weight", ((8192, 1024), torch.float8_e4m3fn)),
         ("attn.attn_sink", ((16,), torch.bfloat16)),
     ):
-        bad = dict(table, **{name: change})
+        bad = dict(table)
+        bad[name] = change
         with pytest.raises(MonoUnsupported, match=name):
             weights.bind_layer(_Block(bad, AttentionMode.FULL), _v41_config(), Dims(4))
     missing = {k: v for k, v in table.items() if k != "ffn_norm.weight"}
@@ -486,3 +525,59 @@ def test_routed_experts_off_a8w4_are_refused(interleaved, fp8_activations):
     )
     with pytest.raises(MonoUnsupported, match="not A8W4"):
         weights.bind_layer(block, _v41_config(), Dims(4))
+
+
+def _mega_copies(table, w13_shape=None):
+    """MegaMoE's routed experts: its copies hold them, the parameters are
+    released to (0,) (``MegaMxfp4MoEMethod._process_weight_layout_after_loading``)."""
+    released = dict(table)
+    kept = {}
+    for name in ("w13_weight", "w2_weight"):
+        shape, dtype = table[f"ffn.experts.{name}"]
+        released[f"ffn.experts.{name}"] = ((0,), dtype)
+        kept[name] = torch.empty(shape, dtype=dtype, device="meta")
+        kept[f"{name}_scale"] = torch.empty((1,), dtype=torch.uint8, device="meta")
+    if w13_shape is not None:
+        kept["w13_weight"] = torch.empty(
+            w13_shape, dtype=kept["w13_weight"].dtype, device="meta"
+        )
+    return released, kept
+
+
+def test_routed_experts_are_read_where_the_moe_keeps_them():
+    from atom.models.deepseek_v41.config import AttentionMode
+    from atom.models.deepseek_v41.mono import weights
+
+    table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(4))
+    released, kept = _mega_copies(table)
+    bound = weights.bind_layer(
+        _Block(released, AttentionMode.FULL, kept=kept), _v41_config(), Dims(4)
+    )
+    for name, tensor in kept.items():
+        assert bound[f"ffn.experts.{name}"] is tensor
+
+
+def test_kept_routed_experts_off_the_table_are_refused():
+    from atom.models.deepseek_v41.config import AttentionMode
+    from atom.models.deepseek_v41.mono import weights
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(4))
+    shape = table["ffn.experts.w13_weight"][0]
+    released, kept = _mega_copies(table, (shape[0] // 2, *shape[1:]))
+    with pytest.raises(MonoUnsupported, match="ffn.experts.w13_weight"):
+        weights.bind_layer(
+            _Block(released, AttentionMode.FULL, kept=kept), _v41_config(), Dims(4)
+        )
+
+
+def test_only_mega_reads_routed_experts_outside_the_parameters():
+    from atom.model_ops.moe import MegaMxfp4MoEMethod, Mxfp4MoEMethod
+
+    names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+    mega = ("_mega_w1", "_mega_w1_scale", "_mega_w2", "_mega_w2_scale")
+    layer = SimpleNamespace(**{n: object() for n in names + mega})
+    # the other MXFP4 paths read the parameters, as before
+    assert Mxfp4MoEMethod.routed_expert_copies(None, layer) == {}
+    copies = MegaMxfp4MoEMethod.routed_expert_copies(None, layer)
+    assert copies == {n: getattr(layer, m) for n, m in zip(names, mega)}

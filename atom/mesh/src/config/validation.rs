@@ -13,6 +13,13 @@ impl ConfigValidator {
                 reason: "Must be greater than zero".to_string(),
             });
         }
+        if config.resolved_fastokens_max_tokenize_bytes() == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "fastokens.max_tokenize_bytes".to_string(),
+                value: "0".to_string(),
+                reason: "Must be greater than zero".to_string(),
+            });
+        }
         #[cfg(feature = "ext-proc")]
         config.ext_proc.validate(config)?;
         Self::validate_mode(&config.mode)?;
@@ -210,6 +217,22 @@ impl ConfigValidator {
                 field: "worker_startup_check_interval_secs".to_string(),
                 value: config.worker_startup_check_interval_secs.to_string(),
                 reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if config.kv_storage_deadline_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "kv_storage_deadline_ms".to_string(),
+                value: config.kv_storage_deadline_ms.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if !(0.0..=1.0).contains(&config.kv_storage_weight) {
+            return Err(ConfigError::InvalidValue {
+                field: "kv_storage_weight".to_string(),
+                value: config.kv_storage_weight.to_string(),
+                reason: "Must be between 0 and 1".to_string(),
             });
         }
 
@@ -427,6 +450,44 @@ mod tests {
             assert!(error.to_string().contains("prepare_pool."), "{error}");
         }
         RouterConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn kv_storage_deadline_must_be_positive() {
+        let config = RouterConfig {
+            kv_storage_deadline_ms: 0,
+            ..Default::default()
+        };
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("kv_storage_deadline_ms"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn kv_storage_weight_must_be_a_fraction() {
+        for weight in [-0.1, 1.5, f64::NAN] {
+            let config = RouterConfig {
+                kv_storage_weight: weight,
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("kv_storage_weight"), "{error}");
+        }
+    }
+
+    #[test]
+    fn fastokens_tokenize_limit_must_be_positive() {
+        let mut config = RouterConfig::default();
+        config.fastokens.max_tokenize_bytes = Some(0);
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("fastokens.max_tokenize_bytes"),
+            "{error}"
+        );
+        config.fastokens.max_tokenize_bytes = Some(1);
+        config.validate().unwrap();
     }
 
     #[test]

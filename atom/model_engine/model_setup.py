@@ -14,11 +14,11 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
-from aiter import init_dist_env
 from aiter.dist.utils import get_distributed_init_method
 from torch import nn
 
 from atom.config import Config, local_device_index, set_current_atom_config
+from atom.distributed.pp_comm import init_pp_aware_dist_env
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.distributed.ulysses_sp import check_aiter_sp_api, sp_is_enabled
 from atom.model_engine.tp_multinode import managed_store_client
@@ -42,10 +42,14 @@ logger = logging.getLogger("atom")
 ModelLoader = Callable[[Config, type, torch.device], nn.Module]
 
 
-def init_model_env(config: Config, rank: int) -> torch.device:
+def init_model_env(
+    config: Config, rank: int, *, device_communicators: bool = True
+) -> torch.device:
     """Set up this process for building its rank's model: the current
     config, its device and its parallel groups (their ranks decide what a
-    rank loads). Returns the device."""
+    rank loads). Returns the device. A process that only loads leaves the
+    groups' device communicators out (``device_communicators=False``; not
+    with PP)."""
     # Read just below (sp_is_enabled) and by model construction.
     set_current_atom_config(config)
     if sp_is_enabled():
@@ -97,44 +101,25 @@ def init_model_env(config: Config, rank: int) -> torch.device:
         torch.distributed.init_process_group(
             backend="nccl", store=store, rank=global_rank, world_size=world_size
         )
-    # AITER reuses the default group and creates the model-parallel groups.
-    if config.pipeline_parallel_size > 1:
-        from atom.distributed.pp_comm import init_pp_aware_dist_env
-
-        # No local_rank here, unlike the non-PP branch below. Safe only
-        # because PP is single-node today: CoreManager rejects multi-node
-        # DP when pp_size > 1, and asserts PP+DP out entirely, so
-        # global_rank is already the physical device index. Revisit if
-        # either restriction is lifted.
-        init_pp_aware_dist_env(
-            tensor_model_parallel_size=config.tensor_parallel_size,
-            pipeline_model_parallel_size=pp_size,
-            global_rank=global_rank,
-            world_size=world_size,
-            distributed_init_method=distributed_init_method,
-            backend="nccl",
-            data_parallel_size=dp_size,
-            prefill_context_model_parallel_size=config.pcp_group_size,
-        )
-    else:
+    # Own the initialization sequence so AITER cannot reset the configured
+    # custom-all-reduce policy inside init_dist_env before creating groups.
+    init_pp_aware_dist_env(
+        tensor_model_parallel_size=config.tp_world_size,
+        pipeline_model_parallel_size=pp_size,
+        global_rank=global_rank,
+        world_size=world_size,
+        distributed_init_method=distributed_init_method,
+        backend="nccl",
+        local_rank=local_device_rank,
+        data_parallel_size=dp_size,
+        prefill_context_model_parallel_size=config.pcp_group_size,
+        decode_context_parallel_size=config.decode_context_parallel_size,
+        disable_custom_all_reduce=config.disable_custom_all_reduce,
+        device_communicators=device_communicators,
+    )
+    if config.pipeline_parallel_size == 1:
         # The group spans the devices that exist; apply_simulated_tp then
         # makes it *report* the logical width so layers shard that many ways.
-        init_dist_env(
-            config.tp_world_size,
-            rankID=rank,
-            backend="nccl",
-            distributed_init_method=distributed_init_method,
-            # This node's physical device index. Without it aiter derives a
-            # local rank from the DP-scaled global rank, which overruns the
-            # device list on every node after the first.
-            local_rank=local_device_rank,
-            data_parallel_size=config.parallel_config.data_parallel_size,
-            data_parallel_rank=config.parallel_config.data_parallel_rank,
-            prefill_context_model_parallel_size=config.pcp_group_size,
-            decode_context_parallel_size=getattr(
-                config, "decode_context_parallel_size", 1
-            ),
-        )
         apply_simulated_tp(config)
     return device
 

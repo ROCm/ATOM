@@ -20,7 +20,6 @@ import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, astuple, dataclass, field
-from pathlib import Path
 from typing import Any
 
 import msgpack
@@ -106,8 +105,9 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
-from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
+from atom.utils import envs, get_open_port, make_zmq_path, mooncake_hca, zmq_socket_ctx
 from atom.utils.network import get_ip
+from atom.utils.pci_topology import gpu_pci_bdf
 
 logger = logging.getLogger("atom")
 
@@ -156,7 +156,6 @@ KV_CACHE_READY_EVENT_TTL_S = 600.0
 # Requests whose ready event aged out are remembered up to this many, oldest
 # dropped first, so a late transfer still finds that its prefill is complete.
 KV_CACHE_READY_EXPIRED_MAX = 1 << 16
-_IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
 class SlotPool:
@@ -247,59 +246,6 @@ def _swa_ring_ids(seq) -> list[int]:
     return [int(slot)] if slot is not None and slot >= 0 else []
 
 
-def _ib_device_exists(device_name: str) -> bool:
-    return (_IB_SYSFS_ROOT / device_name).exists()
-
-
-def _auto_select_ib_device(phys_idx: int) -> str:
-    # Older environments expose paired HCAs as rdmaN. Spur MI350 fabric exposes
-    # them as ionic_N, so try ionic_N only when rdmaN is not present.
-    rdma_device = f"rdma{phys_idx}"
-    if _ib_device_exists(rdma_device):
-        return rdma_device
-    ionic_device = f"ionic_{phys_idx}"
-    if _ib_device_exists(ionic_device):
-        return ionic_device
-    return rdma_device
-
-
-def _parse_ib_devices(configured_devices: str) -> list[str]:
-    """Normalize a comma-separated Mooncake RDMA device filter."""
-    return list(
-        dict.fromkeys(
-            device.strip() for device in configured_devices.split(",") if device.strip()
-        )
-    )
-
-
-def _select_ib_devices(
-    protocol: str,
-    configured_devices: str,
-    phys_idx: int | None,
-    *,
-    enable_alternate_hca: bool = False,
-    hca_count: int = 8,
-) -> list[str]:
-    """Resolve the HCAs on which Mooncake registers this rank's GPU memory."""
-    if protocol.strip().lower() == "tcp":
-        return []
-    if configured_devices:
-        return _parse_ib_devices(configured_devices)
-    if phys_idx is None:
-        raise ValueError("physical GPU index is required for RDMA device selection")
-
-    primary = _auto_select_ib_device(phys_idx)
-    devices = [primary]
-    if enable_alternate_hca:
-        if hca_count <= 0:
-            raise ValueError("ib_hca_count must be a positive integer")
-        for idx in range(hca_count):
-            device = _auto_select_ib_device(idx)
-            if device not in devices and _ib_device_exists(device):
-                devices.append(device)
-    return devices
-
-
 def _discover_active_matched_rails(primary_device: str) -> list[str]:
     """Discover active HCAs in the primary's numbered device-name family."""
     family = re.fullmatch(r"(.*\D)(\d+)", primary_device)
@@ -310,10 +256,10 @@ def _discover_active_matched_rails(primary_device: str) -> list[str]:
         )
     pattern = re.compile(re.escape(family[1]) + r"(\d+)")
     try:
-        devices = list(_IB_SYSFS_ROOT.iterdir())
+        devices = list(mooncake_hca.IB_SYSFS_ROOT.iterdir())
     except OSError as exc:
         raise ValueError(
-            f"Cannot discover RDMA HCAs in {_IB_SYSFS_ROOT}; "
+            f"Cannot discover RDMA HCAs in {mooncake_hca.IB_SYSFS_ROOT}; "
             "set ATOM_MOONCAKE_MATCHED_RAILS to an explicit HCA list"
         ) from exc
 
@@ -359,7 +305,7 @@ def _resolve_matched_rails(
             )
         rails = _discover_active_matched_rails(ib_devices[0])
     else:
-        rails = _parse_ib_devices(value)
+        rails = mooncake_hca.parse_ib_devices(value)
     _validate_matched_rails(protocol, ib_devices, rails)
     return rails
 
@@ -377,36 +323,11 @@ def _validate_matched_rails(
             "disable ib_enable_alternate_hca and use at most one ib_device"
         )
     if ib_devices[0] not in matched_rails or any(
-        not _ib_device_exists(device) for device in matched_rails
+        not mooncake_hca.ib_device_exists(device) for device in matched_rails
     ):
         raise ValueError(
             "Matched rails must name existing local HCAs including the primary HCA"
         )
-
-
-def _select_ib_device(
-    protocol: str, configured_device: str, phys_idx: int | None
-) -> str:
-    """Resolve the Mooncake device filter without enabling RDMA for TCP.
-
-    Mooncake's TCP transport requires an empty device list. Passing a usable
-    HCA alongside ``protocol=tcp`` allows the transfer engine to activate RDMA
-    as an alternate path, which violates the caller's explicit transport
-    choice. RDMA-family transports retain the existing configured/automatic
-    device selection.
-    """
-    return ",".join(_select_ib_devices(protocol, configured_device, phys_idx))
-
-
-def _configure_mooncake_transport(protocol: str) -> None:
-    """Make Mooncake honor ATOM's explicit transport selection.
-
-    Legacy TransferEngine builds auto-discover installed HCAs independently
-    of the device filter. ``MC_FORCE_TCP`` is Mooncake's supported override
-    for preventing that implicit RDMA transport from being installed.
-    """
-    if protocol.strip().lower() == "tcp":
-        os.environ["MC_FORCE_TCP"] = "true"
 
 
 # ZMQ side-channel message types
@@ -505,9 +426,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self._pending_chunked_admissions: dict[ReqId, TransferId] = {}
         self.host_ip = get_ip()
 
-        # Pending requests: req_id -> (Sequence, block_table)
-        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int]]] = {}
-        self._reqs_need_save: dict[ReqId, tuple[Any, list[int]]] = {}
+        # Pending requests: req_id -> (Sequence, block ids, state slot).
+        # Recv and chunked save entries hold the full block table; build_connector_meta
+        # trims chunked saves to the prompt's pages (_prompt_block_ids). A non-chunked
+        # save is queued already trimmed.
+        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int], int]] = {}
+        self._reqs_need_save: dict[ReqId, tuple[Any, list[int], int]] = {}
 
         # Source-block ownership: the scheduler frees a finished request's HBM
         # only once every connector stops claiming it. Claimed in
@@ -598,6 +522,18 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
         return 0, False
 
+    def _prompt_block_ids(self, seq: Sequence, block_ids: list[int]) -> list[int]:
+        """The pages of `block_ids` that hold `seq`'s prompt, all D allocates.
+
+        P can hold more: MTP lookahead pages, and with deferred output the page
+        a finished prefill's one extra step takes when the prompt fills its
+        last page. D computes the first token's KV itself, and the producer
+        aborts the send unless D's destination page count equals
+        ceil(source pages / src_block_skip_factor).
+        """
+        page_tokens = self.block_size * self.dcp_size
+        return block_ids[: -(-seq.num_prompt_tokens // page_tokens)]
+
     def build_connector_meta(self) -> ConnectorMetadata:
         # Sweep even behind a capacity-blocked head, and on idle PP ticks.
         # Expiry queues the existing cancellation protocol; it never frees D's
@@ -625,12 +561,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             assert req.kv_transfer_params is not None
             req.kv_transfer_params["local_slot_index"] = slot_idx
             if req.kv_transfer_params.get("chunked_transfer"):
-                # MTP owns lookahead pages beyond the prompt on P. D reserves
-                # only prompt pages; keep the extra pages pinned on the sequence
-                # but leave them out of both initial and final transfer metadata.
-                page_tokens = self.block_size * self.dcp_size
-                prompt_blocks = (req.num_prompt_tokens + page_tokens - 1) // page_tokens
-                block_ids = block_ids[:prompt_blocks]
+                # Pages past the prompt stay pinned on the sequence, but out
+                # of both initial and final transfer metadata.
+                block_ids = self._prompt_block_ids(req, block_ids)
             meta.add_new_req_to_save(
                 request_id=req_id,
                 local_block_ids=block_ids,
@@ -807,6 +740,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             seq.kv_transfer_params_output = None
             return
 
+        # On D the live table, only copied into the output below; P queues a
+        # list of its own.
+        prefill_block_ids = seq.block_table
+        if self.is_producer:
+            prefill_block_ids = self._prompt_block_ids(seq, list(prefill_block_ids))
+
         # Claim iff we will send: the same `do_remote_decode` gate that fills
         # `_reqs_need_save`.
         if self.is_producer and (getattr(seq, "kv_transfer_params", None) or {}).get(
@@ -819,7 +758,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # aborted load releases the allocation.
             self._reqs_need_save[seq.id] = (
                 seq,
-                list(seq.block_table),
+                prefill_block_ids,
                 seq.state_slot,
             )
 
@@ -832,7 +771,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
-            "remote_block_ids": list(seq.block_table),
+            "remote_block_ids": list(prefill_block_ids),
             # The consumer's SWA ring slot; the producer keys the SWA region
             # transfer by it. Empty for backends with no SWA state.
             "remote_swa_block_ids": _swa_ring_ids(seq),
@@ -980,8 +919,9 @@ class _UnitPlan:
     """Where a producer's PAGE regions land on one consumer rank."""
 
     cmap: list[int]
-    # Per region, when cutting heads: (consumer block bytes, slice rows).
-    cuts: list[tuple[int, np.ndarray]] | None
+    # Per region, when cutting heads: (consumer block bytes, slice rows, their
+    # staged gather).
+    cuts: list[tuple[int, np.ndarray, GatherLayout]] | None
     num_consumer_regions: int = 0
 
 
@@ -1120,39 +1060,25 @@ class MooncakeConnector(KVConnectorBase):
         # Determine which RDMA device this TP rank should use. TCP is
         # intentionally initialized with an empty device filter so Mooncake
         # cannot activate an available HCA as an alternate path.
-        # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
-        # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
-        # By default, register only with the local NIC. Alternate-HCA mode
-        # registers a single engine on multiple NICs. On rail-isolated fabrics,
+        # By default, register only with the GPU's PCIe-local NIC. Alternate-HCA
+        # mode registers a single engine on multiple NICs. On rail-isolated fabrics,
         # matched-rail mode instead selects a single-HCA engine per request.
-        _configure_mooncake_transport(self.protocol)
-        configured_ib_device = kv_transfer_config.get(
-            "ib_device", ""
-        ) or os.environ.get("ATOM_MOONCAKE_IB_DEVICE", "")
+        mooncake_hca.configure_transport(self.protocol)
+        configured_ib_device = (
+            kv_transfer_config.get("ib_device", "") or envs.ATOM_MOONCAKE_IB_DEVICE
+        )
         enable_alternate_hca = bool(
             kv_transfer_config.get("ib_enable_alternate_hca", False)
         )
         hca_count = int(kv_transfer_config.get("ib_hca_count", 8))
-        phys_idx: int | None = None
+        gpu_bdf: str | None = None
         if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
-            visible_idx = torch.cuda.current_device()
-            # ROCR first, for the reason in numa_utils._physical_index: it
-            # filters before HIP, so a ROCR-only mask must not fall through to
-            # the identity mapping.
-            visible_env = (
-                os.environ.get("ROCR_VISIBLE_DEVICES")
-                or os.environ.get("HIP_VISIBLE_DEVICES")
-                or os.environ.get("CUDA_VISIBLE_DEVICES")
-            )
-            if visible_env:
-                visible_list = [d for d in visible_env.split(",") if d != ""]
-                phys_idx = int(visible_list[visible_idx])
-            else:
-                phys_idx = visible_idx
-        ib_devices = _select_ib_devices(
+            # The GPU this rank drives, whatever *_VISIBLE_DEVICES masks it.
+            gpu_bdf = gpu_pci_bdf(torch.cuda.current_device())
+        ib_devices = mooncake_hca.select_ib_devices(
             self.protocol,
             configured_ib_device,
-            phys_idx,
+            gpu_bdf,
             enable_alternate_hca=enable_alternate_hca,
             hca_count=hca_count,
         )
@@ -1169,11 +1095,9 @@ class MooncakeConnector(KVConnectorBase):
             logger.info("Mooncake TCP selected; RDMA device selection is disabled")
         elif not configured_ib_device:
             logger.info(
-                "Auto-selecting RDMA devices %s for physical GPU %d "
-                "(visible_idx=%d, tp_rank=%d)",
+                "Auto-selecting RDMA devices %s for GPU %s (tp_rank=%d)",
                 ib_device,
-                phys_idx,
-                visible_idx,
+                gpu_bdf,
                 self.tp_rank,
             )
 
@@ -1228,7 +1152,7 @@ class MooncakeConnector(KVConnectorBase):
         self._block_region_roles: list[str | None] = []
         # Per PAGE region: its head runs, and its spec where the backend names
         # its units (MHA); `_unit_layout` is the three packed for a producer.
-        self._block_head_major_runs: tuple[tuple[int, int] | None, ...] = ()
+        self._block_head_major_runs: tuple[tuple[int, tuple[int, ...]] | None, ...] = ()
         self._block_unit_specs: tuple[PageUnitSpec, ...] | None = None
         self._unit_layout: bytes | None = None
         self._unit_plans: dict[tuple, _UnitPlan] = {}
@@ -3188,7 +3112,8 @@ class MooncakeConnector(KVConnectorBase):
         """Pair our units with consumer rank `rank` of `tp` by spec, and cut
         heads where that rank holds fewer than we do."""
         specs = [PageUnitSpec(*unit[:5]) for unit in layout]
-        runs = [None if unit[5] is None else tuple(unit[5]) for unit in layout]
+        # msgpack hands back lists; head runs compare as `(heads, widths)` tuples.
+        runs = [None if u[5] is None else (u[5][0], tuple(u[5][1])) for u in layout]
         widths = [unit[6] for unit in layout]
         end = None
         if self.pp_rank < self.pp_size - 1:
@@ -3209,15 +3134,13 @@ class MooncakeConnector(KVConnectorBase):
                 f"DCP; got producer TP {self.tp_size} DCP {self.dcp_size}, "
                 f"consumer TP {tp} DCP {dcp}"
             )
-        cuts = [
-            (
-                widths[c],
-                consumer_head_slices(
-                    ours[i][1], widths[c], ours[i][0], runs[c], rank, tp, str(specs[c])
-                ),
+        cuts = []
+        for i, c in enumerate(cmap):
+            rows = consumer_head_slices(
+                ours[i][1], widths[c], ours[i][0], runs[c], rank, tp, str(specs[c])
             )
-            for i, c in enumerate(cmap)
-        ]
+            gather = GatherLayout.from_slices(ours[i][1], widths[c], rows)
+            cuts.append((widths[c], rows, gather))
         return _UnitPlan(cmap, cuts, len(specs))
 
     def _consumer_dcp_plan(
@@ -3370,7 +3293,7 @@ class MooncakeConnector(KVConnectorBase):
             role = self._block_region_roles[region_idx]
             if plan.cuts is not None:
                 # Write this consumer's heads of every head-major run.
-                dst_bpb, cuts = plan.cuts[region_idx]
+                dst_bpb, cuts, _ = plan.cuts[region_idx]
                 src = source_blocks[:, None] * bpb + cuts[:, 0]
                 dst = destination_blocks[:, None] * dst_bpb + cuts[:, 1]
                 if not batch.add(
@@ -3487,15 +3410,8 @@ class MooncakeConnector(KVConnectorBase):
         return self._check_staging_sources(
             page_transfer_plan(
                 [
-                    PlannedRegion(
-                        region,
-                        consumer,
-                        bases[consumer],
-                        GatherLayout.from_slices(
-                            self._per_block_bytes_list[region], dst_bytes, rows
-                        ),
-                    )
-                    for region, (consumer, (dst_bytes, rows)) in enumerate(
+                    PlannedRegion(region, consumer, bases[consumer], gather)
+                    for region, (consumer, (_, _, gather)) in enumerate(
                         zip(plan.cmap, plan.cuts)
                     )
                 ],

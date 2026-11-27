@@ -39,6 +39,9 @@ from fastapi.exception_handlers import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from jinja2 import TemplateError
+from pydantic import ValidationError
+from starlette.requests import ClientDisconnect
 from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
@@ -52,7 +55,7 @@ from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
-from atom.model_engine.sequence import new_token_ids
+from atom.model_engine.sequence import leaves_media_on_prefill, new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
 from atom.observability.tracing import TraceMiddleware, set_request_id
@@ -91,6 +94,7 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
     template_needs_tool_call_argument_strings,
+    template_takes_mid_system,
 )
 from .fim import FimFormat, resolve_fim_format
 from .images import check_chat_images, load_chat_images
@@ -104,9 +108,11 @@ from .protocol import (
     BetaChatCompletionRequest,
     BetaCompletionRequest,
     ChatCompletionRequest,
+    ChatCompletionResponse,
     CompletionRequest,
     ModelCard,
     ModelList,
+    check_media_handoff,
     ended_by_stop,
     validate_max_tokens,
 )
@@ -134,10 +140,12 @@ from .request_timing import (
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
+    anthropic_context_length_message,
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
     completes_a_tool_call,
+    fold_mid_system,
     read_whole_blocks,
     stream_failure_frames,
     stream_message_delta,
@@ -210,6 +218,13 @@ DEFAULT_PORT = 8000
 # ============================================================================
 
 engine = None
+# `EncoderOnly` under --encoder-only, which builds no engine.
+encoder = None
+# --accept-ec-transfer-params: a chat request's `ec_transfer_params` names
+# where this prefill server reads its image embeddings. Off, they are dropped:
+# only a router that runs the encoder (ATOMesh) may set them.
+accept_ec_transfer_params = False
+_warned_ec_transfer_params = False
 tokenizer: AutoTokenizer | None = None
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
@@ -232,6 +247,9 @@ reasoning_dialect: Any = None
 # (kwarg, off-value) the chat template reads to switch reasoning off, resolved
 # at startup by asking it; None when the template offers no such switch.
 reasoning_toggle: tuple[str, Any, Any] | None = None
+# Whether the chat template takes a system message inside the conversation
+# (`template_takes_mid_system`); resolved at startup.
+mid_system_supported: bool = True
 processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
@@ -662,6 +680,17 @@ def _coerce_n(requested_n: int | None, temperature: float | None) -> int:
     return n
 
 
+class ContextLengthError(ValueError):
+    """A request that does not fit the context: a 400, which an endpoint may
+    word in its own API's terms from the counts."""
+
+    def __init__(self, message: str, prompt_tokens: int, max_tokens: int, limit: int):
+        super().__init__(message)
+        self.prompt_tokens = prompt_tokens
+        self.max_tokens = max_tokens
+        self.limit = limit
+
+
 def _validate_context_length(
     num_prompt_tokens: int,
     max_tokens: int,
@@ -675,16 +704,21 @@ def _validate_context_length(
     if total_tokens <= int(max_model_len):
         return
 
-    raise ValueError(
+    raise ContextLengthError(
         f"This model's maximum context length is {max_model_len} tokens. "
         f"However, you requested {requested_output_tokens} output tokens and "
         f"your prompt contains at least {num_prompt_tokens} input tokens, for "
         f"a total of at least {total_tokens} tokens. Please reduce the length "
-        f"of the input prompt or the number of requested output tokens."
+        f"of the input prompt or the number of requested output tokens.",
+        int(num_prompt_tokens),
+        requested_output_tokens,
+        int(max_model_len),
     )
 
 
 def _get_engine_config():
+    if encoder is not None:
+        return encoder.config
     config = getattr(engine, "config", None)
     if config is None:
         config = getattr(getattr(engine, "io_processor", None), "config", None)
@@ -718,27 +752,37 @@ def _validate_pool_capacity(
     if max_pool_tokens is None or int(num_prompt_tokens) <= int(max_pool_tokens):
         return
 
-    raise ValueError(
+    raise ContextLengthError(
         f"This server's KV cache holds at most {max_pool_tokens} tokens for a "
         f"single request, and your prompt contains at least {num_prompt_tokens} "
         f"input tokens. Please shorten the prompt, or restart the server with a "
-        f"higher --gpu-memory-utilization to enlarge the cache."
+        f"higher --gpu-memory-utilization to enlarge the cache.",
+        int(num_prompt_tokens),
+        0,
+        # The prompt alone is too long: a limit it fills.
+        int(max_pool_tokens) + 1,
     )
 
 
 def _validate_sequence_context_length(seq, sampling_params=None) -> None:
     limit = _get_engine_max_model_len()
+    pool = _get_engine_max_pool_tokens()
+    # The tighter limit answers first. A pool smaller than the context refuses
+    # a prompt it cannot hold whatever max_tokens is; a pool at least as large
+    # never binds once the context check passes.
+    if pool is not None and (limit is None or pool < limit):
+        _validate_pool_capacity(seq.num_prompt_tokens, pool)
     if getattr(sampling_params, "max_tokens_is_default", False) and limit is not None:
         remaining = limit - seq.num_prompt_tokens
         if remaining <= 0:
-            raise ValueError("The prompt leaves no context space for output tokens")
+            raise ContextLengthError(
+                "The prompt leaves no context space for output tokens",
+                seq.num_prompt_tokens,
+                0,
+                limit,
+            )
         seq.max_tokens = min(seq.max_tokens, remaining)
-    _validate_context_length(
-        seq.num_prompt_tokens,
-        seq.max_tokens,
-        _get_engine_max_model_len(),
-    )
-    _validate_pool_capacity(seq.num_prompt_tokens, _get_engine_max_pool_tokens())
+    _validate_context_length(seq.num_prompt_tokens, seq.max_tokens, limit)
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:
@@ -1038,6 +1082,7 @@ async def generate_async_multimodal(
     multimodal_data: dict[str, Any],
     sampling_params: SamplingParams,
     request_id: str,
+    kv_transfer_params: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
@@ -1053,8 +1098,11 @@ async def generate_async_multimodal(
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
+    kv_transfer_output_meta_info = None
 
     def completion_callback(request_output: RequestOutput):
+        nonlocal kv_transfer_output_meta_info
+        kv_transfer_output_meta_info = request_output.kv_transfer_params_output
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -1071,6 +1119,7 @@ async def generate_async_multimodal(
             token_ids,
             sampling_params,
             stream_callback=completion_callback,
+            kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
@@ -1132,6 +1181,13 @@ async def generate_async_multimodal(
         "tpot": tpot,
         "latency": finished_at - started_at,
     }
+    if kv_transfer_output_meta_info is not None:
+        # Decode has no media: it seeds its prefix cache and positions with these.
+        response["kv_transfer_output_meta_info"] = {
+            **kv_transfer_output_meta_info,
+            "cache_seed": seq.cache_seed,
+            "mrope_position_delta": seq.mrope_position_delta,
+        }
     if return_token_ids and seq is not None:
         response["prompt_token_ids"] = list(seq.prompt_token_ids)
     yield response
@@ -1342,6 +1398,17 @@ def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
         )
 
 
+def _validate_kv_transfer_params(params: dict[str, Any] | None) -> None:
+    """Refuse handoff metadata no leg can serve, before enqueue or SSE headers.
+
+    Every endpoint that takes `kv_transfer_params` calls this first.
+    """
+    if not params:
+        return
+    _validate_chunked_receive(params)
+    check_media_handoff(params, _get_engine_max_model_len())
+
+
 def _engine_kv_transfer_params(
     kv_transfer_params: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
@@ -1351,39 +1418,21 @@ def _engine_kv_transfer_params(
     return {k: v for k, v in kv_transfer_params.items() if k != "prompt_token_ids"}
 
 
-def _prompt_headroom(
-    max_tokens: int, max_ctx: int, kv_transfer_params: dict[str, Any] | None
-) -> int:
-    """Output tokens to reserve when an over-long prompt is truncated.
-
-    A PD router sends the prefill leg ``max_tokens=1`` and the decode leg the
-    client's value. With a KV handoff the reservation therefore cannot depend
-    on ``max_tokens``, or the two legs truncate to different prompts and the
-    transferred blocks no longer match the decode-side sequence.
-    """
-    headroom = max(1024, max_ctx // 8)
-    if kv_transfer_params is None:
-        headroom = min(max_tokens, headroom)
-    return headroom
-
-
 def _prepare_prompt(
     messages,
     template_kwargs: dict[str, Any],
     *,
     tools,
     preserve_tool_call_arguments: bool,
-    max_tokens: int,
-    kv_transfer_params: dict[str, Any] | None,
 ) -> tuple[PrefixEncoding | list[int], str]:
-    """Render, tokenize the engine's way and cut to the context, in one
-    executor step for ``/v1/messages`` and ``/v1/responses``.
+    """Render and tokenize the engine's way, in one executor step for
+    ``/v1/messages`` and ``/v1/responses``.
 
     Returns ``(engine_input, text)``: what preprocess takes in place of the
     prompt (no second tokenize), and the text the engine runs, which seeds the
-    reasoning channel. A prompt longer than the context minus the output
-    headroom is cut from the end; a context with no room for any prompt is
-    refused (ValueError, a 400)."""
+    reasoning channel. The prompt is never cut: cutting drops its end, the
+    latest turn and the generation prompt. Admission refuses an over-long one
+    (``ContextLengthError``)."""
     prompt = apply_chat_template(
         tokenizer,
         custom_message_encoder,
@@ -1392,23 +1441,34 @@ def _prepare_prompt(
         preserve_tool_call_arguments=preserve_tool_call_arguments,
         **template_kwargs,
     )
-    encoded = engine.io_processor.encode_prompt(prompt)
-    max_ctx = int(_get_engine_max_model_len() or 30720)
-    cap = max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
-    if cap < 1:
-        raise ValueError(
-            f"max_tokens={max_tokens} leaves no room for a prompt in this "
-            f"model's {max_ctx}-token context"
+    return engine.io_processor.encode_prompt(prompt), prompt
+
+
+def _renders_without_mid_system(
+    messages, template_kwargs: dict[str, Any], tools
+) -> bool:
+    """Whether the template takes ``messages`` once the system messages inside
+    the conversation (after the first non-system one) are dropped: run only
+    after it refused them, to tell a template that wants its system messages
+    first from one that failed for another reason."""
+    first = next(
+        (i for i, m in enumerate(messages) if m.role != "system"), len(messages)
+    )
+    kept = [m for i, m in enumerate(messages) if i < first or m.role != "system"]
+    if len(kept) == len(messages):
+        return False
+    try:
+        apply_chat_template(
+            tokenizer,
+            custom_message_encoder,
+            kept,
+            tools=tools,
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            **template_kwargs,
         )
-    token_ids = encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded
-    if len(token_ids) <= cap:
-        return encoded, prompt
-    logger.warning("Prompt too long (%d > %d), truncating", len(token_ids), cap)
-    token_ids = list(token_ids[:cap])
-    text = tokenizer.decode(token_ids, skip_special_tokens=False)
-    if not text:
-        raise ValueError("The prompt is empty after truncation to the context")
-    return token_ids, text
+    except Exception:  # noqa: BLE001 - the caller re-raises the original
+        return False
+    return True
 
 
 async def _prepare_engine_input(
@@ -1416,19 +1476,17 @@ async def _prepare_engine_input(
     template_kwargs: dict[str, Any],
     *,
     tools,
-    max_tokens: int,
     kv_transfer_params: dict[str, Any] | None,
 ) -> tuple[PrefixEncoding | list[int], dict[str, Any] | None, bool]:
     """``(engine_input, multimodal_data, starts_in_reasoning)`` for
-    ``/v1/messages`` and ``/v1/responses``.
-
-    A request with images is prepared as on the chat path, and is not cut to
-    the context: a cut could end inside an image. One without goes through
-    ``_prepare_prompt`` as before."""
+    ``/v1/messages`` and ``/v1/responses``: a request with images prepared as
+    on the chat path, one without through ``_prepare_prompt``."""
     if _has_multimodal_content(messages):
         if kv_transfer_params is not None:
-            # A prefill leg cannot hand an image request off, so neither leg
-            # can finish it: refused here, not as a router error or a stall.
+            # Only `/v1/chat/completions` hands an image request off (its
+            # prefill returns the cache seed and MRoPE delta the decode needs);
+            # here neither leg could finish it: refused, not a router error or
+            # a stall.
             raise ValueError("image input cannot be combined with kv_transfer_params")
         _get_multimodal_processor()  # on the loop, as the chat path does
         token_ids, multimodal_data = await asyncio.to_thread(
@@ -1442,8 +1500,6 @@ async def _prepare_engine_input(
         template_kwargs,
         tools=tools,
         preserve_tool_call_arguments=preserve_tool_call_arguments,
-        max_tokens=max_tokens,
-        kv_transfer_params=kv_transfer_params,
     )
     return engine_input, None, prompt_starts_in_reasoning(prompt)
 
@@ -1623,9 +1679,11 @@ async def _race_disconnect(coro, raw_request, request_id):
     ``abort_request`` + ``io_processor.requests.pop`` (for fan-out, this aborts
     every sibling). We then raise ``_ClientDisconnected``.
 
-    ``request.receive()`` is safe here because FastAPI has already parsed the
-    request body into a pydantic model before this handler runs, so there is no
-    unread body for ``receive()`` to race against.
+    ``request.receive()`` is safe here because the request body has already
+    been read to EOF before this runs, so there is no unread body for
+    ``receive()`` to race against: on the plain routes FastAPI parsed it into a
+    pydantic model before the handler ran; on ``PD_LATE_KV_PATH``,
+    ``_read_late_kv_request`` drains it with ``_LateKvBody.rest()``.
     """
     handler_task = asyncio.ensure_future(coro)
 
@@ -1861,6 +1919,8 @@ async def lifespan(app: FastAPI):
         try:
             if engine is not None:
                 engine.close()
+            if encoder is not None:
+                encoder.close()
         finally:
             try:
                 # After the engine: its output threads flush into the hub.
@@ -1897,6 +1957,35 @@ def _engine_route(path: str, **kwargs):
 async def _publish_frontend_stats_once() -> None:
     board, index = _frontend_stats
     board.publish(index, oldest_waiting_since())
+
+
+# What an encoder-only server answers; every other route needs the engine.
+_ENCODER_ONLY_ROUTES = frozenset(
+    (
+        "/v1/chat/completions",
+        "/beta/chat/completions",
+        "/v1/models",
+        "/health",
+        "/metrics",
+    )
+)
+
+
+@app.middleware("http")
+async def _refuse_engine_routes_without_engine(request: Request, call_next):
+    """Under --encoder-only, refuse the routes the absent engine would serve."""
+    if encoder is None or request.url.path in _ENCODER_ONLY_ROUTES:
+        return await call_next(request)
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": f"an encoder-only server does not serve {request.url.path}",
+                "type": "invalid_request_error",
+                "code": 400,
+            }
+        },
+    )
 
 
 @app.middleware("http")
@@ -1947,6 +2036,9 @@ async def _relay_to_hub(request: Request) -> Response:
 
 # ---- Error handlers ----
 
+# ATOM_PD_LATE_KV's decode leg (see pd_late_kv_chat_completions below).
+PD_LATE_KV_PATH = "/v1/pd/late_kv/chat/completions"
+
 # Generation routes whose errors use the OpenAI envelope.
 _OPENAI_ERROR_ROUTES = frozenset(
     {
@@ -1955,6 +2047,8 @@ _OPENAI_ERROR_ROUTES = frozenset(
         "/v1/responses",
         "/beta/chat/completions",
         "/beta/completions",
+        # The router relays the late-KV decode leg's errors to the client.
+        PD_LATE_KV_PATH,
     }
 )
 
@@ -2011,7 +2105,13 @@ async def value_error_handler(request: Request, exc: ValueError):
             "error": {
                 "message": str(exc),
                 "type": "invalid_request_error",
-                "code": 400,
+                # OpenAI's code for it, on which Codex compacts or reports an
+                # exhausted context instead of a generic 400.
+                "code": (
+                    "context_length_exceeded"
+                    if isinstance(exc, ContextLengthError)
+                    else 400
+                ),
             }
         },
     )
@@ -2104,6 +2204,112 @@ async def beta_chat_completions(
     return await _chat_completions(request, raw_request)
 
 
+# ---------------------------------------------------------------------------
+# ATOM_PD_LATE_KV: decode leg of the router's concurrent P/D dispatch.
+# ---------------------------------------------------------------------------
+# PD_LATE_KV_PATH: atomesh (--atom-pd-concurrent) opens this request at the
+# same time as the prefill leg and streams a two-line body: line 1 is the chat
+# request, line 2 -- sent once P answers -- is `{"kv_transfer_params": {...}}`.
+# D parses and validates line 1 while P parses its own copy, so the large-body
+# ingest leaves the P->D critical path. Nothing reaches the engine before line
+# 2, so a failed prefill (the router aborts the body, or it ends early) never
+# enqueues anything on D. With the flag off the route answers 404, which the
+# router takes as "fall back to the serial relay".
+
+
+class _LateKvBody:
+    """Newline-framed reader over a streamed request body."""
+
+    def __init__(self, raw_request: Request):
+        self._chunks = raw_request.stream().__aiter__()
+        self._buf = bytearray()
+        self._eof = False
+
+    async def line(self) -> bytes | None:
+        """The next line without its newline; None once the body is exhausted."""
+        start = 0
+        while True:
+            pos = self._buf.find(b"\n", start)
+            if pos >= 0:
+                line = bytes(self._buf[:pos])
+                del self._buf[: pos + 1]
+                return line
+            if self._eof:
+                return None
+            start = len(self._buf)
+            try:
+                self._buf += await self._chunks.__anext__()
+            except StopAsyncIteration:
+                self._eof = True
+
+    async def rest(self) -> bytes:
+        while not self._eof:
+            try:
+                self._buf += await self._chunks.__anext__()
+            except StopAsyncIteration:
+                self._eof = True
+        return bytes(self._buf)
+
+
+def _parse_late_kv_line(line: bytes) -> dict[str, Any]:
+    try:
+        data = json.loads(line)
+    except ValueError as exc:
+        raise HTTPException(400, f"late-kv line is not JSON: {exc}") from exc
+    kv = data.get("kv_transfer_params") if isinstance(data, dict) else None
+    if not isinstance(kv, dict):
+        raise HTTPException(400, "late-kv line must carry a kv_transfer_params object")
+    return kv
+
+
+@app.post(PD_LATE_KV_PATH, include_in_schema=False)
+async def pd_late_kv_chat_completions(raw_request: Request):
+    """Chat completion whose KV metadata arrives after the request body."""
+    if not envs.ATOM_PD_LATE_KV:
+        raise HTTPException(404, "ATOM_PD_LATE_KV is off")
+    try:
+        request = await _read_late_kv_request(raw_request)
+    except ClientDisconnect:
+        # The router dropped the leg (prefill failed or client left) before
+        # line 2: nothing was enqueued, so there is nothing to clean up.
+        logger.debug("late-kv decode leg disconnected before kv_transfer_params")
+        return Response(status_code=499)
+    return await _chat_completions(request, raw_request)
+
+
+async def _read_late_kv_request(raw_request: Request) -> ChatCompletionRequest:
+    body = _LateKvBody(raw_request)
+    head = await body.line()
+    if head is None:
+        raise HTTPException(400, "late-kv body has no request line")
+    try:
+        payload = json.loads(head)
+    except ValueError as exc:
+        raise HTTPException(400, f"late-kv request line is not JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "late-kv request line must be a JSON object")
+    try:
+        request = ChatCompletionRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors(), body=payload) from exc
+    # Release line 1's raw bytes and parsed dict before waiting on P: for a
+    # multi-MB prompt-id body they would otherwise double the pending hold.
+    del payload, head
+    if request.kv_transfer_params is not None:
+        raise HTTPException(
+            400, "late-kv request line must not carry kv_transfer_params"
+        )
+    # Everything above overlapped with P. Now wait for P's answer.
+    line = await body.line()
+    if line is None:
+        raise HTTPException(400, "late-kv body ended before kv_transfer_params")
+    kv = _parse_late_kv_line(line)
+    if (await body.rest()).strip():
+        raise HTTPException(400, "late-kv body has data after kv_transfer_params")
+    request.kv_transfer_params = kv
+    return request
+
+
 async def _chat_completions(
     request: ChatCompletionRequest | BetaChatCompletionRequest, raw_request: Request
 ):
@@ -2112,7 +2318,7 @@ async def _chat_completions(
     beta = isinstance(request, BetaChatCompletionRequest)
     route = "beta_chat_completions" if beta else "chat_completions"
     validate_model(request.model)
-    _validate_chunked_receive(request.kv_transfer_params)
+    _validate_kv_transfer_params(request.kv_transfer_params)
 
     try:
         request.tools = normalize_chat_tools(request.tools)
@@ -2214,12 +2420,35 @@ async def _chat_completions(
 
         _log_request_model("request", request_id, request)
 
-        is_multimodal = _has_multimodal_content(messages)
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
-        if assistant_prefix is not None and (
-            is_multimodal or request.get_prompt_token_ids() is not None
-        ):
+        has_media = _has_multimodal_content(messages)
+        # A media decode leg's client-body b64 ids are not expanded; it runs on
+        # its prefill's ids from kv_transfer_params (`get_prompt_token_ids`).
+        media_decode_leg = has_media and bool(
+            (kv_transfer_params or {}).get("do_remote_prefill")
+        )
+        pretokenized = request.get_prompt_token_ids(media_decode_leg=media_decode_leg)
+        # A decode leg takes its prefill's expanded ids; its media went to P.
+        # Without P's cache seed its blocks would hash as text: keep the media.
+        is_multimodal = has_media and not (
+            pretokenized is not None and leaves_media_on_prefill(kv_transfer_params)
+        )
+        if encoder is not None and not is_multimodal:
+            raise ValueError("an encoder-only server takes image requests only")
+        # ATOM_PROMPT_IDS_B64 on a P/D prefill leg: the caller sent these ids
+        # itself, and the PD router forwards that same field to decode.
+        # Echoing them as a JSON list would have the router carry a second
+        # copy into decode's kv_transfer_params, which decode then has to
+        # parse and compare. Any other request (a single server's
+        # `return_token_ids`) still echoes, and so does a multimodal prefill:
+        # its ids have the image placeholders expanded, which decode needs.
+        echo_ids = bool(request.return_token_ids) and not (
+            request.prompt_ids_from_b64()
+            and not has_media
+            and bool((kv_transfer_params or {}).get("do_remote_decode"))
+        )
+        if assistant_prefix is not None and (is_multimodal or pretokenized is not None):
             # Only rendered text can be continued.
             raise ValueError(
                 "an assistant prefix cannot be combined with image input or "
@@ -2239,7 +2468,18 @@ async def _chat_completions(
                 merged_kwargs,
                 request.tools,
             )
-        elif (pretokenized := request.get_prompt_token_ids()) is not None:
+            if encoder is not None:
+                return await _encoder_only_response(
+                    request_id, len(prompt_or_tokens), multimodal_data
+                )
+            if request.ec_transfer_params is not None:
+                if accept_ec_transfer_params:
+                    # The prefill encode reads these rows instead of running
+                    # the tower.
+                    multimodal_data["ec_transfer_params"] = request.ec_transfer_params
+                else:
+                    _warn_ec_transfer_params_dropped()
+        elif pretokenized is not None:
             # Reuse prefill IDs to skip template rendering and tokenization.
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
@@ -2359,7 +2599,7 @@ async def _chat_completions(
                     request_id,
                     multimodal_data=multimodal_data,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2385,7 +2625,8 @@ async def _chat_completions(
                     multimodal_data,
                     sampling_params,
                     request_id,
-                    return_token_ids=bool(request.return_token_ids),
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2412,7 +2653,7 @@ async def _chat_completions(
                     sampling_params,
                     request_id,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2438,7 +2679,7 @@ async def _chat_completions(
                     sampling_params,
                     request_id,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2480,12 +2721,64 @@ async def _chat_completions(
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ContextLengthError as e:
+        logger.error(f"Validation error in {route}: {e}")
+        # The same 400 body as any other, but with OpenAI's
+        # context_length_exceeded code, which Codex reads.
+        return await value_error_handler(raw_request, e)
     except ValueError as e:
         logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("Error in %s", route)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _warn_ec_transfer_params_dropped() -> None:
+    global _warned_ec_transfer_params
+    if not _warned_ec_transfer_params:
+        _warned_ec_transfer_params = True
+        logger.warning(
+            "Dropping ec_transfer_params: start the server with "
+            "--accept-ec-transfer-params to read image embeddings from an "
+            "encoder server"
+        )
+
+
+async def _encoder_only_response(
+    request_id: str, num_prompt_tokens: int, multimodal_data: dict[str, Any]
+) -> JSONResponse:
+    """No choices: where the prefill server reads the image embeddings."""
+    from atom.ec_transfer import EcStoreFull
+
+    try:
+        params = await encoder.encode(multimodal_data)
+    except EcStoreFull as e:
+        # The router sends the request on without these, and prefill encodes.
+        logger.warning("Embedding pool full for %s: %s", request_id, e)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "internal_server_error",
+                    "code": 503,
+                }
+            },
+        )
+    resp = ChatCompletionResponse(
+        id=request_id,
+        created=int(time.time()),
+        model=model_name,
+        choices=[],
+        usage={
+            "prompt_tokens": num_prompt_tokens,
+            "completion_tokens": 0,
+            "total_tokens": num_prompt_tokens,
+        },
+        ec_transfer_params=params,
+    )
+    return JSONResponse(content=resp.model_dump(mode="json", exclude_none=True))
 
 
 @app.post("/v1/completions")
@@ -2607,7 +2900,7 @@ async def _completions(
     beta = isinstance(request, BetaCompletionRequest)
     route = "beta_completions" if beta else "completions"
     validate_model(request.model)
-    _validate_chunked_receive(request.kv_transfer_params)
+    _validate_kv_transfer_params(request.kv_transfer_params)
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
@@ -2773,6 +3066,11 @@ async def _completions(
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ContextLengthError as e:
+        logger.error(f"Validation error in {route}: {e}")
+        # The same 400 body as any other, but with OpenAI's
+        # context_length_exceeded code, which Codex reads.
+        return await value_error_handler(raw_request, e)
     except ValueError as e:
         logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -2789,7 +3087,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     and returns Anthropic-formatted responses. Enables Claude Code and other
     Anthropic-compatible tools to use ATOM as a backend.
     """
-    _validate_chunked_receive(request.kv_transfer_params)
+    _validate_kv_transfer_params(request.kv_transfer_params)
     # One validator over the shape both endpoints share: this path already
     # converts, so validating the conversion leaves a single rule rather than
     # a second one in Anthropic's spelling. It checked nothing before, so a
@@ -2814,6 +3112,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     try:
         # Convert Anthropic messages to OpenAI format
         openai_messages = anthropic_to_openai_messages(request.messages, request.system)
+        if not mid_system_supported:
+            openai_messages = fold_mid_system(openai_messages)
         validate_history_tool_calls(openai_messages)
 
         # Apply chat template
@@ -2881,15 +3181,32 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        engine_input, multimodal_data, starts_in_reasoning = (
-            await _prepare_engine_input(
+        try:
+            engine_input, multimodal_data, starts_in_reasoning = (
+                await _prepare_engine_input(
+                    messages,
+                    merged_kwargs,
+                    tools=anthropic_to_openai_tools(request.tools),
+                    kv_transfer_params=kv_transfer_params,
+                )
+            )
+        except TemplateError as exc:
+            # A template that only takes system messages first, which the
+            # startup probe let through (mid_system_supported), yet refused on
+            # this request's shape. Claude Code answers this 400 by resending
+            # with them folded into user turns -- so only when they are what
+            # the template refused.
+            if await asyncio.to_thread(
+                _renders_without_mid_system,
                 messages,
                 merged_kwargs,
-                tools=anthropic_to_openai_tools(request.tools),
-                max_tokens=sampling_params.max_tokens,
-                kv_transfer_params=kv_transfer_params,
-            )
-        )
+                anthropic_to_openai_tools(request.tools),
+            ):
+                raise ValueError(
+                    f'Unexpected role "system" in messages: this model\'s chat '
+                    f"template rejected it ({exc})"
+                ) from exc
+            raise
 
         if request.stream:
             # Streaming response
@@ -3135,11 +3452,18 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as exc:
+        message = (
+            anthropic_context_length_message(
+                exc.prompt_tokens, exc.max_tokens, exc.limit
+            )
+            if isinstance(exc, ContextLengthError)
+            else str(exc)
+        )
         return JSONResponse(
             status_code=400,
             content={
                 "type": "error",
-                "error": {"type": "invalid_request_error", "message": str(exc)},
+                "error": {"type": "invalid_request_error", "message": message},
             },
         )
     except Exception as e:
@@ -3200,7 +3524,7 @@ async def responses_create(raw_request: Request):
                 }
             },
         )
-    _validate_chunked_receive(kv_transfer_params)
+    _validate_kv_transfer_params(kv_transfer_params)
     kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
 
     compatibility = api_compatibility_for(custom_message_encoder)
@@ -3304,7 +3628,6 @@ async def responses_create(raw_request: Request):
                 messages,
                 merged_kwargs,
                 tools=openai_tools,
-                max_tokens=sampling_params.max_tokens,
                 kv_transfer_params=kv_transfer_params,
             )
         )
@@ -3525,6 +3848,8 @@ async def list_models():
 @_engine_route("/health")
 async def health():
     """Report readiness of all engine workers, not just the HTTP process."""
+    if encoder is not None:
+        return {"status": "ok"}
     if engine is None or not engine.core_mgr.is_healthy():
         raise HTTPException(status_code=503, detail="Engine workers unavailable")
     dead = _frontend_hub.dead_workers() if _frontend_hub is not None else []
@@ -3699,6 +4024,41 @@ async def stop_profile():
         raise HTTPException(status_code=500, detail=f"Failed to stop profiling: {e!s}")
 
 
+_offload_lookups_lock = asyncio.Lock()
+
+
+@_engine_route("/offload/lookups", methods=["POST"])
+async def set_offload_lookups(raw_request: Request):
+    """Turn the offload tier's lookups for new requests on or off: {"enabled": bool}."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        body = await raw_request.json()
+    except ValueError:
+        body = None
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if not isinstance(enabled, bool):
+        raise HTTPException(
+            status_code=400, detail='body must be {"enabled": true|false}'
+        )
+    try:
+        # One call at a time: overlapping broadcasts could reach the ranks in
+        # different orders. Off the event loop: each answers between its steps.
+        async with _offload_lookups_lock:
+            ranks = await asyncio.to_thread(engine.set_offload_lookups, enabled)
+    except Exception as e:
+        logger.exception("Failed to set offload lookups")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to set offload lookups: {e!s}"
+        )
+    if not all(r.get("applied") and r.get("enabled") is enabled for r in ranks):
+        # No offload tier that takes it, or one that saves (see the scheduler).
+        raise HTTPException(
+            status_code=409, detail={"enabled": enabled, "ranks": ranks}
+        )
+    return {"status": "success", "enabled": enabled, "ranks": ranks}
+
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
@@ -3706,7 +4066,7 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine
+    global engine, encoder
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -3779,6 +4139,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--accept-ec-transfer-params",
+        action="store_true",
+        help=(
+            "Read a chat request's image embeddings from the encoder server its "
+            "ec_transfer_params name (E/P/D prefill). Set it only where clients "
+            "cannot reach this server except through a router that runs the "
+            "encoder and replaces any client-sent ec_transfer_params (ATOMesh); "
+            "without it they are dropped and this server encodes images itself."
+        ),
+    )
+    parser.add_argument(
         "--request-log",
         type=str,
         default=None,
@@ -3787,11 +4158,29 @@ def main():
     args = parser.parse_args()
     if args.api_server_count < 1:
         parser.error("--api-server-count must be at least 1")
+    if envs.ATOM_PRELOAD == "daemon":
+        # A weight cache daemon serves weights, not requests.
+        from atom.model_loader.weight_cache.daemon import run_daemon
+
+        run_daemon(EngineArgs.from_cli_args(args))
+        return
+    if envs.ATOM_PRELOAD == "server":
+        from atom.model_loader.weight_cache.preload import record_launch
+
+        record_launch()  # the runners start a daemon with it
 
     _setup_frontend(args)
 
-    logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
+    if engine_args.encoder_only:
+        if args.api_server_count > 1:
+            parser.error("--encoder-only serves from one process")
+        logger.info(f"Initializing the vision encoder of {args.model}...")
+        _setup_reasoning_and_tools(args)
+        encoder = engine_args.create_encoder()
+        _serve(args)
+        return
+    logger.info(f"Initializing engine with model {args.model}...")
     # Remote DP nodes block inside engine startup and never run the API loop.
     # Expose their local mmap metrics on the same configured HTTP port.
     dp_rank = (
@@ -3830,7 +4219,8 @@ def _setup_frontend(args) -> None:
     """Request log, tokenizer, chat template and model name: everything a
     front end needs before the engine exists (shared with front-end workers)."""
     global tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global custom_message_encoder, fim_format
+    global custom_message_encoder, fim_format, accept_ec_transfer_params
+    accept_ec_transfer_params = getattr(args, "accept_ec_transfer_params", False)
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")
         _request_logger.setLevel(logging.INFO)
@@ -3866,10 +4256,11 @@ def _setup_reasoning_and_tools(args) -> None:
     global tool_call_parser_cls, required_tool_channel
     global preserve_tool_call_arguments
     global model_starts_in_reasoning, reasoning_toggle, reasoning_dialect
+    global mid_system_supported
     _template_source = chat_template_source(tokenizer, custom_message_encoder)
+    _plain_probe = render_probe_prompt(tokenizer, custom_message_encoder, tools=False)
     reasoning_dialect, _dialect_stated = resolve_dialect(
-        _template_source,
-        render_probe_prompt(tokenizer, custom_message_encoder, tools=False) or "",
+        _template_source, _plain_probe or ""
     )
     logger.info(
         "Reasoning channel: %s%s",
@@ -3892,6 +4283,13 @@ def _setup_reasoning_and_tools(args) -> None:
             "This chat template has no switch for reasoning, so a request "
             "asking for none cannot stop the model producing it. Any that "
             "arrives is still separated and reported, never discarded."
+        )
+
+    mid_system_supported = template_takes_mid_system(tokenizer, custom_message_encoder)
+    if not mid_system_supported and _plain_probe:
+        logger.info(
+            "The chat template cannot take a system message inside the "
+            "conversation; /v1/messages moves those into user turns."
         )
 
     tools_probe = render_probe_prompt(tokenizer, custom_message_encoder, tools=True)
@@ -3955,6 +4353,66 @@ def _setup_stream_dispatch(args) -> None:
     )
 
 
+def _find_jemalloc() -> str | None:
+    """jemalloc's soname if the dynamic linker can find it, else None.
+
+    LD_PRELOAD takes a soname and resolves it like any other library, so no
+    distro-specific paths are needed.
+    """
+    import ctypes.util
+
+    return ctypes.util.find_library("jemalloc")
+
+
+def _loaded_allocator(maps_path="/proc/self/maps") -> str:
+    """The malloc this process actually runs on: ld.so only warns when an
+    LD_PRELOAD entry fails to load and goes on with glibc malloc."""
+    try:
+        with open(maps_path) as maps:
+            for line in maps:
+                if "jemalloc" in line:
+                    return line.split()[-1]
+    except OSError:
+        pass
+    return "glibc malloc"
+
+
+@contextlib.contextmanager
+def _frontend_allocator_env():
+    """Run the front-end workers on jemalloc.
+
+    Each front-end worker tokenizes and renders very long prompts on many
+    threads (default executor + the tokenizers' rayon pool). With glibc malloc
+    every thread gets its own arena and the freed memory stays there, so a
+    worker's RSS keeps growing for hours. jemalloc returns freed pages to the
+    OS and keeps the thread count (and so the tokenizer parallelism) unchanged.
+
+    LD_PRELOAD is only set while the workers are spawned; this process and the
+    engine processes (started before) keep their allocator. Without jemalloc on
+    the host the workers fall back to glibc malloc with one warning.
+    """
+    old = os.environ.get("LD_PRELOAD")
+    if old is not None and "jemalloc" in old:
+        yield old
+        return
+    lib = _find_jemalloc()
+    if lib is None:
+        logger.warning(
+            "libjemalloc.so.2 not found; front-end workers use glibc malloc "
+            "(their memory grows on long runs; install libjemalloc2 to avoid it)"
+        )
+        yield None
+        return
+    os.environ["LD_PRELOAD"] = f"{lib}:{old}" if old else lib
+    try:
+        yield lib
+    finally:
+        if old is None:
+            os.environ.pop("LD_PRELOAD", None)
+        else:
+            os.environ["LD_PRELOAD"] = old
+
+
 def _start_frontend_workers(args) -> None:
     """--api-server-count > 1: start the hub and spawn the front-end workers,
     which take over the public port. This process then serves management
@@ -3977,15 +4435,21 @@ def _start_frontend_workers(args) -> None:
     )
     ctx = multiprocessing.get_context("spawn")
     processes = []
-    for index in range(args.api_server_count):
-        proc = ctx.Process(
-            target=_frontend_worker_main,
-            args=(args, engine.config, hub.connection_info(index), os.getpid()),
-            name=f"ATOM-APIServer-{index}",
-            daemon=True,
-        )
-        proc.start()
-        processes.append(proc)
+    with _frontend_allocator_env() as allocator:
+        for index in range(args.api_server_count):
+            proc = ctx.Process(
+                target=_frontend_worker_main,
+                args=(args, engine.config, hub.connection_info(index), os.getpid()),
+                name=f"ATOM-APIServer-{index}",
+                daemon=True,
+            )
+            proc.start()
+            processes.append(proc)
+    logger.info(
+        "Front-end workers %s spawned with LD_PRELOAD allocator %s",
+        [proc.pid for proc in processes],
+        allocator or "none",
+    )
     try:
         hub.wait_for_workers(processes)
     except RuntimeError:
@@ -4043,10 +4507,11 @@ def _frontend_worker_main(args, config, info, parent_pid) -> None:
         timeout_keep_alive=args.timeout_keep_alive,
     )
     logger.info(
-        "Front-end worker %d serving %s:%s",
+        "Front-end worker %d serving %s:%s on %s",
         info["index"],
         args.host,
         args.server_port,
+        _loaded_allocator(),
     )
     uvicorn.Server(uv_config).run(sockets=[listener])
 
@@ -4072,7 +4537,7 @@ def _serve(args) -> None:
 
     def _sigint_handler(signum, frame):
         logger.info("Received SIGINT, shutting down engine...")
-        engine.close()
+        (encoder or engine).close()
         import psutil
 
         try:

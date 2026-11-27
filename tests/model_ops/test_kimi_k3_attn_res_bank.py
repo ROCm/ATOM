@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Kimi-K3's block-residual bank: allocated once per forward, each closing
 layer copies its prefix into a slot. Every layer's output matches the loop that
 grew the candidates by `torch.cat`, bit for bit."""
@@ -41,8 +43,10 @@ def _torch_attn_res(
     add_hidden2=None,
     quant_dtype=None,
     num_blocks=None,
+    close_block=False,
 ):
     assert quant_dtype is None
+    bank = block_residual
     if num_blocks is not None:
         block_residual = block_residual[:, :num_blocks]
     ps = prefix.float()
@@ -57,7 +61,11 @@ def _torch_attn_res(
     if out_norm_weight is not None:
         mixed = mixed * torch.rsqrt(mixed.pow(2).mean(-1, keepdim=True) + out_eps)
         mixed = mixed * out_norm_weight.float()
-    return mixed.to(prefix.dtype), prefix if add_hidden is None else ps.to(prefix.dtype)
+    prefix_out = prefix if add_hidden is None else ps.to(prefix.dtype)
+    if close_block:
+        bank[:, num_blocks].copy_(prefix_out)
+        prefix_out = None
+    return mixed.to(prefix.dtype), prefix_out
 
 
 LAYERS, BLOCK, HIDDEN, TOKENS = 25, 12, 64, 5
@@ -410,7 +418,8 @@ def test_attention_sites_pass_the_full_bank_and_precomputed_bound(monkeypatch, m
     prefix = torch.randn(TOKENS, HIDDEN)
     seen = []
 
-    def mix(*args):
+    def mix(*args, close_block=False):
+        assert not close_block
         seen.append((args[1], args[-1]))
         return args[0], args[0]
 
@@ -423,6 +432,55 @@ def test_attention_sites_pass_the_full_bank_and_precomputed_bound(monkeypatch, m
         site(prefix, bank)
     assert [count for _, count in seen] == [1, 1, 2, 3]
     assert all(value is bank for value, _ in seen)
+
+
+@pytest.mark.parametrize("layer", [0, 1, 12, 13])
+def test_forward_closes_only_boundaries_without_a_second_copy(
+    monkeypatch, modules, layer
+):
+    site = modules.AttnRes(
+        nn.Identity(), nn.Identity(), block_size=BLOCK, layer_idx=layer
+    )
+    site.score_weight = torch.ones(HIDDEN)
+    x = torch.ones(TOKENS, HIDDEN)
+    bank = torch.zeros(TOKENS, 3, HIDDEN)
+    calls = []
+
+    def mix(*args, close_block=False):
+        calls.append(close_block)
+        return _torch_attn_res(*args, close_block=close_block)
+
+    monkeypatch.setattr(modules.ops, "apply_attn_res", mix)
+    if layer > 0:
+
+        def forbidden_copy(*args):
+            pytest.fail("the fused path must close the block inside the kernel")
+
+        monkeypatch.setattr(site, "maybe_close_block", forbidden_copy)
+    _, prefix = site(x, bank, close_block=True)
+    assert (prefix is None) == (layer % BLOCK == 0)
+    assert calls == ([] if layer == 0 else [layer % BLOCK == 0])
+    expected = torch.zeros_like(bank)
+    if layer % BLOCK == 0:
+        expected[:, layer // BLOCK] = x
+    assert torch.equal(bank, expected)
+
+
+def test_decoder_closes_in_the_mix_without_a_copy(monkeypatch, modules):
+    monkeypatch.setattr(modules.ops, "apply_attn_res", _torch_attn_res)
+    layers, _ = _layers(monkeypatch, modules.kimi)
+    layer = layers[BLOCK]
+
+    def forbidden_copy(*args):
+        pytest.fail("decoder must request the fused bank store")
+
+    monkeypatch.setattr(
+        layer.self_attention_attn_res, "maybe_close_block", forbidden_copy
+    )
+    x = torch.ones(TOKENS, HIDDEN).bfloat16()
+    bank = torch.zeros(TOKENS, 3, HIDDEN).bfloat16()
+    _, _, _, output_bank = layer(None, x, bank, x, x)
+    assert output_bank is bank and torch.equal(bank[:, 1], 3 * x)
 
 
 @pytest.mark.parametrize("blocks", [None, 1])
