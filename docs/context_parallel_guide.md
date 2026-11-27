@@ -637,11 +637,29 @@ With an **fp8 Q and an fp8 KV cache**, aiter serves gqa=64 only from the
 **persistent** decode kernel and aborts the process otherwise (`asm_mla.cu`:
 *"fp8/fp8 with gqa_ratio=64 only supports persistent mode"*).
 
-Native sparse MLA / DSA **decode** under DCP handles this, where aiter runs DCP
-decode persistent (`dcp_persistent_supported`; validated on gfx950), by rebuilding
-the persistent work/reduce metadata after each full IndexShare layer compacts its
-rank-local top-k. Following shared layers reuse its indices, compact indptr and
-work plan.
+Native sparse MLA / DSA **decode** and sparse MTP verify under DCP build one
+whole-row template per step when AITER confirms native support for the builder's
+Q/KV dtypes and gathered head width. The template uses nonempty placeholders and
+one item per workgroup, then each layer patches its current rank-local KV ranges.
+Shared IndexShare layers read the preceding owner's selection. A mismatched,
+folded or unknown consumer rebuilds separate work buffers, preserving the template
+for later native layers. Unqualified steps keep the existing rebuild path.
+
+Reuse is limited to 256 query rows and the exact geometry's workgroup capacity;
+the backing buffers cover the configured query-width range, including intermediate
+capture buckets. Every plan publishes only its active work-indptr prefix, whether
+it qualifies for reuse or not: AITER launches from that tensor's length, and its
+final GPU-written entry counts work items. This preserves the known
+[empty-item boundary](https://github.com/wuhuikx/LLM-Booster/issues/570) above
+256 rows. Rebuilding is not an unconditional numerical reference for empty rows.
+The template must fit the consumer's query rows, including an unpadded drafter;
+otherwise that consumer rebuilds from its own row count.
+
+Separate temporary buffers are allocated only when a qualified template meets a
+mismatched consumer. Steps whose builder cannot qualify a template continue to
+rebuild in their preallocated buffers. Temporary fallback storage keeps each
+captured invocation independent; its allocation cost remains part of the required
+complete decode-step timing.
 
 Persistent **sparse prefill** builds a work plan at the selected prefill head
 width. An owning layer patches its KV ranges only when AITER confirms native,
@@ -787,7 +805,7 @@ MLA rows; see the [recipe](../recipes/DSpark.md)).
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | On the `q` transport, TP8/DCP8 gathers 96 real heads. Native FP8 prefill may retain 96; BF16 prefill pads to 128. Decode and folded routes follow their own tables and AITER support. Widths above 128 are unverified. The `kv` transport attends only local heads. |
-| gathered head width 64 | Eligible decode rebuilds persistent metadata per full IndexShare layer. Native persistent `q` prefill patches whole-row plans; folded plans and small BF16 head groups rebuild. Eligible FP8 non-persistent `q` prefill needs no plan. The `kv` transport uses the dcp=1 plan. See [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64). |
+| gathered head width 64 | Qualified decode and sparse verify reuse a step's native whole-row plan; other decode shapes rebuild. Native persistent `q` prefill patches whole-row plans; folded plans and small BF16 head groups rebuild. Eligible FP8 non-persistent `q` prefill needs no plan. The `kv` transport uses the dcp=1 plan. See [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64). |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group) |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |

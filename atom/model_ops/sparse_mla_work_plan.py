@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
-"""Point a DCP sparse prefill's per-forward MLA work plan at one layer's keys.
+"""Point a native DCP sparse MLA work plan at the current layer's keys.
 
 The metadata builder plans the forward's query rows once, one whole row a work
-item (`AiterMLAMetadataBuilder._sparse_prefill_work_plan`). Only each row's
+item. Decode templates also reserve an item for every empty row. Only each row's
 rank-owned key range changes from one DSA layer to the next, so a layer rewrites
 the items' KV start and end instead of planning again.
 """

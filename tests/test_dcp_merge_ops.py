@@ -1602,36 +1602,6 @@ def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengt
     torch.testing.assert_close(values.float() * scales, keys.float(), rtol=0, atol=0)
 
 
-def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
-    """Decode and folded prefill rebuild with their own query widths."""
-    tree = ast.parse(_ATTENTION_MLA_PATH.read_text(encoding="utf-8"))
-
-    def _name(node):
-        return ast.unparse(node)
-
-    by_enclosing_func = {}
-    for func in ast.walk(tree):
-        if not isinstance(func, ast.FunctionDef):
-            continue
-        for node in ast.walk(func):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_rebuild_sparse_dcp_persistent_metadata"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "self"
-            ):
-                by_enclosing_func[func.name] = _name(node.args[6])
-
-    assert by_enclosing_func == {
-        "_forward_decode": "self.dcp_kernel_num_heads",
-        "_forward_prefill_mla": "q.shape[1]",
-    }, (
-        "a _rebuild_sparse_dcp_persistent_metadata call site is passing the "
-        f"wrong gathered_num_heads (7th positional arg): got {by_enclosing_func}"
-    )
-
-
 @needs_dcp_ops
 def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge(monkeypatch):
     """Prefill uses queried native widths and retains BF16 small-head grouping."""

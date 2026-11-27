@@ -16,6 +16,10 @@ from aiter import (
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
+from aiter.ops.attention import (
+    get_mla_decode_fwd_max_splits,
+    get_mla_decode_shape_support,
+)
 
 from atom.config import kv_cache_torch_dtype
 from atom.distributed.dcp_utils import (
@@ -684,16 +688,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             (reduce_indptr_size, reduce_indptr_type),
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
-        ) = get_mla_metadata_info_v1(
-            self.max_bs,
-            max_seqlen_qo,
-            self.persistent_num_heads,
-            self.dtype_q,
-            self.dtype_kv,
-            is_sparse=self.is_sparse,
-            fast_mode=True,
-            **_mla_seg_meta_kwargs(),
-        )
+        ) = self._persistent_work_buffer_sizes(max_seqlen_qo)
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
 
         mla_metadata = {
@@ -1076,6 +1071,73 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # return self.model_runner.tokenID_processor.async_copy_stream
         return self.model_runner.async_execute_stream
 
+    def _persistent_work_buffer_sizes(self, max_q_len: int):
+        def sizes(query_length):
+            return get_mla_metadata_info_v1(
+                self.max_bs,
+                query_length,
+                self.persistent_num_heads,
+                self.dtype_q,
+                self.dtype_kv,
+                is_sparse=self.is_sparse,
+                fast_mode=True,
+                **_mla_seg_meta_kwargs(),
+            )
+
+        allocated = sizes(max_q_len)
+        if not self.sparse_dcp_metadata_rebuild or max_q_len == 1:
+            return allocated
+        # An intermediate capture width can have higher occupancy than either
+        # endpoint. Reserve every buffer for the configured query-width range.
+        for query_length in range(1, max_q_len):
+            allocated = tuple(
+                (
+                    (
+                        tuple(max(a, b) for a, b in zip(shape, other, strict=True))
+                        if isinstance(shape, tuple)
+                        else max(shape, other)
+                    ),
+                    dtype,
+                )
+                for (shape, dtype), (other, _) in zip(
+                    allocated, sizes(query_length), strict=True
+                )
+            )
+        return allocated
+
+    def _active_work_indptr(self, work_indptr, heads, max_q_len):
+        # AITER launches one worker per entry minus one, even without plan reuse.
+        groups = get_mla_decode_fwd_max_splits(
+            heads, max_q_len, self.dtype_q, self.dtype_kv
+        )
+        if work_indptr.numel() < groups + 1:
+            raise RuntimeError(
+                "MLA work-indptr capacity is smaller than its active plan"
+            )
+        return work_indptr[: groups + 1]
+
+    def _sparse_dcp_decode_plan(self, rows: int, heads: int, work_indptr):
+        """Describe a native template with one whole query row per workgroup."""
+        if not self.sparse_dcp_metadata_rebuild or self.block_size != 1:
+            return None
+        support = get_mla_decode_shape_support(
+            heads,
+            1,
+            self.dtype_q,
+            self.dtype_kv,
+            persistent=True,
+            return_lse=True,
+            page_size=1,
+        )
+        if support.supported is not True or not support.native:
+            return None
+        # Empty first items can hide subsequent live work in an MLA workgroup.
+        # Keep one item per group and retain the qualified 256-row boundary.
+        groups = get_mla_decode_fwd_max_splits(heads, 1, self.dtype_q, self.dtype_kv)
+        if not 0 < rows <= min(256, groups) or work_indptr.numel() < groups + 1:
+            return None
+        return (rows, heads, self.dtype_q, self.dtype_kv)
+
     def _set_mla_persistent_worker_buffers_sparse_mtp(
         self,
         num_tokens: int,
@@ -1090,24 +1152,39 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         their own persistent metadata (max_seqlen_qo=2) intact.
         """
         var = self.model_runner.forward_vars
+        heads = (
+            self.persistent_num_heads
+            if self.sparse_dcp_metadata_rebuild
+            else self.padded_num_attention_heads
+        )
+        plan = self._sparse_dcp_decode_plan(
+            num_tokens, heads, var["sparse_mtp_work_indptr"]
+        )
         split_params = {
-            "kv_granularity": max(self.block_size, 16),
+            "kv_granularity": (
+                triton.next_power_of_2(self.index_topk_out)
+                if plan is not None
+                else max(self.block_size, 16)
+            ),
             "max_seqlen_qo": 1,
             "uni_seqlen_qo": 1,
             "fast_mode": 1,
-            "max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO,
+            "max_split_per_batch": 1 if plan is not None else _MLA_SPLIT_BUDGET_AUTO,
         }
         work_meta_data = var["sparse_mtp_work_meta_data"]
         work_info_set = var["sparse_mtp_work_info_set"]
-        work_indptr = var["sparse_mtp_work_indptr"]
+        work_indptr = self._active_work_indptr(var["sparse_mtp_work_indptr"], heads, 1)
         reduce_indptr = var["sparse_mtp_reduce_indptr"]
         reduce_final_map = var["sparse_mtp_reduce_final_map"]
         reduce_partial_map = var["sparse_mtp_reduce_partial_map"]
         get_mla_metadata_v1(
             var["sparse_cu_seqlens_q"].gpu[: num_tokens + 1],
-            var["sparse_kv_indptr"].gpu[: num_tokens + 1],
+            # Unit placeholders give even empty rows their own workgroup.
+            var["sparse_cu_seqlens_q" if plan else "sparse_kv_indptr"].gpu[
+                : num_tokens + 1
+            ],
             var["sparse_kv_last_page_lens"].gpu[:num_tokens],
-            self.padded_num_attention_heads,
+            heads,
             1,  # nhead_kv
             True,
             work_meta_data,
@@ -1132,6 +1209,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # least this many. MLAAttention._forward_decode asserts it without
             # DCP, on eager steps and at capture (a host check: not on replay).
             "sparse_mtp_num_tokens": num_tokens,
+            "sparse_mtp_dcp_decode_plan": plan,
         }
 
     def set_mla_persistent_worker_buffers(
@@ -1169,7 +1247,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         work_meta_data = var[f"{prefix}work_meta_data"]
         work_info_set = var[f"{prefix}work_info_set"]
-        work_indptr = var[f"{prefix}work_indptr"]
+        work_indptr = self._active_work_indptr(
+            var[f"{prefix}work_indptr"], self.persistent_num_heads, max_q_len
+        )
         reduce_indptr = var[f"{prefix}reduce_indptr"]
         reduce_final_map = var[f"{prefix}reduce_final_map"]
         reduce_partial_map = var[f"{prefix}reduce_partial_map"]
@@ -1185,6 +1265,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # of the persistent sparse-index buffer once the context exceeds
         # index_topk (dense >> sparse) -> illegal KV-cache access.
         use_sparse_meta = self.is_sparse and (max_q_len == 1 or sparse_decode)
+        plan = (
+            self._sparse_dcp_decode_plan(bs, self.persistent_num_heads, work_indptr)
+            if use_sparse_meta and max_q_len == 1 and not only_update
+            else None
+        )
+        if plan is not None:
+            split_params.update(
+                kv_granularity=triton.next_power_of_2(self.index_topk_out),
+                max_split_per_batch=1,
+            )
         kv_indptr_for_metadata = (
             var[f"{prefix}sparse_kv_indptr"].gpu[: bs + 1]
             if use_sparse_meta
@@ -1205,6 +1295,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             else var[f"{prefix}kv_last_page_lens"].gpu[:bs]
         )
         cu_seqlens_q = var[f"{prefix}cu_seqlens_q"].gpu[: bs + 1]
+        if plan is not None:
+            cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[: bs + 1]
+            kv_indptr_for_metadata = cu_seqlens_q
         if only_update:
             decode_update_mla_metadata_v1(
                 cu_seqlens_q,
@@ -1253,6 +1346,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "reduce_indptr": reduce_indptr,
             "reduce_final_map": reduce_final_map,
             "reduce_partial_map": reduce_partial_map,
+            "sparse_dcp_decode_plan": plan,
         }
 
     def compact_topk_indices(self, rows: torch.Tensor) -> None:
@@ -3871,9 +3965,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     ) -> None:
         super().finish_ubatch(ubatch_idx, ub, ub_attn, max_seqlen_q)
         prefix = f"ub{ubatch_idx}_"
-        self.set_mla_persistent_worker_buffers(
+        work = self.set_mla_persistent_worker_buffers(
             ub.running_bs, max_seqlen_q, prefix=prefix
         )
+        for name, value in work.items():
+            setattr(ub_attn, name, value)
         ub_attn.index_rows = self._decode_index_rows(
             ub_attn,
             ub.running_bs,
