@@ -193,6 +193,8 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
             raise RuntimeError(name)
 
     core.label = "test"
+    core._idle_when_blocked = False
+    core._dp_group_hidden_work = False
     core.utility_queue = None
     core.utility_handler = SimpleNamespace(
         process_queue=lambda *a: None, push_metrics=lambda **k: None
