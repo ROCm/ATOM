@@ -158,6 +158,7 @@ def _postprocess(
                 required_channel=None,
                 structured_requests=None,
                 num_spec_step=2,
+                temperatures=temperatures,
             ),
             temperatures,
             top_ks,
