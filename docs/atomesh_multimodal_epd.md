@@ -452,32 +452,32 @@ How the Mooncake transfer works:
   `atom/utils/envs.py`, taking precedence. P's reader also takes its
   server's `kv_transfer_config` `ib_device`, `ib_enable_alternate_hca` and
   `ib_hca_count`, so KV and embeddings register on the same HCAs.
-- Acceptance runs name the HCAs. They set `ATOM_MOONCAKE_IB_DEVICE` on E,
-  P and D to the HCAs local to each role's GPUs, from a per-node map of
-  GPU to HCA by PCIe switch, together with `MC_DISABLE_HIP=1`. Unconfigured, `mooncake_hca.auto_select_ib_device` tries
-  `rdma<N>` and then `ionic_<N>`. On g15, whose HCAs are named `rocep*`, it
-  finds neither and hands Mooncake a missing `rdma<N>`, so Mooncake
-  installs only TCP and HIP. In the 1P1D run of D8, the HCAs received 0 GiB
-  and loopback 22.3 GiB.
-- The variable holds one value per server, not per rank. E, on one GPU,
-  registers on its local HCA. Each TP4 rank of P and D registers on every
-  HCA listed for its role, and the connector advertises `ib_device` as
-  `None` for a multi-HCA engine (`MooncakeConnector.__init__`).
-  The PD and E/P/D runs fail when a role's HCAs moved no RDMA bytes, so a
-  run off RDMA cannot pass. A per-rank mapping from GPU to HCA by PCI
-  locality in `mooncake_hca.auto_select_ib_device` is the fix if it happens.
+- Unconfigured, `mooncake_hca.auto_select_ib_device` picks the ACTIVE HCA
+  on the PCIe switch of the engine's GPU, found from the GPU's PCI address
+  (`gpu_pci_bdf`, `nic.rail_rdma_device`; main's #3884), whatever the HCAs
+  are named. Each rank, and E on its one GPU, registers on its own GPU's
+  HCA. Where the topology names no single HCA, the engine refuses to start
+  and names `ib_device` and `ATOM_MOONCAKE_IB_DEVICE`.
+- The acceptance runs (D8) predate #3884 and name the HCAs: they set
+  `ATOM_MOONCAKE_IB_DEVICE` on E, P and D to the HCAs local to each role's
+  GPUs, together with `MC_DISABLE_HIP=1`. The selection then tried
+  `rdma<N>` and `ionic_<N>`, and on g15, whose HCAs are named `rocep*`,
+  handed Mooncake a missing `rdma<N>`: in D8's 1P1D run the HCAs received
+  0 GiB and loopback 22.3 GiB. A run after #3884 may leave the variable
+  unset.
+- The variable holds one value per server, not per rank: set, each TP4
+  rank of P and D registers on every HCA listed for its role, and the
+  connector advertises `ib_device` as `None` for a multi-HCA engine
+  (`MooncakeConnector.__init__`). The PD and E/P/D runs fail when a role's
+  HCAs moved no RDMA bytes, so a run off RDMA cannot pass.
 - Naming the HCAs also puts A4's and A5's KV on the same transport, so A5's
   PD baseline runs on it too.
 
 Why not `ATOM_MOONCAKE_MATCHED_RAILS` (`docs/mooncake_matched_rails.md`):
 - That doc warns that a multi-HCA engine may pick a disconnected rail.
   Matched rails avoids that with one single-HCA engine per rail.
-- It does not apply here, for two reasons:
-  1. It needs a single GPU-local primary HCA per rank. Left unset, that is
-     `mooncake_hca.auto_select_ib_device`'s pick, which on a `rocep*` node is the
-     missing `rdma<N>` above, so auto mode refuses to start. Set
-     explicitly, it is one HCA for every rank of the server.
-  2. It covers only the KV connector's P-to-D writes, not E's pool.
+- It does not apply here: it covers only the KV connector's P-to-D writes,
+  not E's pool. E and P warn at engine setup when it is set.
 - E and P sit on different nodes (D17), so the risk of a disconnected rail
   applies to E's read. The RDMA byte check above catches it.
 
