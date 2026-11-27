@@ -442,7 +442,7 @@ def _kup_qpe_persistent_kernel(
     # Tokens past n_local * NUM_CTAS (only when M > #CTAs * tiles per CTA).
     for k in range(n_local, gl.cdiv(M - pid, NUM_CTAS)):
         t = pid + k * NUM_CTAS
-        ks, kpos = _kv_idx_load(
+        t_slot, kpos = _kv_idx_load(
             t, M, pos_ptr, slot_mapping_ptr, pos_stride_b, R, num_warps
         )
         k_nope, k_pe, kc2, ks2 = _kv_data_load(
@@ -452,7 +452,7 @@ def _kup_qpe_persistent_kernel(
         kv_n, kv_p = _kv_values(
             k_nope, k_pe, kc2, ks2, k_scale_rcprl, kv_cache_ptr, R, IS_NEOX, num_warps
         )
-        _kv_put(kv_n, kv_p, ks, kv_cache_ptr, kv_cache_stride_b, L, R,
+        _kv_put(kv_n, kv_p, t_slot, kv_cache_ptr, kv_cache_stride_b, L, R,
                 BLOCK_SIZE, num_warps)  # fmt: skip
 
     gl.amd.gfx1250.tdm.async_wait(0)
