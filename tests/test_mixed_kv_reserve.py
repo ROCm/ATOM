@@ -25,6 +25,15 @@ def runner_module():
         yield load("atom.model_engine.model_runner")
 
 
+@pytest.fixture(params=["base", "rollout"])
+def profile_runner_cls(request, runner_module):
+    if request.param == "rollout":
+        from atom.rollout.model_runner_ext import RLHFModelRunner
+
+        return RLHFModelRunner
+    return runner_module.ModelRunner
+
+
 @pytest.mark.parametrize("width", [1, 8])
 @pytest.mark.parametrize("budget", [2048, 8192, 32768])
 @pytest.mark.parametrize("max_seqs", [2, 256, 1024])
@@ -129,11 +138,12 @@ def test_profile_addresses_include_full_draft_lookahead(
 @pytest.mark.parametrize("width,profile_query_width", [(1, 1), (8, 8), (8, None)])
 @pytest.mark.parametrize("deferred", [False, True])
 def test_pure_decode_profile_preserves_full_k_through_postprocess(
-    runner_module, monkeypatch, width, profile_query_width, deferred
+    runner_module, profile_runner_cls, monkeypatch, width, profile_query_width, deferred
 ):
     from atom.model_ops import rejection_sampler
 
-    runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
+    runner = profile_runner_cls.__new__(profile_runner_cls)
+    runner._true_vocab_size = 0
     runner.config = SimpleNamespace(
         max_model_len=257,
         max_num_seqs=4,
@@ -350,7 +360,14 @@ def test_long_context_work_is_bounded_without_reducing_query_shapes(
 @pytest.mark.parametrize("dp_attention", [False, True])
 @pytest.mark.parametrize("token_budget,spec_bs", [(16, 2), (64, 4)])
 def test_profile_budgets_reserved_peak_and_releases_scratch(
-    monkeypatch, fail_unsplit, confidence, dp_attention, token_budget, spec_bs
+    monkeypatch,
+    runner_module,
+    profile_runner_cls,
+    fail_unsplit,
+    confidence,
+    dp_attention,
+    token_budget,
+    spec_bs,
 ):
     from atom.model_engine import mixed_profile
     from atom.spec_decode.dspark_verify import VerifyScheduler
@@ -387,7 +404,7 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
             pool_open = False
             memory["allocated"] = 80
 
-    def forward(batch, *, profile_query_width=None):
+    def forward(self, batch, *, profile_query_width=None):
         assert profile_query_width == (batch.width if batch.prefill == 0 else None)
         assert runner.gpu_forward_metrics is None
         observed.append(memory["reserved"])
@@ -401,7 +418,10 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
         memory.update(peak=allocated, reserved_peak=reserved, reserved=reserved)
         memory["non_torch"] = 13 if batch.prefill == 0 else 7
 
-    runner = SimpleNamespace(
+    # Keep the real rollout override between the profiler and model execution.
+    monkeypatch.setattr(runner_module.ModelRunner, "forward", forward)
+    runner = profile_runner_cls.__new__(profile_runner_cls)
+    runner.__dict__.update(
         config=config,
         gpu_forward_metrics=object(),
         max_bs=4,
@@ -409,7 +429,6 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
         warmup_max_tokens=lambda: token_budget,
         attn_metadata_builder=SimpleNamespace(temporary_profile_cache=temporary_pool),
         tokenID_processor=SimpleNamespace(clean=lambda: None),
-        forward=forward,
     )
     if confidence:
         runner.drafter = SimpleNamespace(mtp_k=7, verify_scheduler=verify)

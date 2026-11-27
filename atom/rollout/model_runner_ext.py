@@ -358,8 +358,10 @@ class RLHFModelRunner(
         return super().run_model(input_ids, batch)
 
     @torch.inference_mode()
-    def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        result = super().forward(batch)
+    def forward(
+        self, batch: ScheduledBatch, *, profile_query_width: int | None = None
+    ) -> ScheduledBatchOutput:
+        result = super().forward(batch, profile_query_width=profile_query_width)
 
         if self._extract_mode and self._captured_hidden_states is not None:
             self._store_hidden_states(batch)
