@@ -168,7 +168,11 @@ def kv_nvfp4_store(
     v_payload: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    """Quantize this step's staged K and V into the paged NVFP4 cache."""
+    """Quantize this step's staged K and V into the paged NVFP4 cache.
+
+    The sparse layers no longer stage K/V: aiter's ``fused_qknorm_idxrqknorm``
+    writes them into the NVFP4 pool itself (``kv_cache_dtype="nvfp4"`` with the
+    scale planes), byte for byte what this produces. Kept as that reference."""
     num_heads, head_dim = kv_stage.shape[3], kv_stage.shape[4]
     strides = (kv_stage.stride(0), kv_stage.stride(2), kv_stage.stride(3))
     _nvfp4_store(

@@ -694,3 +694,138 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
     torch.cuda.synchronize()
     for old_output, new_output in zip(old_outputs, new_outputs):
         assert torch.equal(old_output, new_output)
+
+
+# ---------------------------------------------------------------------------
+# The split decode selector. It replaces the packed selector on few rows, and
+# its claim is the same indices, table and contexts -- so, as for the two
+# selectors above, agreement with the packed one is the property.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "rows,width,tile,max_q,want",
+    [
+        (8, 8192, 512, 8, True),  # one request, verify of 8, 1M launch bound
+        (32, 8192, 512, 8, True),
+        (33, 8192, 512, 8, False),  # past the row gate: the packed chain
+        (8, 2048, 512, 8, False),  # a 262K launch bound: four packed tiles
+        (8, 2049, 512, 8, True),
+        (8, 8192, 512, 0, False),  # prefill
+        (0, 8192, 512, 8, False),
+    ],
+)
+def test_split_decode_selector_gate(rows, width, tile, max_q, want):
+    got = m._split_decode_selector_wins(
+        rows=rows, width=width, tile=tile, decode_max_q=max_q
+    )
+    assert got is want
+
+
+@gpu
+@pytest.mark.parametrize("pages_per_block", [1, 8])
+@pytest.mark.parametrize("ties", [False, True])
+@pytest.mark.parametrize(
+    "batch,max_q,contexts",
+    [
+        (1, 8, [510_000]),  # eight packed tiles
+        (4, 8, [1_000_000, 300_000, 9, 2_000]),  # sixteen tiles .. under top-k blocks
+        (3, 1, [65_536, 65_537, 65_600]),  # on and just past a group edge
+        (2, 4, [70_000, 4]),
+    ],
+)
+def test_split_decode_selector_matches_packed(
+    monkeypatch, batch, max_q, contexts, ties, pages_per_block
+):
+    max_block = 8192  # a graph's launch bound, far past the requests
+    rows = batch * max_q
+    g = torch.Generator(device="cuda").manual_seed(batch * 31 + max_q)
+    score = torch.randn((1, rows, max_block), device="cuda", generator=g)
+    if ties:
+        # Coarse scores: equal keys but for the block id, at every group edge.
+        score = torch.round(score * 2) / 2
+    seq = torch.tensor(contexts, device="cuda", dtype=torch.int32)
+    table = torch.randint(
+        0, 1 << 20, (batch, max_block), device="cuda", dtype=torch.int32, generator=g
+    )
+
+    def select(split):
+        idx = torch.full((1, rows, TOPK), -7, dtype=torch.int32, device="cuda")
+        out, args = m._alloc_emit(rows, 1, TOPK, table, True, "cuda", pages_per_block)
+        out[0].fill_(-7)
+        out[1].fill_(-7)
+        with monkeypatch.context() as patch:
+            if not split:
+                patch.setattr(m, "DECODE_SPLIT_TOPK_MAX_ROWS", 0)
+            m._launch_select(
+                score, idx, seq, seq, batch, TOPK, INIT, LOCAL, table, args, 1,
+                max_q, max_q, m.DECODE_TOPK_BLOCK_SIZE_K, m.DECODE_TOPK_NUM_WARPS, True, pages_per_block,
+                pages_per_block=pages_per_block,
+            )  # fmt: skip
+        return idx, out[0], out[1]
+
+    assert m._split_decode_selector_wins(
+        rows=rows, width=max_block, tile=m.DECODE_TOPK_BLOCK_SIZE_K, decode_max_q=max_q
+    )
+    packed, split = select(False), select(True)
+    for a, b in zip(packed, split):
+        assert torch.equal(a, b)
+    # Not vacuous: something was selected.
+    assert (packed[0] >= 0).any()
+
+
+# --- aiter's FlyDSL prefill block scorer on the FP4 index cache
+
+
+@pytest.mark.parametrize(
+    "rows, fp4, supported, expected",
+    [
+        (2048, True, True, True),
+        (2047, True, True, False),  # below the row bound
+        (4096, False, True, False),  # BF16 / FP8 index cache
+        (4096, True, False, False),  # aiter declines (arch or shape)
+    ],
+)
+def test_flydsl_prefill_scorer_gate(monkeypatch, rows, fp4, supported, expected):
+    monkeypatch.setattr(m, "index_score_prefill_nvfp4", lambda *a: None)
+    asked = []
+    monkeypatch.setattr(
+        m,
+        "index_score_prefill_nvfp4_supported",
+        lambda *a: asked.append(a) or supported,
+    )
+    scale = torch.zeros(1, 128, 8, dtype=torch.uint8) if fp4 else None
+    q, payload, score = torch.zeros(1, 1, 128), torch.zeros(1, 128, 64), object()
+    meta = tuple(object() for _ in range(4))
+    scorer = m._flydsl_prefill_scorer(q, payload, scale, score, meta, 0.5, rows)
+    if asked:  # aiter's predicate takes the scorer's first nine arguments
+        assert asked == [(q, payload, scale, score, *meta, 0.5)]
+    assert (scorer is not None) == expected
+
+
+@gpu
+def test_flydsl_prefill_scorer_matches_triton(monkeypatch):
+    from atom.model_ops.minimax_m3.index_fp4 import index_fp4_store
+
+    if m.get_gfx() != "gfx1250":
+        pytest.skip("gfx1250 only")
+    kw = _inputs([2560, 300], [8192, 1024], 4, "cuda")
+    bf16 = kw["index_kv_cache"]
+    pages = bf16.shape[0]
+    payload = torch.zeros(pages, SPARSE_BLOCK_SIZE, 64, dtype=torch.uint8).cuda()
+    scale = torch.zeros(pages, SPARSE_BLOCK_SIZE, 8, dtype=torch.uint8).cuda()
+    slots = torch.arange(pages * SPARSE_BLOCK_SIZE, device="cuda")
+    index_fp4_store(bf16.view(-1, HEAD_DIM), slots, payload, scale)
+    kw.update(index_kv_cache=payload, index_kv_scale=scale)
+    kw["block_table"] = torch.randperm(pages, dtype=torch.int32, device="cuda").view(
+        kw["block_table"].shape
+    )
+    gate, took = m._flydsl_prefill_scorer, []
+    monkeypatch.setattr(
+        m, "_flydsl_prefill_scorer", lambda *a: took.append(gate(*a)) or took[-1]
+    )
+    flydsl = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    assert took and took[0] is not None
+    monkeypatch.setattr(m, "_flydsl_prefill_scorer", lambda *a: None)
+    triton_ = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    torch.cuda.synchronize()
+    for a, b in zip(flydsl, triton_):
+        assert torch.equal(a, b)

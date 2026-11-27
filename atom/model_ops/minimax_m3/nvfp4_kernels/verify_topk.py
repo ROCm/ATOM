@@ -15,6 +15,7 @@ the split of the blocks, ties at the cutoff included.
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import buffer_load, mfma
@@ -576,9 +577,12 @@ def can_fuse_verify_topk(
             and k_cache.stride(-1) == 1
         )
     return (
+        # A Gluon kernel on CDNA4 MFMA and buffer loads: elsewhere (gfx1250) the
+        # separate Triton score + top-k runs.
+        get_gfx_runtime() == "gfx950"
         # Whole draft groups only: a padded row count leaves a partial group
         # whose split count the merge would read past.
-        q.shape[0] % num_draft == 0
+        and q.shape[0] % num_draft == 0
         and q.shape[0] // num_draft >= min_reqs
         and q.dtype in (torch.bfloat16, torch.float16)
         and q.shape[-1] == 128

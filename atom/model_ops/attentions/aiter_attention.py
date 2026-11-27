@@ -542,12 +542,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and hasattr(module, "use_mla")
             and not module.use_mla
         ):
-            kv_format = ""
-            if _is_indexed_sparse_attention(module):
-                from atom.utils import envs
-
-                if envs.ATOM_M3_SPARSE_KV_NVFP4:
-                    kv_format = "nvfp4"
+            # The format the sparse impl declared at construction
+            # (`SparseMHAPagedAttentionImpl.kv_format`): the model's traced
+            # forward branches on that same declaration.
+            kv_format = (
+                module.impl.kv_format if _is_indexed_sparse_attention(module) else ""
+            )
             kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, kv_format))
         return tuple(kinds)
 
@@ -666,8 +666,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ``max_num_batched_tokens`` rows. Prefill chunks and decode steps are
         scheduled under it, warmup stays within it, and CUDA graph capture drops
         decode buckets above ``max_schedulable_decode_bs`` (which charges every
-        sequence ``mtp_k + 1`` rows). One buffer per ``name`` -- the K/V stage
-        and the index-key stage."""
+        sequence ``mtp_k + 1`` rows). One buffer per ``name``: the index-key
+        stage of an FP4 index (NVFP4 K/V is written into its pool directly)."""
         stages = getattr(self, "_quant_stages", None)
         if stages is None:
             stages = self._quant_stages = {}
@@ -766,10 +766,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 module.impl.index_scale = pool.field_view(
                     "index_scale", row, torch.uint8, (-1, self.block_size, scale_bytes)
                 )
-                (
-                    module.impl.index_stage,
-                    module.impl.index_stage_slots,
-                ) = self._quant_stage("index", (self.block_size, spec.dim))
+                # With NVFP4 K/V the fused qk-norm/rope/cache write quantizes the
+                # index key into these planes too; only an FP8/BF16 K/V layer
+                # stages it for index_fp4_store.
+                kv_nvfp4 = any(
+                    isinstance(k, KvGeometry) and k.kv_format == "nvfp4"
+                    for k in self._module_kinds(module)
+                )
+                if not kv_nvfp4:
+                    (
+                        module.impl.index_stage,
+                        module.impl.index_stage_slots,
+                    ) = self._quant_stage("index", (self.block_size, spec.dim))
             else:
                 module.impl.index_cache = pool.field_view(
                     "index", row, spec.dtype, (-1, self.block_size, spec.dim)
@@ -795,20 +803,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         k_cache, v_cache = pool.kv_views(row)
         if pool.kv_format == "nvfp4":
+            # The fused qk-norm/rope/cache write quantizes K/V straight into
+            # these planes: no staging buffer.
             module.k_scale, module.v_scale = pool.scale_views(row)
             module.impl.kv_nvfp4 = True
-            module.impl.kv_stage, module.impl.kv_stage_slots = self._quant_stage(
-                "kv", (2, self.block_size, geometry.num_kv_heads, geometry.head_dim)
-            )
-            impl = module.impl
-            if impl.index_cache is not None and impl.index_scale is None:
-                from atom.config import m3_nvfp4_stage_unsupported_reason
-
-                reason = m3_nvfp4_stage_unsupported_reason(
-                    impl.kv_stage.shape[0], impl.index_cache.shape[0]
-                )
-                if reason is not None:
-                    raise ValueError(reason)
         elif config.kv_cache_dtype == "fp8":
             module.k_scale, module.v_scale = pool.scale_views(row)
 
