@@ -236,6 +236,14 @@ pick their policy with `--encode-policy` (defaults to `--policy`):
 Startup waits for encode workers like prefill and decode, and `/workers`
 counts them as `encode_count`.
 
+With `--backend atom`, `--atom-pd-concurrent` (default off) sends a relay-mode
+`/v1/chat/completions` request to decode while prefill runs, as a two-line body
+on `/v1/pd/late_kv/chat/completions`: the request, then prefill's
+`kv_transfer_params` once prefill answers. Decode needs `ATOM_PD_LATE_KV=1`; a
+decode that answers 404 gets the serial relay's request instead (logged once).
+A prefill failure aborts decode's body before the second line, so decode
+enqueues nothing.
+
 Messages and Responses have no PD adapter: in PD mode `/v1/messages` and
 `/v1/responses` return `501 unsupported_api_topology`. Serve them from regular
 HTTP workers.

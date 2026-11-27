@@ -320,6 +320,12 @@ pub struct CliArgs {
     #[arg(long, default_value = "none", value_parser = ["none", "idx2idx"], help_heading = "PD Disaggregation")]
     pub atom_pd_rank_mapping_policy: String,
 
+    /// ATOM-only: in relay mode, send a /v1/chat/completions request to decode while
+    /// prefill runs and pass prefill's KV metadata as a late line (decode needs
+    /// ATOM_PD_LATE_KV=1; a decode that answers 404 gets the serial relay)
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    pub atom_pd_concurrent: bool,
+
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
     pub worker_startup_timeout_secs: u64,
@@ -660,6 +666,7 @@ impl CliArgs {
             .encode_policy(self.encode_policy.as_ref().map(|p| self.parse_policy(p)))
             .backend(self.backend.into())
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
+            .atom_pd_concurrent(self.atom_pd_concurrent)
             .policy(policy)
             .connection_mode(connection_mode)
             .host(&self.host)
@@ -776,6 +783,23 @@ mod tests {
         for rate in ["-1", "2", "NaN"] {
             assert!(parse(rate).is_err(), "{rate} was accepted");
         }
+    }
+
+    #[test]
+    fn atom_pd_concurrent_flag_maps_to_router_config() {
+        let parse = |args: &[&str]| {
+            CliArgs::try_parse_from(args)
+                .unwrap()
+                .to_router_config(Vec::new())
+                .unwrap()
+        };
+        assert!(!parse(&["atomesh"]).atom_pd_concurrent);
+        assert!(!CliArgs::default().atom_pd_concurrent);
+        let config = parse(&["atomesh", "--backend", "atom", "--atom-pd-concurrent"]);
+        assert!(config.atom_pd_concurrent && config.atom_pd_concurrent_dispatch());
+        // The flag has no effect off the ATOM backend.
+        let config = parse(&["atomesh", "--backend", "sglang", "--atom-pd-concurrent"]);
+        assert!(config.atom_pd_concurrent && !config.atom_pd_concurrent_dispatch());
     }
 
     #[test]
@@ -1013,6 +1037,7 @@ impl Default for CliArgs {
             encode: Vec::new(),
             encode_policy: None,
             atom_pd_rank_mapping_policy: "none".to_string(),
+            atom_pd_concurrent: false,
             worker_startup_timeout_secs: 1800,
             worker_startup_check_interval: 30,
             log_dir: None,
