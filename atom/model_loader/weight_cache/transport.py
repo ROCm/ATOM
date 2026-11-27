@@ -358,6 +358,7 @@ class _Server:
         # why they could not go on with weights rewritten under them.
         self.launches: dict = {}
         self.stopped = False  # `stop`: the weights are not to be used
+        self.unfollowed = False  # a server could not go on at the last resume
         self.load = None  # `load`'s doing: (checkpoint) -> why not (the daemon's)
         self._changing = threading.Lock()  # one stop or load at a time
         self.stopping = False
@@ -664,7 +665,9 @@ class _Server:
         with self._lock:
             self.keys.update(keys or {})
             self.stopped = False
-        return self._tell_launches({"event": "use", "changed": changed})
+        why = self._tell_launches({"event": "use", "changed": changed})
+        self.unfollowed = bool(why)  # it stays stopped until told again
+        return why
 
     def _hold(self, conn: socket.socket, by) -> None:
         """For whoever is about to stop this daemon (``by``: the ranks of one

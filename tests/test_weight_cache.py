@@ -2328,6 +2328,59 @@ def test_stop_and_load_reach_the_servers_that_have_the_weights(cache_dir, monkey
         d.close()
 
 
+def test_a_server_that_could_not_go_on_with_other_weights_is_told_again(
+    cache_dir, monkeypatch
+):
+    d = _Daemon("ow", {"gpu_a": ({"key": "a"}, {})})
+    rank = session._Rank("TP0", d.path, "gpu0|0000:00:00", {"rank": 0})
+    d.server.keys[os.path.basename(d.path)] = rank.key
+    monkeypatch.setenv(preload._LAUNCH_ENV, "1_1.0")
+    monkeypatch.setattr(session, "_control", None)
+    found = {"socket": d.socket, "paths": [d.path]}
+    monkeypatch.setattr(session, "read_session", lambda: found)
+    told, broken = [], [True]
+
+    def use(changed):
+        told.append(changed)
+        if changed and broken:
+            broken.clear()
+            raise RuntimeError("kept the old ones")
+
+    try:
+        assert session._attach(d.socket, [rank]) == []
+        session.serve_notices(lambda rewrite: None, use)
+        _wait_for(lambda: not d.server.cannot_stop(), 5)
+        assert d.server.stop() == []
+        assert "kept the old ones" in d.server.resume(changed=True)[0]
+        assert d.server.unfollowed
+        # Whatever the next `use` says, its engines hear that they changed.
+        assert d.server.resume(changed=False) == [] and not d.server.unfollowed
+        assert told[-2:] == [True, True]
+    finally:
+        session._control.close()
+        d.close()
+
+
+def test_a_load_of_what_is_held_reaches_a_server_that_could_not_go_on(monkeypatch):
+    keys, told = [{"checkpoint": "c"}], []
+    server = SimpleNamespace(
+        cannot_stop=lambda rewrite: [],
+        _ask=lambda gpu, what: 0,
+        stopped=False,
+        unfollowed=False,
+        resume=lambda changed: told.append(changed) or [],
+    )
+    with atom_without_aiter() as load_module:
+        daemon = load_module("atom.model_loader.weight_cache.daemon")
+        held = (None, [(0, None)], [dict(keys[0])])
+        monkeypatch.setattr(daemon, "_launch", lambda args, model: held)
+        # Nothing to write and every server serves it: nothing to tell.
+        assert daemon._load(None, "c", server, ["gpu"], keys, []) == [] and told == []
+        server.unfollowed = True
+        assert daemon._load(None, "c", server, ["gpu"], keys, []) == []
+        assert told == [False]
+
+
 def _held_plan(model):
     """How a daemon would hold ``model`` on a device: (the plan of its
     parameters, the tensors they are held in by storage)."""
@@ -2520,6 +2573,39 @@ def test_v41_dspark_derives_again_what_its_first_draft_steps_kept():
         context_layers=layers, _context_kv_fused=None, _noise_row=None
     )
     dspark.refresh_derived_weights(idle)
+
+
+def test_v41_dspark_reads_the_noise_row_where_the_table_is(monkeypatch):
+    mod = gpu_stack_import("atom.models.deepseek_v41.dspark")
+    read = mod.DeepseekV41DSpark._read_noise_row
+    table = torch.arange(12.0).reshape(4, 3)
+    config = SimpleNamespace(dspark_noise_token_id=2)
+    # One rank holds the whole table.
+    whole = nn.Embedding.from_pretrained(table)
+    draft = SimpleNamespace(embed=whole, config=config, _embed_peer=None)
+    assert read(draft).tolist() == [6, 7, 8]
+    # Its owner ranks' shards, mapped.
+    draft._embed_peer = lambda ids, out: table[ids] + 1
+    assert read(draft).tolist() == [7, 8, 9]
+
+    # A sharded table without the mapping: this rank's rows, summed over the
+    # ranks of the TP group.
+    class Sharded(nn.Embedding):
+        tp_size, vocab_start_idx, vocab_end_idx = 2, 2, 4
+
+    seen = []
+
+    def masked(ids, weight, lo, hi):
+        seen.append((lo, hi))
+        return weight[ids - lo]
+
+    monkeypatch.setattr(mod, "VocabParallelEmbedding", Sharded)
+    monkeypatch.setattr(mod, "masked_embedding", masked)
+    monkeypatch.setattr(mod, "get_tp_group", lambda: SimpleNamespace(device_group=1))
+    monkeypatch.setattr(mod.dist, "all_reduce", lambda row, group: row.add_(group))
+    shard = Sharded.from_pretrained(table[2:])
+    draft = SimpleNamespace(embed=shard, config=config, _embed_peer=None)
+    assert read(draft).tolist() == [7, 8, 9] and seen == [(2, 4)]
 
 
 def test_the_command_line_does_not_change_weights(cache_dir):

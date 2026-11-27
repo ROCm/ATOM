@@ -213,8 +213,10 @@ def _load(engine_args, model, server, gpus, keys, loaders) -> list[str]:
     if why or len(new) != len(keys):
         return ["it is not another checkpoint of the model this daemon holds:"] + why
     if new == keys and not any(server._ask(gpu, "poisoned") for gpu in gpus):
-        # What the daemon holds: there is nothing to write, only to use again.
-        return server.resume(changed=False) if server.stopped else []
+        # What the daemon holds: there is nothing to write, only to use again,
+        # also by a server that could not go on when it was loaded.
+        waits = server.stopped or server.unfollowed
+        return server.resume(changed=False) if waits else []
     t0 = time.monotonic()
     ctx = multiprocessing.get_context("spawn")
     pipes = [ctx.Pipe() for _ in ranks]

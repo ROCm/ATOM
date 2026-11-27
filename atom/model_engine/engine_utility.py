@@ -1054,7 +1054,8 @@ class EngineUtilityHandler:
         has been preempted to recompute on the weights as they are now
         (``kv_change``), the cached prefixes are forgotten, and the runners
         first derive again what they had made of the weights; one that cannot
-        leaves the engine stopped."""
+        leaves the engine stopped (its launch says ``changed`` again the next
+        time: ``weight_cache.session``)."""
         reply = {"cmd": WEIGHTS_IN_USE_CMD}
         if args.get("changed"):
             reply = self._utility_on_every_rank(

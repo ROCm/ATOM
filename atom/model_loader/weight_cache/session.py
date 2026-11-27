@@ -220,6 +220,9 @@ def weights_status() -> dict | None:
 
 def _listen(conn: socket.socket, stop, use) -> None:
     """Do what the daemon tells this launch, and answer why it could not."""
+    # Weights that changed, which its engines could not go on with: they are
+    # told so again at the next `use`, whatever that one says.
+    owed = False
     while True:
         try:
             told = _recv(conn, limit=1 << 20)
@@ -229,7 +232,9 @@ def _listen(conn: socket.socket, stop, use) -> None:
             if told["event"] == "stop":
                 stop(False)
             else:
-                use(told["changed"])
+                owed = owed or told["changed"]
+                use(owed)
+                owed = False
             why = None
         except Exception as e:  # noqa: BLE001 - told to the daemon
             why = str(e)
