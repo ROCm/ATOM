@@ -419,6 +419,54 @@ def test_unconsumed_answers_are_dropped(server, monkeypatch):
     assert "x" not in lookup.pending_ids()
 
 
+def test_a_discarded_prefetch_reports_its_run_from_the_prompts_head(server):
+    config = _config(extra=_extra(lookup_threads=1))
+    lookup = make_umbp_store_scheduler(config)._lookup_client
+    seq = _seq(6)
+    _store(server, config, seq, range(3))
+    sid = str(seq.id)
+    assert lookup.submit(seq, sid)
+    _wait(lambda: lookup.poll(sid))
+    lookup.discard(sid)
+    assert sid not in lookup.pending_ids()
+    assert lookup.pop_discarded_hits() == {sid: 3 * BLOCK}
+    assert lookup.pop_discarded_hits() == {}
+
+
+def test_a_prefetch_discarded_in_flight_reports_once_it_answers(server):
+    config = _config(extra=_extra(lookup_threads=1))
+    lookup = make_umbp_store_scheduler(config)._lookup_client
+    seq = _seq(6)
+    _store(server, config, seq, range(2))
+    sid = str(seq.id)
+    server.slow_on = ("exists", 0.2)
+    assert lookup.submit(seq, sid)
+    lookup.discard(sid)
+    # Still in flight: its request stays detached until the lookup answers.
+    assert sid in lookup.pending_ids() and lookup.pop_discarded_hits() == {}
+    _wait(lambda: sid not in lookup.pending_ids())
+    assert lookup.pop_discarded_hits() == {sid: 2 * BLOCK}
+    assert not lookup.answered(sid)  # no lookup will read it
+
+
+def test_a_request_admitted_without_its_lookup_is_settled_at_the_next_build(
+    server, monkeypatch
+):
+    # HBM holds all but one block, under the load floor: the engine admits
+    # the request without waiting for its prefetch (`detach_lookup`).
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", str(4 * BLOCK))
+    sched, _ = _lazy(300, extra=_extra(lookup_threads=1))
+    seq = _seq(6)
+    sid = str(seq.id)
+    sched.prefetch_lookups([seq])
+    _wait(lambda: sched._lookup_client.poll(sid))
+    assert sched.can_detach_lookup(seq, 5 * BLOCK)
+    assert sched.detach_lookup(seq, 5 * BLOCK)
+    assert sid in sched._detached_lookups
+    sched.build_connector_meta()
+    assert sid not in sched._detached_lookups
+
+
 def test_tier_probe_reads_a_prefetched_answer_then_the_index(server):
     config = _config(extra=_extra(lookup_threads=1, tier_index_chunks=64))
     sched = make_umbp_store_scheduler(config)

@@ -107,7 +107,16 @@ def _process_state(monkeypatch):
     )
     # A load of one block is worth it here; the default floor is 8192 tokens.
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", str(BLOCK))
-    monkeypatch.setenv("ATOM_OFFLOAD_MISS_ACCOUNTING", "1")
+    # P's scheduler settings (kit/fab_up.sh with PD_UMBP_GB, kit/best.sh, the
+    # dpep-base P env): tier-aware admission order, SLRU half protected.
+    for name, value in (
+        ("ATOM_OFFLOAD_MISS_ACCOUNTING", "1"),
+        ("ATOM_PREFILL_ORDER", "cached_first"),
+        ("ATOM_PREFIX_CACHE_POLICY", "slru"),
+        ("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5"),
+        ("ATOM_OFFLOAD_PREHASHED_SAVE", "1"),
+    ):
+        monkeypatch.setenv(name, value)
     use_one_rank(monkeypatch)
     _cpu_fences(monkeypatch)
     with mock.patch("torch.cuda.current_device", lambda: 0):
@@ -619,3 +628,27 @@ def test_a_chunk_one_stage_lost_is_loaded_from_no_stage(prefill_node, server):
     stats = node.sched.get_statistics()
     assert stats["load_failures"] == 0 and stats["umbp_uneven_lookups"] >= 1
     assert stats["loaded_tokens"] == 3 * BLOCK - load.load_spec.hbm_cached_tokens
+
+
+def test_a_turn_hbm_holds_is_admitted_without_waiting_for_its_lookup(
+    prefill_node, monkeypatch
+):
+    # At the default load floor (8192 tokens), a request whose HBM hit leaves
+    # less than that to compute is admitted without its lookup's answer
+    # (`detach_lookup`): the path most turns of an agentic conversation take.
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "8192")
+    node = prefill_node(lookup_threads=1)
+    first = _seq(PROMPT)
+    node.serve(first)
+    turn = Sequence(
+        list(first.token_ids[: first.num_prompt_tokens])
+        + list(range(50_000, 50_000 + BLOCK)),
+        BLOCK,
+        sampling_params=SamplingParams(max_tokens=2),
+    )
+    node.prefill(turn)
+    assert node.sched._perf_counters["lookup_detached"] == 1
+    assert node.holds(turn)
+    node.settle()
+    assert not node.sched._detached_lookups
+    assert node.loads == []

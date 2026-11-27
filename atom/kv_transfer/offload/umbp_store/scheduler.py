@@ -95,6 +95,13 @@ class _ServerLookup(StoreLookupBase):
     and waits for it. Every call to the server runs on the lookup threads,
     each with its own client, never on the scheduler thread.
 
+    A request whose HBM hit leaves less than the load floor is admitted
+    without its prefetch's answer (`detach_lookup`, by default on): the base
+    discards the prefetch (:meth:`discard`) and later reads the run from the
+    prompt's head it found (:meth:`pop_discarded_hits`, which
+    `reconcile_detached_lookups` takes). A UMBP lookup holds nothing on the
+    server, so a discarded one has nothing else to release.
+
     A server this process has marked (:mod:`.taint`) holds nothing for the
     lookups. The mark is this process's only; the workers, which place it,
     refuse their own loads either way.
@@ -127,6 +134,11 @@ class _ServerLookup(StoreLookupBase):
         # answer or None for no answer, answered at).
         self._inflight: dict[str, Future] = {}
         self._answers: dict[str, tuple[Any, int, list[bool] | None, float]] = {}
+        # Discarded lookups (`detach_lookup`): those still in flight, and the
+        # runs from the prompt's head of those answered, for
+        # `pop_discarded_hits`.
+        self._orphans: set[str] = set()
+        self._discarded_hits: dict[str, int] = {}
         self.prefetched = 0
         self.prefetch_answers_used = 0
         self.prefetch_answers_stale = 0
@@ -204,6 +216,7 @@ class _ServerLookup(StoreLookupBase):
         with self._lock:
             self._answers.pop(str(lookup_id), None)
             self._inflight.pop(str(lookup_id), None)
+            self._orphans.discard(str(lookup_id))
 
     # -- the asynchronous protocol of the chunked base ----------------------
     def submit(self, seq: Any, lookup_id: str) -> bool:
@@ -254,6 +267,38 @@ class _ServerLookup(StoreLookupBase):
         """Whether ``lookup_id``'s prefetch has answered (or none is in flight)."""
         return not self.is_pending(lookup_id)
 
+    def discard(self, lookup_id) -> None:
+        """Forget a prefetch its request will never read (`detach_lookup`).
+
+        An answered one reports its run from the prompt's head to
+        :meth:`pop_discarded_hits` now, one in flight once it answers; one
+        that got no answer reports nothing.
+        """
+        sid = str(lookup_id)
+        with self._lock:
+            entry = self._answers.pop(sid, None)
+            if entry is not None:
+                self._report_discarded_locked(sid, entry[2])
+            elif sid in self._inflight:
+                self._orphans.add(sid)
+
+    def pop_discarded_hits(self) -> dict[str, int]:
+        """Discarded lookups' runs from the prompt's head, in tokens, answered
+        since the last call (`reconcile_detached_lookups`)."""
+        with self._lock:
+            hits, self._discarded_hits = self._discarded_hits, {}
+        return hits
+
+    def _report_discarded_locked(self, sid: str, answer: list[bool] | None) -> None:
+        if answer is None:
+            return
+        run = 0
+        for held in answer:
+            if not held:
+                break
+            run += 1
+        self._discarded_hits[sid] = run * self._chunk_tokens
+
     def answered(self, lookup_id) -> bool:
         with self._lock:
             return str(lookup_id) in self._answers
@@ -299,6 +344,10 @@ class _ServerLookup(StoreLookupBase):
             answer = None
         with self._lock:
             self._inflight.pop(sid, None)
+            if sid in self._orphans:
+                self._orphans.discard(sid)
+                self._report_discarded_locked(sid, answer)
+                return
             self._answers[sid] = (ref, chunks, answer, time.monotonic())
 
     def _take_answer(self, sid: str, seq: Any, chunks: int) -> list[bool] | None:
@@ -467,6 +516,14 @@ class UMBPStoreOffloadScheduler(KVStoreOffloadScheduler):
                 cfg.chunk_tokens,
                 f"umbp_store save_policy={cfg.save_policy}",
             )
+
+    def build_connector_meta(self):
+        # A request admitted without its lookup's answer (`detach_lookup`) is
+        # settled here, as the MP scheduler settles its own: its save floor
+        # follows the run the discarded lookup found, and the request is
+        # forgotten once that lookup answered or ended.
+        self.reconcile_detached_lookups()
+        return super().build_connector_meta()
 
     def _prompt_digests(self, seq: Any, num_tokens: int) -> list[bytes]:
         """The store digests of `seq`'s first `num_tokens // chunk` chunks."""
