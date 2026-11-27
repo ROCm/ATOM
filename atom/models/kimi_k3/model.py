@@ -2404,6 +2404,19 @@ class KimiK3ForCausalLM(nn.Module):
         return self.language_model.get_expert_mapping()
 
 
+def _vision_config(atom_config: Config):
+    vision_config = getattr(
+        getattr(atom_config, "multimodal_config", None), "vision_config", None
+    )
+    if vision_config is None:
+        raise ValueError(
+            "Kimi-K3 needs the full HF config (with `vision_config`) to "
+            "build its vision tower. Start the server with "
+            "--trust-remote-code."
+        )
+    return vision_config
+
+
 class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
     """Kimi-K3 with the MoonViT3d vision tower attached.
 
@@ -2421,18 +2434,19 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         "mm_projector.",
     )
 
+    @classmethod
+    def encoder_only_modules(cls, atom_config: Config) -> dict[str, nn.Module]:
+        """The vision modules alone, by attribute name, for ``--encoder-only``
+        (``atom.model_engine.encoder_only``)."""
+        from atom.models.kimi_k3_vl import build_vision_modules
+
+        names = ("vision_tower", "mm_projector")
+        return dict(zip(names, build_vision_modules(_vision_config(atom_config))))
+
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__(atom_config, prefix=prefix)
 
-        vision_config = getattr(
-            getattr(atom_config, "multimodal_config", None), "vision_config", None
-        )
-        if vision_config is None:
-            raise ValueError(
-                "Kimi-K3 needs the full HF config (with `vision_config`) to "
-                "build its vision tower. Start the server with "
-                "--trust-remote-code."
-            )
+        vision_config = _vision_config(atom_config)
 
         # The tower only runs where the token embeddings are produced.
         self.has_vision_tower = get_pp_group().is_first_rank

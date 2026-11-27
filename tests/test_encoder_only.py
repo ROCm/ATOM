@@ -385,3 +385,29 @@ def test_minimax_m3_names_its_vision_modules_as_the_model_does(monkeypatch):
     )
     assert list(modules) == ["vision_tower", "multi_modal_projector", "patch_merge_mlp"]
     assert tuple(modules.values()) == built
+
+
+def test_kimi_k3_names_its_vision_modules_as_the_model_does(monkeypatch):
+    model = gpu_stack_import("atom.models.kimi_k3.model")
+    kimi_vl = gpu_stack_import("atom.models.kimi_k3_vl")
+    built = (nn.Linear(1, 1), nn.Linear(1, 1))
+    vision_config = object()
+    monkeypatch.setattr(
+        kimi_vl,
+        "build_vision_modules",
+        lambda config: built if config is vision_config else None,
+    )
+    config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(vision_config=vision_config)
+    )
+    modules = model.KimiK3ForConditionalGeneration.encoder_only_modules(config)
+    assert list(modules) == ["vision_tower", "mm_projector"]
+    assert tuple(modules.values()) == built
+
+
+def test_kimi_k3_without_a_vision_config_is_refused():
+    model = gpu_stack_import("atom.models.kimi_k3.model")
+    with pytest.raises(ValueError, match="vision_config"):
+        model.KimiK3ForConditionalGeneration.encoder_only_modules(
+            SimpleNamespace(multimodal_config=None)
+        )
