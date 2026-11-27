@@ -41,7 +41,7 @@ def engine_step(monkeypatch):
         utility_queue=queue.Queue(),
         _postprocess=Mock(),
         label="test",
-        _load_event_wait=False,
+        step_hooks=(),
     )
     engine._wait_for_kv_progress = lambda: engine_core.EngineCore._wait_for_kv_progress(
         engine

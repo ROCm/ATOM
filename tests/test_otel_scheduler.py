@@ -294,7 +294,6 @@ def test_real_engine_dispatch_keeps_tracing_when_metrics_returns_early(
         core.output_queue = queue.Queue()
         core.stream_output_queue = queue.Queue()
         core.kv_transfer_enabled = False
-        core._load_event_wait = False
         core._poll_kv_transfer_progress = lambda: None
         core._poll_dynamic_chunking_calibration = lambda: None
         core._in_flight = deque()

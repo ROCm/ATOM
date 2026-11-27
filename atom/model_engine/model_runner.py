@@ -54,7 +54,6 @@ from atom.distributed.ulysses_sp import (
     sp_is_enabled,
     sp_local_len,
 )
-from atom.kv_transfer import progress_doorbell
 from atom.kv_transfer.disaggregation import (
     KVConnectorFactory,
     KVConnectorOutput,
@@ -4150,9 +4149,6 @@ class ModelRunner:
         if connector is None:
             return KVConnectorOutput()
 
-        # Before the drain: a completion recorded after this either is in this
-        # answer or rings the doorbell again (`progress_doorbell`).
-        progress_doorbell.rearm()
         finished = connector.get_finished()
         # New connectors may return the full KVConnectorOutput so they can
         # report richer states. LMCache offload uses failed_recving to wake a

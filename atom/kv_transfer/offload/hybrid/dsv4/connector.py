@@ -36,6 +36,7 @@ from numbers import Integral
 
 import torch
 
+from atom.kv_transfer import progress_doorbell
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
@@ -1773,6 +1774,9 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # - finished_loading wakes successfully loaded requests.
         # - failed_loading wakes them for recompute using already allocated blocks.
         # - finished_saving releases blocks whose free was deferred during save.
+        # Rearm before the drain: a load recorded after this either is in this
+        # answer or rings the doorbell again (`progress_doorbell`).
+        progress_doorbell.rearm()
         with self._lock:
             dl, fl, ds = self._drain_common_completions_locked()
             dss = set(self._done_sidecar_save)

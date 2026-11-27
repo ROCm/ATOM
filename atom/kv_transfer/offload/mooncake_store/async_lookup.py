@@ -46,7 +46,7 @@ class _RenewalExpiryAlarm:
     A finished renewal rings it itself (`_ring_kv_progress`); a stalled one
     rings nothing, yet from its timeout on its load may go out (`renew_async`
     answers "timeout"). Without this ring an engine holding its step for that
-    load (`EngineCore._wait_for_loads`) would sleep to the hold's bound. One
+    load (`load_wait.OffloadLoadWait`) would sleep to the hold's bound. One
     daemon thread for all renewals, started on first use.
     """
 
@@ -394,7 +394,7 @@ class AsyncStoreLookup(LookupClient):
             if future is None or future.cancelled():
                 return "rejected"
             # The load it holds back can leave now: wake an engine holding its
-            # step for it (`EngineCore._wait_for_loads`); a no-op otherwise.
+            # step for it (`load_wait.OffloadLoadWait`); a no-op otherwise.
             future.add_done_callback(_ring_kv_progress)
             ticket = self._renewals[sid] = (ident, future, time.monotonic())
             # A renewal stalled to its timeout releases the load too: wake

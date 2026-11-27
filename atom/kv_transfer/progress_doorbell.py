@@ -8,19 +8,21 @@ when the engine asks, and the engine asks after each forward. A tier load that
 lands while the engine is scheduling is therefore seen one forward late. The
 doorbell lets the thread that finished the load say so at once: it pushes one
 small marker on the worker's KV output channel, the engine's KV output thread
-turns it into a wake of the engine's KV progress event, and the engine then
-asks for the completions as usual. The doorbell carries no completion data;
-the aggregation protocol (one outstanding query, drain-once replies, TP quorum
-in `KVOutputAggregator`) is unchanged.
+rings the engine's own doorbell, which sets the engine's KV progress event, and
+the engine then asks for the completions as usual. The doorbell carries no
+completion data; the aggregation protocol (one outstanding query, drain-once
+replies, TP quorum in `KVOutputAggregator`) is unchanged.
 
-Rings coalesce: after one ring, the next one is sent only once the worker has
-answered a completion query (`rearm`, called before the query drains the
-completion sets), so a burst of completions costs one message, and none is
-lost: a completion recorded after `rearm` either is in that query's answer or
-rings again.
+Rings coalesce in a worker: after one ring, the next one is sent only once the
+worker has answered a completion query (`rearm`, called by the offload worker's
+`get_finished` before it drains its completion sets), so a burst of completions
+costs one message, and none is lost: a completion recorded after `rearm` either
+is in that query's answer or rings again.
 
-Installed per worker process by `AsyncIOProc` only when the engine uses it
-(`ATOM_OFFLOAD_LOAD_EVENT_WAIT`); uninstalled, `ring` is a no-op.
+Every worker process gets a sender (`AsyncIOProc`); only offload load pools
+that use it ring (`LoadExecutor`, `ATOM_OFFLOAD_LOAD_EVENT_WAIT`). In the engine
+process the offload load wait installs one (`load_wait.OffloadLoadWait`) and
+counts the rings (`rings`). Uninstalled, `ring` is a no-op.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ _lock = threading.Lock()
 _send: Callable[[], None] | None = None
 _coalesce = True
 _rung = False
+_rings = 0
 
 
 def install(send: Callable[[], None] | None, *, coalesce: bool = True) -> None:
@@ -52,11 +55,13 @@ def install(send: Callable[[], None] | None, *, coalesce: bool = True) -> None:
 
 def ring() -> None:
     """Announce progress (a load finished or failed); coalesced, never raises."""
-    global _rung
+    global _rung, _rings
     with _lock:
         if _send is None or _rung:
             return
         _rung = _coalesce
+        # Counted before the send: whoever is woken by it sees the count.
+        _rings += 1
         send = _send
     try:
         send()
@@ -71,6 +76,13 @@ def rearm() -> None:
     global _rung
     with _lock:
         _rung = False
+
+
+def rings() -> int:
+    """How many rings this process has sent: a reader that remembers the count
+    it last saw can tell a ring from any other wake of the same event."""
+    with _lock:
+        return _rings
 
 
 def installed() -> bool:
