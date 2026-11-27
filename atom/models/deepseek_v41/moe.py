@@ -20,6 +20,10 @@ shapes keep the gate's own GEMM.
 tokens. Mixed image/text prefills use the shared fused two-bias router;
 expert dispatch, quantization, shared overlap and combination stay in V4.
 
+Where the shared expert is native MXFP8 and runs on the layer's stream, it
+reads the MXFP8 pair of its input that the FFN seam writes with the norm
+(`takes_mxfp8_input`), so it launches no quantize of its own.
+
 The shared expert is its own module unless it has the routed experts' format:
 an FP4PTPC checkpoint's per-channel FP8 one is fused into the routed experts
 that online quantization makes per-channel FP8 (FusedMoE's fused shared slot).
@@ -154,5 +158,20 @@ class MoE(V4MoE):
         v41_record_tbo_expert_output(routed)
         return routed, is_complete
 
-    def forward(self, hidden):
-        return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
+    def routed_with_shared_mxfp8(self, x, x_fp8, x_scale):
+        routed = super().routed_with_shared_mxfp8(x, x_fp8, x_scale)
+        v41_record_tbo_expert_output(routed)
+        return routed
+
+    def forward(self, hidden, hidden_fp8=None, hidden_scale=None):
+        """``hidden_fp8`` / ``hidden_scale``: the MXFP8 pair of ``hidden`` that
+        the FFN seam writes with the norm, for the shared expert in place of
+        its own quantize launch; only where `takes_mxfp8_input` holds."""
+        width = hidden.shape[-1]
+        if hidden_fp8 is None:
+            return super().forward(hidden.reshape(-1, width)).view_as(hidden)
+        return self.single_stream_moe_forward(
+            hidden.reshape(-1, width),
+            hidden_fp8.reshape(-1, width),
+            hidden_scale.reshape(-1, width // 32),
+        ).view_as(hidden)

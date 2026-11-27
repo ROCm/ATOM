@@ -74,6 +74,10 @@ from atom.model_loader.weight_utils import local_model_dir
 # code as opaque; Indexer.forward_batched dispatches via the latter to hide
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.model_ops.activation import (
+    silu_mul_mxfp8_available,
+    silu_mul_mxfp8_fuse,
+)
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     FP4_GFX950_OPUS,
     FP4_GFX1250_NATURAL,
@@ -2925,18 +2929,53 @@ class Expert(nn.Module):
             self.w2.input_size
         )
 
+    def reads_mxfp8_input(self) -> bool:
+        """Whether ``forward`` can take ``x``'s MXFP8 pair (``x_fp8`` /
+        ``x_scale``): a native group32 FP8 ``gate_up_proj``, which would
+        quantize ``x`` to exactly that pair itself."""
+        gate_up = self.gate_up_proj
+        return (
+            gate_up.native_a8_group_rows is not None
+            and not gate_up.runs_bf16
+            and gate_up.weight.dtype == torch.float8_e4m3fn
+        )
+
+    def w2_takes_silu_mul_mxfp8(self) -> bool:
+        """Whether SiLU-mul and ``w2``'s input quant run as one launch (AITER
+        ``silu_mul_mxfp8``): a native group32 FP8 ``w2``, which would quantize
+        the BF16 ``silu_and_mul`` output to exactly that MXFP8 pair itself, and
+        a ``[gate | up]`` output twice ``w2``'s (padded) input width, a
+        multiple of 32."""
+        w2 = self.w2
+        width = int(w2.weight.shape[-1])
+        return (
+            w2.native_a8_group_rows is not None
+            and not w2.runs_bf16
+            and w2.weight.dtype == torch.float8_e4m3fn
+            and width % 32 == 0
+            and int(self.gate_up_proj.weight.shape[0]) == 2 * width
+            and silu_mul_mxfp8_available()
+        )
+
     def forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
         weights: torch.Tensor | None = None,  # [num_tokens, 1]  optional gate
+        x_fp8: torch.Tensor | None = None,  # [num_tokens, dim]  x's MXFP8 pair,
+        x_scale: torch.Tensor | None = None,  # [num_tokens, dim / 32]  if made
     ) -> torch.Tensor:  # [num_tokens, dim]
 
         dtype = x.dtype
         # Single fused GEMM. Layout is [gate | up] concat on last dim — matches
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
-        # feed the bf16 GEMM output directly.
-        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        # feed the bf16 GEMM output directly. A caller holding x's MXFP8 pair
+        # (`reads_mxfp8_input`; bit for bit what the GEMM would quantize x to)
+        # saves that quantize launch.
+        if x_fp8 is not None:
+            combined = self.gate_up_proj(x_fp8, x_scale=x_scale)
+        else:
+            combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         # A BF16 w2 (no group32 FP8 GEMM here) takes no quantized input, and a
         # per-channel one quantizes its own.
         scale_kwargs = fused_scale_kwargs(
@@ -2956,6 +2995,11 @@ class Expert(nn.Module):
             if native_mx:
                 x_scale = x_scale.view(torch.float8_e8m0fnu)
             return self.w2(x_fp8, x_scale=x_scale)
+        if weights is None and self.w2_takes_silu_mul_mxfp8():
+            # One launch for silu_and_mul + w2's quantize_fp8 of its BF16
+            # output; the same codes and E8M0 scales.
+            act_fp8, act_scale = silu_mul_mxfp8_fuse(combined, self.swiglu_limit)
+            return self.w2(act_fp8, x_scale=act_scale)
         out = torch.empty(
             (combined.shape[0], combined.shape[-1] // 2),
             dtype=dtype,
@@ -3014,6 +3058,9 @@ class MoE(nn.Module):
     standard sqrtsoftplus path. Expert *selection* comes from `tid2eid[input_ids]`
     while expert *weights* still use sqrtsoftplus(gate_logits). Accuracy verified.
     """
+
+    # Whether the routed MegaMoE call computes the shared expert (see __init__).
+    _shared_in_routed = False
 
     def __init__(
         self,
@@ -3139,6 +3186,21 @@ class MoE(nn.Module):
         )
         # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
         self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None
+        # A target layer's shared expert, computed apart, goes into the routed
+        # MegaMoE call (AITER's shared_in), which then returns routed + shared.
+        # The DSpark / MTP draft layers ("mtp.<i>") keep theirs.
+        from atom.model_ops.fused_moe.flydsl_mega_experts import (
+            attach_mega_shared_expert,
+        )
+
+        self._shared_in_routed = (
+            self.shared_experts is not None
+            and not prefix.startswith("mtp.")
+            and self.tp_size == 1
+            and not self._use_dual_stream
+            and not self._use_comm_fused_dispatch
+            and attach_mega_shared_expert(self.experts, self.shared_experts)
+        )
         # Register self in static_forward_context so the custom op dispatcher
         # can look us up by `layer_name` (= self.prefix): maybe_dual_stream_forward
         # (dual-stream) and the comm-fused token-bucket dispatch.
@@ -3212,6 +3274,34 @@ class MoE(nn.Module):
         )
         return topk_weights, topk_ids
 
+    def router_logits(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gate(x)  # [num_tokens, n_routed_experts]
+
+    def takes_mxfp8_input(self) -> bool:
+        """Whether ``single_stream_moe_forward`` can take the MXFP8 pair of its
+        rows for the shared expert: one that reads it
+        (`Expert.reads_mxfp8_input`), on the layer's own stream (the
+        dual-stream and comm-fused ops carry the BF16 rows alone)."""
+        return (
+            self.shared_experts is not None
+            and self.shared_experts.reads_mxfp8_input()
+            and not self._use_dual_stream
+            and not self._use_comm_fused_dispatch
+        )
+
+    def routed_with_shared_mxfp8(
+        self, x: torch.Tensor, x_fp8: torch.Tensor, x_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """The routed call of a `_shared_in_routed` layer (routed + shared),
+        whose shared expert reads ``x``'s MXFP8 pair."""
+        from atom.model_ops.fused_moe.flydsl_mega_experts import (
+            moe_forward_shared_mxfp8,
+        )
+
+        return moe_forward_shared_mxfp8(
+            self.experts, x, self.router_logits(x), x_fp8, x_scale
+        )
+
     def routed_expert_forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
@@ -3228,10 +3318,9 @@ class MoE(nn.Module):
         `forward_context.context.input_ids` before each forward, and
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
-        router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
         return self.experts.forward_maybe_comm_fused(
             x,
-            router_logits,
+            self.router_logits(x),
             shared_partial,
             before_stage2_for_rows=before_stage2_for_rows,
             before_shared_add=before_shared_add,
@@ -3290,6 +3379,8 @@ class MoE(nn.Module):
     def single_stream_moe_forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
+        x_fp8: torch.Tensor | None = None,  # x's MXFP8 pair for the shared
+        x_scale: torch.Tensor | None = None,  # expert (`takes_mxfp8_input`)
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine.
 
@@ -3300,7 +3391,21 @@ class MoE(nn.Module):
         `torch.compile` traces this method (the CUDA event is not traceable);
         the traced graph keeps the separate add in `combine_outputs`.
         """
-        shared = self.shared_experts(x) if self.shared_experts is not None else None
+        if self._shared_in_routed:
+            # The routed MegaMoE call adds the shared expert (run_mega_moe).
+            if x_fp8 is None:
+                routed, _ = self.routed_expert_forward(x)
+            else:
+                routed = self.routed_with_shared_mxfp8(x, x_fp8, x_scale)
+            return self.combine_outputs(
+                routed, None, prefix=f"{self.prefix}.combine_outputs"
+            )
+        if self.shared_experts is None:
+            shared = None
+        elif x_fp8 is None:
+            shared = self.shared_experts(x)
+        else:
+            shared = self.shared_experts(x, x_fp8=x_fp8, x_scale=x_scale)
         if (
             shared is not None
             and not torch.compiler.is_compiling()

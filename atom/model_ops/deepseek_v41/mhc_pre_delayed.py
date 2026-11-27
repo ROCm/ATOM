@@ -12,7 +12,7 @@ mhc_fused_post_pre_delayed_asm_supported holds (H=5120); seams without a post
 stay on Triton. ATOM_DSV41_MHC_BACKEND=triton forces Triton everywhere.
 
 The norm is the sublayer's own. Attention can request HIP's fused MXFP8
-output alongside BF16 for its other readers; FFN keeps the BF16 interface.
+output alongside BF16 for its other readers, and FFN for its shared expert.
 Its consumers (wqkv_a's group32 GEMM, the bounded-replay row gather) read
 row-major (T, H/32) E8M0 scales. gfx950 writes those; gfx1250 writes its
 m32k4 GEMM A-scale layout unless asked for `scale_row_major`, which ATOM
