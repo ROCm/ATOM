@@ -51,7 +51,6 @@ export ATOM_DP_SESSION_AFFINITY=1
 export ATOM_DP_LB_REQ_EQUIV=512
 export ATOM_ENABLE_PREFILL_DELAYER=1
 export ATOM_PREFILL_DECODE_INTERVAL=10
-export ATOM_PREFILL_INITIAL_RAMP=0
 
 python3 -m atom.entrypoints.openai_server \
   --model $MODEL_PATH --served-model-name $MODEL_PATH \
