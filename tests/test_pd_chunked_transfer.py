@@ -466,6 +466,10 @@ def scheduler_connector(
             parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
             kv_cache_block_size=4,
             decode_context_parallel_size=dcp_size,
+            # Sized like an engine's pool: with ATOM_PD_EARLY_HANDOFF on by
+            # default, a producer connector also builds the early-handoff
+            # admission rule, which router-chunked requests never use.
+            num_kvcache_blocks=1024,
         )
     )
 
@@ -2216,6 +2220,7 @@ def test_a_preempted_producer_request_rejected_on_readmission_hands_nothing_off(
             parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
             kv_cache_block_size=4,
             decode_context_parallel_size=1,
+            num_kvcache_blocks=100,  # early handoff, on by default, sizes its rule
         )
     )
     seq = seq_factory(

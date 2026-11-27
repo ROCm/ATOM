@@ -370,8 +370,9 @@ def test_early_request_whose_d_never_comes_expires_without_a_source(
 @pytest.mark.parametrize(
     "name,raw,expected",
     [
-        ("ATOM_PD_EARLY_HANDOFF", None, False),
+        ("ATOM_PD_EARLY_HANDOFF", None, True),
         ("ATOM_PD_EARLY_HANDOFF", "1", True),
+        ("ATOM_PD_EARLY_HANDOFF", "0", False),
         ("ATOM_PD_EARLY_HANDOFF_SPECULATIVE", None, True),
         ("ATOM_PD_EARLY_HANDOFF_SPECULATIVE", "0", False),
     ],
@@ -788,7 +789,7 @@ def test_worker_reports_a_retired_transfers_source_safe():
 def test_flag_off_router_chunked_retired_transfer_releases_only_its_own_claim(
     monkeypatch, seq_factory
 ):
-    """Main's router-chunked mode, ATOM_PD_EARLY_HANDOFF unset. There P
+    """Main's router-chunked mode, ATOM_PD_EARLY_HANDOFF=0. There P
     allocates only after D reached it, so a save can meet a retired transfer
     only as the cancellation of a request that never got a source: D's write
     request expired as an orphan (P stuck in a long step), P's registration is
@@ -803,7 +804,7 @@ def test_flag_off_router_chunked_retired_transfer_releases_only_its_own_claim(
     from atom.model_engine.scheduler import Scheduler
     from atom.model_engine.sequence import SequenceStatus
 
-    monkeypatch.delenv("ATOM_PD_EARLY_HANDOFF", raising=False)
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", "0")
     p = Scheduler(MockConfig())
     p.kv_connector = conn = scheduler_connector(monkeypatch, True)
     assert conn.enable_chunked_transfer and not conn._speculative
@@ -1332,6 +1333,54 @@ def test_p_offers_early_handoff_only_with_the_flag(monkeypatch, api, flag):
     assert ("early_handoff" in info) is (flag == "1")
     if flag == "1":
         assert info["early_handoff"] == {"version": 1}
+
+
+def test_default_on_with_an_incompatible_d_keeps_the_legacy_relay(monkeypatch, api):
+    """ATOM_PD_EARLY_HANDOFF unset (on by default): P offers early handoff,
+    a Kimi-K3 DCP8 D declares it cannot receive chunked transfer, so the
+    router does not ask and P answers after its prefill (legacy relay); were
+    chunked metadata sent anyway, D would refuse it."""
+    from fastapi import HTTPException
+
+    monkeypatch.delenv("ATOM_PD_EARLY_HANDOFF", raising=False)
+    d_cfg, _ = _config("kv_consumer", tp=8, dcp=8, model_type="kimi_linear")
+    _engine(api, monkeypatch, cfg=d_cfg)
+    assert asyncio.run(api.kv_transfer_info())["chunked_receive"]["accepts"] is False
+    with pytest.raises(HTTPException):
+        api._validate_chunked_receive(
+            {"chunked_transfer": True, "do_remote_prefill": True, "remote_tp_size": 1}
+        )
+
+    api._early_handoff_endpoint_cache.clear()
+    _engine(api, monkeypatch)
+    assert asyncio.run(api.kv_transfer_info())["early_handoff"] == {"version": 1}
+    # The router's request for an incompatible D carries no `early_handoff`.
+    assert api._early_handoff_params({"do_remote_decode": True}) is None
+
+
+def test_default_on_with_a_compatible_pair_answers_early(monkeypatch, api):
+    """ATOM_PD_EARLY_HANDOFF unset: a compatible D declares it can receive,
+    the router asks, and P answers at dispatch with chunked metadata."""
+    monkeypatch.delenv("ATOM_PD_EARLY_HANDOFF", raising=False)
+    d_cfg, _ = _config("kv_consumer", tp=8)
+    _engine(api, monkeypatch, cfg=d_cfg)
+    cap = asyncio.run(api.kv_transfer_info())["chunked_receive"]
+    assert cap["accepts"] is True and cap["tp_size"] == 8
+
+    api._early_handoff_endpoint_cache.clear()
+    _, calls = _engine(api, monkeypatch)
+    assert asyncio.run(api.kv_transfer_info())["early_handoff"] == {"version": 1}
+    assert api._early_handoff_params(dict(ROUTER_ASKS)) is not None
+
+    async def go():
+        (out,) = [o async for o in _generate(api, dict(ROUTER_ASKS))]
+        kv = out["kv_transfer_output_meta_info"]
+        assert kv["chunked_transfer"] is True
+        assert kv["transfer_id"].startswith("early-")
+        assert calls.params["pd_early_handoff"] is True
+        _finished(calls)
+
+    asyncio.run(go())
 
 
 def test_router_chunked_mode_takes_precedence(monkeypatch, api):

@@ -220,9 +220,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # metadata it cannot serve and no model needs a per-deployment opt-out.
     # P then answers at DP dispatch with chunked-transfer metadata (line 1 of
     # an NDJSON body) and ends the body when the prefill ends (line 2), so the
-    # router keeps P's load guard for the whole prefill. Default 0 until the
-    # GPU A/B in the docs row passes; 0 = never offer (legacy relay).
-    "ATOM_PD_EARLY_HANDOFF": lambda: _flag_env("ATOM_PD_EARLY_HANDOFF", "0"),
+    # router keeps P's load guard for the whole prefill. Default 1: a pair the
+    # router does not ask for keeps the legacy relay on its own; 0 = never
+    # offer (legacy relay for every pair).
+    "ATOM_PD_EARLY_HANDOFF": lambda: _flag_env("ATOM_PD_EARLY_HANDOFF", "1"),
     # With early handoff: let an early request allocate its source before D's
     # write request arrives when P's pool provably keeps room for every
     # registered chunked request (see MooncakeConnectorScheduler.
