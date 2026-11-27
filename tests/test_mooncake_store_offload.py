@@ -1409,7 +1409,6 @@ def test_rail_rdma_device_refuses_two_equally_close_nics(tmp_path):
 def node(tmp_path, monkeypatch):
     pci, ib = _make_node(tmp_path)
     monkeypatch.setattr(nic, "_IB_SYSFS_ROOT", ib)
-    monkeypatch.setattr(nic, "_PCI_SYSFS_ROOT", pci)
     monkeypatch.setattr(nic, "gpu_pci_bdf", lambda index: f"0000:{GPU_BDF[index]}:00.0")
     real = nic.rail_rdma_device
     # Keyword defaults were bound at import; rebind to the fake tree.
