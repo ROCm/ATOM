@@ -9,6 +9,8 @@ a lease renewal has an executor of its own and takes the backend ahead of any
 queued query, waiting only for the call in flight.
 """
 
+import heapq
+import itertools
 import logging
 import queue
 import threading
@@ -32,6 +34,63 @@ def _ring_kv_progress(_future) -> None:
 # How long the scheduler thread waits for its own advisory renewal RPC: a slow
 # Store RPC must not stall the scheduler and, through the DP lockstep, its peers.
 RENEW_TIMEOUT_S = 1.0
+
+# The alarm below sleeps on the real clock, as its condition wait does.
+_monotonic = time.monotonic
+
+
+class _RenewalExpiryAlarm:
+    """Rings the KV progress doorbell when an async renewal reaches its timeout
+    unfinished.
+
+    A finished renewal rings it itself (`_ring_kv_progress`); a stalled one
+    rings nothing, yet from its timeout on its load may go out (`renew_async`
+    answers "timeout"). Without this ring an engine holding its step for that
+    load (`EngineCore._wait_for_loads`) would sleep to the hold's bound. One
+    daemon thread for all renewals, started on first use.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._heap: list = []  # (expiry, seq no, future)
+        self._order = itertools.count()
+        self._thread = None
+        self._closed = False
+
+    def arm(self, future, timeout_s: float) -> None:
+        with self._cond:
+            if self._closed:
+                return
+            expiry = _monotonic() + timeout_s
+            heapq.heappush(self._heap, (expiry, next(self._order), future))
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="store-renew-alarm", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify()
+
+    def _run(self) -> None:
+        while True:
+            expired = []
+            with self._cond:
+                while not self._closed:
+                    now = _monotonic()
+                    while self._heap and self._heap[0][0] <= now:
+                        expired.append(heapq.heappop(self._heap)[2])
+                    if expired:
+                        break
+                    self._cond.wait(self._heap[0][0] - now if self._heap else None)
+                if self._closed:
+                    return
+            if any(not f.done() for f in expired):
+                progress_doorbell.ring()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._heap.clear()
+            self._cond.notify()
 
 
 class DaemonExecutor:
@@ -139,6 +198,7 @@ class AsyncStoreLookup(LookupClient):
         # polls; `_stuck_renewals` holds retired futures whose RPC still runs.
         self._renewals = {}
         self._stuck_renewals = []
+        self._renewal_alarm = _RenewalExpiryAlarm()
         self.backend_slot = _BackendSlot()
         self.pending = {}
         # sid -> when its Store query was sent: the read lease the answer grants
@@ -337,6 +397,9 @@ class AsyncStoreLookup(LookupClient):
             # step for it (`EngineCore._wait_for_loads`); a no-op otherwise.
             future.add_done_callback(_ring_kv_progress)
             ticket = self._renewals[sid] = (ident, future, time.monotonic())
+            # A renewal stalled to its timeout releases the load too: wake
+            # the engine then as well.
+            self._renewal_alarm.arm(future, RENEW_TIMEOUT_S)
         _, future, submitted = ticket
         if future.done():
             del self._renewals[sid]
@@ -370,6 +433,7 @@ class AsyncStoreLookup(LookupClient):
         # Daemon workers: a hung Store RPC does not hold engine exit.
         self.executor.shutdown()
         self.renew_executor.shutdown()
+        self._renewal_alarm.close()
         # And the backend's own workers (the Store's per-pool lookups).
         if self.backend is not None:
             self.backend.close()

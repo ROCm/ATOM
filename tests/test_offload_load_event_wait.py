@@ -673,16 +673,11 @@ def test_aggregation_start_time_is_exposed():
 # -- a load parked on its Store lease renewal -----------------------------------------
 
 
-def test_renewal_finishing_mid_hold_wakes_it_and_ships_the_load(
-    engine_core,
-    aiter_arch,  # noqa: F811 (fixture)
-    cluster,  # noqa: F811 (fixture)
-    scheduler_clock,  # noqa: F811 (fixture)
-    monkeypatch,
-):
-    """`ATOM_STORE_ASYNC_RENEW`: the renewal's completion rings the engine's
-    doorbell, the hold ships the GET it released, and the GET's own landing
-    ends the hold -- long before its bound."""
+def _hold_for_a_renewal(engine_core, clock, monkeypatch, *, stall):
+    """Hold a step for one load parked on its async Store lease renewal
+    (`ATOM_STORE_ASYNC_RENEW`), bound 2 s. The renewal finishes at 30 ms, or
+    with `stall` never (its timeout is 0.1 s). Each shipped GET lands 20 ms
+    later. Returns (seconds held, GETs shipped, loads reported, wait stats)."""
     from concurrent.futures import Future
 
     from test_mooncake_store_offload import (
@@ -692,6 +687,7 @@ def test_renewal_finishing_mid_hold_wakes_it_and_ships_the_load(
         _seq,
     )
 
+    from atom.kv_transfer.offload.mooncake_store import async_lookup
     from atom.kv_transfer.offload.mooncake_store.scheduler import (
         MooncakeStoreOffloadScheduler,
     )
@@ -700,9 +696,18 @@ def test_renewal_finishing_mid_hold_wakes_it_and_ships_the_load(
     connector = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
     seq = _seq(59, 50)
     _arm_load(connector, seq, hbm=16, lmc=40)
-    scheduler_clock.now += 2.0  # old enough to need a renewal
+    clock.now += 2.0  # old enough to need a renewal
     future = Future()
-    _install_future(connector, scheduler_clock, monkeypatch, future, [])
+    if stall:
+        # Real clock: the renewal's timeout passes while the step is held.
+        monkeypatch.setattr(async_lookup, "RENEW_TIMEOUT_S", 0.1)
+        client = connector._lookup_client
+        client.renew_executor.shutdown()
+        client.renew_executor = SimpleNamespace(
+            submit=lambda fn, keys: future, shutdown=lambda: None
+        )
+    else:
+        _install_future(connector, clock, monkeypatch, future, [])
 
     event = threading.Event()
     doorbell = threading.Event()
@@ -750,18 +755,53 @@ def test_renewal_finishing_mid_hold_wakes_it_and_ships_the_load(
     engine._load_wait.tick_s = 2.0
     for name in ("_ship_connector_meta", "_wait_for_loads"):
         setattr(engine, name, MethodType(getattr(engine_core.EngineCore, name), engine))
-    threading.Timer(0.03, future.set_result, (5,)).start()  # renewal finishes
+    if not stall:
+        threading.Timer(0.03, future.set_result, (5,)).start()  # renewal finishes
     try:
         t0 = time.monotonic()
         engine_core.EngineCore._prestart_tier_loads_and_wait(engine)
         elapsed = time.monotonic() - t0
-
-        assert len(shipped) == 1  # the GET went out once, after the renewal
-        assert reported == {seq.id}
-        assert elapsed < 1.0  # ended by events, not the 2 s bound
-        stats = engine._load_wait
-        assert (stats.waits, stats.landed, stats.timed_out) == (1, 1, 0)
-        assert stats.wakes >= 2  # the renewal, then the GET
         assert not connector._reqs_need_recv
+        return elapsed, shipped, reported, seq, engine._load_wait
     finally:
         connector.close()
+
+
+def test_renewal_finishing_mid_hold_wakes_it_and_ships_the_load(
+    engine_core,
+    aiter_arch,  # noqa: F811 (fixture)
+    cluster,  # noqa: F811 (fixture)
+    scheduler_clock,  # noqa: F811 (fixture)
+    monkeypatch,
+):
+    """`ATOM_STORE_ASYNC_RENEW`: the renewal's completion rings the engine's
+    doorbell, the hold ships the GET it released, and the GET's own landing
+    ends the hold -- long before its bound."""
+    elapsed, shipped, reported, seq, stats = _hold_for_a_renewal(
+        engine_core, scheduler_clock, monkeypatch, stall=False
+    )
+    assert len(shipped) == 1  # the GET went out once, after the renewal
+    assert reported == {seq.id}
+    assert elapsed < 1.0  # ended by events, not the 2 s bound
+    assert (stats.waits, stats.landed, stats.timed_out) == (1, 1, 0)
+    assert stats.wakes >= 2  # the renewal, then the GET
+
+
+def test_renewal_stalled_past_its_timeout_wakes_the_hold_and_ships_the_load(
+    engine_core,
+    aiter_arch,  # noqa: F811 (fixture)
+    cluster,  # noqa: F811 (fixture)
+    scheduler_clock,  # noqa: F811 (fixture)
+    monkeypatch,
+):
+    """A renewal that never finishes rings nothing itself, but at its timeout
+    the load may go out ("timeout"): the expiry rings the doorbell, the hold
+    ships the GET and ends on its landing, not at the 2 s bound."""
+    elapsed, shipped, reported, seq, stats = _hold_for_a_renewal(
+        engine_core, scheduler_clock, monkeypatch, stall=True
+    )
+    assert len(shipped) == 1  # the GET went out at the renewal's timeout
+    assert reported == {seq.id}
+    assert 0.1 <= elapsed < 1.0
+    assert (stats.waits, stats.landed, stats.timed_out) == (1, 1, 0)
+    assert stats.wakes >= 2  # the renewal's expiry, then the GET
