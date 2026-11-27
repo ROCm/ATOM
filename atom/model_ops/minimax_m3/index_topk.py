@@ -36,6 +36,7 @@ from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import (
     nvfp4_scaled_dot,
     nvfp4_split_query,
 )
+from atom.utils import envs
 
 try:
     # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
@@ -1259,6 +1260,127 @@ def _prefill_topk_block_size_k(max_block: int) -> int:
     )
 
 
+@triton.jit
+def _prefill_merge_topk_kernel(
+    partial_key_ptr,
+    topk_ptr,
+    row_starts,
+    row_prefix,
+    topk,
+    stride_p_h,
+    stride_p_n,
+    stride_p_k,
+    stride_ti_h,
+    stride_ti_n,
+    stride_ti_t,
+    block_table_ptr,
+    sparse_bt_ptr,
+    sparse_ctx_ptr,
+    stride_bt_b,
+    stride_sbt_n,
+    NUM_KV_HEADS: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    MERGE_SIZE: tl.constexpr,
+    pages_per_block: tl.constexpr,
+    block_page_stride: tl.constexpr,
+    CHUNK_BLOCKS: tl.constexpr,  # blocks a list of BLOCK_SIZE_T keys covers
+):
+    """A row's top-k of its lists of `_pack_score_key` keys (aiter's fused
+    prefill scorer + top-16 writes one list a chunk it reaches), and the emit."""
+    pid_q = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    seq_start = tl.load(row_starts + pid_b)
+    block_num = tl.load(row_starts + pid_b + 1) - seq_start
+    if pid_q >= block_num:
+        return
+    prefix_len = tl.load(row_prefix + pid_b)
+    valid_blocks = (prefix_len + pid_q + SPARSE_BLOCK) // SPARSE_BLOCK
+    num_partial = (valid_blocks + CHUNK_BLOCKS - 1) // CHUNK_BLOCKS * BLOCK_SIZE_T
+
+    cols = tl.arange(0, MERGE_SIZE)
+    keys = tl.load(
+        partial_key_ptr
+        + pid_h * stride_p_h
+        + (seq_start + pid_q) * stride_p_n
+        + cols * stride_p_k,
+        mask=cols < num_partial,
+        other=0,
+    )
+    winners = tl.topk(keys, BLOCK_SIZE_T)
+    slots = tl.arange(0, BLOCK_SIZE_T)
+    topk_idx = (winners & 0xFFFF).to(tl.int32) - 1
+    topk_idx = tl.where(slots < tl.minimum(topk, valid_blocks), topk_idx, -1)
+    tl.store(
+        topk_ptr
+        + pid_h * stride_ti_h
+        + (seq_start + pid_q) * stride_ti_n
+        + slots * stride_ti_t,
+        topk_idx,
+        mask=slots < topk,
+    )
+
+    emit_row = (seq_start + pid_q) * NUM_KV_HEADS + pid_h
+    _emit_sparse_block_table_row(
+        topk_idx,
+        block_table_ptr + pid_b * stride_bt_b,
+        sparse_bt_ptr + emit_row * stride_sbt_n,
+        sparse_ctx_ptr + emit_row,
+        prefix_len + pid_q + 1,
+        topk,
+        pid_h,
+        SPARSE_BLOCK,
+        pages_per_block,
+        block_page_stride=block_page_stride,
+        NUM_KV_HEADS=NUM_KV_HEADS,
+        BLOCK_SIZE_T=BLOCK_SIZE_T,
+    )
+
+
+def _launch_prefill_merge(
+    partial_keys,
+    topk_idx,
+    row_starts,
+    row_prefix,
+    block_table,
+    emit_args,
+    rows_per_req,
+    topk,
+    block_page_stride,
+    pages_per_block,
+    chunk_blocks,
+):
+    """Each row's top-k of its lists ``[heads, total_q, lists * 16]`` (a list
+    covers ``chunk_blocks`` blocks; only those a row reaches are read), and the
+    emission."""
+    num_idx_heads, _, num_partial = partial_keys.shape
+    batch = row_starts.shape[0] - 1
+    sparse_bt, sparse_ctx, stride_bt_b, stride_sbt_n = emit_args
+    _prefill_merge_topk_kernel[(rows_per_req, batch, num_idx_heads)](
+        partial_keys,
+        topk_idx,
+        row_starts,
+        row_prefix,
+        topk,
+        *partial_keys.stride(),
+        *topk_idx.stride(),
+        block_table,
+        sparse_bt,
+        sparse_ctx,
+        stride_bt_b,
+        stride_sbt_n,
+        NUM_KV_HEADS=num_idx_heads,
+        SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+        BLOCK_SIZE_T=triton.next_power_of_2(topk),
+        MERGE_SIZE=triton.next_power_of_2(num_partial),
+        pages_per_block=pages_per_block,
+        block_page_stride=block_page_stride,
+        CHUNK_BLOCKS=chunk_blocks,
+        num_warps=1,
+    )
+
+
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
 @triton.jit
 def _topk_index_packed_kernel(
@@ -1545,20 +1667,58 @@ def _decode_index_score_tiled_kernel(
 FLYDSL_PREFILL_SCORE_MIN_ROWS = 2048
 
 
-def _flydsl_prefill_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len):
+def _flydsl_prefill_scorer(
+    idx_q, index_kv_cache, index_kv_scale, score, meta, sm_scale, max_query_len
+):
     """aiter's FlyDSL prefill scorer when it serves the call (FP4 index cache, a
     prefill of at least ``FLYDSL_PREFILL_SCORE_MIN_ROWS`` rows, aiter's own
-    predicate: gfx1250 and the shapes it supports), else None."""
+    predicate on the scorer's first nine arguments: gfx1250 and the shapes it
+    supports), else None."""
     if (
         index_kv_scale is None
         or index_score_prefill_nvfp4 is None
         or max_query_len < FLYDSL_PREFILL_SCORE_MIN_ROWS
         or not index_score_prefill_nvfp4_supported(
-            idx_q, index_kv_cache, index_kv_scale
+            idx_q, index_kv_cache, index_kv_scale, score, *meta, sm_scale
         )
     ):
         return None
     return index_score_prefill_nvfp4
+
+
+def _flydsl_prefill_topk(
+    idx_q,
+    index_kv_cache,
+    index_kv_scale,
+    meta,
+    sm_scale,
+    max_query_len,
+    topk,
+    max_block,
+    emit,
+):
+    """(aiter's fused prefill scorer + top-16, its chunk) when
+    ``ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL`` is on, the call emits (the merge
+    always does), aiter serves it (gfx1250, the FP4 index cache, top-16) and
+    prefers it to the scorer + selector for this shape, else None. Imported
+    directly: the flag needs an aiter with the op."""
+    if index_kv_scale is None or not emit or not envs.ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL:
+        return None
+    from aiter.ops.flydsl.index_score_prefill import (
+        index_topk_prefill_chunk_blocks,
+        index_topk_prefill_nvfp4,
+        index_topk_prefill_nvfp4_preferred,
+        index_topk_prefill_nvfp4_supported,
+    )
+
+    if not index_topk_prefill_nvfp4_supported(
+        idx_q, index_kv_cache, index_kv_scale, *meta, sm_scale, topk, max_block
+    ) or not index_topk_prefill_nvfp4_preferred(idx_q, max_block):
+        return None
+    batch = meta[1].shape[0] - 1
+    # aiter's default for this grid, which the merge needs to know.
+    chunk = index_topk_prefill_chunk_blocks(idx_q, max_query_len, batch, max_block)
+    return index_topk_prefill_nvfp4, chunk
 
 
 @torch.no_grad()
@@ -1624,6 +1784,65 @@ def minimax_m3_index_topk(
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
 
+    fused = _flydsl_prefill_topk(
+        idx_q,
+        index_kv_cache,
+        index_kv_scale,
+        (block_table, cu_seqlens_q, seq_lens, prefix_lens),
+        sm_scale,
+        max_query_len,
+        topk,
+        max_block,
+        emit_sparse_block_table,
+    )
+    if fused is not None:
+        # aiter's fused scorer + top-16 (ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL): the
+        # scores never reach memory. Each workgroup hands on a row's 16 best
+        # blocks of its chunk as `_pack_score_key` keys, and the merge picks the
+        # row's 16 and emits: the selector's keys, top-k and emission.
+        index_topk, chunk_blocks = fused
+        keys = index_topk(
+            idx_q,
+            index_kv_cache,
+            index_kv_scale,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            sm_scale,
+            max_query_len,
+            max_block,
+            init_blocks,
+            local_blocks,
+            chunk_blocks=chunk_blocks,
+        )
+        topk_idx = torch.empty(
+            (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
+        )
+        emit_out, emit_args = _alloc_emit(
+            total_q,
+            num_idx_heads,
+            topk,
+            block_table,
+            True,
+            idx_q.device,
+            emit_pages_per_block,
+        )
+        _launch_prefill_merge(
+            keys,
+            topk_idx,
+            cu_seqlens_q,
+            prefix_lens,
+            block_table,
+            emit_args,
+            max_query_len,
+            topk,
+            block_page_stride,
+            emit_pages_per_block,
+            chunk_blocks,
+        )
+        return (topk_idx, *emit_out)
+
     score = torch.empty(
         (num_idx_heads, total_q, max_block),
         dtype=torch.float32,
@@ -1646,7 +1865,13 @@ def minimax_m3_index_topk(
     if is_fp4:
         _check_fp4_index(index_kv_cache, index_kv_scale, head_dim)
     flydsl_score = _flydsl_prefill_scorer(
-        idx_q, index_kv_cache, index_kv_scale, max_query_len
+        idx_q,
+        index_kv_cache,
+        index_kv_scale,
+        score,
+        (block_table, cu_seqlens_q, seq_lens, prefix_lens),
+        sm_scale,
+        max_query_len,
     )
     if flydsl_score is not None:
         flydsl_score(

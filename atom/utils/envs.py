@@ -524,6 +524,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 gfx1250 FP4 index, prefill: aiter's FlyDSL scorer fused with the
+    # top-16 block selection (`index_topk_prefill_nvfp4`) where aiter prefers it
+    # to the scorer + selector; the same selection. Opt-in for A/B.
+    "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL": lambda: _flag_env(
+        "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL"
+    ),
     # MiniMax-M3: store the sparse (indexed) layers' K/V as NVFP4 (e2m1 + E4M3 per
     # 16) in their own pool; dense layers, the draft and --kv_cache_dtype are
     # unchanged.

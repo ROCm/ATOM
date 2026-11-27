@@ -786,13 +786,18 @@ def test_split_decode_selector_matches_packed(
 )
 def test_flydsl_prefill_scorer_gate(monkeypatch, rows, fp4, supported, expected):
     monkeypatch.setattr(m, "index_score_prefill_nvfp4", lambda *a: None)
+    asked = []
     monkeypatch.setattr(
-        m, "index_score_prefill_nvfp4_supported", lambda q, p, s: supported
+        m,
+        "index_score_prefill_nvfp4_supported",
+        lambda *a: asked.append(a) or supported,
     )
     scale = torch.zeros(1, 128, 8, dtype=torch.uint8) if fp4 else None
-    scorer = m._flydsl_prefill_scorer(
-        torch.zeros(1, 1, 128), torch.zeros(1, 128, 64), scale, rows
-    )
+    q, payload, score = torch.zeros(1, 1, 128), torch.zeros(1, 128, 64), object()
+    meta = tuple(object() for _ in range(4))
+    scorer = m._flydsl_prefill_scorer(q, payload, scale, score, meta, 0.5, rows)
+    if asked:  # aiter's predicate takes the scorer's first nine arguments
+        assert asked == [(q, payload, scale, score, *meta, 0.5)]
     assert (scorer is not None) == expected
 
 
@@ -813,8 +818,12 @@ def test_flydsl_prefill_scorer_matches_triton(monkeypatch):
     kw["block_table"] = torch.randperm(pages, dtype=torch.int32, device="cuda").view(
         kw["block_table"].shape
     )
-    assert m._flydsl_prefill_scorer(kw["idx_q"], payload, scale, 2560) is not None
+    gate, took = m._flydsl_prefill_scorer, []
+    monkeypatch.setattr(
+        m, "_flydsl_prefill_scorer", lambda *a: took.append(gate(*a)) or took[-1]
+    )
     flydsl = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    assert took and took[0] is not None
     monkeypatch.setattr(m, "_flydsl_prefill_scorer", lambda *a: None)
     triton_ = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()
