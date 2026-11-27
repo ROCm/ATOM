@@ -26,7 +26,7 @@ def test_stacked_expert_loader_ignores_fused_shared_expert_map_tail():
     w13.weight_loader = lambda *args, **kwargs: None
     w2.weight_loader = lambda *args, **kwargs: None
     experts = SimpleNamespace(
-        moe_parallel_config=SimpleNamespace(tp_rank=0),
+        moe_parallel_config=SimpleNamespace(tp_rank=0, tp_size=1),
         expert_layout=SimpleNamespace(num_routed=routed),
         expert_map=torch.tensor([0, 1, 2, -1, -1, -1, 3, -1]),
         w13_weight=w13,
@@ -115,6 +115,9 @@ def test_mtp_maps_stacked_and_per_expert_checkpoints(source, target):
     from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
 
     model = Qwen4ExpMTP.__new__(Qwen4ExpMTP)
+    torch.nn.Module.__init__(model)
+    model.fused_shared_experts = 0
+    model.disable_fused_shared_loading = True
     rewriter = CheckpointNameRewriter(
         weights_mapping=model.weights_mapping,
         mtp_remap=model.remap_mtp_weight_name,

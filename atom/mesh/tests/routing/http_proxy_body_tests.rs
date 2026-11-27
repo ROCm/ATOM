@@ -48,7 +48,8 @@ async fn upstream(response: Response) -> (reqwest::Response, JoinHandle<()>) {
 fn wrap(response: reqwest::Response) -> (Body, Arc<dyn Worker>, Arc<RecordingPolicy>) {
     let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://test-worker").build());
     let policy = Arc::new(RecordingPolicy::default());
-    let load = WorkerLoadGuard::new(worker.clone(), None);
+    let load = WorkerLoadGuard::new(worker.clone(), None).with_prefill_tokens(5);
+    assert_eq!(worker.prefill_tokens(), 5);
     let body = ProxyBody::response(response, worker.clone(), policy.clone(), load).into_body();
     (body, worker, policy)
 }
@@ -92,6 +93,7 @@ async fn fixed_length_and_empty_completion_is_recorded_without_an_eof_poll() {
             u64::from(status.is_server_error())
         );
         assert_eq!(worker.load(), 0);
+        assert_eq!(worker.prefill_tokens(), 0);
         server.abort();
     }
 }
@@ -121,6 +123,8 @@ async fn stream_eof_error_and_early_drop_record_distinct_outcomes() {
         assert!(body.frame().await.unwrap().unwrap().is_data());
         assert!(policy.0.lock().unwrap().is_empty());
         assert_eq!(worker.load(), 1);
+        // The first streamed frame ends the prefill; the request stays counted.
+        assert_eq!(worker.prefill_tokens(), 0);
         if end == "cancel" {
             drop(body);
         } else {
