@@ -46,6 +46,10 @@ def test_opus_decode_flattens_queries_and_preserves_planes(
     def wrong_scorer(*args, **kwargs):
         pytest.fail("MFMA FP4 decode reached the FP8 scorer")
 
+    def gather(group, x, dim):
+        assert dim == -1
+        return torch.cat([x] * world, dim=dim)
+
     opus.mqa_logits_mxfp4_config = configure
     opus.mqa_logits_mxfp4 = score
     topk_mod.top_k_per_row_decode = select
@@ -58,9 +62,7 @@ def test_opus_decode_flattens_queries_and_preserves_planes(
         monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(dcp_ops, "get_dcp_world_size", lambda: world)
     monkeypatch.setattr(dcp_ops, "get_dcp_group", lambda: object())
-    monkeypatch.setattr(
-        dcp_ops, "dcp_all_gather", lambda group, x, dim: x.repeat(world, 1)
-    )
+    monkeypatch.setattr(dcp_ops, "dcp_all_gather", gather)
     # Run the real dispatcher and adapter on CPU; only their allocations and
     # GPU kernels are replaced. No GPU is needed to verify these arguments.
     monkeypatch.setattr(

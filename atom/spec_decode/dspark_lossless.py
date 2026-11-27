@@ -147,6 +147,11 @@ class DSparkLossless:
                 reason,
             )
             return None
+        if drafter.config.enable_mixed_prefill_decode:
+            raise ValueError(
+                "Cannot arm lossless draft sampling with mixed prefill/decode: "
+                "mixed draft staging does not support the probability-ratio path."
+            )
         # A confidence-scheduled verify takes its length from the confidence
         # head, which reads the sampled drafts: lossless only if that length
         # comes from older drafts than the ones it verifies.

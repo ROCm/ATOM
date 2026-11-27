@@ -350,13 +350,13 @@ async fn an_atom_model_without_a_chat_template_answers_chats_with_501() {
     assert_chats_refused_and_completions_served(&ctx, "atom-encoder").await;
 }
 
-/// A DeepSeek V4 tokenizer renders with llm-tokenizer's built-in encoder, which ignores
-/// the template the ATOM worker advertises.
+/// A DeepSeek V4 tokenizer renders with its encoder as ATOM does (`ChatControls`),
+/// whatever template the ATOM worker advertises: its chats are bound to no template.
 #[tokio::test]
-async fn an_atom_model_whose_tokenizer_ignores_its_template_answers_chats_with_501() {
+async fn an_atom_model_whose_tokenizer_renders_with_its_encoder_serves_chats() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::copy(hf_tokenizer_path(), dir.path().join("tokenizer.json")).unwrap();
-    let config = json!({"architectures": ["DeepseekV4ForCausalLM"]});
+    let config = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"});
     std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
     let info = GetModelInfoResponse {
         tokenizer_path: dir.path().to_str().unwrap().into(),
@@ -365,12 +365,16 @@ async fn an_atom_model_whose_tokenizer_ignores_its_template_answers_chats_with_5
     let url = serve_atom(info, 1).await;
     let ctx = context();
     register(&ctx, json!({ "url": url })).await.unwrap();
-    assert_chats_refused_and_completions_served(&ctx, "atom-deepseek").await;
+    wait_for_tokenizer(&ctx, "atom-deepseek").await;
+    let chat = json!({"model": "atom-deepseek", "messages": [{"role": "user", "content": "hi"}]});
+    let chat: ChatCompletionRequest = serde_json::from_value(chat).unwrap();
+    let (payload, _) = prepare_chat(Arc::new(chat), None, Some("atom-deepseek".into()), &ctx)
+        .expect("a chat rendered with the model's encoder is served");
+    assert!(payload.chat_template.is_none());
 }
 
-/// Once the tokenizer job has registered `model`'s tokenizer, its chats get 501 and its
-/// completions are prepared.
-async fn assert_chats_refused_and_completions_served(ctx: &Arc<AppContext>, model: &str) {
+/// Waits for the tokenizer job to register `model`'s tokenizer.
+async fn wait_for_tokenizer(ctx: &Arc<AppContext>, model: &str) {
     let registered = async {
         while !ctx.tokenizer_registry.contains(model) {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -379,6 +383,12 @@ async fn assert_chats_refused_and_completions_served(ctx: &Arc<AppContext>, mode
     tokio::time::timeout(Duration::from_secs(60), registered)
         .await
         .expect("the tokenizer job registers the model's tokenizer");
+}
+
+/// Once the tokenizer job has registered `model`'s tokenizer, its chats get 501 and its
+/// completions are prepared.
+async fn assert_chats_refused_and_completions_served(ctx: &Arc<AppContext>, model: &str) {
+    wait_for_tokenizer(ctx, model).await;
 
     let chat = json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
     let chat: ChatCompletionRequest = serde_json::from_value(chat).unwrap();
@@ -791,6 +801,7 @@ async fn an_atom_worker_reporting_dp_size_4_registers_four_ranks_each_sending_it
         let plan = PlacementPlan::Single {
             worker,
             policy_name: "random",
+            prefill_tokens: 0,
         };
         let mut payload = build_generate_payload(format!("r{rank}"), &body, None, vec![7, 8, 9]);
         GrpcEngine::new()

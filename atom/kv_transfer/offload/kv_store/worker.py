@@ -32,7 +32,10 @@ Completion protocol, per worker and operation:
 * A chunk the store already holds when a save reaches its window is neither
   read nor put: it is source-safe at once and counts as stored, so a save
   whose every chunk was held ends in a success like any other.
-* A load ends in exactly one of done or failed, all-or-nothing.
+* A load ends in exactly one of done or failed, all-or-nothing. Where PP
+  stages push (``stages_push_load_terminals``), that terminal goes to the PP
+  head's kv_status socket as it lands, or to this stage's poll when the head's
+  pipe is full; a load that raises still reports through the poll (``_guard``).
 * A slot returns to the pool only once no GPU or store access can still reach
   it. One a store transfer or a GPU copy may still reach is quarantined for
   good, and the pool's memory then outlives the worker (``pool.close``).
@@ -60,7 +63,15 @@ from typing import Any
 
 import torch
 
-from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
+from atom.distributed.pp_transport import (
+    PPKVStatusPusher,
+    stages_push_load_terminals,
+)
+from atom.kv_transfer.disaggregation.types import (
+    KVConnectorOutput,
+    SaveOperationId,
+    SaveSourceGroupId,
+)
 from atom.kv_transfer.offload import atom_lmcache_staging
 from atom.kv_transfer.offload._block_gpu_connector import (
     _DEFAULT_GPU_STAGING_BYTES,
@@ -201,6 +212,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         self._gpu_connector: BlockGPUConnector | None = None
         self._namespace: str | None = None
         self._world = 1
+        # Where load terminals go instead of this stage's KV poll, if anywhere.
+        self._load_terminal_pusher: PPKVStatusPusher | None = None
         self._chunk_bytes = 0
         self._stats_lock = threading.Lock()
         # Whether one-run windows are copied in place; see `register_kv_caches`.
@@ -394,6 +407,10 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 executor.shutdown(wait=False)
             drained = self._sender.close()
         super().close()
+        # The load threads are joined: no terminal is still on its way out.
+        pusher, self._load_terminal_pusher = self._load_terminal_pusher, None
+        if pusher is not None:
+            pusher.close()
         if not drained and not self._sender.close():
             logger.warning(
                 "%s: the save sender is still busy; resources stay open",
@@ -435,6 +452,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         rank, world = pp_aware_rank_and_world(self._config, _tp_group())
         self._rank = rank
         self._world = world
+        self._load_terminal_pusher = self._open_load_terminal_pusher()
         # Scheduler blocks, threaded from the model runner. MLA stores its KV
         # token-major, so the codec cannot infer the count from shape[0].
         # The dense codec reads kv_caches. M3 and V4.1 read the PAGE region map.
@@ -877,6 +895,29 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 SaveSourceGroupId(operation, ((index * chunk, (index + 1) * chunk),))
             )
 
+    def _open_load_terminal_pusher(self) -> PPKVStatusPusher | None:
+        """A PUSH to the PP head's kv_status socket, where stages push (else None)."""
+        if not stages_push_load_terminals(self._config):
+            return None
+        pc = self._config.parallel_config
+        return PPKVStatusPusher(pc.pipeline_parallel_rank, pc.pp_kv_status_addr)
+
+    def _report_load_terminal(self, req: LMCacheReqMeta, ok: bool) -> None:
+        """A load's one terminal: pushed to the PP head when a pusher is open and
+        takes it, else kept for this stage's next KV poll (`get_finished`)."""
+        completion = self._load_completion_id(req)
+        with self._lock:
+            if not ok:
+                self._record_load_error_blocks(req)
+            pusher = self._load_terminal_pusher
+            if pusher is not None and pusher.try_send(
+                KVConnectorOutput(finished_loading={completion})
+                if ok
+                else KVConnectorOutput(failed_loading={completion})
+            ):
+                return
+            (self._done_load if ok else self._failed_load).add(completion)
+
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
         assert ls is not None
@@ -885,8 +926,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         lmc = int(ls.lmcache_cached_tokens)
         t_total0 = time.perf_counter()
         if lmc <= hbm:
-            with self._lock:
-                self._done_load.add(self._load_completion_id(req))
+            self._report_load_terminal(req, ok=True)
             return
         chunk = self.chunk_size
         end_tokens = (
@@ -910,9 +950,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 chunk,
                 problem,
             )
-            with self._lock:
-                self._failed_load.add(self._load_completion_id(req))
-                self._record_load_error_blocks(req)
+            self._report_load_terminal(req, ok=False)
             return
 
         pool, client, gpu_connector = self._registered()
@@ -1030,12 +1068,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             )
         self._maybe_log_store_stats()
         # Last, for the reason `_do_save_req` gives.
-        with self._lock:
-            if failure is None:
-                self._done_load.add(self._load_completion_id(req))
-            else:
-                self._failed_load.add(self._load_completion_id(req))
-                self._record_load_error_blocks(req)
+        self._report_load_terminal(req, ok=failure is None)
 
     # -- in-place copies ---------------------------------------------------
     def _in_place_stream(self) -> torch.cuda.Stream:

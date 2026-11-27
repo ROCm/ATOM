@@ -1,0 +1,5 @@
+# The image clones its own copies of all four repos at pinned SHAs, so the build
+# context only needs release/. Keeping .git and run artefacts out of it keeps the
+# context under a megabyte.
+# context is release/ itself; nothing to exclude beyond logs
+*.log

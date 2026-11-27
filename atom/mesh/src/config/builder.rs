@@ -171,6 +171,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn atom_pd_concurrent(mut self, enable: bool) -> Self {
+        self.config.atom_pd_concurrent = enable;
+        self
+    }
+
     pub fn host<S: Into<String>>(mut self, host: S) -> Self {
         self.config.host = host.into();
         self
@@ -382,6 +387,16 @@ impl RouterConfigBuilder {
 
     pub fn mooncake_admin_port(mut self, port: u16) -> Self {
         self.config.mooncake_admin_port = port;
+        self
+    }
+
+    pub fn kv_storage_deadline_ms(mut self, ms: u64) -> Self {
+        self.config.kv_storage_deadline_ms = ms;
+        self
+    }
+
+    pub fn kv_storage_weight(mut self, weight: f64) -> Self {
+        self.config.kv_storage_weight = weight;
         self
     }
 

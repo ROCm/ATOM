@@ -2079,6 +2079,7 @@ mod k_cache_reconcile {
                 return Ok(PlacementPlan::Single {
                     worker,
                     policy_name: "cache_aware",
+                    prefill_tokens: 0,
                 });
             }
             let prefill = mock_grpc_worker(
@@ -2095,6 +2096,7 @@ mod k_cache_reconcile {
                 decode,
                 prefill_policy: "cache_aware",
                 decode_policy: "cache_aware",
+                prefill_tokens: 0,
             })
         }
     }

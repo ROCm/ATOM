@@ -10,7 +10,9 @@ bounded by an earlier layer's candidates scores only those blocks: the kept
 list is handed over as the block table (`candidate_table`), so the width is
 `candidate_topk_blocks` blocks and not a whole context, and its columns are
 lifted back to compressed-row ids after. A layer producing candidates picks
-them off each band's logits before its top-k.
+them off each band's logits before its top-k, and with packed logits takes
+that top-k over the blocks it just picked rather than over the whole row
+(`top_k_within_candidates`: the same selection, for finite scores).
 
 Each query row is its own batch item (`next_n=1`) with its own bound, so
 nothing here is a function of the batch's composition: a prefill token, a
@@ -35,7 +37,12 @@ from atom.model_ops.indexer import (
 
 from .candidate_table import lift_candidate_selection
 from .index_plane import FP4_FLYDSL, FP4_MFMA
-from .indexer import pick_candidate_blocks, pick_candidate_blocks_packed
+from .indexer import (
+    candidate_topk_launch,
+    pick_candidate_blocks,
+    pick_candidate_blocks_packed,
+    top_k_within_candidates,
+)
 
 __all__ = [
     "quantize_query_fp4",
@@ -183,6 +190,11 @@ def score_topk_quantized(
             if not candidate_count
             else _picker(bound, block_size, chosen, packed, workspace, width)
         ),
+        band_topk=(
+            _topk_within_picks(chosen, block_size, topk, workspace)
+            if candidate_count and packed is not None
+            else None
+        ),
     )
     if candidates is not None:
         # Columns of the compacted width, which only this function knows how to
@@ -221,6 +233,31 @@ def _index_rows(cache, scaled, table, bound, width, ragged, packed, workspace):
         bands=None if packed is None else packed.bands,
         packed_offsets=None if packed is None else packed.offsets,
     )
+
+
+def _topk_within_picks(chosen, block_size, topk, workspace):
+    """A packed band's top-k over the candidate blocks `_picker` has just
+    picked for it, when they are more than `topk` blocks (then they hold the
+    whole top-k: `top_k_within_candidates`), on the workspace's compacted
+    plane (`candidate_scratch`); a band too tall for it keeps the whole-row
+    top-k."""
+    count = chosen.shape[1]
+    if count <= topk or not workspace.candidate_rows:
+        return None
+    width = count * block_size
+    launch = candidate_topk_launch(count)
+
+    def band_topk(scores, span, out, starts, ends):
+        scratch = workspace.candidate_scratch(out.shape[0], width)
+        if scratch is None:
+            return False
+        top_k_within_candidates(
+            scores, starts, ends, chosen[span], block_size, out, topk,
+            *scratch, launch,
+        )  # fmt: skip
+        return True
+
+    return band_topk
 
 
 def _picker(bound, block_size, chosen, packed, workspace, width):

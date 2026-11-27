@@ -52,42 +52,33 @@ pub(crate) fn default_template_kwargs(
 }
 
 /// Why atomesh cannot render chats as `workers`' ATOM worker does, if it cannot: the
-/// model's tokenizer renders them with a built-in encoder that ignores the chat template
-/// (`built_in_encoder`: DeepSeek V3.2 and V4), or the worker reports no chat template
-/// (Kimi-K3's encoder) and the router sets none (`configured`).
+/// worker reports no chat template and the router sets none (`configured`). A model
+/// with `ChatControls` renders with its encoder instead (`chat_render`).
 pub(crate) fn atom_chat_render_gap(
     workers: &[Arc<dyn Worker>],
     configured: bool,
-    built_in_encoder: bool,
 ) -> Option<String> {
-    let mut atom = workers
-        .iter()
-        .filter(|worker| worker.metadata().runtime_type == RuntimeType::Atom);
-    if built_in_encoder {
-        return atom.next().map(|worker| {
-            format!(
-                "atomesh's tokenizer renders them with a built-in encoder that ignores the \
-                 chat template, so their prompts would differ from those its ATOM worker {} \
-                 renders",
-                worker.url()
-            )
-        });
-    }
     if configured {
         return None;
     }
-    atom.find(|worker| {
-        worker.chat_template().is_none() && !worker.metadata().labels.contains_key("chat_template")
-    })
-    .map(|worker| {
-        format!(
-            "its ATOM worker {} renders them without a chat template, which atomesh needs",
-            worker.url()
-        )
-    })
+    workers
+        .iter()
+        .filter(|worker| worker.metadata().runtime_type == RuntimeType::Atom)
+        .find(|worker| {
+            worker.chat_template().is_none()
+                && !worker.metadata().labels.contains_key("chat_template")
+        })
+        .map(|worker| {
+            format!(
+                "its ATOM worker {} renders them without a chat template, which atomesh needs",
+                worker.url()
+            )
+        })
 }
 
-/// Process chat messages and apply the HuggingFace chat template.
+/// Process chat messages and apply the HuggingFace chat template, with the
+/// request's `reasoning_effort` and then its `chat_template_kwargs` as the
+/// template kwargs.
 ///
 /// Requires a HuggingFace tokenizer (directly or via `CachedTokenizer` or
 /// `FastTokenizer`); other tokenizer kinds return an error because the gRPC path
@@ -96,8 +87,13 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
-    let template_kwargs = merged_template_kwargs(request, None);
-    process_chat_messages_with_kwargs(request, tokenizer, &template_kwargs, None)
+    render_chat_messages(
+        request,
+        &request.messages,
+        tokenizer,
+        &template_kwargs(request),
+        None,
+    )
 }
 
 /// The kwargs a chat renders with: `default_kwargs`, then its reasoning effort and its own.
@@ -135,6 +131,30 @@ pub fn process_chat_messages_with_kwargs(
     template_kwargs: &HashMap<String, Value>,
     message_tools: Option<&MessageTools>,
 ) -> Result<ProcessedMessages, String> {
+    render_chat_messages(
+        request,
+        &request.messages,
+        tokenizer,
+        template_kwargs,
+        message_tools,
+    )
+}
+
+/// The template kwargs `process_chat_messages` renders `request` with.
+pub(crate) fn template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+    merged_template_kwargs(request, None)
+}
+
+/// `process_chat_messages` with `messages` in place of the request's own,
+/// `template_kwargs` as the template kwargs, and each message given its own
+/// `message_tools`.
+pub(crate) fn render_chat_messages(
+    request: &ChatCompletionRequest,
+    messages: &[ChatMessage],
+    tokenizer: &dyn Tokenizer,
+    template_kwargs: &HashMap<String, Value>,
+    message_tools: Option<&MessageTools>,
+) -> Result<ProcessedMessages, String> {
     let any = tokenizer.as_any();
     let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
         let inner = match any.downcast_ref::<CachedTokenizer>() {
@@ -151,7 +171,7 @@ pub fn process_chat_messages_with_kwargs(
     };
 
     let content_format = hf_tokenizer.chat_template_content_format();
-    let mut transformed_messages = process_content_format(&request.messages, content_format)?;
+    let mut transformed_messages = process_content_format(messages, content_format)?;
 
     process_tool_call_arguments(&mut transformed_messages)?;
     if let Some(declared) = message_tools {
@@ -197,16 +217,10 @@ pub fn process_chat_messages_with_kwargs(
         (typed, _) => typed,
     };
 
-    let final_template_kwargs = if template_kwargs.is_empty() {
-        None
-    } else {
-        Some(template_kwargs)
-    };
-
     let params = ChatTemplateParams {
         add_generation_prompt: true,
         tools: tools_json.as_deref(),
-        template_kwargs: final_template_kwargs,
+        template_kwargs: (!template_kwargs.is_empty()).then_some(template_kwargs),
         ..Default::default()
     };
 

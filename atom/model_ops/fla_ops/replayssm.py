@@ -48,6 +48,7 @@ __all__ = [
     "flush_threshold_ok",
     "replayssm_buffer_shapes",
     "replayssm_commit",
+    "replayssm_flush_wait",
     "replayssm_gated_delta_rule",
     "replayssm_materialize",
     "replayssm_sigmoid_gating_delta_rule",
@@ -402,6 +403,38 @@ def _replay_dot(
     return acc
 
 
+@triton.jit
+def _owns_kg_records(
+    flush_arrivals, slot, i_hv, HV: tl.constexpr, do_flush, WAIT: tl.constexpr
+):
+    """Whether this slice may overwrite the head's k/g records.
+
+    Append-only steps use the first slice; flushes use the last arrival.
+    Wait for all warp loads before the barrier and count. The record
+    stores depend on the count; release atomics would add L2 writeback.
+    """
+    owns = tl.program_id(0) == 0
+    if do_flush:
+        tl.inline_asm_elementwise(
+            WAIT, "=v,v", [i_hv], dtype=tl.int32, is_pure=False, pack=1
+        )
+        tl.debug_barrier()
+        p_count = flush_arrivals + slot * HV + i_hv
+        owns = tl.atomic_add(p_count, 1, sem="relaxed") == tl.num_programs(0) - 1
+        if owns:
+            tl.store(p_count, 0)
+    return owns
+
+
+def replayssm_flush_wait() -> str:
+    """Resolve the target's load-wait instruction when its record pool is built."""
+    return (
+        "s_wait_loadcnt 0"
+        if get_gfx_runtime().startswith("gfx12")
+        else "s_waitcnt vmcnt(0)"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Commit kernel -- runs once per forward, shared by every linear-attn layer    #
 # --------------------------------------------------------------------------- #
@@ -693,6 +726,8 @@ def _replayssm_fwd_kernel(
     buf_k,
     buf_u,
     buf_g,
+    flush_arrivals,
+    WAIT: tl.constexpr,
     write_pos,
     slot_idx,
     cu_seqlens,
@@ -862,6 +897,7 @@ def _replayssm_fwd_kernel(
         )
         b_ck += tl.sum(b_kwt * b_xk[:, None], 0)
         b_cq += tl.sum(b_kwt * b_xq[:, None], 0)
+        owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
 
         if do_flush:
             tl.store(
@@ -871,7 +907,7 @@ def _replayssm_fwd_kernel(
                 ),
                 mask=mask_k[:, None] & mask_v[None, :],
             )
-        if i_v == 0:
+        if owns_kg:
             p_bkt = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -907,7 +943,7 @@ def _replayssm_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_u.to(p_bu.dtype.element_ty), mask=mask_v)
-        if i_v == 0:
+        if owns_kg:
             p_bg2 = buf_g + slot * stride_bufg_slot + base * stride_bufg_pos
             tl.store(p_bg2 + i_hv * stride_bufg_hv, b_gt.to(p_bg2.dtype.element_ty))
         return
@@ -944,6 +980,7 @@ def _replayssm_fwd_kernel(
         IS_KDA,
     )
     if T1_FAST:
+        owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
         # T == 1: nothing chains from token to token, so S_h is never needed as
         # a value -- only its two contractions, S_h^T k and S_h^T q, and both
         # distribute over the record sum because (k_j (x) u_j)^T x = (k_j.x)u_j:
@@ -1012,7 +1049,7 @@ def _replayssm_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_u.to(p_bu.dtype.element_ty), mask=mask_v)
-        if i_v == 0:
+        if owns_kg:
             p_bk = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -1040,6 +1077,7 @@ def _replayssm_fwd_kernel(
     # is a bare k~ @ u with no transpose to stage through LDS.
     b_h = b_s0 * b_decay[:, None]
     b_h += _replay_dot(b_kw, b_ru, True, DOT_MODE)
+    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
 
     # ---- 2. flush: the checkpoint absorbs the committed prefix --------------
     if do_flush:
@@ -1098,9 +1136,7 @@ def _replayssm_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_v.to(p_bu.dtype.element_ty), mask=mask_v)
-        # k and g do not depend on the V split; let one program own the store
-        # instead of having every V-block redundantly write the same bytes.
-        if i_v == 0:
+        if owns_kg:
             p_bk = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -1407,6 +1443,9 @@ def replayssm_gated_delta_rule(
     route: str = "auto",
     o: torch.Tensor | None = None,
     fork_slots: torch.Tensor | None = None,
+    *,
+    flush_arrivals: torch.Tensor,
+    flush_wait: str,
 ) -> torch.Tensor:
     """ReplaySSM forward for one linear-attention layer.
 
@@ -1430,6 +1469,10 @@ def replayssm_gated_delta_rule(
             instead of a fresh tensor, saving the caller a device copy.
         fork_slots: a state fork's (write, source) slot pairs, see
             :func:`seed_forked_slots`.
+        flush_arrivals: zero-initialized contiguous int32 ``[num_slots, HV]``
+            scratch owned by this layer's record pool, retained through queued
+            work and graph replay. A flushing launch resets the counters it uses.
+        flush_wait: :func:`replayssm_flush_wait` resolved once at pool creation.
 
     Returns:
         ``o`` of shape ``[1, T_tot, HV, V]`` -- same leading-batch convention
@@ -1547,6 +1590,8 @@ def replayssm_gated_delta_rule(
         buf_k=buf_k,
         buf_u=buf_u,
         buf_g=buf_g,
+        flush_arrivals=flush_arrivals,
+        WAIT=flush_wait,
         write_pos=write_pos,
         slot_idx=slot_idx,
         cu_seqlens=cu_seqlens,
@@ -1634,6 +1679,8 @@ def _replayssm_kda_fwd_kernel(
     buf_k,
     buf_u,
     buf_g,
+    flush_arrivals,
+    WAIT: tl.constexpr,
     write_pos,
     slot_idx,
     cu_seqlens,
@@ -1730,6 +1777,7 @@ def _replayssm_kda_fwd_kernel(
     # KDA keeps the state transposed as [BV, BK], so the contraction is u^T @ k~.
     b_h = b_h * b_decay[None, :]
     b_h += _replay_dot(tl.trans(b_ru), b_kw, False, DOT_MODE)
+    owns_kg = _owns_kg_records(flush_arrivals, slot, i_hv, HV, do_flush, WAIT)
 
     if do_flush:
         tl.store(p_ckpt_hv, b_h.to(p_ckpt_hv.dtype.element_ty), mask=mask_h)
@@ -1773,7 +1821,7 @@ def _replayssm_kda_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_v.to(p_bu.dtype.element_ty), mask=mask_v)
-        if i_v == 0:
+        if owns_kg:
             p_bk = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -1820,6 +1868,9 @@ def replayssm_sigmoid_gating_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     lower_bound: float | None = None,
     fork_slots: torch.Tensor | None = None,
+    *,
+    flush_arrivals: torch.Tensor,
+    flush_wait: str,
 ) -> torch.Tensor:
     """ReplaySSM for the KDA (Kimi-K3) linear-attention layer.
 
@@ -1829,7 +1880,8 @@ def replayssm_sigmoid_gating_delta_rule(
     speculative token.  See the module docstring for the algebra.
 
     ``o`` may be passed to write the output in place (K3 does this);
-    ``fork_slots`` as in :func:`replayssm_gated_delta_rule`.
+    ``fork_slots``, ``flush_arrivals`` and ``flush_wait`` follow
+    :func:`replayssm_gated_delta_rule`.
     """
     assert q.shape[0] == 1, "varlen layout expected (B == 1)"
     seed_forked_slots(ckpt, fork_slots)
@@ -1878,6 +1930,8 @@ def replayssm_sigmoid_gating_delta_rule(
         buf_k=buf_k,
         buf_u=buf_u,
         buf_g=buf_g,
+        flush_arrivals=flush_arrivals,
+        WAIT=flush_wait,
         write_pos=write_pos,
         slot_idx=slot_idx,
         cu_seqlens=cu_seqlens,
