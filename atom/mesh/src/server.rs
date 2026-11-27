@@ -225,9 +225,13 @@ async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Respo
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
-        .await
-        .into_response()
+    WorkerManager::get_all_worker_loads(
+        &state.context.worker_registry,
+        &state.context.client,
+        state.context.router_config.backend,
+    )
+    .await
+    .into_response()
 }
 
 async fn create_worker(

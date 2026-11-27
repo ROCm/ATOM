@@ -84,6 +84,7 @@ async fn create_mocker_context_inner(
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
+        config.backend,
         config.worker_startup_check_interval_secs,
     )));
     let worker_job_queue = Arc::new(OnceLock::new());

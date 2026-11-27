@@ -198,6 +198,7 @@ mod pd_routing_unit_tests {
                     worker_registry.clone(),
                     policy_registry.clone(),
                     client.clone(),
+                    config.backend,
                     config.worker_startup_check_interval_secs,
                 )));
 
