@@ -636,6 +636,24 @@ def _shared_fold_weights_of(mlp: "MiniMaxM3MLP") -> dict | None:
     return _prepare_shared_fold_weights(w13, s13, w2, s2)
 
 
+
+def _register_deferred_tail_launch() -> None:
+    """gfx1250: GEMM2 + the deferred tail + the all-reduce in one launch (mono/gfx1250/moe_tail_ar); elsewhere,
+    or without its kernels, the tail stays in the all-reduce as before (logged once)."""
+    try:
+        from atom.models.minimax_m3.mono.gfx1250.moe_tail_ar import (
+            register_deferred_tail_launch,
+        )
+    except ImportError as e:
+        _log_once(
+            "moe_tail_launch",
+            f"MiniMax-M3: the one-launch MoE tail is not available ({e}); "
+            "GEMM2 and the tail all-reduce run as separate launches",
+            warn=True,
+        )
+        return
+    register_deferred_tail_launch()
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax-M3 routed MoE for MXFP4 checkpoints."""
 
@@ -772,6 +790,9 @@ class MiniMaxM3MoE(nn.Module):
             and tp_size > 1
             and get_pp_group().world_size == 1
         )
+        if self._tail_in_ar:
+            # gfx1250 TP4 decode: GEMM2 + this tail + the all-reduce in one launch (mono/gfx1250/moe_tail_ar)
+            _register_deferred_tail_launch()
         self._owner_layer = None
         # ATOM_MINIMAX_M3_MOE_ROUTED_FIRST: the router launches before the shared
         # MLP's kernels (dual stream + glue epilogue + fused router only).
@@ -881,6 +902,7 @@ class MiniMaxM3MoE(nn.Module):
         shared_output: torch.Tensor | None,
         before_add=None,
         launch_shared=None,
+        route_and_experts=None,
     ) -> torch.Tensor:
         """`_scale_routed(routed) + shared_output` with the scale and the add in
         the routed MoE's gather-reduce when aiter takes the epilogue; `before_add`
@@ -891,7 +913,10 @@ class MiniMaxM3MoE(nn.Module):
         launches the shared MLP and returns its output; it runs right after the
         router launch (or after the routed MoE when no router hook ran).
         ATOM_MINIMAX_M3_MOE_TAIL_IN_AR: the gather-reduce may be deferred into
-        the all-reduce that reads the returned (then unwritten) tensor."""
+        the all-reduce that reads the returned (then unwritten) tensor.
+        `route_and_experts`: the routed branch in place of `_route_and_experts`."""
+        if route_and_experts is None:
+            route_and_experts = self._route_and_experts
         defer = getattr(self, "_tail_in_ar", False) and self._defer_tail_now(
             hidden_states
         )
@@ -911,7 +936,7 @@ class MiniMaxM3MoE(nn.Module):
 
                     stack.enter_context(moe_after_router_hook(_after_router))
                 scope = stack.enter_context(_moe_defer_tail()) if defer else None
-                routed_output = self._route_and_experts(hidden_states)
+                routed_output = route_and_experts(hidden_states)
             if scope is not None and scope.deferred is None:
                 _log_once(
                     f"nodefer_{hidden_states.shape[0]}",
@@ -993,15 +1018,41 @@ class MiniMaxM3MoE(nn.Module):
             )
         return routed_output.view(orig_shape)
 
+    def _front_moe_forward(self, hidden_states: torch.Tensor, front) -> torch.Tensor:
+        """One stream, after the layer's MoE-front launch (launch A ``mf``): it routed
+        `hidden_states` (its own output), wrote their MXFP4 rows and ran the shared
+        expert. The routed experts take its routes and rows; its shared output is the
+        gather's addend with no join, so the deferred tail may run in the next
+        all-reduce's launch (aiter ``moe_tail_ar``). Production's bits."""
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+            MoeRouterQuantRows,
+            moe_router_quant_rows,
+        )
+
+        rows = MoeRouterQuantRows(front.xq, front.xs)
+        routing = (front.topk_weights, front.topk_ids)
+
+        def route_and_experts(x: torch.Tensor) -> torch.Tensor:
+            with moe_router_quant_rows(front.topk_ids, rows):
+                return self.experts.forward_impl(x, None, routing=routing)
+
+        return self._routed_plus_shared(
+            hidden_states, front.shared, route_and_experts=route_and_experts
+        )
+
     def dual_stream_moe_forward(
         self,
         hidden_states: torch.Tensor,
         shared_in: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Overlap the independent shared MLP with the routed MoE branch (or,
-        with the shared fold, run it inside the routed MoE's launches)."""
+        with the shared fold, run it inside the routed MoE's launches; or, after
+        the layer's MoE-front launch, on one stream)."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
+        front = launch_a.take_moe_front(self, hidden_states)
+        if front is not None:
+            return self._front_moe_forward(hidden_states, front).view(orig_shape)
         if (
             getattr(self, "_shared_fold_weights", None) is not None
             and hidden_states.shape[0] not in self._shared_fold_declined
