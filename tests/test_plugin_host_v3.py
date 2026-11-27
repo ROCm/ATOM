@@ -540,3 +540,44 @@ def test_a_model_built_again_registers_its_spans_anew():
         host.span_op("toy.block.span", "L0", lambda x, e: x, lambda x, e: x)
     host.new_model_build()
     host.span_op("toy.block.span", "L0", lambda x, e: x, lambda x, e: x)
+
+
+def test_the_runner_steps_are_the_host_calls_in_their_order(monkeypatch):
+    calls = []
+    for name in ("install_modules", "check_plan", "prepare_plan", "freeze_weights"):
+        monkeypatch.setattr(
+            host, name, lambda *a, _n=name, **k: calls.append((_n, a, k))
+        )
+    model, draft = object(), object()
+    host.install_built(model, types.SimpleNamespace(model=draft))
+    host.install_built(model)
+    assert calls == [
+        ("install_modules", (model,), {}),
+        ("install_modules", (draft,), {"prefix": "draft"}),
+        ("check_plan", (), {}),
+        ("install_modules", (model,), {}),
+        ("check_plan", (), {}),
+    ]
+    calls.clear()
+    host.prepare_built("cuda:0", model, types.SimpleNamespace(model=draft))
+    host.prepare_built("cuda:0", model)
+    assert calls == [
+        ("prepare_plan", ("cuda:0",), {}),
+        ("freeze_weights", (model, draft), {"prefixes": ("", "draft")}),
+        ("prepare_plan", ("cuda:0",), {}),
+        ("freeze_weights", (model, None), {"prefixes": ("", "draft")}),
+    ]
+
+
+def test_the_runner_configures_from_the_config_and_a_stand_in_is_native(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        host, "configure", lambda plan=None, **kw: seen.append((plan, kw))
+    )
+    config = types.SimpleNamespace(plugin_source="src", plugin_arm="native")
+    host.configure_runner(config)
+    host.configure_runner(types.SimpleNamespace())
+    assert seen == [
+        ("src", {"arm": "native", "config": config}),
+        (None, {"arm": "plugin", "config": seen[1][1]["config"]}),
+    ]

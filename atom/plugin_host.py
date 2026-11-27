@@ -1212,6 +1212,17 @@ def configure(
         logger.info("plugin_host: %s", status())
 
 
+def configure_runner(config: Any) -> None:
+    """`configure` for the runner: the plan and the arm ride the engine
+    ``Config`` (``plugin_source`` / ``plugin_arm``); a config without them (a
+    stand-in) is native."""
+    configure(
+        getattr(config, "plugin_source", None),
+        arm=getattr(config, "plugin_arm", "plugin"),
+        config=config,
+    )
+
+
 def _route_tables(plan) -> dict[Any, dict[str, tuple[_Route, ...]]]:
     from atom import plugin_recipe
 

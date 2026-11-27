@@ -974,9 +974,7 @@ class ModelRunner:
 
         # A recipe's plan (--plugin-recipe) before the build: the model's seams
         # bind as it is built, and the plan may name the model class to build.
-        plugin_host.configure(
-            config.plugin_source, arm=config.plugin_arm, config=config
-        )
+        plugin_host.configure_runner(config)
         self.model = get_model(config, self.device, self._build_and_load_model)
         # After weight processing, before warmup and capture. Here rather than in
         # the loader so a runner that builds its model differently still sets it.
