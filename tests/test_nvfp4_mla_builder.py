@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """The MLA metadata builder under ATOM_MLA_NVFP4: what it refuses at startup,
 the tail and CSR it allocates before KV sizing, and that releasing the KV pools
