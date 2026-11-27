@@ -1204,6 +1204,9 @@ class Scheduler:
         # seq id -> when `has_forward_work` first saw it blocked on a tier lookup
         # (ATOM_DP_IDLE_WHEN_BLOCKED). Bounded by the waiting queue.
         self._forward_blocked_since: dict[int, float] = {}
+        # Whether `prestart_tier_loads` already ran this tick's early tier load
+        # (consumed by the next `_schedule`).
+        self._early_load_prestarted = False
         # (seq id, prompt tokens reused) of requests `share_cache` routing placed
         # on an estimated prefix, for the CoreManager (`_note_dp_reuse`).
         self.dp_reuse_reports: list[tuple] = []
@@ -2696,21 +2699,19 @@ class Scheduler:
             )
         if self.enable_dynamic_chunking:
             self._record_prefill_supply()
-        if self.kv_connector is not None and self.waiting:
-            prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
-            if prefetch is not None:
-                # Includes requests whose lookup will be detached: the lookup
-                # still refreshes the tier's LRU (`_can_detach_tier_lookup`).
-                prefetch(
-                    itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
-                )
-
         # Start tier loads for waiting requests whose lookup answered, on this
         # tick whatever the delayer decides. Before the delayer so a request
         # whose load is in flight is not counted as prefillable work (and so a
         # FIRE is not spent on nothing). Local to this rank: no collective, and
-        # nothing is scheduled for prefill here.
-        self._early_load_tier_prefixes()
+        # nothing is scheduled for prefill here. Skipped, with the lookup
+        # prefetch before it, when the engine already ran this tick's pass
+        # ahead of `schedule()` (`prestart_tier_loads`), so the per-tick bounds
+        # stay per step.
+        if self._early_load_prestarted:
+            self._early_load_prestarted = False
+        else:
+            self._prefetch_waiting_lookups()
+            self._early_load_tier_prefixes()
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
@@ -5039,6 +5040,108 @@ class Scheduler:
         if parked:
             logger.debug("[EARLY-LOAD] parked %d tier load(s)", parked)
         return parked
+
+    def _prefetch_waiting_lookups(self) -> None:
+        """Submit the async tier lookups of the head of `waiting`, once per
+        tick (from `_schedule`, or from `prestart_tier_loads` when it runs that
+        tick's early tier load instead)."""
+        if self.kv_connector is None or not self.waiting:
+            return
+        prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
+        if prefetch is not None:
+            # Includes requests whose lookup will be detached: the lookup
+            # still refreshes the tier's LRU (`_can_detach_tier_lookup`).
+            prefetch(itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH))
+
+    def prestart_tier_loads(self) -> list[Sequence]:
+        """Run this tick's early tier load ahead of `schedule()` and return the
+        requests it parked (`ATOM_OFFLOAD_LOAD_EVENT_WAIT`).
+
+        Exactly the early load `_schedule` runs (same lookup prefetch, same
+        `_early_load_tier_prefixes`, same KV-pressure bounds), only earlier, so
+        the engine can ship the loads before it schedules and let their
+        completion events, rather than the end of the next forward, decide when
+        they become prefillable. It *is* that tick's pass: the `schedule()` that
+        follows skips its own, so the per-tick bounds (`_EARLY_LOAD_PER_TICK`,
+        retry and prune cadence) stay per step. State loads it queued are
+        published now so a joint load leaves with the first metadata build.
+
+        Not while a decode is running: this pass allocates, and a running
+        decode's page reservation (`reserved_decode_blocks`) is installed only
+        inside `_schedule()`. That is an ordering requirement, not a tuning
+        choice; the pass inside `_schedule()`, behind the reservation, runs
+        instead.
+        """
+        if not self.waiting or self._has_running_decode():
+            return []
+        self._prefetch_waiting_lookups()
+        entries = self._early_load.entries
+        before = set(entries)
+        self._early_load_prestarted = True
+        if not self._early_load_tier_prefixes():
+            return []
+        started = [
+            seq
+            for seq_id, (seq, _) in entries.items()
+            if seq_id not in before
+            and seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        ]
+        if started:
+            self._publish_state_loads()
+        return started
+
+    def _has_running_decode(self) -> bool:
+        """Whether `running` holds anything besides partial prefills."""
+        return len(self.running) > self._partial_prefill_count
+
+    def load_wait_tradeoff(self, loading: list[Sequence]) -> tuple[int, int]:
+        """(gain, cost) of holding this tick's forward for the tier loads of
+        `loading` (the engine's event-driven load wait).
+
+        gain: requests of `loading` still in flight that this tick could admit
+        if their load landed now -- a free request slot each, and the prefill
+        ahead of them in `waiting` order (partial prefills, then admittable
+        waiters with the router's cached-prefix estimate) leaves token budget.
+        Each one that lands in time prefills one forward earlier.
+
+        cost: requests this tick's forward carries anyway -- everything in
+        `running` (partial prefills and decodes) plus the admittable waiters
+        that fit ahead of the last admittable target. Each one is delayed by
+        whatever the engine waits. Requests further back are delayed too, but
+        the next forward no longer has to carry the loaded prefill, which hands
+        them that capacity back; to first order the two cancel, so they are not
+        counted.
+
+        Pure: no allocation, no collective, no state change. Best effort like
+        the delayer's fill signal; a wrong count costs at most the bounded wait
+        or one step of latency, never correctness.
+        """
+        targets = {id(seq) for seq in loading if self._still_loading(seq)}
+        cost = len(self.running)
+        slots = self.max_num_seqs - len(self.running)
+        if not targets or slots <= 0:
+            return 0, cost
+        budget = self.max_num_batched_tokens
+        ahead = self._partial_prefill_remaining_tokens()
+        gain = 0
+        carried = 0  # admittable non-target waiters seen so far
+        for seq in self.waiting:
+            if ahead >= budget or slots <= 0:
+                break
+            if id(seq) in targets:
+                gain += 1
+                slots -= 1
+                cost += carried
+                carried = 0
+                ahead += self.pending_prefill_tokens(seq)
+                targets.discard(id(seq))
+                if not targets:
+                    break
+            elif self._is_admittable_prefill(seq):
+                carried += 1
+                slots -= 1
+                ahead += self.pending_prefill_tokens(seq, estimate=True)
+        return gain, cost
 
     def _early_load_admit(
         self,

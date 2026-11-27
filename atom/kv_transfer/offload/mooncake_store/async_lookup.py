@@ -19,9 +19,15 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager
 from threading import Condition, RLock
 
+from atom.kv_transfer import progress_doorbell
 from atom.kv_transfer.offload.lookup_client import LookupClient
 
 logger = logging.getLogger("atom")
+
+
+def _ring_kv_progress(_future) -> None:
+    progress_doorbell.ring()
+
 
 # How long the scheduler thread waits for its own advisory renewal RPC: a slow
 # Store RPC must not stall the scheduler and, through the DP lockstep, its peers.
@@ -327,6 +333,9 @@ class AsyncStoreLookup(LookupClient):
             future = self.renew_executor.submit(self._renew_keys, keys)
             if future is None or future.cancelled():
                 return "rejected"
+            # The load it holds back can leave now: wake an engine holding its
+            # step for it (`EngineCore._wait_for_loads`); a no-op otherwise.
+            future.add_done_callback(_ring_kv_progress)
             ticket = self._renewals[sid] = (ident, future, time.monotonic())
         _, future, submitted = ticket
         if future.done():

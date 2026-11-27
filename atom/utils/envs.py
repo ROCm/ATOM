@@ -1571,6 +1571,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
+    # Default on (0 turns it off). Event-driven load wait: each step of the
+    # single-engine and DP loops runs the early tier load ahead of schedule()
+    # and, when the trade pays, holds the step until the loads it started
+    # land, woken by the workers' load-completion doorbell, not a sleep. No
+    # fixed wait: the bound is the measured forward time weighted by how many
+    # requests gain against how many the hold delays (`LoadWaitState.
+    # budget_s`), so a running decode makes it ~0 and a cold engine never
+    # holds. Inert without an offload tier that loads early (Mooncake Store).
+    "ATOM_OFFLOAD_LOAD_EVENT_WAIT": lambda: _flag_env(
+        "ATOM_OFFLOAD_LOAD_EVENT_WAIT", "1"
+    ),
     # Minimum external-tier hit worth loading, in tokens. None when unset: each
     # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(
