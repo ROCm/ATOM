@@ -3,13 +3,20 @@
 # Copyright (c) 2026 ATOM Project Contributors
 """The Mooncake image embedding transfer: P pulls E's rows over RDMA.
 
-E keeps each request's embedding rows in a pool of GPU memory registered with
-a Mooncake TransferEngine and answers with a handle; P reads the rows with
-``transfer_sync_read``. An entry is ``[generation word | rows]``. E reuses
-space oldest-first, and only once an entry's lease has expired; it changes an
-entry's word before writing over the entry. P reads the rows, then rereads the
-word: a word other than the one in the handle means the rows may be another
-request's, and P encodes the images itself.
+E registers one region with a Mooncake TransferEngine: a slot table, then a
+pool of rows. Each entry's rows sit in the pool, and its slot holds
+``(generation, address, length, ack)``; rows never overlap a slot. E answers
+with a handle naming the rows and the slot, and P reads the rows, then the
+slot, with ``transfer_sync_read``. A slot whose three values differ from the
+handle's means the rows may have been given up or overwritten, and P encodes
+the images itself.
+
+E reuses pool space and slots oldest-first, and only once an entry's lease
+has expired. Before writing over an entry it zeroes the entry's slot, and it
+writes a new entry's slot after its rows. Generations only grow, so a slot
+never matches a handle given out for another entry. ``ack`` is written 0 and
+reserved for P to acknowledge a read, so that E can reclaim the entry before
+its lease ends.
 
 Neither ``MooncakeEcWriter`` nor ``MooncakeEcReader`` locks: each is used by
 one thread at a time (E's encoder thread puts, P's model runner reads).
@@ -20,14 +27,14 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-from atom.ec_transfer.base import EcStoreFull, dtype_name, handle_matches
+from atom.ec_transfer.base import EcStoreFull, dtype_name, handle_mismatch
 from atom.utils import envs, mooncake_hca
 from atom.utils.network import get_ip
 from atom.utils.numa_utils import _physical_index
@@ -43,9 +50,10 @@ except ImportError:
 
 TRANSPORT = "mooncake"
 DEFAULT_PROTOCOL = "rdma"
-_WORD = 8  # bytes of the generation word that starts an entry
+_SLOT_FIELDS = 4  # generation, address, length, ack: int64 each
+_SLOT = _SLOT_FIELDS * 8  # bytes of a slot
 _ALIGN = 64  # entry start alignment in the pool
-_INVALID = 0  # the word of an entry E has given up; no generation is 0
+DEFAULT_SLOTS = 4096  # entries E can hold at once, whatever their size
 
 
 def _open_engine(
@@ -112,6 +120,7 @@ def _positive_int(value: Any) -> bool:
 class _Entry:
     start: int
     end: int
+    slot: int
     created: float
 
 
@@ -124,22 +133,30 @@ class MooncakeEcWriter:
         device: torch.device | str,
         *,
         protocol: str = DEFAULT_PROTOCOL,
+        slots: int = DEFAULT_SLOTS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._buf = torch.zeros(size_bytes, dtype=torch.uint8, device=device)
-        self._engine, self.session = _open_engine(self._buf.device, protocol)
-        _register(self._engine, self._buf)
+        # One registration: the slot table, then the pool.
+        self._region = torch.zeros(
+            slots * _SLOT + size_bytes, dtype=torch.uint8, device=device
+        )
+        self._slots = self._region[: slots * _SLOT].view(torch.int64).view(slots, -1)
+        self._buf = self._region[slots * _SLOT :]
+        self._engine, self.session = _open_engine(self._region.device, protocol)
+        _register(self._engine, self._region)
         self._lease_s = envs.ATOM_EC_LEASE_S
         self._clock = clock
         self._entries: deque[_Entry] = deque()
-        # Random start: a word left inside another entry's rows never matches.
+        self._free_slots: deque[int] = deque(range(slots))
+        # A random start: a restarted E never reissues a past generation.
         self._generation = int.from_bytes(os.urandom(6), "little") + 1
 
-    def _word(self, offset: int) -> torch.Tensor:
-        return self._buf[offset : offset + _WORD].view(torch.int64)
+    def _slot_address(self, slot: int) -> int:
+        return self._region.data_ptr() + slot * _SLOT
 
-    def _place(self, need: int) -> int:
-        """Start of ``need`` free bytes, evicting expired entries oldest-first."""
+    def _place(self, need: int) -> tuple[int, int]:
+        """Start of ``need`` free bytes and a free slot, evicting expired
+        entries oldest-first."""
         if need > self._buf.numel():
             raise EcStoreFull(
                 f"{need} bytes of embeddings exceed the {self._buf.numel()} byte pool"
@@ -150,36 +167,43 @@ class MooncakeEcWriter:
         end = start + need
         now = self._clock()
         victims = []
-        while any(e.start < end and start < e.end for e in self._entries):
+        while not self._free_slots or any(
+            e.start < end and start < e.end for e in self._entries
+        ):
             oldest = self._entries[0]
             if now - oldest.created < self._lease_s:
                 self._entries.extendleft(reversed(victims))
+                for e in victims:
+                    self._free_slots.remove(e.slot)
                 raise EcStoreFull(
-                    f"pool of {self._buf.numel()} bytes is full: every entry in "
-                    f"the way is inside its {self._lease_s} s lease"
+                    f"pool of {self._buf.numel()} bytes and "
+                    f"{len(self._slots)} slots is full: every entry in the way "
+                    f"is inside its {self._lease_s} s lease"
                 )
             victims.append(self._entries.popleft())
+            self._free_slots.append(victims[-1].slot)
         if victims:
             for e in victims:
-                self._word(e.start).fill_(_INVALID)
-            _sync(self._buf)
-        return start
+                self._slots[e.slot].zero_()
+            _sync(self._region)
+        return start, self._free_slots.popleft()
 
     def put(self, key: int, rows: torch.Tensor) -> dict[str, Any]:
         """Store ``rows`` and return the handle P reads them by.
-
-        ``address`` is the entry's generation word; the rows follow it.
-        Raises ``EcStoreFull`` when no space is past its lease.
-        """
+        Raises ``EcStoreFull`` when no space or slot is past its lease."""
         payload = rows.contiguous().view(-1).view(torch.uint8)
-        need = -(-(_WORD + payload.numel()) // _ALIGN) * _ALIGN
-        start = self._place(need)
+        need = -(-payload.numel() // _ALIGN) * _ALIGN
+        start, slot = self._place(need)
         self._generation += 1
-        body = start + _WORD
-        self._buf[body : body + payload.numel()].copy_(payload)
-        self._word(start).fill_(self._generation)
-        _sync(self._buf)
-        self._entries.append(_Entry(start, start + need, self._clock()))
+        address = self._buf.data_ptr() + start
+        self._buf[start : start + payload.numel()].copy_(payload)
+        # The rows, then their slot: a slot P reads as matching names rows
+        # already written. Both land before the handle leaves E.
+        self._slots[slot].copy_(
+            torch.tensor([self._generation, address, payload.numel(), 0])
+        )
+        _sync(self._region)
+        self._entries.append(_Entry(start, start + need, slot, self._clock()))
         return {
             "transport": TRANSPORT,
             "key": key,
@@ -187,15 +211,19 @@ class MooncakeEcWriter:
             "dtype": dtype_name(rows.dtype),
             TRANSPORT: {
                 "session": self.session,
-                "address": self._buf.data_ptr() + start,
+                "address": address,
                 "length": payload.numel(),
                 "generation": self._generation,
+                "slot": self._slot_address(slot),
             },
         }
 
 
 class MooncakeEcReader:
-    """P's side: reads rows from E's pool into a registered buffer."""
+    """P's side: reads rows from E's pool into a registered buffer.
+
+    ``fallbacks`` counts the reads that returned None, by reason; each is
+    logged with its reason and the running counts."""
 
     def __init__(
         self,
@@ -209,8 +237,8 @@ class MooncakeEcReader:
         ``ib_enable_alternate_hca`` and ``ib_hca_count`` the reader's engine
         takes as the KV connector's does."""
         kv = kv_transfer_config or {}
-        # The reread generation word, then the rows.
-        self._buf = torch.zeros(size_bytes + _WORD, dtype=torch.uint8, device=device)
+        # The reread slot, then the rows.
+        self._buf = torch.zeros(size_bytes + _SLOT, dtype=torch.uint8, device=device)
         self._engine, _ = _open_engine(
             self._buf.device,
             protocol,
@@ -219,44 +247,61 @@ class MooncakeEcReader:
             hca_count=int(kv.get("ib_hca_count", 8)),
         )
         _register(self._engine, self._buf)
+        self.fallbacks: Counter[str] = Counter()
+
+    def _fallback(self, reason: str, session: Any = None) -> None:
+        self.fallbacks[reason] += 1
+        logger.warning(
+            "Image embeddings from %s unusable: %s; running the vision tower "
+            "(fallbacks so far: %s)",
+            session,
+            reason,
+            dict(self.fallbacks),
+        )
 
     def get(
         self, handle: dict[str, Any], key: int, dtype: torch.dtype
     ) -> torch.Tensor | None:
         """The rows E stored for ``key``, or None if P must encode itself."""
-        if not handle_matches(handle, TRANSPORT, key, dtype):
+        reason = handle_mismatch(handle, TRANSPORT, key, dtype)
+        if reason is not None:
+            self._fallback(reason)
             return None
         where = handle[TRANSPORT]
         session = where.get("session")
         address, length = where.get("address"), where.get("length")
-        generation = where.get("generation")
-        # A generation of 0 would match a given-up or never-written entry.
+        generation, slot = where.get("generation"), where.get("slot")
+        # A generation of 0 would match a given-up or never-written slot.
         if not (
             isinstance(session, str)
             and _positive_int(address)
             and _positive_int(generation)
             and _positive_int(length)
+            and _positive_int(slot)
             and length % (handle["rows"] * dtype.itemsize) == 0
         ):
-            logger.warning("Malformed image embedding handle: %s", where)
+            self._fallback("malformed handle", session)
             return None
-        if length > self._buf.numel() - _WORD:
-            logger.warning(
-                "Image embeddings of %d bytes exceed the %d byte read buffer",
-                length,
-                self._buf.numel() - _WORD,
+        if length > self._buf.numel() - _SLOT:
+            self._fallback(
+                f"{length} bytes exceed the {self._buf.numel() - _SLOT} byte "
+                "read buffer",
+                session,
             )
             return None
+        # Work queued on this buffer (its zero fill, the previous read's
+        # clone) must finish before the NIC writes into it.
+        _sync(self._buf)
         ptr = self._buf.data_ptr()
-        ret = self._engine.transfer_sync_read(
-            session, ptr + _WORD, address + _WORD, length
-        )
+        ret = self._engine.transfer_sync_read(session, ptr + _SLOT, address, length)
         if ret == 0:
-            ret = self._engine.transfer_sync_read(session, ptr, address, _WORD)
+            ret = self._engine.transfer_sync_read(session, ptr, slot, _SLOT)
         if ret != 0:
-            logger.warning("Image embedding read from %s failed (ret=%d)", session, ret)
+            self._fallback(f"read failed (ret={ret})", session)
             return None
-        if self._buf[:_WORD].view(torch.int64).item() != generation:
+        seen = self._buf[:_SLOT].view(torch.int64).tolist()
+        if seen[:3] != [generation, address, length]:
+            self._fallback("entry given up or reused", session)
             return None
-        rows = self._buf[_WORD : _WORD + length].view(dtype)
+        rows = self._buf[_SLOT : _SLOT + length].view(dtype)
         return rows.view(handle["rows"], -1).clone()
