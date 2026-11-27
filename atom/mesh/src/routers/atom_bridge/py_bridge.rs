@@ -3,7 +3,7 @@
 //! to LLMEngine / CoreManager; each engine step comes back in one
 //! `StepSink.push`.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -12,7 +12,6 @@ use pyo3::{
     prelude::*,
     types::{PyDict, PyList},
 };
-use serde_json::{Map, Value};
 use tracing::{debug, warn};
 
 use super::{
@@ -21,15 +20,12 @@ use super::{
     },
     RequestExtras,
 };
-use axum::response::Response;
-
 use crate::{
     core::placement::types::PlacementPlan,
     protocols::common::StringOrArray,
     routers::{
-        comm::error,
         grpc::engine::Dispatcher,
-        prepare::{generation_payload::GenerationPayload, RenderedChat},
+        prepare::generation_payload::GenerationPayload,
         token_handle::{engine_error::EngineError, token_handle::TokenHandle},
     },
 };
@@ -174,7 +170,7 @@ impl BridgeRequest {
         params.set_item("tool_choice_required", extras.tool_choice_required)?;
         params.set_item("dp_session_id", &extras.dp_session_id)?;
         params.set_item("dp_parent_session_id", &extras.dp_parent_session_id)?;
-        params.set_item("prompt_handle", extras.prompt_handle)?;
+        params.set_item("chat", &extras.chat_json)?;
         Ok(params)
     }
 }
@@ -283,52 +279,6 @@ fn submit(
         call_abort(bridge, key);
     }
     Ok(siblings)
-}
-
-/// The chat prompt rendered by `TokenBridge.render_chat`, for a model whose
-/// template the router cannot render (a Python message encoder, or a
-/// tokenizer with no Jinja template), from the `body` the client sent with
-/// the `template_kwargs` merged over its own, and the handle `submit`
-/// collects its encoding by (`prompt_handle`). A `ValueError` is the
-/// request's fault.
-pub(crate) async fn render_chat(
-    bridge: &Arc<Py<PyAny>>,
-    body: &Map<String, Value>,
-    template_kwargs: Option<&HashMap<String, Value>>,
-) -> Result<(RenderedChat, Option<u64>), Response> {
-    let mut body = body.clone();
-    if let Some(kwargs) = template_kwargs {
-        let kwargs = serde_json::to_value(kwargs)
-            .map_err(|e| error::internal_error("serialize_failed", e.to_string()))?;
-        body.insert("chat_template_kwargs".to_string(), kwargs);
-    }
-    let body = Value::Object(body).to_string();
-    let bridge = Arc::clone(bridge);
-    let rendered = tokio::task::spawn_blocking(move || {
-        Python::attach(|py| {
-            bridge
-                .bind(py)
-                .call_method1("render_chat", (body,))
-                .and_then(|r| r.extract::<(String, Vec<u32>, Option<String>, Option<u64>)>())
-                .map_err(|e| py_err_to_engine(py, &e))
-        })
-    })
-    .await
-    .map_err(|e| error::internal_error("render_task_failed", e.to_string()))?;
-    match rendered {
-        Ok((text, token_ids, prompt_opener, handle)) => Ok((
-            RenderedChat {
-                text,
-                token_ids,
-                prompt_opener,
-            },
-            handle,
-        )),
-        Err(EngineError::RequestBuildFailed(message)) => {
-            Err(error::bad_request("process_messages_failed", message))
-        }
-        Err(other) => Err(error::internal_error("render_failed", format!("{other:?}"))),
-    }
 }
 
 /// A `ValueError` is the request's fault (400); anything else, the server's.

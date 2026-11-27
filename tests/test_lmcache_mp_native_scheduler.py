@@ -689,7 +689,7 @@ def test_loads_are_not_limited_by_the_save_limit(monkeypatch):
     terminal(scheduler, request.save_operation)
 
 
-def engine_scheduler(monkeypatch, *, adapter=None, **overrides):
+def engine_scheduler(monkeypatch, *, adapter=None, role="offload", **overrides):
     adapter = adapter if adapter is not None else Adapter()
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
     monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
@@ -705,7 +705,7 @@ def engine_scheduler(monkeypatch, *, adapter=None, **overrides):
         state_checkpoint_demand=False,
         kv_transfer_config={
             "kv_connector": "lmcache_mp",
-            "kv_role": "offload",
+            "kv_role": role,
             "kv_connector_extra_config": {
                 "lmcache.chunk_size": 8,
             },
@@ -828,6 +828,36 @@ def test_engine_holds_back_a_restore_while_every_restore_slot_is_taken(monkeypat
     assert connector.lookup_pending(fourth) is True
     assert impl._lookup_client.lookup(fourth.token_ids, str(fourth.id)) == 0
     assert connector.lookup_pending(fourth) is False
+
+
+def test_full_restore_slots_do_not_hold_a_request_once_lookups_are_off(monkeypatch):
+    """With lookups off a request without an answer starts no load, so it
+    needs no restore slot; one that holds an answer still waits for one."""
+    engine, connector, adapter = engine_scheduler(
+        monkeypatch, adapter=_MissFromAdapter(400), role="kv_consumer"
+    )
+    seqs = [
+        Sequence(list(range(100 * i, 100 * i + 24)), 4, has_per_req_cache=True)
+        for i in range(3)
+    ]
+    for seq in seqs:
+        engine.add(seq)
+    engine.schedule()
+    assert seqs[2].status == SequenceStatus.WAITING  # both slots are taken
+
+    assert connector.set_offload_lookups(False) is True
+    queries = len(adapter.queries)
+    newcomer = Sequence(list(range(300, 324)), 4, has_per_req_cache=True)
+    engine.add(newcomer)
+    engine.schedule()
+    assert seqs[2].status == newcomer.status == SequenceStatus.RUNNING
+    assert len(adapter.queries) == queries
+
+    impl = connector._require_impl()
+    holder = Sequence(list(range(200, 224)), 4, has_per_req_cache=True)
+    hit = impl._lookup_client.lookup(holder.token_ids, str(holder.id))
+    impl._lookup_results[str(holder.id)] = (holder, hit)
+    assert connector.lookup_pending(holder) is True
 
 
 class _AsyncAdapter(_Adapter):

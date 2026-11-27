@@ -5,10 +5,8 @@
 OpenAI server's, a request's sequences through CoreManager, its outputs back
 to Rust once per step, and abort."""
 
-import itertools
 import threading
 import types
-from collections import OrderedDict
 
 import pytest
 
@@ -21,7 +19,6 @@ from atom.entrypoints.openai.protocol import (
     DEFAULT_TOP_P,
 )
 from atom.model_engine.request import RequestOutput
-from atom.model_engine.segment_tokenizer import PrefixEncoding
 
 
 class _Seq:
@@ -97,8 +94,9 @@ def _bridge(engine=None, *, max_model_len=None, output_limit=None, channel=None)
     bridge._engine_lock = threading.Lock()
     bridge._seq_ids = {}
     bridge._local = threading.local()
-    bridge._rendered = OrderedDict()
-    bridge._render_handles = itertools.count(1)
+    bridge._format = types.SimpleNamespace(
+        refuse_unheld_tool_calls=lambda chat, token_ids: None
+    )
     bridge.engine.core_mgr._flush_stream_batch_fn = bridge._flush
     return bridge
 
@@ -254,51 +252,27 @@ def test_a_submit_admission_refuses_never_reaches_core_manager():
     assert bridge.engine.io_processor.requests == {}
 
 
-# ── a Python-rendered prompt's encoding ───────────────────────────────────
+# ── the prompt ────────────────────────────────────────────────────────────
 
 
-def _rendering(bridge, encoded):
-    bridge._renderer = types.SimpleNamespace(render=lambda request: ("PROMPT", None))
-    bridge.engine.io_processor.encode_prompt = lambda prompt: encoded
-
-
-def test_the_encoding_render_chat_built_reaches_preprocessing_once():
-    """Its block-hash chain is not thrown away and computed again."""
+def test_the_prompt_reaches_preprocessing_as_the_ids_rust_rendered():
+    """Rust renders every chat: Python takes its ids, and has nothing to
+    render with."""
     bridge = _bridge()
-    encoded = PrefixEncoding([1, 2, 3], "HASHES")
-    _rendering(bridge, encoded)
-    _, ids, _, handle = bridge.render_chat('{"messages": []}')
-    assert ids == [1, 2, 3] and handle is not None
-    bridge.submit(7, ids, {"prompt_handle": handle})
-    assert bridge.engine.prompt is encoded
-    assert bridge._rendered == {}  # collected
-
-
-def test_without_a_matching_encoding_the_ids_go_as_they_are():
-    bridge = _bridge()
-    _rendering(bridge, PrefixEncoding([1, 2, 3], "HASHES"))
-    handle = bridge.render_chat("{}")[3]
-    bridge.submit(7, [9, 9], {"prompt_handle": handle})  # not the rendered ids
-    assert bridge.engine.prompt == [9, 9]
-    bridge.submit(8, [1, 2, 3], {"prompt_handle": 12345})  # unknown handle
+    bridge.submit(7, [1, 2, 3], {})
     assert bridge.engine.prompt == [1, 2, 3]
-
-    _rendering(bridge, [4, 5])  # no tokenizer cache: plain ids, no handle
-    assert bridge.render_chat("{}")[3] is None
+    assert not hasattr(bridge, "render_chat")
 
 
-def test_uncollected_encodings_are_bounded_by_count_and_age(monkeypatch):
-    monkeypatch.setattr(token_bridge, "_RENDERED_MAX", 2)
+def test_a_chat_body_is_checked_against_the_tool_call_grammar():
     bridge = _bridge()
-    _rendering(bridge, PrefixEncoding([1], None))
-    handles = [bridge.render_chat("{}")[3] for _ in range(3)]
-    assert list(bridge._rendered) == handles[1:]
-
-    clock = iter([1000.0, 1000.0 + token_bridge._RENDERED_TTL_S + 1])
-    monkeypatch.setattr(token_bridge.time, "monotonic", lambda: next(clock))
-    old = bridge.render_chat("{}")[3]
-    new = bridge.render_chat("{}")[3]  # the earlier ones have aged out
-    assert old not in bridge._rendered and list(bridge._rendered) == [new]
+    checked = []
+    bridge._format = types.SimpleNamespace(
+        refuse_unheld_tool_calls=lambda chat, ids: checked.append((chat, ids))
+    )
+    bridge.submit(7, [1, 2], {"chat": '{"messages": []}'})
+    bridge.submit(8, [3], {})
+    assert checked == [({"messages": []}, [1, 2])]
 
 
 # ── a lost step ───────────────────────────────────────────────────────────
@@ -338,18 +312,28 @@ _TOOLS = [
 
 
 def _refusal(monkeypatch, parser_cls, grammar_on):
-    """`ChatRenderer`'s check, for a model whose prompt opens K3's think."""
+    """`ChatFormat`'s check, for a K3 prompt that opens its think channel."""
     from atom.entrypoints.openai import kimi_k3_tokens
 
     monkeypatch.setenv("ATOM_TOOL_CALL_GRAMMAR", "1" if grammar_on else "0")
     monkeypatch.setattr(token_bridge.structured_output, "available", lambda: True)
-    renderer = token_bridge.ChatRenderer.__new__(token_bridge.ChatRenderer)
-    renderer.tool_parser_cls = parser_cls
-    think = kimi_k3_tokens.THINK_START
-    renderer.dialect = types.SimpleNamespace(prompt_open_marker=think)
-    return lambda tools, tool_choice=None: renderer._refuse_unheld_tool_calls(
-        tools, tool_choice, think
+    chat_format = token_bridge.ChatFormat.__new__(token_bridge.ChatFormat)
+    chat_format.tool_parser_cls = parser_cls
+    chat_format.checks_tool_call_grammar = token_bridge.ChatFormat.holds_tool_calls(
+        parser_cls
     )
+    think = kimi_k3_tokens.THINK_START
+    chat_format.tokenizer = types.SimpleNamespace(decode=lambda ids: "prompt" + think)
+    chat_format.dialect = types.SimpleNamespace(prompt_open_marker=think)
+    chat_format.model_starts_in_reasoning = False
+
+    def refuse(tools, tool_choice=None):
+        chat = {"messages": [{"role": "user", "content": "hi"}], "tools": tools}
+        if tool_choice is not None:
+            chat["tool_choice"] = tool_choice
+        chat_format.refuse_unheld_tool_calls(chat, [1, 2])
+
+    return refuse
 
 
 def test_a_k3_chat_with_tools_the_server_would_hold_is_refused(monkeypatch):

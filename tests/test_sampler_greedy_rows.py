@@ -119,3 +119,66 @@ def test_gpu_sampling_greedy_rows_and_no_mask_readback(path, greedy):
     assert not correction_names.intersection(
         {"aten::is_nonzero", "aten::nonzero", "aten::item", "aten::_local_scalar_dense"}
     )
+
+
+def _no_topk_select(*_args, **_kwargs):
+    raise AssertionError("no greedy row: the argmax must not run")
+
+
+@pytest.mark.parametrize("column", [False, True])
+def test_no_greedy_row_skips_the_correction(monkeypatch, column):
+    monkeypatch.setattr(sampler, "topk_select", _no_topk_select)
+    rows = 5
+    probs = torch.rand(rows, 16)
+    temperatures = torch.full((rows,), 0.7)
+    sampled = torch.arange(rows, dtype=torch.long)
+    if column:
+        sampled = sampled.view(rows, 1)
+    got = sampler._apply_greedy_tokens(probs, temperatures, sampled, any_greedy=False)
+    assert got.shape == (rows,) and got.dtype == torch.int32
+    assert got.tolist() == list(range(rows))
+
+
+@pytest.mark.parametrize("filters", [(None, None), (None, 0.9), (4, None)])
+def test_a_batch_without_greedy_rows_samples_the_same_either_way(monkeypatch, filters):
+    """``any_greedy=False`` drops only work whose result nobody keeps."""
+    monkeypatch.setattr(sampler, "AITER_TOPK_TOPP_AVAILABLE", False)
+    monkeypatch.setattr(sampler.warnings, "warn", lambda *a, **k: None)
+    instance = sampler.Sampler()
+    monkeypatch.setattr(instance, "_temperature_sample", _noise_picks_the_high_tie)
+    logits = torch.randn(6, 32, generator=torch.Generator().manual_seed(7))
+    temperatures = torch.tensor([0.5, 0.7, 1.0, 1.3, 0.9, 0.6])
+
+    def run(any_greedy):
+        torch.manual_seed(11)
+        return instance(
+            logits, temperatures, *filters, all_greedy=False, any_greedy=any_greedy
+        )
+
+    monkeypatch.setattr(sampler, "topk_select", _torch_topk_select)
+    expected = run(True)
+    monkeypatch.setattr(sampler, "topk_select", _no_topk_select)
+    got = run(False)
+    assert got.dtype == expected.dtype == torch.int32
+    assert torch.equal(got, expected)
+
+
+def test_verification_rows_pass_any_greedy_through(monkeypatch):
+    monkeypatch.setattr(sampler, "topk_select", _no_topk_select)
+    instance = sampler.Sampler()
+    seen = {}
+
+    def forward(*_args, **kwargs):
+        seen.update(kwargs)
+        return torch.zeros(3, dtype=torch.int32)
+
+    monkeypatch.setattr(instance, "forward", forward)
+    instance.sample_verification_tokens(
+        torch.zeros(3, 8),
+        torch.tensor([1, 3]),
+        torch.tensor([0.7, 0.9]),
+        None,
+        None,
+        any_greedy=False,
+    )
+    assert seen["any_greedy"] is False
