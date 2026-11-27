@@ -19,12 +19,12 @@ this; nothing of it lives on the engine or the scheduler. Before each
    doorbell (`progress_doorbell`), which sets the engine's KV progress event --
    fetches one completion answer requested after that ring, so a landed load
    is admitted by this `schedule()` (`ATOM_OFFLOAD_LOAD_EVENT_WAIT`, on);
-3. only with `ATOM_OFFLOAD_LOAD_WAIT_HOLD` (off by default): holds the step for
-   the loads it started while holding pays (`LoadWaitState.budget_s` over
-   `load_wait_tradeoff`), woken by the doorbell, ending as soon as every
-   started load landed. The bound is rank-local; its cost lands on every DP
-   peer at the forward collective, so it stays off until it is group-aware or
-   measured with the prefill delayer on and in 4P8D.
+3. with `ATOM_OFFLOAD_LOAD_WAIT_HOLD` (on by default, `0` turns it off): holds
+   the step for the loads it started while holding pays
+   (`LoadWaitState.budget_s` over `load_wait_tradeoff`), woken by the
+   doorbell, ending as soon as every started load landed. The hold delays
+   every DP peer at the forward collective; the bound charges that through
+   `cost * dp_size`, never exceeds one tick and is ~0 while decodes run.
 
 Rank-local throughout: no collective runs here and the step count is
 unchanged, so DP lockstep holds.

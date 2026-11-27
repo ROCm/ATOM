@@ -7,7 +7,7 @@
 The early tier load runs ahead of `schedule()` and its loads are shipped at
 once; after a KV progress doorbell (a worker's load job ended) one completion
 answer requested after the ring is fetched before `schedule()`
-(`ATOM_OFFLOAD_LOAD_EVENT_WAIT`, on). With `ATOM_OFFLOAD_LOAD_WAIT_HOLD` (off by
+(`ATOM_OFFLOAD_LOAD_EVENT_WAIT`, on). With `ATOM_OFFLOAD_LOAD_WAIT_HOLD` (on by
 default) the step is also held for the loads it started while holding pays:
 the hold blocks on the doorbell, not on a sleep, and ends as soon as every
 started load landed; its bound comes from the measured forward time and the
@@ -294,10 +294,10 @@ def test_without_the_hook_the_same_load_prefills_later(
     assert engine.step_hooks == ()
 
 
-# -- the default: doorbell + a fresh answer before schedule(), no hold -----------
+# -- hold off: doorbell + a fresh answer before schedule() only -----------------
 
 
-def test_default_does_not_hold_for_a_load_in_flight(
+def test_hold_off_does_not_hold_for_a_load_in_flight(
     engine_core, monkeypatch, seq_factory
 ):
     sched, _, (seq,) = _fire(monkeypatch, seq_factory)
@@ -325,7 +325,7 @@ def _steps_to_prefill_with_pauses(module, engine, mgr, seq, pause_s=0.1):
     return None
 
 
-def test_default_fresh_answer_admits_a_landed_load_before_schedule(
+def test_hold_off_fresh_answer_admits_a_landed_load_before_schedule(
     engine_core, monkeypatch, seq_factory
 ):
     """The load lands between steps. The doorbell makes the next step fetch an
@@ -342,7 +342,7 @@ def test_default_fresh_answer_admits_a_landed_load_before_schedule(
     assert _steps_to_prefill_with_pauses(engine_core, engine, mgr, seq) >= 3
 
 
-def test_default_fresh_answer_runs_while_a_decode_is_running(
+def test_hold_off_fresh_answer_runs_while_a_decode_is_running(
     engine_core, monkeypatch, seq_factory
 ):
     # No pre-phase load while a decode runs (page reservation), but a load that
@@ -406,10 +406,11 @@ def test_load_wait_hook_follows_its_envs(monkeypatch):
     monkeypatch.delenv("ATOM_OFFLOAD_LOAD_EVENT_WAIT", raising=False)
     monkeypatch.delenv("ATOM_OFFLOAD_LOAD_WAIT_HOLD", raising=False)
     hook = load_wait.load_wait_hook(engine, config)
-    assert hook is not None and hook.hold is False  # default: no hold
+    assert hook is not None and hook.hold is True  # default: hold on
     assert hook.state.dp_size == 4
-    monkeypatch.setenv("ATOM_OFFLOAD_LOAD_WAIT_HOLD", "1")
-    assert load_wait.load_wait_hook(engine, config).hold is True
+    monkeypatch.setenv("ATOM_OFFLOAD_LOAD_WAIT_HOLD", "0")
+    hook = load_wait.load_wait_hook(engine, config)
+    assert hook is not None and hook.hold is False  # off: doorbell only
     monkeypatch.setenv("ATOM_OFFLOAD_LOAD_EVENT_WAIT", "0")
     assert load_wait.load_wait_hook(engine, config) is None
 
