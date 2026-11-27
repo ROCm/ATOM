@@ -2,7 +2,7 @@
 
 High-performance model routing gateway for **PD (Prefill–Decode) disaggregated** LLM serving. It routes inference across heterogeneous worker fleets with cache-aware load balancing, a gRPC pipeline that keeps tokenization in Rust, and built-in reliability primitives.
 
-Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine, tokenizer, and OpenAI-compatible serving semantics, while Atomesh provides the HTTP server, request routing, lifecycle management, observability, and PyO3 bridge. This allows the same Atomesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
+Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine (LLMEngine and its CoreManager), while Atomesh serves the OpenAI API itself: it renders the chat template, tokenizes, detokenizes, runs the reasoning and tool-call parsers and writes the SSE, and hands token ids to the engine through a PyO3 token bridge (`routers/atom_bridge`, see `docs/atomesh_rust_frontend.md`). This allows the same Atomesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
 
 ## Features
 
@@ -137,9 +137,12 @@ image must provide `protoc` either way, for `smg-grpc-client`.
 
 ### ATOM standalone
 
-ATOM standalone mode starts the ATOM engine and tokenizer in Python, while Rust
-Mesh provides the HTTP server, lifecycle handling, observability, and PyO3
-request bridge. Enable the Atomesh entrypoint through
+ATOM standalone mode starts the ATOM engine in Python, while Rust Mesh serves
+the OpenAI API (template, tokenizer, parsers, SSE) and hands each request's
+token ids to the engine through the token bridge. A model whose chat template
+is Python (DeepSeek-V3.2's, V4's and V4.1's encoders, Kimi-K3's tokenizer) is
+rendered in Rust too, as ATOM renders it (see below). Enable the Atomesh
+entrypoint through
 `USE_ATOMESH_ENTRYPOINTS=1`:
 
 ```bash
@@ -163,12 +166,29 @@ without `mesh-only`, it defaults to ATOM standalone mode.
 ```bash
 ./target/release/atomesh launch \
   --worker-urls http://worker1:8000 http://worker2:8000 \
-  --policy cache_aware
+  --policy cache_aware \
+  --backend atom
 
 USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 ```
+
+ATOM workers need `--backend atom`, in regular mode as in PD mode. Without it
+the router keys an image chat as it would for SGLang: two chats that differ only
+in an image past `prefix_hash`'s token window, or after a long shared text, get
+the same `cache_aware` or `prefix_hash` key, though ATOM keys every KV block of
+a media prompt by all its media and shares no block between them. The binary
+defaults to `--backend sglang`; the Python entrypoint's `mesh-only` passes
+`--backend atom` unless the command line sets `--backend` (or its alias
+`--runtime`) itself, so put `--backend sglang` there to route to SGLang workers.
+
+`--backend atom` also changes how the router discovers an HTTP worker's model:
+it reads `/v1/models` instead of SGLang's `/server_info` and `/model_info`, and
+the model id it returns names the worker's model. For a worker serving under an
+alias (`--served-model-name`) that id is the alias, so the router loads the
+worker's tokenizer from `--tokenizer-path` or `--model-path` when either is
+set, and from the model id only otherwise.
 
 ### Envoy external processing
 
@@ -201,6 +221,14 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
 ```
 
 Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cache transfer).
+
+With `--backend atom`, `--atom-pd-concurrent` (default off) sends a relay-mode
+`/v1/chat/completions` request to decode while prefill runs, as a two-line body
+on `/v1/pd/late_kv/chat/completions`: the request, then prefill's
+`kv_transfer_params` once prefill answers. Decode needs `ATOM_PD_LATE_KV=1`; a
+decode that answers 404 gets the serial relay's request instead (logged once).
+A prefill failure aborts decode's body before the second line, so decode
+enqueues nothing.
 
 Messages and Responses have no PD adapter: in PD mode `/v1/messages` and
 `/v1/responses` return `501 unsupported_api_topology`. Serve them from regular
@@ -266,11 +294,24 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 `prefix_hash` routes on exact request tokens. Messages and Responses have no
 registered token-routing template, so under `prefix_hash` they return
-`501 token_routing_unsupported`. So do chats for a model whose tokenizer
-llm-tokenizer renders with a built-in encoder chosen from `config.json`, not a
-chat template, such as DeepSeek V3.2 and V4
-([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
-need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
+`501 token_routing_unsupported`. Use a policy that does not need tokens, such
+as `cache_aware` or `round_robin`, for these APIs.
+
+The router renders a chat it tokenizes with the model's chat template and the
+request's `reasoning_effort` and `chat_template_kwargs`. A checkpoint whose
+`config.json` has `model_type` `deepseek_v32`, `deepseek_v4`, `deepseek_v41`
+(or its `deepseek_v41_text` / `deepseek_v41_dspark`), `kimi_k3` or `kimi_k31`
+renders with llm-tokenizer's port of the model's encoder instead,
+given the chat as ATOM's server gives it (`routers/prepare/chat_render.rs`):
+the body as sent, `thinking` and `reasoning_effort` resolved by ATOM's
+reasoning controls (for V4.1, `minimal` as `low`, `medium` and `xhigh` as
+`high`, `none` as chat mode), and the prompt's text encoded as ATOM encodes
+it, so its tokens are ATOM's (`test_requests_tokenize_as_on_atom`). The
+same render prepares the chats of the gRPC and ATOM standalone routers. A
+tokenizer llm-tokenizer renders with a built-in encoder chosen from
+`config.json`, whose `model_type` is none of these, is refused at registration
+([#3377](https://github.com/ROCm/ATOM/issues/3377)): its chats would render
+otherwise than ATOM renders them.
 
 ## Tokenization
 

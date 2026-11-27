@@ -25,8 +25,10 @@ For the in-process path, the public configuration remains
 layouts: `m3` for MiniMax-M3 PAGE regions
 (including its NSA index cache), `kimi_k3` when the text config has
 `model_type == "kimi_linear"` (dense paged MLA KV plus a KDA per-request state
-tier), `qwen` for GDN hybrids (`qwen3_next`, `qwen3_5_*`; a subclass of the
-K3 tier over an MHA page image), `hybrid` when `hf_config.compress_ratios` is
+tier), `qwen` for GDN hybrids (`qwen3_next`, `qwen3_5_*`, `qwen4_exp`; a
+subclass of the K3 tier over a PAGE image in the MHA pool, or in the QSA arena
+for Qwen3.8, whose image also carries the PLE windows), `hybrid` when
+`hf_config.compress_ratios` is
 present (DSV4 PAGE+SLOT), and `dense` otherwise.
 `kv_transfer_config.offload_layout` can override compatible choices without
 giving scheduler and worker different connector names. MiniMax-M3 cannot be
@@ -101,7 +103,7 @@ Four rules carry the module:
 | `hybrid/dsv4/codec.py` | `DSV4PageSlotCodec`, `DSV4CheckpointCodec`, and `DSV4CheckpointStore`: unified GPU layout plans plus AOS1 framing/storage. |
 | `hybrid/dsv4/triton_page_slot.py` | Raw-`uint8` PAGE/SLOT gather/scatter kernels; PAGE is forward-indexed and SLOT is reverse-indexed. |
 | `hybrid/kimi_k3/connector.py` | Kimi-K3 worker and scheduler: the dense paged-KV path plus one extra leg for the KDA per-request state tier. |
-| `hybrid/qwen/connector.py` | Qwen GDN worker and scheduler. Subclasses the K3 tier; the pages come from the MHA pool. |
+| `hybrid/qwen/connector.py` | Qwen GDN worker and scheduler. Subclasses the K3 tier; the pages come from the MHA pool or Qwen3.8's QSA arena. |
 | `hybrid/kimi_k3/staging.py` | Single-entry bounded GPU staging buffer, D2H/H2D copy stream, and producer event for one flat state entry per transfer. |
 | `hybrid/kimi_k3/state_object.py` | One state checkpoint as a single opaque object keyed by ATOM's own hash, bypassing LMCache's `ChunkedTokenDatabase` (state bytes are not token-sliceable). |
 | `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
@@ -124,6 +126,7 @@ Four rules carry the module:
 | `kv_store/keys.py` | Layout namespace (with each backend's own prefix), the prompt's 16-byte chunk hash chain, and object key spelling. |
 | `kv_store/layouts.py` | The layouts a KV store moves (dense, M3 PAGE, V4.1 replay PAGE) and the codec for each; a backend names the subset it moves. |
 | `kv_store/pool.py` | `TransferSlotPool`: the registered save/load slots in HBM, with quarantine. |
+| `kv_store/save_pipeline.py` | Opt-in save pipeline (`ATOM_STORE_SAVE_BATCH_CHUNKS`, default 0): one sender thread per worker makes a save's lookups and puts, so the save thread packs the next batch while the previous one is put. |
 | `kv_store/scheduler.py`, `kv_store/worker.py` | The scheduler (digest-carrying requests, paced save retries, lookup helpers) and worker (windowed put/get through the pool, completion protocol) every KV-store backend extends. |
 | `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included) and the startup refusals (layouts other than dense, M3 PAGE, and V4.1 PAGE, DCP > 1, odd chunks). |
 | `mooncake_store/layouts.py` | Which layouts this connector moves (dense, M3 PAGE, V4.1 replay PAGE). |
@@ -313,6 +316,19 @@ layout of its own and keeps the namespace that gave it, so native ATOM's V4.1
 tiers stay reachable across the change. The vLLM plugin, which had no V4.1
 tiers before, also hashes V4.1's `sliding_window` and `candidate_block_size`.
 
+A load-only tier (`kv_role: kv_consumer`) can stop being asked once what it
+holds is back in HBM, for example a recorded benchmark warmup after it was
+replayed: `POST /offload/lookups` with `{"enabled": false}` makes every DP
+engine start no tier lookup for new requests, and `true` resumes them. An
+answer a request already holds still loads, and a load planned before the
+switch re-takes its pin with one synchronous lookup when it is dispatched. A
+lookup that no request has consumed yet, answered or still in flight, is
+released, so that request prefills its prompt and is not held back waiting
+for the tier. The call
+answers 409 with each engine's reply unless all of them applied it. A tier
+that saves refuses to switch off: without a lookup its saves would store
+every prompt from token 0.
+
 ### MP lifetime and representation
 
 Engine group `0` contains ordinary PAGE views, where block ID `0` is valid
@@ -448,6 +464,11 @@ reverse).
   quarantined (below) leaves the rest working. A save packs a window (highest chunks
   first, like the dense tail-to-head order), then puts it; a load gets a
   window (lowest first), then unpacks it.
+  With `ATOM_STORE_SAVE_BATCH_CHUNKS` set (1-64), a sender thread puts each
+  batch while the save packs the next. A non-integer or a value outside
+  0-64 raises at connector init, and so, with the flag at 1-64, does
+  `OFFLOAD_COPY_WORKERS` > 1: the sender's one preparing flag serves a
+  single save thread.
 
 ### Keys and lookup
 
@@ -559,6 +580,12 @@ reverse).
   stage reports the same per-chunk set (a stage that stopped early would
   otherwise leave those groups short of their all-stage quorum for good). An
   exception from the GPU copy claims neither; `_guard` reports the failure.
+  With `ATOM_STORE_SAVE_BATCH_CHUNKS` on, the save instead waits for its
+  queued puts, then, if a fresh device fence succeeds, claims the source
+  quiescent and reports source-safe every chunk below the lowest one read
+  (on the staged path that can repeat a group already reported before a
+  later one raised; the aggregators drop repeats); if the fence fails, it
+  reports the failure without either claim.
 - Every load ends in exactly one done or failed, all-or-nothing: any key whose
   result is not exactly the chunk's size (missing, unready, lease expired, an
   object of another size) fails the whole load.
@@ -678,8 +705,9 @@ settings. The same keys work in `kv_connector_extra_config` of
 
 `OFFLOAD_COPY_WORKERS`, `OFFLOAD_LOAD_WORKERS`, `OFFLOAD_MIN_LOAD_TOKENS`,
 `OFFLOAD_PROFILE` and the `OFFLOAD_GPU_STAGING_*` knobs apply as for the dense
-path. `ATOM_STORE_ASYNC_RENEW=1` (default off) moves the pre-load lease
-renewal off the scheduler thread; see the lease paragraph above.
+path, except that `ATOM_STORE_SAVE_BATCH_CHUNKS` 1-64 needs
+`OFFLOAD_COPY_WORKERS=1`. `ATOM_STORE_ASYNC_RENEW=1` (default off) moves the
+pre-load lease renewal off the scheduler thread; see the lease paragraph above.
 
 ```bash
 # Store: one master, owners on NICs no prefill worker uses (here NUMA1's).
@@ -739,7 +767,11 @@ this worker config.
   `put_chunks`; `windows`, the windows the save reached, each looked up once,
   and `segments`, the runs of missing chunks it packed and put, of which
   `in_place_segments` in place; `put_bytes`, the bytes of the chunks it
-  put, held chunks not included; `exists_ms`, `pack_ms`, `put_ms`)
+  put, held chunks not included; `exists_ms`, `pack_ms`, `put_ms`; with
+  `ATOM_STORE_SAVE_BATCH_CHUNKS` on, `segments` counts batches, `put_ms`
+  sums the native time of the save's puts, and `exists_ms` is the wait for
+  each lookup, which includes the time it queues behind this save's earlier
+  puts on the sender thread and building the next window's keys)
   and `[OFFLOAD-LOAD-PROF]` (`get_ms`, `unpack_ms`, `retrieve_ms`,
   `effective_gbps`) per operation, with `status=ok` or the failure that ended
   it, whose rate-limited warning names the first Mooncake result code.

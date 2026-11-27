@@ -12,10 +12,13 @@ import torch
 import zmq
 
 from atom.config import Config
+from atom.distributed.group_agreement import group_max_each
 from atom.kv_transfer.disaggregation import KVOutputAggregator
+from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.dp_sync_gate import MAX_DP_SYNC_INTERVAL, DPSyncGate
 from atom.model_engine.dynamic_chunking import (
     DYNAMIC_CHUNKING_POLL_STEPS,
     ChunkSizePredictor,
@@ -60,8 +63,44 @@ logger = logging.getLogger("atom")
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
 # idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
+# ATOM_DP_IDLE_WHEN_BLOCKED: how long a DP loop whose only work is blocked on a
+# tier lookup or load sleeps before it votes again. A sleep rather than
+# `yield_gil`: the lookup and load threads it waits on share this process's
+# GIL, and a loop spinning on it slows them down.
+BLOCKED_IDLE_SLEEP_S = 0.0005
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
+
+
+def dp_idle_when_blocked(config: Config) -> bool:
+    """Whether `ATOM_DP_IDLE_WHEN_BLOCKED` asks this DP engine to vote only
+    work a pass could forward. An explicit value is used as is, on any role.
+    Unset, it is on only on a P/D prefill instance (`kv_producer`), where an
+    arrival at an idle P otherwise waits out a ~110 ms eager DP dummy behind
+    its own Store lookup; an aggregated server and a decode instance keep the
+    plain vote, as measured. The prefill delayer still turns it off
+    (`DPEngineCoreProc._resolve_idle_when_blocked`)."""
+    enabled = envs.ATOM_DP_IDLE_WHEN_BLOCKED
+    if enabled is None:
+        enabled = disaggregated_kv_role(config) == "kv_producer"
+    return enabled
+
+
+def yield_gil() -> None:
+    """Hand the GIL to this process's other threads now.
+
+    A busy loop holds the GIL for as long as it does not block: an idle pass
+    blocks nowhere, and neither does the stretch between queuing a step's
+    outputs and the loop's next blocking call. A thread that is ready to run
+    meanwhile -- the output sender with a request's last chunk, the input
+    reader with a new request -- then gets the GIL only when CPython forces a
+    switch, after `sys.getswitchinterval()` (5 ms by default): the last chunk
+    of every request sat that long in `output_queue` once the engine went
+    idle. `time.sleep(0)` drops and retakes the GIL around a zero-length
+    sleep, so such a thread runs at once; the loop pays microseconds.
+    """
+    time.sleep(0)
+
 
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
@@ -183,6 +222,7 @@ class EngineCore:
             config.pool_entries = block_info.get("pool_entries", {})
             config.pool_entry_bytes = block_info.get("pool_entry_bytes", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
+            config.state_transfer_slots = block_info.get("state_transfer_slots", 0)
             self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
@@ -507,7 +547,9 @@ class EngineCore:
         Waits until KV transfers in flight have reported back (with
         ``ATOM_STORE_ASYNC_RENEW`` a load parked on its lease renewal counts,
         and the metadata build may dispatch its GET meanwhile), then preempts
-        what is running so it recomputes on what follows. When the weights
+        what is running so it recomputes on what follows; an image decode leg
+        whose media its prefill kept cannot recompute, and is finished
+        instead (`Scheduler.preempt_running`). When the weights
         change, the KV connector must also drop what it keeps for later
         requests. Raises with the reason, changing nothing that was running.
         """
@@ -573,10 +615,12 @@ class EngineCore:
                         self.scheduler.engine_stats.bump_step()
                     else:
                         self.scheduler.engine_stats.note_idle(now)
+                        yield_gil()
                 else:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    yield_gil()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -669,7 +713,8 @@ class EngineCore:
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
                 self.scheduler.prefill_delayer.notify_prefill_executed(
-                    scheduled_batch.total_tokens_num_prefill
+                    scheduled_batch.total_tokens_num_prefill,
+                    decoded=scheduled_batch.total_seqs_num_decode > 0,
                 )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
@@ -714,6 +759,8 @@ class EngineCore:
         if finished_seqs:
             self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
+        # The sender ships them now, not a switch interval later (`yield_gil`).
+        yield_gil()
 
     def has_pending_kv_work(self) -> bool:
         """True while KV transfer work outlives the scheduler queues.
@@ -1097,6 +1144,30 @@ class DPEngineCoreProc(EngineCore):
         self._init_prefill_delayer(config, self.dp_group)
         # `share_cache` routing reads each rank's own prefill backlog.
         self._report_backlog = config.dp_load_balance == "share_cache"
+        self._idle_when_blocked = self._resolve_idle_when_blocked(config)
+        # Reduced by `_sync_dp_state`: some rank's vote hid unfinished work.
+        self._dp_group_hidden_work = False
+
+    def _resolve_idle_when_blocked(self, config: Config) -> bool:
+        """`ATOM_DP_IDLE_WHEN_BLOCKED`: whether this rank reports work to its DP
+        group only when a pass could produce a batch (`has_forward_work`).
+        Defaults by P/D role (`dp_idle_when_blocked`). Off with a prefill
+        delayer, whose cadence counts passes: it needs
+        `ATOM_ENABLE_PREFILL_DELAYER=0`. The delayer is on by default with DP,
+        so the role default alone stays quiet; only an explicit setting that
+        the delayer overrides is warned about."""
+        if not dp_idle_when_blocked(config):
+            return False
+        if self.scheduler.prefill_delayer is not None:
+            if envs.ATOM_DP_IDLE_WHEN_BLOCKED is not None:
+                logger.warning(
+                    "%s: ATOM_DP_IDLE_WHEN_BLOCKED ignored with the prefill "
+                    "delayer on (set ATOM_ENABLE_PREFILL_DELAYER=0)",
+                    self.label,
+                )
+            return False
+        logger.info("%s: ATOM_DP_IDLE_WHEN_BLOCKED on", self.label)
+        return True
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -1128,11 +1199,22 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
+        # Set once the group agreed to shut down: ATOM_DP_IDLE_WHEN_BLOCKED's
+        # narrower vote no longer applies (see the exit below), on every rank.
+        draining = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
+            interval = self._validate_dp_sync_interval(envs.ATOM_DP_SYNC_INTERVAL)
+            # Interval 1 syncs every round, as on main: no gate.
+            gate = DPSyncGate(interval) if interval > 1 else None
             while True:
-                self.utility_handler.process_queue(self.utility_queue, self)
+                sync_now = gate is None or gate.should_sync()
+                if sync_now:
+                    # Utility commands can hold the engine (offload, weight
+                    # sync, pause). Applying them only on rounds that sync lets
+                    # every rank see a hold before its next forward.
+                    self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
                     next_metrics_push = now + metrics_interval
@@ -1146,15 +1228,59 @@ class DPEngineCoreProc(EngineCore):
                     or self._weight_sync_fenced
                     or self._generation_paused
                 )
-                local_unfinished = not self.scheduler.is_finished() and not local_held
-
+                idle_when_blocked = self._idle_when_blocked and not draining
                 # MAX-reduced: one held rank holds every rank of the group, so
                 # their forwards stay paired.
-                global_has_unfinished, global_shutdown, global_held = (
-                    self._sync_dp_state(local_unfinished, shutdown, local_held)
-                )
+                if sync_now:
+                    # This rank's vote. By default any unfinished state,
+                    # `deferred_free_blocks` included, so a group whose only
+                    # work is waiting runs DP dummy forwards back to back. With
+                    # ATOM_DP_IDLE_WHEN_BLOCKED only what a pass could forward
+                    # (`has_forward_work`); the idle drain below advances the
+                    # rest. Only on rounds that sync, so a skipped round sends
+                    # no lookups and starts no defer windows.
+                    if not idle_when_blocked:
+                        local_unfinished = (
+                            not self.scheduler.is_finished() and not local_held
+                        )
+                        local_hidden = False
+                    elif local_held:
+                        # Held first: a held rank runs no pass, so it must not
+                        # send lookups or start their defer windows.
+                        local_unfinished = local_hidden = False
+                    else:
+                        local_unfinished = self.scheduler.has_forward_work()
+                        # Work this narrower vote hides (blocked requests,
+                        # deferred frees), reduced with the vote; see the
+                        # shutdown exit below.
+                        local_hidden = (
+                            not local_unfinished and not self.scheduler.is_finished()
+                        )
+                    global_has_unfinished, global_shutdown, global_held = (
+                        self._sync_dp_state(
+                            local_unfinished, shutdown, local_held, local_hidden
+                        )
+                    )
+                    if gate is not None:
+                        gate.synced(global_has_unfinished, global_shutdown, global_held)
+                else:
+                    # The last sync found unfinished work in the group: stay
+                    # paired, including a dummy on ranks with no local work.
+                    global_has_unfinished, global_shutdown, global_held = (
+                        True,
+                        False,
+                        False,
+                    )
 
                 if global_shutdown and not global_has_unfinished:
+                    if self._dp_group_hidden_work:
+                        # Some rank's blocked request or deferred free voted
+                        # "no work": every rank votes as with the flag off from
+                        # here, so they settle before the exit as they do off.
+                        # A reduced value, so all ranks switch on this pass
+                        # whatever their own setting.
+                        draining = True
+                        continue
                     logger.info(
                         f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
                     )
@@ -1173,11 +1299,23 @@ class DPEngineCoreProc(EngineCore):
                     self.scheduler.engine_stats.note_idle(now)
                     if self.scheduler.prefill_delayer is not None:
                         self.scheduler.prefill_delayer.notify_idle()
-                    if self.has_pending_kv_work():
+                    # The PAGE checkpoint copies the last batch issued complete
+                    # in the next `schedule()`, which an idle pass never runs:
+                    # finish them here, before the drain publishes state work,
+                    # so they turn READY (reusable, evictable, storable to the
+                    # CPU tier) instead of staying COPYING with their pins
+                    # (`BlockManager.complete_previous_checkpoint_batch`).
+                    self.scheduler.block_manager.complete_previous_checkpoint_batch()
+                    blocked = idle_when_blocked and bool(self.scheduler.waiting)
+                    if self.has_pending_kv_work() or blocked:
                         # Local RPCs only. Anything that reaches schedule()
                         # would run the delayer's cross-DP all_reduce off
                         # lockstep, so the idle drain must stay off that path.
+                        # A request blocked on its tier load is waiting too:
+                        # the poll is what settles it.
                         self._advance_idle_kv_transfer()
+                    if blocked:
+                        time.sleep(BLOCKED_IDLE_SLEEP_S)
                     continue
 
                 self.scheduler.engine_stats.note_busy(now)
@@ -1187,6 +1325,8 @@ class DPEngineCoreProc(EngineCore):
                 # After the pair, so the idle rank's dummy counts too: that is
                 # what keeps every rank's step number equal. See `bump_step`.
                 self.scheduler.engine_stats.bump_step()
+                if gate is not None:
+                    gate.busy_round_done()
         finally:
             try:
                 # Isolate the final publish so a publisher hiccup cannot skip
@@ -1201,6 +1341,37 @@ class DPEngineCoreProc(EngineCore):
             finally:
                 tracing.shutdown()
 
+    def _validate_dp_sync_interval(self, interval: int | None) -> int:
+        """Reject different sync cadences before any rank enters the busy loop.
+
+        One MAX reduction gives both bounds. Every rank sees the same mismatch
+        and raises, rather than pairing a state collective with a peer's model
+        collective on the first skipped round. A peer lost here shuts the loop
+        down as `_sync_dp_state` does.
+        """
+        # Packed capped, so any int fits the int64 payload; past the cap is invalid.
+        value = 0 if interval is None else min(interval, MAX_DP_SYNC_INTERVAL + 1)
+        try:
+            highest, neg_lowest, invalid = group_max_each(
+                (value, -value, int(interval is None or value > MAX_DP_SYNC_INTERVAL)),
+                self.dp_group,
+            )
+        except RuntimeError as e:
+            logger.warning(f"{self.label}: DP sync interval agreement failed: {e}")
+            self._shutting_down = True
+            return 1
+        if invalid:
+            raise ValueError(
+                f"ATOM_DP_SYNC_INTERVAL must be an integer up to {MAX_DP_SYNC_INTERVAL} "
+                "on every DP rank; at least one rank has an invalid value"
+            )
+        if highest != -neg_lowest:
+            raise ValueError(
+                "ATOM_DP_SYNC_INTERVAL must match on every DP rank; "
+                f"got values from {-neg_lowest} to {highest}"
+            )
+        return value
+
     def _execute_dummy_batch(self):
         fwd_out = self.runner_mgr.call_func("dummy_execution", wait_out=True)
         if self.scheduler.running:
@@ -1213,16 +1384,23 @@ class DPEngineCoreProc(EngineCore):
         local_has_unfinished: bool,
         local_shutdown: bool = False,
         local_held: bool = False,
+        local_hidden: bool = False,
     ) -> tuple[bool, bool, bool]:
+        """MAX-reduce this rank's flags over the DP group. `local_hidden`
+        (ATOM_DP_IDLE_WHEN_BLOCKED: unfinished work the vote left out) is
+        reduced too, into `_dp_group_hidden_work`; every rank sends it, so the
+        collective is the same whatever each rank's setting."""
+        self._dp_group_hidden_work = local_hidden
         if self._shutting_down:
             return local_has_unfinished, True, local_held
 
         try:
             state_tensor = torch.tensor(
                 [
-                    1 if local_has_unfinished else 0,
-                    1 if local_shutdown else 0,
-                    1 if local_held else 0,
+                    int(local_has_unfinished),
+                    int(local_shutdown),
+                    int(local_held),
+                    int(local_hidden),
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -1230,10 +1408,10 @@ class DPEngineCoreProc(EngineCore):
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
-            global_has_unfinished = state_tensor[0].item() == 1
-            global_shutdown = state_tensor[1].item() == 1
-            global_held = state_tensor[2].item() == 1
-            return global_has_unfinished, global_shutdown, global_held
+            # One decode for the four flags.
+            unfinished, shutdown, held, hidden = state_tensor.tolist()
+            self._dp_group_hidden_work = hidden == 1
+            return unfinished == 1, shutdown == 1, held == 1
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             self._shutting_down = True
@@ -1724,6 +1902,8 @@ class DecodeEngineCore(EngineCore):
             pass
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
+        # The sender ships them now, not a switch interval later (`yield_gil`).
+        yield_gil()
         return True
 
     @staticmethod

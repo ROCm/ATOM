@@ -1094,7 +1094,51 @@ def test_engine_routes_are_the_management_endpoints():
         "/server_info",
         "/start_profile",
         "/stop_profile",
+        "/offload/lookups",
     }
+
+
+_APPLIED = {"applied": True, "enabled": False}
+
+
+@pytest.mark.parametrize(
+    "ranks,body,expected",
+    [
+        (None, {"enabled": False}, 503),
+        ([_APPLIED] * 2, b"not json", 400),
+        ([_APPLIED] * 2, {"enabled": "no"}, 400),
+        (RuntimeError("rank 3 did not answer"), {"enabled": False}, 500),
+        ([_APPLIED] * 2, {"enabled": False}, 200),
+        ([_APPLIED, {"applied": False, "enabled": False}], {"enabled": False}, 409),
+        ([_APPLIED, {"applied": True, "enabled": True}], {"enabled": False}, 409),
+    ],
+)
+def test_offload_lookups_succeeds_only_when_every_rank_applied_it(
+    monkeypatch, ranks, body, expected
+):
+    from fastapi.testclient import TestClient
+
+    calls = []
+
+    def switch(enabled):
+        calls.append(enabled)
+        if isinstance(ranks, Exception):
+            raise ranks
+        return ranks
+
+    engine = None if ranks is None else SimpleNamespace(set_offload_lookups=switch)
+    monkeypatch.setattr(api_server, "engine", engine)
+    client = TestClient(api_server.app)
+    if isinstance(body, bytes):
+        reply = client.post("/offload/lookups", content=body)
+    else:
+        reply = client.post("/offload/lookups", json=body)
+    assert reply.status_code == expected
+    assert calls == ([False] if expected in (200, 409, 500) else [])
+    if expected == 200:
+        assert reply.json() == {"status": "success", "enabled": False, "ranks": ranks}
+    if expected == 409:
+        assert reply.json()["detail"] == {"enabled": False, "ranks": ranks}
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Unix socket")
@@ -1212,8 +1256,8 @@ def test_relay_answers_503_while_the_hub_is_not_serving(monkeypatch, tmp_path):
 
 
 class TestPreparePrompt:
-    """`_prepare_prompt`: render, tokenize the engine's way, cut to the
-    context, on the executor, for /v1/messages and /v1/responses."""
+    """`_prepare_prompt`: render and tokenize the engine's way, on the
+    executor, for /v1/messages and /v1/responses. Never cut to the context."""
 
     @pytest.fixture
     def prepare(self, monkeypatch):
@@ -1234,59 +1278,33 @@ class TestPreparePrompt:
                 io_processor=SimpleNamespace(encode_prompt=encode_prompt),
             ),
         )
-        monkeypatch.setattr(
-            api_server,
-            "tokenizer",
-            SimpleNamespace(decode=lambda ids, **_kw: "k" * len(ids)),
-        )
         monkeypatch.setattr(api_server, "custom_message_encoder", None)
-        rendered = {}
         monkeypatch.setattr(
             api_server,
             "apply_chat_template",
-            lambda _tok, _enc, messages, **kwargs: rendered.setdefault(
-                "text", messages
-            ),
+            lambda _tok, _enc, messages, **kwargs: messages,
         )
 
-        def run(prompt, max_tokens, chain=False, kv=None):
+        def run(prompt, chain=False):
             encoded["chain"] = chain
-            rendered.clear()
             return api_server._prepare_prompt(
-                prompt,
-                {},
-                tools=None,
-                preserve_tool_call_arguments=False,
-                max_tokens=max_tokens,
-                kv_transfer_params=kv,
+                prompt, {}, tools=None, preserve_tool_call_arguments=False
             )
 
         return run
 
-    def test_a_prompt_that_fits_goes_to_the_engine_as_encoded(self, prepare):
-        engine_input, text = prepare("x" * 50, max_tokens=10, chain=True)
+    def test_a_prompt_goes_to_the_engine_as_encoded(self, prepare):
+        engine_input, text = prepare("x" * 50, chain=True)
         # The engine's own encoding, chain included, so preprocess reuses it.
         assert engine_input.token_ids == list(range(50))
         assert engine_input.block_hashes == "chain"
         assert text == "x" * 50
 
-    def test_an_over_long_prompt_is_cut_to_the_context(self, prepare):
-        # 100-token context, 10 reserved for output: 90 kept.
-        engine_input, text = prepare("x" * 150, max_tokens=10, chain=True)
-        assert engine_input == list(range(90))
-        assert text == "k" * 90
-
-    @pytest.mark.parametrize("max_tokens", [100, 1024])
-    def test_no_room_for_a_prompt_is_refused(self, prepare, max_tokens):
-        with pytest.raises(ValueError, match="no room for a prompt"):
-            prepare("x" * 5, max_tokens=max_tokens)
-
-    def test_an_empty_cut_is_refused(self, prepare, monkeypatch):
-        monkeypatch.setattr(
-            api_server, "tokenizer", SimpleNamespace(decode=lambda ids, **_kw: "")
-        )
-        with pytest.raises(ValueError, match="empty after truncation"):
-            prepare("x" * 150, max_tokens=10)
+    def test_an_over_long_prompt_is_not_cut(self, prepare):
+        # 100-token context: the prompt is left whole for admission to refuse.
+        engine_input, text = prepare("x" * 150)
+        assert engine_input == list(range(150))
+        assert text == "x" * 150
 
 
 class TestDeploymentDefaultOutputCap:
@@ -1361,6 +1379,7 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
         "tool_call_parser_cls",
         "preserve_tool_call_arguments",
         "required_tool_channel",
+        "mid_system_supported",
     )
     for name in names:
         monkeypatch.setattr(api_server, name, "unset", raising=False)
@@ -1375,6 +1394,7 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
         "template_keeps_tool_call_arguments": lambda *_a: keeps,
         "template_needs_tool_call_argument_strings": lambda *_a: needs_strings,
         "required_call_channel": lambda *_a: "channel",
+        "template_takes_mid_system": lambda *_a: False,
     }
     for name, stub in stubs.items():
         monkeypatch.setattr(api_server, name, stub)
@@ -1391,3 +1411,4 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
     assert api_server.tool_call_parser_cls == "parser"
     assert api_server.preserve_tool_call_arguments is preserve
     assert api_server.required_tool_channel == "channel"
+    assert api_server.mid_system_supported is False

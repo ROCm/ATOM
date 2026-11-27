@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Runner wiring only; storage and protocol tests do not require this import."""
 
 import weakref
@@ -108,17 +110,18 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
             runner,
             SimpleNamespace(
                 total_seqs_num=bs,
+                is_mixed=False,
                 return_logprobs=[False] * bs,
                 any_logprobs=False,
                 required_channel=None,
                 structured_requests=None,
                 num_spec_step=2 if verified else 0,
             ),
-            torch.zeros(4, 8),
             torch.ones(bs),
             None,
             None,
             True,
+            runner_module.LmHeadOutput(None, torch.zeros(4, 8)),
             hidden_states=None,
         )
     send_status.assert_called_once()
@@ -191,11 +194,11 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
                 structured_requests=None,
                 num_spec_step=2 if verified else 0,
             ),
-            torch.zeros(4, 8),
             temperatures,
             top_ks,
             top_ps,
             all_greedy,
+            runner_module.LmHeadOutput(None, torch.zeros(4, 8)),
             hidden_states=None,
         )
     runner.sampler.assert_called_once()
@@ -241,7 +244,7 @@ def test_a_uniform_k_reaches_the_sampler_as_a_scalar(ks, ps):
         )
     }
     group = sampling_group(buffers)
-    runner = SimpleNamespace(forward_vars=buffers)
+    runner = SimpleNamespace(forward_vars=buffers, verify_head=None)
     batch = SimpleNamespace(
         total_seqs_num=bs,
         temperatures=np.ones(bs, np.float32),

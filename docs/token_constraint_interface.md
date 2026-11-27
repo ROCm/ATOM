@@ -41,7 +41,7 @@ channel rows:
   `tokenIDProcessor`'s output/batch lifecycle. Release requests are sent for
   structured (grammar) requests only.
 
-Head-ID bypass (`_head_ids_serve`) and the gfx1250 step override decline when
+A verify head's token ids (`VerifyHead.samples_step`) and the gfx1250 step override decline when
 `has_constraints(batch)` is true. RapidServe prefill applies the channel
 directly (`apply_required_channel`); structured output is refused there.
 
