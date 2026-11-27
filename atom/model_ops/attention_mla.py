@@ -2261,11 +2261,37 @@ class MLAAttention(nn.Module):
         prefill_q: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        kv_c_normed_new: torch.Tensor | None = None,
+        k_rope_new: torch.Tensor | None = None,
+        q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Legacy single-pass path: gather the full cached+new context into
         k_full / v_full and run one flash_attn. OOMs on long contexts (peak
-        ≈ total_kv × heads × (qk_dim + v_dim) × dtype)."""
+        ≈ total_kv × heads × (qk_dim + v_dim) × dtype).
+
+        With FP8 attention and a gather that can write FP8, K/V are gathered
+        straight into FP8 buffers with the chunked path's scales, and only Q
+        (with the new tokens' K/V, for those scales) is quantized: the caller's
+        ``q_fp8`` / ``kv_out_scales``, else `_quantize_new_tokens` of
+        ``kv_c_normed_new`` / ``k_rope_new``. Otherwise Q/K/V are quantized
+        together after a BF16 gather, as before."""
         self._check_fp8_prefill_mha(prefill_q)
+        fp8_gather = bool(
+            self._fp8_mha_ok
+            and (kv_out_scales is not None or kv_c_normed_new is not None)
+            and self._gather_writes_fp8(kv_cache)
+        )
+        if not fp8_gather:
+            q_fp8 = kv_out_scales = None
+        elif kv_out_scales is None:
+            prefill_q, k_new, v_new, quant_k_rope = self._new_token_kv(
+                prefill_q, kv_c_normed_new, k_rope_new
+            )
+            q_fp8, _, kv_out_scales = self._quantize_new_tokens(
+                prefill_q, k_new, v_new, quant_k_rope
+            )
+        kv_dtype = torch.float8_e4m3fn if fp8_gather else self.dtype
         k_full = torch.empty(
             (
                 attn_metadata.total_kv,
@@ -2273,14 +2299,14 @@ class MLAAttention(nn.Module):
                 self.qk_nope_head_dim + self.qk_rope_head_dim,
             ),
             device=prefill_q.device,
-            dtype=self.dtype,
+            dtype=kv_dtype,
         )
         v_full = torch.empty(
             (attn_metadata.total_kv, self.num_heads, self.v_head_dim),
             device=prefill_q.device,
-            dtype=self.dtype,
+            dtype=kv_dtype,
         )
-        self._gather_cached_kv_b_proj(
+        kv_fp8 = self._gather_cached_kv_b_proj(
             kv_cache,
             attn_metadata.kv_indptr,
             attn_metadata.kv_indices,
@@ -2289,6 +2315,7 @@ class MLAAttention(nn.Module):
             v_full,
             getattr(attn_metadata, "shuffle_kv_block_indptr", None),
             getattr(attn_metadata, "shuffle_kv_block_indices", None),
+            kv_out_scales=kv_out_scales,
         )
         prefill_q, k_full = self._drop_rope_pad(prefill_q, k_full)
         output = self._flash_attn_prefill(
@@ -2302,8 +2329,52 @@ class MLAAttention(nn.Module):
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
             causal=True,
+            q_fp8=q_fp8,
+            kv_fp8=kv_fp8,
         )
         return self.o_proj(output.flatten(start_dim=-2))
+
+    def _gather_writes_fp8(self, kv_cache: torch.Tensor) -> bool:
+        """Whether `_kv_b_proj_gather` writes FP8 K/V from its epilogue for
+        this layer (FlyDSL gather on an unshuffled cache, FP8 outputs served).
+        Resolves the same per-layer flags; their probes read only shapes,
+        dtypes and devices, so one-row stand-ins answer for any length."""
+        if self.kv_shuffled or not (
+            self.use_flydsl_gather_kv_b_proj and _FLYDSL_GATHER_AVAILABLE
+        ):
+            return False
+        if self._flydsl_gather_ok is None or (
+            self._flydsl_gather_ok and self._flydsl_gather_fp8_ok is None
+        ):
+            weight = _maybe_view_mxfp4_weight_for_gather(
+                self.kv_b_proj, self.kv_b_proj.weight
+            )
+            weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
+            qk_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+
+            def rows(dtype):
+                return (
+                    kv_cache.new_empty((1, self.num_heads, qk_dim), dtype=dtype),
+                    kv_cache.new_empty(
+                        (1, self.num_heads, self.v_head_dim), dtype=dtype
+                    ),
+                )
+
+            if self._flydsl_gather_ok is None:
+                self._flydsl_gather_ok = gather_kv_b_proj_flydsl_supported(
+                    kv_cache, weight, weight_scale, *rows(self.dtype)
+                )
+            if self._flydsl_gather_ok:
+                scale = kv_cache.new_ones(1, dtype=torch.float32)
+                self._flydsl_gather_fp8_ok = gather_kv_b_proj_flydsl_fp8_supported(
+                    kv_cache,
+                    weight,
+                    weight_scale,
+                    *rows(torch.float8_e4m3fn),
+                    k_out_scale=scale,
+                    v_out_scale=scale,
+                )
+        return bool(self._flydsl_gather_ok and self._flydsl_gather_fp8_ok)
 
     def _gather_cached_kv_b_proj(
         self,
@@ -2366,8 +2437,10 @@ class MLAAttention(nn.Module):
         DCP -- and ``kv_indices`` selects rows out of it.
 
         With ``kv_out_scales`` the FlyDSL epilogue writes FP8 into the first
-        half of each contiguous BF16 workspace and returns the FP8 views and
-        descales. BF16 output returns None so the caller quantizes separately.
+        half of each contiguous BF16 workspace (or into FP8 outputs as given,
+        which only callers that checked `_gather_writes_fp8` pass) and returns
+        the FP8 views and descales. BF16 output returns None so the caller
+        quantizes separately.
         """
         weight = self.kv_b_proj.weight
         gather_weight = _maybe_view_mxfp4_weight_for_gather(self.kv_b_proj, weight)
@@ -2391,7 +2464,8 @@ class MLAAttention(nn.Module):
                     self._flydsl_gather_fp8_ok is not False
                     and kv_out_scales is not None
                     and all(
-                        t.dtype == torch.bfloat16 and t.is_contiguous()
+                        t.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+                        and t.is_contiguous()
                         for t in (k_out, v_out)
                     )
                 )
@@ -2399,7 +2473,13 @@ class MLAAttention(nn.Module):
                 out_kwargs = {}
                 if fp8_outputs:
                     k_fp8, v_fp8 = (
-                        t.view(torch.float8_e4m3fn).view(-1)[: t.numel()].view(t.shape)
+                        (
+                            t
+                            if t.dtype == torch.float8_e4m3fn
+                            else t.view(torch.float8_e4m3fn)
+                            .view(-1)[: t.numel()]
+                            .view(t.shape)
+                        )
                         for t in (k_out, v_out)
                     )
                     if self._flydsl_gather_fp8_ok is None:
@@ -3982,7 +4062,11 @@ class MLAAttention(nn.Module):
             )
         elif attn_metadata.has_cached:
             output = self._forward_prefill_cached_single_pass(
-                prefill_q, kv_cache, attn_metadata
+                prefill_q,
+                kv_cache,
+                attn_metadata,
+                q_fp8=q_fp8,
+                kv_out_scales=kv_out_scales,
             )
         else:
             output = self._flash_attn_prefill(
@@ -4050,7 +4134,7 @@ class MLAAttention(nn.Module):
                     )
                 else:
                     output = self._forward_prefill_cached_single_pass(
-                        prefill_q, kv_cache, attn_metadata
+                        prefill_q, kv_cache, attn_metadata, k_nope, k_rope
                     )
             else:
                 output = self._forward_prefill_mha(
