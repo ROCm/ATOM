@@ -699,6 +699,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 gfx1250 NVFP4 index: the decode indexer (scorer + top-k, sparse
+    # table emit included) through aiter's FlyDSL `index_topk_decode_nvfp4` in
+    # place of the FP4 work-map scorer + selector. Opt-in for A/B.
+    "ATOM_M3_DECODE_INDEX_TOPK_FLYDSL": lambda: _flag_env(
+        "ATOM_M3_DECODE_INDEX_TOPK_FLYDSL"
+    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

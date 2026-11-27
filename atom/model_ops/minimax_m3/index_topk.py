@@ -45,6 +45,7 @@ PREFILL_TOPK_NUM_WARPS = _prefill_policy.PREFILL_TOPK_NUM_WARPS
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views as nvfp4_page_views
+from atom.utils import envs
 
 
 @functools.cache
@@ -1758,6 +1759,41 @@ def _triton_decode_score(
     return score
 
 
+def _flydsl_decode_index_topk(
+    idx_q, index_kv_cache, index_scorer, max_block, max_query_len, topk
+):
+    """(aiter's FlyDSL decode indexer, its bf16 query, the index cache's two
+    views, the score plane it scores into) when ``ATOM_M3_DECODE_INDEX_TOPK_FLYDSL``
+    asks for it on an NVFP4 index cache and aiter serves the call (aiter decides:
+    gfx1250, at most 32 (index head, query row) pairs a request, top-k <= 32),
+    else None. Imported directly: the flag needs an aiter with the op."""
+    if (
+        index_scorer is None
+        or not index_scorer.nvfp4
+        or not envs.ATOM_M3_DECODE_INDEX_TOPK_FLYDSL
+    ):
+        return None
+    from aiter.ops.flydsl.index_score_decode import (
+        index_topk_decode_nvfp4,
+        index_topk_decode_nvfp4_supported,
+        index_topk_decode_score_plane,
+    )
+
+    total_q, heads, _ = idx_q.shape
+    # The FP4 index's query is e4m3 (cast as is); bf16 holds it exactly.
+    q = idx_q.to(torch.bfloat16)
+    payload, scale = nvfp4_page_views(index_kv_cache)
+    # The record's width, not this step's: it must not move between graph replays.
+    score = index_topk_decode_score_plane(
+        heads, total_q, index_scorer.max_block, idx_q.device
+    )
+    if not index_topk_decode_nvfp4_supported(
+        q, payload, scale, score, max_query_len, topk
+    ):
+        return None
+    return index_topk_decode_nvfp4, q, payload, scale, score
+
+
 @torch.no_grad()
 def minimax_m3_index_topk_decode(
     idx_q: torch.Tensor,  # [total_q == batch*max_query_len, num_idx_heads, head_dim]
@@ -1835,6 +1871,37 @@ def minimax_m3_index_topk_decode(
         idx_q.device,
         pages_per_block,
     )
+
+    flydsl_topk = _flydsl_decode_index_topk(
+        idx_q, index_kv_cache, index_scorer, max_block, max_query_len, topk
+    )
+    if flydsl_topk is not None:
+        # aiter's FlyDSL scorer on a length-proportional plan, then its decode
+        # selector: `_topk_index_packed_kernel`'s keys, pins, order and emit.
+        run, q, payload, scale, score = flydsl_topk
+        emit_kw = {}
+        if emit_out:
+            emit_kw = {
+                "sparse_bt": emit_out[0],
+                "sparse_ctx": emit_out[1],
+                "pages_per_block": pages_per_block,
+                "block_page_stride": block_page_stride,
+            }
+        run(
+            q,
+            payload,
+            scale,
+            score,
+            block_table,
+            seq_lens,
+            sm_scale,
+            max_query_len,
+            topk_idx,
+            init_blocks,
+            local_blocks,
+            **emit_kw,
+        )
+        return (topk_idx, *emit_out) if emit_out else topk_idx
 
     if index_scorer is not None:
         views, _, score_decode = _fp4_index_ops(index_scorer)
