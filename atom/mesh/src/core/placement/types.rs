@@ -34,8 +34,6 @@ pub enum PlacementPlan {
     Single {
         worker: Arc<dyn Worker>,
         policy_name: &'static str,
-        /// The selection's `RouteDecision::binding`, for the dispatch hooks.
-        binding: Option<u64>,
         /// Prompt tokens charged to `worker` until its prefill finishes.
         prefill_tokens: usize,
     },
@@ -44,8 +42,6 @@ pub enum PlacementPlan {
         decode: Arc<dyn Worker>,
         prefill_policy: &'static str,
         decode_policy: &'static str,
-        prefill_binding: Option<u64>,
-        decode_binding: Option<u64>,
         /// Prompt tokens charged to `prefill` until its prefill finishes.
         prefill_tokens: usize,
     },

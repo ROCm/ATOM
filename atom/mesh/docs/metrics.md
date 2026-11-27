@@ -158,17 +158,17 @@ the least-loaded worker (`no_session`). Its branches:
   next sweep drops it;
 - `rebind`: the pinned worker is unhealthy, removed or circuit-open, or under
   idx2idx not among the prefill candidates the decode's rank leaves, or a
-  request placed on the current pin failed with a server error or got no
-  response, so the session's next request (a retry included) is placed again
-  like a new one, away from every worker it failed on since its last hit
-  while another one is healthy. The worker a failure counts against is the one
-  the request was sent to, after DP rank mapping; a request placed before the
-  session last moved does not count. Under `--atom-pd-rank-mapping-policy
+  request of the session failed on the pinned worker with a server error or got
+  no response, so the session's next request (a retry included) is placed again
+  like a new one, away from every worker it failed on since its last hit while
+  another one is healthy. A late failure on a worker the session has left does
+  not count; one from an older placement on the worker the session is pinned to
+  again does, and places it once more. Under `--atom-pd-rank-mapping-policy
   idx2idx`, a failed prefill also releases the decode pin, although the decode
   was never sent. HTTP, PD and ext_proc routing report failures; gRPC does not.
-  For HTTP and PD routing a body that breaks after a successful status is not
-  a failure; ext_proc also reports an upstream reset or timeout after the
-  response started;
+  For HTTP and PD routing a body that breaks after a successful status is not a
+  failure; ext_proc also reports an upstream reset or timeout after the response
+  started;
 - `expired`: the session was idle for more than `--session-affinity-ttl-secs`
   (120 minutes) and is placed again, still away from the workers it failed on
   since its last hit.
@@ -208,8 +208,10 @@ is outside). A session pinned to another rank is re-pinned and counts as
 `rebind`. Only when idx2idx would move every healthy prefill are all of them
 offered, and then the remap leaves the selected one in place, as its target on
 the decode's rank is unavailable; a remap therefore takes a health or
-membership change between planning and reservation. A session that moves
-leaves its KV cache on the old worker. The HTTP routers and the
+membership change between planning and reservation. Two in-flight requests of
+one session also record `rank_mapping` without a remap when either of them
+rebinds the pin: the one dispatched second finds the reassignment taken. A
+session that moves leaves its KV cache on the old worker. The HTTP routers and the
 external-processing PD executor record it when they send the request, and
 external-processing single-worker routes when they hand the route to Envoy;
 gRPC routers do not.

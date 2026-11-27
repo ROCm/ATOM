@@ -10,7 +10,7 @@ pub async fn apply_policy(
     policy: &dyn LoadBalancingPolicy,
     descriptor: &RequestDescriptor<'_>,
     hash_ring: Option<Arc<HashRing>>,
-) -> Result<(Arc<dyn Worker>, Option<u64>), PlacementError> {
+) -> Result<Arc<dyn Worker>, PlacementError> {
     if candidates.is_empty() {
         return Err(PlacementError::NoAvailableWorkers);
     }
@@ -27,9 +27,7 @@ pub async fn apply_policy(
     // The planner passes the candidates of one pool.
     let pool = candidates[0].worker_type().as_metric_label();
     record_decision(pool, policy.name(), selected.as_ref(), decision);
-    selected
-        .map(|worker| (worker, decision.binding))
-        .ok_or(PlacementError::PolicyReturnedNone)
+    selected.ok_or(PlacementError::PolicyReturnedNone)
 }
 
 /// Records one selection. Runs before the router adds the request, so the
