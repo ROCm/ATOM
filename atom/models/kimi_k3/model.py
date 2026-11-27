@@ -179,6 +179,10 @@ _RMS_FUSABLE_QUANT_TYPES = (
 )
 
 
+# Legacy TP8 threshold; the current runtime crossover remains unqualified.
+_KDA_IN_PROJ_SPLIT_MIN_TOKENS = 8192
+
+
 def _is_e8m0_blockscale(
     quant_config: QuantizationConfig | None, quant_type: QuantType
 ) -> bool:
@@ -1230,20 +1234,23 @@ class KimiKDAAttention(nn.Module):
         self.fuse_f_a_quant = (
             f_b_type == QuantType.per_Token and f_b_dtype == dtypes.fp8
         )
+        self._split_in_proj = False
+        self._in_proj_views = None
 
     def get_streaming_deferred_modules(self) -> tuple[nn.Module, ...]:
         """Children that must remain unquantized until KDA fuses their weights."""
         return self.in_proj, self.f_a_proj
 
     def process_weights_after_loading(self) -> None:
-        """Fuse all hidden-input projections into the single in-proj (one GEMM).
+        """Fuse all hidden-input projections into a single in-proj weight.
 
         Upstream already loads q/k/v/g into a single ``in_proj``
         (``MergedColumnParallelLinear``) via ``packed_modules_mapping``. Here we
         extend that fused weight in place with the two remaining projections that
         also consume ``hidden_states`` -- ``b_proj`` (beta) and ``f_a_proj`` --
-        so ``forward`` runs one ``self.in_proj(...)`` producing
-        ``[q | k | v | g | b | f_a]`` instead of three separate launches. The
+        so ``forward`` can emit ``[q | k | v | g | b | f_a]`` in one launch.
+        Eligible large prefills split this weight into ``[q | k | v | g]``
+        and ``[b | f_a]`` row views to use the tuned tile-aligned GEMM. The
         tail storage is then released (the modules stay as empty shells; their
         bf16 post-load hooks are no-ops and never re-run). Runs once; idempotent.
 
@@ -1294,6 +1301,35 @@ class KimiKDAAttention(nn.Module):
             dim=0,
         ).contiguous()
         self._in_proj_fused = True
+        self._split_in_proj = self._supports_in_proj_split()
+        if self._split_in_proj:
+            qkvg_rows = 4 * self.local_proj_size
+            # A plain tuple keeps the views out of the loader's post-load walk.
+            self._in_proj_views = (
+                self.in_proj.make_row_view(0, qkvg_rows),
+                self.in_proj.make_row_view(
+                    qkvg_rows, self.num_local_heads + self.head_dim
+                ),
+            )
+
+    def _supports_in_proj_split(self) -> bool:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        # Keep wrappers/subclasses outside the inherited native-only scope.
+        return (
+            type(self) is __class__
+            # Child post-load hooks may quantize the fused BF16 weight later.
+            and effective_layer_quant(self.in_proj.quant_config, self.in_proj.prefix)[0]
+            == QuantType.No
+            and self.tp_size == 8
+            and self.hidden_size == 7168
+            and self.local_proj_size == 1536
+            and self.num_local_heads == 12
+            and self.head_dim == 128
+            and self.in_proj.weight.dtype == torch.bfloat16
+            and self.in_proj.weight.shape == (6284, 7168)
+            and get_gfx_runtime() == "gfx950"
+        )
 
     def _run_kda(
         self,
@@ -1391,35 +1427,43 @@ class KimiKDAAttention(nn.Module):
         hidden_states = hidden_states[:num_actual_tokens]
         if hidden_states_scale is not None:
             hidden_states_scale = hidden_states_scale[:num_actual_tokens]
-        # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
-        # part. `out_gate` is the KDA output gate consumed at o_norm below
-        # (computed here so it rides the same GEMM instead of a separate one
-        # after the recurrence). in_proj's weight was grown in
-        # process_weights_after_loading to the fused [q | k | v | g | b | f_a],
-        # so this single unquantized call emits all six; f_b_proj stays a
-        # separate GEMM because it consumes f_a's output, not hidden_states.
+        # Split only the eligible large-prefill case; f_b_proj still consumes
+        # f_a's output and stays a separate GEMM in either path.
         lp = self.local_proj_size
         nlh = self.num_local_heads
         hd = self.head_dim
-        fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
+        if (
+            kda_metadata.num_prefills > 0
+            and num_actual_tokens >= _KDA_IN_PROJ_SPLIT_MIN_TOKENS
+            and self._split_in_proj
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states_scale is None
+            and hidden_states.is_contiguous()
+        ):
+            qkvg_proj, tail_proj = self._in_proj_views
+            qkvg = qkvg_proj(hidden_states)
+            tail = tail_proj(hidden_states)
+        else:
+            fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
+            qkvg, tail = fused_in[..., : 4 * lp], fused_in[..., 4 * lp :]
         # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
-        # row stride N_fused). Both causal-conv consumers read the token stride
+        # row stride N). Both causal-conv consumers read the token stride
         # from the tensor itself — causal_conv1d_fn uses x.stride(1) after
         # transpose (channel-last: stride(0)==1), and causal_conv1d_update only
         # requires x.stride(1)==1 (feature-contiguous, which the slice preserves).
-        mixed_qkv = fused_in[..., : 3 * lp]
-        out_gate = fused_in[..., 3 * lp : 4 * lp]
+        mixed_qkv = qkvg[..., : 3 * lp]
+        out_gate = qkvg[..., 3 * lp :]
         # beta is widened to fp32 inside _run_kda (see the note there): the KDA
         # delta-rule write strength must stay fp32 for accuracy.
-        beta = fused_in[..., 4 * lp : 4 * lp + nlh].unsqueeze(0)
+        beta = tail[..., :nlh].unsqueeze(0)
         # f_a feeds a second GEMM (f_b_proj) and is a column slice of the fused
-        # output, so it needs a unit row stride rather than the fused N_fused one.
+        # output, so it needs a unit row stride rather than the output's N.
         # Under a per-token FP8 f_b_proj that copy would be followed by a quant
         # of the same [T, head_dim]; strided_per_token_quant does the gather AND the
         # quant in one kernel, so only the quantized result is ever written.
         # Otherwise the plain contiguous copy runs and f_b_proj quantizes (or
         # not) exactly as before.
-        f_a_view = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd]
+        f_a_view = tail[..., nlh : nlh + hd]
         if self.fuse_f_a_quant:
             from atom.model_ops.kimi_k3 import strided_per_token_quant
 
@@ -1437,7 +1481,7 @@ class KimiKDAAttention(nn.Module):
         # Prefill returns its own contiguous output. Allocate this buffer only
         # for decode/spec-decode, where the recurrence writes into it directly.
         if kda_metadata.num_prefills <= 0:
-            out = fused_in.new_empty(
+            out = qkvg.new_empty(
                 (num_actual_tokens, self.num_local_heads, self.head_dim)
             )
 
@@ -1517,9 +1561,9 @@ class KimiKDAAttention(nn.Module):
                 )
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.
-            assert kda_out.dtype == fused_in.dtype, (
-                "KDA output dtype must match the former fused_in-backed output "
-                f"buffer: got {kda_out.dtype} vs {fused_in.dtype}"
+            assert kda_out.dtype == qkvg.dtype, (
+                "KDA output dtype must match the projection output "
+                f"buffer: got {kda_out.dtype} vs {qkvg.dtype}"
             )
             assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
             out = kda_out.squeeze(0)
