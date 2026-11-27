@@ -13,6 +13,7 @@ import time
 from typing import Annotated, Any
 
 import numpy as np
+from fastapi import HTTPException
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -24,6 +25,8 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
+
+from atom.model_engine.request import server_abort
 
 # ============================================================================
 # Constants
@@ -170,6 +173,29 @@ def decode_prompt_token_ids_b64(text: str) -> array.array:
 # reason -- `max_tokens`, `aborted`, `unschedulable: ...` -- cut it off.
 MODEL_STOP_REASONS = ("eos", "stop", "stop_sequence")
 STOP_TOKEN_REASON_PREFIX = "stop_"
+
+
+class ServerAborted(HTTPException):
+    """The server ended the request itself (`request.server_abort`): the
+    client is answered 503 and why, not a completion cut short."""
+
+    def __init__(self, why: str):
+        super().__init__(status_code=503, detail=f"Request aborted: {why}")
+
+    def __str__(self) -> str:
+        return self.detail
+
+
+def raise_for_server_abort(finish_reason) -> None:
+    why = server_abort(finish_reason)
+    if why is not None:
+        raise ServerAborted(why)
+
+
+def server_aborted_frames(exc: ServerAborted) -> str:
+    """What ends an OpenAI stream whose request the server ended."""
+    error = {"type": "server_error", "code": "server_abort", "message": str(exc)}
+    return f"data: {json.dumps({'error': error})}\n\n{STREAM_DONE_MESSAGE}"
 
 
 def ended_by_stop(finish_reason: str | None) -> bool:

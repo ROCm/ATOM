@@ -65,13 +65,7 @@ from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.kv_cache_binding import kv_cache_bindings
 from atom.model_engine.mixed_profile import profile_mixed_memory
-from atom.model_engine.model_setup import (
-    build_model,
-    construct_drafter,
-    get_model,
-    init_model_env,
-    load_weights,
-)
+from atom.model_engine.model_setup import build_model, get_model, init_model_env
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
@@ -106,9 +100,9 @@ from atom.model_engine.token_logprobs import (
     unpack_token_logprobs,
 )
 from atom.model_loader.weight_cache.client import (
+    build_and_load_drafter,
+    build_and_load_model,
     daemon_load_extra,
-    load_drafter_from_cache,
-    load_from_cache,
 )
 from atom.model_loader.weight_utils import params_on_meta
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
@@ -1176,22 +1170,18 @@ class ModelRunner:
     def _build_and_load_model(
         self, config: Config, model_class: type, device: torch.device
     ) -> torch.nn.Module:
-        """Construct the model and load its weights (from disk, or a weight
-        cache daemon's under ATOM_PRELOAD): the loader ``get_model`` calls.
+        """Construct the model and load its weights: the loader ``get_model``
+        calls.
 
         Override point: subclasses (e.g. the rapidserve decode process) may
         construct on the meta device and import weights via IPC instead.
         """
-        if envs.ATOM_PRELOAD == "server":
-            # A weight cache daemon's weights, if it can give them.
-            model = load_from_cache(config, model_class, device, rank=self.rank)
-            if model is not None:
-                return model
-        model = build_model(config, model_class, device)
         load_start = time.perf_counter()
-        loaded = load_weights(model, config)
-        # The parameters the checkpoint wrote, by name; None if none was read.
-        self._checkpoint_param_names = None if config.load_dummy else frozenset(loaded)
+        # With it: the parameters the checkpoint wrote, by name; None if none
+        # was read.
+        model, self._checkpoint_param_names = build_and_load_model(
+            config, model_class, device, rank=self.rank
+        )
         load_elapsed = time.perf_counter() - load_start
         logger.info(
             f"[{self.rank_name}] Model load done: {config.model} "
@@ -1202,16 +1192,11 @@ class ModelRunner:
     def _build_and_load_drafter(self) -> Drafter:
         """Construct the drafter and load its weights, sharing with the loaded
         model what the draft does not hold itself."""
-        if envs.ATOM_PRELOAD == "server":
-            drafter = load_drafter_from_cache(
-                self.config, self.device, self, self.model, rank=self.rank
-            )
-            if drafter is not None:
-                return drafter
-        drafter = construct_drafter(self.config, self.device, self)
         logger.info("Loading drafter model...")
         load_start = time.perf_counter()
-        drafter.load_model(self.model)
+        drafter = build_and_load_drafter(
+            self.config, self.device, self, self.model, rank=self.rank
+        )
         load_elapsed = time.perf_counter() - load_start
         logger.info(
             f"[{self.rank_name}] Drafter load done: "
@@ -3591,6 +3576,37 @@ class ModelRunner:
 
     def release_constraints(self, request_ids):
         release_token_constraints(self, request_ids)
+
+    def await_forwards(self, rewrite: bool = False) -> None:
+        """Return once everything this rank sent to its device has run: a
+        weight cache daemon's `stop` waits for it. ``rewrite``: the weights it
+        maps are about to hold other values; raises where mono kernels may
+        run, which keep copies of them (``_takes_weight_updates``), and under
+        pipeline parallelism, whose later stages neither stop with the first
+        one nor refresh before it goes on."""
+        mono = self.config.hf_config.architectures[0] in mono_decode_installers
+        mono = mono or type(self.verify_head).__module__.startswith("atom.mono")
+        if rewrite and mono and envs.ATOM_MONO_ENABLE:
+            raise RuntimeError(
+                "mono kernels may keep copies of the weights (ATOM_MONO_ENABLE=0 "
+                "serves without them)"
+            )
+        if rewrite and self.config.pipeline_parallel_size > 1:
+            raise RuntimeError("pipeline stages do not stop and go on together")
+        torch.cuda.synchronize(self.device)
+
+    @torch.inference_mode()  # what a forward made is written only there
+    def weights_changed(self) -> None:
+        """The weights this rank maps hold other values (a weight cache
+        daemon's `load`): every module derives again, where it keeps it, what
+        it made of them after they loaded (``refresh_derived_weights``)."""
+        drafter = getattr(self, "drafter", None)
+        models = [self.model] if drafter is None else [self.model, drafter.model]
+        for model in models:
+            for module in model.modules():
+                if hasattr(module, "refresh_derived_weights"):
+                    module.refresh_derived_weights()
+        torch.cuda.synchronize(self.device)
 
     def prepare_structured_output(
         self,

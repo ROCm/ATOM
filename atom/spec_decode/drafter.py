@@ -713,13 +713,19 @@ class Drafter(abc.ABC):
         # than by one method probe.
         spec = self.speculative_config
         standalone_ckpt = spec.method == "eagle3" or spec.use_dspark_with_draft()
-        return load_model(
+        loaded = load_model(
             self.model,
             spec.model if standalone_ckpt else self.config.model,
             spec.draft_model_hf_config,
             self.config.load_dummy,
             not standalone_ckpt,
         )
+        # What a draft makes of several modules' weights once all are loaded:
+        # part of the load, so a weight cache daemon holds it with them.
+        derive = getattr(self.model, "derive_from_weights", None)
+        if derive is not None:
+            derive()
+        return loaded
 
     def attach_to_target(self, target_model: nn.Module, loaded: set[str]) -> None:
         """Share with the loaded target what the draft did not load itself."""

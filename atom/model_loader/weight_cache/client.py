@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""A server's side (ATOM_PRELOAD): take the weights from the daemon on its
-GPUs, starting or restarting the daemon as needed."""
+"""A server rank's side: its model and drafter with their weights, mapped
+from the daemon the launch's main process found or started (session) under
+ATOM_PRELOAD, read from the checkpoint otherwise."""
 
 from __future__ import annotations
 
@@ -9,7 +10,6 @@ import contextlib
 import gc
 import os
 import re
-import signal
 import socket
 import sys
 import threading
@@ -19,7 +19,7 @@ from typing import Any, NamedTuple
 import torch
 from torch import nn
 
-from atom.distributed.group_agreement import group_agree, group_max, group_min
+from atom.distributed.group_agreement import group_agree
 from atom.model_loader.weight_cache.export import (
     _leftover_meta,
     _run_prepare_finalize,
@@ -33,16 +33,16 @@ from atom.model_loader.weight_cache.key import (
     structure,
 )
 from atom.model_loader.weight_cache.preload import (
+    _detail,
+    _fail,
     _hold_unused,
     _pid_running,
-    _spawn_daemon,
-    _started_by_launch,
-    launch_recorded,
+    read_session,
     stop_daemon,
-    uncacheable,
-    unsupported,
 )
 from atom.model_loader.weight_cache.transport import (
+    PROTOCOL,
+    _connect,
     _recv,
     _send,
     daemon_alive,
@@ -51,11 +51,8 @@ from atom.model_loader.weight_cache.transport import (
 )
 from atom.model_loader.weight_cache.values import _TAG, _Miss, logger
 from atom.model_loader.weight_utils import params_on_meta
-from atom.utils import worker_process_name
+from atom.utils import envs, worker_process_name
 
-# What a rank finds (the launch acts on the most severe): no daemon, one it
-# can use, one it cannot.
-_NONE, _USABLE, _UNUSABLE = range(3)
 # [the drafter part] of the payload this process took its model from, for
 # load_drafter_from_cache, which runs after the model's.
 _draft: list | None = None
@@ -74,7 +71,7 @@ class _Rank(NamedTuple):
     """One runner of the launch."""
 
     label: str
-    path: str  # its GPU's daemon socket
+    path: str  # its GPU's name (socket_path)
     device: torch.device
     group: Any  # every runner of the launch: they decide together
 
@@ -85,6 +82,12 @@ def build_model(config, model_class, device):
     from atom.model_engine import model_setup
 
     return model_setup.build_model(config, model_class, device)
+
+
+def load_weights(model, config):
+    from atom.model_engine import model_setup
+
+    return model_setup.load_weights(model, config)
 
 
 def construct_drafter(config, device, runner):
@@ -114,15 +117,6 @@ def _agree(reasons: list[str], group) -> None:
     """Every rank goes on, or none does (raises _Unfit)."""
     if not group_agree(not reasons, group):
         raise _Unfit(reasons)
-
-
-def _detail(reasons: list[str]) -> str:
-    return "\n  ".join(reasons[:25]) or "another rank cannot (see its log)"
-
-
-def _is_running(started: dict) -> bool:
-    """The daemon this launch started (its main process) is still there."""
-    return _pid_running(started["pid"], started.get("created"))
 
 
 class _MetaBuild:
@@ -167,28 +161,24 @@ def _load_bar(log: str | None) -> str:
     return bars[-1].decode(errors="replace") if bars else ""
 
 
-def _wait_together(me: _Rank, started: dict | None) -> bool:
-    """Wait until every GPU's daemon serves or will not: all ranks together,
-    so none sits in a collective while another waits out a load. A daemon
-    that hangs is the user's to stop. Rank 0 shows the daemon's progress bar
-    as a disk load shows its own. Returns whether a daemon held this GPU
-    meanwhile."""
+def _wait_serving(me: _Rank, session: dict) -> bool:
+    """Wait until the session's daemon holds the weights of every GPU of the
+    launch, or will not (its main process is gone): each rank by itself, on
+    what every rank sees, so they go on together. A daemon that hangs is the
+    user's to stop. Rank 0 shows the daemon's progress bar as a disk load
+    shows its own. Returns whether a daemon held this GPU meanwhile."""
     t0 = last = time.monotonic()
     held, drawn = False, ""
     shows = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     while True:
-        alive = daemon_alive(me.path)
-        held = held or alive
-        waiting = (alive and not os.path.exists(me.path)) or (
-            # The daemon this launch started has not taken the GPU yet.
-            started is not None
-            and not held
-            and _is_running(started)
+        held = held or daemon_alive(me.path)
+        serving = all(
+            daemon_alive(p) and (daemon_state(p) or {}).get("state") == "serving"
+            for p in session["paths"]
         )
-        if not group_max(int(waiting), me.group):
+        if serving or not _pid_running(session["pid"], session.get("created")):
             return held
-        log = (started or daemon_state(me.path) or {}).get("log") if shows else None
-        bar = _load_bar(log)
+        bar = _load_bar(session.get("log")) if shows else ""
         if bar != drawn:
             done = " 100%|" in bar
             sys.stderr.write(f"\r{_TAG} daemon: {bar}" + "\n" * done)
@@ -204,18 +194,27 @@ def _wait_together(me: _Rank, started: dict | None) -> bool:
 
 
 def _fetch(me: _Rank) -> tuple[socket.socket, dict]:
-    """Get the daemon's payload; the connection stays open (raises _Miss)."""
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    """Get this GPU's payload from the daemon; the connection stays open
+    (raises _Miss)."""
+    sock = None
     try:
-        sock.settimeout(30)
-        sock.connect(me.path)
-        _send(sock, {"cmd": "get", "who": f"pid {os.getpid()} {me.label}"})
+        sock = _connect(me.path)
+        _send(
+            sock,
+            {
+                "cmd": "get",
+                "v": PROTOCOL,
+                "gpu": os.path.basename(me.path),
+                "launch": envs.ATOM_PRELOAD_LAUNCH,
+                "who": f"pid {os.getpid()} {me.label}",
+            },
+        )
         sock.settimeout(600)  # the daemon checksums its storages first
         payload = _recv(sock)
         sock.settimeout(None)
     except Exception as e:  # noqa: BLE001
-        sock.close()
-        raise _Miss(f"daemon at {me.path} unreachable: {e}") from None
+        _close(sock)
+        raise _Miss(f"the daemon holding {me.path} is unreachable: {e}") from None
     if "error" in payload:
         sock.close()
         raise _Miss(payload["error"])
@@ -233,23 +232,20 @@ def _check_payload(payload: dict, key: dict) -> list[str]:
     return []
 
 
-def _probe(me: _Rank, started: dict | None, held: bool, key: dict):
-    """This rank's daemon, once _wait_together returned (``held``: one held
-    the GPU meanwhile): (connection, payload, why it cannot be used, status)."""
-    sock, payload, status = None, None, _USABLE
+def _probe(me: _Rank, session: dict, key: dict):
+    """This rank's weights from the session's daemon, once _wait_serving
+    returned: (connection, payload, why they cannot be used)."""
+    sock, payload = None, None
     try:
         if not daemon_alive(me.path):
-            if held:
-                # Its memory may still be in use: not a GPU without a daemon.
-                raise _Miss(
-                    "the daemon on this GPU exited before serving; see its log in "
-                    + os.path.dirname(me.path)
-                )
-            if started is None:
-                return None, None, [], _NONE
             raise _Miss(
-                f"the weight cache daemon (pid {started['pid']}) did not take this GPU; "
-                f"see {started['log']}"
+                f"the weight cache daemon (pid {session['pid']}) does not hold this "
+                f"GPU: it exited before serving, see {session.get('log') or 'its log'}"
+            )
+        if (daemon_state(me.path) or {}).get("socket") != session["socket"]:
+            raise _Miss(
+                "another daemon holds this GPU than the one the launch found "
+                f"(pid {session['pid']})"
             )
         sock, payload = _fetch(me)
         reasons = _check_payload(payload, key)
@@ -258,24 +254,14 @@ def _probe(me: _Rank, started: dict | None, held: bool, key: dict):
     except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
         reasons = [f"weight cache error: {e!r}"]
     if reasons:
-        status = max(status, _UNUSABLE)
         _close(sock)
         sock = None
-    return sock, payload, reasons, status
+    return sock, payload, reasons
 
 
 def _close(sock) -> None:
     if sock is not None:
         sock.close()
-
-
-def _fail(label: str, reasons: list[str], pid=None) -> RuntimeError:
-    return RuntimeError(
-        f"{_TAG} {label}: ATOM_PRELOAD cannot use or replace the weight cache daemon"
-        f"{f' (pid {pid})' if pid else ''}: {_detail(reasons)}\nFix the cause above, or launch "
-        "without ATOM_PRELOAD once the daemon is gone (python -m "
-        "atom.model_loader.weight_cache stop; --force stops one that servers use)."
-    )
 
 
 def _stop_and_reclaim(path: str, device: torch.device, held: bool) -> None:
@@ -306,11 +292,9 @@ def _stop_and_reclaim(path: str, device: torch.device, held: bool) -> None:
     )
 
 
-def _stop_together(me: _Rank, why, held: bool, pid=None, started=None) -> None:
-    """Stop the daemon on every rank's GPU, or on none: fail if servers use
-    any rank's. With ``started``, this launch's own, that one goes too,
-    whichever holds the GPUs (an aborted launch may have left one starting,
-    which then took them first). Returns once the memory is free."""
+def _stop_together(me: _Rank, why, held: bool, pid=None) -> None:
+    """Stop the daemon on every rank's GPU, or on none: fail if another
+    launch's servers use any rank's. Returns once the memory is free."""
     # Held from here: no server takes the weights between this check, the
     # ranks' agreement and the stop. Let go, the daemon serves again.
     hold, err = _hold_unused(me.path)
@@ -320,73 +304,12 @@ def _stop_together(me: _Rank, why, held: bool, pid=None, started=None) -> None:
         err = None
         try:
             _stop_and_reclaim(me.path, me.device, held)
-            if started is not None and _is_running(started):
-                with contextlib.suppress(ProcessLookupError):  # another rank's did
-                    os.kill(started["pid"], signal.SIGTERM)  # it never took a GPU
         except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
             err = f"could not stop the daemon: {e}"
         if not group_agree(err is None, me.group):
             raise _fail(me.label, [err] if err else [], pid)
     finally:
         _close(hold)
-
-
-def _replace_daemon(
-    me: _Rank, reasons, held, pid, started, present, key
-) -> dict | None:
-    """The launch cannot use what is on its GPUs (``reasons``; ``present``:
-    a daemon is on some): stop it and start a daemon of this launch's own.
-    Returns the daemon started; None: load from disk, as the one this launch
-    started cannot be used either, none can be started, or a daemon found
-    that loading ``key`` leaves state it cannot share."""
-    marked = uncacheable(key)  # written by that daemon
-    skip = group_max(int(marked is not None), me.group)  # on any rank
-    if started is not None:
-        _stop_together(me, reasons, held, started=started)
-        logger.warning(
-            f"{_TAG} {me.label}: the weight cache daemon this launch started cannot "
-            f"be used, so it was stopped and this server loads from disk (daemon "
-            f"log {started['log']}). If every launch of this configuration ends "
-            f"here, launch it without ATOM_PRELOAD:\n  {_detail(marked or reasons)}"
-        )
-        return None
-    if present:
-        logger.warning(
-            f"{_TAG} {me.label}: {'stopping' if skip else 'restarting'} the weight "
-            f"cache daemon{f' (pid {pid})' if pid else ''}, it cannot be used here:"
-            f"\n  {_detail(reasons)}"
-        )
-        why = ["it would need a restart, since it cannot be used here:"] + reasons
-        _stop_together(me, why, held, pid)
-    if skip:
-        logger.warning(
-            f"{_TAG} {me.label}: a daemon found that this load leaves state the "
-            "cache cannot share, so no daemon is started and this server loads from "
-            "disk (python -m atom.model_loader.weight_cache stop forgets this):"
-            f"\n  {_detail(marked or [])}"
-        )
-        return None
-    if not present:
-        logger.info(f"{_TAG} {me.label}: no weight cache daemon here; starting one")
-    err = None
-    try:
-        started = _spawn_daemon()
-    except _Miss as e:
-        err = str(e)
-    except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
-        err = f"could not start a weight cache daemon: {e!r}"
-    if not group_agree(err is None, me.group):
-        # No daemon holds these GPUs now: none was there, or it was stopped.
-        logger.warning(
-            f"{_TAG} {me.label}: {err or 'another rank could not start the daemon'}; "
-            "loading from disk"
-        )
-        return None
-    logger.info(
-        f"{_TAG} {me.label}: started weight cache daemon pid {started['pid']} "
-        f"(log {started['log']}); waiting for it to load"
-    )
-    return started
 
 
 def _differs(part: dict, model: nn.Module) -> list[str]:
@@ -427,64 +350,41 @@ def _apply_process(me: _Rank, export: dict) -> int:
 
 
 def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module | None:
-    """This rank's model with a daemon's weights; None: load from disk.
-
-    Starts a daemon when there is none; when the one there cannot be used,
-    stops it and starts a new one (once). If the daemon this launch started
-    cannot be used either, or none can be started, the server loads from
-    disk. Every rank of the launch takes the same decisions."""
+    """This rank's model with the weights of the daemon the launch's main
+    process found or started; None: load from disk (no such daemon, or its
+    weights cannot be used here: it is stopped then, and the next launch
+    starts its own). Every rank of the launch takes the same decisions."""
     global _draft, _load_extra
-    if not launch_recorded():
-        logger.warning(
-            f"{_TAG} {worker_process_name(config, rank)}: ATOM_PRELOAD needs the "
-            "launch its API server records (see that server's log if there is one); "
-            "loading from disk"
-        )
-        return None
-    # Before the first collective: every rank, on every node, leaves here.
-    why = unsupported(config)
-    if why:
-        logger.warning(
-            f"{_TAG} {worker_process_name(config, rank)}: the weight cache does "
-            f"not support {', '.join(why)}; loading from disk"
-        )
+    session = read_session()
+    if session is None:
         return None
     t0 = time.perf_counter()
     me = _rank(config, device, rank)
-    # The daemon ranks of this launch started before this call, if any.
-    started = _started_by_launch()
-    # Taken once, before this server builds anything (as the daemon's was).
+    # As the daemon's rank took its own: before this server builds anything.
     key = compute_key(config, rank)
-    while True:
-        held = _wait_together(me, started)
-        sock, payload, reasons, status = _probe(me, started, held, key)
-        lo, hi = group_min(status, me.group), group_max(status, me.group)
-        state = daemon_state(me.path) or {}
-        pid = state.get("daemon_pid") or state.get("pid")  # as `status` shows it
-        if lo == hi == _USABLE:
-            built = _MetaBuild(config, lambda: build_model(config, model_class, device))
-            try:
-                _agree(built.error or _differs(payload, built.obj), me.group)
-                t_map = time.perf_counter()
-                mapped, error = _map(built.obj, payload["export"], device)
-                _agree(error + _on_meta([built.obj]), me.group)
-                break
-            except _Unfit as e:
-                reasons = e.reasons
-                # Unmapped before the daemon stops, or its memory stays in use.
-                built.drop()
-        elif lo == _NONE < hi and not reasons:
-            reasons = [
-                (
-                    "a daemon serves only some of this launch's GPUs"
-                    if status != _NONE
-                    else "no daemon serves this GPU, but other GPUs of this launch have one"
-                )
-            ]
+    held = _wait_serving(me, session)
+    sock, payload, reasons = _probe(me, session, key)
+    built = None
+    try:
+        _agree(reasons, me.group)
+        built = _MetaBuild(config, lambda: build_model(config, model_class, device))
+        _agree(built.error or _differs(payload, built.obj), me.group)
+        t_map = time.perf_counter()
+        mapped, error = _map(built.obj, payload["export"], device)
+        _agree(error + _on_meta([built.obj]), me.group)
+    except _Unfit as e:
+        # Unmapped before the daemon stops, or its memory stays in use.
+        if built is not None:
+            built.drop()
         _close(sock)
-        started = _replace_daemon(me, reasons, held, pid, started, hi > _NONE, key)
-        if started is None:
-            return None
+        _stop_together(me, e.reasons, held, session["pid"])
+        logger.warning(
+            f"{_TAG} {me.label}: the weight cache daemon (pid {session['pid']}) cannot "
+            f"be used here, so it was stopped and this server loads from disk. If "
+            f"every launch of this configuration ends here, launch it without "
+            f"ATOM_PRELOAD:\n  {_detail(e.reasons)}"
+        )
+        return None
 
     model = built.obj
     try:
@@ -500,9 +400,12 @@ def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module | No
     # Holds the connection open for this process's lifetime: the daemon
     # counts it as a server using its weights.
     threading.Thread(target=_watch_daemon, args=(sock, me), daemon=True).start()
+    waited = (
+        "waited for the daemon the launch started, " if session.get("started") else ""
+    )
     logger.info(
-        f"{_TAG} {me.label}: cache hit, mapped {mapped / (1 << 30):.2f} GiB from daemon pid {pid} "
-        f"in {time.perf_counter() - t0:.2f}s ({'started the daemon and waited for it, ' if started else ''}"
+        f"{_TAG} {me.label}: cache hit, mapped {mapped / (1 << 30):.2f} GiB from daemon "
+        f"pid {session['pid']} in {time.perf_counter() - t0:.2f}s ({waited}"
         f"fetch+checks {t_map - t0 - built.seconds:.2f}s, meta build {built.seconds:.2f}s, "
         f"map {time.perf_counter() - t_map:.2f}s, {n_moe} MoE prepare/finalize)"
     )
@@ -558,6 +461,29 @@ def load_drafter_from_cache(config, device, runner, target, *, rank: int):
         f"{_TAG} {me.label}: drafter from the cache, mapped "
         f"{mapped / (1 << 30):.2f} GiB in {time.perf_counter() - t0:.2f}s"
     )
+    return drafter
+
+
+def build_and_load_model(config, model_class, device, *, rank: int):
+    """This rank's model with its weights, a daemon's under ATOM_PRELOAD or
+    read from the checkpoint, and the names of the parameters the checkpoint
+    wrote (None: none was read here)."""
+    if envs.ATOM_PRELOAD == "server":
+        model = load_from_cache(config, model_class, device, rank=rank)
+        if model is not None:
+            return model, None
+    model = build_model(config, model_class, device)
+    loaded = load_weights(model, config)
+    return model, None if config.load_dummy else frozenset(loaded)
+
+
+def build_and_load_drafter(config, device, runner, target, *, rank: int):
+    """The drafter with its weights, from where ``target`` (the loaded model)
+    has its own; it shares with it what the draft does not hold itself."""
+    drafter = load_drafter_from_cache(config, device, runner, target, rank=rank)
+    if drafter is None:
+        drafter = construct_drafter(config, device, runner)
+        drafter.load_model(target)
     return drafter
 
 

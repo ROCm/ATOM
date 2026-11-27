@@ -7,7 +7,6 @@ import logging
 from copy import copy
 
 import torch
-import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.tuned_gemm import tgemm
 from torch import nn
@@ -37,11 +36,12 @@ from atom.model_ops.dspark_markov_argmax import (
     dspark_markov_argmax_tp,
     markov_weights_unsupported,
 )
-from atom.model_ops.embed_head import VocabParallelEmbedding, masked_embedding
+from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.peer_embedding import PeerEmbedding, shared_peer_embedding
+from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import make_v4_quant_config
 from atom.models.deepseek_v4_dspark import (
     DSparkConfidenceHead,
@@ -285,6 +285,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
         self.rope = RotaryEmbedding(
             args.qk_rope_head_dim, capacity + self.block_size, base=args.rope_theta
         )
+        # The noise token's row of the checkpoint's embedding table, which
+        # every draft block starts from: loaded as a weight of the draft's
+        # (`_load_noise_row`), since a TP rank's shard of the shared table
+        # need not hold it.
+        self.noise_row = atom_parameter(torch.empty(args.hidden_size))
+        self.noise_row.weight_loader = self._load_noise_row
         self.embed = self.head = None
         self._unbind_embedding()
 
@@ -300,9 +306,16 @@ class DeepseekV41DSpark(DSparkDraftModel):
         pass over every tensor in it. Stage names survive `weights_mapper`
         untouched, so the remap is identity -- what this is really for is the
         `None`, which is how the loader is told a tensor belongs to somebody
-        else rather than that it failed to route.
+        else rather than that it failed to route. The embedding table is the
+        one tensor of the target's it reads: its noise row.
         """
+        if name == "embed.weight":
+            return "noise_row"
         return name if name.startswith("mtp.") else None
+
+    def _load_noise_row(self, param, table) -> None:
+        """``noise_row`` from the checkpoint's whole embedding ``table``."""
+        param.data.copy_(table[self.config.dspark_noise_token_id])
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Same mapping as the backbone, over the draft's smaller expert set."""
@@ -320,20 +333,19 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def _unbind_embedding(self) -> None:
         self._embedding_bound = False
         self._embed_peer: PeerEmbedding | None = None
-        self._noise_row: torch.Tensor | None = None
 
     @torch.no_grad()
     def _bind_embedding(self) -> None:
-        """Where the draft reads the shared embedding's rows, and the noise
-        row, resolved once on the first draft step outside a graph capture
-        (a warmup forward), as `LazyRunner` binds mono.
+        """Where the draft reads the shared embedding's rows, resolved once
+        on the first draft step outside a graph capture (a warmup forward),
+        as `LazyRunner` binds mono.
 
         A vocab-parallel bf16 table is read from its owner ranks' shards
         (`shared_peer_embedding`, the mapping mono's draft also reads):
         the anchors in `build_peer_block_state`, no lookup and no all-reduce.
-        The noise row is one fixed row every draft path reuses (this block,
-        hi's, mono's without the peer read); it is never taken through the
-        custom all-reduce, which returns zeros during a graph warmup.
+        The noise row is not read from the table: it is the draft's own
+        (`noise_row`), one fixed row every draft path reuses (this block,
+        hi's, mono's without the peer read).
         """
         if self._embedding_bound:
             return
@@ -351,25 +363,18 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 )
             except MonoUnsupported as why:
                 logger.warning("V4.1 DSpark: peer embedding off: %s", why)
-        ids = torch.full(
-            (1,),
-            self.config.dspark_noise_token_id,
-            dtype=torch.long,
-            device=embed.weight.device,
-        )
-        if self._embed_peer is not None:
-            row = self._embed_peer(
-                ids, embed.weight.new_empty(1, embed.weight.shape[1])
-            )
-        elif sharded:
-            row = masked_embedding(
-                ids, embed.weight, embed.vocab_start_idx, embed.vocab_end_idx
-            )
-            dist.all_reduce(row, group=get_tp_group().device_group)
-        else:
-            row = embed(ids)
-        self._noise_row = row.flatten()
         self._embedding_bound = True
+
+    @torch.no_grad()
+    def derive_from_weights(self) -> None:
+        """What the context write fuses of the stages' weights, made once
+        they have loaded (`Drafter.load_weights`): part of the load, so a
+        weight cache daemon holds it with them and a `load` writes it again."""
+        self._context_kv_fusion()
+        self._draft_kv_tail_fusion()
+        for attention in self.context_layers:
+            # A view of this process's own: not what the load leaves.
+            object.__setattr__(attention, "_wkv_shard", None)
 
     def target_aux_capture_spec(self, layer_ids, hidden_size, _target_layers=None):
         # Published taps (37, 38, 39) have no Engram. A block pre-hook at an
@@ -650,9 +655,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
         return ids
 
     def _noise_embedding(self) -> torch.Tensor:
-        """The noise token's embedding row (`_bind_embedding`)."""
+        """The noise token's embedding row; the shared table's rows are bound
+        with it (`_bind_embedding`)."""
         self._bind_embedding()
-        return self._noise_row
+        return self.noise_row
 
     def block_backbone(self, input_ids, positions, num_draft):
         from atom.utils.forward_context import get_forward_context

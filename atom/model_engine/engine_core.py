@@ -582,6 +582,21 @@ class EngineCore:
         if scheduler.can_recompute_prompts:
             scheduler.preempt_running()
 
+    def abort_requests(self, reason: str, deadline: float) -> tuple[int, int]:
+        """End every request this engine has as ``reason``: (how many ran,
+        how many waited). Raises, ending none, where what runs cannot be
+        preempted (``prepare_kv_change``)."""
+        scheduler = self.scheduler
+        running = len(scheduler.running)
+        self.prepare_kv_change(weights=False, deadline=deadline)
+        ended = scheduler.abort_waiting(reason)
+        rejected = scheduler.take_rejected()
+        if rejected:
+            # A held engine runs no step to hand them out: answered from here.
+            self._release_request_resources(rejected)
+            self.output_queue.put_nowait(rejected)
+        return running, ended - running
+
     def busy_loop(self):
         shutdown = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S

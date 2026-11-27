@@ -351,6 +351,20 @@ def normalize_hf_config(raw: dict) -> DeepseekV41TextConfig:
     return config
 
 
+def server_checkpoint_reads(config) -> tuple[list[str], dict]:
+    """What a server reads from the checkpoint by itself, not as weights
+    (`models.registry.server_checkpoint_reads`): the Engram tables' tensors
+    (`weights.CheckpointReader.engram_tables`), and the settings their
+    hashing follows."""
+    tensors = [
+        f"layers.{layer}.engram.embed{part}"
+        for layer in config.engram_layer_ids
+        for part in (".weight", ".scale")
+    ]
+    follows = {k: v for k, v in config.to_dict().items() if k.startswith("engram_")}
+    return tensors, follows
+
+
 def validate_speculative_config(config):
     """Supported DSpark deployment; model math and shared scheduling stay separate."""
     speculative = config.speculative_config

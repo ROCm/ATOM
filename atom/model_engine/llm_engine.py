@@ -13,7 +13,9 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.engine_utility import WEIGHTS_IN_USE_CMD, WEIGHTS_STOPPED_CMD
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
+from atom.model_engine.request import SERVER_ABORT_REASON
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
 from atom.model_engine.sequence import Sequence, leaves_media_on_prefill
 from atom.multimodal.registry import get_mrope_input_positions
@@ -92,9 +94,35 @@ def prepare_config(model, tokenizer=None, **kwargs):
 
 class LLMEngine:
 
+    def _weights_stopped(self, rewrite: bool, why: str | None = None) -> None:
+        """A weight cache daemon's stop, for the engines. With ``why`` every
+        request they have ends as that (the clients' error); those that come
+        after wait until the weights are in use again."""
+        replies = self.core_mgr.broadcast_utility_command_sync(
+            WEIGHTS_STOPPED_CMD,
+            rewrite=rewrite,
+            abort=None if why is None else SERVER_ABORT_REASON + why,
+        )
+        if why is not None:
+            ended = [reply.get("aborted", (0, 0)) for reply in replies or ()]
+            ran, waited = sum(n[0] for n in ended), sum(n[1] for n in ended)
+            logger.warning(
+                f"[weight-cache] ended {ran + waited} request(s) ({ran} running, "
+                f"{waited} waiting): {why}; new ones wait"
+            )
+
     def __init__(self, model, tokenizer=None, **kwargs):
         config, self.tokenizer = prepare_config(model, tokenizer, **kwargs)
         self.config = config
+        if envs.ATOM_PRELOAD == "server":
+            # Once for the launch, before its engines start: their ranks map
+            # the weights of the daemon this finds or starts.
+            from atom.model_loader.weight_cache.session import (
+                open_session,
+                serve_notices,
+            )
+
+            open_session(config, model, kwargs)
         self.data_parallel_size = config.parallel_config.data_parallel_size
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
@@ -103,6 +131,13 @@ class LLMEngine:
             self.core_mgr = DisaggCoreManager(config)
         else:
             self.core_mgr = CoreManager(config)
+        if envs.ATOM_PRELOAD == "server":
+            # The daemon's `stop` and `load` reach the engines from here on.
+            tell = self.core_mgr.broadcast_utility_command_sync
+            serve_notices(
+                self._weights_stopped,
+                lambda changed: tell(WEIGHTS_IN_USE_CMD, changed=changed),
+            )
         self._structured_preflight = WorkerGrammarPreflight(
             self, self.tokenizer, config
         )

@@ -153,15 +153,17 @@ def build_model(config: Config, model_class: type, device: torch.device) -> nn.M
         torch.set_default_device(None)
 
 
-def load_weights(model: nn.Module, config: Config) -> set[str]:
+def load_weights(model: nn.Module, config: Config, units=None) -> set[str]:
     """Load the checkpoint into a built model and process it for serving.
-    Returns the names of the parameters loaded or created at load."""
+    Returns the names of the parameters loaded or created at load. ``units``:
+    a group of modules at a time (``load_model``)."""
     return load_model(
         model,
         config.model,
         config.hf_config,
         config.load_dummy,
         load_fused_expert_weights_fn=getattr(model, "load_fused_expert_weights", None),
+        units=units,
     )
 
 
