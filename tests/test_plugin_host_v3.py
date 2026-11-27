@@ -507,9 +507,8 @@ def test_a_recipes_metadata_fields_are_ignored():
 def test_a_process_without_a_plan_builds_the_recipes_model_class():
     """The weight-cache daemon builds the model without configuring the host: the class comes from the config's
     recipe, so the servers it serves can map its weights."""
-    from types import SimpleNamespace
-
     import json
+    from types import SimpleNamespace
 
     doc = {
         "schema": recipes.RECIPE_SCHEMA,
