@@ -1333,7 +1333,7 @@ pub enum AtomRole {
 pub fn stub_ec_transfer_params() -> serde_json::Value {
     json!({"transport": "mooncake", "key": 42, "rows": 16, "dtype": "bfloat16",
            "mooncake": {"session": "e0:17001", "address": 4096, "length": 2048,
-                        "generation": 3}})
+                        "generation": 3, "slot": 1024}})
 }
 
 /// The `cache_seed` a stub prefill server returns in its `kv_transfer_params`.
