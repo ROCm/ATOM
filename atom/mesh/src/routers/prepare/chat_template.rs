@@ -46,42 +46,33 @@ pub(crate) fn default_template_kwargs(
 }
 
 /// Why atomesh cannot render chats as `workers`' ATOM worker does, if it cannot: the
-/// model's tokenizer renders them with a built-in encoder that ignores the chat template
-/// (`built_in_encoder`: DeepSeek V3.2 and V4), or the worker reports no chat template
-/// (Kimi-K3's encoder) and the router sets none (`configured`).
+/// worker reports no chat template and the router sets none (`configured`). A model
+/// with `ChatControls` renders with its encoder instead (`chat_render`).
 pub(crate) fn atom_chat_render_gap(
     workers: &[Arc<dyn Worker>],
     configured: bool,
-    built_in_encoder: bool,
 ) -> Option<String> {
-    let mut atom = workers
-        .iter()
-        .filter(|worker| worker.metadata().runtime_type == RuntimeType::Atom);
-    if built_in_encoder {
-        return atom.next().map(|worker| {
-            format!(
-                "atomesh's tokenizer renders them with a built-in encoder that ignores the \
-                 chat template, so their prompts would differ from those its ATOM worker {} \
-                 renders",
-                worker.url()
-            )
-        });
-    }
     if configured {
         return None;
     }
-    atom.find(|worker| {
-        worker.chat_template().is_none() && !worker.metadata().labels.contains_key("chat_template")
-    })
-    .map(|worker| {
-        format!(
-            "its ATOM worker {} renders them without a chat template, which atomesh needs",
-            worker.url()
-        )
-    })
+    workers
+        .iter()
+        .filter(|worker| worker.metadata().runtime_type == RuntimeType::Atom)
+        .find(|worker| {
+            worker.chat_template().is_none()
+                && !worker.metadata().labels.contains_key("chat_template")
+        })
+        .map(|worker| {
+            format!(
+                "its ATOM worker {} renders them without a chat template, which atomesh needs",
+                worker.url()
+            )
+        })
 }
 
-/// Process chat messages and apply the HuggingFace chat template.
+/// Process chat messages and apply the HuggingFace chat template, with the
+/// request's `reasoning_effort` and then its `chat_template_kwargs` as the
+/// template kwargs.
 ///
 /// Requires a HuggingFace tokenizer (directly or via `CachedTokenizer` or
 /// `FastTokenizer`); other tokenizer kinds return an error because the gRPC path
@@ -90,7 +81,12 @@ pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
-    process_chat_messages_with_defaults(request, tokenizer, None, None)
+    render_chat_messages(
+        request,
+        &request.messages,
+        tokenizer,
+        &template_kwargs(request),
+    )
 }
 
 /// The label with an ATOM worker's reasoning toggle, `[name, off value, on value]`:
@@ -131,38 +127,6 @@ pub fn process_chat_messages_with_defaults(
     default_kwargs: Option<&HashMap<String, Value>>,
     atom: Option<&AtomChat>,
 ) -> Result<ProcessedMessages, String> {
-    let any = tokenizer.as_any();
-    let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
-        let inner = match any.downcast_ref::<CachedTokenizer>() {
-            Some(cached) => cached.inner().as_any(),
-            None => any.downcast_ref::<FastTokenizer>()?.inner().as_any(),
-        };
-        inner.downcast_ref::<HuggingFaceTokenizer>()
-    });
-
-    let Some(hf_tokenizer) = hf_tokenizer else {
-        return Err(
-            "gRPC router requires HuggingFace tokenizer with chat template support".to_string(),
-        );
-    };
-
-    let content_format = hf_tokenizer.chat_template_content_format();
-    let mut transformed_messages = process_content_format(&request.messages, content_format)?;
-
-    process_tool_call_arguments(&mut transformed_messages)?;
-
-    let tools_json: Option<Vec<Value>> = request
-        .tools
-        .as_ref()
-        .map(|tools| {
-            tools
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()
-        .map_err(|e| format!("Failed to serialize tools: {}", e))?;
-
     let mut combined_template_kwargs = default_kwargs.cloned().unwrap_or_default();
 
     if let (None, Some(reasoning_effort)) = (atom, &request.reasoning_effort) {
@@ -188,16 +152,79 @@ pub fn process_chat_messages_with_defaults(
         }
     }
 
-    let final_template_kwargs = if combined_template_kwargs.is_empty() {
-        None
-    } else {
-        Some(&combined_template_kwargs)
+    render_chat_messages(
+        request,
+        &request.messages,
+        tokenizer,
+        &combined_template_kwargs,
+    )
+}
+
+/// The template kwargs `process_chat_messages` renders `request` with.
+pub(crate) fn template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+    let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
+    let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
+
+    if let Some(reasoning_effort) = &request.reasoning_effort {
+        combined_template_kwargs.insert(
+            "reasoning_effort".to_string(),
+            Value::String(reasoning_effort.clone()),
+        );
+    }
+
+    if let Some(template_kwargs) = &request.chat_template_kwargs {
+        for (key, value) in template_kwargs {
+            combined_template_kwargs.insert(key.clone(), value.clone());
+        }
+    }
+
+    combined_template_kwargs
+}
+
+/// `process_chat_messages` with `messages` in place of the request's own and
+/// `template_kwargs` as the template kwargs.
+pub(crate) fn render_chat_messages(
+    request: &ChatCompletionRequest,
+    messages: &[ChatMessage],
+    tokenizer: &dyn Tokenizer,
+    template_kwargs: &HashMap<String, Value>,
+) -> Result<ProcessedMessages, String> {
+    let any = tokenizer.as_any();
+    let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
+        let inner = match any.downcast_ref::<CachedTokenizer>() {
+            Some(cached) => cached.inner().as_any(),
+            None => any.downcast_ref::<FastTokenizer>()?.inner().as_any(),
+        };
+        inner.downcast_ref::<HuggingFaceTokenizer>()
+    });
+
+    let Some(hf_tokenizer) = hf_tokenizer else {
+        return Err(
+            "gRPC router requires HuggingFace tokenizer with chat template support".to_string(),
+        );
     };
+
+    let content_format = hf_tokenizer.chat_template_content_format();
+    let mut transformed_messages = process_content_format(messages, content_format)?;
+
+    process_tool_call_arguments(&mut transformed_messages)?;
+
+    let tools_json: Option<Vec<Value>> = request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map_err(|e| format!("Failed to serialize tools: {}", e))?;
 
     let params = ChatTemplateParams {
         add_generation_prompt: true,
         tools: tools_json.as_deref(),
-        template_kwargs: final_template_kwargs,
+        template_kwargs: (!template_kwargs.is_empty()).then_some(template_kwargs),
         ..Default::default()
     };
 

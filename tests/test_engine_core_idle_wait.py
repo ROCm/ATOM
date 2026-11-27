@@ -53,7 +53,7 @@ def idle(monkeypatch, request):
     engine._generation_paused = False
     engine.input_queue = queue.Queue()
     engine.utility_queue = queue.Queue()
-    engine._kv_progress_event = Event()
+    engine._wake_event = Event()
     engine._process_engine_step = step
     if pp_head:
         engine.is_head, engine._in_flight = True, deque()
@@ -100,7 +100,7 @@ def test_a_request_queued_before_the_wait_is_not_slept_on(idle):
     def arrive(now):  # the input thread's put and set, after the pull, before the wait
         stats.note_idle = lambda now: None
         engine.input_queue.put_nowait([seq])
-        engine._kv_progress_event.set()
+        engine._wake_event.set()
 
     stats.note_idle = arrive
     loop = threading.Thread(target=engine.busy_loop, daemon=True)
@@ -110,7 +110,7 @@ def test_a_request_queued_before_the_wait_is_not_slept_on(idle):
         assert stepped == [[seq.id]]
     finally:
         engine.input_queue.put_nowait([core.get_exit_sequence()])
-        engine._kv_progress_event.set()
+        engine._wake_event.set()
         loop.join(5)
     assert not loop.is_alive()
 
@@ -124,7 +124,7 @@ def test_a_put_while_the_queues_are_checked_is_not_slept_on(idle):
             if not arrived:
                 arrived.append(True)
                 engine.input_queue.put_nowait("request")
-                engine._kv_progress_event.set()
+                engine._wake_event.set()
             return super().empty()
 
     engine.utility_queue = Arriving()

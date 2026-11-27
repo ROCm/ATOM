@@ -229,6 +229,46 @@ mod a_chat_template {
             )
         );
     }
+
+    /// transformers gives chat templates `strftime_now` and `raise_exception`,
+    /// and ATOM standalone serving renders its chats here, so a template that
+    /// calls them, as gpt-oss's does in every system message, must render the
+    /// date, and refuse a chat with the template's own message. transformers
+    /// 5.16.1 renders this toy template to `Current date: <today>\nuser: hi\n`
+    /// and refuses the second chat with `channel tags in content`.
+    #[test]
+    fn test_strftime_now_and_raise_exception_are_defined_as_in_transformers() {
+        const TEMPLATE: &str = r#"{{- "Current date: " + strftime_now("%Y-%m-%d") + "\n" }}
+{%- for m in messages %}
+    {%- if "<|channel|>" in m.content %}
+        {{- raise_exception("channel tags in content") }}
+    {%- endif %}
+    {{- m.role + ": " + m.content + "\n" }}
+{%- endfor %}"#;
+        let mut tokenizer = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
+        tokenizer.set_chat_template(TEMPLATE.to_string()).unwrap();
+        let chat = |content: &str| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": content}]
+            }))
+            .unwrap()
+        };
+
+        let rendered = process_chat_messages(&chat("hi"), &tokenizer).unwrap().text;
+        let date = rendered
+            .strip_prefix("Current date: ")
+            .and_then(|rest| rest.strip_suffix("\nuser: hi\n"))
+            .unwrap_or_else(|| panic!("{rendered:?}"));
+        assert!(
+            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok(),
+            "{rendered:?}"
+        );
+
+        let refused = process_chat_messages(&chat("<|channel|>analysis<|message|>hi"), &tokenizer)
+            .unwrap_err();
+        assert!(refused.contains("channel tags in content"), "{refused}");
+    }
 }
 
 mod b_tool_constraints {
@@ -1540,26 +1580,34 @@ mod h_prepare_chat_generate {
         assert!(template.served_by(&worker));
     }
 
-    /// A tokenizer found by its id is checked against what it was loaded with, as one
-    /// found by name is: the tokenizer and its entry come from one lookup.
+    /// A tokenizer found by its id renders with the encoder controls it was loaded
+    /// with, as one found by name does: the tokenizer and its entry come from one
+    /// lookup, and a chat with controls needs no template.
     #[test]
-    fn test_a_tokenizer_found_by_id_keeps_its_built_in_encoder_refusal() {
-        use crate::core::{BasicWorkerBuilder, RuntimeType};
+    fn test_a_tokenizer_found_by_id_renders_with_its_chat_controls() {
+        use crate::{
+            core::{BasicWorkerBuilder, RuntimeType},
+            routers::prepare::chat_render::ChatControls,
+        };
 
         let registry = test_mocks::tokenizer_registry_with("m");
         let id = registry.get_by_name("m").unwrap().id;
         let components = test_mocks::app_context_with_tokenizer_registry(registry);
-        components.chats_without_template.write().insert(id.clone());
         let worker = BasicWorkerBuilder::new("grpc://atom:4")
             .runtime_type(RuntimeType::Atom)
             .model_id(id.as_str())
-            .label("chat_template", "{{ messages }}")
             .build();
         components.worker_registry.register(Arc::new(worker));
-        let refused = prepare_chat(chat_req(false), None, Some(id), &components)
-            .err()
-            .expect("a built-in encoder's chat is refused");
-        assert_eq!(refused.status(), http::StatusCode::NOT_IMPLEMENTED);
+        let status = || {
+            let chat = prepare_chat(chat_req(false), None, Some(id.clone()), &components);
+            chat.err().map(|refused| refused.status())
+        };
+        assert_eq!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
+        let controls = &components.chat_controls;
+        controls
+            .write()
+            .insert(id.clone(), ChatControls::DeepseekV41);
+        assert_ne!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
     }
 
     #[test]

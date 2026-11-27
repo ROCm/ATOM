@@ -1166,7 +1166,11 @@ class DeepseekV2MoE(nn.Module):
             and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             tbo_active = get_current_atom_config().enable_tbo
-            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
+            if (
+                envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+                and not tbo_active
+                and self.experts.allows_concurrent_shared_stream
+            ):
                 self._use_dual_stream = True
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV2MLP(
@@ -1582,6 +1586,7 @@ class Indexer(nn.Module):
         # the q latent it is handed comes quantized with a scale (the owner's
         # fused q norm + quant for q_b_proj); set by the owning attention
         self.quantized_q = False
+        self.exchange_stream = None
         if external_k_weights and pcp_is_enabled():
             raise ValueError(
                 "External indexer projections require PCP1: the PCP op "

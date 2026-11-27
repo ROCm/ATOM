@@ -32,6 +32,91 @@ def _runtime_pieces():
     return PagedAttentionCache, DeepseekV41RuntimeModel
 
 
+@pytest.mark.parametrize("replay, expected", [(True, [19]), (False, [19, 20, 39])])
+def test_model_eplb_boundary_and_collection(replay, expected):
+    from aiter_stub import atom_without_aiter
+
+    # Exercise the real model and collector on CPU, with only external GPU
+    # kernel imports substituted, as the model-op CPU tests do.
+    with atom_without_aiter() as load:
+        model_cls = load("atom.models.deepseek_v41.runtime").DeepseekV41RuntimeModel
+        collect_ep_moe_layers = load("atom.model_ops.eplb").collect_ep_moe_layers
+        model = model_cls.__new__(model_cls)
+        torch.nn.Module.__init__(model)
+        model.replay, model.decoder_start = replay, 20
+        model.layers = torch.nn.ModuleList()
+        for layer_id in (19, 20, 39):
+            layer = torch.nn.Module()
+            layer.layer_id, layer.use_ep = layer_id, True
+            layer.w13_weight = torch.zeros(1)
+            layer.w2_weight = torch.zeros(1)
+            model.layers.append(layer)
+        assert model.eplb_layer_end == (20 if replay else None)
+        assert sorted(collect_ep_moe_layers(model)) == expected
+
+
+@pytest.mark.parametrize(
+    "requested, unsupported, expected",
+    [(True, False, 20), (False, False, None), (True, True, None)],
+)
+def test_runtime_decides_eplb_layout_before_allocating_layers(
+    monkeypatch, requested, unsupported, expected
+):
+    from aiter_stub import atom_without_aiter
+
+    with atom_without_aiter() as load:
+        runtime = load("atom.models.deepseek_v41.runtime")
+        captured = []
+
+        def construct_model(model, hf_config, **kwargs):
+            torch.nn.Module.__init__(model)
+            captured.append(kwargs["eplb_layer_end"])
+            model.layers = torch.nn.ModuleList()
+
+        monkeypatch.setattr(
+            runtime.DeepseekV41MultimodalModel, "__init__", construct_model
+        )
+        monkeypatch.setattr(
+            runtime.DeepseekV41RuntimeModel, "_build_replay_stages", lambda *args: None
+        )
+        monkeypatch.setattr(runtime, "_Backbone", lambda **kwargs: torch.nn.Identity())
+        hf = SimpleNamespace(
+            num_hidden_layers=40,
+            kv_source_layer_ids=[2, 8, 14, 20],
+            engram_layer_ids=[39] if unsupported else [1, 14],
+        )
+        config = SimpleNamespace(
+            hf_config=hf,
+            enable_decoder_swa_bounded_replay=requested,
+            max_model_len=8192,
+            online_quant_config=None,
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        )
+        model = runtime.DeepseekV41RuntimeModel(config)
+        assert captured == [expected]
+        assert model.eplb_layer_end == expected
+
+
+def test_mono_eplb_refusal_is_cpu_tested(monkeypatch):
+    from atom.models.deepseek_v41.mono.config import config_refusal
+    from atom.mono.runtime import deployment
+
+    monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")
+    monkeypatch.setattr(deployment, "is_vllm", lambda: False)
+    monkeypatch.setattr(deployment, "is_sglang", lambda: False)
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "1")
+    monkeypatch.setenv("ATOM_DSV41_SIDE_STREAMS", "0")
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures/config.json"
+    config = runtime_config(
+        hf_config=normalize_hf_config(json.loads(fixture.read_text())),
+        enable_expert_parallel=False,
+        is_multinode_tp=False,
+    )
+    assert config_refusal(config) is None
+    config.eplb_enable = True
+    assert config_refusal(config) == "EPLB"
+
+
 def test_production_geometry_has_only_four_global_owners():
     fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures/config.json"
     config = normalize_hf_config(json.loads(fixture.read_text()))
@@ -112,7 +197,6 @@ def runtime_config(**overrides):
         {"kv_transfer_config": {"connector": "moriio"}},
         {"enable_rapidserve": True},
         {"online_quant_config": {}},
-        {"eplb_enable": True},
         {"kv_cache_dtype": "fp16"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
@@ -153,10 +237,25 @@ def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
         validate_runtime_config(
             runtime_config(kv_transfer_config={"kv_connector": "mooncake"})
         )
+    # The shared UMBP L1 pool, like the Store, moves PAGEs and replays state.
+    umbp_pool = {
+        "kv_connector": "umbp_pool",
+        "kv_connector_extra_config": {"address": "unix:///unused"},
+    }
+    validate_runtime_config(
+        runtime_config(
+            kv_transfer_config=umbp_pool,
+            enable_encoder_swa_bounded_replay=True,
+            kv_cache_block_size=256,
+        )
+    )
+    with pytest.raises(ValueError, match="shared UMBP L1 pool without encoder SWA"):
+        validate_runtime_config(runtime_config(kv_transfer_config=umbp_pool))
     for connector in ("lmcache_offload", "moriio"):
         with pytest.raises(
             ValueError,
-            match="KV transfer other than lmcache_mp, mooncake_store or mooncake",
+            match="KV transfer other than lmcache_mp, mooncake_store, mooncake or "
+            "umbp_pool",
         ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})

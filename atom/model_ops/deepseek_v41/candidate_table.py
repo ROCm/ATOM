@@ -25,6 +25,23 @@ import triton.language as tl
 
 
 @triton.jit
+def kept_context(cand, seen, ROWS: tl.constexpr):
+    """Columns a row's kept blocks `cand` (ascending, `-1` tail) cover once
+    compacted, the row seeing `seen` of its own: every kept block whole but
+    the last, which runs to `seen`.
+
+    A kept block before the request's newest block is full, not the entire
+    gap to `seen`. Its contribution is bounded by one block even if the pin
+    was lost upstream; empty rows still have no visible columns.
+    """
+    live = cand >= 0
+    kept = tl.sum(live.to(tl.int32), axis=0)
+    last_selected = tl.max(tl.where(live, cand, -1), axis=0)
+    last_span = tl.minimum(tl.maximum(seen - last_selected * ROWS, 0), ROWS)
+    return tl.where(kept > 0, (kept - 1) * ROWS + last_span, 0)
+
+
+@triton.jit
 def _candidate_table_kernel(
     candidates,
     block_tables,
@@ -63,14 +80,7 @@ def _candidate_table_kernel(
     tl.store(table + token * candidate_stride + slots, unit, mask=mask)
 
     seen = tl.load(visible + token).to(tl.int32)
-    kept = tl.sum(live.to(tl.int32))
-    last_selected = tl.max(tl.where(live, cand, -1))
-    # A kept block before the request's newest block is full, not the entire
-    # gap to `seen`. Bound its contribution by one block even if the pin was
-    # lost upstream; empty rows still have no visible columns.
-    last_span = tl.minimum(tl.maximum(seen - last_selected * ROWS, 0), ROWS)
-    bound = (kept - 1) * ROWS + last_span
-    tl.store(context + token, tl.where(kept > 0, bound, 0))
+    tl.store(context + token, kept_context(cand, seen, ROWS))
 
 
 @triton.jit

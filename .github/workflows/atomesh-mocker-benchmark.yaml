@@ -157,6 +157,16 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib --features atom-engine
 
+      # The routing integration tests: ingress, the HTTP and PD routers and
+      # their placement, through mock workers.
+      - name: Run atomesh routing tests
+        run: |
+          set -euo pipefail
+          cargo test \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --profile ci --test routing_tests
+
       # The token parity test compares the router's tokens with the ones ATOM's
       # own endpoints give, here on CPU, for a DeepSeek-V4.1-Flash revision whose
       # tokenizer files and chat encoder the script downloads from HuggingFace.

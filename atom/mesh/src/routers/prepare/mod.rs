@@ -26,6 +26,7 @@ use crate::{
     },
 };
 
+pub(crate) mod chat_render;
 pub(crate) mod chat_template;
 pub(crate) mod fast_tokenizer;
 pub mod generation_payload;
@@ -71,16 +72,6 @@ fn lookup_tokenizer_entry(
         })
 }
 
-/// A chat prompt rendered outside the router, for a model whose template the
-/// router cannot render (ATOM's Python message encoders).
-#[derive(Debug, Clone)]
-pub struct RenderedChat {
-    pub text: String,
-    pub token_ids: Vec<u32>,
-    /// The channel opener the prompt ends on (`ResponseContext::prompt_opener`).
-    pub prompt_opener: Option<String>,
-}
-
 pub fn prepare_chat(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
@@ -90,15 +81,34 @@ pub fn prepare_chat(
     prepare_chat_with(req, headers, model_id, components, None, false)
 }
 
-/// `prepare_chat`, taking the prompt as `rendered` when it is given, and,
-/// with `reads_prompt_opener`, naming the opener a prompt it renders ends on
-/// (`ResponseContext::prompt_opener`; a rendered prompt names its own).
+/// A chat's body as the client `sent` it (JSON bytes), for
+/// `prepare_chat_with`, where `model` renders with an encoder of its own
+/// (`chat_render`): the typed request drops or rewrites fields that encoder
+/// reads (`thinking`, a system message's `tools`, `tool_choice`). A chat
+/// whose model renders with a template is not parsed again.
+pub fn sent_chat_body(
+    sent: &[u8],
+    model: Option<&str>,
+    components: &AppContext,
+) -> Result<Option<Arc<serde_json::Map<String, serde_json::Value>>>, Response> {
+    if model.and_then(|m| components.chat_controls_of(m)).is_none() {
+        return Ok(None);
+    }
+    serde_json::from_slice(sent)
+        .map(|body| Some(Arc::new(body)))
+        .map_err(|e| error::bad_request("invalid_request", e.to_string()))
+}
+
+/// `prepare_chat`, rendering the prompt (`chat_render::render_chat`) with the
+/// chat's body as `sent` where the caller has it, and, with
+/// `reads_prompt_opener`, naming the opener the prompt ends on
+/// (`ResponseContext::prompt_opener`).
 pub fn prepare_chat_with(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
     model_id: Option<String>,
     components: &AppContext,
-    rendered: Option<RenderedChat>,
+    sent: Option<&serde_json::Map<String, serde_json::Value>>,
     reads_prompt_opener: bool,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
@@ -111,15 +121,14 @@ pub fn prepare_chat_with(
     let tokenizer = entry.tokenizer.clone();
     let workers = components.worker_registry.get_by_model(model_id_str);
     // What its tokenizer was loaded with: a template file is a template, as
-    // --chat-template is; a built-in encoder renders without one.
+    // --chat-template is; a model with encoder controls renders without one.
     let id = entry.id;
+    let controls = components.chat_controls.read().get(&id).copied();
     let templated = components.router_config.chat_template.is_some()
         || components.tokenizer_template_files.read().contains_key(&id);
-    let built_in_encoder = components.chats_without_template.read().contains(&id);
-    // A prompt rendered outside the router needs no template.
-    if let Some(gap) = rendered
+    if let Some(gap) = controls
         .is_none()
-        .then(|| atom_chat_render_gap(&workers, templated, built_in_encoder))
+        .then(|| atom_chat_render_gap(&workers, templated))
         .flatten()
     {
         return Err(error::not_implemented(
@@ -141,34 +150,29 @@ pub fn prepare_chat_with(
         .transpose()
         .map_err(|e| error::internal_error("invalid_reasoning_toggle", e))?;
 
-    let rendered_here = rendered.is_none();
-    let (processed, token_ids, prompt_opener) = match rendered {
-        Some(rendered) => (
-            ProcessedMessages {
-                text: rendered.text,
-                stop_sequences: body_ref.stop.clone(),
-            },
-            rendered.token_ids,
-            rendered.prompt_opener,
-        ),
-        None => {
-            let processed = process_chat_messages_with_defaults(
-                &body_ref,
-                &*tokenizer,
-                default_kwargs.as_ref(),
-                atom.as_ref(),
-            )
-            .map_err(|e| error::bad_request("process_messages_failed", e))?;
-            let encoding = tokenizer
-                .encode(&processed.text, false)
-                .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
-            let token_ids = encoding.token_ids().to_vec();
-            let prompt_opener = reads_prompt_opener
-                .then(|| response_context::prompt_opener(&processed.text))
-                .flatten();
-            (processed, token_ids, prompt_opener)
-        }
+    let (text, prompt_opener) = match controls {
+        Some(_) => chat_render::render_chat(&body_ref, sent, &*tokenizer, controls),
+        None => process_chat_messages_with_defaults(
+            &body_ref,
+            &*tokenizer,
+            default_kwargs.as_ref(),
+            atom.as_ref(),
+        )
+        .map(|processed| {
+            let opener = response_context::prompt_opener(&processed.text);
+            (processed.text, opener)
+        }),
+    }
+    .map_err(|e| error::bad_request("process_messages_failed", e))?;
+    let processed = ProcessedMessages {
+        text,
+        stop_sequences: body_ref.stop.clone(),
     };
+    let encoding = tokenizer
+        .encode(&processed.text, false)
+        .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
+    let token_ids = encoding.token_ids().to_vec();
+    let prompt_opener = prompt_opener.filter(|_| reads_prompt_opener);
 
     let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
         generate_tool_constraints(tools, &req.tool_choice, &req.model)
@@ -195,7 +199,8 @@ pub fn prepare_chat_with(
         tool_constraints,
     );
     (payload.dp_session_id, payload.dp_parent_session_id) = dp_session_ids(headers.as_ref());
-    if rendered_here {
+    if controls.is_none() {
+        // Rendered with the template: only the ATOM workers serving it read these ids.
         let fingerprint = loaded_template(components, &id).ok_or_else(|| {
             let err = PlacementError::ChatTemplateChanged;
             placement_err_to_response(err, Some(model_id_str))

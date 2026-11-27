@@ -74,6 +74,9 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
             // 2. Worker labels: model_path
             // 3. Router config (CLI args): --tokenizer-path
             // 4. Router config (CLI args): --model-path
+            // 5. Worker labels: served_model_name. Under `--backend atom` or
+            //    `vllm` it is the model id `/v1/models` returns, an alias when
+            //    the worker serves under `--served-model-name`, so it comes last.
             let tokenizer_path: String = if let Some(path) = labels
                 .get("tokenizer_path")
                 .or_else(|| labels.get("model_path"))
@@ -90,9 +93,11 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
                     path, model_id
                 );
                 path.clone()
+            } else if let Some(path) = labels.get("served_model_name") {
+                path.clone()
             } else {
                 warn!(
-                    "No tokenizer_path or model_path found for model {} (checked worker labels and router config)",
+                    "No tokenizer_path, model_path or served_model_name found for model {} (checked worker labels and router config)",
                     model_id
                 );
                 continue;
