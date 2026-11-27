@@ -22,7 +22,7 @@ from atom import plugin_recipe as recipes
 # Dynamo imports this on its first compile; once an earlier test module has built a
 # Runner (real AITER importable), that import fails, so take it at collection.
 try:
-    import torch.distributed.tensor.experimental  # noqa: F401
+    import torch.distributed.tensor.experimental
 except ImportError:  # pragma: no cover
     pass
 
