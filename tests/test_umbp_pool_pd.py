@@ -16,9 +16,11 @@ import types
 
 import pytest
 import test_moriio_fabric
+import test_umbp_l1_pool as umbp_tests
 import test_umbp_store_lazy as lazy_tests
 import torch
-from test_multi_connector import FakeWorkerSub, _worker
+from conftest import MockConfig
+from test_multi_connector import FakeSchedSub, FakeWorkerSub, _sched, _worker
 
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     validate_multi_config,
@@ -27,6 +29,7 @@ from atom.kv_transfer.pool.umbp import pool as umbp_pool
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 
 stack = test_moriio_fabric.stack
+l1 = umbp_tests.l1
 
 ADDRESS = "unix:///tmp/umbp-l1/server.sock"
 PRODUCER = {
@@ -221,3 +224,147 @@ class TestLazyTierBesideThePool:
             sched.bind_block_manager(
                 types.SimpleNamespace(kv=umbp_like, enable_prefix_caching=True)
             )
+
+
+class _Receiving:
+    """A scheduler-side connector whose P/D receive writes whole block tables,
+    or skips what this engine holds (incremental push)."""
+
+    def __init__(self, whole):
+        self.whole = whole
+
+    def receive_rewrites_prefix(self, seq):
+        return self.whole
+
+    def make_block_pool(self, *args, **kwargs):
+        return None
+
+
+class TestReceiveGuard:
+    """D beside a pool other ranks read: a request its receive writes whole
+    takes no prefix hit and starts no copy (ROCm/ATOM#3919's rule, for
+    MoRIIO)."""
+
+    BLOCKS_HIT = 5  # 20 tokens in blocks of 4
+
+    @pytest.fixture
+    def engine(self, l1, monkeypatch):
+        from atom.model_engine import block_manager as bm_module
+
+        cfg = MockConfig(
+            num_kvcache_blocks=32, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        made = iter(range(8))
+
+        def make(config, num_blocks, *, on_evict=None, on_remap=None, **_):
+            return umbp_tests.make_pool(
+                l1,
+                f"rank{next(made)}",
+                num_blocks,
+                on_evict=on_evict,
+                on_remap=on_remap,
+            )
+
+        monkeypatch.setattr(bm_module, "make_block_pool", make)
+        return lambda whole: bm_module.BlockManager(cfg, kv_connector=_Receiving(whole))
+
+    @staticmethod
+    def compute(bm, seq_factory, tokens):
+        seq = seq_factory(tokens)
+        bm.allocate(seq, 0)
+        bm.hash_blocks(seq, len(tokens))
+        if bm.kv.read_by_other_pools:  # UMBP's: the device reports its writes
+            umbp_tests.settle(bm.kv)
+        return seq
+
+    def test_received_whole_it_takes_no_hit_even_from_its_own_pool(
+        self, engine, seq_factory
+    ):
+        rank = engine(True)
+        tokens = list(range(20))
+        self.compute(rank, seq_factory, tokens)
+        calls = []
+        umbp_tests.count_fetches(rank, calls)
+        received = seq_factory(tokens + [100, 101])
+        assert not rank.shared_prefix_pending(received)
+        assert rank.can_allocate(received) == 0
+        assert calls == []
+
+    def test_received_whole_it_copies_nothing_from_another_rank(
+        self, engine, seq_factory
+    ):
+        rank0, rank1 = engine(False), engine(True)
+        tokens = list(range(20))
+        self.compute(rank0, seq_factory, tokens)
+        calls = []
+        umbp_tests.count_fetches(rank1, calls)
+        received = seq_factory(tokens + [100, 101])
+        assert not rank1.shared_prefix_pending(received)
+        assert rank1.can_allocate(received) == 0
+        assert calls == []
+
+    def test_with_incremental_push_it_hits_what_another_rank_holds(
+        self, engine, seq_factory
+    ):
+        rank0, rank1 = engine(False), engine(False)
+        tokens = list(range(20))
+        self.compute(rank0, seq_factory, tokens)
+        received = seq_factory(tokens + [100, 101])
+        if rank1.kv.async_fetch:
+            assert rank1.shared_prefix_pending(received)
+            umbp_tests.land(rank1, received)
+        assert rank1.can_allocate(received) == self.BLOCKS_HIT
+
+    def test_a_request_holding_blocks_starts_no_copy(self, engine, seq_factory):
+        rank0, rank1 = engine(False), engine(False)
+        tokens = list(range(20))
+        self.compute(rank0, seq_factory, tokens)
+        calls = []
+        umbp_tests.count_fetches(rank1, calls)
+        parked = seq_factory(tokens + [100, 101])
+        parked.block_table = [0]  # holds its blocks while its receive lands
+        rank1._fetch_shared_prefix(parked)
+        assert calls == []
+        assert parked not in rank1._shared_prefix_asked
+
+    def test_atoms_own_pool_keeps_its_hits(self, seq_factory):
+        from atom.model_engine.block_manager import BlockManager
+        from atom.model_engine.block_pool import BlockPool
+
+        cfg = MockConfig(
+            num_kvcache_blocks=32, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        rank = BlockManager(cfg, kv_connector=_Receiving(True))
+        assert isinstance(rank.kv, BlockPool) and not rank.kv.read_by_other_pools
+        tokens = list(range(20))
+        self.compute(rank, seq_factory, tokens)
+        assert rank.can_allocate(seq_factory(tokens + [100, 101])) == self.BLOCKS_HIT
+
+
+class TestWhoReceivesWhole:
+    def test_moriio_without_incremental_push(self, stack, monkeypatch):
+        sched = object.__new__(stack.conn.MoRIIOConnectorScheduler)
+        sched.is_producer = False
+        remote = types.SimpleNamespace(
+            kv_transfer_params={"do_remote_prefill": True}, has_per_req_cache=False
+        )
+        local = types.SimpleNamespace(kv_transfer_params=None, has_per_req_cache=False)
+        monkeypatch.setenv("ATOM_MORIIO_INCREMENTAL_PUSH", "0")
+        assert sched.receive_rewrites_prefix(remote)
+        assert not sched.receive_rewrites_prefix(local)
+        monkeypatch.setenv("ATOM_MORIIO_INCREMENTAL_PUSH", "1")
+        assert not sched.receive_rewrites_prefix(remote)
+        # Per-request state is pushed whole whatever the flag says.
+        stateful = types.SimpleNamespace(
+            kv_transfer_params={"do_remote_prefill": True}, has_per_req_cache=True
+        )
+        assert sched.receive_rewrites_prefix(stateful)
+        sched.is_producer = True
+        assert not sched.receive_rewrites_prefix(remote)
+
+    def test_multi_asks_every_sub(self):
+        seq = types.SimpleNamespace()
+        assert _sched([FakeSchedSub(), _Receiving(True)]).receive_rewrites_prefix(seq)
+        assert not _sched([FakeSchedSub(), _Receiving(False)]).receive_rewrites_prefix(
+            seq
+        )

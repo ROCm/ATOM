@@ -299,6 +299,12 @@ class BlockManager:
         self._shared_prefix_asked: WeakKeyDictionary[Sequence, int] = (
             WeakKeyDictionary()
         )
+        # The connector's word on a request whose prompt a P/D receive writes
+        # whole (`KVConnectorSchedulerBase.receive_rewrites_prefix`); None
+        # without a connector, or with one that receives nothing.
+        self._receive_rewrites_prefix = getattr(
+            kv_connector, "receive_rewrites_prefix", None
+        )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
         # state). The backing tensor is pre-allocated by ModelRunner and
@@ -1434,8 +1440,34 @@ class BlockManager:
         )
         return self._no_joint(reason)
 
+    def _lands_whole_in_shared_pool(self, seq: Sequence) -> bool:
+        """Whether `seq`'s prompt KV arrives whole from a P/D producer, into a
+        pool other pools read.
+
+        Such a request takes no prefix hit and starts no copy from other
+        pools. The receive writes every block of its table from another
+        device, which no stream of this process orders: a claimed hit would be
+        published blocks rewritten while another pool copies them out (a block
+        is read from outside once its writes have landed, and has to stay as
+        it is while indexed), and a prefix copied in would be overwritten on
+        arrival. With no hit its blocks are fresh, published once the receive
+        has landed. With incremental push (MoRIIO) the producer skips the
+        blocks this engine holds, the receive rewrites none, and the request
+        hits as any other.
+        """
+        asks = self._receive_rewrites_prefix
+        return bool(
+            asks is not None
+            and getattr(self.kv, "read_by_other_pools", False)
+            and asks(seq)
+        )
+
     def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
         """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`."""
+        if self._lands_whole_in_shared_pool(seq):
+            return _PrefixWalk(
+                seq.num_tokens, seq.cache_seed, self.kv.index_version, [], []
+            )
         if self.kv.shares_content and self.enable_prefix_caching:
             self._fetch_shared_prefix(seq)
         prompt = self._prompt_hashes(seq)
@@ -1466,6 +1498,13 @@ class BlockManager:
         the walk does not match either.
         """
         if self._shared_prefix_asked.get(seq) == seq.cache_seed:
+            return
+        if seq.block_table or self._lands_whole_in_shared_pool(seq):
+            # A request to be received whole, before its allocation and after:
+            # parked for its receive it holds its blocks, and a copy then
+            # would put a second copy of the prefix beside the blocks being
+            # received. Not recorded as asked: preempted after its receive,
+            # the request prefills here and asks then.
             return
         self._shared_prefix_asked[seq] = seq.cache_seed
         n = self._n_hash_blocks(seq) - 1

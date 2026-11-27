@@ -451,6 +451,14 @@ class MultiConnector(KVConnectorBase):
 class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
 
+    def receive_rewrites_prefix(self, seq: Any) -> bool:
+        """Any sub's answer: only a P/D consumer leg can say True."""
+        for connector in self._connectors:
+            asks = getattr(connector, "receive_rewrites_prefix", None)
+            if asks is not None and asks(seq):
+                return True
+        return False
+
     def make_block_pool(
         self, config: Any, num_blocks: int, **kwargs: Any
     ) -> KVBlockPool | None:

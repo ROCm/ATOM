@@ -203,6 +203,9 @@ class UmbpL1Pool(KVBlockPool):
 
     shares_content = True
     async_fetch = True
+    # Other pools of the group copy out what this one publishes, fetching
+    # here or not (`KVBlockPool.read_by_other_pools`).
+    read_by_other_pools = True
 
     def __init__(
         self,
@@ -999,6 +1002,10 @@ class UmbpBlockPool(KVBlockPool):
     @property
     def shares_content(self) -> bool:
         return self.umbp.shares_content
+
+    @property
+    def read_by_other_pools(self) -> bool:
+        return self.umbp.read_by_other_pools
 
     @property
     def async_fetch(self) -> bool:

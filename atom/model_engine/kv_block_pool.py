@@ -65,6 +65,11 @@ class KVBlockPool(ABC):
     #: a sequence back while `fetch_pending`), rather than `fetch` in line.
     async_fetch: bool = False
 
+    #: Whether other pools copy out what this one publishes, whether or not it
+    #: fetches itself: an indexed block may be read from outside this process
+    #: at any time, so its bytes have to stay as published.
+    read_by_other_pools: bool = False
+
     #: Lanes by block id (MiniMax-M3 index sharding): `BlockManager` takes
     #: logical block j from lane ``j % residues``. ATOM's `BlockPool` keeps
     #: lanes; a pool whose backend grants block ids has one

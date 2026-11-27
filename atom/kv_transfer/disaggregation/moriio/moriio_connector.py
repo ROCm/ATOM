@@ -3724,6 +3724,17 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         of the held prefix blocks (`update_state_after_alloc`)."""
         self._block_manager = block_manager
 
+    def receive_rewrites_prefix(self, seq: Sequence) -> bool:
+        """`KVConnectorSchedulerBase.receive_rewrites_prefix`: a decode-side
+        request the producer pushes whole, the blocks this decode already holds
+        included -- every request without ATOM_MORIIO_INCREMENTAL_PUSH, and one
+        whose model carries per-request state (`_local_prefix_blocks` is 0
+        for both)."""
+        params = getattr(seq, "kv_transfer_params", None) or {}
+        if self.is_producer or not params.get("do_remote_prefill"):
+            return False
+        return not envs.ATOM_MORIIO_INCREMENTAL_PUSH or bool(seq.has_per_req_cache)
+
     def _local_prefix_blocks(self, seq: Sequence) -> int:
         """ATOM_MORIIO_INCREMENTAL_PUSH: the leading block-table entries whose
         KV this decode already holds -- its own prefix-cache hit, which

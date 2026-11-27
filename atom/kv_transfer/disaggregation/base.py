@@ -144,6 +144,17 @@ class KVConnectorSchedulerBase(ABC):
         """Update internal state after the scheduler allocates blocks."""
         ...
 
+    def receive_rewrites_prefix(self, seq: Any) -> bool:
+        """Whether `seq` waits for a P/D receive that writes its whole block
+        table, the blocks of a prefix this engine already holds included.
+
+        Asked before allocation. `BlockManager` then gives the request no
+        prefix hit in a pool other pools read (`KVBlockPool
+        .read_by_other_pools`): the receive would rewrite published blocks
+        while another pool may be copying them out.
+        """
+        return False
+
     def make_block_pool(
         self,
         config: Any,
