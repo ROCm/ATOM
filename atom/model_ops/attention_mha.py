@@ -1706,6 +1706,44 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             q, k, v, position=position, q_scale=q_scale, qkv=qkv, **kwargs
         )
 
+    def _aq1_decode(self, num_tokens):
+        """(decode metadata, max_seq_len) when this step's QKV chain and its
+        indexer-CP scores can run as one launch (aiter ``flydsl_aq1``): a decode
+        step of one request with ``num_tokens`` query rows, the CP indexer with
+        four index heads on FP4 keys; else None."""
+        if (
+            self.indexer_cp_group is None
+            or self.num_idx_heads != 4
+            or self.index_shard[1] != 1
+        ):
+            return None
+        try:
+            from atom.models.minimax_m3.mono.gfx1250.aq import aq1_supported
+        except ImportError:
+            return None
+        sm = self._sparse_metadata(get_forward_context())
+        decode_md = getattr(sm, "decode", None)
+        if decode_md is None or getattr(sm, "prefill", None) is not None:
+            return None
+        seq_lens, block_table = decode_md.seq_lens, decode_md.block_table
+        if (
+            seq_lens.dtype != torch.int32
+            or block_table.dtype != torch.int32
+            or block_table.stride(1) != 1
+            or not envs.ATOM_M3_CP_SCORE_FLYDSL
+            or self.index_cache.dtype != torch.uint8
+            or aq1_supported(
+                num_tokens,
+                self.num_idx_heads,
+                seq_lens.numel(),
+                getattr(decode_md, "max_query_len", 1),
+                self.num_idx_heads,
+            )
+            is not None
+        ):
+            return None
+        return decode_md, int(sm.max_seq_len)
+
     def _fused_qkv_chain(self, x, x_scale, q, position, k_cache, v_cache, k_scale,
                          v_scale, slot_mapping, index_slot_mapping):  # fmt: skip
         """The QKV GEMM + norm / RoPE + NVFP4 K/V and index inserts in one aiter
@@ -1716,6 +1754,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             mxfp8_qkv_norm_rope_nvfp4_insert,
         )
 
+        self._aq1_scores = None
         linear = self.fused_qkv_linear[0]
         num_tokens = x.shape[0]
         if not (
@@ -1752,6 +1791,60 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         index_q = torch.empty(
             (num_tokens, self.index_q_size), dtype=torch.bfloat16, device=x.device
         )
+        aq1 = self._aq1_decode(num_tokens)
+        if aq1 is not None:
+            # One request's decode step under the indexer CP: the chain and this
+            # rank's index scores in one launch (aiter flydsl_aq1, the same bytes);
+            # _cp_index_topk_decode takes the scores instead of launching the scorer.
+            from atom.models.minimax_m3.mono.gfx1250.aq import flydsl_aq1
+
+            decode_md, max_seq_len = aq1
+            blocks = -(-max_seq_len // 128)
+            local = -(-blocks // self.indexer_cp_world)
+            scores = torch.empty(
+                (self.num_idx_heads, num_tokens, local),
+                dtype=torch.float32,
+                device=x.device,
+            )
+            flydsl_aq1(
+                x,
+                x_scale.view(torch.float8_e8m0fnu),
+                linear.weight,
+                linear.weight_scale,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.index_q_norm.weight,
+                self.index_k_norm.weight,
+                _minimax_m3_cos_sin_cache(self.rotary_emb, q),
+                position,
+                slot_mapping,
+                index_slot_mapping,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                self.index_cache,
+                self.index_scale,
+                q_out,
+                index_q,
+                self.q_norm.variance_epsilon,
+                num_index_heads=self.num_idx_heads,
+                block_table=decode_md.block_table,
+                seq_lens=decode_md.seq_lens,
+                max_seq_len=max_seq_len,
+                rank=self.indexer_cp_rank,
+                world=self.indexer_cp_world,
+                max_query_len=num_tokens,
+                sm_scale=self.scale,
+                scores=scores,
+            )
+            self._aq1_scores = (
+                index_q.data_ptr(),
+                decode_md.block_table.data_ptr(),
+                decode_md.seq_lens.data_ptr(),
+                scores,
+            )
+            return q_out, index_q
         mxfp8_qkv_norm_rope_nvfp4_insert(
             x,
             x_scale.view(torch.float8_e8m0fnu),
@@ -2467,9 +2560,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             {} if pages_per_block is None else {"pages_per_block": pages_per_block}
         )
         global_blocks = block_table.shape[1]
+        aq1, self._aq1_scores = getattr(self, "_aq1_scores", None), None
+        if aq1 is not None and aq1[:3] == (
+            index_q.data_ptr(),
+            block_table.data_ptr(),
+            seq_lens.data_ptr(),
+        ):
+            # this layer's QKV chain launch (AQ1) computed the scores already
+            scores = aq1[3]
+        else:
+            scores = None
         # By block id: this rank's own planes under a sharded index cache,
         # which hold every block it scores (`index_shard.page_view`).
-        scores = indexer_context_scores(
+        scores = scores if scores is not None else indexer_context_scores(
             index_q,
             self.index_cache_by_page,
             block_table,
