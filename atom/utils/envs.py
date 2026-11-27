@@ -918,10 +918,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3 prefill index top-k: the widest tile (blocks, a power of two)
     # the Triton packed selector sorts at once. Same selection at any value.
     # Unset: 256 on gfx1250, else 1024 (`_prefill_topk_block_size_k`).
-    "ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K": lambda: (
-        int(os.environ["ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K"])
-        if os.getenv("ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K")
-        else None
+    "ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K": lambda: _optional_int_env(
+        "ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K"
     ),
     # MiniMax-M3 decode index block scores over the FP4 index cache on gfx1250:
     # aiter's FlyDSL scorer (`aiter.ops.flydsl.index_score_decode`) instead of

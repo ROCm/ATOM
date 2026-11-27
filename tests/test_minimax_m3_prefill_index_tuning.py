@@ -183,3 +183,32 @@ def test_the_default_launches_are_ones_aiter_builds(monkeypatch, fused):
         launch["select"] = (0, 1)
     compiled = compile_index_score_prefill_nvfp4(**launch, chunk_max=CHUNK_MAX)
     assert compiled["launch"] is not None
+
+
+SCORE_FLAG = "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL"
+
+
+def _triton_scorer(monkeypatch):
+    launched = []
+
+    class Launch:
+        def __getitem__(self, grid):
+            return lambda *a, **k: launched.append(grid)
+
+    monkeypatch.setattr(m, "_index_block_score_kernel", Launch())
+    return launched
+
+
+def test_the_flydsl_scorer_is_on_by_default(monkeypatch, aiter_scorer):
+    monkeypatch.delenv(SCORE_FLAG, raising=False)
+    triton_launches = _triton_scorer(monkeypatch)
+    _prefill(monkeypatch)
+    assert len(aiter_scorer) == 1 and not triton_launches
+
+
+def test_off_keeps_the_triton_scorer(monkeypatch, aiter_scorer):
+    monkeypatch.setenv(SCORE_FLAG, "0")
+    monkeypatch.setitem(sys.modules, AITER_OP, None)  # not even imported
+    triton_launches = _triton_scorer(monkeypatch)
+    _prefill(monkeypatch)
+    assert len(triton_launches) == 1 and not aiter_scorer
