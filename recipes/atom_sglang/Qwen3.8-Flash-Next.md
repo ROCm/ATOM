@@ -306,6 +306,33 @@ message size, so decode all-reduces stay exact. It perturbs prefill
 activations (max ~3% of a tensor's range per reduction), so validate accuracy
 on the target workload before enabling it.
 
+## Optional: sequence-parallel collectives over SDMA
+
+TP prefills above 1024 tokens keep the HC residual token-sharded
+(`ATOM_QWEN4_EXP_SP_MIN_TOKENS`); their reduce-scatters and all-gathers block
+the compute stream on RCCL. `ATOM_QWEN4_EXP_SP_SDMA=1` runs them on the copy
+engines (mori CCO SDMA) instead, overlapped with the hyper-connections around
+them (MI308X, 12k-token prefill: TP2 -12% step time, TP4/EP4 -7%). The
+transport is bf16 (no quantization).
+
+```bash
+# mori ships in the ATOM images; elsewhere add it from the ATOM checkout
+# (amd-mori-nightly >= 1.2.6.dev20261116, CCO SDMA with MI308X engine balancing):
+pip install -e ".[qwen38-tp-sdma]"
+export ATOM_QWEN4_EXP_SP_SDMA=1
+# Only when torch loads ROCm's private libdrm (rocm_sysdeps), as TheRock wheels do:
+export LD_PRELOAD=/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2:/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1
+```
+
+It applies to TP serving on gfx942 only (validated on MI308X) and needs mori
+(above), FlyDSL and aiter's `SdmaComm` (ROCm/aiter#6514). Each rank holds
+(4 x TP - 2) x ceil(max_num_batched_tokens / TP) rows x hidden x 2 B of receive
+buffers (16k tokens: ~252 MB at TP2, ~294 MB at TP4). If any TP rank cannot use
+it (a dependency or the preload missing, TP across nodes), every rank logs one
+warning and keeps RCCL. A failure inside the collective setup of mori or aiter's
+`SdmaComm` (e.g. its buffer allocation) can still block startup until the gloo
+timeout.
+
 ## Optional: bursty prefill on an idle server
 
 When several requests reach an idle server at once and their prefill takes

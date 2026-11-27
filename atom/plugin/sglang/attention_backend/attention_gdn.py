@@ -646,7 +646,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             bs=bs,
             draft_token_num=draft_token_num,
         )
-        buf_k, buf_u, buf_g, write_pos = prepare_layer(
+        buf_k, buf_u, buf_g, flush_arrivals, write_pos, flush_wait = prepare_layer(
             self.layer_num,
             ckpt,
             num_v_heads=self.num_v_heads // self.tp_size,
@@ -675,6 +675,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             buf_k=buf_k,
             buf_u=buf_u,
             buf_g=buf_g,
+            flush_arrivals=flush_arrivals,
+            flush_wait=flush_wait,
             write_pos=write_pos,
             slot_idx=slot_idx,
             cu_seqlens=self._spec_cu_seqlens(bs, draft_token_num, mixed_blocks.device),
