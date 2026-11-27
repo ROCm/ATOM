@@ -25,7 +25,7 @@ from atom.kv_transfer.disaggregation.pd_producer import (
     mooncake_producer_connectors,
 )
 from atom.kv_transfer.disaggregation.staging_config import minimax_page_staging
-from atom.utils import envs
+from atom.utils import envs, mooncake_hca
 
 logger = logging.getLogger("atom")
 
@@ -258,7 +258,7 @@ def _connector_class():
 
         def serve(self) -> threading.Thread:
             """Engine, staging (its only registered memory), warm gathers, listener."""
-            mc._configure_mooncake_transport(self.protocol)
+            mooncake_hca.configure_transport(self.protocol)
             self._init_transfer_engine(",".join(self.ib_devices))
             device = next(iter(self._kv_source_views.values())).device
             staging = self._alloc_kv_staging(STAGING_SLOT_BYTES, device)

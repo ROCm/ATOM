@@ -94,7 +94,7 @@ def stage_connector(monkeypatch, *, send_process, rails=""):
     monkeypatch.setattr(mc, "get_ip", lambda: "192.0.2.2")
     monkeypatch.setattr(mc, "get_open_port", lambda: 17000)
     monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
-    monkeypatch.setattr(mc, "_ib_device_exists", lambda device: True)
+    monkeypatch.setattr(mc.mooncake_hca, "ib_device_exists", lambda device: True)
     monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(mc, "ThreadPoolExecutor", MagicMock())
     monkeypatch.setattr(mc.zmq, "Context", MagicMock())
