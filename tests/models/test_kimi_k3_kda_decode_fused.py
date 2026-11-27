@@ -374,6 +374,17 @@ def test_child_online_quantization_is_seen_on_first_use(modules, monkeypatch):
     torch.testing.assert_close(out, torch.full_like(out, 3))
 
 
+def test_cached_weights_do_not_require_repeating_post_load(modules, monkeypatch):
+    c = layer_case(modules, monkeypatch, verify=True)
+    # A cached model already has fused weights, while new runtime caches start empty.
+    assert c.attn._in_proj_fused
+    assert c.attn._fused_kda_max_programs is None
+    c.attn.process_weights_after_loading()
+    out = c.attn._forward_impl(c.hidden)
+    assert len(c.calls.fused) == 1 and not c.calls.split
+    torch.testing.assert_close(out, torch.full_like(out, 2))
+
+
 @pytest.mark.parametrize("replacement", ["state", "conv", "records", "weight"])
 def test_pool_or_weight_rebinding_rechecks_eligibility(
     modules, monkeypatch, replacement

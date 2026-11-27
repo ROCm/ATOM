@@ -1250,6 +1250,8 @@ class KimiKDAAttention(nn.Module):
         self.fuse_f_a_quant = (
             f_b_type == QuantType.per_Token and f_b_dtype == dtypes.fp8
         )
+        self._fused_kda_max_programs = None
+        self._fused_kda_pool = None
 
     def get_streaming_deferred_modules(self) -> tuple[nn.Module, ...]:
         """Children that must remain unquantized until KDA fuses their weights."""
@@ -1313,11 +1315,10 @@ class KimiKDAAttention(nn.Module):
             ],
             dim=0,
         ).contiguous()
-        self._init_fused_kda_decode()
         self._in_proj_fused = True
 
     def _init_fused_kda_decode(self) -> None:
-        """Cache device/model constants; child weight hooks and pools settle later."""
+        """Cache device/model constants once after normal or cached-weight loading."""
         supported = (
             get_gfx_runtime() == "gfx950"
             and self.head_dim == 128
@@ -1455,6 +1456,8 @@ class KimiKDAAttention(nn.Module):
                 hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
             )
 
+        if self._fused_kda_max_programs is None:
+            self._init_fused_kda_decode()
         cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
         conv_state = cache.k_cache
         ssm_state = cache.v_cache
