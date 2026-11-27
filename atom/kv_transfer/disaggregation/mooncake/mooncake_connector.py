@@ -726,7 +726,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         if not already_claimed:
             self._awaiting_send.discard(str(seq.id))
             self._unpin(seq.id)
-            self._early_sources.pop(str(seq.id), None)
+            self._forget_early_source(seq.id)
         if previous_waiting is not None:
             self._chunked_waiting[seq.id] = previous_waiting
             self._note_waiting(seq)
@@ -858,8 +858,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             aborted = produced_no_handoff(seq)
             self._chunked_waiting.pop(seq.id, None)
             self._chunked_ready.discard(seq.id)
-            self._early_sources.pop(str(seq.id), None)
-            self._answered.discard(seq.id)
+            self._forget_early_source(seq.id)
+            if self._answer_at_schedule:
+                self._answered.discard(seq.id)
             if aborted:
                 # Its cancellation is queued below. A finished source keeps
                 # its pin until D reaches P or the worker reports it safe.
@@ -965,7 +966,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
         self._unpin(req_id)
-        self._early_sources.pop(str(req_id), None)
+        self._forget_early_source(req_id)
 
     def abort_send(self, seq: Sequence) -> None:
         # request_finished queued cancellation; only the aggregated
@@ -1104,6 +1105,14 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             self._spec_pins.pop(str(req_id), None)
             self._spec_state_pins.discard(str(req_id))
 
+    def _forget_early_source(self, req_id) -> Sequence | None:
+        """Drop and return `req_id`'s early source. Only a speculative
+        connector records them (`update_state_after_alloc`), so one without
+        early handoff carries no early-handoff state."""
+        if not self._speculative:
+            return None
+        return self._early_sources.pop(str(req_id), None)
+
     def bind_block_manager(self, block_manager: Any) -> None:
         """Bound the rule by what the allocator can actually hand out: its
         usable pages (a checkpoint-enabled pool reserves a null block that
@@ -1165,7 +1174,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 # A source allocated before this report no longer waits on D
                 # (or, on failure, was already retired by the worker).
                 self._unpin(completion.operation_id)
-                source = self._early_sources.pop(str(completion.operation_id), None)
+                source = self._forget_early_source(completion.operation_id)
                 pending = self._chunked_waiting.get(completion.operation_id)
                 if pending is not None:
                     seq, _ = pending
@@ -1542,7 +1551,9 @@ class MooncakeConnector(KVConnectorBase):
         self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
         self._chunked_prefills: dict[ReqId, ChunkedPrefill] = {}
         self._chunked_local_ids: dict[ReqId, ReqId] = {}
-        self._retired_chunked_transfers: OrderedDict[ReqId, None] = OrderedDict()
+        # Retired transfer id -> whether `pd_source_safe` was reported for it
+        # (`_retire_chunked_transfer`).
+        self._retired_chunked_transfers: OrderedDict[ReqId, bool] = OrderedDict()
         self._pending_chunked_requests: list[tuple[dict, float]] = []
         self._received_handoffs: dict[ReqId, PrefillHandoff] = {}
         self._pending_handoffs: dict[ReqId, _PendingHandoff] = {}

@@ -185,6 +185,29 @@ def test_speculative_off_keeps_the_gate(monkeypatch, seq_factory):
     assert not p._spec_pins
 
 
+def test_lifecycle_without_speculative_touches_no_early_source_state(
+    monkeypatch, seq_factory
+):
+    """Undo, finish, send and D's report reach no early-handoff record on a
+    connector that keeps none (as `tests/test_pd_source_claim.py`'s stand-in)."""
+    monkeypatch.delenv("ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", raising=False)
+    p = make_scheduler_connector(monkeypatch, True, early=True, speculative=False)
+    del p._early_sources, p._answered
+    seq = seq_factory(list(range(10)), kv_transfer_params=p_params())
+    p.admission_ready(seq)
+    _ack(p, seq)
+    assert p.admission_ready(seq)
+    from atom.model_engine.sequence import new_block_table
+
+    seq.block_table = new_block_table([0, 1, 2])
+    p.update_state_after_alloc(seq)
+    p.cancel_preadmission(seq)  # an undispatched allocation is undone
+    _allocate(p, seq, [0, 1, 2])
+    _ack(p, seq, succeeded=False)
+    _finish_prefill(p, seq)
+    p.send_finished(seq.id)
+
+
 @pytest.mark.parametrize(
     "pool,a_ready,b_ready",
     [
@@ -1686,3 +1709,16 @@ def test_dispatch_to_dp_ranks_records_each_rank_after_the_send():
         None,
         None,
     ]
+
+
+def test_router_kill_switch_is_documented():
+    """The router's early-handoff switch (read in Rust, not `envs.py`) has a
+    row in the env reference like every `ATOM_PD_*` knob."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).parents[1]
+    rust = (root / "atom/mesh/src/core/placement/backend/atom.rs").read_text()
+    name = re.search(r'EARLY_HANDOFF_ENV: &str = "([A-Z_]+)"', rust).group(1)
+    doc = (root / "docs/environment_variables.md").read_text()
+    assert f"**{name}**" in doc

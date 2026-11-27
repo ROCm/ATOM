@@ -991,9 +991,12 @@ def chunked_receive_capability(cfg) -> dict[str, Any]:
     """What this server declares it can receive as a chunked-transfer D.
 
     `accepts` covers the constraints that depend on D alone; the router adds
-    the one that depends on the pair (D TP a multiple of P TP). The same
-    checks guard the receive itself (`_validate_chunked_receive`), so the
-    declaration and the refusal cannot drift apart.
+    the one that depends on the pair (D TP a multiple of P TP). Only the DCP
+    clause is shared with the receive's own refusal
+    (`_per_request_state_under_dcp`, in `_validate_chunked_receive`); the PP
+    rule is checked there in `chunked_topology_supported`'s form and the TP
+    rule is restated in the router (`atom.rs`), so those are kept alike by
+    hand.
     """
     reason = None
     if _mooncake_connector(cfg, "kv_consumer") is None:
@@ -1643,8 +1646,8 @@ def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
             status_code=400,
             detail="Chunked P/D requires D PP=1 and D TP a multiple of positive P TP",
         )
-    # D declares the same in /kv_transfer_info (`chunked_receive_capability`),
-    # so a router that negotiates never sends what this refuses.
+    # D declares this clause in /kv_transfer_info through the same predicate
+    # (`chunked_receive_capability`), so a negotiating router never sends it.
     if _per_request_state_under_dcp(cfg):
         raise HTTPException(
             status_code=400,

@@ -71,7 +71,9 @@ def _mooncake(is_producer=True):
         dcp_size=1,
         hash_block_size=16,
         pp_size=1,
+        # Early handoff off: no early-handoff state may be touched.
         _speculative=False,
+        _answer_at_schedule=False,
     )
 
 
