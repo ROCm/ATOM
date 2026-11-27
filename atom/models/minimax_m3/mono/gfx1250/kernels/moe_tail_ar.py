@@ -46,6 +46,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from .. import moe_tail_ar_layout as LY
 from aiter.ops.flydsl.kernels import mxfp4_preshuffle_gfx1250_tdm as _tdm
+from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -64,6 +65,16 @@ SCOPE_SYS = 3 << 3  # system: what a peer's IPC-mapped memory needs
 SENT_LO = 0x7FFF7FFF
 SENT_HI = -0x7FFF8000  # 0x80008000 as int32
 TLW = 8  # timeline words a workgroup
+# shared down inside the launch (``sd``): 48 workgroups ahead of the tiles, wave w of workgroup d = output columns
+# [128 d + 16 w, +16), production's ``batched_gemm_a8w8_mx32_..._sk1`` chain (6 scaled-fp8 16x16x128 steps from
+# zero, bf16 out) on h (E4M3 [8, 768] + E8M0 [8, 24], written by an earlier launch)
+SD_INTER = 768
+SD_STEPS = SD_INTER // 128  # 6
+SD_COLS = 128  # output columns a workgroup
+NSD = HIDDEN // SD_COLS  # 48
+SD_X = 0  # LDS: h B fragments [step 6][jj 4][kgrp 2][tok 8] x 16 B
+SD_SC = SD_STEPS * 4 * 16 * 16  # 6144: h E8M0 words [tok][step]
+(SDT_H, SDT_HS, SDT_DW, SDT_DS, SDT_SF) = range(5)  # the shared-down table (int64 words)
 
 
 def _bits(w):
@@ -248,6 +259,8 @@ def launch_moe_tail_ar(
     probe: Constexpr[int],
     fp8: Constexpr[int],
     tl: Constexpr[int],
+    sd: Constexpr[int] = 0,
+    arg_sdt: fx.Pointer = None,
 ):
     """``arg_c``: the grouped GEMM2 output bf16 [i32_m, 6144] followed by this rank's own gathered rows bf16
     [tokens, 6144], owned by this launch: every half-word 0xffff before the first launch (the launch re-arms
@@ -331,8 +344,11 @@ def launch_moe_tail_ar(
     ctr_err = LY.ctr_err(max_rows)
     kname = (
         f"moe_tail_ar_k5_gfx1250{'_tl' if tl else ''}_r{tokens}{'_add' if has_add else ''}"
-        f"{'_sc' if has_scale else ''}{'' if fp8 else '_bf16'}_p{probe}_" + g2_name
+        f"{'_sc' if has_scale else ''}{'' if fp8 else '_bf16'}_p{probe}{'_sd' if sd else ''}_" + g2_name
     )
+    if sd and (tl or not has_add):
+        raise ValueError("moe_tail_ar: the shared-down build has an addend and no timeline")
+    NSD_ = NSD if sd else 0
 
     @flyc.kernel(name=kname, known_block_size=[block, 1, 1])
     def kernel_moe_tail_ar(
@@ -363,11 +379,13 @@ def launch_moe_tail_ar(
         i32_maxit: fx.Int32,
         f32_scale: fx.Float32,
         f64_eps: fx.Float64,
+        arg_sdt: fx.Pointer,
     ):
         base_ptr = fx.SharedAllocator(static=True).allocate(arena)._ptr
         holder[0] = base_ptr
         tid = fx.Int32(fx.thread_idx.x)
-        bid = fx.Int32(fx.block_idx.x)
+        bid_raw = fx.Int32(fx.block_idx.x)
+        bid = bid_raw - NSD_  # the original roles' index (the shared-down workgroups lead the grid)
         wave = fx.Int32(rocdl.readfirstlane(T.i32, tid // WAVE))
         lane = tid % WAVE
         one = fx.Float32(1.0)
@@ -400,7 +418,84 @@ def launch_moe_tail_ar(
                 base = (((i32_rank + i) & (RANKS - 1)) == d).select(fx.Int64(ins[d]), base)
             return create_buffer_resource_from_addr(base, num_records_bytes=inbox_bytes)
 
-        if bid < NTILE:
+        sdt_rs = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_sdt)), num_records_bytes=5 * 8)
+
+        def sdt_word(i):
+            w_ = Vec(buffer_load(sdt_rs, 2 * i, vec_width=2, dtype=T.i32))
+            return (fx.Int64(fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(w_[1])))) << fx.Int64(32)) | fx.Int64(
+                fx.Uint32(fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(w_[0])))))
+
+        if const_expr(sd):
+            sf_rs = create_buffer_resource_from_addr(sdt_word(SDT_SF), num_records_bytes=tokens * HIDDEN * 2)
+        if bid_raw < NSD_:
+            if const_expr(sd):
+                # ---------------- shared down: output columns [128 d + 16 wave, +16) ----------------
+                lane16 = lane % 16
+                kgrp = lane // 16
+                lds_idx = fx.Int64(fx.ptrtoint(base_ptr))
+                lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
+                lds_load_b32, lds_store_b32 = make_lds_copy_ops(32)
+                row = bid_raw * SD_COLS + wave * 16 + lane16
+                dw_rs = create_buffer_resource_from_addr(sdt_word(SDT_DW), num_records_bytes=HIDDEN * SD_INTER)
+                ds_rs = create_buffer_resource_from_addr(sdt_word(SDT_DS), num_records_bytes=HIDDEN * (SD_INTER // 32))
+                ds_w = (row // 32) * (SD_INTER // 4) + row % 32
+                dsc = [fx.Int32(buffer_load(ds_rs, ds_w + ks_ * 32, vec_width=1, dtype=T.i32, cache_modifier=1))
+                       for ks_ in range_constexpr(SD_STEPS)]
+                d_u = (row // 16) * SD_INTER + row % 16
+                df = [
+                    [Vec(buffer_load(dw_rs, (d_u + (ks_ * 8 + jj * 2 + kgrp) * 16) * 4, vec_width=4, dtype=T.i32,
+                                     cache_modifier=1)) for jj in range_constexpr(4)]
+                    for ks_ in range_constexpr(SD_STEPS)
+                ]
+                rocdl.sched_barrier(0)
+                # h (plain: written by an earlier launch): 384 16-B chunks (token u // 48, K [16 (u % 48), +16)) over
+                # the 256 threads; h scales: [tok][24] bytes = [tok][6] words, word i = tok * 6 + step
+                h_rs = create_buffer_resource_from_addr(sdt_word(SDT_H), num_records_bytes=tokens * SD_INTER)
+                hs_rs = create_buffer_resource_from_addr(sdt_word(SDT_HS), num_records_bytes=tokens * (SD_INTER // 32))
+                for m_ in range_constexpr(2):
+                    u = tid + 256 * m_
+                    if u < tokens * (SD_INTER // 16):
+                        hc = Vec(buffer_load(h_rs, u * 4, vec_width=4, dtype=T.i32))
+                        tok = u // (SD_INTER // 16)
+                        k0 = (u % (SD_INTER // 16)) * 16
+                        lds_store_b128(lds_idx, SD_X + (((k0 // 128) * 4 + (k0 % 128) // 32) * 16 + ((k0 % 32) // 16) * 8
+                                                         + tok) * 16, hc)
+                if tid < tokens * SD_STEPS:
+                    hw_ = fx.Int32(buffer_load(hs_rs, tid, vec_width=1, dtype=T.i32))
+                    lds_store_b32(lds_idx, SD_SC + tid * 4, Vec.from_elements([hw_], fx.Int32))
+                _lds_barrier()
+                tok16 = lane16 % 8
+                atom = fx.make_mma_atom(
+                    fx.rocdl.WMMAScale(16, 16, 128, fx.Float8E4M3FN, fx.Float8E4M3FN, fx.Float32, opsel_a=0, opsel_b=0))
+                dacc = fx.make_rmem_tensor(8, fx.Float32)
+                dacc.store(fx.full(8, 0.0, fx.Float32))
+
+                def _cat4(v):
+                    v01 = Vec(v[0]).shuffle(Vec(v[1]), list(range(8)))
+                    v23 = Vec(v[2]).shuffle(Vec(v[3]), list(range(8)))
+                    return v01.shuffle(v23, list(range(16)))
+
+                def _rm(v):
+                    t_ = fx.make_rmem_tensor(16, fx.Int32)
+                    t_.store(v)
+                    return t_
+
+                for ks_ in range_constexpr(SD_STEPS):
+                    xf = [lds_load_b128(lds_idx, SD_X + ((ks_ * 4 + jj) * 16 + kgrp * 8 + tok16) * 16)
+                          for jj in range_constexpr(4)]
+                    xs_ = fx.Int32(Vec(lds_load_b32(lds_idx, SD_SC + (tok16 * SD_STEPS + ks_) * 4))[0])
+                    fx.gemm(atom, dacc, _rm(_cat4(df[ks_])), _rm(_cat4(xf)), dacc, scale_a=dsc[ks_], scale_b=xs_)
+                # acc[i]: output column 8 kgrp + i of the wave's 16, token lane16 -> k5-sentinel words, device scope
+                if lane16 < tokens:
+                    av_ = Vec(dacc.load())
+                    o_ = []
+                    for c in range_constexpr(4):
+                        w_ = _f2bf2(fx.Float32(av_[2 * c]), fx.Float32(av_[2 * c + 1]))
+                        o_.append(w_ ^ _bits(w_))
+                    buffer_store(Vec.from_elements(o_, fx.Int32).ir_value(), sf_rs,
+                                 (lane16 * HIDDEN + bid_raw * SD_COLS + wave * 16 + kgrp * 8) * 2, offset_is_bytes=True,
+                                 cache_modifier=SCOPE_DEV)
+        elif bid < NTILE:
             # ---------------- GEMM2 tile (m-tile mt, column tile cblk), then token mt's gather ----------------
             mt = bid // NT
             cblk = bid % NT
@@ -428,6 +523,8 @@ def launch_moe_tail_ar(
             add_rs = create_buffer_resource_from_addr(
                 fx.Int64(fx.ptrtoint(arg_add)), num_records_bytes=tokens * HIDDEN * 2
             )
+            if const_expr(sd):
+                add_rs = sf_rs  # the shared output comes from this launch's shared-down workgroups (polled below)
             av = Vec(buffer_load(add_rs, LY.pack_index(tgs, pcol) * 4, vec_width=4, dtype=T.i32))
             rnd = fx.Int32(buffer_load(ctr_rs, LY.slab(tgs, pcol), vec_width=1, dtype=T.i32))
             g_rs = []
@@ -469,7 +566,8 @@ def launch_moe_tail_ar(
                 return tuple(
                     Vec(buffer_load(g_rs[k], pcol * 4, vec_width=4, dtype=T.i32, cache_modifier=SCOPE_DEV))
                     for k in range_constexpr(4)
-                )
+                ) + ((Vec(buffer_load(add_rs, LY.pack_index(tgs, pcol) * 4, vec_width=4, dtype=T.i32,
+                                      cache_modifier=SCOPE_DEV)),) if const_expr(sd) else ())
 
             def g_pending(vs):
                 m_ = fx.Int32(0)
@@ -479,14 +577,24 @@ def launch_moe_tail_ar(
                 return fx.Int32(rocdl.ballot(T.i32, m_ != 0)) != 0
 
             # the four route rows' packs: the data is its own flag (armed 0xffff, written once by their tiles)
-            (g0, g1, g2, g3) = g_load()
-            gpend = gl & g_pending((g0, g1, g2, g3))
-            git = fx.Int32(0)
-            while gpend & (git < i32_maxit):
-                rocdl.s_sleep(1)
+            if const_expr(sd):
+                (g0, g1, g2, g3, av) = g_load()
+                gpend = gl & g_pending((g0, g1, g2, g3, av))
+                git = fx.Int32(0)
+                while gpend & (git < i32_maxit):
+                    rocdl.s_sleep(1)
+                    (g0, g1, g2, g3, av) = g_load()
+                    gpend = g_pending((g0, g1, g2, g3, av))
+                    git = git + 1
+            else:
                 (g0, g1, g2, g3) = g_load()
-                gpend = g_pending((g0, g1, g2, g3))
-                git = git + 1
+                gpend = gl & g_pending((g0, g1, g2, g3))
+                git = fx.Int32(0)
+                while gpend & (git < i32_maxit):
+                    rocdl.s_sleep(1)
+                    (g0, g1, g2, g3) = g_load()
+                    gpend = g_pending((g0, g1, g2, g3))
+                    git = git + 1
             if gl & gpend & (lane == 0):
                 fx.atomic_add(ctr + ctr_err, fx.Int32(1), syncscope="agent")
             stamp(2)
@@ -517,6 +625,9 @@ def launch_moe_tail_ar(
                 # consumed: the rows' packs armed again for the next launch
                 for k in range_constexpr(4):
                     buffer_store(sent.ir_value(), g_rs[k], pcol * 16, offset_is_bytes=True, cache_modifier=SCOPE_DEV)
+                if const_expr(sd):
+                    buffer_store(sent.ir_value(), sf_rs, LY.pack_index(tgs, pcol) * 16, offset_is_bytes=True,
+                                 cache_modifier=SCOPE_DEV)
             if const_expr(tl):
                 stamp(3)
                 rocdl.s_wait_storecnt(0)
@@ -730,7 +841,8 @@ def launch_moe_tail_ar(
         arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_ids, arg_rows, arg_gw, arg_add,
         arg_res, arg_nw, arg_out, arg_outs, arg_res_out, arg_ctr, arg_tl,
         i64_in0, i64_in1, i64_in2, i64_in3, i32_m, i32_slot, i32_rank, i32_maxit, f32_scale, f64_eps,
-    ).launch(grid=(LY.grid(tile_n, tokens), 1, 1), block=(block, 1, 1), stream=stream)  # fmt: skip
+        arg_sdt if arg_sdt is not None else arg_ctr,
+    ).launch(grid=(LY.grid(tile_n, tokens) + NSD_, 1, 1), block=(block, 1, 1), stream=stream)  # fmt: skip
 
 
 launch_moe_tail_ar.compile_hints["llvm_options"] = dict(_tdm.launch_gemm_a8w4_tdm.compile_hints["llvm_options"])

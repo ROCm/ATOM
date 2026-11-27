@@ -152,8 +152,8 @@ LD_END = LD_SC + ROWS * D_STEPS * 4
 
 # device table (int64 words), one a MoE layer (the scratch words are shared by every layer of a rank)
 (T_RW, T_RB, T_NVR, T_GW, T_GS, T_DW, T_DS, T_IDS, T_WTS, T_XQ, T_XS, T_SH, T_XB, T_LG, T_HB, T_CNT,
- T_ERR, T_GP, T_RP) = range(19)
-T_WORDS = 19
+ T_ERR, T_GP, T_RP, T_HP, T_HSP) = range(21)
+T_WORDS = 21  # T_HP / T_HSP: the layer's plain h (E4M3 [8, 768]) / hs (E8M0 [8, 24]) for a later launch's down
 POLL_SLEEP = 1  # data-as-flag polls: each consumer polls only the words it reads (SYNC: s_sleep 1-4 equal)
 
 
@@ -1088,6 +1088,14 @@ def launch_mf(
                     if (q == 0) & (tile == 0):
                         buffer_store(e8, copy_rs(T_HB, e, HCOPY), HBUF + (tok * N_GROUPS + g) * 4, offset_is_bytes=True,
                                      cache_modifier=SCOPE_DEV)
+                    # the plain h / hs (production's bytes) for a shared down in a later launch (interface h)
+                    if q == 0:
+                        buffer_store(Vec.from_elements([fx.Int32(q8[0]), fx.Int32(q8[1])], fx.Int32),
+                                     _rsrc(_word(tab, T_HP), ROWS * S_INTER), tok * S_INTER + g * GROUP + tile * 8,
+                                     offset_is_bytes=True)
+                    if (q == 0) & (tile == 0):
+                        buffer_store(fx.Uint8(e8), _rsrc(_word(tab, T_HSP), ROWS * N_GROUPS), tok * N_GROUPS + g,
+                                     offset_is_bytes=True)
             stamp(3, drain=True)
             count_out(e)
         else:

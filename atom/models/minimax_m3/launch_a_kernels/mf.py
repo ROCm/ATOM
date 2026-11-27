@@ -130,12 +130,37 @@ def _tables(moe, nv):
             dn.weight_scale.data.view(torch.uint8),
         )
         tab = mf_table(*keep, outs, mf_scratch(dev), num_valid_rows=nv)
+        _register_shared_down(outs, dn)
         got = (tab, outs, keep + (nv,))
     else:
         logger.info("MiniMax-M3 MoE front: %s keeps production's MoE (not the shape the launch takes)",
                     getattr(moe, "prefix", "?"))
     _TABLES[key] = got
     return got
+
+
+def shared_down_registry() -> dict:
+    """aiter ``moe_tail_ar.SHARED_DOWN`` (addend address -> shared-down operands), or {} without it."""
+    try:
+        from atom.models.minimax_m3.mono.gfx1250 import moe_tail_ar
+    except ImportError:
+        return {}
+    return getattr(moe_tail_ar, "SHARED_DOWN", {})
+
+
+def _register_shared_down(outs, dn) -> None:
+    """The shared down runs in P6's tail launch (aiter ``moe_tail_ar``, its shared-down workgroups) when aiter has
+    it: registered under the launch's shared output (the glue epilogue's addend), whose buffer is armed here,
+    outside any capture. The launch then runs router + gate_up only (roles 3) and writes h / hs for it."""
+    try:
+        from atom.models.minimax_m3.mono.gfx1250.moe_tail_ar import SHARED_DOWN, shared_down_table
+    except ImportError:
+        return
+    if getattr(outs, "h", None) is None:
+        return
+    desc = (outs.h, outs.hs, dn.weight.data.view(torch.uint8), dn.weight_scale.data.view(torch.uint8))
+    shared_down_table(*desc)
+    SHARED_DOWN[outs.shared.data_ptr()] = desc
 
 
 def run(call):
@@ -175,6 +200,8 @@ def run(call):
                 tab,
                 max_rows=k5.max_rows,
                 maxit=launch_a.k5_maxit(),
+                # router + gate_up when the shared down runs in the tail launch, else the whole shared expert
+                roles=3 if outs.shared.data_ptr() in shared_down_registry() else 7,
             )
             launch_a.set_moe_front(moe, out, outs)
             return out, res_out

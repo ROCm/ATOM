@@ -43,6 +43,8 @@ class MfOutputs:
         self.xq = torch.zeros((8, 6144 // 2), dtype=torch.uint8, device=device)
         self.xs = torch.zeros((8, 6144 // 32), dtype=torch.uint8, device=device)
         self.shared = torch.zeros((8, 6144), dtype=torch.bfloat16, device=device)
+        self.h = torch.zeros((8, 768), dtype=torch.uint8, device=device)  # interface h: E4M3, row-major
+        self.hs = torch.zeros((8, 24), dtype=torch.uint8, device=device)  # E8M0, row-major
 
 
 def mf_table(gate_w, bias, gu_w, gu_s, dn_w, dn_s, outs: MfOutputs, scratch, num_valid_rows=None):
@@ -73,6 +75,8 @@ def mf_table(gate_w, bias, gu_w, gu_s, dn_w, dn_s, outs: MfOutputs, scratch, num
     words[K.T_ERR] = scratch["err"].data_ptr()
     words[K.T_GP] = scratch["gp"].data_ptr()
     words[K.T_RP] = scratch["rp"].data_ptr()
+    words[K.T_HP] = outs.h.data_ptr()
+    words[K.T_HSP] = outs.hs.data_ptr()
     return torch.tensor(words, dtype=torch.int64, device=gate_w.device)
 
 

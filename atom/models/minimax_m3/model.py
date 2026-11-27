@@ -1036,8 +1036,28 @@ class MiniMaxM3MoE(nn.Module):
             with moe_router_quant_rows(front.topk_ids, rows):
                 return self.experts.forward_impl(x, None, routing=routing)
 
+        from atom.models.minimax_m3.launch_a_kernels.mf import shared_down_registry
+
+        before_add = None
+        if front.shared.data_ptr() in shared_down_registry():
+            # The launch ran router + gate_up only; the shared down runs in P6's tail
+            # launch, which drops this `before` unrun. Every other reader of the addend
+            # runs it first: production's down into the addend (same bytes).
+            down = self.shared_experts.down_proj
+
+            def before_add():
+                front.shared.copy_(
+                    down(
+                        front.h.view(down.weight.dtype),
+                        x_scale=front.hs.view(torch.float8_e8m0fnu),
+                    )
+                )
+
         return self._routed_plus_shared(
-            hidden_states, front.shared, route_and_experts=route_and_experts
+            hidden_states,
+            front.shared,
+            before_add=before_add,
+            route_and_experts=route_and_experts,
         )
 
     def dual_stream_moe_forward(

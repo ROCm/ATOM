@@ -37,6 +37,33 @@ TIMELINES = None
 JOIN_FIRST_OK = False
 _SYNCED: set = set()
 _STATE = {"c_stores": 0}
+# Shared down inside the launch: the glue-epilogue addend's address -> (h E4M3 [8, 768], hs E8M0 [8, 24], down weight
+# E4M3 [6144, 768] (16, 16)-preshuffled as uint8, its E8M0 scales uint8). A tail whose addend is registered runs the
+# shared down in its own workgroups (h from an earlier launch) and does not read the addend buffer. The caller's
+# epilogue `before` of a registered addend must be production's shared down into that addend: every path that reads
+# the addend runs `before` first, and the shared-down launch drops it unrun (it computes the same bytes itself).
+SHARED_DOWN: dict = {}
+_SD: dict = {}  # (device, h, hs, dw, ds addresses) -> (table int64 [5], shared-output buffer bf16 [8, 6144], armed 0xffff)
+
+
+def _sd_key(h, hs, dw, ds):
+    return (h.device.index, h.data_ptr(), hs.data_ptr(), dw.data_ptr(), ds.data_ptr())
+
+
+def shared_down_table(h, hs, dw, ds):
+    """The shared-down table of one layer and its shared-output buffer (armed once, outside any capture)."""
+    key = _sd_key(h, hs, dw, ds)
+    t = _SD.get(key)
+    if t is None:
+        assert h.dtype == torch.uint8 and tuple(h.shape) == (ROWS, 768) and h.is_contiguous()
+        assert hs.dtype == torch.uint8 and tuple(hs.shape) == (ROWS, 24) and hs.is_contiguous()
+        assert dw.numel() == LY.HIDDEN * 768 and ds.numel() == LY.HIDDEN * 24
+        sf = torch.empty((ROWS, LY.HIDDEN), dtype=torch.bfloat16, device=h.device)
+        sf.view(torch.int16).fill_(-1)
+        tab = torch.tensor([h.data_ptr(), hs.data_ptr(), dw.data_ptr(), ds.data_ptr(), sf.data_ptr()],
+                           dtype=torch.int64, device=h.device)
+        t = _SD[key] = (tab, sf)
+    return t
 
 
 @dataclasses.dataclass
@@ -124,6 +151,7 @@ def flydsl_moe_tail_ar(
     grouped: torch.Tensor | None = None,
     fp8_out: bool = True,
     sync: bool = True,
+    shared_down=None,
 ):
     """Returns (out E4M3 [8, N], res_out bf16 [8, N], scale E8M0 [8, N / 32]), or with ``fp8_out`` False (out bf16
     [8, N], res_out): what ``k5_fused_ar_rms_tail(..., gemma_norm=True, fp8_out=...)`` returns after production's
@@ -167,8 +195,12 @@ def flydsl_moe_tail_ar(
         int(g2.a_is_fp4), int(g2.n_experts),
         WAVES_PER_TENSOR_TDM if waves_per_tensor_tdm is None else waves_per_tensor_tdm, int(g2.tdm_b_th),
         int(g2.lds_soa_load_interleave), int(g2.rolled_drain), int(g2.a_preshuffled), tokens, has_add, has_scale,
-        max_rows, PROBE if probe is None else probe, int(bool(fp8_out)), tl,
+        max_rows, PROBE if probe is None else probe, int(bool(fp8_out)), tl, int(shared_down is not None),
     )  # fmt: skip
+    sdt = None
+    if shared_down is not None:
+        assert addend is not None and timeline is None
+        sdt = shared_down_table(*shared_down)[0]
     ctr_ptr = flyc.from_c_void_p(fx.Int32, int(ctr))
     args = (
         ptr_arg(grouped, fx.BFloat16), ptr_arg(g2.a), ptr_arg(g2.w), ptr_arg(g2.a_scales, fx.Int32),
@@ -183,6 +215,7 @@ def flydsl_moe_tail_ar(
         float(addend_scale) if has_scale else 1.0, float(eps),
         stream,
         *spec,
+        ptr_arg(sdt if sdt is not None else res, fx.Int64),
     )  # fmt: skip
     key = ("moe_tail_ar", dev.index) + spec
     if key not in _SYNCED:
@@ -278,9 +311,17 @@ def fused_tail(ca, tail, operands, res_inp, w, eps, gemma_norm, lamport_order, f
     kept = tail.gemm2
     if kept is None or operands is None or not gemma_norm or lamport_order:
         return None
-    if tail.before is not None and not JOIN_FIRST_OK:
-        return None  # one stream only (see JOIN_FIRST_OK)
     _, rows_t, w_t, add = operands
+    # A registered addend: its `before` is production's shared down into it, which this launch's shared-down
+    # workgroups replace (no join). Its output buffer is armed outside a capture (the eager warm-up call).
+    sd = SHARED_DOWN.get(add.data_ptr()) if add is not None and TIMELINES is None else None
+    if sd is not None and _sd_key(*sd) not in _SD:
+        if torch.cuda.is_current_stream_capturing():
+            sd = None
+        else:
+            shared_down_table(*sd)
+    if tail.before is not None and not JOIN_FIRST_OK and sd is None:
+        return None  # one stream only (see JOIN_FIRST_OK)
     tokens = tail.out.shape[0]
     if tokens != ROWS or tuple(res_inp.shape) != (ROWS, LY.HIDDEN) or res_inp.dtype != torch.bfloat16:
         return None
@@ -294,7 +335,10 @@ def fused_tail(ca, tail, operands, res_inp, w, eps, gemma_norm, lamport_order, f
 
     res_inp = _lamport_aligned(res_inp.contiguous())
     w = _lamport_aligned(w.contiguous())
-    tail.run_before()
+    if sd is not None:
+        tail.before = None  # the fallback shared down, computed by this launch instead
+    else:
+        tail.run_before()
     tail.gemm2 = None
     tlb = None
     if TIMELINES is not None:
@@ -302,12 +346,12 @@ def fused_tail(ca, tail, operands, res_inp, w, eps, gemma_norm, lamport_order, f
         TIMELINES.append(tlb)
     return flydsl_moe_tail_ar(
         kept.call(), kept.ids, rows_t, w_t, add, tail.scale, res_inp, w, eps, inbox, ctr, slot, rank,
-        maxit=_K5_AR_MAXIT, max_rows=max_rows, fp8_out=bool(fp8_out), timeline=tlb,
+        maxit=_K5_AR_MAXIT, max_rows=max_rows, fp8_out=bool(fp8_out), timeline=tlb, shared_down=sd,
     )
 
 
 __all__ = [
-    "ENABLED", "Gemm2Call", "KeptGemm2", "MAXIT", "ROWS", "flydsl_moe_tail_ar", "fused_tail", "grouped_scratch",
+    "SHARED_DOWN", "shared_down_table", "ENABLED", "Gemm2Call", "KeptGemm2", "MAXIT", "ROWS", "flydsl_moe_tail_ar", "fused_tail", "grouped_scratch",
     "keep_gemm2", "supported",
 ]  # fmt: skip
 

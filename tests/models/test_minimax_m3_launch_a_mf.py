@@ -18,10 +18,12 @@ class _FakeAiterMf(types.ModuleType):
         super().__init__("atom.models.minimax_m3.mono.gfx1250.mf")
         self.tables = []  # num_valid_rows of each mf_table call
         self.launches = []  # table of each flydsl_mf call
+        self.roles = []  # roles of each flydsl_mf call
 
     class MfOutputs:
         def __init__(self, device):
             self.device = device
+            self.shared = torch.zeros(8, 4)  # the launch's shared output (the glue epilogue's addend)
 
     def mf_scratch(self, device):
         return {}
@@ -32,6 +34,7 @@ class _FakeAiterMf(types.ModuleType):
 
     def flydsl_mf(self, x, x_scale, w, w_scale, res, norm_w, eps, inbox, ctr, slot, rank, tab, **kw):
         self.launches.append(tab)
+        self.roles.append(kw.get("roles", 7))
         return torch.zeros(8, 4), torch.zeros(8, 4)
 
 
@@ -139,3 +142,24 @@ def test_switch_off_runs_stage_o(env, monkeypatch):
     monkeypatch.setattr(mf, "ENABLED", False)
     assert mf.run(_call()) == "stage_o"
     assert fake.launches == []
+
+
+def test_whole_shared_expert_without_tail_down(env, monkeypatch):
+    fake, state = env
+    monkeypatch.setattr(mf, "shared_down_registry", lambda: {})
+    state["nv"] = torch.tensor([8], dtype=torch.int32)
+    mf.run(_call())
+    assert fake.roles == [7]  # router + gate_up + down: the launch's shared output is the addend
+
+
+class _Registered(dict):
+    def __contains__(self, key):
+        return True
+
+
+def test_router_gate_up_when_tail_runs_down(env, monkeypatch):
+    fake, state = env
+    monkeypatch.setattr(mf, "shared_down_registry", lambda: _Registered())
+    state["nv"] = torch.tensor([8], dtype=torch.int32)
+    mf.run(_call())
+    assert fake.roles == [3]  # router + gate_up: the shared down runs in P6's tail launch
