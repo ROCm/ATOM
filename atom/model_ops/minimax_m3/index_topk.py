@@ -2278,7 +2278,8 @@ def _flydsl_prefill_topk(
 ):
     """(aiter's fused prefill scorer + top-16, its chunk) when
     ``ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL`` asks for it and it serves the call
-    (aiter decides: gfx1250, the FP4 index cache, top-16), else None. The row
+    (aiter decides: gfx1250, the FP4 index cache, top-16) and aiter prefers it to
+    the scorer + selector for this shape, else None. The row
     bound is the FlyDSL scorer's -- the same loop -- and the merge that takes
     its keys always emits. Imported directly: the flag needs an aiter that has
     the op."""
@@ -2292,12 +2293,15 @@ def _flydsl_prefill_topk(
     from aiter.ops.flydsl.index_score_prefill import (
         index_topk_prefill_chunk_blocks,
         index_topk_prefill_nvfp4,
+        index_topk_prefill_nvfp4_preferred,
         index_topk_prefill_nvfp4_supported,
     )
 
+    # aiter decides both: what the op serves, and where it beats the scorer +
+    # selector (short contexts and few rows go to those).
     if not index_topk_prefill_nvfp4_supported(
         idx_q, index_kv_cache, index_kv_scale, topk, max_block
-    ):
+    ) or not index_topk_prefill_nvfp4_preferred(idx_q, max_block):
         return None
     opts = dict(_flydsl_prefill_score_opts(envs.ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS))
     if "chunk_blocks" not in opts:

@@ -50,9 +50,10 @@ table_kernels = pytest.mark.skipif(
 @pytest.fixture
 def aiter_op(monkeypatch):
     """Stand-in for aiter's prefill index module: records each launch."""
-    calls = types.SimpleNamespace(fused=[], scorer=[], serves=True)
+    calls = types.SimpleNamespace(fused=[], scorer=[], serves=True, preferred=True)
     mod = types.ModuleType(AITER_OP)
     mod.index_topk_prefill_chunk_blocks = lambda *a, **kw: 256
+    mod.index_topk_prefill_nvfp4_preferred = lambda *a: calls.preferred
     mod.index_score_prefill_nvfp4_supported = lambda *a: True
     mod.index_score_prefill_nvfp4 = lambda *a, **kw: calls.scorer.append((a, kw))
     mod.index_topk_prefill_nvfp4_supported = lambda *a: calls.serves
@@ -145,11 +146,19 @@ def test_the_op_gets_the_tuned_launch(monkeypatch, aiter_op):
 
 
 @pytest.mark.parametrize(
-    "case", ["bf16 index", "no emission", "short prefill", "aiter declines"]
+    "case",
+    [
+        "bf16 index",
+        "no emission",
+        "short prefill",
+        "aiter declines",
+        "aiter prefers two",
+    ],
 )
 def test_other_calls_keep_the_selector(monkeypatch, aiter_op, case):
     monkeypatch.setenv(FLAG, "1")
     aiter_op.serves = case != "aiter declines"
+    aiter_op.preferred = case != "aiter prefers two"
     if case in ("bf16 index", "short prefill"):
         # These go to the Triton scorer (BF16 index; FP4 under the FlyDSL row
         # bound), a stand-in too: the inputs are CPU tensors.
