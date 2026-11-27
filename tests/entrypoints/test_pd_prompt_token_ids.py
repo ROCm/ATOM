@@ -3,7 +3,9 @@
 
 """Test prefill prompt-ID responses and decode reuse without tokenizing."""
 
+import array
 import asyncio
+import base64
 import importlib.util
 import pathlib
 from types import SimpleNamespace
@@ -779,6 +781,52 @@ class TestMultimodalPD:
         assert d_seq.mrope_position_delta == p_seq.mrope_position_delta == -2
         assert d_seq.media_on_prefill_instance
         assert not p_seq.media_on_prefill_instance
+
+    @pytest.mark.parametrize("with_cache_seed", [True, False])
+    def test_b64_decode_leg_takes_prefill_expanded_ids(
+        self, pd_engine, monkeypatch, with_cache_seed
+    ):
+        # ATOM_PROMPT_IDS_B64: the client body's b64 ids have the image
+        # placeholders not expanded, and the router forwards that body to D
+        # unchanged; P's expanded ids reach D in kv_transfer_params.
+        monkeypatch.setenv("ATOM_PROMPT_IDS_B64", "1")
+        unexpanded = [101, 7]
+        assert unexpanded != PROMPT_IDS
+        client_body = {
+            "model": "m",
+            "messages": IMAGE_MESSAGES,
+            "prompt_token_ids_b64": base64.b64encode(
+                array.array("I", unexpanded).tobytes()
+            ).decode("ascii"),
+        }
+        (prefill,) = _post_chat(
+            [
+                {
+                    **client_body,
+                    "max_tokens": 1,
+                    "return_token_ids": True,
+                    "kv_transfer_params": {
+                        "do_remote_decode": True,
+                        "do_remote_prefill": False,
+                    },
+                }
+            ]
+        )
+        assert prefill.status_code == 200, prefill.text
+        # A media prefill still echoes its expanded ids.
+        assert prefill.json()["prompt_token_ids"] == PROMPT_IDS
+        kv = prefill.json()["kv_transfer_params"]
+        if not with_cache_seed:
+            kv.pop("cache_seed")
+        kv["prompt_token_ids"] = prefill.json()["prompt_token_ids"]
+
+        (decode,) = _post_chat([{**client_body, "kv_transfer_params": kv}])
+        assert decode.status_code == 200, decode.text
+        _p_seq, d_seq = pd_engine.seqs
+        assert list(d_seq.token_ids) == PROMPT_IDS
+        assert d_seq.media_on_prefill_instance == with_cache_seed
+        # P preprocessed the media; D only when P handed off no cache seed.
+        assert len(pd_engine.prepared) == (1 if with_cache_seed else 2)
 
     def test_decode_without_cache_seed_preprocesses_the_media(self, pd_engine):
         # As from a prefill instance that hands off no cache seed.
