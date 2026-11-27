@@ -28,7 +28,7 @@ import torch
 from atom.model_ops.attentions.deepseek_v41.backend import (
     DeepseekV41MetadataBuilder,
 )
-from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache, cut_slab
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
     sparse_attn_v41_paged_2src,
     sparse_attn_v41_paged_2src_bf16,
@@ -450,12 +450,8 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
     def _allocate_buffers(self, sizes, device):
         # vLLM owns the allocation. Consume its budgeted slab once, then expose
         # one tensor per source with the same layout as native allocations.
-        slab = self._allocate_backing(sum(sizes), device)
-        views, offset = [], 0
-        for size in sizes:
-            views.append(slab[offset : offset + size])
-            offset += size
-        return tuple(views)
+        _, views = cut_slab(lambda n: self._allocate_backing(n, device), sizes)
+        return views
 
     def _allocate_backing(self, size, device):
         """The slab, trimmed and zeroed to core's contract.

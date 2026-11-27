@@ -69,11 +69,10 @@ try:
 
     from atom.config import QuantizationConfig
     from atom.model_ops.attention_mla import (
-        _MLA_DCP_KERNEL_WIDTHS,
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT,
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS,
-        _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
+        MLAAttention,
         mla_dcp_kernel_num_heads,
         mla_dcp_sparse_prefill_num_heads,
     )
@@ -89,6 +88,7 @@ try:
         reorg_kvcache,
     )
     from atom.model_ops.linear import ColumnParallelLinear
+    from atom.model_ops.utils import dynamic_per_batched_tensor_quant
     from atom.quant_spec import LayerQuantConfig, QuantType
 
     _DCP_OPS_ERR = None
@@ -824,6 +824,147 @@ def test_a2a_scrubs_the_empty_rank():
     torch.testing.assert_close(got[0].float(), o[1][0].float(), rtol=8e-3, atol=8e-3)
 
 
+def _on_every_rank(monkeypatch, n, run):
+    """``run(rank)`` as each rank in turn, its all-to-alls fed by every rank's sends.
+
+    What a rank sends depends on its own inputs alone, so a first pass records
+    each rank's sends and a second hands rank j, call by call, chunk j of every
+    rank's send -- the permutation ``all_to_all_single`` performs. Returns the
+    outputs and how many all-to-alls a rank ran.
+    """
+    sent = [[] for _ in range(n)]
+    rank, calls = 0, iter(())
+
+    def record(recv, send, group):
+        sent[rank].append(send.clone())
+
+    def serve(recv, send, group):
+        k = next(calls)
+        chunks = [sent[r][k].view(n, -1)[rank] for r in range(n)]
+        recv.view(n, -1).copy_(torch.stack(chunks))
+
+    for fake in (record, serve):
+        monkeypatch.setattr(torch.distributed, "all_to_all_single", fake)
+        outs = []
+        for rank in range(n):
+            calls = iter(range(len(sent[rank])))
+            outs.append(run(rank))
+    return outs, len(sent[0])
+
+
+def _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs):
+    from atom.model_ops.dcp_ops import cp_lse_a2a, cp_lse_a2a_head_major
+
+    head_major = kwargs.pop("head_major", False)
+    merge = cp_lse_a2a_head_major if head_major else cp_lse_a2a
+    group = SimpleNamespace(world_size=len(o), device_group=None)
+
+    def run(rank):
+        x = o[rank].transpose(0, 1).contiguous() if head_major else o[rank]
+        return merge(x, lse[rank], group, owned_counts=owned_counts[rank], **kwargs)
+
+    return _on_every_rank(monkeypatch, len(o), run)[0]
+
+
+@needs_gpu
+@pytest.mark.parametrize(
+    "dtype, quant",
+    [(torch.float32, False), (torch.bfloat16, False), (torch.bfloat16, True)],
+)
+def test_head_major_a2a_matches_the_packed_one_bitwise(monkeypatch, dtype, quant):
+    """Sending the head-major output with its LSE apart feeds the combine the
+    same values the pack did, so every rank's result is the same bits, the
+    dummy-backed empty row included. Head-major fused quant is rejected."""
+    b, h, d, n_ranks = 5, 16, 32, 4
+    g = torch.Generator(device=DEV).manual_seed(3)
+    o = [
+        torch.randn(b, h, d, generator=g, device=DEV).to(dtype) for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+    o[0][1] = float("nan")
+    owned_counts = [
+        torch.ones(b, dtype=torch.int32, device=DEV) for _ in range(n_ranks)
+    ]
+    owned_counts[0][1] = 0
+    kwargs = {"quant_dtype": dtypes.fp8} if quant else {"return_lse": True}
+
+    if quant:
+        with pytest.raises(TypeError):
+            _cp_lse_a2a_on_every_rank(
+                monkeypatch, o, lse, owned_counts, head_major=True, **kwargs
+            )
+        return
+
+    packed = _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs)
+    head_major = _cp_lse_a2a_on_every_rank(
+        monkeypatch, o, lse, owned_counts, head_major=True, **kwargs
+    )
+
+    if not quant:
+        roundtrip = _a2a_roundtrip(o, lse, n_ranks, owned_counts)
+        assert torch.equal(torch.cat([out for out, _ in packed], dim=1), roundtrip)
+    for want, got in zip(packed, head_major, strict=True):
+        for x, y in zip(want, got, strict=True):
+            assert torch.equal(x.view(torch.uint8), y.view(torch.uint8))
+
+
+@needs_gpu
+@pytest.mark.parametrize("merge_in_fp32", [False, True])
+@pytest.mark.parametrize("fp8_absorb", [False, True])
+def test_project_merge_out_head_major_matches_the_packed_one(
+    monkeypatch, fp8_absorb, merge_in_fp32
+):
+    """The DCP tail returns the same bits with ``head_major`` as without. Only
+    the bf16 projection stores ``[H, B, V]``, so only it skips the pack and
+    sends the LSE in a second all-to-all."""
+    b, h, latent, v_dim, n_ranks = 8, 16, 128, 32, 4
+    g = torch.Generator(device=DEV).manual_seed(9)
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.pbm_enabled, layer.dcp_comm_backend = True, "a2a"
+    layer.dcp_group = SimpleNamespace(world_size=n_ranks, device_group=None)
+    layer.num_heads, layer.kv_lora_rank, layer.v_head_dim = h // n_ranks, latent, v_dim
+    layer.o_proj = lambda x: x
+    w_v = torch.randn(h, v_dim, latent, generator=g, device=DEV).bfloat16()
+    layer.W_V_dcp, layer.W_V_dcp_scale = (
+        dynamic_per_batched_tensor_quant(w_v, dtype=dtypes.fp8)
+        if fp8_absorb
+        else (w_v, None)
+    )
+    layer.W_V_scale = layer.W_V_dcp_scale  # what _v_up_proj reads for a None scale
+    o = [
+        torch.randn(b, h, latent, generator=g, device=DEV).bfloat16()
+        for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+    owned_counts = [
+        torch.ones(b, dtype=torch.int32, device=DEV) for _ in range(n_ranks)
+    ]
+    owned_counts[0][1] = 0
+
+    def tail(head_major):
+        return _on_every_rank(
+            monkeypatch,
+            n_ranks,
+            lambda r: (
+                layer._dcp_project_merge_out_head_major
+                if head_major and not fp8_absorb
+                else layer._dcp_project_merge_out
+            )(
+                o[r],
+                lse[r],
+                merge_in_fp32=merge_in_fp32,
+                owned_counts=owned_counts[r],
+            ),
+        )
+
+    packed, packed_a2as = tail(False)
+    head_major, head_major_a2as = tail(True)
+    assert (packed_a2as, head_major_a2as) == (1, 1 if fp8_absorb else 2)
+    for want, got in zip(packed, head_major, strict=True):
+        assert torch.equal(want, got)
+
+
 @needs_dcp_ops
 def test_lse_pack_slots_covers_the_transfer_dtypes():
     """fp32 needs one slot, 16-bit dtypes need two; anything else must raise
@@ -846,6 +987,16 @@ def test_cp_lse_a2a_is_a_no_op_without_a_dcp_group():
     assert cp_lse_a2a(o, lse, group) is o
     out, out_lse = cp_lse_a2a(o, lse, group, return_lse=True)
     assert out is o and out_lse is lse
+
+
+@needs_dcp_ops
+def test_head_major_merge_requires_a_dcp_group():
+    from atom.model_ops.dcp_ops import cp_lse_a2a_head_major
+
+    with pytest.raises(AssertionError, match="requires DCP"):
+        cp_lse_a2a_head_major(
+            torch.randn(4, 2, 8), torch.randn(2, 4), SimpleNamespace(world_size=1)
+        )
 
 
 # ─────────────────────────────────────────────────────────── DCPConfig parsing ──
@@ -1062,7 +1213,10 @@ def test_sparse_prefill_nonps_runs_one_split(dcp):
 
 
 @pytest.mark.parametrize("nonps, plans", [(True, 0), (False, 1)])
-def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
+@pytest.mark.parametrize("padded_heads,prefill_heads", [(64, 64), (128, 96)])
+def test_pcp_reindex_builds_work_plan_only_when_read(
+    monkeypatch, nonps, plans, padded_heads, prefill_heads
+):
     """Under PCP the owned-query reindex rebuilds the sparse-prefill work plan;
     the non-persistent kernel reads none, so it must not be built or attached."""
     try:
@@ -1080,7 +1234,9 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         device="cpu",
         index_topk=2048,
         dcp_sparse_prefill_nonps=nonps,
-        padded_num_attention_heads=64,
+        dcp_world_size=1,
+        padded_num_attention_heads=padded_heads,
+        sparse_prefill_num_heads=prefill_heads,
         block_size=1,
         dtype_q=None,
         dtype_kv=None,
@@ -1094,7 +1250,7 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         gpu=torch.ones(4, dtype=torch.int32)
     )
     builder._dcp_sparse_prefill_mode = "q"
-    builder.sparse_prefill_num_heads = 64
+    builder._sparse_prefill_kv_granularity = 16
     builder._sparse_prefill_work_view_cache = {}
     for name in (
         "_sparse_prefill_work_plan",
@@ -1116,6 +1272,8 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         builder, md, 4, np.array([1, 2, 3, 4]), ""
     )
     assert len(built) == plans
+    if plans:
+        assert built[0][3] == prefill_heads
     assert hasattr(md, "sparse_prefill_work_meta_data") == bool(plans)
     assert md.sparse_cu_seqlens_q.tolist() == [0, 1, 2]  # rank 0 owns q0, q2
 
@@ -1321,7 +1479,7 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
 
 @needs_gpu
 @pytest.mark.parametrize(
-    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 128)]
+    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 96)]
 )
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
 def test_sparse_prefill_builder_allocates_for_its_consumer(
@@ -1353,6 +1511,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         kv_cache_dtype=cache_dtype,
         index_cache_dtype="fp8",
         attn_prefill_chunk_size=0,
+        speculative_config=None,
         enable_tbo=False,
         enable_tbo_decode=False,
         compilation_config=SimpleNamespace(static_forward_context={}),
@@ -1444,23 +1603,11 @@ def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengt
 
 
 def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
-    """Pins gathered_num_heads at both call sites, not just the function.
-
-    Decode and sparse prefill round the gathered query width through
-    different tables (mla_dcp_kernel_num_heads vs mla_dcp_sparse_prefill_
-    num_heads) and can disagree (e.g. num_heads=12, dcp=8 -> 96 vs 128).
-    Passing the wrong one plans persistent work descriptors for the wrong
-    nhead; nothing importable on the CPU gate would notice a regression
-    here, so read the two call sites from source instead.
-    """
+    """Decode and folded prefill rebuild with their own query widths."""
     tree = ast.parse(_ATTENTION_MLA_PATH.read_text(encoding="utf-8"))
 
     def _name(node):
-        if isinstance(node, ast.Name):
-            return node.id
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            return f"{node.value.id}.{node.attr}"
-        return None
+        return ast.unparse(node)
 
     by_enclosing_func = {}
     for func in ast.walk(tree):
@@ -1478,7 +1625,7 @@ def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width()
 
     assert by_enclosing_func == {
         "_forward_decode": "self.dcp_kernel_num_heads",
-        "_forward_prefill_mla": "self.dcp_sparse_prefill_num_heads",
+        "_forward_prefill_mla": "q.shape[1]",
     }, (
         "a _rebuild_sparse_dcp_persistent_metadata call site is passing the "
         f"wrong gathered_num_heads (7th positional arg): got {by_enclosing_func}"
@@ -1486,20 +1633,38 @@ def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width()
 
 
 @needs_dcp_ops
-def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge():
-    """Demonstrates the gap the test above guards against is real, not just
-    hypothetical: at this head count the two width tables actually disagree.
-    """
-    decode_width = mla_dcp_kernel_num_heads(
-        12, 8, kv_cache_dtype="bf16", persistent=True
+def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge(monkeypatch):
+    """Prefill uses queried native widths and retains BF16 small-head grouping."""
+    from types import SimpleNamespace
+
+    from atom.model_ops import attention_mla
+
+    monkeypatch.setattr(
+        attention_mla,
+        "get_mla_decode_shape_support",
+        lambda width, *a, **k: SimpleNamespace(
+            native=width in (16, 32, 64, 96, 128), supported=True
+        ),
     )
-    prefill_width = mla_dcp_sparse_prefill_num_heads(12, 8, persistent=True)
-    assert (decode_width, prefill_width) == (96, 128), (
-        "expected decode's and sparse prefill's width tables to disagree "
-        f"here; got decode={decode_width}, prefill={prefill_width} -- if "
-        "they now agree, the case above no longer proves the two call sites "
-        "must use their own width, pick another num_heads/dcp pair that "
-        "still diverges"
+    widths = {
+        dcp: (
+            mla_dcp_kernel_num_heads(12, dcp, kv_cache_dtype="bf16", persistent=True),
+            mla_dcp_sparse_prefill_num_heads(
+                12,
+                dcp,
+                persistent=True,
+                dtype_q=torch.bfloat16,
+                dtype_kv=torch.bfloat16,
+            )[0],
+        )
+        for dcp in (4, 8)
+    }
+    assert widths == {4: (48, 64), 8: (96, 128)}
+    assert (
+        mla_dcp_sparse_prefill_num_heads(
+            12, 8, persistent=False, dtype_q=torch.bfloat16, dtype_kv=torch.bfloat16
+        )[0]
+        == 128
     )
 
 
@@ -1983,7 +2148,7 @@ def test_decode_width_comes_from_the_matching_table(num_heads, dcp, dtype):
             num_heads, dcp, HEAD_WIDTH_MIN, kv_cache_dtype=dtype, persistent=persistent
         )
         if persistent:
-            allowed = _MLA_DCP_KERNEL_WIDTHS
+            allowed = range(16, 129, 16)
         else:
             allowed = (
                 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8
@@ -2003,24 +2168,19 @@ def test_decode_width_comes_from_the_matching_table(num_heads, dcp, dtype):
 def test_sparse_prefill_width_matches_its_own_persistence_predicate(
     num_heads, dcp, rebuild
 ):
-    """The pairing this whole file exists for.
-
-    The width must come from this call site's own table
-    (``_MLA_DCP_SPARSE_PREFILL_WIDTHS*``), not decode's -- reading decode's
-    answer here is exactly how a sparse prefill would get its width chosen
-    from the wrong table.
-    """
+    """Persistent prefill selects a queried native width or conservative padding."""
     persistent = mla_dcp_sparse_prefill_is_persistent(
         dcp, True, sparse_metadata_rebuild=rebuild
     )
     w = mla_dcp_sparse_prefill_num_heads(
-        num_heads, dcp, HEAD_WIDTH_MIN, persistent=persistent
-    )
-    allowed = (
-        _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT
-        if persistent
-        else _MLA_DCP_SPARSE_PREFILL_WIDTHS
-    )
+        num_heads,
+        dcp,
+        HEAD_WIDTH_MIN,
+        persistent=persistent,
+        dtype_q=torch.bfloat16,
+        dtype_kv=torch.bfloat16,
+    )[0]
+    allowed = range(16, 129, 16) if persistent else _MLA_DCP_SPARSE_PREFILL_WIDTHS
     gathered = max(num_heads * dcp, HEAD_WIDTH_MIN)
     if gathered <= allowed[-1]:
         assert w in allowed, f"persistent={persistent}: {w} not in {allowed}"
@@ -2169,18 +2329,37 @@ def test_decode_is_persistent_requires_platform_support():
 
 
 @needs_dcp_ops
-def test_sparse_prefill_persistent_table_would_allow_gqa64():
-    """The persistent row is wired up, not dead.
+def test_sparse_prefill_queries_native_gqa64(monkeypatch):
+    from types import SimpleNamespace
 
-    Guards against the table being present but unreachable -- if enabling
-    persistent sparse prefill still could not pick 64, the plumbing would be
-    pointless and the 64->128 padding would stay.
-    """
+    from atom.model_ops import attention_mla
+
+    monkeypatch.setattr(
+        attention_mla,
+        "get_mla_decode_shape_support",
+        lambda width, *a, **k: SimpleNamespace(native=width == 64, supported=True),
+    )
     assert (
-        mla_dcp_sparse_prefill_num_heads(8, 8, HEAD_WIDTH_MIN, persistent=True) == 64
+        mla_dcp_sparse_prefill_num_heads(
+            8,
+            8,
+            HEAD_WIDTH_MIN,
+            persistent=True,
+            dtype_q=torch.bfloat16,
+            dtype_kv=torch.bfloat16,
+        )[0]
+        == 64
     ), "persistent sparse prefill should reach gqa=64, not pad past it"
     assert (
-        mla_dcp_sparse_prefill_num_heads(8, 8, HEAD_WIDTH_MIN, persistent=False) == 128
+        mla_dcp_sparse_prefill_num_heads(
+            8,
+            8,
+            HEAD_WIDTH_MIN,
+            persistent=False,
+            dtype_q=torch.bfloat16,
+            dtype_kv=torch.bfloat16,
+        )[0]
+        == 128
     ), (
         "the non-persistent pad table still pads 64 to 128; only the "
         "non-persistent gqa64 kernel (mla_dcp_sparse_prefill_mode) runs at 64"

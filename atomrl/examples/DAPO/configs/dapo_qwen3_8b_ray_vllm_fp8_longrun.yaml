@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# verl-aligned Ray online rollout — FP8 FORMAL LONG RUN (Qwen3-8B-Base, DAPO math).
+#
+# Strict per_block_fp8 reproduction of verl `rollout.quantization=fp8_per_block`,
+# entirely inside AtomRL's native Ray controller path (NO verl dependency):
+#   - rollout : vLLM AsyncLLM online `fp8_per_block` (per-128-block FP8). BF16
+#     actor weights re-quantized inside vLLM on every ZMQ CUDA-IPC weight sync via
+#     atomrl.engine.inference.vllm_fp8_utils (ROCm-safe layerwise reload; incoming
+#     IPC-buffer views are cloned so the deferred reload owns valid storage).
+#   - training: FP8 end-to-end (blockwise2d Lumen FP8 linear, fp32 master), opt-in
+#     via run_dapo.sh TRAIN_FP8=1 (LUMEN_FP8=1 LUMEN_FP8_SCALING=blockwise2d). With
+#     TRAIN_FP8=0 the training forward stays BF16 (fp32 master + bf16 compute).
+#   - token-level TIS rollout correction (corrects the FP8 vs BF16 gap; validated
+#     rollout_corr/kl ~= 0.004, matching verl per_block_fp8).
+#
+# Scale/hyperparams 1:1 with the BF16 formal long run
+# (dapo_qwen3_8b_ray_vllm_longrun.yaml): 1000 steps, batch 32x16=512, resp 20480.
+# Launch via run_longrun_ray_vllm_fp8.sh (docker exec -d, detached).
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B-Base"
+  training_backend: fsdp2
+  generation_backend: vllm
+  max_total_sequence_length: 21504      # 1024 prompt + 20480 response
+  max_response_length: 20480
+  train_global_batch_size: 512          # 32 train prompts x 16 generations
+  gen_batch_size: 96                    # over-sample 96 prompts/round
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 21504          # verl ppo_max_token_len_per_gpu
+  learning_rate: 1.0e-6
+  lr_warmup_steps: 10
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  training:
+    optimizer_dtype: bf16               # COMPUTE dtype (master weights stay fp32)
+    fsdp_cfg:
+      # Ray path: FSDP2 CPU offload unsupported; micro_batch=1 bounds peak
+      # activation to ONE 21504-token sequence. vLLM fp8_per_block also frees
+      # ~half the rollout weight memory vs BF16, so headroom is ample.
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+  generation:
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.30
+      max_model_len: 21504
+      dtype: bfloat16
+      enforce_eager: true
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 32768
+      max_num_seqs: 64
+      quantization: fp8_per_block        # verl-aligned online per-block FP8 rollout
+      calculate_log_probs: true          # TIS rollout correction
+      enable_sleep_mode: false
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: dapo
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  loss_agg_mode: token-mean
+  dapo:
+    num_generations: 16                 # verl rollout.n
+    kl_coeff: 0.0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    dynamic_sampling: true
+    token_level_pg: true
+    overlong_reward_shaping: true
+    max_resp_len: 20480
+    filter_groups:
+      enable: true
+      metric: acc
+      max_num_gen_batches: 10
+    overlong_buffer:
+      enable: true
+      len: 512
+      penalty_factor: 1.0
+      log: false
+
+quantization:
+  rollout:
+    precision: fp8
+  training:
+    fp8: null                           # config default = BF16 forward; FP8 E2E training via run_dapo.sh TRAIN_FP8=1 (LUMEN_FP8 env)
+    lumen_norm: false
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet"
+  shuffle: true
+  shuffle_seed: 10086
+
+val_dataset: "${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet"
+val_steps: 10
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: "${oc.env:DATA_ROOT}/ckpts/atomrl-dapo/longrun-ray-vllm-fp8-8b"
+  save_steps: 50
+  save_total_limit: 5
+  resume: true
+
+logger:
+  wandb_enabled: true
+  log_interval: 1
+  wandb:
+    project: ATOMRL
+    name: longrun-ray-vllm-fp8-8b-perblock
+
+num_training_steps: 1000
+seed: 10086

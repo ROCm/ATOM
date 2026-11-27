@@ -31,6 +31,7 @@ from atom.model_ops.fla_ops.fused_recurrent import fused_recurrent_gated_delta_r
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
+    replayssm_flush_wait,
     replayssm_gated_delta_rule,
     replayssm_materialize,
 )
@@ -78,6 +79,10 @@ def _copier(kda=False) -> _Copier:
         replayssm_buf_g=torch.zeros(
             (LAYERS, SLOTS) + sg, dtype=torch.float32, device=DEV
         ),
+        replayssm_flush_arrivals=torch.zeros(
+            LAYERS, SLOTS, H, dtype=torch.int32, device=DEV
+        ),
+        replayssm_flush_wait=replayssm_flush_wait(),
         # Every slot as a prefill leaves it.
         replayssm_write_pos=torch.full((SLOTS,), -1, dtype=torch.int32, device=DEV),
         kv_cache=torch.zeros(
@@ -158,6 +163,8 @@ def _decode(c, slot, accepted, windows, xs):
                 buf_k=r.replayssm_buf_k[layer],
                 buf_u=r.replayssm_buf_u[layer],
                 buf_g=r.replayssm_buf_g[layer],
+                flush_arrivals=r.replayssm_flush_arrivals[layer],
+                flush_wait=r.replayssm_flush_wait,
                 write_pos=r.replayssm_write_pos,
                 slot_idx=_ix(slot),
                 cu_seqlens=_cu(),

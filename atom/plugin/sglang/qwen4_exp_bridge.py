@@ -1669,6 +1669,20 @@ def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:
     if not callable(getter):
         raise TypeError("Flash QSA requires a SGLang KV pool with get_kv_buffer")
 
+    # SGLang reserves a padding page beyond pool.size. Native index pages use
+    # the same physical IDs as K/V, so include that page in both side caches;
+    # sizing only from usable tokens leaves the final allocatable page OOB.
+    first_layer_id = 0 if is_draft else int(qsa_layers[0].layer_num)
+    try:
+        first_k, _ = getter(first_layer_id)
+    except (KeyError, IndexError) as exc:
+        raise RuntimeError(
+            f"Flash QSA KV mapping missing for layer {first_layer_id} "
+            f"(draft={is_draft}, pool={type(pool).__name__})"
+        ) from exc
+    if torch.is_tensor(first_k) and first_k.ndim == 3:
+        num_pages = int(first_k.shape[0]) // block_size
+
     device = next(model.parameters()).device
     raw = torch.zeros(
         (len(qsa_layers), num_pages, block_size, 1, index_head_dim),
