@@ -557,7 +557,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         if self.markov_head.fused_sample:
             # One request: all K steps in one launch, bit-identical to the
             # two-stage fused path below (dspark_markov_chain.py); None where
-            # its guard does not hold.
+            # its guard does not hold or ATOM_DSPARK_FUSED_MARKOV_CHAIN=0.
             from atom.model_ops.dspark_markov_chain import markov_chain_bs1
 
             chain_embeds = markov_chain_bs1(

@@ -20,8 +20,8 @@ on ties.
 Served when (``usable``): ONE request (the block's rows are its K positions),
 K <= 8, bf16 logits / tables of rank 256, and aiter's
 ``markov_argmax_chain_supported`` (gfx1250, a vocabulary of whole 16-id tiles
-that fits the CUs). Anything else, or an aiter without the op, keeps the
-two-stage path.
+that fits the CUs). Anything else, an aiter without the op, or
+``ATOM_DSPARK_FUSED_MARKOV_CHAIN=0`` keeps the two-stage path.
 
 The exchange waits for every workgroup, which holds when the launch has the GPU
 to itself. Its waits are bounded so that a workgroup that never becomes
@@ -38,12 +38,14 @@ from typing import Any, NamedTuple
 
 import torch
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
 
 RANK = 256
 MAX_STEPS = 8
 _UNSET = object()
-_op: Any = _UNSET  # aiter.ops.markov_argmax_chain, or None without it
+_op: Any = _UNSET  # aiter.ops.markov_argmax_chain, or None: off or no op
 _failed = False
 _calls = 0
 
@@ -58,17 +60,26 @@ _state: dict[int, _DeviceState] = {}
 
 
 def _aiter_op():
-    """aiter's ``markov_argmax_chain`` module, or None for an aiter without it."""
+    """aiter's ``markov_argmax_chain`` module, or None when
+    ``ATOM_DSPARK_FUSED_MARKOV_CHAIN`` is off or aiter lacks the op; looked
+    up once."""
     global _op
     if _op is _UNSET:
-        try:
-            op = importlib.import_module("aiter.ops.markov_argmax_chain")
-        except ImportError:
+        if not envs.ATOM_DSPARK_FUSED_MARKOV_CHAIN:
             op = None
             logger.info(
-                "aiter has no markov_argmax_chain: the DSpark Markov chain keeps "
+                "ATOM_DSPARK_FUSED_MARKOV_CHAIN=0: the DSpark Markov chain keeps "
                 "the two-stage path"
             )
+        else:
+            try:
+                op = importlib.import_module("aiter.ops.markov_argmax_chain")
+            except ImportError:
+                op = None
+                logger.info(
+                    "aiter has no markov_argmax_chain: the DSpark Markov chain "
+                    "keeps the two-stage path"
+                )
         _op = op
     return _op
 
@@ -149,7 +160,7 @@ def check_errors(every: int = 512) -> None:
                 "DSpark Markov chain: a workgroup of the one-launch chain was not "
                 f"resident (steps 0x{st.err_host.item():x} waited it out), so those "
                 "steps' drafts are not to be trusted. Something else holds CUs of "
-                "this GPU; set ATOM_DSPARK_FUSED_MARKOV_SAMPLE=0 to sample with "
+                "this GPU; set ATOM_DSPARK_FUSED_MARKOV_CHAIN=0 to sample with "
                 "the two-stage path."
             )
         st.err_host.copy_(st.ws.err, non_blocking=True)
