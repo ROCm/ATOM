@@ -440,6 +440,7 @@ def test_default_off_delayer_matches_pinned_trace(monkeypatch):
             "has_partial": tick % 3 == 0,
             "prefill_cost": 20.5,
             "waiting_requests": 3,
+            "prefill_budget": 16,
         }
         assert tuple(old.should_allow_prefill(**kwargs)) == tuple(
             new.should_allow_prefill(**kwargs)
