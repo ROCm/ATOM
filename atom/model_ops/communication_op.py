@@ -3,7 +3,8 @@
 
 """ATOM tensor-parallel all_reduce layer.
 
-A thin wrapper over the aiter TP all_reduce that centralises the TBO-aware
+A thin wrapper over the aiter TP all_reduce -- and the fused all_reduce +
+RMSNorm (+ quant) the norms run -- that centralises the TBO-aware
 routing, so call sites (model AR points such as attention output-proj and MoE
 combine) don't each hand-roll an ``if tbo_aware: tbo_all_reduce else: plain``
 branch — nor even thread a ``tbo_aware`` flag through. Whether an all_reduce
@@ -39,6 +40,13 @@ def _tbo_aware_tp_reduce(tp_size: int) -> bool:
     )
 
 
+def _register_tbo_ops() -> None:
+    """Registers the TBO-aware ops (``torch.ops.aiter.tbo_*``). They live in
+    ``module_dispatch_ops``, which a model need not import: the model registry
+    imports a model's module only when it is built."""
+    from atom.model_ops import module_dispatch_ops  # noqa: F401
+
+
 def tensor_model_parallel_all_reduce(x: torch.Tensor) -> torch.Tensor:
     """TP all_reduce; routes through the TBO-aware custom op on the pure-TP+TBO
     path (decided internally via ``_tbo_aware_tp_reduce``), else a plain reduce.
@@ -52,10 +60,93 @@ def tensor_model_parallel_all_reduce(x: torch.Tensor) -> torch.Tensor:
     from aiter.dist.parallel_state import get_tp_group
 
     if _tbo_aware_tp_reduce(get_tp_group().world_size):
+        _register_tbo_ops()
         return torch.ops.aiter.tbo_all_reduce(x)
     from aiter.dist.communication_op import tensor_model_parallel_all_reduce as ar
 
     return ar(x)
+
+
+def tensor_model_parallel_fused_allreduce_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """aiter's fused TP all_reduce + residual add + RMSNorm, ``(out,
+    residual_out)``; ``gemma_norm`` normalizes with ``x * (1 + w)``. Routed like
+    ``tensor_model_parallel_all_reduce``: on the pure-TP+TBO path through the
+    TBO-aware op, which on a split step hands the all_reduce to the comm stream
+    and runs the norm after it, and runs the fused kernel otherwise."""
+    from aiter.dist.parallel_state import get_tp_group
+
+    if _tbo_aware_tp_reduce(get_tp_group().world_size):
+        _register_tbo_ops()
+        return torch.ops.aiter.tbo_fused_allreduce_rmsnorm(
+            x, residual, weight, eps, gemma_norm
+        )
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_fused_allreduce_rmsnorm as fused,
+    )
+
+    return fused(x, residual, weight, eps, gemma_norm=gemma_norm)
+
+
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    quant_type: str = "per_token",
+    group_size: int = 128,
+    emit_bf16: bool = False,
+    transpose_scale: bool = False,
+    gemma_norm: bool = False,
+):
+    """aiter's fused TP all_reduce + residual add + RMSNorm + quant, ``(out,
+    residual_out, scale)``, plus the bf16 normed activation if ``emit_bf16``.
+    ``transpose_scale`` lays a per-group scale out column-major. Routed like
+    ``tensor_model_parallel_fused_allreduce_rmsnorm`` for the FP8 quants a
+    split step runs unfused, ``"per_token"`` and ``"per_group"``; any other
+    ``quant_type`` keeps the fused kernel."""
+    from aiter.dist.parallel_state import get_tp_group
+
+    if quant_type in ("per_token", "per_group") and _tbo_aware_tp_reduce(
+        get_tp_group().world_size
+    ):
+        _register_tbo_ops()
+        out, residual_out, scale, bf16 = (
+            torch.ops.aiter.tbo_fused_allreduce_rmsnorm_quant(
+                x,
+                residual,
+                weight,
+                eps,
+                quant_type,
+                group_size,
+                emit_bf16,
+                transpose_scale,
+                gemma_norm,
+            )
+        )
+        if emit_bf16:
+            return out, residual_out, scale, bf16
+        return out, residual_out, scale
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant as fused,
+    )
+
+    return fused(
+        x,
+        residual,
+        weight,
+        eps,
+        quant_type=quant_type,
+        group_size=group_size,
+        emit_bf16=emit_bf16,
+        transpose_scale=transpose_scale,
+        gemma_norm=gemma_norm,
+    )
 
 
 def tensor_model_parallel_all_reduce_add(

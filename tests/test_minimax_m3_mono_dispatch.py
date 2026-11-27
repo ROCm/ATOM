@@ -58,6 +58,11 @@ def test_supported_deployment_has_no_refusal(native):
     assert dispatch._config_refusal(_atom_config()) is None
 
 
+def test_prefill_only_tbo_keeps_mono(native):
+    # M3 routes under UBatchWrapper and declines the prefill steps it splits
+    assert dispatch._config_refusal(_atom_config(enable_tbo=True)) is None
+
+
 def test_nvfp4_caches_are_supported_together_only(native):
     nv = {"kv_cache_dtype": "nvfp4", "index_cache_dtype": "nvfp4"}
     assert dispatch._config_refusal(_atom_config(**nv)) is None
@@ -99,7 +104,7 @@ def test_nvfp4_caches_are_supported_together_only(native):
         ({"index_cache_dtype": "bf16"}, "index cache"),
         ({"kv_cache_block_size": 16}, "block size"),
         ({"max_model_len": (1 << 20) + 1}, "max_model_len"),
-        ({"enable_tbo_decode": True}, "TBO"),
+        ({"enable_tbo": True, "enable_tbo_decode": True}, "decode TBO"),
         (
             {"compilation_config": SimpleNamespace(cudagraph_mode=_Mode(True))},
             "TR_HYBRID",

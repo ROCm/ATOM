@@ -53,7 +53,9 @@ def _dspark_mode_supported(atom_config) -> bool:
 
 def _config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use mono, or None."""
-    checks = common_refusals(atom_config, Dims, SUPPORTED_TP) + [
+    checks = common_refusals(
+        atom_config, Dims, SUPPORTED_TP, refuse_prefill_tbo=False
+    ) + [
         # fp8 K/V + fp8 index, or NVFP4 K/V + NVFP4 index (single-buffer pages), not mixed
         (
             atom_config.kv_cache_dtype in ("fp8", "nvfp4"),

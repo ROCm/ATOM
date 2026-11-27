@@ -22,6 +22,11 @@ Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward  — V2/V3.2/V4 MoE (summed)
   - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared unsummed)
   - torch.ops.aiter.indexer_score_topk         — V4 sparse indexer
+
+and, taking no `layer_name`, the TBO-aware TP collectives that
+`communication_op` routes pure TP + TBO through:
+  - torch.ops.aiter.tbo_all_reduce
+  - torch.ops.aiter.tbo_fused_allreduce_rmsnorm[_quant]
 """
 
 import torch
@@ -237,19 +242,37 @@ direct_register_custom_op(
 )
 
 
-def tbo_all_reduce(x: torch.Tensor) -> torch.Tensor:
-    from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+# ---------------------------------------------------------------------------
+# TBO-aware TP collectives (pure TP + TBO)
+# ---------------------------------------------------------------------------
+#
+# Reached through `communication_op` on the pure-TP+TBO path. Whether a step
+# is split is known only inside the micro-batch threads, so each op decides
+# that at run time: in a micro-batch of `ATOM_TBO_TP_AR_MODE=overlap` (the
+# default) the all-reduce runs on the comm stream, overlapping the partner
+# micro-batch's compute; otherwise -- unsplit steps, decode, "inline" -- the
+# op runs aiter's collective as without TBO, on the compute stream.
 
+
+def _tbo_overlaps() -> bool:
     from atom.utils.tbo.ubatching import tbo_active
 
-    if not tbo_active():
-        return tensor_model_parallel_all_reduce(x)
+    return tbo_active() and envs.ATOM_TBO_TP_AR_MODE == "overlap"
 
-    # "inline": the plain all-reduce on the compute stream (no overlap).
-    # "overlap" (default): on the comm stream, overlapping the partner ubatch.
-    if envs.ATOM_TBO_TP_AR_MODE != "overlap":
-        return tensor_model_parallel_all_reduce(x)
 
+def _tbo_tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    """`x` all-reduced on this micro-batch's TP communicator and the comm
+    stream, into a tensor allocated beforehand on the compute stream.
+
+    Allocated on the comm stream, the output would go back to that stream's
+    pool once its readers drop it, and the partner's next hand-off could be
+    given that memory and write it while this micro-batch still reads it: a
+    hand-off waits only on compute up to the partner's yield. Memory of the
+    compute stream is reused only by work ordered after the reads. The comm
+    phase returns nothing, so nothing is held either (`tbo_on_comm`).
+
+    A disabled communicator returns without writing `out`, so it is refused
+    instead of handing back uninitialized memory."""
     from atom.utils.tbo.ubatching import (
         tbo_current_ubatch_id,
         tbo_get_comm_stream,
@@ -257,17 +280,30 @@ def tbo_all_reduce(x: torch.Tensor) -> torch.Tensor:
         tbo_on_comm,
     )
 
-    ub_comm = tbo_get_ubatch_tp_comm(tbo_current_ubatch_id())
-    if ub_comm is None:
+    comm = tbo_get_ubatch_tp_comm(tbo_current_ubatch_id())
+    if comm is None:
         # world_size == 1: nothing to reduce.
         return x
+    if comm.disabled:
+        raise RuntimeError(
+            "TBO TP all-reduce: this micro-batch's TP communicator is "
+            "disabled; set ATOM_TBO_TP_AR_MODE=inline"
+        )
+    out = torch.empty_like(x)
 
-    # Out-of-place all_reduce on this ubatch's dedicated communicator, on the
-    # comm stream, overlapping the partner ubatch's compute. Not held: see
-    # `tbo_on_comm`.
-    return tbo_on_comm(
-        lambda: ub_comm.all_reduce(x, stream=tbo_get_comm_stream()), hold=False
-    )
+    def all_reduce():
+        comm.all_reduce(x, out_tensor=out, stream=tbo_get_comm_stream())
+
+    tbo_on_comm(all_reduce, hold=False)
+    return out
+
+
+def tbo_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    if _tbo_overlaps():
+        return _tbo_tp_all_reduce(x)
+    from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+
+    return tensor_model_parallel_all_reduce(x)
 
 
 def _tbo_all_reduce_fake(x: torch.Tensor) -> torch.Tensor:
@@ -279,5 +315,145 @@ direct_register_custom_op(
     op_func=tbo_all_reduce,
     mutates_args=(),
     fake_impl=_tbo_all_reduce_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def tbo_fused_allreduce_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gemma_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """aiter's fused TP all-reduce + residual add + RMSNorm, `(out,
+    residual_out)`. An overlapping micro-batch runs the all-reduce as a
+    hand-off (`_tbo_tp_all_reduce`) and the norm after it
+    (`layernorm.add_rms_norm`) instead."""
+    if _tbo_overlaps():
+        from atom.model_ops.layernorm import add_rms_norm
+
+        return add_rms_norm(_tbo_tp_all_reduce(x), residual, weight, eps, gemma_norm)
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_fused_allreduce_rmsnorm,
+    )
+
+    return tensor_model_parallel_fused_allreduce_rmsnorm(
+        x, residual, weight, eps, gemma_norm=gemma_norm
+    )
+
+
+def _tbo_fused_allreduce_rmsnorm_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gemma_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="tbo_fused_allreduce_rmsnorm",
+    op_func=tbo_fused_allreduce_rmsnorm,
+    mutates_args=(),
+    fake_impl=_tbo_fused_allreduce_rmsnorm_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def tbo_fused_allreduce_rmsnorm_quant(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    quant_type: str,
+    group_size: int,
+    emit_bf16: bool,
+    transpose_scale: bool,
+    gemma_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """aiter's fused TP all-reduce + residual add + RMSNorm + FP8 quant
+    (`quant_type` "per_token" or "per_group"), `(out, residual_out, scale,
+    bf16)`: `bf16` the normed activation if `emit_bf16`, else empty -- the
+    schema has no optional output. An overlapping micro-batch runs the
+    all-reduce as a hand-off and the norm and quant after it
+    (`layernorm.per_token_fp8_quant`, `layernorm.rms_norm_per_group_fp8_quant`)
+    instead."""
+    if _tbo_overlaps():
+        from atom.model_ops.layernorm import (
+            add_rms_norm,
+            per_token_fp8_quant,
+            rms_norm_per_group_fp8_quant,
+        )
+
+        reduced = _tbo_tp_all_reduce(x)
+        if quant_type == "per_token":
+            normed = add_rms_norm(reduced, residual, weight, eps, gemma_norm)
+            out, scale, bf16, residual_out = per_token_fp8_quant(normed, emit_bf16)
+        else:
+            out, scale, bf16, residual_out = rms_norm_per_group_fp8_quant(
+                reduced,
+                residual,
+                weight,
+                eps,
+                group_size=group_size,
+                transpose_scale=transpose_scale,
+                emit_bf16=emit_bf16,
+                gemma_norm=gemma_norm,
+            )
+    else:
+        from aiter.dist.communication_op import (
+            tensor_model_parallel_fused_allreduce_rmsnorm_quant,
+        )
+
+        outs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+            x,
+            residual,
+            weight,
+            eps,
+            quant_type=quant_type,
+            group_size=group_size,
+            emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
+            gemma_norm=gemma_norm,
+        )
+        out, residual_out, scale = outs[:3]
+        bf16 = outs[3] if emit_bf16 else None
+    return out, residual_out, scale, x.new_empty(0) if bf16 is None else bf16
+
+
+def _tbo_fused_allreduce_rmsnorm_quant_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    quant_type: str,
+    group_size: int,
+    emit_bf16: bool,
+    transpose_scale: bool,
+    gemma_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.utility.dtypes import fp8
+
+    m, n = x.shape
+    if quant_type == "per_token":
+        scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    elif transpose_scale:
+        # column-major, stride (1, M), as aiter's fused kernel returns it
+        scale = torch.empty(
+            (n // group_size, m), dtype=torch.float32, device=x.device
+        ).transpose(0, 1)
+    else:
+        scale = torch.empty((m, n // group_size), dtype=torch.float32, device=x.device)
+    bf16 = torch.empty_like(x) if emit_bf16 else x.new_empty(0)
+    return torch.empty_like(x, dtype=fp8), torch.empty_like(x), scale, bf16
+
+
+direct_register_custom_op(
+    op_name="tbo_fused_allreduce_rmsnorm_quant",
+    op_func=tbo_fused_allreduce_rmsnorm_quant,
+    mutates_args=(),
+    fake_impl=_tbo_fused_allreduce_rmsnorm_quant_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
