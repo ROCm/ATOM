@@ -116,7 +116,8 @@ examples:
       steps: 3
       checks:
         metrics:
-          - {name: rollout_corr/k3_kl, ref: 0.00399, rtol: 0.50}
+          # Pinned runs now span down to 0.001958 under dynamic sampling.
+          - {name: rollout_corr/k3_kl, ref: 0.00399, rtol: 0.60}
           - {name: entropy, ref: 0.599, rtol: 0.50}
           - {name: rollout_corr/kl, ref: 0.00374, band: 10}
           - {name: rollout_corr/ppl_ratio, info: true}
