@@ -332,8 +332,8 @@ async fn the_writer_applies_batches_and_frees_released_lanes() {
 }
 
 /// A rank's shared lane holds the blocks its shared tier names that the rank holds, until
-/// the tier or the rank lets go of them or the rank is reset; a rank without one drops the
-/// tier.
+/// the tier or the rank lets go of them, the tier is cleared or the rank is reset; a rank
+/// without one drops the tier.
 #[tokio::test]
 async fn a_shared_lane_holds_what_the_rank_shares_and_holds() {
     let ttl = Duration::from_secs(120);
@@ -383,6 +383,19 @@ async fn a_shared_lane_holds_what_the_rank_shares_and_holds() {
         .write(true, vec![stored(0, &seq, 0..3, 4)], vec![])
         .await;
     settles(match_holders, &seq, &lanes, &[Some(0)]).await;
+    assert_eq!(match_holders(&seq, &[Some(holder.lane())]), [Some(12)]);
+    // Shared again, the tier removes a block and is cleared in one batch: its lane holds
+    // none of the three blocks, the rank's own all of them.
+    holder
+        .write(false, vec![], vec![shared(hashes(0..3))])
+        .await;
+    settles(match_holders, &seq, &lanes, &[Some(12)]).await;
+    holder
+        .write(false, vec![], vec![removed(2..3), KvEvent::Cleared])
+        .await;
+    settles(match_holders, &seq, &lanes, &[Some(0)]).await;
+    until(|| status.lock().shared_blocks == Some(0)).await;
+    assert_eq!(status.lock().indexed_blocks, Some(3));
     assert_eq!(match_holders(&seq, &[Some(holder.lane())]), [Some(12)]);
     let other = Arc::new(Mutex::new(SourceStatus::default()));
     let unshared = partition.hold(other.clone()).unwrap();
