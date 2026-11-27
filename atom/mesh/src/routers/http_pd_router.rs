@@ -1540,6 +1540,11 @@ impl PDRouter {
                     (body, Some(end))
                 }
                 Err(e) => {
+                    // A malformed line 1, or a body that ended or failed before
+                    // the handoff, is P's failure (as on every `prefill_done`
+                    // path), not a cancellation: dropping the 200 response
+                    // unfinished would record nothing in P's circuit breaker.
+                    lines.outcome.finish(false);
                     error!(
                         "ATOM prefill {} request_id={} early handoff parse failed: {}",
                         prefill.url(),
@@ -3818,6 +3823,67 @@ mod tests {
         r.assert_released();
         assert_eq!(r.prefill.circuit_breaker().total_failures(), 0);
         assert_eq!(r.decode.circuit_breaker().total_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn early_handoff_line_one_failure_is_recorded_as_a_prefill_failure() {
+        // P answers 200 with the early-handoff header, then line 1 is malformed,
+        // the body ends before any line, or the body fails: a 502, and one
+        // failure (not a cancellation) in P's circuit breaker.
+        for case in ["malformed", "eof", "cut"] {
+            let p = serve(axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || async move {
+                    let (tx, rx) =
+                        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+                    match case {
+                        "malformed" => {
+                            let _ = tx.try_send(Ok(bytes::Bytes::from_static(b"not json\n")));
+                        }
+                        "cut" => {
+                            let _ = tx.try_send(Err(std::io::Error::other("cut")));
+                        }
+                        _ => {}
+                    }
+                    drop(tx);
+                    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/x-ndjson")
+                        .header(ATOM_EARLY_HANDOFF_HEADER, "1")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            ))
+            .await;
+            let router = atom_test_router(&p, false);
+            let prefill = early_test_worker(
+                &p,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+            let decode = early_test_worker("http://decode.invalid", WorkerType::Decode);
+            let ctx = router
+                .adapter
+                .prepare_pair(prefill.as_ref(), decode.as_ref())
+                .unwrap();
+            let post = router
+                .client
+                .post(format!("{p}/v1/chat/completions"))
+                .json(&json!({}));
+            let guard = WorkerLoadGuard::new(prefill.clone(), None);
+            let result = router
+                .atom_prefill_kv(post, &prefill, guard, None, &ctx, "req-1")
+                .await;
+            let response = match result {
+                Ok(_) => panic!("{case}: a broken line 1 must fail the prefill"),
+                Err(response) => response,
+            };
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
+            assert_eq!(prefill.circuit_breaker().total_failures(), 1, "{case}");
+            assert_eq!(prefill.circuit_breaker().total_successes(), 0, "{case}");
+            assert_eq!(prefill.load(), 0, "{case}");
+        }
     }
 
     /// An early-handoff P whose body reports `ok` on line 2 after `done_ms`,
