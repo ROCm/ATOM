@@ -25,6 +25,7 @@ from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
+import kv_store_test_support
 import numpy as np
 import pytest
 import torch
@@ -311,23 +312,13 @@ class FakeStore:
 # next window while a put is in flight, a GPU copy failure there drains and
 # claims after a fence, and it needs one save thread. Their pipelined
 # counterparts are in test_kv_store_save_pipeline.py.
-_SERIAL_SAVE_ONLY = {
+SERIAL_SAVE_ONLY = {
     "test_put_failure_is_quiescent_and_reports_every_chunk",
     "test_gpu_copy_failure_claims_nothing",
     "test_the_kv_budget_holds_back_a_staging_buffer_per_copy_thread",
 }
-
-
-@pytest.fixture(autouse=True, params=["serial", "pipelined"])
-def save_mode(request, monkeypatch):
-    """Every test once per save path (``ATOM_STORE_SAVE_BATCH_CHUNKS`` 0 / 64)."""
-    if request.param == "serial":
-        monkeypatch.delenv("ATOM_STORE_SAVE_BATCH_CHUNKS", raising=False)
-    elif request.node.originalname in _SERIAL_SAVE_ONLY:
-        pytest.skip("the serial save's contract")
-    else:
-        monkeypatch.setenv("ATOM_STORE_SAVE_BATCH_CHUNKS", "64")
-    return request.param
+# Every test once per save path; see `kv_store_test_support.save_mode`.
+save_mode = kv_store_test_support.save_mode
 
 
 @pytest.fixture(autouse=True)

@@ -15,6 +15,14 @@ PD is not supported: a `multi` connector with a P/D connector beside
 Design notes are in
 [`atom/kv_transfer/offload/README.md`](../atom/kv_transfer/offload/README.md#mori-umbp-offload-umbp_store).
 
+`umbp_store` is not `umbp_pool`. `umbp_store` is a KV offload tier: each
+worker puts and gets chunks of its own KV through `mori.umbp.UMBPClient`,
+and the HBM KV pool stays ATOM's. `umbp_pool` (`atom/kv_transfer/pool/umbp/`)
+hands the paged KV pool itself to UMBP (`mori_umbp_l1.L1Client` adopts it), so
+DP ranks share cached prefixes in HBM; see the KV pool backend section of
+`docs/environment_variables.md`. Use `umbp_store` to extend the prefix cache
+into host memory, `umbp_pool` to share HBM prefixes across DP ranks.
+
 ## How it works
 
 ```text
@@ -177,6 +185,12 @@ An unknown `umbp_store.*` key is an error.
 Like `mooncake_store`, `umbp_store` loads only hits of at least 512 tokens
 (two chunks); the global default for other tiers is 8192. The existing
 `OFFLOAD_MIN_LOAD_TOKENS` setting overrides it.
+
+`ATOM_STORE_SAVE_BATCH_CHUNKS` (opt-in, default 0) applies to `umbp_store`
+as it does to `mooncake_store`: set to 1-64, each worker's saves go through the
+shared save pipeline, where one sender thread makes the save's lookups and
+puts while the save thread packs the next batch (it needs
+`OFFLOAD_COPY_WORKERS=1`). See `docs/environment_variables.md`.
 
 One server serves one node. A tensor-parallel group over several nodes is
 refused at startup, and with DP over several nodes each node's ranks reach

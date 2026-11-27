@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """Fakes and builders the KV-store offload tests share (``mooncake_store``,
 ``umbp_store``): the block GPU connector, AITER's dtype table, the engine
@@ -17,6 +18,7 @@ import types
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
 import torch
 from conftest import atom_config_double, with_min_load
 
@@ -42,6 +44,25 @@ CHUNK = 8  # tokens per store chunk: two blocks
 BYTES_PER_BLOCK = 16
 CHUNK_BYTES = BYTES_PER_BLOCK * CHUNK // BLOCK
 SLOT = 4096  # one slot's stride for CHUNK_BYTES
+
+
+@pytest.fixture(autouse=True, params=["serial", "pipelined"])
+def save_mode(request, monkeypatch):
+    """Every test once per save path (``ATOM_STORE_SAVE_BATCH_CHUNKS`` 0 / 64).
+
+    The shared worker switches every KV-store backend's saves to the save
+    pipeline when the variable is set. A test module lists, in
+    ``SERIAL_SAVE_ONLY``, the tests whose expected result is the serial path's
+    own; they are skipped on the pipelined one. Use it with
+    ``save_mode = kv_store_test_support.save_mode`` in the test module.
+    """
+    if request.param == "serial":
+        monkeypatch.delenv("ATOM_STORE_SAVE_BATCH_CHUNKS", raising=False)
+    elif request.node.originalname in getattr(request.module, "SERIAL_SAVE_ONLY", ()):
+        pytest.skip("the serial save's contract")
+    else:
+        monkeypatch.setenv("ATOM_STORE_SAVE_BATCH_CHUNKS", "64")
+    return request.param
 
 
 class FakeGPUConnector:

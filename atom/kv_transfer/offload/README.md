@@ -838,6 +838,16 @@ chunk hash chain keys, the HBM transfer slot pool, the windowed put/get loop
 Select it with
 `{"kv_connector": "umbp_store", "kv_role": "offload", "kv_connector_extra_config": {"umbp_store.address": "unix:///tmp/umbp/server.sock"}}`.
 Offload only: `validate_multi_config` refuses it beside a P/D connector.
+`ATOM_STORE_SAVE_BATCH_CHUNKS` switches its saves to the save pipeline as it
+does `mooncake_store`'s.
+
+`umbp_store` is not `umbp_pool`. `umbp_store` is a KV offload tier: each
+worker puts and gets chunks of its own KV through `mori.umbp.UMBPClient`,
+and the HBM KV pool stays ATOM's. `umbp_pool` (`atom/kv_transfer/pool/umbp/`)
+hands the paged KV pool itself to UMBP (`mori_umbp_l1.L1Client` adopts it), so
+DP ranks share cached prefixes in HBM; see the KV pool backend section of
+`docs/environment_variables.md`. Use `umbp_store` to extend the prefix cache
+into host memory, `umbp_pool` to share HBM prefixes across DP ranks.
 How to install, start and check UMBP, with the settings table, is in
 [`recipes/UMBP-KV-Offload.md`](../../../recipes/UMBP-KV-Offload.md); the
 MiniMax-M3 aggregated TP4 walkthrough is

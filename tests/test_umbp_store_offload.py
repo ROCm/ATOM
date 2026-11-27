@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """The UMBP offload connector (``umbp_store``), on CPU.
 
@@ -26,6 +27,7 @@ import time
 import types
 from types import SimpleNamespace
 
+import kv_store_test_support
 import pytest
 import torch
 from kv_store_test_support import (
@@ -195,6 +197,11 @@ class FakeUMBPClient:
             ctypes.memmove(ptr, data, size)
             answers.append(True)
         return answers
+
+
+# Every test once per save path (the shared worker's serial save and the
+# opt-in save pipeline); see `kv_store_test_support.save_mode`.
+save_mode = kv_store_test_support.save_mode
 
 
 @pytest.fixture(autouse=True)
