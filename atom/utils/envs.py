@@ -1429,7 +1429,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fills target_fill of a prefill chunk (or the batch budget cannot take the
     # next request), prefill is released at once, ahead of the interval and the
     # adaptive rule. It ends when a rank cannot (or KV runs high) and re-arms
-    # once the group has no decode.
+    # once the group has no decode. A release whose forward also decodes (mixed
+    # batching) arms no interval, as no mixed forward does: intended.
     "ATOM_PREFILL_INITIAL_RAMP": lambda: (
         os.getenv("ATOM_PREFILL_INITIAL_RAMP", "1").lower() in ("1", "true")
     ),
