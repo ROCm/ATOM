@@ -20,7 +20,11 @@
        flat FlyDSL scorer + FlyDSL selector + emit)
 
 Each variant is captured in a CUDA graph and replayed (--direct: launched
-directly, events around each call); times are the median of --reps runs (us). Every replay scores another working set (--sets disjoint
+directly, events around each call); times are the median of --reps runs (us).
+In graph mode also, from the profiler, the replay's kernel time (sum of its
+kernels) and span (first kernel start to last kernel end; kBW% from it): the
+event time holds the replay's launch latency (variant E, one tiny kernel,
+shows it), which a replay inside the model's graph hides. Every replay scores another working set (--sets disjoint
 page sets a request, rotated through the block table outside the timed region),
 so the index pages come from HBM, not the L2. BW = live index bytes (9216 B a
 block: e2m1 rows + E4M3 scales) / time, as % of 17.5 TB/s. Before timing, F's
@@ -99,7 +103,7 @@ def timed_direct(fn, reps, rotate):
     return statistics.median(ts)
 
 
-def timed(fn, reps, rotate):
+def timed(fn, reps, rotate, kernels):
     rotate(0)
     fn()
     torch.cuda.synchronize()
@@ -119,7 +123,46 @@ def timed(fn, reps, rotate):
         b.record()
         b.synchronize()
         ts.append(a.elapsed_time(b) * 1e3)
-    return statistics.median(ts)
+    return statistics.median(ts), *device_times(graph, min(reps, 50), rotate, kernels)
+
+
+def device_times(graph, reps, rotate, kernels):
+    """(kernel us, span us) of one replay, medians, from the profiler: the sum
+    of the replay's kernel durations, and its first kernel's start to its last
+    kernel's end. The event time above also holds the replay's launch, which a
+    replay inside a model's graph does not pay; these do not."""
+    import gzip
+    import tempfile
+
+    acts = [torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=acts) as prof:
+        for i in range(reps):
+            rotate(i + 1)
+            graph.replay()
+            torch.cuda.synchronize()
+    with tempfile.NamedTemporaryFile(suffix=".json.gz") as f:
+        prof.export_chrome_trace(f.name)
+        with gzip.open(f.name) as g:
+            ev = json.load(g)["traceEvents"]
+    # kernels only (the rotation's copies are memcpys or one copy kernel)
+    ks = sorted(
+        (e["ts"], e["dur"], e["name"])
+        for e in ev
+        if e.get("cat") == "kernel" and "copy" not in e.get("name", "").lower()
+    )
+    if len(ks) != kernels * reps:
+        names = sorted({n for _, _, n in ks})
+        print(
+            f"  profiler: {len(ks)} kernels in {reps} replays, want {kernels}: {names}"
+        )
+        return float("nan"), float("nan")
+    per = kernels
+    kern, span = [], []
+    for r in range(reps):
+        grp = ks[r * per : (r + 1) * per]
+        kern.append(sum(d for _, d, _ in grp))
+        span.append(grp[-1][0] + grp[-1][1] - grp[0][0])
+    return statistics.median(kern), statistics.median(span)
 
 
 def bench(a, ctx, bs, rows):
@@ -293,7 +336,11 @@ def bench(a, ctx, bs, rows):
 
     rotate(0)
     sel_score.copy_(triton_score())  # Tk / Sk select from a scored plane
+    tiny = torch.zeros(1, device=DEV)
     variants = [
+        # the replay's own cost: one tiny kernel (event time minus kernel time
+        # is what every variant's event time carries on top)
+        ("E  one tiny kernel", lambda: tiny.add_(1), False),
         ("T  triton score", triton_score, True),
         ("F  flydsl score", flydsl_score, True),
         ("Ff flydsl flat score", flat_score, True),
@@ -321,6 +368,11 @@ def bench(a, ctx, bs, rows):
             for wg in (512, 768, 1024, 1536, 2048)
         ]
     variants = [v for v in variants if v[0].split()[0] not in failed]
+
+    def pair(name):
+        """Variants that launch two kernels a replay (scorer + selector)."""
+        return name.split()[0] in ("TT", "FT", "TS", "XX", "FA", "TA")
+
     for name, fn, is_score in variants:
         if a.sweep and ref is not None:  # every ring / budget: the same bits
             rotate(0)
@@ -328,13 +380,25 @@ def bench(a, ctx, bs, rows):
             torch.cuda.synchronize()
             bad = ref.view(torch.int32)[mask] != got.view(torch.int32)[mask]
             assert not bad.any(), f"{name}: errRatio {bad.float().mean().item():.3e}"
-        us = (timed_direct if a.direct else timed)(fn, a.reps, rotate)
+        if a.direct:
+            us, kern, span = (
+                timed_direct(fn, a.reps, rotate),
+                float("nan"),
+                float("nan"),
+            )
+        else:
+            us, kern, span = timed(fn, a.reps, rotate, 2 if pair(name) else 1)
         bw = 100 * nbytes / (us * 1e-6) / HBM
+        kbw = 100 * nbytes / (span * 1e-6) / HBM
         mode = "direct" if a.direct else "graph"
-        print(f"{bs:>4} {ctx:>7} {mode:<6} {name:<26} {us:8.1f} {bw:6.1f}")
+        print(
+            f"{bs:>4} {ctx:>7} {mode:<6} {name:<26} {us:8.1f} {bw:6.1f}"
+            f" {kern:8.1f} {span:8.1f} {kbw:6.1f}"
+        )
         rows.append(
             {"bs": bs, "ctx": ctx, "varlen": a.varlen, "mode": mode,
-             "variant": name, "us": us, "bw_pct": bw}
+             "variant": name, "us": us, "bw_pct": bw, "kernel_us": kern,
+             "span_us": span, "span_bw_pct": kbw}
         )  # fmt: skip
 
 
@@ -364,7 +428,10 @@ def main():
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
     rows = []
-    print(f"{'bs':>4} {'ctx':>7} {'mode':<6} {'variant':<26} {'us':>8} {'BW%':>6}")
+    print(
+        f"{'bs':>4} {'ctx':>7} {'mode':<6} {'variant':<26} {'us':>8} {'BW%':>6}"
+        f" {'kern us':>8} {'span us':>8} {'kBW%':>6}"
+    )
     for ctx in a.ctx:
         for bs in a.bs:
             bench(a, ctx, bs, rows)
