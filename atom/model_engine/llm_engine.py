@@ -703,8 +703,6 @@ class InputOutputProcessor:
 
     def __init__(self, config, tokenizer, block_size):
         self.config = config
-        # `ATOM_DP_LM_HEAD_MODE=argmax` decodes greedy ids only (read once).
-        self._greedy_ids_only = envs.ATOM_DP_LM_HEAD_MODE == "argmax"
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.structured_admission = None
@@ -884,7 +882,8 @@ class InputOutputProcessor:
             kv_transfer=kv_transfer_params,
             multimodal=multimodal_data is not None,
         )
-        if self._greedy_ids_only and not serves_greedy_ids(sampling_params):
+        greedy_only = envs.ATOM_DP_LM_HEAD_MODE == "argmax"
+        if greedy_only and not serves_greedy_ids(sampling_params):
             raise ValueError(
                 "ATOM_DP_LM_HEAD_MODE=argmax serves greedy requests only: "
                 "temperature 0, no logprobs, structured output or required tool"
