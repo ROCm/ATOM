@@ -278,7 +278,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::wrap(Arc::new(RoundRobinPolicy::new()));
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let (chosen, _) = apply_policy(&candidates, &recorder, &descriptor, None)
+        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
@@ -291,7 +291,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::wrap(Arc::new(RandomPolicy::new()));
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let (chosen, _) = apply_policy(&candidates, &recorder, &descriptor, None)
+        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
@@ -304,7 +304,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::wrap(Arc::new(PowerOfTwoPolicy::new()));
         let descriptor = make_descriptor(Some("m"), None, None, None);
 
-        let (chosen, _) = apply_policy(&candidates, &recorder, &descriptor, None)
+        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
@@ -360,7 +360,7 @@ mod b_policy_apply {
         let recorder = RecordingPolicy::round_robin();
         let descriptor = make_descriptor(Some("m_no_ring"), None, None, None);
 
-        let (chosen, _) = apply_policy(&candidates, &recorder, &descriptor, None)
+        let chosen = apply_policy(&candidates, &recorder, &descriptor, None)
             .await
             .unwrap();
         let calls = recorder.calls();
@@ -459,7 +459,7 @@ mod b_policy_apply {
         let policy = RandomPolicy::new();
 
         for _ in 0..32 {
-            let (chosen, _) = apply_policy(&candidates, &policy, &descriptor, None)
+            let chosen = apply_policy(&candidates, &policy, &descriptor, None)
                 .await
                 .unwrap();
             assert!(candidate_urls.iter().any(|u| u == chosen.url()));
@@ -860,26 +860,8 @@ mod d_pd_planning {
             }
         }
 
-        /// The plan for `text` with only decode rank `decode_rank` and the prefills at
-        /// `healthy` available.
-        async fn plan(
-            &self,
-            text: &str,
-            headers: Option<&HeaderMap>,
-            decode_rank: usize,
-            healthy: &[usize],
-        ) -> PlacementPlan {
-            for (rank, decode) in self.decodes.iter().enumerate() {
-                decode.set_healthy(rank == decode_rank);
-            }
-            for (idx, prefill) in self.prefills.iter().enumerate() {
-                prefill.set_healthy(healthy.contains(&idx));
-            }
-            let descriptor = make_descriptor(Some("m"), Some(text), None, headers);
-            self.planner.plan(&descriptor).await.unwrap()
-        }
-
-        /// The prefill [`Self::plan`] selects.
+        /// The prefill planned for `text` with only decode rank `decode_rank` and the
+        /// prefills at `healthy` available.
         async fn place(
             &self,
             text: &str,
@@ -887,7 +869,14 @@ mod d_pd_planning {
             decode_rank: usize,
             healthy: &[usize],
         ) -> Arc<dyn Worker> {
-            match self.plan(text, headers, decode_rank, healthy).await {
+            for (rank, decode) in self.decodes.iter().enumerate() {
+                decode.set_healthy(rank == decode_rank);
+            }
+            for (idx, prefill) in self.prefills.iter().enumerate() {
+                prefill.set_healthy(healthy.contains(&idx));
+            }
+            let descriptor = make_descriptor(Some("m"), Some(text), None, headers);
+            match self.planner.plan(&descriptor).await.unwrap() {
                 PlacementPlan::Pair { prefill, .. } => prefill,
                 other => panic!("expected Pair, got {:?}", other),
             }
@@ -960,16 +949,11 @@ mod d_pd_planning {
         headers.insert("x-session-id", http::HeaderValue::from_static("session-1"));
 
         for (decode_rank, pinned) in [(0, "http://p1@0"), (1, "http://p1@1")] {
-            let PlacementPlan::Pair {
-                prefill,
-                prefill_binding,
-                ..
-            } = cluster.plan("", Some(&headers), decode_rank, &[0, 1]).await
-            else {
-                panic!("expected Pair");
-            };
+            let prefill = cluster
+                .place("", Some(&headers), decode_rank, &[0, 1])
+                .await;
             assert_eq!(prefill.url(), pinned);
-            dp_sticky.on_dispatch("prefill", Some(&headers), &prefill, prefill_binding);
+            dp_sticky.on_dispatch("prefill", Some(&headers), &prefill);
         }
         let changes: Vec<_> = handle
             .render()
@@ -983,10 +967,10 @@ mod d_pd_planning {
         );
     }
 
-    /// Selected first, decode still hands its binding to the plan: a failure reported with
-    /// it moves the session's decode, and the prefill follows to the new rank.
+    /// Under idx2idx, decode is selected first and is the bound worker: a failure on it
+    /// moves the session's decode, and the prefill follows to the new rank.
     #[tokio::test]
-    async fn test_idx2idx_decode_binding_reaches_the_failure_hook() {
+    async fn test_idx2idx_decode_failure_moves_the_prefill_with_it() {
         let decode_policy = Arc::new(crate::policies::DpStickyPolicy::new());
         let source = [
             dp_worker("http://p", 0, prefill()),
@@ -1003,16 +987,11 @@ mod d_pd_planning {
         let mut headers = HeaderMap::new();
         headers.insert("x-session-id", http::HeaderValue::from_static("session-1"));
         let descriptor = make_descriptor(Some("m"), None, None, Some(&headers));
-        let PlacementPlan::Pair {
-            decode,
-            decode_binding,
-            ..
-        } = planner.plan(&descriptor).await.unwrap()
-        else {
+        let PlacementPlan::Pair { decode, .. } = planner.plan(&descriptor).await.unwrap() else {
             panic!("expected Pair");
         };
         assert_eq!(decode.url(), "http://d@0");
-        decode_policy.on_dispatch_failed(Some(&headers), &decode, decode_binding);
+        decode_policy.on_dispatch_failed(Some(&headers), &decode);
         let PlacementPlan::Pair {
             prefill, decode, ..
         } = planner.plan(&descriptor).await.unwrap()

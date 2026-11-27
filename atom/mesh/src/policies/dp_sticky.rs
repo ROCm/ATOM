@@ -6,17 +6,13 @@
 //! minimum-load balancing. A stale mapping is replaced when its worker is no
 //! longer healthy or a candidate (another DP rank under idx2idx), the session
 //! has been idle for too long, or a request of the session failed with a server
-//! error or got no response. A failure counts only for a request placed on the
-//! session's current binding, on the worker it was sent to after DP rank
-//! mapping. Under ATOM PD idx2idx rank mapping, a failed prefill also releases
-//! the decode binding, although the decode was never sent.
+//! error or got no response on its bound worker. Under ATOM PD idx2idx rank
+//! mapping, a failed prefill also releases the decode binding, although the
+//! decode was never sent.
 
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -45,17 +41,13 @@ const NO_SESSION: &str = "no_session";
 #[derive(Debug)]
 struct StickyAssignment {
     worker: WorkerIdentity,
-    /// Identifies this placement of the session. A request carries it from
-    /// selection to its dispatch and failure hooks, so a request placed before
-    /// the session moved cannot act on the new binding.
-    binding: u64,
     last_access: Instant,
     /// Where the session's last request was sent, after DP rank mapping.
     dispatched: Option<WorkerIdentity>,
     /// Why the session was last reassigned, until a request is sent.
     reassigned: Option<&'static str>,
-    /// A request of the session failed on the worker it was sent to, so the
-    /// next request, a retry included, is placed again.
+    /// A request of the session failed on its bound worker, so the next
+    /// request, a retry included, is placed again.
     failed: bool,
     /// Workers the session's requests failed on since its last hit. Placing
     /// it again leaves them out while another worker is healthy.
@@ -77,7 +69,6 @@ pub struct DpStickyPolicy {
     /// pin every session to the same DP rank. Established sessions use the
     /// lock-free assignment lookup above.
     assign_lock: Mutex<()>,
-    next_binding: AtomicU64,
 }
 
 impl DpStickyPolicy {
@@ -85,7 +76,6 @@ impl DpStickyPolicy {
         Self {
             assignments: DashMap::new(),
             assign_lock: Mutex::new(()),
-            next_binding: AtomicU64::new(0),
         }
     }
 
@@ -178,22 +168,21 @@ impl DpStickyPolicy {
     }
 
     /// Returns the selection with the session outcome (hit, new, rebind,
-    /// expired, or no_session for requests without a session ID) and the
-    /// binding it was placed on.
+    /// expired, or no_session for requests without a session ID).
     fn select_worker_impl(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
-    ) -> (Option<usize>, &'static str, Option<u64>) {
+    ) -> (Option<usize>, &'static str) {
         let session_id = extract_sticky_routing_key(info.headers);
         let Some(session_id) = session_id else {
-            return (Self::select_low_load_worker(workers), NO_SESSION, None);
+            return (Self::select_low_load_worker(workers), NO_SESSION);
         };
         let now = Instant::now();
 
         if let Some(mut assignment) = self.assignments.get_mut(session_id) {
             if let Some(index) = Self::hit(workers, &mut assignment, now) {
-                return (Some(index), AFFINITY_HIT, Some(assignment.binding));
+                return (Some(index), AFFINITY_HIT);
             }
         }
 
@@ -207,7 +196,7 @@ impl DpStickyPolicy {
             None => (AFFINITY_NEW, None, Vec::new()),
             Some(mut assignment) => {
                 if let Some(index) = Self::hit(workers, &mut assignment, now) {
-                    return (Some(index), AFFINITY_HIT, Some(assignment.binding));
+                    return (Some(index), AFFINITY_HIT);
                 }
                 let outcome = if Self::is_expired(&assignment, now) {
                     AFFINITY_EXPIRED
@@ -222,14 +211,12 @@ impl DpStickyPolicy {
         };
 
         let Some(selected_index) = self.select_new_session_worker(workers, now, &avoid) else {
-            return (None, outcome, None);
+            return (None, outcome);
         };
-        let binding = self.next_binding.fetch_add(1, Ordering::Relaxed);
         self.assignments.insert(
             session_id.to_string(),
             StickyAssignment {
                 worker: Self::worker_identity(&workers[selected_index]),
-                binding,
                 last_access: now,
                 dispatched,
                 reassigned: (outcome != AFFINITY_NEW).then_some(outcome),
@@ -237,7 +224,7 @@ impl DpStickyPolicy {
                 avoid,
             },
         );
-        (Some(selected_index), outcome, Some(binding))
+        (Some(selected_index), outcome)
     }
 }
 
@@ -254,17 +241,13 @@ impl LoadBalancingPolicy for DpStickyPolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> (Option<usize>, RouteDecision) {
-        let (selected, outcome, binding) = self.select_worker_impl(workers, info);
+        let (selected, outcome) = self.select_worker_impl(workers, info);
         let branch = if selected.is_some() {
             outcome
         } else {
             NO_HEALTHY_WORKERS
         };
-        let decision = RouteDecision {
-            binding,
-            ..RouteDecision::branch(branch)
-        };
-        (selected, decision)
+        (selected, RouteDecision::branch(branch))
     }
 
     fn on_dispatch(
@@ -272,7 +255,6 @@ impl LoadBalancingPolicy for DpStickyPolicy {
         pool: &'static str,
         headers: Option<&http::HeaderMap>,
         worker: &Arc<dyn Worker>,
-        binding: Option<u64>,
     ) {
         let Some(session_id) = extract_sticky_routing_key(headers) else {
             return;
@@ -280,13 +262,9 @@ impl LoadBalancingPolicy for DpStickyPolicy {
         let Some(mut assignment) = self.assignments.get_mut(session_id) else {
             return;
         };
-        // A request placed before the session moved does not move it back.
-        if binding != Some(assignment.binding) {
-            return;
-        }
         let identity = Self::worker_identity(worker);
-        // Without a reassignment, only rank mapping can move a pinned session: a request
-        // placed on an earlier binding returned above.
+        // Without a reassignment, rank mapping moved the pinned session, or another in-flight
+        // request of the session took the reassignment.
         let reason = assignment
             .reassigned
             .take()
@@ -301,26 +279,21 @@ impl LoadBalancingPolicy for DpStickyPolicy {
         assignment.dispatched = Some(identity);
     }
 
-    /// A failed request placed on the session's current binding releases it:
-    /// the next request, a retry included, is placed again (`rebind`, or
-    /// `expired` after the idle timeout), away from every worker the session
-    /// failed on since its last hit while another one is healthy. The worker
-    /// avoided is the one the request was sent to, after DP rank mapping; under
-    /// ATOM PD idx2idx, a failed prefill also releases the decode binding,
-    /// although the decode was never sent. A request placed before the session
-    /// moved keeps the new binding, whenever it fails.
-    fn on_dispatch_failed(
-        &self,
-        headers: Option<&http::HeaderMap>,
-        worker: &Arc<dyn Worker>,
-        binding: Option<u64>,
-    ) {
+    /// A failure on the session's bound worker releases the binding: the next
+    /// request, a retry included, is placed again (`rebind`, or `expired`
+    /// after the idle timeout), away from every worker the session failed on
+    /// since its last hit while another one is healthy. Under ATOM PD idx2idx,
+    /// a failed prefill also releases the decode binding, although the decode
+    /// was never sent. A late failure on a worker the session has left keeps
+    /// the new binding; one from an older placement on the worker the session
+    /// is bound to again releases it, at the cost of one extra rebind.
+    fn on_dispatch_failed(&self, headers: Option<&http::HeaderMap>, worker: &Arc<dyn Worker>) {
         let Some(session_id) = extract_sticky_routing_key(headers) else {
             return;
         };
         let identity = Self::worker_identity(worker);
         if let Some(mut assignment) = self.assignments.get_mut(session_id) {
-            if binding == Some(assignment.binding) {
+            if assignment.worker == identity {
                 assignment.failed = true;
                 if !assignment.avoid.contains(&identity) {
                     assignment.avoid.push(identity);
@@ -520,15 +493,9 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
-        let (selected, decision) = policy.select_with_decision(workers, &info).await;
-        let selected = selected.unwrap();
-        policy.on_dispatch(pool, Some(&headers), &workers[selected], decision.binding);
+        let selected = policy.select_worker(workers, &info).await.unwrap();
+        policy.on_dispatch(pool, Some(&headers), &workers[selected]);
         selected
-    }
-
-    /// The session's current binding: the one its last placed request carries.
-    fn binding(policy: &DpStickyPolicy, session: &str) -> Option<u64> {
-        policy.assignments.get(session).map(|entry| entry.binding)
     }
 
     fn expire(policy: &DpStickyPolicy, session: &str) {
@@ -599,14 +566,8 @@ mod tests {
 
         // The pin stays on rank 0 while rank mapping dispatches to rank 1, 1, then 0.
         for dispatched in [1, 1, 0] {
-            let (selected, decision) = policy.select_with_decision(&ranks, &info).await;
-            assert_eq!(selected, Some(0));
-            policy.on_dispatch(
-                "prefill",
-                Some(&headers),
-                &ranks[dispatched],
-                decision.binding,
-            );
+            assert_eq!(policy.select_worker(&ranks, &info).await, Some(0));
+            policy.on_dispatch("prefill", Some(&headers), &ranks[dispatched]);
         }
 
         assert_eq!(
@@ -629,12 +590,11 @@ mod tests {
         };
 
         assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
-        let placed = binding(&policy, "session-1");
-        policy.on_dispatch_failed(Some(&headers), &workers[0], placed);
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
         // The retry avoids worker 0, where it failed.
         let (retry, decision) = policy.select_with_decision(&workers, &info).await;
         assert_eq!((retry, decision.branch), (Some(1), "rebind"));
-        policy.on_dispatch("regular", Some(&headers), &workers[1], decision.binding);
+        policy.on_dispatch("regular", Some(&headers), &workers[1]);
         assert_eq!(branch(&policy, &workers, &info).await, "hit");
 
         assert_eq!(
@@ -657,7 +617,7 @@ mod tests {
         };
 
         // Worker 1 holds fewer sessions, but s2 failed there.
-        policy.on_dispatch_failed(Some(&s2), &workers[1], binding(&policy, "s2"));
+        policy.on_dispatch_failed(Some(&s2), &workers[1]);
         let (retry, decision) = policy.select_with_decision(&workers, &info).await;
         assert_eq!((retry, decision.branch), (Some(0), "rebind"));
 
@@ -665,7 +625,7 @@ mod tests {
         let only = &workers[1..];
         assert_eq!(route(&policy, only, "regular", "s4").await, 0);
         let s4 = headers("s4");
-        policy.on_dispatch_failed(Some(&s4), &only[0], binding(&policy, "s4"));
+        policy.on_dispatch_failed(Some(&s4), &only[0]);
         let info = SelectWorkerInfo {
             headers: Some(&s4),
             ..Default::default()
@@ -689,14 +649,14 @@ mod tests {
         let s = headers("s");
 
         // a fails, then b: the next retry goes to c, not back to a.
-        policy.on_dispatch_failed(Some(&s), &workers[0], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&s), &workers[0]);
         assert_eq!(route(&policy, &workers, "regular", "s").await, 1);
-        policy.on_dispatch_failed(Some(&s), &workers[1], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&s), &workers[1]);
         assert_eq!(route(&policy, &workers, "regular", "s").await, 2);
 
         // A hit on c clears the set: a failure on c then avoids c alone.
         assert_eq!(route(&policy, &workers, "regular", "s").await, 2);
-        policy.on_dispatch_failed(Some(&s), &workers[2], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&s), &workers[2]);
         assert_eq!(route(&policy, &workers, "regular", "s").await, 0);
     }
 
@@ -711,22 +671,20 @@ mod tests {
         };
 
         assert_eq!(route(&policy, &workers, "regular", "session-1").await, 0);
-        let old = binding(&policy, "session-1");
         workers[0].set_healthy(false);
-        let (_, rebind) = policy.select_with_decision(&workers, &info).await;
-        assert_eq!(rebind.branch, "rebind");
+        assert_eq!(branch(&policy, &workers, &info).await, "rebind");
         // A request still running on worker 0 fails, before and after the
         // rebound session's next request is sent to worker 1.
-        policy.on_dispatch_failed(Some(&headers), &workers[0], old);
-        policy.on_dispatch("regular", Some(&headers), &workers[1], rebind.binding);
-        policy.on_dispatch_failed(Some(&headers), &workers[0], old);
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
+        policy.on_dispatch("regular", Some(&headers), &workers[1]);
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
         workers[0].set_healthy(true);
         let (selected, decision) = policy.select_with_decision(&workers, &info).await;
         assert_eq!((selected, decision.branch), (Some(1), "hit"));
     }
 
     #[tokio::test]
-    async fn a_failure_on_the_mapped_rank_places_the_session_again() {
+    async fn a_failure_off_the_bound_rank_keeps_the_binding() {
         let policy = DpStickyPolicy::new();
         let ranks = dp_workers();
         let headers = headers("session-1");
@@ -735,12 +693,13 @@ mod tests {
             ..Default::default()
         };
 
-        // The pin is rank 0; rank mapping sends the request to rank 1.
-        let (selected, decision) = policy.select_with_decision(&ranks, &info).await;
-        assert_eq!(selected, Some(0));
-        policy.on_dispatch("prefill", Some(&headers), &ranks[1], decision.binding);
-        policy.on_dispatch_failed(Some(&headers), &ranks[1], decision.binding);
-        assert_eq!(branch(&policy, &ranks, &info).await, "rebind");
+        // The pin is rank 0; the request is sent to rank 1 and fails there.
+        // Since the planner selects prefill on the decode rank, this happens only
+        // when health changed after planning, and the next request rebinds then.
+        assert_eq!(policy.select_worker(&ranks, &info).await, Some(0));
+        policy.on_dispatch("prefill", Some(&headers), &ranks[1]);
+        policy.on_dispatch_failed(Some(&headers), &ranks[1]);
+        assert_eq!(branch(&policy, &ranks, &info).await, "hit");
     }
 
     #[tokio::test]
@@ -756,13 +715,13 @@ mod tests {
         }
         let s = headers("s");
         assert_eq!(route(&policy, &workers, "regular", "s").await, 0);
-        policy.on_dispatch_failed(Some(&s), &workers[0], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&s), &workers[0]);
         assert_eq!(route(&policy, &workers, "regular", "s").await, 1);
 
         // A hit on b clears a from the set: a failure on b goes back to a,
         // the lighter of a and c.
         assert_eq!(route(&policy, &workers, "regular", "s").await, 1);
-        policy.on_dispatch_failed(Some(&s), &workers[1], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&s), &workers[1]);
         assert_eq!(route(&policy, &workers, "regular", "s").await, 0);
     }
 
@@ -778,7 +737,7 @@ mod tests {
         assert_eq!(route(&policy, &workers, "regular", "s").await, 0);
         // Worker 1 holds another session, so the tie would go back to worker 0.
         assert_eq!(route(&policy, &workers, "regular", "other").await, 1);
-        policy.on_dispatch_failed(Some(&headers), &workers[0], binding(&policy, "s"));
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
 
         workers.iter().for_each(|worker| worker.set_healthy(false));
         assert_eq!(policy.select_worker(&workers, &info).await, None);
@@ -789,9 +748,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_placed_before_a_rebind_keeps_the_new_binding() {
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _recorder = metrics::set_default_local_recorder(&recorder);
         let policy = DpStickyPolicy::new();
         let workers = workers();
         let headers = headers("session-1");
@@ -802,23 +758,46 @@ mod tests {
 
         // A PD relay request reserves decode worker 0; its decode is sent
         // after its prefill.
-        let (reserved, stale) = policy.select_with_decision(&workers, &info).await;
-        assert_eq!(reserved, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
         // Meanwhile another request of the session fails on worker 0, and the
         // next one is placed on worker 1 and sent there.
         assert_eq!(route(&policy, &workers, "decode", "session-1").await, 0);
-        policy.on_dispatch_failed(Some(&headers), &workers[0], binding(&policy, "session-1"));
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
         assert_eq!(route(&policy, &workers, "decode", "session-1").await, 1);
         // The first request's decode is now sent to worker 0 and fails.
-        policy.on_dispatch("decode", Some(&headers), &workers[0], stale.binding);
-        policy.on_dispatch_failed(Some(&headers), &workers[0], stale.binding);
+        policy.on_dispatch("decode", Some(&headers), &workers[0]);
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
 
         let (selected, decision) = policy.select_with_decision(&workers, &info).await;
         assert_eq!((selected, decision.branch), (Some(1), "hit"));
-        assert_eq!(
-            worker_changes(&handle.render()),
-            [r#"mesh_session_worker_change_total{pool="decode",reason="rebind"} 1"#]
-        );
+    }
+
+    /// The cost the worker check accepts: a session placed on worker 0, then 1,
+    /// then 0 again releases its new binding when a request from its first
+    /// placement fails late on worker 0. The session is placed once more.
+    #[tokio::test]
+    async fn an_older_failure_on_the_worker_the_session_returned_to_releases_it() {
+        let policy = DpStickyPolicy::new();
+        let workers = workers();
+        let headers = headers("session-1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        // The first placement's request is still running on worker 0.
+        assert_eq!(route(&policy, &workers, "decode", "session-1").await, 0);
+        workers[0].set_healthy(false);
+        assert_eq!(route(&policy, &workers, "decode", "session-1").await, 1);
+        workers[0].set_healthy(true);
+        workers[1].set_healthy(false);
+        assert_eq!(route(&policy, &workers, "decode", "session-1").await, 0);
+        workers[1].set_healthy(true);
+        // The old request fails on worker 0, where the session is bound again.
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
+
+        let (selected, decision) = policy.select_with_decision(&workers, &info).await;
+        assert_eq!((selected, decision.branch), (Some(1), "rebind"));
     }
 
     #[tokio::test]
@@ -833,15 +812,14 @@ mod tests {
 
         // A request placed on rank 0 is still running there when the
         // session fails on rank 0 and is placed again on rank 1.
-        let (_, stale) = policy.select_with_decision(&ranks, &info).await;
-        policy.on_dispatch("prefill", Some(&headers), &ranks[0], stale.binding);
-        policy.on_dispatch_failed(Some(&headers), &ranks[0], stale.binding);
-        let (selected, current) = policy.select_with_decision(&ranks, &info).await;
-        assert_eq!(selected, Some(1));
+        assert_eq!(policy.select_worker(&ranks, &info).await, Some(0));
+        policy.on_dispatch("prefill", Some(&headers), &ranks[0]);
+        policy.on_dispatch_failed(Some(&headers), &ranks[0]);
+        assert_eq!(policy.select_worker(&ranks, &info).await, Some(1));
         // Rank mapping sends the current request to rank 0, then the stale
         // request fails there.
-        policy.on_dispatch("prefill", Some(&headers), &ranks[0], current.binding);
-        policy.on_dispatch_failed(Some(&headers), &ranks[0], stale.binding);
+        policy.on_dispatch("prefill", Some(&headers), &ranks[0]);
+        policy.on_dispatch_failed(Some(&headers), &ranks[0]);
 
         let (selected, decision) = policy.select_with_decision(&ranks, &info).await;
         assert_eq!((selected, decision.branch), (Some(1), "hit"));

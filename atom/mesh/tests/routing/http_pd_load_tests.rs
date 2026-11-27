@@ -143,31 +143,24 @@ fn dispatch_with_headers(
     dispatch_with_policy(kind, p, d, streaming, headers, None, None)
 }
 
-/// A pool's policy and the binding its selection returned.
-type Placed = Option<(Arc<dyn LoadBalancingPolicy>, Option<u64>)>;
-
 fn dispatch_with_policy(
     kind: DispatchKind,
     p: &GatedServer,
     d: &GatedServer,
     streaming: bool,
     headers: Option<HeaderMap>,
-    prefill_policy: Placed,
-    decode_policy: Placed,
+    prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+    decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
 ) -> JoinHandle<Response> {
     let mut router = tests::create_test_pd_router();
     // As ATOM PD runs in CI; it maps only DP-aware workers.
     router.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
     router.atom_pd_concurrent = matches!(kind, DispatchKind::AtomConcurrent);
-    let mut prefill_binding = None;
-    let mut decode_binding = None;
-    if let Some((policy, binding)) = prefill_policy {
+    if let Some(policy) = prefill_policy {
         router.policy_registry.set_prefill_policy(policy);
-        prefill_binding = binding;
     }
-    if let Some((policy, binding)) = decode_policy {
+    if let Some(policy) = decode_policy {
         router.policy_registry.set_decode_policy(policy);
-        decode_binding = binding;
     }
     let prefill = p.worker.clone();
     let decode = d.worker.clone();
@@ -197,8 +190,6 @@ fn dispatch_with_policy(
                     decode,
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
-                    prefill_binding,
-                    decode_binding,
                     prefill_tokens: 7,
                 },
                 headers.as_ref(),
@@ -808,8 +799,8 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
             bootstrap_port: None,
         })
     };
-    let session_request = |p: &GatedServer, d: &GatedServer, binding: Option<u64>| {
-        let policy = Some((policy.clone(), binding));
+    let session_request = |p: &GatedServer, d: &GatedServer| {
+        let policy = Some(policy.clone());
         dispatch_with_policy(
             DispatchKind::Atom,
             p,
@@ -821,10 +812,10 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
         )
     };
 
-    let (selected, placed) = policy.select_with_decision(&decode, &info).await;
+    let (selected, _) = policy.select_with_decision(&decode, &info).await;
     assert_eq!(selected, Some(0));
     let mut p = prefill().await;
-    let task = session_request(&p, &a, placed.binding);
+    let task = session_request(&p, &a);
     p.wait_entered().await;
     p.respond(prefill_response());
     a.wait_entered().await;
@@ -835,10 +826,10 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
     // A is down, so the session rebinds to B. Neither a failed prefill nor an
     // unexecuted reservation sends anything to B.
     a.worker.set_healthy(false);
-    let (selected, placed) = policy.select_with_decision(&decode, &info).await;
+    let (selected, _) = policy.select_with_decision(&decode, &info).await;
     assert_eq!(selected, Some(1));
     let mut p = prefill().await;
-    let task = session_request(&p, &b, placed.binding);
+    let task = session_request(&p, &b);
     p.wait_entered().await;
     p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
     assert!(result(task).await.status().is_server_error());
@@ -850,8 +841,6 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
             decode: b.worker.clone(),
             prefill_policy: "round_robin",
             decode_policy: "dp_sticky",
-            prefill_binding: None,
-            decode_binding: placed.binding,
             prefill_tokens: 0,
         },
         Some(&headers),
@@ -862,10 +851,10 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
     assert_eq!(decode_dispatches(), 1);
 
     // The first request B receives is compared against A.
-    let (selected, placed) = policy.select_with_decision(&decode, &info).await;
+    let (selected, _) = policy.select_with_decision(&decode, &info).await;
     assert_eq!(selected, Some(1));
     let mut p = prefill().await;
-    let task = session_request(&p, &b, placed.binding);
+    let task = session_request(&p, &b);
     p.wait_entered().await;
     p.respond(prefill_response());
     b.wait_entered().await;
@@ -896,7 +885,7 @@ async fn a_decode_server_error_releases_the_session_binding_and_a_client_error_d
                 ..Default::default()
             };
 
-            let (selected, placed) = policy.select_with_decision(&decode, &info).await;
+            let (selected, _) = policy.select_with_decision(&decode, &info).await;
             assert_eq!(selected, Some(0));
             let task = dispatch_with_policy(
                 kind,
@@ -905,7 +894,7 @@ async fn a_decode_server_error_releases_the_session_binding_and_a_client_error_d
                 false,
                 Some(headers.clone()),
                 None,
-                Some((policy.clone(), placed.binding)),
+                Some(policy.clone()),
             );
             p.wait_entered().await;
             p.respond(prefill_response());
@@ -946,9 +935,9 @@ async fn a_prefill_server_error_releases_only_the_prefill_binding() {
             ..Default::default()
         };
 
-        let (selected, prefill_placed) = prefill_policy.select_with_decision(&prefill, &info).await;
+        let (selected, _) = prefill_policy.select_with_decision(&prefill, &info).await;
         assert_eq!(selected, Some(0));
-        let (selected, decode_placed) = decode_policy.select_with_decision(&decode, &info).await;
+        let (selected, _) = decode_policy.select_with_decision(&decode, &info).await;
         assert_eq!(selected, Some(0));
         let task = dispatch_with_policy(
             kind,
@@ -956,8 +945,8 @@ async fn a_prefill_server_error_releases_only_the_prefill_binding() {
             &d,
             false,
             Some(headers.clone()),
-            Some((prefill_policy.clone(), prefill_placed.binding)),
-            Some((decode_policy.clone(), decode_placed.binding)),
+            Some(prefill_policy.clone()),
+            Some(decode_policy.clone()),
         );
         p.wait_entered().await;
         p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
@@ -1010,7 +999,7 @@ async fn an_idx2idx_prefill_server_error_places_the_decode_session_again() {
             ..Default::default()
         };
 
-        let (selected, placed) = policy.select_with_decision(&decode, &info).await;
+        let (selected, _) = policy.select_with_decision(&decode, &info).await;
         assert_eq!(selected, Some(0));
         let task = dispatch_with_policy(
             kind,
@@ -1019,7 +1008,7 @@ async fn an_idx2idx_prefill_server_error_places_the_decode_session_again() {
             false,
             Some(headers.clone()),
             None,
-            Some((policy.clone(), placed.binding)),
+            Some(policy.clone()),
         );
         p.wait_entered().await;
         p.respond(StatusCode::SERVICE_UNAVAILABLE.into_response());
