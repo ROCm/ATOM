@@ -14,7 +14,8 @@ Example::
 `namespace`      prefix of this engine's pool names; two engines on one
                  server need different ones. Default "atom".
 `group`          share group; pools exchange blocks only within one. Derived
-                 from the model and KV format when empty.
+                 from the model and KV format when empty. Fabric requires an
+                 explicit model/revision group and appends a KV-format digest.
 `fetch`          copy prefixes in from other ranks' pools. Default true.
 `share_ratio`    fraction of the paged blocks UMBP manages and shares, in
                  (0, 1]. This process always allocates the pool; UMBP adopts

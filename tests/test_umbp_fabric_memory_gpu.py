@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
-"""Opt-in allocation accounting checks; no service or peer GPU is needed.
+"""GPU allocation accounting checks; no service or peer GPU is needed.
 
 Run on an idle FABRIC-capable GPU with the matching MORI package/extension:
-RUN_UMBP_FABRIC_GPU_TESTS=1 python -m pytest -s tests/test_umbp_fabric_memory_gpu.py
+python -m pytest -s tests/test_umbp_fabric_memory_gpu.py
 """
 
 import gc
 import json
-import os
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("RUN_UMBP_FABRIC_GPU_TESTS") != "1",
-    reason="set RUN_UMBP_FABRIC_GPU_TESTS=1 on an idle FABRIC-capable GPU",
+    not torch.version.hip or not torch.cuda.is_available(),
+    reason="requires a ROCm GPU",
 )
 
 _ARENA_BYTES = 64 << 20
@@ -26,15 +26,15 @@ _IN_DOUBT_ALLOCATIONS = []
 
 @pytest.mark.parametrize("transport", ["ipc", "fabric"])
 def test_pool_allocation_is_counted_by_torch(transport, record_property):
-    # Keep all runtime imports/probes behind the explicit opt-in marker.
-    import torch
-
     from atom.kv_transfer.pool.umbp.pool import UmbpPoolMemory
 
-    assert torch.cuda.is_available(), "this opt-in test requires a GPU"
-    assert (
-        torch.cuda.get_allocator_backend() == "native"
-    ), "allocated_bytes accounting requires the native caching allocator"
+    if torch.cuda.get_allocator_backend() != "native":
+        pytest.skip("allocated_bytes accounting requires the native caching allocator")
+    if transport == "fabric":
+        pytest.importorskip("mori.umbp_l1")
+        native = pytest.importorskip("mori_umbp_l1")
+        if getattr(native, "NATIVE_L1_FABRIC_VERSION", None) != 2:
+            pytest.skip("requires the native L1 FABRIC extension")
     device = torch.device("cuda", torch.cuda.current_device())
 
     # Initialize both zeroing paths before measuring, including their kernels.

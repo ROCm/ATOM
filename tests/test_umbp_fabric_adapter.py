@@ -4,6 +4,7 @@
 
 """CPU contracts for the native FABRIC allocation and PAGE layout adapter."""
 
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,7 +13,7 @@ import torch
 
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
 from atom.kv_transfer.pool.umbp import pool as umbp_pool
-from atom.kv_transfer.pool.umbp.pool import UmbpPoolMemory, pool_id_for
+from atom.kv_transfer.pool.umbp.pool import UmbpPoolMemory, pool_id_for, share_group_for
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 
 ADDRESS = "unix:///unused-umbp-l1.sock"
@@ -164,6 +165,22 @@ def test_default_settings_keep_the_ipc_pool_name():
     assert pool_id_for(config, settings, rank=1) == "atom:dp2:tp1"
 
 
+def test_old_extension_is_rejected_for_fabric_without_changing_ipc(monkeypatch):
+    module = SimpleNamespace(NATIVE_L1_FABRIC_VERSION=1, L1Client=Mock())
+    helpers = Mock(side_effect=AssertionError("unexpected native helper import"))
+    monkeypatch.setattr(umbp_pool, "_load_client_module", lambda: module)
+    monkeypatch.setattr(umbp_pool, "_load_native_l1_helpers", helpers)
+    with pytest.raises(RuntimeError, match="NATIVE_L1_FABRIC_VERSION=2"):
+        umbp_pool._connect(UmbpPoolSettings(ADDRESS, transport="fabric"))
+    module.L1Client.assert_not_called()
+    helpers.assert_not_called()
+    assert umbp_pool._connect(UmbpPoolSettings(ADDRESS)) == (
+        module,
+        module.L1Client.return_value,
+    )
+    helpers.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "node_id,group",
     [("", "compatible-kv"), ("tray-a", ""), (" ", "compatible-kv"), ("tray-a", " ")],
@@ -221,3 +238,49 @@ def test_ipc_pool_id_keeps_its_existing_namespace_even_with_node_id():
     )
     config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_rank=3))
     assert pool_id_for(config, settings, rank=2) == "other-engine:dp3:tp2"
+
+
+def test_fabric_group_tracks_format_without_depending_on_local_model_paths():
+    config = SimpleNamespace(
+        model="/tray-a/model",
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+        index_cache_layout=None,
+        kv_cache_block_size=128,
+        quant_config=SimpleNamespace(online_quant_config_raw={"mode": "fp8"}),
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            model="/tray-a/draft",
+            draft_kv_dtype="bf16",
+            num_speculative_tokens=2,
+        ),
+    )
+    settings = UmbpPoolSettings(ADDRESS, transport="fabric", group="model-revision")
+    expected = share_group_for(config, settings)
+    peer = deepcopy(config)
+    peer.model = "/tray-b/model"
+    peer.speculative_config.model = "/tray-b/draft"
+    assert share_group_for(peer, settings) == expected
+    assert expected.startswith("model-revision:atom-")
+    for field, value in (
+        ("kv_cache_dtype", "fp8"),
+        ("index_cache_dtype", "fp4"),
+        ("index_cache_layout", "opus"),
+        ("kv_cache_block_size", 64),
+        ("quant_config", SimpleNamespace(online_quant_config_raw=None)),
+        ("speculative_config", None),
+    ):
+        changed = deepcopy(config)
+        setattr(changed, field, value)
+        assert share_group_for(changed, settings) != expected, field
+    for field, value in (
+        ("method", "dspark"),
+        ("draft_kv_dtype", "fp8"),
+        ("num_speculative_tokens", 3),
+    ):
+        changed = deepcopy(config)
+        setattr(changed.speculative_config, field, value)
+        assert share_group_for(changed, settings) != expected, field
+    # IPC's explicit override remains verbatim, even across these formats.
+    ipc = UmbpPoolSettings(ADDRESS, group="model-revision")
+    assert share_group_for(config, ipc) == share_group_for(changed, ipc) == ipc.group

@@ -96,6 +96,11 @@ def _load_native_l1_helpers():
 def _connect(settings: UmbpPoolSettings):
     module = _load_client_module()
     if settings.transport == "fabric":
+        if getattr(module, "NATIVE_L1_FABRIC_VERSION", None) != 2:
+            raise RuntimeError(
+                "UMBP FABRIC needs the MORI extension with "
+                "NATIVE_L1_FABRIC_VERSION=2"
+            )
         _, require_native_l1_support = _load_native_l1_helpers()
         module = require_native_l1_support(module)
     return module, module.L1Client(settings.address)
@@ -119,7 +124,7 @@ def share_group_for(config, settings: UmbpPoolSettings) -> str:
     additionally refuses a pool whose per-region block sizes differ from its
     group's.
     """
-    if settings.group:
+    if settings.group and settings.transport != "fabric":
         return settings.group
     spec = config.speculative_config
     facts = {
@@ -132,7 +137,20 @@ def share_group_for(config, settings: UmbpPoolSettings) -> str:
         ),
         "draft": None if spec is None else [str(spec.method), str(spec.model)],
     }
+    if settings.transport == "fabric":
+        # Config has resolved the cache dtypes/layout before either process
+        # gets here. Model (including draft) revisions belong in the explicit
+        # group: their local filesystem paths need not match across trays.
+        del facts["model"]
+        facts["index_cache_layout"] = config.index_cache_layout
+        facts["draft"] = (
+            None
+            if spec is None
+            else [str(spec.method), spec.draft_kv_dtype, spec.num_speculative_tokens]
+        )
     digest = hashlib.sha1(json.dumps(facts, sort_keys=True).encode()).hexdigest()
+    if settings.transport == "fabric":
+        return f"{settings.group}:atom-{digest[:16]}"
     return f"atom-{digest[:16]}"
 
 
@@ -674,7 +692,9 @@ class UmbpPoolMemory(KVPoolMemory):
 
     def writes_issued(self) -> None:
         if self._closed or self._stopping.is_set():
-            raise RuntimeError(f"UMBP pool {self.pool_id}: memory is closing")
+            if self._native_memory is not None:
+                raise RuntimeError(f"UMBP pool {self.pool_id}: memory is closing")
+            return
         if self._mapped_base is None:
             return
         import torch
@@ -700,6 +720,7 @@ class UmbpPoolMemory(KVPoolMemory):
         issued = self._issued
         failed = False
         pending_stamp = None
+        retry_delay = 0.01
         while not self._stopping.is_set():
             if not issued and pending_stamp is None:
                 self._wake.clear()
@@ -721,9 +742,15 @@ class UmbpPoolMemory(KVPoolMemory):
                     time.sleep(0.0005)
                     continue
             try:
-                self._client.commit(self.pool_id, pending_stamp)
+                if self._native_memory is not None:
+                    # Bound reporter shutdown separately from memory teardown.
+                    # A timed-out Commit is not evidence that DMA has drained.
+                    self._client.commit(self.pool_id, pending_stamp, timeout_ms=1000)
+                else:
+                    self._client.commit(self.pool_id, pending_stamp)
                 pending_stamp = None
                 failed = False
+                retry_delay = 0.01
             except Exception:  # sharing degrades, serving goes on
                 if not failed:
                     logger.exception(
@@ -732,7 +759,13 @@ class UmbpPoolMemory(KVPoolMemory):
                         self.pool_id,
                     )
                 failed = True
-                self._stopping.wait(0.01)
+                if self._native_memory is not None:
+                    self._stopping.wait(retry_delay)
+                    retry_delay = min(retry_delay * 2, 1.0)
+                else:
+                    # Preserve IPC's existing behavior: the next completed
+                    # forward supplies a new cumulative progress stamp.
+                    pending_stamp = None
 
     def allocate(self, nbytes: int, device) -> Any:
         if self._device is not None:
@@ -815,9 +848,9 @@ class UmbpPoolMemory(KVPoolMemory):
         self._wake.set()
         if self._watcher is not None:
             # Keep IPC's bounded shutdown; FABRIC requires a drained reporter.
-            # MORI L1Client::Commit sets a 120-second gRPC deadline. Let an
-            # in-flight call return (or time out) before native close; a join
-            # timeout is not proof that the reporter has stopped using KV.
+            # FABRIC Commit uses a one-second RPC deadline. Let an in-flight
+            # call return before native close; a join timeout is not proof
+            # that the reporter has stopped using KV.
             # The later GPU synchronization and Detach have their own waits.
             self._watcher.join(timeout=None if self._native_memory is not None else 1.0)
         if self._native_memory is not None:

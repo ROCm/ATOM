@@ -183,7 +183,7 @@ def test_close_stops_reporter_and_is_idempotent(
     ready = threading.Event()
     attempts = []
 
-    def commit(*_):
+    def commit(*_, **kwargs):
         attempts.append(time.monotonic())
         if state == "retrying":
             if len(attempts) >= 3:
@@ -215,7 +215,10 @@ def test_close_stops_reporter_and_is_idempotent(
     assert memory._closed and memory._mapped_base is None and not memory._issued
     attempts_at_close = len(attempts)
     memory.close()
-    with pytest.raises(RuntimeError, match="memory is closing"):
+    if memory._native_memory is not None:
+        with pytest.raises(RuntimeError, match="memory is closing"):
+            memory.writes_issued()
+    else:
         memory.writes_issued()
     assert len(attempts) == attempts_at_close
     if memory._native_memory is not None:
@@ -223,7 +226,7 @@ def test_close_stops_reporter_and_is_idempotent(
         memory._client.detach.assert_not_called()
     else:
         memory._client.detach.assert_called_once_with("owner")
-    if state == "retrying":
+    if state == "retrying" and memory._native_memory is not None:
         assert len(attempts) >= 3
         assert all(b - a >= 0.008 for a, b in pairwise(attempts))
 
@@ -237,12 +240,13 @@ def test_fabric_close_waits_for_inflight_commit(owner, monkeypatch, commit_fails
     entered_join = threading.Event()
     errors = []
 
-    def commit(*_):
+    def commit(*_, timeout_ms):
+        assert timeout_ms == 1000
         entered_commit.set()
         assert finish_commit.wait(5), "test did not release the blocked Commit"
         if commit_fails:
             # Simulate the native client's gRPC deadline expiring, without
-            # making a CPU regression wait for the real 120-second deadline.
+            # making a CPU regression wait for the real RPC deadline.
             raise RuntimeError("Commit deadline exceeded")
 
     def detach():
@@ -308,6 +312,7 @@ def test_fabric_close_failure_preserves_state_for_retry(owner):
     assert native_memory.close.call_count == 2
 
 
+@pytest.mark.parametrize("owner", ["fabric"], indirect=True)
 @pytest.mark.parametrize("later_pending", [False, True])
 def test_commit_retries_only_completed_writes(owner, monkeypatch, later_pending):
     import torch
@@ -319,7 +324,7 @@ def test_commit_retries_only_completed_writes(owner, monkeypatch, later_pending)
     acknowledged = threading.Event()
     later = FakeEvent()
 
-    def commit(*_):
+    def commit(*_, **kwargs):
         if memory._client.commit.call_count == 1:
             first_attempt.set()
             assert allow_failure.wait(1)
@@ -345,3 +350,45 @@ def test_commit_retries_only_completed_writes(owner, monkeypatch, later_pending)
         later.set()
         assert acknowledged.wait(1)
         assert len(attempts) == 3 and attempts[2].args[1] > attempts[1].args[1]
+
+
+@pytest.mark.parametrize("owner", ["fabric"], indirect=True)
+def test_fabric_commit_backoff_is_capped_and_stops_with_the_owner(owner, monkeypatch):
+    memory, event = owner
+    delays = []
+
+    def wait(delay):
+        delays.append(delay)
+        if len(delays) == 9:
+            memory._stopping.set()
+        return memory._stopping.is_set()
+
+    monkeypatch.setattr(memory._stopping, "wait", wait)
+    memory._client.commit.side_effect = RuntimeError("UMBP unavailable")
+    memory._issued.append((1, event))
+    memory._report_progress()
+    assert delays == [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.0, 1.0]
+    assert memory._client.commit.call_count == len(delays)
+
+
+def test_ipc_failed_commit_waits_for_new_writes(owner):
+    memory, _ = owner
+    failed = threading.Event()
+    acknowledged = threading.Event()
+
+    def commit(*_):
+        if memory._client.commit.call_count == 1:
+            failed.set()
+            raise RuntimeError("UMBP unavailable")
+        acknowledged.set()
+
+    memory._client.commit.side_effect = commit
+    memory.writes_issued()
+    assert failed.wait(1)
+    assert not acknowledged.wait(0.05)
+    memory._client.commit.assert_called_once()
+    first_stamp = memory._client.commit.call_args.args[1]
+    memory.writes_issued()
+    assert acknowledged.wait(1)
+    assert memory._client.commit.call_args.args[1] > first_stamp
+    assert not memory._client.commit.call_args.kwargs
