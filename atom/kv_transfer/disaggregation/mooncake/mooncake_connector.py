@@ -20,7 +20,6 @@ import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, astuple, dataclass, field
-from pathlib import Path
 from typing import Any
 
 import msgpack
@@ -104,11 +103,11 @@ from atom.kv_transfer.disaggregation.types import (
     pair_units,
     produced_no_handoff,
 )
-from atom.kv_transfer.offload.mooncake_store.nic import gpu_pci_bdf, rail_rdma_device
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
-from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
+from atom.utils import envs, get_open_port, make_zmq_path, mooncake_hca, zmq_socket_ctx
 from atom.utils.network import get_ip
+from atom.utils.pci_topology import gpu_pci_bdf
 
 logger = logging.getLogger("atom")
 
@@ -157,7 +156,6 @@ KV_CACHE_READY_EVENT_TTL_S = 600.0
 # Requests whose ready event aged out are remembered up to this many, oldest
 # dropped first, so a late transfer still finds that its prefill is complete.
 KV_CACHE_READY_EXPIRED_MAX = 1 << 16
-_IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
 class SlotPool:
@@ -248,67 +246,6 @@ def _swa_ring_ids(seq) -> list[int]:
     return [int(slot)] if slot is not None and slot >= 0 else []
 
 
-def _ib_device_exists(device_name: str) -> bool:
-    return (_IB_SYSFS_ROOT / device_name).exists()
-
-
-def _auto_select_ib_device(gpu_bdf: str) -> str:
-    """The ACTIVE HCA behind the GPU's PCIe switch (HIP's order is not PCI order)."""
-    try:
-        return rail_rdma_device(gpu_bdf)
-    except ValueError as exc:
-        raise ValueError(f"{exc}; set ib_device or ATOM_MOONCAKE_IB_DEVICE") from None
-
-
-def _numbered_ib_device(index: int) -> str:
-    # Older environments expose HCAs as rdmaN. Spur MI350 fabric exposes them
-    # as ionic_N, so try ionic_N only when rdmaN is not present.
-    rdma_device = f"rdma{index}"
-    if _ib_device_exists(rdma_device):
-        return rdma_device
-    ionic_device = f"ionic_{index}"
-    if _ib_device_exists(ionic_device):
-        return ionic_device
-    return rdma_device
-
-
-def _parse_ib_devices(configured_devices: str) -> list[str]:
-    """Normalize a comma-separated Mooncake RDMA device filter."""
-    return list(
-        dict.fromkeys(
-            device.strip() for device in configured_devices.split(",") if device.strip()
-        )
-    )
-
-
-def _select_ib_devices(
-    protocol: str,
-    configured_devices: str,
-    gpu_bdf: str | None,
-    *,
-    enable_alternate_hca: bool = False,
-    hca_count: int = 8,
-) -> list[str]:
-    """Resolve the HCAs on which Mooncake registers this rank's GPU memory."""
-    if protocol.strip().lower() == "tcp":
-        return []
-    if configured_devices:
-        return _parse_ib_devices(configured_devices)
-    if gpu_bdf is None:
-        raise ValueError("the GPU's PCI address is required for RDMA device selection")
-
-    primary = _auto_select_ib_device(gpu_bdf)
-    devices = [primary]
-    if enable_alternate_hca:
-        if hca_count <= 0:
-            raise ValueError("ib_hca_count must be a positive integer")
-        for idx in range(hca_count):
-            device = _numbered_ib_device(idx)
-            if device not in devices and _ib_device_exists(device):
-                devices.append(device)
-    return devices
-
-
 def _discover_active_matched_rails(primary_device: str) -> list[str]:
     """Discover active HCAs in the primary's numbered device-name family."""
     family = re.fullmatch(r"(.*\D)(\d+)", primary_device)
@@ -319,10 +256,10 @@ def _discover_active_matched_rails(primary_device: str) -> list[str]:
         )
     pattern = re.compile(re.escape(family[1]) + r"(\d+)")
     try:
-        devices = list(_IB_SYSFS_ROOT.iterdir())
+        devices = list(mooncake_hca.IB_SYSFS_ROOT.iterdir())
     except OSError as exc:
         raise ValueError(
-            f"Cannot discover RDMA HCAs in {_IB_SYSFS_ROOT}; "
+            f"Cannot discover RDMA HCAs in {mooncake_hca.IB_SYSFS_ROOT}; "
             "set ATOM_MOONCAKE_MATCHED_RAILS to an explicit HCA list"
         ) from exc
 
@@ -368,7 +305,7 @@ def _resolve_matched_rails(
             )
         rails = _discover_active_matched_rails(ib_devices[0])
     else:
-        rails = _parse_ib_devices(value)
+        rails = mooncake_hca.parse_ib_devices(value)
     _validate_matched_rails(protocol, ib_devices, rails)
     return rails
 
@@ -386,36 +323,11 @@ def _validate_matched_rails(
             "disable ib_enable_alternate_hca and use at most one ib_device"
         )
     if ib_devices[0] not in matched_rails or any(
-        not _ib_device_exists(device) for device in matched_rails
+        not mooncake_hca.ib_device_exists(device) for device in matched_rails
     ):
         raise ValueError(
             "Matched rails must name existing local HCAs including the primary HCA"
         )
-
-
-def _select_ib_device(
-    protocol: str, configured_device: str, gpu_bdf: str | None
-) -> str:
-    """Resolve the Mooncake device filter without enabling RDMA for TCP.
-
-    Mooncake's TCP transport requires an empty device list. Passing a usable
-    HCA alongside ``protocol=tcp`` allows the transfer engine to activate RDMA
-    as an alternate path, which violates the caller's explicit transport
-    choice. RDMA-family transports retain the existing configured/automatic
-    device selection.
-    """
-    return ",".join(_select_ib_devices(protocol, configured_device, gpu_bdf))
-
-
-def _configure_mooncake_transport(protocol: str) -> None:
-    """Make Mooncake honor ATOM's explicit transport selection.
-
-    Legacy TransferEngine builds auto-discover installed HCAs independently
-    of the device filter. ``MC_FORCE_TCP`` is Mooncake's supported override
-    for preventing that implicit RDMA transport from being installed.
-    """
-    if protocol.strip().lower() == "tcp":
-        os.environ["MC_FORCE_TCP"] = "true"
 
 
 # ZMQ side-channel message types
@@ -1151,10 +1063,10 @@ class MooncakeConnector(KVConnectorBase):
         # By default, register only with the GPU's PCIe-local NIC. Alternate-HCA
         # mode registers a single engine on multiple NICs. On rail-isolated fabrics,
         # matched-rail mode instead selects a single-HCA engine per request.
-        _configure_mooncake_transport(self.protocol)
-        configured_ib_device = kv_transfer_config.get(
-            "ib_device", ""
-        ) or os.environ.get("ATOM_MOONCAKE_IB_DEVICE", "")
+        mooncake_hca.configure_transport(self.protocol)
+        configured_ib_device = (
+            kv_transfer_config.get("ib_device", "") or envs.ATOM_MOONCAKE_IB_DEVICE
+        )
         enable_alternate_hca = bool(
             kv_transfer_config.get("ib_enable_alternate_hca", False)
         )
@@ -1163,7 +1075,7 @@ class MooncakeConnector(KVConnectorBase):
         if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
             # The GPU this rank drives, whatever *_VISIBLE_DEVICES masks it.
             gpu_bdf = gpu_pci_bdf(torch.cuda.current_device())
-        ib_devices = _select_ib_devices(
+        ib_devices = mooncake_hca.select_ib_devices(
             self.protocol,
             configured_ib_device,
             gpu_bdf,

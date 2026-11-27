@@ -729,6 +729,7 @@ class TestPPLoopPublication:
             _run_then_publish_kv_events=run_then_publish,
             has_pending_kv_work=lambda: work == "kv",
             _advance_idle_kv_transfer=do_work,
+            _wait_for_input=lambda: None,
             _drain_kv_work_at_exit=lambda: None,
             kv_transfer_enabled=False,
             pp_transport=SimpleNamespace(recv_metadata=recv_metadata),
