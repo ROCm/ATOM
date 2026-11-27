@@ -61,7 +61,8 @@ class BlockPool(KVBlockPool):
     Both cached containers map a block to the `monotonic()` time it was
     released, so the PAGE checkpoint store can weigh the next cached block
     against its coldest image (`oldest_reusable_free`) instead of always
-    spending the cached block first.
+    spending the cached block first. Only that store reads the time, so it is
+    taken only once a store is attached (`stamp_release`); otherwise it is 0.
 
     `_cached` is an insertion-ordered mapping rather than a queue because
     `claim` takes a *named* block off the free list on every prefix hit: left
@@ -93,6 +94,7 @@ class BlockPool(KVBlockPool):
             raise ValueError("protected_ratio must be between 0 and 1")
         self.cache_policy = cache_policy
         self.protected_ratio = protected_ratio
+        self.stamp_release = False
         self._protected: OrderedDict[int, float] = OrderedDict()
         self._reused: set[int] = set()
         # `max_blocks` is how far `extend` may go, and so how many Block
@@ -398,11 +400,12 @@ class BlockPool(KVBlockPool):
         self._used.remove(block_id)
         self._free.add(block_id)
         if block.hash != -1:
+            released = monotonic() if self.stamp_release else 0.0
             if block_id in self._reused:
-                self._protected[block_id] = monotonic()
+                self._protected[block_id] = released
                 self._trim_protected()
             else:
-                self._cached[block_id] = monotonic()
+                self._cached[block_id] = released
             return
         heappush(self._vacant, block_id)
         # Stale entries are skipped, not removed, so the heap can outgrow the

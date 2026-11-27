@@ -263,6 +263,7 @@ class PageUnitCheckpointStore:
         offload_sink: bool = False,
     ):
         self.pool = pool
+        pool.stamp_release = True
         self.spec = spec
         # Whether anything downstream can carry a store. False leaves the
         # offload queue permanently empty and takes no pins, which is what a
@@ -369,11 +370,10 @@ class PageUnitCheckpointStore:
     def _next_victim(self, protected: int = -1) -> int:
         """Which eligible checkpoint to spend when the free list is short.
 
-        This is the eviction policy, and the only place it lives: least
-        recently used, which `_lru` already orders. A different policy
-        replaces this method and nothing else -- in particular it must not
-        touch `_is_evictable`, which is the eligibility rule three callers
-        share.
+        Least recently used, which `_lru` already orders. Whether it goes
+        before a cached prefix block is `_colder_than_cached`'s call. A
+        different policy must not touch `_is_evictable`, which is the
+        eligibility rule three callers share.
         """
         return next(self._evictable(protected), -1)
 
@@ -408,11 +408,12 @@ class PageUnitCheckpointStore:
         """Raise the free list to `count`, spending checkpoints where they are colder.
 
         Vacant units are taken first -- a caller asking for what is already
-        there evicts nothing. Past them, a take spends cached prefix blocks,
-        oldest release first, and a checkpoint last used before that block was
-        released is evicted instead (`_colder_than_cached`): both kinds of
-        reusable content compete in one LRU. Each eviction returns a whole
-        image's units, so the loop overshoots by at most one checkpoint.
+        there evicts nothing. Past them, a take spends cached prefix blocks in
+        `BlockPool._take_free`'s order, and a checkpoint last used before the
+        next such block was released is evicted instead
+        (`_colder_than_cached`): both kinds of reusable content compete in one
+        LRU. Each eviction returns a whole image's units, so the loop
+        overshoots by at most one checkpoint.
 
         Unreachable counts are refused before anything is spent. The loop
         alone gives up only once it has evicted everything it can, so a count
@@ -1120,7 +1121,8 @@ class PagedStateCheckpointCoordinator:
         self.checkpoints_orphaned = 0
         # Per live request, by `id(seq)` like `_pending`: the image it resumed
         # from (`begin_restore`) and the boundaries it stored
-        # (`take_checkpoint_ops`). Taken by `rerank_checkpoints`.
+        # (`take_checkpoint_ops`, `publish_midstep`). Taken by
+        # `rerank_checkpoints`.
         self._resumed_from: dict[int, int] = {}
         self._stored_by: dict[int, list[int]] = {}
         self.checkpoints_demoted = 0
@@ -1189,9 +1191,10 @@ class PagedStateCheckpointCoordinator:
         `take_checkpoint_ops` and READY one batch after that, the same two
         steps `checkpoint`'s boundaries take.
         """
-        del seq
         for slot, _pos, h in reservations:
             self._scratch_queued.append((h, slot))
+            if seq is not None:
+                self._stored_by.setdefault(id(seq), []).append(h)
 
     def cancel_midstep(self, reservations: list[tuple]) -> None:
         """Hand back scratch slots whose forward never ran."""

@@ -1016,6 +1016,22 @@ class TestRerankCheckpoints:
         assert c.store._lru[c.store.lookup(11)] != float("-inf")
         assert c.checkpoints_demoted == 0
 
+    def test_a_midstep_image_is_ranked_like_a_boundary(self):
+        c, _ = _snapshot_coordinator(2, readable_midstep=True)
+        self.store_for(c, _seq(0), 11)
+        turn2 = _seq(1)
+        turn2.midstep_anchor_pos = 40
+        self.resume(c, turn2, 11)
+        c.publish_midstep(c.reserve_midstep(turn2, [(40, 22)]), turn2)
+        c.take_checkpoint_ops()
+        c.complete_previous_batch()
+        assert c.store.contains(22)
+        c.rerank_checkpoints(turn2)
+
+        self.resume(c, _seq(2), 22)
+
+        assert c.checkpoints_demoted == 1
+
     def test_a_requests_own_image_is_rewarmed_when_it_finishes(self):
         c = self.coordinator()
         seq = _seq(0)
