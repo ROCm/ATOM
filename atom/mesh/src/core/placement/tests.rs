@@ -584,7 +584,7 @@ mod c_regular_planning {
                 tokens: Some(&[1u32, 2, 3]),
                 headers: None,
                 stream: false,
-                carries_media: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -603,6 +603,25 @@ mod c_regular_planning {
     }
 
     #[tokio::test]
+    async fn test_single_charges_the_prompt_only_when_streaming() {
+        let src = MockWorkerSource::new().add_worker(make_regular_http("http://m1-w:8000", "m1"));
+        let planner = make_planner(src, MockPolicySource::new());
+        let tokens = [1u32, 2, 3];
+        for (stream, charged) in [(true, 3), (false, 0)] {
+            let descriptor = RequestDescriptor {
+                stream,
+                ..make_descriptor(Some("m1"), None, Some(&tokens), None)
+            };
+            match planner.plan(&descriptor).await.unwrap() {
+                PlacementPlan::Single { prefill_tokens, .. } => {
+                    assert_eq!(prefill_tokens, charged, "stream={stream}");
+                }
+                other => panic!("expected Single, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_grpc_single_worker_excludes_http() {
         let src = MockWorkerSource::new()
             .add_worker(make_regular_http("http://h:8000", "m"))
@@ -617,7 +636,7 @@ mod c_regular_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -641,7 +660,7 @@ mod c_regular_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1004,6 +1023,24 @@ mod d_pd_planning {
     }
 
     #[tokio::test]
+    async fn test_pair_charges_the_prefill_worker_whether_or_not_streaming() {
+        let planner = make_planner(one_p_one_d_http("m"), MockPolicySource::new());
+        let tokens = [1u32, 2, 3, 4];
+        for stream in [true, false] {
+            let descriptor = RequestDescriptor {
+                stream,
+                ..make_descriptor(Some("m"), None, Some(&tokens), None)
+            };
+            match planner.plan(&descriptor).await.unwrap() {
+                PlacementPlan::Pair { prefill_tokens, .. } => {
+                    assert_eq!(prefill_tokens, 4, "stream={stream}");
+                }
+                other => panic!("expected Pair, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_http_1p1d_pair() {
         let planner = make_planner(one_p_one_d_http("m"), MockPolicySource::new());
         let plan = planner
@@ -1033,7 +1070,7 @@ mod d_pd_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1147,7 +1184,7 @@ mod d_pd_planning {
                 tokens: None,
                 headers: None,
                 stream: false,
-                carries_media: false,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1629,6 +1666,7 @@ mod f_atom_adapter {
             prefill_dp_size: 2,
             prefill_dp_rank: Some(1),
             decode_dp_rank: None,
+            carries_media: false,
         });
         let mut p = json!({"prompt": [1, 2, 3], "stream": true, "max_tokens": 10});
         let mut d = p.clone();
@@ -1794,6 +1832,7 @@ mod f_atom_adapter {
             prefill_dp_size: 4,
             prefill_dp_rank: Some(2),
             decode_dp_rank: Some(2),
+            carries_media: false,
         });
         let mut kv = json!({});
         adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
@@ -1848,6 +1887,7 @@ mod f_atom_adapter {
             prefill_dp_size: 1,
             prefill_dp_rank: None,
             decode_dp_rank: None,
+            carries_media: false,
         });
         let mut kv = json!({});
         let err = adapter.enrich_decode_kv(&mut kv, &ctx).unwrap_err();
@@ -2406,7 +2446,7 @@ mod h_integration {
             tokens: Some(&tokens),
             headers: Some(&headers),
             stream: false,
-            carries_media: false,
+            ..Default::default()
         };
 
         for _ in 0..2 {

@@ -72,6 +72,8 @@ skipped after a failed prefill adds none.
 | `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit on the worker the prompt ran on; today only `cache_aware`. |
 | `mesh_route_cache_estimate_error_ratio` | Histogram, ratio -1 to 1 | `pool` | Same requests: (estimated - actual) / prompt tokens. |
 | `mesh_kv_events_dropped_predictions_total` | Counter, prompts | `model`, `pool` | `--kv-events`: a prompt routed to a worker is left out of the KV index's predictions, as the writer of its partition is behind. The first drop in a partition also logs a warning. |
+| `mesh_kv_storage_lookups_total` | Counter, lookups | `source` (a store of `/kv_storage/sources`), `result`: `hit`, `miss`, `skipped`, `timeout`, `error`, `breaker_open`, `overloaded`, `unreadable` | `--kv-storage-weight` above 0: a request asks a store its candidate workers read what it holds of the prompt (see [below](#store-lookups)). |
+| `mesh_kv_storage_lookup_duration_seconds` | Histogram, seconds | `source` | The same, for each lookup sent to the store's pools: from its first request to its last answer, or to `--kv-storage-deadline-ms`. |
 | `mesh_prefix_hash_policy_branch_total` | Counter, decisions | `branch` | `prefix_hash`, the same branches without `pool`. Deprecated by [#3141] for `mesh_route_branch_total{policy="prefix_hash"}`. |
 
 Histogram buckets:
@@ -79,7 +81,9 @@ Histogram buckets:
 - prefix match ratio: 0, 0.1, 0.2, ..., 0.9, 0.95, 1;
 - selected worker's active requests: 0, 1, 2, 4, ..., 4096;
 - estimate error ratio: -1, -0.5, -0.25, -0.1, -0.05, -0.01, 0, 0.01, 0.05,
-  0.1, 0.25, 0.5, 1.
+  0.1, 0.25, 0.5, 1;
+- store lookup duration: `--prometheus-duration-buckets`, by default 0.001 to
+  240 s.
 
 ## Branches
 
@@ -223,7 +227,10 @@ match ratio only when it picked the worker holding the best match, which covers
 every `affinity` decision and any `relocate` that happened to pick it. With
 `--kv-events`, its `kv_affinity` decisions estimate the selection from the KV
 event index, short of the block of the prompt's last token, which the engine
-always computes. The
+always computes. With `--kv-storage-weight`, they add what the engine will load
+from the Mooncake Store the worker reads, by ATOM's load rule. When that store
+does not answer, the match rate counts the device cache alone and the decision
+has no estimate. The
 router drops the estimate when it sends the prompt to a different worker than
 the policy chose, because DP ranks keep separate KV caches; under
 `--atom-pd-rank-mapping-policy idx2idx` that takes a health or membership change
@@ -234,11 +241,34 @@ between planning and reservation.
 On the tree's branches, the two differ because the ratio counts characters
 while the engine counts tokens in blocks, and the tree does not see engine
 eviction, chat templates or KV offload. `kv_affinity` counts tokens: the
-blocks the index matches, short of the last token's block, over the prompt's
-tokens. It differs where the index is not the engine's cache at that moment:
-batches not applied yet, blocks evicted since, and predictions for a worker
-without exact events. A positive error means the router overestimated; a
+blocks the index matches, short of the last token's block, and with
+`--kv-storage-weight` what the engine will load from the store, over the
+prompt's tokens. It differs where the index is not the engine's cache at that
+moment: batches not applied yet, blocks evicted since, and predictions for a
+worker without exact events. A positive error means the router overestimated; a
 negative one means the engine reused more than predicted.
+
+### Store lookups
+
+With `--kv-storage-weight` above 0, `cache_aware` asks each Mooncake Store its
+candidate workers read what it holds of the prompt, by ATOM's keys, before
+choosing. `result` says how a lookup ended:
+
+- `skipped`: not asked, as the engine would load nothing past the device
+  cache's hit even if the store held the whole prompt.
+- `hit` or `miss`: the pools' answers say the store holds the prompt's first
+  chunks, or not its first one.
+- `timeout`: a request to the pools was still out at
+  `--kv-storage-deadline-ms`. The lookup has no answer at all, not even from
+  the pools that answered in time.
+- `error`: no pool answered for the first chunk past those held.
+- `breaker_open`: not asked, as 5 `timeout` or `error` lookups in a row opened
+  the store's breaker; after 10 s one lookup probes the store again.
+- `overloaded`: not asked, as its requests would take the store's lookups past
+  256 requests out to its pools.
+- `unreadable`: not asked, as the store failed ATOM's chain check.
+
+A lookup without an answer gives the workers that read the store no store hit.
 
 ## Example queries
 

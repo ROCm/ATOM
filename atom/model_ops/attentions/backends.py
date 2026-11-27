@@ -39,6 +39,7 @@ from atom.model_ops.attentions.token_layout.batch_ids import (
     build_cu_seqlens,
     build_query_layout,
 )
+from atom.model_ops.attentions.token_layout.decode import mrope_decode_positions
 from atom.model_ops.attentions.token_layout.prefill import (
     PrefillBatch,
     prefill_positions,
@@ -178,6 +179,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def ubatch_forward(self, metadata):
         """Keep parent resources alive until all microbatch work is enqueued."""
         return nullcontext()
+
+    def publish_draft_state(self, metadata):
+        """Publish target state-slot addresses consumed by the draft forward."""
 
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""
@@ -1166,19 +1170,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         width = scheduled_tokens if running_tokens is None else running_tokens
         positions = self._mrope_cpu_view(width)
         positions[:, scheduled_tokens:] = 0
-        lengths = batch.num_scheduled_tokens[: len(context_lens)]
-        offset = 0
-        for req_id, context_len, length in zip(batch.req_ids, context_lens, lengths):
-            start = int(context_len) - int(length)
-            stop = int(context_len)
-            delta = batch.mrope_position_deltas.get(req_id)
-            if delta is None:
-                base = np.arange(start, stop, dtype=np.int64)
-            else:
-                base = np.arange(start + int(delta), stop + int(delta), dtype=np.int64)
-            positions[:, offset : offset + int(length)] = base[None, :]
-            offset += int(length)
-
+        mrope_decode_positions(
+            batch.req_ids,
+            context_lens,
+            batch.num_scheduled_tokens[: len(context_lens)],
+            batch.mrope_position_deltas,
+            positions,
+        )
         return self._stage_mrope(width, group)
 
     @h2d_producer("early", runner="model_runner")
@@ -1242,7 +1240,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         group.publish()
 
     def decode_spans(self, batch: ScheduledBatch) -> tuple[int, np.ndarray, np.ndarray]:
-        """A pure-decode step's `(bs, per-request lengths, exclusive prefix sum)`.
+        """The decode region's `(bs, per-request lengths, exclusive prefix sum)`.
 
         One place, so no caller can pair a length vector with someone else's
         cumsum: both come off `num_scheduled_tokens` and the buffer
@@ -1252,7 +1250,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         bs = batch.total_seqs_num_decode
         return (
             bs,
-            batch.num_scheduled_tokens[:bs],
+            batch.num_scheduled_tokens[batch.total_seqs_num_prefill :],
             self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
         )
 
@@ -1705,6 +1703,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             )
         if state_ops.block_copies:
             self.copy_paged_blocks(state_ops.block_copies)
+        if batch.is_mixed:
+            return self.prepare_mixed(batch, running_bs, running_tokens, ubatch_slices)
         if is_prefill:
             built = self.prepare_prefill(
                 batch, running_bs, running_tokens, ubatch_slices, pcp_groups
@@ -1730,6 +1730,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     # `ReqGraph`s, each on `build_for_req_graph_capture`'s step
     # (`ModelRunner._record_prefill_req_graphs`). Empty: none.
     prefill_req_graph_sizes: tuple[int, ...] = ()
+
+    def prepare_mixed(self, batch, running_bs, running_tokens, ubatch_slices=None):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support mixed prefill+decode "
+            "batches: this metadata builder has no prepare_mixed. Disable "
+            "--enable-mixed-prefill-decode."
+        )
 
 
 class AttentionImpl(nn.Module):

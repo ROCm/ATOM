@@ -3,17 +3,18 @@
 
 A prefix hit starts a request's extend at ``P > 0``: SGLang's tree hands back
 the PAGEs below ``P`` (main rows and index planes, shared, read-only), but the
-request's STATE slot (window ring, compressor rings, Engram cursor) holds
-nothing at ``P``. Native ATOM rebuilds it by default, and SGLang's opt-in
-encoder replay the same way, and so does this module: recompute the ``R`` rows
-``[P - R, P)`` into the freshly reset slot, write no shared PAGE (ATOM's
-compress plan writes no group below ``write_from = P``), and seed the Engram
-history from the tokens before ``P - R``. The window rows below
-``P - R + 127`` see a truncated window: a bounded approximation, the one
-native ATOM defaults to (``Config.enable_encoder_swa_bounded_replay=True``,
-``R = 128``, ``REPLAY_ROWS``). SGLang's default is exact instead (its SWA pool
-keeps the window behind a hit); this module has no such pool and always
-replays. It matches native ATOM, not an exact recompute.
+request's STATE slot (window ring, compressor rings, Engram cursor, and under
+DSpark the draft's context windows) holds nothing at ``P``. Native ATOM
+rebuilds it by default, and SGLang's opt-in encoder replay the same way, and so
+does this module: recompute the ``R`` rows ``[P - R, P)`` into the freshly
+reset slot, write no shared PAGE (ATOM's compress plan writes no group below
+``write_from = P``), and seed the Engram history from the tokens before
+``P - R``. The window rows below ``P - R + 127`` see a truncated window: a
+bounded approximation, the one native ATOM defaults to
+(``Config.enable_encoder_swa_bounded_replay=True``, ``R = 128``,
+``REPLAY_ROWS``). SGLang's default is exact instead (its SWA pool keeps the
+window behind a hit); this module has no such pool and always replays. It
+matches native ATOM, not an exact recompute.
 
 The ``R`` rows run as native ATOM runs them (``BlockManager.replay_start``):
 inside the step's own forward, prepended to the hit request's span. ATOM sees
@@ -93,6 +94,18 @@ PAGE rows (``deepseek_v41_bridge.HostPageRows``) stay valid: a radix checkpoint
 rewrites a live request's row in place, so every
 ``UnifiedRadixCache.checkpoint_into_tree`` drops that slot's host copy
 (``_install_checkpoint_invalidation``), and the next decode reads it again.
+The same invalidation keeps an EXTEND's rows copied at its allocation
+(``deepseek_v41_bridge.ExtendRowRead``) valid under radix: the copy holds the
+hit's prefix pages (``alloc_for_extend`` writes them with the extend's own)
+and is refused if a checkpoint rewrote one of its rows after it was queued.
+
+Prefill token graphs (``deepseek_v41_bridge.prefill_token_graph_bucket``): a
+fused step pads to the bucket holding its widened rows, as native pads a
+replaying prefill: every launch outside the model's eager regions is sized by
+the token count alone, and the replay itself (slot reset at ``P - R``, no
+global write below ``P``, Engram history) is staged metadata the eager
+attention / Engram regions read. ``trim_output`` selects SGLang's rows out of
+the bucket.
 
 Refused while radix is on (``deepseek_v41_bridge``): mixed chunk (the seam
 serves EXTEND batches only), session radix cache, KV storage backends
@@ -101,6 +114,41 @@ elsewhere) and a custom radix backend. Disabled chunked prefill is refused
 for every launch, and SGLang itself refuses unified memory (the only KV
 relocation) for this model. With ``--disable-radix-cache`` nothing here is
 installed.
+
+DSpark (SGLang's ``DSparkWorkerV2`` over the V4.1 target, the one speculative
+deployment the bridge serves) runs under the replay unchanged, as native ATOM
+runs DSpark under its prefix cache:
+
+- The draft's per-request state is its three context windows (draft layers
+  40-42), rings in the request's own STATE slot beside the target's 40 (native
+  ``docs/deepseek_v41_dspark.md``: "43 request-owned windows"). The Markov
+  head carries nothing across rounds (its bias is ``W1[x_{k-1}]`` inside a
+  block), SGLang's next draft input is the prefill's bonus token and
+  ``seq_lens``, and the verify's tentative state is committed inside its own
+  round, before any prefill is staged (``require_committed``). So a hit
+  needs exactly what the target needs: the slot rebuilt below ``P``.
+- The rebuild is the replay's own forward. The target wrapper writes the
+  draft's context rows from every row its forward ran
+  (``V41DSparkTargetSurface.finish_forward``, native ``compute_draft_kv``'s
+  "every scheduled row is written"): the widened forward's rows, ``[P - R, P)``
+  included. Native does the same: ``BlockManager.replay_start`` starts a hit's
+  forward a hash block (128 rows) below it and ``compute_draft_kv`` runs on
+  that forward's positions. ``R >= window`` (128, the draft's window too)
+  covers the first draft block's context ``[L - 128, L)``.
+- Decoder SWA bounded replay stays on under DSpark (as natively): a hit's
+  widened span ``[P - R, L)`` is at least the window long, so the step
+  replays, the late layers (and the draft taps on them) run on its last 128
+  rows ``[L - 128, L)`` alone and ``write_context_kv`` writes exactly those --
+  the first draft block's context, reaching into ``[P - R, P)`` when
+  ``L - P < 128``.
+- SGLang's DSpark injection (``write_target_hidden_kv``) still sees only
+  SGLang's rows ``[P, L)``: the wrapper gathers them out of the widened aux.
+  SGLang keeps its own draft KV for ``[0, P)`` in the tree's token slots;
+  this draft has none outside the slot's windows, so there is nothing to
+  reuse and nothing stale.
+- Verify and draft-block graphs never see a hit: the replay runs only on an
+  EXTEND (``is_extend_without_speculative``), and the first verify after it
+  stages off a committed slot like any other.
 
 Radix on by default for V4.1 on the plugin: whenever SGLang's radix cache is
 on (no ``--disable-radix-cache``) and ATOM serves the model. ``ATOM_SGLANG_V41_RADIX=0``

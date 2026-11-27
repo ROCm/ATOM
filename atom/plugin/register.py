@@ -368,6 +368,10 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
     def _is_dsv4_or_glm52_runner(runner) -> bool:
         return _is_dsv4_runner(runner) or _is_glm52_runner(runner)
 
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        _is_v41_runner as _is_dsv41_runner,
+    )
+
     def _uses_glm52_generic_draft_frontend(runner) -> bool:
         model = getattr(runner, "model", None)
         return bool(getattr(model, "_atom_glm52_uses_generic_draft_frontend", False))
@@ -464,8 +468,22 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
         def can_run(self, forward_batch):
             try:
-                model_runner = getattr(self, "model_runner", None)
-                is_supported_model = _is_dsv4_or_glm52_runner(model_runner)
+                # Both model checks are decided once per graph runner (its
+                # model runner is fixed), not on every decode / verify step.
+                # DeepSeek-V4.1 shares V4's architecture name in SGLang but
+                # stages its own graphs (verify and DSpark draft block,
+                # `deepseek_v41_bridge`); the V4 verify-graph knobs below are
+                # not its.
+                verdict = self.__dict__.get("_atom_v4_graph_knobs")
+                if verdict is None:
+                    model_runner = getattr(self, "model_runner", None)
+                    verdict = (
+                        _is_dsv4_or_glm52_runner(model_runner)
+                        and not _is_dsv41_runner(model_runner),
+                        _is_glm52_runner(model_runner),
+                    )
+                    self._atom_v4_graph_knobs = verdict
+                is_supported_model, is_glm52 = verdict
                 mode = getattr(forward_batch, "forward_mode", None)
                 is_target_verify = bool(
                     getattr(mode, "is_target_verify", lambda: False)()
@@ -479,7 +497,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 # that replay on for every supported model; a 6-token prompt
                 # then faults inside the replayed kernel. Eager verify uses
                 # the live length. DeepSeek-V4 still follows the flag.
-                if _is_glm52_runner(model_runner) and is_target_verify:
+                if is_glm52 and is_target_verify:
                     return False
                 if (
                     is_supported_model

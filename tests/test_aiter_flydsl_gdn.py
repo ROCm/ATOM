@@ -434,7 +434,10 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
     from atom.model_ops import attention_gdn as gdn
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
-    from atom.model_ops.fla_ops.replayssm import replayssm_buffer_shapes
+    from atom.model_ops.fla_ops.replayssm import (
+        replayssm_buffer_shapes,
+        replayssm_flush_wait,
+    )
     from atom.utils import envs
 
     if mode == "flydsl" and not ON_GFX942:
@@ -451,6 +454,8 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
         replay_buf_k=torch.zeros((3, *sk), device="cuda", dtype=torch.bfloat16),
         replay_buf_u=torch.zeros((3, *su), device="cuda", dtype=torch.bfloat16),
         replay_buf_g=torch.zeros((3, *sg), device="cuda", dtype=torch.float32),
+        replay_flush_arrivals=torch.zeros(3, 24, device="cuda", dtype=torch.int32),
+        replay_flush_wait=replayssm_flush_wait(),
     )
     attention = gdn.GatedDeltaNet.__new__(gdn.GatedDeltaNet)
     torch.nn.Module.__init__(attention)
@@ -543,6 +548,7 @@ def test_replayssm_checkpoint_from_flydsl_prefill_matches_triton(lengths, state_
     verify replays. Both prefill kernels must leave the same one."""
     from atom.model_ops.fla_ops.replayssm import (
         replayssm_buffer_shapes,
+        replayssm_flush_wait,
         replayssm_gated_delta_rule,
     )
 
@@ -615,6 +621,8 @@ def test_replayssm_checkpoint_from_flydsl_prefill_matches_triton(lengths, state_
             ckpt=ckpt,
             buf_k=torch.zeros((slots, *shape_k), device="cuda", dtype=torch.bfloat16),
             buf_u=buf_u,
+            flush_arrivals=torch.zeros(slots, 24, device="cuda", dtype=torch.int32),
+            flush_wait=replayssm_flush_wait(),
             buf_g=torch.zeros((slots, *shape_g), device="cuda", dtype=torch.float32),
             write_pos=torch.zeros(slots, device="cuda", dtype=torch.int32),
             slot_idx=writes,
