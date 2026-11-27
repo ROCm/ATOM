@@ -666,6 +666,10 @@ class EngineCore:
             # Ordered after the completed forward on every worker, including
             # final/aborted requests when there will be no subsequent batch.
             self.runner_mgr.call_func("release_multimodal_requests", request_ids)
+        if envs.ATOM_MLA_NVFP4 and sequences:
+            self.runner_mgr.call_func(
+                "release_nvfp4_tails", [seq.id for seq in sequences]
+            )
 
     def _process_engine_step_inner(self):
         # Clear before scheduling/polling, never between checking progress and

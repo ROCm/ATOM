@@ -54,6 +54,12 @@ from atom.model_ops.attention_mla import (
     mla_dense_min_query_heads,
     mla_kernel_num_heads,
 )
+from atom.model_ops.attentions.nvfp4_hp_ring import Nvfp4HpRing
+from atom.model_ops.attentions.nvfp4_mla import (
+    NVFP4_HEADS,
+    NVFP4_PAGE,
+    Nvfp4MlaCache,
+)
 from atom.model_ops.attentions.selection_pack import (
     pack_row_selections,
 )
@@ -517,6 +523,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Set by `allocate_kv_cache_tensors`, which runs long after
         # construction -- on the P/D decode side too, over the imported pool.
         self.kv_pool: MlaKvPool | None = None
+        # The NVFP4 pages and the BF16 tail of each request's open tile. None
+        # unless ATOM_MLA_NVFP4 is set; the FP8 pool does not allocate one.
+        self.nvfp4_cache: Nvfp4MlaCache | None = None
+        # Its tail and the step's page CSR (`_allocate_nvfp4_buffers`).
+        self._nvfp4_ring: Nvfp4HpRing | None = None
+        self._nvfp4_csr: tuple[torch.Tensor, ...] | None = None
         # Each prefill batch's host-side sparse plan, by buffer prefix, from
         # `_stage_prefill_batch` to `_finish_prefill_batch`; None for a dense
         # one.
@@ -778,6 +790,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         mla_metadata["kv_last_page_lens"].cpu.fill_(1)
         mla_metadata["kv_last_page_lens"].copy_to_gpu()
+        if envs.ATOM_MLA_NVFP4:
+            # Each row's BF16 tail-ring row, staged per step with the other
+            # decode metadata so a captured graph reads the same address.
+            mla_metadata["nvfp4_tail_slots"] = CpuGpuBuffer(
+                self.max_bs, publication_group="mla_csr", **i32_kwargs
+            )
         if self.is_sparse:
             mla_metadata["cu_seqlen_ks"] = CpuGpuBuffer(
                 self.max_num_batched_tokens,
@@ -1005,6 +1023,35 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if config.enable_tbo:
             self._allocate_ubatch_buffers(max_seqlen_qo)
+        if envs.ATOM_MLA_NVFP4:
+            self._allocate_nvfp4_buffers()
+
+    def _allocate_nvfp4_buffers(self) -> None:
+        """The NVFP4 BF16 tail and the step's page CSR, before the memory
+        profile, so the KV budget counts them like the other workspaces.
+
+        Both scale with `max_bs`, not with the page count, and neither is a
+        view of the pool, so they stay allocated across a sleep.
+        """
+        self._check_nvfp4_supported()
+        runner = self.model_runner
+        layers = self._kv_pool_layers()
+        if not layers:
+            return
+        self._nvfp4_ring = Nvfp4HpRing(
+            self.max_bs + 1,
+            layers,
+            mla_kv_entry_dim(runner.config.hf_config),
+            device=runner.device,
+        )
+        # Fixed addresses, so a captured decode reads whatever
+        # `_build_nvfp4_csr` wrote this step.
+        i32 = {"dtype": torch.int32, "device": runner.device}
+        self._nvfp4_csr = (
+            torch.zeros(self.max_bs + 1, **i32),
+            torch.zeros(self.max_bs * self.block_table_cols, **i32),
+            torch.zeros(self.max_bs, **i32),
+        )
 
     def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
         # Ready together before `kv_indices_generate_triton`, the step's first
@@ -1015,6 +1062,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "sparse_kv_indptr",
             "index_row_ends",
             "index_mtp_row_ends",
+            "nvfp4_tail_slots",
         )
         sparse_prefill = (
             "cu_seqlen_ks",
@@ -1490,6 +1538,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def release_kv_pools(self) -> None:
         if self.kv_pool is not None:
             self.kv_pool.release()
+        if self.nvfp4_cache is not None:
+            # The cache and every layer's `impl.nvfp4` hold views of the FP4
+            # planes; `allocate_kv_cache_tensors` builds a new cache on wake.
+            for module in self.pool_rows.get(MLA_ROWS, {}):
+                getattr(module, "impl", module).nvfp4 = None
+            self.nvfp4_cache = None
 
     def _module_kinds(self, module) -> tuple:
         """One row space: the MLA layers, target and shared draft alike."""
@@ -1540,13 +1594,64 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if runner.has_mla_indexer
             else {}
         )
+        nvfp4 = bool(envs.ATOM_MLA_NVFP4)
+        if nvfp4:
+            self._check_nvfp4_supported()
         return MlaKvPool(
             layers=self._kv_pool_layers(),
             block_size=runner.block_size,
             entry_dim=mla_kv_entry_dim(hf_config),
             kv_dtype=kv_cache_torch_dtype(runner.config.kv_cache_dtype),
+            nvfp4=nvfp4,
             **indexer,
         )
+
+    def _check_nvfp4_supported(self) -> None:
+        """NVFP4 replaces the FP8 cache, so every reader of that cache is out.
+
+        Prefill attends to the forward's own K/V and never reads history, so a
+        prefill over cached context (prefix hit, chunked prefill) has nothing to
+        read. The shader is one query, 128 heads, page 64. A request's tail row
+        is freed by `EngineCore._release_request_resources`, which the
+        pipeline-parallel and RapidServe engine loops do not reach, and KV
+        transfer has no layout for the FP4 planes or the tail.
+        """
+        runner = self.model_runner
+        config = runner.config
+        problems = []
+        if runner.block_size != NVFP4_PAGE:
+            problems.append(f"block_size={runner.block_size} (needs {NVFP4_PAGE})")
+        if self.num_attention_heads != NVFP4_HEADS:
+            problems.append(
+                f"{self.num_attention_heads} query heads per rank (needs "
+                f"{NVFP4_HEADS}: tp=1 or --enable-dp-attention)"
+            )
+        if config.enable_prefix_caching:
+            problems.append("prefix caching")
+        if config.enable_chunked_prefill:
+            problems.append("chunked prefill")
+        if runner.has_mla_indexer:
+            problems.append("sparse MLA indexer")
+        if config.speculative_config is not None:
+            problems.append("speculative decoding")
+        if config.decode_context_parallel_size > 1:
+            problems.append("decode context parallel")
+        if config.prefill_context_parallel_size > 1:
+            problems.append("prefill context parallel")
+        # TBO splits a decode into micro-batches with their own metadata, which
+        # the NVFP4 tail rows and CSR are not built for.
+        if config.enable_tbo or config.enable_tbo_decode:
+            problems.append("two-batch overlap")
+        if config.pipeline_parallel_size > 1:
+            problems.append("pipeline parallelism")
+        if config.enable_rapidserve:
+            problems.append("RapidServe")
+        if config.kv_transfer_config:
+            problems.append("KV transfer")
+        if problems:
+            raise RuntimeError(
+                "ATOM_MLA_NVFP4 cannot run with: " + ", ".join(problems) + "."
+            )
 
     def _supports_dcp_index_staging(self) -> bool:
         """Whether producer index pages can be gathered into DCP consumer pages.
@@ -1570,6 +1675,30 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         hf_config = runner.config.hf_config
         self.kv_pool = self._declare_kv_pool()
         self.kv_pool.allocate(blocks, runner.device, buf=buf)
+        self.nvfp4_cache = None
+        layers = self._kv_pool_layers()
+        if self.kv_pool.nvfp4 and layers:
+            # The paged pool is the FP4 cache: one scheduler block is one page,
+            # so `blocks` is the page count. No FP8 rows are allocated.
+            nope, aux = self.kv_pool.field("kv_nope"), self.kv_pool.field("kv_aux")
+            self.nvfp4_cache = Nvfp4MlaCache(
+                layers,
+                blocks,
+                self.max_bs,
+                mla_kv_entry_dim(hf_config),
+                device=runner.device,
+                kv_nope=nope,
+                kv_aux=aux,
+                ring=self._nvfp4_ring,
+            )
+            logger.info(
+                "NVFP4 MLA cache: %d layers x %d pages, %.1f GiB FP4 (paged pool, "
+                "no FP8 rows) + %.2f GiB BF16 tail",
+                layers,
+                blocks,
+                self.kv_pool.pool_bytes(blocks) / 2**30,
+                self.nvfp4_cache.ring.nbytes() / 2**30,
+            )
         out: dict = {}
         if runner.has_mla_indexer:
             index_cache_layer_ids, _ = self._index_cache_layout()
@@ -1602,9 +1731,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # The row the sizing walk gave this module. Its `layer_num` would
         # agree only while every layer of the model is MLA and this is stage 0.
         row = self.pool_rows[MLA_ROWS][module]
-        # The pool's slice is `[blocks, rows, dim]`; MLA addresses by row, so
-        # the block axis folds away. Contiguous, so this is a view.
-        kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
+        if self.kv_pool.nvfp4:
+            # `k_cache` is the C plane, `[pages, 16384]` uint8. No FP8 writer
+            # or reader runs under NVFP4; the planes are reached through impl.nvfp4.
+            kv_cache = self.kv_pool.layer("kv_nope", row)
+        else:
+            # The pool's slice is `[blocks, rows, dim]`; MLA addresses by row,
+            # so the block axis folds away. Contiguous, so this is a view.
+            kv_cache = self.kv_pool.layer("kv", row).view(-1, 1, self.kv_pool.entry_dim)
         module.max_model_len = runner.config.max_model_len
         index_cache = None
         index_scale = None
@@ -1646,6 +1780,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     -1, 1, runner.aligned_index_dim
                 )
         module.kv_cache = kv_cache
+        # `module` is the paged Attention wrapper; MLAAttention.forward_impl
+        # runs on its `impl` and reads the NVFP4 cache from there.
+        impl = getattr(module, "impl", module)
+        impl.nvfp4 = self.nvfp4_cache
+        impl.nvfp4_layer = row
+        if self.nvfp4_cache is not None:
+            # prepare_mla_nvfp4_params refuses to run inside a graph capture,
+            # so build it here, long before the first one.
+            self.nvfp4_cache.params(impl.scale)
         return KVCacheTensor(
             layer_num=module.layer_num,
             k_cache=kv_cache,
@@ -1668,6 +1811,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         runner = self.model_runner
         if self.kv_pool is None:
+            return None
+        if self.kv_pool.nvfp4:
+            # P/D transports and offload parse one packed latent region per
+            # layer; the FP4 planes are not that layout, and
+            # `_check_nvfp4_supported` refuses KV transfer.
             return None
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
@@ -2068,7 +2216,47 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             batch, running_bs, running_tokens, group
         )
         self._attach_selection(attn_metadata)
+        if self.nvfp4_cache is not None and not batch.is_dummy_run:
+            prefill = self.prefill_batch(batch, running_tokens)
+            rows = self.nvfp4_cache.bind_rows(batch.req_ids[: prefill.scheduled_bs])
+            attn_metadata.nvfp4_tail_rows_host = rows.tolist()
+            try:
+                # One plan for every layer, so a layer's FP4 write is a gather
+                # and one producer launch rather than a loop over tiles.
+                plan = self.nvfp4_cache.plan_prefill(
+                    rows, prefill.cached_lens, prefill.seqlens_q, prefill.block_tables
+                )
+            except ValueError:
+                plan = None
+            attn_metadata.nvfp4_prefill_plan = (
+                None if plan is None else self.nvfp4_cache.upload_plan(plan)
+            )
         return attn_metadata, positions
+
+    def _build_nvfp4_csr(self, attn_metadata, running_bs: int) -> None:
+        """The step's page64 CSR, once for all layers, into fixed buffers.
+
+        Runs outside any graph, after the step's metadata upload on the same
+        stream (as `kv_indices_generate_triton` does), so a replayed decode
+        reads this step's CSR.
+        """
+        if self.nvfp4_cache is None:
+            return
+        from aiter.mla import mla_decode_prepare_page_csr
+
+        indptr, indices, last = self._nvfp4_csr
+        mla_decode_prepare_page_csr(
+            attn_metadata.context_lens[:running_bs],
+            attn_metadata.block_tables[:running_bs],
+            indptr[: running_bs + 1],
+            indices,
+            last[:running_bs],
+        )
+        attn_metadata.nvfp4_csr = (indptr, indices, last)
+
+    def release_nvfp4_tails(self, request_ids) -> None:
+        if self.nvfp4_cache is not None:
+            self.nvfp4_cache.release(request_ids)
 
     def stage_ubatch_prefill(self, batch, attn_metadata, ubatches, pcp_groups):
         groups = super().stage_ubatch_prefill(
@@ -3522,6 +3710,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             counts["index_mtp_row_ends"] = running_tokens
         if self.dcp_world_size > 1:
             counts["g_kv_indptr"] = running_bs + 1
+        if self.nvfp4_cache is not None:
+            # Padding rows (past the scheduled requests) point at the scratch
+            # row, so the captured graph can run the full padded batch.
+            reqs = () if batch.is_dummy_run else batch.req_ids[:scheduled_bs]
+            var["nvfp4_tail_slots"].np[:running_bs] = self.nvfp4_cache.bind_rows(
+                reqs, pad_to=running_bs
+            )
+            counts["nvfp4_tail_slots"] = running_bs
         group.set_counts(counts)
         ctx["block_tables"] = block_table_state(var["block_tables"]).stage(
             running_bs, group
@@ -3537,6 +3733,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         attn_metadata.dtype_q = self.dtype_q
+        if self.nvfp4_cache is not None:
+            attn_metadata.nvfp4_tail_slots = var["nvfp4_tail_slots"].gpu[:running_bs]
 
         # Round-robin CP global kv_indptr (only under DCP; None otherwise so the
         # non-DCP / qlen=1 paths keep the plain kernel). Consumed by
@@ -3588,6 +3786,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.block_ratio,
             attn_metadata.max_seqlen_k,
         )
+        self._build_nvfp4_csr(attn_metadata, running_bs)
 
         is_sparse_mtp = self.is_sparse and max_seqlen_q > 1
         if is_sparse_mtp:
@@ -3796,6 +3995,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.capture_ubatch_decode(
                 attn_metadata, bs, decode_ubatch_slices, max_q_len
             )
+        if self.nvfp4_cache is not None:
+            # No request is live in a capture: every row uses the scratch tail
+            # row, and its slot (PAD) makes the FP4 producer skip the write.
+            tail = var["nvfp4_tail_slots"]
+            tail.acquire_write()
+            tail.np[:bs] = self.nvfp4_cache.pad_row
+            tail.copy_to_gpu(bs)
+            attn_metadata.nvfp4_tail_slots = tail.gpu[:bs]
+            self._build_nvfp4_csr(attn_metadata, bs)
         positions = var["positions"].copy_to_gpu(scheduled_tokens)
         context = Context(
             positions=positions,

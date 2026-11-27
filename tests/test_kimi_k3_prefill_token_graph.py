@@ -42,6 +42,7 @@ def _mla_impl(cls=None, **over):
         "split_prefill_recording": True,
         "is_sparse_mla": False,
         "o_proj": nn.Identity(),
+        "nvfp4": None,
     }
     impl.__dict__.update({**fields, **over})
     return impl
@@ -417,6 +418,7 @@ def _dense_impl(prefix_k, prefix_v):
         rope_is_zero_pad=False,
         use_flydsl_fp8_prefill_attn=False,
         _flydsl_fp8_mha_ok=None,
+        nvfp4=None,
         split_prefill_recording=True,
         _gather_cached_kv_b_proj=gather,
     )

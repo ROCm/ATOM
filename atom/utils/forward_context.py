@@ -670,6 +670,10 @@ class AttentionMetaData:
     # True for standard causal attention; False only for DSpark's bidirectional
     # draft block. The MLA asm decode kernel selects a different .co by this flag.
     causal: bool = True
+    # NVFP4 MLA only: BF16 tail-ring row of each scheduled request, by batch row.
+    nvfp4_tail_slots: torch.Tensor | None = None
+    # NVFP4 MLA prefill: the step's tile plan, shared by every layer.
+    nvfp4_prefill_plan: dict | None = None
 
     state: AttnState = AttnState.PREFILL_NATIVE
     """One of `DECODE / PREFILL_NATIVE / PREFILL_PREFIX` — controls which

@@ -1331,6 +1331,12 @@ class ModelRunner:
     def release_multimodal_requests(self, request_ids):
         self.vision_embeddings.release(request_ids)
 
+    def release_nvfp4_tails(self, request_ids):
+        builder = getattr(self, "attn_metadata_builder", None)
+        release = getattr(builder, "release_nvfp4_tails", None)
+        if release is not None:
+            release(request_ids)
+
     def exit(self):
         if not self.still_running:
             return

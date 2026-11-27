@@ -71,6 +71,11 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange_many,
     pcp_is_enabled,
 )
+from atom.model_ops.attentions.nvfp4_mla import (
+    kup_fusable,
+    publish_prefill_kv,
+    try_nvfp4_decode,
+)
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     PERSISTENT_WORK_BUFFERS,
 )
@@ -827,6 +832,8 @@ class MLAAttention(nn.Module):
         super().__init__()
         self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
         self._flydsl_fp8_mha_ok: bool | None = None
+        self.nvfp4 = None
+        self.nvfp4_layer = 0
         # Set by a model whose prefill token graph records up to the attention
         # core (`records_prefill_split`).
         self.split_prefill_recording = False
@@ -1944,6 +1951,11 @@ class MLAAttention(nn.Module):
         # Convert from (B, N, V) to (B, N * V)
         return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
 
+    def _k_up_weight(self, group=False):
+        if self.qrep_enabled and group:
+            return self.W_K_qrep, self.W_K_qrep_scale
+        return self.W_K, self.W_K_scale
+
     def _absorb_into_q_out(self, kv_cache, dtype_q):
         return (
             self._absorb_q_pack_enabled
@@ -1957,7 +1969,8 @@ class MLAAttention(nn.Module):
         # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
         # group=False (prefill / non-QREP) takes only this rank's heads.
         # k_up_proj=False returns q_nope un-absorbed, (B, N, P), for a caller
-        # that absorbs it into q_out itself.
+        # that absorbs it into q_out itself, or fuses the K-up (NVFP4,
+        # `kup_fusable`).
         if self.qrep_enabled and not group:
             # Row-view weight: computes only this rank's heads, so the redundant
             # group-wide GEMM never happens (the old code projected all group
@@ -1975,10 +1988,7 @@ class MLAAttention(nn.Module):
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
 
-        if self.qrep_enabled and group:
-            W_K, W_K_scale = self.W_K_qrep, self.W_K_qrep_scale
-        else:
-            W_K, W_K_scale = self.W_K, self.W_K_scale
+        W_K, W_K_scale = self._k_up_weight(group)
 
         if is_rocm_aiter_fp4bmm_enabled():
             # FP4 BMM: (N, B, P) x (N, P, L) -> (N, B, L)
@@ -3536,8 +3546,10 @@ class MLAAttention(nn.Module):
         """Whether this forward runs `forward_prefill_split`: a prefill
         token-graph recording, or the capture's warmup forward before it
         (`prefill_token_graph_capture`, which a KDA layer's split reads too)."""
+        # NVFP4 publishes the prefill latent on the eager path only.
         return (
-            self.split_prefill_recording
+            self.nvfp4 is None
+            and self.split_prefill_recording
             and prefill_token_graph_capture()
             and self.prefill_split_supported()
         )
@@ -3686,7 +3698,16 @@ class MLAAttention(nn.Module):
 
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self._prefill_q(q, q_scale, k_rope, positions)
-            if kv_cache.numel() > 0:
+            # k_rope is post-RoPE from here. Under NVFP4 the FP4 pages are the
+            # only cache and get this latent; prefill attention runs on the
+            # forward's own K/V below, so nothing reads an FP8 copy.
+            publish_prefill_kv(self, k_nope, k_rope, positions, attn_metadata)
+            if self.nvfp4 is not None and attn_metadata.has_cached:
+                raise RuntimeError(
+                    "NVFP4 MLA prefill cannot read cached context; the history "
+                    "is only in FP4 pages."
+                )
+            if self.nvfp4 is None and kv_cache.numel() > 0:
                 self._write_kv(kv_cache, k_nope, k_rope, attn_metadata.slot_mapping)
 
             if attn_metadata.has_cached:
@@ -3726,14 +3747,26 @@ class MLAAttention(nn.Module):
                 and context.is_prefill
                 and self._absorb_into_q_out(kv_cache, attn_metadata.dtype_q)
             )
-            if absorb_into_q_out:
-                q_nope, q_rope = self._q_proj_and_k_up_proj(
-                    q, x_scale=q_scale, group=use_qrep, k_up_proj=False
-                )
-            else:
-                q_nope, q_rope = self._q_proj_and_k_up_proj(
-                    q, x_scale=q_scale, group=use_qrep
-                )
+            # NVFP4 with the fused K-up: q_nope stays un-absorbed and the
+            # NVFP4 decode quantizes it inside its own K-up GEMM. Only these two
+            # paths pass `k_up_proj`, so a stand-in without it serves every other.
+            kup_fused = kup_fusable(self) and not is_rocm_aiter_fp4bmm_enabled()
+            no_k_up = {"k_up_proj": False} if absorb_into_q_out or kup_fused else {}
+            q_nope, q_rope = self._q_proj_and_k_up_proj(
+                q, x_scale=q_scale, group=use_qrep, **no_k_up
+            )
+            nvfp4_out = try_nvfp4_decode(
+                self,
+                q_nope,
+                q_rope,
+                k_nope,
+                k_rope,
+                positions,
+                attn_metadata,
+                w_k=self._k_up_weight(use_qrep)[0] if kup_fused else None,
+            )
+            if nvfp4_out is not None:
+                return nvfp4_out
 
             # ---- Prefill Context Parallel --------------------------------
             # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But
