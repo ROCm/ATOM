@@ -46,18 +46,28 @@ def dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-def handle_matches(handle: Any, transport: str, key: int, dtype: torch.dtype) -> bool:
-    """Whether ``handle``'s common fields name ``key``'s rows in ``dtype`` on
-    ``transport``. A handle from elsewhere may be malformed: never raise."""
-    return (
-        isinstance(handle, dict)
-        and handle.get("transport") == transport
-        and handle.get("key") == key
-        and handle.get("dtype") == dtype_name(dtype)
-        and type(handle.get("rows")) is int
-        and handle["rows"] > 0
-        and isinstance(handle.get(transport), dict)
-    )
+def handle_mismatch(
+    handle: Any, transport: str, key: int, dtype: torch.dtype
+) -> str | None:
+    """Why ``handle``'s common fields do not name ``key``'s rows in ``dtype``
+    on ``transport``, or None when they do. A handle from elsewhere may be
+    malformed: never raise."""
+    if not isinstance(handle, dict):
+        return "malformed handle"
+    if handle.get("transport") != transport:
+        return f"transport {handle.get('transport')!r} is not {transport!r}"
+    if handle.get("key") != key:
+        return "key differs from this request's"
+    if handle.get("dtype") != dtype_name(dtype):
+        return f"stored as {handle.get('dtype')!r}, read as {dtype_name(dtype)!r}"
+    rows = handle.get("rows")
+    if (
+        type(rows) is not int
+        or rows <= 0
+        or not isinstance(handle.get(transport), dict)
+    ):
+        return "malformed handle"
+    return None
 
 
 def _backends() -> dict[str, tuple[type, type]]:
