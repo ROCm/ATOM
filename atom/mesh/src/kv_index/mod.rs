@@ -15,10 +15,9 @@ mod tests;
 
 use std::{fmt::Debug, sync::Arc};
 
-use async_trait::async_trait;
 pub(crate) use partition::{match_groups, match_lanes, Holder, Lane, Partition, Predictor};
 
-use crate::core::Worker;
+use crate::{core::Worker, kv_tiers::TieredHit};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PrefixHash(u64);
@@ -28,35 +27,16 @@ struct PrefixHash(u64);
 pub(crate) struct HolderId(u8);
 
 /// What policies read of the index.
-#[async_trait]
 pub(crate) trait PrefixMatchProvider: Send + Sync + Debug {
-    /// The leading tokens of `tokens` each worker's device cache holds, in the order of
-    /// `workers`: by its KV events when they are exact, raised to the prompts routed to it
-    /// when they are partial, and by those prompts alone when it has none indexed.
-    /// `Some(0)` for a worker that holds none of them, `None` for one the index knows
-    /// nothing of. The walk read-locks the shards of the partitions it reads.
-    fn match_workers(&self, tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<u32>>;
+    /// What the index knows of the leading tokens of `tokens` at each worker, in the order
+    /// of `workers`; `None` for a worker it knows nothing of. `device` is what the
+    /// worker's device cache holds, `Some(0)` when none of them: by its KV events when
+    /// they are exact, raised to the prompts routed to it when they are partial, and by
+    /// those prompts alone when it has none indexed. `stored` is not the index's to tell,
+    /// and `Some(0)`. The walk read-locks the shards of the partitions it reads.
+    fn tiered_hits(&self, tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<TieredHit>>;
 
     /// Predicts that `worker` will hold `tokens`, routed to it, without waiting for the
     /// index's writer.
     fn on_routed(&self, _tokens: &[u32], _worker: &dyn Worker) {}
-
-    /// The tokens of `tokens` each worker's engine will report cached, in the order of
-    /// `workers`, when its device cache holds what `device` says: that, with what it then
-    /// loads from a store `store_weight` counts; None where `device` is, or where that
-    /// store does not answer.
-    async fn cached_tokens(
-        &self,
-        _tokens: &[u32],
-        _workers: &[Arc<dyn Worker>],
-        device: &[Option<u32>],
-    ) -> Vec<Option<u32>> {
-        device.to_vec()
-    }
-
-    /// What a token an engine loads from a store counts for in a match rate, against one
-    /// its device cache holds: 0 while no store is asked.
-    fn store_weight(&self) -> f64 {
-        0.0
-    }
 }

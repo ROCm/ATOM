@@ -21,7 +21,7 @@ use crate::{
     kv_storage::StorageSources,
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::PolicyRegistry,
+    policies::{KvTiers, PolicyRegistry},
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{
         atom_bridge::AtomBridgeRuntime,
@@ -298,11 +298,11 @@ impl AppContextBuilder {
             let port = router_config.mooncake_admin_port;
             Arc::new(StorageSources::new(port, deadline, client.clone()))
         });
+        // The policies read the index and ask the stores themselves, each at the tier
+        // weights in its own config.
         if let Some(monitor) = &kv_event_monitor {
-            if let Some(storage) = &kv_storage {
-                monitor.read_stores(storage.clone(), router_config.kv_storage_weight);
-            }
-            policy_registry.set_kv_events(monitor.clone());
+            let tiers = KvTiers::new(monitor.clone(), kv_storage.clone());
+            policy_registry.set_kv_tiers(tiers);
         }
         let tokenize_limits = TokenizeLimits::new(&router_config);
         Ok(AppContext {
@@ -438,7 +438,7 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::new(config.policy.clone())));
+        self.policy_registry = Some(Arc::new(PolicyRegistry::for_router(config)));
         self
     }
 

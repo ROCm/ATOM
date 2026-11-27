@@ -4,22 +4,22 @@
 //! Batches the stream missed are replayed from the engine, if it serves a replay.
 //! Admitted batches go to the writer of the rank's index partition, which has a thread of
 //! its own. What each stream carried is what `/kv_events/sources` shows. A registered
-//! worker without exact events is also predicted to hold the prompts routed to it. What a
-//! worker's engine will report cached also counts what it loads from the store it reads,
-//! if any. The ranks whose device pools are in one share group are followed as such: a
-//! rank's engine will copy in what the pools of the other ranks of its group hold.
+//! worker without exact events is also predicted to hold the prompts routed to it. Of each
+//! worker the index tells the policies what its device cache holds. The stores the workers
+//! read, and what a token of theirs counts for, are the policies'. The ranks whose device
+//! pools are in one share group are followed as such: a rank's engine will copy in what
+//! the pools of the other ranks of its group hold.
 
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, OnceLock,
+        Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -41,11 +41,11 @@ use super::{
     wire::{self, DecodedBatch},
 };
 use crate::{
-    core::{Worker, WorkerType},
+    core::Worker,
     kv_index::{
         match_groups, match_lanes, Holder, Lane, Partition, Predictor, PrefixMatchProvider,
     },
-    kv_storage::StorageSources,
+    kv_tiers::TieredHit,
     observability::metrics::schema::names,
 };
 
@@ -74,7 +74,6 @@ pub struct KvEventMonitor {
     /// while its partition has no lane left.
     predictors: DashMap<String, Option<Predictor>>,
     partitions: DashMap<(String, &'static str, u32), Arc<Partition>>,
-    stores: OnceLock<(Arc<StorageSources>, f64)>,
     /// The subscriptions of ranks in a share group; below two, no rank copies from another.
     shared_ranks: AtomicUsize,
     threads: Handle,
@@ -184,7 +183,6 @@ impl KvEventMonitor {
             subscriptions: DashMap::new(),
             predictors: DashMap::new(),
             partitions: DashMap::new(),
-            stores: OnceLock::new(),
             shared_ranks: AtomicUsize::new(0),
             threads: runtime.handle().clone(),
             runtime: Some(runtime),
@@ -266,12 +264,6 @@ impl KvEventMonitor {
         }
     }
 
-    /// Counts, in what a worker's engine will report cached, what it loads from the store
-    /// it reads among `stores`, and in its match rate `weight` of each of those tokens.
-    pub fn read_stores(&self, stores: Arc<StorageSources>, weight: f64) {
-        let _ = self.stores.set((stores, weight));
-    }
-
     fn partition(&self, model_id: &str, pool: &'static str, block_size: u32) -> Arc<Partition> {
         self.partitions
             .entry((model_id.into(), pool, block_size))
@@ -288,10 +280,12 @@ impl KvEventMonitor {
         sources.sort_by(|a, b| a.worker.cmp(&b.worker));
         sources
     }
-}
 
-#[async_trait]
-impl PrefixMatchProvider for KvEventMonitor {
+    /// The leading tokens of `tokens` each worker's device cache holds, in the order of
+    /// `workers`: by its KV events when they are exact, raised to the prompts routed to it
+    /// when they are partial, and by those prompts alone when it has none indexed.
+    /// `Some(0)` for a worker that holds none of them, `None` for one the index knows
+    /// nothing of. The walk read-locks the shards of the partitions it reads.
     fn match_workers(&self, tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
         let (events, predicted): (Vec<_>, Vec<_>) = workers
             .iter()
@@ -311,6 +305,19 @@ impl PrefixMatchProvider for KvEventMonitor {
             })
             .unzip();
         match_lanes(tokens, &events, &predicted)
+    }
+}
+
+impl PrefixMatchProvider for KvEventMonitor {
+    fn tiered_hits(&self, tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<TieredHit>> {
+        let device = self.match_workers(tokens, workers);
+        let hit = |device: &Option<u32>| {
+            Some(TieredHit {
+                device: (*device)?,
+                stored: Some(0),
+            })
+        };
+        device.iter().map(hit).collect()
     }
 
     fn on_routed(&self, tokens: &[u32], worker: &dyn Worker) {
@@ -345,35 +352,6 @@ impl PrefixMatchProvider for KvEventMonitor {
         if let Some(predictor) = entry.as_ref() {
             predict(predictor, tokens, worker);
         }
-    }
-
-    async fn cached_tokens(
-        &self,
-        tokens: &[u32],
-        workers: &[Arc<dyn Worker>],
-        device: &[Option<u32>],
-    ) -> Vec<Option<u32>> {
-        let mut cached = device.to_vec();
-        let Some((stores, _)) = self.stores.get() else {
-            return cached;
-        };
-        // A decode worker takes the prompt's KV from its prefill worker.
-        let (readers, asked): (Vec<usize>, Vec<(&str, u32)>) = (workers.iter().zip(device))
-            .enumerate()
-            .filter(|(_, (worker, _))| !matches!(worker.worker_type(), WorkerType::Decode))
-            .filter_map(|(i, (worker, device))| Some((i, (worker.url(), (*device)?))))
-            .unzip();
-        for (i, found) in readers
-            .into_iter()
-            .zip(stores.cached_tokens(tokens, &asked).await)
-        {
-            cached[i] = found;
-        }
-        cached
-    }
-
-    fn store_weight(&self) -> f64 {
-        self.stores.get().map_or(0.0, |(_, weight)| *weight)
     }
 }
 
@@ -1329,66 +1307,6 @@ mod tests {
         monitor.on_routed(&vec![0; (1 << 24) + 1], &worker);
         let dropped = r#"mesh_kv_events_dropped_predictions_total{model="model",pool="regular"} 1"#;
         assert!(recorder.handle().render().contains(dropped));
-    }
-
-    /// A decode worker takes the prompt's KV from its prefill worker, and a worker whose
-    /// device cache the index knows nothing of is not asked for: of four readers of a
-    /// store, it answers for the last two, each by what its own device holds.
-    #[tokio::test]
-    async fn a_store_answers_for_its_readers_the_index_knows_but_decode_workers() {
-        use std::collections::HashMap;
-
-        use axum::{extract::Query, routing::get, Json, Router};
-        use serde_json::{json, Map, Value};
-
-        use crate::kv_storage::{keys, OffloadReport};
-
-        // A master's admin service that holds every key but the taint key.
-        let answer = |Query(query): Query<HashMap<String, String>>| async move {
-            let state = |key: &str| json!({"ok": key != keys::TAINT_KEY, "values": [{}]});
-            let data: Map<String, Value> = (query["keys"].split(','))
-                .map(|key| (key.to_string(), state(key)))
-                .collect();
-            Json(json!({"success": true, "data": data}))
-        };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let service = Router::new().route("/batch_query_keys", get(answer));
-        tokio::spawn(async move { axum::serve(listener, service).await });
-        let stores = StorageSources::new(port, Duration::from_millis(500), reqwest::Client::new());
-        let report = OffloadReport {
-            backend: "mooncake_store".into(),
-            masters: vec!["127.0.0.1:50051".into()],
-            namespace: "atomkv1-0123456789abcdef01234567".into(),
-            chunk_tokens: 2,
-            world: 1,
-            min_load_tokens: 4,
-            chain_check: keys::chain_check(2),
-        };
-        let urls = [
-            "http://d:8000",
-            "http://n:8000",
-            "http://r:8000",
-            "http://h:8000",
-        ];
-        for url in urls {
-            stores.add(url, "model", &report);
-        }
-        let monitor = KvEventMonitor::start().unwrap();
-        monitor.read_stores(Arc::new(stores), 1.0);
-        let decode = BasicWorkerBuilder::new(urls[0]).worker_type(WorkerType::Decode);
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(decode.build()),
-            Arc::new(BasicWorkerBuilder::new(urls[1]).build()),
-            Arc::new(BasicWorkerBuilder::new(urls[2]).build()),
-            Arc::new(BasicWorkerBuilder::new(urls[3]).build()),
-        ];
-        // The store holds the 6 chunks of 12 tokens, of which the engine takes 10. With 8 on
-        // the device, the 2 more are under the 4 it loads at least.
-        let prompt: Vec<u32> = (0..12).collect();
-        let device = [Some(0), None, Some(0), Some(8)];
-        let cached = monitor.cached_tokens(&prompt, &workers, &device).await;
-        assert_eq!(cached, [Some(0), None, Some(10), Some(8)]);
     }
 
     #[test]

@@ -858,6 +858,39 @@ mod tests {
         }
     }
 
+    /// The weight on the command line is the `TierWeights` in the config of each
+    /// cache-aware policy of the `AppContext` built from it: the default policy, one a
+    /// worker's `policy` label asks for by name, and one the PD routers create. Leaving
+    /// it out of the `RouterConfig`, or of what the registry creates policies with,
+    /// fails it at the default.
+    #[tokio::test]
+    async fn cli_kv_storage_weight_fills_the_tier_weights_of_every_cache_aware_policy() {
+        use crate::{
+            app_context::AppContext,
+            core::prepare_pool::PreparePoolRuntime,
+            policies::{CacheAwarePolicy, LoadBalancingPolicy, TierWeights},
+        };
+
+        let flags = "atomesh --kv-events --kv-storage-weight 0.25";
+        let args = CliArgs::try_parse_from(flags.split_whitespace()).unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
+        let context = AppContext::from_config(config.clone(), 5, runtime.handle())
+            .await
+            .unwrap();
+        let registry = &context.policy_registry;
+        let policies: [std::sync::Arc<dyn LoadBalancingPolicy>; 3] = [
+            registry.get_default_policy(),
+            registry.on_worker_added("m", Some("cache_aware")),
+            registry.create_policy(&config.policy),
+        ];
+        for policy in policies {
+            let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+            let want = TierWeights { stored: 0.25 };
+            assert_eq!(cache_aware.tier_weights(), want);
+        }
+    }
+
     #[test]
     fn cli_kv_storage_options_map_to_router_config() {
         let args = CliArgs::try_parse_from([
