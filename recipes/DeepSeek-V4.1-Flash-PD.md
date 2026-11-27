@@ -18,7 +18,9 @@ This recipe covers two P/D deployments of DeepSeek-V4.1-Flash on MI355X:
 
 The red solid line is this ladder; every point on it is listed below and has
 its own section with the full configuration. The reference curves (B300
-Dynamo vLLM FP4, B200 and MI355X vLLM) are public InferenceX data.
+Dynamo vLLM FP4, B200 and MI355X vLLM) are public InferenceX data. The faint
+red dashed line is the same points on the earlier aiperf basis, kept for
+comparison.
 
 The deployment is one P instance (DEP4, 4 GPUs) on a P node and one D
 instance (8 GPUs) on a D node, 12 MI355X GPUs in total, running
@@ -27,22 +29,35 @@ files, the AgentX scenario, a 3600 s benchmark duration, 10 warm-up requests
 per lane and seed 42.
 
 - **x = 1000 / P90 ITL** (tokens/s per user, from aiperf's per-request ITL).
-- **y = total tok/s / 12 GPUs** (aiperf total token throughput, input +
-  output with server token counts, divided by all 12 GPUs, P included).
+- **y = total tok/s / 12 GPUs**: sum of input + output tokens (server token
+  counts) over the successful profiling records, divided by the wall-clock
+  span of those records (earliest request start to latest request end), divided
+  by all 12 GPUs, P included.
+
+**y definition.** y = Σ(ISL+OSL) of successful profiling records ÷ their
+wall-clock span ÷ GPUs (SemiAnalysis InferenceX formula,
+`infx/results/agentic/request_metrics.py`). Earlier revisions used aiperf's
+`total_token_throughput`, whose denominator includes the grace and
+cancel-drain period, understating y by about 8% (3,930 s against a record span
+of about 3,625 s at c256-c768; about 0.8% at c1-c32, whose aiperf window was
+3,630 s). The span equals aiperf's own `benchmark_duration` on every point.
+The same formula reproduces SemiAnalysis's published B300 c256 value:
+(6,655,596,341 + 44,759,287) tokens ÷ 3,625.23 s ÷ 12 = 154,021 tok/s/GPU.
+x is unchanged.
 
 ### Points
 
 | Point | Topology (12 GPUs) | D shape | x | y | TTFT mean / P50 / P90 / P99 (ms) | ITL mean / P50 / P90 / P99 (ms) | Requests |
 |---|---|---|---:|---:|---|---|---:|
-| [c1](#c1) | P DEP4 + D TP8 Mono | `--max-num-seqs 1`, capture `[1]`, poll 4 | 1244.6 | 2,803 | 271 / 208 / 416 / 1,809 | 0.778 / 0.777 / 0.803 / 0.966 | 506 |
-| [c2](#c2) | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 1049.4 | 3,133 | 261 / 228 / 427 / 1,073 | 0.852 / 0.813 / 0.953 / 1.567 | 568 |
-| [c4](#c4) | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 1043.8 | 3,811 | 228 / 180 / 402 / 1,053 | 0.838 / 0.811 / 0.958 / 1.449 | 878 |
-| [c8](#c8) | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 927.6 | 6,135 | 196 / 159 / 341 / 684 | 0.888 / 0.827 / 1.078 / 1.371 | 1,516 |
-| [c16](#c16) | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 753.8 | 10,661 | 198 / 154 / 356 / 971 | 1.002 / 0.946 / 1.327 / 1.817 | 2,856 |
-| [c32](#c32) | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 469.6 | 22,664 | 291 / 195 / 401 / 1,296 | 1.433 / 1.252 / 2.130 / 3.474 | 5,226 |
-| [c256](#c256) | P DEP4 + D DEP8 | MegaMoE, default DEP capture table, 1 API server | 257.7 | 140,077 | 407 / 323 / 666 / 1,942 | 3.696 / 3.713 / 3.880 / 4.443 | 43,463 |
-| [c512](#c512) | P DEP4 + D DEP8 | MegaMoE, fine capture table, 4 API servers | 203.6 | 252,064 | 1,170 / 689 / 2,110 / 9,448 | 4.588 / 4.604 / 4.913 / 5.639 | 81,508 |
-| [c768](#c768) | P DEP4 + D DEP8, **Store 1 TiB** | MegaMoE, fine capture table, 4 API servers | 160.7 | 347,062 | 2,707 / 1,870 / 5,885 / 14,434 | 5.667 / 5.759 / 6.222 / 6.564 | 114,129 |
+| [c1](#c1) | P DEP4 + D TP8 Mono | `--max-num-seqs 1`, capture `[1]`, poll 4 | 1244.6 | 2,830 | 271 / 208 / 416 / 1,809 | 0.778 / 0.777 / 0.803 / 0.966 | 506 |
+| [c2](#c2) | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 1049.4 | 3,156 | 261 / 228 / 427 / 1,073 | 0.852 / 0.813 / 0.953 / 1.567 | 568 |
+| [c4](#c4) | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 1043.8 | 3,839 | 228 / 180 / 402 / 1,053 | 0.838 / 0.811 / 0.958 / 1.449 | 878 |
+| [c8](#c8) | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 927.6 | 6,189 | 196 / 159 / 341 / 684 | 0.888 / 0.827 / 1.078 / 1.371 | 1,516 |
+| [c16](#c16) | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 753.8 | 10,754 | 198 / 154 / 356 / 971 | 1.002 / 0.946 / 1.327 / 1.817 | 2,856 |
+| [c32](#c32) | P DEP4 + D TP8 Mono | `--max-num-seqs 64`, Mono capture table, poll 16 | 469.6 | 22,831 | 291 / 195 / 401 / 1,296 | 1.433 / 1.252 / 2.130 / 3.474 | 5,226 |
+| [c256](#c256) | P DEP4 + D DEP8 | MegaMoE, default DEP capture table, 1 API server | 257.7 | 151,919 | 407 / 323 / 666 / 1,942 | 3.696 / 3.713 / 3.880 / 4.443 | 43,463 |
+| [c512](#c512) | P DEP4 + D DEP8 | MegaMoE, fine capture table, 4 API servers | 203.6 | 273,135 | 1,170 / 689 / 2,110 / 9,448 | 4.588 / 4.604 / 4.913 / 5.639 | 81,508 |
+| [c768](#c768) | P DEP4 + D DEP8, **Store 1 TiB** | MegaMoE, fine capture table, 4 API servers | 160.7 | 375,861 | 2,707 / 1,870 / 5,885 / 14,434 | 5.667 / 5.759 / 6.222 / 6.564 | 114,129 |
 
 Every point had 0 request errors and was not cancelled. Compiles inside the
 measurement window (FlyDSL AOT / aiter JIT): 0 on P and D for c1, c2, c8 and
@@ -50,18 +65,18 @@ c256; P 3 (c4), P 8 (c16), D 4 (c32), D 1 (c512), P 1 (c768).
 
 | Point | Total tok/s | Output tok/s | D batch / rank | Mean ISL | Mean OSL | Prefix-cache read |
 |---|---:|---:|---:|---:|---:|---:|
-| c1 | 33,639 | 217 | 1.00 | 239.8K | 1,557 | 98.6% |
-| c2 | 37,600 | 242 | 1.03 | 238.7K | 1,549 | 98.1% |
-| c4 | 45,726 | 310 | 1.06 | 187.8K | 1,284 | 97.7% |
-| c8 | 73,623 | 489 | 1.22 | 175.1K | 1,171 | 98.2% |
-| c16 | 127,934 | 812 | 1.42 | 161.6K | 1,032 | 98.1% |
-| c32 | 271,971 | 1,575 | 2.25 | 187.8K | 1,094 | 97.9% |
-| c256 | 1,680,929 | 11,248 | 5.67 | 151.0K | 1,017 | 97.0% |
-| c512 | 3,024,763 | 21,598 | 13.42 | 144.8K | 1,041 | 96.5% |
-| c768 | 4,164,743 | 29,823 | 22.60 | 142.4K | 1,027 | 96.7% |
+| c1 | 33,960 | 219 | 1.00 | 239.8K | 1,557 | 98.6% |
+| c2 | 37,877 | 244 | 1.03 | 238.7K | 1,549 | 98.1% |
+| c4 | 46,067 | 312 | 1.06 | 187.8K | 1,284 | 97.7% |
+| c8 | 74,269 | 493 | 1.22 | 175.1K | 1,171 | 98.2% |
+| c16 | 129,047 | 819 | 1.42 | 161.6K | 1,032 | 98.1% |
+| c32 | 273,976 | 1,587 | 2.25 | 187.8K | 1,094 | 97.9% |
+| c256 | 1,823,027 | 12,199 | 5.67 | 151.0K | 1,017 | 97.0% |
+| c512 | 3,277,621 | 23,403 | 13.42 | 144.8K | 1,041 | 96.5% |
+| c768 | 4,510,333 | 32,298 | 22.60 | 142.4K | 1,027 | 96.7% |
 
 Reference: public InferenceX data for B300 (Dynamo, 12 GPUs, c768) is
-x 214 / y 420.2K; the c768 point here reaches 83% of that y at lower x.
+x 214 / y 420.2K; the c768 point here reaches 89% of that y at lower x (same y formula on both).
 
 ### Per-point configuration summary
 
@@ -394,7 +409,7 @@ Per point, the order is: Store, then P (wait for its four
 
 ### c1
 
-**Result.** x = 1244.6 tok/s/user, y = 2,803 tok/s/GPU (total 33,639 tok/s over 12 GPUs, output 217 tok/s). TTFT mean / P50 / P90 / P99 = 271 / 208 / 416 / 1,809 ms. ITL mean / P50 / P90 / P99 = 0.778 / 0.777 / 0.803 / 0.966 ms. 506 requests, 0 errors. Window 2026-11-25 22:29:09 - 23:29:39 UTC (3,630 s). Compiles inside the window: P 0, D 0. D batch per rank 1.00.
+**Result.** x = 1244.6 tok/s/user, y = 2,830 tok/s/GPU (total 33,960 tok/s over 12 GPUs, output 219 tok/s; span of the records 3,595.7 s). TTFT mean / P50 / P90 / P99 = 271 / 208 / 416 / 1,809 ms. ITL mean / P50 / P90 / P99 = 0.778 / 0.777 / 0.803 / 0.966 ms. 506 requests, 0 errors. Window 2026-11-25 22:29:09 - 23:29:39 UTC (3,630 s). Compiles inside the window: P 0, D 0. D batch per rank 1.00.
 
 **Nodes and GPUs.** P node `g41`: P (DEP4) on GPUs 0-3, plus the Mooncake Store, router, ingress and AgentX client. D node `g12`: D (TP8 Mono, `--max-num-seqs 1`, poll 4, 1 API server) on GPUs 0-7. Mooncake Store 256 GiB. 12 GPUs. Ports as defined above (base 30400). Driver segment name: `4p8d_tp8s1-poll4`.
 
@@ -616,7 +631,7 @@ aiperf profile --scenario inferencex-agentx-mvp --url http://$P_HOST:$INGRESS_PO
 
 ### c2
 
-**Result.** x = 1049.4 tok/s/user, y = 3,133 tok/s/GPU (total 37,600 tok/s over 12 GPUs, output 242 tok/s). TTFT mean / P50 / P90 / P99 = 261 / 228 / 427 / 1,073 ms. ITL mean / P50 / P90 / P99 = 0.852 / 0.813 / 0.953 / 1.567 ms. 568 requests, 0 errors. Window 2026-11-25 20:22:31 - 21:23:01 UTC (3,630 s). Compiles inside the window: P 0, D 0. D batch per rank 1.03.
+**Result.** x = 1049.4 tok/s/user, y = 3,156 tok/s/GPU (total 37,877 tok/s over 12 GPUs, output 244 tok/s; span of the records 3,603.4 s). TTFT mean / P50 / P90 / P99 = 261 / 228 / 427 / 1,073 ms. ITL mean / P50 / P90 / P99 = 0.852 / 0.813 / 0.953 / 1.567 ms. 568 requests, 0 errors. Window 2026-11-25 20:22:31 - 21:23:01 UTC (3,630 s). Compiles inside the window: P 0, D 0. D batch per rank 1.03.
 
 **Nodes and GPUs.** P node `g41`: P (DEP4) on GPUs 0-3, plus the Mooncake Store, router, ingress and AgentX client. D node `g12`: D (TP8 Mono, `--max-num-seqs 64`, poll 16, 1 API server) on GPUs 0-7. Mooncake Store 256 GiB. 12 GPUs. Ports as defined above (base 30400). Driver segment name: `4p8d_tp8s1-poll4`.
 
@@ -831,7 +846,7 @@ aiperf profile --scenario inferencex-agentx-mvp --url http://$P_HOST:$INGRESS_PO
 
 ### c4
 
-**Result.** x = 1043.8 tok/s/user, y = 3,811 tok/s/GPU (total 45,726 tok/s over 12 GPUs, output 310 tok/s). TTFT mean / P50 / P90 / P99 = 228 / 180 / 402 / 1,053 ms. ITL mean / P50 / P90 / P99 = 0.838 / 0.811 / 0.958 / 1.449 ms. 878 requests, 0 errors. Window 2026-11-25 16:05:02 - 17:05:32 UTC (3,630 s). Compiles inside the window: P 3, D 0. D batch per rank 1.06.
+**Result.** x = 1043.8 tok/s/user, y = 3,839 tok/s/GPU (total 46,067 tok/s over 12 GPUs, output 312 tok/s; span of the records 3,603.2 s). TTFT mean / P50 / P90 / P99 = 228 / 180 / 402 / 1,053 ms. ITL mean / P50 / P90 / P99 = 0.838 / 0.811 / 0.958 / 1.449 ms. 878 requests, 0 errors. Window 2026-11-25 16:05:02 - 17:05:32 UTC (3,630 s). Compiles inside the window: P 3, D 0. D batch per rank 1.06.
 
 **Nodes and GPUs.** P node `g41`: P (DEP4) on GPUs 0-3, plus the Mooncake Store, router, ingress and AgentX client. D node `g12`: D (TP8 Mono, `--max-num-seqs 64`, poll 16, 1 API server) on GPUs 0-7. Mooncake Store 256 GiB. 12 GPUs. Ports as defined above (base 30400). Driver segment name: `4p8d_tp8s1-poll4`.
 
@@ -1050,7 +1065,7 @@ aiperf profile --scenario inferencex-agentx-mvp --url http://$P_HOST:$INGRESS_PO
 
 ### c8
 
-**Result.** x = 927.6 tok/s/user, y = 6,135 tok/s/GPU (total 73,623 tok/s over 12 GPUs, output 489 tok/s). TTFT mean / P50 / P90 / P99 = 196 / 159 / 341 / 684 ms. ITL mean / P50 / P90 / P99 = 0.888 / 0.827 / 1.078 / 1.371 ms. 1,516 requests, 0 errors. Window 2026-11-25 19:21:35 - 20:22:05 UTC (3,630 s). Compiles inside the window: P 0, D 0. D batch per rank 1.22.
+**Result.** x = 927.6 tok/s/user, y = 6,189 tok/s/GPU (total 74,269 tok/s over 12 GPUs, output 493 tok/s; span of the records 3,598.4 s). TTFT mean / P50 / P90 / P99 = 196 / 159 / 341 / 684 ms. ITL mean / P50 / P90 / P99 = 0.888 / 0.827 / 1.078 / 1.371 ms. 1,516 requests, 0 errors. Window 2026-11-25 19:21:35 - 20:22:05 UTC (3,630 s). Compiles inside the window: P 0, D 0. D batch per rank 1.22.
 
 **Nodes and GPUs.** P node `g41`: P (DEP4) on GPUs 0-3, plus the Mooncake Store, router, ingress and AgentX client. D node `g12`: D (TP8 Mono, `--max-num-seqs 64`, poll 16, 1 API server) on GPUs 0-7. Mooncake Store 256 GiB. 12 GPUs. Ports as defined above (base 30400). Driver segment name: `4p8d_tp8s1-poll4`.
 
@@ -1264,7 +1279,7 @@ aiperf profile --scenario inferencex-agentx-mvp --url http://$P_HOST:$INGRESS_PO
 
 ### c16
 
-**Result.** x = 753.8 tok/s/user, y = 10,661 tok/s/GPU (total 127,934 tok/s over 12 GPUs, output 812 tok/s). TTFT mean / P50 / P90 / P99 = 198 / 154 / 356 / 971 ms. ITL mean / P50 / P90 / P99 = 1.002 / 0.946 / 1.327 / 1.817 ms. 2,856 requests, 0 errors. Window 2026-11-25 18:20:38 - 19:21:08 UTC (3,630 s). Compiles inside the window: P 8, D 0. D batch per rank 1.42.
+**Result.** x = 753.8 tok/s/user, y = 10,754 tok/s/GPU (total 129,047 tok/s over 12 GPUs, output 819 tok/s; span of the records 3,598.7 s). TTFT mean / P50 / P90 / P99 = 198 / 154 / 356 / 971 ms. ITL mean / P50 / P90 / P99 = 1.002 / 0.946 / 1.327 / 1.817 ms. 2,856 requests, 0 errors. Window 2026-11-25 18:20:38 - 19:21:08 UTC (3,630 s). Compiles inside the window: P 8, D 0. D batch per rank 1.42.
 
 **Nodes and GPUs.** P node `g41`: P (DEP4) on GPUs 0-3, plus the Mooncake Store, router, ingress and AgentX client. D node `g12`: D (TP8 Mono, `--max-num-seqs 64`, poll 16, 1 API server) on GPUs 0-7. Mooncake Store 256 GiB. 12 GPUs. Ports as defined above (base 30400). Driver segment name: `4p8d_tp8s1-poll4`.
 
@@ -1486,7 +1501,7 @@ aiperf profile --scenario inferencex-agentx-mvp --url http://$P_HOST:$INGRESS_PO
 
 ### c32
 
-**Result.** x = 469.6 tok/s/user, y = 22,664 tok/s/GPU (total 271,971 tok/s over 12 GPUs, output 1,575 tok/s). TTFT mean / P50 / P90 / P99 = 291 / 195 / 401 / 1,296 ms. ITL mean / P50 / P90 / P99 = 1.433 / 1.252 / 2.130 / 3.474 ms. 5,226 requests, 0 errors. Window 2026-11-25 21:24:02 - 22:24:32 UTC (3,630 s). Compiles inside the window: P 0, D 4. D batch per rank 2.25.
+**Result.** x = 469.6 tok/s/user, y = 22,831 tok/s/GPU (total 273,976 tok/s over 12 GPUs, output 1,587 tok/s; span of the records 3,603.4 s). TTFT mean / P50 / P90 / P99 = 291 / 195 / 401 / 1,296 ms. ITL mean / P50 / P90 / P99 = 1.433 / 1.252 / 2.130 / 3.474 ms. 5,226 requests, 0 errors. Window 2026-11-25 21:24:02 - 22:24:32 UTC (3,630 s). Compiles inside the window: P 0, D 4. D batch per rank 2.25.
 
 **Nodes and GPUs.** P node `g41`: P (DEP4) on GPUs 0-3, plus the Mooncake Store, router, ingress and AgentX client. D node `g12`: D (TP8 Mono, `--max-num-seqs 64`, poll 16, 1 API server) on GPUs 0-7. Mooncake Store 256 GiB. 12 GPUs. Ports as defined above (base 30400). Driver segment name: `4p8d_tp8s1-poll4`.
 
@@ -1703,7 +1718,7 @@ aiperf profile --scenario inferencex-agentx-mvp --url http://$P_HOST:$INGRESS_PO
 
 ### c256
 
-**Result.** x = 257.7 tok/s/user, y = 140,077 tok/s/GPU (total 1,680,929 tok/s over 12 GPUs, output 11,248 tok/s). TTFT mean / P50 / P90 / P99 = 407 / 323 / 666 / 1,942 ms. ITL mean / P50 / P90 / P99 = 3.696 / 3.713 / 3.880 / 4.443 ms. 43,463 requests, 0 errors. Window 2026-11-25 20:01:55 - 21:07:25 UTC (3,930 s). Compiles inside the window: P 0, D 0. D batch per rank 5.67.
+**Result.** x = 257.7 tok/s/user, y = 151,919 tok/s/GPU (total 1,823,027 tok/s over 12 GPUs, output 12,199 tok/s; span of the records 3,623.7 s). TTFT mean / P50 / P90 / P99 = 407 / 323 / 666 / 1,942 ms. ITL mean / P50 / P90 / P99 = 3.696 / 3.713 / 3.880 / 4.443 ms. 43,463 requests, 0 errors. Window 2026-11-25 20:01:55 - 21:07:25 UTC (3,930 s). Compiles inside the window: P 0, D 0. D batch per rank 5.67.
 
 **Nodes and GPUs.** P node `g15`: P (DEP4) on GPUs 0-3, plus the Mooncake Store, router, ingress and AgentX client. D node `g20`: D (DEP8 MegaMoE, `--max-num-seqs 128`, 1 API server) on GPUs 0-7. Mooncake Store 256 GiB. 12 GPUs. Ports as defined above (base 30400). Driver segment name: `4p8d_dep8`.
 
@@ -1923,7 +1938,7 @@ aiperf profile --scenario inferencex-agentx-mvp --url http://$P_HOST:$INGRESS_PO
 
 ### c512
 
-**Result.** x = 203.6 tok/s/user, y = 252,064 tok/s/GPU (total 3,024,763 tok/s over 12 GPUs, output 21,598 tok/s). TTFT mean / P50 / P90 / P99 = 1,170 / 689 / 2,110 / 9,448 ms. ITL mean / P50 / P90 / P99 = 4.588 / 4.604 / 4.913 / 5.639 ms. 81,508 requests, 0 errors. Window 2026-11-26 02:59:44 - 04:05:14 UTC (3,930 s). Compiles inside the window: P 0, D 1. D batch per rank 13.42.
+**Result.** x = 203.6 tok/s/user, y = 273,135 tok/s/GPU (total 3,277,621 tok/s over 12 GPUs, output 23,403 tok/s; span of the records 3,626.8 s). TTFT mean / P50 / P90 / P99 = 1,170 / 689 / 2,110 / 9,448 ms. ITL mean / P50 / P90 / P99 = 4.588 / 4.604 / 4.913 / 5.639 ms. 81,508 requests, 0 errors. Window 2026-11-26 02:59:44 - 04:05:14 UTC (3,930 s). Compiles inside the window: P 0, D 1. D batch per rank 13.42.
 
 **Nodes and GPUs.** P node `g41`: P (DEP4) on GPUs 0-3, plus the Mooncake Store, router, ingress and AgentX client. D node `g12`: D (DEP8 MegaMoE, `--max-num-seqs 128`, 4 API servers) on GPUs 0-7. Mooncake Store 256 GiB. 12 GPUs. Measured with ports +1000 (base 31400). Driver segment name: `4p8d_dep8`.
 
@@ -2145,7 +2160,7 @@ aiperf profile --scenario inferencex-agentx-mvp --url http://$P_HOST:$INGRESS_PO
 
 ### c768
 
-**Result.** x = 160.7 tok/s/user, y = 347,062 tok/s/GPU (total 4,164,743 tok/s over 12 GPUs, output 29,823 tok/s). TTFT mean / P50 / P90 / P99 = 2,707 / 1,870 / 5,885 / 14,434 ms. ITL mean / P50 / P90 / P99 = 5.667 / 5.759 / 6.222 / 6.564 ms. 114,129 requests, 0 errors. Window 2026-11-26 12:41:57 - 13:47:27 UTC (3,930 s). Compiles inside the window: P 1, D 0. D batch per rank 22.60.
+**Result.** x = 160.7 tok/s/user, y = 375,861 tok/s/GPU (total 4,510,333 tok/s over 12 GPUs, output 32,298 tok/s; span of the records 3,628.9 s). TTFT mean / P50 / P90 / P99 = 2,707 / 1,870 / 5,885 / 14,434 ms. ITL mean / P50 / P90 / P99 = 5.667 / 5.759 / 6.222 / 6.564 ms. 114,129 requests, 0 errors. Window 2026-11-26 12:41:57 - 13:47:27 UTC (3,930 s). Compiles inside the window: P 1, D 0. D batch per rank 22.60.
 
 **Nodes and GPUs.** P node `g41`: P (DEP4) on GPUs 0-3, selected by UUID (see the note below), plus the Mooncake Store, router, ingress and AgentX client. D node `g20`: D (DEP8 MegaMoE, `--max-num-seqs 128`, 4 API servers) on GPUs 0-7. Mooncake Store 1024 GiB. 12 GPUs. Measured with ports +1000 (base 31400). Driver segment name: `4p8d_dep8`.
 
