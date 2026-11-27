@@ -99,6 +99,16 @@ class StageEnd:
     fabric: bool  # fabric hops requested here, and this rank passed probe_fabric
 
 
+def fabric_hop_ends(hosts: list[str]) -> set[int]:
+    """The stages at either end of a hop between hosts: the only ones a fabric
+    hop can involve, so the only ones that set mori up (``probe_fabric``)."""
+    ends = set()
+    for s, (a, b) in enumerate(itertools.pairwise(hosts)):
+        if a != b:
+            ends.update((s, s + 1))
+    return ends
+
+
 def plan_hop_transports(stages: list[StageEnd], fabric_allowed: bool) -> list[str]:
     """Transport of each hop ``s -> s + 1``: ``"ipc"`` (both ends on one host,
     mailbox on), ``"fabric"`` (different hosts, fabric usable on both ends and
@@ -400,9 +410,11 @@ def fabric_kernels(device: torch.device) -> FabricKernels:
 def probe_fabric(device: torch.device) -> str | None:
     """None when this rank can serve a fabric hop, else why not. Local, no
     collective: mori and torch.symm_mem import, the device exports fabric
-    handles, the MORI backend allocates (which test-exports a handle), and the
-    kernels build. Leaves the MORI backend selected on success (process-global,
-    as aiter's custom all-reduce does); restores the previous one on failure."""
+    handles, the MORI backend can be selected and the kernels build. No test
+    allocation: the hop's own allocation is voted on by both ends in
+    ``FabricHop``, which keeps the hop on NCCL if either end fails. Leaves the
+    MORI backend selected on success (process-global, as aiter's custom
+    all-reduce does); restores the previous one on failure."""
     try:
         import mori.allocator as mori_allocator
         import torch.distributed._symmetric_memory as symm_mem
@@ -420,8 +432,6 @@ def probe_fabric(device: torch.device) -> str | None:
         return f"torch.symm_mem already uses the {prev} backend"
     try:
         symm_mem.set_backend("MORI")
-        probe = symm_mem.empty(64, dtype=torch.uint8, device=device)
-        del probe
         fabric_kernels(device)
     except Exception as e:  # noqa: BLE001
         if prev is not None:

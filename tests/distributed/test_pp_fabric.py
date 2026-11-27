@@ -63,6 +63,32 @@ def test_plan_same_host_never_fabric():
     ) == ["nccl"]
 
 
+def test_fabric_hop_ends():
+    assert pf.fabric_hop_ends(["a"] * 4 + ["b"] * 4) == {3, 4}
+    assert pf.fabric_hop_ends(["a"] * 8) == set()
+    assert pf.fabric_hop_ends(["a", "b", "a", "b"]) == {0, 1, 2, 3}
+    assert pf.fabric_hop_ends(["a", "a", "b", "b", "c", "c"]) == {1, 2, 3, 4}
+    assert pf.fabric_hop_ends(["a"]) == set()
+
+
+def test_hop_group_only_on_the_hop_ends(monkeypatch):
+    """Only the hop's two ranks create its group, with local synchronization: a
+    rank outside it never calls new_group (torch would make it join an
+    ncclCommSplit that the gloo members never join)."""
+    calls = []
+
+    def new_group(ranks, **kw):
+        calls.append((ranks, kw))
+        return "pair"
+
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    ranks = [10, 11, 12, 13, 14, 15, 16, 17]
+    got = [mb._hop_group(ranks, 3, r) for r in range(8)]
+    assert got == [None, None, None, "pair", "pair", None, None, None]
+    want = {"backend": "gloo", "use_local_synchronization": True}
+    assert calls == [([13, 14], want)] * 2
+
+
 # -- buffer layout -----------------------------------------------------------------------------------------------------
 def test_counter_page_words_are_distinct_and_fit():
     rows_words = set(range(pf.ROWS_WORD, pf.ROWS_WORD + pf.MAX_SLOTS))
