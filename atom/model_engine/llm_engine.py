@@ -700,6 +700,10 @@ def serves_greedy_ids(params: SamplingParams) -> bool:
 class InputOutputProcessor:
     # Class default: a processor built without `__init__` ships nothing.
     prefix_hash_block_size = 0
+    # `__init__` sets this from `ATOM_DP_LM_HEAD_MODE`; the class default keeps
+    # a processor built without `__init__` (e.g. `__new__` in tests) answering
+    # "serves every request", matching the non-argmax default.
+    _greedy_ids_only = False
 
     def __init__(self, config, tokenizer, block_size):
         self.config = config
