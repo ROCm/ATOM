@@ -102,3 +102,60 @@ def test_gluon_tdm_matches_triton(monkeypatch, gluon_tdm, blocks, add_count, qua
     # seeds the Gluon kernel's online softmax instead of closing it).
     row_error = (y_g - y_t).norm(dim=-1) / y_t.norm(dim=-1)
     assert row_error.max() < (1e-2 if quant else 5e-3)
+
+
+def _e8m0_kwargs(quant):
+    if quant != "e8m0":
+        return {"quant_dtype": torch.float8_e4m3fn if quant else None}
+    return {
+        "quant_dtype": torch.float8_e4m3fn,
+        "e8m0_scale": True,
+        "transpose_scale": True,
+    }
+
+
+# The small-T kernel (a program a token) and the persistent one (from
+# _STREAM_MIN_T tokens) share their per-token arithmetic: a row's outputs must
+# not depend on T or on which kernel ran.
+@pytest.mark.parametrize("blocks", [1, 3, 8])
+@pytest.mark.parametrize("add_count", [0, 2])
+@pytest.mark.parametrize("quant", [False, True, "e8m0"])
+@torch.inference_mode()
+def test_gluon_tdm_rows_do_not_depend_on_t(
+    monkeypatch, gluon_tdm, blocks, add_count, quant
+):
+    big = gluon_tdm._STREAM_MIN_T + 37
+    prefix, block, score_weight, norm_weight, adds = _inputs(
+        big, blocks, add_count, 20261127 + 10 * blocks + add_count
+    )
+    kwargs = {
+        "add_hidden": adds[0],
+        "out_norm_weight": norm_weight,
+        "out_eps": 1e-5,
+        "add_hidden2": adds[1],
+        **_e8m0_kwargs(quant),
+    }
+    full = _run(True, monkeypatch, prefix, block, score_weight, 1e-5, **kwargs)
+    for rows in (1, 29, 301):
+        sub_kwargs = {
+            k: (v[:rows] if isinstance(v, torch.Tensor) and v.dim() == 2 else v)
+            for k, v in kwargs.items()
+        }
+        sub = _run(
+            True,
+            monkeypatch,
+            prefix[:rows],
+            block[:rows],
+            score_weight,
+            1e-5,
+            **sub_kwargs,
+        )
+        for i, (got, want) in enumerate(zip(sub, full)):
+            if quant == "e8m0" and i == 1:
+                # column-major scales: [H // 128, T] storage viewed as [T, H // 128]
+                groups = got.shape[1]
+                got = got.view(torch.uint8).reshape(groups, rows)
+                want = want.view(torch.uint8).reshape(groups, big)[:, :rows]
+            else:
+                got, want = got.view(torch.uint8), want[:rows].view(torch.uint8)
+            assert torch.equal(got, want), (rows, i)
