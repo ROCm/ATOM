@@ -231,7 +231,7 @@ Check: is the changed method overridden in subclasses? If not, all variants are 
 For **Tier 1** files (model_runner, config, deepseek_v2, scheduler):
 - [ ] List every function/method changed. Grep for callers: `grep -r 'def <name>' atom/models/ atom/model_engine/`. If any caller not mentioned in the PR exists, flag it.
 - [ ] For `deepseek_v2.py`: run `grep -rn 'def <changed_method>' atom/models/` — does any subclass override it differently? If not overridden → all DSv2/V3/V3-0324/Kimi are affected.
-- [ ] Is there an integration test (full forward pass, not unit test alone) exercising this path after the change? If not → `📝 HK3`
+- [ ] Is there an integration test (full forward pass, not unit test alone) exercising this path after the change? If not, say so in a 📝 — the id is internal
 - [ ] State explicitly: if this change is wrong, what breaks? (crash / silent wrong value / OOM / cudagraph break) and how would it be detected?
 
 For **Tier 2** files (moe, attention_mla, linear, aiter_mla, scheduler):
@@ -264,7 +264,7 @@ Six failure categories — work all six in order. Severity: 🔴 block / ⚠️ 
 Format, one per rule id:
 
 ```
-<RULE-ID> FIRE|CLEAR|N/A — <the specific reason, naming file:line, symbol, or the condition>
+<RULE-ID> FIRE|CLEAR|N/A — <the reason: file:line or the condition; a FIRE citing no file backticks a symbol the card will name>
 ```
 
 `CLEAR` means you looked and it does not apply *to this diff*; it is a claim, and the

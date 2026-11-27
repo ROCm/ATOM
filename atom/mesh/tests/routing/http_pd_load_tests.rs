@@ -19,6 +19,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 enum DispatchKind {
     Atom,
     AtomChunked,
+    /// ATOM with `--atom-pd-concurrent`: decode is sent while prefill runs.
+    AtomConcurrent,
     Vllm,
     Sglang,
 }
@@ -156,6 +158,7 @@ fn dispatch_with_policy(
     let mut router = tests::create_test_pd_router();
     // As ATOM PD runs in CI; it maps only DP-aware workers.
     router.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
+    router.atom_pd_concurrent = matches!(kind, DispatchKind::AtomConcurrent);
     let mut prefill_binding = None;
     let mut decode_binding = None;
     if let Some((policy, binding)) = prefill_policy {
@@ -183,7 +186,7 @@ fn dispatch_with_policy(
             return_logprob: false,
             request_text: None,
             tokens: None,
-            carries_media: false,
+            media_count: 0,
             model_id: None,
             headers: headers.clone().map(Arc::new),
         };
@@ -196,12 +199,13 @@ fn dispatch_with_policy(
                     decode_policy: "round_robin",
                     prefill_binding,
                     decode_binding,
+                    prefill_tokens: 7,
                 },
                 headers.as_ref(),
             )
             .unwrap();
         match kind {
-            DispatchKind::Atom | DispatchKind::AtomChunked => {
+            DispatchKind::Atom | DispatchKind::AtomChunked | DispatchKind::AtomConcurrent => {
                 let decode_body = if matches!(kind, DispatchKind::AtomChunked) {
                     json!({"kv_transfer_params": {"chunked_transfer": true}})
                 } else {
@@ -276,19 +280,28 @@ impl IngressBackend {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (capture, requests) = mpsc::unbounded_channel();
-        let app = Router::new().route(
-            "/v1/chat/completions",
-            post(move |body: Bytes| {
-                let capture = capture.clone();
-                async move {
-                    let (reply, response) = oneshot::channel();
-                    capture
-                        .send((serde_json::from_slice::<Value>(&body).unwrap(), reply))
-                        .unwrap();
-                    response.await.unwrap()
-                }
-            }),
-        );
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |body: Bytes| {
+                    let capture = capture.clone();
+                    async move {
+                        let (reply, response) = oneshot::channel();
+                        capture
+                            .send((serde_json::from_slice::<Value>(&body).unwrap(), reply))
+                            .unwrap();
+                        response.await.unwrap()
+                    }
+                }),
+            )
+            // An ATOM prefill that offers chunked transfer, for ATOM PD routers.
+            .route(
+                "/kv_transfer_info",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"tp_size": 1, "kv_role": "kv_producer",
+                        "chunked_transfer": {"remote_host": "127.0.0.1"}}))
+                }),
+            );
         Self {
             worker: Arc::new(
                 BasicWorkerBuilder::new(url)
@@ -443,6 +456,138 @@ async fn pd_ingress_dispatches_next_request_while_prefill_body_is_blocked() {
     assert_eq!(pool.shutdown().await, 0);
 }
 
+/// Through ingress, an ATOM PD router dispatches a text chat chunked when its prefill offers
+/// chunked transfer, but an `image_url` chat through the response relay: decode receives it
+/// only after prefill answers, with no `chunked_transfer` in its `kv_transfer_params`. The
+/// relay needs prefill's handoff: a prefill that answers an image chat with a null or absent
+/// `kv_transfer_params` gets the chat a 502 and decode never sees it.
+#[tokio::test]
+async fn atom_pd_ingress_relays_an_image_chat_without_chunked_transfer() {
+    use crate::{
+        app_context::AppContext,
+        config::{PolicyConfig, RouterConfig, RoutingMode},
+        core::prepare_pool::PreparePoolRuntime,
+        routers::ingress::InferenceEnvelope,
+    };
+
+    let mut prefill = IngressBackend::start(WorkerType::Prefill {
+        bootstrap_port: None,
+    })
+    .await;
+    let mut decode = IngressBackend::start(WorkerType::Decode).await;
+    let config = RouterConfig {
+        mode: RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        policy: PolicyConfig::RoundRobin,
+        backend: BackendType::Atom,
+        disable_retries: true,
+        ..Default::default()
+    };
+    let mut pool = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap(),
+    );
+    app.worker_registry.register(prefill.worker.clone());
+    app.worker_registry.register(decode.worker.clone());
+    let router = PDRouter::new(&app).await.unwrap();
+    let text = json!({"type": "text", "text": "Which color is this?"});
+    let image = json!({"type": "image_url", "image_url": {"url": "https://x/red.png"}});
+    let prompt_ids = json!([101, 102, 103, 104]);
+    // An ATOM multimodal prefill that hands off (ROCm/ATOM#3410) answers non-streaming with
+    // the prompt ids it expanded from the media, and a handoff carrying the media's cache seed
+    // and MRoPE offset, with which decode skips the media.
+    let handoff = json!({"do_remote_prefill": true, "do_remote_decode": false,
+        "remote_engine_id": "prefill-0", "remote_block_ids": [3, 4],
+        "cache_seed": 7, "mrope_position_delta": -2});
+    let with_handoff = json!({"choices": [], "prompt_token_ids": prompt_ids,
+        "kv_transfer_params": handoff});
+    // One that does not hand off answers `"kv_transfer_params": null`, as ATOM's prefill does;
+    // an answer without the field is refused alike.
+    let null_handoff = json!({"choices": [], "prompt_token_ids": prompt_ids,
+        "kv_transfer_params": null});
+    let absent_handoff = json!({"choices": [], "prompt_token_ids": prompt_ids});
+    for (content, prefill_answer) in [
+        (json!([text]), None),
+        (json!([text, image]), Some(with_handoff)),
+        (json!([text, image]), Some(null_handoff)),
+        (json!([text, image]), Some(absent_handoff)),
+    ] {
+        let body = json!({"model": "pd-ingress-test",
+            "messages": [{"role": "user", "content": content}]});
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let request = InferenceEnvelope::parse(
+            "/v1/chat/completions".parse().unwrap(),
+            headers,
+            Bytes::from(body.to_string()),
+            &app,
+        )
+        .await
+        .unwrap();
+        let (router, app) = (router.clone(), app.clone());
+        let task = tokio::spawn(async move { router.route_inference(request, &app).await });
+        let (prefill_body, prefill_reply) = prefill.next_request().await;
+        let chunked_param = |body: &Value| body["kv_transfer_params"]["chunked_transfer"].clone();
+        let Some(prefill_answer) = prefill_answer else {
+            assert_eq!(chunked_param(&prefill_body), json!(true));
+            let (decode_body, decode_reply) = decode.next_request().await;
+            assert_eq!(chunked_param(&decode_body), json!(true));
+            prefill_reply
+                .send(axum::Json(json!({"choices": []})).into_response())
+                .unwrap();
+            decode_reply
+                .send(axum::Json(json!({"choices": []})).into_response())
+                .unwrap();
+            let response = result(task).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body().collect().await.unwrap();
+            continue;
+        };
+        assert_eq!(chunked_param(&prefill_body), Value::Null, "{prefill_body}");
+        assert_eq!(prefill_body["stream"], json!(false), "{prefill_body}");
+        // Decode waits for prefill's answer.
+        assert!(timeout(Duration::from_millis(100), decode.requests.recv())
+            .await
+            .is_err());
+        let handoff = prefill_answer["kv_transfer_params"].clone();
+        prefill_reply
+            .send(axum::Json(prefill_answer).into_response())
+            .unwrap();
+        if handoff.is_null() {
+            let response = result(task).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                response.headers()["x-mesh-error-code"],
+                "prefill_missing_kv_transfer_params"
+            );
+            assert!(decode.requests.try_recv().is_err());
+            continue;
+        }
+        let (decode_body, decode_reply) = decode.next_request().await;
+        assert_eq!(decode_body["messages"], body["messages"]);
+        let decode_kv = &decode_body["kv_transfer_params"];
+        for key in ["cache_seed", "mrope_position_delta", "remote_block_ids"] {
+            assert_eq!(decode_kv[key], handoff[key], "{key}: {decode_body}");
+        }
+        assert_eq!(decode_kv["prompt_token_ids"], prompt_ids, "{decode_body}");
+        assert_eq!(chunked_param(&decode_body), Value::Null, "{decode_body}");
+        decode_reply
+            .send(axum::Json(json!({"choices": []})).into_response())
+            .unwrap();
+        let response = result(task).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+    }
+    assert_eq!((prefill.worker.load(), decode.worker.load()), (0, 0));
+    assert_eq!(pool.shutdown().await, 0);
+}
+
 #[tokio::test]
 async fn pd_dispatch_uses_each_workers_credentials_without_leaking_client_keys() {
     for kind in KINDS {
@@ -522,10 +667,13 @@ async fn check_streaming_lifecycle(kind: DispatchKind, end: StreamEnd) {
         "{kind:?}: P must count before response headers"
     );
     assert_eq!(d.worker.load(), 1, "{kind:?}: selected D must be reserved");
+    assert_eq!(p.worker.prefill_tokens(), 7, "{kind:?}: P holds the prompt");
+    assert_eq!(d.worker.prefill_tokens(), 0, "{kind:?}: D has no prefill");
 
     p.respond(prefill_response());
     d.wait_entered().await;
     wait_load(&p.worker, 0).await;
+    assert_eq!(p.worker.prefill_tokens(), 0, "{kind:?}: prefill done");
     assert_eq!(d.worker.load(), 1, "D must count while waiting for headers");
 
     let (response, tx) = stream_response(StatusCode::OK);
@@ -704,6 +852,7 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
             decode_policy: "dp_sticky",
             prefill_binding: None,
             decode_binding: placed.binding,
+            prefill_tokens: 0,
         },
         Some(&headers),
     );
@@ -831,7 +980,11 @@ async fn a_prefill_server_error_releases_only_the_prefill_binding() {
 
 #[tokio::test]
 async fn an_idx2idx_prefill_server_error_places_the_decode_session_again() {
-    for kind in [DispatchKind::Atom, DispatchKind::AtomChunked] {
+    for kind in [
+        DispatchKind::Atom,
+        DispatchKind::AtomChunked,
+        DispatchKind::AtomConcurrent,
+    ] {
         let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(SessionAffinityPolicy::dp_sticky());
         let (mut p, mut d) = servers().await;
         let dp_worker = |server: &GatedServer, rank, role| -> Arc<dyn Worker> {
@@ -912,10 +1065,12 @@ async fn cancelling_dispatch_releases_pending_load() {
         let task = dispatch(kind, &p, &d, true);
         p.wait_entered().await;
         assert_eq!(p.worker.load(), 1);
+        assert_eq!(p.worker.prefill_tokens(), 7);
         assert_eq!(d.worker.load(), 1);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(p.worker.load(), 0);
+        assert_eq!(p.worker.prefill_tokens(), 0);
         assert_eq!(d.worker.load(), 0);
     }
 }
@@ -1004,6 +1159,7 @@ async fn check_stalled_dual_dispatch_error(fail_prefill: bool) {
         let task = dispatch(DispatchKind::Sglang, &p, &d, streaming);
         p.wait_entered().await;
         d.wait_entered().await;
+        assert_eq!(p.worker.prefill_tokens(), 7);
         let (failed, peer) = if fail_prefill {
             (&mut p, &d)
         } else {
@@ -1026,6 +1182,7 @@ async fn check_stalled_dual_dispatch_error(fail_prefill: bool) {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&bytes).contains("upstream unavailable"));
         assert_eq!(p.worker.load(), 0);
+        assert_eq!(p.worker.prefill_tokens(), 0);
         assert_eq!(d.worker.load(), 0);
     }
 }

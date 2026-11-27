@@ -148,6 +148,63 @@ def anthropic_context_length_message(
     )
 
 
+def fold_mid_system(messages: list[dict]) -> list[dict]:
+    """System messages after the conversation has started, moved into user
+    turns: what Claude Code itself falls back to, for a template that cannot
+    take them (``template_takes_mid_system``).
+
+    Each joins the next user message when one follows (past any tool results,
+    which must stay right after the call they answer), else the user message
+    right before it, else becomes a user message of its own. The next one is
+    preferred because joining the previous one would, for a reminder between
+    an assistant reply and the next user turn, leave two user turns in a row.
+    """
+    result: list[dict] = []
+    pending: list[str] = []
+
+    def flush_back() -> None:
+        if result and result[-1]["role"] == "user":
+            last = result[-1]
+            result[-1] = {
+                **last,
+                "content": _with_text(last["content"], pending, before=False),
+            }
+        else:
+            result.append({"role": "user", "content": "\n\n".join(pending)})
+        pending.clear()
+
+    started = False
+    for message in messages:
+        role = message["role"]
+        if role == "system" and started:
+            pending.append(message["content"])
+            continue
+        started = started or role != "system"
+        if pending and role == "user":
+            message = {
+                **message,
+                "content": _with_text(message["content"], pending, before=True),
+            }
+            pending.clear()
+        elif pending and role != "tool":
+            flush_back()
+        result.append(message)
+    if pending:
+        flush_back()
+    return result
+
+
+def _with_text(content: Any, texts: list[str], *, before: bool) -> Any:
+    """``content`` (a string or chat parts) with ``texts`` added as text."""
+    if isinstance(content, list):
+        parts = [{"type": "text", "text": text} for text in texts]
+        return [*parts, *content] if before else [*content, *parts]
+    joined = "\n\n".join(texts)
+    if not content:
+        return joined
+    return f"{joined}\n\n{content}" if before else f"{content}\n\n{joined}"
+
+
 def anthropic_to_openai_messages(
     messages: list[AnthropicMessage],
     system: Any | None = None,
@@ -233,11 +290,15 @@ def anthropic_to_openai_messages(
                                     ),
                                 }
                             )
+                # Tool results first: they answer the call just before them,
+                # and Anthropic puts them first in the message too. Text after
+                # them (Claude Code adds reminders there) went first, leaving
+                # a user turn between a tool call and its result.
+                result.extend(tool_results)
                 if _has_image(content):
                     result.append({"role": "user", "content": _parts(content)})
                 elif text_parts:
                     result.append({"role": "user", "content": "\n".join(text_parts)})
-                result.extend(tool_results)
         elif role == "system":
             # Mid-conversation system messages (Claude Code sends reminders
             # this way). str() of a block list put its Python repr in the prompt.

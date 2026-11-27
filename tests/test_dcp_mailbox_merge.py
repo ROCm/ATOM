@@ -39,7 +39,15 @@ def _group(world=4):
 def a2a_calls(monkeypatch):
     calls = []
 
-    def fake_a2a(out, lse, group, owned_counts=None, quant_dtype=None):
+    def fake_a2a(
+        out,
+        lse,
+        group,
+        owned_counts=None,
+        quant_dtype=None,
+        head_major=False,
+    ):
+        assert not head_major
         calls.append(quant_dtype)
         return "a2a"
 
@@ -245,7 +253,9 @@ class _PerTokenFp8Proj:
 
 
 _METADATA = SimpleNamespace(
-    dcp_owned_counts=torch.ones(8, dtype=torch.int32), dcp_sparse_prefill_kv=None
+    dcp_owned_counts=torch.ones(8, dtype=torch.int32),
+    index_exchange_done=None,
+    dcp_sparse_prefill_kv=None,
 )
 
 
@@ -255,8 +265,16 @@ def _merge_layer(monkeypatch, seen):
     from atom.model_ops.attention_mla import MLAAttention
 
     def fake_merge(
-        o, lse, group, backend, ctx=None, owned_counts=None, quant_dtype=None
+        o,
+        lse,
+        group,
+        backend,
+        ctx=None,
+        owned_counts=None,
+        quant_dtype=None,
+        head_major=False,
     ):
+        assert not head_major
         seen.append((backend, quant_dtype))
         return o if quant_dtype is None else (o, None)
 

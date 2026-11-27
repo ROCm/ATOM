@@ -313,6 +313,18 @@ pub struct CliArgs {
     )]
     pub session_parent_mode: String,
 
+    /// With --kv-storage-weight, how long a request waits for the stores its workers load
+    /// from to say what they hold of the prompt, in milliseconds. Past it a store's lookup
+    /// has no answer at all, and counts toward the store's breaker
+    #[arg(long, default_value_t = 3, help_heading = "Routing Policy")]
+    pub kv_storage_deadline_ms: u64,
+
+    /// With --kv-events, what a token a worker's engine will load from the Mooncake Store
+    /// it reads counts for in cache_aware's match rate (0 to 1), against one its device
+    /// cache holds. Above 0, a request waits for the stores that could add to it; 0 asks none
+    #[arg(long, default_value_t = 0.0, value_parser = parse_fraction, help_heading = "Routing Policy")]
+    pub kv_storage_weight: f64,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -342,6 +354,12 @@ pub struct CliArgs {
     /// selects decode first and prefill among the workers on its rank
     #[arg(long, default_value = "none", value_parser = ["none", "idx2idx"], help_heading = "PD Disaggregation")]
     pub atom_pd_rank_mapping_policy: String,
+
+    /// ATOM-only: in relay mode, send a /v1/chat/completions request to decode while
+    /// prefill runs and pass prefill's KV metadata as a late line (decode needs
+    /// ATOM_PD_LATE_KV=1; a decode that answers 404 gets the serial relay)
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    pub atom_pd_concurrent: bool,
 
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
@@ -527,7 +545,14 @@ pub struct CliArgs {
     pub tool_call_parser: Option<String>,
 
     // ==================== Backend ====================
-    /// Backend runtime to use
+    /// Backend runtime of the workers; ATOM workers need `atom`
+    ///
+    /// ATOM workers need `atom` in regular mode as in PD mode: it keys an
+    /// image chat by all its media, as ATOM's prefix cache does. It also
+    /// discovers an HTTP worker's model through `/v1/models`, whose model id
+    /// (an alias under `--served-model-name`) names the worker's model;
+    /// `--tokenizer-path` and `--model-path` take precedence over it for the
+    /// worker's tokenizer.
     #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime", help_heading = "Backend")]
     pub backend: Backend,
 
@@ -700,6 +725,7 @@ impl CliArgs {
             .mode(mode)
             .backend(self.backend.into())
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
+            .atom_pd_concurrent(self.atom_pd_concurrent)
             .policy(policy)
             .session_affinity(session_affinity)
             .connection_mode(connection_mode)
@@ -757,6 +783,8 @@ impl CliArgs {
             .dp_aware(self.dp_aware)
             .kv_events(self.kv_events)
             .mooncake_admin_port(self.mooncake_admin_port)
+            .kv_storage_deadline_ms(self.kv_storage_deadline_ms)
+            .kv_storage_weight(self.kv_storage_weight)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
@@ -820,6 +848,23 @@ mod tests {
     }
 
     #[test]
+    fn atom_pd_concurrent_flag_maps_to_router_config() {
+        let parse = |args: &[&str]| {
+            CliArgs::try_parse_from(args)
+                .unwrap()
+                .to_router_config(Vec::new())
+                .unwrap()
+        };
+        assert!(!parse(&["atomesh"]).atom_pd_concurrent);
+        assert!(!CliArgs::default().atom_pd_concurrent);
+        let config = parse(&["atomesh", "--backend", "atom", "--atom-pd-concurrent"]);
+        assert!(config.atom_pd_concurrent && config.atom_pd_concurrent_dispatch());
+        // The flag has no effect off the ATOM backend.
+        let config = parse(&["atomesh", "--backend", "sglang", "--atom-pd-concurrent"]);
+        assert!(config.atom_pd_concurrent && !config.atom_pd_concurrent_dispatch());
+    }
+
+    #[test]
     fn cli_prepare_options_map_to_router_config() {
         let args = CliArgs::try_parse_from([
             "atomesh",
@@ -874,6 +919,21 @@ mod tests {
             assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 10);
             assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
         }
+    }
+
+    #[test]
+    fn cli_kv_storage_options_map_to_router_config() {
+        let args = CliArgs::try_parse_from([
+            "atomesh",
+            "--kv-storage-weight",
+            "0.5",
+            "--kv-storage-deadline-ms",
+            "7",
+        ])
+        .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert_eq!(config.kv_storage_weight, 0.5);
+        assert_eq!(config.kv_storage_deadline_ms, 7);
     }
 
     #[test]
@@ -1067,11 +1127,14 @@ impl Default for CliArgs {
             session_affinity_max_entries: DEFAULT_SESSION_AFFINITY_MAX_ENTRIES,
             session_parent_mode: "independent".to_string(),
             mooncake_admin_port: 9003,
+            kv_storage_deadline_ms: 3,
+            kv_storage_weight: 0.0,
             pd_disaggregation: false,
             decode: Vec::new(),
             prefill_policy: None,
             decode_policy: None,
             atom_pd_rank_mapping_policy: "none".to_string(),
+            atom_pd_concurrent: false,
             worker_startup_timeout_secs: 1800,
             worker_startup_check_interval: 30,
             log_dir: None,

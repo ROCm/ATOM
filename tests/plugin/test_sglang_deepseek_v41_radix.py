@@ -20,7 +20,9 @@ hit's span starts at ``P - R``, which the bridge translates into ATOM's
 7. the host-row invalidation that lets overlap run;
 8. the GPU page-check tool (``v41_radix_page_check``);
 9. admission: a 400 at the scheduler's queue door for positional embedding
-   overrides.
+   overrides;
+10. DSpark under the replay: launch policy and refusals, verify rounds that
+    never carry a replay, a DSpark prefill hit.
 """
 
 import importlib.util
@@ -129,7 +131,7 @@ def _extend_fb(prefix, lengths, slots, mode=EXTEND):
         seq_lens=torch.tensor(ends, dtype=torch.int64),
         seq_lens_cpu=torch.tensor(ends, dtype=torch.int64),
         req_pool_indices=torch.tensor(slots, dtype=torch.int64),
-        req_pool_indices_cpu=None,
+        req_pool_indices_cpu=torch.tensor(slots, dtype=torch.int64),
         extend_seq_lens=None,
         extend_prefix_lens=None,
         extend_seq_lens_cpu=list(lengths),
@@ -546,7 +548,13 @@ def _radix_bags(**overrides):
                 )
             ),
         ),
-        "spec": SimpleNamespace(speculative_algorithm=None),
+        "spec": SimpleNamespace(
+            speculative_algorithm=None,
+            speculative_num_draft_tokens=None,
+            speculative_draft_model_path=None,
+            speculative_use_block_verification=False,
+        ),
+        "model": SimpleNamespace(model_path="/models/v41"),
         "disagg": SimpleNamespace(disaggregation_mode="null", language_model_only=True),
         "parallel": SimpleNamespace(
             enable_dp_attention=False, dcp_size=1, moe_dense_tp_size=None
@@ -571,7 +579,7 @@ def launch(monkeypatch):
     from sglang.srt import runtime_context
 
     state = SimpleNamespace(bags=_radix_bags())
-    for name in ("memory", "exec", "spec", "disagg", "parallel", "schedule"):
+    for name in ("memory", "exec", "spec", "disagg", "parallel", "schedule", "model"):
         monkeypatch.setattr(
             runtime_context, f"get_{name}", lambda name=name: state.bags[name]
         )
@@ -597,14 +605,6 @@ class TestRefusals:
         # runs (`TestLaunchPolicy`); the bridge has no stand-in refusal.
         monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
         refuse_unsupported_sglang_features()
-
-    def test_speculation_stays_refused(self, launch):
-        # No radix-specific speculation path: the launch contract refuses
-        # speculative decoding with radix on or off.
-        launch.bags["spec"].speculative_algorithm = "DSPARK"
-        with pytest.raises(ValueError, match="speculative decoding") as refused:
-            refuse_unsupported_sglang_features()
-        assert "radix" not in str(refused.value)
 
     @pytest.mark.parametrize(
         ("bag", "path", "value", "match"),
@@ -662,8 +662,12 @@ class TestLaunchPolicy:
         # A plain record: SGLang's resolving view reads it the same way.
         monkeypatch.setattr(radix, "_resolving_view", lambda server_args: server_args)
 
-    ARGS = SimpleNamespace(disable_radix_cache=False)
+    ARGS = SimpleNamespace(disable_radix_cache=False, speculative_algorithm=None)
     V41 = SimpleNamespace(model_type="deepseek_v41")
+
+    @staticmethod
+    def _args(spec=None):
+        return SimpleNamespace(disable_radix_cache=False, speculative_algorithm=spec)
 
     def test_default_launch_keeps_radix(self, caplog):
         with caplog.at_level("WARNING", logger="atom"):
@@ -683,10 +687,23 @@ class TestLaunchPolicy:
 
     def test_radix_already_off_declares_nothing(self, monkeypatch, caplog):
         monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
-        args = SimpleNamespace(disable_radix_cache=True)
+        args = SimpleNamespace(disable_radix_cache=True, speculative_algorithm="DSPARK")
         with caplog.at_level("WARNING", logger="atom"):
             assert radix.v41_radix_launch_override(args, self.V41) == {}
         assert not caplog.records
+
+    def test_dspark_keeps_radix(self, caplog):
+        with caplog.at_level("WARNING", logger="atom"):
+            assert radix.v41_radix_launch_override(self._args("DSPARK"), self.V41) == {}
+        assert not caplog.records
+
+    def test_radix_off_wins_over_dspark(self, monkeypatch, caplog):
+        monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
+        with caplog.at_level("WARNING", logger="atom"):
+            assert radix.v41_radix_launch_override(self._args("DSPARK"), self.V41) == {
+                "disable_radix_cache": True
+            }
+        assert "ATOM_SGLANG_V41_RADIX is off" in caplog.records[0].getMessage()
 
     # ATOM's text type never reaches SGLang's registry: SGLang's V4.1 config
     # forces ``deepseek_v41``.
@@ -715,7 +732,7 @@ class TestLaunchPolicy:
         base = _sglang_module("sglang.srt.arg_groups.model_override_base")
         monkeypatch.setattr(radix, "_resolving_view", base.resolving_view)
         monkeypatch.setenv("ATOM_SGLANG_V41_RADIX", "0")
-        args = SimpleNamespace(disable_radix_cache=False)
+        args = SimpleNamespace(disable_radix_cache=False, speculative_algorithm=None)
         args._resolved_overrides = [("earlier", {"disable_radix_cache": True})]
         assert radix.v41_radix_launch_override(args, self.V41) == {}
         args._resolved_overrides = []
@@ -801,6 +818,7 @@ def _v41_atom_config():
         kv_cache_block_size=128,
         enable_decoder_swa_bounded_replay=True,
         enable_encoder_swa_bounded_replay=True,
+        speculative_config=None,
         online_quant_config={"layer_quant_config": {}},
         quant_config=None,
         hf_config=SimpleNamespace(sliding_window=128, fp4ptpc=False),
@@ -1287,12 +1305,18 @@ class TestFusedMetadata:
     def _builder(self, monkeypatch, captured):
         def prepare_prefill(batch, running_bs, running_tokens):
             captured.update(batch=batch, bs=running_bs, tokens=running_tokens)
-            return SimpleNamespace(engram_embeddings=None), None
+            metadata = SimpleNamespace(
+                engram_embeddings=None,
+                step=SimpleNamespace(),
+            )
+            return metadata, None
 
         builder = SimpleNamespace(
             cache=object(),
             block_size=PAGE,
-            geometry=SimpleNamespace(history_size=HISTORY, window_size=128),
+            geometry=SimpleNamespace(
+                history_size=HISTORY, window_size=128, speculative_tokens=0
+            ),
             max_bs=8,
             max_num_batched_tokens=4096,
             _decoder_replays=True,
@@ -1300,6 +1324,8 @@ class TestFusedMetadata:
             prepare_model_inputs=lambda ids, md: captured.update(ids=ids),
         )
         monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        # The pool's decoder row table (outside a SGLang forward context).
+        monkeypatch.setattr(bridge, "_decoder_rows_from", lambda: np.zeros(8, np.int64))
         return builder
 
     def _fb(self):
@@ -1678,3 +1704,309 @@ class TestOverrideAdmission:
         assert type(reason).__name__ == "FINISH_ABORT"
         assert reason.message == error and int(reason.status_code) == 400
         assert streamed == [["pe"]] and aborted == [1]
+
+
+# ---------------------------------------------------------------------------
+# 10. DSpark under the replay
+# ---------------------------------------------------------------------------
+
+
+VERIFY = ForwardMode.TARGET_VERIFY
+DSPARK_WIDTH = bridge.V41_DSPARK_VERIFY_TOKENS
+
+
+def _verify_fb(prefix, slots):
+    ends = [p + DSPARK_WIDTH for p in prefix]
+    return SimpleNamespace(
+        forward_mode=VERIFY,
+        rids=[f"v{i}" for i in range(len(slots))],
+        batch_size=len(slots),
+        seq_lens=torch.tensor(ends, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor(ends, dtype=torch.int64),
+        req_pool_indices=torch.tensor(slots, dtype=torch.int64),
+        req_pool_indices_cpu=None,
+        atom_v41_req_pool_indices_cpu=torch.tensor(slots, dtype=torch.int64),
+        spec_info=SimpleNamespace(
+            draft_token_num=DSPARK_WIDTH,
+            live_seq_lens_cpu=torch.tensor(prefix, dtype=torch.int64),
+        ),
+    )
+
+
+class TestDSparkUnderTheReplay:
+    def test_dspark_is_not_a_radix_refusal(self, launch):
+        launch.bags["spec"].speculative_algorithm = "DSPARK"
+        bags = launch.bags
+        refusals = bridge._radix_refusals(bags["memory"], bags["schedule"])
+        assert [name for name, on in refusals if on] == []
+
+    def test_verify_rounds_read_no_stamps(self, monkeypatch, req_to_token, radix_on):
+        monkeypatch.setattr(
+            bridge, "_radix_stamps", lambda: pytest.fail("verify read stamps")
+        )
+        batch = build_v41_scheduled_batch(_verify_fb([PAGE + 3, 40], [1, 2]), PAGE)
+        assert batch.replaying == {}
+        assert batch.replay_rows.tolist() == [0, 0]
+        assert batch.num_scheduled_tokens.tolist() == [DSPARK_WIDTH] * 2
+
+    def test_the_seam_leaves_verify_batches_alone(self, monkeypatch, radix_on):
+        world = _World(monkeypatch)
+        batch = world.batch([PAGE], [1], mode=VERIFY)
+        assert run_v41_prefix_replay(world.worker, batch) is None
+        assert not world.pool.state_gen.any()
+        assert not radix._LOGGED_FIRST_FUSED
+
+    def test_the_seam_leaves_a_deferred_decode_round_alone(self, monkeypatch, radix_on):
+        """`dspark_deferred_seq_lens_patch` leaves a DSpark decode round's
+        host ``seq_lens_cpu`` / ``seq_lens_sum`` None until its verify: the
+        seam decides on the mode alone and never reads them (a prefill keeps
+        upstream's resolve, so an EXTEND always has them)."""
+
+        class _Deferred(SimpleNamespace):
+            def __getattribute__(self, name):
+                if name in ("seq_lens_cpu", "seq_lens_sum", "prefix_lens"):
+                    pytest.fail(f"the seam read {name} of a decode round")
+                return super().__getattribute__(name)
+
+        world = _World(monkeypatch)
+        for mode in (DECODE, VERIFY):
+            batch = _Deferred(forward_mode=mode, spec_algorithm="DSPARK")
+            assert run_v41_prefix_replay(world.worker, batch) is None
+        assert not world.pool.state_gen.any()
+
+    def test_dspark_prefill_hit_rides_in_its_step(self, monkeypatch, radix_on):
+        """SGLang's ``DSparkWorkerV2._forward_prefill`` hands the target
+        worker the EXTEND ``ScheduleBatch`` (FULL capture): the seam plans the
+        same record as without speculation."""
+        world = _World(monkeypatch)
+        req = _req(range(500, 500 + 2 * PAGE + 9), rid="d")
+        batch = world.batch([2 * PAGE], [3], [req])
+        batch.spec_algorithm = "DSPARK"
+        fused = run_v41_prefix_replay(world.worker, batch)
+        assert fused.starts.tolist() == [2 * PAGE - R]
+        assert fused.ends.tolist() == [2 * PAGE]
+
+
+# ---------------------------------------------------------------------------
+# 11. The prefill fixes under radix: rows copied at allocation, prefill
+#     token graphs on a fused step
+# ---------------------------------------------------------------------------
+
+
+class _SyncedEvent:
+    def record(self, stream=None):
+        pass
+
+    def synchronize(self):
+        pass
+
+
+@pytest.mark.usefixtures("stamps")
+class TestExtendRowsUnderRadix:
+    """`ExtendRowRead` with radix cache on: the copy holds a hit's prefix
+    pages and the replay's rows below P; a checkpoint after the copy refuses
+    it."""
+
+    @pytest.fixture(autouse=True)
+    def _rows(self, monkeypatch, req_to_token):
+        monkeypatch.setattr(bridge, "_EXTEND_ROWS", bridge.ExtendRowRead())
+        monkeypatch.setattr(
+            bridge, "_device_module", lambda device: SimpleNamespace(Event=_SyncedEvent)
+        )
+        monkeypatch.setattr(
+            bridge, "_V41_BUILDER", SimpleNamespace(cache=object(), block_size=PAGE)
+        )
+        self.reads = []
+        original = bridge._block_rows
+
+        def counted(*args, **kwargs):
+            self.reads.append(len(args[1]))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(bridge, "_block_rows", counted)
+        return req_to_token
+
+    def _alloc(self, table, slots, rids, ends):
+        batch = SimpleNamespace(
+            reqs=[SimpleNamespace(rid=rid) for rid in rids],
+            seq_lens_cpu=torch.tensor(ends, dtype=torch.int64),
+            req_to_token_pool=SimpleNamespace(req_to_token=table),
+        )
+        slots_cpu = torch.tensor(slots, dtype=torch.int64)
+        bridge.read_v41_extend_rows_at_alloc(batch, slots_cpu, slots_cpu)
+
+    def _hit_step(self):
+        # r0 hits at 2 PAGEs (replaying [2 PAGE - R, 2 PAGE)); r1 cold.
+        fb = _extend_fb([2 * PAGE, 0], [5, 9], [1, 2])
+        fb.req_pool_indices_cpu = torch.tensor([1, 2], dtype=torch.int64)
+        return _carry(fb, _fused([0], [1], [2 * PAGE - R], [2 * PAGE]))
+
+    def test_a_hit_takes_its_copy_prefix_pages_included(self, req_to_token):
+        self._alloc(req_to_token, [1, 2], ["r0", "r1"], [2 * PAGE + 5, 9])
+        batch = build_v41_scheduled_batch(self._hit_step(), PAGE)
+        assert self.reads == []
+        # The prefix pages the tree handed back, with the extend's own: the
+        # replay's rows [2 PAGE - R, 2 PAGE) sit in page 3.
+        assert [row.tolist() for row in batch.block_tables] == [[7, 3, 9], [5]]
+        assert batch.num_scheduled_tokens.tolist() == [5 + R, 9]
+
+    def test_a_checkpoint_after_the_copy_refuses_it(self, req_to_token):
+        self._alloc(req_to_token, [1, 2], ["r0", "r1"], [2 * PAGE + 5, 9])
+        # The tree repoints slot 1's row in place (`checkpoint_into_tree`).
+        req_to_token[1, :PAGE] = 13 * PAGE + torch.arange(PAGE)
+        bridge.forget_host_page_rows(1)
+        batch = build_v41_scheduled_batch(self._hit_step(), PAGE)
+        assert self.reads == [2]
+        assert [row.tolist() for row in batch.block_tables] == [[13, 3, 9], [5]]
+
+    def test_a_checkpoint_before_the_copy_keeps_it(self, req_to_token):
+        # A chunked request is checkpointed while its next batch is built,
+        # before that batch's allocation queues the copy.
+        req_to_token[1, :PAGE] = 13 * PAGE + torch.arange(PAGE)
+        bridge.forget_host_page_rows(1)
+        self._alloc(req_to_token, [1, 2], ["r0", "r1"], [2 * PAGE + 5, 9])
+        batch = build_v41_scheduled_batch(self._hit_step(), PAGE)
+        assert self.reads == []
+        assert [row.tolist() for row in batch.block_tables] == [[13, 3, 9], [5]]
+
+
+@pytest.mark.usefixtures("stamps")
+class TestPrefillTokenGraphsUnderRadix:
+    """A fused step pads to the bucket holding its widened rows, as native
+    pads a replaying prefill; SGLang gets its own rows back."""
+
+    @pytest.fixture(autouse=True)
+    def _graphs(self, monkeypatch):
+        from atom.utils import region_graph
+
+        graphs = bridge._PrefillTokenGraphs()
+        graphs.sizes = (256, 512)
+        monkeypatch.setattr(bridge, "_PREFILL_GRAPHS", graphs)
+        monkeypatch.setattr(
+            region_graph.TokenGraph,
+            "bucket",
+            staticmethod(
+                lambda tokens, phase, multiple_of=1: next(
+                    (n for n in (256, 512) if n >= tokens), None
+                )
+            ),
+        )
+        return graphs
+
+    def _builder(self, monkeypatch, captured):
+        def prepare_prefill(batch, running_bs, running_tokens):
+            captured.update(batch=batch, bs=running_bs, tokens=running_tokens)
+            return (
+                SimpleNamespace(
+                    engram_embeddings=None,
+                    step=SimpleNamespace(),
+                ),
+                torch.arange(1000, 1000 + running_tokens),
+            )
+
+        builder = SimpleNamespace(
+            cache=object(),
+            block_size=PAGE,
+            geometry=SimpleNamespace(
+                history_size=HISTORY, window_size=128, speculative_tokens=0
+            ),
+            max_bs=8,
+            max_num_batched_tokens=4096,
+            _decoder_replays=True,
+            prepare_prefill=prepare_prefill,
+            prepare_model_inputs=lambda ids, md: captured.update(ids=ids.clone()),
+        )
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        monkeypatch.setattr(bridge, "_decoder_rows_from", lambda: np.zeros(8, np.int64))
+        return builder
+
+    def _fused_step(self):
+        fb = _extend_fb([PAGE, 0], [3, 2], [1, 2])
+        fb.input_ids = torch.tensor([11, 12, 13, 21, 22])
+        setattr(fb, FUSED_ATTR, _fused([0], [1], [PAGE - R], [PAGE]))
+        positions = torch.tensor([PAGE, PAGE + 1, PAGE + 2, 0, 1])
+        wide_ids, wide_pos, keep = expand_v41_forward_inputs(
+            fb, fb.input_ids, positions
+        )
+        return fb, wide_ids, wide_pos, keep
+
+    def test_a_fused_step_pads_on_its_widened_rows(self, monkeypatch, req_to_token):
+        captured = {}
+        self._builder(monkeypatch, captured)
+        fb, wide_ids, _, _ = self._fused_step()
+        metadata = bridge.build_deepseek_v41_forward_metadata(fb)
+        # 5 + R = 133 rows ran by ATOM: the 256 bucket, not SGLang's 5 rows'.
+        assert captured["tokens"] == 256 and captured["bs"] == 2
+        assert captured["batch"].num_scheduled_tokens.tolist() == [3 + R, 2]
+        assert captured["batch"].replaying[0].until == PAGE
+        padded = metadata.sglang_padded_inputs
+        assert padded.scheduled_tokens == 5 + R
+        assert padded.input_ids.shape[0] == 256
+        assert torch.equal(padded.input_ids[: 5 + R], wide_ids)
+        assert not padded.input_ids[5 + R :].any()
+        assert torch.equal(captured["ids"], padded.input_ids)
+        assert padded.positions.tolist() == list(range(1000, 1256))
+
+    def test_a_widened_step_past_every_bucket_runs_eagerly(
+        self, monkeypatch, req_to_token
+    ):
+        captured = {}
+        self._builder(monkeypatch, captured)
+        fb = _extend_fb([PAGE, 0], [3, 400], [1, 4])
+        fb.input_ids = torch.arange(403)
+        setattr(fb, FUSED_ATTR, _fused([0], [1], [PAGE - R], [PAGE]))
+        positions = torch.cat([torch.arange(PAGE, PAGE + 3), torch.arange(400)])
+        expand_v41_forward_inputs(fb, fb.input_ids, positions)
+        # SGLang's 403 rows would fit 512; ATOM's 531 do not.
+        metadata = bridge.build_deepseek_v41_forward_metadata(fb)
+        assert captured["tokens"] == 403 + R
+        assert getattr(metadata, "sglang_padded_inputs", None) is None
+
+    def test_the_runtime_hands_sglang_its_rows_out_of_the_bucket(
+        self, monkeypatch, req_to_token
+    ):
+        from atom.plugin.sglang.runtime import forward_context as plugin_fc
+        from atom.plugin.sglang.runtime import model_arch
+        from atom.utils.forward_context import get_forward_context
+
+        captured = {}
+        self._builder(monkeypatch, captured)
+        fb = _extend_fb([PAGE, 0], [3, 2], [1, 2])
+        fb.input_ids = torch.tensor([11, 12, 13, 21, 22])
+        setattr(fb, FUSED_ATTR, _fused([0], [1], [PAGE - R], [PAGE]))
+        spec = model_arch.SGLangModelAdapterSpec(
+            build_forward_metadata=lambda config, batch, positions: (
+                bridge.build_deepseek_v41_forward_metadata(batch)
+            ),
+        )
+        monkeypatch.setattr(
+            model_arch, "resolve_model_arch_spec", lambda config: ("X", spec)
+        )
+        monkeypatch.setattr(
+            plugin_fc, "_resolve_running_tokens_are_unified", lambda *a: True
+        )
+        atom_config = SimpleNamespace(
+            hf_config=None,
+            enable_dp_attention=False,
+            parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        )
+        with plugin_fc.SGLangPluginRuntime(
+            atom_config=atom_config,
+            forward_batch=fb,
+            positions=torch.tensor([PAGE, PAGE + 1, PAGE + 2, 0, 1]),
+            input_ids=fb.input_ids,
+            expand_forward_inputs=expand_v41_forward_inputs,
+        ) as runtime:
+            forward = get_forward_context()
+            assert forward.tr_graph == "replay"
+            assert forward.context.scheduled_tokens == 5 + R
+            assert runtime.input_ids.shape[0] == 256
+            assert runtime.positions.shape[0] == 256
+            hidden = torch.arange(256)[:, None].expand(256, 2)
+            out = runtime.trim_output(hidden)
+            # SGLang's five rows: r0's own three after its R replay rows,
+            # then r1's two.
+            assert out[:, 0].tolist() == [R, R + 1, R + 2, R + 3, R + 4]
+            aux = runtime.trim_output((hidden, hidden + 1))
+            assert aux[1][:, 0].tolist() == [R + 1, R + 2, R + 3, R + 4, R + 5]

@@ -12,7 +12,7 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use mesh::config::RouterConfig;
+use mesh::config::{PreparePoolConfig, RouterConfig};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -66,7 +66,15 @@ mod power_of_two_tests {
     /// Test that power of two prefers less loaded workers
     #[tokio::test]
     async fn test_power_of_two_prefers_less_loaded() {
-        let config = TestRouterConfig::power_of_two(3601);
+        let mut config = TestRouterConfig::power_of_two(3601);
+        // The default preparation pool scales with the host's CPUs (2 threads
+        // and 20 queue slots on 4 CPUs), which would turn some of the 30
+        // concurrent requests below into 503s; fix it so they all fit.
+        config.prepare_pool = PreparePoolConfig {
+            workers: Some(2),
+            queue_capacity: Some(64),
+            ..PreparePoolConfig::default()
+        };
 
         let ctx = AppTestContext::new_with_config(
             config,

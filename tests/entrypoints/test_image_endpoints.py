@@ -224,9 +224,10 @@ class TestAnthropicTranslation:
                 {"type": "text", "text": "b"},
             ]
         )
+        # Tool results first: they answer the call before this message.
         assert messages == [
-            {"role": "user", "content": "a\nb"},
             {"role": "tool", "tool_call_id": "t1", "content": "x\ny"},
+            {"role": "user", "content": "a\nb"},
         ]
 
 
@@ -506,8 +507,8 @@ class TestMessagesEndpoint:
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_a_pd_handoff_with_images_is_refused(server, stream):
-    """A prefill leg cannot hand an image request off: 400 on either leg,
-    before anything is fetched."""
+    """Only Chat Completions hands an image request from prefill to decode:
+    Responses and Messages answer one with 400, before anything is fetched."""
     handoff = {"kv_transfer_params": {"do_remote_decode": True}, "stream": stream}
     responses = _responses({"input": _user_image(), **handoff})
     messages = _messages([_base64_image()], **handoff)

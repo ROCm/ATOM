@@ -446,7 +446,8 @@ _GDN_STEP: ContextVar[_GDNStep | None] = ContextVar(
 
 
 class SGLangGatedDeltaNet(GatedDeltaNet):
-    """Run batched ATOM GDN while filling SGLang's verify snapshots."""
+    """ATOM GDN under SGLang. TARGET_VERIFY runs ReplaySSM, or the batched path
+    with ``ATOM_ENABLE_REPLAYSSM=0``."""
 
     def forward(
         self,
@@ -480,26 +481,22 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
         if attn_backend is None:
             raise RuntimeError(
-                "ATOM Qwen3.5 TARGET_VERIFY requires an active SGLang "
-                "attention backend."
+                "ATOM GDN TARGET_VERIFY requires an active SGLang attention backend."
             )
         linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
         if getattr(linear_backend, "forward_metadata", None) is None:
             raise RuntimeError(
-                "ATOM Qwen3.5 TARGET_VERIFY requires initialized SGLang "
-                "GDN metadata."
+                "ATOM GDN TARGET_VERIFY requires initialized SGLang GDN metadata."
             )
         req_to_token_pool = getattr(linear_backend, "req_to_token_pool", None)
         if req_to_token_pool is None:
-            raise RuntimeError(
-                "ATOM Qwen3.5 TARGET_VERIFY requires the SGLang mamba pool."
-            )
+            raise RuntimeError("ATOM GDN TARGET_VERIFY requires the SGLang mamba pool.")
         layer_cache = req_to_token_pool.mamba2_layer_cache(self.layer_num)
         if not hasattr(layer_cache, "intermediate_ssm") or not hasattr(
             layer_cache, "intermediate_conv_window"
         ):
             raise RuntimeError(
-                "ATOM Qwen3.5 TARGET_VERIFY requires speculative GDN "
+                "ATOM GDN TARGET_VERIFY requires speculative GDN "
                 "intermediate-state buffers."
             )
 
@@ -526,7 +523,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         cache_indices = linear_backend.forward_metadata.mamba_cache_indices[:bs]
         conv_states = layer_cache.conv[0]
         # Same view Native passes to GatedDeltaNet: FlyDSL decode keeps a
-        # logical KV view over physical VK storage. Verify reads that view.
+        # logical KV view over physical VK storage. The batched path reads
+        # that view; ReplaySSM addresses the raw pool.
         ssm_states = layer_cache.temporal
         policy = getattr(self, "gdn_flydsl_policy", None)
         if policy is not None and policy.decode:
@@ -648,7 +646,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             bs=bs,
             draft_token_num=draft_token_num,
         )
-        buf_k, buf_u, buf_g, write_pos = prepare_layer(
+        buf_k, buf_u, buf_g, flush_arrivals, write_pos, flush_wait = prepare_layer(
             self.layer_num,
             ckpt,
             num_v_heads=self.num_v_heads // self.tp_size,
@@ -677,6 +675,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             buf_k=buf_k,
             buf_u=buf_u,
             buf_g=buf_g,
+            flush_arrivals=flush_arrivals,
+            flush_wait=flush_wait,
             write_pos=write_pos,
             slot_idx=slot_idx,
             cu_seqlens=self._spec_cu_seqlens(bs, draft_token_num, mixed_blocks.device),
@@ -692,8 +692,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
     ) -> torch.Tensor:
         """`[bs, draft]` table into the flat `intermediate_ssm` slot pool.
 
-        Cached per shape and filled in place: CUDA graph replay requires the
-        tensor address to stay put across iterations.
+        Built once per shape and never mutated. `_verify_batched_ssm` hands the
+        kernel a pad-masked copy, not this table.
         """
         cache = getattr(self, "_spec_slot_table_cache", None)
         if cache is None:
@@ -734,14 +734,19 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         `intermediate_ssm` as a flat `[slot * step]` pool via a 2D index table,
         so every per-step state lands where SGLang's
         `fused_mamba_state_scatter_with_mask` expects it. The live SSM state is
-        never written, so it needs no snapshot/restore.
+        only read.
 
         The conv update is folded into one wide-window call over SGLang's
         deduplicated sliding-window `intermediate_conv_window`.
 
-        Equivalence with the stepwise loop is covered bit-for-bit by
-        tests/plugin/test_gdn_target_verify_batched_equiv.py and
-        tests/plugin/test_sglang_gdn_verify_batched_ssm.py.
+        tests/plugin/test_gdn_target_verify_batched_equiv.py checks this call
+        pattern bit-for-bit against a per-step loop, using its own stand-in
+        call rather than this method.
+        tests/plugin/test_sglang_gdn_verify_batched_ssm.py drives this method
+        through forward() and checks the plugin contract: both buffers have
+        nonzero contents for each live request at steps 1..draft-1 (SSM
+        step 0 is host-seeded), the live state is untouched, one conv and
+        one SSM kernel call, and pad rows give zero output.
         """
         query_all, key_all, value_all, g, beta = self._spec_conv_qkv(
             layer_cache=layer_cache,
@@ -765,6 +770,10 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                 "intermediate_ssm buffer."
             )
         slot_table = self._spec_ssm_slot_table(bs, draft_token_num, mixed_blocks.device)
+        # A pad row (cache index < 0) gets no conv output, so its q/k/v are
+        # uninitialised. Slot -1 makes the kernel zero its output and skip its
+        # state.
+        ssm_state_indices = torch.where(cache_indices.view(bs, 1) < 0, -1, slot_table)
         flat_phys = pool.view(pool.shape[0] * pool.shape[1], *pool.shape[2:])
         # FlyDSL keeps live state as a logical KV view over physical VK.
         # ``intermediate_ssm`` is that same physical layout. A transpose view
@@ -791,7 +800,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             initial_state=recurrent_state,
             inplace_final_state=True,
             cu_seqlens=cu_seqlens,
-            ssm_state_indices=slot_table,
+            ssm_state_indices=ssm_state_indices,
             use_qk_l2norm_in_kernel=True,
         )
         output_blocks.copy_(
@@ -867,20 +876,19 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         with `view[s, t, d, w] = phys[s, d, t + w]` (see `MambaPool.__init__`
         and `conv_window_dedup_enabled` in SGLang's memory_pool.py). That
         physical row is exactly what ATOM's spec `causal_conv1d_update` writes,
-        so recovering it lets one call replace the whole per-step loop.
+        so recovering it lets one call write every step's window.
 
-        Raises when the view is not that dedup layout. DFLASH target verify on
-        ROCm requires the linear-chain deduplicated layout.
+        Raises when the view is not that dedup layout, which GDN target
+        verify on ROCm requires.
         """
         if window_view.ndim != 4:
             raise RuntimeError(
-                "ATOM GDN batched TARGET_VERIFY requires a rank-4 "
-                "intermediate_conv_window."
+                "ATOM GDN TARGET_VERIFY requires a rank-4 intermediate_conv_window."
             )
         num_slots, draft, dim, win = window_view.shape
         if draft != draft_token_num:
             raise RuntimeError(
-                "ATOM GDN batched TARGET_VERIFY received an incompatible "
+                "ATOM GDN TARGET_VERIFY received an incompatible "
                 f"draft dimension: expected {draft_token_num}, got {draft}."
             )
         shared_win = draft + win - 1
@@ -894,7 +902,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             or stride_slot != dim * shared_win
         ):
             raise RuntimeError(
-                "ATOM GDN batched TARGET_VERIFY requires SGLang's "
+                "ATOM GDN TARGET_VERIFY requires SGLang's "
                 "deduplicated sliding-window intermediate_conv_window "
                 f"(shape={tuple(window_view.shape)} "
                 f"stride={tuple(window_view.stride())})."
@@ -1087,9 +1095,10 @@ class SGLangGDNForwardContext:
     ) -> GDNAttentionMetadata | None:
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
-            # SGLangGatedDeltaNet fills SGLang's transactional snapshots using
-            # ATOM's stepwise kernels. Keep the outer ATOM context active for
-            # MoE, norms and collectives without native GDN metadata.
+            # TARGET_VERIFY runs SGLangGatedDeltaNet's own conv + SSM verify
+            # (ReplaySSM, or the batched path with ATOM_ENABLE_REPLAYSSM=0) and
+            # needs no native GDN metadata. Keep the outer ATOM context active
+            # for MoE, norms and collectives.
             return None
 
         bs = forward_batch.batch_size
