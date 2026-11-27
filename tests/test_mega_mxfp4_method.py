@@ -351,7 +351,9 @@ def _mega_layer(**attrs):
     )
 
 
-def _mega_method(monkeypatch, layer, a_quant_dtype=None):
+def _mega_method(
+    monkeypatch, layer, a_quant_dtype=None, prepare_finalize=_PrepareFinalize
+):
     """A MegaMxfp4MoEMethod after the real init_prepare_finalize on `layer`,
     over a pass-through MoRI transport, recording the inherited apply (Mega's
     step), fused_moe (the fallback's) and aiter's resolver."""
@@ -416,7 +418,7 @@ def _mega_method(monkeypatch, layer, a_quant_dtype=None):
     def make_prepare_finalize():
         state.prepared += 1
         state.wire = method.routed_rows_wire
-        return _PrepareFinalize()
+        return prepare_finalize and prepare_finalize()
 
     method.maybe_make_prepare_finalize = make_prepare_finalize
     method.get_fused_moe_quant_config = lambda _layer: "quant config"
@@ -630,3 +632,40 @@ def test_the_fallback_runs_bf16_at_every_row_count_it_serves(monkeypatch):
             )
             == dtypes.bf16
         ), m
+
+
+def _mori_v2_prepare_finalize():
+    """A MoRI v2 transport (ATOM_MORI_V2), which runs its own MegaMoE."""
+    from atom.model_ops.fused_moe import mori_v2_prepare_finalize as v2
+
+    class V2(v2.MoriV2PrepareAndFinalize):
+        def __init__(self):
+            self.mega = None
+
+        def topk_indices_dtype(self):
+            return None
+
+        def bind_mega_transport(self, _layer, _method):
+            self.mega = object()
+
+    return V2()
+
+
+@pytest.mark.parametrize(
+    "prepare_finalize",
+    [None, _mori_v2_prepare_finalize],
+    ids=["no-all2all-backend", "mori-v2"],
+)
+def test_quantized_steps_only_without_mori_v1_is_refused_at_build(
+    monkeypatch, prepare_finalize
+):
+    """Without MoRI v1's kernel no step could fall back, so Mega would take
+    them all: the build refuses rather than drop the switch silently."""
+    experts = _m31_experts(monkeypatch)
+    layer = _mega_layer(
+        activation=experts.activation,
+        swiglu_limit=experts.swiglu_limit,
+        mega_quantized_steps_only=True,
+    )
+    with pytest.raises(NotImplementedError, match="quantized-steps-only"):
+        _mega_method(monkeypatch, layer, "fp4", prepare_finalize=prepare_finalize)

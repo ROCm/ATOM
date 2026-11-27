@@ -2829,6 +2829,15 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         if getattr(layer, "mega_quantized_steps_only", False):
             self.routed_rows_wire = None
             super().init_prepare_finalize(layer)
+            # Only MoRI v1's modular kernel runs fused_moe on Mega's weights;
+            # without it Mega would take every step.
+            if type(self.fused_experts) is not FusedMoEModularKernel:
+                raise NotImplementedError(
+                    "MegaMoE quantized-steps-only needs the MoRI v1 all2all "
+                    "kernel for the steps Mega does not take; got "
+                    f"{type(self.fused_experts).__name__} (an all2all backend is "
+                    "required, and ATOM_MORI_V2 is unsupported)"
+                )
             self.mori_experts = self.fused_experts
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         self.fused_experts = MegaFusedExperts(
