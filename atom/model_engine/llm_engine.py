@@ -680,12 +680,25 @@ class LLMEngine:
         }
 
 
+def serves_greedy_ids(params: SamplingParams) -> bool:
+    """Whether a request can take `ATOM_DP_LM_HEAD_MODE=argmax`'s greedy ids:
+    temperature 0, no logprobs, no structured output or required channel."""
+    return (
+        params.temperature == 0
+        and not params.logprobs
+        and not is_structured(params)
+        and params.required_channel is None
+    )
+
+
 class InputOutputProcessor:
     # Class default: a processor built without `__init__` ships nothing.
     prefix_hash_block_size = 0
 
     def __init__(self, config, tokenizer, block_size):
         self.config = config
+        # `ATOM_DP_LM_HEAD_MODE=argmax` decodes greedy ids only (read once).
+        self._greedy_ids_only = envs.ATOM_DP_LM_HEAD_MODE == "argmax"
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.structured_admission = None
@@ -865,6 +878,11 @@ class InputOutputProcessor:
             kv_transfer=kv_transfer_params,
             multimodal=multimodal_data is not None,
         )
+        if self._greedy_ids_only and not serves_greedy_ids(sampling_params):
+            raise ValueError(
+                "ATOM_DP_LM_HEAD_MODE=argmax serves greedy requests only: "
+                "temperature 0, no logprobs, structured output or required tool"
+            )
         if is_structured(sampling_params):
             if sampling_params.required_channel is not None:
                 raise ValueError(
