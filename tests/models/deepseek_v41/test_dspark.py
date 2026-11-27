@@ -307,6 +307,7 @@ def test_the_block_head_takes_the_sampled_block_only_when_bound(bound, greedy, s
     model = SimpleNamespace(
         draft_sampling="bound" if bound else None,
         _sharded_markov_sample=lambda: sharded,
+        _dp_markov_sample_pad=lambda *a: None,
         _head_and_sample_q=lambda *a: "sampled",
         _head_and_sample_sharded=lambda *a: "greedy-sharded",
         _head_and_sample=lambda *a: "greedy",
@@ -368,3 +369,139 @@ def test_the_sampled_block_feeds_the_confidence_head_its_w1_rows(monkeypatch, sh
         assert shape == (B, T, V) and shard is None
     prev = torch.tensor([[7, 1, 2], [8, 4, 5]])
     assert torch.equal(seen["embeds"], markov.markov_w1(prev))
+
+
+@pytest.mark.parametrize("pad", [None, 0, 8])
+def test_the_greedy_block_takes_the_dp_shard_where_a_pad_is_measured(pad):
+    """TP sharding first; else the DP shard when its gate hands back a pad;
+    else the replicated head. Never the DP shard for the sampled block."""
+    cls = _draft_model()
+    model = SimpleNamespace(
+        draft_sampling=None,
+        _sharded_markov_sample=lambda: False,
+        _dp_markov_sample_pad=lambda *a: pad,
+        _head_and_sample_dp=lambda *a: ("greedy-dp", a[-1]),
+        _head_and_sample=lambda *a: "greedy",
+    )
+    got = cls.head_and_sample(model, ("normed", "hc"), "anchors", 5)
+    assert got == ("greedy" if pad is None else ("greedy-dp", pad))
+    model.draft_sampling = "bound"
+    model._head_and_sample_q = lambda *a: "sampled"
+    assert cls.head_and_sample(model, ("normed", "hc"), "anchors", 5) == "sampled"
+
+
+class _Exchange:
+    """An all-gather between threads standing in for DP ranks."""
+
+    def __init__(self, world):
+        import threading
+
+        self.world = world
+        self.slots = [None] * world
+        self.barrier = threading.Barrier(world)
+
+    def group(self, rank):
+        exchange = self
+
+        class Group:
+            world_size = exchange.world
+            rank_in_group = rank
+
+            def all_gather(self, t, dim=0, use_custom=True):
+                exchange.barrier.wait()
+                exchange.slots[rank] = t.clone()
+                exchange.barrier.wait()
+                out = torch.cat(exchange.slots, dim)
+                exchange.barrier.wait()
+                return out
+
+        return Group()
+
+
+def _markov_argmax_shard(base, prev, w1, w2, out, start, group, **kwargs):
+    """`dspark_markov_argmax_tp` in torch: this shard's (max, id), the lowest
+    rank among equal maxima."""
+    embed = w1[prev.long()]
+    logits = (
+        base.float() + embed.float() @ w2[start : start + base.shape[1]].float().t()
+    )
+    idx = logits.argmax(-1)
+    val = logits.gather(1, idx[:, None])[:, 0]
+    packed = torch.stack([val, (idx + start).float()], -1)
+    pairs = group.all_gather(packed, dim=0).view(group.world_size, -1, 2)
+    winner = pairs[:, :, 0].argmax(0)
+    out.copy_(pairs[:, :, 1].gather(0, winner[None])[0].to(out.dtype))
+    kwargs["embed_out"].copy_(embed)
+
+
+@pytest.mark.parametrize("pad", [0, 8])
+def test_the_dp_sharded_block_drafts_what_the_replicated_head_does(monkeypatch, pad):
+    """Two DP ranks with their own rows: each one's DP-sharded block (one
+    gather of rows + anchors, its vocab slice, the pick over both ranks) gives
+    the ids and confidences its replicated head gives. Integer weights keep
+    every sum exact, and the narrow value range makes ties common."""
+    import functools
+    import threading
+
+    dspark = _draft_module()
+    cls = dspark.DeepseekV41DSpark
+    world, B, T, V, r, dim = 2, 3, 4, 16, 4, 8
+    gen = torch.Generator().manual_seed(0)
+
+    def ints(*shape):
+        return torch.randint(-2, 3, shape, generator=gen).float()
+
+    markov = DSparkMarkovHead(V, r)
+    markov.fused_sample = False  # the replicated reference picks in torch
+    markov.markov_w1.weight.data = ints(V, r)
+    markov.markov_w2.weight.data = ints(V, r)
+    weight = ints(V, dim)
+    head = SimpleNamespace(
+        num_embeddings=V,
+        weight=weight,
+        get_logits=lambda x: x @ weight.t(),
+        _vocab_shard_logits=lambda x, rank, n: x
+        @ weight[rank * V // n : (rank + 1) * V // n].t(),
+    )
+
+    def confidence(hidden, embeds):
+        return hidden.sum(-1) + embeds.sum(-1)
+
+    model = SimpleNamespace(
+        head=head, mtp=[SimpleNamespace(markov_head=markov, confidence_head=confidence)]
+    )
+    model.forward_head = functools.partial(cls.forward_head, model)
+
+    inputs = [
+        (
+            ints(B * T, dim),
+            ints(B, T, dim),
+            torch.randint(0, V, (B,), generator=gen).int(),
+        )
+        for _ in range(world)
+    ]
+    exchange = _Exchange(world)
+    local = threading.local()
+    monkeypatch.setattr(dspark, "get_dp_group", lambda: local.group)
+    monkeypatch.setattr(dspark, "dspark_markov_argmax_tp", _markov_argmax_shard)
+    got, errors = [None] * world, []
+
+    def rank_main(rank):
+        local.group = exchange.group(rank)
+        try:
+            got[rank] = cls._head_and_sample_dp(model, *inputs[rank], pad)
+        except Exception as e:  # noqa: BLE001 -- surfaced below
+            errors.append(e)
+            exchange.barrier.abort()
+
+    threads = [threading.Thread(target=rank_main, args=(r,)) for r in range(world)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    for rank in range(world):
+        ref_ids, ref_conf = cls._head_and_sample(model, *inputs[rank])
+        ids, conf = got[rank]
+        assert torch.equal(ids, ref_ids.to(ids.dtype))
+        assert torch.equal(conf, ref_conf)
