@@ -238,6 +238,12 @@ class ScheduledBatch:
         state_maintenance_ops: StateMaintenanceOps | None = None,
         is_deferred_out: bool = True,
     ):
+        # When the scheduler decided this batch: after the block pool's flush
+        # of what the pass decided (`Scheduler.schedule`). A pool whose
+        # backend lets other ranks read blocks hears from each pipeline stage
+        # that the batch decided at this instant landed there
+        # (`KVPoolMemory.writes_issued`). None for a batch built elsewhere.
+        self.kv_pool_stamp: int | None = None
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
         self.remote_kv_block_ids = remote_kv_block_ids or []
@@ -2100,6 +2106,9 @@ class Scheduler:
         # Here for the same reason as the tick: what this pass decided about
         # blocks reaches the pool's backend once, whichever return was taken.
         self.block_manager.kv.flush()
+        if result is not None:
+            # Read after the flush, so it is no earlier than anything flushed.
+            result[0].kv_pool_stamp = time.monotonic_ns()
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
 

@@ -101,13 +101,38 @@ def pool_id_for(config, settings: UmbpPoolSettings) -> str:
     return f"{settings.namespace}:dp{dp_rank}"
 
 
-def pool_parts(config) -> int:
-    """How many runners an engine rank has, i.e. how many buffers its pool is
-    made of: one per device of its tensor-parallel group."""
+def _tp_parts(config) -> int:
     world = getattr(config, "tp_world_size", None)
     if world is None:
         world = getattr(config, "tensor_parallel_size", 1)
     return max(1, int(world or 1))
+
+
+def _pp_size(config) -> int:
+    return max(1, int(getattr(config, "pipeline_parallel_size", 1) or 1))
+
+
+def pool_parts(config) -> int:
+    """How many runners an engine rank has, i.e. how many buffers its pool is
+    made of: one per device of its tensor-parallel group, on every pipeline
+    stage. The stages of a PP engine hold different layers of the same blocks
+    under the same block ids (PP takes the smallest block count of all of
+    them), so a stage's buffer is a part of the one pool as a TP shard is."""
+    return _tp_parts(config) * _pp_size(config)
+
+
+def pool_part(config, rank: int) -> int:
+    """Which part runner `rank` (its TP rank) of this pipeline stage brings:
+    stage-major, ``pp_rank * tp + rank``."""
+    tp = _tp_parts(config)
+    if not 0 <= rank < tp:
+        raise ValueError(
+            f"runner {rank} has no part in a UMBP pool of {tp} per stage "
+            "(one per tensor-parallel rank)"
+        )
+    parallel = getattr(config, "parallel_config", None)
+    pp_rank = int(getattr(parallel, "pipeline_parallel_rank", 0) or 0)
+    return pp_rank * tp + rank
 
 
 def share_group_for(config, settings: UmbpPoolSettings) -> str:
@@ -132,6 +157,15 @@ def share_group_for(config, settings: UmbpPoolSettings) -> str:
         ),
         "draft": None if spec is None else [str(spec.method), str(spec.model)],
     }
+    if _pp_size(config) > 1:
+        # Pools exchange part p with part p, and pool parts count both TP
+        # shards and pipeline stages: a TP4 pool and a PP4 pool both have four.
+        # Under PP a part is a stage's layers, so the split must match too.
+        # Left out at PP 1, so a group id from before parts stays as it was.
+        from atom.kv_transfer.offload.kv_store.keys import pp_stage_layer_spans
+
+        facts["tp_parts"] = _tp_parts(config)
+        facts["pp_layers"] = [list(span) for span in pp_stage_layer_spans(config)]
     digest = hashlib.sha1(json.dumps(facts, sort_keys=True).encode()).hexdigest()
     return f"atom-{digest[:16]}"
 
@@ -639,15 +673,21 @@ class UmbpPoolMemory(KVPoolMemory):
         ratio: float,
         part: int = 0,
         num_parts: int = 1,
+        batch_stamps: bool = False,
     ):
         self._client = client
         self.pool_id = pool_id
         self.group = group
         self.ratio = ratio
-        # Which of the pool's buffers this runner's is (its TP rank), of how
-        # many. One part: the rank has a single runner.
+        # Which of the pool's buffers this runner's is (`pool_part`: its stage,
+        # then its TP rank), of how many. One part: the rank has one runner.
         self.part = part
         self.num_parts = num_parts
+        # Whether a forward's progress is the scheduler's stamp of its batch
+        # rather than this process's clock (a pipeline stage, see
+        # `writes_issued`), and the last such stamp seen.
+        self.batch_stamps = batch_stamps
+        self._batch_stamp: int | None = None
         self._device = None
         # Where UMBP's part was adopted from; None until `bind_layout`.
         self._mapped_base: int | None = None
@@ -657,15 +697,28 @@ class UmbpPoolMemory(KVPoolMemory):
         self._watcher: threading.Thread | None = None
         self._closed = False
 
-    def writes_issued(self) -> None:
+    def writes_issued(self, stamp: int | None = None) -> None:
         if self._mapped_base is None:
             return
         import torch
 
-        # Read the clock first: whatever the scheduler stamped before this
-        # instant was decided before the event below was recorded, so the
-        # event completing proves those writes landed.
-        stamp = time.monotonic_ns()
+        if self.batch_stamps:
+            # A pipeline stage runs behind the head, which schedules, and
+            # flushes, up to a batch per stage ahead of it. This stage's clock
+            # can be past a flush whose batch it has not run, so the event
+            # below proves only that the batch this forward carries landed
+            # here: the head's stamp of it (`ScheduledBatch.kv_pool_stamp`).
+            # A forward no batch decided (a dummy) proves nothing new.
+            if stamp is not None:
+                self._batch_stamp = max(stamp, self._batch_stamp or stamp)
+            stamp = self._batch_stamp
+            if stamp is None:
+                return
+        else:
+            # Read the clock first: whatever the scheduler stamped before
+            # this instant was decided before the event below was recorded,
+            # so the event completing proves those writes landed.
+            stamp = time.monotonic_ns()
         event = torch.cuda.Event()
         event.record()
         self._issued.append((stamp, event))
@@ -831,17 +884,18 @@ def make_umbp_l1_pool(
 def make_umbp_pool_memory(
     config, settings: UmbpPoolSettings, rank: int = 0
 ) -> UmbpPoolMemory:
-    parts = pool_parts(config)
-    if not 0 <= rank < parts:
-        raise ValueError(
-            f"runner {rank} has no part in a UMBP pool of {parts} "
-            "(one per tensor-parallel rank)"
-        )
+    part = pool_part(config, rank)
     _, client = _connect(settings)
     pool_id = pool_id_for(config, settings)
     group = share_group_for(config, settings)
     return UmbpPoolMemory(
-        client, pool_id, group, settings.share_ratio, part=rank, num_parts=parts
+        client,
+        pool_id,
+        group,
+        settings.share_ratio,
+        part=part,
+        num_parts=pool_parts(config),
+        batch_stamps=_pp_size(config) > 1,
     )
 
 

@@ -178,7 +178,6 @@ class TestRefusedAtStartup:
         [
             ("is_multinode_tp", True, "one node"),
             ("pcp_group_size", 2, "prefill context parallel"),
-            ("pipeline_parallel_size", 2, "pipeline parallel"),
         ],
     )
     def test_layouts_one_server_and_one_scheduler_cannot_cover(

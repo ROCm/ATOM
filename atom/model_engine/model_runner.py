@@ -3763,7 +3763,7 @@ class ModelRunner:
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
         """Publish completed chunk snapshots and the legacy final-ready event."""
         # Before the early return: decodes write the pool too.
-        self._kv_pool_memory().writes_issued()
+        self._kv_pool_memory().writes_issued(getattr(batch, "kv_pool_stamp", None))
         if batch.total_seqs_num_prefill <= 0:
             return
         connector = get_kvconnector()

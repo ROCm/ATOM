@@ -269,7 +269,7 @@ class KVPoolMemory(ABC):
         moves blocks itself needs this; one that does not ignores it.
         """
 
-    def writes_issued(self) -> None:
+    def writes_issued(self, stamp: int | None = None) -> None:
         """Every write of one forward into the pool has been issued.
 
         Called by the runner on the thread and stream it issues them on, once
@@ -277,6 +277,9 @@ class KVPoolMemory(ABC):
         device is done. A backend that lets another process read or fill
         blocks needs to know when they are, and this is where it can find out
         (a device event recorded here completes after every earlier write).
+
+        `stamp` is when the scheduler decided this forward's batch
+        (`ScheduledBatch.kv_pool_stamp`), None for a forward no batch decided.
         """
 
     def close(self) -> None:

@@ -60,9 +60,10 @@ def _check_supported(config: Any) -> None:
             f"the umbp_pool connector supports {', '.join(_SUPPORTED_ARCHITECTURES)}, "
             f"not {architectures}"
         )
-    # Tensor-parallel attention within a rank is one pool of several parts, a
-    # runner's buffer each (`pool.pool_parts`). Every part has to reach the one
-    # UMBP server, and one scheduler has to own the pool.
+    # Tensor-parallel attention within a rank, and pipeline stages, make one
+    # pool of several parts, a runner's buffer each (`pool.pool_parts`). Every
+    # part has to reach the one UMBP server, and one scheduler owns the pool:
+    # under PP the head's (`UmbpPoolConnectorScheduler.make_block_pool`).
     if getattr(config, "is_multinode_tp", False):
         raise ValueError(
             "the umbp_pool connector needs a rank's tensor-parallel group on one "
@@ -71,11 +72,6 @@ def _check_supported(config: Any) -> None:
     if int(getattr(config, "pcp_group_size", 1) or 1) > 1:
         raise ValueError(
             "the umbp_pool connector does not support prefill context parallel"
-        )
-    if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
-        raise ValueError(
-            "the umbp_pool connector does not support pipeline parallel: each "
-            "stage has its own scheduler, and a pool has one"
         )
 
 
@@ -146,6 +142,13 @@ class UmbpPoolConnectorScheduler(KVConnectorSchedulerBase):
     ) -> KVBlockPool:
         from atom.kv_transfer.pool.umbp.pool import make_umbp_block_pool
 
+        parallel = getattr(self.config, "parallel_config", None)
+        if int(getattr(parallel, "pipeline_parallel_rank", 0) or 0) > 0:
+            # Every stage of a PP engine builds a scheduler, but only the head
+            # schedules: its pool is the engine's, and a second `open` would
+            # take the slots over. The other stages keep ATOM's own pool, which
+            # nothing allocates from; their runners still bring their parts.
+            return None
         # One pool for every share ratio: at 1 its private part is empty.
         self.pool = make_umbp_block_pool(
             config,
