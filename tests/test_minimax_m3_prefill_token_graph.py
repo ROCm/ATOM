@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 """ATOM_M3_PREFILL_TOKEN_GRAPH: only the MiniMax-M3 sparse builder with an FP4 index
 cache takes prefill token graphs, and only when the flag is set (default off); the
