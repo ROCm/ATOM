@@ -31,11 +31,12 @@ from atom.utils.forward_context import get_forward_context
 
 class LmHeadOutput(NamedTuple):
     """A step's LM head output (``ModelRunner.run_lm_head``): a verify head's
-    ids and spec status where they stand for the step, else the logits;
-    neither on a step the model ran whole."""
+    ids and spec status where they stand for the step, else the logits (or
+    fp32 greedy ids on a decode the DP-sharded head serves under
+    `ATOM_DP_LM_HEAD_MODE=argmax`); neither on a step the model ran whole."""
 
     verified: VerifyOutput | None
-    logits: torch.Tensor | None
+    logits: torch.Tensor | None  # or argmax mode's fp32 greedy ids [rows]
 
 
 class VerifyHead:
