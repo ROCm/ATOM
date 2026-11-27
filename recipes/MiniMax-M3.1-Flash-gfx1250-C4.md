@@ -2,15 +2,15 @@
 
 This recipe installs the C4-decode-optimized ATOM and aiter branches into the official ATOM base image for
 gfx1250, starts MiniMax-M3.1-Flash with TP4 + DSpark (K = 7), and reproduces our accuracy and InferenceX AgentX
-numbers (C4 and C64, 1 hour).
+numbers (C4 and C64, 1 hour). A prebuilt image with everything installed is in section 2.
 
 | | |
 |---|---|
 | Model | `amd/MiniMax-M3.1-Flash-Quark-MXFP4` (MXFP4 MoE, MXFP8 dense), with its DSpark draft in `dspark/` |
 | Hardware | 4 x AMD Instinct MI455X (gfx1250), TP4 |
 | Base image | `rocm/atom-dev:ub24-dcgpu-rk-10.2.0-pyt2.14.0-rocmtri3.9-24d5394c-atomsrc-gfx1250-b1123` (torch 2.14.0 + ROCm 10.2, triton 3.9.0, ATOM / aiter in `/root/venv/atom-venv-gfx1250`) |
-| ATOM | branch `xiaobingsuper/m31-c4-gfx1250-opt` of ROCm/ATOM; measured code = commit `51930f366844faf9c100a77ec1c621b651a84573` (the branch tip adds only this recipe and its helpers under `recipes/`) |
-| aiter | branch `xiaobingsuper/m31-c4-gfx1250-opt` of ROCm/aiter, commit `c390792879a5af356226e09a5da0e0919cfc9d74` (composable_kernel submodule `96afae1d`) |
+| ATOM | branch `xiaobingsuper/m31-c4-gfx1250-opt` of ROCm/ATOM; measured code = commit `b1142d8af8d61aa21e2dd1fcf65bd8a8148963d8` (later commits on the branch only touch `recipes/` and `tests/`) |
+| aiter | branch `xiaobingsuper/m31-c4-gfx1250-opt` of ROCm/aiter, commit `e871889f933d410c32147815ab454710580f944a` (composable_kernel submodule `96afae1d`) |
 | LMCache (C64 only) | LMCache/LMCache `f22dec28` (0.5.6rc3.dev20), built in the container |
 | Benchmark clients | aiperf (SemiAnalysisAI/aiperf `754356e9`, scenario `inferencex-agentx-mvp`), lm_eval 0.4.12 |
 
@@ -18,19 +18,37 @@ numbers (C4 and C64, 1 hour).
 
 Both branches are the code we measured, unchanged:
 
-- **ATOM** = the MiniMax-M3.1 gfx1250 stack `61c8db8` (ROCm/ATOM main + the M3.1 PRs + the combo16 fusions) plus
-  one commit with the C4 decode work: async verdict and early output, one-launch draft metadata / sampler /
-  verify, draft KV inside the decode graph, Markov-chain resident kernel, stream-capture and H2D host trims, the LM
-  head in its own graph, o_proj + post-attention all-reduce + residual + RMSNorm in one launch ("Stage O"), DSpark draft
-  layers as two launches each.
-- **aiter** = the matching aiter stack `9c3f0ef` plus one commit with the C4 kernels (Stage O kernels, 8-row
-  router, QKV / o_proj tiles, GEMM1 wave-level route for <= 16 tokens, split-K GEMM1 plan for 8 tokens) and one commit
-  that puts the routed-MoE tuning rows into `aiter/configs/model_configs/minimax_m3_gfx1250_tuned_grouped_fmoe.csv`, so
-  aiter's default config lookup picks them (no `AITER_CONFIG_GROUPED_FMOE`, no file copy).
+- **ATOM** = the MiniMax-M3.1 gfx1250 stack `61c8db8` (ROCm/ATOM main + the M3.1 PRs + the combo16 fusions) plus:
+  - the first round of C4 decode work (November 25): async verdict and early output, one-launch draft metadata /
+    sampler / verify, draft KV inside the decode graph, Markov-chain resident kernel, stream-capture and H2D host
+    trims, the LM head in its own graph, o_proj + post-attention all-reduce + residual + RMSNorm in one launch
+    ("Stage O"), DSpark draft layers as two launches each;
+  - the second round (November 27), one commit per piece. The gfx1250 decode launches live in
+    `atom/models/minimax_m3/mono/gfx1250/`:
+    - MoE front launch (o_proj + all-reduce + residual + RMSNorm + router + shared expert at 8 rows), the routed MoE on
+      one stream, and its GEMM2 + tail + the next all-reduce + norm + MXFP8 quant as one launch, which also runs the
+      shared expert's down projection;
+    - AQ: QKV norm / RoPE / NVFP4 insert, this rank's indexer-CP scores and the cross-rank index top-k exchange in one
+      launch, including layer 0's QKV chain;
+    - DMF: a dense layer's o_proj + all-reduce + norm + MLP in one launch;
+    - the LM head at <= 8 rows as one TDM-streamed launch (bit-identical to the GEMM it replaces);
+    - DSpark: the draft tap written by the next all-reduce, four draft-graph nodes removed;
+    - host trims of the decode step: logits all-gather in the decode graph, deferred D2H, next ids from the verify
+      launch, no per-step attention-plan refresh;
+  - work from another workstream on the same branch: the prefill / decode (PD) disaggregation stack, and the FlyDSL
+    FP4 indexer paths for gfx1250, which are on by default (decode scorer + top-k, fused prefill scorer + top-16).
+- **aiter** = the matching aiter stack `9c3f0ef` plus:
+  - the C4 kernels (Stage O kernels, 8-row router, QKV / o_proj tiles, GEMM1 wave-level route for <= 16 tokens,
+    split-K GEMM1 plan for 8 tokens);
+  - the routed-MoE tuning rows in `aiter/configs/model_configs/minimax_m3_gfx1250_tuned_grouped_fmoe.csv`, so aiter's
+    default config lookup picks them (no `AITER_CONFIG_GROUPED_FMOE`, no file copy);
+  - a model-free hook that lets a model register a deferred MoE tail launch with the all-reduce, plus residual taps;
+  - the other workstream's MXFP8 GEMM kernels and tables (ROCm/aiter#8273), FlyDSL indexer kernels and the PD
+    prefill MoE rows.
 
-The C4 pieces are on by default and gate themselves (gfx1250, TP4, a decode step of one request x 8 rows, ...); other
-shapes take the stack's regular path. The stack's other fusions are opt-in flags and are set in the launch command
-below.
+The C4 pieces are on by default and gate themselves (gfx1250, TP4, a decode step of one request x 8 rows, the
+indexer CP, ...); other shapes take the stack's regular path. They add no environment variables. The stack's other
+fusions are opt-in flags and are set in the launch command below.
 
 ## 1. Host
 
@@ -42,8 +60,17 @@ below.
 
 ## 2. Container
 
-Prebuilt image with section 3 already done: `rocm/fw-bringup:gfx1250-minimax-m3-20261125-lmcache` (set `IMAGE` to it
-below and skip section 3).
+Prebuilt image with section 3 already done: `rocm/fw-bringup:gfx1250-minimax-m3-20261127`. Set `IMAGE` to it below
+and skip section 3. It holds:
+- the two branches at the measured commits, installed editable in `/root/venv/atom-venv-gfx1250`
+  (`/opt/ATOM`, `/opt/aiter`), with the CK fix of section 3 applied;
+- LMCache `f22dec28` built for this torch / ROCm;
+- the benchmark clients in `/opt/bench` (aiperf, lm_eval);
+- prebuilt aiter JIT modules and warm FlyDSL / Triton / TorchInductor caches for the C4 and C64 configurations, so
+  the first server start and the first requests do not wait for kernel compilation;
+- a 1P1D prefill / decode disaggregation recipe for two nodes in `/app/m31_pd_recipe/` (README, `kit/`, `ctl/`).
+
+The numbers in section 7 dated November 27 were measured with the code in this image.
 
 ```bash
 IMAGE=rocm/atom-dev:ub24-dcgpu-rk-10.2.0-pyt2.14.0-rocmtri3.9-24d5394c-atomsrc-gfx1250-b1123
@@ -66,13 +93,13 @@ export GPU_ARCHS=gfx1250 PYTORCH_ROCM_ARCH=gfx1250
 BRANCH=xiaobingsuper/m31-c4-gfx1250-opt
 # ATOM (pure Python)
 git clone --depth 1 -b $BRANCH https://github.com/ROCm/ATOM.git /opt/ATOM
-# the tip only adds recipes/ on top of the measured code 51930f366; this prints nothing:
-git -C /opt/ATOM fetch -q --depth 1 origin 51930f366844faf9c100a77ec1c621b651a84573 && \
-  git -C /opt/ATOM diff --stat FETCH_HEAD HEAD -- . ':!recipes'
+# later commits only touch recipes/ and tests/; this prints nothing:
+git -C /opt/ATOM fetch -q --depth 1 origin b1142d8af8d61aa21e2dd1fcf65bd8a8148963d8 && \
+  git -C /opt/ATOM diff --stat FETCH_HEAD HEAD -- . ':!recipes' ':!tests'
 pip install --no-deps --no-build-isolation -e /opt/ATOM
 # aiter (Python + JIT-built HIP modules; nothing is compiled here)
 git clone --depth 1 -b $BRANCH https://github.com/ROCm/aiter.git /opt/aiter
-git -C /opt/aiter log -1 --format=%H         # c390792879a5af356226e09a5da0e0919cfc9d74
+git -C /opt/aiter log -1 --format=%H         # e871889f933d410c32147815ab454710580f944a
 git -C /opt/aiter submodule update --init --depth 1 3rdparty/composable_kernel
 # ROCm 10.2's clang defines __gfx125__ for gfx1250, which turns on CK's TDM block, where a misplaced brace in
 # amd_tdm_store breaks the module_sample / module_activation JIT builds (C64 needs them). One-line fix, the same as in
@@ -251,36 +278,39 @@ on the C4 server (forced 4.04); `ref step` is the client-side time of one decode
 
 ## 7. Expected numbers
 
-Measured with exactly this recipe (base image + the two branches), November 2026, on two 4 x MI455X nodes: one with
-1 TB of host RAM (accuracy, C4, C64 without LMCache) and one with 2 TB (C64 with LMCache at 384 GiB/rank).
+November 27 rows: the prebuilt image of section 2 (the branches at the commits in the table at the top), on a
+4 x MI455X node with 1 TB of host RAM (accuracy, C4). November 25 rows: the earlier branch commits (ATOM `51930f36`,
+aiter `c3907928`) installed into the base image with this recipe, on 4 x MI455X nodes with 1 TB of host RAM (accuracy,
+C4, C64 without LMCache) and 2 TB (C64 with LMCache at 384 GiB/rank).
 
 **Accuracy** (fresh server, real DSpark acceptance, `CONC=4`):
 
-| Check | Result |
-|---|---|
-| gate.py (17 x 23, tool call) | PASS |
-| GSM8K 5-shot c1, first 250 | 0.960 (flexible) / 0.956 (strict) |
-| Accepted length, c1 phase | 4.637 |
-| GSM8K 5-shot c16, all 1319 | 0.9522 (flexible) / 0.9500 (strict) |
-| Accepted length, c16 phase | 4.740 |
+| Check | November 27 | November 25 |
+|---|---|---|
+| gate.py (17 x 23, tool call) | PASS | PASS |
+| GSM8K 5-shot c1, first 250 (flexible / strict) | 0.960 / 0.956 (responses byte-identical to November 25) | 0.960 / 0.956 |
+| Accepted length, c1 phase | 4.637 | 4.637 |
+| GSM8K 5-shot c16, all 1319 (flexible / strict) | 0.9538 / 0.9522 | 0.9522 / 0.9500 |
+| Accepted length, c16 phase | 4.722 | 4.740 |
 
-**bs1 decode step** (C4 server, forced acceptance 4.04, `a1_fixed.py`): 4.099 ms at 110K context, 4.353 ms at 500K.
+**bs1 decode step** (C4 server, forced acceptance 4.04, `a1_fixed.py`, 110K / 500K context): 4.099 / 4.353 ms with the
+November 25 commits; not re-measured for November 27 (the C4 AgentX row below reflects the decode step).
 
 **AgentX, 1 hour** (InferenceX AgentX replay, forced acceptance 4.04):
 
 | Run | tok/s/chip | Interactivity P90 (tok/s/user) | Median | ITL p50 / p90 | TTFT p50 / p90 | Prefix hit | Requests / failed |
 |---|---:|---:|---:|---|---|---|---|
-| **C4, these branches** (LMCache off) | **10,460** | **874.4** | 923.7 | 1.1 / 1.1 ms | 0.24 / 0.98 s | 97.7% | 764 / 0 |
+| **C4, Nov 27** (LMCache off, 1 TB node) | **11,049** | **967.9** | 1004.2 | 1.0 / 1.0 ms | 0.05 / 0.54 s | 97.8% | 804 / 0 |
+| C4, Nov 25 (LMCache off, 1 TB node) | 10,460 | 874.4 | 923.7 | 1.1 / 1.1 ms | 0.24 / 0.98 s | 97.7% | 764 / 0 |
+| C64, Nov 25 (LMCache on, 384 GiB/rank, 2 TB node) | 128,726 | 286.1 | 393.9 | 2.5 / 3.5 ms | 0.33 / 0.83 s | 97.3% (LMCache 1.3%) | 12,236 / 3 |
+| C64, Nov 25 (LMCache off, 1 TB node) | 128,233 | 266.7 | 403.5 | 2.5 / 3.7 ms | 0.31 / 1.01 s | 95.8% | 12,209 / 1 |
 | C4, vLLM on MI355X (InferenceX) | 10,322 | 581.4 | | | | | |
-| **C64, these branches** (LMCache on, 384 GiB/rank, 2 TB node) | **128,726** | **286.1** | 393.9 | 2.5 / 3.5 ms | 0.33 / 0.83 s | 97.3% (LMCache 1.3%) | 12,236 / 3 |
-| **C64, these branches** (LMCache off, 1 TB node) | **128,233** | **266.7** | 403.5 | 2.5 / 3.7 ms | 0.31 / 1.01 s | 95.8% | 12,209 / 1 |
 | C64, vLLM on MI355X (InferenceX) | 112,879 | 114.7 | | | | | |
 
-C4 with these branches: interactivity P90 **1.50x** vLLM on MI355X (874.4 vs 581.4), tok/s/chip 1.01x.
-C64 with these branches, LMCache on at 384 GiB/rank (2 TB node): interactivity P90 **2.49x** vLLM on MI355X (286.1 vs
-114.7), tok/s/chip 1.14x (128,726 vs 112,879).
-C64 with these branches, LMCache off (1 TB node): interactivity P90 **2.33x** vLLM on MI355X (266.7 vs 114.7),
-tok/s/chip 1.14x (128,233 vs 112,879). Not recommended, for reference: LMCache at 160 GiB/rank on the same node gave P90
-244.3 and 127,074 tok/s/chip (the tier stayed full and loaded nothing).
-
-
+November 27, C4: interactivity P90 **1.66x** vLLM on MI355X (967.9 vs 581.4), tok/s/chip 1.07x.
+November 25, C64 with LMCache at 384 GiB/rank (2 TB node): interactivity P90 **2.49x** vLLM on MI355X (286.1 vs 114.7),
+tok/s/chip 1.14x (128,726 vs 112,879).
+The vLLM MI355X numbers are the InferenceX values these comparisons have used since November 23; InferenceX's later
+single-node TP4 run (November 24) reports P90 561.8 at C4 and 116.0 at C64.
+On a ~1 TB node, C64 without LMCache: November 25 gave P90 266.7 (2.33x). Not recommended, for reference: LMCache at
+160 GiB/rank on such a node gave P90 244.3 and 127,074 tok/s/chip (the tier stayed full and loaded nothing).
