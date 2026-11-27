@@ -14,6 +14,7 @@ from atom.mono.dsa_indexer.plan import (
 )
 from atom.mono.plan.build_key import kernel_symbol
 from atom.mono.plan.execution import BLOCKS
+from atom.utils import envs
 
 MAX_LEGACY_TOKENS = 64
 MAX_TOKENS = BLOCKS
@@ -63,6 +64,9 @@ class IxBuild:
     score_blocks: int = field(default=BLOCKS, metadata={"sym": "sb"})
     # gfx950 short verify: BF16 prepacked Q projection and local MQA scheduling.
     short_gemm: bool = field(default=False, metadata={"sym": "sq"})
+    # Eligible K3 FP4 plain-decode builds (capacity <=256K) switch each step
+    # to rank-local execution only when every live request has <=8K keys.
+    short_decode: bool = field(default=False, metadata={"sym": "d1"})
 
     @property
     def stream_scores(self) -> bool:
@@ -104,17 +108,17 @@ class IxBuild:
 
     @property
     def short_owned_verify(self) -> bool:
-        """Allow runtime short-verify ownership and rank-local Q projection."""
+        """Allow short verify or admitted plain decode to stay rank-local."""
         return (
             self.replicated
             and self.world > 1
-            and self.qlen in (6, 8)
+            and (self.qlen in (6, 8) or (self.qlen == 1 and self.short_decode))
             and 0 < self.max_ctx <= isel.SPLIT_MIN
             and 0
             < self.tokens
             <= (MAX_VERIFY_TOKENS if self.qlen == 6 else MAX_LEGACY_TOKENS)
             and self.tokens % self.qlen == 0
-            and (self.qlen == 6 or self.tokens // self.qlen <= self.world)
+            and (self.qlen in (1, 6) or self.tokens // self.qlen <= self.world)
         )
 
     @property
@@ -241,4 +245,18 @@ def dual_score_resources_fit(resources: list[dict]) -> bool:
     return bool(resources) and all(
         r["vgpr"] <= 128 and r["lds"] <= 80 * 1024 and r["scratch"] == 0
         for r in resources
+    )
+
+
+def short_decode_enabled(shape, rows, world, max_ctx, replicated, qlen):
+    return (
+        replicated
+        and world == 8
+        and qlen == 1
+        and 0 < rows <= MAX_LEGACY_TOKENS
+        and max_ctx <= isel.SPLIT_MIN
+        and shape.fp4
+        and shape.q_lora == 1536
+        and not shape.rope_dim
+        and envs.ATOM_MONO_K3_SHORT_DECODE
     )

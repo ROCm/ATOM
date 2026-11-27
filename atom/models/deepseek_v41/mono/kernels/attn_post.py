@@ -45,7 +45,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from atom.models.deepseek_v41.mono import attention_plan as aplan
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels.attention import (
     MERGE_OUT_WORDS,
@@ -99,22 +98,10 @@ from atom.models.deepseek_v41.mono.kernels.dims import (
     WOA_ROWS,
     Dims,
 )
-from atom.models.deepseek_v41.mono.kernels.index_score import (
-    PER_THREAD as SEL_PER_THREAD,
-)
-from atom.models.deepseek_v41.mono.kernels.index_score import (
-    SEL_BITS_WORDS,
-    SEL_RADIX_WORDS,
-    run_indexer,
-)
-from atom.models.deepseek_v41.mono.kernels.index_score import (
-    scratch_pairs as index_pairs,
-)
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.red import acc_sum, acc_word
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
-from atom.models.deepseek_v41.mono.kernels.topk import lds_words
 from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, rcp_pow2
 from atom.mono.device.numa import region_addrs
@@ -132,6 +119,15 @@ from atom.mono.device.ops import (
 from atom.mono.device.ranks import peer_bases, sum_partials
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import preg
+from atom.mono.dsa_indexer.paged.fused import plan as ip
+from atom.mono.dsa_indexer.paged.fused.score import PER_THREAD as SEL_PER_THREAD
+from atom.mono.dsa_indexer.paged.fused.score import (
+    SEL_BITS_WORDS,
+    SEL_RADIX_WORDS,
+    run_indexer,
+)
+from atom.mono.dsa_indexer.paged.fused.score import scratch_pairs as index_pairs
+from atom.mono.dsa_indexer.paged.fused.topk import lds_words
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
 from atom.mono.plan.layout import pair_layout

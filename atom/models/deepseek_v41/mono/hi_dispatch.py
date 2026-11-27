@@ -59,7 +59,7 @@ class HiDecodeModel(MonoDecodeModel):
         # draft context launch (the draft writes its own context there)
         super().__init__(
             model, drafter, max_model_len, index_fp4, dp_ranks, None, None,
-            draft_context=False,
+            draft_context=False, standalone_indexer=False,
         )  # fmt: skip
         self._hi = hook
         # the hook's in-graph verify, not ATOM's mono LM head

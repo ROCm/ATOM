@@ -770,6 +770,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # until ROCm/aiter#7967), any other keeps ATOM's mono path; "1": on, or an
     # error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
+    # K3 short qlen1 scheduling is opt-in pending separate GPU qualification.
+    "ATOM_MONO_K3_SHORT_DECODE": lambda: os.getenv("ATOM_MONO_K3_SHORT_DECODE", "0")
+    == "1",
+    # Ordinary gfx950 FP4: TP2/4 default on; TP8 and attention DP2/4
+    # require explicit 1. DP selections stay local to each attention rank.
+    # Installed HI and its per-step fallback keep their indexer. An auto HI
+    # install refusal follows this ordinary route. Set 0 for embedded/native.
+    "ATOM_DSV41_MONO_INDEXER": lambda: os.getenv("ATOM_DSV41_MONO_INDEXER", "1") == "1",
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because

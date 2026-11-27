@@ -12,9 +12,9 @@ import torch
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels import compress as cp
 from atom.models.deepseek_v41.mono.kernels.dims import HEAD_DIM, HIDDEN
+from atom.mono.dsa_indexer.paged.fused import plan as ip
 from atom.mono.runtime.uncached import uncached_bytes
 
 

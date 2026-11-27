@@ -434,7 +434,8 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a, **k: "atom mono")
+    monkeypatch.setattr(dispatch, "indexer_enabled", lambda *a, **k: False)
     if mode == "1":
         with pytest.raises(MonoUnsupported, match="FlyDSL layout"):
             dispatch.install_mono_decode(
@@ -653,11 +654,14 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
     decoder = SimpleNamespace(write_context="atom mono context write")
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: decoder)
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a, **k: decoder)
+    monkeypatch.setattr(dispatch, "indexer_enabled", lambda *a, **k: False)
     monkeypatch.setattr(
         dispatch, "MonoDraftModel", lambda m, dp: SimpleNamespace(model=m)
     )
     model, cfg, drafter, builder, _ = args
+    cfg.enable_dp_attention = False
+    cfg.tensor_parallel_size = 4
     with caplog.at_level(logging.INFO, logger="atom"):
         got = dispatch.install_mono_decode(
             model, cfg, drafter, metadata_builder=builder

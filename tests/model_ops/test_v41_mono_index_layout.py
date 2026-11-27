@@ -13,8 +13,8 @@ def _key_probe(mfma):
     from aiter.ops.flydsl.kernels import buffer_ops as bo
     from flydsl.expr import range_constexpr
 
-    from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import STAGE_ARGS, _keys
     from atom.mono.device.ops import ld_i32, rsrc
+    from atom.mono.dsa_indexer.paged.score_fp4 import STAGE_ARGS, _keys
 
     @flyc.kernel
     def probe(

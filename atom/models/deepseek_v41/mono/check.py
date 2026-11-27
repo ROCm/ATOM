@@ -19,10 +19,10 @@ from atom.model_ops.deepseek_v41.paged_scoring import quantize_query_rows
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.v4_kernels.indexer_weights import scale_indexer_weights
 from atom.model_ops.v4_kernels.paged_decode import _sparse_attn_v4_paged_decode_triton
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
+from atom.mono.dsa_indexer.paged.fused import plan as ip
 from atom.mono.runtime.compare import compare
 
 logger = logging.getLogger("atom")
@@ -203,9 +203,17 @@ def check_front(runner, layer_id, block, state, rope, cache, step, res_out, gate
     if attn.indexer is not None:
         parts.append(_diff("normed", runner.normed, normed))
         parts.append(_diff("qr", runner.qr.view(torch.uint8), qr.view(torch.uint8)))
-        parts += _index_projections(runner, attn, rope, cache, step)
+        if not runner.indexer_apart:
+            parts += _index_projections(runner, attn, rope, cache, step)
     if runner.rank == 0:
         logger.info("V4.1 mono check layer %d: %s", layer_id, "; ".join(parts))
+
+
+def check_index_projections(runner, attn, rope, cache, step):
+    """Compare independent projections after their launch has completed."""
+    parts = _index_projections(runner, attn, rope, cache, step)
+    if runner.rank == 0:
+        logger.info("V4.1 mono indexer check: %s", "; ".join(parts))
 
 
 def decode_keys(cache, spec, step):

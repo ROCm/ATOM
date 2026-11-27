@@ -31,6 +31,7 @@ from atom.models.deepseek_v41.mono.config import (
     MAX_REQUESTS,
     MAX_ROWS,
     config_refusal,
+    indexer_enabled,
 )
 from atom.models.deepseek_v41.mono.draft_runner import DraftMonoRunner
 from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
@@ -105,12 +106,19 @@ class MonoDecodeModel(nn.Module):
         outputs,
         sampling,
         draft_context: bool = True,
+        *,
+        tp_size: int = 1,
+        standalone_indexer: bool = True,
+        indexer_workspace=None,
     ) -> None:
         super().__init__()
         self.model = model
         self._drafter = drafter
         # DP attention's ranks, 0 without it (``step_supported``)
         self._dp_ranks = dp_ranks
+        self._tp_size = tp_size
+        self._index_fp4 = index_fp4
+        self._standalone_indexer = standalone_indexer
         # created on its first eligible step (``LazyRunner``); ``sampling``
         # None and ``draft_context`` False: an owner that neither verifies
         # through the mono LM head nor writes the draft's context through
@@ -124,6 +132,8 @@ class MonoDecodeModel(nn.Module):
                 outputs,
                 sampling,
                 draft_context,
+                standalone_indexer=standalone_indexer,
+                indexer_workspace=indexer_workspace,
             ),
             "V4.1 mono decode",
         )
@@ -134,7 +144,11 @@ class MonoDecodeModel(nn.Module):
         the decision ``forward`` takes, which the step's head and the draft's
         context write take again after it (a replayed graph does not call
         ``forward``)."""
-        return step_supported(rows, embeds, self._dp_ranks) and self._mono.ready(rows)
+        return (
+            step_supported(rows, embeds, self._dp_ranks)
+            and self.layer_rows_supported(rows)
+            and self._mono.ready(rows)
+        )
 
     def forward(self, input_ids, positions, inputs_embeds=None):
         if self.serves_step(input_ids.numel(), inputs_embeds is not None):
@@ -159,6 +173,20 @@ class MonoDecodeModel(nn.Module):
             [tap[:rows] for tap in taps], positions[:rows], metadata.cache,
             metadata.step,
         )  # fmt: skip
+
+    def uses_layer_mono(self, input_ids, inputs_embeds=None):
+        return self.serves_step(input_ids.numel(), inputs_embeds is not None)
+
+    def layer_rows_supported(self, rows):
+        # At TP2, large FP4 decode batches are faster with native layers.
+        # The outer wrapper still runs their standalone Mono indexer.
+        return not (
+            self._tp_size == 2
+            and not self._dp_ranks
+            and rows >= 40
+            and self._standalone_indexer
+            and indexer_enabled(self._index_fp4, self._tp_size)
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
@@ -246,7 +274,7 @@ class MonoDraftModel(nn.Module):
             return getattr(self.model, name)
 
 
-def install_mono_decode(
+def _install_layer_decode(
     model: nn.Module, atom_config, drafter, *, metadata_builder
 ) -> nn.Module:
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model
@@ -287,6 +315,18 @@ def install_mono_decode(
     draft = None
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
         draft = drafter.model = MonoDraftModel(drafter.model, dp_ranks)
+    standalone = indexer_enabled(
+        atom_config.index_cache_dtype == "fp4",
+        atom_config.tensor_parallel_size,
+        dp_ranks=dp_ranks,
+    )
+    workspace = None
+    if standalone:
+        from atom.models.deepseek_v41.mono.indexer_workspace import IndexerWorkspace
+
+        workspace = IndexerWorkspace(
+            model, atom_config.max_model_len, atom_config.tensor_parallel_size
+        )
     # the forward's output buffer and the step's staged sampling (one slot:
     # mono refuses pipeline parallel, whose forward_vars ring would swap them)
     staged = metadata_builder.model_runner.forward_vars
@@ -298,7 +338,46 @@ def install_mono_decode(
         dp_ranks,
         staged["outputs"],
         (staged["temperatures"].gpu, staged["top_ps"].gpu),
+        tp_size=atom_config.tensor_parallel_size,
+        indexer_workspace=workspace,
     )
     if draft is not None:
         draft.context_writer = decoder.write_context
+    if standalone:
+        from atom.models.deepseek_v41.mono.indexer_dispatch import MonoIndexerModel
+
+        return MonoIndexerModel(decoder, model, atom_config, workspace=workspace)
     return decoder
+
+
+def install_mono_decode(
+    model: nn.Module, atom_config, drafter, *, metadata_builder=None
+) -> nn.Module:
+    dp_ranks = dp_attention_ranks(atom_config) if atom_config.enable_dp_attention else 0
+    standalone = indexer_enabled(
+        atom_config.index_cache_dtype == "fp4",
+        atom_config.tensor_parallel_size,
+        dp_ranks=dp_ranks,
+    )
+    # Native indexer math does not contain the layer runner's MoE. DP4 can
+    # use a local hook without expanding ordinary layer Mono's DP2 admission.
+    if (
+        dp_ranks
+        and standalone
+        and hi_gate.mode() != "1"
+        and config_refusal(atom_config) is not None
+        and config_refusal(atom_config, supported_dpa=(2, 4)) is None
+    ):
+        from atom.models.deepseek_v41.mono.indexer_dispatch import (
+            MonoIndexerModel,
+            NativeDecodeModel,
+        )
+        from atom.models.deepseek_v41.mono.indexer_workspace import IndexerWorkspace
+
+        workspace = IndexerWorkspace(model, atom_config.max_model_len, 1)
+        return MonoIndexerModel(
+            NativeDecodeModel(model), model, atom_config, workspace=workspace
+        )
+    return _install_layer_decode(
+        model, atom_config, drafter, metadata_builder=metadata_builder
+    )

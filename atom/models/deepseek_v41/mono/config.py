@@ -3,8 +3,8 @@
 # Copyright (c) 2026 ATOM Project Contributors
 """The deployments V4.1 mono serves, and why any other is refused."""
 
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
+from atom.mono.dsa_indexer.paged.fused import plan as ip
 from atom.mono.runtime.deployment import common_refusals, first_refusal
 from atom.utils import envs
 
@@ -33,7 +33,21 @@ ATTENTION_KEYS_MAX = 640
 INDEXER_SHAPE = (ip.TOPK, ip.TOPK_BLOCKS, ip.BLOCK_ROWS, ip.HEADS, ip.DIM)
 
 
-def config_refusal(atom_config) -> str | None:
+def indexer_enabled(index_fp4, tp_size, *, dp_ranks=0):
+    """TP2/4 defaults on; TP8 and experimental DP2/4 require explicit opt-in."""
+    return (
+        index_fp4
+        and envs.ATOM_DSV41_MONO_INDEXER
+        and (tp_size != 8 or envs.is_set("ATOM_DSV41_MONO_INDEXER"))
+        and (
+            not dp_ranks
+            or dp_ranks in (2, 4)
+            and envs.is_set("ATOM_DSV41_MONO_INDEXER")
+        )
+    )
+
+
+def config_refusal(atom_config, *, supported_dpa=SUPPORTED_DPA) -> str | None:
     """Why this deployment cannot use V4.1 mono, or None."""
     spec = atom_config.speculative_config
     method = None if spec is None else spec.method
@@ -41,7 +55,7 @@ def config_refusal(atom_config) -> str | None:
     hf = atom_config.hf_config
     keys = hf.sliding_window + hf.index_topk
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
-    checks += common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA) + [
+    checks += common_refusals(atom_config, Dims, SUPPORTED_TP, supported_dpa) + [
         # the kernels read the native 32x32 FP8 dense weights
         (not hf.fp4ptpc, "an FP4PTPC checkpoint's per-channel FP8 linears"),
         (

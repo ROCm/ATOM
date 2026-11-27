@@ -10,7 +10,7 @@ draft block's (``write_draft_step_meta``, with its rows' positions)."""
 import triton
 import triton.language as tl
 
-from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.mono.dsa_indexer.paged.fused import plan as ip
 from atom.mono.plan.execution import BLOCKS
 
 # a token's window key metadata words: first window position, window count,

@@ -45,7 +45,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.config import MAX_ROWS
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
 from atom.models.deepseek_v41.mono.kernels.dims import (
@@ -56,23 +55,6 @@ from atom.models.deepseek_v41.mono.kernels.dims import (
     Q_RANK,
     Dims,
     kvrow_scale0,
-)
-from atom.models.deepseek_v41.mono.kernels.index_query import (
-    IDX_ROPE,
-    IDX_ROWS,
-    IQ_IN_PLACE_MAX,
-    IW_TASKS,
-    iq_group_fp4,
-    iq_group_weight,
-    iq_in_place,
-    iw_tasks,
-    stage_iquant,
-    stage_iquant_fp4,
-    stage_iw,
-    step_queried,
-)
-from atom.models.deepseek_v41.mono.kernels.index_query import (
-    scratch_pairs as indexer_pairs,
 )
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR, code_round, fp8_value
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
@@ -121,6 +103,22 @@ from atom.mono.device.ops import (
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import POLL_MAX, Quad, preg, publish
+from atom.mono.dsa_indexer.paged.fused import plan as ip
+from atom.mono.dsa_indexer.paged.fused.query import (
+    IDX_ROPE,
+    IDX_ROWS,
+    IQ_IN_PLACE_MAX,
+    IW_TASKS,
+    iq_group_fp4,
+    iq_group_weight,
+    iq_in_place,
+    iw_tasks,
+    stage_iquant,
+    stage_iquant_fp4,
+    stage_iw,
+    step_queried,
+)
+from atom.mono.dsa_indexer.paged.fused.query import scratch_pairs as indexer_pairs
 from atom.mono.plan.arith import sel
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
@@ -245,6 +243,7 @@ class AttnPreBuild:
     # FULL / REINDEX layers, whose normed row and q latent feed the indexer and
     # the compressor: the bf16 ``normed`` row out (and NB), the q latent's MXFP8
     # pair out, and the indexer's q / weights projections
+    indexer_apart: bool = False
     feeds_index: bool = False
     # the index plane is FP4: the indexer query quantized as its scorer reads
     # it (``stage_iquant_fp4``)
@@ -1853,7 +1852,7 @@ def run_wqb(c, key, first, stride, per, with_iq=True):
     index_w)."""
     a, dims = c["args"], c["d"]
     wqb, wqb_s = a["wqb"], a["wqb_s"]
-    iq = key.feeds_index and with_iq
+    iq = key.feeds_index and not key.indexer_apart and with_iq
     tasks = [first if i == 0 else first + stride * i for i in range(per)]
     whole = stride * per == dims.wqb_tasks  # every slot a task
     clamped = tasks if whole else [fx.min(t, dims.wqb_tasks - 1) for t in tasks]
@@ -1910,7 +1909,7 @@ def run_iq(c, key):
     the layer kernel keeps off wq_b: every CTA runs its own (``IQ_TASKS`` ==
     ``BLOCKS``) wherever wq_b runs; on a step that scores a row only
     (``step_queried``)."""
-    if const_expr(key.feeds_index):  # noqa: SIM102
+    if const_expr(key.feeds_index and not key.indexer_apart):  # noqa: SIM102
         if step_queried(c):
             _iq_alone(c, key)
 
@@ -2171,7 +2170,7 @@ def run_attn_pre(
         pl = peer_offsets(s, dims)
         c["qx8"] = preg(c["sym"], pl["qg"], "qg")
         c["qx8s"] = preg(c["sym"], pl["qgs"], "qgs")
-    if const_expr(key.feeds_index):
+    if const_expr(key.feeds_index and not key.indexer_apart):
         # the head weights read the normed rows alone: ahead of wq_b and the
         # index query, which wait on the q latent
         enter_stage("k1.index_w")
@@ -2196,7 +2195,12 @@ def run_attn_pre(
     assert IQ_TASKS == BLOCKS
     # the layer kernel's FP4 query quantized by its GEMV's group tasks
     # (``iq_in_place``): no quantization stage
-    iq_quantizes = fused and key.feeds_index and iq_in_place(s, key.index_fp4)
+    iq_quantizes = (
+        fused
+        and key.feeds_index
+        and not key.indexer_apart
+        and iq_in_place(s, key.index_fp4)
+    )
     if const_expr(iq_quantizes and key.tok_par):
         # the group tasks read every token's head weights where iw pushed them
         c["iw"] = preg(c["sym"], peer_offsets(s, dims)["iwg"], "iwg")
@@ -2217,7 +2221,7 @@ def run_attn_pre(
     else:
         run_wqb(c, key, first_task(bid, WQB0), BLOCKS, wqb_per_cta)
     stamp(timeline, tls, tid, tl0 + 6)
-    if const_expr(key.feeds_index and not iq_quantizes):
+    if const_expr(key.feeds_index and not key.indexer_apart and not iq_quantizes):
         if const_expr(key.tok_par):
             # the quantization reads every token's head weights where iw
             # pushed them
@@ -2235,6 +2239,9 @@ def run_attn_pre(
             nbg = preg(c["sym"], pl["nbg"], "nbg")
             for t in range(first_task(bid, NORM0), s, BLOCKS):
                 normed_row_from(c, nbg, t, own_n)
+            if const_expr(key.indexer_apart):
+                for t in range(first_task(bid, QKV0), s, BLOCKS):
+                    query_row_from(c, t, own_n)
 
 
 def lds_struct(name, fields):
@@ -2382,6 +2389,7 @@ def build_attn_pre(key: AttnPreBuild):
         s=s,
         f=int(key.fold),
         ix=int(key.feeds_index),
+        apart=int(key.indexer_apart),
         i4=int(key.index_fp4),
         a=int(key.aux),
         tl=int(key.timeline),
@@ -2450,3 +2458,16 @@ def build_attn_pre(key: AttnPreBuild):
 
     ABI.check(attn_pre, launch)
     return launch
+
+
+@traced
+def query_row_from(c, t, n):
+    """Gather another rank's MXFP8 latent for the separate indexer."""
+    tid, a = c["tid"], c["args"]
+    if t // n != c["rank"]:
+        if tid < QX8_WORDS:
+            (v,) = c["poll"]([(c["qx8"], t * QX8_WORDS + tid, 1)])
+            bo.buffer_store(v[0], rsrc(a["qr_out"]), t * QX8_WORDS + tid)
+        if tid < Q_RANK // 32:
+            (v,) = c["poll"]([(c["qx8s"], t * (Q_RANK // 32) + tid, 1)])
+            bo.buffer_store(fx.Int8(v[0]), rsrc(a["qrs_out"]), t * (Q_RANK // 32) + tid)

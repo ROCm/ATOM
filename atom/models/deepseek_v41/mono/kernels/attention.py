@@ -45,7 +45,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v41.mono import attention_plan as aplan
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.config import ATTENTION_KEYS_MAX
 from atom.models.deepseek_v41.mono.kernels.dims import (
     HEAD_DIM,
@@ -80,6 +79,7 @@ from atom.mono.device.ops import (
     xshfl,
 )
 from atom.mono.device.sync import Quad
+from atom.mono.dsa_indexer.paged.fused import plan as ip
 from atom.mono.plan.execution import BLOCKS, THREADS
 
 CH, CHUNKS = aplan.CH, aplan.CHUNKS  # keys a chunk, chunks a token

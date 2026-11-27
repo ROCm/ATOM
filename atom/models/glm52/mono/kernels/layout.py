@@ -146,7 +146,7 @@ def indexer_uses_tiles(index_max_seq: int, indexer_cp: bool) -> bool:
 # valid entries, so the merged input is dense and in index order, and a global
 # winner is always inside its own list's top-``topk``, so no level drops one.
 # The tree ends at the level holding a single list.  This is DeepSeek-V4.1's
-# design (``atom/models/deepseek_v41/mono/index_plan.py:95-154``) at GLM's
+# design (``atom/mono/dsa_indexer/paged/plan.py:95-154``) at GLM's
 # constants: INDEX_SEG 16384, topk 2048 -> fan 8 -> two merge levels reach
 # 16384 * 8 * 8 = 1048576, with no LDS beyond today's.
 INDEX_SEG = INDEX_LOCAL_LDS_CAPACITY

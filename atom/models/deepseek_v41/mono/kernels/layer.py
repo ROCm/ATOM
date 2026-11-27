@@ -43,7 +43,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu
 from flydsl.expr.typing import Int32, Int64
 
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import compress as cp
@@ -67,7 +66,6 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
 )
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
 from atom.models.deepseek_v41.mono.kernels.dims import HIDDEN, Dims
-from atom.models.deepseek_v41.mono.kernels.index_query import IQ_GROUPS, iq_in_place
 from atom.models.deepseek_v41.mono.kernels.layer_post import (
     LayerPostBuild,
     gather_x,
@@ -86,6 +84,8 @@ from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, rsrc
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp_begin, stamp_flush
+from atom.mono.dsa_indexer.paged.fused import plan as ip
+from atom.mono.dsa_indexer.paged.fused.query import IQ_GROUPS, iq_in_place
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS
 from atom.mono.plan.layout import pair_layout

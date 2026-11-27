@@ -45,16 +45,6 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, T
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.kernels.index_query import await_queries
-from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4, sload4
-from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
-from atom.models.deepseek_v41.mono.kernels.topk import (
-    radix_select,
-    radix_slot,
-    select_words,
-)
-from atom.models.deepseek_v41.mono.step_meta import KMETA
 from atom.mono.device.ops import (
     CM_SYS,
     butterfly,
@@ -69,6 +59,15 @@ from atom.mono.device.ops import (
 )
 from atom.mono.device.select import key_bits, order_key
 from atom.mono.device.sync import POLL_MAX, preg, publish
+from atom.mono.dsa_indexer.paged.fused import plan as ip
+from atom.mono.dsa_indexer.paged.fused.plan import own_rows
+from atom.mono.dsa_indexer.paged.fused.query import await_queries
+from atom.mono.dsa_indexer.paged.fused.score_fp4 import run_scores4, sload4
+from atom.mono.dsa_indexer.paged.fused.topk import (
+    radix_select,
+    radix_slot,
+    select_words,
+)
 from atom.mono.plan.arith import pick, sel
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
 from atom.mono.plan.trace import enter_stage
@@ -540,7 +539,9 @@ def _selected_rows(c, t, ident, lift=False):
     lifts = (a["ilift"] != 0) | lift
     row = fx.Int32((lifts & (ident >= 0)).select(lifted, ident))
     toff = fx.Int32(
-        bo.buffer_load(rsrc(a["kmeta"]), t * KMETA + 2, vec_width=1, dtype=T.i32)
+        bo.buffer_load(
+            rsrc(a["kmeta"]), t * ip.KEY_META_WORDS + 2, vec_width=1, dtype=T.i32
+        )
     )
     rpp = a["rows_per_page"]
     live = fx.max(row, 0)
@@ -746,7 +747,8 @@ def run_scores(c, t0, n, bid, bounds, max_chunks):
     a = c["args"]
     reindex = a["ilift"] != 0
     owners = [
-        sel(reindex, t0 + t, ld_i32(a["kmeta"], (t0 + t) * KMETA + 2)) for t in range(n)
+        sel(reindex, t0 + t, ld_i32(a["kmeta"], (t0 + t) * ip.KEY_META_WORDS + 2))
+        for t in range(n)
     ]
     counts, spans, width_log2 = ip.score_tasks(bounds, owners, BLOCKS, TASK_CHUNKS_LOG2)
     width = Int32(1) << width_log2

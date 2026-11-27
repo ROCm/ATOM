@@ -33,8 +33,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.kernels.red import acc_sum
 from atom.mono.device.mx import FP8_MAX, clamp_fp8
 from atom.mono.device.ops import (
     CM_NT,
@@ -52,6 +50,7 @@ from atom.mono.device.ops import (
     wave_umax_dpp,
 )
 from atom.mono.device.sync import Quad
+from atom.mono.dsa_indexer.paged.fused import plan as ip
 from atom.mono.plan.execution import THREADS, WAVES
 
 IDX_ROWS = ip.HEADS * ip.DIM  # 4096
@@ -401,3 +400,17 @@ def stage_iquant_fp4(c, task, live):
             w = got[1][0].bitcast(fx.Float32)
             bo.buffer_store(w * fx.Float32(IDX_WEIGHTS_SCALE), rsrc(a["iw_out"]), row)
         query_done(c, row)
+
+
+def acc_word(w, g, col):
+    """RED's word of wave ``w``'s lane (g, col) C quad."""
+    return (w * 64 + g * 16 + (col ^ (4 * g))) * 4
+
+
+def acc_sum(red, r, t, waves=None):
+    """Row r, token t of the waves' accumulators at ``red``, summed in wave
+    order from 0 (``waves``: which, in order; all of them by default)."""
+    tot = fx.Float32(0.0)
+    for w in waves if waves is not None else range(WAVES):
+        tot = tot + fx.ptr_load(red + (acc_word(w, r // 4, t) + r % 4))
+    return tot

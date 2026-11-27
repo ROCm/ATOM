@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from atom.mono.dsa_indexer.plan import SCORE_KEYS
 from atom.mono.plan.execution import THREADS, WAVES
 
+ROW_COPIES = 4
+
 
 @dataclass(frozen=True)
 class Radix:

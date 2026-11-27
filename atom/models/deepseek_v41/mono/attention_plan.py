@@ -17,8 +17,8 @@ Called by the kernel on traced Int32 and by the CPU property test on Python
 ints (``index_plan``'s rules: non-negative ``//`` operands only).
 """
 
-from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.config import ATTENTION_KEYS_MAX
+from atom.mono.dsa_indexer.paged.fused import plan as ip
 from atom.mono.plan.arith import sel
 
 CH = 64  # keys a chunk: a score task's, four waves of 16

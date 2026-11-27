@@ -40,11 +40,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, T, as_ir_value
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.kernels.index_query import (
-    await_queries,
-    step_queried,
-)
 from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
@@ -56,6 +51,8 @@ from atom.mono.device.ops import (
     rsrc,
     traced,
 )
+from atom.mono.dsa_indexer.paged.fused import plan as ip
+from atom.mono.dsa_indexer.paged.fused.query import await_queries, step_queried
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.trace import enter_stage
 

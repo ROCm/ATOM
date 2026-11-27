@@ -8,7 +8,7 @@ allocated row. All division in the shared function has nonnegative operands.
 
 import pytest
 
-from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.mono.dsa_indexer.paged import plan as ip
 
 TOKENS = [0, 1, 35]
 COMPACT_ROWS = ip.TOPK_BLOCKS * ip.BLOCK_ROWS

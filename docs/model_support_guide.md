@@ -175,7 +175,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **MoE:** V4's `FusedMoE`, subclassed only to flatten the offline caller's batch dimension and declare `bias_vl`. There is no second expert backend.
 - **Graphs:** `CUDAGraphMode.FULL` captures the whole decode forward, one graph per `(batch size, query bucket)`; `TR_HYBRID` records token graphs with attention eager between their segments. `torch.compile` is not supported.
 - **Speculation:** Native DSpark proposes five tokens from the checkpoint's three draft stages. Implemented and tested, with quality acceptance still open — see [the DSpark guide](deepseek_v41_dspark.md).
-- **Guides:** [runtime](deepseek_v41_runtime.md), [cache format and graphs](deepseek_v41_performance.md), [protocol](deepseek_v41_protocol.md), [image requests](deepseek_v41_vision.md), [DSpark](deepseek_v41_dspark.md), [recipe](../recipes/DeepSeek-V4.1-Flash.md).
+- **Guides:** [runtime](deepseek_v41_runtime.md), [cache format and graphs](deepseek_v41_performance.md), [protocol](deepseek_v41_protocol.md), [image requests](deepseek_v41_vision.md), [DSpark](deepseek_v41_dspark.md), [FP4 Mono indexer routing](environment_variables.md#mono-decode-routing), [recipe](../recipes/DeepSeek-V4.1-Flash.md).
 
 ### Qwen3.5 MTP (`Qwen3_5MTP`)
 

@@ -33,7 +33,7 @@ NUMA = "%s:" + str(1 << 25) + ":0"
 BUILDS = {
     "k1": (
         k1.build_attn_pre, k1.ABI, k1.AttnPreBuild(tokens=12),
-        {"tokens": 24, "fold": False, "feeds_index": True, "index_fp4": True,
+        {"tokens": 24, "fold": False, "feeds_index": True, "indexer_apart": True, "index_fp4": True,
          "aux": True, "tp": 2, "timeline": True, "diag_off": DIAG,
          "tok_par": True, "kv_fp8": True, "numa": NUMA % "lin",
          "shard": True, "embed_in": True},
