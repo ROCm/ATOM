@@ -15,6 +15,7 @@ from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.distributed.ulysses_sp import sp_gather_rows, sp_is_enabled
+from atom.model_ops import lm_head_stream
 from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
@@ -424,7 +425,10 @@ class ParallelLMHead(VocabParallelEmbedding):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
             if sp_is_enabled() and not self.num_embeddings % get_pcp_group().world_size:
                 return self._sp_sharded_logits(x)
-        logits = tgemm.mm(x, self.weight, self.bias)
+        # Decode rows (M <= 8, gfx1250): one TDM-streamed launch, bit-identical to tgemm.mm (lm_head_stream.py).
+        logits = lm_head_stream.mm(x, self.weight, self.bias)
+        if logits is None:
+            logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
             logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)
