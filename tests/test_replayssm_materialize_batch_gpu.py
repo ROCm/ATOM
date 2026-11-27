@@ -204,6 +204,8 @@ def test_retired_generation_keeps_queued_raw_pointer_inputs_alive():
     pool.materialize(src, dst, steps)
     torch.cuda.synchronize()
     outputs = [row[0] for row in rows]
+    for checkpoint in outputs:
+        checkpoint[4].fill_(7)
     work = _random((1024, 1024))
     consumer = torch.cuda.Stream()
     consumer.wait_stream(torch.cuda.current_stream())
