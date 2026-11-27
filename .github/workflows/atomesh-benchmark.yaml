@@ -14,8 +14,9 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
-    # Do not use paths here. The required gate must be published for every PR;
-    # ci-gate below keeps the old path filter behavior for expensive jobs.
+    # Do not use paths here. The required gate must be published for every PR.
+    # No GPU or Slurm job runs on a PR, so there ci-gate only decides whether
+    # load-config runs.
   pull_request_review:
     types: [submitted]
   schedule:
@@ -409,7 +410,7 @@ jobs:
       - name: Build benchmark matrix
         id: matrix
         env:
-          SUITE: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
+          SUITE: ${{ github.event_name == 'schedule' && 'nightly' || (github.event_name == 'workflow_dispatch' && inputs.suite || 'smoke') }}
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
@@ -1532,14 +1533,19 @@ jobs:
           echo "RDMA smoke summary written to ${summary_path}"
 
   run-model-benchmark:
+    # Not on pull requests: their merge checks are the ATOMesh unit tests and
+    # the accuracy runs. The latest push to main on this workflow's
+    # paths runs the smoke suite (DeepSeek-V4 1P1D over Mooncake), since a newer
+    # push cancels a run still pending. To run it on a PR branch, dispatch this
+    # workflow with suite=smoke and case_names=ds-v4-1p1d-tp8-smoke.
     name: ${{ matrix.group.name }}
     needs: [ci-gate, load-config]
     if: >-
       needs.load-config.outputs.has_matrix == 'true'
       && (
         github.event_name == 'schedule'
+        || github.event_name == 'push'
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
-        || (github.event.pull_request && !github.event.pull_request.head.repo.fork)
       )
     strategy:
       fail-fast: false
@@ -1839,7 +1845,7 @@ jobs:
             summarize-results=${{ needs.summarize-results.result }}
           required-results: |
             load-config=${{ needs.load-config.result }}
-            run-model-benchmark=${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark) || (github.event.pull_request && !github.event.pull_request.head.repo.fork)) && needs.run-model-benchmark.result || 'success' }}
+            run-model-benchmark=${{ (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)) && needs.run-model-benchmark.result || 'success' }}
 
   dashboard:
     concurrency:

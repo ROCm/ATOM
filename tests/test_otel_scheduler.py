@@ -193,6 +193,8 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
             raise RuntimeError(name)
 
     core.label = "test"
+    core._idle_when_blocked = False
+    core._dp_group_hidden_work = False
     core.utility_queue = None
     core.utility_handler = SimpleNamespace(
         process_queue=lambda *a: None, push_metrics=lambda **k: None
@@ -212,6 +214,8 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
     core._is_rl_weights_offloaded = core._weight_sync_fenced = False
     core._generation_paused = False
     core._sync_dp_state = lambda *a: (False, True, False)
+    # Teardown is tested without a DP group; interval agreement has its own tests.
+    core._validate_dp_sync_interval = lambda interval: interval
     monkeypatch.setattr(tracing, "shutdown", lambda: calls.append("trace"))
     # A later PP stage neither drains KV work nor shuts a KV event publisher down.
     if failure in {"drain", "shutdown"} and engine_kind != "pp_downstream":

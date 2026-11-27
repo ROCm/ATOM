@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Qwen3.8-Flash-Next sequence-parallel HC streams, on CPU with simulated TP ranks."""
 
+import itertools
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import MethodType, SimpleNamespace
@@ -9,18 +10,17 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
-qwen4_exp = qwen4_exp_mtp = sequence_parallel = None
+qwen4_exp = qwen4_exp_mtp = None
 
 
 @pytest.fixture(scope="module", autouse=True)
 def imported_models():
-    global qwen4_exp, qwen4_exp_mtp, sequence_parallel
+    global qwen4_exp, qwen4_exp_mtp
     if torch.cuda.is_available():
-        from atom.distributed import sequence_parallel as rows
         from atom.models import qwen4_exp as target
         from atom.models import qwen4_exp_mtp as draft
 
-        qwen4_exp, qwen4_exp_mtp, sequence_parallel = target, draft, rows
+        qwen4_exp, qwen4_exp_mtp = target, draft
         yield
     else:
         from aiter_stub import atom_without_aiter
@@ -28,9 +28,8 @@ def imported_models():
         with atom_without_aiter() as load:
             qwen4_exp = load("atom.models.qwen4_exp")
             qwen4_exp_mtp = load("atom.models.qwen4_exp_mtp")
-            sequence_parallel = load("atom.distributed.sequence_parallel")
             yield
-    qwen4_exp = qwen4_exp_mtp = sequence_parallel = None
+    qwen4_exp = qwen4_exp_mtp = None
 
 
 class _Collectives:
@@ -68,7 +67,7 @@ def ranks(monkeypatch):
     """`ranks(world, fn)` runs `fn(rank)` on `world` simulated TP ranks; outside
     `ranks` the TP world size is 1."""
     local = threading.local()
-    monkeypatch.setattr(sequence_parallel, "get_tp_group", lambda: local.group)
+    monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: local.group)
     monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_rank", lambda: local.rank)
     monkeypatch.setattr(
         qwen4_exp,
@@ -133,6 +132,112 @@ def test_scatter_sums_partials_into_local_rows(ranks, world, tokens, trailing):
         torch.testing.assert_close(gathered, total)
 
 
+def _pending_reduce_scatter(summed, bounds):
+    """The pending type is available after the module fixture loads Qwen."""
+
+    class Pending(qwen4_exp.PendingReduceScatter):
+        def chunks(self):
+            for r0, r1 in itertools.pairwise(self.bounds):
+                yield r0, r1, summed[r0:r1]
+
+    return Pending(None, None, bounds, None)
+
+
+class _FakeAllGatherWriter:
+    """Checks that the pushed ranges tile this rank's rows as announced."""
+
+    def __init__(self, local_rows, num_tokens, pushes, hidden):
+        self.buf = torch.full((local_rows, hidden), float("nan"), dtype=torch.float64)
+        self.num_tokens, self.pushes, self.pushed = num_tokens, pushes, []
+
+    def rows(self, r0, r1):
+        return self.buf[r0:r1]
+
+    def push(self, r0, r1):
+        self.pushed.append((r0, r1))
+
+    def finish(self):
+        assert len(self.pushed) == self.pushes
+        assert all(a < b for a, b in self.pushed)
+        assert all(b0 == a1 for (_, b0), (a1, _) in itertools.pairwise(self.pushed))
+        assert self.pushed[0][0] == 0 and self.pushed[-1][1] == self.buf.shape[0]
+        return qwen4_exp.get_tp_group().all_gather(self.buf)[: self.num_tokens]
+
+
+class _FakeSdma:
+    """`SdmaCollectives` over the simulated TP group."""
+
+    def __init__(self, world, hidden):
+        self.world, self.hidden = world, hidden
+
+    def fits(self, local_rows):
+        return True
+
+    def reduce_scatter(self, x, local_rows, chunks):
+        padded = qwen4_exp._pad_rows(x, self.world * local_rows - x.shape[0])
+        summed = qwen4_exp.get_tp_group().reduce_scatter_tensor(padded)
+        bounds = [local_rows * j // chunks for j in range(chunks + 1)]
+        return _pending_reduce_scatter(summed, bounds)
+
+    def all_gather(self, local_rows, num_tokens, pushes):
+        return _FakeAllGatherWriter(local_rows, num_tokens, pushes, self.hidden)
+
+
+class _FakeHyperConnection:
+    """Per-row stand-in for `Qwen4ExpHyperConnection.mix_fused(_rows)`."""
+
+    hc_count = 2
+    block_inject_weight = object()
+
+    def mix_fused(self, streams, pending):
+        if pending is not None:
+            block, raw = pending
+            streams = streams + torch.cat([block * raw[:, :1], block * raw[:, 1:]], 1)
+        mixed = streams.view(streams.shape[0], 2, -1).mean(1)
+        return mixed, (streams, torch.tanh(streams[:, :2]))
+
+    def mix_fused_rows(self, streams, pending, rows, *, mixed_out, h_out, raw_out):
+        if pending is not None:
+            pending = (pending[0], pending[1][rows])
+        mixed, (h, raw) = self.mix_fused(streams[rows], pending)
+        mixed_out.copy_(mixed)
+        if pending is not None:
+            h_out[rows] = h
+        raw_out[rows] = raw
+
+
+# Per-rank rows 514 / 257 / 1025 (one chunk), 3001 (two) and 4501 (three).
+@pytest.mark.parametrize(
+    "world,tokens", [(2, 1027), (4, 1027), (4, 4099), (2, 6001), (2, 9001)]
+)
+def test_sdma_mix_gather_matches_rccl(ranks, world, tokens):
+    """Over SDMA, `mix_gather` mixes the reduce-scatter chunk by chunk and
+    all-gathers the mixed rows range by range; the result must equal the
+    one-shot RCCL path, padded rows included."""
+    hidden = 6
+    torch.manual_seed(0)
+    partials = torch.randn(world, tokens, hidden, dtype=torch.float64)
+    streams = torch.randn(tokens, 2 * hidden, dtype=torch.float64)
+    raw = torch.randn(tokens, 2, dtype=torch.float64)
+
+    def on_rank(rank):
+        results = []
+        for sdma in (False, True):
+            sp = qwen4_exp._SequenceParallel(
+                tokens, world, rank, _FakeSdma(world, hidden) if sdma else None
+            )
+            pending = (sp.scatter(partials[rank]), sp.shard(raw))
+            mixed, (h, r) = sp.mix_gather(
+                _FakeHyperConnection(), sp.shard(streams), pending
+            )
+            results.append((mixed, h, r))
+        return results
+
+    for rccl, sdma in ranks(world, on_rank):
+        for a, b in zip(rccl, sdma):
+            assert torch.equal(a, b)
+
+
 class _Layer:
     """Per-token stand-in for a fused decoder layer; the PLE layer needs every
     token of the request (its causal convolution is a prefix sum here)."""
@@ -169,6 +274,7 @@ def _model(num_layers, ple_layer, return_hc_state, embed, hc=4):
         layers=layers,
         # As `Qwen4ExpModel.__init__`: the layer after the last PLE layer.
         sp_start_layer=ple_layer + 1,
+        sp_sdma=None,
         hyper_connection_mixer=SimpleNamespace(
             apply_pending=apply_pending,
             mix_fused=lambda h, p: (apply_pending(h, p)[:, :hidden] * 0.5, None),
@@ -242,7 +348,7 @@ def test_sp_gates(ranks, monkeypatch, env, tokens, target_shards, drafter_shards
     quantizes, so it follows the env threshold alone."""
     monkeypatch.setenv("ATOM_QWEN4_EXP_SP_MIN_TOKENS", env)
     assert qwen4_exp.HC_QUANT_ROWS_MAX == 1024
-    target = SimpleNamespace(sp_start_layer=2, end_layer=48)
+    target = SimpleNamespace(sp_start_layer=2, end_layer=48, sp_sdma=None)
     target_gate = MethodType(qwen4_exp.Qwen4ExpModel._sequence_parallel, target)
     drafter_gate = qwen4_exp._SequenceParallel.maybe
     results = ranks(2, lambda rank: (target_gate(tokens), drafter_gate(tokens)))

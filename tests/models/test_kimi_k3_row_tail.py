@@ -93,11 +93,13 @@ def ranks(monkeypatch):
 class _Stub(nn.Module):
     """Stands in for a sub-module class; the test sets `fn` after `__init__`."""
 
+    allows_concurrent_shared_stream = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
 
-    def forward(self, *args):
-        return self.fn(*args)
+    def forward(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -217,6 +219,16 @@ def test_forward_with_dual_stream_off_takes_the_row_sharded_tail(ranks, monkeypa
         torch.testing.assert_close(summed, expected)
 
 
+def test_shared_stream_capability_keeps_short_steps_single_stream(ranks, monkeypatch):
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    monkeypatch.setattr(_Stub, "allows_concurrent_shared_stream", False)
+    for (routed, shared), (routed_out, shared_out), up_rows in _base_and_op_target(
+        ranks, 2, lambda block, x: block.forward(x)
+    ):
+        assert up_rows == [2, 2]
+        assert torch.equal(routed_out, routed) and torch.equal(shared_out, shared)
+
+
 def test_forward_with_tbo_enabled_keeps_the_base_pair(
     ranks, monkeypatch, stub_block_parts
 ):
@@ -288,9 +300,11 @@ def _torch_attn_res(
     add_hidden2=None,
     quant_dtype=None,
     num_blocks=None,
+    close_block=False,
 ):
     """Attention residual and output RMS norm in FP32 torch."""
     assert quant_dtype is None
+    bank = block_residual
     if num_blocks is not None:
         block_residual = block_residual[:, :num_blocks]
     ps = prefix.float()
@@ -302,7 +316,11 @@ def _torch_attn_res(
     y = (scores.softmax(-1)[..., None] * cands).sum(1)
     y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + out_eps)
     y = y * out_norm_weight.float()
-    return y.to(prefix.dtype), prefix if add_hidden is None else ps.to(prefix.dtype)
+    prefix_out = prefix if add_hidden is None else ps.to(prefix.dtype)
+    if close_block:
+        bank[:, num_blocks].copy_(prefix_out)
+        prefix_out = None
+    return y.to(prefix.dtype), prefix_out
 
 
 class _Attention(nn.Module):
@@ -576,8 +594,7 @@ def test_mono_fallback_uses_post_attention_reduction():
         torch.zeros(2, 1, 4),
     )
     site = _Stub()
-    site.fn = lambda *args: (normed, prefix)
-    site.maybe_close_block = lambda prefix, blocks: (blocks, prefix)
+    site.fn = lambda *args, **kwargs: (normed, prefix)
     layer = SimpleNamespace(
         self_attention_attn_res=site,
         is_linear_attn=True,

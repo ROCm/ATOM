@@ -1,7 +1,7 @@
 use super::{
-    AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigResult, HealthCheckConfig,
-    MetricsConfig, PolicyConfig, PreparePoolConfig, RetryConfig, RouterConfig, RoutingMode,
-    TokenizerCacheConfig,
+    AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigResult, FastokensConfig,
+    HealthCheckConfig, MetricsConfig, PolicyConfig, PreparePoolConfig, RetryConfig, RouterConfig,
+    RoutingMode, TokenizerCacheConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -15,6 +15,11 @@ pub struct RouterConfigBuilder {
 impl RouterConfigBuilder {
     pub fn prepare_pool(mut self, config: PreparePoolConfig) -> Self {
         self.config.prepare_pool = config;
+        self
+    }
+
+    pub fn fastokens(mut self, config: FastokensConfig) -> Self {
+        self.config.fastokens = config;
         self
     }
 
@@ -157,6 +162,11 @@ impl RouterConfigBuilder {
 
     pub fn atom_pd_rank_mapping_policy(mut self, policy: AtomPdRankMappingPolicy) -> Self {
         self.config.atom_pd_rank_mapping_policy = policy;
+        self
+    }
+
+    pub fn atom_pd_concurrent(mut self, enable: bool) -> Self {
+        self.config.atom_pd_concurrent = enable;
         self
     }
 

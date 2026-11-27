@@ -21,9 +21,11 @@ decides which is which; the two paths hand each other the same tensors. A
 full-attention layer still runs K2 for everything after its attention
 (``_pre_o_core``), unless ``bind_model`` left it on the production path.
 
-The kernels write each block into a slot of a bank sized for the whole stack,
-as ``AttnRes.maybe_close_block`` does. ``_fallback`` calls the original layer
-forward on that bank, bypassing module hooks because mono records aux taps itself.
+The kernels write each block into a slot of a bank sized for the whole stack.
+The attention-residual close writes the same slots in its kernel, except for
+layer 0's ``AttnRes.maybe_close_block`` fallback. ``_fallback`` calls the original
+layer forward on that bank, bypassing module hooks because mono records aux taps
+itself.
 
 ATOM carries two pending adds between layers (an MoE layer defers its routed and
 its shared output separately); K2 all-reduces one MoE output, so a mono layer
@@ -83,6 +85,8 @@ logger = logging.getLogger("atom")
 K2_TAG0 = 128
 # the DSA layers' indexer launches, past every K2's
 IX_TAG0 = 2 * K2_TAG0
+# the recurrent state pools K1 has a build for (``KdaPreBuild.state16``)
+STATE_DTYPES = (torch.float32, torch.float16)
 
 
 def inner_model(model):
@@ -199,7 +203,7 @@ class K3MonoDecodeRunner:
         )
         first = next(p for p in self.plans if p.mono)
         self.device = first.kda.w_in.device
-        self.state_len = self._state_len()
+        self.state_len, self.state16 = self._state_constants()
         self.replay_cap = self._replay_cap()
         self._replay_tables = {}  # layer id -> (K1's ReplaySSM table, its pointers)
         # the DSA layers' indexers: static checks every rank shares, so no
@@ -216,9 +220,10 @@ class K3MonoDecodeRunner:
             self.ix = None
         self._allocate()
 
-    def _state_len(self) -> int:
-        """The conv state's window, a build constant: ``CONV_WIDTH - 1`` plus the
-        verify window the KDA state pool was allocated for.
+    def _state_constants(self) -> tuple[int, bool]:
+        """The KDA state pools' build constants: the conv state's window
+        (``CONV_WIDTH - 1`` plus the verify window the pool was allocated for)
+        and whether the recurrent state is fp16 (``state16``).
 
         Every mono layer is checked, not just the first. ``_conv_state`` and
         ``_recurrent_state`` are the only validation the KDA state pools get,
@@ -248,23 +253,29 @@ class K3MonoDecodeRunner:
         Build time has that vote for free: ``bind_agreed`` turns this rank's
         ``MonoUnsupported`` into a ``group_agree(False)`` every peer follows.
         """
-        lens = set()
+        lens, dtypes = set(), set()
         for plan in self.plans:
             if not plan.mono:
                 continue
             lens.add(self._conv_state(plan.layer_id).size(-1))
-            self._recurrent_state(plan.layer_id)
+            dtypes.add(self._recurrent_state(plan.layer_id).dtype)
         if len(lens) != 1:
             raise MonoUnsupported(
                 f"mono layers disagree on the conv window: {sorted(lens)}; "
                 "`state_len` is one build constant for all of them"
             )
-        return lens.pop()
+        if len(dtypes) != 1:
+            raise MonoUnsupported(
+                "mono layers disagree on the recurrent state dtype: "
+                f"{sorted(map(str, dtypes))}"
+            )
+        self.state_dtypes = (dtypes.pop(),)  # the one dtype a step admits
+        return lens.pop(), self.state_dtypes[0] == torch.float16
 
     def _replay_cap(self) -> int:
         """ReplaySSM's record buffer length (its ``cache_len``), 0 without:
         read off the buffers allocated, every mono layer's checked as
-        ``_state_len`` checks the state pools -- a build constant, refused for
+        ``_state_constants`` checks the state pools -- a build constant, refused for
         the whole runner. K1 indexes them as contiguous [slot][head][cap][128]:
         k and u bf16, the log gates fp32."""
         caps = set()
@@ -293,22 +304,22 @@ class K3MonoDecodeRunner:
             raise MonoUnsupported(f"mono layers disagree on ReplaySSM: {sorted(caps)}")
         return caps.pop()
 
-    def _recurrent_state(self, layer_id: int) -> torch.Tensor:
+    def _recurrent_state(self, layer_id: int, dtypes=STATE_DTYPES) -> torch.Tensor:
         """The layer's KDA recurrent state, checked.
 
         `config_refusal` checks `ATOM_GDN_SSM_DTYPE`, which is the *request*;
         this is the pool that was actually allocated. The recurrence reads and
-        writes it in place as fp32 (see `_allocate`), so a narrower pool is
-        reinterpreted rather than converted -- wrong numbers, no error. The
-        conv state next door has been checked all along; this one was not,
-        although the module docstring claimed both were.
+        writes it in place as fp32, or as fp16 under ``state16``, so any other
+        dtype is reinterpreted rather than converted -- wrong numbers, no
+        error. A step admits only ``state_dtypes``: K1 reads the pool at the
+        element size its build was made for.
         """
         cache = get_forward_context().kv_cache_data[f"layer_{layer_id}"]
         state = cache.v_cache
-        if state.dtype != torch.float32:
+        if state.dtype not in dtypes:
             raise MonoUnsupported(
-                f"layer {layer_id}: recurrent state {state.dtype}, the "
-                "recurrence reads it in place as float32"
+                f"layer {layer_id}: recurrent state {state.dtype}, K1 is built "
+                f"for {' or '.join(map(str, dtypes))}"
             )
         return state
 
@@ -391,6 +402,7 @@ class K3MonoDecodeRunner:
                 onorm_eps=p.kda.onorm_eps,
                 lower_bound=p.kda.lower_bound,
                 write_idx=p.kda.write_idx,
+                state16=self.state16,
                 replay_cap=self.replay_cap,
                 replay_window=window,
                 **k1.gemv_staging(rows),
@@ -596,7 +608,7 @@ class K3MonoDecodeRunner:
                 f"layer {plan.layer_id}: conv window {state.size(-1)} != the "
                 f"built {key.state_len}"
             )
-        rstate = self._recurrent_state(plan.layer_id)
+        rstate = self._recurrent_state(plan.layer_id, self.state_dtypes)
         slots, accepted = state_slots(metadata, self.ones)
         core = prefix.new_empty(prefix.size(0), self.dims.proj)
         p = torch.Tensor.data_ptr

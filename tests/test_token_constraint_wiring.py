@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """The ModelRunner call sites of the token-constraint boundary.
 
 The runner is imported against AITER/Triton stand-ins on a CPU job (the same
 way as the other runner wiring tests), so none of this needs a GPU. Each test
 pins one place where the runner hands a step to the boundary: preparation,
-sampler-bypass eligibility, error delivery, release, and the RapidServe prefill
-path.
+error delivery, release, and the RapidServe prefill path. (A verify head's
+token ids stand only for an unconstrained step: tests/model_ops/test_verify_head.py.)
 """
 
 import contextlib
 from types import SimpleNamespace
 from unittest import mock
 
-import numpy as np
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
@@ -127,34 +127,14 @@ def test_forward_without_a_grammar_prepares_nothing(rule):
     runner.structured_output.prepare.assert_not_called()
 
 
-def _bypass_runner(monkeypatch):
-    runner = object.__new__(mod.ModelRunner)
-    runner.rejection_sampler = object()
-    spec = SimpleNamespace(num_spec_steps=1, num_draft_tokens_np=np.array([1, 1]))
-    monkeypatch.setattr(
-        mod, "get_forward_context", lambda: SimpleNamespace(spec_decode_metadata=spec)
-    )
-    monkeypatch.setattr(mod, "RELAXED_TOP_N", 1)
-    tokens = torch.zeros(2, 2, dtype=torch.int32)
-    verdict = torch.zeros(3, 2, dtype=torch.int32)
-    return runner, (tokens, verdict)
-
-
-@pytest.mark.parametrize(
-    "rule,served", [({}, True), (GRAMMAR, False), (CHANNEL, False)]
-)
-def test_head_ids_serve_only_unconstrained_verifies(monkeypatch, rule, served):
-    runner, head = _bypass_runner(monkeypatch)
-    batch = _batch(temperatures=torch.zeros(2), top_ks=torch.full((2,), -1), **rule)
-    assert runner._head_ids_serve(head, batch) is served
-
-
 # -- error delivery ----------------------------------------------------------
 
 
 def _postprocess_runner(ids, grammar):
     runner = object.__new__(mod.ModelRunner)
     runner._served = None
+    # the head: the hidden states are the logits
+    runner.model = SimpleNamespace(compute_logits=lambda hidden: hidden)
     runner.structured_output = grammar
     runner.sampler = lambda logits, *a, **k: logits.argmax(-1)
     runner.forward_done_event = SimpleNamespace(record=lambda stream=None: None)
@@ -175,10 +155,41 @@ def _postprocess_runner(ids, grammar):
 
 def _postprocess(runner, batch):
     mod_fc = SimpleNamespace(spec_decode_metadata=None)
+    hidden = torch.eye(4)[:2]
     with mock.patch.object(mod, "get_forward_context", lambda: mod_fc):
         return runner.postprocess(
-            batch, torch.eye(4)[:2], torch.ones(2), None, None, True, None
+            batch,
+            torch.ones(2),
+            None,
+            None,
+            True,
+            mod.LmHeadOutput(None, runner.compute_logits(hidden)),
+            hidden_states=hidden,
         )
+
+
+@pytest.mark.parametrize("ids_head", [True, False])
+def test_the_argmax_heads_ids_skip_the_sampler(monkeypatch, ids_head):
+    """Under `ATOM_DP_LM_HEAD_MODE=argmax` the head output is fp32 greedy ids:
+    postprocess, through the sampler bound at startup (`GreedyIdsOrSample`),
+    takes an int32 copy without sampling; logits still go through the
+    sampler."""
+    runner = _postprocess_runner({10: (3,), 11: (1,)}, None)
+    sampler = mock.Mock(return_value=torch.tensor([3, 1], dtype=torch.int32))
+    runner.sampler = mod.GreedyIdsOrSample(sampler)
+    prepare = mock.Mock(return_value=({10: (3,), 11: (1,)}, None))
+    runner.tokenID_processor.prepare_sampled_ids = prepare
+    head = torch.tensor([3.0, 1.0, 2.0]) if ids_head else torch.eye(4)[[3, 1, 2]]
+    fc = SimpleNamespace(spec_decode_metadata=None)
+    monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
+    out = runner.postprocess(
+        _batch(), torch.zeros(2), None, None, True, mod.LmHeadOutput(None, head), None
+    )
+    assert sampler.called is not ids_head
+    ids = prepare.call_args.args[1]
+    assert ids.dtype == torch.int32 and ids.tolist() == [3, 1]
+    assert ids.data_ptr() != head.data_ptr()
+    assert out.token_ids == [(3,), (1,)]
 
 
 def test_grammar_errors_are_delivered_with_the_step_output():
@@ -215,7 +226,9 @@ def _rapid_runner(monkeypatch, logits):
         True,
         False,
     )
-    runner.run_model = lambda ids, batch: (logits, None)
+    runner.run_model = lambda ids, batch: logits
+    # the head: the hidden states are the logits
+    runner.model = SimpleNamespace(compute_logits=lambda hidden: hidden)
     runner.sampler = lambda lg, temperatures, top_ks, top_ps, greedy: lg.argmax(-1)
     monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
     monkeypatch.setattr(mod, "reset_forward_context", lambda: None)
