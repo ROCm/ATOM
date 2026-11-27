@@ -221,6 +221,29 @@ def _filled_apart(vals, device: int):
     return out["got"]
 
 
+def _staging_in_line(metadata):
+    """The step's Engram staging to run on the step's own stream (its lookup
+    in line), None to keep its side stream. The forward joins the side stream
+    before its first layer (the all-gather spins on CUs: beside a kernel that
+    needs every CU resident it deadlocks), so the side stream overlaps
+    nothing, while its fork and join, captured, are 2-parent graph nodes a
+    replay pays ~4 us of idle each for (G368; hblk/h1a unit test). In line,
+    the fork, the join and the ``done`` records are same-stream no-ops. Not
+    where the step was staged outside the forward (the plugin's metadata
+    builder) or where taking a layer's rows gathers on the main stream itself
+    (``fallback_done``)."""
+    rows = getattr(metadata, "engram_embeddings", None)
+    staging = getattr(rows, "staging", None)
+    if (
+        staging is None
+        or getattr(metadata, "staged_outside_forward", False)
+        or staging.fallback_done
+        or not isinstance(getattr(staging, "stream", None), torch.cuda.Stream)
+    ):
+        return None
+    return staging
+
+
 class V41MonoDecodeRunner:
     """Binds every rank's weights and buffers, or none: a rank that cannot is a
     refusal every rank agrees on (``group_agree``) before anything collective.
@@ -1168,6 +1191,18 @@ class V41MonoDecodeRunner:
         self.numa_word = scratch_word(self.scratch[start:], area, "V4.1 mono")
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """``_forward``, the Engram staging (if any) on the step's own stream
+        meanwhile (``_staging_in_line``)."""
+        staging = _staging_in_line(get_forward_context().attn_metadata)
+        if staging is None:
+            return self._forward(input_ids, positions)
+        side, staging.stream = staging.stream, torch.cuda.current_stream()
+        try:
+            return self._forward(input_ids, positions)
+        finally:
+            staging.stream = side
+
+    def _forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         model = self.model
         metadata = get_forward_context().attn_metadata
         cache, step = metadata.cache, metadata.step
