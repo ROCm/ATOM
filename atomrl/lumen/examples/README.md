@@ -132,20 +132,10 @@ and calling that script directly. `DRY_RUN=1` prints the `torchrun` line.
 
 ## CI mapping
 
-The inline matrix in `.github/workflows/atomrl-lumen-gpu-shard.yaml` mirrors
-rows 1–13 exactly. Lumen changes run the AtomRL packaging/unit jobs, Lumen CPU
-tests, and the serialized 13-case GPU shard on
-`atom-mi355-8gpu.predownload`; AtomRL-only changes do not request the Lumen GPU
-runner. Fork pull requests never use self-hosted GPUs.
-
-The shard builds `atomrl/docker/Dockerfile.lumen` with AITER `main`. Cases 1–12
-invoke their normal host launchers with that image, so nested containers receive
-real host mounts; case 13 runs directly in the same container. The shard searches the
-shared runner model roots for Llama-2-7b-hf (case 4) and Qwen3-8B (cases 11 and
-13), fails rather than downloading when they are absent, and generates
-deterministic NumPy or Alpaca JSONL smoke data. Every container mounts the
-current checkout at `/workspace/ATOM` and refreshes only the root editable
-install with `--no-deps`.
+Lumen changes run package verification and CPU-safe tests on Python 3.10 and
+3.12. The numbered GPU examples are release-validation workloads and are not
+run by pull-request CI. Run them explicitly on an 8-GPU host with the commands
+in the table above when preparing or validating a GPU release image.
 
 ---
 
