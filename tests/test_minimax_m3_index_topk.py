@@ -1034,9 +1034,17 @@ class TestPrefillNarrowRowsGate:
         assert not gate(arch="gfx942")
         assert not gate(emit=True)  # one more launch than the fused Triton selector
 
-    def test_off_by_default(self, gate, monkeypatch):
-        monkeypatch.setattr(m.envs, "ATOM_M3_PREFILL_TOPK_FLYDSL", False)
-        assert not gate()
+    def test_off_by_default(self, monkeypatch):
+        # Exercise the real lazy default, not a forced value: no `gate` fixture (it shadows
+        # `envs.ATOM_M3_PREFILL_TOPK_FLYDSL` with a module attribute), clear the env var, and
+        # assert nothing shadows the lazy lookup. This way a flip of the registered default
+        # from "0" to "1" -- which re-introduces the GSM8K regression this flag guards --
+        # fails here instead of being hidden by a forced-False flag.
+        monkeypatch.delenv("ATOM_M3_PREFILL_TOPK_FLYDSL", raising=False)
+        assert "ATOM_M3_PREFILL_TOPK_FLYDSL" not in vars(m.envs)
+        assert not m._prefill_narrow_rows_to_aiter(
+            "gfx950", emit=False, topk=TOPK, decode_max_q=0
+        )
 
 
 def _pinned(score, nvalid, init, local):
