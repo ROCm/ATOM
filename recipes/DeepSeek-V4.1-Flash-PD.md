@@ -1,11 +1,18 @@
 # DeepSeek V4.1-Flash P/D disaggregation on MI355X
 
+**Naming.** `xPyD` counts instances, not GPUs: x prefill (P) instances and y
+decode (D) instances. Each instance's shape and GPU count are written next to
+it, for example "1P1D: P DEP4 (4 GPUs) + D DEP8 (8 GPUs), 12 GPUs" or
+"2P2D: 2x P DEP4 + 2x D DEP8". Run labels inside the commands (such as
+`4p8d_dep8`) and the chart's file name keep their original GPU-count names;
+they are only labels.
+
 This recipe covers two P/D deployments of DeepSeek-V4.1-Flash on MI355X:
 
-- **4P8D on two nodes, 12 GPUs: the AgentX ladder c1-c768** (P DEP4 + D TP8 Mono at c1-c32, P DEP4 + D DEP8 at c256-c768). This is the main part below: the chart, the results, and for every point on the chart a complete, copyable launch configuration ([c1](#c1), [c2](#c2), [c4](#c4), [c8](#c8), [c16](#c16), [c32](#c32), [c256](#c256), [c512](#c512), [c768](#c768)).
-- **4P4D on one 8-GPU node** (P DEP4 + D DEP4, TTFT-optimized for AgentX C256), in the appendix [Single-node 4P4D](#appendix-single-node-4p4d-ttft-optimized-agentx-c256).
+- **1P1D on two nodes, 12 GPUs: the AgentX ladder c1-c768.** P DEP4 (4 GPUs) + D TP8 Mono (8 GPUs) at c1-c32, P DEP4 (4 GPUs) + D DEP8 (8 GPUs) at c256-c768. This is the main part below: the chart, the results, and for every point on the chart a complete, copyable launch configuration ([c1](#c1), [c2](#c2), [c4](#c4), [c8](#c8), [c16](#c16), [c32](#c32), [c256](#c256), [c512](#c512), [c768](#c768)).
+- **1P1D on one node, 8 GPUs** (P DEP4 (4 GPUs) + D DEP4 (4 GPUs), TTFT-optimized for AgentX C256), in the appendix [Single-node 1P1D](#appendix-single-node-1p1d-ttft-optimized-agentx-c256).
 
-## 4P8D AgentX ladder (c1-c768, 3600 s)
+## 1P1D AgentX ladder (c1-c768, 3600 s)
 
 ![DeepSeek-V4.1-Flash P/D on MI355X: token throughput per GPU vs P90 interactivity (AgentX, 3600 s)](DeepSeek-V4.1-Flash-PD-4P8D-AgentX-curve.png)
 
@@ -2387,7 +2394,7 @@ aiperf profile --scenario inferencex-agentx-mvp --url http://$P_HOST:$INGRESS_PO
 - The c768 P used UUID-based GPU selection with a local diagnostic patch
   (see [c768](#c768)); the other points used `HIP_VISIBLE_DEVICES=0,1,2,3`.
 
-## Appendix: Single-node 4P4D (TTFT-optimized, AgentX C256)
+## Appendix: Single-node 1P1D (TTFT-optimized, AgentX C256)
 
 This appendix describes a single-node prefill/decode (P/D) split for
 DeepSeek-V4.1-Flash-1017 on 8x MI355X running the AgentX C256 workload. The
@@ -2396,7 +2403,7 @@ Both run TP4 with DP attention and EP4 (DEP4). The workload uses FP8 KV, an
 FP4 index plane, DSpark with five speculative tokens, prefix caching, and a
 Mooncake Store as the P-side KV offload tier.
 
-Compared with the earlier 4P4D configuration, the base of this recipe (E14a)
+Compared with the earlier single-node 1P1D configuration, the base of this recipe (E14a)
 cuts mean TTFT from 3.74 s to 1.07-1.24 s (-67 to -71%). ITL improves from
 6.91 to 6.37 ms, and output throughput rises from 6,644 to about 7,390 tok/s
 (+11%).
@@ -2423,10 +2430,11 @@ and runs on the same host. Against it, this P/D config is better on TTFT mean,
 P50 and P90. The single instance is still slightly better on P99 TTFT, ITL and
 output throughput per GPU. See [Results](#results).
 
-The two-node 4P8D AgentX ladder (c1-c768, 12 GPUs) is the main part of this
-recipe; see [4P8D AgentX ladder](#4p8d-agentx-ladder-c1-c768-3600-s).
+The two-node 1P1D AgentX ladder (c1-c768, P DEP4 + D TP8 Mono or D DEP8,
+12 GPUs) is the main part of this recipe; see
+[1P1D AgentX ladder](#1p1d-agentx-ladder-c1-c768-3600-s).
 
-### What changed relative to the earlier 4P4D config
+### What changed relative to the earlier 1P1D config
 
 | # | Role | Change | Effect measured on AgentX C256 |
 |---|---|---|---|
@@ -2449,7 +2457,7 @@ gave no gain or traded one metric for another:
 - a short-request bypass in the scheduler
 - asynchronous Store unpack
 - early-load tuning
-- a 6:2 P:D split, which MoRI's power-of-two rule blocks inside one node
+- a 6:2 P:D GPU split, which MoRI's power-of-two rule blocks inside one node
 
 ### Dependencies
 
@@ -2734,7 +2742,7 @@ atomesh launch --host $HOST_IP --port 31530 --prometheus-port 31531 \
   --prefill http://$HOST_IP:31500 --decode http://$HOST_IP:31600
 ```
 
-As in the [8P16D shared-Store recipe](DeepSeek-V4.1-6P16D-C1228-Share-Cache.md#router-and-encoding-ingress),
+As in the [4P4D shared-Store recipe (4x P EP2 + 4x D TP4, 24 GPUs)](DeepSeek-V4.1-6P16D-C1228-Share-Cache.md#router-and-encoding-ingress),
 the measured AgentX runs sent chat requests through an encoding ingress in
 front of atomesh. The ingress applies the exact V4.1 tokenizer and chat
 encoding, preserves streaming, tool payloads, request IDs and cancellation,
@@ -2807,7 +2815,7 @@ is in seconds and ITL is the mean in ms. Throughput is aiperf output tok/s.
 
 | Config | GPUs | TTFT mean | P50 | P90 | P99 | ITL | tok/s | tok/s/GPU |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Earlier 4P4D (standard MoE, chunk 32K, delayer on) | 8 | 3.742 | 2.941 | 6.151 | 18.80 | 6.91 | 6,644 | 830 |
+| Earlier 1P1D, P DEP4 + D DEP4 (standard MoE, chunk 32K, delayer on) | 8 | 3.742 | 2.941 | 6.151 | 18.80 | 6.91 | 6,644 | 830 |
 | Single DEP8, standard MoE | 8 | 1.875 | 1.347 | 3.021 | 10.68 | 7.81 | 7,067 | 883 |
 | Single DEP8, mega, chunk 16K | 8 | 1.268 | 0.927 | 1.963 | **8.03** | **5.97** | **7,618** | **952** |
 | **E14a (items 1-5), run 1** | 8 | 1.072 | 0.818 | 1.476 | **7.44** | 6.37 | 7,393 | 924 |
@@ -2905,7 +2913,7 @@ What the tables show:
   not needed and are not part of this recipe.
 - Hosts differ. The same configuration ran about 12% slower on Host B than
   on Host A, so compare only runs from the same host.
-- P:D ratios other than 4:4 inside one node are limited. MoRI's EP needs a
+- P:D GPU splits other than 4:4 inside one node are limited. MoRI's EP needs a
   power-of-two GPU count per instance, and atomesh has neither weighted
-  routing nor P-instance affinity. A 6:2-style split (P DEP4 + DEP2, D DEP2)
-  was measured and lost: ITL rose to 12 ms and TTFT to 2.9 s.
+  routing nor P-instance affinity. A 6:2 GPU split, 2P1D (P DEP4 + P DEP2 +
+  D DEP2, 8 GPUs), was measured and lost: ITL rose to 12 ms and TTFT to 2.9 s.
