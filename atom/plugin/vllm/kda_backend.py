@@ -24,6 +24,11 @@ from vllm.v1.attention.backends.utils import (
 # unconditionally) to stay on the write slot.
 KimiK3KDAMetadata.non_spec_state_indices_in_tensor = None
 KimiK3KDAMetadata.spec_state_indices_in_tensor = None
+# The shared forward also reads the step's midstep KDA checkpoints. vLLM's
+# scheduler places none. A class default, like the two above, rather than an
+# instance attribute: `dataclasses.replace()` copies only declared fields, so
+# the per-segment copies of a mixed spec / non-spec step would lose the latter.
+KimiK3KDAMetadata.kda_snapshots = None
 
 
 class AtomKimiK3KDAMetadataBuilder(KimiK3KDAMetadataBuilder):

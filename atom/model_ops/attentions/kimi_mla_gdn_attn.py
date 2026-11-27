@@ -8,6 +8,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer, midstep_rerun_rows
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
@@ -17,6 +18,13 @@ from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     pooled_path_enabled,
     speculative_kpool_history_size,
+)
+from atom.models.kimi_k3.midstep import (
+    KdaSnapshots,
+    kda_midstep_enabled,
+    kda_midstep_transfer,
+    kda_snapshots,
+    refuse_midstep_under_pipeline,
 )
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import AttentionMetaData, Context
@@ -39,6 +47,18 @@ from .triton_mla import TritonMLAMetadataBuilder
 # need both a rung and an anchor. Other free runtime slots are also available.
 # A full shared pool drops optional targets and cuts at an unbacked anchor.
 MIDSTEP_SCRATCH_SLOTS = 4
+
+
+def flash_kda_chunk() -> int:
+    """aiter FlashKDA's recurrence chunk: the grid a midstep KDA checkpoint
+    sits on, counted from each forward's first token.
+
+    Imported on use, by the midstep path alone: only an aiter with
+    ROCm/aiter#7413 exports it, and the switch needs that aiter anyway.
+    """
+    from aiter.ops.triton.kimi_delta_attn import FLASH_KDA_CHUNK
+
+    return FLASH_KDA_CHUNK
 
 
 class KimiMLAGDNBackend(AttentionBackend):
@@ -396,18 +416,31 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         127 ordinary KV blocks — 0.112% of the paged pool — drawn from the same
         free list as everything else, and evicted by the same LRU.
 
-        Midstep-readable on grid 1 (`_reads_midstep`): the re-run ends a head
-        at any token, and the conv window needs `conv_kernel - 1` of the
-        forward's tokens before the target.
+        Midstep-readable where `_reads_midstep` holds, by one of two means. By
+        default the forward re-runs each interior target's head: grid 1, since
+        a re-run ends at any token, with `conv_kernel - 1` of the forward's
+        tokens before the target for the conv window. Under
+        `ATOM_K3_KDA_STATE_MIDSTEP=1` (`atom.models.kimi_k3.midstep`), which
+        startup refuses under pipeline parallelism, aiter's
+        `chunk_kimi_delta_attn` itself stores the state at each interior
+        position the coordinator reserves (`snapshot_targets`), on FlashKDA's
+        chunk grid, and no head is re-run.
 
-        Interior SSM images use the head re-run's final state, converted by
-        the shared checkpoint writer to the pool dtype (`ATOM_GDN_SSM_DTYPE`).
-        End targets copy the settled runtime state. PAGE storage and restore
-        preserve those slot bytes exactly. Both pool dtypes are named in the
-        layout id, so a build that changed either cannot read another's images.
+        Interior SSM images are the head re-run's final state or, under the
+        switch, the recurrence's snapshot, which it stores in the final
+        state's dtype and layout; the shared checkpoint writer puts either
+        into the slot in the pool dtype (`ATOM_GDN_SSM_DTYPE`). End targets
+        copy the settled runtime state. PAGE storage and restore preserve
+        those slot bytes exactly. Both pool dtypes are named in the layout id,
+        so a build that changed either cannot read another's images.
         """
         if not self._uses_paged_checkpoints():
             return StateTransfer.fork(1)
+        midstep = kda_midstep_enabled()
+        if midstep:
+            refuse_midstep_under_pipeline(
+                self.model_runner.config.pipeline_parallel_size
+            )
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         # Everything a reader needs to reassemble the image at the same byte
@@ -442,6 +475,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         )
         if not self._reads_midstep():
             return StateTransfer.copy(layout_id, decode_keep=self._decode_keep())
+        if midstep:
+            return kda_midstep_transfer(
+                layout_id,
+                self.model_runner.config.hf_config.linear_conv_kernel_dim,
+                grid=flash_kda_chunk(),
+                decode_keep=self._decode_keep(),
+            )
         return StateTransfer.copy(
             layout_id,
             decode_keep=self._decode_keep(),
@@ -452,8 +492,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
     def _checkpoint_targets(self, batch) -> dict | None:
         """This step's midstep checkpoints, as `midstep_rerun_rows` device
-        tensors for the KDA forward to write them from."""
-        if not any(batch.state_save_all):
+        tensors for the KDA forward to write them from.
+
+        None under `ATOM_K3_KDA_STATE_MIDSTEP=1`: the step's targets then go
+        through `kda_snapshots` instead (`_kda_snapshots`), on FlashKDA's grid,
+        and the forward re-runs no head."""
+        if not any(batch.state_save_all) or kda_midstep_enabled():
             return None
         found = self._midstep_targets(batch, 1)
         if not found:
@@ -892,6 +936,47 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         else:
             buf.np[:n] = -1
         group.set_count(buf, rows)
+
+    def finish_prefill(self, batch, attn_metadata, running_bs, running_tokens):
+        super().finish_prefill(batch, attn_metadata, running_bs, running_tokens)
+        # `GDNStateMixin.finish_prefill` has built the GDN metadata, or left
+        # None for a prefill without block tables.
+        if attn_metadata.gdn_metadata is not None:
+            attn_metadata.gdn_metadata.kda_snapshots = self._kda_snapshots(batch)
+
+    def _kda_snapshots(self, batch: ScheduledBatch) -> KdaSnapshots | None:
+        """The midstep checkpoints this prefill takes from the recurrence
+        (`kda_snapshots`), None with the switch off: the forward then re-runs
+        heads for them (`_checkpoint_targets`)."""
+        if not kda_midstep_enabled():
+            return None
+        return kda_snapshots(
+            batch.state_save_all,
+            batch.state_rows,
+            batch.num_cached_tokens,
+            batch.num_scheduled_tokens,
+            batch.state_slots_committed,
+            num_slots=self.model_runner.mamba_k_cache.shape[1],
+            grid=flash_kda_chunk(),
+            conv_len=self.model_runner.config.hf_config.linear_conv_kernel_dim - 1,
+            device=self.device,
+        )
+
+    def step_needs_eager(self, batch: ScheduledBatch) -> bool:
+        """Also for a prefill that takes KDA snapshots.
+
+        `KimiKDAAttention._forward_impl` writes them. A prefill replaying a
+        token graph runs the recurrence through the split instead
+        (`_kda_recurrence`), which writes no checkpoint, and the scheduler
+        files every reserved position after the forward whether or not it was
+        written. A step with no reservation still replays. The switch is read
+        last: a decode, or a prefill without reservations, does not pay for it.
+        """
+        return super().step_needs_eager(batch) or (
+            batch.total_tokens_num_prefill > 0
+            and any(batch.state_save_all)
+            and kda_midstep_enabled()
+        )
 
     def build_for_cudagraph_capture(self, bs: int, *, decode_ubatch_slices=None):
         attn_metadata, context = super().build_for_cudagraph_capture(

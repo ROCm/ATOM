@@ -14,6 +14,7 @@ is what the production one already does with itself.
 
 from __future__ import annotations
 
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -103,6 +104,11 @@ def tp_world(size: int):
             yield K3._KimiMLAGDNCommon
         finally:
             K3.get_tp_group = original
+
+
+def k3_module(builder_cls):
+    """The module `tp_world` loaded the builder from, to patch a name on."""
+    return sys.modules[builder_cls.__module__]
 
 
 def layout_of(**kwargs) -> str:
@@ -239,3 +245,61 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
                 builder(Builder, replayssm=True, pp=2, kpool=4, kpool_tail=kpool_tail)
             )
         assert transfer.decode_keep == "none"
+
+    @pytest.mark.parametrize(
+        "num_spec, kpool, keep", [(2, 1, "snapshot"), (0, 1, "settled"), (2, 4, "none")]
+    )
+    def test_the_midstep_switch_leaves_a_decode_boundary_as_it_was(
+        self, monkeypatch, num_spec, kpool, keep
+    ):
+        """The switch moves where a prefill checkpoint is taken. What a decode
+        boundary keeps is still the backend's `_decode_keep`."""
+        monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
+        with tp_world(TP) as Builder:
+            monkeypatch.setattr(k3_module(Builder), "flash_kda_chunk", lambda: 32)
+            transfer = Builder.state_transfer(
+                builder(Builder, num_spec=num_spec, kpool=kpool)
+            )
+        # No snapshot holds a kpool plane, so that model reads none midstep.
+        assert transfer.midstep_grid == (32 if kpool == 1 else 0)
+        assert transfer.decode_keep == keep
+
+    def test_the_midstep_switch_writes_nothing_the_head_re_runs_would_not(
+        self, monkeypatch
+    ):
+        """The switch chooses the means where a prefill can write a checkpoint
+        (`_reads_midstep`), and adds no model to them: GLM-5.3 shares the
+        builder but its forward takes no snapshot."""
+        monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
+        with tp_world(TP) as Builder:
+            monkeypatch.setattr(k3_module(Builder), "flash_kda_chunk", lambda: 32)
+            glm = builder(Builder, model_type="glm5_next_text")
+            assert not Builder.state_transfer(glm).readable_midstep
+            kpool = builder(Builder, kpool=4)
+            assert not Builder.state_transfer(kpool).readable_midstep
+
+    def test_without_the_midstep_switch_aiter_is_not_asked_for_the_grid(
+        self, monkeypatch
+    ):
+        """An aiter without ROCm/aiter#7413 has no `FLASH_KDA_CHUNK` to import.
+        Off the switch the grid is the head re-run's own."""
+
+        def no_grid():
+            raise ImportError("FLASH_KDA_CHUNK")
+
+        monkeypatch.delenv("ATOM_K3_KDA_STATE_MIDSTEP", raising=False)
+        with tp_world(TP) as Builder:
+            monkeypatch.setattr(k3_module(Builder), "flash_kda_chunk", no_grid)
+            transfer = Builder.state_transfer(builder(Builder))
+        assert transfer.midstep_grid == 1
+
+    def test_the_midstep_switch_is_refused_under_pipeline_parallelism(
+        self, monkeypatch
+    ):
+        """At startup, in `state_transfer`."""
+        monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
+        with (
+            tp_world(TP) as Builder,
+            pytest.raises(RuntimeError, match="pipeline_parallel_size=2"),
+        ):
+            Builder.state_transfer(builder(Builder, pp=2))

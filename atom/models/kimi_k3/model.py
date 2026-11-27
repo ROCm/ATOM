@@ -1305,9 +1305,18 @@ class KimiKDAAttention(nn.Module):
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
+        snapshot_targets: tuple[tuple[int, int], ...] | None = None,
+        snapshot_out: torch.Tensor | None = None,
     ):
         from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
+        # Only passed when there are snapshots, so an image without them (or a
+        # step without any) calls the kernel exactly as before.
+        snap = (
+            {"snapshot_targets": snapshot_targets, "snapshot_out": snapshot_out}
+            if snapshot_targets
+            else {}
+        )
         return chunk_kimi_delta_attn(
             q=q,
             k=k,
@@ -1334,6 +1343,7 @@ class KimiKDAAttention(nn.Module):
             # fused decode kernel writes. Without it the state comes back
             # K-first and decode reads it transposed.
             state_v_first=True,
+            **snap,
         )
 
     def _prefill_kda(self, q, k, v, gate, beta, initial, ckpt):
@@ -1484,15 +1494,43 @@ class KimiKDAAttention(nn.Module):
             initial = gather_kda_initial_state(
                 ssm_state, state_indices_in, kda_metadata.has_initial_state
             )
+            # A step's midstep checkpoints come one of two ways, never both:
+            # as heads to re-run (`ssm_checkpoints`), or under
+            # ATOM_K3_KDA_STATE_MIDSTEP=1 as snapshots the recurrence stores
+            # (`kda_snapshots`).
             ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
+            snaps = kda_metadata.kda_snapshots
+            snap_out = None
             if ckpt is not None and "kda_tokens" in ckpt:
                 kda_out, last_state, head_states = self._prefill_kda(
                     q, k, v, gate, beta, initial, ckpt
                 )
             else:
-                kda_out, last_state = self._run_kda(
-                    q, k, v, gate, beta, initial, query_start_loc, True
-                )
+                if snaps is not None and snaps.targets:
+                    # In the final state's dtype and layout, so a snapshot is
+                    # the bits a forward ending at its position leaves in the
+                    # slot.
+                    snap_out = initial.new_empty(
+                        (len(snaps.targets), *initial.shape[1:])
+                    )
+                    kda_out, last_state = self._run_kda(
+                        q,
+                        k,
+                        v,
+                        gate,
+                        beta,
+                        initial,
+                        query_start_loc,
+                        True,
+                        snapshot_targets=snaps.targets,
+                        snapshot_out=snap_out,
+                    )
+                else:
+                    # No snapshot arguments: the call the token-graph split
+                    # makes (`_prefill_recurrence`), argument for argument.
+                    kda_out, last_state = self._run_kda(
+                        q, k, v, gate, beta, initial, query_start_loc, True
+                    )
                 head_states = last_state
             # last_state already has ssm_state's dtype (fla preserves the
             # initial_state dtype; the gathered initial is allocated as such),
@@ -1514,6 +1552,10 @@ class KimiKDAAttention(nn.Module):
                     chunk_size=1,
                     conv_state_len=kda_metadata.ssm_conv_state_len,
                     h_rows=ckpt["h_rows"],
+                )
+            if snaps is not None:
+                write_state_checkpoints(
+                    **snaps.checkpoint_args(snap_out, ssm_state, mixed_qkv, conv_state)
                 )
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.

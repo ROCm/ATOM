@@ -829,6 +829,7 @@ def _kda_metadata():
         non_spec_state_indices_in_tensor=torch.tensor([1, 3]),
         non_spec_query_start_loc=torch.tensor([0, 3, 5]),
         has_initial_state=torch.tensor([True, False]),
+        kda_snapshots=None,
     )
 
 

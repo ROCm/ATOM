@@ -11,6 +11,17 @@ unnarrowed instead. Torch only, so the plan is testable without triton.
 import torch
 
 
+def checkpoint_target_columns(targets, device) -> tuple[torch.Tensor, ...]:
+    """`midstep_checkpoint_targets`' `(row, slot, offset, is_end, runtime_slot)`
+    tuples, in the order given, as the int32 device columns
+    `write_state_checkpoints` takes: rows, slots, offs, is_end, runtime_slots.
+    """
+    return tuple(
+        torch.tensor([int(v) for v in col], dtype=torch.int32, device=device)
+        for col in zip(*targets, strict=True)
+    )
+
+
 def interior_state_snapshots(
     rows: torch.Tensor,
     offs: torch.Tensor,

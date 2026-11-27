@@ -31,7 +31,10 @@ from atom.model_ops.fla_ops.replayssm import (
     replayssm_flush_wait,
     replayssm_materialize,
 )
-from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
+from atom.model_ops.gdn_midstep_snapshots import (
+    checkpoint_target_columns,
+    interior_state_snapshots,
+)
 from atom.model_ops.mamba_ops.causal_conv1d import (
     PAD_SLOT_ID,
     compute_causal_conv1d_metadata,
@@ -67,6 +70,7 @@ from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferRegion
+    from atom.models.kimi_k3.midstep import KdaSnapshots
 
 logger = logging.getLogger("atom")
 
@@ -182,6 +186,9 @@ class GDNAttentionMetadata:
     # mapping the chunk kernel builds internally. Only computed when there are
     # checkpoints to place against it.
     ssm_chunk_offsets: torch.Tensor | None = None
+    # Kimi-K3 midstep checkpoints (ATOM_K3_KDA_STATE_MIDSTEP=1) this prefill
+    # writes, as `_KimiMLAGDNCommon._kda_snapshots` builds them, else None.
+    kda_snapshots: "KdaSnapshots | None" = None
     # Conv tokens a checkpoint holds, `conv_kernel - 1`; see `_conv_state_len`.
     ssm_conv_state_len: int = 0
     # Keep the chunk kernel's per-chunk states for a caller that places its own
@@ -1449,18 +1456,17 @@ class GDNStateMixin(PoolRowsMixin):
         if not found:
             return None
 
-        def mk(col):
-            return torch.tensor(col, dtype=torch.int32, device=self.device)
-
-        rows, slots, offs, is_end, runtime = zip(*found)
+        rows, slots, offs, is_end, runtime = checkpoint_target_columns(
+            found, self.device
+        )
         return {
-            "rows": mk(rows),
-            "slots": mk(slots),
-            "offs": mk(offs),
-            "is_end": mk(is_end),
-            "runtime": mk(runtime),
+            "rows": rows,
+            "slots": slots,
+            "offs": offs,
+            "is_end": is_end,
+            "runtime": runtime,
             # Host-side, so nothing downstream waits on the device for them.
-            "interior_host": [not e for e in is_end],
+            "interior_host": [not target[3] for target in found],
         }
 
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):

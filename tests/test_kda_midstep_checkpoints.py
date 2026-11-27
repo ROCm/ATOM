@@ -488,6 +488,7 @@ def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
         has_initial_state=torch.tensor([True, True]),
         ssm_checkpoints=ckpt,
         ssm_conv_state_len=3,
+        kda_snapshots=None,
     )
     context = SimpleNamespace(
         tr_graph=None,

@@ -283,6 +283,28 @@ def test_kimi_k3_vllm_metadata_adds_state_read_indices():
         """)
 
 
+def test_kimi_k3_vllm_metadata_keeps_kda_snapshots_through_replace():
+    """A mixed spec / non-spec step forwards `dataclasses.replace()` copies of
+    the metadata, which carry declared fields only. The shared KDA forward
+    reads `kda_snapshots` on every one of them."""
+    _run_without_test_stubs("""
+        from dataclasses import fields, replace
+
+        from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadata
+
+        import atom.plugin.vllm.kda_backend  # noqa: F401
+
+        assert "kda_snapshots" not in {f.name for f in fields(KimiK3KDAMetadata)}
+        metadata = KimiK3KDAMetadata(
+            **{f.name: None for f in fields(KimiK3KDAMetadata) if f.init}
+        )
+        assert metadata.kda_snapshots is None
+        segment = replace(metadata, num_prefills=0, num_actual_tokens=0)
+        assert segment is not metadata
+        assert segment.kda_snapshots is None
+        """)
+
+
 def test_kimi_k3_uses_dedicated_kda_metadata_backend():
     _run_without_test_stubs("""
         from vllm.models.kimi_k3.nvidia.kda_metadata import (
