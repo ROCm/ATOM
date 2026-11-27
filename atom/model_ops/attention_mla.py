@@ -763,8 +763,36 @@ try:
     _FLYDSL_FP8_MHA_GFX1250_AVAILABLE = (
         "q_descale" in inspect.signature(flash_attn_varlen_a8w8_m32x8).parameters
     )
+    # Builds whose varlen entry can merge into a running (O, LSE) as it stores.
+    _FLYDSL_FP8_MHA_GFX1250_CARRY = (
+        _FLYDSL_FP8_MHA_GFX1250_AVAILABLE
+        and "carry_state" in inspect.signature(flash_attn_varlen_a8w8_m32x8).parameters
+    )
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_FP8_MHA_GFX1250_AVAILABLE = False
+    _FLYDSL_FP8_MHA_GFX1250_CARRY = False
+
+# Chunked-context prefill merges inside the FMHA when the kernel can
+# (`_chunk_carry_ok`); ATOM_MLA_CHUNK_CARRY=0 keeps merge_attn_states.
+_MLA_CHUNK_CARRY = bool(envs.ATOM_MLA_CHUNK_CARRY)
+
+
+def _chunk_carry_ok(layer, q_fp8, new_out, new_lse) -> bool:
+    """Whether the context chunks can merge into (new_out, new_lse) inside
+    the FMHA: the gfx1250 FP8 FlyDSL backend with a ``carry_state`` build,
+    and the new tokens' result in the layout that kernel writes."""
+    return bool(
+        _MLA_CHUNK_CARRY
+        and _FLYDSL_FP8_MHA_GFX1250_CARRY
+        and layer._fp8_mha_ok
+        and layer._fp8_mha_backend == "flydsl_gfx1250"
+        and q_fp8 is not None
+        and new_lse is not None
+        and new_out.dtype == torch.bfloat16
+        and new_out.is_contiguous()
+        and new_lse.dtype == torch.float32
+        and new_lse.is_contiguous()
+    )
 
 
 def _flydsl_fp8_mha_gfx1250_supported(
@@ -1591,8 +1619,14 @@ class MLAAttention(nn.Module):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None,
         k_rope: torch.Tensor | None = None,
+        carry_into: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """Dispatch MLA prefill to the FP8 backend or AITER varlen attention.
+
+        ``carry_into=(out, lse)`` (gfx1250 FlyDSL backend with ``carry_state``
+        only, see `_chunk_carry_ok`): ``out`` / ``lse`` hold these queries'
+        attention over other keys, and the kernel merges this call's keys into
+        them in place; returns ``(out, lse)``.
 
         Every FP8 backend uses bottom-right causal masking and returns
         natural-log FP32 LSE in [heads, total_q] layout. Unsupported device/model configurations
@@ -1646,6 +1680,13 @@ class MLAAttention(nn.Module):
                 # The kernel writes LSE as [total_q, heads, 1].
                 return out, lse.squeeze(-1).transpose(0, 1).contiguous()
             if self._fp8_mha_backend == "flydsl_gfx1250":
+                carry = {}
+                if carry_into is not None:
+                    carry = {
+                        "out": carry_into[0],
+                        "lse": carry_into[1],
+                        "carry_state": True,
+                    }
                 return flash_attn_varlen_a8w8_m32x8(
                     q8,
                     k8,
@@ -1660,7 +1701,10 @@ class MLAAttention(nn.Module):
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    **carry,
                 )
+            if carry_into is not None:
+                raise ValueError("carry_into needs the gfx1250 FlyDSL FP8 backend")
             return flydsl_flash_attn_fp8_func(
                 q8,
                 k8,
@@ -2546,6 +2590,8 @@ class MLAAttention(nn.Module):
             # so the per-chunk gather becomes gather-local -> AllGather ->
             # reorg -> kv_b_proj. The rest of the merge logic below
             # is identical to the non-DCP path.
+            carry = _chunk_carry_ok(self, q_fp8, new_out, new_lse)
+            carry_kw = {"carry_into": (new_out, new_lse)} if carry else {}
             chunked_out, chunked_lse = self._dcp_compute_prefill_context(
                 prefill_q,
                 kv_cache,
@@ -2554,8 +2600,20 @@ class MLAAttention(nn.Module):
                 q_fp8=q_fp8,
                 kv_out_scales=kv_out_scales,
                 ctx_gathers=ctx_gathers,
+                **carry_kw,
             )
+            if carry:
+                # The chunks merged into the new tokens' result as they ran.
+                return new_out
         else:
+            # Carry-state FMHA: each chunk folds its partial softmax into the
+            # new tokens' (O, LSE) in place as it stores -- no merge_attn_states
+            # and no per-chunk O/LSE, and a chunk leaves the rows of sequences it
+            # holds no keys of untouched. A global-axis chunk holds keys of only
+            # ~2 sequences, so the pairwise merges below rewrite the whole
+            # [T, H, D_v] output ~num_chunks times for ~2 x T changed rows.
+            carry = _chunk_carry_ok(self, q_fp8, new_out, new_lse)
+            carry_kw = {"carry_into": (new_out, new_lse)} if carry else {}
             k_workspace = chunk_meta.k_workspace
             v_workspace = chunk_meta.v_workspace
             for c in range(chunk_meta.num_chunks):
@@ -2602,7 +2660,10 @@ class MLAAttention(nn.Module):
                     return_lse=True,
                     q_fp8=q_fp8,
                     kv_fp8=kv_fp8,
+                    **carry_kw,
                 )
+                if carry:
+                    continue
                 if chunked_out is None:
                     chunked_out = suf_out
                     chunked_lse = suf_lse
@@ -2619,6 +2680,9 @@ class MLAAttention(nn.Module):
                     )
                     chunked_out = tmp_out
                     chunked_lse = tmp_lse
+            if carry:
+                # Step 3 already happened chunk by chunk.
+                return new_out
 
         # Step 3: merge cached prefix (prefix) with new tokens (suffix).
         # If every seq happened to have zero cached tokens this iter, fall
@@ -2728,8 +2792,13 @@ class MLAAttention(nn.Module):
         q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
         kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
         ctx_gathers: "dict[int, DcpAllGatherHandle] | None" = None,
+        carry_into: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """DCP chunked cached-prefix context attention.
+
+        With ``carry_into=(out, lse)`` (see `_chunk_carry_ok`) every chunk's
+        FMHA merges into ``out`` / ``lse`` in place and nothing is returned
+        (``(None, None)``); otherwise the chunks are LSE-merged here.
 
         Per chunk: index_select this rank's local compressed KV, AllGather it
         across the DCP group, then one fused pass turns the rank-major
@@ -2818,9 +2887,12 @@ class MLAAttention(nn.Module):
                 return_lse=True,
                 q_fp8=q_fp8,
                 kv_fp8=kv_fp8,
+                **({"carry_into": carry_into} if carry_into is not None else {}),
             )
 
-            # 5. LSE-merge across chunks.
+            # 5. LSE-merge across chunks (inside the FMHA under carry_into).
+            if carry_into is not None:
+                continue
             if chunked_out is None:
                 chunked_out = ctx_out
                 chunked_lse = ctx_lse

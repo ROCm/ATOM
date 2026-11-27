@@ -531,6 +531,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", "0") == "1"
     ),
+    # MLA chunked-context prefill on the gfx1250 FlyDSL FP8 FMHA: each chunk
+    # merges into the running (O, LSE) inside the kernel when AITER supports
+    # carry_state. 0 keeps merge_attn_states. Added 2026-11-27.
+    "ATOM_MLA_CHUNK_CARRY": lambda: (os.getenv("ATOM_MLA_CHUNK_CARRY", "1") != "0"),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
