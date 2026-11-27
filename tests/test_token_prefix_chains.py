@@ -204,6 +204,25 @@ def test_an_extension_too_large_to_store_keeps_the_prompt_it_extends(monkeypatch
     assert reused == [0, len(a1) // 16, len(a1) // 16]
 
 
+def test_a_prompt_a_stored_one_holds_whole_is_not_stored():
+    # A truncated retry or a repeat: the stored prompt serves every later one
+    # at least as well, so only a fork from the retry is stored beside it.
+    rng = np.random.default_rng(6)
+    long = tokens(rng, 3000)
+    chains = pb.TokenPrefixChains(1 << 20, 16)
+    for prompt, reused, stored in (
+        (long, 0, 1),
+        (long[:1000], 1000 // 16, 1),
+        (long, 3000 // 16, 1),
+        (long[:1000] + tokens(rng, 500), 1000 // 16, 2),
+    ):
+        before = chains.stats()["blocks_reused"]
+        assert list(chains.block_hashes(prompt).as_array()) == full_chain(prompt, 16)
+        assert chains.stats()["blocks_reused"] - before == reused
+        assert len(chains._order) == len(chains._lru) == stored
+    assert np.asarray(long, np.int32).tobytes() in [r.tokens for r in chains._order]
+
+
 _extend = pb.extend_block_hashes
 
 

@@ -121,7 +121,8 @@ class EngineCore:
         self._ingested_seqs = 0
         self._last_backlog_report: tuple[int, int] | None = None
         self._next_backlog_report = 0.0
-        self._kv_progress_event = threading.Event()
+        # Set by every input put and worker KV output: wakes a waiting busy loop.
+        self._wake_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
@@ -189,7 +190,7 @@ class EngineCore:
                 config,
                 local_proc_num=config.tp_size_local if config.is_multinode_tp else None,
                 on_worker_failure=self._send_engine_dead,
-                kv_progress_event=self._kv_progress_event,
+                kv_progress_event=self._wake_event,
             )
             self._post_model_load_hook()
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
@@ -645,7 +646,7 @@ class EngineCore:
         # Clear before scheduling/polling, never between checking progress and
         # waiting. Arrivals during this step remain latched until the next step.
         if self.kv_transfer_enabled:
-            self._kv_progress_event.clear()
+            self._wake_event.clear()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -711,14 +712,14 @@ class EngineCore:
         # Work queued before the event was cleared must also prevent sleeping.
         if not self.input_queue.empty() or not self.utility_queue.empty():
             return
-        self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
+        self._wake_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
 
     def _wait_for_input(self) -> None:
         """Sleep until the input thread queues work, a worker's KV output arrives, or
         `IDLE_WAIT_S` passes: a spinning loop holds the GIL the input thread needs."""
-        self._kv_progress_event.clear()  # before the reads: a later put sets it again
+        self._wake_event.clear()  # before the reads: a later put sets it again
         if self.input_queue.empty() and self.utility_queue.empty():
-            self._kv_progress_event.wait(IDLE_WAIT_S)
+            self._wake_event.wait(IDLE_WAIT_S)
 
     def _postprocess(self, seqs, fwd_out, batch):
         if self._report_backlog:
@@ -1033,21 +1034,21 @@ class EngineCore:
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
                         self.input_queue.put_nowait(reqs)
-                        self._kv_progress_event.set()
+                        self._wake_event.set()
                         self._offer_tier_lookups(reqs)
                     elif request_type == EngineCoreRequestType.DP_PREFIX_CREDIT:
                         self.input_queue.put_nowait((request_type, reqs))
-                        self._kv_progress_event.set()
+                        self._wake_event.set()
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
-                        self._kv_progress_event.set()
+                        self._wake_event.set()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
-                        self._kv_progress_event.set()
+                        self._wake_event.set()
                         alive = False
                         reason = request_type
             logger.debug(f"{self.label}: input thread exit due to {reason}")
