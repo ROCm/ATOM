@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Real materialize kernels, pointer lifetimes and the four-buffer commit path."""
 
 from types import SimpleNamespace
