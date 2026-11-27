@@ -313,10 +313,13 @@ def prefill_token_graph_capture() -> bool:
 
 def forks(stream: torch.cuda.Stream | None) -> bool:
     """Whether a region declared on ``stream`` runs beside the main stream
-    in this forward -- recorded, or inside a whole-forward capture."""
+    in this forward -- recorded, or inside a whole-forward capture that may
+    branch (`side_stream`'s gate). A recorded region's fork stays under
+    `graph_records_single_stream`: the region runs eagerly between segments,
+    so its fork is no branch of a graph."""
     if stream is None:
         return False
-    return _recorder() is not None or forward_context.get_forward_context().in_hipgraph
+    return _recorder() is not None or forward_context.graph_may_fork()
 
 
 def join_stream(*streams: torch.cuda.Stream | None) -> None:

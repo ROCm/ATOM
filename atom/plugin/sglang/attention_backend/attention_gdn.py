@@ -382,7 +382,8 @@ def _layer_states(pool: Any, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]
 
 
 class _GDNStep:
-    """What every GDN layer of one forward reads after its compute.
+    """What every GDN layer of one forward reads: the verify route and, after
+    its compute, the radix-track inputs.
 
     `SGLangGDNForwardContext.build` makes one per forward and `bind` publishes
     it for the forward batch it was built from (`current`). For an extend with
