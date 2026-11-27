@@ -110,20 +110,21 @@ def test_p_reads_stored_rows_until_lease_expires_and_slot_is_reused(engines):
     assert torch.equal(reader.get(params2, 12, torch.bfloat16), rows(2))
 
 
-def test_read_racing_a_slot_reuse_sees_a_changed_word(engines, monkeypatch):
+def test_read_racing_a_slot_reuse_sees_a_given_up_slot(engines, monkeypatch):
     clock = Clock()
     pool = ec.MooncakeEcWriter(320, "cpu", clock=clock)
     reader = ec.MooncakeEcReader(1024, "cpu")
     params = pool.put(11, rows(1))
 
-    # P reads the old entry at E's first sync of the reuse: the victim is
-    # given up, its old rows not yet overwritten.
+    # P reads the old entry at E's first sync of the reuse: the victim's slot
+    # is zeroed, its old rows not yet overwritten.
     mid_overwrite = []
-    monkeypatch.setattr(
-        ec,
-        "_sync",
-        lambda buf: mid_overwrite.append(reader.get(params, 11, torch.bfloat16)),
-    )
+
+    def sync(buf):
+        if buf is pool._region and not mid_overwrite:
+            mid_overwrite.append(reader.get(params, 11, torch.bfloat16))
+
+    monkeypatch.setattr(ec, "_sync", sync)
     clock.now += LEASE_S
     pool.put(12, rows(2))
     assert mid_overwrite[0] is None
@@ -145,8 +146,8 @@ def test_full_pool_raises_and_keeps_entries_inside_their_lease(engines):
 
 def test_space_is_reused_oldest_first(engines):
     clock = Clock()
-    # Three 320-byte entries fill the pool.
-    pool = ec.MooncakeEcWriter(960, "cpu", clock=clock)
+    # Three 256-byte entries fill the pool.
+    pool = ec.MooncakeEcWriter(768, "cpu", clock=clock)
     reader = ec.MooncakeEcReader(1024, "cpu")
     first = pool.put(1, rows(1))
     clock.now += 1
@@ -189,7 +190,7 @@ def test_reader_grows_to_fit_larger_rows(engines):
     # Only the grown buffer stays registered.
     assert engines[-1].regions == [(reader._buf.data_ptr(), reader._buf.numel())]
     assert reader._buf.data_ptr() != old_ptr
-    assert reader._buf.numel() - 8 >= params["mooncake"]["length"]
+    assert reader._buf.numel() - 32 >= params["mooncake"]["length"]
 
 
 def test_reader_doubles_when_it_grows(engines):
@@ -198,7 +199,7 @@ def test_reader_doubles_when_it_grows(engines):
     params = pool.put(11, rows(1))  # 256 bytes of rows
 
     assert torch.equal(reader.get(params, 11, torch.bfloat16), rows(1))
-    assert reader._buf.numel() - 8 == 400
+    assert reader._buf.numel() - 32 == 400
 
 
 def test_reader_refuses_rows_past_its_limit(engines):
@@ -206,7 +207,7 @@ def test_reader_refuses_rows_past_its_limit(engines):
     reader = ec.MooncakeEcReader(64, "cpu")
     params = pool.put(11, rows(1))
     assert reader.get(params, 11, torch.bfloat16) is None
-    assert reader._buf.numel() - 8 == 64
+    assert reader._buf.numel() - 32 == 64
 
 
 def test_reader_failing_to_grow_keeps_its_buffer(engines, monkeypatch):
@@ -224,7 +225,8 @@ def test_pool_registers_on_the_configured_device(engines):
     pool = ec.MooncakeEcWriter(1024, "cpu", clock=Clock())
     engine = engines[0]
     assert engine.init_args == ("192.0.2.7", "P2PHANDSHAKE", "rdma", "rocep139s0")
-    assert engine.regions == [(pool._buf.data_ptr(), 1024)]
+    # One registration: the slot table, then the pool.
+    assert engine.regions == [(pool._region.data_ptr(), ec.DEFAULT_SLOTS * 32 + 1024)]
     assert pool.session == "192.0.2.7:17000"
 
 
@@ -281,16 +283,22 @@ def test_handle_names_its_transport_and_keeps_mooncake_fields_apart(engines):
         "rows": 4,
         "dtype": "bfloat16",
     }
-    assert set(handle["mooncake"]) == {"session", "address", "length", "generation"}
+    assert set(handle["mooncake"]) == {
+        "session",
+        "address",
+        "length",
+        "generation",
+        "slot",
+    }
 
 
 def test_read_refuses_generation_zero(engines):
-    # A zeroed or given-up entry's word is 0: a handle claiming 0 must not
+    # A given-up slot is all zero: a handle claiming generation 0 must not
     # read it as a match.
     pool = ec.MooncakeEcWriter(1024, "cpu", clock=Clock())
     reader = ec.MooncakeEcReader(1024, "cpu")
     handle = pool.put(11, rows(1))
-    pool._word(handle["mooncake"]["address"] - pool._buf.data_ptr()).fill_(0)
+    pool._slots[0].zero_()
     assert reader.get(with_mooncake(handle, generation=0), 11, torch.bfloat16) is None
 
 
@@ -309,6 +317,7 @@ def test_read_refuses_generation_zero(engines):
         {"mooncake": {"length": 250}},
         {"mooncake": {"address": "0x10"}},
         {"mooncake": {"session": 7}},
+        {"mooncake": {"slot": 0}},
     ],
 )
 def test_malformed_handle_reads_none_without_raising(engines, broken):
@@ -365,3 +374,88 @@ def test_engine_registers_on_alternate_hcas(engines, monkeypatch):
         torch.device("cuda", 1), "rdma", enable_alternate_hca=True, hca_count=3
     )
     assert engines[-1].init_args[3] == "ionic_1,ionic_0,ionic_2"
+
+
+def test_slot_holds_generation_address_length_and_a_zero_ack(engines):
+    pool = ec.MooncakeEcWriter(1024, "cpu", slots=4, clock=Clock())
+    handle = pool.put(11, rows(1))
+    where = handle["mooncake"]
+    slot = (where["slot"] - pool._region.data_ptr()) // 32
+    assert pool._slots[slot].tolist() == [
+        where["generation"],
+        where["address"],
+        where["length"],
+        0,
+    ]
+    # Rows never overlap the slot table.
+    assert where["address"] >= pool._region.data_ptr() + 4 * 32
+
+
+def test_rows_equal_to_an_old_generation_never_revive_its_handle(engines):
+    # The old layout kept the word in front of the rows, where a later
+    # entry's rows could land and, by chance, equal it.
+    clock = Clock()
+    pool = ec.MooncakeEcWriter(256, "cpu", clock=clock)
+    reader = ec.MooncakeEcReader(1024, "cpu")
+    old = pool.put(11, rows(1))
+    clock.now += LEASE_S
+    forged = torch.full((32,), old["mooncake"]["generation"], dtype=torch.int64)
+    pool.put(12, forged.view(torch.bfloat16).view(4, -1))
+    assert reader.get(old, 11, torch.bfloat16) is None
+
+
+def test_running_out_of_slots_evicts_only_past_the_lease(engines):
+    clock = Clock()
+    pool = ec.MooncakeEcWriter(4096, "cpu", slots=2, clock=clock)
+    reader = ec.MooncakeEcReader(1024, "cpu")
+    first = pool.put(1, rows(1))
+    second = pool.put(2, rows(2))
+    with pytest.raises(EcStoreFull, match="2 slots"):
+        pool.put(3, rows(3))
+    assert torch.equal(reader.get(first, 1, torch.bfloat16), rows(1))
+
+    clock.now += LEASE_S
+    third = pool.put(3, rows(3))
+    assert third["mooncake"]["slot"] == first["mooncake"]["slot"]
+    assert reader.get(first, 1, torch.bfloat16) is None
+    assert torch.equal(reader.get(second, 2, torch.bfloat16), rows(2))
+    assert torch.equal(reader.get(third, 3, torch.bfloat16), rows(3))
+
+
+def test_reader_syncs_its_buffer_before_the_nic_writes_it(engines, monkeypatch):
+    pool = ec.MooncakeEcWriter(1024, "cpu", clock=Clock())
+    reader = ec.MooncakeEcReader(1024, "cpu")
+    handle = pool.put(11, rows(1))
+    events = []
+    monkeypatch.setattr(
+        ec, "_sync", lambda buf: events.append("sync" if buf is reader._buf else "e")
+    )
+    engine = reader._engine
+    read = engine.transfer_sync_read
+    monkeypatch.setattr(
+        engine,
+        "transfer_sync_read",
+        lambda *a: events.append("read") or read(*a),
+    )
+    assert torch.equal(reader.get(handle, 11, torch.bfloat16), rows(1))
+    assert events == ["sync", "read", "read"]
+
+
+def test_every_fallback_is_logged_and_counted_by_reason(engines, caplog):
+    clock = Clock()
+    pool = ec.MooncakeEcWriter(256, "cpu", clock=clock)
+    reader = ec.MooncakeEcReader(1024, "cpu")
+    old = pool.put(11, rows(1))
+    clock.now += LEASE_S
+    pool.put(12, rows(2))
+    with caplog.at_level("WARNING", logger="atom"):
+        assert reader.get(old, 11, torch.bfloat16) is None
+        assert reader.get(old, 99, torch.bfloat16) is None
+        assert reader.get(old, 11, torch.float16) is None
+    assert reader.fallbacks == {
+        "entry given up or reused": 1,
+        "key differs from this request's": 1,
+        "stored as 'bfloat16', read as 'float16'": 1,
+    }
+    assert "entry given up or reused" in caplog.text
+    assert "192.0.2.7:17000" in caplog.text
