@@ -17,6 +17,7 @@ import pytest
 from aiter_stub import atom_without_aiter
 
 from atom.kv_transfer.offload.mooncake_store import nic
+from atom.utils import mooncake_hca
 
 with atom_without_aiter() as load:
     mc = load("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
@@ -58,7 +59,7 @@ def node(tmp_path, monkeypatch):
     def build(prefix="rdma", inactive=()):
         pci, ib = _node(tmp_path, prefix, inactive)
         monkeypatch.setattr(
-            mc,
+            mooncake_hca,
             "rail_rdma_device",
             lambda bdf: nic.rail_rdma_device(bdf, ib_root=ib, pci_root=pci),
         )
@@ -69,14 +70,16 @@ def node(tmp_path, monkeypatch):
 @pytest.mark.parametrize("prefix", ["rdma", "ionic_"])
 def test_auto_select_follows_the_pci_tree_not_the_hip_index(node, prefix):
     node(prefix)
-    picked = [mc._select_ib_devices("rdma", "", f"0000:{b}:00.0") for b in GPU_BUS]
+    picked = [
+        mooncake_hca.select_ib_devices("rdma", "", f"0000:{b}:00.0") for b in GPU_BUS
+    ]
     assert picked == [[f"{prefix}{n}"] for n in LOCAL]
 
 
 def test_auto_select_refuses_a_guess_and_names_the_pd_override(node):
     node(inactive=("rdma3",))
     with pytest.raises(ValueError) as refused:
-        mc._select_ib_devices("rdma", "", "0000:75:00.0")
+        mooncake_hca.select_ib_devices("rdma", "", "0000:75:00.0")
     message = str(refused.value)
     assert message.startswith("cannot tell GPU 0000:75:00.0's NIC")
     assert message.endswith("; set ib_device or ATOM_MOONCAKE_IB_DEVICE")
