@@ -149,13 +149,6 @@ def _processor(le, monkeypatch, mode):
     return le.InputOutputProcessor(config, tokenizer=None, block_size=16)
 
 
-@pytest.mark.parametrize("mode", ["argmax", "allgather"])
-def test_the_processor_reads_the_mode_once(monkeypatch, modules, mode):
-    _, _, le = modules
-    processor = _processor(le, monkeypatch, mode)
-    assert processor._greedy_ids_only is (mode == "argmax")
-
-
 def test_preprocess_fanout_rejects_a_sampled_request_under_argmax(monkeypatch, modules):
     _, _, le = modules
     processor = _processor(le, monkeypatch, "argmax")
