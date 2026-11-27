@@ -170,7 +170,10 @@ def take_moe_front(moe, hidden_states: torch.Tensor):
 
 
 def stats() -> dict:
-    return dict(_S["calls"])
+    """The seam's calls by path, with the dense layers' (``dense_mf``)."""
+    from atom.models.minimax_m3 import dense_mf
+
+    return {**_S["calls"], **dense_mf.stats()}
 
 
 def set_enabled(on: bool) -> None:

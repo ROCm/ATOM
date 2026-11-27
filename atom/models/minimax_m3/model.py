@@ -96,6 +96,7 @@ from atom.models.minimax_m3.index_schedule import (
     sparse_attention_layer_ids as _sparse_attention_layer_ids,
 )
 from atom.models.minimax_m3 import launch_a
+from atom.models.minimax_m3 import dense_mf
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
     IntermediateTensors,
@@ -1842,6 +1843,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # the traced forward keeps one branch; the op picks the fused launch or the
         # production calls per step.
         self.launch_a_seam = launch_a.bind(self, prefix)
+        # DMF (C4 decode, gfx1250 TP4): a dense layer's post-attention op
+        # (`dense_mf.minimax_m3_dense_tail`: o_proj + AR + norm + MLP as one launch), or None.
+        self.dense_seam = None if self.is_moe_layer else dense_mf.bind(self, prefix)
 
     def _attn_tail(self, positions, hidden_states, hidden_states_scale, residual, mode):
         """The launch-A seam: the attention up to o_proj's MXFP8 input, then o_proj
@@ -1960,6 +1964,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
             if aux_hidden_state is not None:
                 return hidden_states, residual, aux_hidden_state
             return hidden_states, residual
+        if self.dense_seam is not None:
+            # a dense layer: o_proj, the AR + norm and the MLP below, here inside the seam's op
+            attn_output, attn_scale = self.self_attn.attend_mxfp8(
+                positions, hidden_states, hidden_states_scale
+            )
+            hidden_states, residual = torch.ops.aiter.minimax_m3_dense_tail(
+                attn_output,
+                attn_scale,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                self.dense_seam,
+                dense_mf.TAIL_AR_NORM,
+            )
+            if aux_hidden_state is not None:
+                return hidden_states, residual, aux_hidden_state
+            return hidden_states, residual
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -2043,6 +2064,20 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 launch_a.TAIL_SP_AR_NORM,
             )  # fmt: skip
             return self.block_sparse_moe(hidden_states), residual
+        if self.dense_seam is not None:
+            # a dense layer: o_proj, the (sequence-parallel) AR + norm and the MLP below, in the seam's op
+            attn_output, attn_scale = self.self_attn.attend_mxfp8(
+                positions, hidden_states, hidden_states_scale
+            )
+            return torch.ops.aiter.minimax_m3_dense_tail(
+                attn_output,
+                attn_scale,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                self.dense_seam,
+                dense_mf.TAIL_SP_AR_NORM,
+            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
