@@ -467,6 +467,68 @@ def test_full_forward_selects_mixed_only_when_needed(monkeypatch, mixed):
 
 
 @pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mixed_workspace_with_meta_weights(monkeypatch, fp8, enabled):
+    import atom.models.deepseek_v4 as model
+    from atom.config import CompilationLevel
+    from atom.model_loader.weight_utils import params_on_meta
+
+    class Block(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.attn = torch.nn.Module()
+            self.attn.attn_sink = model.atom_parameter(torch.empty(2))
+            self.attn.register_buffer("swa_plane", torch.zeros(1, 4), persistent=False)
+            self.attn.n_local_heads = 2
+            self.attn.head_dim = 4
+            self.attn.kv_fp8 = fp8
+
+    monkeypatch.setattr(model, "Block", Block)
+    monkeypatch.setattr(model, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    for name in ("VocabParallelEmbedding", "RMSNorm", "ParallelHead"):
+        monkeypatch.setattr(model, name, lambda *a, **kw: torch.nn.Identity())
+    args = SimpleNamespace(
+        max_seq_len=32,
+        norm_eps=1e-6,
+        hc_eps=1e-6,
+        hc_mult=2,
+        vocab_size=16,
+        dim=4,
+        n_layers=2,
+    )
+    config = SimpleNamespace(
+        enable_mixed_prefill_decode=enabled,
+        max_num_batched_tokens=8,
+        compilation_config=SimpleNamespace(level=CompilationLevel.NO_COMPILATION),
+    )
+    with params_on_meta():
+        target = model.DeepseekV4Model(atom_config=config, args=args)
+
+    first = target.layers[0].attn
+    assert first.attn_sink.is_meta
+    assert first.swa_plane.device == torch.device("cpu")
+    if not enabled:
+        assert all(
+            not hasattr(layer.attn, "_mixed_workspace") for layer in target.layers
+        )
+        return
+    workspace = first._mixed_workspace
+    assert all(layer.attn._mixed_workspace is workspace for layer in target.layers)
+    assert workspace.q.device == first.swa_plane.device
+    assert workspace.q.shape == (8, 8)
+    workspace.q.fill_(3)
+    torch.testing.assert_close(
+        workspace.rows(2, 3)[0], torch.full((3, 8), 3, dtype=torch.bfloat16)
+    )
+    if fp8:
+        assert workspace.out.device == first.swa_plane.device
+        assert workspace.out.shape == (8, 2, 4)
+    else:
+        assert workspace.out is None
+
+
+@pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("supports_out", [False, True])
 def test_mixed_workspace_growing_tokens_and_decode_alternation(
     monkeypatch, fp8, supports_out

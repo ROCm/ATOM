@@ -3959,7 +3959,8 @@ class DeepseekV4Model(nn.Module):
                 atom_config.max_num_batched_tokens,
                 first_attn.n_local_heads,
                 first_attn.head_dim,
-                device=first_attn.attn_sink.device,
+                # Weight-cache construction puts parameters on meta, not buffers.
+                device=first_attn.swa_plane.device,
                 fp8=first_attn.kv_fp8,
             )
             for layer in self.layers:
