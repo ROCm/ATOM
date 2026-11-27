@@ -170,15 +170,15 @@ impl Pipeline {
             .await
     }
 
-    /// `execute_chat`, with the prompt `rendered` outside the router when it
-    /// is given (`prepare::prepare_chat_with`).
+    /// `execute_chat`, rendering the prompt with the chat's body as `sent`
+    /// where the caller has it (`prepare::prepare_chat_with`).
     pub async fn execute_chat_with(
         &self,
         req: Arc<ChatCompletionRequest>,
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<AppContext>,
-        rendered: Option<prepare::RenderedChat>,
+        sent: Option<Arc<serde_json::Map<String, serde_json::Value>>>,
     ) -> Response {
         let start = Instant::now();
         let model = req.model.clone();
@@ -197,7 +197,7 @@ impl Pipeline {
             headers,
             model_id,
             &components,
-            rendered,
+            sent.as_deref(),
             self.atom_output.is_some(),
         ) {
             Ok(t) => t,
@@ -346,7 +346,9 @@ impl Pipeline {
             tokens,
             headers: resp_ctx.headers.as_ref(),
             stream: resp_ctx.original.is_streaming(),
-            carries_media: false,
+            // Image routing keys are HTTP chat only: this path routes on
+            // the text and tokens alone.
+            media_count: 0,
         };
         self.planner
             .plan(&descriptor)

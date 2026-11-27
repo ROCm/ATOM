@@ -1,0 +1,198 @@
+name: AtomRL and Lumen CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "atomrl/**"
+      - ".github/workflows/atomrl-*.yaml"
+      - ".github/scripts/lumen-docker-compat.py"
+  push:
+    branches: [main]
+    paths:
+      - "atomrl/**"
+      - ".github/workflows/atomrl-*.yaml"
+      - ".github/scripts/lumen-docker-compat.py"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  changes:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      atomrl: ${{ steps.classify.outputs.atomrl }}
+      lumen_shell: ${{ steps.classify.outputs.lumen_shell }}
+      lumen_package: ${{ steps.classify.outputs.lumen_package }}
+      lumen_tests: ${{ steps.classify.outputs.lumen_tests }}
+      lumen_compat: ${{ steps.classify.outputs.lumen_compat }}
+      packaging_workflow: ${{ steps.classify.outputs.packaging_workflow }}
+      atomrl_packaging: ${{ steps.classify.outputs.atomrl_packaging }}
+      main_workflow: ${{ steps.classify.outputs.main_workflow }}
+      run_atomrl: ${{ steps.result.outputs.run_atomrl }}
+      run_lumen: ${{ steps.result.outputs.run_lumen }}
+      run_packaging: ${{ steps.result.outputs.run_packaging }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: classify
+        uses: dorny/paths-filter@v3
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            atomrl:
+              - 'atomrl/**'
+              - '!atomrl/lumen/**'
+              - '!atomrl/atomrl/lumen/**'
+              - '!atomrl/tests/lumen/**'
+            lumen_shell:
+              - 'atomrl/lumen/**'
+            lumen_package:
+              - 'atomrl/atomrl/lumen/**'
+            lumen_tests:
+              - 'atomrl/tests/lumen/**'
+            lumen_compat:
+              - '.github/scripts/lumen-docker-compat.py'
+            packaging_workflow:
+              - '.github/workflows/atomrl-*.yaml'
+            atomrl_packaging:
+              - 'atomrl/{pyproject.toml,setup.py}'
+            main_workflow:
+              - '.github/workflows/atomrl-unit-tests.yaml'
+      - id: result
+        env:
+          ATOMRL: ${{ steps.classify.outputs.atomrl }}
+          LUMEN_SHELL: ${{ steps.classify.outputs.lumen_shell }}
+          LUMEN_PACKAGE: ${{ steps.classify.outputs.lumen_package }}
+          LUMEN_TESTS: ${{ steps.classify.outputs.lumen_tests }}
+          LUMEN_COMPAT: ${{ steps.classify.outputs.lumen_compat }}
+          PACKAGING_WORKFLOW: ${{ steps.classify.outputs.packaging_workflow }}
+          ATOMRL_PACKAGING: ${{ steps.classify.outputs.atomrl_packaging }}
+          MAIN_WORKFLOW: ${{ steps.classify.outputs.main_workflow }}
+        run: |
+          run_atomrl=false
+          run_lumen=false
+          run_packaging=false
+          if [[ "$ATOMRL" == true || "$LUMEN_PACKAGE" == true ||
+                "$LUMEN_TESTS" == true ||
+                "$LUMEN_COMPAT" == true || "$MAIN_WORKFLOW" == true ||
+                "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            run_atomrl=true
+          fi
+          if [[ "$LUMEN_SHELL" == true || "$LUMEN_PACKAGE" == true ||
+                "$LUMEN_TESTS" == true || "$LUMEN_COMPAT" == true ||
+                "$MAIN_WORKFLOW" == true ||
+                "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            run_lumen=true
+          fi
+          if [[ "$PACKAGING_WORKFLOW" == true || "$ATOMRL_PACKAGING" == true ||
+                "$MAIN_WORKFLOW" == true ||
+                "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            run_packaging=true
+          fi
+          echo "run_atomrl=$run_atomrl" >> "$GITHUB_OUTPUT"
+          echo "run_lumen=$run_lumen" >> "$GITHUB_OUTPUT"
+          echo "run_packaging=$run_packaging" >> "$GITHUB_OUTPUT"
+  packaging:
+    name: Verify wheel (Python ${{ matrix.python-version }})
+    needs: changes
+    if: needs.changes.outputs.run_packaging == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build and inspect wheel
+        run: |
+          python -m pip install "setuptools>=77" wheel setuptools-scm build
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+package.ci python -m build --wheel --no-isolation --outdir dist
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+          wheel = next(Path("dist").glob("atom-*.whl"))
+          with zipfile.ZipFile(wheel) as archive:
+              names = archive.namelist()
+              metadata = archive.read(next(n for n in names if n.endswith(".dist-info/METADATA"))).decode()
+          assert not any(n.startswith("atomrl/") for n in names)
+          assert "Requires-Dist: ray[default]>=2.9" not in metadata
+          assert "Requires-Dist: omegaconf<2.4,>=2.3" not in metadata
+          PY
+          rm -rf atomrl-dist
+          python -m build --wheel --no-isolation --outdir atomrl-dist atomrl
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          wheel = next(Path("atomrl-dist").glob("atomrl-*.whl"))
+          with zipfile.ZipFile(wheel) as archive:
+              names = archive.namelist()
+              metadata = archive.read(
+                  next(n for n in names if n.endswith(".dist-info/METADATA"))
+              ).decode()
+          assert any(n.startswith("atomrl/") for n in names)
+          assert "Author: Advanced Micro Devices, Inc." in metadata
+          assert "Requires-Dist: ray[default]>=2.9" in metadata
+          assert "Requires-Dist: omegaconf<2.4,>=2.3" in metadata
+          PY
+
+  atomrl-unit:
+    name: AtomRL CPU (Python ${{ matrix.python-version }})
+    needs: changes
+    if: needs.changes.outputs.run_atomrl == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "ray[default]>=2.9" "omegaconf>=2.3,<2.4" datasets accelerate \
+            safetensors "transformers==5.16.1" triton pyzmq pytest \
+            "tomli>=2; python_version < '3.11'" \
+            "megatron-core==0.18.2; python_version >= '3.12'"
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci pip install --no-deps -e .
+          pip install --no-deps -e atomrl
+      - run: >-
+          python -m pytest atomrl/tests/unit
+          -m "not gpu and not multigpu" -q
+
+  lumen-cpu:
+    name: Lumen CPU (Python ${{ matrix.python-version }})
+    needs: changes
+    if: needs.changes.outputs.run_lumen == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest pyyaml numpy
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+lumen.ci pip install --no-deps -e .
+          pip install --no-deps -e atomrl
+      - name: Run CPU-safe Lumen coverage
+        run: |
+          PYTHONPATH="$GITHUB_WORKSPACE/atomrl" python -m pytest \
+            atomrl/tests/lumen/patches/test_registry.py \
+            atomrl/tests/lumen/patches/test_cli.py \
+            atomrl/tests/lumen/models/test_launcher_parity.py \
+            atomrl/tests/lumen/models/test_training_stack_policy.py -q

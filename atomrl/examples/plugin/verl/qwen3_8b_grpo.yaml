@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# verl + AtomRL plugin: Qwen3-8B GRPO with FSDP2 + ATOM rollout.
+#
+# AtomRL registers automatically on `import verl` via the verl.plugins
+# entry-point. Installing ATOM from the repository root registers it lazily.
+#
+# What the plugin provides:
+#   - training:  atomrl_fsdp2 backend (Lumen FSDP2Engine with optional FP8)
+#   - rollout:   atom backend (ATOMReplicaManager with sleep/wake lifecycle)
+#
+# Launch:
+#   bash examples/plugin/verl/run.sh
+
+data:
+  train_files: ${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/dapo-math-17k.filtered.parquet
+  val_files: ${oc.env:DATA_ROOT}/data_cached/qwen3-8b-maxprompt1024/aime-2024.filtered.parquet
+  train_batch_size: 128
+  max_prompt_length: 1024
+  max_response_length: 2048
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: ${oc.env:DATA_ROOT}/models/Qwen3-8B-Base
+
+  actor:
+    strategy: atomrl_fsdp2
+    ppo_mini_batch_size: 128
+    ppo_micro_batch_size_per_gpu: 1
+    grad_clip: 1.0
+    optim:
+      lr: 1.0e-6
+      weight_decay: 0.1
+    lr_scheduler_type: constant
+    lr_warmup_steps: 10
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+
+  rollout:
+    name: atom
+    mode: async
+    gpu_memory_utilization: 0.30
+    tensor_parallel_size: 1
+    dtype: bfloat16
+    max_model_len: 2048
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 4096
+    max_num_seqs: 64
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+
+  ref:
+    fsdp_config:
+      param_offload: true
+
+algorithm:
+  adv_estimator: grpo
+  grpo:
+    num_generations: 16
+  kl_ctrl:
+    kl_coeff: 0.0
+
+reward_model:
+  reward_fn: atomrl.rewards.math_reward.dapo_math_reward
+
+trainer:
+  total_training_steps: 3
+  logger:
+    - wandb
+  project_name: atomrl-plugin-verl
+  experiment_name: qwen3-8b-grpo-fsdp2-atom
+  log_freq: 1
+  n_gpus_per_node: 8
+  nnodes: 1
+  save_freq: -1

@@ -1,0 +1,6 @@
+transformers>=4.51.0
+datasets
+peft
+huggingface_hub>=0.24.0
+numpy>=1.26.0
+sentencepiece

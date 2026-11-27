@@ -60,8 +60,15 @@ impl AtomAdapter {
         Self { prefill_info }
     }
 
-    fn can_chunk_request(body: &Value) -> bool {
-        if body.get("n").and_then(Value::as_u64).unwrap_or(1) != 1
+    /// Requests with media take the response relay: decode needs the prompt
+    /// ids prefill expands from the media and the handoff's `cache_seed`,
+    /// which chunked mode starts decode without. ATOM's multimodal prefill
+    /// hands them off only once ROCm/ATOM#3410 lands; before it, prefill
+    /// answers `kv_transfer_params: null` and the relay answers the request
+    /// 502 `prefill_missing_kv_transfer_params`.
+    fn can_chunk_request(body: &Value, carries_media: bool) -> bool {
+        if carries_media
+            || body.get("n").and_then(Value::as_u64).unwrap_or(1) != 1
             || body.get("best_of").and_then(Value::as_u64).unwrap_or(1) != 1
         {
             return false;
@@ -132,6 +139,7 @@ pub struct AtomPairCtx {
     pub prefill_dp_size: usize,
     pub prefill_dp_rank: Option<usize>,
     pub decode_dp_rank: Option<usize>,
+    pub carries_media: bool,
 }
 
 fn downcast(ctx: &PairCtx) -> Result<&AtomPairCtx, AdapterError> {
@@ -143,7 +151,16 @@ impl BackendAdapter for AtomAdapter {
     fn prepare_pair(
         &self,
         prefill: &dyn Worker,
+        decode: &dyn Worker,
+    ) -> Result<PairCtx, AdapterError> {
+        self.prepare_pair_with_media(prefill, decode, 0)
+    }
+
+    fn prepare_pair_with_media(
+        &self,
+        prefill: &dyn Worker,
         _decode: &dyn Worker,
+        media_count: usize,
     ) -> Result<PairCtx, AdapterError> {
         Ok(Box::new(AtomPairCtx {
             transfer_id: format!("xfer-{}", Uuid::new_v4()),
@@ -151,12 +168,13 @@ impl BackendAdapter for AtomAdapter {
             prefill_dp_size: prefill.dp_size().unwrap_or(1),
             prefill_dp_rank: prefill.dp_rank(),
             decode_dp_rank: _decode.dp_rank(),
+            carries_media: media_count > 0,
         }))
     }
 
     fn inject_prefill_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
         let pair = downcast(ctx)?;
-        let chunked = Self::can_chunk_request(body)
+        let chunked = Self::can_chunk_request(body, pair.carries_media)
             && self
                 .prefill_info
                 .chunked_transfer
@@ -188,7 +206,7 @@ impl BackendAdapter for AtomAdapter {
     /// metadata from the completed prefill response in execute_atom_relay.
     fn inject_decode_fields(&self, body: &mut Value, ctx: &PairCtx) -> Result<(), AdapterError> {
         let pair = downcast(ctx)?;
-        if !Self::can_chunk_request(body) {
+        if !Self::can_chunk_request(body, pair.carries_media) {
             return Ok(());
         }
         if let Some(template) = self.prefill_info.chunked_transfer.get(&pair.prefill_url) {
@@ -301,6 +319,72 @@ fn map_atom_prefill_idx2idx(
                 decode.url()
             );
             prefill
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+
+    use super::{AtomAdapter, AtomPrefillInfo};
+    use crate::core::placement::backend::BackendAdapter;
+    use crate::core::placement::test_support::{make_decode_http, make_prefill_http};
+    use crate::routers::prepare::inference::{InferenceRequest, ParsedInference};
+
+    /// The prefill and decode `kv_transfer_params` of a chat, with media as
+    /// ingress finds it, between a prefill that offers chunked transfer and a decode.
+    fn transfer_params(body: Value) -> (Value, Value) {
+        let route = "/v1/chat/completions";
+        let parsed = ParsedInference::parse(route, body.to_string().as_bytes()).unwrap();
+        let media_count = parsed.metadata_with_text(false).media_count;
+        let prefill = make_prefill_http("http://p:8000", "m", Some(8998));
+        let decode = make_decode_http("http://d:8000", "m");
+        let mut info = AtomPrefillInfo::default();
+        info.tp_sizes.insert(prefill.url().to_string(), 1);
+        let template = json!({"remote_host": "10.0.0.1", "remote_handshake_port": 6301});
+        info.chunked_transfer
+            .insert(prefill.url().to_string(), template);
+        let adapter = AtomAdapter::new(Arc::new(info));
+        let ctx = adapter
+            .prepare_pair_with_media(prefill.as_ref(), decode.as_ref(), media_count)
+            .unwrap();
+        let (mut prefill_body, mut decode_body) = (body.clone(), body);
+        adapter
+            .inject_prefill_fields(&mut prefill_body, &ctx)
+            .unwrap();
+        adapter
+            .inject_decode_fields(&mut decode_body, &ctx)
+            .unwrap();
+        (
+            prefill_body["kv_transfer_params"].clone(),
+            decode_body["kv_transfer_params"].clone(),
+        )
+    }
+
+    #[test]
+    fn a_chat_ingress_finds_media_in_takes_the_response_relay() {
+        let chat = |content: Value| {
+            json!({"model": "m", "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": content},
+            ]})
+        };
+        let text = json!({"type": "text", "text": "Which color is this?"});
+        for media in [
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/red.png"}}),
+            json!({"type": "video_url", "video_url": {"url": "https://example.com/v.mp4"}}),
+        ] {
+            let (prefill, decode) = transfer_params(chat(json!([text, media])));
+            assert_eq!(prefill["chunked_transfer"], Value::Null, "{prefill}");
+            assert_eq!(decode, Value::Null, "{decode}");
+        }
+        for content in [json!([text, text]), json!("Which color is this?")] {
+            let (prefill, decode) = transfer_params(chat(content));
+            assert_eq!(prefill["chunked_transfer"], true, "{prefill}");
+            assert_eq!(decode["chunked_transfer"], true, "{decode}");
         }
     }
 }

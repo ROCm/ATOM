@@ -158,6 +158,7 @@ fn single(worker: Arc<dyn Worker>) -> PlacementPlan {
     PlacementPlan::Single {
         worker,
         policy_name: "random",
+        prefill_tokens: 0,
     }
 }
 
@@ -629,6 +630,7 @@ async fn a_pair_leg_that_refuses_fails_the_dispatch_and_cancels_the_other() {
         decode: atom_worker(&serve(decode.clone()).await),
         prefill_policy: "random",
         decode_policy: "random",
+        prefill_tokens: 0,
     };
     // Both calls open; D has not answered when P refuses.
     let refused = async {
