@@ -194,6 +194,30 @@ fn media_url(part: &ContentPart) -> Option<(&'static str, &str)> {
     }
 }
 
+/// `messages` as sent, a chat body's JSON, with the digests
+/// [`with_media_digests`] puts in place of their media: for the encoders that
+/// read the body as sent (`chat_render`).
+pub(crate) fn digest_sent_media(messages: &mut serde_json::Value) {
+    let parts = messages
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get_mut("content")?.as_array_mut())
+        .flatten();
+    for part in parts {
+        let kind = match part.get("type").and_then(serde_json::Value::as_str) {
+            Some("image_url") => "image",
+            Some("video_url") => "video",
+            _ => continue,
+        };
+        let url = part.pointer(&format!("/{kind}_url/url"));
+        let Some(url) = url.and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        *part = serde_json::json!({"type": "text", "text": media_digest(kind, url)});
+    }
+}
+
 /// See [`RoutingChat::front`]: one digest of `digested`, `request`'s messages
 /// with their media digested in place, up to and including the last media part,
 /// and of whether each image's `detail` is `"low"`, which the in-place digests

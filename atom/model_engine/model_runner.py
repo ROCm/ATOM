@@ -32,7 +32,7 @@ from torch.profiler import record_function
 
 from atom import structured_output
 from atom.config import Config, set_current_atom_config
-from atom.distributed.group_agreement import agree_kv_budget, group_min
+from atom.distributed.group_agreement import agree_kv_budget, group_agree, group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     cut_pcp_prefill_ubatches,
@@ -179,6 +179,25 @@ from atom.utils.tbo import (
 from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
 logger = logging.getLogger("atom")
+
+
+class GreedyIdsOrSample:
+    """The sampler under `ATOM_DP_LM_HEAD_MODE=argmax`: a decode head output
+    is fp32 greedy ids, cast to int32; logits (a prefill, or a step the head
+    does not shard) go to the sampler. Bound once at startup, so other
+    modes call the sampler directly."""
+
+    def __init__(self, sampler):
+        self.sampler = sampler
+
+    def __call__(self, logits: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if logits.dim() == 1:
+            return logits.to(torch.int32)
+        return self.sampler(logits, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.sampler, name)
+
 
 # a drafted model's head picks by the shared mono LM head launch, in front of
 # ATOM's Triton picks (`_bind_verify_head`)
@@ -849,6 +868,33 @@ def _profile_runner_stage(method):
     return wrapped
 
 
+def _forward_cpu_groups():
+    """The CPU groups of the ranks that run one request's forward together:
+    its TP group, then its PCP group, each when it has more than one rank."""
+    if not torch.distributed.is_initialized():
+        return ()
+    return tuple(
+        group.cpu_group
+        for group in (get_tp_group(), get_pcp_group())
+        if group.world_size > 1
+    )
+
+
+def _any_greedy(batch: ScheduledBatch, all_greedy: bool) -> bool:
+    """Whether any scheduled request samples greedily, read on the CPU.
+
+    The sampler's greedy-row correction (an argmax over the vocabulary and a
+    select) only changes greedy rows; with none in the batch it is skipped.
+    Read off the batch's requested temperatures (``prepare_sample`` clamps a
+    copy of them) with the sampler's own threshold, so a request the sampler
+    treats as greedy always counts.
+    """
+    if all_greedy:
+        return True
+    temperatures = batch.temperatures[: batch.total_seqs_num]
+    return bool((temperatures <= SAMPLER_EPS).any())
+
+
 class ModelRunner:
     # The verify head (`_bind_verify_head`), None where the logits are the
     # head output; whether this step deferred the previous verify's status
@@ -864,6 +910,9 @@ class ModelRunner:
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
+        # Readers of an encoder server's image embeddings, one per transport,
+        # built on first use; None where the transport cannot start here.
+        self.ec_readers = {}
         self.mark_trace = getattr(config, "mark_trace", False)
         from atom.utils.graph_marker import set_graph_marker_enabled
 
@@ -1064,6 +1113,7 @@ class ModelRunner:
                 metadata_builder=self.attn_metadata_builder,
             )
         self._bind_verify_head()
+        self._init_dp_argmax_head()
         # A model that can run a whole decode step itself (sampling and
         # verification included); see run_model.
         self._step_override = (
@@ -1110,6 +1160,29 @@ class ModelRunner:
                     else "default"
                 ),
             )
+
+    def _init_dp_argmax_head(self):
+        """Under `ATOM_DP_LM_HEAD_MODE=argmax`, check for the model's one
+        DP-sharded `ParallelLMHead`, its logits the head output and no draft
+        verified (startup fails otherwise), and bind the sampler that passes
+        its greedy ids through."""
+        if envs.ATOM_DP_LM_HEAD_MODE != "argmax":
+            return
+        from atom.model_ops.embed_head import ParallelLMHead
+
+        heads = [m for m in self.model.modules() if isinstance(m, ParallelLMHead)]
+        if (
+            self.verify_head is not None
+            or self.config.speculative_config
+            or len(heads) != 1
+            or not heads[0].dp_shards_vocab
+        ):
+            raise ValueError(
+                "ATOM_DP_LM_HEAD_MODE=argmax needs pure DP (TP 1, DP > 1, the "
+                "vocab divisible by DP), one ParallelLMHead whose logits are the "
+                "model's head output, and no speculative decoding"
+            )
+        self.sampler = GreedyIdsOrSample(self.sampler)
 
     def poll_forward_metrics(self):
         if self.gpu_forward_metrics is not None:
@@ -1196,6 +1269,64 @@ class ModelRunner:
         arange = self.arange_np[:total_num_tokens] - cumsums_offsets
 
         return cu_num_tokens, arange
+
+    def _ec_reader(self, handle, dtype):
+        """This rank's reader for ``handle``'s transport, built on first use,
+        or None where it cannot start: this rank then encodes the images."""
+        transport = handle.get("transport") if isinstance(handle, dict) else None
+        if not isinstance(transport, str):
+            return None
+        if transport not in self.ec_readers:
+            from atom.ec_transfer import create_reader
+
+            # Sized for the first request's rows and grown on demand: a
+            # buffer for the longest prompt is 12 GiB at MiniMax-M3's 1M
+            # context, allocated outside the KV cache's share of the GPU. A
+            # request's image rows never outnumber its prompt's tokens.
+            row_bytes = self.config.hf_config.hidden_size * dtype.itemsize
+            max_bytes = self.config.max_model_len * row_bytes
+            rows = handle.get("rows")
+            first = rows * row_bytes if type(rows) is int and rows > 0 else row_bytes
+            try:
+                self.ec_readers[transport] = create_reader(
+                    transport,
+                    min(first, max_bytes),
+                    self.device,
+                    max_bytes=max_bytes,
+                    kv_transfer_config=getattr(self.config, "kv_transfer_config", None),
+                )
+            # Unknown transport (ValueError), missing library (RuntimeError,
+            # ImportError), or no memory or HCA for the engine (RuntimeError).
+            except (ImportError, OSError, RuntimeError, ValueError) as e:
+                logger.warning(
+                    "Cannot read image embeddings over %r here (%s); "
+                    "this server runs the vision tower for them",
+                    transport,
+                    e,
+                )
+                self.ec_readers[transport] = None
+        return self.ec_readers[transport]
+
+    def read_image_embeddings(self, handle, cache_seed, dtype):
+        """The rows an encoder server stored for ``cache_seed``, or None when
+        this rank must run its own vision tower."""
+        reader = self._ec_reader(handle, dtype)
+        rows = None if reader is None else reader.get(handle, cache_seed, dtype)
+        # Every rank of the forward takes E's rows, or none does: E's rows and
+        # a rank's own tower's need not be bit-identical, and mixing them
+        # would split the ranks' activations. Each rank reaches this call for
+        # the same request at the same point of the step.
+        agreed = rows is not None
+        for group in _forward_cpu_groups():
+            agreed = group_agree(agreed, group)
+        if not agreed:
+            logger.warning(
+                "Image embeddings over %r are unavailable%s; running the vision tower",
+                handle.get("transport") if isinstance(handle, dict) else None,
+                "" if rows is None else " on another rank",
+            )
+            return None
+        return rows
 
     def release_multimodal_requests(self, request_ids):
         self.vision_embeddings.release(request_ids)
@@ -3360,6 +3491,7 @@ class ModelRunner:
                             batch,
                             self.device,
                             self.config.torch_dtype,
+                            self.read_image_embeddings,
                         )
                     else:
                         mm_data_values = list(batch.multimodal_data.values())
@@ -3581,7 +3713,9 @@ class ModelRunner:
         anchors.copy_(rows[anchors.long()])
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """The model's logits of ``hidden_states``: every sampling path's."""
+        """The model's logits of ``hidden_states``: every sampling path's; or fp32
+        greedy ids [rows] on a decode the DP-sharded head serves under
+        ``ATOM_DP_LM_HEAD_MODE=argmax``."""
         return self.model.compute_logits(hidden_states)
 
     def run_lm_head(
@@ -3589,8 +3723,9 @@ class ModelRunner:
     ) -> LmHeadOutput:
         """The step's LM head, after the forward and outside its graph, on the
         forward's stream: the verify head's verify where its ids stand for
-        the step, else the logits (neither on a step the model ran whole,
-        `_served`). A lossless drafter's sampled step verifies by the
+        the step, else the logits (or fp32 greedy ids on a decode the DP-sharded
+        head serves under `ATOM_DP_LM_HEAD_MODE=argmax`; neither on a step the
+        model ran whole, `_served`). A lossless drafter's sampled step verifies by the
         probability ratio, which reads the logits."""
         if self._served is not None:
             return LmHeadOutput(None, None)
@@ -3626,6 +3761,7 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         verified, logits = lm_head_output
+        any_greedy = _any_greedy(batch, all_greedy)
         # Keep probability payloads available on every participating rank.
         need_logprobs = batch.any_logprobs
         logprob_snapshot = None
@@ -3655,6 +3791,7 @@ class ModelRunner:
                 top_ps,
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
+                any_greedy=any_greedy,
             )
             # Prefill has zero bonus/rejection counts, in the same contiguous
             # layout as verification. Slice before reshaping to avoid row gaps.
@@ -3705,6 +3842,7 @@ class ModelRunner:
                     temperatures,
                     top_ks,
                     top_ps,
+                    any_greedy=any_greedy,
                 )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
@@ -3715,6 +3853,7 @@ class ModelRunner:
                 top_ps=top_ps,
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
+                any_greedy=any_greedy,
             )
             sampled_tokens, spec_status = self.rejection_sampler.forward(
                 spec_decode_metadata,
@@ -5455,7 +5594,14 @@ class RapidServeModelRunner(ModelRunner):
             # path returns token ids only and computes no logprobs, so nothing
             # reads the unmasked row.
             apply_required_channel(self, batch, logits)
-            sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
+            sampled = self.sampler(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                any_greedy=_any_greedy(batch, all_greedy),
+            )
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.

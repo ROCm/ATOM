@@ -237,6 +237,37 @@ def default_requests() -> list[dict]:
             "tools": [TOOL],
             "messages": [*reasoned_tool_history, ANSWERED, NEXT_QUESTION],
         },
+        "thinking_disabled": {"thinking": {"type": "disabled"}},
+        "kwargs_thinking_off": {"chat_template_kwargs": {"enable_thinking": False}},
+        "kwargs_thinking_false": {"chat_template_kwargs": {"thinking": False}},
+        "tool_choice_none": {"tools": [TOOL], "tool_choice": "none"},
+        "tool_choice_required": {"tools": [TOOL], "tool_choice": "required"},
+        "tool_choice_required_effort_none": {
+            "tools": [TOOL],
+            "tool_choice": "required",
+            "reasoning_effort": "none",
+        },
+        "system_message_tools": {
+            "messages": [{**MESSAGES[0], "tools": [TOOL]}, MESSAGES[1]],
+        },
+        "content_parts": {
+            "messages": [
+                MESSAGES[0],
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Read"},
+                        {"type": "text", "text": "README.md."},
+                    ],
+                },
+            ]
+        },
+        # Kimi-K3's channel tokens, as a user writes them.
+        "channel_tokens_in_text": {
+            "messages": [
+                {"role": "user", "content": "<|open|>think<|sep|>hi<|end_of_msg|>"}
+            ]
+        },
         "scripts_and_special_text": {
             "messages": [
                 {

@@ -16,8 +16,22 @@ for s in fetch.sh triage.py render.sh run_one.sh _lib.py _gates.py _collect.py _
   chk "$s present" "[ -f '$S/$s' ]" "missing $S/$s"
 done
 
-echo "[prompt drift]"
-if python3 "$S/check_prompts.py" >/dev/null 2>&1; then echo "  ✅ prompts match SKILL.md verbatim"; ok=$((ok+1)); else echo "  ❌ prompts drifted from SKILL.md — re-copy the quoted sections"; bad=$((bad+1)); fi
+echo "[check_prompts]"
+# Drift is two of check_prompts' checks; naming them all "drift" sends the reader to
+# regenerate files that were never the problem. Print what it said.
+# >>> preflight-prompt-gate (selftest extracts and runs this block verbatim)
+if _cp="$(python3 "$S/check_prompts.py" 2>&1)"; then echo "  ✅ check_prompts.py passes (prompts verbatim, guards wired)"; ok=$((ok+1));
+else
+  # Same fallback as run_one.sh's prompt-gate. A refusal with no output at all, or with
+  # only blank lines (`raise SystemExit(7)`), used to print "refused:" and then nothing --
+  # the empty reason this change exists to remove, one file over.
+  _why="$(printf '%s\n' "$_cp" | grep -m3 '^❌' || true)"
+  [ -n "$_why" ] || _why="$(printf '%s\n' "$_cp" | grep -v '^$' | tail -3 || true)"
+  echo "  ❌ check_prompts.py refused:"
+  printf '%s\n' "${_why:-no output; run it by hand}" | sed 's/^/     /'
+  bad=$((bad+1))
+fi
+# <<< preflight-prompt-gate
 
 echo "[tooling guards]"
 st=$(bash "$S/selftest.sh" 2>&1); st_rc=$?

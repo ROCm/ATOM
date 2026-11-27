@@ -9,6 +9,7 @@ from dataclasses import dataclass, fields
 from atom import LLMEngine
 from atom.config import (
     CompilationConfig,
+    Config,
     CUDAGraphMode,
     DCPConfig,
     DSparkConfig,
@@ -186,6 +187,7 @@ class EngineArgs:
     spec_decode_kv_cache_dtype: str | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
+    encoder_only: bool = False
     disagg_prefill_max_num_seqs: int | None = None
     disagg_constrained: bool = False
     online_quant_config: dict | None = None
@@ -816,6 +818,14 @@ class EngineArgs:
             "CU-masked streams + shm coordination.",
         )
         parser.add_argument(
+            "--encoder-only",
+            action="store_true",
+            help="Serve only the model's vision encoder, on one GPU and without "
+            "an engine core: a chat request with images is answered with "
+            "ec_transfer_params, where a prefill server reads its image "
+            "embeddings, and no choices.",
+        )
+        parser.add_argument(
             "--disagg-prefill-max-num-seqs",
             type=int,
             default=None,
@@ -1069,6 +1079,18 @@ class EngineArgs:
         logger.info(f"Engine kwargs: {kwargs}")
 
         return kwargs
+
+    def create_encoder(self):
+        """The ``--encoder-only`` server's encoder, in place of an engine."""
+        from atom.model_engine.encoder_only import create_encoder_only
+
+        config_fields = {f.name for f in fields(Config)}
+        kwargs = self._get_engine_kwargs()
+        return create_encoder_only(
+            Config(
+                self.model, **{k: v for k, v in kwargs.items() if k in config_fields}
+            )
+        )
 
     _PARALLEL_CONFIG_FIELDS = (
         "data_parallel_size",

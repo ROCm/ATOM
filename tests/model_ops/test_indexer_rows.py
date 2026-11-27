@@ -295,7 +295,7 @@ def test_striped_rows_come_back_rank_major(
     monkeypatch.setattr(
         score_module,
         "_score_paged",
-        lambda query, weights, cache, rows, topk, scale, stable, on_band, out: (
+        lambda query, weights, cache, rows, topk, scale, stable, on_band, out, *_: (
             score(query, weights, rows, out)
         ),
     )

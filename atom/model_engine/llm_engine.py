@@ -340,6 +340,12 @@ class LLMEngine:
         )
         return [resp.get("result", {}) for resp in responses]
 
+    def set_offload_lookups(self, enabled: bool) -> list[dict[str, Any]]:
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "set_offload_lookups", enabled=enabled
+        )
+        return [resp.get("result", {}) for resp in responses]
+
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")
 
@@ -680,6 +686,17 @@ class LLMEngine:
         }
 
 
+def serves_greedy_ids(params: SamplingParams) -> bool:
+    """Whether a request can take `ATOM_DP_LM_HEAD_MODE=argmax`'s greedy ids:
+    temperature 0, no logprobs, no structured output or required channel."""
+    return (
+        params.temperature == 0
+        and not params.logprobs
+        and not is_structured(params)
+        and params.required_channel is None
+    )
+
+
 class InputOutputProcessor:
     # Class default: a processor built without `__init__` ships nothing.
     prefix_hash_block_size = 0
@@ -865,6 +882,12 @@ class InputOutputProcessor:
             kv_transfer=kv_transfer_params,
             multimodal=multimodal_data is not None,
         )
+        greedy_only = envs.ATOM_DP_LM_HEAD_MODE == "argmax"
+        if greedy_only and not serves_greedy_ids(sampling_params):
+            raise ValueError(
+                "ATOM_DP_LM_HEAD_MODE=argmax serves greedy requests only: "
+                "temperature 0, no logprobs, structured output or required tool"
+            )
         if is_structured(sampling_params):
             if sampling_params.required_channel is not None:
                 raise ValueError(
