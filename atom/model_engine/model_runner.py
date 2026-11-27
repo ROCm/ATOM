@@ -1013,10 +1013,7 @@ class ModelRunner:
 
         # A recipe's module / method takeovers, after both loads; then the plan
         # against the seams the built models declared (refuses the start).
-        plugin_host.install_modules(self.model)
-        if getattr(self, "drafter", None) is not None:
-            plugin_host.install_modules(self.drafter.model, prefix="draft")
-        plugin_host.check_plan()
+        plugin_host.install_built(self.model, getattr(self, "drafter", None))
 
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
@@ -1107,9 +1104,9 @@ class ModelRunner:
         # (a prepare that fails refuses the start); then every parameter and
         # buffer is recorded: one weight preparation for every graph, prefill
         # and decode of this process (the capture report names any change).
-        plugin_host.prepare_plan(self.device)
-        drafter_model = getattr(getattr(self, "drafter", None), "model", None)
-        plugin_host.freeze_weights(self.model, drafter_model, prefixes=("", "draft"))
+        plugin_host.prepare_built(
+            self.device, self.model, getattr(self, "drafter", None)
+        )
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
