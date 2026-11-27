@@ -347,16 +347,19 @@ ATOMESH_TORCH_PROFILE_ROLES="${ATOMESH_TORCH_PROFILE_ROLES:-prefill,decode}"
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
 
-default_profiler_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
+# Rank 0's online_quant_info_*.json dump for this run. It has its own variable
+# so that collecting it does not also hand the engine a profiler directory on
+# every launch; the profiler window below supplies one per worker instead.
+online_quant_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
 if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
-  default_profiler_dir="${RUN_DIR}/online_quant/${ATOMESH_EXECUTION_PHASE}/rank-${NODE_RANK}"
+  online_quant_dir="${RUN_DIR}/online_quant/${ATOMESH_EXECUTION_PHASE}/rank-${NODE_RANK}"
 fi
-export ATOM_TORCH_PROFILER_DIR="${ATOM_TORCH_PROFILER_DIR:-${default_profiler_dir}}"
+export ATOM_ONLINE_QUANT_INFO_DIR="${ATOM_ONLINE_QUANT_INFO_DIR:-${online_quant_dir}}"
 RUNTIME_LOG_DIR="${RUN_DIR}/logs"
 if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
   RUNTIME_LOG_DIR="${RUNTIME_LOG_DIR}/${ATOMESH_EXECUTION_PHASE}"
 fi
-mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
+mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_ONLINE_QUANT_INFO_DIR}"
 
 role_tp="${PREFILL_TP_SIZE}"
 if [[ "${AGGREGATED}" == "1" ]]; then
@@ -879,6 +882,7 @@ wait_http() {
   local timeout="$3"
   local pid="${4:-}"
   local deadline=$(( $(date +%s) + timeout ))
+  local peer
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
     exit_if_mooncake_store_died
@@ -890,6 +894,12 @@ wait_http() {
       [[ "${rc}" -eq 0 ]] && rc=1
       echo "[wait][FAIL] ${name} process exited before becoming ready rc=${rc}" >&2
       exit "${rc}"
+    fi
+    # After this node's own checks: when both failed, its own failure is the
+    # one to report.
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] ${name}: another node's launcher exited (${peer})" >&2
+      exit 1
     fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       echo "[wait][FAIL] ${name} not ready after ${timeout}s" >&2
@@ -1040,10 +1050,11 @@ purge_lmcache_disk() {
 #  - MOONCAKE_STORE_POOLS=per_nic (default shared), for owners that must share
 #    the stages' NICs: one master per owner NIC, every owner on exactly one
 #    NIC, and each stage reads its own NIC's pool (mooncake_store.pools).
-#  - MOONCAKE_STORE_DECODE_OWNERS, in the same format: owners the decode node
-#    starts on its own memory, joining the prefill node's masters
-#    (pd_worker_layout multi_node, one prefill node and one decode node). The
-#    prefill workers start once every pool counts the owners of both nodes.
+#  - MOONCAKE_STORE_DECODE_OWNERS, in the same format: owners each decode node
+#    starts on its own memory, joining the masters of the one prefill worker's
+#    node (pd_worker_layout multi_node: every decode node; packed_nodes: each
+#    node with decode workers only, at its first one). The prefill workers
+#    start once every pool counts the owners of all nodes.
 #  - MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS (colon-separated, default the model):
 #    the owners pin huge pages under MPOL_BIND, so the clean page cache of
 #    these goes first; each node must then fit its pins with 128 GiB to spare,
@@ -1053,9 +1064,9 @@ purge_lmcache_disk() {
 #    pages its NICs refuse to register.
 #  - MOONCAKE_STORE_WAIT_TIMEOUT (default 1200 s) bounds each wait for the
 #    Store once this node has compacted: for every pool to count its owners,
-#    and on a decode node for the prefill node's masters. A wait on the other
+#    and on a decode node for the prefill node's masters. A wait on another
 #    node's part also allows for that node's compaction, which its Store waits
-#    for: 2 x MOONCAKE_STORE_COMPACT_TIMEOUT, one per NUMA node.
+#    for: MOONCAKE_STORE_COMPACT_TIMEOUT per NUMA node its owners pin.
 # Every Mooncake process runs with MC_NUM_QP_PER_EP=1, the decode workers' P->D
 # transfer engine included (peers with different QP counts cannot connect).
 # The launcher owns the workers' ATOM_KV_OFFLOAD and
@@ -1092,6 +1103,8 @@ mooncake_store_master_count=0
 # metrics of the run are saved.
 mooncake_store_ready=0
 mooncake_store_metrics_saved=0
+# Set once this node started its decode owners, at its first decode worker.
+mooncake_store_decode_owners_started=0
 # The prefill workers' env for the running Store, set by start_mooncake_store.
 mooncake_store_prefill_env=()
 
@@ -1191,6 +1204,32 @@ plan_mooncake_store_owners() {
     mooncake_owner_plan_numa mooncake_owner_plan_gib mooncake_owner_plan_devices
 }
 
+# mooncake_node_starts_decode_owners <rank>: whether that node's decode workers
+# start MOONCAKE_STORE_DECODE_OWNERS; a packed prefill's node has its own owners.
+mooncake_node_starts_decode_owners() {
+  [[ "${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" != "packed_nodes" \
+    || "$1" != "${prefill_nodes[0]:-0}" ]]
+}
+
+# How many nodes start MOONCAKE_STORE_DECODE_OWNERS, each once: every decode
+# node under multi_node, each node with decode workers only under packed_nodes.
+mooncake_decode_owner_node_count() {
+  local node
+  local -A owner_nodes=()
+  case "${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" in
+    multi_node) echo $(( ${yD:-1} * ${DECODE_NODES_PER_WORKER:-1} )) ;;
+    packed_nodes)
+      for node in ${decode_nodes[@]+"${decode_nodes[@]}"}; do
+        if mooncake_node_starts_decode_owners "${node}"; then
+          owner_nodes[${node}]=1
+        fi
+      done
+      echo "${#owner_nodes[@]}"
+      ;;
+    *) echo 0 ;;
+  esac
+}
+
 # Fills mooncake_pool_devices and mooncake_pool_capacity from the owners of
 # every node, numbering the pools alike on each; exits 2 on an invalid setting.
 plan_mooncake_store_pools() {
@@ -1199,7 +1238,11 @@ plan_mooncake_store_pools() {
   local -a numa=() gib=() devices=()
   parse_mooncake_owner_spec MOONCAKE_STORE_OWNERS numa gib devices
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
-    parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS numa gib devices
+    local node node_count
+    node_count="$(mooncake_decode_owner_node_count)"
+    for ((node = 0; node < node_count; node++)); do
+      parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS numa gib devices
+    done
   fi
   mooncake_pool_devices=()
   mooncake_pool_capacity=()
@@ -1240,7 +1283,7 @@ plan_mooncake_store_pools() {
 
 # Refuses a Store port outside the TCP range, or one that two Store processes
 # of a node would bind: each pool's master, metadata and metrics ports, and the
-# owners' service ports, on the prefill node, which runs the masters; the
+# owners' service ports, on the prefill node, which runs the masters; each
 # decode node's owners only join them. Needs both plans.
 check_mooncake_store_ports() {
   local -a names=() ports=() decode_numa=() decode_gib=() decode_devices=()
@@ -1356,10 +1399,13 @@ check_mooncake_store_settings() {
   fi
   require_mooncake_qp_per_endpoint
   refuse_mooncake_nic_auto_discovery
-  local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}" num_decode="${yD:-1}"
+  local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}"
+  local prefill_nodes_per_worker="${PREFILL_NODES_PER_WORKER:-1}" decode_owner_node_count
+  decode_owner_node_count="$(mooncake_decode_owner_node_count)"
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
-    && [[ "${layout}" != "multi_node" || "${num_prefill}" != "1" || "${num_decode}" != "1" ]]; then
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node, here ${layout}), one prefill node (here ${num_prefill}), whose masters they join, and one decode node (here ${num_decode}): the pools count the decode owners once" >&2
+    && [[ "${num_prefill}" != "1" || "${prefill_nodes_per_worker}" != "1" \
+      || "${decode_owner_node_count}" == "0" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node or packed_nodes, here ${layout}, with ${decode_owner_node_count} such node(s)) and one prefill worker (here ${num_prefill}) on one node (prefill nodes_per_worker, here ${prefill_nodes_per_worker}), whose masters they join: every prefill node starts masters of its own" >&2
     exit 2
   fi
   # This shell starts one Store, planned for its first prefill worker's GPUs;
@@ -1420,7 +1466,7 @@ validate_mooncake_store_settings() {
   while IFS='=' read -r name _; do
     if [[ "${name}" == ATOMESH_DECODE_ENV_MOONCAKE_STORE \
       || "${name}" == ATOMESH_DECODE_ENV_MOONCAKE_STORE_* ]]; then
-      echo "[mooncake-store][FAIL] ${name}: the Mooncake Store settings belong to the prefill role env (ATOMESH_PREFILL_ENV_), which every node reads; in the decode role env only the decode node would see them" >&2
+      echo "[mooncake-store][FAIL] ${name}: the Mooncake Store settings belong to the prefill role env (ATOMESH_PREFILL_ENV_), which every node reads; in the decode role env only the decode nodes would see them" >&2
       exit 2
     fi
   done < <(env)
@@ -1436,7 +1482,7 @@ validate_mooncake_store_settings() {
     check_mooncake_store_settings
   )
   (
-    # The decode node's owners start from the decode role env.
+    # Each decode node's owners start from the decode role env.
     apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
     require_mooncake_qp_per_endpoint
     refuse_mooncake_nic_auto_discovery
@@ -1600,13 +1646,34 @@ stop_mooncake_store() {
   [[ -z "${mooncake_store_failed_rc}" ]]
 }
 
+# Prints the rank-rc-* of another node whose launcher exited non-zero: the
+# servers, router or Store owners that node was to bring never come. Only Spur
+# workers publish rank-rc-* (cleanup_spur in pd_slurm_job.sh); under plain
+# Slurm there are none, and srun --kill-on-bad-exit=1 stops the other nodes.
+failed_peer_node() {
+  local f rc
+  for f in "${RUN_DIR}"/rank-rc-*; do
+    [[ -f "${f}" && "${f}" != *.tmp && "${f##*/}" != "rank-rc-${NODE_RANK}" ]] || continue
+    rc="$(cat "${f}" 2>/dev/null)"
+    if [[ -n "${rc}" && "${rc}" != "0" ]]; then
+      echo "${f##*/}=${rc}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Fails startup (stopping what it started) unless <condition> holds within
-# <timeout> seconds; a dying Store process fails it at once.
+# <timeout> seconds. It fails at once when a Store process dies, when a Store
+# log reports a failure (Failed to setup client, Failed to mount, Check failed,
+# FATAL), or when another node's launcher exits non-zero, checked in that
+# order: when this node and another both failed, this node's failure is the
+# one to report.
 wait_for_mooncake_store() {
   local what="$1" timeout="$2"
   shift 2
   local deadline=$(( $(date +%s) + timeout ))
-  local log
+  local log peer
   until "$@"; do
     if ! reap_dead_mooncake_store; then
       echo "[wait][FAIL] mooncake-store ${what}: a Store process exited" >&2
@@ -1621,6 +1688,11 @@ wait_for_mooncake_store() {
         exit 1
       fi
     done
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] mooncake-store ${what}: another node's launcher exited (${peer})" >&2
+      stop_mooncake_store || true
+      exit 1
+    fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       for log in "${mooncake_store_logs[@]}"; do
         tail -n 20 "${log}" >&2 || true
@@ -1760,7 +1832,7 @@ report_mooncake_store_owners() {
   done
 }
 
-# mooncake_store_cross_node_timeout <owner setting>: the wait for the other
+# mooncake_store_cross_node_timeout <owner setting>: the wait for another
 # node's part of the Store, whose owners <owner setting> lists:
 # MOONCAKE_STORE_WAIT_TIMEOUT plus that node's compaction, which comes first
 # there: numa_memory_budget.py compacts each NUMA node with pins in turn, and
@@ -1851,7 +1923,7 @@ start_mooncake_store() {
   local owners_timeout
   owners_timeout="$(mooncake_store_wait_timeout)"
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
-    # The decode node mounts its owners only once it has compacted its memory.
+    # Each decode node mounts its owners only once it has compacted its memory.
     owners_timeout="$(mooncake_store_cross_node_timeout MOONCAKE_STORE_DECODE_OWNERS)"
   fi
   wait_for_mooncake_store "owners" "${owners_timeout}" \
@@ -1871,13 +1943,17 @@ start_mooncake_store() {
   echo "[wait][OK] mooncake-store masters=${host_ip}:${ATOMESH_MOONCAKE_MASTER_PORT}+100/pool pools=${mooncake_pool_devices[*]:-shared} metrics=http://${host_ip}:${ATOMESH_MOONCAKE_METRICS_PORT}/metrics"
 }
 
-# On a decode node: starts MOONCAKE_STORE_DECODE_OWNERS on this node's memory,
-# joining the prefill node's masters, before the decode workers load. Waits
-# until every pool counts the owners of all nodes, as the prefill node does
-# before its workers start.
+# On a node that starts them (mooncake_node_starts_decode_owners): starts
+# MOONCAKE_STORE_DECODE_OWNERS on this node's memory, joining the prefill
+# node's masters, before the decode workers load. Waits until every pool counts
+# the owners of all nodes, as the prefill node does before its workers start.
 start_mooncake_store_decode_owners() {
   mooncake_store_requested || return 0
   [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] || return 0
+  # Once per node, at its first decode worker: a packed node can run several.
+  mooncake_node_starts_decode_owners "${NODE_RANK}" || return 0
+  [[ "${mooncake_store_decode_owners_started}" == "0" ]] || return 0
+  mooncake_store_decode_owners_started=1
   plan_mooncake_store_pools
   plan_mooncake_store_owners MOONCAKE_STORE_DECODE_OWNERS
   check_mooncake_owner_devices
@@ -1887,15 +1963,15 @@ start_mooncake_store_decode_owners() {
   mooncake_store_logs=()
   mooncake_store_names=()
   mooncake_store_master_count=0
-  local timeout
-  timeout="$(mooncake_store_wait_timeout)"
   # The prefill node starts its masters only once it has compacted its memory.
   wait_for_mooncake_store "prefill-node masters" \
     "$(mooncake_store_cross_node_timeout MOONCAKE_STORE_OWNERS)" \
     mooncake_masters_ready "${NODE0_ADDR}"
   start_mooncake_store_owners "${NODE0_ADDR}"
   echo "[wait] mooncake-store decode owners=${#mooncake_owner_plan_numa[@]} joining ${NODE0_ADDR}"
-  wait_for_mooncake_store "owners" "${timeout}" \
+  # Another decode node mounts its owners only once it has compacted, too.
+  wait_for_mooncake_store "owners" \
+    "$(mooncake_store_cross_node_timeout MOONCAKE_STORE_DECODE_OWNERS)" \
     mooncake_store_capacity_reaches "${NODE0_ADDR}"
   report_mooncake_store_owners
   echo "[wait][OK] mooncake-store decode owners mounted on ${NODE0_ADDR}'s pools ${mooncake_pool_devices[*]:-shared}"
@@ -1942,10 +2018,10 @@ write_metadata() {
 EOF
 }
 
-# ATOM_TORCH_PROFILER_DIR above does not reach the engine: EngineArgs always
-# passes its own torch_profiler_dir (None by default), which overrides the env
-# default in Config, so the profiler is off unless the flag is on the command.
-# One directory per worker keeps P/D ranks that share a node apart.
+# Put a profiler directory on the command line only while the window is on:
+# this script exports no ATOM_TORCH_PROFILER_DIR, so a launch that does not
+# profile carries none. One directory per worker keeps P/D ranks that share a
+# node apart; an explicit flag also outranks the environment default in Config.
 build_torch_profiler_args() {
   local log_name="$1"
   local -n out_args="$2"

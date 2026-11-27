@@ -9,14 +9,15 @@ namespace, and the adapters both connector halves open to the server.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
-from atom.model_engine.dp_routing.topology import prefix_spread_enabled
+from atom.model_engine.dp_routing.topology import shared_prefix_routing_enabled
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -45,7 +46,7 @@ def _storage_kv_transfer_config(config: Any) -> dict[str, Any]:
 
 
 def require_chunk_matches_server(adapter: Any, config: Any) -> None:
-    """Under `prefix_spread`, the chunk the router predicts loads with
+    """Under `prefix_spread` or `share_cache`, the chunk the router predicts loads with
     (`offcfg.lmcache_chunk_tokens`) must be the one the MP server runs on.
 
     The router reads the configured chunk before any server is asked; a
@@ -54,13 +55,13 @@ def require_chunk_matches_server(adapter: Any, config: Any) -> None:
     so other strategies and runs with only one routable engine are not
     checked. Called by both worker registrations (PAGE-only and native-state).
     """
-    if not prefix_spread_enabled(config):
+    if not shared_prefix_routing_enabled(config):
         return
     configured = offcfg.lmcache_chunk_tokens(_storage_kv_transfer_config(config))
     server = int(adapter.lmcache_tokens_per_chunk)
     if configured != server:
         raise ValueError(
-            "--dp-load-balance prefix_spread with LMCache MP needs the "
+            f"--dp-load-balance {config.dp_load_balance} with LMCache MP needs the "
             f"configured chunk to match the server: configured {configured} "
             f"(lmcache.chunk_size or LMCACHE_CHUNK_SIZE), server {server}"
         )
@@ -94,6 +95,8 @@ def _transfer_mode(config: Any) -> str:
 
 def _validate_mp_config(config: Any) -> tuple[int, int]:
     """Validate topology constraints shared by generic PAGE layouts."""
+    from atom.spec_decode.draft_kv import draft_owns_kv_pool
+
     tp_size = offcfg._strict_integer(
         "tensor_parallel_size",
         getattr(config, "tensor_parallel_size", 1) or 1,
@@ -106,7 +109,7 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     )
     dcp_size = offcfg._strict_integer(
         "decode_context_parallel_size",
-        getattr(config, "decode_context_parallel_size", 1) or 1,
+        config.decode_context_parallel_size,
         minimum=1,
     )
     pcp_size = offcfg._strict_integer(
@@ -133,7 +136,27 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     if pp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PP yet")
     if dcp_size != 1:
-        raise NotImplementedError("lmcache_mp does not support DCP yet")
+        hf = getattr(config, "hf_config", None)
+        hf = getattr(hf, "text_config", hf)
+        if (
+            (tp_size, dcp_size) != (8, 8)
+            or getattr(hf, "model_type", None) not in ("glm_moe_dsa", "kimi_linear")
+            or getattr(config, "enable_dp_attention", False)
+            or dp_size != 1
+            or draft_owns_kv_pool(config)
+        ):
+            raise NotImplementedError(
+                "lmcache_mp does not support DCP outside GLM DSA / K3 "
+                "TP8+DCP8 with DP=1, no DP attention or separate draft pool"
+            )
+        block_size = offcfg._strict_integer(
+            "LMCache MP block size", config.kv_cache_block_size, minimum=1
+        )
+        interleave = _dcp_interleave(config)
+        if block_size % interleave:
+            raise ValueError(
+                "LMCache MP physical block size must be divisible by DCP interleave"
+            )
     if pcp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PCP yet")
     # Single-host DP replicas deliberately share one (model_name, worker_id,
@@ -155,6 +178,29 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     return tp_size, pp_size
 
 
+def _dcp_interleave(config: Any) -> int:
+    return offcfg._strict_integer(
+        "DCP interleave size",
+        config.dcp_config.interleave_size,
+        minimum=1,
+    )
+
+
+def _logical_block_size(config: Any) -> int:
+    """Global tokens covered by one block-table entry on each DCP rank.
+
+    The physical PAGE and its in-block permutation remain unchanged. MP keys
+    use global token IDs, but each worker copies only its local shard.
+    """
+    return offcfg._strict_integer(
+        "LMCache MP block size", config.kv_cache_block_size, minimum=1
+    ) * offcfg._strict_integer(
+        "decode_context_parallel_size",
+        config.decode_context_parallel_size,
+        minimum=1,
+    )
+
+
 def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     """Conservatively identify configs whose complete PAGE cache is TP-replicated.
 
@@ -167,10 +213,15 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     registering any cache memory.
     """
 
-    if _config_has_own_pool_draft(config):
-        # A DSpark draft whose backend owns a KV pool appends per-rank-sharded
-        # PAGE regions (`draft_kv.py` declares factor 1), so the complete PAGE
-        # object is not replicated even when the target's is.
+    from atom.spec_decode.draft_kv import draft_owns_kv_pool
+
+    if int(config.decode_context_parallel_size) > 1:
+        return False
+    if draft_owns_kv_pool(config):
+        # A draft with its own KV pool (an MHA DSpark/EAGLE3 draft,
+        # `draft_owns_kv_pool`) appends per-rank-sharded PAGE regions
+        # (`draft_kv.py` declares factor 1), so the complete PAGE object is not
+        # replicated even when the target's is.
         return False
     hf_config = getattr(config, "hf_config", None)
     # MiniMax-M3 is GQA. Some TP ranks can happen to own the same KV head when
@@ -185,22 +236,6 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     if getattr(hf_config, "model_type", None) == "kimi_linear":
         return False
     return getattr(hf_config, "kv_lora_rank", None) is not None
-
-
-def _config_has_own_pool_draft(config: Any) -> bool:
-    """Whether a speculative draft caches into a KV pool of its own.
-
-    Mirrors `spec_decode.draft_kv.draft_kv_builder`, which only DSpark calls:
-    the draft's own backend answers through `DRAFT_OWNS_KV_POOL`.
-    """
-
-    speculative = getattr(config, "speculative_config", None)
-    draft_hf = getattr(speculative, "draft_model_hf_config", None)
-    if getattr(speculative, "method", None) != "dspark" or draft_hf is None:
-        return False
-    from atom.utils.selector import attn_family, get_attn_backend
-
-    return bool(get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL)
 
 
 def _tp_replication_factor(config: Any) -> int:
@@ -220,6 +255,8 @@ def _tp_replication_factor(config: Any) -> int:
         collapse = configured
     else:
         raise TypeError("lmcache.mp.tp_rank_collapse must be true, false, or 'auto'")
+    if collapse and int(config.decode_context_parallel_size) > 1:
+        raise ValueError("LMCache MP TP rank collapse cannot discard DCP shards")
     return tp_size if collapse else 1
 
 
@@ -302,6 +339,10 @@ def _model_namespace(
         world_size,
     )
     namespace = f"{page_namespace}::lmcache-mp-v{_MP_LAYOUT_VERSION}"
+    if int(config.decode_context_parallel_size) > 1:
+        # PAGE namespaces already include DCP size. Interleave also changes
+        # which global tokens each rank's otherwise equal-shaped bytes hold.
+        namespace += f"::dcp-interleave-{_dcp_interleave(config)}"
     if checkpoint_spec is not None:
         hf = getattr(config, "hf_config", None)
         hf = getattr(hf, "text_config", hf)
@@ -343,21 +384,36 @@ def _make_scheduler_adapter(
 
     num_kv_readers = _tp_replication_factor(config)
 
-    class _ReaderAwareSchedulerAdapter(AtomMPSchedulerAdapter):
-        """Reserve one LMCache read lock for every collapsed TP consumer."""
+    class _SaltedSchedulerAdapter(AtomMPSchedulerAdapter):
+        """Salt a session's keys with its prompt's media, and reserve one
+        LMCache read lock for every collapsed TP consumer."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            # session -> `tier_cache_salt`, for salted prompts only.
+            self.cache_salts: dict[str, str] = {}
 
         def _create_key(self, *args: Any, **kwargs: Any) -> Any:
             key = super()._create_key(*args, **kwargs)
-            return replace(key, num_kv_readers=num_kv_readers)
+            key = replace(key, num_kv_readers=num_kv_readers)
+            salt = self.cache_salts.get(key.request_id)
+            return replace(key, cache_salt=salt) if salt else key
+
+        def salt_session(self, request_id: str, salt: str) -> None:
+            self.cache_salts[request_id] = salt
+
+        def end_session(self, request_id: str) -> None:
+            self.cache_salts.pop(request_id, None)
+            super().end_session(request_id)
 
     extra = _extra_config(config)
-    return _ReaderAwareSchedulerAdapter(
+    return _SaltedSchedulerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
         model_name=_model_namespace(
             config, checkpoint_spec=checkpoint_spec, images=images
         ),
-        block_size=int(config.kv_cache_block_size),
+        block_size=_logical_block_size(config),
         parallel_config=_parallel_strategy(config, 0),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
     )
@@ -369,19 +425,44 @@ def _make_worker_adapter(
     import zmq
     from lmcache.integration.atom import AtomMPWorkerAdapter
 
+    class _SaltedWorkerAdapter(AtomMPWorkerAdapter):
+        """Salt a transfer's keys with its prompt's media (`transfer_spec`)."""
+
+        def _create_key(self, request_id: str, spec: Any) -> Any:
+            key = super()._create_key(request_id, spec)
+            return replace(key, cache_salt=spec.cache_salt)
+
     extra = _extra_config(config)
-    return AtomMPWorkerAdapter(
+    return _SaltedWorkerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
         model_name=_model_namespace(
             config, checkpoint_spec=checkpoint_spec, images=images
         ),
-        block_size=int(config.kv_cache_block_size),
+        block_size=_logical_block_size(config),
         parallel_config=_parallel_strategy(config, rank),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
         heartbeat_interval=float(extra.get("lmcache.mp.heartbeat_interval", 10.0)),
         transfer_mode=_transfer_mode(config),
     )
+
+
+def transfer_spec(**fields: Any) -> Any:
+    """LMCache's `AtomMPTransferSpec` plus the prompt's media
+    (`LMCacheReqMeta.cache_salt`) for the key. Built on first use: LMCache is
+    imported only where a transfer is submitted."""
+    from lmcache.integration.atom import AtomMPTransferSpec
+
+    return _salted_transfer_spec(AtomMPTransferSpec)(**fields)
+
+
+@functools.cache
+def _salted_transfer_spec(base: type) -> type:
+    @dataclass
+    class TransferSpec(base):
+        cache_salt: str = ""
+
+    return TransferSpec
 
 
 def require_native_state_server(adapter: Any, config: Any) -> None:

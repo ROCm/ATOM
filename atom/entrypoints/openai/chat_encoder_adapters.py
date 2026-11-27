@@ -67,6 +67,9 @@ class MessageEncoderAdapter:
     defaults: dict[str, Any] = field(default_factory=dict, compare=False)
     prepare_kwargs: KwargsPreparer = _identity_kwargs
     preserve_content: bool = False
+    # Whether the encoder takes a history tool call's arguments as the JSON
+    # string the client sent, not parsed into a mapping.
+    preserve_tool_call_arguments: bool = False
     reasoning_rules: ReasoningRules | None = None
     # The encoder module's own message processing, when it has one
     # (DeepSeek-V4.1's `process_image_messages`: joins a content list's text
@@ -113,12 +116,19 @@ class _EncoderPreparation:
     kwargs: KwargsPreparer = _identity_kwargs
     supports_tools: bool = False
     preserve_content: bool = False
+    preserve_tool_call_arguments: bool = False
     reasoning_rules: ReasoningRules | None = None
 
 
 _PREPARERS = {
+    # DeepSeek-V3.2's and V4's encoders read a history tool call's arguments
+    # as the JSON string the client sent: V3.2's `json.loads` it (a mapping
+    # raises), V4's renders a mapping as one `arguments` parameter.
+    "encoding_dsv32": _EncoderPreparation(preserve_tool_call_arguments=True),
     "encoding_dsv4": _EncoderPreparation(
-        messages=_prepare_deepseek_v4_messages, supports_tools=True
+        messages=_prepare_deepseek_v4_messages,
+        supports_tools=True,
+        preserve_tool_call_arguments=True,
     ),
     "encoding_dsv41": _EncoderPreparation(
         messages=deepseek_v41_encoder.prepare_messages,
@@ -182,6 +192,7 @@ def build_message_encoder_adapter(
         prepare_kwargs=preparation.kwargs,
         supports_tools=preparation.supports_tools,
         preserve_content=preparation.preserve_content,
+        preserve_tool_call_arguments=preparation.preserve_tool_call_arguments,
         reasoning_rules=preparation.reasoning_rules,
         source_path=source_path,
         accepts=_accepted_kwargs(accepts_from or encoder),

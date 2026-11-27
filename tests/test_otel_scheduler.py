@@ -193,6 +193,8 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
             raise RuntimeError(name)
 
     core.label = "test"
+    core._idle_when_blocked = False
+    core._dp_group_hidden_work = False
     core.utility_queue = None
     core.utility_handler = SimpleNamespace(
         process_queue=lambda *a: None, push_metrics=lambda **k: None
@@ -204,6 +206,7 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
         is_finished=lambda: True,
         publish_kv_events=lambda: cleanup("publish"),
         shutdown_kv_events=lambda: cleanup("shutdown"),
+        close_kv_connector=lambda: None,
     )
     core.runner_mgr = SimpleNamespace(call_func=lambda *a, **k: None)
     core.is_head = engine_kind == "pp_head"
@@ -211,10 +214,11 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
     core._is_rl_weights_offloaded = core._weight_sync_fenced = False
     core._generation_paused = False
     core._sync_dp_state = lambda *a: (False, True, False)
+    # Teardown is tested without a DP group; interval agreement has its own tests.
+    core._validate_dp_sync_interval = lambda interval: interval
     monkeypatch.setattr(tracing, "shutdown", lambda: calls.append("trace"))
-    if failure in {"drain", "shutdown"} and not (
-        engine_kind == "pp_downstream" and failure == "drain"
-    ):
+    # A later PP stage neither drains KV work nor shuts a KV event publisher down.
+    if failure in {"drain", "shutdown"} and engine_kind != "pp_downstream":
         with pytest.raises(RuntimeError, match=failure):
             core.busy_loop()
     else:
@@ -296,6 +300,7 @@ def test_real_engine_dispatch_keeps_tracing_when_metrics_returns_early(
         core._pending_prefix_hash = deque()
         core._defer_prefix_hash = False
         core.pp_size = pp_size
+        core.pp_max_inflight = pp_size
         completions = deque()
         core.pp_transport = SimpleNamespace(
             send_metadata=lambda batch: None,
@@ -371,7 +376,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
 
     failure_callbacks = []
 
-    def runner_manager(*args, on_worker_failure, kv_progress_event):
+    def runner_manager(*args, local_proc_num, on_worker_failure, kv_progress_event):
         assert kv_progress_event is not None
         failure_callbacks.append(on_worker_failure)
         return SimpleNamespace(call_func=call)
@@ -387,8 +392,10 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
     config = MockConfig(
         parallel_config=SimpleNamespace(control_address="unused", data_parallel_size=1),
         tp_world_size=1,
+        is_multinode_tp=False,
         pcp_group_size=1,
         runner_qualname="unused",
+        weight_sync_runner=False,
         enforce_eager=True,
         disagg_is_decode=False,
         pipeline_parallel_size=1,

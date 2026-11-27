@@ -21,6 +21,58 @@ publishes its own completed KV; Decode waits for every stage, and source blocks
 remain pinned until all TP/PP readers finish. Existing topology/layout limits
 still apply. See [the implementation and CPU verification notes](../docs/pd_chunked_kv_transfer_zh.md).
 
+## Decode admission
+
+Mooncake reserves D's destination KV blocks before P writes them, so a backlog
+of pending receives can hold most of D's KV pool while few requests decode.
+The opt-in `pd_admission` policy defers a new receive while the receive targets
+already pending would exceed a per-rank byte budget, and can keep room free for
+the admitted requests to keep decoding. Set it in the consumer's
+top-level `--kv-transfer-config`; with `multi`, put it next to `connectors` and
+list the Mooncake consumer first:
+
+```json
+"pd_admission": {"enabled": true, "max_pending_kv_fraction": 0.15}
+```
+
+Each limit applies only when set; with none set, the byte budget defaults to
+`max_pending_kv_fraction: 0.15`. Omit a limit to turn it off; `null` is
+rejected.
+
+| Option | Meaning |
+| --- | --- |
+| `max_pending_kv_fraction` | Fraction of each D rank's paged KV pool, converted to bytes at startup. |
+| `max_pending_kv_bytes` | Bytes per D rank, instead of a fraction. |
+| `num_reserved_decode_tokens` | Decode tokens kept free for each admitted request to grow by, for example `512`. A new receive is deferred if, after it takes its blocks, the free pool could not grow every receiving, ready and running request and itself by that many tokens, each capped by what it may still generate but never below what a P/D receive's first decode takes. Reusable cached blocks count as free, and a local prefix hit on a block another request holds takes nothing. That first decode appends the first token and `num_speculative_tokens` verify slots, then needs room for one decode step past them: `2 × (num_speculative_tokens + 1)` tokens with speculative decoding, 2 without. Startup rejects a smaller value. |
+
+The byte budget charges the blocks Mooncake writes: a local prefix hit is
+charged only on a full transfer (offset 0). Whole-prompt and chunked receives
+share the budget. A request
+holds its credit until its first local forward; preemption, a failed receive
+and a cancelled one (once its writes drain) return it. With nothing pending,
+one request may exceed the byte budget, so long prompts are not starved. The
+decode reserve covers every admitted request, including one past its first
+forward, so it holds while any request runs on D; only an idle D admits below
+it. Falling below it defers admission only and never preempts. Both limits
+apply to Mooncake P/D receives only: a request parked for a tier or replay KV
+load through an offload connector is not checked, and holds its blocks outside
+the reserve until its load lands and it runs. D must have PP=1, DCP=1, PCP=1,
+SP=1 and a single paged KV pool. Metrics are listed under `atom:pd_admission_*`
+in the [metrics guide](../docs/metrics_guide.md#scheduler).
+
+## Producer state transfer slots
+
+A producer of a KDA/GDN model (Kimi-K3, Qwen3-Next) holds a
+finished request's state slots until the decode takes its KV, which can fill
+P's state pool and block new prefills when D is full. Set the key in a MoRIIO
+producer's top-level `--kv-transfer-config`:
+
+| Option | Meaning |
+| --- | --- |
+| `state_transfer_slots` | State slots per rank kept past the live ones. A finished request's state moves to one and its live slots return to admission. Each costs one state slot's bytes from the KV budget. Only a MoRIIO producer of a KDA/GDN model, as the only connector, uses them; set anywhere else, the key sizes nothing and logs a warning. A non-negative integer; default `0`. |
+
+See the [scheduling guide](../docs/scheduling_kv_cache_guide.md#pd-producer-state-transfer-slots).
+
 ## Prerequisites
 
 - Two nodes with AMD MI300X GPUs (8 GPUs each for TP=8)
@@ -86,9 +138,17 @@ GPU memory and does not need this setting.
   `ib_hca_count - 1`, skipping missing devices and duplicates.
 - `ib_hca_count` defaults to `8` and must be positive when automatic alternate
   HCA selection is enabled. It is an index range to scan, not a guarantee that
-  eight HCAs will be selected. Automatic selection checks `rdmaN`, then
-  `ionic_N`, for each physical GPU/HCA index; GPU masking is resolved through
-  `HIP_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES`.
+  eight HCAs will be selected. The scan checks `rdmaN`, then `ionic_N`, for
+  each index. Other names, such as `mlx5_N`, are not scanned, so on those nodes
+  alternate-HCA mode adds nothing to the GPU-local HCA.
+- The GPU-local HCA is the ACTIVE HCA sharing the GPU's PCIe switch in sysfs,
+  found from the PCI address of the GPU the rank drives, so `*_VISIBLE_DEVICES`
+  masks need no mapping. It is not `rdma<GPU index>`: HIP numbers GPUs in KFD
+  order, not PCI order (HIP GPU 0 of an MI355X node can be bus `0x75`, behind
+  `rdma3`). Where the topology names no single ACTIVE HCA behind the GPU's
+  switch, or the closest one is closer to another GPU (the GPU's own HCA is
+  down or missing), startup fails and asks for `ib_device` rather than taking
+  another GPU's HCA.
 - An explicit `ib_device` in the connector config, or
   `ATOM_MOONCAKE_IB_DEVICE` in the environment, overrides automatic selection.
   Comma-separated lists are trimmed and deduplicated; the first device is used

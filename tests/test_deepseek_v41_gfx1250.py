@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The gfx1250 DeepSeek-V4.1 single-launch decode step on the CPU (no GPU):
 - which deployments and which steps it takes (needs aiter, skipped without it);
 - its kernel's per-step arithmetic (kernels/index_plan.py, moe_plan.py) and counter / LDS layout (layout.py), run on
@@ -9,6 +10,7 @@
 import importlib.util
 import random
 import sys
+import threading
 import types
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -42,6 +44,7 @@ def atom_config(**overrides):
         "pipeline_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
+        "is_multinode_tp": False,
         "enable_tbo": False,
         "enable_tbo_decode": False,
         "compilation_config": NS(level=0),
@@ -171,6 +174,15 @@ def test_a_refused_deployment_keeps_the_model(monkeypatch):
     assert out is inner
 
 
+def test_lossless_sampling_keeps_the_model(monkeypatch):
+    """The single launch drafts and verifies inside the kernel and publishes
+    no q, so an armed lossless drafter keeps the production model."""
+    monkeypatch.setattr(dispatch, "refusal", lambda cfg: None)
+    inner = nn.Linear(1, 1)
+    drafter = NS(lossless=object())
+    assert dispatch.install_single_step(inner, atom_config(), drafter) is inner
+
+
 @needs_aiter
 def test_mono_dispatch_routes_to_the_single_launch_when_enabled(monkeypatch):
     monkeypatch.setattr(gfx1250, "enabled", lambda: True)
@@ -182,7 +194,9 @@ def test_mono_dispatch_routes_to_the_single_launch_when_enabled(monkeypatch):
 
     monkeypatch.setattr(dispatch, "install_single_step", install)
     cfg = atom_config()
-    assert mono_dispatch.install_mono_decode("m", cfg, "d") == "single"
+    assert mono_dispatch.install_mono_decode("m", cfg, "d", metadata_builder=None) == (
+        "single"
+    )
     assert seen["args"] == ("m", cfg, "d")
 
 
@@ -324,6 +338,21 @@ def test_a_production_step_drafts_from_the_drafter(served):
     assert runner.forgot == [
         "a"
     ]  # this batch's requests: their kept q no longer match their drafts
+
+
+def test_a_constrained_replay_declines_previous_served_drafts(served):
+    m, drafter = served
+    runner = m._single.runner
+    assert m.step_override(torch.zeros(48), 8, _batch()) is runner
+    batch = _batch(
+        structured_requests=[1], total_seqs_num=1, req_ids=["current", "other"]
+    )
+    assert m.step_override(torch.zeros(48), 8, batch) is None
+    drafter.compute_draft_kv()
+    assert drafter.kv == 1
+    assert drafter.propose(next_token_ids=torch.zeros(1)) == "production"
+    assert runner.steps == 1
+    assert runner.forgot == ["current"]
 
 
 def test_a_prefill_keeps_the_running_requests_kernel_q(served):
@@ -583,3 +612,44 @@ def test_tail_slots_ordered():
 
 def test_lds_regions():
     assert LY.TP_PAYLOAD < LY.FRONT_LDS < LY.RKEEP
+
+
+def test_the_step_kernel_traces_on_several_threads_at_once(monkeypatch):
+    """Four ranks' target kernels traced at once on four threads, compile-only (``ARCH``: no GPU): every trace counts
+    its poll timeouts through its own kernel's counter, and no IR value of one trace reaches another (a module-level
+    counter pointer failed this: 'operand from a different MLIRContext', or an LLVM abort).
+    """
+    pytest.importorskip("flydsl")
+    monkeypatch.setenv("ARCH", "gfx1250")
+    from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+    from atom.models.deepseek_v41.mono.gfx1250.kernels import step
+    from atom.mono.runtime.compile import compile_only
+
+    seen, errors = {}, {}
+    counter = hx._counter
+
+    def traced_counter():  # each thread's view of the counter while its trace emits the timeout checks
+        ptr = counter()
+        seen.setdefault(threading.get_ident(), set()).add(ptr is not None)
+        return ptr
+
+    monkeypatch.setattr(hx, "_counter", traced_counter)
+
+    def build(rank):
+        try:
+            launcher = step.build(6, rank, part="target", trd=5)[0]
+            with compile_only():
+                launcher(0, 0, 0, 0, 0, 0, 1.0, 0, 0)
+        except Exception as error:  # noqa: BLE001 - reported below, per rank
+            errors[rank] = error
+
+    threads = [threading.Thread(target=build, args=(rank,)) for rank in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors, errors
+    assert len(seen) == 4 and all(v == {True} for v in seen.values()), seen
+    assert (
+        hx._counter() is None
+    )  # cleared at the end of this thread's traces (none ran here)

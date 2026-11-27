@@ -92,6 +92,7 @@ def _run_fused(recv, b, h, d, n, pack):
         n,
         HEAD_DIM=d,
         H_LOCAL=h,
+        H_ROUNDED=triton.next_power_of_2(h),
         LSE_PACK=pack,
         N_ROUNDED=triton.next_power_of_2(n),
         FP8_MAX=float(torch.finfo(FP8).max),
@@ -122,7 +123,10 @@ def _torch_combine_fp32(recv, b, h, d, n, pack):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("b,h,d,n", [(51, 4, 256, 4), (8, 4, 256, 4), (1, 2, 128, 2)])
+@pytest.mark.parametrize(
+    "b,h,d,n",
+    [(51, 4, 256, 4), (8, 4, 256, 4), (1, 2, 128, 2), (8, 12, 128, 8)],
+)
 def test_fused_matches_fp32_combine_then_quant(dtype, b, h, d, n):
     pack = _lse_pack_slots(dtype)
     recv = _make_recv(n, b, h, d, dtype, pack)
@@ -275,6 +279,7 @@ def test_non_power_of_two_group():
         n,
         HEAD_DIM=d,
         H_LOCAL=h,
+        H_ROUNDED=triton.next_power_of_2(h),
         LSE_PACK=pack,
         N_ROUNDED=triton.next_power_of_2(n),
         FP8_MAX=float(torch.finfo(FP8).max),

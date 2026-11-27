@@ -40,6 +40,7 @@ LOSSLESS = (
 
 class FakeDraftModel:
     supports_lossless_draft = True
+    lossless_block_verify = False
     vocab_size = VOCAB
 
     def __init__(self):
@@ -70,10 +71,12 @@ def proposer(
     prop.config = SimpleNamespace(
         max_num_seqs=MAX_BS,
         pipeline_parallel_size=pp,
+        tensor_parallel_size=1,
         **{
             "kv_transfer_config": {},
             "enable_rapidserve": False,
             "disagg_is_decode": False,
+            "enable_mixed_prefill_decode": False,
             **config,
         },
     )
@@ -337,21 +340,23 @@ def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
     assert prop.lossless.draft_scratch.nbytes
 
 
-def test_the_rejection_sampler_owns_the_verify_scratch_and_warmup(monkeypatch):
-    """The ratio verify compiles per store width, draft count, vocab and
-    logits dtype, so the warmup must use the ones serving will; its scratch,
-    warmup and step counter are the rejection sampler's, not the drafter's."""
+@pytest.mark.parametrize("block", [False, True])
+def test_the_rejection_sampler_owns_the_verify_scratch_and_warmup(monkeypatch, block):
+    """The ratio verify compiles per store width, draft count, vocab, logits
+    dtype and verify rule, so the warmup must use the ones serving will; its
+    scratch, warmup and step counter are the rejection sampler's, not the
+    drafter's."""
     from atom.model_ops import rejection_sampler as rs_mod
 
     sampler = rs_mod.RejectionSampler()
     monkeypatch.setattr(sparse_q_store, "Q_WIDTH", 8)
     calls = []
     monkeypatch.setattr(rs_mod, "warmup_ratio_verify", lambda *a: calls.append(a))
-    sampler.arm_ratio(MAX_BS, T, VOCAB, torch.bfloat16, "cpu")
+    sampler.arm_ratio(MAX_BS, T, VOCAB, torch.bfloat16, "cpu", block=block)
     assert sampler._ratio_scratch.nbytes
-    ((steps, vocab, width, dtype, scratch),) = calls
+    ((steps, vocab, width, dtype, scratch, rule),) = calls
     # The store's width, as the drafter sizes it (`store_width`).
-    assert (steps, vocab, width, dtype) == (T, VOCAB, 8, torch.bfloat16)
+    assert (steps, vocab, width, dtype, rule) == (T, VOCAB, 8, torch.bfloat16, block)
     assert scratch is sampler._ratio_scratch
 
 

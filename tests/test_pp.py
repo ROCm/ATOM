@@ -66,6 +66,7 @@ from atom.models.utils import (
     PPMissingLayer,
     get_pp_indices,
     make_layers,
+    pp_holds_embedding,
 )
 from tests.conftest import MockConfig
 
@@ -82,6 +83,50 @@ if "aiter" in _stubbed:
 # ---------------------------------------------------------------------------
 # Layer partition
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "disabled,expected_enabled,device_communicators",
+    [(False, True, True), (True, False, False)],
+)
+def test_pp_init_applies_custom_all_reduce_policy_before_dist_init(
+    monkeypatch, disabled, expected_enabled, device_communicators
+):
+    events = []
+    monkeypatch.setattr(
+        pp_comm,
+        "set_custom_all_reduce",
+        lambda enabled: events.append(("custom_ar", enabled)),
+    )
+    monkeypatch.setattr(
+        pp_comm,
+        "init_distributed_environment",
+        lambda **kwargs: events.append(("dist", kwargs["local_rank"])),
+    )
+    monkeypatch.setattr(
+        pp_comm,
+        "ensure_model_parallel_initialized",
+        lambda *_args, **kwargs: events.append(
+            ("model_parallel", kwargs["device_communicators"])
+        ),
+    )
+
+    pp_comm.init_pp_aware_dist_env(
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        global_rank=0,
+        world_size=2,
+        distributed_init_method="tcp://127.0.0.1:12345",
+        local_rank=3,
+        disable_custom_all_reduce=disabled,
+        device_communicators=device_communicators,
+    )
+
+    assert events == [
+        ("custom_ar", expected_enabled),
+        ("dist", 3),
+        ("model_parallel", device_communicators),
+    ]
 
 
 class _RealLayer(nn.Module):
@@ -205,6 +250,42 @@ def test_send_packs_only_proxy_keys_to_group_relative_next(monkeypatch):
     assert set(sent["tensors"].keys()) == {"hidden_states", "residual"}
     assert sent["dst"] == 1
     assert torch.equal(sent["tensors"]["hidden_states"], torch.ones(3, 4))
+
+
+@pytest.mark.parametrize(
+    "pp_rank,pp_size,arch,method,holds,producer",
+    [
+        (0, 2, "KimiK3ForConditionalGeneration", None, True, False),
+        (1, 2, "KimiK3ForConditionalGeneration", None, False, False),
+        # A declared PP method's drafter shares the target's embedding.
+        (1, 2, "KimiK3ForConditionalGeneration", "dspark", True, False),
+        (1, 4, "KimiK3ForConditionalGeneration", "dspark", False, False),
+        (3, 4, "KimiK3ForConditionalGeneration", "dspark", True, False),
+        # Undeclared: the drafter keeps its own, so build none for it.
+        (1, 2, "KimiK3ForConditionalGeneration", "eagle", False, False),
+        (1, 2, "MiniMaxM3SparseForCausalLM", "dspark", False, False),
+        (0, 1, "KimiK3ForConditionalGeneration", "dspark", True, False),
+        # A P/D producer's draft only writes context K/V: no last-stage copy.
+        (1, 2, "KimiK3ForConditionalGeneration", "dspark", False, True),
+        (0, 2, "KimiK3ForConditionalGeneration", "dspark", True, True),
+    ],
+)
+def test_pp_holds_embedding(
+    monkeypatch, pp_rank, pp_size, arch, method, holds, producer
+):
+    grp = MagicMock(is_first_rank=pp_rank == 0, is_last_rank=pp_rank == pp_size - 1)
+    fake_ps = MagicMock()
+    fake_ps.get_pp_group.return_value = grp
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", fake_ps)
+    spec = method and types.SimpleNamespace(
+        method=method, use_dspark=lambda: method == "dspark"
+    )
+    config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(architectures=[arch]),
+        speculative_config=spec,
+        kv_transfer_config={"kv_role": "kv_producer"} if producer else {},
+    )
+    assert pp_holds_embedding(config) is holds
 
 
 def test_send_tolerates_missing_residual(monkeypatch):
@@ -684,6 +765,66 @@ def test_decode_inflight_block():
     assert seq.id in batch3.req_ids
 
 
+def test_mixed_batch_keeps_a_middle_chunk_out_of_flight():
+    """A mixed batch is `[prefill | decode]`. Its decode rows and final-chunk
+    prefill rows yield a token; a middle-chunk prefill row does not, so it is
+    neither blocked nor released by this batch -- only by its final chunk's."""
+    from types import SimpleNamespace
+
+    batch = SimpleNamespace(
+        req_ids=[1, 2, 3, 4],
+        total_seqs_num_prefill=2,
+        total_seqs_num_decode=2,
+        is_final_chunk=[False, True, False, False],
+    )
+    assert list(Scheduler._pp_inflight_req_ids(batch)) == [2, 3, 4]
+
+    sched = Scheduler(_pp_config())
+    sched._pp_inflight_token_block.add(1)  # held by its final-chunk batch
+    sched.release_pp_inflight(batch)
+    assert 1 in sched._pp_inflight_token_block
+
+
+def test_mixed_middle_chunk_completing_first_keeps_its_seq_blocked():
+    """valarLip's PP + mixed case, end to end. Batch M carries A's middle chunk
+    beside a decode, batch F A's final chunk. If M completes first, A must stay
+    blocked until F's token is back: it was advanced past its prompt when F was
+    scheduled, so decoding it now would read a stale token and position."""
+    cfg = _pp_config(enable_mixed_prefill_decode=True, max_num_batched_tokens=64)
+    sched = Scheduler(cfg)
+    block = cfg.kv_cache_block_size
+    d = _make_seq(16, block_size=block)
+    sched.add(d)
+    sched.schedule()  # d's whole prompt
+    d.token_ids.append(42)  # its token came back: d now decodes
+    d.num_tokens += 1
+    d.type = SequenceType.DECODE
+
+    a = _make_seq(100, block_size=block)
+    sched.add(a)
+    m, _ = sched.schedule()
+    assert m.is_mixed and m.req_ids == [a.id, d.id]
+    assert m.is_final_chunk[0] is False
+    sched.mark_pp_inflight(m)
+
+    f = None
+    for _ in range(4):
+        batch, _ = sched.schedule()
+        sched.mark_pp_inflight(batch)
+        if a.id in batch.req_ids and batch.is_final_chunk[batch.req_ids.index(a.id)]:
+            f = batch
+            break
+    assert f is not None
+
+    sched.release_pp_inflight(m)  # M completes before F
+    assert a.id in sched._pp_inflight_token_block
+    batch, _ = sched.schedule()
+    assert a.id not in batch.req_ids
+
+    sched.release_pp_inflight(f)
+    assert a.id not in sched._pp_inflight_token_block
+
+
 def test_multiple_seqs_partial_and_final():
     cfg = _pp_config(max_num_batched_tokens=200)
     sched = Scheduler(cfg)
@@ -719,6 +860,48 @@ def test_middle_chunk_output_discarded():
     initial_num_tokens = seq.num_tokens
     sched.postprocess(list(seqs1.values()), fwd_out, batch=batch1)
     assert seq.num_tokens == initial_num_tokens
+
+
+def test_mixed_batch_keeps_the_decode_token_under_pp():
+    """A mixed batch's decode rows are not middle chunks.
+
+    `is_final_chunk` is padded with False for the decode rows that trail the
+    prefill rows; the advance-on-schedule loop read those as middle chunks and
+    dropped every decode row's sampled token on every mixed step.
+    """
+    import numpy as np
+
+    cfg = _pp_config(max_num_batched_tokens=100, enable_mixed_prefill_decode=True)
+    sched = Scheduler(cfg)
+
+    def output(batch):
+        n = len(batch.req_ids)
+        return ScheduledBatchOutput(
+            req_ids=list(batch.req_ids),
+            token_ids=[(42,)] * n,
+            num_rejected=np.zeros(n, dtype=np.int32),
+            num_bonus=np.zeros(n, dtype=np.int32),
+            draft_token_ids=None,
+            is_deferred_out=False,
+        )
+
+    decoding = _make_seq(32, block_size=cfg.kv_cache_block_size)
+    sched.add(decoding)
+    batch1, seqs1 = sched.schedule()
+    sched.postprocess(list(seqs1.values()), output(batch1), batch=batch1)
+
+    prefilling = _make_seq(300, block_size=cfg.kv_cache_block_size)
+    sched.add(prefilling)
+    batch2, seqs2 = sched.schedule()
+    assert batch2.is_mixed
+    assert batch2.req_ids == [prefilling.id, decoding.id]
+    assert batch2.is_final_chunk == [False, False]  # middle chunk + decode pad
+
+    decode_tokens = decoding.num_tokens
+    prompt_tokens = prefilling.num_tokens
+    sched.postprocess(list(seqs2.values()), output(batch2), batch=batch2)
+    assert decoding.num_tokens == decode_tokens + 1
+    assert prefilling.num_tokens == prompt_tokens  # the middle chunk's is dropped
 
 
 @pytest.mark.parametrize(
@@ -807,7 +990,10 @@ def test_the_fill_probe_sizes_a_waiting_request_as_admission_will():
     sched.add(_make_seq(10000))
     _with_census(sched)
 
-    assert sched._local_prefill_pending_work() == (True, 256)
+    assert sched._local_prefill_pending_work(limits=sched._prefill_limits()) == (
+        True,
+        256,
+    )
     assert not sched._dynamic_chunking_counts
     batch, _ = sched.schedule()
     assert batch.total_tokens_num == 256
@@ -1199,7 +1385,7 @@ def _prefill_ids(sched):
 
 def test_held_seq_is_skipped_by_both_prefill_scans():
     sched, seq, _, _ = _held_after_first_chunk()
-    pending, _ = sched._local_prefill_pending_work()
+    pending, _ = sched._local_prefill_pending_work(limits=sched._prefill_limits())
     assert not pending, "the probe counted a held chunk as pending work"
     assert seq.id not in _prefill_ids(sched)
     assert seq.id in sched._checkpoint_holds
@@ -1246,7 +1432,8 @@ def test_head_flushes_a_held_chunk_when_its_ack_arrives():
     sched.mark_pp_inflight(batch)
     core = PPEngineCoreProc.__new__(PPEngineCoreProc)
     core.scheduler = sched
-    core.pp_size = 1  # the in-flight chunk fills the window: schedule nothing
+    # The in-flight chunk fills the window: schedule nothing.
+    core.pp_size = core.pp_max_inflight = 1
     core._in_flight = deque([(batch, seqs, False)])
     core._pending_prefix_hash = deque()
     core._defer_prefix_hash = True

@@ -14,9 +14,9 @@ from atom.model_ops.fla_ops.chunk import (
 )
 from atom.model_ops.fla_ops.fused_recurrent import fused_recurrent_gated_delta_rule
 
+ON_GFX942 = torch.cuda.get_device_properties().gcnArchName.split(":")[0] == "gfx942"
 requires_gfx942 = pytest.mark.skipif(
-    torch.cuda.get_device_properties().gcnArchName.split(":")[0] != "gfx942",
-    reason="FlyDSL GDN decode is supported only on gfx942",
+    not ON_GFX942, reason="FlyDSL GDN decode is validated only on gfx942"
 )
 
 
@@ -168,8 +168,9 @@ def test_decode(batch, state_dtype, physical_vk):
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("physical_vk", [True])
+@pytest.mark.parametrize("reuse_out", [False, True])
 @requires_gfx942
-def test_decode_graph_mixed_padding(state_dtype, physical_vk):
+def test_decode_graph_mixed_padding(state_dtype, physical_vk, reuse_out):
     q, k, v, a, b, log, bias = inputs(4)
     original = torch.randn(8, 24, 128, 128, device="cuda", dtype=state_dtype) * 0.1
     state = original.clone()
@@ -177,17 +178,21 @@ def test_decode_graph_mixed_padding(state_dtype, physical_vk):
         state = state.transpose(-1, -2).contiguous().transpose(-1, -2)
     reads = torch.tensor([0, 1, 2, -1], device="cuda", dtype=torch.int32)
     writes = torch.tensor([4, 5, 6, -1], device="cuda", dtype=torch.int32)
+    out = torch.full_like(v[0], float("nan")) if reuse_out else None
     for _ in range(3):
-        fly.decode(q, k, v, a, b, state, log, bias, reads, writes)
+        fly.decode(q, k, v, a, b, state, log, bias, reads, writes, out=out)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        result, _ = fly.decode(q, k, v, a, b, state, log, bias, reads, writes)
+        result, _ = fly.decode(q, k, v, a, b, state, log, bias, reads, writes, out=out)
+    if reuse_out:
+        assert result.data_ptr() == out.data_ptr()
     for live in (3, 2, 1, 3):
         ri = list(range(live)) + [-1] * (4 - live)
         wi = list(range(4, 4 + live)) + [-1] * (4 - live)
         reads.copy_(torch.tensor(ri, device="cuda", dtype=torch.int32))
         writes.copy_(torch.tensor(wi, device="cuda", dtype=torch.int32))
         state.copy_(original)
+        result.fill_(float("nan"))
         graph.replay()
         reference = original.clone()
         expected = baseline_decode(
@@ -204,6 +209,7 @@ def test_decode_graph_mixed_padding(state_dtype, physical_vk):
         )
         close(result[:, :live], expected, f"graph live={live}")
         assert torch.count_nonzero(result[:, live:]) == 0
+        assert not torch.signbit(result[:, live:]).any()
         close(state, reference, "graph state")
 
 
@@ -285,6 +291,23 @@ def test_triton_decode_skips_padding_rows_with_tokens(monkeypatch):
     torch.testing.assert_close(storage[0], original[0], rtol=0, atol=0)
 
 
+class _GdnLayer:
+    base_linear_attention = None
+
+    def __init__(self, impl):
+        self.impl = impl
+
+
+def _with_one_gdn_layer(builder, layer, state):
+    """`_gdn_flydsl_policies` decides once from the runner's SSM slot, for
+    the GDN layers in the pool rows."""
+    from atom.model_ops.attentions.gdn_attn import LINEAR_STATE_ROWS
+
+    builder._pool_rows = {LINEAR_STATE_ROWS: {layer: 0}}
+    builder._state_shape_for_runner = lambda: (None, tuple(state.shape[1:]))
+    builder._state_dtypes = lambda: (None, state.dtype)
+
+
 @pytest.mark.parametrize("replayssm", [False, True])
 @pytest.mark.parametrize("supported_arch", [False, True])
 @pytest.mark.parametrize("decode_backend", ["auto", "triton", "flydsl"])
@@ -310,9 +333,10 @@ def test_qwen_backend_binds_zero_copy_vk_state(
     monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
     monkeypatch.setattr(fly, "backend", lambda stage: decode_backend)
     monkeypatch.setattr(fly, "ops", lambda: object())
-    monkeypatch.setattr(fly, "decode_device_supported", lambda device: supported_arch)
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: supported_arch)
     attention = SimpleNamespace(allow_aiter_flydsl=allowed, dt_bias=raw)
-    layer = SimpleNamespace(base_linear_attention=None, impl=attention)
+    layer = _GdnLayer(attention)
+    _with_one_gdn_layer(builder, layer, raw)
     result = builder.build_kv_cache_tensor(layer)
     assert result.v_cache.data_ptr() == raw.data_ptr()
     expected = (
@@ -320,9 +344,13 @@ def test_qwen_backend_binds_zero_copy_vk_state(
     )
     assert attention.gdn_flydsl_policy.decode == expected
     assert result.v_cache.stride()[-2:] == ((1, 128) if expected else (128, 1))
+    # Prefill does not depend on the pool layout; under ReplaySSM it needs gfx942.
+    prefill = (
+        allowed and decode_backend != "triton" and (supported_arch or not replayssm)
+    )
+    assert attention.gdn_flydsl_policy.prefill == prefill
+    assert builder._flydsl_prefill_enabled == prefill
     if replayssm:
-        assert not attention.gdn_flydsl_policy.prefill
-        assert not builder._flydsl_prefill_enabled
         assert result.v_cache is raw
 
 
@@ -359,8 +387,6 @@ def test_align_flydsl_decode_rejects_strided_and_views_padded_indices():
 
 
 def test_unsupported_device_decode_fallback(monkeypatch):
-    from types import SimpleNamespace
-
     q, k, v, a, b, log, bias = inputs(3)
     state = torch.randn(6, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
     vk = state.transpose(-1, -2).contiguous().transpose(-1, -2)
@@ -368,11 +394,7 @@ def test_unsupported_device_decode_fallback(monkeypatch):
     writes = reads + 3
     monkeypatch.setattr(fly, "backend", lambda stage: "auto")
     monkeypatch.setattr(fly, "ops", lambda: object())
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(gcnArchName="gfx950"),
-    )
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: False)
     assert not fly.decode_supported(q, k, v, a, b, vk, log, bias, reads, writes)
     with pytest.raises(ValueError, match="Unsupported"):
         fly.decode(q, k, v, a, b, vk, log, bias, reads, writes)
@@ -386,12 +408,12 @@ def test_unsupported_device_decode_fallback(monkeypatch):
     torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
 
 
-@pytest.mark.parametrize("missing_ops", [False, True])
+@pytest.mark.parametrize("no_hip", [False, True])
 @pytest.mark.parametrize("lossy_decode", [False, True])
-def test_policy_dependencies_and_lossy(monkeypatch, missing_ops, lossy_decode):
+def test_policy_dependencies_and_lossy(monkeypatch, no_hip, lossy_decode):
     monkeypatch.setattr(fly, "backend", lambda stage: "auto")
-    monkeypatch.setattr(fly, "ops", lambda: None if missing_ops else object())
-    monkeypatch.setattr(fly, "decode_device_supported", lambda device: True)
+    monkeypatch.setattr(fly, "ops", lambda: None if no_hip else object())
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: True)
     policy = fly.select_policy(
         allowed=True,
         replayssm=False,
@@ -399,8 +421,8 @@ def test_policy_dependencies_and_lossy(monkeypatch, missing_ops, lossy_decode):
         state=torch.empty(1, 24, 128, 128, device="cuda", dtype=torch.bfloat16),
         activation_dtype=torch.bfloat16,
     )
-    assert policy.prefill == (not missing_ops)
-    assert policy.decode == (not missing_ops and not lossy_decode)
+    assert policy.prefill == (not no_hip)
+    assert policy.decode == (not no_hip and not lossy_decode)
 
 
 @pytest.mark.parametrize("mode", ["replayssm", "unsupported", "disabled", "flydsl"])
@@ -412,11 +434,14 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
     from atom.model_ops import attention_gdn as gdn
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
-    from atom.model_ops.fla_ops.replayssm import replayssm_buffer_shapes
+    from atom.model_ops.fla_ops.replayssm import (
+        replayssm_buffer_shapes,
+        replayssm_flush_wait,
+    )
     from atom.utils import envs
 
-    if mode == "flydsl" and not fly.decode_device_supported(torch.device("cuda")):
-        pytest.skip("FlyDSL decode numerical coverage requires gfx942")
+    if mode == "flydsl" and not ON_GFX942:
+        pytest.skip("FlyDSL GDN decode is validated only on gfx942")
     q, k, v, a, b, log, bias = inputs(3)
     raw = torch.randn(3, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
     reference = raw.clone()
@@ -429,6 +454,8 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
         replay_buf_k=torch.zeros((3, *sk), device="cuda", dtype=torch.bfloat16),
         replay_buf_u=torch.zeros((3, *su), device="cuda", dtype=torch.bfloat16),
         replay_buf_g=torch.zeros((3, *sg), device="cuda", dtype=torch.float32),
+        replay_flush_arrivals=torch.zeros(3, 24, device="cuda", dtype=torch.int32),
+        replay_flush_wait=replayssm_flush_wait(),
     )
     attention = gdn.GatedDeltaNet.__new__(gdn.GatedDeltaNet)
     torch.nn.Module.__init__(attention)
@@ -453,13 +480,13 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
         fly, "backend", lambda stage: "triton" if mode == "disabled" else "auto"
     )
     if mode == "unsupported":
-        monkeypatch.setattr(fly, "decode_device_supported", lambda device: False)
+        monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: False)
     monkeypatch.setattr(
         GDNAttentionMetadataBuilder, "build_kv_cache_tensor", lambda self, module: cache
     )
-    cache = builder.build_kv_cache_tensor(
-        SimpleNamespace(base_linear_attention=None, impl=attention)
-    )
+    layer = _GdnLayer(attention)
+    _with_one_gdn_layer(builder, layer, raw)
+    cache = builder.build_kv_cache_tensor(layer)
     # Production binds a zero-filled pool before prefill populates logical KV
     # states. Seed logical values after binding, not physical pre-bind storage.
     cache.v_cache.copy_(reference)
@@ -512,3 +539,238 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
         assert cache.v_cache.is_contiguous()
     else:
         close(cache.v_cache, reference, "forward state")
+
+
+@pytest.mark.parametrize("lengths", [(64,), (129, 1000), (3808, 4352)])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_replayssm_checkpoint_from_flydsl_prefill_matches_triton(lengths, state_dtype):
+    """Under ReplaySSM a prefill writes the contiguous KV checkpoint the next
+    verify replays. Both prefill kernels must leave the same one."""
+    from atom.model_ops.fla_ops.replayssm import (
+        replayssm_buffer_shapes,
+        replayssm_flush_wait,
+        replayssm_gated_delta_rule,
+    )
+
+    n = len(lengths)
+    q, k, v, a, b, log, bias = inputs(sum(lengths))
+    g, beta = fused_gdn_gating(log, a, b, bias)
+    cu = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    pool = torch.randn(2 * n + 1, 24, 128, 128, device="cuda", dtype=state_dtype) * 0.1
+    reads = torch.arange(1, n + 1, device="cuda", dtype=torch.int32)
+    writes = reads + n
+    live = torch.arange(n, device="cuda") % 2 == 0
+    metadata = fly.build_prefill_metadata(lengths, cu)
+    assert fly.prefill_supported(q, k, v, g, beta, metadata)
+
+    # The two prefill branches of `GatedDeltaNet.forward`.
+    baseline = pool.clone()
+    initial = baseline.index_select(0, reads.long())
+    initial.masked_fill_(~live.view(-1, 1, 1, 1), 0)
+    expected, expected_ht = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial,
+        output_final_state=True,
+        cu_seqlens=cu,
+        use_qk_l2norm_in_kernel=True,
+    )
+    baseline.index_copy_(0, writes.long(), expected_ht.to(state_dtype))
+    flydsl = pool.clone()
+    result, result_ht, _ = fly.prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        flydsl,
+        cu,
+        metadata,
+        state_indices=reads,
+        has_initial_state=live,
+    )
+    flydsl.index_copy_(0, writes.long(), result_ht.to(state_dtype))
+
+    close(result, expected, f"replayssm prefill {lengths} {state_dtype} output")
+    assert flydsl.is_contiguous()
+    close(flydsl[writes.long()], baseline[writes.long()], "checkpoint")
+    others = torch.ones(pool.shape[0], dtype=torch.bool, device="cuda")
+    others[writes.long()] = False
+    torch.testing.assert_close(flydsl[others], pool[others], rtol=0, atol=0)
+
+    # The next verify window replays each checkpoint, nothing committed yet.
+    window = 4
+    vq, vk, vv, va, vb, _, _ = inputs(n * window, seed=7)
+    vg, vbeta = fused_gdn_gating(log, va, vb, bias)
+    shape_k, shape_u, shape_g = replayssm_buffer_shapes(2 * window, 24, 128, 128, False)
+    slots = pool.shape[0]
+
+    def verify(ckpt):
+        buf_u = torch.zeros((slots, *shape_u), device="cuda", dtype=torch.bfloat16)
+        out = replayssm_gated_delta_rule(
+            q=vq,
+            k=vk,
+            v=vv,
+            g=vg,
+            beta=vbeta,
+            ckpt=ckpt,
+            buf_k=torch.zeros((slots, *shape_k), device="cuda", dtype=torch.bfloat16),
+            buf_u=buf_u,
+            flush_arrivals=torch.zeros(slots, 24, device="cuda", dtype=torch.int32),
+            flush_wait=replayssm_flush_wait(),
+            buf_g=torch.zeros((slots, *shape_g), device="cuda", dtype=torch.float32),
+            write_pos=torch.zeros(slots, device="cuda", dtype=torch.int32),
+            slot_idx=writes,
+            cu_seqlens=torch.arange(
+                0, n * window + 1, window, device="cuda", dtype=torch.int32
+            ),
+            max_query_len=window,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return out, buf_u
+
+    expected_out, expected_records = verify(baseline)
+    result_out, result_records = verify(flydsl)
+    close(result_out, expected_out, "replayssm verify output")
+    close(result_records, expected_records, "replayssm records")
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_replayssm_prefill_layer_dispatch_matches_triton(monkeypatch, keep):
+    """The Native GDN layer under ReplaySSM prefill metadata, both backends."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from atom.model_ops import attention_gdn as gdn
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
+    from atom.model_ops.fla_ops.replayssm import replayssm_buffer_shapes
+    from atom.utils import envs
+
+    lengths = (129, 1000)
+    tokens = sum(lengths)
+    q, k, v, a, b, log, bias = inputs(tokens)
+    cu = torch.tensor([0, 129, tokens], device="cuda", dtype=torch.int32)
+    reads = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    writes = torch.tensor([3, 4], device="cuda", dtype=torch.int32)
+    live = torch.tensor([True, False], device="cuda")
+    original = torch.randn(5, 24, 128, 128, device="cuda", dtype=torch.float32) * 0.1
+    shapes = replayssm_buffer_shapes(8, 24, 128, 128, False)
+    monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
+    # Isolate GDN from the unrelated convolution, preserving real q/k/v values.
+    monkeypatch.setattr(
+        gdn, "causal_conv1d_fn", lambda *args, **kwargs: (q[0], k[0], v[0])
+    )
+    kernels = (fly.prefill, gdn.chunk_gated_delta_rule, gdn.replayssm_gated_delta_rule)
+
+    def run(prefill_backend):
+        pool = original.clone()
+        ring = [
+            torch.randn((5, *shape), device="cuda").to(dtype)
+            for shape, dtype in zip(
+                shapes, (torch.bfloat16, torch.bfloat16, torch.float32)
+            )
+        ]
+        write_pos = torch.full((5,), 2, device="cuda", dtype=torch.int32)
+        untouched = [t.clone() for t in (*ring, write_pos)]
+        cache = SimpleNamespace(
+            v_cache=pool,
+            k_cache=torch.zeros(5, 1, 1, device="cuda", dtype=torch.bfloat16),
+            replay_buf_k=ring[0],
+            replay_buf_u=ring[1],
+            replay_buf_g=ring[2],
+        )
+        attention = gdn.GatedDeltaNet.__new__(gdn.GatedDeltaNet)
+        torch.nn.Module.__init__(attention)
+        for name, value in {
+            "layer_num": 0,
+            "tp_size": 1,
+            "num_k_heads": 8,
+            "num_v_heads": 24,
+            "head_k_dim": 128,
+            "head_v_dim": 128,
+            "A_log": log,
+            "dt_bias": bias,
+            "allow_aiter_flydsl": True,
+            "activation": "silu",
+            "conv1d": SimpleNamespace(weight=torch.zeros(1, 1, 1), bias=None),
+        }.items():
+            setattr(attention, name, value)
+        monkeypatch.setattr(fly, "backend", lambda stage: prefill_backend)
+        monkeypatch.setattr(
+            GDNAttentionMetadataBuilder,
+            "build_kv_cache_tensor",
+            lambda self, module: cache,
+        )
+        builder = object.__new__(Qwen4ExpMetadataBuilder)
+        builder.replayssm = True
+        layer = _GdnLayer(attention)
+        _with_one_gdn_layer(builder, layer, pool)
+        bound = builder.build_kv_cache_tensor(layer)
+        assert bound.v_cache is pool
+        assert not attention.gdn_flydsl_policy.decode
+        metadata = SimpleNamespace(
+            replayssm=True,
+            write_pos=write_pos,
+            slot_idx=writes,
+            has_initial_state=live,
+            no_initial_state=~live,
+            spec_query_start_loc=None,
+            non_spec_query_start_loc=cu,
+            spec_sequence_masks=None,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            spec_state_indices_tensor=None,
+            spec_state_indices_in_tensor=None,
+            non_spec_state_indices_tensor=writes,
+            non_spec_state_indices_in_tensor=reads,
+            non_spec_state_indices_i64=writes.long(),
+            non_spec_state_indices_in_i64=reads.long(),
+            num_actual_tokens=tokens,
+            num_accepted_tokens=None,
+            num_prefills=2,
+            num_decodes=0,
+            ssm_checkpoints=None,
+            keep_intermediate_states=keep,
+            flydsl_prefill_metadata=fly.build_prefill_metadata(lengths, cu),
+        )
+        context = SimpleNamespace(
+            attn_metadata=SimpleNamespace(gdn_metadata=metadata),
+            kv_cache_data={"layer_0": cache},
+        )
+        monkeypatch.setattr(gdn, "get_forward_context", lambda: context)
+        prefill, chunked, replay = (Mock(wraps=kernel) for kernel in kernels)
+        monkeypatch.setattr(fly, "prefill", prefill)
+        monkeypatch.setattr(gdn, "chunk_gated_delta_rule", chunked)
+        monkeypatch.setattr(gdn, "replayssm_gated_delta_rule", replay)
+        out = attention(
+            torch.empty(tokens, 1, device="cuda"),
+            b,
+            a,
+            torch.empty_like(v[0]),
+            "layer_0",
+        )
+        flydsl = prefill_backend != "triton" and ON_GFX942
+        assert prefill.call_count == int(flydsl)
+        assert chunked.call_count == int(not flydsl)
+        replay.assert_not_called()
+        assert pool.is_contiguous()
+        for before, after in zip(untouched, (*ring, write_pos)):
+            torch.testing.assert_close(after, before, rtol=0, atol=0)
+        return out, pool, pop_last_intermediate_states()
+
+    expected, expected_pool, expected_h = run("triton")
+    actual, actual_pool, actual_h = run("auto")
+    close(actual, expected, "replayssm layer output")
+    close(actual_pool[writes.long()], expected_pool[writes.long()], "checkpoint")
+    others = [0, 1, 2]
+    torch.testing.assert_close(actual_pool[others], original[others], rtol=0, atol=0)
+    if keep:
+        close(actual_h, expected_h, "published snapshots")
+    else:
+        assert actual_h is None and expected_h is None

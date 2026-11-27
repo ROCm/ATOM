@@ -356,7 +356,9 @@ class HiPrograms:
                 ch["knobs"] = {"INDEX_KLAYOUT": self.index_layout}
             blocks = L.window_layer_blocks(first=False, tp=self.tp, source=self.sources[p.layer_id],
                                            engram=p.engram, **ch)  # fmt: skip
-        stages = L.moe_route_early([st for b in blocks for st in b.stages(sc)])
+        stages = L.moe_route_early(
+            [st for b in blocks for st in b.stages(sc)], tp=self.tp
+        )
         tag = "_".join(str(x) for x in p.program_key).replace(" ", "").replace("+", "")
         tag += (
             ("_push" if push else "")

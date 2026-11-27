@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """ATOM's four V4.1 classes, as this frontend needs them.
 
 The metadata builder, the CSA2 cache, attention and the Engram staging each
@@ -26,7 +28,7 @@ import torch
 from atom.model_ops.attentions.deepseek_v41.backend import (
     DeepseekV41MetadataBuilder,
 )
-from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache, cut_slab
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
     sparse_attn_v41_paged_2src,
 )
@@ -35,9 +37,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
-from atom.model_ops.engram.device.hashing import engram_snapshot_indices
 from atom.model_ops.engram.device.staging import EngramStaging
-from atom.model_ops.engram.device.uva import uva_gather_into
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 from atom.utils.region_graph import join_stream
 
@@ -175,6 +175,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
                 self.device,
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
+                prefill_window_staging=self._prefill_window_staging,
             )
         cached = getattr(self, "_capture_dummy", None)
         if cached is None:
@@ -191,6 +192,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
                 self.device,
                 max_tokens=ceiling_tokens,
                 workspace=self.score_workspace,
+                prefill_window_staging=self._prefill_window_staging,
             )
             self._capture_dummy = cached
         elif (
@@ -220,11 +222,14 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         start_positions=None,
         engram_live=True,
         cache_override=None,
+        final_heads=None,
     ):
         """``engram_live`` False: Engram's forward kernels run on no token.
 
         ``cache_override`` selects private profiling capture storage without
         changing the serving binding or forcing a verify batch into prefill.
+        ``final_heads``: returns the requests' heads once they are known; the
+        step is staged at ``start_positions`` until then (`_settle_heads`).
         """
         spans, rows, offset, next_page = [], [], 0, 0
         slots = batch.state_slots_committed
@@ -291,6 +296,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
                 is_prefill=is_prefill,
                 engram_live=engram_live,
                 replay_layout=(resumes, floors, cached_until, histories),
+                final_heads=final_heads,
             )
 
 
@@ -440,6 +446,12 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
         )
         super()._report_stale_state(cursors, starts, requests, fresh | warmup)
 
+    def _allocate_buffers(self, sizes, device):
+        # vLLM owns the allocation. Consume its budgeted slab once, then expose
+        # one tensor per source with the same layout as native allocations.
+        _, views = cut_slab(lambda n: self._allocate_backing(n, device), sizes)
+        return views
+
     def _allocate_backing(self, size, device):
         """The slab, trimmed and zeroed to core's contract.
 
@@ -562,37 +574,44 @@ def _attend_block(
     # decode allows it, the window write. `window_kv` is what is left for
     # `write_window` below, which is nothing when that fold happened. The
     # FP8 pool's attention reads the query as MXFP8 (`query_fp8`).
-    query_fp8 = cache.query_fp8(query)
+    a8w4 = self._use_a8w4_attention(query, cache)
+    query_fp8 = cache.query_fp8(query, a8w4=a8w4)
     if queries is None:
         kv, window_kv = cache.rope_quant_window(
-            self.spec.layer_id, query, kv_normed, rope, step, query_fp8
+            self.spec.layer_id, query, kv_normed, rope, step, query_fp8, a8w4=a8w4
         )
     else:
         kv, window_kv = cache.rope_quant_window(
-            self.spec.layer_id, None, kv_normed, rope, step
+            self.spec.layer_id, None, kv_normed, rope, step, a8w4=a8w4
         )
         cache.rotate_query(query, rope, queries.positions, query_fp8)
     # A forked compressor was already waited at the scorer, on whichever
     # stream that ran; joining it again costs one wait and keeps one rule.
     join_stream(self.index_stream, self.compress_stream)
     prefix, prefix_indptr, second, second_indptr = (
-        cache.attention_indices(self.spec, step)
+        cache.attention_indices(self.spec, step, a8w4=a8w4)
         if queries is None
-        else queries.indices(cache, self.spec)
+        else queries.indices(cache, self.spec, a8w4=a8w4)
     )
     flat_query = query.flatten(0, 1)
-    if cache.kv_fp8:
+    pool = cache.main_view(self.spec.kv_owner)
+    if cache.packed and not a8w4:
+        pool = (pool, cache.ring_view(self.spec.layer_id))
+    kwargs = {"out": flat_query}
+    if a8w4 or cache.kv_fp8:
         attend = sparse_attn_v41_paged_2src
         attending = tuple(part.flatten(0, 1) for part in query_fp8)
+        if a8w4:
+            kwargs["pool_scale_dtype"] = torch.float8_e4m3fn
     else:
         attend = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
         attending = flat_query
     if step.decode:
         cache.write_window(self.spec.layer_id, window_kv, step)
-        if cache.packed:
+        if cache.packed and not a8w4:
             output = packed_decode(
                 flat_query,
-                cache.pool,
+                pool,
                 prefix,
                 prefix_indptr,
                 self.attn_sink,
@@ -603,7 +622,7 @@ def _attend_block(
             # ring: the second source, beside the selection in the pool.
             output = attend(
                 attending,
-                cache.pool,
+                pool,
                 prefix,
                 prefix_indptr,
                 cache.ring_view(self.spec.layer_id),
@@ -611,20 +630,20 @@ def _attend_block(
                 second_indptr,
                 self.attn_sink,
                 self.softmax_scale,
-                out=flat_query,
+                **kwargs,
             )
     else:
         output = attend(
             attending,
-            cache.pool,
+            pool,
             prefix,
             prefix_indptr,
-            kv.flatten(0, -2),
+            kv if cache.kv_fp8 or a8w4 else kv.flatten(0, -2),
             second,
             second_indptr,
             self.attn_sink,
             self.softmax_scale,
-            out=flat_query,
+            **kwargs,
         )
         # Preserve the prior ring until every query has consumed its prefix.
         cache.write_window(self.spec.layer_id, window_kv, step)
@@ -790,7 +809,7 @@ class VllmEngramStaging(EngramStaging):
         if not getattr(self, "_vllm_prefetch_joined", False):
             self._await_layer(self.done[layer])
         if host._tp_group is not None and self.collective is None:
-            out = self.flat[layer][:width]
+            out = self._rows(width)[host.layer_ids.index(layer)]
             out = host._tp_group.all_gather(out, use_custom=True, dim=1)
             out = out[:, : host.embed_width]
             host.buffers[layer].gpu[:width].copy_(out)
@@ -815,32 +834,7 @@ def _prefetch(self, width):
     # neither order the inputs nor join the graph capture.
     self.stream.wait_stream(compute)
     with torch.cuda.stream(self.stream):
-        for layer in host.layer_ids:
-            ids = engram_snapshot_indices(
-                self.uva.hash_tables,
-                layer,
-                self.snapshot[:width],
-                self.uva.row_ids[:width],
-            )
-            table = host.prefetcher._tables[layer]
-            uva_gather_into(
-                table,
-                ids,
-                self.flat[layer][:width].view(width, host.local_heads, table.head_dim),
-                head_start=host.head_start,
-                local_heads=host.local_heads,
-                total_heads=host.total_heads,
-            )
-            if self.collective is not None:
-                out = self.gathered[layer][:width]
-                self.collective.all_gather_unreg(
-                    self.flat[layer][:width], out=out, dim=1
-                )
-                if self.gathered[layer] is not host.buffers[layer].gpu:
-                    host.buffers[layer].gpu[:width].copy_(out[:, : host.embed_width])
-            elif host._tp_group is None:
-                host.buffers[layer].gpu[:width].copy_(self.flat[layer][:width])
-            self.done[layer].record(self.stream)
+        self._lookup(width)
 
 
 def _await_layer(self, event) -> None:

@@ -66,7 +66,7 @@ def _builder(
         _HEAD_DIM,
         32,
         history_size=history_size,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         speculative_tokens=speculative_tokens,
         layer_ratios=(ratio,),
         index_topk=4,
@@ -81,16 +81,27 @@ def _builder(
         else None
     )
     builder.score_workspace = None
+    builder._prefill_window_staging = (
+        torch.empty(
+            (_CAPACITY * geometry.ring_slots + max_tokens) * geometry.window_row_bytes,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        if geometry.window_fp8
+        else None
+    )
     builder.block_size, builder.device = 32, "cuda"
     builder.max_bs, builder.max_num_batched_tokens = _CAPACITY, max_tokens
     buffers = metadata_buffers(_CAPACITY, max_tokens, 1, "cuda", geometry)
-    for name in ("positions", "batch_id_per_q_token"):
-        buffers[name].publication_group = "v41_step"
-    buffers["cu_seqlens_q"].publication_group = "early"
+    buffers["positions"].publication_group = "v41_step"
+    for name in ("cu_seqlens_q", "batch_id_per_q_token"):
+        buffers[name].publication_group = "early"
     buffers["block_tables"].publication_group = "seq_metadata"
     assert all(buffer.cpu.is_pinned() for buffer in buffers.values())
     builder.model_runner = SimpleNamespace(
-        forward_vars=buffers, v41_graphs_enabled=True
+        forward_vars=buffers,
+        v41_graphs_enabled=True,
+        config=SimpleNamespace(enable_tbo=False),
     )
     builder.engram = None
     return builder
@@ -155,8 +166,10 @@ def _projections(ratio, phase, tokens=_CAPACITY):
 
 
 def _reset_cache(cache, *, page_byte=0x5A, state_value=0.0):
-    cache.backing.zero_()
-    cache.page_bytes.fill_(page_byte)
+    for allocation in cache.allocations:
+        allocation.zero_()
+    for _, region in cache.page_regions:
+        region.fill_(page_byte)
     for state in cache.compress_state(0):
         state.fill_(state_value)
 
@@ -205,7 +218,15 @@ def _assert_plan(step, ratio, boundaries, writes):
 
 
 def _main_rows(cache):
+    if cache.window_fp8:
+        return torch.cat(cache.main_view(0), dim=-1).view(
+            cache.num_pages, -1, cache.geometry.main_row_bytes
+        )
     return cache.pages.view("main_0")[0]
+
+
+def _page_bytes(cache):
+    return torch.cat([view for _, view in cache.page_regions], dim=1)
 
 
 def _assert_only_rows_changed(cache, before, pages, row):
@@ -221,7 +242,9 @@ def _assert_only_rows_changed(cache, before, pages, row):
 
 
 def _assert_matches_eager(actual, expected):
-    torch.testing.assert_close(actual.page_bytes, expected.page_bytes, rtol=0, atol=0)
+    torch.testing.assert_close(
+        _page_bytes(actual), _page_bytes(expected), rtol=0, atol=0
+    )
     for observed, reference in zip(
         actual.compress_state(0), expected.compress_state(0)
     ):
@@ -242,13 +265,13 @@ def test_ratio2_zero_boundary_capture_replays_a_real_compressed_page(packed):
         _assert_plan(captured_step, 2, boundaries=0, writes=_CAPACITY)
         captured_storage = _storage(captured_step, 2)
         before = _main_rows(builder.cache).clone()
-        before_pages = builder.cache.page_bytes.clone()
+        before_pages = _page_bytes(builder.cache).clone()
         # Capture itself is not execution. This first replay really writes the
         # position-0 ring, while the compression grid has only sentinels.
         graph.replay()
         stream.synchronize()
         torch.testing.assert_close(
-            builder.cache.page_bytes, before_pages, rtol=0, atol=0
+            _page_bytes(builder.cache), before_pages, rtol=0, atol=0
         )
         for state, projected in zip(builder.cache.compress_state(0), (values, scores)):
             torch.testing.assert_close(
@@ -331,7 +354,7 @@ def test_ratio1_shrunk_replay_sentinels_stop_page_and_state_tail_writes(packed):
 
 
 def _cache_storage(cache):
-    tensors = [cache.backing, cache.cursor, cache.tentative_staging.gpu]
+    tensors = [*cache.allocations, cache.cursor, cache.tentative_staging.gpu]
     tensors.extend(tensor for pair in cache.indptr_buffers.values() for tensor in pair)
     return tuple((t.data_ptr(), tuple(t.shape), t.stride()) for t in tensors)
 
@@ -861,7 +884,8 @@ def test_plugin_publication_owner_waits_before_pinned_source_overwrite():
         buffer.cpu.fill_(22)  # only AFTER begin waited for the old source reader
 
         torch.cuda._sleep(100_000_000)
-        groups["v4_plans"].publish((8,))
+        groups["v4_plans"].set_count(buffer, 8)
+        groups["v4_plans"].publish()
         observations[1].copy_(buffer.gpu)
         read_done[1].record()
         owner.finish()
@@ -869,7 +893,8 @@ def test_plugin_publication_owner_waits_before_pinned_source_overwrite():
         owner.begin()
         assert read_done[1].query(), "begin returned before the previous epoch H2D read"
         buffer.cpu.fill_(33)
-        groups["v4_plans"].publish((8,))
+        groups["v4_plans"].set_count(buffer, 8)
+        groups["v4_plans"].publish()
         observations[2].copy_(buffer.gpu)
         owner.finish()
         owner.completion.synchronize()
@@ -974,3 +999,21 @@ def test_engram_join_outside_full_capture_keeps_replay_prefetch_live(monkeypatch
             assert staged.data_ptr() == pointer
             assert torch.all(observed == value)
             assert waits == {"layer": 1, "fork": epoch}
+
+
+@pytest.mark.parametrize("packed,width", [(False, 1), (True, 6)])
+def test_decode_indptr_oracle_matches_live_metadata(packed, width):
+    """Validate the fallback buffers without requiring a vLLM installation."""
+    builder = _builder(
+        2, packed, max_tokens=_CAPACITY * width, speculative_tokens=width - 1
+    )
+    step = _prepare(builder, [3, 7], slots=(3, 1), pages=(2, 4), width=width)
+    builder.cache.indptrs(step)
+    _assert_decode_indptrs(
+        step.indptrs[2][:2],
+        builder.cache.geometry,
+        [3, 7],
+        width,
+        step.running_tokens,
+        2,
+    )

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Ragged PAGE/STATE addressing for the unchanged V4 BF16 CSR kernels."""
+"""CSR row addressing for BF16 pools and contiguous quantized sources."""
 
 import torch
 import triton
@@ -41,8 +41,8 @@ def _indptr_scan(
 ):
     """One program: a running offset over the forward's whole token axis.
 
-    `SPLIT` (a BF16 decode, see `fill_step_indptrs`) keeps the window out of
-    the prefix: `pptr` counts the selection alone and `eptr` the window.
+    `SPLIT` (FP8 or BF16 decode) keeps the window out of the prefix:
+    `pptr` counts the selection alone and `eptr` the full window.
 
     V4's `_v4_decode_indptr_kernel`, for CSA2's classes: a prefix sum has to
     see every earlier token, so this is one serial scan rather than a grid, and
@@ -92,7 +92,15 @@ def _indptr_scan(
         prefix_total += tl.sum(count)
         if EXTEND or SPLIT:
             if EXTEND:
-                reach = tl.where(live, tl.minimum(pos - history_end + 1, WINDOW), 0)
+                reach = tl.where(
+                    live,
+                    (
+                        pos - first + 1
+                        if SPLIT
+                        else tl.minimum(pos - history_end + 1, WINDOW)
+                    ),
+                    0,
+                )
             else:
                 reach = history
             tl.store(
@@ -141,7 +149,7 @@ def _indptr_scan_all(
             )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["WINDOW_ROWS"])
 def _indices(
     selected,
     pptr,
@@ -171,9 +179,11 @@ def _indices(
     RING_STRIDE: tl.constexpr,
     RUN_ROWS: tl.constexpr,
     PACKED: tl.constexpr,
-    MAIN_ROW_BYTES: tl.constexpr,
     HISTORY: tl.constexpr,
+    SPLIT_PREFILL: tl.constexpr,
+    WINDOW_ROWS,
 ):
+    # WINDOW_ROWS is a live batch offset, not a compile-time shape.
     # `HISTORY`: the window rows at the tail of each prefix slice. A split
     # decode has them in `_window_rows`'s list instead.
     t = tl.program_id(0)
@@ -208,15 +218,9 @@ def _indices(
             tables + batch * table_stride + ids // ROWS_PER_PAGE, valid, other=0
         )
         rank = tl.cumsum(valid.to(tl.int32)) - 1
+        row = pages * PAGE_ROWS + global_offset + ids % ROWS_PER_PAGE
         if PACKED:
-            address = (
-                pages.to(tl.int64) * PAGE_ROWS
-                + global_offset
-                + (ids % ROWS_PER_PAGE) * MAIN_ROW_BYTES
-            )
-            row = address << 1
-        else:
-            row = pages * PAGE_ROWS + global_offset + ids % ROWS_PER_PAGE
+            row = row.to(tl.int64) << 1
         tl.store(prefix + pbegin + rank, row, valid)
     if HISTORY:
         slot = tl.load(slots + batch)
@@ -235,7 +239,16 @@ def _indices(
     if not DECODE and layer == 0:  # one extend plane for the whole run
         count = tl.minimum(pos - history_end + 1, WINDOW)
         begin = tl.load(eptr + t)
-        tl.store(extend + begin + i, t - count + 1 + i, i < count)
+        if SPLIT_PREFILL:
+            history_row = batch * RING_SLOTS + (first + i) % RING_SLOTS
+            tl.store(extend + begin + i, history_row, i < window_count)
+            tl.store(
+                extend + begin + window_count + i,
+                WINDOW_ROWS + t - count + 1 + i,
+                i < count,
+            )
+        else:
+            tl.store(extend + begin + i, t - count + 1 + i, i < count)
 
 
 @triton.jit
@@ -276,11 +289,11 @@ def _window_rows(
 def splits_window(step, geometry):
     """Whether this forward's attention reads its window as a second source.
 
-    A BF16 decode: every row's window is already in the ring, which is a view
-    the sparse kernel can take as its second source. A prefill's second is the
-    forward's own KV, and the packed pool's decode reads one tagged list.
+    FP8 always separates CSA and SWA. BF16 decode also reads the ring as its
+    second source. FP4's existing BF16 adapter gathers a mixed tagged prefix
+    and consumes dequantized current KV as its prefill second source.
     """
-    return step.decode and not geometry.packed
+    return geometry.kv_dtype == "fp8" or (step.decode and not geometry.packed)
 
 
 def _replay_start(step):
@@ -304,7 +317,7 @@ def _cached_until(step):
     return _replay_start(step) if cached is None else cached
 
 
-def fill_step_indptrs(step, geometry, buffers):
+def fill_step_indptrs(step, geometry, buffers, *, split=None):
     """`{ratio: (prefix indptr, extend indptr, reserved top-k)}` for this step.
 
     Into the caller's fixed buffers: a table at a fresh address each forward
@@ -313,9 +326,10 @@ def fill_step_indptrs(step, geometry, buffers):
 
     A split decode (`splits_window`) counts the selection alone in the prefix
     and the window in the extend indptr, the same for every ratio.
+    A8W4 explicitly requests `split=True` for NVFP4 CSA and MXFP8 SWA.
     """
     ratios = geometry.layer_ratios
-    split = splits_window(step, geometry)
+    split = splits_window(step, geometry) if split is None else split
     built = {}
     for ratio in ratios:
         prefix, extend = buffers[ratio]
@@ -368,7 +382,17 @@ def build_window_rows(step, geometry, window, eptr):
 
 
 def build_indices(
-    selected, indptrs, step, geometry, window, owner, ratio, layers=1, stride=0
+    selected,
+    indptrs,
+    step,
+    geometry,
+    window,
+    owner,
+    ratio,
+    layers=1,
+    stride=0,
+    *,
+    split=None,
 ):
     """`layers` consecutive layers' indices, starting at `window`'s, laid out
     by `indptrs`: `ratio`'s `(prefix, extend, reserved top-k)` of
@@ -378,10 +402,14 @@ def build_indices(
     forward's own rows -- so the run shares one plane of it. A split decode
     (`splits_window`) writes the selection alone, which every layer of a group
     shares, so it builds one plane for the group.
+    `split=True` also gives the NVFP4 cache untagged CSA/SWA row IDs for A8W4.
     """
-    history = not splits_window(step, geometry)
+    split = splits_window(step, geometry) if split is None else split
+    history = not split
+    packed = geometry.packed and not split
+    split_prefill = split and not step.decode
     if layers > 1 and not history:
-        raise ValueError("A split decode's selection is one plane for the group")
+        raise ValueError("Split-source selection is one plane for the group")
     topk = 0 if selected is None else selected.shape[-1]
     pptr, eptr, reserved = indptrs
     if topk != reserved:
@@ -392,19 +420,24 @@ def build_indices(
     plane = step.running_tokens * (topk + geometry.window_size * history)
     prefix = torch.empty(
         layers * plane,
-        dtype=torch.int64 if geometry.packed else torch.int32,
+        dtype=torch.int64 if packed else torch.int32,
         device=step.positions.device,
     )
     extend = torch.empty(
         (
             0
             if step.decode
-            else step.running_tokens * min(step.max_q_len, geometry.window_size)
+            else step.running_tokens
+            * (
+                geometry.window_size
+                if split_prefill
+                else min(step.max_q_len, geometry.window_size)
+            )
         ),
         dtype=torch.int32,
         device=step.positions.device,
     )
-    if step.running_tokens and plane:
+    if step.running_tokens and (plane or (geometry.window_fp8 and not step.decode)):
         _indices[(step.running_tokens, layers)](
             selected if topk else prefix,
             pptr,
@@ -425,10 +458,14 @@ def build_indices(
             _cached_until(step),
             DECODE=step.decode,
             ROWS_PER_PAGE=geometry.block_size // (ratio or 1),
-            PAGE_ROWS=geometry.page_bytes
-            // (1 if geometry.packed else geometry.row_bytes),
-            PACKED=geometry.packed,
-            MAIN_ROW_BYTES=geometry.main_row_bytes,
+            PAGE_ROWS=(
+                geometry.rows_per_page(ratio or 1)
+                if geometry.window_fp8
+                else geometry.page_bytes // geometry.row_bytes
+            ),
+            PACKED=packed,
+            SPLIT_PREFILL=split_prefill,
+            WINDOW_ROWS=(step.cu_seqlens_q.numel() - 1) * geometry.ring_slots,
             TOPK=topk,
             BLOCK=triton.next_power_of_2(max(topk, geometry.window_size)),
             WINDOW=geometry.window_size,

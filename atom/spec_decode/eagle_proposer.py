@@ -237,14 +237,18 @@ class EagleProposer(Drafter):
             # Shallow-copy instead of deepcopy: with MLA targets (K2.6), the
             # atom_config holds non-picklable cuda.Stream objects under
             # downstream fields that deepcopy can't traverse. We only mutate
-            # hf_config and compilation_config.level on the draft, so
-            # isolating just those two attrs is sufficient.
+            # hf_config, compilation_config.level and kv_cache_dtype on the
+            # draft, so isolating just those attrs is sufficient.
             draft_atom_config = copy.copy(self.config)
             draft_atom_config.hf_config = draft_model_hf_config
             draft_atom_config.compilation_config = copy.copy(
                 self.config.compilation_config
             )
             draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
+            # The draft's attention reads its cache dtype from this config, and
+            # its pool is built at `speculative_config.draft_kv_dtype`: they
+            # must be the one value (DSpark does the same).
+            draft_atom_config.kv_cache_dtype = self.speculative_config.draft_kv_dtype
             # Draft attention layer_num must continue from the target model's
             # layer count so it maps to the correct kv_cache_data entry.
             model = model_class(
@@ -252,11 +256,12 @@ class EagleProposer(Drafter):
                 layer_offset=self.config.hf_config.num_hidden_layers,
             )
             # Whether this draft needs a KV pool of its own is a property of
-            # the draft's config, answered by the backend that config resolves
-            # to. A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
+            # the draft's config, decided by the draft's attention family
+            # (`selector.DRAFT_POOL_FAMILIES`, the answer `draft_owns_kv_pool`
+            # gives). A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
             # binds into the target's pool and gets None here; model_runner
             # accounts for its +1 layer via num_nextn_predict_layers.
-            builder = draft_kv_builder(self.runner, draft_model_hf_config)
+            builder = draft_kv_builder(self.runner, draft_model_hf_config, model)
             if builder is not None:
                 self.runner.draft_kv_builder = builder
             return model
@@ -865,6 +870,9 @@ class EagleProposer(Drafter):
                             num_reject_tokens,
                         )
                         # From here the loop owns the pass's positions buffer.
+                        # `prepare_mtp_decode` derives each step's SWA extents
+                        # from it, so it must be `running_bs` wide before the
+                        # metadata advance; padding only before forward is late.
                         if self.step is not None:
                             positions = self.step.stage(
                                 running_bs, {"positions": positions}

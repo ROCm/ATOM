@@ -43,6 +43,10 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
+# Off in a process that only loads (a weight cache daemon sets it): the
+# servers that take its weights set up MoE communication themselves.
+MOE_PREPARE_FINALIZE = True
+
 
 def _weight_identity(param: nn.Parameter) -> str:
     """Name the weight a loader was handed, for failures inside one.
@@ -177,7 +181,9 @@ def _save_online_quant_info(
     """Save online quantization info to a JSON file (rank 0 only)."""
     if get_tp_group().rank_in_group != 0:
         return
-    output_dir = envs.ATOM_TORCH_PROFILER_DIR or os.getcwd()
+    output_dir = (
+        envs.ATOM_ONLINE_QUANT_INFO_DIR or envs.ATOM_TORCH_PROFILER_DIR or os.getcwd()
+    )
     os.makedirs(output_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     timestamp_ns = time.time_ns() % 1_000_000_000
@@ -403,7 +409,7 @@ def load_model(
         # since sglang will call this func automatically after finishing loading
         if isinstance(quant_method, QuantizeMethodBase) and not is_sglang():
             quant_method.process_weights_after_loading(module)
-        if isinstance(quant_method, FusedMoEMethodBase):
+        if MOE_PREPARE_FINALIZE and isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)
 
         # Online quantization creates new params (e.g. weight_scale) that are

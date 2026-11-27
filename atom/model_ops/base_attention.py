@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 import torch
 import triton
 import triton.language as tl
+from aiter import dtypes
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     pa_decode_gluon_supports_arch,
 )
@@ -17,11 +18,12 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.utils import envs, mark_spliting_op
+from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
-from .attention_mla import MLAModules, _mla_output_width
-from .sp_attention import gather_heads, ulysses_attention
+from .attention_mla import MLAAttention, MLAModules, _mla_output_width
+from .sp_attention import attention_fp8_fake, gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
 
@@ -449,14 +451,19 @@ def _flydsl_prepare_explicit_plan(
     existing_plan,
     plan_step_owner=None,
     plan_cache_owner=None,
+    plan_segment: int = 0,
+    plan_workgroup_budget: int | None = None,
 ):
     """Return the explicit plan aiter #5809 requires.
 
     ``plan_partition_cap``: None takes ``flydsl_plan_shape``, i.e. aiter's
     defaults except at head_dim 256; a caller's cap is kept, with aiter's
-    default budget.
+    default budget, or ``plan_workgroup_budget`` when given.
     ``plan_step_owner``: a per-step object whose calls all share the same
     lengths; the plan is then refreshed once per step instead of every call.
+    ``plan_segment``: which slice of one call's rows this is, for a caller that
+    runs more rows than one plan takes in segments of equal size, each with a plan
+    of its own.
     ``plan_cache_owner``: the object that owns plan/scratch storage. Omit it
     for process-lifetime storage (required by captured decode graphs); sparse
     prefill passes its ephemeral metadata so variable row counts are released.
@@ -473,12 +480,12 @@ def _flydsl_prepare_explicit_plan(
         max_partitions = int(plan_partition_cap)
     else:
         max_partitions = shape.get("max_partitions")
-    workgroup_budget = shape.get("workgroup_budget")
 
     if existing_plan is not None and flydsl_plan_matches(
         existing_plan, num_seqs, num_kv_heads
     ):
         return existing_plan
+    workgroup_budget = shape.get("workgroup_budget", plan_workgroup_budget)
 
     from atom.utils.tbo.ubatching import tbo_current_ubatch_id
 
@@ -497,6 +504,7 @@ def _flydsl_prepare_explicit_plan(
         workgroup_budget,
         device.index,
         plan_step_owner is not None,
+        plan_segment,
     )
     plans = _FLYDSL_RUNTIME_PLANS
     if plan_cache_owner is not None:
@@ -1000,8 +1008,34 @@ def fake_(
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
-@eager_region()
 def unified_attention_with_output_base(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+) -> torch.Tensor:
+    """The attention: an MLA layer's prefill split on a prefill token-graph
+    recording and the warmup forward before it
+    (`MLAAttention.records_prefill_split`); otherwise one TR-graph break
+    (`_attention_region`) on a recording or inside a graph capture, and a
+    plain call when nothing records -- a drafter's eager step under a replay
+    included, where no recorder exists and the region would run it the same."""
+    fwd_ctx = get_forward_context()
+    if fwd_ctx.tr_graph != "record" and not fwd_ctx.in_hipgraph:
+        return _attention(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
+    if use_mla:
+        atom_config = get_current_atom_config()
+        impl = atom_config.compilation_config.static_forward_context[layer_name].impl
+        if isinstance(impl, MLAAttention) and impl.records_prefill_split():
+            return impl.forward_prefill_split(q, q_scale, k, v, positions, layer_name)
+    return _attention_region(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
+
+
+def _attention(
     q: torch.Tensor,
     q_scale: torch.Tensor | None,
     k: torch.Tensor,
@@ -1035,6 +1069,40 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
+
+
+# The attention as one break in a recorded forward.
+_attention_region = eager_region()(_attention)
+
+
+@mark_spliting_op(is_custom=True, gen_fake=attention_fp8_fake, mutates_args=["scale"])
+@eager_region()
+def unified_attention_fp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    qkv: torch.Tensor | None,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """`unified_attention_with_output_base` for a layer whose impl writes its
+    output as OCP FP8 plus per-token descales (`supports_output_quant`): the
+    output, and its descales into ``scale``."""
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    output = torch.empty(q.shape, device=q.device, dtype=dtypes.fp8)
+    self.impl.forward_impl(
+        q=q,
+        k=k,
+        v=v,
+        position=positions,
+        qkv=qkv,
+        quantized_output=output,
+        output_scale=scale,
+    )
+    return output
 
 
 def linear_attention_with_output_base_fake(

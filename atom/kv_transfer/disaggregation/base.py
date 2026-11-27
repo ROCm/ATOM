@@ -19,15 +19,23 @@ Two roles are defined:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+
+if TYPE_CHECKING:
+    from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
 
 
 class KVConnectorBase(ABC):
     """Worker-side KV connector interface (one instance per TP rank)."""
 
     is_producer: bool
+
+    def set_forward_stream(self, stream: Any) -> None:
+        """The stream the model runner is about to run a forward on; only
+        `RapidServeModelRunner` reports one, per forward. Only a connector that
+        stages transfers on it (the Mooncake Store) keeps it."""
 
     @classmethod
     def kv_budget_reserve_bytes(cls, config: Any) -> int:
@@ -78,6 +86,13 @@ class KVConnectorBase(ABC):
     def publish_prefill_chunks(self, batch: Any) -> None:
         """Publish completed prefill chunks; no-op without chunked P/D transfer."""
 
+    def note_state_stages(self, stages: dict) -> None:
+        """The runner just copied these (live slot, transfer slot) pairs on this
+        stream. Only handed to a connector with state transfer slots."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no state transfer slots to stage into"
+        )
+
     def get_finished_recv_blocks(self) -> list[int]:
         """Return block IDs from recently completed receives for GPU memory fence.
 
@@ -87,6 +102,16 @@ class KVConnectorBase(ABC):
         """
         return []
 
+    def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory | None:
+        """Provide the paged KV pool's memory, or None to leave it to the runner.
+
+        A connector that takes the pool over (`atom/kv_transfer/pool`) returns a
+        `KVPoolMemory`: where the bytes come from, how they divide into blocks
+        and when the device has finished writing them. Asked once, before the
+        pool is allocated. Transfer and offload connectors keep None.
+        """
+        return None
+
 
 class KVConnectorSchedulerBase(ABC):
     """Scheduler-side KV connector interface.
@@ -95,7 +120,67 @@ class KVConnectorSchedulerBase(ABC):
     for lifecycle events it does not own.
     """
 
+    is_offload = False
+    # True only when `cancel_undispatched_load` can return True; the engine
+    # skips the call for an aborted in-flight load unless this is True.
+    cancels_undispatched_loads = False
     is_producer: bool
+
+    # Offload-tier hooks the scheduler reads from any connector; one without a
+    # tier keeps these defaults.
+    chunk_size: int = 0
+    lowers_hbm_hit_to_chunk: bool = False
+    supports_early_load: bool = False
+
+    def lookup_ready(self, seq: Any) -> bool:
+        """Whether `seq`'s tier answer can be consumed without a round trip."""
+        return False
+
+    def lookup_pending(self, seq: Any) -> bool:
+        """Whether admission should pass over `seq` for its in-flight tier
+        lookup; the first call starts the request's defer window."""
+        return False
+
+    def lookup_would_defer(self, seq: Any) -> bool:
+        """`lookup_pending` without starting the window, for probes."""
+        return False
+
+    def held_tier_hit(self, seq: Any) -> int:
+        """The tier hit armed for `seq`'s coming load, 0 when none."""
+        return 0
+
+    def cancel_pending_load(self, seq: Any) -> None:
+        """Forget the load armed for `seq`."""
+
+    def cancel_undispatched_load(self, seq: Any) -> bool:
+        """Cancel a parked load only if no worker owns its destination.
+
+        False preserves the existing terminal-report cleanup contract.
+        """
+        return False
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        """Take back an admission the scheduler withdraws before any dispatch;
+        by default that is cancelling the pending load."""
+        self.cancel_pending_load(seq)
+
+    def close(self) -> None:
+        """Release threads or sockets the connector holds at engine shutdown."""
+
+    supports_pd_admission = False
+
+    def stage_state_for_send(self, seq: Any, src_slot: int, dst_slot: int) -> None:
+        """Have the workers copy a finished request's state into its transfer
+        slot before its push. Only asked when transfer slots were sized."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no state transfer slots to stage into"
+        )
+
+    def pd_receive_block_offset(
+        self, seq: Any, num_blocks: int, num_cached_blocks: int
+    ) -> int | None:
+        """First destination block for this PD load; None for other loads."""
+        return None
 
     @abstractmethod
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
@@ -116,6 +201,25 @@ class KVConnectorSchedulerBase(ABC):
         """Update internal state after the scheduler allocates blocks."""
         ...
 
+    def make_block_pool(
+        self,
+        config: Any,
+        num_blocks: int,
+        *,
+        on_evict: Any = None,
+        on_remap: Any = None,
+        cache_policy: str = "lru",
+        protected_ratio: float = 0.5,
+        reserve_null_block: bool = False,
+    ) -> KVBlockPool | None:
+        """Provide the scheduler's block pool, or None for ATOM's own.
+
+        The counterpart of `KVConnectorBase.kv_pool_memory`: a `KVBlockPool`
+        deciding which block a request gets and what is evicted, over memory
+        the worker side provided. Asked once, while `BlockManager` is built.
+        """
+        return None
+
     def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Preserve completions unless the backend consumes chunked P/D metadata."""
         return output
@@ -133,7 +237,7 @@ class KVConnectorSchedulerBase(ABC):
         can drop its store it answers False, and the engine refuses the weight
         change rather than serve old-weight KV from it.
         """
-        return not getattr(self, "is_offload", False)
+        return not self.is_offload
 
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""

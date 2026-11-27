@@ -238,6 +238,34 @@ models:
           run_eval: true
           eval_concurrency: [128, 512]
 
+      accuracy:
+        # 0.95: the per-request state pool does not fit at 0.85.
+        - &dsv4_moriio_gsm8k
+          name: ds-v4-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          server:
+            common_args:
+              gpu_memory_utilization: 0.95
+          env:
+            common:
+              KV_CONNECTOR: moriio
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+          accuracy:
+            threshold: 0.90
+        - <<: *dsv4_moriio_gsm8k
+          name: ds-v4-2p1d-tp8-moriio-gsm8k
+          topology: 2p1d_tp8_moriio
+          nodes: "${ATOMESH_2P1D_NODES}"
+          prefill:
+            workers: 2
+
     accuracy:
       task: gsm8k
       fewshot: 3
@@ -324,6 +352,27 @@ models:
             wait_server_timeout: 1800
           run_eval: true
           eval_concurrency: [65]
+
+        - name: glm-52-mxfp4-2p1d-tp8
+          topology: 2p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
 
         # Keep each AgentX concurrency in its own job so every measurement starts
         # from a fresh ATOM service instead of inheriting HBM prefix-cache state.
@@ -964,6 +1013,9 @@ models:
         # AgentX enables comm-group reuse from CONC 56 up (C56/C64/C72).
         AITER_REUSE_IDENTICAL_COMM_GROUPS: "0"
         ATOM_GDN_SSM_DTYPE: "fp16"
+        # Mono decode defaults on; pinned off, and turned on only where a cell
+        # says so, so a change to its refusals cannot silently move a cell.
+        ATOM_MONO_ENABLE: "0"
         # Already the ATOM default; pinned so a default flip cannot silently
         # move the published numbers.
         ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: "1"
@@ -1025,6 +1077,17 @@ models:
             run_eval: false
           name: kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1
           concurrency: [1]
+          # Mono decode at C1, as recipes/Agentic-Kimi-K3.md runs it: the five
+          # projections mono reads as plain bf16 stay out of the online quant.
+          # Server args are per cell, shared by both roles, so the prefill
+          # server also loads these five in bf16.
+          env:
+            decode:
+              ATOM_MONO_ENABLE: "1"
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_dspark7_args
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","*self_attn.in_proj*","*self_attn.f_b_proj*","*self_attn.o_proj*","*shared_experts.gate_up_proj*","*shared_experts.down_proj*"]}'
 
         - <<: *kimi_k3_agentic_tp8
           name: kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c2
@@ -1306,8 +1369,8 @@ models:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 512
 
-      # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
-      # the published dashboard. The stop_profile export stalls both engines,
+      # Dispatch-only: push runs `smoke` and the schedule only MoRI IO
+      # accuracy, so nothing here reaches the published dashboard. The stop_profile export stalls both engines,
       # which makes this cell's aiperf numbers incomparable with its C72 twin.
       profile:
         - <<: *kimi_k3_agentic_no_dspark

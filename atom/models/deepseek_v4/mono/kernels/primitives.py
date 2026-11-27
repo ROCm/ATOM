@@ -13,6 +13,7 @@ from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels.dpp_utils import update_dpp_i32
+from atom.mono.polling import SPIN_PAUSE_ASM
 
 _UMAX_DPP_ASM = "\n".join(
     [
@@ -42,9 +43,10 @@ def uniform_f32(value):
 
 
 def spin_pause() -> None:
-    """Keep tagged-mailbox polling loads inside the retry loop."""
+    """Keep tagged-mailbox polling loads inside the retry loop and sleep
+    ``POLL_SLEEP_UNITS`` between polls (``s_nop 0`` at 1; see ``atom.mono.polling``)."""
 
-    llvm.InlineAsmOp(None, [], "s_nop 0", "", has_side_effects=True)
+    llvm.InlineAsmOp(None, [], SPIN_PAUSE_ASM, "", has_side_effects=True)
 
 
 def read_lane_i32(value, lane):

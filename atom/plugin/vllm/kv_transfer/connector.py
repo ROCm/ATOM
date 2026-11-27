@@ -1056,7 +1056,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         than believing it, which is why this is a bypass and not a bug fix.)
 
         What is actually movable is the carving ATOM already did: the main page
-        plane plus one index plane per compression owner, each dense in pages.
+        regions and each compression owner's index planes, all dense in pages.
         Each becomes its own segment, in `unit_regions` order, because that
         order is the stored object's key space.
 
@@ -1113,26 +1113,13 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 f"published={unit_bytes}, cache regions={declared}, "
                 f"geometry.paged_bytes={paged_bytes}"
             )
-        # The arena has to balance, not just the PAGE side of it. Every check
-        # above compares the published planes against another statement of the
-        # PAGE unit, so all of them still pass if a plane is missing from both
-        # -- or if the STATE region the other leg moves is not the rest of the
-        # allocation. This is the one identity that spans both legs:
-        #
-        #     Sigma(published unit bytes) * pages + slots * state_bytes == arena
-        #
-        # The left side is what this connector will move; the right is what the
-        # cache was built to hold, from `paged_extents` and `state_fields`. A
-        # plane dropped from `v41_page_planes` shortens the left and nothing
-        # else, so it reads as a shortfall of exactly that plane.
-        #
-        # What it does NOT catch, stated so the next reader does not trust it
-        # too far: a field missing from `state_fields` moves both sides at once,
-        # because the STATE leg sends the entry as flat bytes sized from the
-        # same geometry. The guard for that is that there is no per-field
-        # selection on this path at all -- `state_entry_views` hands over
-        # `state_bytes[slot]` whole -- which the tests assert directly.
-        arena = int(cache.backing.numel())
+        # Account for every persistent source, including quantized main and
+        # window data/scale planes. `backing` alone holds only the auxiliary
+        # index/state slice for a quantized cache. The allocations are disjoint
+        # views of vLLM's slab, so count their bytes even when storage is shared.
+        # PAGE bytes plus all per-request STATE bytes must cover that arena,
+        # apart from bounded alignment padding.
+        arena = sum(t.numel() * t.element_size() for t in cache.allocations)
         alignment = int(cache.geometry.alignment)
         moved = sum(unit_bytes) * num_blocks + int(cache.num_slots) * int(
             cache.geometry.state_bytes

@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Shared V4 metadata staging survives ragged request changes and graph replay."""
 
 from types import SimpleNamespace
@@ -446,6 +448,7 @@ def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
     builder.geometry, builder.device, builder.block_size = geo, "cpu", 32
     builder.cache = None
     builder.score_workspace = None
+    builder._prefill_window_staging = None
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(1, 6, 1, "cpu", geo)
     )
@@ -502,7 +505,7 @@ def test_parent_preparation_preserves_phase(device, phase, position, length):
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(1, 8, 4, device, geo),
         tokenID_processor=SimpleNamespace(
-            num_rejected=None, verify_ctx_lens=lambda ctx: ctx
+            num_rejected=None, verify_ctx_lens=lambda ctx: ctx, spec_status_owed=False
         ),
     )
     batch = SimpleNamespace(

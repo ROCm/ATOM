@@ -12,16 +12,23 @@ import torch
 import zmq
 
 from atom.config import Config
+from atom.distributed.group_agreement import group_max_each
 from atom.kv_transfer.disaggregation import KVOutputAggregator
+from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.dp_sync_gate import MAX_DP_SYNC_INTERVAL, DPSyncGate
 from atom.model_engine.dynamic_chunking import (
     DYNAMIC_CHUNKING_POLL_STEPS,
     ChunkSizePredictor,
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
-from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.engine_utility import (
+    EngineUtilityHandler,
+    ask_what_runners_cannot_take,
+)
+from atom.model_engine.prefill_backlog import prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
@@ -56,8 +63,44 @@ logger = logging.getLogger("atom")
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
 # idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
+# ATOM_DP_IDLE_WHEN_BLOCKED: how long a DP loop whose only work is blocked on a
+# tier lookup or load sleeps before it votes again. A sleep rather than
+# `yield_gil`: the lookup and load threads it waits on share this process's
+# GIL, and a loop spinning on it slows them down.
+BLOCKED_IDLE_SLEEP_S = 0.0005
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
+
+
+def dp_idle_when_blocked(config: Config) -> bool:
+    """Whether `ATOM_DP_IDLE_WHEN_BLOCKED` asks this DP engine to vote only
+    work a pass could forward. An explicit value is used as is, on any role.
+    Unset, it is on only on a P/D prefill instance (`kv_producer`), where an
+    arrival at an idle P otherwise waits out a ~110 ms eager DP dummy behind
+    its own Store lookup; an aggregated server and a decode instance keep the
+    plain vote, as measured. The prefill delayer still turns it off
+    (`DPEngineCoreProc._resolve_idle_when_blocked`)."""
+    enabled = envs.ATOM_DP_IDLE_WHEN_BLOCKED
+    if enabled is None:
+        enabled = disaggregated_kv_role(config) == "kv_producer"
+    return enabled
+
+
+def yield_gil() -> None:
+    """Hand the GIL to this process's other threads now.
+
+    A busy loop holds the GIL for as long as it does not block: an idle pass
+    blocks nowhere, and neither does the stretch between queuing a step's
+    outputs and the loop's next blocking call. A thread that is ready to run
+    meanwhile -- the output sender with a request's last chunk, the input
+    reader with a new request -- then gets the GIL only when CPython forces a
+    switch, after `sys.getswitchinterval()` (5 ms by default): the last chunk
+    of every request sat that long in `output_queue` once the engine went
+    idle. `time.sleep(0)` drops and retakes the GIL around a zero-length
+    sleep, so such a thread runs at once; the loop pays microseconds.
+    """
+    time.sleep(0)
+
 
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
@@ -65,14 +108,39 @@ HELD_POLL_S = 0.01
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
+def flush_dp_reuse(scheduler, output_queue) -> None:
+    """Queue the scheduler's `share_cache` reuse reports (`Scheduler.
+    dp_reuse_reports`) for the CoreManager. Called before a step's outputs are
+    queued: a request's report then reaches the router before its first or
+    last output, which complete or release its placement."""
+    reports = scheduler.dp_reuse_reports
+    if reports:
+        scheduler.dp_reuse_reports = []
+        output_queue.put_nowait(("DP_REUSE", reports))
+
+
+def publish_idle_state_work(scheduler) -> None:
+    """Publish the state loads and stores `scheduler` holds while no batch runs."""
+    scheduler._publish_state_loads()
+    scheduler._publish_state_stores()
+
+
 class EngineCore:
     # This process's name, for the title and every GC log line. A class
     # attribute because it is per-process state and each engine is spawned into
     # its own interpreter; `_setup_engine_process` is the only writer.
     _process_name = "EngineCore"
+    # Whether the engine reports its prefill backlog to the CoreManager
+    # (`share_cache` routing); the data-parallel engine turns it on.
+    _report_backlog = False
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
+        # Requests taken from the input queue, and the last (ingested, prefill
+        # left) pair reported to the CoreManager (`_report_prefill_backlog`).
+        self._ingested_seqs = 0
+        self._last_backlog_report: tuple[int, int] | None = None
+        self._next_backlog_report = 0.0
         self._kv_progress_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
@@ -139,6 +207,7 @@ class EngineCore:
                 config.tp_world_size * config.pcp_group_size,
                 config.runner_qualname,
                 config,
+                local_proc_num=config.tp_size_local if config.is_multinode_tp else None,
                 on_worker_failure=self._send_engine_dead,
                 kv_progress_event=self._kv_progress_event,
             )
@@ -151,7 +220,9 @@ class EngineCore:
             # sliding-window pool each look up the class they declared, so
             # adding an architecture never touches this line.
             config.pool_entries = block_info.get("pool_entries", {})
+            config.pool_entry_bytes = block_info.get("pool_entry_bytes", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
+            config.state_transfer_slots = block_info.get("state_transfer_slots", 0)
             self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
@@ -193,6 +264,12 @@ class EngineCore:
                     f"{self.label}: cudagraph capture{decode_sizes} cost: {cap_cost:.2f} "
                     f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
+            # Fixed once the model is loaded, so asked once.
+            unavailable = (
+                ask_what_runners_cannot_take(self.runner_mgr, self.label)
+                if config.weight_sync_runner
+                else {}
+            )
             good = True
         finally:
             logger.info(
@@ -238,7 +315,9 @@ class EngineCore:
             self.output_queue,
             label=self.label,
             scheduler=self.scheduler,
+            unavailable=unavailable,
         )
+        self._weight_syncs_unavailable = unavailable
 
         # KV cache allocated, graphs captured, BlockPool built: everything this
         # process holds for its lifetime exists, and the next thing is traffic.
@@ -308,7 +387,7 @@ class EngineCore:
     def _send_ready_signal(self):
         self.output_queue.put_nowait(("READY", self._ready_payload()))
 
-    def _ready_payload(self) -> dict[str, int] | None:
+    def _ready_payload(self) -> dict[str, object] | None:
         """Startup facts the frontend cannot read off its own Config.
 
         `num_kvcache_blocks` is measured in this subprocess, so the API server's
@@ -316,10 +395,18 @@ class EngineCore:
         ceiling rather than the raw block count leaves the dcp arithmetic with
         its owner, `BlockManager`, and gives the frontend a single number to
         compare a prompt against.
+
+        `weight_syncs_unavailable` maps each weight-sync feature this engine's
+        runners cannot take to the reason. CoreManager merges every engine's
+        and refuses such a sync before any engine runs it: under PP, one
+        stage's runners alone may be the ones that cannot.
         """
-        if self.scheduler is None:
-            return None
-        return {"max_pool_tokens": self.scheduler.block_manager.max_pool_tokens}
+        payload = {}
+        if self.scheduler is not None:
+            payload["max_pool_tokens"] = self.scheduler.block_manager.max_pool_tokens
+        if self._weight_syncs_unavailable:
+            payload["weight_syncs_unavailable"] = self._weight_syncs_unavailable
+        return payload or None
 
     def _post_model_load_hook(self):
         """Called after ModelRunner is initialized (model loaded) but before
@@ -432,8 +519,10 @@ class EngineCore:
     def _report_held_kv_work(self) -> None:
         """Let transfers already in flight report back while no forward runs.
 
-        Starts none, and runs nothing while the weights (and so the KV pool)
-        may be released.
+        Starts no new transfer, except that with ``ATOM_STORE_ASYNC_RENEW`` the
+        metadata build may dispatch the GET of a load parked on its lease
+        renewal. Runs nothing while the weights (and so the KV pool) may be
+        released.
         """
         if not self._is_rl_weights_offloaded and self.has_pending_kv_work():
             self._advance_idle_kv_transfer(dispatch_new=False)
@@ -455,8 +544,12 @@ class EngineCore:
     def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
         """Get the KV pool ready to be zeroed, freed or recomputed, or raise.
 
-        Waits until KV transfers in flight have reported back, then preempts
-        what is running so it recomputes on what follows. When the weights
+        Waits until KV transfers in flight have reported back (with
+        ``ATOM_STORE_ASYNC_RENEW`` a load parked on its lease renewal counts,
+        and the metadata build may dispatch its GET meanwhile), then preempts
+        what is running so it recomputes on what follows; an image decode leg
+        whose media its prefill kept cannot recompute, and is finished
+        instead (`Scheduler.preempt_running`). When the weights
         change, the KV connector must also drop what it keeps for later
         requests. Raises with the reason, changing nothing that was running.
         """
@@ -522,10 +615,12 @@ class EngineCore:
                         self.scheduler.engine_stats.bump_step()
                     else:
                         self.scheduler.engine_stats.note_idle(now)
+                        yield_gil()
                 else:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    yield_gil()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -537,24 +632,28 @@ class EngineCore:
                 except Exception:
                     logger.exception("KV event publish during shutdown failed")
                 self.scheduler.shutdown_kv_events()
+                self.scheduler.close_kv_connector()
             finally:
                 tracing.shutdown()
 
     def _process_engine_step(self):
+        return self._run_then_publish_kv_events(self._process_engine_step_inner)
+
+    def _run_then_publish_kv_events(self, step):
         try:
-            return self._process_engine_step_inner()
+            return step()
         finally:
             # Swallow publisher errors so they cannot mask an exception from
-            # the engine step itself.
+            # the step itself.
             try:
                 self.scheduler.publish_kv_events()
             except Exception:
-                logger.exception("KV event publish in engine-step finally failed")
+                logger.exception("KV event publish after engine step failed")
 
     def _release_request_resources(self, sequences):
         structured_ids = [seq.id for seq in sequences if is_structured(seq)]
         if structured_ids:
-            self.runner_mgr.call_func("release_structured_requests", structured_ids)
+            self.runner_mgr.call_func("release_constraints", structured_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]
@@ -614,7 +713,8 @@ class EngineCore:
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
                 self.scheduler.prefill_delayer.notify_prefill_executed(
-                    scheduled_batch.total_tokens_num_prefill
+                    scheduled_batch.total_tokens_num_prefill,
+                    decoded=scheduled_batch.total_seqs_num_decode > 0,
                 )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
@@ -636,6 +736,9 @@ class EngineCore:
         self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
 
     def _postprocess(self, seqs, fwd_out, batch):
+        if self._report_backlog:
+            # Ahead of this step's outputs, which complete or release placements.
+            flush_dp_reuse(self.scheduler, self.output_queue)
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
             seqs,
@@ -656,6 +759,8 @@ class EngineCore:
         if finished_seqs:
             self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
+        # The sender ships them now, not a switch interval later (`yield_gil`).
+        yield_gil()
 
     def has_pending_kv_work(self) -> bool:
         """True while KV transfer work outlives the scheduler queues.
@@ -694,7 +799,9 @@ class EngineCore:
         # No forward batch will run this tick, but offload load/save work may
         # still need to be dispatched or reported back to the scheduler.
         # `dispatch_new=False` on the shutdown drain: report in-flight work
-        # back, but start no new transfers (see `_dispatch_idle_offload_work`).
+        # back, but start no new transfers (see `_dispatch_idle_offload_work`);
+        # with `ATOM_STORE_ASYNC_RENEW` the metadata build may still dispatch
+        # the GET of a load parked on its lease renewal.
         now = time.monotonic()
         if now < self._next_idle_kv_drain:
             return
@@ -713,7 +820,9 @@ class EngineCore:
         transfers finish and report, but must not publish new state loads/stores.
         A fresh store dispatched here spills bytes nothing will read back, and --
         worse -- keeps `has_pending_kv_work()` True, so this very loop could
-        manufacture its own work and never converge before the deadline.
+        manufacture its own work and never converge before the deadline. The
+        one exception: with `ATOM_STORE_ASYNC_RENEW` the metadata build may
+        dispatch the GET of a load already parked on its lease renewal.
         """
         if not self.kv_transfer_enabled:
             return
@@ -793,28 +902,19 @@ class EngineCore:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
         if connector is None or not (
-            getattr(connector, "is_offload", False)
-            or (
-                getattr(connector, "is_producer", False)
-                and getattr(connector, "enable_chunked_transfer", False)
-            )
+            connector.is_offload or getattr(connector, "is_producer", False)
         ):
             return
-        # getattr for the same reason as `kv_connector` above: this path is
-        # reached with scheduler doubles that implement only the connector
-        # surface.
-        #
         # `dispatch_new=False` on the shutdown drain: publishing new state
         # loads/stores there hands the connector work whose bytes nothing will
         # read back, and -- worse -- each fresh store keeps `has_pending_kv_work`
         # True, so the drain loop that waits on it manufactures its own exit
         # condition and never converges. Still build/process the meta so
-        # already-dispatched transfers finish and report.
+        # already-dispatched transfers finish and report (with
+        # `ATOM_STORE_ASYNC_RENEW` that build may dispatch the GET of a load
+        # parked on its lease renewal).
         if dispatch_new:
-            for name in ("_publish_state_loads", "_publish_state_stores"):
-                publish = getattr(self.scheduler, name, None)
-                if publish is not None:
-                    publish()
+            publish_idle_state_work(self.scheduler)
         meta = connector.build_connector_meta()
         if not connector_metadata_has_work(meta):
             return
@@ -822,8 +922,15 @@ class EngineCore:
 
     def pull_and_process_input_queue(self):
         recv_reqs = []
+        credit_updates = []
         while not self.input_queue.empty():
             seqs = self.input_queue.get_nowait()
+            if (
+                isinstance(seqs, tuple)
+                and seqs[0] == EngineCoreRequestType.DP_PREFIX_CREDIT
+            ):
+                credit_updates.extend(seqs[1])
+                continue
             for seq in seqs:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
                     logger.debug(f"{self.label}: input_queue get exit engine")
@@ -832,7 +939,40 @@ class EngineCore:
         if len(recv_reqs) > 0:
             logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
+            self._ingested_seqs += len(recv_reqs)
+        self._apply_prefix_credit_updates(credit_updates)
         return False
+
+    def _apply_prefix_credit_updates(self, credit_updates):
+        """Apply credits and publish the same authoritative backlog snapshot."""
+        if credit_updates:
+            self.scheduler.correct_prefix_estimates(credit_updates)
+            report = (self._ingested_seqs, prefill_backlog(self.scheduler))
+            self.output_queue.put_nowait(("PREFILL_BACKLOG", (*report, credit_updates)))
+            self._last_backlog_report = report
+
+    # How often the backlog is recomputed: the walk runs on the engine thread
+    # every DP rank waits for, and between two reports the CoreManager adds the
+    # charges of the requests it sent since.
+    BACKLOG_REPORT_INTERVAL_S = 0.01
+
+    def _report_prefill_backlog(self, now: float) -> None:
+        """Push (seqs ingested, prefill tokens still to compute) when it changed,
+        at most every `BACKLOG_REPORT_INTERVAL_S`.
+
+        For `share_cache` DP routing, which balances on what each rank really
+        has left to prefill (`Scheduler.pending_prefill_tokens`). A running seq
+        that has produced tokens is decoding and counts nothing; a preempted one
+        waits to prefill again and counts what it must recompute.
+        """
+        if now < self._next_backlog_report:
+            return
+        self._next_backlog_report = now + self.BACKLOG_REPORT_INTERVAL_S
+        backlog = prefill_backlog(self.scheduler)
+        report = (self._ingested_seqs, backlog)
+        if report != self._last_backlog_report:
+            self._last_backlog_report = report
+            self.output_queue.put_nowait(("PREFILL_BACKLOG", (*report, ())))
 
     def _offer_tier_lookups(self, reqs) -> None:
         """Let an offload connector start tier lookups for arrived requests.
@@ -910,6 +1050,9 @@ class EngineCore:
                         self.input_queue.put_nowait(reqs)
                         self._kv_progress_event.set()
                         self._offer_tier_lookups(reqs)
+                    elif request_type == EngineCoreRequestType.DP_PREFIX_CREDIT:
+                        self.input_queue.put_nowait((request_type, reqs))
+                        self._kv_progress_event.set()
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
@@ -953,6 +1096,16 @@ class EngineCore:
                     socket.send(obj)
                     continue
 
+                if isinstance(item, tuple) and item[0] == "PREFILL_BACKLOG":
+                    obj = pickle.dumps((EngineCoreRequestType.PREFILL_BACKLOG, item[1]))
+                    socket.send(obj)
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "DP_REUSE":
+                    obj = pickle.dumps((EngineCoreRequestType.DP_REUSE, item[1]))
+                    socket.send(obj)
+                    continue
+
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
                     # Send utility command response back to CoreManager
                     response_data = item[1]
@@ -989,6 +1142,32 @@ class DPEngineCoreProc(EngineCore):
         self._shutting_down = False
 
         self._init_prefill_delayer(config, self.dp_group)
+        # `share_cache` routing reads each rank's own prefill backlog.
+        self._report_backlog = config.dp_load_balance == "share_cache"
+        self._idle_when_blocked = self._resolve_idle_when_blocked(config)
+        # Reduced by `_sync_dp_state`: some rank's vote hid unfinished work.
+        self._dp_group_hidden_work = False
+
+    def _resolve_idle_when_blocked(self, config: Config) -> bool:
+        """`ATOM_DP_IDLE_WHEN_BLOCKED`: whether this rank reports work to its DP
+        group only when a pass could produce a batch (`has_forward_work`).
+        Defaults by P/D role (`dp_idle_when_blocked`). Off with a prefill
+        delayer, whose cadence counts passes: it needs
+        `ATOM_ENABLE_PREFILL_DELAYER=0`. The delayer is on by default with DP,
+        so the role default alone stays quiet; only an explicit setting that
+        the delayer overrides is warned about."""
+        if not dp_idle_when_blocked(config):
+            return False
+        if self.scheduler.prefill_delayer is not None:
+            if envs.ATOM_DP_IDLE_WHEN_BLOCKED is not None:
+                logger.warning(
+                    "%s: ATOM_DP_IDLE_WHEN_BLOCKED ignored with the prefill "
+                    "delayer on (set ATOM_ENABLE_PREFILL_DELAYER=0)",
+                    self.label,
+                )
+            return False
+        logger.info("%s: ATOM_DP_IDLE_WHEN_BLOCKED on", self.label)
+        return True
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -1020,31 +1199,88 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
+        # Set once the group agreed to shut down: ATOM_DP_IDLE_WHEN_BLOCKED's
+        # narrower vote no longer applies (see the exit below), on every rank.
+        draining = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
         try:
+            interval = self._validate_dp_sync_interval(envs.ATOM_DP_SYNC_INTERVAL)
+            # Interval 1 syncs every round, as on main: no gate.
+            gate = DPSyncGate(interval) if interval > 1 else None
             while True:
-                self.utility_handler.process_queue(self.utility_queue, self)
+                sync_now = gate is None or gate.should_sync()
+                if sync_now:
+                    # Utility commands can hold the engine (offload, weight
+                    # sync, pause). Applying them only on rounds that sync lets
+                    # every rank see a hold before its next forward.
+                    self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
                     next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
+                if self._report_backlog:
+                    self._report_prefill_backlog(time.monotonic())
                 local_held = (
                     self._is_rl_weights_offloaded
                     or self._weight_sync_fenced
                     or self._generation_paused
                 )
-                local_unfinished = not self.scheduler.is_finished() and not local_held
-
+                idle_when_blocked = self._idle_when_blocked and not draining
                 # MAX-reduced: one held rank holds every rank of the group, so
                 # their forwards stay paired.
-                global_has_unfinished, global_shutdown, global_held = (
-                    self._sync_dp_state(local_unfinished, shutdown, local_held)
-                )
+                if sync_now:
+                    # This rank's vote. By default any unfinished state,
+                    # `deferred_free_blocks` included, so a group whose only
+                    # work is waiting runs DP dummy forwards back to back. With
+                    # ATOM_DP_IDLE_WHEN_BLOCKED only what a pass could forward
+                    # (`has_forward_work`); the idle drain below advances the
+                    # rest. Only on rounds that sync, so a skipped round sends
+                    # no lookups and starts no defer windows.
+                    if not idle_when_blocked:
+                        local_unfinished = (
+                            not self.scheduler.is_finished() and not local_held
+                        )
+                        local_hidden = False
+                    elif local_held:
+                        # Held first: a held rank runs no pass, so it must not
+                        # send lookups or start their defer windows.
+                        local_unfinished = local_hidden = False
+                    else:
+                        local_unfinished = self.scheduler.has_forward_work()
+                        # Work this narrower vote hides (blocked requests,
+                        # deferred frees), reduced with the vote; see the
+                        # shutdown exit below.
+                        local_hidden = (
+                            not local_unfinished and not self.scheduler.is_finished()
+                        )
+                    global_has_unfinished, global_shutdown, global_held = (
+                        self._sync_dp_state(
+                            local_unfinished, shutdown, local_held, local_hidden
+                        )
+                    )
+                    if gate is not None:
+                        gate.synced(global_has_unfinished, global_shutdown, global_held)
+                else:
+                    # The last sync found unfinished work in the group: stay
+                    # paired, including a dummy on ranks with no local work.
+                    global_has_unfinished, global_shutdown, global_held = (
+                        True,
+                        False,
+                        False,
+                    )
 
                 if global_shutdown and not global_has_unfinished:
+                    if self._dp_group_hidden_work:
+                        # Some rank's blocked request or deferred free voted
+                        # "no work": every rank votes as with the flag off from
+                        # here, so they settle before the exit as they do off.
+                        # A reduced value, so all ranks switch on this pass
+                        # whatever their own setting.
+                        draining = True
+                        continue
                     logger.info(
                         f"{self.label}: All DP ranks agreed to shutdown, exiting busy_loop"
                     )
@@ -1063,11 +1299,23 @@ class DPEngineCoreProc(EngineCore):
                     self.scheduler.engine_stats.note_idle(now)
                     if self.scheduler.prefill_delayer is not None:
                         self.scheduler.prefill_delayer.notify_idle()
-                    if self.has_pending_kv_work():
+                    # The PAGE checkpoint copies the last batch issued complete
+                    # in the next `schedule()`, which an idle pass never runs:
+                    # finish them here, before the drain publishes state work,
+                    # so they turn READY (reusable, evictable, storable to the
+                    # CPU tier) instead of staying COPYING with their pins
+                    # (`BlockManager.complete_previous_checkpoint_batch`).
+                    self.scheduler.block_manager.complete_previous_checkpoint_batch()
+                    blocked = idle_when_blocked and bool(self.scheduler.waiting)
+                    if self.has_pending_kv_work() or blocked:
                         # Local RPCs only. Anything that reaches schedule()
                         # would run the delayer's cross-DP all_reduce off
                         # lockstep, so the idle drain must stay off that path.
+                        # A request blocked on its tier load is waiting too:
+                        # the poll is what settles it.
                         self._advance_idle_kv_transfer()
+                    if blocked:
+                        time.sleep(BLOCKED_IDLE_SLEEP_S)
                     continue
 
                 self.scheduler.engine_stats.note_busy(now)
@@ -1077,6 +1325,8 @@ class DPEngineCoreProc(EngineCore):
                 # After the pair, so the idle rank's dummy counts too: that is
                 # what keeps every rank's step number equal. See `bump_step`.
                 self.scheduler.engine_stats.bump_step()
+                if gate is not None:
+                    gate.busy_round_done()
         finally:
             try:
                 # Isolate the final publish so a publisher hiccup cannot skip
@@ -1087,8 +1337,40 @@ class DPEngineCoreProc(EngineCore):
                 except Exception:
                     logger.exception("KV event publish during DP shutdown failed")
                 self.scheduler.shutdown_kv_events()
+                self.scheduler.close_kv_connector()
             finally:
                 tracing.shutdown()
+
+    def _validate_dp_sync_interval(self, interval: int | None) -> int:
+        """Reject different sync cadences before any rank enters the busy loop.
+
+        One MAX reduction gives both bounds. Every rank sees the same mismatch
+        and raises, rather than pairing a state collective with a peer's model
+        collective on the first skipped round. A peer lost here shuts the loop
+        down as `_sync_dp_state` does.
+        """
+        # Packed capped, so any int fits the int64 payload; past the cap is invalid.
+        value = 0 if interval is None else min(interval, MAX_DP_SYNC_INTERVAL + 1)
+        try:
+            highest, neg_lowest, invalid = group_max_each(
+                (value, -value, int(interval is None or value > MAX_DP_SYNC_INTERVAL)),
+                self.dp_group,
+            )
+        except RuntimeError as e:
+            logger.warning(f"{self.label}: DP sync interval agreement failed: {e}")
+            self._shutting_down = True
+            return 1
+        if invalid:
+            raise ValueError(
+                f"ATOM_DP_SYNC_INTERVAL must be an integer up to {MAX_DP_SYNC_INTERVAL} "
+                "on every DP rank; at least one rank has an invalid value"
+            )
+        if highest != -neg_lowest:
+            raise ValueError(
+                "ATOM_DP_SYNC_INTERVAL must match on every DP rank; "
+                f"got values from {-neg_lowest} to {highest}"
+            )
+        return value
 
     def _execute_dummy_batch(self):
         fwd_out = self.runner_mgr.call_func("dummy_execution", wait_out=True)
@@ -1102,16 +1384,23 @@ class DPEngineCoreProc(EngineCore):
         local_has_unfinished: bool,
         local_shutdown: bool = False,
         local_held: bool = False,
+        local_hidden: bool = False,
     ) -> tuple[bool, bool, bool]:
+        """MAX-reduce this rank's flags over the DP group. `local_hidden`
+        (ATOM_DP_IDLE_WHEN_BLOCKED: unfinished work the vote left out) is
+        reduced too, into `_dp_group_hidden_work`; every rank sends it, so the
+        collective is the same whatever each rank's setting."""
+        self._dp_group_hidden_work = local_hidden
         if self._shutting_down:
             return local_has_unfinished, True, local_held
 
         try:
             state_tensor = torch.tensor(
                 [
-                    1 if local_has_unfinished else 0,
-                    1 if local_shutdown else 0,
-                    1 if local_held else 0,
+                    int(local_has_unfinished),
+                    int(local_shutdown),
+                    int(local_held),
+                    int(local_hidden),
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -1119,10 +1408,10 @@ class DPEngineCoreProc(EngineCore):
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
-            global_has_unfinished = state_tensor[0].item() == 1
-            global_shutdown = state_tensor[1].item() == 1
-            global_held = state_tensor[2].item() == 1
-            return global_has_unfinished, global_shutdown, global_held
+            # One decode for the four flags.
+            unfinished, shutdown, held, hidden = state_tensor.tolist()
+            self._dp_group_hidden_work = hidden == 1
+            return unfinished == 1, shutdown == 1, held == 1
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             self._shutting_down = True
@@ -1577,7 +1866,7 @@ class DecodeEngineCore(EngineCore):
             self._send_block_assignment(seq)
         return False
 
-    def _process_engine_step(self):
+    def _process_engine_step_inner(self):
         """Override: handle None from DecodeScheduler when prefill_waiting is
         non-empty but running is empty (sequences are still being prefilled)."""
         if not self.scheduler.has_requests():
@@ -1613,6 +1902,8 @@ class DecodeEngineCore(EngineCore):
             pass
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
+        # The sender ships them now, not a switch interval later (`yield_gil`).
+        yield_gil()
         return True
 
     @staticmethod

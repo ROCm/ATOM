@@ -46,6 +46,7 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | `GET`  | `/health` | Health check (returns `{"status": "ok"}`) |
 | `POST` | `/start_profile` | Start torch profiler on the engine |
 | `POST` | `/stop_profile` | Stop torch profiler and flush traces |
+| `POST` | `/offload/lookups` | Turn an `lmcache_mp` tier's lookups for new requests on or off (`{"enabled": bool}`) |
 
 ### Request models
 
@@ -412,7 +413,7 @@ closes (`<|close|>response<|sep|>`) the next tokens are forced to
 `<|open|>tools<|sep|><|open|>call tool="`. The tool name and arguments stay the
 model's. A model that writes `<|open|>tools<|sep|>` itself, by any other way,
 has opened it too: nothing is held back from then on. Every other format, every other `tool_choice`, and `/v1/messages` and
-`/v1/responses` sample as before; see `atom/model_ops/required_channel.py`.
+`/v1/responses` sample as before; see `atom/model_ops/triton_required_channel.py`.
 A required request's own `stop` strings can still end it before a call.
 
 Forwarding it to the chat template is a separate step, and one that used to be
@@ -839,8 +840,9 @@ Script-specific arguments:
 | `--bs` | `1` | Batch size (number of parallel requests) |
 | `--random-input` | `False` | Use random token input instead of predefined text |
 
-If `--torch-profiler-dir` is not specified, the script defaults to
-`./profiler_traces`.
+If `--torch-profiler-dir` is not specified, the script writes to
+`ATOM_TORCH_PROFILER_DIR` when that is set (and not empty), and otherwise
+defaults to `./profiler_traces`.
 
 ### Profiling during benchmarks
 
@@ -1079,7 +1081,7 @@ script using `EngineArgs.add_cli_args`):
 | `--tensor-parallel-size`, `-tp` | `1` | Tensor parallel size |
 | `--data-parallel-size`, `-dp` | `1` | Data parallel size |
 | `--enforce-eager` | `False` | Disable CUDA graph capture; use eager execution |
-| `--enable_prefix_caching` | `False` | Enable prefix caching |
+| `--enable_prefix_caching` | `True` | Enable prefix caching; `--no-enable_prefix_caching` disables it |
 | `--enable-log-stats` / `--no-enable-log-stats` | `True` | Emit the periodic engine-status line (throughput, running/waiting reqs, KV usage, prefix-cache hit rate) |
 | `--throughput-log-interval` | `10.0` | Seconds between engine-status lines |
 | `--port` | `8006` | Internal engine communication port |

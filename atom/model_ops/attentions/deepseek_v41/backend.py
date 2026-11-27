@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
 import logging
+from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -54,7 +57,12 @@ from atom.utils.tbo import NUM_TBO_UBATCHES
 
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
-from .metadata import RequestSpan, prepare_batch_step, visible_buffer_name
+from .metadata import (
+    RequestSpan,
+    prepare_batch_step,
+    stage_positions,
+    visible_buffer_name,
+)
 from .score_planner import ScorePlanner
 
 logger = logging.getLogger("atom")
@@ -73,6 +81,24 @@ def _compress_plan_buffer_names(ratio):
     }
 
 
+@dataclass
+class _Unsettled:
+    """A step staged before the previous verify's status (`_prepare_step`),
+    finished once it is taken (`take_spec_status`): its requests' final heads
+    (``final_heads`` takes the status), what restages over them, and the
+    group that publishes the step. ``state_owed``: `prepare_model_inputs`
+    left the state that reads the heads (`prepare_state`) to the settle."""
+
+    batch: object
+    spans: list
+    metadata: object
+    final_heads: Callable
+    planners: tuple
+    compress_plans: Callable | None
+    group: object
+    state_owed: bool = False
+
+
 class DeepseekV41Backend(AttentionBackend):
     @staticmethod
     def get_name():
@@ -85,6 +111,9 @@ class DeepseekV41Backend(AttentionBackend):
 
 class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     tbo_comm_stream_priority = -1
+    # the step staged before the previous verify's status, until it is taken
+    # (`take_spec_status`)
+    _unsettled: _Unsettled | None = None
 
     # Reuse V4's publisher and staging contract, including fixed addresses and
     # running_bs padding. Only pool-slot -> physical-row geometry differs.
@@ -188,7 +217,28 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # allocations precede the memory profile: get_num_blocks accounts
         # for them in peak/current PyTorch bytes, outside the KV pool. They
         # remain resident across KV release, like the parent forward buffers.
+        # One SWA staging source per execution owner, not per attention layer.
+        # Layers consume it serially; TBO children overlap and need disjoint
+        # sources. Reserve before profiling so this scratch is in the budget.
+        self._prefill_window_staging = (
+            torch.empty(
+                (self.max_bs * self.geometry.ring_slots + self.max_num_batched_tokens)
+                * self.geometry.window_row_bytes,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            if self.geometry.window_fp8
+            else None
+        )
         if model_runner.config.enable_tbo:
+            self._ubatch_prefill_window_staging = [
+                (
+                    torch.empty_like(self._prefill_window_staging)
+                    if self._prefill_window_staging is not None
+                    else None
+                )
+                for _ in range(NUM_TBO_UBATCHES)
+            ]
             model_runner.forward_vars.update(self._ubatch_step_buffers())
             self._ubatch_indptrs = [
                 {
@@ -419,6 +469,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         return {}
 
     def allocate_per_req_cache(self, entries):
+        # The arena is allocated here rather than carved from the runner's
+        # paged buffer (`paged_pool_bytes` is zero), so this is where a pool a
+        # KV connector provides has to be taken from. ATOM's own pool keeps
+        # the cache's allocations as they are.
+        memory = self.model_runner._kv_pool_memory()
         self.cache = PagedAttentionCache(
             self.geometry,
             self.num_blocks,
@@ -426,14 +481,56 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.device,
             max_tokens=self.max_num_batched_tokens,
             workspace=self.score_workspace,
+            prefill_window_staging=self._prefill_window_staging,
+            allocate_backing=memory.allocate if memory.single_allocation else None,
         )
         self.copies = StateCopies(
             self.cache, self.model_runner.state_runtime.checkpoint_spec, self.max_bs
         )
         return {}
 
+    def owned_pool_layout(self):
+        """`(arena, PAGE regions)` of the pool this builder allocated itself.
+
+        A PAGE unit is one scheduler block: its main page and its rows in every
+        index plane (`PagedAttentionCache.unit_regions`). The STATE slots after
+        the paged extent are not in any region -- a block's bytes are the PAGE
+        alone, which is all a prefix hit reuses under encoder bounded replay.
+        """
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
+        cache = self.cache
+        # `arena` is the one allocation a connector's memory handed out (the
+        # BF16 arena, or the slab the quantized source buffers are cut from);
+        # None when the pool is ATOM's own.
+        if cache is None or cache.arena is None:
+            return None
+        regions = [
+            KVTransferRegion(base, cache.num_pages * unit, unit)
+            for base, unit in cache.unit_regions()
+        ]
+        return cache.arena, regions
+
+    def copy_paged_blocks(self, copies):
+        """Every region of a PAGE unit (`unit_regions`: its main pages and its
+        rows in each index plane), from `copies[i][0]` to `copies[i][1]`: one
+        gather and one scatter per region."""
+        # Staged through pinned memory: a pageable host-to-device copy waits
+        # for the device, which here would stall the step's whole launch.
+        ids = torch.tensor(copies, dtype=torch.int64).t().contiguous()
+        if self.device != "cpu":
+            ids = ids.pin_memory()
+        ids = ids.to(self.device, non_blocking=True)
+        src, dst = ids[0], ids[1]
+        cache = self.cache
+        planes = [view for _, view in cache.page_regions] + [
+            plane for owned in cache.index_planes.values() for plane in owned
+        ]
+        for plane in planes:
+            plane.index_copy_(0, dst, plane.index_select(0, src))
+
     def state_entry_views(self, slot):
-        return [self.copies.entry(slot)]
+        return self.copies.entries(slot)
 
     def relocate_state_slots(self, pairs):
         self.copies.relocate(pairs)
@@ -454,8 +551,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         order -- the order `StateCopies` cuts a checkpoint
         image into, which `build_native_state_mp_layout` aliases unit by unit.
 
-        For P/D (`slot_regions`): the request's whole STATE slot as one
-        slot-indexed region. A slot is contiguous and holds every
+        For P/D (`slot_regions`): all regions belonging to a STATE slot.
+        Quantized windows use one data/scale region per layer. Together they hold every
         layer's window ring -- the decoder's bounded-replay tail and the DSpark
         context layers included -- plus the compressor rings and the cursor, so
         it is all a consumer needs to decode and draft from the prompt's end.
@@ -478,7 +575,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # Equal byte widths do not imply equal physical layout. Mooncake
             # checks these roles before writing any PAGE.
             names = [f"{name}_fp4_{self.cache.geometry.index_layout}" for name in names]
-        planes = [("dsv41.page", self.cache.page_bytes)] + [
+        planes = [(f"dsv41.{name}", view) for name, view in self.cache.page_regions] + [
             (f"dsv41.{name}_plane.{owner}", plane)
             for owner, owned in self.cache.index_planes.items()
             for name, plane in zip(names, owned)
@@ -505,11 +602,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # of the slot's previous tenant (`MooncakeConnector._post_write_requests`).
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-        state = self.cache.state_bytes  # [slots, state_bytes] uint8 view
-        slot_unit = int(state.shape[1])
-        p_d = (
-            KVConnectorFactory.connector_name(runner.config.kv_transfer_config)
-            == "mooncake"
+        states = self.cache.state_regions
+        p_d = any(
+            name == "mooncake"
+            for name, _ in (KVConnectorFactory.leaf_connectors(runner.config) or [])
         )
         return KVTransferTensors(
             pages=pages,
@@ -518,15 +614,16 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 [
                     KVTransferRegion(
                         state.data_ptr(),
-                        int(state.shape[0]) * slot_unit,
-                        slot_unit,
-                        semantic_role="dsv41.state_slot",
+                        state.numel(),
+                        state.shape[1],
+                        semantic_role=f"dsv41.{name}",
                     )
+                    for name, state in states
                 ]
                 if p_d
                 else []
             ),
-            num_slots=int(state.shape[0]) if p_d else 0,
+            num_slots=self.cache.num_slots if p_d else 0,
             tp_replication_factor=tp_size,
             native_state_tp_replication_factor=tp_size,
             paged_state_checkpoint_spec=spec,
@@ -565,11 +662,14 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         start_positions=None,
         engram_live=True,
         ubatch_slices=None,
+        final_heads=None,
     ):
         """``engram_live`` False: Engram's forward kernels run on no token (a
         capture: they record on serving's buffers, touching none).
         ``ubatch_slices``: a TBO prefill's micro-batches, each a step of its
-        own staged and published with this one."""
+        own staged and published with this one.
+        ``final_heads``: returns the requests' heads once they are known; the
+        step is staged at ``start_positions`` until then (`_settle_heads`)."""
         spans, rows, offset, next_page = [], [], 0, 0
         slots = batch.state_slots_committed
         if not batch.is_dummy_run and len(slots) != batch.total_seqs_num:
@@ -611,6 +711,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 self.device,
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
+                prefill_window_staging=self._prefill_window_staging,
             )
             if batch.is_dummy_run
             else self.cache
@@ -630,6 +731,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             engram_live=engram_live,
             replay_layout=(resumes, floors, cached_until, histories),
             ubatch_slices=ubatch_slices,
+            final_heads=final_heads,
         )
 
     def _step_group(self, name):
@@ -655,9 +757,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         engram_live=True,
         replay_layout=(None, None, None, None),
         ubatch_slices=None,
+        final_heads=None,
     ):
         """``replay_layout``: ``_replay_layout``'s (resumes, floors,
-        cached_until, histories) for a resumed prefill, else all None."""
+        cached_until, histories) for a resumed prefill, else all None.
+        ``final_heads``: `_prepare`'s, taken before the step is published."""
         resumes, floors, cached_until, histories = replay_layout
         offset = sum(span.length for span in spans)
         token_mask = self._token_mask(batch, spans, offset)
@@ -700,10 +804,12 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # `extra_write`: CSA2's K_pool is 1 or 2, narrower than a verify step,
         # so without the slack the plan drops what a rejection re-exposes.
         # A lean step (`RoundService.LEAN`) has none: nothing it runs reads them.
-        plans = (
-            None
-            if service >= RoundService.LEAN
-            else self._build_compress_plans(
+        lean = service >= RoundService.LEAN
+
+        def compress_plans(spans):
+            if lean:
+                return None
+            return self._build_compress_plans(
                 np.asarray([span.length for span in spans], dtype=np.int32),
                 np.asarray([span.end for span in spans], dtype=np.int32),
                 write_from=resumes,
@@ -713,7 +819,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 extra_write=self.geometry.speculative_tokens if tentative else 0,
                 group=group,
             )
-        )
+
+        plans = compress_plans(spans)
         live = offset if engram_live and not batch.is_dummy_run else 0
         self._stage(
             ENGRAM_ROWS,
@@ -732,7 +839,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state_slot_out=state_slot_out,
             plans=plans,
             planners=self.step_planners,
-            lean=service >= RoundService.LEAN,
+            lean=lean,
             floors=floors,
             cached_until=cached_until,
             finals=(
@@ -754,9 +861,12 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self._stage_ubatch_step(step, rows, cache, ub_idx, ub)
             for ub_idx, ub in enumerate(ubatch_slices)
         ]
-        for staged in (group, *map(self._step_group, ubatch_groups)):
-            if staged is not None:
-                staged.publish()
+        # A step owing the previous verify's status is published once its heads
+        # settle (`take_spec_status`), the rest of its preparation first
+        if final_heads is None:
+            for staged in (group, *map(self._step_group, ubatch_groups)):
+                if staged is not None:
+                    staged.publish()
         # A serving prefill, an idle rank's included; not a warmup's, which
         # computes every row.
         if self._decoder_replays and is_prefill and cache is self.cache:
@@ -776,7 +886,69 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             ]
         if decode_round is not None:
             decode_round.laid_out(metadata)
+        # every step's: none left over from one that never reached the take
+        self._unsettled = (
+            None
+            if final_heads is None
+            else _Unsettled(
+                batch, spans, metadata, final_heads,
+                () if lean else self.step_planners,
+                None if lean else compress_plans, group,
+            )
+        )  # fmt: skip
         return metadata, step.positions
+
+    def take_spec_status(self, processor) -> None:
+        """The status the step owes, then the step finished with it
+        (`_settle`)."""
+        unsettled, self._unsettled = self._unsettled, None
+        if unsettled is not None:
+            self._settle(unsettled)
+        processor.take_deferred_spec_status()
+
+    def _settle(self, u: "_Unsettled") -> None:
+        """An unsettled step at its final heads: the requests moved there
+        (`_settle_heads`) and their compress plans rebuilt, the step published,
+        then the state that reads where they start prepared (``state_owed``:
+        `prepare_model_inputs` left it)."""
+        metadata = u.metadata
+        step = metadata.step
+        moved = self._settle_heads(u.batch, u.spans, step, u.final_heads(), u.planners)
+        if moved and u.compress_plans is not None:
+            step.plans = u.compress_plans(u.spans)
+        metadata.max_seqlen_k = max((span.end for span in step.requests), default=0)
+        if u.group is not None:
+            u.group.publish()
+        if u.state_owed:
+            self._prepare_state(metadata, on_device=True)
+
+    def _settle_heads(self, batch, spans, step, heads, planners):
+        """Move ``spans`` (in place) and their staged ``step`` to ``heads``,
+        before the step is published: the positions and what the planners lay
+        out over them are restaged (`stage_positions`). True when a request
+        moved, its compress plans then the caller's to rebuild. Nothing else
+        a step stages depends on where its requests start."""
+        if batch.is_dummy_run:  # fabricated requests start at 0 whatever
+            return False
+        moved = False
+        for i, (span, head) in enumerate(zip(spans, heads.tolist())):
+            if span.position != head:
+                spans[i] = replace(span, position=head)
+                moved = True
+        if not moved:
+            return False
+        buffers = self.model_runner.forward_vars
+        step.request_positions, _, step.planned_host = stage_positions(
+            spans,
+            buffers,
+            buffers["cu_seqlens_q"].np,
+            np.asarray([span.length for span in spans], dtype=np.int32),
+            step.running_tokens,
+            tuple(ratio for ratio, _ in self.geometry.compress_ratios),
+            planners,
+        )
+        step.requests = tuple(spans)
+        return True
 
     def _publish_decoder(self, step, rows, cache, running_bs):
         """The `ReplayPlan` of the rows a replaying prefill's decoder runs on:
@@ -834,6 +1006,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             group.publish()
         tail.request_floors = tail.request_positions.astype(np.int32)
         tail.request_cached_until = np.zeros(len(spans), np.int32)
+        # This tail runs prefill attention, but bypasses cache.begin_step().
+        # Bind the same reserved source before eager execution or graph capture.
+        cache._reserve_prefill_window(tail)
         cache.publish_replay_layout(tail, running_bs, floors=floors)
         return ReplayPlan(
             tail=tail,
@@ -1096,6 +1271,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         if cache.workspace is not None:
             step.tile_workspace = cache.workspace.tile_slice(ts)
+        step.prefill_window_staging = self._ubatch_prefill_window_staging[ubatch_idx]
         step.plans = make_compress_plans(
             np.asarray([span.length for span in spans], dtype=np.int32),
             np.asarray([span.end for span in spans], dtype=np.int32),
@@ -1144,21 +1320,36 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         self, batch, running_bs, running_tokens, max_seqlen_q, decode_ubatch_slices=None
     ):
         # The config refuses decode TBO (`deepseek_v41.config`): never sliced.
-        starts = None
+        heads = final_heads = None
         if self.geometry.speculative_tokens and batch.total_seqs_num:
             # The scheduler reserves a full draft span, including placeholders
             # from the previous step. Ragged verification takes its head.
-            starts = self.model_runner.tokenID_processor.verify_ctx_lens(
-                np.asarray(batch.context_lens) - (batch.num_spec_step + 1)
-            )
+            processor = self.model_runner.tokenID_processor
+            span_heads = np.asarray(batch.context_lens) - (batch.num_spec_step + 1)
+            heads = processor.verify_ctx_lens(span_heads)
+            if (
+                processor.spec_status_owed
+                and not self.model_runner.spec_status_deferred
+            ):
+                # `heads` count no draft rejected until the status is taken.
+                def final_heads():
+                    processor.take_deferred_spec_status()
+                    return processor.verify_ctx_lens(span_heads)
+
         return self._prepare(
             batch,
             running_bs,
             running_tokens,
             max_q_len=max_seqlen_q,
             tentative=bool(self.geometry.speculative_tokens),
-            start_positions=starts,
+            start_positions=heads,
+            final_heads=final_heads,
         )
+
+    def settles_spec_status(self, batch, max_seqlen_q) -> bool:
+        """A decode verify is staged before the previous verify's status and
+        moves its requests' heads once that is taken (`_settle_heads`)."""
+        return bool(self.geometry.speculative_tokens) and not batch.has_prefill
 
     def _engram_batch(self, step, cache, metadata, tokens):
         """This forward on the device, for the Engram kernels.
@@ -1240,15 +1431,20 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             else self._engram_batch(step, cache, metadata, tokens)
         )
         on_device = not metadata.dummy and (staged is not None or batch is not None)
-        if metadata.dummy:
-            histories = np.full(
-                (step.scheduled_bs, self.geometry.history_size), -1, np.int64
-            )
-        elif metadata.served_by_round is RoundService.DEVICE:
-            # its start is the device's: no probe (`prepare_device_round_state`)
-            histories = cache.prepare_device_round_state(step, histories=not on_device)
+        # A step staged for the forward to look its rows up (``staged``) runs
+        # nothing here that reads its published buffers or where its requests
+        # start but its state: that waits for the heads (`take_spec_status`).
+        # Any other path reads them here (the host its histories, the device
+        # batch its positions): the step settles now, the status with it.
+        unsettled = self._unsettled
+        if unsettled is not None and staged is None:
+            self._unsettled = None
+            self._settle(unsettled)
+        if unsettled is not None and staged is not None:
+            unsettled.state_owed = True
+            histories = None
         else:
-            histories = cache.prepare_state(step, histories=not on_device)
+            histories = self._prepare_state(metadata, on_device)
         if self.engram is not None:
             prepared = self.engram.prepare(
                 step.requests,
@@ -1292,8 +1488,25 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self._write_engram_cursor(step, cache, batch)
         elif staged is None and not metadata.dummy and not step.tentative:
             cache.advance_cursor(step, histories)
+
+    def _prepare_state(self, metadata, on_device: bool):
+        """The step's state before any layer writes it
+        (`PagedAttentionCache.prepare_state`): its restored histories, None
+        where the device works them out (``on_device``), a tentative step's
+        pending state told so."""
+        step, cache = metadata.step, metadata.cache
+        if metadata.dummy:
+            return np.full(
+                (step.scheduled_bs, self.geometry.history_size), -1, np.int64
+            )
+        if metadata.served_by_round is RoundService.DEVICE:
+            # its start is the device's: no probe (`prepare_device_round_state`)
+            histories = cache.prepare_device_round_state(step, histories=not on_device)
+        else:
+            histories = cache.prepare_state(step, histories=not on_device)
         if on_device and step.tentative:
             cache.pending.staged_on_device = True
+        return histories
 
     def commit_speculative_state(self, metadata, last_token_indices):
         # A served step whose forward committed it already, at these anchors

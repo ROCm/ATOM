@@ -24,6 +24,8 @@ import hashlib
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 
+from atom.mono import polling
+
 _SCALARS = (int, float, bool, str, enum.Enum)
 _ATOM = Path(__file__).resolve().parents[2]
 
@@ -42,6 +44,8 @@ def source_digest(*paths: str) -> str:
         for f in files:
             h.update(str(f.relative_to(_ATOM)).encode())
             h.update(f.read_bytes())
+            if f.name == "polling.py":
+                h.update(polling.CACHE_TAG)  # its value is from the environment
     return h.hexdigest()[:16]
 
 
@@ -68,6 +72,20 @@ def _scalar_fields(key, prefix: str) -> list:
             )
         out.append((name, value))
     return out
+
+
+def kernel_symbol(stem, **params):
+    """An Itanium-mangled ATOM symbol, without importing the GPU compiler.
+
+    Match AITER kernel-signature rendering: keep parameter order, encode
+    booleans as 0/1, and replace minus signs for the amdhsa assembler.
+    """
+    signature = "_".join(
+        f"{key}{int(value) if isinstance(value, bool) else value}"
+        for key, value in params.items()
+    ).replace("-", "_")
+    name = f"{stem}_{signature}"
+    return f"_ZN4atom{len(name)}{name}E"
 
 
 def symbol_params(key) -> dict:

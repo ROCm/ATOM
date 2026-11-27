@@ -425,6 +425,8 @@ class GatedDeltaNet(nn.Module):
                     buf_k=layer_cache.replay_buf_k,
                     buf_u=layer_cache.replay_buf_u,
                     buf_g=layer_cache.replay_buf_g,
+                    flush_arrivals=layer_cache.replay_flush_arrivals,
+                    flush_wait=layer_cache.replay_flush_wait,
                     write_pos=gdn_metadata.write_pos,
                     slot_idx=gdn_metadata.slot_idx[:nsd],
                     cu_seqlens=spec_query_start_loc[: nsd + 1],
@@ -465,13 +467,15 @@ class GatedDeltaNet(nn.Module):
         wrote_core_attn_out = False
         if gdn_metadata.num_prefills > 0:
             ckpt = gdn_metadata.ssm_checkpoints
+            # A pool at another dtype than `h` takes its interior targets from
+            # snapshots that `GDNStateMixin.finish_prefill` plans and the chunk
+            # kernel stores unnarrowed, which FlyDSL prefill does not produce.
+            h_snap = None
+            if ckpt is not None and "snap_idx" in ckpt:
+                h_snap = ssm_state.new_empty((ckpt["num_snaps"], *ssm_state.shape[1:]))
             flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
             use_flydsl_prefill = False
-            if (
-                flydsl_policy is not None
-                and flydsl_policy.prefill
-                and not use_replayssm
-            ):
+            if flydsl_policy is not None and flydsl_policy.prefill and h_snap is None:
                 from atom.model_ops.fla_ops.gdn_flydsl import (
                     prefill,
                     prefill_supported,
@@ -542,6 +546,9 @@ class GatedDeltaNet(nn.Module):
                     keep_intermediate_states=(
                         ckpt is not None or gdn_metadata.keep_intermediate_states
                     ),
+                    state_snapshots=(
+                        (ckpt["snap_idx"], h_snap) if h_snap is not None else None
+                    ),
                 )
             # Init cache
             ssm_state.index_copy_(
@@ -589,7 +596,7 @@ class GatedDeltaNet(nn.Module):
                 # above) and shares `slots` with the SSM half, so the two
                 # always describe the same token position.
                 write_state_checkpoints(
-                    h,
+                    h if h_snap is None else h_snap,
                     ssm_state,
                     mixed_qkv_non_spec,
                     conv_state,
@@ -602,6 +609,7 @@ class GatedDeltaNet(nn.Module):
                     non_spec_query_start_loc,
                     CHUNK_SIZE,
                     gdn_metadata.ssm_conv_state_len,
+                    h_rows=None if h_snap is None else ckpt["h_rows"],
                 )
         elif gdn_metadata.num_decodes > 0 and use_replayssm:
             nd = gdn_metadata.num_decodes
@@ -615,6 +623,8 @@ class GatedDeltaNet(nn.Module):
                 buf_k=layer_cache.replay_buf_k,
                 buf_u=layer_cache.replay_buf_u,
                 buf_g=layer_cache.replay_buf_g,
+                flush_arrivals=layer_cache.replay_flush_arrivals,
+                flush_wait=layer_cache.replay_flush_wait,
                 write_pos=gdn_metadata.write_pos,
                 slot_idx=gdn_metadata.slot_idx[:nd],
                 cu_seqlens=non_spec_query_start_loc[: nd + 1],

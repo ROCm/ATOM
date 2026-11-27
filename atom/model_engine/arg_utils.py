@@ -19,6 +19,7 @@ from atom.config import (
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
+from atom.model_ops.indexer.layout import MFMA, NATURAL, PRESHUFFLE
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -120,6 +121,8 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    tensor_parallel_size_local: int | None = None
+    tensor_parallel_rank: int = 0
     decode_context_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
@@ -132,9 +135,11 @@ class EngineArgs:
     data_parallel_base_port: int | None = None
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
+    enable_mixed_prefill_decode: bool = False
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
+    index_cache_layout: str | None = None
     block_size: int = 16
     max_model_len: int | None = None
     max_num_batched_tokens: int = 16384
@@ -178,6 +183,7 @@ class EngineArgs:
     draft_model: str | None = None
     spec_decode_acceptance_rate: float | None = None
     spec_decode_acceptance_length: float | None = None
+    spec_decode_kv_cache_dtype: str | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
     disagg_prefill_max_num_seqs: int | None = None
@@ -215,6 +221,28 @@ class EngineArgs:
             type=int,
             default=1,
             help="Tensor parallel size.",
+        )
+        parser.add_argument(
+            "--tensor-parallel-size-local",
+            type=int,
+            default=None,
+            help=(
+                "Number of tensor-parallel ranks to run on THIS node. Defaults "
+                "to --tensor-parallel-size (single-node). Set it lower to "
+                "spread one TP group over several nodes; every node then needs "
+                "--data-parallel-master-ip of the node that runs TP rank 0 and "
+                "the same --data-parallel-base-port."
+            ),
+        )
+        parser.add_argument(
+            "--tensor-parallel-rank",
+            type=int,
+            default=0,
+            help=(
+                "First tensor-parallel rank owned by this node. Node 0 uses 0 "
+                "and serves the API; the second node of a 2x4 run uses 4 and "
+                "runs only its model-runner workers."
+            ),
         )
         parser.add_argument(
             "--pipeline-parallel-size",
@@ -313,6 +341,13 @@ class EngineArgs:
             "Use --no-enable_prefix_caching to disable.",
         )
         parser.add_argument(
+            "--enable-mixed-prefill-decode",
+            action="store_true",
+            help="Pack prefill chunks and decode seqs into the same forward "
+            "pass (DeepSeek-V4 only; refused at launch elsewhere). Profiles "
+            "mixed workspace before sizing the KV cache. Off by default.",
+        )
+        parser.add_argument(
             "--port",
             type=int,
             default=8006,
@@ -320,20 +355,32 @@ class EngineArgs:
         )
         parser.add_argument(
             "--kv_cache_dtype",
-            choices=["bf16", "fp8"],
+            choices=["bf16", "fp8", "fp4", "nvfp4"],
             type=str,
             default="bf16",
-            help="KV cache type. Default is 'bf16'.",
+            help="KV cache type. Default is 'bf16'. 'fp4' is MiniMax-M3.1's MXFP4 K/V "
+            "or DeepSeek-V4.1's own FP4 KV; 'nvfp4' is MiniMax-M3.1's NVFP4 K/V "
+            "(needs --index-cache-dtype nvfp4); other models refuse them. M3's "
+            "conditions are in the configuration guide.",
         )
         parser.add_argument(
             "--index-cache-dtype",
             "--index_cache_dtype",
-            choices=["bf16", "fp8", "fp4"],
+            choices=["bf16", "fp8", "fp4", "nvfp4"],
             type=str,
             default=None,
             help="Index cache type. Native single-node DeepSeek-V4 defaults to "
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
-            "default to --kv_cache_dtype.",
+            "default to --kv_cache_dtype. 'fp4' is MiniMax-M3's MXFP4 index "
+            "cache or another model's own FP4 layout; 'nvfp4' is MiniMax-M3's NVFP4 index "
+            "cache (e2m1 + e4m3 per 16); see the configuration guide.",
+        )
+        parser.add_argument(
+            "--index-cache-layout",
+            choices=[PRESHUFFLE, MFMA, NATURAL],
+            default=None,
+            help="FP4 index cache layout. DSA defaults to preshuffle; use mfma "
+            "for OPUS. V4/V4.1 must match the configured scorer backend.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -411,6 +458,12 @@ class EngineArgs:
             "prompt-token load. 'least_tokens': route to the rank with "
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "'share_cache': with an offload tier every rank shares "
+            "(mooncake_store, lmcache_mp), route to the rank with the least "
+            "prefill left as the ranks report it, charging a request only what "
+            "it will compute (prompt minus the prefix any rank already put in "
+            "the tier); needs --enable_prefix_caching and "
+            "ATOM_FRONTEND_PREFIX_HASH=1, excludes ATOM_DP_SESSION_AFFINITY. "
             "'prefix_spread': keep a request on the rank holding its prompt's "
             "prefix unless that rank has a prefill backlog and another is "
             "about to idle (ATOM_DP_PREFIX_IDLE_TOKENS); the moved request "
@@ -469,6 +522,21 @@ class EngineArgs:
             "--method eagle3; optional for --method dspark (needed for the "
             "DFlash-backbone drafts such as Kimi-K3-DSpark, omitted for "
             "V4-Pro-DSpark which ships inside the target checkpoint).",
+        )
+        parser.add_argument(
+            "--spec-decode-kv-cache-dtype",
+            type=str,
+            default=None,
+            choices=["bf16", "fp8"],
+            help="KV dtype of the speculative draft's pages "
+            "(SpeculativeConfig.kv_cache_dtype). A draft with a KV pool of its own "
+            "(an MHA draft: MiniMax-M3.1's DSpark, an MHA EAGLE3 draft) takes "
+            "either; omitted, --kv_cache_dtype's (bf16 under an fp4 / nvfp4 target). A draft in the target's pool "
+            "always has --kv_cache_dtype, and a different value here is an error. "
+            "A DeepSeek-V4.1 DSpark draft is not set by this flag (refused): use "
+            '--dspark-config \'{"draft_kv_dtype":"fp8"}\', a different setting '
+            "(how the draft reads the target's pool, not its own pages). "
+            "Needs --method and --num-speculative-tokens > 0.",
         )
         parser.add_argument(
             "--spec-decode-acceptance-length",
@@ -832,8 +900,13 @@ class EngineArgs:
                 '  "enable_project_before_merge" (bool, TRUE): project V '
                 "before the output merge, shrinking it by "
                 "kv_lora_rank/v_head_dim.\n"
-                "  \"comm_backend\" (str, a2a): 'a2a' = one all-to-all; "
-                "'ag_rs' = AllGather LSE + ReduceScatter output.\n"
+                "  \"comm_backend\" (str, auto): 'auto' = 'mailbox' on gfx950 "
+                "with DCP > 1 unless decode TBO or plugin mode, else 'a2a'; "
+                "'a2a' = one packed all-to-all or separate output/LSE "
+                "all-to-alls for head-major prefill; 'ag_rs' = AllGather LSE "
+                "+ ReduceScatter output; "
+                "'mailbox' = aiter's FlyDSL mailbox combine for decode (a2a "
+                "elsewhere).\n"
                 "The last three default to the NEW behaviour (and the middle "
                 "two auto-disable where unsupported), so a control run must "
                 "pass the old values explicitly -- passing nothing re-runs the "
@@ -899,6 +972,9 @@ class EngineArgs:
         kwargs = {
             f.name: getattr(self, f.name) for f in fields(self) if f.name != "model"
         }
+        # Let Config resolve ATOM_TORCH_PROFILER_DIR when no path was supplied.
+        if self.torch_profiler_dir is None:
+            kwargs.pop("torch_profiler_dir")
 
         # Handle special transformations
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
@@ -928,6 +1004,7 @@ class EngineArgs:
                 method=method,
                 model=draft_model or self.model,
                 num_speculative_tokens=num_spec_tokens,
+                kv_cache_dtype=kwargs.pop("spec_decode_kv_cache_dtype"),
                 synthetic_acceptance_rate=synthetic_acceptance_rate,
                 synthetic_acceptance_length=synthetic_acceptance_length,
             )
@@ -937,6 +1014,11 @@ class EngineArgs:
             kwargs.pop("draft_model")
             kwargs.pop("spec_decode_acceptance_rate")
             kwargs.pop("spec_decode_acceptance_length")
+            if kwargs.pop("spec_decode_kv_cache_dtype") is not None:
+                raise ValueError(
+                    "--spec-decode-kv-cache-dtype needs --method and "
+                    "--num-speculative-tokens > 0."
+                )
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
@@ -979,22 +1061,46 @@ class EngineArgs:
 
         # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs
         # too: LLMEngine still reads the loose kwarg on the legacy path.
-        parallel_config_kwargs = {
-            "data_parallel_size": kwargs["data_parallel_size"],
-            "data_parallel_size_local": kwargs.pop("data_parallel_size_local"),
-            "data_parallel_rank": kwargs.pop("data_parallel_rank"),
-            "data_parallel_master_ip": kwargs.pop("data_parallel_master_ip"),
-            "data_parallel_master_port": kwargs.pop("data_parallel_master_port"),
-        }
-        base_port = kwargs.pop("data_parallel_base_port")
-        if base_port is not None:
-            parallel_config_kwargs["data_parallel_base_port"] = base_port
-        kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
+        for name in self._PARALLEL_CONFIG_FIELDS:
+            if name != "data_parallel_size":
+                kwargs.pop(name)
+        kwargs["parallel_config"] = self.parallel_config()
 
         logger.info(f"Engine kwargs: {kwargs}")
 
         return kwargs
 
+    _PARALLEL_CONFIG_FIELDS = (
+        "data_parallel_size",
+        "data_parallel_size_local",
+        "data_parallel_rank",
+        "data_parallel_master_ip",
+        "data_parallel_master_port",
+        "data_parallel_base_port",
+        "tensor_parallel_size_local",
+        "tensor_parallel_rank",
+    )
+
+    def parallel_config(self) -> ParallelConfig:
+        """This node's ParallelConfig, with the ATOM_DP_* environment applied.
+
+        A node that runs only TP workers reads the engine's address from it as
+        well, so both nodes resolve that address the same way.
+        """
+        kwargs = {name: getattr(self, name) for name in self._PARALLEL_CONFIG_FIELDS}
+        if kwargs["data_parallel_base_port"] is None:
+            del kwargs["data_parallel_base_port"]
+        return ParallelConfig(**kwargs)
+
     def create_engine(self, tokenizer=None) -> LLMEngine:
-        """Create and return an LLMEngine instance with the configured parameters."""
+        """Create and return an LLMEngine instance with the configured parameters.
+
+        A node whose TP slice starts past rank 0 (--tensor-parallel-rank) has no
+        engine to create: it runs its TP workers for the engine on another node
+        and exits the process with their status once they stop.
+        """
+        if self.tensor_parallel_rank > 0:
+            from atom.model_engine.tp_multinode import serve_remote_tp_ranks
+
+            raise SystemExit(serve_remote_tp_ranks(self))
         return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())

@@ -19,6 +19,8 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
+from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
+
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
 
@@ -122,6 +124,16 @@ class _AtomMetricsCollector:
                 "Fraction of KV-cache blocks currently allocated.",
                 snapshot.get("kv_cache_usage_ratio", 0),
             ),
+            (
+                "atom:requests_deferred_free",
+                "Finished or aborted requests held whole until every connector releases them: a P/D decode pull, a whole-request offload save, or a load still writing into their blocks. Early-release offload leases are excluded.",
+                snapshot.get("requests_deferred_free", 0),
+            ),
+            (
+                "atom:kv_cache_blocks_deferred_free",
+                "Physical KV blocks of finished or aborted requests held whole until every connector releases them: a P/D decode pull, a whole-request offload save, or a load still writing into their blocks. Early-release offload leases are excluded. Shared prefix blocks are counted once.",
+                snapshot.get("kv_blocks_deferred_free", 0),
+            ),
         )
         for name, documentation, value in gauges:
             metric = GaugeMetricFamily(name, documentation)
@@ -155,6 +167,11 @@ class _AtomMetricsCollector:
             yield metric
 
         dp_router = snapshot.get("dp_router", {})
+        for key, documentation in ShareCacheRouter.DECISIONS.items():
+            name = "atom:dp_" + key.removesuffix("_total")
+            metric = CounterMetricFamily(name, documentation)
+            metric.add_metric([], float(dp_router.get(key, 0)))
+            yield metric
         for name, documentation, value in (
             (
                 "atom:dp_affinity_new",
@@ -498,6 +515,35 @@ class _AtomMetricsCollector:
                             values[queue_state],
                         )
             yield metric
+
+        pending = GaugeMetricFamily(
+            "atom:pd_admission_pending_requests",
+            "PD requests holding admission credits through their first scheduled forward.",
+            labels=["dp_rank", "engine_role", "state"],
+        )
+        pending_bytes = GaugeMetricFamily(
+            "atom:pd_admission_pending_kv_bytes",
+            "Physical receive-target bytes held by pending PD requests per D rank.",
+            labels=["dp_rank", "engine_role"],
+        )
+        deferred = CounterMetricFamily(
+            "atom:pd_admission_deferred",
+            "PD requests deferred by a credit limit, counted once per admission wait and limit.",
+            labels=["dp_rank", "engine_role", "reason"],
+        )
+        for rank in ranks:
+            if "pd_admission" not in rank:
+                continue
+            labels = [str(rank["dp_rank"]), rank["engine_role"]]
+            admission = rank["pd_admission"]
+            for request_state, count in admission["pending"].items():
+                pending.add_metric([*labels, request_state], count)
+            pending_bytes.add_metric(labels, admission["pending_kv_bytes"])
+            for reason, count in admission["deferred"].items():
+                deferred.add_metric([*labels, reason], count)
+        yield pending
+        yield pending_bytes
+        yield deferred
 
         cache = snapshot.get("cache", {})
         if describe or "offload_tokens" in cache:

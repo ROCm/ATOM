@@ -11,6 +11,7 @@ All functions are traced inside a @flyc.kernel body.
 from __future__ import annotations
 
 import re as _re
+import threading as _threading
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -298,18 +299,32 @@ def unlikely(b):
 
 
 # Poll timeouts made visible. Every bounded poll (cross-rank tag waits, device handoffs) gives up after 2 s and the
-# kernel goes on with whatever it read; a timeout therefore means wrong results. TOFLAG[0] (set by the step kernel to its
-# 'cyc' scratch) counts them: int32 [0] += 1, int32 [1] = the last site id. The runner reads it after a step.
-TOFLAG = [None]
+# kernel goes on with whatever it read; a timeout therefore means wrong results. The step kernel's 'cyc' scratch counts
+# them: int32 [0] += 1, int32 [1] = the last site id; the runner reads it after a step. Its pointer is an IR value of the
+# trace that loaded it, so it is held per thread for that trace only (``timeout_counter``): FlyDSL traces a kernel on
+# the calling thread with thread-local compile state, and concurrent traces (several ranks' or widths' builds on
+# threads) must not see each other's values.
+_TRACE = _threading.local()
 POLL_TICKS = 200000000   # a bounded poll gives up after this many clock ticks (~2 s) and records a timeout
+
+
+def timeout_counter(ptr):
+    """The trace's poll-timeout counter (an address, its kernel's 'cyc'), or None: set at the start of a trace that
+    counts timeouts, cleared at its end."""
+    _TRACE.counter = ptr
+
+
+def _counter():
+    return getattr(_TRACE, "counter", None)
 
 
 @_ASTR.transform
 def note_timeout(t0, site):
-    if fx.const_expr(TOFLAG[0] is not None):
+    flag = _counter()
+    if fx.const_expr(flag is not None):
         if clock() - t0 >= fx.Int64(POLL_TICKS):
-            atomic_add(TOFLAG[0], 1)
-            gstore(TOFLAG[0] + fx.Int64(4), fx.Int32(site))
+            atomic_add(flag, 1)
+            gstore(flag + fx.Int64(4), fx.Int32(site))
 
 
 

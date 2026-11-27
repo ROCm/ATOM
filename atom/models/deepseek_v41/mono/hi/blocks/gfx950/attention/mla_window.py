@@ -310,6 +310,15 @@ def _q_tile(k, p: _APlan, r, ht, pos):
         not p.ragged
     ):  # the tile's words (in this order: the 16-head programs' code as before)
         got = mb.poll([(k.mb[p.q], e0w + w, 2) for w in ws], k.tag)
+    else:  # a dead head's words from the last live head
+        hw = HD // 2
+        got = mb.poll(
+            [
+                (k.mb[p.q], (r * p.heads + p.head(ht, w // hw)) * hw + w % hw, 2)
+                for w in ws
+            ],
+            k.tag,
+        )
     for j, w in enumerate(ws):
         hh, dw = w // (HD // 2), w % (HD // 2)
         vals = [v for word in got[j] for v in bf2_f32(word)]
@@ -657,7 +666,7 @@ def _attn(k, t, p: _APlan):
 
 
 class MLAWindowAttn(Block):
-    """``heads``: this rank's query heads (64 at TP1; TP shards them, 16 a rank at TP4, 8 at TP8): 16-head tiles, the
+    """``heads``: this rank's query heads (64 at TP1; TP shards them, 32 a rank at TP2, 16 at TP4, 8 at TP8): 16-head tiles, the
     last one ragged when heads is not a multiple of 16 (``_APlan.tiles``)."""
 
     def __init__(self, name: str, q: Channel, kvn: Channel, out: Channel, ring: str, pos: str, rope: str, sink: str,

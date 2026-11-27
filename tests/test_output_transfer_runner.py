@@ -1,19 +1,36 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Runner wiring only; storage and protocol tests do not require this import."""
 
 import weakref
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-runner_module = pytest.importorskip(
-    "atom.model_engine.model_runner",
-    reason="runner integration requires AITER",
-    exc_type=ImportError,
-)
+runner_module = None  # bound by `_runner_module` for the whole file
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _runner_module():
+    """The real runner module; AITER and Triton are stood in for on a CPU job."""
+    global runner_module
+    with atom_without_aiter() as load:
+        runner_module = load("atom.model_engine.model_runner")
+        yield runner_module
+
+
+@pytest.fixture(autouse=True)
+def isolated_topology(monkeypatch):
+    # No sequence/context parallelism here; under the CPU stand-ins the real
+    # group queries would return mocks.
+    monkeypatch.setattr(runner_module, "sp_is_enabled", lambda: False)
+    monkeypatch.setattr(runner_module, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(runner_module, "get_pcp_world_size", lambda: 1)
 
 
 def sampling_group(buffers):
@@ -85,25 +102,26 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         ),
         drafter=SimpleNamespace(lossless=None),
         forward_done_event=mock.Mock(),
-    )
-    runner._constrain_required_channel = MethodType(
-        runner_module.ModelRunner._constrain_required_channel, runner
+        _served=None,
+        structured_output=None,
     )
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(
             runner,
             SimpleNamespace(
                 total_seqs_num=bs,
+                is_mixed=False,
                 return_logprobs=[False] * bs,
                 any_logprobs=False,
                 required_channel=None,
+                structured_requests=None,
                 num_spec_step=2 if verified else 0,
             ),
-            torch.zeros(4, 8),
             torch.ones(bs),
             None,
             None,
             True,
+            runner_module.LmHeadOutput(None, torch.zeros(4, 8)),
             hidden_states=None,
         )
     send_status.assert_called_once()
@@ -159,9 +177,8 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
         sampler=mock.Mock(side_effect=None if verified else _Reached),
         rejection_sampler=SimpleNamespace(forward=mock.Mock(side_effect=_Reached)),
         drafter=drafter,
-    )
-    runner._constrain_required_channel = MethodType(
-        runner_module.ModelRunner._constrain_required_channel, runner
+        _served=None,
+        structured_output=None,
     )
     runner.sampler.sample_verification_tokens = mock.Mock(
         return_value=torch.zeros(bs, dtype=torch.int32)
@@ -174,12 +191,14 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
                 return_logprobs=[False] * bs,
                 any_logprobs=False,
                 required_channel=None,
+                structured_requests=None,
+                num_spec_step=2 if verified else 0,
             ),
-            torch.zeros(4, 8),
             temperatures,
             top_ks,
             top_ps,
             all_greedy,
+            runner_module.LmHeadOutput(None, torch.zeros(4, 8)),
             hidden_states=None,
         )
     runner.sampler.assert_called_once()
@@ -225,13 +244,14 @@ def test_a_uniform_k_reaches_the_sampler_as_a_scalar(ks, ps):
         )
     }
     group = sampling_group(buffers)
-    runner = SimpleNamespace(forward_vars=buffers)
+    runner = SimpleNamespace(forward_vars=buffers, verify_head=None)
     batch = SimpleNamespace(
         total_seqs_num=bs,
         temperatures=np.ones(bs, np.float32),
         top_ks=np.array(ks, np.int32),
         top_ps=np.array(ps, np.float32),
         required_channel=None,
+        structured_requests=None,
     )
     _, top_ks, _, _, _ = runner_module.ModelRunner.prepare_sample(runner, batch, group)
     assert type(top_ks) is int and top_ks == ks[0]
@@ -268,6 +288,7 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
         top_ks=np.array(ks, np.int32),
         top_ps=np.array(ps, np.float32),
         required_channel=None,
+        structured_requests=None,
         is_dummy_run=False,
         total_tokens_num_prefill=0,
     )
@@ -318,6 +339,7 @@ def test_the_draft_q_lookup_is_gated_like_its_consumer(temps, prefill, verifies)
         top_ks=np.full(bs, -1, np.int32),
         top_ps=np.ones(bs, np.float32),
         required_channel=None,
+        structured_requests=None,
         is_dummy_run=False,
         total_tokens_num_prefill=prefill,
     )
@@ -445,14 +467,19 @@ def test_clean_waits_for_every_queued_copy_before_dropping_it(cpu_processor):
 
 
 @pytest.mark.parametrize("armed", [False, True])
-def test_an_armed_runner_binds_the_draft_and_arms_the_ratio_verify(monkeypatch, armed):
+@pytest.mark.parametrize("block", [False, True])
+def test_an_armed_runner_binds_the_draft_and_arms_the_ratio_verify(
+    monkeypatch, armed, block
+):
     """Armed, the runner binds the draft to its filters, keeps top-k ties and
-    arms the ratio verify (scratch and compile) for the model dtype; unarmed it
-    touches none of them."""
+    arms the ratio verify (scratch and compile) for the model dtype and the
+    drafter's verify rule; unarmed it touches none of them."""
     import numpy as np
 
     top_ks = SimpleNamespace(gpu=torch.zeros(4, dtype=torch.int32), np=np.zeros(4))
-    lossless = SimpleNamespace(bind_target=mock.Mock()) if armed else None
+    lossless = (
+        SimpleNamespace(bind_target=mock.Mock(), block_verify=block) if armed else None
+    )
     model = SimpleNamespace(vocab_size=160)
     runner = SimpleNamespace(
         drafter=SimpleNamespace(lossless=lossless, model=model, mtp_k=3),
@@ -470,5 +497,5 @@ def test_an_armed_runner_binds_the_draft_and_arms_the_ratio_verify(monkeypatch, 
     lossless.bind_target.assert_called_once_with(runner.forward_vars, model)
     runner.sampler.keep_ties.assert_called_once_with(top_ks.gpu)
     runner.rejection_sampler.arm_ratio.assert_called_once_with(
-        8, 3, 160, torch.bfloat16, "cpu"
+        8, 3, 160, torch.bfloat16, "cpu", block=block
     )

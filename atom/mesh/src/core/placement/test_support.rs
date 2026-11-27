@@ -405,11 +405,10 @@ pub fn make_descriptor<'a>(
 ) -> RequestDescriptor<'a> {
     RequestDescriptor {
         model_id,
-        protocol: None,
         text,
         tokens,
         headers,
-        stream: false,
+        ..Default::default()
     }
 }
 
@@ -473,6 +472,7 @@ mod fixture_smoke_tests {
             tokens: Some(&[1, 2, 3]),
             headers: Some(&hm),
             hash_ring: None,
+            carries_media: false,
         };
         let _ = policy.select_worker(&workers, &info).await;
         let calls = policy.calls();

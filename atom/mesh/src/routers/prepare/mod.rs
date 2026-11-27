@@ -18,7 +18,9 @@ use crate::{
     tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
 };
 
+pub(crate) mod chat_render;
 pub(crate) mod chat_template;
+pub(crate) mod fast_tokenizer;
 pub mod generation_payload;
 pub(crate) mod parser_factory_lookup;
 pub mod response_context;
@@ -29,7 +31,7 @@ pub(crate) mod tool_constraints;
 #[cfg(test)]
 mod tests;
 
-use chat_template::process_chat_messages;
+use chat_template::ProcessedMessages;
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
@@ -54,6 +56,39 @@ pub fn prepare_chat(
     model_id: Option<String>,
     components: &AppContext,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
+    prepare_chat_with(req, headers, model_id, components, None, false)
+}
+
+/// A chat's body as the client `sent` it (JSON bytes), for
+/// `prepare_chat_with`, where `model` renders with an encoder of its own
+/// (`chat_render`): the typed request drops or rewrites fields that encoder
+/// reads (`thinking`, a system message's `tools`, `tool_choice`). A chat
+/// whose model renders with a template is not parsed again.
+pub fn sent_chat_body(
+    sent: &[u8],
+    model: Option<&str>,
+    components: &AppContext,
+) -> Result<Option<Arc<serde_json::Map<String, serde_json::Value>>>, Response> {
+    if model.and_then(|m| components.chat_controls_of(m)).is_none() {
+        return Ok(None);
+    }
+    serde_json::from_slice(sent)
+        .map(|body| Some(Arc::new(body)))
+        .map_err(|e| error::bad_request("invalid_request", e.to_string()))
+}
+
+/// `prepare_chat`, rendering the prompt (`chat_render::render_chat`) with the
+/// chat's body as `sent` where the caller has it, and, with
+/// `reads_prompt_opener`, naming the opener the prompt ends on
+/// (`ResponseContext::prompt_opener`).
+pub fn prepare_chat_with(
+    req: Arc<ChatCompletionRequest>,
+    headers: Option<HeaderMap>,
+    model_id: Option<String>,
+    components: &AppContext,
+    sent: Option<&serde_json::Map<String, serde_json::Value>>,
+    reads_prompt_opener: bool,
+) -> Result<(GenerationPayload, ResponseContext), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
@@ -62,13 +97,18 @@ pub fn prepare_chat(
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
 
-    let processed = process_chat_messages(&body_ref, &*tokenizer)
+    let controls = components.chat_controls_of(model_id_str);
+    let (text, prompt_opener) = chat_render::render_chat(&body_ref, sent, &*tokenizer, controls)
         .map_err(|e| error::bad_request("process_messages_failed", e))?;
-
+    let processed = ProcessedMessages {
+        text,
+        stop_sequences: body_ref.stop.clone(),
+    };
     let encoding = tokenizer
         .encode(&processed.text, false)
         .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
     let token_ids = encoding.token_ids().to_vec();
+    let prompt_opener = prompt_opener.filter(|_| reads_prompt_opener);
 
     let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
         generate_tool_constraints(tools, &req.tool_choice, &req.model)
@@ -113,6 +153,7 @@ pub fn prepare_chat(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opener,
     };
 
     Ok((payload, ctx))
@@ -167,6 +208,7 @@ pub fn prepare_generate(
         reasoning_parser_factory: components.reasoning_parser_factory.clone(),
         configured_tool_parser: components.configured_tool_parser.clone(),
         configured_reasoning_parser: components.configured_reasoning_parser.clone(),
+        prompt_opener: None,
     };
 
     Ok((payload, ctx))

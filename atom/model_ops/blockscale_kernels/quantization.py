@@ -101,6 +101,33 @@ def quantize_fp8_kernel(X, Y, S, SIZE, DEQUANT: tl.constexpr):
 
 
 @triton.jit
+def quantize_fp8_taps_kernel(X0, X1, X2, SX0, SX1, SX2, Y, S, TAPW: tl.constexpr):
+    # `quantize_fp8_kernel` over the row-wise concatenation of three
+    # [rows, TAPW] taps (V4.1 DSpark's), read in place: the same 1024-element
+    # tiles and the same group math (`fp8_groups`), so the output matches
+    # quantizing the concatenated tensor bit for bit.
+    # TAPW is a multiple of 1024, so a tile never straddles a row or a tap.
+    BPT: tl.constexpr = TAPW // 1024
+    pid = tl.program_id(0)
+    row = pid // (3 * BPT)  # 3 == blockscale.FP8_TAPS (X0..X2)
+    blk = pid % (3 * BPT)
+    tap = blk // BPT
+    col = (blk % BPT) * 1024
+    if tap == 0:
+        src = X0 + row.to(tl.int64) * SX0
+    elif tap == 1:
+        src = X1 + row.to(tl.int64) * SX1
+    else:
+        src = X2 + row.to(tl.int64) * SX2
+    lanes = tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]
+    x = tl.load(src + col + lanes).to(tl.float32)
+    q, code, _ = fp8_groups(x)
+    groups = pid * 32 + tl.arange(0, 32)
+    tl.store(Y + groups[:, None] * 32 + tl.arange(0, 32)[None, :], q)
+    tl.store(S + groups, code.to(tl.uint8))
+
+
+@triton.jit
 def quantize_fp4_kernel(
     X,
     Y,

@@ -5,7 +5,11 @@
 
 from dataclasses import dataclass
 
-from atom.kv_transfer.offload.load_math import loadable_hit, tier_load_tokens
+from atom.kv_transfer.offload.load_math import (
+    chunk_floor,
+    loadable_hit,
+    tier_load_tokens,
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +29,8 @@ class OffloadTierProfile:
     min_load_tokens: int = 0
     # The tier's transfer granularity in tokens (`register(chunk_tokens=...)`).
     load_chunk_tokens: int = 1
+    # Only tiers whose admission can reload the unaligned HBM tail opt in.
+    lowers_hbm_hit_to_chunk: bool = False
 
     def loadable_tokens(
         self, local: int, hit: int, num_prompt: int | None = None
@@ -36,9 +42,17 @@ class OffloadTierProfile:
         if not self.loads:
             return 0
         chunk = self.load_chunk_tokens
+        if self.lowers_hbm_hit_to_chunk:
+            local = chunk_floor(local, chunk)
         return tier_load_tokens(
             local,
             loadable_hit(hit, num_prompt, chunk),
             chunk,
             self.min_load_tokens,
         )
+
+    def credited_tokens(self, local: int, loaded: int) -> int:
+        """Reusable extent, without counting a reloaded HBM tail twice."""
+        if loaded and self.lowers_hbm_hit_to_chunk:
+            return max(local, chunk_floor(local, self.load_chunk_tokens) + loaded)
+        return local + loaded

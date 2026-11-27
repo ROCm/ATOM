@@ -24,6 +24,7 @@ from aiter.dist.parallel_state import (
     get_prefill_context_model_parallel_world_size,
 )
 
+from atom.distributed.comm_utils import gather_rows
 from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.utils.tbo.ubatch_splitting import UBatchSlice
 
@@ -146,7 +147,12 @@ def pcp_round_robin_split(
     # Divisibility by pcp_size is guaranteed upstream by pcp_pad_len (callers
     # pad before splitting); the view below would error if violated.
     rest = tuple(input_.shape[1:])
-    return input_.view(-1, pcp_size, *rest)[:, pcp_rank].contiguous()
+    # Not `.contiguous()`: a one-row shard counts as contiguous while its row
+    # stride is still pcp_size, which kernels that check strides reject (aiter's
+    # cached-positions RoPE).
+    return input_.view(-1, pcp_size, *rest)[:, pcp_rank].clone(
+        memory_format=torch.contiguous_format
+    )
 
 
 def pcp_allgather_rerange(
@@ -160,24 +166,40 @@ def pcp_allgather_rerange(
     output[t] == global token t.
 
     Mirrors SGLang `cp_all_gather_rerange_output` (round-robin branch).
+    Gathers that are issued together should go through
+    `pcp_allgather_rerange_many` as one collective.
     """
+    return pcp_allgather_rerange_many([input_], pcp_size)[0]
+
+
+def pcp_allgather_rerange_many(
+    inputs: list[torch.Tensor], pcp_size: int | None = None
+) -> list[torch.Tensor]:
+    """`pcp_allgather_rerange` of every tensor in `inputs` (same row count) in
+    one grouped collective."""
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
-        return input_
-    group = get_pcp_group()
-    # aiter all_gather(dim=0) returns rank-major concat: [pcp*L, *rest].
-    gathered = group.all_gather(input_.contiguous(), dim=0)
-    local_len = input_.shape[0]
-    rest = tuple(input_.shape[1:])
+        return list(inputs)
+    assert all(t.shape[0] == inputs[0].shape[0] for t in inputs), [
+        t.shape[0] for t in inputs
+    ]
+    comm = get_pcp_group().device_communicator
+    gathered = gather_rows(
+        lambda ts: comm.all_gatherv(ts, dim=0), [t.contiguous() for t in inputs]
+    )
+    return [_rerange(g, pcp_size, t.shape[0]) for g, t in zip(gathered, inputs)]
+
+
+def _rerange(gathered: torch.Tensor, pcp_size: int, local_len: int) -> torch.Tensor:
     # rank-major [pcp, L, *rest] -> transpose -> token-major [L, pcp, *rest]
     # -> flatten to [L*pcp, *rest] == original global order.
-    out = (
+    rest = tuple(gathered.shape[1:])
+    return (
         gathered.view(pcp_size, local_len, *rest)
         .transpose(0, 1)
         .reshape(pcp_size * local_len, *rest)
     )
-    return out
 
 
 # ==== MoE-path PCP collectives (rank-major gather + reduce_scatter) ====
@@ -247,81 +269,8 @@ def pcp_owned_rows_by_request(
     return starts.astype(np.int32)
 
 
-# pcp_pad_indptr / pcp_pad_dense share the (tensor, n_pad) signature but pad two
-# DIFFERENT metadata shapes, so they are kept separate on purpose:
-#
-#   dense (per-query: one value per token), e.g. skip_prefix_len_csa:
-#       [5, 3, 8]  --pcp_pad_dense(.,1)-->  [5, 3, 8, 0]
-#                                                     ^ dummy query q3 = 0 row
-#
-#   ragged (per-query variable-length segments, sliced by an indptr prefix-sum),
-#   e.g. kv_indices grouped by kv_indptr:
-#       kv_indptr  = [0, 2, 5, 6]   kv_indices = [a,b | c,d,e | f]
-#       --pcp_pad_indptr(kv_indptr, 1)-->  [0, 2, 5, 6, 6]
-#                                                       ^ dummy q3 segment =
-#                                                         indices[6:6] = EMPTY
-#       (kv_indices itself is NOT touched — the dummy query references no KV)
-#
-# So dense APPENDS ZERO ROWS; indptr APPENDS REPEATS OF THE LAST PREFIX-SUM
-# VALUE (giving the dummy query a zero-length segment). Both make padded dummy
-# queries contribute nothing to attention; they are sliced to 1/W by owned_q
-# and dropped after the final all-gather.
-def pcp_pad_indptr(kv_indptr: torch.Tensor, n_pad: int) -> torch.Tensor:
-    """Pad a ragged prefix-sum indptr `[T+1]` to `[T+n_pad+1]`.
-
-    Appends `n_pad` entries each repeating the last value, i.e. the padded
-    (dummy) queries get zero-length KV segments. Used so per-query metadata
-    matches the token sequence padded to a multiple of pcp_size; the dummy
-    tokens then contribute nothing to attention.
-    """
-    if n_pad <= 0:
-        return kv_indptr
-    tail = kv_indptr[-1:].expand(n_pad)
-    return torch.cat([kv_indptr, tail], dim=0)
-
-
 def pcp_pad_dense(t: torch.Tensor, n_pad: int) -> torch.Tensor:
     """Pad a dense per-token tensor `[T, ...]` to `[T+n_pad, ...]` with zeros."""
     if n_pad <= 0:
         return t
     return torch.cat([t, t.new_zeros(n_pad, *t.shape[1:])], dim=0)
-
-
-def pcp_reindex_ragged(
-    kv_indptr: torch.Tensor,  # [T_global + 1] int32 — global per-query prefix sum
-    kv_indices: torch.Tensor,  # [kv_indptr[-1]] — ragged packed values
-    owned_q: torch.Tensor,  # [T_local] long — global query ids this rank owns
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reindex a ragged (indptr, indices) pair down to this rank's queries.
-
-    Given global per-query ragged metadata and the global query ids this rank
-    owns (round-robin shard), produce the compacted local `(indptr_local,
-    indices_local)` so that for the i-th owned query:
-        indices_local[indptr_local[i] : indptr_local[i+1]]
-          == kv_indices[kv_indptr[g] : kv_indptr[g+1]]   where g = owned_q[i]
-
-    Used to shard the per-query prefill index buffers (kv_indptr/kv_indices
-    _prefix_swa / _extend) to 1/W while the values themselves still point into
-    the full KV (paged unified_kv) / full extend kv tensor.
-    """
-    device = kv_indptr.device
-    owned_q = owned_q.to(device)
-    starts = kv_indptr[owned_q]  # [T_local]
-    ends = kv_indptr[owned_q + 1]  # [T_local]
-    lens = ends - starts  # [T_local] per-owned-query segment length
-    indptr_local = torch.zeros(
-        owned_q.shape[0] + 1, dtype=kv_indptr.dtype, device=device
-    )
-    torch.cumsum(lens, dim=0, out=indptr_local[1:])
-    total = int(indptr_local[-1].item())
-    if total == 0:
-        return indptr_local, kv_indices.new_empty(0)
-    # Build a gather map: for each output slot, which source index to read.
-    # out_slot s in [indptr_local[i], indptr_local[i+1]) reads from
-    # starts[i] + (s - indptr_local[i]).
-    out_arange = torch.arange(total, device=device)
-    # seg id per output slot via searchsorted on the local indptr.
-    seg = torch.searchsorted(indptr_local[1:], out_arange, right=True)  # [total]
-    src = starts[seg] + (out_arange - indptr_local[seg])
-    indices_local = kv_indices[src]
-    return indptr_local, indices_local

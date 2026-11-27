@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2026 ATOM Project Contributors
 
 """
 DeepSeek-V4 model for ATOM (PR1: skeleton + tiny-config eager forward).
@@ -19,9 +20,9 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
@@ -60,6 +61,7 @@ from atom.config import (
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
+    pcp_allgather_rerange_many,
     pcp_pad_len,
     pcp_round_robin_split,
 )
@@ -78,6 +80,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
 )
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_add,
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.indexer import (
@@ -96,6 +99,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    fp8_group32_k_pad_align,
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.quant_v4 import act_quant_inplace
@@ -133,11 +137,7 @@ from atom.utils.forward_context import (
     pass_scheduled_tokens_gpu,
 )
 from atom.utils.region_graph import token_graph
-from atom.utils.tbo.ubatching import (
-    tbo_active,
-    tbo_switch_to_compute_sync,
-    tbo_yield_and_switch_from_compute_to_comm,
-)
+from atom.utils.tbo.ubatching import tbo_active, tbo_on_comm
 
 logger = logging.getLogger(__name__)
 
@@ -615,7 +615,14 @@ def _wo_a_is_bf16_on_disk(model_path):
     return False
 
 
-def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
+def make_v4_quant_config(
+    hf_config,
+    model_path=None,
+    online_quant_config=None,
+    *,
+    shared_expert_spec=None,
+    online_routed_experts=False,
+):
     """Build a QuantizationConfig that knows V4's per-layer quant scheme.
 
     Two V4 SKUs supported:
@@ -647,6 +654,10 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
     preserved on BOTH the source lookup AND the online lookup — returning
     the same spec on the online path triggers the FusedMoE/Linear
     ``source == online_target`` early-return so those layers stay untouched.
+
+    ``shared_expert_spec`` pins the shared experts on both lookups.
+    ``online_routed_experts`` lets an online layer pattern convert the routed
+    experts.
     """
 
     base = QuantizationConfig(hf_config, online_quant_config=online_quant_config)
@@ -696,7 +707,17 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
         # dequant→requant round-trip for these layers (which would either
         # crash on the moe assert or further damage already-quantized weights).
         if ".ffn.experts" in layer_name:
+            if (
+                online_routed_experts
+                and use_online_quant
+                and base.online_pattern_spec(layer_name) is not None
+            ):
+                return orig_lookup(
+                    layer_name, use_online_quant=True, check_children=check_children
+                )
             return routed_spec
+        if shared_expert_spec is not None and ".shared_experts" in layer_name:
+            return shared_expert_spec
         # BF16 / fp32 raw paths
         if (
             ".compressor.wkv" in layer_name
@@ -1221,9 +1242,17 @@ class Compressor(nn.Module):
             persistent=False,
         )
 
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        """`[num_tokens, dim]` -> `[num_tokens, 2 * coff * head_dim]`, the kv and
+        score `forward` pools. Single fused BF16 GEMM via tgemm."""
+        assert (
+            x.dim() == 2 and x.shape[-1] == self.dim
+        ), f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        return self.wkv_gate(x)
+
     def forward(
         self,
-        x: torch.Tensor,  # [num_tokens, dim]
+        projected: torch.Tensor,  # [num_tokens, 2*coff*head_dim]
         plan: "CompressPlan",
         state_slot_in: torch.Tensor,  # [bs] int32
         state_slot_out: torch.Tensor,  # [bs] int32
@@ -1256,7 +1285,9 @@ class Compressor(nn.Module):
         because the input act_quant simulation is applied upstream.
 
         Args:
-            x:           [num_tokens, dim] flat ragged batch hidden state.
+            projected:   `project(x)` of the flat ragged batch hidden state,
+                         gathered to the full sequence under PCP
+                         (`_pcp_gather_compressor_inputs`).
             plan:        CompressPlan from attn_metadata.compress_plans[ratio]
                          (or a synthetic bs=1 plan during warmup).
             state_slot_in:  [bs] int32 — state group each seq READS its incoming
@@ -1270,40 +1301,19 @@ class Compressor(nn.Module):
                          Required for the Indexer FP8 path (slot resolution).
         """
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
         rd = self.rope_head_dim
 
-        # Single fused BF16 GEMM via tgemm. (Probing whether dropping the
-        # otype=fp32 upcast — relying on fused_compress_attn's internal fp32
-        # accumulator instead — is accuracy-neutral.) torch.split returns
-        # zero-copy strided views; downstream kernels (fused_compress_attn,
-        # update_compressor_states) accept strided kv/score (only inner
-        # stride must be 1).
+        # torch.split returns zero-copy strided views; downstream kernels
+        # (fused_compress_attn, update_compressor_states) accept strided
+        # kv/score (only inner stride must be 1).
         coff_d = (1 + overlap) * d
-        combined = self.wkv_gate(x)
-        # ===== PCP (full-KV) =====
-        # `x` here is this rank's 1/W round-robin shard (model.forward entry split).
-        # The wkv_gate projection above is per-token (parallelizable), but the
-        # downstream fused_compress_attn compresses `ratio` CONSECUTIVE tokens
-        # into one entry — which round-robin split breaks. So all-gather the
-        # projected `combined` back to full sequence order before compression,
-        # mirroring SGLang's compute_kv_score (all-gather kv_score after the
-        # projection, before the cross-token compress). The plan /
-        # state_slot_out passed to fused_compress_attn are full-sequence
-        # (never split in the builder), so they match the gathered `combined`.
-        if _pcp_active():
-            _tbo = tbo_active()
-            if _tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
-            combined = pcp_allgather_rerange(combined, get_pcp_world_size())
-            if _tbo:
-                tbo_switch_to_compute_sync()
-        kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
+        assert projected.dim() == 2 and projected.shape[-1] == 2 * coff_d, tuple(
+            projected.shape
+        )
+        kv, score = torch.split(projected, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
         # Order is critical: fused kernel reads state cache as-of-end-of-
@@ -1681,8 +1691,36 @@ class Indexer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Stubs — implementations land in tasks #5-#8
+# Attention execution
 # ---------------------------------------------------------------------------
+
+
+_NULL_SPAN = nullcontext()
+
+
+@contextmanager
+def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool):
+    """Select segment metadata and phase, restoring them on exit.
+
+    Other context fields describe the whole batch. Segment operations must
+    size their work from the supplied tensors and metadata."""
+    saved_md = fc.attn_metadata
+    saved_is_prefill = ctx.is_prefill
+    fc.attn_metadata = seg_md
+    ctx.is_prefill = is_prefill
+    try:
+        yield
+    finally:
+        fc.attn_metadata = saved_md
+        ctx.is_prefill = saved_is_prefill
+
+
+def _mixed_span(tag: str):
+    """Create a span only while profiling. Called inside the opaque attention op,
+    so the predicate is evaluated at runtime rather than captured by Dynamo."""
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(tag)
+    return _NULL_SPAN
 
 
 class DeepseekV4Attention(nn.Module):
@@ -1888,6 +1926,9 @@ class DeepseekV4Attention(nn.Module):
         )
         self.layer_name = prefix
         atom_config = get_current_atom_config()
+        if atom_config.enable_mixed_prefill_decode:
+            self.forward_impl_default = self.forward_impl
+            self.forward_impl = self._forward_impl_mixed
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
         # Frozen bool: when KV cache dtype is fp8, route writes/attention to the
         # native 2buff fp8 path (compute-only 2buff quant, op4 fp8 prefill, op5
@@ -2019,6 +2060,7 @@ class DeepseekV4Attention(nn.Module):
         return at once: main Compressor -> alt_stream (CSA + HCA), Indexer
         Compressor -> indexer_stream (CSA only). Launched ahead of the Q/KV
         projections, which they then overlap; `_sparse_attention` joins them.
+        A PCP prefill first gathers their projections in one collective.
 
         A dummy run skips them: warmup runs before allocate_kv_cache, so their
         caches are unbound."""
@@ -2030,17 +2072,42 @@ class DeepseekV4Attention(nn.Module):
             attn_md.compress_plans[self.compress_ratio] if self.compress_ratio else None
         )
         side = self._compressors_async()
-        for compressor, stream in self._compressor_streams():
+        pairs = self._compressor_streams()
+        gathered = (
+            self._pcp_gather_compressor_inputs(x, [c for c, _ in pairs])
+            if pairs and _pcp_active()
+            else [None] * len(pairs)
+        )
+        for (compressor, stream), projected in zip(pairs, gathered):
             if side:
                 stream.wait_stream(fc.main_stream)
+                if projected is not None:
+                    # Made on the main stream, which may reuse it once this
+                    # returns: hold it until the side stream has read it.
+                    projected.record_stream(stream)
             with torch.cuda.stream(stream) if side else nullcontext():
+                # Without PCP the projection runs on the side stream too.
+                if projected is None:
+                    projected = compressor.project(x)
                 compressor(
-                    x,
+                    projected,
                     plan=plan,
                     state_slot_in=attn_md.state_slot_in,
                     state_slot_out=attn_md.state_slot_out,
                     block_tables=attn_md.block_tables,
                 )
+
+    @staticmethod
+    def _pcp_gather_compressor_inputs(
+        x: torch.Tensor, compressors: list["Compressor"]
+    ) -> list[torch.Tensor]:
+        """Each compressor's projection of `x`, gathered to the full sequence
+        in one collective. Under PCP `x` is this rank's round-robin 1/W rows,
+        while a compressor pools `ratio` consecutive tokens; its plan and
+        state slots are already full-sequence. Mirrors SGLang's
+        compute_kv_score: gather after the projection, before the pooling."""
+        projected = [c.project(x) for c in compressors]
+        return tbo_on_comm(pcp_allgather_rerange_many, projected, get_pcp_world_size())
 
     def _compressor_streams(self):
         """Each compressor this layer runs and the side stream it runs on:
@@ -2079,6 +2146,11 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         """TR_HYBRID order: compressor launch -> pre/proj+norm -> paged core
         (which joins the compressors) -> post, each a piece of its own."""
+        # No mixed form: a mixed batch runs only on the FULL path
+        # (`forward_impl`), and `Config._validate_mixed_prefill_decode` refuses
+        # TR_HYBRID with mixed at launch. Not checked here: this order is
+        # traced, and Dynamo would fold an `is_mixed` read against the warmup
+        # batch, so the check could never fire.
         torch.ops.aiter.v4_attn_compress_launch(x, self.layer_name)
 
         (
@@ -2301,20 +2373,96 @@ class DeepseekV4Attention(nn.Module):
             x, positions, run_indexer_proj=False
         )
         qkn = self._qk_norm_rope(q, kv_pre, positions)
-        o = self._sparse_attention(
-            qkn,
-            positions,
-            x=x,
-            qr=qr,
-            qr_scale=qr_scale,
-        )
+        o = self._sparse_attention(qkn, positions, x=x, qr=qr, qr_scale=qr_scale)
         return self._attn_post(o, positions)
+
+    def _forward_impl_mixed(self, x: torch.Tensor, positions: torch.Tensor):
+        fc = get_forward_context()
+        if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
+            return torch.zeros_like(x)
+        if not fc.attn_metadata.is_mixed:
+            return self.forward_impl_default(x, positions)
+        # Each half owns its compressor plan; the carrier has none.
+        q, kv_pre, qr, qr_scale, *_ = self._attn_pre(
+            x, positions, run_indexer_proj=False
+        )
+        o = self._attn_mixed(fc.attn_metadata, q, kv_pre, qr, qr_scale, x, positions)
+        return self._attn_post(o, positions)
+
+    def _attn_mixed(
+        self,
+        attn_md: "AttentionMetaData_DSV4",
+        q: torch.Tensor,
+        kv_pre: torch.Tensor,
+        qr: torch.Tensor,
+        qr_scale: torch.Tensor | None,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run QK-norm/RoPE once, then compressors and sparse attention per segment.
+
+        The carrier masks prefill SWA writes until attention has consumed the
+        preceding window. BF16 output reuses Q; FP8 uses a separate BF16 buffer."""
+        fc = get_forward_context()
+        ctx = fc.context
+        n_p = attn_md.num_prefill_tokens
+        n_d = x.size(0) - n_p
+        # q_norm scales can be column-major or padded/shuffled. Their apparent
+        # first dimension is not a token axis: project before splitting them.
+        idx_q_quant = idx_weights = idx_q_scale = None
+        if self.indexer is not None and not self.skip_topk:
+            idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
+                x, qr, positions, qr_scale
+            )
+        qkn = self._qk_norm_rope(q, kv_pre, positions, True)
+
+        # Each segment writes only its own rows, preserving the other query slice.
+        out = qkn.q_sa
+        if out is None:
+            out = torch.empty(
+                (n_p + n_d, self.n_local_heads, self.head_dim),
+                dtype=x.dtype,
+                device=x.device,
+            )
+
+        def _seg(lo: int, hi: int, seg_md, is_prefill: bool) -> None:
+            sl = slice(lo, hi)
+            tag = "prefill" if is_prefill else "decode"
+            with (
+                _segment_forward_context(
+                    fc,
+                    ctx,
+                    seg_md,
+                    is_prefill=is_prefill,
+                ),
+                _mixed_span(f"mixed_seg[{tag}] n={hi - lo}"),
+            ):
+                # Launch and join decide side streams by the same predicate
+                # (`_compressors_async`), so the join in `_sparse_attention`
+                # always matches what this launch did.
+                self._launch_compressors(x[sl])
+                self._sparse_attention(
+                    qkn.slice_tokens(sl),
+                    positions[sl],
+                    idx_q_quant=None if idx_q_quant is None else idx_q_quant[sl],
+                    idx_weights=None if idx_weights is None else idx_weights[sl],
+                    idx_q_scale=None if idx_q_scale is None else idx_q_scale[sl],
+                    x=x[sl],
+                    out=out[sl],
+                    decode=partial(sparse_attn_v4_paged_decode, out=out[sl]),
+                )
+
+        with _mixed_span(f"mixed[n_p={n_p} n_d={n_d}]"):
+            _seg(0, n_p, attn_md.prefill_attn_metadata, True)
+            _seg(n_p, n_p + n_d, attn_md.decode_attn_metadata, False)
+        return out.view(n_p + n_d, -1)
 
     def _qk_norm_rope(
         self,
         q: torch.Tensor,
         kv_pre: torch.Tensor,
         positions: torch.Tensor,
+        mixed: bool = False,
     ) -> "QKNormRopeOut":
         """The fused QK-norm/RoPE (+ decode SWA write). Single source.
 
@@ -2333,10 +2481,10 @@ class DeepseekV4Attention(nn.Module):
         # `_attn_pre` this sits UPSTREAM of that guard and needs its own.
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return _qkn_placeholder(self, q, q.shape[0], zeros=True)
-        attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
+        attn_md = fc.attn_metadata
         rd = self.rope_head_dim
         ratio = self.compress_ratio
-        is_decode = attn_md.state is AttnState.DECODE
+        is_decode = attn_md.state is AttnState.DECODE or mixed
         swa_dest_rows = (
             attn_md.swa_dest_rows[ratio]
             if (is_decode and attn_md.swa_dest_rows is not None)
@@ -2358,8 +2506,8 @@ class DeepseekV4Attention(nn.Module):
         #
         # Decode has no ordering hazard, so writing before the attention reads
         # the window is safe. Prefill does — chunked prefix reads must see the
-        # PRIOR chunk — so it passes `swa_*=None` and scatters its window tail
-        # after sparse_attn below.
+        # PRIOR chunk — so pure prefill passes `swa_*=None`; mixed masks its
+        # prefill rows. Both scatter the prefill window after sparse_attn.
         #
         # bf16 → qkn.q_sa / qkn.kv populated; fp8 2buff → qkn.q_packed / qkn.q_rope
         # / qkn.k_packed / qkn.k_rope populated (the 2buff layout nope-fp8 [.,512] +
@@ -2408,9 +2556,15 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor | None = None,  # FULL only: inline `forward_batched`
         qr: torch.Tensor | None = None,  # FULL only, same
         qr_scale: torch.Tensor | None = None,  # FULL only, same
+        out: torch.Tensor | None = None,
+        decode=sparse_attn_v4_paged_decode,
     ) -> torch.Tensor:
         """The TOKEN-shaped tail: indexer top-k, CSA pack, the paged attention, and
         prefill's SWA write.
+
+        ``out``, when given, is the ``[num_tokens, n_local_heads, head_dim]``
+        prefill destination. Mixed decode binds its destination to ``decode``
+        in `_attn_mixed`, keeping the ordinary decode kernel call unchanged.
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP8
@@ -2487,7 +2641,7 @@ class DeepseekV4Attention(nn.Module):
             # (unified_kv_rope set) → aiter ASM with pre-packed fp8 Q + the
             # 2buff fp8/bf16 pools read with no requant. The optional H=128
             # prefill-ASM decode route also consumes the shared empty CSR.
-            o = sparse_attn_v4_paged_decode(
+            o = decode(
                 qkn.q_sa,
                 self.unified_kv,
                 kv_indices,
@@ -2519,42 +2673,32 @@ class DeepseekV4Attention(nn.Module):
             #     rank keeps full KV), and
             #   - sparse_attn's extend source must be the FULL extend K so each
             #     1/W query can attend the whole in-chunk SWA window.
-            # So all-gather the extend K back to full order; positions/
-            # cu_seqlens_q/state_slot_out for the SWA write stay full
-            # (cu_seqlens_q / state_slot_out are per-seq, never split;
-            # positions_full comes from the forward context which holds the
-            # pre-split copy).
+            # So all-gather the extend K back to full order, together with the
+            # positions the SWA write addresses the ring by, in one collective
+            # (cu_seqlens_q / state_slot_out are per-seq, never split).
+            # Positions are gathered rather than read off the forward context:
+            # an MTP draft pass runs at the target's positions + 1.
             #
             # The extend K's representation depends on the kv-cache layout:
-            #   - bf16 → single `qkn.kv` [T, 1, 576]; all-gather it (kv_full).
+            #   - bf16 → single `qkn.kv` [T, 512].
             #   - fp8 2buff → `qkn.k_packed` [T, 1, 512] fp8 (nope + inline e8m0
-            #     scale) + `qkn.k_rope` [T, 1, 64] bf16; all-gather BOTH (the
-            #     scale rides inside k_packed, so no separate scale gather). fp8
-            #     all_gather is a pure byte movement — RCCL supports it directly.
-            # Both use the SAME rerange, so the gathered tensors stay aligned
-            # with the full-sequence kv_indices_extend / positions_full.
+            #     scale) + `qkn.k_rope` [T, 1, 64] bf16 (the scale rides inside
+            #     k_packed, so no separate scale gather).
             pcp_on = _pcp_active()
             if pcp_on:
                 pcp_ws = get_pcp_world_size()
-                _tbo_attn = tbo_active()
-                if _tbo_attn:
-                    tbo_yield_and_switch_from_compute_to_comm()
                 if self.kv_fp8:
-                    k_packed_full = pcp_allgather_rerange(qkn.k_packed, pcp_ws)
-                    k_rope_full = pcp_allgather_rerange(qkn.k_rope, pcp_ws)
+                    k_packed_full, k_rope_full, positions_full = tbo_on_comm(
+                        pcp_allgather_rerange_many,
+                        [qkn.k_packed, qkn.k_rope, positions],
+                        pcp_ws,
+                    )
                     kv_full = None
                 else:
                     k_packed_full = k_rope_full = None
-                    kv_full = pcp_allgather_rerange(qkn.kv, pcp_ws)
-                # positions must match the full-sequence coords for the
-                # swa_write ring addressing (`positions[src] % cache_size`).
-                # `positions` here is this rank's 1/W shard (split in
-                # ForCausalLM.forward); all-gather it back to full order with
-                # the same rerange used for the extend K (NOT fc.context.
-                # positions, which the builder reindexed to 1/W).
-                positions_full = pcp_allgather_rerange(positions, pcp_ws)
-                if _tbo_attn:
-                    tbo_switch_to_compute_sync()
+                    kv_full, positions_full = tbo_on_comm(
+                        pcp_allgather_rerange_many, [qkn.kv, positions], pcp_ws
+                    )
             else:
                 k_packed_full, k_rope_full = qkn.k_packed, qkn.k_rope
                 kv_full = qkn.kv
@@ -2578,9 +2722,9 @@ class DeepseekV4Attention(nn.Module):
             # quant; bf16 → OPUS / Triton over q_sa and the bf16 extend kv_full.
             # Under PCP the extend K is the PCP all-gathered full sequence
             # (k_*_full for fp8, kv_full for bf16); off PCP it is this fwd's
-            # tensor unchanged. On bf16 the wrapper reuses out=qkn.q_sa as the
-            # attention output buffer (q_sa is not needed after this call →
-            # avoids an extra empty_like); fp8 ignores both q_sa and out.
+            # tensor unchanged. Without a caller's `out`, the output reuses
+            # q_sa (not needed after this call), which the fp8 path, whose
+            # q_sa is None, turns into a fresh allocation.
             o = sparse_attn_v4_paged_2src(
                 qkn.q_sa,
                 self.unified_kv,
@@ -2591,9 +2735,7 @@ class DeepseekV4Attention(nn.Module):
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
                 self.softmax_scale,
-                # Reuse q_sa as the attention output buffer; q_sa is not needed
-                # after this call and this avoids an extra empty_like allocation.
-                out=qkn.q_sa,
+                out=qkn.q_sa if out is None else out,
                 unified_kv_rope=self.unified_kv_rope,
                 q_packed=qkn.q_packed,
                 q_rope=qkn.q_rope,
@@ -2751,12 +2893,16 @@ class Expert(nn.Module):
         # Fused [w1; w3] (gate_up_proj): both share input x, both ColumnParallel
         # — standard llama/dsv2 fusion. Disk still split; routed via
         # packed_modules_mapping in DeepseekV4ForCausalLM.
+        # A per-rank intermediate the group32 FP8 GEMM cannot step (V4.1-Flash's
+        # 2304 at TP8: 288) is padded by the pair, zero rows / columns (320).
+        k_pad = fp8_group32_k_pad_align(quant_config, f"{prefix}.w2")
         self.gate_up_proj = MergedColumnParallelLinear(
             dim,
             [inter_dim, inter_dim],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=k_pad,
         )
         self.w2 = RowParallelLinear(
             inter_dim,
@@ -2765,13 +2911,15 @@ class Expert(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.w2",
+            input_pad_align=k_pad,
         )
         self.swiglu_limit = swiglu_limit
         # ATOM_V4_USE_TRITON_FUSION: clamp + silu(gate)*up [+ weights] + FP8
         # quant in one aiter triton kernel, and w2 takes its `x_scale` instead
         # of quantizing itself. The kernel needs this rank's intermediate
         # width to be a multiple of 128 (V4.1-Flash's 2304: whole or at TP2,
-        # not 576 at TP4 or 288 at TP8); other widths keep the unfused path.
+        # not 576 at TP4 or the padded 320 at TP8); other widths keep the
+        # unfused path.
         self.use_fused_clamp_act_mul = shared_expert_fused_act_enabled(
             self.w2.input_size
         )
@@ -2788,7 +2936,13 @@ class Expert(nn.Module):
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
-        if self.use_fused_clamp_act_mul:
+        # A BF16 w2 (no group32 FP8 GEMM here) takes no quantized input, and a
+        # per-channel one quantizes its own.
+        scale_kwargs = fused_scale_kwargs(
+            self.w2.native_a8_group_rows,
+            self.w2.quant_type.value == QuantType.per_1x128.value,
+        )
+        if self.use_fused_clamp_act_mul and scale_kwargs and not self.w2.runs_bf16:
             native_mx = self.w2.native_a8_group_rows is not None
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,
@@ -2796,7 +2950,7 @@ class Expert(nn.Module):
                 activation="silu",
                 weights=weights,
                 dtype_quant=dtypes.fp8,
-                **fused_scale_kwargs(self.w2.native_a8_group_rows),
+                **scale_kwargs,
             )
             if native_mx:
                 x_scale = x_scale.view(torch.float8_e8m0fnu)
@@ -2812,6 +2966,33 @@ class Expert(nn.Module):
         if weights is not None:
             out = weights.to(dtype) * out
         return self.w2(out)  # [num_tokens, dim]
+
+
+# The V4 family's dual-stream MoE row bound on expert-parallel decode steps
+# when ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD is not set. 1536 = 256 requests a rank
+# x 6 DSpark rows a request: the largest of the 1152/1344/1536-row decode
+# graphs of a 1024-request expert-parallel batch, the shapes the shared/routed
+# overlap was measured on (a multi-rank MegaMoE bench, shared on the side
+# stream against shared in series). Row counts above it were not measured, so
+# they keep the single-stream path. It is a fixed bound rather than the
+# configured graph size because larger decode graphs are untested. The gain
+# comes from hiding the shared expert behind the routed MoE's expert-parallel
+# token exchange (dispatch/combine waits), so a deployment without one
+# (`FusedMoEParallelConfig.exchanges_tokens`: no EP, TP-only EP, simulated DP)
+# keeps the generic bound, as do prefill steps (chunks of these sizes were not
+# measured).
+V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD = 1536
+
+
+def v4_dual_stream_decode_token_threshold(exchanges_tokens: bool) -> int:
+    """The V4 MoE's dual-stream row bound on decode steps:
+    ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD where it is set (0 still turns the
+    dual stream off), else `V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD` where the
+    routed MoE exchanges tokens across ranks (``exchanges_tokens``) and the
+    variable's default where it does not."""
+    if envs.is_set("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD") or not exchanges_tokens:
+        return envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+    return V4_DUAL_STREAM_DECODE_TOKEN_THRESHOLD
 
 
 class MoE(nn.Module):
@@ -2839,6 +3020,8 @@ class MoE(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_eplb: bool = True,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -2905,6 +3088,7 @@ class MoE(nn.Module):
             pad_align=128,
             enable_comm_fused=True,
             mxfp4_fp8_activations=args.moe_fp8_activations,
+            enable_eplb=enable_eplb,
         )
         self.experts.swiglu_limit = args.swiglu_limit
         self._fuse_shared_into_routed = self.experts.num_fused_shared_experts > 0
@@ -2929,13 +3113,28 @@ class MoE(nn.Module):
         # Dual-stream: run shared_experts on `alt_stream` in parallel with
         # routed experts on the current stream. Mirrors V2's pattern. Only
         # active when shared_experts exist (not fused into routed) AND the
-        # env threshold is positive AND we got an alt_stream from the model.
-        # Per-call token count gating happens inside the custom op dispatcher
-        # — prefill (large batch) skips dual-stream (overhead > benefit).
+        # env threshold is positive AND we got an alt_stream from the model
+        # AND the experts' method allows a concurrent shared-expert stream.
+        # Per-call row gating happens inside the custom op dispatcher: a call
+        # with more rows than its step's bound (set below) stays single-stream.
         self._use_dual_stream = (
             self.shared_experts is not None
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+            and self.experts.allows_concurrent_shared_stream
+        )
+        # V4 family with an expert-parallel token exchange: the routed MoE
+        # waits on it for a large part of each layer, which the side-stream
+        # shared expert fills up to larger decode batches than the generic
+        # default. Prefill steps and deployments without such an exchange keep
+        # the generic bound; an explicitly set ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD applies
+        # to every case. Decided here from the parallel config, never in
+        # forward.
+        self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        self._dual_stream_decode_token_threshold = (
+            v4_dual_stream_decode_token_threshold(
+                self.experts.moe_parallel_config.exchanges_tokens
+            )
         )
         # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
         self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None
@@ -3019,6 +3218,7 @@ class MoE(nn.Module):
         before_stage2_for_rows=None,
         before_shared_add=None,
         stage2_stream: torch.cuda.Stream | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """Gate + FusedMoE routed-expert pass.
 
@@ -3035,6 +3235,7 @@ class MoE(nn.Module):
             before_stage2_for_rows=before_stage2_for_rows,
             before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
+            shared_ready=shared_ready,
         )
 
     @mark_trace
@@ -3044,13 +3245,17 @@ class MoE(nn.Module):
         shared: torch.Tensor | None,  # [num_tokens, dim] or None
         prefix: str = "",
     ) -> torch.Tensor:  # [num_tokens, dim]
-        """Add shared-expert contribution (when not fused into routed) and
-        all-reduce across TP ranks.
+        """Add the shared-expert contribution (when it is not already fused into
+        the routed output) and all-reduce across TP ranks.
+
+        At TP > 1 the shared-expert add is folded into that all-reduce.
         """
         if shared is not None:
             # Both on this rank's rows: the routed experts' PCP reduction
             # (ATOM_PCP_MOE_MERGE) happens inside FusedMoE, and the shared
             # expert, sharded by TP alone, never takes part in it.
+            if self.tp_size > 1:
+                return tensor_model_parallel_all_reduce_add(routed, shared)
             routed = routed + shared
         if self.tp_size > 1:
             # ATOM AR layer decides internally (via _tbo_aware_tp_reduce) whether
@@ -3059,12 +3264,50 @@ class MoE(nn.Module):
             routed = tensor_model_parallel_all_reduce(routed)
         return routed
 
+    def _routed_with_shared_in_combine(
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        shared: torch.Tensor,  # [num_tokens, dim]
+        shared_ready: torch.cuda.Event,
+    ) -> torch.Tensor:  # [num_tokens, dim]
+        """Routed pass whose combine adds `shared` once `shared_ready` fires.
+
+        Shared by the single- and dual-stream paths; only the stream the
+        caller recorded `shared_ready` on differs. Comm-fused steps never take
+        this path (`combine_accepts_shared` excludes them), so a complete
+        result here is an error.
+        """
+        routed, is_complete = self.routed_expert_forward(
+            x, shared_partial=shared, shared_ready=shared_ready
+        )
+        if is_complete:
+            raise RuntimeError("a comm-fused step reached the shared-in-combine path")
+        return self.combine_outputs(
+            routed, None, prefix=f"{self.prefix}.combine_outputs"
+        )
+
     def single_stream_moe_forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
-        """Sequential: shared_experts → routed_experts → combine."""
+        """Sequential: shared_experts → routed_experts → combine.
+
+        Where the routed combine adds the shared output
+        (`FusedMoE.combine_accepts_shared`), it is handed down through
+        `_routed_with_shared_in_combine` with the event recorded on this same
+        stream, and there is no separate add. That branch is skipped while
+        `torch.compile` traces this method (the CUDA event is not traceable);
+        the traced graph keeps the separate add in `combine_outputs`.
+        """
         shared = self.shared_experts(x) if self.shared_experts is not None else None
+        if (
+            shared is not None
+            and not torch.compiler.is_compiling()
+            and self.experts.combine_accepts_shared(x.shape[0])
+        ):
+            shared_ready = torch.cuda.Event()
+            shared_ready.record()
+            return self._routed_with_shared_in_combine(x, shared, shared_ready)
         routed, is_complete = self.routed_expert_forward(x, shared_partial=shared)
         if is_complete:
             return routed
@@ -3081,10 +3324,18 @@ class MoE(nn.Module):
         """Run shared_experts on `alt_stream` in parallel with routed_experts
         on the current stream. Mirrors V2's pattern. Both reads of `x` are
         independent; main stream waits on alt_stream's completion before
-        combining.
+        combining, unless the routed combine adds the shared output itself
+        (`FusedMoE.combine_accepts_shared`): then only the combine waits for it.
         """
         routed_stream = torch.cuda.current_stream(x.device)
         self.alt_stream.wait_stream(routed_stream)
+        if self.experts.combine_accepts_shared(x.shape[0]):
+            with torch.cuda.stream(self.alt_stream):
+                shared = self.shared_experts.forward(x)
+                shared_ready = torch.cuda.Event()
+                shared_ready.record(self.alt_stream)
+            shared.record_stream(routed_stream)
+            return self._routed_with_shared_in_combine(x, shared, shared_ready)
         shared_produced = False
         shared_waited = False
 
@@ -3529,6 +3780,9 @@ class ParallelHead(ParallelLMHead):
     fp32 path while halving VRAM and using the faster a16w16 kernel.
     """
 
+    # its logits are the mHC reduction and norm, then the projection
+    logits_are_head = False
+
     def __init__(
         self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6
     ):
@@ -3822,15 +4076,17 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @property
     def disable_fused_shared_loading(self) -> bool:
-        """True when shared experts are NOT fused into the routed MoE kernel, so
-        the weight loader must keep `ffn.shared_experts.*` on the standalone
-        Expert module instead of rewriting them into the fused slot. Read from
-        the actual built MoE layers so it always agrees with model structure.
+        """True when no MoE layer fuses its shared experts into the routed
+        kernel, so the weight loader must keep `ffn.shared_experts.*` on the
+        standalone Expert module instead of rewriting them into the fused slot.
+        Read from the actual built MoE layers so it always agrees with model
+        structure.
         """
-        for m in self.model.modules():
-            if m.__class__.__name__ == "MoE":
-                return not getattr(m, "_fuse_shared_into_routed", True)
-        return False
+        return not any(
+            m._fuse_shared_into_routed
+            for m in self.model.modules()
+            if m.__class__.__name__ == "MoE"
+        )
 
     def forward(
         self,

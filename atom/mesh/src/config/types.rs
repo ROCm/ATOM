@@ -18,15 +18,16 @@ pub enum BackendType {
     Atom,
 }
 
-/// Strategy used by the ATOM PD router to map a selected prefill DP rank to
-/// the selected decode DP rank.
+/// How the ATOM PD router pairs prefill and decode DP ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AtomPdRankMappingPolicy {
     /// Do not rewrite the planner-selected prefill/decode DP ranks.
     #[default]
     #[serde(rename = "none")]
     None,
-    /// Map prefill rank N to decode rank N when both sides expose DP workers.
+    /// Run prefill on the decode's DP rank N when both sides expose DP workers: the
+    /// planner selects decode first and prefill among the workers on rank N, and the
+    /// router moves a prefill selected elsewhere to rank N.
     #[serde(rename = "idx2idx")]
     Idx2Idx,
 }
@@ -60,6 +61,8 @@ pub struct RouterConfig {
     pub ext_proc: crate::ext_proc::ExtProcConfig,
     #[serde(default)]
     pub prepare_pool: PreparePoolConfig,
+    #[serde(default)]
+    pub fastokens: FastokensConfig,
     pub mode: RoutingMode,
     #[serde(default)]
     pub backend: BackendType,
@@ -69,6 +72,10 @@ pub struct RouterConfig {
     pub atom_standalone: bool,
     #[serde(default)]
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
+    /// ATOM PD relay: open D's leg together with P's and send P's KV metadata
+    /// late (`--atom-pd-concurrent`; D needs `ATOM_PD_LATE_KV=1`).
+    #[serde(default)]
+    pub atom_pd_concurrent: bool,
 
     pub policy: PolicyConfig,
     pub host: String,
@@ -78,6 +85,12 @@ pub struct RouterConfig {
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     pub dp_aware: bool,
+    /// Follow the KV cache events each worker reports at `/kv_event_sources`.
+    #[serde(default)]
+    pub kv_events: bool,
+    /// The admin port of each master of the Mooncake Store a worker offloads to.
+    #[serde(default = "default_mooncake_admin_port")]
+    pub mooncake_admin_port: u16,
     pub api_key: Option<String>,
     pub metrics: Option<MetricsConfig>,
     pub log_dir: Option<String>,
@@ -147,6 +160,8 @@ pub struct PreparePoolConfig {
     )]
     pub prepare_timeout_ms: u64,
     /// Tokenization byte limit (default: 1 MiB); overrides --ext-proc-max-tokenize-bytes.
+    /// The models fastokens encodes have the larger of this limit and 64 MiB,
+    /// unless --fastokens-max-tokenize-bytes sets theirs.
     #[arg(id = "prepare_max_tokenize_bytes", long = "prepare-max-tokenize-bytes")]
     pub max_tokenize_bytes: Option<usize>,
 }
@@ -160,6 +175,63 @@ impl Default for PreparePoolConfig {
             prepare_timeout_ms: DEFAULT_PREPARE_TIMEOUT_MS,
             max_tokenize_bytes: None,
         }
+    }
+}
+
+/// Default `--fastokens-max-tokenize-bytes`, unless the other models' limit is
+/// larger.
+pub const DEFAULT_FASTOKENS_MAX_TOKENIZE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default `--fastokens-segment-cache-mb`. A segment costing more than 1/64 of
+/// the budget is never cached, so this one caches tool outputs of up to about
+/// 8 MB of text.
+pub const DEFAULT_FASTOKENS_SEGMENT_CACHE_MB: usize = 1024;
+
+/// Encoding prompts with fastokens rather than HuggingFace `tokenizers`.
+#[derive(Debug, Clone, Default, clap::Args, Serialize, Deserialize, PartialEq, Eq)]
+#[command(next_help_heading = "Tokenizer")]
+#[serde(default)]
+pub struct FastokensConfig {
+    /// Models whose prompts encode with fastokens, by the name or source their
+    /// tokenizer registers under, or `*` for every model. Decoding and chat
+    /// templates stay with HuggingFace. A model whose prompts fastokens does
+    /// not encode as HuggingFace does stays with HuggingFace.
+    #[arg(
+        id = "fastokens_models",
+        long = "fastokens-models",
+        num_args = 1..,
+        value_delimiter = ','
+    )]
+    pub models: Vec<String>,
+    /// Fail to register such a model's tokenizer instead of keeping HuggingFace.
+    #[arg(id = "fastokens_strict", long = "fastokens-strict")]
+    pub strict: bool,
+    /// Tokenization byte limit for those models (default: the larger of 64 MiB
+    /// and the other models' limit).
+    #[arg(
+        id = "fastokens_max_tokenize_bytes",
+        long = "fastokens-max-tokenize-bytes"
+    )]
+    pub max_tokenize_bytes: Option<usize>,
+    /// fastokens' segment cache per tokenizer, in MiB; 0 turns it off
+    /// (default: 1024). It holds the ids of the text between special tokens,
+    /// which an agent's requests re-send with its history.
+    #[arg(id = "fastokens_segment_cache_mb", long = "fastokens-segment-cache-mb")]
+    pub segment_cache_mb: Option<usize>,
+}
+
+impl FastokensConfig {
+    /// Whether the tokenizer registered as `name` from `source` encodes with fastokens.
+    pub fn covers(&self, name: &str, source: &str) -> bool {
+        self.models
+            .iter()
+            .any(|model| model == "*" || model == name || model == source)
+    }
+
+    pub fn segment_cache_bytes(&self) -> usize {
+        self.segment_cache_mb
+            .unwrap_or(DEFAULT_FASTOKENS_SEGMENT_CACHE_MB)
+            .saturating_mul(1024 * 1024)
     }
 }
 
@@ -427,12 +499,18 @@ impl Default for MetricsConfig {
     }
 }
 
+/// Mooncake's `--metrics_port`.
+fn default_mooncake_admin_port() -> u16 {
+    9003
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
             prepare_pool: PreparePoolConfig::default(),
+            fastokens: FastokensConfig::default(),
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -445,6 +523,8 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
+            kv_events: false,
+            mooncake_admin_port: default_mooncake_admin_port(),
             api_key: None,
             metrics: None,
             log_dir: None,
@@ -462,6 +542,7 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             atom_standalone: false,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
+            atom_pd_concurrent: false,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,
@@ -525,6 +606,30 @@ impl RouterConfig {
             .unwrap_or(DEFAULT_MAX_TOKENIZE_BYTES)
     }
 
+    /// The tokenization byte limit for the models fastokens encodes.
+    pub fn resolved_fastokens_max_tokenize_bytes(&self) -> usize {
+        self.fastokens.max_tokenize_bytes.unwrap_or_else(|| {
+            DEFAULT_FASTOKENS_MAX_TOKENIZE_BYTES.max(self.resolved_max_tokenize_bytes())
+        })
+    }
+
+    /// Whether the HTTP PD router's and ext-proc's planners select decode first and
+    /// prefill on the decode's DP rank: the ATOM backend with idx2idx rank mapping. gRPC
+    /// PD does not map ranks.
+    pub fn prefill_on_decode_rank(&self) -> bool {
+        matches!(self.backend, BackendType::Atom)
+            && matches!(
+                self.atom_pd_rank_mapping_policy,
+                AtomPdRankMappingPolicy::Idx2Idx
+            )
+    }
+
+    /// Whether the HTTP PD router dispatches an ATOM relay's decode leg
+    /// concurrently with prefill: `--atom-pd-concurrent` on the ATOM backend.
+    pub fn atom_pd_concurrent_dispatch(&self) -> bool {
+        matches!(self.backend, BackendType::Atom) && self.atom_pd_concurrent
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
@@ -574,6 +679,30 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_atom_with_idx2idx_plans_prefill_on_the_decode_rank() {
+        for backend in [BackendType::Sglang, BackendType::Vllm, BackendType::Atom] {
+            for mapping in [
+                AtomPdRankMappingPolicy::None,
+                AtomPdRankMappingPolicy::Idx2Idx,
+            ] {
+                let config = RouterConfig {
+                    backend,
+                    atom_pd_rank_mapping_policy: mapping,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    config.prefill_on_decode_rank(),
+                    matches!(
+                        (backend, mapping),
+                        (BackendType::Atom, AtomPdRankMappingPolicy::Idx2Idx)
+                    ),
+                    "{backend:?} {mapping}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn prepare_pool_defaults_overrides_and_legacy_config_deserialization() {

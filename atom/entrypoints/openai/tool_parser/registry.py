@@ -285,10 +285,12 @@ def resolve_tool_call_parser(
 
 
 def template_keeps_tool_call_arguments(rendered_probe: str | None) -> bool:
-    """Whether the template that rendered the tools probe takes history
-    tool-call argument strings as sent. Kimi-K3's encoder renders them
-    verbatim; parsing them first changes the prompt. Read off the template,
-    never off ``--tool-call-parser``."""
+    """Kimi-K3's check: whether the template that rendered the tools probe
+    takes history tool-call argument strings as sent. Kimi-K3's encoder renders
+    them verbatim; parsing them first changes the prompt. Read off the template,
+    never off ``--tool-call-parser``. Templates that concatenate the string
+    (DeepSeek-R1/V3) are found by
+    ``chat_encoders.template_needs_tool_call_argument_strings``."""
     return (
         rendered_probe is not None
         and resolve_from_prompt(rendered_probe) is KimiK3Parser

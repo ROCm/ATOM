@@ -21,6 +21,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.offload import register_backends
+from atom.kv_transfer.offload.config import DEFAULT_MIN_LOAD_TOKENS, connector_extras
 from atom.kv_transfer.offload.tier import OffloadTierProfile
 from atom.utils import envs
 
@@ -62,6 +63,29 @@ def pd_transfer_config(kv_transfer_config: dict | None) -> dict | None:
     return cfg if name in PD_TRANSFER_BACKENDS else None
 
 
+def requested_state_transfer_slots(connector: dict) -> int:
+    """A connector entry's validated ``state_transfer_slots``, 0 when unset."""
+    slots = connector.get("state_transfer_slots", 0)
+    if isinstance(slots, bool) or not isinstance(slots, int) or slots < 0:
+        raise ValueError(
+            f"state_transfer_slots must be a non-negative integer, got {slots!r}"
+        )
+    return slots
+
+
+def warn_unsized_state_transfer_slots(kv_transfer_config: dict | None, sized: int):
+    """Warn when `state_transfer_slots` is set anywhere but sized no slots."""
+    cfg = kv_transfer_config or {}
+    subs = [cfg, *(sub or {} for sub in cfg.get("connectors") or ())]
+    requested = max(requested_state_transfer_slots(sub) for sub in subs)
+    if requested and not sized:
+        logger.warning(
+            "state_transfer_slots=%d is ignored: only a MoRIIO producer that is "
+            "the only connector, serving a KDA/GDN model, uses it",
+            requested,
+        )
+
+
 class KVConnectorFactory:
     """Registry + factory for KV connector backends.
 
@@ -94,15 +118,31 @@ class KVConnectorFactory:
     # data and e8m0 scale). Absent means no: the P/D backends parse one region
     # per role and layer.
     _copies_whole_block_regions: ClassVar[dict[str, bool]] = {}
+    # Whether a backend moves NVFP4 KV and index pages (`topology_moves_nvfp4_pages`).
+    # Absent means no.
+    _moves_nvfp4_pages: ClassVar[dict[str, bool]] = {}
+    # Whether a backend moves a DSpark draft's KV kept in a dtype of its own beside an
+    # NVFP4 target (`topology_moves_own_dtype_draft`). Absent means no.
+    _moves_own_dtype_draft: ClassVar[dict[str, bool]] = {}
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
+    # Whether a backend stores and restores a PAGE checkpoint image, the
+    # per-request state behind a hybrid's pages. Absent means no: a model
+    # whose state rides that image refuses it.
+    _reads_page_images: ClassVar[dict[str, bool]] = {}
+    _min_load_tokens: ClassVar[dict[str, int | None]] = {}
     # Whether a backend's tier is one store every DP rank reads (an LMCache MP
     # server, Mooncake Store), not one per rank. Absent means per rank.
     _shared_tier: ClassVar[dict[str, bool]] = {}
     # A backend's transfer granularity, read off its connector config alone:
     # "module:function" taking the leaf's `kv_transfer_config`. Absent means 1.
     _chunk_tokens: ClassVar[dict[str, str]] = {}
+    _lowers_hbm_hit_to_chunk: ClassVar[dict[str, bool]] = {}
+    # A backend that provides the paged pool and shares it across DP ranks:
+    # "module:function" taking the leaf's `kv_transfer_config`, returning what
+    # routing may count on (`pool_sharing`).
+    _shares_pool: ClassVar[dict[str, str]] = {}
 
     @classmethod
     def register(
@@ -118,8 +158,14 @@ class KVConnectorFactory:
         copies_whole_block_regions: bool = False,
         requires_pd_staging: bool = True,
         offload: bool = False,
+        reads_page_images: bool = False,
+        min_load_tokens: int | None = None,
         shared_tier: bool = False,
         chunk_tokens: str | None = None,
+        lowers_hbm_hit_to_chunk: bool = False,
+        moves_nvfp4_pages: bool = False,
+        moves_own_dtype_draft: bool = False,
+        shares_pool: str | None = None,
     ) -> None:
         """Register a KV connector backend.
 
@@ -131,6 +177,11 @@ class KVConnectorFactory:
             scheduler_class: Class name within *scheduler_module*.
             offload: The backend is a KV offload tier; a ``multi`` runs at most
                 one (`is_offload_backend`).
+            reads_page_images: The backend carries PAGE checkpoint images
+                (`reads_page_images`).
+            min_load_tokens: This tier's own default for the smallest hit worth
+                loading (`resolve_min_load_tokens`); None keeps the global
+                default.
             reads_block_regions: Whether this backend reads the PAGE region
                 map. A predicate of the engine config is asked when the answer
                 depends on the model. The default is True.
@@ -139,6 +190,16 @@ class KVConnectorFactory:
             chunk_tokens: ``"module:function"`` returning the tier's transfer
                 granularity in tokens from the leaf's ``kv_transfer_config``
                 (`offload_tier`).
+            lowers_hbm_hit_to_chunk: Admission may reload an unaligned HBM tail
+                from the preceding transfer chunk, rather than recompute it.
+            moves_nvfp4_pages: The backend moves NVFP4 KV and index pages: by the
+                head runs their layout declares, or whole.
+            moves_own_dtype_draft: The backend moves a DSpark draft's KV in a dtype
+                of its own beside an NVFP4 target, its rows as bytes of their own.
+            shares_pool: ``"module:function"`` for a backend that provides the
+                paged pool and shares it across DP ranks, returning from the
+                leaf's ``kv_transfer_config`` what routing may count on
+                (`pool_sharing`).
         """
         cls._registry[name] = {
             "worker_module": worker_module,
@@ -168,9 +229,16 @@ class KVConnectorFactory:
             )
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
+        cls._reads_page_images[name] = bool(reads_page_images)
+        cls._min_load_tokens[name] = min_load_tokens
         cls._shared_tier[name] = bool(shared_tier)
+        cls._lowers_hbm_hit_to_chunk[name] = bool(lowers_hbm_hit_to_chunk)
+        cls._moves_nvfp4_pages[name] = bool(moves_nvfp4_pages)
+        cls._moves_own_dtype_draft[name] = bool(moves_own_dtype_draft)
         if chunk_tokens:
             cls._chunk_tokens[name] = chunk_tokens
+        if shares_pool:
+            cls._shares_pool[name] = shares_pool
 
     @classmethod
     def canonical_name(cls, value: object, *, path: str = "kv_transfer_config") -> str:
@@ -193,10 +261,68 @@ class KVConnectorFactory:
         return canonical
 
     @classmethod
+    def pool_sharing(cls, config: Any) -> dict[str, Any] | None:
+        """What a configured pool-providing backend offers DP routing, or None.
+
+        ``{"loads": bool, "session_migrate_margin": float | None}``: whether a
+        rank copies a prefix it lacks from another rank's pool, and how crowded
+        a rank may get before a session moves off it. From the registry and
+        ``config`` alone; nothing is built.
+        """
+        for name, sub in cls.leaf_connectors(config) or ():
+            target = cls._shares_pool.get(name)
+            if target is None:
+                continue
+            module, attr = target.split(":", 1)
+            return getattr(importlib.import_module(module), attr)(
+                sub.kv_transfer_config
+            )
+        return None
+
+    @classmethod
     def is_offload_backend(cls, name: str) -> bool:
         """Whether the registered backend ``name`` (canonical) is an offload tier."""
 
         return cls._offload.get(name, False)
+
+    @classmethod
+    def reads_page_images(cls, name: str) -> bool:
+        """Whether the registered backend ``name`` (canonical) carries PAGE
+        checkpoint images."""
+
+        return cls._reads_page_images.get(name, False)
+
+    @classmethod
+    def shared_offload_connectors(cls) -> frozenset[str]:
+        return frozenset(
+            name
+            for name in cls._registry
+            if cls._offload.get(name, False) and cls._shared_tier.get(name, False)
+        )
+
+    @classmethod
+    def lowers_hbm_hit_to_chunk(cls, name: str) -> bool:
+        return cls._lowers_hbm_hit_to_chunk.get(name, False)
+
+    @classmethod
+    def resolve_min_load_tokens(cls, config: Any) -> int:
+        """`OFFLOAD_MIN_LOAD_TOKENS` for this configuration: the user's value,
+        else the configured offload tier's own default, else
+        `DEFAULT_MIN_LOAD_TOKENS`.
+
+        Called once, by `Config`, which keeps it in `offload_min_load_tokens`;
+        it is never written into the process environment, so another engine in
+        the process keeps its own. A ``multi`` runs at most one offload tier, so
+        this reads that leaf, not the P/D transport beside it.
+        """
+        override = envs.OFFLOAD_MIN_LOAD_TOKENS
+        if override is not None:
+            return override
+        for name, _ in cls.leaf_connectors(config) or ():
+            if cls.is_offload_backend(name):
+                tier = cls._min_load_tokens.get(name)
+                return DEFAULT_MIN_LOAD_TOKENS if tier is None else tier
+        return DEFAULT_MIN_LOAD_TOKENS
 
     @classmethod
     def offload_tier(cls, config: Any) -> OffloadTierProfile:
@@ -207,13 +333,13 @@ class KVConnectorFactory:
             return OffloadTierProfile()
         tier = shared = False
         chunk_tokens = 1
+        lowers_hbm_hit_to_chunk = False
         for name, sub in cls.leaf_connectors(config) or ():
             role = (getattr(sub, "kv_transfer_config", None) or {}).get(
                 "kv_role", "offload"
             )
             if cls.is_offload_backend(name) and role in ("offload", "kv_both"):
                 if name == "mooncake_store":
-                    from atom.kv_transfer.offload.config import connector_extras
                     from atom.kv_transfer.offload.mooncake_store.config import (
                         parse_mooncake_store_config,
                     )
@@ -227,12 +353,13 @@ class KVConnectorFactory:
                         store = parse_mooncake_store_config(sub.kv_transfer_config)
                         if len(store.store_masters()) > 1:
                             raise ValueError(
-                                "--dp-load-balance prefix_spread requires one shared "
+                                "Shared-prefix DP routing requires one shared "
                                 "Mooncake Store pool; mooncake_store.pools addresses "
                                 "distinct master/metadata pairs"
                             )
                 tier = True
                 shared |= cls._shared_tier.get(name, False)
+                lowers_hbm_hit_to_chunk |= cls._lowers_hbm_hit_to_chunk.get(name, False)
                 hook = cls._chunk_tokens.get(name)
                 if hook:
                     module, _, attr = hook.partition(":")
@@ -243,8 +370,9 @@ class KVConnectorFactory:
             return OffloadTierProfile()
         return OffloadTierProfile(
             loads=shared,
-            min_load_tokens=int(envs.OFFLOAD_MIN_LOAD_TOKENS),
+            min_load_tokens=config.offload_min_load_tokens,
             load_chunk_tokens=chunk_tokens,
+            lowers_hbm_hit_to_chunk=lowers_hbm_hit_to_chunk,
         )
 
     @classmethod
@@ -367,6 +495,38 @@ class KVConnectorFactory:
         )
 
     @classmethod
+    def _every_leaf_declares(cls, flags: dict[str, bool], config: Any) -> bool:
+        """Does every transport `config` runs declare the flag in `flags`? False when
+        it runs none or the topology cannot be parsed."""
+        leaves = cls.leaf_connectors(config)
+        return bool(leaves) and all(flags.get(name, False) for name, _ in leaves)
+
+    @staticmethod
+    def _declaring(flags: dict[str, bool]) -> tuple[str, ...]:
+        """The registered backends that declare the flag in `flags`, sorted."""
+        return tuple(sorted(name for name, declared in flags.items() if declared))
+
+    @classmethod
+    def topology_moves_nvfp4_pages(cls, config: Any) -> bool:
+        """Does every transport `config` runs declare `moves_nvfp4_pages`?"""
+        return cls._every_leaf_declares(cls._moves_nvfp4_pages, config)
+
+    @classmethod
+    def nvfp4_page_connectors(cls) -> tuple[str, ...]:
+        """The registered backends that declare `moves_nvfp4_pages`, sorted."""
+        return cls._declaring(cls._moves_nvfp4_pages)
+
+    @classmethod
+    def topology_moves_own_dtype_draft(cls, config: Any) -> bool:
+        """Does every transport `config` runs declare `moves_own_dtype_draft`?"""
+        return cls._every_leaf_declares(cls._moves_own_dtype_draft, config)
+
+    @classmethod
+    def own_dtype_draft_connectors(cls) -> tuple[str, ...]:
+        """The registered backends that declare `moves_own_dtype_draft`, sorted."""
+        return cls._declaring(cls._moves_own_dtype_draft)
+
+    @classmethod
     def _leaf_reads_block_regions(cls, connector: str, config: Any) -> bool:
         declared = cls._reads_block_regions.get(connector, True)
         if isinstance(declared, bool):
@@ -452,6 +612,12 @@ KVConnectorFactory.register(
     worker_class="MooncakeConnector",
     scheduler_module="atom.kv_transfer.disaggregation.mooncake.mooncake_connector",
     scheduler_class="MooncakeConnectorScheduler",
+    # Cuts an NVFP4 KV page by the head runs `Nvfp4KvLayout.head_runs` declares; the
+    # index page has no head axis and moves whole.
+    moves_nvfp4_pages=True,
+    # A draft's own-dtype rows are units of their own; `pair_units` refuses a
+    # consumer whose draft units differ.
+    moves_own_dtype_draft=True,
 )
 
 # Composite backend: fans out to several sub-connectors listed under
@@ -469,3 +635,8 @@ KVConnectorFactory.register(
 # Registration is explicit after the factory exists; importing an offload
 # value type does not recursively import this factory.
 register_backends(KVConnectorFactory)
+
+# Connectors that provide the paged pool itself (atom/kv_transfer/pool).
+from atom.kv_transfer.pool import register_backends as _register_pool
+
+_register_pool(KVConnectorFactory)

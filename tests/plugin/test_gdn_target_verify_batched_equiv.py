@@ -1,8 +1,9 @@
-"""Differential tests for the default batched GDN target-verify path.
+"""Differential tests for the batched GDN target-verify path.
 
-The production SGLang plugin folds the whole draft block into one conv update
-and one SSM recurrent call. These tests retain the removed per-draft-step
-implementation as a test-only numerical reference.
+The SGLang plugin's batched TARGET_VERIFY path (``ATOM_ENABLE_REPLAYSSM=0``)
+folds the whole draft block into one conv update and one SSM recurrent call.
+These tests retain the removed per-draft-step implementation as a test-only
+numerical reference.
 
 These tests check, with the real kernels, whether the two call patterns are
 numerically interchangeable, and whether SGLang's buffer layouts can be
@@ -17,9 +18,15 @@ addressed the way ATOM's batched kernels expect:
 
 The negative-control tests exist so that a future refactor cannot make the
 equivalence tests pass vacuously: they assert that realistic adapter bugs are
-still detected. See section 17 of ``ATOM_Qwen3.5_DFLASH_TP8复现与实现报告.md``.
+still detected.
 
-Nothing here touches the plugin's production path.
+These tests call the kernels directly, not the plugin's ``forward()`` or
+``_verify_batched_ssm``. ``_conv_batched_live`` repeats the kernel call from
+``_spec_conv_qkv``. The SSM stand-in ``_ssm_batched`` covers only the plain
+state layout (no FlyDSL logical KV view), slots ``cache_index * draft + step``
+and no pad rows;
+``test_sglang_gdn_verify_batched_ssm.py`` covers the plugin's own call through
+``forward()``.
 """
 
 from __future__ import annotations
@@ -49,7 +56,6 @@ CONV_DIM = 2 * K_DIM + V_DIM  # q, k and v are packed into mixed_qkv
 
 NUM_SLOTS = 24
 
-# Draft lengths spanning the sweep in section 16 of the report.
 DRAFT_LENS = [4, 8, 16]
 BATCH_SIZES = [1, 3]
 
@@ -216,16 +222,6 @@ def test_ssm_per_step_loop_matches_batched_slot_table(bs: int, draft: int):
     torch.testing.assert_close(inter_b, inter_a, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("draft", DRAFT_LENS)
-def test_batched_ssm_leaves_live_state_untouched(draft: int):
-    """The batched path writes only into the slot pool, so the plugin's
-    snapshot/restore of the live SSM state becomes unnecessary."""
-    inp = _Inputs(3, draft)
-    live_before = inp.live_ssm.clone()
-    _ssm_batched(inp)
-    torch.testing.assert_close(inp.live_ssm, live_before, rtol=0, atol=0)
-
-
 def test_ssm_equivalence_detects_collapsed_slot_table():
     """Negative control: a naive adapter reusing one slot for every step (what
     a 1D index table would do) must NOT compare equal.
@@ -259,7 +255,8 @@ def test_ssm_equivalence_detects_missing_live_state_seed():
 # Conv
 # --------------------------------------------------------------------------
 def _conv_per_step_loop(inp: _Inputs):
-    """Plugin behaviour today: one narrow-window update per draft step."""
+    """Removed production path (one narrow-window update per draft step), retained
+    as a test-only numerical reference."""
     conv = inp.live_conv.clone()
     qkv = torch.zeros(inp.bs, inp.draft, CONV_DIM, device="cuda", dtype=torch.bfloat16)
     windows = torch.zeros(
@@ -282,27 +279,31 @@ def _conv_per_step_loop(inp: _Inputs):
     return qkv, windows
 
 
-def _conv_batched(inp: _Inputs, seed: bool = True):
-    """One spec call writing the shared wide window, mirroring SGLang's
-    deduplicated ``intermediate_conv_window`` physical buffer."""
+def _conv_batched_live(inp: _Inputs, live_conv: torch.Tensor, fill: float):
+    """The production call (``_spec_conv_qkv``): the history is read in place
+    from the live pool by cache slot (``conv_state_in``) and the wide window is
+    written by batch position. Rows whose cache slot is the pad slot (-1) have
+    it only in the read table."""
     shared_win = inp.draft + STATE_LEN - 1
-    conv = torch.zeros(
-        NUM_SLOTS, CONV_DIM, shared_win, device="cuda", dtype=torch.bfloat16
+    window = torch.full(
+        (NUM_SLOTS, CONV_DIM, shared_win), fill, device="cuda", dtype=torch.bfloat16
     )
-    if seed:
-        conv[inp.cache_indices, :, :STATE_LEN] = inp.live_conv[inp.cache_indices]
     query_start_loc = torch.arange(
         0, (inp.bs + 1) * inp.draft, inp.draft, device="cuda", dtype=torch.int32
     )
     query, key, value = causal_conv1d_update(
         inp.mixed.reshape(inp.bs * inp.draft, CONV_DIM),
-        conv,
+        window,
         inp.conv_weight,
         K_DIM,
         V_DIM,
         inp.conv_bias,
         "silu",
-        conv_state_indices=inp.cache_indices.reshape(inp.bs, 1).to(torch.int32),
+        conv_state_indices=torch.arange(inp.bs, device="cuda", dtype=torch.int32).view(
+            inp.bs, 1
+        ),
+        conv_state_indices_in=inp.cache_indices.view(inp.bs, 1),
+        conv_state_in=live_conv,
         num_accepted_tokens=torch.ones(inp.bs, device="cuda", dtype=torch.int32),
         query_start_loc=query_start_loc,
         max_query_len=inp.draft,
@@ -311,10 +312,9 @@ def _conv_batched(inp: _Inputs, seed: bool = True):
     qkv = torch.cat([query, key, value], dim=-1).reshape(inp.bs, inp.draft, CONV_DIM)
     # SGLang's view: step t's window is phys[..., t : t + STATE_LEN].
     windows = torch.stack(
-        [conv[inp.cache_indices, :, t : t + STATE_LEN] for t in range(inp.draft)],
-        dim=1,
+        [window[: inp.bs, :, t : t + STATE_LEN] for t in range(inp.draft)], dim=1
     )
-    return qkv, windows
+    return qkv, windows, window
 
 
 @pytest.mark.parametrize("draft", DRAFT_LENS)
@@ -324,20 +324,89 @@ def test_conv_per_step_windows_match_wide_window_slices(bs: int, draft: int):
     per-step conv window that the loop materialises."""
     inp = _Inputs(bs, draft)
     qkv_a, win_a = _conv_per_step_loop(inp)
-    qkv_b, win_b = _conv_batched(inp)
+    qkv_b, win_b, _ = _conv_batched_live(inp, inp.live_conv, 0.0)
 
     torch.testing.assert_close(qkv_b, qkv_a, rtol=0, atol=0)
     torch.testing.assert_close(win_b, win_a, rtol=0, atol=0)
 
 
-def test_conv_equivalence_detects_missing_history_seed():
-    """Negative control: not seeding the wide window with the live conv history
-    must NOT compare equal."""
-    inp = _Inputs(3, 8)
+def _live_conv_in_layout(live_conv: torch.Tensor, layout: str) -> torch.Tensor:
+    if layout == "slot_dim_tok":
+        return live_conv.clone()
+    # Same logical [slot, dim, K-1], dim axis contiguous (stride(-2) == 1).
+    relaid = torch.empty(
+        NUM_SLOTS, STATE_LEN, CONV_DIM, device="cuda", dtype=live_conv.dtype
+    ).transpose(1, 2)
+    relaid.copy_(live_conv)
+    return relaid
+
+
+@pytest.mark.parametrize("layout", ["slot_dim_tok", "dim_contiguous"])
+@pytest.mark.parametrize("pad_rows", [(), (1,), (1, 3)])
+@pytest.mark.parametrize("draft", [3, 4])
+def test_conv_reading_live_pool_in_place_matches_per_step_loop(
+    draft: int, pad_rows: tuple, layout: str
+):
+    """Reading the history straight from the live pool gives the same q/k/v
+    and per-step windows as the loop for every real row, skips padded rows
+    entirely, and never writes the live pool."""
+    bs = 4
+    inp = _Inputs(bs, draft)
+    for row in pad_rows:
+        inp.cache_indices[row] = -1
+    real = [i for i in range(bs) if i not in pad_rows]
     qkv_a, win_a = _conv_per_step_loop(inp)
-    qkv_b, win_b = _conv_batched(inp, seed=False)
-    assert not torch.allclose(qkv_b.float(), qkv_a.float(), rtol=1e-2, atol=1e-2)
-    assert not torch.allclose(win_b.float(), win_a.float(), rtol=1e-2, atol=1e-2)
+
+    live = _live_conv_in_layout(inp.live_conv, layout)
+    live_before = live.clone()
+    fill = 7.0
+    qkv_b, win_b, window = _conv_batched_live(inp, live, fill)
+
+    torch.testing.assert_close(qkv_b[real], qkv_a[real], rtol=0, atol=0)
+    torch.testing.assert_close(win_b[real], win_a[real], rtol=0, atol=0)
+    assert torch.equal(live, live_before)
+    untouched = [i for i in range(NUM_SLOTS) if i not in real]
+    assert torch.all(window[untouched] == fill)
+
+
+def test_conv_state_in_width_check_counts_accepted_tokens():
+    """With validate_data, a separate read pool must hold the columns the
+    accepted-token offset reads: width - 1 is enough only when every row
+    accepted one token."""
+    inp = _Inputs(3, 4)
+    shared_win = inp.draft + STATE_LEN - 1
+    window = torch.zeros(
+        NUM_SLOTS, CONV_DIM, shared_win, device="cuda", dtype=torch.bfloat16
+    )
+    query_start_loc = torch.arange(
+        0, (inp.bs + 1) * inp.draft, inp.draft, device="cuda", dtype=torch.int32
+    )
+
+    def call(accepted: int):
+        causal_conv1d_update(
+            inp.mixed.reshape(inp.bs * inp.draft, CONV_DIM),
+            window,
+            inp.conv_weight,
+            K_DIM,
+            V_DIM,
+            inp.conv_bias,
+            "silu",
+            conv_state_indices=torch.arange(
+                inp.bs, device="cuda", dtype=torch.int32
+            ).view(inp.bs, 1),
+            conv_state_indices_in=inp.cache_indices.view(inp.bs, 1),
+            conv_state_in=inp.live_conv,
+            num_accepted_tokens=torch.full(
+                (inp.bs,), accepted, device="cuda", dtype=torch.int32
+            ),
+            query_start_loc=query_start_loc,
+            max_query_len=inp.draft,
+            validate_data=True,
+        )
+
+    call(1)
+    with pytest.raises(AssertionError, match="narrower than num_accepted_tokens"):
+        call(2)
 
 
 def test_conv_equivalence_detects_off_by_one_window_slice():
@@ -345,33 +414,9 @@ def test_conv_equivalence_detects_off_by_one_window_slice():
     NOT compare equal."""
     inp = _Inputs(3, 8)
     _qkv_a, win_a = _conv_per_step_loop(inp)
-    shared_win = inp.draft + STATE_LEN - 1
-    conv = torch.zeros(
-        NUM_SLOTS, CONV_DIM, shared_win, device="cuda", dtype=torch.bfloat16
-    )
-    conv[inp.cache_indices, :, :STATE_LEN] = inp.live_conv[inp.cache_indices]
-    query_start_loc = torch.arange(
-        0, (inp.bs + 1) * inp.draft, inp.draft, device="cuda", dtype=torch.int32
-    )
-    causal_conv1d_update(
-        inp.mixed.reshape(inp.bs * inp.draft, CONV_DIM),
-        conv,
-        inp.conv_weight,
-        K_DIM,
-        V_DIM,
-        inp.conv_bias,
-        "silu",
-        conv_state_indices=inp.cache_indices.reshape(inp.bs, 1).to(torch.int32),
-        num_accepted_tokens=torch.ones(inp.bs, device="cuda", dtype=torch.int32),
-        query_start_loc=query_start_loc,
-        max_query_len=inp.draft,
-        validate_data=False,
-    )
+    _qkv_b, _win_b, window = _conv_batched_live(inp, inp.live_conv, 0.0)
     shifted = torch.stack(
-        [
-            conv[inp.cache_indices, :, t + 1 : t + 1 + STATE_LEN]
-            for t in range(inp.draft - 1)
-        ],
+        [window[: inp.bs, :, t + 1 : t + 1 + STATE_LEN] for t in range(inp.draft - 1)],
         dim=1,
     )
     assert not torch.allclose(
@@ -389,7 +434,7 @@ def test_intermediate_ssm_layout_is_flattenable():
 
     This mirrors the allocation in SGLang's
     ``MambaPool.__init__`` (memory_pool.py); if that ever stops being
-    contiguous the conversion layer must copy instead of view."""
+    contiguous, ``_verify_batched_ssm`` raises rather than viewing it."""
     draft = 8
     layers, slots = 2, NUM_SLOTS
     cache = torch.zeros(

@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import zmq
 
+from atom.config import KVEventsConfig
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
@@ -78,6 +79,7 @@ def _bare_manager(cls, **kwargs):
             prefill_context_parallel_size=1,
             keep_finished_outputs=kwargs.get("keep_finished_outputs", False),
             asyncio_mode=kwargs.get("asyncio_mode", False),
+            kv_events_config=KVEventsConfig(),
         ),
         label=cls.__name__,
         local_engine_count=kwargs.get("local_engine_count", 2),
@@ -191,6 +193,12 @@ class OutputThreadStateTest(unittest.TestCase):
         """It stays None until the API server resolves it; offline never does."""
         for mgr in self.managers:
             self.assertIsNone(mgr._flush_stream_batch_fn)
+
+    def test_kv_event_sources_are_built_with_the_shared_state(self):
+        """`/kv_event_sources` serves what the manager built, under either
+        manager; with events off there is no publisher to report."""
+        for mgr in self.managers:
+            self.assertEqual(mgr.kv_event_sources, {})
 
     def test_load_accounting_is_sized_for_the_engine_count(self):
         mgr = _bare_manager(CoreManager, local_engine_count=4)

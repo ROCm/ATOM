@@ -93,7 +93,10 @@ def config(**extra):
     return SimpleNamespace(
         kv_cache_block_size=4,
         tensor_parallel_size=2,
+        decode_context_parallel_size=1,
+        dcp_config=SimpleNamespace(interleave_size=1),
         hf_config=SimpleNamespace(model_type="reusable_test_model", kv_lora_rank=512),
+        speculative_config=None,
         kv_transfer_config={
             "kv_connector": "lmcache_mp",
             "kv_role": "offload",
@@ -102,8 +105,13 @@ def config(**extra):
     )
 
 
-def _make_worker(*, images=True):
-    instance = NativeStateLMCacheMPConnector(config())
+def _make_worker(*, images=True, dcp=1):
+    cfg = config()
+    if dcp > 1:
+        cfg.tensor_parallel_size = 8
+        cfg.decode_context_parallel_size = dcp
+        cfg.hf_config.model_type = "kimi_linear"
+    instance = NativeStateLMCacheMPConnector(cfg)
     page = torch.zeros((32, 1, 32), dtype=torch.uint8)
     spec = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
     tensors = KVTransferTensors(
@@ -120,9 +128,9 @@ def _make_worker(*, images=True):
     )
     tensors.set_block_count(32)
     instance._native_layout = build_native_state_mp_layout(
-        tensors, block_size=4, chunk_size=8, images=images
+        tensors, block_size=instance.block_size, chunk_size=8 * dcp, images=images
     )
-    instance.chunk_size = 8
+    instance.chunk_size = 8 * dcp
     instance.submitted = []
     instance.submitted_request_ids = []
     instance.future = Future()
@@ -160,6 +168,29 @@ def request(*, loading=False, units=(0, 25, 31), generation=1, hbm=0):
         load_operation=LoadOperationId(7, generation) if loading else None,
         native_state=NativeStateTransfer(units, 16, 998, 2 if loading else None),
     )
+
+
+@pytest.mark.parametrize("loading", [False, True])
+def test_dcp8_transfers_local_pages_with_the_full_native_image(loading):
+    worker = _make_worker(dcp=8)
+    req = request(loading=loading)
+    req.token_ids = list(range(128))
+    req.native_state = replace(req.native_state, boundary_tokens=128)
+    if loading:
+        req.load_spec = LoadSpec(64, 128)
+        worker._submit_load(req, object())
+    else:
+        req.save_spec = SaveSpec(64)
+        worker._submit_save(req, object())
+    assert worker.submitted[0].start == 64
+    assert worker.submitted[0].end == 128
+    assert worker.submitted[0].block_ids == [[3, 4], [0], [25], [31]]
+    assert [g.tokens_per_block for g in worker._native_layout.kernel_groups] == [
+        32,
+        64,
+        64,
+        64,
+    ]
 
 
 def test_store_transmits_page_zero_as_real_native_unit(worker):
@@ -282,14 +313,14 @@ def _kv_only_load(hbm=8):
 
 
 def test_kv_only_load_reads_page_alone_under_the_request_session(page_worker):
-    req = _kv_only_load()
+    req = replace(_kv_only_load(), cache_salt="11")
     page_worker._submit_load(req, object())
     # The lookup that reported the reach also locked it, under this session.
     assert page_worker.submitted_request_ids == ["atom-offload-dp0:7"]
     [spec] = page_worker.submitted
     # PAGE for [8, 16) and nothing else: the layout has no image group.
     assert spec.block_ids == [[3, 4]]
-    assert spec.request_configs is None
+    assert spec.cache_salt == "11"
 
 
 def test_page_only_save_stores_page_alone(page_worker):
@@ -299,7 +330,7 @@ def test_page_only_save_stores_page_alone(page_worker):
     page_worker._submit_save(req, object())
     [spec] = page_worker.submitted
     assert spec.block_ids == [[1, 2, 3, 4]]
-    assert spec.request_configs is None
+    assert spec.cache_salt == ""
     page_worker.future.ready = True
     terminals = [
         completion
@@ -629,6 +660,40 @@ def test_native_restore_reports_success_and_returns_its_slot(worker, cuda):
     assert not second.failed_loading
     assert worker._restore_descriptor_slots == [3]
     assert worker._native_loads == {}
+
+
+def test_restore_deadline_counts_from_the_restore_not_the_retrieve(
+    worker, cuda, monkeypatch
+):
+    """The host may first poll a retrieve long after submitting it. The
+    retrieve is terminal by then and its restore only just enqueued: the
+    deadline bounds the restore from there, and still stops the engine if that
+    copy never completes."""
+    from atom.kv_transfer.offload.mp import transfer
+
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker._restore_descriptor_slots = [3]
+    worker._native_copy = lambda stores, restores, descriptor_slot=0: None
+    req = request(loading=True)
+    worker._submit_load(req, object())
+
+    now[0] += worker._transfer_deadline_s + 5
+    worker.future.value, worker.future.ready = True, True
+    first = worker.get_finished()
+    assert not first.finished_loading and not first.failed_loading
+    assert len(worker._native_loads) == 1
+
+    now[0] += worker._transfer_deadline_s - 1
+    assert not worker.get_finished().finished_loading
+    now[0] += 2
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
+        worker.get_finished()
+    assert worker._restore_descriptor_slots == []
+
+    cuda.events[-1].done = True
+    assert worker.get_finished().finished_loading == {req.load_operation}
+    assert worker._restore_descriptor_slots == [3]
 
 
 def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):

@@ -86,6 +86,7 @@ class LMCacheMPConnector(KVConnectorBase):
             # The forward rebuilds the state from the PAGE below any hit
             # (`StateTransfer.replay`), a tier load's included, so PAGE alone
             # is all a load has to bring.
+            transfer_tensors = transfer_tensors.without_slots()
             impl = mp_worker.LMCacheMPConnector(self._config)
         elif _has_per_request_state(kv_caches):
             # Fork-slot GDN (pipeline parallelism, RapidServe) publishes no
@@ -198,8 +199,22 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
             prefetch(seqs)
 
     def lookup_pending(self, seq: Any) -> bool:
-        pending = getattr(self._require_impl(), "lookup_pending", None)
-        return bool(pending(seq)) if callable(pending) else False
+        return self._require_impl().lookup_pending(seq)
+
+    def lookup_would_defer(self, seq: Any) -> bool:
+        return self._require_impl().lookup_would_defer(seq)
+
+    # The base class defines these as defaults, which would shadow `__getattr__`
+    # and leave the impl's own unreached: forward each explicitly.
+    def cancel_pending_load(self, seq: Any) -> None:
+        self._require_impl().cancel_pending_load(seq)
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        self._require_impl().cancel_preadmission(seq)
+
+    def close(self) -> None:
+        if self._impl is not None:
+            self._impl.close()
 
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         check = getattr(self._require_impl(), "can_detach_lookup", None)

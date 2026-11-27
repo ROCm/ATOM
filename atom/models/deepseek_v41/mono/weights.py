@@ -13,8 +13,8 @@ from dataclasses import dataclass
 import torch
 
 from atom.models.deepseek_v41.config import AttentionMode
-from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.mono.plan.shard import Shard
+from atom.models.deepseek_v41.mono.kernels.dims import SHARED_PAD, Dims
+from atom.mono.plan.shard import Shard, padded
 from atom.mono.runtime.consensus import MonoUnsupported
 
 
@@ -65,7 +65,10 @@ def expected(
         config.moe_intermediate_size, "routed intermediate"
     )
     inter_padded = -(-inter // MOE_PAD) * MOE_PAD
-    sh_inter = shard.split(config.moe_intermediate_size, "shared intermediate")
+    # the shared expert's rank share, padded as the loader pads it (``SHARED_PAD``)
+    sh_inter = padded(
+        shard.split(config.moe_intermediate_size, "shared intermediate"), SHARED_PAD
+    )
     mix = hc * (hc + 2)
     table = {
         "attn_norm.weight": ((hidden,), BF16),

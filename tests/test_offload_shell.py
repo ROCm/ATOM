@@ -8,6 +8,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from conftest import with_min_load
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
@@ -39,23 +40,25 @@ def _config(*, compress_ratios=None, layout=None):
     kv_transfer_config = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
     if layout is not None:
         kv_transfer_config["offload_layout"] = layout
-    return SimpleNamespace(
-        model="model",
-        model_tag="model",
-        kv_cache_dtype="fp8",
-        kv_cache_block_size=4,
-        decode_context_parallel_size=1,
-        state_checkpoint_interval_tokens=8,
-        tensor_parallel_size=1,
-        hf_config=SimpleNamespace(
-            compress_ratios=compress_ratios,
-            num_hidden_layers=2,
-            num_attention_heads=2,
-            num_key_value_heads=2,
-            hidden_size=16,
-            head_dim=8,
-        ),
-        kv_transfer_config=kv_transfer_config,
+    return with_min_load(
+        SimpleNamespace(
+            model="model",
+            model_tag="model",
+            kv_cache_dtype="fp8",
+            kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+            state_checkpoint_interval_tokens=8,
+            tensor_parallel_size=1,
+            hf_config=SimpleNamespace(
+                compress_ratios=compress_ratios,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                hidden_size=16,
+                head_dim=8,
+            ),
+            kv_transfer_config=kv_transfer_config,
+        )
     )
 
 

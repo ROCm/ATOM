@@ -405,6 +405,18 @@ def tier_verified_for_s(pool_gib: float) -> float:
 #: (DSV4) keeps its own in the SLOT sidecar. `qwen` subclasses the K3 tier.
 _STATE_TIER_LAYOUTS = frozenset({"kimi_k3", "qwen"})
 
+#: Of those, the layouts that keep the tier under PP. Only K3's PAGE
+#: checkpoints span the stages (`paged_checkpoints_span_pipeline`); Qwen keeps
+#: fork checkpoints under PP, publishes no layout id, and its worker turns the
+#: tier off.
+_PP_STATE_TIER_LAYOUTS = frozenset({"kimi_k3"})
+
+
+def state_tier_spans_pipeline(layout: str) -> bool:
+    """Whether `layout` keeps its state tier under PP."""
+    return layout in _PP_STATE_TIER_LAYOUTS
+
+
 #: Roles from which the worker will save / load. Mirrors `_do_save` / `_do_load`
 #: in `OffloadWorkerMixin`; the state legs ride those same halves.
 _SAVE_ROLES = frozenset({"offload", "kv_both", "kv_producer"})
@@ -417,12 +429,13 @@ class StateTierCapability:
 
     Derived from configuration, not from the connector's public name. The name
     only says which connector class is constructed; whether that class builds a
-    `StateOffloadTier` depends on the layout it resolves, the pipeline depth,
-    and the role it was given. The engine used to install a `StateOffloadIndex`
-    for any `lmcache_offload`, so a K3 run under PP>1 -- or any `dense`/`hybrid`
-    run -- got an index against a worker that would never build the tier. That
-    mismatch is what left stores emitted with nowhere to go, and it is the
-    common root of the tier-none fallback paths.
+    `StateOffloadTier` depends on the layout it resolves, the pipeline depth
+    for a layout whose checkpoints do not span stages, and the role it was
+    given. The engine used to install a `StateOffloadIndex` for any
+    `lmcache_offload`, so any `dense`/`hybrid` run got an index against a
+    worker that would never build the tier. That mismatch is what left stores
+    emitted with nowhere to go, and it is the common root of the tier-none
+    fallback paths.
 
     `reason` is filled in whenever the tier is off, so the log names which check
     refused it rather than leaving the operator to guess.
@@ -506,9 +519,9 @@ def state_tier_capability(config) -> StateTierCapability:
 
     A capability descriptor rather than a name check, because the two are not
     the same question and the worker refuses on conditions the name cannot see
-    (no transfer config, a `multi` composite with no offload sub, `pp_size > 1`,
-    an unknown explicit override, a layout that offloads no state, or a `kv_role`
-    that neither saves nor loads). Config alone because this runs in the engine
+    (no transfer config, a `multi` composite with no offload sub, an unknown
+    explicit override, a layout that offloads no state, `pp_size > 1` for a
+    layout other than K3's, or a `kv_role` that neither saves nor loads). Config alone because this runs in the engine
     process at
     `BlockManager.__init__`, before any worker connector exists -- so it must
     agree with the worker by construction, which is why the layout comes from
@@ -542,18 +555,19 @@ def state_tier_capability(config) -> StateTierCapability:
     if name not in _STATE_TIER_BACKENDS:
         return replace(none, reason=f"connector {name!r} hosts no state tier")
 
-    # The worker refuses PP outright: `CacheEngineKey` has no PP component, so
-    # two stages at the same TP rank would overwrite each other's entries.
-    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
-    if pp_size > 1:
-        return replace(none, reason=f"pipeline_parallel_size={pp_size}")
-
     try:
         layout = select_offload_layout(layout_config)
     except ValueError as exc:  # an unknown explicit override
         return replace(none, reason=str(exc))
     if layout not in _STATE_TIER_LAYOUTS:
         return replace(none, reason=f"layout {layout!r} offloads no state")
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    if pp_size > 1 and not state_tier_spans_pipeline(layout):
+        return replace(
+            none,
+            reason=f"layout {layout!r} keeps no state tier at "
+            f"pipeline_parallel_size={pp_size}",
+        )
 
     role = cfg.get("kv_role", "offload")
     can_store = role in _SAVE_ROLES
@@ -567,8 +581,13 @@ def state_tier_cpu_bytes() -> int:
     """CPU bytes the state tier may keep per worker (`OFFLOAD_STATE_CPU_SIZE`,
     GiB, default 32), carved from the paged-KV LMCache pool it shares.
 
-    One reader for both halves: the worker's `StateByteCodec` evicts against
-    it and the engine's `StateOffloadIndex` mirrors the resulting entry bound.
+    Under PP this is the stages' average, not each stage's cap: the stages pool
+    it and every stage keeps the same number of images
+    (`state_tier_cpu_entries`), so a stage holds that count times its own image.
+    A stage whose image is larger than the average holds more than this, while
+    `scale_cpu_size_for_pp` gives it a pool by layer count, so
+    `LMCACHE_MAX_LOCAL_CPU_SIZE` has to fit the stage with the most state per
+    layer (stage 0 of Kimi-K3 at PP8).
     """
     return int(float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30))
 
@@ -589,6 +608,24 @@ def _lmcache_engine_config(config):
         if sub is not None:
             kvcfg = sub
     return build_lmcache_config(kvcfg)
+
+
+def state_tier_cpu_entries(spec, config) -> int:
+    """Checkpoint images each worker's state tier keeps.
+
+    One reader for both halves: the worker's `StateByteCodec` evicts against
+    it and the engine's `StateOffloadIndex` mirrors it.
+
+    Under PP the stages' budgets are pooled and split by image bytes, as
+    `scale_cpu_size_for_pp` splits the KV pool by layers, so every stage keeps
+    the same count. Split evenly, a stage with a smaller image would keep
+    images whose other parts the largest-image stage had already evicted, and
+    a load needs every stage's part. The total across stages is unchanged.
+    """
+    if not spec.pipeline_op_bytes:
+        return state_tier_cpu_bytes() // spec.image_bytes
+    stages = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    return state_tier_cpu_bytes() * stages // spec.pipeline_op_bytes
 
 
 def state_tier_chunk_tokens(config) -> int:

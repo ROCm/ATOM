@@ -18,6 +18,7 @@ def _hash(spec=None):
         sequence_parallel_size=1,
         dcp_config=None,
         enable_dp_attention=True,
+        enable_mixed_prefill_decode=False,
         index_cache_dtype="fp4",
         index_cache_layout=None,
         enable_decoder_swa_bounded_replay=True,
@@ -32,6 +33,7 @@ def _hash(spec=None):
 
 
 def _spec(method="dspark", k=3, **kw):
+    kw.setdefault("draft_kv_dtype", "bf16")  # a field of every SpeculativeConfig
     return SimpleNamespace(method=method, num_speculative_tokens=k, **kw)
 
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The mono framework's host mechanisms that need no GPU: TP agreement, kernel
 argument tables, compile-only builds, and the framework's dependency rules."""
 
@@ -12,11 +13,12 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from atom.distributed.group_agreement import group_agree
+from atom.distributed.group_agreement import group_agree, group_min_each
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import (
     _COMPILE_ONLY,
     compile_only,
+    kernel_names,
     kernel_resources,
     scratch_bytes,
 )
@@ -121,6 +123,26 @@ def test_one_refusing_rank_turns_every_rank_down(refuser):
     assert dict(out) == {r: refuser is None for r in range(world)}
 
 
+def _min_each_worker(rank, world, init, out):
+    dist.init_process_group("gloo", init_method=init, rank=rank, world_size=world)
+    out[rank] = group_min_each((rank, -rank, 7), dist.group.WORLD)
+    dist.destroy_process_group()
+
+
+def test_each_position_is_decided_on_its_own_in_one_collective():
+    world = 3
+    with tempfile.TemporaryDirectory() as d:
+        out = mp.Manager().dict()
+        mp.spawn(
+            _min_each_worker,
+            args=(world, f"file://{d}/store", out),
+            nprocs=world,
+            join=True,
+        )
+    assert dict(out) == {r: (0, -2, 7) for r in range(world)}
+    assert group_min_each((3, 1), None) == (3, 1)
+
+
 def _module_files():
     return sorted(FRAMEWORK.rglob("*.py"))
 
@@ -145,6 +167,7 @@ def test_the_framework_package_is_found():
 
 # --------------------------------------------------------------- shared runner parts
 from atom.mono.runtime import route
+from atom.mono.runtime import widths as widths_module
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
 
@@ -174,19 +197,11 @@ def test_bind_agreed_converts_other_failures_to_refusal():
         bind_agreed(oom, None)
 
 
-def _mlir_escaped(data: bytes) -> str:
-    return "".join(
-        chr(b) if 0x20 <= b < 0x7F and b not in b'\\"' else f"\\{b:02X}" for b in data
-    )
-
-
 class _CompiledLauncher:
-    """A compiled ``@flyc.jit`` launcher as ``scratch_bytes`` / ``kernel_names``
-    read it: one artifact whose module text holds a code object's scratch size
-    (``value``: its msgpack encoding) and kernel ``name``."""
+    """A compiled launcher's complete MLIR module and synthetic metadata."""
 
-    def __init__(self, value: bytes, name: bytes = b"k_s6"):
-        elf = (
+    def __init__(self, value: bytes, name: bytes = b"k_s6", object_format="bin"):
+        self.elf = (
             b"\x7fELF\x02\x01"
             + b"\x9b.private_segment_fixed_size"
             + value
@@ -195,13 +210,34 @@ class _CompiledLauncher:
             + name
             + b".kd\x00"
         )
-        text = (
-            f'gpu.binary @m [#gpu.object<#rocdl.target, bin = "{_mlir_escaped(elf)}">]'
+        escaped = "".join(f"\\{byte:02X}" for byte in self.elf)
+        prefix = "bin = " if object_format == "bin" else ""
+        self.object_text = (
+            f'#gpu.object<#rocdl.target<chip = "gfx950">, {prefix}"{escaped}">'
         )
-        self._mem_cache = {"key": type("Artifact", (), {"_ir_text": text})()}
+        self.module_text = f"module {{ gpu.binary @m [{self.object_text}] }}"
+        self._mem_cache = {
+            "key": type("Artifact", (), {"_ir_text": self.module_text})()
+        }
 
     def __call__(self, *args):  # already compiled: the compile-only call is a no-op
         pass
+
+
+@pytest.fixture
+def compiled_launcher(monkeypatch):
+    """Mock only extraction so metadata and width tests also run without FlyDSL."""
+    from atom.mono.runtime import compile as compile_module
+
+    code_objects = {}
+    monkeypatch.setattr(compile_module, "_code_object", code_objects.__getitem__)
+
+    def make(value: bytes, name: bytes = b"k_s6"):
+        launcher = _CompiledLauncher(value, name)
+        code_objects[launcher.module_text] = launcher.elf
+        return launcher
+
+    return make
 
 
 class _NoArgs:
@@ -210,15 +246,51 @@ class _NoArgs:
         return ()
 
 
-NO_SCRATCH = _CompiledLauncher(b"\x00")
+@pytest.fixture
+def no_scratch(compiled_launcher):
+    return compiled_launcher(b"\x00")
 
 
 @pytest.mark.parametrize(
     "value, size",
     [(b"\x00", 0), (b"\x24", 36), (b"\xcc\x90", 144), (b"\xcd\x14\x8c", 5260)],
 )
-def test_scratch_bytes_reads_the_code_objects_private_segment(value, size):
-    assert scratch_bytes(_CompiledLauncher(value)) == size
+@pytest.mark.parametrize("reader", ["metadata", "bin", "fatbin"])
+def test_scratch_bytes_reads_the_code_objects_private_segment(
+    request, reader, value, size
+):
+    if reader == "metadata":
+        launcher = request.getfixturevalue("compiled_launcher")(value)
+    else:
+        # The current pre-checks unit-tests job does not install FlyDSL, so
+        # these Binary/Fatbin parameters skip in CI. They are exercised by
+        # manual runs in a FlyDSL-enabled environment, not a CI parser gate.
+        pytest.importorskip("flydsl")
+        launcher = _CompiledLauncher(value, object_format=reader)
+        from atom.mono.runtime.compile import _code_object
+
+        assert _code_object(launcher.module_text) == launcher.elf
+    assert scratch_bytes(launcher) == size
+    assert kernel_names(launcher) == ["k_s6"]
+
+
+@pytest.mark.parametrize("object_format", ["bin", "fatbin"])
+def test_code_object_reads_first_binary_and_first_object(object_format):
+    # Like the real-parser parameters above, this runs manually with FlyDSL;
+    # the current pre-checks unit-tests job skips it rather than guarding it.
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime.compile import _code_object
+
+    first = _CompiledLauncher(b"\x00", b"first", object_format)
+    other_target = _CompiledLauncher(b"\x24", b"other_target", object_format)
+    other_binary = _CompiledLauncher(b"\x34", b"other_binary", object_format)
+    text = (
+        "module {"
+        f" gpu.binary @a [{first.object_text}, {other_target.object_text}]"
+        f" gpu.binary @b [{other_binary.object_text}]"
+        " }"
+    )
+    assert _code_object(text) == first.elf
 
 
 def _note(key: bytes, value: bytes) -> bytes:
@@ -255,7 +327,7 @@ def test_scratch_bytes_refuses_a_launcher_without_a_binary():
         scratch_bytes(launcher)
 
 
-def test_a_width_is_built_and_compiled_once():
+def test_a_width_is_built_and_compiled_once(no_scratch):
     built, compiled = [], []
 
     def build(rows):
@@ -264,7 +336,7 @@ def test_a_width_is_built_and_compiled_once():
 
     def kernels(k):
         compiled.append(k)
-        return [(NO_SCRATCH, _NoArgs)]
+        return [(no_scratch, _NoArgs)]
 
     widths = WidthBuilds(build, kernels, None, "test")
     assert widths.prepare(6) and widths.prepare(6)
@@ -274,8 +346,6 @@ def test_a_width_is_built_and_compiled_once():
 def test_each_rank_compiles_its_own_share_of_a_width_first(monkeypatch):
     """Rank r of w compiles every w-th kernel from r first (the ranks side by
     side, not queued on one cache lock), then loads all of them."""
-    from atom.mono.runtime import widths as widths_module
-
     monkeypatch.setattr(widths_module.dist, "get_rank", lambda group: 1)
     monkeypatch.setattr(widths_module.dist, "get_world_size", lambda group: 3)
     widths = WidthBuilds(lambda key: key, lambda k: [], object(), "test")
@@ -286,8 +356,22 @@ def test_each_rank_compiles_its_own_share_of_a_width_first(monkeypatch):
     ]
 
 
-def test_a_built_width_logs_its_kernels_names(caplog):
-    launchers = [_CompiledLauncher(b"\x00", n) for n in (b"post_s6", b"pre_s6")]
+def test_a_lean_rebuild_leaves_out_what_any_rank_spilled(monkeypatch):
+    """A rank whose own kernels did not spill still leaves out the ones at the
+    places another rank's spilled: every rank rebuilds into one structure."""
+
+    def all_gather_object(every, places, group):
+        every[:] = [places, {1}]  # the other rank spilled the second kernel
+
+    monkeypatch.setattr(widths_module.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(widths_module.dist, "all_gather_object", all_gather_object)
+    widths = WidthBuilds(lambda key: key, lambda k: [], object(), "test")
+    a, b, c = object(), object(), object()
+    assert widths._spilled_anywhere({a: 0, b: 0, c: 52}) == [b, c]
+
+
+def test_a_built_width_logs_its_kernels_names(caplog, compiled_launcher):
+    launchers = [compiled_launcher(b"\x00", n) for n in (b"post_s6", b"pre_s6")]
     widths = WidthBuilds(
         lambda key: key, lambda k: [(x, _NoArgs) for x in launchers], None, "test"
     )
@@ -296,29 +380,31 @@ def test_a_built_width_logs_its_kernels_names(caplog):
     assert "test kernels built: post_s6, pre_s6" in caplog.text
 
 
-def test_a_width_that_fails_to_build_is_not_kept():
+def test_a_width_that_fails_to_build_is_not_kept(no_scratch):
     def build(rows):
         raise RuntimeError("trace error")
 
-    widths = WidthBuilds(build, lambda k: [(NO_SCRATCH, _NoArgs)], None, "test")
+    widths = WidthBuilds(build, lambda k: [(no_scratch, _NoArgs)], None, "test")
     assert not widths.prepare(12)
     with pytest.raises(KeyError):
         widths[12]
 
 
-def test_a_refused_width_is_not_built_again():
+def test_a_refused_width_is_not_built_again(no_scratch):
     tries = []
 
     def build(rows):
         tries.append(rows)
         raise ValueError("LDS outgrows a CU's")
 
-    widths = WidthBuilds(build, lambda k: [(NO_SCRATCH, _NoArgs)], None, "test")
+    widths = WidthBuilds(build, lambda k: [(no_scratch, _NoArgs)], None, "test")
     assert not widths.prepare(48) and not widths.prepare(48)
     assert tries == [48]
 
 
-def test_a_kernel_with_scratch_refuses_its_width_with_a_warning(caplog):
+def test_a_kernel_with_scratch_refuses_its_width_with_a_warning(
+    caplog, compiled_launcher, no_scratch
+):
     tries = []
 
     def build(rows):
@@ -328,8 +414,8 @@ def test_a_kernel_with_scratch_refuses_its_width_with_a_warning(caplog):
     widths = WidthBuilds(
         build,
         lambda k: [
-            (NO_SCRATCH, _NoArgs),
-            (_CompiledLauncher(b"\x34", b"post_s48"), _NoArgs),
+            (no_scratch, _NoArgs),
+            (compiled_launcher(b"\x34", b"post_s48"), _NoArgs),
         ],
         None,
         "test",
@@ -342,8 +428,10 @@ def test_a_kernel_with_scratch_refuses_its_width_with_a_warning(caplog):
         widths[48]
 
 
-def test_a_spilled_kernel_is_rebuilt_lean_and_its_width_served(caplog):
-    spill = _CompiledLauncher(b"\x18", b"pre_s56")
+def test_a_spilled_kernel_is_rebuilt_lean_and_its_width_served(
+    caplog, compiled_launcher, no_scratch
+):
+    spill = compiled_launcher(b"\x18", b"pre_s56")
     lean_calls = []
 
     def lean(built, spilled):
@@ -352,7 +440,7 @@ def test_a_spilled_kernel_is_rebuilt_lean_and_its_width_served(caplog):
 
     widths = WidthBuilds(
         lambda key: "fat",
-        lambda k: [(NO_SCRATCH, _NoArgs)] + ([(spill, _NoArgs)] if k == "fat" else []),
+        lambda k: [(no_scratch, _NoArgs)] + ([(spill, _NoArgs)] if k == "fat" else []),
         None,
         "test",
         lean=lean,
@@ -363,8 +451,8 @@ def test_a_spilled_kernel_is_rebuilt_lean_and_its_width_served(caplog):
     assert "pre_s56 need scratch, rebuilt lean" in caplog.text
 
 
-def test_a_lean_rebuild_that_still_spills_refuses_its_width(caplog):
-    spill = _CompiledLauncher(b"\x18", b"pre_s56")
+def test_a_lean_rebuild_that_still_spills_refuses_its_width(caplog, compiled_launcher):
+    spill = compiled_launcher(b"\x18", b"pre_s56")
     widths = WidthBuilds(
         lambda key: "fat",
         lambda k: [(spill, _NoArgs)],
@@ -377,10 +465,12 @@ def test_a_lean_rebuild_that_still_spills_refuses_its_width(caplog):
     assert "pre_s56 needs 24 B of scratch" in caplog.text
 
 
-def test_a_spill_with_nothing_leaner_refuses_without_a_rebuild(caplog):
+def test_a_spill_with_nothing_leaner_refuses_without_a_rebuild(
+    caplog, compiled_launcher
+):
     """``lean`` None (a K2 or indexer spill: no K1 build to restage) refuses
     the width on the first build, not after compiling the same one again."""
-    spill = _CompiledLauncher(b"\x18", b"post_s56")
+    spill = compiled_launcher(b"\x18", b"post_s56")
     builds = []
 
     def build(key):
@@ -411,10 +501,12 @@ def test_a_build_that_refuses_is_logged_by_its_reason(caplog):
     assert "Traceback" not in caplog.text
 
 
-def test_an_unreadable_binary_refuses_its_width_instead_of_raising(caplog):
+def test_an_unreadable_binary_refuses_its_width_instead_of_raising(
+    caplog, compiled_launcher
+):
     """A launcher whose binary cannot be read (no compiled artifact) is a build
     failure every rank agrees on, not an exception out of ``prepare``."""
-    unread = _CompiledLauncher(b"\x00")
+    unread = compiled_launcher(b"\x00")
     unread._mem_cache = {}
     widths = WidthBuilds(
         lambda key: "built", lambda k: [(unread, _NoArgs)], None, "test"
@@ -565,3 +657,100 @@ def test_aiter_stub_teardown_spares_modules_that_took_nothing():
         ):
             sys.modules.pop(name, None)
         sys.modules.update(saved)
+
+
+def _aux_drafter(aux_extract):
+    from types import SimpleNamespace
+
+    import torch
+
+    config = SimpleNamespace(dspark_target_layer_ids=(1, 3))
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_hf_config=config),
+        _aux_buffers=[torch.zeros(4, 8, dtype=torch.bfloat16) for _ in range(2)],
+        aux_extract=aux_extract,
+    )
+
+
+def test_bind_aux_taps_carries_the_drafters_extract():
+    from atom.mono.runtime.aux_taps import bind_aux_taps
+
+    def extract(output, layer):
+        return output[0]
+
+    taps = bind_aux_taps(_aux_drafter(aux_extract=extract), 8)
+    assert taps.layer_ids == (1, 3)
+    assert taps.extract is extract
+
+
+def test_bind_aux_taps_refuses_tapped_layers_without_an_extract():
+    """`extract` is required whenever a layer is tapped; only the drafterless
+    `AuxTaps((), ())` has none."""
+    from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
+
+    for kernel in (None, lambda out, layer: out):
+        with pytest.raises(MonoUnsupported, match="no aux extract"):
+            bind_aux_taps(_aux_drafter(aux_extract=None), 8, kernel)
+    assert AuxTaps((), ()).extract is None
+
+
+def test_bind_aux_taps_refuses_an_extract_the_kernels_do_not_compute():
+    """A runner that writes the taps from its kernels never calls ``extract``,
+    so a drafter armed with another one would draft from two features."""
+    from atom.mono.runtime.aux_taps import bind_aux_taps
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    def kernel(output, layer):
+        return output[0]
+
+    def other(output, layer):
+        return output[1]
+
+    with pytest.raises(MonoUnsupported, match="aux extract"):
+        bind_aux_taps(_aux_drafter(aux_extract=other), 8, kernel)
+    assert bind_aux_taps(_aux_drafter(aux_extract=kernel), 8, kernel).extract is kernel
+    # a runner that calls the extract itself takes any
+    assert bind_aux_taps(_aux_drafter(aux_extract=other), 8).extract is other
+
+
+@pytest.mark.parametrize("before", [None, "7"])
+def test_srcloc_scoped_keeps_depth_frames_then_flydsls_own_setting(monkeypatch, before):
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    if before is None:
+        monkeypatch.delenv(srcloc._DEPTH_ENV, raising=False)
+    else:
+        monkeypatch.setenv(srcloc._DEPTH_ENV, before)
+    with srcloc.scoped():
+        assert os.environ[srcloc._DEPTH_ENV] == str(srcloc.DEPTH)
+    assert os.environ.get(srcloc._DEPTH_ENV) == before
+
+
+def test_srcloc_unlocated_captures_no_location_in_any_holder(monkeypatch):
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    monkeypatch.delenv("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", raising=False)
+    before = [mod.capture_user_location for mod in srcloc._HOLDERS]
+    # restored on an error too
+    with pytest.raises(KeyError), srcloc.unlocated():
+        for mod in srcloc._HOLDERS:
+            assert mod.capture_user_location is srcloc._unknown_location
+        raise KeyError
+    assert [mod.capture_user_location for mod in srcloc._HOLDERS] == before
+
+
+def test_srcloc_unlocated_keeps_locations_when_debug_info_is_on(monkeypatch):
+    """With debug info the locations are in the binary: ``scoped()``'s
+    locations, not none."""
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    monkeypatch.setenv("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", "1")
+    monkeypatch.delenv(srcloc._DEPTH_ENV, raising=False)
+    before = [mod.capture_user_location for mod in srcloc._HOLDERS]
+    with srcloc.unlocated():
+        assert [mod.capture_user_location for mod in srcloc._HOLDERS] == before
+        assert os.environ[srcloc._DEPTH_ENV] == str(srcloc.DEPTH)
+    assert srcloc._DEPTH_ENV not in os.environ

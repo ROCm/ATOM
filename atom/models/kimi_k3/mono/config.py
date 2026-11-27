@@ -27,11 +27,11 @@ closes each one:
 * **TP sharding** -- ``SUPPORTED_TP``; ``Dims`` refuses any size that does not
   divide every width.
 * **weight layouts** -- ``weights.py`` checks each tensor it binds.
-* **KV dtype** -- the conv state must be bf16 and the recurrent state fp32.
-  ``ATOM_GDN_SSM_DTYPE`` is checked here, but that is the *request*; the pools
-  that were actually allocated are checked in ``runner._conv_state`` and
-  ``runner._recurrent_state`` -- at build for the first mono layer, and again
-  where each step packs them.
+* **KV dtype** -- the conv state must be bf16 and the recurrent state fp32 or
+  fp16 (``KdaPreBuild.state16``). ``ATOM_GDN_SSM_DTYPE`` is checked here, but
+  that is the *request*; the pools that were actually allocated are checked in
+  ``runner._conv_state`` and ``runner._recurrent_state`` -- at build for every
+  mono layer, and again, against the build, where each step packs them.
 """
 
 from dataclasses import dataclass
@@ -245,14 +245,16 @@ def config_refusal(atom_config) -> str | None:
     # layers and their KV split stay on the production path), and the DSA
     # layers' mono indexer is written for the DCP split -- it serves only
     # under DCP = TP and is off otherwise (``dsa_indexer.bind._refusal``).
+    # The one KV connector served is a Mooncake P/D decode, which queues no
+    # copy kernel of its own (`_served_connectors`).
     checks += (
         common_refusals(atom_config, Dims, SUPPORTED_TP, refuse_decode_cp=False)
-        + resident_grid_refusals(atom_config)
+        + resident_grid_refusals(atom_config, _served_connectors(atom_config))
     ) + [
-        # the KDA recurrence reads and writes fp32 state in place; a narrower
-        # pool would be read as fp32 rather than converted
+        # the KDA recurrence reads and writes the state in place as fp32 or as
+        # fp16; any other pool would be reinterpreted rather than converted
         (
-            envs.ATOM_GDN_SSM_DTYPE == "fp32",
+            envs.ATOM_GDN_SSM_DTYPE in ("fp32", "fp16"),
             f"ATOM_GDN_SSM_DTYPE={envs.ATOM_GDN_SSM_DTYPE}",
         ),
         # the model's own widths, which the kernels bake
@@ -333,3 +335,26 @@ def config_refusal(atom_config) -> str | None:
         ),
     ]
     return first_refusal(checks)
+
+
+def _served_connectors(atom_config) -> tuple[str, ...]:
+    """The KV connectors served beside the kernels: bounded LMCache MP copies,
+    and Mooncake, when it is the
+    P/D decode of a deployment without decode CP, whose receives are NIC
+    writes into the pools this rank already holds.
+
+    Mooncake's consumer queues GPU work of its own only for a model that hands
+    it a slot scatter (DeepSeek-V4's compressor staging) or for a DCP landing
+    pool (`mla_landing_configured`); K3 hands it none. A decode running CP is
+    left refused all the same: mono has never served one behind a connector.
+    A producer, any other transport, or an offload tier beside it (`multi`)
+    copies on streams of its own.
+    """
+    from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
+
+    if (
+        atom_config.decode_context_parallel_size == 1
+        and disaggregated_kv_role(atom_config) == "kv_consumer"
+    ):
+        return ("lmcache_mp", "mooncake")
+    return ("lmcache_mp",)

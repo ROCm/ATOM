@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Request spans shared by CSA2 paging, compression and Engram staging."""
 
 from collections.abc import Mapping
@@ -73,9 +75,17 @@ class BatchStep:
     candidate_blocks: dict[int, object] = field(default_factory=dict)
     # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
     # launch wrote for the whole run.
-    group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
+    group_indices: dict[int | tuple[int, str], tuple[torch.Tensor, ...]] = field(
+        default_factory=dict
+    )
     # A split decode's window rows (`indices.build_window_rows`), every layer's.
     window_rows: torch.Tensor | None = None
+    # One layer's live Q/KV preparation, consumed after the side-stream join.
+    attention_inputs: tuple | None = None
+    # Reusable raw storage for one layer's live SWA history/current-KV source.
+    # The serving cache binds the parent's; TBO gives each child its own.
+    # Keep this across begin_forward: only its live views depend on the step.
+    prefill_window_staging: torch.Tensor | None = None
     # A bounded-replay forward's `ReplayPlan` (`models.deepseek_v41.
     # bounded_replay`): the rows its decoder ran on, for what else reads the
     # decoder's rows after it (the DSpark draft's window). None where the
@@ -86,6 +96,9 @@ class BatchStep:
     # addresses for every such step. None where no replay can run.
     decoder: object | None = None
     indptrs: dict[int, tuple] = field(default_factory=dict)
+    # A8W4 separates CSA/SWA even when the same step also uses the BF16
+    # adapter (for example, an ASM query shape outside its supported range).
+    a8w4_indptrs: dict[int, tuple] = field(default_factory=dict)
     # ratio -> [width] int32: compressed rows each query row may see. Worked
     # out on the host, where `positions` is staged and where RoPE takes its
     # own, so this adds no second source of truth.
@@ -156,10 +169,12 @@ class BatchStep:
         self.selected.clear()
         self.candidates.clear()
         self.indptrs = {}
+        self.a8w4_indptrs = {}
         self.tiles.clear()
         self.candidate_blocks.clear()
         self.group_indices.clear()
         self.window_rows = None
+        self.attention_inputs = None
         self.replay = None
 
     @property
@@ -192,6 +207,38 @@ class StepPlan(NamedTuple):
 def visible_buffer_name(ratio):
     """One spelling for the buffer the builder declares and this module fills."""
     return f"v41_index_visible_{ratio}"
+
+
+def stage_positions(requests, buffers, cu, lengths, running_tokens, ratios, planners):
+    """Stage what a step's rows owe their positions: the positions, each
+    ratio's visible counts, and the planners' tables laid out over them.
+    Returns ``(starts, planner rows, planner host data)``."""
+    scheduled_bs, scheduled_tokens = len(requests), int(lengths.sum())
+    positions = buffers["positions"]
+    starts = np.asarray([span.position for span in requests], dtype=positions.np.dtype)
+    prefill_positions(
+        np.arange(scheduled_tokens, dtype=positions.np.dtype),
+        starts,
+        cu[: scheduled_bs + 1],
+        lengths,
+        out=positions.np[:scheduled_tokens],
+    )
+    positions.np[scheduled_tokens:running_tokens] = 0
+    for ratio in ratios:
+        # Padding rows hold position 0 and earn that position's count; the
+        # scorer reaches them with no visible columns either way. Written
+        # through the destination, which narrows serving's int64 positions to
+        # the int32 the scorer reads and spares an expression's temporaries.
+        visible = buffers[visible_buffer_name(ratio)].np[:running_tokens]
+        np.add(positions.np[:running_tokens], 1, out=visible)
+        np.floor_divide(visible, ratio, out=visible)
+    # Planners read the rows staged above and publish with them.
+    planned, planned_host = {}, {}
+    for planner in planners:
+        plan = planner(buffers, running_tokens)
+        planned.update(plan.rows)
+        planned_host.update(plan.host)
+    return starts, planned, planned_host
 
 
 def prepare_batch_step(
@@ -284,30 +331,9 @@ def prepare_batch_step(
         )
     else:
         del required["batch_id_per_q_token"]
-    positions = buffers["positions"]
-    starts = np.asarray([span.position for span in requests], dtype=positions.np.dtype)
-    prefill_positions(
-        np.arange(scheduled_tokens, dtype=positions.np.dtype),
-        starts,
-        cu.np[: scheduled_bs + 1],
-        lengths,
-        out=positions.np[:scheduled_tokens],
+    starts, planned, planned_host = stage_positions(
+        requests, buffers, cu.np, lengths, running_tokens, ratios, planners
     )
-    positions.np[scheduled_tokens:running_tokens] = 0
-    for ratio in ratios:
-        # Padding rows hold position 0 and earn that position's count; the
-        # scorer reaches them with no visible columns either way. Written
-        # through the destination, which narrows serving's int64 positions to
-        # the int32 the scorer reads and spares an expression's temporaries.
-        visible = buffers[visible_buffer_name(ratio)].np[:running_tokens]
-        np.add(positions.np[:running_tokens], 1, out=visible)
-        np.floor_divide(visible, ratio, out=visible)
-    # Planners read the rows staged above and publish with them.
-    planned, planned_host = {}, {}
-    for planner in planners:
-        plan = planner(buffers, running_tokens)
-        planned.update(plan.rows)
-        planned_host.update(plan.host)
     required.update(planned)
     if state_slot_out is None:
         # Isolated eager cache callers have no metadata builder. Serving passes

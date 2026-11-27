@@ -193,6 +193,84 @@ REASONING_TOGGLES: tuple[tuple[str, Any, Any], ...] = (
 _PROBE_REFUSALS = (TemplateError, TypeError, ValueError, AssertionError)
 
 
+_MID_SYSTEM_TOP = "MID_SYSTEM_PROBE_TOP"
+_MID_SYSTEM_USER = "MID_SYSTEM_PROBE_USER"
+_MID_SYSTEM_PRIOR = "MID_SYSTEM_PROBE_PRIOR"
+_MID_SYSTEM_LAST = "MID_SYSTEM_PROBE_LAST"
+_MID_SYSTEM_MARK = "MID_SYSTEM_PROBE_MARK"
+
+
+def template_takes_mid_system(
+    tokenizer: Any, custom_encoder: MessageEncoderAdapter | None = None
+) -> bool:
+    """Whether the template renders a system message inside the conversation
+    where it was sent, without disturbing the turns around it.
+
+    Claude Code sends reminders that way, typically right after a user turn
+    and before the assistant's reply. Of the templates on this box,
+    DeepSeek-R1's moves them to the head of the prompt (a new prefix every
+    turn), gpt-oss's drops them, and DeepSeek-V4's encoder renders one after a
+    user turn with no role markers at all, merging that user turn, the
+    reminder and the assistant's reply into one run of text; DeepSeek-V4.1,
+    GLM-5.2 and Qwen3 take them. A ``False`` only means /v1/messages moves the
+    messages into user turns, so any failure here answers ``False``.
+    """
+    top = {"role": "system", "content": _MID_SYSTEM_TOP}
+    user = {"role": "user", "content": _MID_SYSTEM_USER}
+    prior = {"role": "assistant", "content": _MID_SYSTEM_PRIOR}
+    last = {"role": "user", "content": _MID_SYSTEM_LAST}
+    mark = {"role": "system", "content": _MID_SYSTEM_MARK}
+
+    def render(messages):
+        return apply_chat_template(tokenizer, custom_encoder, messages)
+
+    try:
+        plain = render([top, user, prior, last])
+        after_user = render([top, user, mark, prior, last])
+        after_assistant = render([top, user, prior, mark, last])
+        trailing = render([top, user, prior, last, mark])
+    except (*_PROBE_REFUSALS, NotImplementedError):
+        # DeepSeek-V4's encoder refuses shapes it does not know this way.
+        return False
+    except Exception:  # answering False only folds more
+        logger.warning(
+            "The chat template failed on a system message inside the "
+            "conversation; treating it as not taking one.",
+            exc_info=True,
+        )
+        return False
+
+    def in_order(text, *markers):
+        positions = [text.find(m) for m in markers]
+        return all(p >= 0 for p in positions) and positions == sorted(positions)
+
+    # The assistant turn's header: what the plain render puts between the user
+    # turn and the reply. It must still precede the reply after a reminder.
+    header = plain[
+        plain.find(_MID_SYSTEM_USER)
+        + len(_MID_SYSTEM_USER) : plain.find(_MID_SYSTEM_PRIOR)
+    ]
+    reply_at = after_user.find(_MID_SYSTEM_PRIOR)
+    # What the template appends to ask for the answer; a trailing reminder
+    # must keep it (the reminder text cannot be part of it).
+    generation_prompt = plain[plain.rfind(_MID_SYSTEM_LAST) + len(_MID_SYSTEM_LAST) :]
+    return (
+        in_order(
+            after_user,
+            _MID_SYSTEM_USER,
+            _MID_SYSTEM_MARK,
+            _MID_SYSTEM_PRIOR,
+            _MID_SYSTEM_LAST,
+        )
+        and after_user[:reply_at].endswith(header)
+        and in_order(
+            after_assistant, _MID_SYSTEM_PRIOR, _MID_SYSTEM_MARK, _MID_SYSTEM_LAST
+        )
+        and in_order(trailing, _MID_SYSTEM_LAST, _MID_SYSTEM_MARK)
+        and trailing.endswith(generation_prompt)
+    )
+
+
 def resolve_reasoning_toggle(
     tokenizer: Any, custom_encoder: MessageEncoderAdapter | None = None
 ) -> tuple[str, Any, Any] | None:
@@ -272,6 +350,42 @@ def render_probe_prompt(
     except _PROBE_REFUSALS as e:
         logger.warning("The model's chat template refused the probe: %s", e)
         return None
+
+
+def template_needs_tool_call_argument_strings(
+    tokenizer: Any, custom_encoder: MessageEncoderAdapter | None
+) -> bool:
+    """Whether the template refuses history tool-call arguments as a mapping
+    but renders them as the JSON string the client sent.
+
+    Arguments are parsed into a mapping by default because most templates
+    iterate them; DeepSeek-R1/V3's concatenates them as a string and raises
+    ``TypeError`` on a mapping, failing every turn after a tool call, and
+    DeepSeek-V3.2's / V4's encoders read the string too.
+    """
+    # Custom encoders are model-scoped Python, not Jinja: their adapter says
+    # (DeepSeek-V3.2's and V4's take the string, V4.1's either form).
+    if custom_encoder is not None:
+        return custom_encoder.preserve_tool_call_arguments
+
+    def renders(arguments: Any) -> bool:
+        call = {"name": "get_weather", "arguments": arguments}
+        messages = [
+            *PROBE_MESSAGES,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_0", "type": "function", "function": call}],
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "sunny"},
+        ]
+        try:
+            apply_chat_template(tokenizer, None, messages, tools=PROBE_TOOLS)
+        except _PROBE_REFUSALS:
+            return False
+        return True
+
+    return not renders({"city": "Paris"}) and renders('{"city": "Paris"}')
 
 
 def apply_chat_template(

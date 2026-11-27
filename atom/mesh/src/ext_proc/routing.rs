@@ -121,6 +121,7 @@ impl EndpointRouter {
             tokens: input.tokens.as_deref(),
             headers: Some(&request.headers),
             stream: input.stream,
+            media_count: input.media_count,
         };
         let plan = planner.plan(&descriptor).await.map_err(|e| {
             ProcessingError::from(crate::routers::comm::error::IngressError::placement(

@@ -1,20 +1,57 @@
 # SPDX-License-Identifier: MIT
 """Rendezvous ports stay owned from allocation through worker shutdown."""
 
+import ast
 import copy
 import errno
 import multiprocessing
 import socket
 import time
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from atom.config import ParallelConfig
+from atom.config import KVEventsConfig, ParallelConfig
 from atom.model_engine.engine_core_mgr import CoreManager
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "atom/model_engine/model_setup.py",
+        "atom/rollout/model_runner_ext.py",
+    ],
+)
+def test_distributed_initializers_forward_custom_all_reduce_policy(
+    relative_path,
+) -> None:
+    source = (Path(__file__).parents[1] / relative_path).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "init_pp_aware_dist_env"
+    ]
+
+    assert calls, relative_path
+    for call in calls:
+        policy = next(
+            (
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg == "disable_custom_all_reduce"
+            ),
+            None,
+        )
+        assert isinstance(policy, ast.Attribute), relative_path
+        assert isinstance(policy.value, ast.Name) and policy.value.id == "config"
+        assert policy.attr == "disable_custom_all_reduce"
 
 
 @pytest.fixture
@@ -35,6 +72,7 @@ def manager(monkeypatch):
             dp_load_balance="round_robin",
             keep_finished_outputs=False,
             asyncio_mode=False,
+            kv_events_config=KVEventsConfig(),
         ),
         label="test",
         local_engine_count=0,
@@ -120,6 +158,8 @@ def test_separate_stores_have_distinct_ports_and_keys(manager):
         manager._start_distributed_store(config)
     ports = [config.parallel_config.data_parallel_base_port for config in configs]
     assert ports[0] != ports[1]
+    ids = [config.parallel_config.server_instance_id for config in configs]
+    assert all(ids) and ids[0] != ids[1]
     clients = [dist.TCPStore("127.0.0.1", port, is_master=False) for port in ports]
     for i, client in enumerate(clients):
         client.set("same-key", str(i))
@@ -193,6 +233,9 @@ def _model_runner_worker(pc, layout, global_rank):
         prefill_context_parallel_size=pcp,
         pcp_group_size=pcp,
         decode_context_parallel_size=dcp,
+        is_multinode_tp=False,
+        tp_rank_start=0,
+        disable_custom_all_reduce=False,
         master_addr="127.0.0.1",
         port=0,
     )
@@ -295,10 +338,14 @@ def test_groups_without_a_timeout_outlast_a_slow_nodes_load(monkeypatch):
     from atom.utils.distributed.utils import raise_default_group_timeout
 
     monkeypatch.setattr(distributed_c10d, "default_pg_timeout", timedelta(minutes=30))
+    monkeypatch.setattr(
+        distributed_c10d, "default_pg_nccl_timeout", timedelta(minutes=10)
+    )
     raise_default_group_timeout(7200)
-    # What a gloo group created without a timeout, as aiter's are, now gets.
-    gloo = distributed_c10d._get_default_timeout(dist.Backend.GLOO)
-    assert gloo == timedelta(hours=2)
+    # What gloo and NCCL groups created without a timeout, as aiter's are, get.
+    for backend in (dist.Backend.GLOO, dist.Backend.NCCL):
+        assert distributed_c10d._get_default_timeout(backend) == timedelta(hours=2)
     # A longer default someone else chose is kept.
     raise_default_group_timeout(60)
-    assert distributed_c10d._get_default_timeout(dist.Backend.GLOO) == gloo
+    for backend in (dist.Backend.GLOO, dist.Backend.NCCL):
+        assert distributed_c10d._get_default_timeout(backend) == timedelta(hours=2)

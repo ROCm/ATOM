@@ -22,21 +22,21 @@ pytest.importorskip(
 )
 
 from atom.models.utils import PPMissingLayer, get_pp_indices
-from atom.spec_decode.drafter import AuxCaptureSpec
+from atom.spec_decode.drafter import AuxCaptureSpec, check_shared_embedding
 from atom.spec_decode.pp_aux_relay import PPAuxRelay
 
 
 class _FakeTarget(nn.Module):
     """A PP slice of a target: layers outside the stage are `PPMissingLayer`."""
 
-    def __init__(self, n_layers, resident_range, with_embed):
+    def __init__(self, n_layers, resident_range):
         super().__init__()
         lo, hi = resident_range
         self.layers = nn.ModuleList(
             nn.Identity() if lo <= i < hi else PPMissingLayer() for i in range(n_layers)
         )
-        # Like the real models: off the first stage the embedding is missing.
-        self.embed_tokens = nn.Identity() if with_embed else PPMissingLayer()
+        # Residency of `-1` follows layer 0, whatever the embedding module is.
+        self.embed_tokens = nn.Identity()
 
 
 _CTX = types.SimpleNamespace(
@@ -52,13 +52,17 @@ def _forward_context():
         yield _CTX
 
 
+def _pp_group(group):
+    return mock.patch("atom.spec_decode.pp_aux_relay.get_pp_group", return_value=group)
+
+
 def _relay(layer_ids, n_layers, resident_range, *, first, last, hidden=8):
-    target = _FakeTarget(n_layers, resident_range, with_embed=first)
+    target = _FakeTarget(n_layers, resident_range)
     spec = AuxCaptureSpec(
         layer_ids=tuple(layer_ids), hidden_size=hidden, extract=lambda out, mod: out
     )
     group = types.SimpleNamespace(is_first_rank=first, is_last_rank=last)
-    with mock.patch("atom.spec_decode.pp_aux_relay.get_pp_group", return_value=group):
+    with _pp_group(group):
         relay = PPAuxRelay(spec, target)
         relay.arm(target)
     return relay, target
@@ -176,7 +180,9 @@ def test_last_stage_arms_only_its_own_taps():
     from atom.spec_decode.drafter import Drafter
 
     hidden = 8
-    target = _FakeTarget(8, (4, 8), with_embed=False)
+    # The last stage may hold an embedding copy for its drafter, yet the `-1`
+    # tap still arrives through the relay.
+    target = _FakeTarget(8, (4, 8))
     spec = AuxCaptureSpec(
         layer_ids=(-1, 2, 5), hidden_size=hidden, extract=lambda out, mod: out
     )
@@ -228,7 +234,7 @@ def test_relay_send_is_sized_to_the_forward_rows():
 
 @pytest.mark.parametrize("world_size", [1, 2])
 def test_build_takes_the_drafter_class_spec_and_arms_only_under_pp(world_size):
-    target = _FakeTarget(8, (0, 4), with_embed=True)
+    target = _FakeTarget(8, (0, 4))
     spec = AuxCaptureSpec(layer_ids=(-1, 2), hidden_size=8, extract=lambda o, m: o)
     # Every stage, drafter or not, takes the spec from the drafter class.
     drafter_cls = types.SimpleNamespace(aux_capture_spec=lambda config: spec)
@@ -237,7 +243,7 @@ def test_build_takes_the_drafter_class_spec_and_arms_only_under_pp(world_size):
         world_size=world_size, is_first_rank=True, is_last_rank=False
     )
     with (
-        mock.patch("atom.spec_decode.pp_aux_relay.get_pp_group", return_value=group),
+        _pp_group(group),
         mock.patch(
             "atom.spec_decode.pp_aux_relay.drafter_class", return_value=drafter_cls
         ),
@@ -270,3 +276,70 @@ def test_relay_hook_compiles_without_an_in_place_update():
         handle.remove()
         torch._dynamo.reset()
     assert "update" not in names
+
+
+def _k3_draft_sharing(embed):
+    from atom.models.kimi_k3_dspark import KimiK3DSpark
+
+    target = types.SimpleNamespace(
+        model=types.SimpleNamespace(embed_tokens=embed),
+        lm_head=types.SimpleNamespace(num_embeddings=16),
+    )
+    draft = types.SimpleNamespace(vocab_size=16, embed_tokens=None)
+    KimiK3DSpark.share_with_target(draft, target, set())
+    return draft
+
+
+def test_k3_draft_shares_the_last_stages_embedding():
+    # Under PP the draft drafts from the last stage's copy of the target's
+    # embedding, never its own (Kimi-K3.1-DSpark ships none).
+    embed = nn.Embedding(16, 4)
+    draft = _k3_draft_sharing(embed)
+    assert draft.embed_tokens is embed
+    check_shared_embedding(draft)
+
+
+def test_a_k3_draft_on_a_stage_without_the_embedding_is_refused():
+    draft = _k3_draft_sharing(PPMissingLayer())
+    with pytest.raises(TypeError, match="pp_speculative_methods"):
+        check_shared_embedding(draft)
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_pp_refuses_eagle3_whose_taps_it_cannot_relay(monkeypatch, pp_size):
+    """EAGLE3 taps target layers with no config-only spec; under PP its taps on
+    earlier stages never fire, so the runner refuses it."""
+    runner_mod = pytest.importorskip(
+        "atom.model_engine.model_runner", exc_type=ImportError
+    )
+    from atom.spec_decode.eagle_proposer import EagleProposer
+
+    monkeypatch.setattr(
+        runner_mod, "get_pp_group", lambda: types.SimpleNamespace(world_size=pp_size)
+    )
+    runner = object.__new__(runner_mod.ModelRunner)
+    runner.config = types.SimpleNamespace()
+    drafter = object.__new__(EagleProposer)
+    drafter._captures_aux = True  # as EagleProposer.arm_aux_capture leaves it
+    if pp_size == 1:
+        runner._refuse_unrelayed_pp_taps(drafter)
+        return
+    with pytest.raises(NotImplementedError, match="EAGLE3"):
+        runner._refuse_unrelayed_pp_taps(drafter)
+
+
+def test_pp_keeps_a_drafter_whose_taps_the_config_declares(monkeypatch):
+    runner_mod = pytest.importorskip(
+        "atom.model_engine.model_runner", exc_type=ImportError
+    )
+    monkeypatch.setattr(
+        runner_mod, "get_pp_group", lambda: types.SimpleNamespace(world_size=4)
+    )
+    runner = object.__new__(runner_mod.ModelRunner)
+    runner.config = types.SimpleNamespace()
+    # DSpark's shape: the spec comes from the config, so every stage relays it.
+    drafter = types.SimpleNamespace(
+        captures_aux=True, aux_capture_spec=lambda config: object()
+    )
+    runner._refuse_unrelayed_pp_taps(drafter)
+    runner._refuse_unrelayed_pp_taps(None)

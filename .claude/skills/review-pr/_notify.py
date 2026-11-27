@@ -51,6 +51,51 @@ def mark_notified():
         fh.write("notified=true\n")
 
 
+def post_comment(repo, pr, body, tok):
+    """POST one comment; -> (created comment id, failure detail or None). `None` id means nothing landed.
+
+    Returning the id rather than the status is the point. A POST that GitHub answers 2xx but
+    does not act on is indistinguishable from a successful one by status alone, and that is
+    not hypothetical: urllib downgrades a POST to a GET when it follows a 301/302, so a
+    renamed or mis-cased repo answers 200 with the comment *list* and creates nothing. The
+    first live run on ATOM hit exactly this -- "reported" printed, notified=true written, the
+    report job silenced by that flag, and no comment on the PR. Reading back the id GitHub
+    assigned is the only answer here that cannot be faked by a redirect or an empty 2xx.
+    """
+    url = f"https://api.github.com/repos/{repo}/issues/{pr}/comments"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"body": body}).encode(),
+        headers={
+            "Authorization": f"token {tok}",
+            "Accept": "application/vnd.github+json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = getattr(resp, "status", None)
+            landed = getattr(resp, "url", url)
+            try:
+                data = json.load(resp)
+            except Exception:  # noqa: BLE001 - best effort
+                data = None
+    except Exception as e:  # noqa: BLE001 - must not fail CI
+        return None, f"POST {url} raised: {e}"
+
+    cid = data.get("id") if isinstance(data, dict) else None
+    if cid is None:
+        # Say which of the two shapes this was, because they need different fixes: a
+        # redirect means the repo moved, a 2xx without an id means the API changed.
+        moved = "" if landed == url else f"; request was redirected to {landed}"
+        kind = type(data).__name__
+        return None, (
+            f"POST {url} -> HTTP {status} but no comment was created "
+            f"(response was {kind}{moved})"
+        )
+    return cid, None
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: _notify.py <pr>")
@@ -83,21 +128,15 @@ def main():
     if not tok or not repo:
         print("no ATOM_BOT_TOKEN / GITHUB_REPOSITORY -- would post:\n" + body)
         return 0
-    req = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/issues/{pr}/comments",
-        data=json.dumps({"body": body}).encode(),
-        headers={
-            "Authorization": f"token {tok}",
-            "Accept": "application/vnd.github+json",
-        },
-        method="POST",
-    )
-    try:
-        urllib.request.urlopen(req, timeout=15)
-        mark_notified()
-        print(f"reported [{cls}] -> @{owner}")
-    except Exception as e:  # noqa: BLE001 - a failed notice must not fail CI
-        print(f"notify failed: {e}")
+
+    cid, detail = post_comment(repo, pr, body, tok)
+    if cid is None:
+        # Stay silent about having notified: the report job on hosted infra is the last
+        # thing that can speak, and it only speaks while this flag is unset.
+        print(f"notify failed: {detail}")
+        return 0
+    mark_notified()
+    print(f"reported [{cls}] -> @{owner} (comment {cid})")
     return 0
 
 

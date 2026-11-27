@@ -17,7 +17,10 @@ from atom.kv_transfer.disaggregation.types import (
     req_id_of,
 )
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload._offload_common import validated_kv_role
+from atom.kv_transfer.offload._offload_common import (
+    tier_lookup_kwargs,
+    validated_kv_role,
+)
 from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
@@ -144,9 +147,13 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         if not self._do_load or not getattr(client, "driving", False):
             return
         for seq in seqs:
-            if self._lookup_len(seq) <= 0:
+            if not self._lookup_wanted(seq):
                 continue
-            client.offer(str(seq.id), functools.partial(self._offered_tokens, seq))
+            client.offer(
+                str(seq.id),
+                functools.partial(self._offered_tokens, seq),
+                **tier_lookup_kwargs(seq),
+            )
 
     def _offered_tokens(self, seq: Any) -> list[int] | None:
         """The prompt to look up, or None once `seq` stopped waiting for one.
@@ -156,6 +163,48 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         if getattr(seq, "status", None) != SequenceStatus.WAITING:
             return None
         return self._lookup_token_ids(seq)
+
+    # -- turning lookups off ---------------------------------------------------
+
+    _lookups_enabled = True
+
+    def set_offload_lookups(self, enabled: bool) -> bool:
+        """Start tier lookups for new requests or not; True if applied.
+
+        Off once what a read-only tier holds is back in HBM (a replayed warmup).
+        An answer already held still loads, and a load planned before the
+        switch re-takes its pin with one synchronous lookup when dispatched.
+        A lookup no request has consumed, answered or not, is released, so
+        that request prefills its prompt.
+        Refused while this scheduler saves: without a lookup its saves would
+        store every prompt from token 0 again.
+        """
+        if not enabled and self._do_save:
+            return False
+        self._lookups_enabled = bool(enabled)
+        if enabled:
+            for name in ("_lookup_wanted", "lookup_pending", "lookup_would_defer"):
+                self.__dict__.pop(name, None)
+        else:
+            # On the instance: a scheduler that is never switched off keeps
+            # the class methods and pays nothing for the switch.
+            cls = type(self)
+            self._lookup_wanted = lambda seq: False
+            self.lookup_pending = lambda seq: (
+                not self._lookups_off_for(seq) and cls.lookup_pending(self, seq)
+            )
+            self.lookup_would_defer = lambda seq: (
+                not self._lookups_off_for(seq) and cls.lookup_would_defer(self, seq)
+            )
+        self._lookup_client.set_enabled(enabled)
+        return True
+
+    def _lookups_off_for(self, seq: Any) -> bool:
+        """Lookups are off and `seq` holds no answer from before: it cannot load."""
+        if self._lookups_enabled:
+            return False
+        held = self._lookup_results.get(str(seq.id))
+        return held is None or held[0] is not seq
 
     # -- same-step saves -------------------------------------------------------
 
@@ -199,8 +248,14 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return reach
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
-        matched = super().get_num_new_matched_tokens(seq)
         sid = str(seq.id)
+        if not self._lookups_enabled and self._lookups_off_for(seq):
+            # As with loads off (`_do_load`): no lookup, and a plan made from a
+            # remembered hit before the switch must not load after allocation.
+            if sid in self._load_specs:
+                self._clear_pending_load(sid)
+            return 0, False
+        matched = super().get_num_new_matched_tokens(seq)
         num_prompt = int(seq.num_prompt_tokens)
         # The base's remembered hit, not `hit_tokens`: a step answered from the
         # memo runs no lookup, so there is no client-side state to read back.
@@ -211,7 +266,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         load_spec = self._load_specs.get(sid)
         if load_spec is None:
             return matched
-        if self.block_size == 1:
+        if self.virtual_block_size == 1:
             # Allocating prompt-1 one-token blocks cannot provide a destination
             # for the complete final LMCache chunk. Recompute instead.
             self._clear_pending_load(sid)
@@ -259,8 +314,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                     int(end),
                 )
         # Also catches retirements that bypass _finish_retired_request, such as
-        # a late save with nothing left to store.
-        self._end_finished_sessions()
+        # a late save with nothing left to store. The shared builder above has
+        # already advanced the lookups this step.
+        self._end_finished_sessions(reconcile=False)
         stats = getattr(self._lookup_client, "driver_stats", None)
         if stats:
             for key, value in stats.items():
@@ -404,7 +460,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         """
         return self.__dict__.setdefault("_sessions_to_end", {})
 
-    def _end_finished_sessions(self) -> None:
+    def _end_finished_sessions(self, *, reconcile: bool = True) -> None:
         """End each finished request's session once no save or lookup remains.
 
         A detached lookup (`detach_lookup`) can outlive its request. If
@@ -417,18 +473,18 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         # Pumped on every pass: a detached lookup must be released even while
         # its request is still transferring and the waiting queue, which
         # drives `prefetch_lookups`, is empty.
+        # Terminal-only calls still need the shared reconciliation to free
+        # detached lookup locks; the metadata build has already done it.
+        if reconcile:
+            self._reconcile_lookups_each_step()
         client = self._lookup_client
-        pump = getattr(client, "pump", None)
-        if callable(pump):
-            pump()
-        self.reconcile_detached_lookups()
         pending = self._pending_session_ends()
-        in_flight = getattr(client, "is_pending", None)
+
         for sid, seq in list(pending.items()):
             entry = self._save_tracker.get(sid)
             if (entry is not None and entry[0] is seq) or sid in self._save_inflight:
                 continue
-            if callable(in_flight) and in_flight(sid):
+            if client is not None and client.is_pending(sid):
                 continue
             del pending[sid]
             # No save can follow now: the workers' copy of its tokens goes.

@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Engram n-gram row indices and cursor rows, computed where the tokens are.
 
 The table lookup has been on the device since UVA; what stayed on the host was
@@ -37,6 +39,18 @@ class EngramBatch:
 
 
 @triton.jit
+def _compressed(input_ids, lookup, dead_mask, at, valid, HAS_MASK: tl.constexpr):
+    """Token ``at``'s compressed id, DEAD (-1) where the mask says so; 0 off
+    ``valid``."""
+    raw = tl.load(input_ids + at, mask=valid, other=0)
+    value = tl.load(lookup + raw, mask=valid, other=0)
+    if HAS_MASK:
+        dead = tl.load(dead_mask + at, mask=valid, other=0)
+        value = tl.where(dead != 0, -1, value)
+    return value
+
+
+@triton.jit
 def _compress_kernel(
     input_ids,
     lookup,
@@ -59,12 +73,18 @@ def _compress_kernel(
         tokens = tl.load(live_count)
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = offsets < tokens
-    raw = tl.load(input_ids + offsets, mask=live, other=0)
-    value = tl.load(lookup + raw, mask=live, other=0)
-    if HAS_MASK:
-        dead = tl.load(dead_mask + offsets, mask=live, other=0)
-        value = tl.where(dead != 0, -1, value)
+    value = _compressed(input_ids, lookup, dead_mask, offsets, live, HAS_MASK)
     tl.store(out + offsets, value, mask=live)
+
+
+@triton.jit
+def _hash_step(rolling, blocked, source, multiplier, PAD: tl.constexpr):
+    """One lookback of the rolling hash. `blocked` latches, and the order is
+    the reference's -- latch, then substitute -- so the lookback that finds
+    DEAD is itself `PAD`."""
+    blocked = blocked | (source == -1)
+    value = tl.where(blocked, PAD, source).to(tl.int64)
+    return rolling ^ (value * multiplier), blocked
 
 
 @triton.jit
@@ -84,24 +104,16 @@ def _engram_hash_kernel(
     NGRAM: tl.constexpr,
     NHEADS: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    SNAPSHOT: tl.constexpr = False,
 ):
     """One program per token; `NGRAM` lookbacks, `NHEADS` row ids per lookback.
 
     The lookback walks `[history | this request's compressed ids]` by address
     rather than materializing the reference's `combined`.
-
-    `blocked` latches, and the order is the reference's -- latch, then
-    substitute -- so the lookback that finds DEAD is itself `PAD`.
     """
     token = tl.program_id(0)
-    if SNAPSHOT:
-        padded = tl.load(compressed + token * NGRAM) == -2
-    else:
-        batch = tl.load(batch_ids + token)
-        local = token - tl.load(cu_seqlens + batch)
-        row = tl.load(history_index + batch)
-        padded = False
+    batch = tl.load(batch_ids + token)
+    local = token - tl.load(cu_seqlens + batch)
+    row = tl.load(history_index + batch)
 
     rolling = tl.zeros((), dtype=tl.int64)
     blocked = tl.zeros((), dtype=tl.int1)
@@ -111,34 +123,61 @@ def _engram_hash_kernel(
     live = heads < NHEADS
 
     for shift in tl.static_range(NGRAM):
-        if SNAPSHOT:
-            source = tl.load(compressed + token * NGRAM + shift)
-        else:
-            back = local - shift
-            from_chunk = back >= 0
-            source = tl.where(
-                from_chunk,
-                tl.load(compressed + token - shift, mask=from_chunk, other=0),
-                tl.load(
-                    history + row * history_stride + (NGRAM - 1 + back),
-                    mask=back < 0,
-                    other=-1,
-                ),
-            )
-        blocked = blocked | (source == -1)
-        value = tl.where(blocked, PAD, source).to(tl.int64)
-        rolling = rolling ^ (value * tl.load(multipliers + shift))
+        back = local - shift
+        from_chunk = back >= 0
+        source = tl.where(
+            from_chunk,
+            tl.load(compressed + token - shift, mask=from_chunk, other=0),
+            tl.load(
+                history + row * history_stride + (NGRAM - 1 + back),
+                mask=back < 0,
+                other=-1,
+            ),
+        )
+        rolling, blocked = _hash_step(
+            rolling, blocked, source, tl.load(multipliers + shift), PAD
+        )
         if shift:
             column = (shift - 1) * NHEADS + heads
             size = tl.load(head_sizes + column, mask=live, other=1)
             offset = tl.load(head_offsets + column, mask=live, other=0)
-            result = tl.where(padded, -1, rolling % size + offset)
-            tl.store(out + token * out_stride + column, result, live)
+            tl.store(out + token * out_stride + column, rolling % size + offset, live)
+
+
+@triton.jit
+def _lookback(
+    compressed, input_ids, lookup, dead_mask, history, token, local, row, live,
+    shift, history_stride, NGRAM: tl.constexpr, COMPRESS: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):  # fmt: skip
+    """Lookback ``shift`` of ``token``: this request's compressed id inside the
+    step (``COMPRESS``: compressed here from the raw ids, as ``_compress_kernel``
+    does), past its start the committed history; -1 off ``live``."""
+    back = local - shift
+    inside = live & (back >= 0)
+    if COMPRESS:
+        step_id = tl.where(
+            inside,
+            _compressed(input_ids, lookup, dead_mask, token - shift, inside, HAS_MASK),
+            -1,
+        )
+    else:
+        step_id = tl.load(compressed + token - shift, inside, -1)
+    return tl.where(
+        back >= 0,
+        step_id,
+        tl.load(
+            history + row * history_stride + NGRAM - 1 + back, live & (back < 0), -1
+        ),
+    )
 
 
 @triton.jit
 def _engram_snapshot_kernel(
     compressed,
+    input_ids,
+    lookup,
+    dead_mask,
     batch_ids,
     cu_seqlens,
     history,
@@ -152,64 +191,135 @@ def _engram_snapshot_kernel(
     cursor_slot_stride,
     cursor_row_stride,
     live_count,
+    multipliers,
+    head_sizes,
+    head_offsets,
+    row_ids,
+    multiplier_stride,
+    head_stride,
+    row_layer_stride,
+    row_token_stride,
     NGRAM: tl.constexpr,
     BLOCK: tl.constexpr,
     STAGE_CURSOR: tl.constexpr,
     COUNTED: tl.constexpr,
+    COMPRESS: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    LAYERS: tl.constexpr,
+    PAD: tl.constexpr,
+    NHEADS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
+    """A block of tokens (``program_id(0)``) x a layer (``program_id(1)``).
+    Layer 0's program: the tokens' frozen lookbacks (``out`` [token][NGRAM],
+    newest first; -2 a padding row) and a verify step's cursor candidates,
+    ``COMPRESS``: with the step's compressed ids made here from the raw ones
+    (each token's also stored to ``compressed``) instead of read. With
+    ``LAYERS`` stacked layers, every program also hashes its layer's row ids
+    from the lookbacks into ``row_ids`` [layer][token][heads] (-1 a padding
+    row), as ``_engram_hash_kernel`` hashes a token: the layers' int64
+    modulos on their own programs."""
     if COUNTED:
         tokens = tl.load(live_count)
     token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    layer = tl.program_id(1)
     live = token < tokens
     batch = tl.load(batch_ids + token, live, 0)
     local = token - tl.load(cu_seqlens + batch, live, 0)
     row = tl.load(history_index + batch, live, 0)
-    for shift in tl.static_range(NGRAM):
-        back = local - shift
-        source = tl.where(
-            back >= 0,
-            tl.load(compressed + token - shift, live & (back >= 0), -1),
-            tl.load(
-                history + row * history_stride + NGRAM - 1 + back,
-                live & (back < 0),
-                -1,
-            ),
-        )
-        # -1 is a real DEAD token; -2 marks padding with no table read.
-        tl.store(
-            out + token * NGRAM + shift,
-            tl.where(live, source, -2),
-            token < padded_tokens,
-        )
-        if STAGE_CURSOR and shift < NGRAM - 1:
-            # Snapshot is newest-first; a cursor stores oldest-first history
-            # AFTER this token. Both use these same committed lookbacks.
+    if layer == 0:
+        if COMPRESS:
+            own = _compressed(input_ids, lookup, dead_mask, token, live, HAS_MASK)
+            tl.store(compressed + token, own, live)
+        for shift in tl.static_range(NGRAM):
+            source = _lookback(
+                compressed, input_ids, lookup, dead_mask, history, token, local,
+                row, live, shift, history_stride, NGRAM, COMPRESS, HAS_MASK,
+            )  # fmt: skip
+            # -1 is a real DEAD token; -2 marks padding with no table read.
             tl.store(
-                cursor_out
-                + batch * cursor_slot_stride
-                + local * cursor_row_stride
-                + NGRAM
-                - 1
-                - shift,
-                source,
+                out + token * NGRAM + shift,
+                tl.where(live, source, -2),
+                token < padded_tokens,
+            )
+            if STAGE_CURSOR and shift < NGRAM - 1:
+                # Snapshot is newest-first; a cursor stores oldest-first
+                # history AFTER this token. Both use these same lookbacks.
+                tl.store(
+                    cursor_out
+                    + batch * cursor_slot_stride
+                    + local * cursor_row_stride
+                    + NGRAM
+                    - 1
+                    - shift,
+                    source,
+                    live,
+                )
+        if STAGE_CURSOR:
+            position = tl.load(cursor_positions + token - local, live, 0)
+            tl.store(
+                cursor_out + batch * cursor_slot_stride + local * cursor_row_stride,
+                position + local + 1,
                 live,
             )
-    if STAGE_CURSOR:
-        position = tl.load(cursor_positions + token - local, live, 0)
-        tl.store(
-            cursor_out + batch * cursor_slot_stride + local * cursor_row_stride,
-            position + local + 1,
-            live,
-        )
+    if LAYERS:
+        heads = tl.arange(0, BLOCK_H)
+        own_heads = heads < NHEADS
+        stored = (token < padded_tokens)[:, None] & own_heads[None, :]
+        rolling = tl.zeros((BLOCK,), dtype=tl.int64)
+        blocked = tl.zeros((BLOCK,), dtype=tl.int1)
+        for shift in tl.static_range(NGRAM):
+            source = _lookback(
+                compressed, input_ids, lookup, dead_mask, history, token, local,
+                row, live, shift, history_stride, NGRAM, COMPRESS, HAS_MASK,
+            )  # fmt: skip
+            rolling, blocked = _hash_step(
+                rolling, blocked, source,
+                tl.load(multipliers + layer * multiplier_stride + shift), PAD,
+            )  # fmt: skip
+            if shift:
+                column = (shift - 1) * NHEADS + heads
+                size = tl.load(head_sizes + layer * head_stride + column, own_heads, 1)
+                offset = tl.load(
+                    head_offsets + layer * head_stride + column, own_heads, 0
+                )
+                result = tl.where(
+                    live[:, None],
+                    rolling[:, None] % size[None, :] + offset[None, :],
+                    -1,
+                )
+                tl.store(
+                    row_ids + layer * row_layer_stride
+                    + token[:, None] * row_token_stride + column[None, :],
+                    result,
+                    stored,
+                )  # fmt: skip
+
+
+SNAPSHOT_BLOCK = 128  # tokens a snapshot program
+SNAPSHOT_HASH_BLOCK = 16  # tokens a program that also hashes its layer
 
 
 def engram_snapshot(
-    tables, batch, out, *, cursor_positions=None, cursor_out=None, live=None
+    tables,
+    batch,
+    out,
+    *,
+    cursor_positions=None,
+    cursor_out=None,
+    live=None,
+    compress=None,
+    rows=None,
 ):
     """Freeze lookbacks before the committed cursor advances.
 
     `live`: the live leading tokens on the device; without it every token of
-    `batch.batch_ids` is.
+    `batch.batch_ids` is. `compress`: `(input_ids, dead_mask)`, the step's
+    compressed ids made in the launch into `batch.compressed`
+    (`engram_compress`'s) instead of read from it. `rows`: `(layer_ids,
+    row_ids)`, every layer's row ids hashed in the launch too, into `row_ids`
+    [layers, out rows, heads] (consecutive layers of the stacked tables,
+    `EngramHashTables.run`); padding rows -1, so the UVA gather reads zeros.
     """
     _check_plane(batch.history, tables)
     tokens = batch.batch_ids.numel()
@@ -233,9 +343,26 @@ def engram_snapshot(
             == batch.history.untyped_storage().data_ptr()
         ):
             raise ValueError("Engram snapshot cursor candidates must not alias history")
+    input_ids, dead_mask = compress if compress is not None else (None, None)
+    layers, row_ids, stacked = 0, None, (None, None, None)
+    if rows is not None:
+        layer_ids, row_ids = rows
+        layers = len(layer_ids)
+        if (
+            row_ids.shape != (layers, out.shape[0], tables.heads)
+            or row_ids.stride(-1) != 1
+        ):
+            raise ValueError("Invalid Engram row buffer")
+        stacked = tables.run(layer_ids)
+    heads = tables.heads // tables.width
+    # tokens a program: fewer where it hashes, its int64 modulos the cost
+    block = SNAPSHOT_HASH_BLOCK if layers else SNAPSHOT_BLOCK
     if out.shape[0]:
-        _engram_snapshot_kernel[(triton.cdiv(out.shape[0], 128),)](
+        _engram_snapshot_kernel[(triton.cdiv(out.shape[0], block), max(layers, 1))](
             batch.compressed,
+            input_ids,
+            tables.lookup,
+            dead_mask,
             batch.batch_ids,
             batch.cu_seqlens,
             batch.history,
@@ -249,40 +376,22 @@ def engram_snapshot(
             cursor_out.stride(0) if stage_cursor else 0,
             cursor_out.stride(1) if stage_cursor else 0,
             live,
+            *stacked,
+            row_ids,
+            stacked[0].stride(0) if layers else 0,
+            stacked[1].stride(0) if layers else 0,
+            row_ids.stride(0) if layers else 0,
+            row_ids.stride(1) if layers else 0,
             NGRAM=tables.ngram,
-            BLOCK=128,
+            BLOCK=block,
             STAGE_CURSOR=stage_cursor,
             COUNTED=live is not None,
-        )
-    return out
-
-
-def engram_snapshot_indices(tables, layer_id, snapshot, out):
-    """Hash frozen lookbacks; padding produces -1 so UVA gathers zeros."""
-    tokens = snapshot.shape[0]
-    if snapshot.shape[1:] != (tables.ngram,) or not snapshot.is_contiguous():
-        raise ValueError("Invalid Engram snapshot layout")
-    if out.shape != (tokens, tables.heads) or out.stride(-1) != 1:
-        raise ValueError("Invalid Engram row buffer")
-    if tokens:
-        multipliers, sizes, offsets = tables.layers[layer_id]
-        _engram_hash_kernel[(tokens,)](
-            snapshot,
-            None,
-            None,
-            None,
-            None,
-            multipliers,
-            sizes,
-            offsets,
-            out,
-            0,
-            out.stride(0),
+            COMPRESS=compress is not None,
+            HAS_MASK=dead_mask is not None,
+            LAYERS=layers,
             PAD=tables.pad_id,
-            NGRAM=tables.ngram,
-            NHEADS=tables.heads // tables.width,
-            BLOCK_H=triton.next_power_of_2(tables.heads // tables.width),
-            SNAPSHOT=True,
+            NHEADS=heads,
+            BLOCK_H=triton.next_power_of_2(heads),
         )
     return out
 
@@ -358,11 +467,14 @@ class EngramHashTables:
     Under a megabyte: only the compressed-vocab table scales with anything, at
     `vocab_size` int32. The embedding tables are not here and do not move.
 
-    `layers` is pre-sliced per layer so a forward does no tensor arithmetic to
-    find its own row.
+    `stacked` holds every layer's constants as rows, in `order`; `layers` is
+    each layer's rows of it, pre-sliced so a forward does no tensor arithmetic
+    to find its own, and a run of consecutive layers hashes in one launch.
     """
 
     lookup: torch.Tensor
+    stacked: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    order: tuple[int, ...]
     layers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
     pad_id: int
     ngram: int
@@ -372,6 +484,14 @@ class EngramHashTables:
     def width(self):
         return self.ngram - 1
 
+    def run(self, layer_ids):
+        """The stacked tables from ``layer_ids``' first row, one row a layer:
+        ``layer_ids`` must be consecutive layers of ``order``."""
+        first = self.order.index(layer_ids[0])
+        if tuple(layer_ids) != self.order[first : first + len(layer_ids)]:
+            raise ValueError(f"layers {layer_ids} are not a run of {self.order}")
+        return tuple(t[first:] for t in self.stacked)
+
     @classmethod
     def from_mapping(cls, mapping, device):
         table = np.asarray(mapping.tokenizer.lookup_table, dtype=np.int64)
@@ -380,18 +500,23 @@ class EngramHashTables:
         if table.max() > np.iinfo(np.int32).max:
             raise ValueError("Compressed vocabulary does not fit an int32 table")
 
-        def resident(values):
-            return torch.as_tensor(np.asarray(values, dtype=np.int64)).to(device)
+        order = tuple(mapping.config.layer_ids)
 
+        def resident(per_layer):
+            rows = [np.asarray(per_layer[layer], dtype=np.int64) for layer in order]
+            return torch.as_tensor(np.stack(rows)).to(device)
+
+        stacked = (
+            resident(mapping.layer_multipliers),
+            resident(mapping.head_vocab_sizes),
+            resident(mapping.head_offsets),
+        )
         return cls(
             lookup=torch.as_tensor(table, dtype=torch.int32).to(device),
+            stacked=stacked,
+            order=order,
             layers={
-                layer: (
-                    resident(mapping.layer_multipliers[layer]),
-                    resident(mapping.head_vocab_sizes[layer]),
-                    resident(mapping.head_offsets[layer]),
-                )
-                for layer in mapping.config.layer_ids
+                layer: tuple(t[i] for t in stacked) for i, layer in enumerate(order)
             },
             pad_id=int(mapping.pad_id),
             ngram=int(mapping.config.max_ngram_size),

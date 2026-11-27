@@ -37,7 +37,6 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 from atom.models.deepseek_v41.mono.gfx1250.kernels import moe_plan as MP
-from atom.models.deepseek_v41.mono.gfx1250.kernels import stamps
 from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import q8words, bf, e8m0_of, handoff, inv_pow2
 
 H, I, TOPK, NE, CTAS = D.HID, D.MOE_I, D.TOPK, D.EXPERTS, D.CTAS
@@ -811,18 +810,11 @@ def moe_dn_shared(c):
 
 
 def moe(c, cnt_off):
-    """The whole routed MoE (all 256 CTAs). cnt_off: byte address of this step's handoff counter (zeroed). Phase stamps
-    (stamps.point 10..14): union, UG, UG -> down handoff, down staging, down."""
-    st = lambda k: stamps.point(10 + k)
+    """The whole routed MoE (all 256 CTAs). cnt_off: byte address of this step's handoff counter (zeroed)."""
     moe_union(c)
-    st(0)
     moe_ug(c)
-    st(1)
     handoff(cnt_off, c["t"], True)
-    st(2)
     moe_dn_stage(c)
-    st(4)
     moe_dn(c)
     if fx.const_expr(not sh8_dnov((c["NP"] // c["topk"] + MAXTOK - 1) // MAXTOK)):
         moe_dn_shared(c)
-    st(3)

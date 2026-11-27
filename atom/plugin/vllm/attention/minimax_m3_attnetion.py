@@ -18,7 +18,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
-from atom.config import get_current_atom_config
+from atom.config import get_current_atom_config, kv_cache_torch_dtype
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
     PAGES_PER_SPARSE_BLOCK,
@@ -105,7 +105,7 @@ def _index_cache_torch_dtype(kv_cache_dtype: str, model_config) -> torch.dtype:
     fp8 -- aiter's ``fused_qknorm_idxrqknorm`` writes them under
     ``kv_cache_dtype="fp8"`` -- so only the label was wrong. ``dtypes.d_dtypes``
     is the same handle the native server resolves this cache through
-    (``atom.model_ops.attentions.aiter_attention._resolve_index_cache_dtype``),
+    (``atom.model_ops.attentions.aiter_attention._index_cache_spec``),
     which keeps the two paths on one arch-correct fp8 dtype instead of a
     hard-coded ``torch.float8_e4m3fn``.
 
@@ -490,7 +490,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             raise ValueError("MiniMax-M3 sparse cache must use page size 128.")
         kv_cache = self.kv_cache
         if self.kv_cache_dtype == "fp8":
-            kv_cache = kv_cache.view(dtypes.d_dtypes[self.kv_cache_dtype])
+            kv_cache = kv_cache.view(kv_cache_torch_dtype(self.kv_cache_dtype))
         num_kv_heads, head_dim = self.num_kv_heads, self.head_dim
         flat = kv_cache.view(num_blocks * 2, block_size, num_kv_heads, head_dim)
         x = 16 // flat.element_size()

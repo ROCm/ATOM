@@ -7,6 +7,8 @@ import json
 import os
 
 import torch
+from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from torch import nn
 
 from atom.config import Config
@@ -22,6 +24,7 @@ from atom.models.qwen4_exp import (
     Qwen4ExpForConditionalGeneration,
     _Qwen4ExpQuantizationConfig,
     _SequenceParallel,
+    moe_pad_align,
 )
 from atom.quant_spec import LayerQuantConfig
 
@@ -42,6 +45,16 @@ def _mtp_weights_quantized(model: str) -> bool:
         return True
     mtp = [n for n in names if n.startswith("mtp.")]
     return not mtp or any("_scale" in n.rsplit(".", 1)[-1] for n in mtp)
+
+
+def _moe_needs_quantized_weights() -> bool:
+    """Whether this GPU has no unquantized (BF16) fused MoE kernel.
+
+    aiter's gfx1250 MoE kernels are MXFP4 only (grouped a4w4/a8w4 and mega
+    MoE). A BF16 expert falls back to the CK 2-stage kernel, which does not
+    build for gfx1250, so a BF16 MTP head is quantized online to MXFP4 there.
+    """
+    return get_gfx_runtime() == "gfx1250"
 
 
 class _UnquantizedMTPQuantizationConfig(_Qwen4ExpQuantizationConfig):
@@ -83,9 +96,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
+        quantized_mtp = _moe_needs_quantized_weights() or _mtp_weights_quantized(
+            atom_config.model
+        )
         quant_cls = (
             _Qwen4ExpQuantizationConfig
-            if _mtp_weights_quantized(atom_config.model)
+            if quantized_mtp
             else _UnquantizedMTPQuantizationConfig
         )
         quant_config = quant_cls(atom_config.quant_config)
@@ -120,6 +136,19 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     prefix="mtp.layers.0",
                     layer_num=self.mtp_start_layer_idx,
                     quant_config=quant_config,
+                    fuse_shared_expert=(
+                        isinstance(quant_config, _UnquantizedMTPQuantizationConfig)
+                        and moe_pad_align(
+                            config.moe_intermediate_size,
+                            get_tensor_model_parallel_world_size(),
+                            quant_config.get_layer_quant_config(
+                                "mtp.layers.0.mlp.experts", check_children=True
+                            ),
+                            config=config,
+                            fuse_shared_expert=True,
+                        )
+                        == 64
+                    ),
                 )
             ]
         )
@@ -165,8 +194,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 class Qwen4ExpMTP(nn.Module):
     weights_mapping = Qwen4ExpForConditionalGeneration.weights_mapping
     packed_modules_mapping = Qwen4ExpForConditionalGeneration.packed_modules_mapping
-    disable_fused_shared_loading = True
-    fused_shared_experts = 0
     get_expert_mapping = Qwen4ExpForConditionalGeneration.get_expert_mapping
     draft_graph_supports_mrope = True
     reuse_draft_graph_step_buffers = True
@@ -180,6 +207,8 @@ class Qwen4ExpMTP(nn.Module):
         super().__init__()
         self.config = atom_config.hf_config
         self.model = Qwen4ExpMultiTokenPredictor(atom_config)
+        self.fused_shared_experts = int(self.model.layers[0].mlp.fuse_shared)
+        self.disable_fused_shared_loading = not self.fused_shared_experts
         self.lm_head = ParallelLMHead(
             self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
         )
@@ -187,7 +216,17 @@ class Qwen4ExpMTP(nn.Module):
     def remap_mtp_weight_name(self, name: str) -> str | None:
         if not name.startswith("mtp."):
             return None
-        return "model." + name[len("mtp.") :]
+        name = "model." + name[len("mtp.") :]
+        if self.fused_shared_experts:
+            # The constructed draft owns this decision. After mtp -> model,
+            # the generic rewriter would consult the target's quant policy,
+            # which can keep its shared expert separate from FP8 routed ones.
+            name = name.replace(
+                ".mlp.shared_expert.",
+                f".mlp.experts.{self.config.num_experts}.",
+                1,
+            )
+        return name
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)

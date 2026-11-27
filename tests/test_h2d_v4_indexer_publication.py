@@ -182,12 +182,33 @@ def test_pcp_ragged_queries_publish_indexer_once(monkeypatch, pp_size, rank):
         md, positions, cu, lengths = make_metadata(
             builder, starts=(8 + 4 * step, 16, 0)
         )
-        md.kv_indptr_extend = torch.arange(12, dtype=torch.int32, device="cuda")
-        md.kv_indices_extend = torch.arange(11, dtype=torch.int32, device="cuda")
+        paged = []
+        monkeypatch.setattr(
+            builder,
+            "_build_paged_prefill_meta",
+            lambda md, *rows, positions_gpu, out=paged, **kw: (
+                out.append((rows, positions_gpu.clone()))
+            ),
+        )
         buf = runner.forward_vars["v4_indexer_cu_committed"]
         buf.gpu.fill_(77)
         torch.cuda._sleep(5_000_000)
-        local = builder._apply_pcp_reindex(md, positions, 3, 3, 11, cu)
+        var = runner.forward_vars
+        local = builder._apply_pcp_reindex(
+            md,
+            positions,
+            3,
+            3,
+            11,
+            11,
+            cu,
+            cu_q_per_seq_gpu=var["cu_seqlens_q"].gpu[:3],
+            block_tables_gpu=var["block_tables"].gpu[:3],
+        )
+        # The paged prefill indices are built for this rank's real rows.
+        ((rows, built_gpu),) = paged
+        assert rows == (3, len(range(rank, 11, 4)), 3)
+        assert torch.equal(built_gpu, local)
         expected_cu = np.r_[0, np.cumsum(md.n_committed_csa_per_seq_cpu)].astype(
             np.int32
         )
@@ -197,7 +218,6 @@ def test_pcp_ragged_queries_publish_indexer_once(monkeypatch, pp_size, rank):
                 md.index_rows.concat.cu_committed.clone(),
                 expected_cu,
                 md.batch_id_per_q_token.clone(),
-                md.kv_indices_extend.clone(),
                 local.clone(),
             )
         )
@@ -209,10 +229,9 @@ def test_pcp_ragged_queries_publish_indexer_once(monkeypatch, pp_size, rank):
         runner._record_forward_vars_event()
     torch.cuda.synchronize()
     ids = np.r_[np.repeat(np.arange(3), lengths), -1][rank::4]
-    for actual, expected, bids, indices, local in saved:
+    for actual, expected, bids, local in saved:
         np.testing.assert_array_equal(actual.cpu().numpy(), expected)
         np.testing.assert_array_equal(bids.cpu().numpy(), ids)
-        assert indices.cpu().tolist() == list(range(rank, 11, 4))
         assert len(local) == 3
     assert torch.all(buf.gpu[4:] == 77)
 

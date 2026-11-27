@@ -42,12 +42,14 @@ from atom.kv_transfer.offload.chunked_scheduler import (
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp.deployment import (
+    _logical_block_size,
     _make_worker_adapter,
     _mp_session_id,
     _published_tp_replication_factor,
     _tp_replication_factor,
     _validate_mp_config,
     require_native_state_server,
+    transfer_spec,
 )
 from atom.kv_transfer.offload.mp.metadata import MPReqMeta
 from atom.kv_transfer.offload.mp.native_state_layout import (
@@ -128,11 +130,7 @@ class LMCacheMPConnector(KVConnectorBase):
         self.kv_role = validated_kv_role(kvc)
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
-        self.block_size = offcfg._strict_integer(
-            "LMCache MP block size",
-            config.kv_cache_block_size,
-            minimum=1,
-        )
+        self.block_size = _logical_block_size(config)
         self.chunk_size: int | None = None
         # Set only when the backend publishes PAGE-backed checkpoint images
         # (`_register_native_state_layout`); every transfer then carries one.
@@ -627,8 +625,6 @@ class LMCacheMPConnector(KVConnectorBase):
         return self._native_layout.transfer_block_ids(pages, unit_ids, count)
 
     def _submit_load(self, req: MPReqMeta, event: Any) -> None:
-        from lmcache.integration.atom import AtomMPTransferSpec
-
         assert req.load_spec is not None
         completion = req.load_operation or req.req_id
         request_id = _mp_session_id(self._config, req.req_id)
@@ -655,11 +651,12 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"load range [{start}, {end}) is not LMCache chunk aligned "
                     f"({self.chunk_size})"
                 )
-            op = AtomMPTransferSpec(
+            op = transfer_spec(
                 token_ids=token_list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=True),
                 start=start,
                 end=end,
+                cache_salt=req.cache_salt,
             )
         except Exception:
             # Nothing was sent: the failure is provable and terminal.
@@ -699,8 +696,6 @@ class LMCacheMPConnector(KVConnectorBase):
             )
 
     def _submit_save(self, req: MPReqMeta, event: Any) -> None:
-        from lmcache.integration.atom import AtomMPTransferSpec
-
         assert req.save_spec is not None
         completion = req.save_operation or req.req_id
         request_id = _mp_session_id(self._config, req.req_id)
@@ -742,11 +737,12 @@ class LMCacheMPConnector(KVConnectorBase):
                 self._immediate_saves[completion] = None
             return
         try:
-            op = AtomMPTransferSpec(
+            op = transfer_spec(
                 token_ids=token_list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=False),
                 start=start,
                 end=end,
+                cache_salt=req.cache_salt,
             )
         except Exception:
             # Nothing was sent: report a terminal failure so the save settles.

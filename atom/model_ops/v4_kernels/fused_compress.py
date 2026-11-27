@@ -83,6 +83,7 @@ except Exception:  # noqa: BLE001 - an optional kernel probe, not an error path
 
 # `quant_mode` -> the kernel's PACKED: CSA2 main rows, values then scales
 PACKED_ROWS = {"packed_fp8": 1, "packed_fp4": 2}
+PLANAR_ROWS = {"planar_fp8": 1, "planar_fp4": 2}
 
 # Supported (head_dim, rope_head_dim, ratio, overlap) tuples for the flydsl
 # kernel — matches V4-Pro Main (D=512) and Indexer-inner (D=128) compressors.
@@ -130,6 +131,7 @@ def _fused_compress_attn_kernel(
     kv_cache_token_stride,
     cache_scale_ptr,  # fp32 [NB, k_per_block] (QUANT path only; dummy ptr otherwise)
     cache_scale_block_stride,  # fp32 elements per block (= k_per_block * cache_stride / 4)
+    cache_scale_token_stride,  # separate CSA2 scale planes only
     block_table_ptr,  # [bs, max_blocks_per_seq] int32
     block_table_seq_stride,  # row stride
     k_per_block,
@@ -157,6 +159,7 @@ def _fused_compress_attn_kernel(
     # CSA2 main rows as values then scales, a row a kv_cache token (uint8):
     # 0 none, 1 E4M3 + E8M0 a 32, 2 E2M1 + E4M3 a 16 (`PACKED_ROWS`)
     PACKED: tl.constexpr,
+    PLANAR: tl.constexpr,  # separate CSA2 data/scale planes, same quantization
     QUANT: tl.constexpr,  # 0 = raw BF16 (CSA/HCA Main), 1 = FP8 e4m3 + ue8m0 scale (Indexer)
     USE_UE8M0: tl.constexpr,  # round scale to power-of-2 (only when QUANT == 1)
     PRESHUFFLE: tl.constexpr,  # MFMA 16x16 preshuffled FP8 layout (only when QUANT == 1)
@@ -376,7 +379,7 @@ def _fused_compress_attn_kernel(
         if PACKED:
             row = (
                 kv_cache_ptr
-                + physical_block * kv_cache_block_stride
+                + row_offset(physical_block, kv_cache_block_stride)
                 + slot_in_block * kv_cache_token_stride
             )
             # The row's BF16 value is what is quantized: the rounding a BF16
@@ -386,7 +389,15 @@ def _fused_compress_attn_kernel(
                 q, code, _ = fp8_groups(tl.reshape(x, (BLOCK_D // 32, 32)))
                 tl.store(row + d, tl.reshape(q, (BLOCK_D,)).to(tl.uint8, bitcast=True))
                 g = tl.arange(0, BLOCK_D // 32)
-                tl.store(row + BLOCK_D + g, code.to(tl.uint8))
+                if PLANAR:
+                    scale_row = (
+                        cache_scale_ptr
+                        + row_offset(physical_block, cache_scale_block_stride)
+                        + slot_in_block * cache_scale_token_stride
+                    )
+                else:
+                    scale_row = row + BLOCK_D
+                tl.store(scale_row + g, code.to(tl.uint8))
             else:
                 code, sign, scale, _ = fp4_groups(
                     tl.reshape(x, (BLOCK_D // 16, 16)), True
@@ -396,8 +407,16 @@ def _fused_compress_attn_kernel(
                     tl.reshape(fp4_pack(code, sign), (BLOCK_D // 2,)),
                 )
                 g = tl.arange(0, BLOCK_D // 16)
+                if PLANAR:
+                    scale_row = (
+                        cache_scale_ptr
+                        + row_offset(physical_block, cache_scale_block_stride)
+                        + slot_in_block * cache_scale_token_stride
+                    )
+                else:
+                    scale_row = row + BLOCK_D // 2
                 tl.store(
-                    row + BLOCK_D // 2 + g,
+                    scale_row + g,
                     scale.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
                 )
         elif QUANT:
@@ -495,7 +514,7 @@ def fused_compress_attn(
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
     fp8_max: float | None = None,  # E4M3 max; required for FP8 quant
     # none | fp8_per_row | fp8_group | fp4 | fp4_gfx950_flydsl | fp4_gfx950_opus |
-    # packed_fp8 | packed_fp4
+    # packed_fp8 | packed_fp4 | planar_fp8 | planar_fp4
     quant_mode: str | None = None,
     # V4-Main native fp8 2buff path (CSA/HCA Main under --kv_cache_dtype fp8).
     # Distinct from `quant` (Indexer-inner per-row preshuffle): writes per-64-tile
@@ -533,6 +552,10 @@ def fused_compress_attn(
         `quantize_fp4` (group 16, E4M3)'s codes, values then scales, into a
         uint8 kv_cache token row at the same slot.
 
+      - "planar_fp8" / "planar_fp4": the same BF16 rounding and quantization,
+        written directly into separate uint8 data and scale planes. Both
+        planes are [pages, k_per_block, row_width] with their own strides.
+
     Side-effecting: the cache scatter, plus the pre-RoPE latent rows into
     `latent_out` when given (CSA2's index key source), are the outputs (Main
     path's BF16 return tensor was vestigial — paged_decode/paged_2src read
@@ -568,7 +591,8 @@ def fused_compress_attn(
         "fp4_gfx950_flydsl",
         "fp4_gfx950_opus",
     )
-    packed = PACKED_ROWS.get(_mode, 0)
+    planar = _mode in PLANAR_ROWS
+    packed = PLANAR_ROWS[_mode] if planar else PACKED_ROWS.get(_mode, 0)
 
     # ------------------------------------------------------------------
     # flydsl dispatch. Pure-GPU time on V4-Pro beats Triton 0.9x→2.9x
@@ -752,6 +776,14 @@ def fused_compress_attn(
         assert (
             head_dim == triton.next_power_of_2(head_dim) and head_dim % 32 == 0
         ), f"{_mode} requires a power-of-two head_dim, got {head_dim}"
+        assert kv_cache.shape[1] == k_per_block and kv_cache.stride(-1) == 1
+        if planar:
+            data_width = head_dim if packed == 1 else head_dim // 2
+            scale_width = head_dim // (32 if packed == 1 else 16)
+            assert kv_cache.shape[2] == data_width
+            assert cache_scale is not None and cache_scale.dtype == torch.uint8
+            assert cache_scale.shape == (*kv_cache.shape[:2], scale_width)
+            assert cache_scale.stride(-1) == 1
 
     BLOCK_D = triton.next_power_of_2(head_dim)
     HALF_ROPE = rope_head_dim // 2
@@ -764,10 +796,10 @@ def fused_compress_attn(
 
     # Cache-scale args (only consumed by the quant path; pass placeholders
     # otherwise so the constexpr branch is never taken).
-    if quant:
+    if quant or planar:
         cache_scale_arg = cache_scale
         cache_scale_block_stride_arg = cache_scale.stride(0)
-        fp8_max_arg = float(fp8_max)
+        fp8_max_arg = float(fp8_max) if quant else 1.0
     else:
         cache_scale_arg = state_slot_mapping  # placeholder int32 ptr (unused)
         cache_scale_block_stride_arg = 0
@@ -807,6 +839,7 @@ def fused_compress_attn(
         kv_cache.stride(1) if has_bt else 0,
         cache_scale_arg,
         cache_scale_block_stride_arg,
+        cache_scale.stride(1) if planar else 0,
         block_tables if has_bt else state_slot_mapping,  # placeholder
         bt_seq_stride,
         k_per_block,
@@ -825,6 +858,7 @@ def fused_compress_attn(
         WRITE_RING=int(write_plan is not None),
         BLOCK_RING=triton.next_power_of_2(dim_full),
         PACKED=packed,
+        PLANAR=planar,
         QUANT=int(quant),
         FP8_MAX=fp8_max_arg,
         USE_UE8M0=int(use_ue8m0),

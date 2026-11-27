@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::types::{PlacementError, RequestDescriptor};
 use crate::core::{HashRing, Worker};
-use crate::observability::metrics::MeshMetrics;
+use crate::observability::{metrics::MeshMetrics, route_trace};
 use crate::policies::{LoadBalancingPolicy, RouteDecision, SelectWorkerInfo};
 
 pub async fn apply_policy(
@@ -19,6 +19,7 @@ pub async fn apply_policy(
         tokens: descriptor.tokens,
         headers: descriptor.headers,
         hash_ring,
+        carries_media: descriptor.carries_media(),
     };
     let (idx, decision) = policy.select_with_decision(candidates, &info).await;
     let selected = idx.map(|idx| candidates[idx].clone());
@@ -48,4 +49,12 @@ fn record_decision(
     if let Some(ratio) = decision.match_ratio {
         MeshMetrics::record_route_prefix_match_ratio(pool, policy, ratio);
     }
+    route_trace::record_selection(
+        pool,
+        policy,
+        selected,
+        decision.branch,
+        decision.match_ratio,
+    );
+    route_trace::record_estimate(pool, selected, decision.estimated_hit_ratio);
 }

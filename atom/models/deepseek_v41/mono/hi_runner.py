@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """DeepSeek-V4.1's high-interactivity (hi) monokernels inside ATOM's V4.1 mono decode
-(``ATOM_DSV41_MONO_HI``, MI355X / gfx950, TP4).
+(``ATOM_DSV41_MONO_HI``, MI355X / gfx950, TP2, TP4 or TP8).
 
 On a step this hook serves, every one of V4.1's 40 decoder layers runs its
 hi layer program (the ``mono/hi`` package: ``layer.window_layer_blocks``, one
@@ -70,11 +71,9 @@ and the exact cross-rank argmax with ATOM's rule: the bf16 logit, ties to the
 lowest id) runs right after the last layer inside the target graph, its weights
 packed from ATOM's own ``model.norm.weight`` / ``model.head.weight``. Its ids
 land in a persistent int32 buffer (``head_ids``) that the in-graph post-verify
-(``round.post_verify``) turns into the verify's output ids and verdict: the
-forward's head output (``HiDecodeModel.compute_head``), which ATOM's runner
-takes instead of logits on the verify steps that read nothing but each row's
-pick. It samples (the hi runtime's ``head_blocks(sample=True)``): per row,
-temperature 0 takes the greedy pick, else one draw of softmax(bf16 logits / T)
+(``round.post_verify``) turns into the verify's output ids and spec status
+(``HiLayers.token_ids``). It samples (the hi runtime's
+``head_blocks(sample=True)``): per row, temperature 0 takes the greedy pick, else one draw of softmax(bf16 logits / T)
 in ATOM's top-p nucleus, the rows with top_p >= 1 drawn in the dot epilogue
 (``race``); Philox counters keyed by the seed, the launch tag, the row and the
 id (the same draw on every rank). The rows' (T, top_p) are a persistent buffer
@@ -99,7 +98,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.engram.host_memory import device_address
+from atom.model_ops.engram.host_memory import shard_device_address
 from atom.models.deepseek_v41.mono import hi_bridge as ml
 from atom.models.deepseek_v41.mono import hi_plan
 from atom.models.deepseek_v41.mono import hi_weights as hw
@@ -173,8 +172,6 @@ class HiLayers(HiDraft, HiPrograms):
         # hook's path at (a capture's included), the builder's lean-step test
         self.runs_every_layer = True
         self.lean_host, self.served_widths, self.lean_steps = False, set(), 0
-        # the rows of this forward's in-graph verify (``end_step``; 0: none), its head output (``head_output``)
-        self.verified = 0
         dev = self.dev = torch.device("cuda", torch.cuda.current_device())
         # (a band's programs: the band's rows)
         R, H = max(self.pwidth(s) for s in self.widths), cfg.hidden_size
@@ -462,7 +459,7 @@ class HiLayers(HiDraft, HiPrograms):
 
     def use_host_tables(self, host, staging) -> None:
         """The Engram kv launch reads each layer's table shard from ATOM's page-locked host shard (``host``: its
-        ``EngramHost``, page-locked at load, a page-locked copy or the mapping registered in place: the same rows
+        ``EngramHost``, page-locked at load, a page-locked copy or the node's shared copy: the same rows
         the hi runtime's ``shard_rows`` names, checked), its pointer tables rebuilt; and ``staging`` (ATOM's
         ``EngramStaging``) skips the step's lookup, all-gather, copies and compressed-id snapshot on the steps the hook
         serves (``EngramStep.served_by_round``, the builder's routing decision: nothing reads its staged rows; the
@@ -608,11 +605,18 @@ class HiLayers(HiDraft, HiPrograms):
         self.par_last[:] = self.par_work
         return True
 
-    def head_output(self, rows: int):
-        """The head output of the forward that just ran on the host (an eager step, or the one a graph capture
-        records; ``HiDecodeModel.compute_head``): its in-graph verify's output ids and verdict at width ``rows``
-        (``post_verify``), or None when it ran none."""
-        if self.pv is None or self.verified != rows:
+    def token_ids(self, metadata, rows: int):
+        """The in-graph verify's output ids and spec status at width ``rows`` (``post_verify``; eager, or replayed
+        with the target graph) of the step ``metadata`` lays out, None where that step ran none: one the round did
+        not serve (``served_by_round``), or not a verify of every request's full span at a width it launched at.
+        """
+        if (
+            self.pv is None
+            or rows not in self.pv.launched
+            or not metadata.served_by_round
+        ):
+            return None
+        if metadata.step.max_q_len != self.split[rows][1]:
             return None
         return self.pv.output(rows)
 
@@ -896,9 +900,8 @@ class HiLayers(HiDraft, HiPrograms):
         self._end_step(cache, step, rows)
         self._ctx_after_target(cache, step, rows)
         if self.pv is not None and step.max_q_len == self.split[rows][1]:
-            # the verdict and commit in the graph (``post_verify``): the forward's head output (``head_output``)
+            # the verify and commit in the graph (``post_verify``): the step's token ids (``token_ids``)
             self.pv.launch(self, cache, step, rows)
-            self.verified = rows
 
     def _end_step(self, cache, step, rows: int) -> None:
         taps = self._taps()
@@ -1017,7 +1020,7 @@ def check(model, atom_config, engram, draft, tp: int, rank: int) -> None:
 
 def host_shard(host, consts: dict, layer: int, tp: int, rank: int) -> tuple:
     """ATOM's page-locked host shard of Engram layer ``layer`` (``host``: its ``EngramHost``, page-locked at load, a
-    page-locked copy or the mapping registered in place) as the hi runtime reads it -> (codes, scales) uint8
+    page-locked copy or the node's shared copy) as the hi runtime reads it -> (codes, scales) uint8
     [rows, 256] / [rows, 8], their rows [lo, hi) and their device addresses. Raises ``MonoUnsupported`` when the rows
     are not those the hi runtime's ``shard_rows`` names for this rank (``consts``: ``engram_consts``).
     """
@@ -1037,17 +1040,8 @@ def host_shard(host, consts: dict, layer: int, tp: int, rank: int) -> tuple:
     ):
         raise MonoUnsupported(f"Engram layer {layer}: ATOM's host shard rows [{lo}, {hi}) {tuple(tq.shape)} / "
                               f"{tuple(ts.shape)}, the hi runtime's {want} x 256 / 8")  # fmt: skip
-    # the device's addresses of the page-locked host pages (the host pointer is not one: Triton maps it per launch, a
-    # hi pointer table holds what the device dereferences); each shard tensor's storage starts at its page-locked
-    # region's base (``host_memory.pin_rows``)
-    wbase, sbase = tq.untyped_storage().data_ptr(), ts.untyped_storage().data_ptr()
-    return (
-        tq,
-        ts,
-        (lo, hi),
-        device_address(tq.data_ptr(), wbase),
-        device_address(ts.data_ptr(), sbase),
-    )
+    # the device's addresses of the page-locked host pages, which a hi pointer table holds for the device to dereference
+    return tq, ts, (lo, hi), shard_device_address(tq), shard_device_address(ts)
 
 
 def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
@@ -1077,8 +1071,8 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     torch.set_default_dtype(torch.float32)
     torch.set_default_device("cpu")
     try:
-        # the builds from FlyDSL's disk cache where it holds them (a restart loads them untraced), their trace checks
-        # left to the CPU checks of the served programs (``hi.emit.compile.serving``)
+        # the builds from FlyDSL's disk cache where it holds them (a restart traces them but compiles none), their
+        # trace checks left to the CPU checks of the served programs (``hi.emit.compile.serving``)
         with serving():
             hook = HiLayers(model, atom_config, widths, max_ctx, engram_mapping, draft)
     finally:

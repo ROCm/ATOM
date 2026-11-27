@@ -222,12 +222,16 @@ class SGLangDeepseekMLAAttention(nn.Module):
         if atom_pcp_on:
             from atom.distributed.pcp_utils import (
                 get_pcp_world_size,
-                pcp_allgather_rerange,
+                pcp_allgather_rerange_many,
             )
 
             pcp_ws = get_pcp_world_size()
-            k_nope = pcp_allgather_rerange(k_nope.squeeze(1), pcp_ws).unsqueeze(1)
-            k_pe = pcp_allgather_rerange(k_pe.squeeze(1), pcp_ws).unsqueeze(1)
+            k_nope, k_pe = (
+                g.unsqueeze(1)
+                for g in pcp_allgather_rerange_many(
+                    [k_nope.squeeze(1), k_pe.squeeze(1)], pcp_ws
+                )
+            )
         elif dsa_use_prefill_cp(forward_batch):
             latent_cache = torch.cat([k_nope.squeeze(1), k_pe.squeeze(1)], dim=-1)
             k_nope, k_pe = attn.rebuild_cp_kv_cache(
