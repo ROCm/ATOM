@@ -242,7 +242,8 @@ class MooncakeEcWriter:
 
 
 class MooncakeEcReader:
-    """P's side: reads rows from E's pool into a registered buffer.
+    """P's side: reads rows from E's pool into a registered buffer, which
+    grows, at least doubling, up to ``max_bytes`` of rows.
 
     ``fallbacks`` counts the reads that returned None, by reason; each is
     logged with its reason and the running counts."""
@@ -252,6 +253,7 @@ class MooncakeEcReader:
         size_bytes: int,
         device: torch.device | str,
         *,
+        max_bytes: int | None = None,
         protocol: str = DEFAULT_PROTOCOL,
         kv_transfer_config: dict[str, Any] | None = None,
     ) -> None:
@@ -259,6 +261,7 @@ class MooncakeEcReader:
         ``ib_enable_alternate_hca`` and ``ib_hca_count`` the reader's engine
         takes as the KV connector's does."""
         kv = kv_transfer_config or {}
+        self._max_bytes = size_bytes if max_bytes is None else max_bytes
         # The reread slot, then the rows.
         self._buf = torch.zeros(size_bytes + _SLOT, dtype=torch.uint8, device=device)
         self._engine, _ = _open_engine(
@@ -280,6 +283,27 @@ class MooncakeEcReader:
             reason,
             dict(self.fallbacks),
         )
+
+    def _fit(self, length: int) -> str | None:
+        """Grow the buffer to hold ``length`` bytes of rows if ``max_bytes``
+        allows; why it cannot, or None when it holds them."""
+        capacity = self._buf.numel() - _SLOT
+        if length <= capacity:
+            return None
+        if length > self._max_bytes:
+            return f"{length} bytes exceed the {self._max_bytes} byte read limit"
+        old = self._buf
+        size = min(max(length, 2 * capacity), self._max_bytes)
+        try:
+            buf = torch.zeros(size + _SLOT, dtype=torch.uint8, device=old.device)
+            _register(self._engine, buf)
+        except RuntimeError as e:
+            return f"cannot grow the read buffer: {e}"
+        self._buf = buf
+        ret = self._engine.unregister_memory(old.data_ptr())
+        if ret != 0:
+            logger.warning("Mooncake unregister_memory failed (ret=%d)", ret)
+        return None
 
     def get(
         self, handle: dict[str, Any], key: int, dtype: torch.dtype
@@ -304,12 +328,9 @@ class MooncakeEcReader:
         ):
             self._fallback("malformed handle", session)
             return None
-        if length > self._buf.numel() - _SLOT:
-            self._fallback(
-                f"{length} bytes exceed the {self._buf.numel() - _SLOT} byte "
-                "read buffer",
-                session,
-            )
+        too_large = self._fit(length)
+        if too_large is not None:
+            self._fallback(too_large, session)
             return None
         # Work queued on this buffer (its zero fill, the previous read's
         # clone) must finish before the NIC writes into it.

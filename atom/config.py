@@ -2476,6 +2476,8 @@ class Config:
 
     # Intra-GPU prefill/decode disaggregation
     enable_rapidserve: bool = False
+    # Serve the vision encoder alone, without an engine core (`encoder_only.py`)
+    encoder_only: bool = False
     # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages)
     disagg_d2p_addr: str = ""
     # ZMQ IPC address: prefill PUSH → decode PULL (PrefillDone messages)
