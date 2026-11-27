@@ -4489,6 +4489,66 @@ def _setup_stream_dispatch(args) -> None:
     )
 
 
+def _find_jemalloc() -> str | None:
+    """jemalloc's soname if the dynamic linker can find it, else None.
+
+    LD_PRELOAD takes a soname and resolves it like any other library, so no
+    distro-specific paths are needed.
+    """
+    import ctypes.util
+
+    return ctypes.util.find_library("jemalloc")
+
+
+def _loaded_allocator(maps_path="/proc/self/maps") -> str:
+    """The malloc this process actually runs on: ld.so only warns when an
+    LD_PRELOAD entry fails to load and goes on with glibc malloc."""
+    try:
+        with open(maps_path) as maps:
+            for line in maps:
+                if "jemalloc" in line:
+                    return line.split()[-1]
+    except OSError:
+        pass
+    return "glibc malloc"
+
+
+@contextlib.contextmanager
+def _frontend_allocator_env():
+    """Run the front-end workers on jemalloc.
+
+    Each front-end worker tokenizes and renders very long prompts on many
+    threads (default executor + the tokenizers' rayon pool). With glibc malloc
+    every thread gets its own arena and the freed memory stays there, so a
+    worker's RSS keeps growing for hours. jemalloc returns freed pages to the
+    OS and keeps the thread count (and so the tokenizer parallelism) unchanged.
+
+    LD_PRELOAD is only set while the workers are spawned; this process and the
+    engine processes (started before) keep their allocator. Without jemalloc on
+    the host the workers fall back to glibc malloc with one warning.
+    """
+    old = os.environ.get("LD_PRELOAD")
+    if old is not None and "jemalloc" in old:
+        yield old
+        return
+    lib = _find_jemalloc()
+    if lib is None:
+        logger.warning(
+            "libjemalloc.so.2 not found; front-end workers use glibc malloc "
+            "(their memory grows on long runs; install libjemalloc2 to avoid it)"
+        )
+        yield None
+        return
+    os.environ["LD_PRELOAD"] = f"{lib}:{old}" if old else lib
+    try:
+        yield lib
+    finally:
+        if old is None:
+            os.environ.pop("LD_PRELOAD", None)
+        else:
+            os.environ["LD_PRELOAD"] = old
+
+
 def _start_frontend_workers(args) -> None:
     """--api-server-count > 1: start the hub and spawn the front-end workers,
     which take over the public port. This process then serves management
@@ -4511,15 +4571,21 @@ def _start_frontend_workers(args) -> None:
     )
     ctx = multiprocessing.get_context("spawn")
     processes = []
-    for index in range(args.api_server_count):
-        proc = ctx.Process(
-            target=_frontend_worker_main,
-            args=(args, engine.config, hub.connection_info(index), os.getpid()),
-            name=f"ATOM-APIServer-{index}",
-            daemon=True,
-        )
-        proc.start()
-        processes.append(proc)
+    with _frontend_allocator_env() as allocator:
+        for index in range(args.api_server_count):
+            proc = ctx.Process(
+                target=_frontend_worker_main,
+                args=(args, engine.config, hub.connection_info(index), os.getpid()),
+                name=f"ATOM-APIServer-{index}",
+                daemon=True,
+            )
+            proc.start()
+            processes.append(proc)
+    logger.info(
+        "Front-end workers %s spawned with LD_PRELOAD allocator %s",
+        [proc.pid for proc in processes],
+        allocator or "none",
+    )
     try:
         hub.wait_for_workers(processes)
     except RuntimeError:
@@ -4577,10 +4643,11 @@ def _frontend_worker_main(args, config, info, parent_pid) -> None:
         timeout_keep_alive=args.timeout_keep_alive,
     )
     logger.info(
-        "Front-end worker %d serving %s:%s",
+        "Front-end worker %d serving %s:%s on %s",
         info["index"],
         args.host,
         args.server_port,
+        _loaded_allocator(),
     )
     uvicorn.Server(uv_config).run(sockets=[listener])
 
