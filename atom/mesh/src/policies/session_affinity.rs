@@ -4,18 +4,13 @@
 //! [`LeastSessionsPolicy`], which reads the live session counts the table
 //! passes in. Later requests stay on that worker until the idle TTL expires,
 //! the worker is unusable or not a candidate (another DP rank under idx2idx), or
-//! a request of the session fails. A failure counts
-//! only for a request placed on the session's current binding, on the worker it
-//! was sent to after DP rank mapping. Under ATOM PD idx2idx rank mapping, a
-//! failed prefill also releases the decode binding, although the decode was
-//! never sent.
+//! a request of the session fails on its bound worker. Under ATOM PD idx2idx
+//! rank mapping, a failed prefill also releases the decode binding, although
+//! the decode was never sent.
 
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -54,17 +49,13 @@ impl WorkerIdentity {
 
 struct StickyAssignment {
     worker: WorkerIdentity,
-    /// Identifies this placement of the session. A request carries it from
-    /// selection to its dispatch and failure hooks, so a request placed before
-    /// the session moved cannot act on the new binding.
-    binding: u64,
     last_access: Instant,
     /// Where the session's last request was sent, after DP rank mapping.
     dispatched: Option<WorkerIdentity>,
     /// Why the session was last reassigned, until a request is sent.
     reassigned: Option<&'static str>,
-    /// A request of the session failed on the worker it was sent to, so the
-    /// next request, a retry included, is placed again.
+    /// A request of the session failed on its bound worker, so the next
+    /// request, a retry included, is placed again.
     failed: bool,
     /// Workers the session's requests failed on since its last hit. Placing
     /// it again leaves them out while another worker is healthy.
@@ -74,11 +65,10 @@ struct StickyAssignment {
 #[derive(Default)]
 pub(crate) struct SessionTable {
     assignments: DashMap<String, StickyAssignment>,
-    next_binding: AtomicU64,
 }
 
 impl SessionTable {
-    /// Bind `key` to `worker` and return the new binding. A rebound session
+    /// Bind `key` to `worker`. A rebound session
     /// keeps where its last request was sent, so the next dispatch can tell
     /// whether the worker changed.
     fn assign(
@@ -87,21 +77,18 @@ impl SessionTable {
         worker: WorkerIdentity,
         now: Instant,
         reassigned: Option<&'static str>,
-    ) -> u64 {
-        let binding = self.next_binding.fetch_add(1, Ordering::Relaxed);
+    ) {
         if let Some(mut entry) = self.assignments.get_mut(key) {
             entry.worker = worker;
-            entry.binding = binding;
             entry.last_access = now;
             entry.reassigned = reassigned;
             entry.failed = false;
-            return binding;
+            return;
         }
         self.assignments.insert(
             key.to_string(),
             StickyAssignment {
                 worker,
-                binding,
                 last_access: now,
                 dispatched: None,
                 reassigned,
@@ -109,15 +96,14 @@ impl SessionTable {
                 avoid: Vec::new(),
             },
         );
-        binding
     }
 
-    /// Release `key`'s binding after a request placed on `binding` failed on
-    /// `worker`. A request placed before the session moved keeps the new
-    /// binding, whenever it fails.
-    fn mark_failed(&self, key: &str, worker: &WorkerIdentity, binding: Option<u64>) {
+    /// Release `key`'s binding after a request failed on `worker`, if it is the
+    /// bound worker. A late failure on a worker the session has left keeps the
+    /// new binding.
+    fn mark_failed(&self, key: &str, worker: &WorkerIdentity) {
         if let Some(mut entry) = self.assignments.get_mut(key) {
-            if binding == Some(entry.binding) {
+            if entry.worker == *worker {
                 entry.failed = true;
                 if !entry.avoid.contains(worker) {
                     entry.avoid.push(worker.clone());
@@ -126,22 +112,13 @@ impl SessionTable {
         }
     }
 
-    /// Record where a request of `key` placed on `binding` was sent. Returns
+    /// Record where a request of `key` was sent. Returns
     /// why the session moved when this worker differs from the one its previous
     /// request was sent to.
-    fn record_dispatch(
-        &self,
-        key: &str,
-        worker: WorkerIdentity,
-        binding: Option<u64>,
-    ) -> Option<&'static str> {
+    fn record_dispatch(&self, key: &str, worker: WorkerIdentity) -> Option<&'static str> {
         let mut entry = self.assignments.get_mut(key)?;
-        // A request placed before the session moved does not move it back.
-        if binding != Some(entry.binding) {
-            return None;
-        }
-        // Without a reassignment, only rank mapping can move a pinned session: a
-        // request placed on an earlier binding returned above.
+        // Without a reassignment, rank mapping moved the pinned session, or another
+        // in-flight request of the session took the reassignment.
         let reason = entry
             .reassigned
             .take()
@@ -202,12 +179,6 @@ impl SessionAffinityPolicy {
         }
     }
 
-    /// The session's current binding.
-    #[cfg(test)]
-    pub(crate) fn binding(&self, key: &str) -> Option<u64> {
-        self.table.assignments.get(key).map(|entry| entry.binding)
-    }
-
     #[cfg(test)]
     pub(crate) fn set_last_access(&self, key: &str, when: Instant) {
         if let Some(mut entry) = self.table.assignments.get_mut(key) {
@@ -226,9 +197,7 @@ impl SessionAffinityPolicy {
 
     /// The bound worker serves the request when the session is not idle for
     /// too long, no request failed since it was placed, and the worker is
-    /// usable. A hit forgets the workers the session failed on. One entry
-    /// lock covers the check and the binding read, so a placement in between
-    /// cannot hand this request the new binding for the old worker.
+    /// usable. A hit forgets the workers the session failed on.
     fn hit(
         &self,
         key: &str,
@@ -242,11 +211,7 @@ impl SessionAffinityPolicy {
         let index = healthy_index(workers, &assignment.worker)?;
         assignment.last_access = now;
         assignment.avoid.clear();
-        let decision = RouteDecision {
-            binding: Some(assignment.binding),
-            ..RouteDecision::branch(AFFINITY_HIT)
-        };
-        Some((Some(index), decision))
+        Some((Some(index), RouteDecision::branch(AFFINITY_HIT)))
     }
 
     fn miss_result(&self, key: &str, now: Instant) -> &'static str {
@@ -277,7 +242,7 @@ impl SessionAffinityPolicy {
         workers: &[Arc<dyn Worker>],
         now: Instant,
         result: &'static str,
-    ) -> u64 {
+    ) {
         let reassigned = (result != AFFINITY_NEW).then_some(result);
         self.table.assign(
             key,
@@ -320,15 +285,11 @@ impl SessionAffinityPolicy {
             return (None, decision);
         };
         let result = self.miss_result(key, now);
-        let binding = self.record_placement(key, selected, workers, now, result);
+        self.record_placement(key, selected, workers, now, result);
         let decision = if self.inner.reports_session_result() {
             RouteDecision::branch(result)
         } else {
             decision
-        };
-        let decision = RouteDecision {
-            binding: Some(binding),
-            ..decision
         };
         (Some(selected), decision)
     }
@@ -401,38 +362,32 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
         pool: &'static str,
         headers: Option<&http::HeaderMap>,
         worker: &Arc<dyn Worker>,
-        binding: Option<u64>,
     ) {
-        self.inner.on_dispatch(pool, headers, worker, binding);
+        self.inner.on_dispatch(pool, headers, worker);
         let Some(key) = self.binding_key(headers) else {
             return;
         };
-        if let Some(reason) =
-            self.table
-                .record_dispatch(key, WorkerIdentity::from_worker(worker), binding)
+        if let Some(reason) = self
+            .table
+            .record_dispatch(key, WorkerIdentity::from_worker(worker))
         {
             MeshMetrics::record_session_worker_change(pool, reason);
         }
     }
 
-    /// A failed request placed on the session's current binding releases it:
-    /// the next request, a retry included, is placed again (`rebind`, or
-    /// `expired` after the idle timeout), away from every worker the session
-    /// failed on since its last hit while another one is healthy. The worker
-    /// avoided is the one the request was sent to, after DP rank mapping; under
-    /// ATOM PD idx2idx, a failed prefill also releases the decode binding,
-    /// although the decode was never sent. A request placed before the session
-    /// moved keeps the new binding, whenever it fails.
-    fn on_dispatch_failed(
-        &self,
-        headers: Option<&http::HeaderMap>,
-        worker: &Arc<dyn Worker>,
-        binding: Option<u64>,
-    ) {
-        self.inner.on_dispatch_failed(headers, worker, binding);
+    /// A failure on the session's bound worker releases the binding: the next
+    /// request, a retry included, is placed again (`rebind`, or `expired`
+    /// after the idle timeout), away from every worker the session failed on
+    /// since its last hit while another one is healthy. Under ATOM PD idx2idx,
+    /// a failed prefill also releases the decode binding, although the decode
+    /// was never sent. A late failure on a worker the session has left keeps
+    /// the new binding; one from an older placement on the worker the session
+    /// is bound to again releases it, at the cost of one extra rebind.
+    fn on_dispatch_failed(&self, headers: Option<&http::HeaderMap>, worker: &Arc<dyn Worker>) {
+        self.inner.on_dispatch_failed(headers, worker);
         if let Some(key) = self.binding_key(headers) {
             self.table
-                .mark_failed(key, &WorkerIdentity::from_worker(worker), binding);
+                .mark_failed(key, &WorkerIdentity::from_worker(worker));
         }
     }
 
