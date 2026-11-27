@@ -37,6 +37,15 @@ def _einops():
 
 with _einops(), atom_without_aiter() as _load:
     model = _load("atom.models.kimi_k3.model")
+    # `_prefill_kda` imports `gather_kda_inputs` from this package at call time.
+    _kimi_k3_ops = _load("atom.model_ops.kimi_k3")
+
+
+@pytest.fixture(autouse=True)
+def _kimi_k3_ops_importable(monkeypatch):
+    """The stand-in import above is dropped from ``sys.modules`` on exit; put
+    it back while a test runs so the call-time import resolves without AITER."""
+    monkeypatch.setitem(sys.modules, "atom.model_ops.kimi_k3", _kimi_k3_ops)
 
 
 @pytest.fixture
