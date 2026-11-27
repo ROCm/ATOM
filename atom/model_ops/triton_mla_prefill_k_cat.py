@@ -48,9 +48,10 @@ def _prefill_k_cat_kernel(
 # the kernel beats torch.cat at every size (1.3 vs 3.4 us at one token, 65 vs
 # 603 us at 10240 tokens x 128 heads), but a call costs about 9 us more host
 # time (13.3 vs 4.3 us). It saves more than that from 32768 token-heads
-# (16.6 us; 8.9 us at 16384), so it runs from there; below that, and on other
-# arches (not measured; on gfx9 one warp is a wave64), each call site keeps
-# what it did on main: torch.cat, or two copies with `copies=True`. Of head
+# (16.6 us; 8.9 us at 16384), so it runs from there; below that `cat_prefill_k`
+# does what the call site did on main: torch.cat, or two copies with
+# `copies=True`. Other arches are not measured (on gfx9 one warp is a wave64):
+# their call sites never call it (`kernel_arch`) and keep main's expression. Of head
 # blocks 4..64 and 1..4 warps, head block 16 with one warp was the fastest at
 # 10240 tokens.
 _PREFILL_K_CAT_ARCH = "gfx1250"
