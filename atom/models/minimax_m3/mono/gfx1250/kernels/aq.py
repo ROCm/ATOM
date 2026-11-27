@@ -172,11 +172,11 @@ def aq_xchg_wgs(niq: int, ql: int) -> int:
     return (niq * ql + 15) // 16 * 16
 
 
-def aq1_lds_bytes(cfg, ql: int, niq: int, ring: int) -> int:
+def aq1_lds_bytes(cfg, ql: int, niq: int, ring: int, groups: int = 2) -> int:
     tile_m, ns, ks, kw = cfg[0], cfg[1], cfg[2], cfg[3]
     astage = cfg[7]
     nqt = (niq * ql + 15) // 16
-    score = 2 * SC_WAVES * ring * SLOT + MAX_BLOCKS * 32 * 4 + nqt * 2 * 32 * QOP_LANE
+    score = groups * SC_WAVES * ring * SLOT + MAX_BLOCKS * 32 * 4 + nqt * 2 * 32 * QOP_LANE
     return max(chain_lds_bytes(tile_m, ns, ks, kw, astage), score)
 
 
@@ -202,7 +202,7 @@ def launch_aq1(
     n_score: Constexpr[int], tl: Constexpr[int] = 0, xchg: Constexpr[int] = 0, topk: Constexpr[int] = 16,
     init_blocks: Constexpr[int] = 0, local_keep: Constexpr[int] = 0, max_rows: Constexpr[int] = 64,
     local_max: Constexpr[int] = 1024, slot_keys: Constexpr[int] = 64, ipf_kib: Constexpr[int] = 0,
-    owner_fast: Constexpr[int] = 1, merge_par: Constexpr[int] = 0,
+    owner_fast: Constexpr[int] = 1, merge_par: Constexpr[int] = 0, sc_groups: Constexpr[int] = 2,
 ):  # fmt: skip
     cfg = (tile_m, ns, ks, kw, wm, wn, depth, astage, wcpol, 0)
     err = chain_config_error(tile_m, ns, ks, kw, wm, wn, depth, astage)
@@ -237,7 +237,10 @@ def launch_aq1(
     sa_loads = mbw // 2 if sa_opsel else mbw
     KB4 = K // 128
     per_thr = tile_m * CPR // block
-    lds_bytes = aq1_lds_bytes(cfg, ql, niq, ring)
+    assert sc_groups in (2, 3), "aq: the score role's compute groups (2: waves 0-3, 8-11; 3: all 12 waves)"
+    lds_bytes = aq1_lds_bytes(cfg, ql, niq, ring, sc_groups)
+    # the grid is co-resident at 2 workgroups a CU (320 KB of LDS a CU): its workgroups wait on each other
+    assert lds_bytes <= 160 * 1024, f"aq: {lds_bytes} B of LDS a workgroup (2 a CU need <= 160 KB)"
     P_ROW = cols * 4 + P_PAD
     P_PLANE = tile_m * P_ROW
     p_units = tile_m * cols // 4
@@ -253,7 +256,7 @@ def launch_aq1(
     nqt = (rows_s + 15) // 16
     assert 1 <= nqt <= 2 and ql <= 128 and 2 <= ring <= 8
     RING = ring
-    RING_BYTES = 2 * SC_WAVES * RING * SLOT  # two compute groups (waves 0-3, 8-11), a ring a wave
+    RING_BYTES = sc_groups * SC_WAVES * RING * SLOT  # compute groups of 4 waves, a ring a wave
     PART = MAX_BLOCKS * 32
     Q_LDS = RING_BYTES + PART * 4  # B operands [p][lane] x 64 B, p = 2 qt + hl
     JH = 4 // (SC_THREADS // (32 * nqt))
@@ -263,7 +266,7 @@ def launch_aq1(
         f"_d{depth}_c{wcpol}"
         f"_h{heads_i}_q{ql}_r{rank_cp}w{world}_g{ring}_s{n_score}{'_tl' if tl else ''}"
         f"{f'_x{topk}i{init_blocks}l{local_keep}m{max_rows}' if xchg else ''}{f'_pf{ipf_kib}' if ipf_kib else ''}{'' if owner_fast else '_ow0'}"
-        f"{'_mp' if merge_par else ''}"
+        f"{'_mp' if merge_par else ''}{f'_sg{sc_groups}' if sc_groups != 2 else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -663,11 +666,18 @@ def launch_aq1(
                     return p * (32 * QOP_LANE) + lane_ * QOP_LANE + ((k ^ ((lane_ >> 2) & 3)) * 16)
 
                 # compute group cg (waves 0-3: 0, waves 8-11: 1) scores blocks j = cg + 2 i; w4: the block quarter
-                cg = (wave >= 2 * SC_WAVES).select(fx.Int32(1), fx.Int32(0))
+                if const_expr(sc_groups == 3):
+                    # waves 4-7 (the idx-q converters) are compute group 1 once the q is in LDS
+                    cg = wave // SC_WAVES
+                else:
+                    cg = (wave >= 2 * SC_WAVES).select(fx.Int32(1), fx.Int32(0))
                 w4 = wave % SC_WAVES
                 rw = cg * SC_WAVES + w4
-                n_g = (nblk - cg + 1) // 2
-                computes = (wave < SC_WAVES) | (wave >= 2 * SC_WAVES)
+                n_g = (nblk - cg + (sc_groups - 1)) // sc_groups
+                if const_expr(sc_groups == 3):
+                    computes = wave >= zero
+                else:
+                    computes = (wave < SC_WAVES) | (wave >= 2 * SC_WAVES)
                 ring_wave = lds_idx + fx.Int64(rw * (RING * SLOT))
                 kd_base = fx.Int64(fx.ptrtoint(arg_ip))
                 ks_base = fx.Int64(fx.ptrtoint(arg_isc))
@@ -682,7 +692,7 @@ def launch_aq1(
                     return (j < 32).select(lo, hi)
 
                 def blk(i):
-                    return cg + 2 * i
+                    return cg + sc_groups * i
 
                 def issue(i):
                     """Async copies of the group's i-th block (this wave's quarter) into its ring slot i % RING."""

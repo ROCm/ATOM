@@ -38,6 +38,11 @@ N_SCORE_X = 112  # with the exchange: 368 QKV + 112 score + 32 exchange = 512 wo
 # previous depth, for the one-server A/B). LDS 124 KB a workgroup at 6, 2 a CU still fit
 RING = 6
 RING_AQ1 = 4  # AQ1 (no exchange) keeps its depth
+# the score role's compute groups: 3 = waves 4-7 (the idx-q converters) join waves 0-3 and 8-11 once the q is in LDS,
+# with RING_S3 key-ring slots a wave (3 groups x 4 waves x RING_S3 slots must stay <= 160 KB of LDS a workgroup);
+# 2 = the previous split (RING), for the one-server A/B
+SC_GROUPS = 3
+RING_S3 = 4
 MAXIT = 20_000_000
 _SCRATCH: dict = {}
 
@@ -154,11 +159,11 @@ def flydsl_aq1(
     eps_bits = struct.unpack("<i", struct.pack("<f", float(eps)))[0]
     stream = torch.cuda.current_stream(x.device)
     spec = (tile_m, ns, ks, kw, wm, wn, depth, niq, astage, wcpol, max_query_len, int(rank), int(world),
-            RING if xchg else RING_AQ1, n_score,
+            (RING_S3 if SC_GROUPS == 3 else RING) if xchg else RING_AQ1, n_score,
             int(timeline is not None), int(xchg),
             *((exchange["topk"], exchange["init_blocks"], exchange["local_keep"], exchange["max_rows"], LOCAL_MAX,
                exchange["slot_keys"]) if xchg else (16, 0, 0, 64, LOCAL_MAX, 64)), IPF_KIB if xchg else 0,
-            OWNER_FAST, int(MERGE_PAR) if xchg else 0)
+            OWNER_FAST, int(MERGE_PAR) if xchg else 0, int(SC_GROUPS) if xchg else 2)
     _run_compiled(
         launch_aq1,
         ptr_arg(x), ptr_arg(x_scale), ptr_arg(w), ptr_arg(w_scale), ptr_arg(slab),
