@@ -41,9 +41,10 @@ class WritingAuxExtract(Protocol):
     copies nothing). It may be called without it, and must then return a new
     tensor as a plain extract does.
 
-    Level 0 only: the hook offers ``out_for`` in an eager forward. A traced
-    forward (``--level`` above 0) calls the extract without it and keeps the
-    hook's copy into the capture buffer."""
+    Level 0 only: the hook offers ``out_for`` in an eager forward on a slice
+    of tokens. A traced forward (``--level`` above 0) and a TBO micro-batch
+    with a packed token order (``ubatch_token_order``) call the extract
+    without it and keep the hook's copy into the capture buffer."""
 
     def __call__(
         self,
@@ -201,8 +202,10 @@ def _aux_hook(
     micro-batch's packed positions), on target forwards only. With ``dest``
     (``dest(tokens)`` -> the destination rows) an ``extract`` that writes into
     a destination is offered the contiguous rows of a slice -- in an eager
-    forward only (level 0): under ``torch.compiler.is_compiling()`` it is
-    called without them and ``write`` copies as for any other spec."""
+    forward only (level 0), and not to a TBO micro-batch with a packed token
+    order (``ubatch_token_order``): there, and under
+    ``torch.compiler.is_compiling()``, it is called without them and
+    ``write`` copies as for any other spec."""
 
     def _hook(module, _inputs, output):
         ctx = get_forward_context().context
@@ -211,12 +214,14 @@ def _aux_hook(
         # rows with noise-token embeddings.
         if ctx.is_draft:
             return
+        # One read: the rows offered to the extract and the rows written below
+        # come from the same offset.
+        offset = ctx.ubatch_token_offset
         if (
             dest is not None
             and ctx.ubatch_token_order is None
             and not torch.compiler.is_compiling()
         ):
-            offset = ctx.ubatch_token_offset
             tensor = extract(
                 output, module, out_for=lambda n: dest(slice(offset, offset + n))
             )
@@ -229,7 +234,6 @@ def _aux_hook(
         # each other.
         tokens = ctx.ubatch_token_order
         if tokens is None:
-            offset = ctx.ubatch_token_offset
             tokens = slice(offset, offset + tensor.shape[0])
         write(tensor, tokens)
 

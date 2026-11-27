@@ -192,7 +192,7 @@ def test_post_reduce_writes_the_given_rows():
 
 @pytest.mark.parametrize(
     "bad",
-    ["short", "dtype", "strided"],
+    ["short", "dtype", "strided", "device"],
 )
 def test_post_reduce_refuses_an_out_it_cannot_write(bad):
     """An unusable destination raises instead of being swapped for a new
@@ -204,6 +204,7 @@ def test_post_reduce_refuses_an_out_it_cannot_write(bad):
         "short": buffer.view(-1)[: 4 * 2048].view(4, 2048),
         "dtype": buffer[:9, :2048].float(),
         "strided": buffer[:9, :2048],
+        "device": torch.empty(9, 2048, dtype=torch.bfloat16),
     }[bad]
     with pytest.raises(ValueError, match="out must be"):
         mhc.post_reduce_streams(pending, residual, post, comb, out=out)

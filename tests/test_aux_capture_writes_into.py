@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Aux taps whose `extract` writes the capture buffer's rows itself
 (`AuxCaptureSpec.writes_into`): the hook offers the rows, and copies nothing
 when they come back."""

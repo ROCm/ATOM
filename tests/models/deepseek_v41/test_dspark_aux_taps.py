@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """V4.1 DSpark input taps write the drafter's capture rows themselves
 (`AuxCaptureSpec.writes_into`): the fused post + mean lands in the buffer, and
 the hook has nothing left to copy."""

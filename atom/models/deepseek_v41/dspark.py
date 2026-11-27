@@ -396,7 +396,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         hidden = state.residual.shape[-1]
         out = None
         if out_for is not None:
-            out = out_for(state.residual.numel() // (state.residual.shape[-2] * hidden))
+            out = out_for(state.residual.shape[:-2].numel())
         return state.stream_mean(out=out).reshape(-1, hidden)
 
     def project_context(self, taps):
