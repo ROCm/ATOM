@@ -36,6 +36,7 @@ def _reset_sequence_counter():
 
 def _make_processor() -> InputOutputProcessor:
     proc = InputOutputProcessor.__new__(InputOutputProcessor)
+    proc._greedy_ids_only = False
     proc.config = MagicMock()
     proc.config.enable_rapidserve = False
     proc.config.kv_transfer_config = None

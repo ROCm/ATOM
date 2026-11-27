@@ -80,6 +80,8 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
     monkeypatch.setattr(pp_engine_core, "time", timer)
     proc = SimpleNamespace(
         _report_backlog=False,
+        _idle_when_blocked=False,
+        _dp_group_hidden_work=False,
         label="test",
         utility_queue=None,
         kv_transfer_enabled=False,
@@ -88,7 +90,11 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
         _report_held_kv_work=lambda: None,
         _drain_kv_work_at_exit=lambda: None,
         pull_and_process_input_queue=lambda: now[0] >= 2 * interval,
-        _sync_dp_state=lambda unfinished, shutdown, offloaded: (False, shutdown, True),
+        _sync_dp_state=lambda unfinished, shutdown, offloaded, hidden=False: (
+            False,
+            shutdown,
+            True,
+        ),
         _validate_dp_sync_interval=lambda interval: interval,
         runner_mgr=SimpleNamespace(call_func=lambda *args, **kwargs: None),
         scheduler=SimpleNamespace(
