@@ -9,8 +9,13 @@ on two MI455X trays in one UALink vPOD:
 This recipe replaces P's LMCache CPU tier with MORI-UMBP: the `umbp_store` connector over one UMBP standalone server
 per tray. Everything else is unchanged: the kit (`/app/m31_pd_recipe`), the P/D flags, D and the router.
 
-Status: CPU-tested only (`tests/test_umbp_store_*.py`). GPU validation is pending; see the checks in section 5. Tracking:
-LLM-Booster #816.
+On branch `zejun/m31-pd-umbp-pool` it can also hand the paged HBM pools to UMBP (`umbp_pool`, the L1): section 7.
+
+Status:
+- `umbp_store`: CPU-tested (`tests/test_umbp_store_*.py`); on GPU, check V1 passed (section 5), and V2 and A1 are
+  pending. Tracking: LLM-Booster #826.
+- `umbp_pool`: CPU-tested (`tests/test_umbp_pool_*.py`, `tests/test_umbp_l1_pool.py`); not run on GPU yet. Tracking:
+  LLM-Booster #827.
 
 ## 1. What runs
 
@@ -36,7 +41,13 @@ docker build -t <you>/m31-pd-umbp:<date> .     # needs network: apt (gRPC), gith
 The Dockerfile starts from the v2 image and changes three things:
 - **mori**: rebuilds the image's own mori c5bdc391 with `BUILD_UMBP=ON`, plus six UMBP-only fixes (#929, #1049, #1048,
   #1086, #1023, #941). The MORI-IO and EP code is unchanged, so the fabric P/D and D's MegaMoE are what v2 ran.
-- **ATOM**: checks out this branch (`zejun/m31-pd-umbp-store`).
+- **mori, L1**: adds UMBP's L1 service and its Python client (`mori_umbp_l1`) for `umbp_pool`:
+  - #1045, #1082 and #1089 from main;
+  - #1102 (draft: multi-part pools, one part per GPU of an engine), vendored at c93838be
+    (`mori-pr1102-c93838be.patch`).
+
+  All under `src/umbp`. The L1 service runs inside the same `umbp_standalone_server`.
+- **ATOM**: checks out this branch (`zejun/m31-pd-umbp-pool`).
 - **kit**: applies `kit.patch` to `/app/m31_pd_recipe/kit`.
 
 Do not add mori#1050 / #1078. They make a lookup lease the keys it finds instead of renewing them, so a conversation's
@@ -138,6 +149,54 @@ What to read:
 - **No `ATOM_M3_INDEX_SHARD`.** A sharded index region does not fit the store's fixed-size chunks. P at TP1 has no
   index shard anyway.
 - **Not covered here:**
-  - `umbp_pool` (UMBP-owned HBM pools shared across DP ranks; ROCm/ATOM#3886 refuses PP);
   - the D tray's DRAM over UALink (mori#1024);
   - an SSD tier.
+  - `umbp_pool` has its own section (7).
+
+## 7. `umbp_pool` (L1): `PD_UMBP_POOL=1`
+
+`umbp_pool` hands each half's paged HBM pool to UMBP. The UMBP server keeps the free list, the content index and the
+eviction order of the pool, and copies a prefix one engine rank lacks from another rank's pool on the same server
+(HBM to HBM).
+
+| | P | D |
+|---|---|---|
+| Connector | `multi[moriio producer, umbp_pool]`, plus `umbp_store` (eager) with `PD_UMBP_GB` | `multi[moriio consumer, umbp_pool]` |
+| Pool | one pool of 4 parts, one per PP stage; the head's scheduler owns it | 4 pools, one per DP rank |
+| Shares with | nobody: the PP4 engine fills the tray, so the server has no other pool | the other DP ranks |
+| UMBP server | in the P container, DRAM tier `PD_UMBP_GB` (or `UMBP_POOL_DRAM_GB`) | in the D container, DRAM tier `UMBP_POOL_DRAM_GB` (1) |
+
+On 1P1D M3.1 this is a functional bring-up: P has no peer pool, and D gains only a shorter P→D push.
+
+```bash
+# either half, through fab_up.sh (on top of section 4's flow)
+PD_UMBP_POOL=1 ./fab_up.sh p <tag> <conc>                  # P: producer + umbp_pool
+PD_UMBP_POOL=1 PD_UMBP_GB=640 ./fab_up.sh p <tag> <conc>   # P: producer + umbp_pool + umbp_store (eager)
+PD_UMBP_POOL=1 ./fab_up.sh d <tag> <conc>                  # D: consumer + umbp_pool, incremental push
+```
+
+| Knob | Default | What |
+|---|---|---|
+| `UMBP_POOL_INCREMENTAL` | 1 | D's `ATOM_MORIIO_INCREMENTAL_PUSH`.<br>1: a prefix D holds, or copies in from another DP rank, is not pushed again.<br>0: every receive writes the whole block table, and such a request takes no prefix hit from the shared pool. |
+| `UMBP_POOL_DRAM_GB` | 1 | The server's DRAM tier when only the L1 runs. |
+| `UMBP_L1_GATHER_COPY` | 0 | Server side. This mori's copy engine gathers host ↔ device only, so 0 batches the GPU-to-GPU copies as `hipMemcpyAsync`. |
+
+**Checks, in order:**
+1. **The pool can be adopted.** MoRIIO fabric allocates each pool in fabric (VMM) memory. UMBP adopts it through a HIP
+   IPC handle (`adopt_exportable_pool`), and whether gfx1250 gives one for that memory is unverified.
+   - Success: every stage of P, and every DP rank of D, logs `UMBP pool atom:dp<r> part <p> of <n>: adopted ...`.
+   - Failure: startup stops with `no HIP IPC handle ... cannot adopt it (it was allocated in exportable memory by a P/D
+     connector ...)`. The pool then has to be allocated by UMBP in fabric memory instead (mori#1074 + ATOM#3828,
+     single-part today).
+2. **P/D correctness.** Section 5's V2 verify (`bad=0`) and GSM8K, with the pool on both halves.
+3. **D-side sharing.** With DP4 sessions spread over D's ranks, D logs `UMBP pool ...: fetched <k> of <n> blocks from
+   peer pools`, and P's push skips those blocks (MoRIIO's push statistics).
+
+**Limits:**
+- **`umbp_store` beside `umbp_pool` is eager only.** Lazy is refused at startup: it saves the blocks ATOM's pool is
+  about to evict, and UMBP chooses those now.
+- **`share_ratio` 1 only on M3 / M3.1.** Whole-block copies for MHA, which a split pool needs, are not implemented.
+- **No `ATOM_M3_INDEX_SHARD`.** UMBP grants the block ids, so they cannot be kept in lanes.
+- **No cross-tray L1.** A PP pool's parts must all be on one server: P = PP8 across two trays (Kimi-K3.1) needs more
+  work.
+

@@ -1,6 +1,6 @@
 diff -ruN a/down.sh b/down.sh
---- kit/down.sh	2026-11-26 12:35:41.529983712 +0000
-+++ kit/down.sh	2026-11-26 12:35:41.538467436 +0000
+--- kit/down.sh	2026-11-27 08:07:09.292217575 +0000
++++ kit/down.sh	2026-11-27 08:07:09.436997912 +0000
 @@ -10,5 +10,7 @@
    sleep 5
  done
@@ -10,9 +10,9 @@ diff -ruN a/down.sh b/down.sh
  sleep 10
  echo "server in $CONTAINER stopped"
 diff -ruN a/fab_env.sh b/fab_env.sh
---- kit/fab_env.sh	2026-11-26 12:35:41.529994762 +0000
-+++ kit/fab_env.sh	2026-11-26 12:35:41.538432776 +0000
-@@ -15,4 +15,8 @@
+--- kit/fab_env.sh	2026-11-27 08:07:09.292377934 +0000
++++ kit/fab_env.sh	2026-11-27 08:07:31.196418318 +0000
+@@ -15,4 +15,16 @@
  # replacing the multi pd_up.sh builds (that one has no moriio_backend). Pending a CPU check of the combination.
  P_KV_LMC='{"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"moriio","moriio_backend":"fabric","moriio_mode":"write","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}'
  # The same with LMCache's lazy (complement) save policy (branch m31-fabric-lazy; LMCACHE_CHUNK_SIZE must be 128 = the block).
@@ -20,11 +20,19 @@ diff -ruN a/fab_env.sh b/fab_env.sh
 +# in one multi connector, umbp_store putting a block to this tray's UMBP server when HBM is about to evict it (lazy,
 +# chunk = the 128-token block). The server runs in the P container (umbp_server.sh, started by pd_up.sh).
 +P_KV_UMBP='{"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"moriio","moriio_backend":"fabric","moriio_mode":"write","handshake_port":6301},{"kv_connector":"umbp_store","kv_role":"offload","kv_connector_extra_config":{"umbp_store.address":"unix:///tmp/umbp/server.sock","umbp_store.chunk_tokens":128,"umbp_store.save_policy":"lazy","umbp_store.lookup_threads":1}}]}'
++# umbp_pool (PD_UMBP_POOL=1; ROCm/ATOM zejun/m31-pd-umbp-pool): UMBP manages this half's paged HBM pool (L1) on the
++# tray's UMBP server, adopting the pool MoRIIO fabric allocates (adopt_exportable_pool). P: beside the producer, plus
++# umbp_store when PD_UMBP_GB gives the server a DRAM tier (eager: lazy needs ATOM to choose the evictions, which UMBP
++# chooses now). D: beside the consumer.
++UMBP_POOL_SUB='{"kv_connector":"umbp_pool","kv_connector_extra_config":{"address":"unix:///tmp/umbp/server.sock","adopt_exportable_pool":true}}'
++P_KV_POOL='{"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"moriio","moriio_backend":"fabric","moriio_mode":"write","handshake_port":6301},'"$UMBP_POOL_SUB"']}'
++P_KV_POOL_STORE='{"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"moriio","moriio_backend":"fabric","moriio_mode":"write","handshake_port":6301},'"$UMBP_POOL_SUB"',{"kv_connector":"umbp_store","kv_role":"offload","kv_connector_extra_config":{"umbp_store.address":"unix:///tmp/umbp/server.sock","umbp_store.chunk_tokens":128,"umbp_store.save_policy":"eager","umbp_store.lookup_threads":1}}]}'
++D_KV_POOL='{"kv_connector":"multi","connectors":[{"kv_role":"kv_consumer","kv_connector":"moriio","moriio_backend":"fabric","moriio_mode":"write","handshake_port":6301},'"$UMBP_POOL_SUB"']}'
  P_KV_LAZY='{"kv_connector":"multi","connectors":[{"kv_role":"kv_producer","kv_connector":"moriio","moriio_backend":"fabric","moriio_mode":"write","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload","save_policy":"lazy"}]}'
 diff -ruN a/fab_up.sh b/fab_up.sh
---- kit/fab_up.sh	2026-11-26 12:35:41.530009282 +0000
-+++ kit/fab_up.sh	2026-11-26 12:35:41.538443686 +0000
-@@ -8,6 +8,16 @@
+--- kit/fab_up.sh	2026-11-27 08:07:09.292603074 +0000
++++ kit/fab_up.sh	2026-11-27 08:07:31.196441358 +0000
+@@ -8,6 +8,27 @@
  CHUNK=${LMC_CHUNK:-}
  if [ "$R" = p ] && [ "${LAZY:-0}" = 1 ] && [ -n "${PD_LMCACHE_GB:-}" ]; then KV=$P_KV_LAZY; CHUNK=${CHUNK:-128}; fi
  [ "$R" = p ] && [ -n "$CHUNK" ] && MORE="${MORE:+$MORE }LMCACHE_CHUNK_SIZE=$CHUNK"
@@ -38,34 +46,50 @@ diff -ruN a/fab_up.sh b/fab_up.sh
 +  MORE="$MORE ATOM_OFFLOAD_MISS_ACCOUNTING=${UMBP_MISS_ACCOUNTING:-1}"
 +  export PD_UMBP_GB
 +fi
++# PD_UMBP_POOL=1 (either half): umbp_pool, UMBP managing the paged HBM pool, on this tray's UMBP server (fab_env.sh).
++# P adds umbp_store, eager, when PD_UMBP_GB is set. On D, ATOM_MORIIO_INCREMENTAL_PUSH=${UMBP_POOL_INCREMENTAL:-1}: a
++# prefix D holds, or copies in from another DP rank, shortens P's push; 0 has every receive written whole, which then
++# takes no prefix hit from the shared pool.
++if [ "${PD_UMBP_POOL:-0}" = 1 ]; then
++  case $R in
++    p) KV=$P_KV_POOL; [ -n "${PD_UMBP_GB:-}" ] && KV=$P_KV_POOL_STORE ;;
++    d) KV=$D_KV_POOL; MORE="${MORE:+$MORE }ATOM_MORIIO_INCREMENTAL_PUSH=${UMBP_POOL_INCREMENTAL:-1}" ;;
++  esac
++  export PD_UMBP_POOL
++fi
  # AL: the forced DSpark acceptance length of the performance runs (pd_run.sh's perf<N>); AL=0 serves at the real one.
  AL=${AL:-4.04}
  # XARGS: more server arguments for this half (e.g. D's --stream-interval 20).
 diff -ruN a/pd_up.sh b/pd_up.sh
---- kit/pd_up.sh	2026-11-26 12:35:41.530098722 +0000
-+++ kit/pd_up.sh	2026-11-26 12:35:41.538457496 +0000
-@@ -51,6 +51,18 @@
+--- kit/pd_up.sh	2026-11-27 08:07:09.293314721 +0000
++++ kit/pd_up.sh	2026-11-27 08:07:31.196466157 +0000
+@@ -51,6 +51,23 @@
    [ "$have" -ge "$need" ] || { say "LMCACHE_GB=$LMCACHE_GB needs ${need} GiB of host memory, ${have} GiB available"; exit 1; }
  fi
  ./prep_container.sh > /dev/null || exit 1
-+if [ "$ROLE" = p ] && [ -n "${PD_UMBP_GB:-}" ]; then
-+  # The UMBP standalone server umbp_store reaches, in this container (one PID namespace with the workers) on the same
-+  # GPUs: its DRAM tier plus 5% and 16 GiB of headroom must be available.
-+  need=$((PD_UMBP_GB * 105 / 100 + 16))
++umbp_gb=
++[ "$ROLE" = p ] && [ -n "${PD_UMBP_GB:-}" ] && umbp_gb=$PD_UMBP_GB
++# umbp_pool's L1 service runs in the same server; alone it needs no DRAM tier to speak of (UMBP_POOL_DRAM_GB, 1).
++[ -z "$umbp_gb" ] && [ "${PD_UMBP_POOL:-0}" = 1 ] && umbp_gb=${UMBP_POOL_DRAM_GB:-1}
++if [ -n "$umbp_gb" ]; then
++  # The UMBP standalone server umbp_store and umbp_pool reach, in this container (one PID namespace with the workers)
++  # on the same GPUs: its DRAM tier plus 5% and 16 GiB of headroom must be available.
++  need=$((umbp_gb * 105 / 100 + 16))
 +  have=$(awk '/^MemAvailable:/ {print int($2 / 1048576)}' /proc/meminfo)
-+  [ "$have" -ge "$need" ] || { say "PD_UMBP_GB=$PD_UMBP_GB needs ${need} GiB of host memory, ${have} GiB available"; exit 1; }
++  [ "$have" -ge "$need" ] || { say "a UMBP DRAM tier of $umbp_gb GiB needs ${need} GiB of host memory, ${have} GiB available"; exit 1; }
 +  mkdir -p "$WORK/logs/$TAG"
-+  docker exec -e UMBP_GB="$PD_UMBP_GB" -e GPUS="$GPUS" -e UMBP_HUGEPAGES="${UMBP_HUGEPAGES:-0}" \
++  docker exec -e UMBP_GB="$umbp_gb" -e GPUS="$GPUS" -e UMBP_HUGEPAGES="${UMBP_HUGEPAGES:-0}" \
++    -e UMBP_L1_GATHER_COPY="${UMBP_L1_GATHER_COPY:-0}" \
 +    "$CONTAINER" bash /kit/umbp_server.sh "/logs/$TAG/umbp-server.log" \
 +    || { say "the UMBP server did not start: $WORK/logs/$TAG/umbp-server.log"; exit 1; }
-+  say "UMBP server up (${PD_UMBP_GB} GiB DRAM): $WORK/logs/$TAG/umbp-server.log"
++  say "UMBP server up (${umbp_gb} GiB DRAM${PD_UMBP_POOL:+, L1 for umbp_pool}): $WORK/logs/$TAG/umbp-server.log"
 +fi
  mkdir -p "$WORK/logs/$TAG"
  if [ "$KV_CONNECTOR" = mooncake ]; then
    # As ATOM's K3 / M3 PD recipes, plus ib_device: Mooncake would pick ionic_<GPU index>, and only ionic_0 is up here.
 diff -ruN a/prep_container.sh b/prep_container.sh
---- kit/prep_container.sh	2026-11-26 12:35:41.530128062 +0000
-+++ kit/prep_container.sh	2026-11-26 12:35:41.538477476 +0000
+--- kit/prep_container.sh	2026-11-27 08:07:09.293540120 +0000
++++ kit/prep_container.sh	2026-11-27 08:07:09.437071342 +0000
 @@ -28,7 +28,7 @@
    docker run -d --name "$CONTAINER" --network host --ipc host --group-add video --cap-add SYS_PTRACE \
      --security-opt seccomp=unconfined --security-opt label=disable \
@@ -77,12 +101,13 @@ diff -ruN a/prep_container.sh b/prep_container.sh
      -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e HF_DATASETS_OFFLINE=1 \
 diff -ruN a/umbp_server.sh b/umbp_server.sh
 --- kit/umbp_server.sh	1970-01-01 00:00:00.000000000 +0000
-+++ kit/umbp_server.sh	2026-11-26 12:35:41.540914711 +0000
-@@ -0,0 +1,51 @@
++++ kit/umbp_server.sh	2026-11-27 08:07:51.534784232 +0000
+@@ -0,0 +1,55 @@
 +#!/bin/bash
-+# umbp_server.sh <log> (in the prefill container): start this tray's MORI-UMBP standalone server with a DRAM tier for
-+# umbp_store, and return once it serves. ATOM's prefill (all PP stages) connects to it at unix://$UMBP_SOCK.
-+# The server and the ATOM workers must share this container (one PID namespace) and its GPU list.
++# umbp_server.sh <log> (in the prefill or decode container): start this tray's MORI-UMBP standalone server, with a
++# DRAM tier for umbp_store and the L1 service umbp_pool uses, and return once it serves. ATOM's workers (all PP stages,
++# or all DP ranks) connect to it at unix://$UMBP_SOCK. The server and the ATOM workers must share this container (one
++# PID namespace) and its GPU list.
 +# Env: UMBP_GB (DRAM tier in GiB, required), UMBP_SOCK (/tmp/umbp/server.sock), GPUS (ROCR_VISIBLE_DEVICES, as the
 +#   server's; empty = all), UMBP_NUMA (0,1: NUMA nodes the DRAM tier spreads over), UMBP_HUGEPAGES (0; 1 = 2 MiB
 +#   pages, reserved beforehand on the host), UMBP_METRICS_PORT (9092; Prometheus), UMBP_READY_S (900).
@@ -106,6 +131,9 @@ diff -ruN a/umbp_server.sh b/umbp_server.sh
 +  MORI_UMBP_LOG_LEVEL=INFO
 +  # Transfer buffers off the mmap path (what ROCm/mori#1048 does in code), for a mori without it.
 +  MALLOC_MMAP_THRESHOLD_=33554432 MALLOC_TRIM_THRESHOLD_=1073741824 MALLOC_TOP_PAD_=268435456
++  # umbp_pool's L1 copies between engine ranks' HBM: this mori's copy engine gathers host <-> device only, so a GPU-to-GPU
++  # gather would be one blocking hipMemcpy a fragment; 0 batches them as hipMemcpyAsync on a stream per device.
++  UMBP_L1_GATHER_COPY="${UMBP_L1_GATHER_COPY:-0}"
 +)
 +[ -n "${GPUS:-}" ] && env_args+=(ROCR_VISIBLE_DEVICES="$GPUS")
 +echo "$(date '+%F %T') umbp_standalone_server unix://$SOCK ${env_args[*]}" > "$LOG"
