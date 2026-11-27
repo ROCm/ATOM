@@ -999,6 +999,180 @@ models:
       model_type: local-completions
       endpoint: completions
 
+  GLM-5.3-Quark-MXFP4-AttnFP8:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/GLM-5.3-Quark-MXFP4-AttnFP8"
+    precision: MXFP4
+    env:
+      common:
+        AITER_QUICK_REDUCE_QUANTIZATION: INT4
+        AITER_USE_FLYDSL_MOE_SORTING: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
+      prefill: {}
+      decode:
+        DECODE_KV_TRANSFER_CONFIG: >-
+          {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 16
+        enable_prefix_caching: false
+        gpu_memory_utilization: 0.8
+        max_num_seqs: 256
+        max_num_batched_tokens: 16384
+        max_model_len: 16384
+        extra_args: '--default-chat-template-kwargs {"enable_thinking":false}'
+    suites:
+      nightly:
+        - name: glm-53-mxfp4-1p1d-tp4
+          topology: 1p1d
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+          env:
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [65]
+
+        - name: glm-53-mxfp4-1p1d-tp8
+          topology: 1p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [65]
+
+      accuracy:
+        - name: glm-53-mxfp4-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          display_topology: 1P1D-TP8-MORIIO
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            workers: 1
+            tp: 8
+            extra_args: "--enforce-eager"
+          decode:
+            workers: 1
+            tp: 8
+          server:
+            common_args:
+              gpu_memory_utilization: 0.8
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+            decode:
+              DECODE_KV_TRANSFER_CONFIG: ""
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+
+        - name: glm-53-mxfp4-1p1d-dpa8-ep8-ll-moriio-gsm8k
+          topology: 1p1d_dpa8_ep8_ll_moriio
+          display_topology: 1P1D-DPA8-EP8-LL-MORIIO
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel --enforce-eager --all2all-backend high-throughput"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel --enforce-eager --all2all-backend low-latency"
+          server:
+            common_args:
+              max_num_batched_tokens: 16384
+              gpu_memory_utilization: 0.8
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+              MORI_SHMEM_HEAP_SIZE: 16G
+              HSA_NO_SCRATCH_RECLAIM: "1"
+            decode:
+              DECODE_KV_TRANSFER_CONFIG: ""
+              ATOM_MORI_V1_LL: "1"
+          benchmark:
+            wait_server_timeout: 7200
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+
+        - name: glm-53-mxfp4-2p1d-ep16p-ep8d-ll-moriio-gsm8k
+          topology: 2p1d_ep16p_ep8d_ll_moriio
+          display_topology: 2P1D-EP16P-EP8D-LL-MORIIO
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel --enforce-eager --all2all-backend high-throughput -dp 2 --data-parallel-size-local 1"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel --enforce-eager --all2all-backend low-latency"
+          server:
+            common_args:
+              max_num_batched_tokens: 16384
+              gpu_memory_utilization: 0.8
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+              MORI_SHMEM_HEAP_SIZE: 16G
+              HSA_NO_SCRATCH_RECLAIM: "1"
+            decode:
+              DECODE_KV_TRANSFER_CONFIG: ""
+              ATOM_MORI_V1_LL: "1"
+          benchmark:
+            wait_server_timeout: 7200
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+
+    accuracy:
+      task: gsm8k
+      fewshot: 3
+      limit: null
+
   Kimi-K3-MXFP4:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
