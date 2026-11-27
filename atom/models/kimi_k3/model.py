@@ -1433,9 +1433,9 @@ class KimiKDAAttention(nn.Module):
         nlh = self.num_local_heads
         hd = self.head_dim
         if (
-            self._split_in_proj
-            and kda_metadata.num_prefills > 0
+            kda_metadata.num_prefills > 0
             and num_actual_tokens >= _KDA_IN_PROJ_SPLIT_MIN_TOKENS
+            and self._split_in_proj
             and hidden_states.dtype == torch.bfloat16
             and hidden_states_scale is None
             and hidden_states.is_contiguous()
