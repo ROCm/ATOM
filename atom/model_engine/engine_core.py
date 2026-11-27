@@ -91,11 +91,11 @@ def send_early_handoff_answers(core) -> None:
     """ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE: tell each early request's front end
     that the step just scheduled scheduled it (or sent it to wait for D), so
     it answers the router now. Queued ahead of the step's forward."""
-    take = getattr(
-        getattr(core.scheduler, "kv_connector", None), "take_early_answers", None
-    )
-    answers = take() if callable(take) else None
-    if not isinstance(answers, list) or not answers:
+    kv_connector = core.scheduler.kv_connector
+    if kv_connector is None:
+        return
+    answers = kv_connector.take_early_answers()
+    if not answers:
         return
     core.output_queue.put_nowait(
         (
@@ -1337,6 +1337,10 @@ class DPEngineCoreProc(EngineCore):
                     # CPU tier) instead of staying COPYING with their pins
                     # (`BlockManager.complete_previous_checkpoint_batch`).
                     self.scheduler.block_manager.complete_previous_checkpoint_batch()
+                    # The vote's admission probe (`has_forward_work`) may have
+                    # sent an early request to wait for D: answer it now, or
+                    # with every rank idle P waits on D while D waits on P.
+                    send_early_handoff_answers(self)
                     blocked = idle_when_blocked and bool(self.scheduler.waiting)
                     if self.has_pending_kv_work() or blocked:
                         # Local RPCs only. Anything that reaches schedule()

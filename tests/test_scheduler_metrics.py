@@ -418,6 +418,7 @@ def test_pd_consumer_counts_its_own_prefix_once_after_transfer(
         is_producer=False,
         is_offload=False,
         build_connector_meta=lambda: None,
+        take_sources_to_abort=list,
     )
     bm = scheduler.block_manager
     if dcp > 1:
@@ -476,6 +477,7 @@ def test_failed_pd_transfer_does_not_record_successful_cache_admission():
         build_connector_meta=lambda: None,
         get_num_new_matched_tokens=lambda seq: (0, False),
         update_state_after_alloc=lambda seq: None,
+        take_sources_to_abort=list,
     )
     seq = Sequence(
         list(range(100, 116)), block_size=4, kv_transfer_params={"first_token_id": 999}
@@ -520,6 +522,7 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
         schedule=lambda: next(proposals),
         take_rejected=list,
         mark_pp_inflight=lambda _: None,
+        kv_connector=None,
     )
     proc.runner_mgr = SimpleNamespace(
         call_func=lambda name, *a, **k: dispatched.append(name)

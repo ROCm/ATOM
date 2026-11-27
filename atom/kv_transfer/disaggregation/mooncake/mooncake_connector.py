@@ -511,9 +511,16 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                     "ATOM_PD_EARLY_HANDOFF_SPECULATIVE needs a sized KV pool "
                     f"(num_kvcache_blocks={self._pool_pages})"
                 )
+        # The pool is refined to the allocator's usable pages, and the live
+        # state slots are learned, in `bind_block_manager`. Until then (None)
+        # a request with a per-request state slot keeps the gate.
+        self._state_slots: int | None = None
+        self._state_slots_per_req = 1
         # Early sources allocated before D's report, str(request id) -> pages.
         # Keyed like `_awaiting_send`: `send_finished` may name either form.
         self._spec_pins: dict[str, int] = {}
+        # Those of them holding a per-request state slot (`has_per_req_cache`).
+        self._spec_state_pins: set[str] = set()
         # Early sources allocated before D's report, str(request id) -> the
         # sequence, so a failed report (the worker retired the transfer: D was
         # told it failed) stops the prefill instead of computing for nobody.
@@ -751,6 +758,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # Allocated before D's report: its pages wait on D until D reaches
             # P or the source is released.
             self._spec_pins[str(seq.id)] = len(seq.block_table)
+            if seq.has_per_req_cache:
+                self._spec_state_pins.add(str(seq.id))
             self._early_sources[str(seq.id)] = seq
         if self.is_producer and params.get("pd_early_handoff"):
             self._answer_early(seq)
@@ -1093,9 +1102,34 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def _unpin(self, req_id) -> None:
         if self._speculative:
             self._spec_pins.pop(str(req_id), None)
+            self._spec_state_pins.discard(str(req_id))
+
+    def bind_block_manager(self, block_manager: Any) -> None:
+        """Bound the rule by what the allocator can actually hand out: its
+        usable pages (a checkpoint-enabled pool reserves a null block that
+        `num_kvcache_blocks` still counts) and its live state slots."""
+        if not self._speculative:
+            return
+        self._pool_pages = int(block_manager.kv.num_usable_blocks)
+        self._state_slots = int(block_manager.num_state_slots)
+        self._state_slots_per_req = int(block_manager.state_slots_per_req)
+
+    def _state_room_before_d(self, seq: Sequence) -> bool:
+        """The page rule, for per-request state slots: the slots pinned before
+        D, plus `seq`'s, plus room for another registered stateful request."""
+        if self._state_slots is None:
+            return False
+        other_waits = any(
+            s.has_per_req_cache and s.id != seq.id
+            for s, _ in self._chunked_waiting.values()
+        )
+        requests = len(self._spec_state_pins) + 1 + int(other_waits)
+        return requests * self._state_slots_per_req <= self._state_slots
 
     def _may_allocate_before_d(self, seq: Sequence) -> bool:
         if not self._speculative:
+            return False
+        if seq.has_per_req_cache and not self._state_room_before_d(seq):
             return False
         need = (
             sum(self._spec_pins.values())

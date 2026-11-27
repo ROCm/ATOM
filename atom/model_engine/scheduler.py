@@ -6486,9 +6486,8 @@ class Scheduler:
         # Early P/D sources whose transfer the worker retired (D was told it
         # failed): abort them like a client disconnect, which cancels the
         # source and so retires its send claim.
-        take_aborts = getattr(self.kv_connector, "take_sources_to_abort", None)
-        if callable(take_aborts):
-            for req_id in take_aborts():
+        if self.kv_connector is not None:
+            for req_id in self.kv_connector.take_sources_to_abort():
                 self.abort_request(req_id)
         process_completions = getattr(self.kv_connector, "process_completions", None)
         if callable(process_completions):
@@ -6727,6 +6726,8 @@ class PrefillScheduler:
     can_recompute_prompts = False
     # P/D admission is decode-side Mooncake policy; this prefill side has none.
     pd_admission: PdAdmissionController | None = None
+    # The decode process owns the KV connector's scheduler side.
+    kv_connector = None
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs

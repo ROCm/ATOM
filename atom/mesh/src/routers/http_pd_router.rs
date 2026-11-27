@@ -397,16 +397,17 @@ impl NdjsonLines {
                     done.get("finish_reason").unwrap_or(&Value::Null)
                 ));
             }
-            // P ends its body right after the terminal line.
-            let mut body_ok = true;
+            // P ends its body right after the terminal line. A body that fails
+            // here is a failed prefill too: the caller answers 502 for it.
             while let Some(chunk) = self.stream.next().await {
                 if let Err(e) = chunk {
-                    debug!("early-handoff prefill body failed after its done line: {e}");
-                    body_ok = false;
-                    break;
+                    self.outcome.finish(false);
+                    return Err(format!(
+                        "prefill stream failed after atom_pd_prefill_done: {e}"
+                    ));
                 }
             }
-            self.outcome.finish(body_ok);
+            self.outcome.finish(true);
             return Ok(());
         }
     }
@@ -3817,6 +3818,156 @@ mod tests {
         r.assert_released();
         assert_eq!(r.prefill.circuit_breaker().total_failures(), 0);
         assert_eq!(r.decode.circuit_breaker().total_failures(), 0);
+    }
+
+    /// An early-handoff P whose body reports `ok` on line 2 after `done_ms`,
+    /// then (`cut`) fails instead of ending cleanly.
+    async fn early_prefill_body_mock(done_ms: u64, cut: bool) -> String {
+        serve(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+                let _ = tx.try_send(Ok(bytes::Bytes::from_static(b"{\"handoff\":1}\n")));
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(done_ms)).await;
+                    let done = json!({"atom_pd_prefill_done": {"ok": true}});
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!("{done}\n")))).await;
+                    if cut {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        let _ = tx.send(Err(std::io::Error::other("cut"))).await;
+                    }
+                });
+                let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/x-ndjson")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        ))
+        .await
+    }
+
+    /// A D that sends its headers only after `delay_ms`.
+    async fn slow_decode_mock(delay_ms: u64) -> String {
+        serve(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                axum::Json(json!({"decoded": true}))
+            }),
+        ))
+        .await
+    }
+
+    fn early_test_worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .build(),
+        )
+    }
+
+    /// Posts to the early-handoff P mock and reads its line 1: what is left
+    /// is the wait for line 2 and P's load guard.
+    async fn early_prefill_end(p_url: &str, prefill: &Arc<dyn Worker>) -> PrefillEnd {
+        let policy: Arc<dyn crate::policies::LoadBalancingPolicy> =
+            Arc::new(CompletionPolicy::default());
+        let request = Client::new()
+            .post(format!("{p_url}/v1/chat/completions"))
+            .json(&json!({}));
+        let guard = WorkerLoadGuard::new(prefill.clone(), None);
+        let response = PDRouter::send(request, prefill.clone(), policy)
+            .await
+            .unwrap();
+        let mut lines = response.into_lines();
+        assert!(lines.next_json_line().await.unwrap().is_some());
+        PrefillEnd {
+            done: Box::pin(lines.prefill_done()),
+            guard,
+        }
+    }
+
+    fn slow_decode_send(
+        d_url: &str,
+        decode: &Arc<dyn Worker>,
+    ) -> impl std::future::Future<Output = Result<WorkerResponse, reqwest::Error>> {
+        let policy: Arc<dyn crate::policies::LoadBalancingPolicy> =
+            Arc::new(CompletionPolicy::default());
+        let request = Client::new()
+            .post(format!("{d_url}/v1/chat/completions"))
+            .json(&json!({}));
+        PDRouter::send(request, decode.clone(), policy)
+    }
+
+    #[tokio::test]
+    async fn early_prefill_body_failing_after_its_done_line_is_a_prefill_error() {
+        // P reports ok, then its body fails, all before D's headers: that is
+        // a failed prefill (502 prefill_error), not a success to wait D out.
+        let p_url = early_prefill_body_mock(30, true).await;
+        let d_url = slow_decode_mock(1500).await;
+        let prefill = early_test_worker(
+            &p_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let decode = early_test_worker(&d_url, WorkerType::Decode);
+        let end = early_prefill_end(&p_url, &prefill).await;
+        let started = Instant::now();
+        let result = PDRouter::send_decode_during_early_prefill(
+            slow_decode_send(&d_url, &decode),
+            end,
+            &p_url,
+            "rid",
+        )
+        .await;
+        let Err(response) = result else {
+            panic!("a P body that fails after its done line must answer 502");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(started.elapsed() < Duration::from_millis(1000));
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("prefill_error"));
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(prefill.circuit_breaker().total_failures(), 1);
+    }
+
+    #[tokio::test]
+    async fn early_prefill_success_releases_its_load_before_decode_answers() {
+        // P completes successfully long before D's headers: P's load guard
+        // goes at P's end, not at D's answer.
+        let p_url = early_prefill_body_mock(30, false).await;
+        let d_url = slow_decode_mock(600).await;
+        let prefill = early_test_worker(
+            &p_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let decode = early_test_worker(&d_url, WorkerType::Decode);
+        let end = early_prefill_end(&p_url, &prefill).await;
+        assert_eq!(prefill.load(), 1);
+        let (result, load_while_d_runs) = tokio::join!(
+            PDRouter::send_decode_during_early_prefill(
+                slow_decode_send(&d_url, &decode),
+                end,
+                &p_url,
+                "rid",
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                prefill.load()
+            }
+        );
+        assert_eq!(load_while_d_runs, 0, "P stayed charged until D answered");
+        let Ok((Ok(response), None)) = result else {
+            panic!("D's answer must come back with P's end already consumed");
+        };
+        assert!(response.status().is_success());
+        assert_eq!(prefill.circuit_breaker().total_failures(), 0);
     }
 
     #[tokio::test]

@@ -228,6 +228,16 @@ class KVConnectorSchedulerBase(ABC):
         """Whether the scheduler may allocate this request and start prefill."""
         return True
 
+    def take_early_answers(self) -> list:
+        """P/D early-handoff request ids whose front end answers the router
+        now (ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE); none without early handoff."""
+        return []
+
+    def take_sources_to_abort(self) -> list:
+        """P/D early sources whose transfer the worker retired, for the
+        scheduler to abort; none without early handoff."""
+        return []
+
     def drop_cached_kv(self) -> bool:
         """Forget KV computed with weights that are about to change.
 

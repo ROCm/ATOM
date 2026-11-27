@@ -30,6 +30,7 @@ def engine_step(monkeypatch):
         compute_detailed_aggregates=Mock(),
         metrics=SimpleNamespace(record_forward=Mock()),
         prefill_delayer=None,
+        kv_connector=None,
     )
     engine = SimpleNamespace(
         scheduler=scheduler,

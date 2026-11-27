@@ -379,6 +379,7 @@ def _p_scheduler(monkeypatch, num_blocks=6, speculative=None):
         speculative=speculative,
         num_kvcache_blocks=num_blocks,
     )
+    p.kv_connector.bind_block_manager(p.block_manager)  # as `Scheduler` does
     return p
 
 
@@ -797,6 +798,7 @@ def _p_scheduler_with_state_slots(monkeypatch, num_blocks, state_slots):
     p.kv_connector = make_scheduler_connector(
         monkeypatch, True, early=True, num_kvcache_blocks=num_blocks
     )
+    p.kv_connector.bind_block_manager(p.block_manager)  # as `Scheduler` does
     return p
 
 
@@ -883,6 +885,95 @@ def test_p_stall_past_the_lookup_timeout_releases_the_early_source(
     finished, _ = _drive(p, d, pw, dw, monkeypatch, lambda f: ds2 in f)
     assert ds2 in finished and ("early-next", True) in results
     assert not p.deferred_free_blocks and p.block_manager.kv.num_free == p_free
+
+
+def _bind(p, *, usable_pages, state_slots=0, per_req=1, reserve_null_block=False):
+    """`bind_block_manager` with a real `BlockPool` for the pages."""
+    from atom.model_engine.block_pool import BlockPool
+
+    pages = usable_pages + int(reserve_null_block)
+    kv = BlockPool(pages, reserve_null_block=reserve_null_block)
+    assert kv.num_usable_blocks == usable_pages
+    p.bind_block_manager(
+        SimpleNamespace(kv=kv, num_state_slots=state_slots, state_slots_per_req=per_req)
+    )
+
+
+def test_the_rule_counts_only_the_allocators_usable_pages(monkeypatch, seq_factory):
+    """Copilot: a checkpoint-enabled pool reserves a null block that
+    `num_kvcache_blocks` still counts. Seven physical blocks, six usable:
+    A (3) + room for B (4) does not fit, so A waits for D."""
+    p = make_scheduler_connector(monkeypatch, True, early=True, num_kvcache_blocks=7)
+    a = seq_factory(_prompt(3), kv_transfer_params=p_params("early-a"))
+    b = seq_factory(_prompt(4, 100), kv_transfer_params=p_params("early-b"))
+    p.admission_ready(a)
+    p.admission_ready(b)
+    assert p.admission_ready(a)  # 3 + 4 <= 7 before the allocator is known
+    _bind(p, usable_pages=6, reserve_null_block=True)
+    assert not p.admission_ready(a)  # 3 + 4 > 6 usable
+    assert not p.admission_ready(b)
+
+
+def test_state_slots_keep_a_stateful_request_behind_the_gate(monkeypatch, seq_factory):
+    """Copilot: six pages and one state slot on P. Pages alone admit A
+    (3 + 3 <= 6) though B is registered; if D reserves B first, A would hold
+    the only slot and B could not allocate. The rule keeps room for B's slot
+    too, so both wait for D, and B goes first when D reaches it."""
+    p = make_scheduler_connector(monkeypatch, True, early=True, num_kvcache_blocks=6)
+    a = seq_factory(_prompt(3), kv_transfer_params=p_params("early-a"))
+    b = seq_factory(_prompt(3, 100), kv_transfer_params=p_params("early-b"))
+    a.has_per_req_cache = b.has_per_req_cache = True
+    p.admission_ready(a)
+    p.admission_ready(b)
+    assert not p.admission_ready(a)  # slots unknown before the bind: the gate
+    _bind(p, usable_pages=6, state_slots=1)
+    assert not p.admission_ready(a)  # 1 + room for B's slot > 1
+    assert not p.admission_ready(b)
+    _ack(p, b)  # D reached B first: the opposite order
+    assert p.admission_ready(b)
+    _allocate(p, b, [0, 1, 2])
+    assert not p._spec_pins and not p._spec_state_pins
+    # With two slots A may go before D, and its slot counts until D's report.
+    p2 = make_scheduler_connector(monkeypatch, True, early=True, num_kvcache_blocks=6)
+    _bind(p2, usable_pages=6, state_slots=2)
+    c = seq_factory(_prompt(1, 200), kv_transfer_params=p_params("early-c"))
+    d = seq_factory(_prompt(1, 300), kv_transfer_params=p_params("early-d"))
+    e = seq_factory(_prompt(1, 400), kv_transfer_params=p_params("early-e"))
+    for s in (c, d, e):
+        s.has_per_req_cache = True
+        p2.admission_ready(s)
+    assert p2.admission_ready(c)  # 0 pinned + 1 + 1 <= 2
+    _allocate(p2, c, [0])
+    assert p2._spec_state_pins == {str(c.id)}
+    assert not p2.admission_ready(d)  # 1 pinned + 1 + room for E > 2
+    _ack(p2, c)
+    assert not p2._spec_state_pins and p2.admission_ready(d)
+
+
+def test_stateful_requests_complete_when_d_reserves_the_other_first(
+    monkeypatch, seq_factory
+):
+    """The same case with real schedulers and workers: P has six pages and
+    one state slot, D room for one request and D reserves B first. Before the
+    fix A took P's only slot before D, B could not allocate, and both stalled
+    until the lookup timeout aborted A."""
+    p = _p_scheduler_with_state_slots(monkeypatch, 6, 1)
+    d = _d_scheduler(monkeypatch, num_blocks=3)
+    pa, da = _pair(seq_factory, "early-a", _prompt(3))
+    pb, db = _pair(seq_factory, "early-b", _prompt(3, 100))
+    pa.has_per_req_cache = pb.has_per_req_cache = True
+    p.extend([pa, pb])
+    d.extend([db, da])  # D reserves B first; A waits for D's room
+    pw, _, _src, destinations = idle_producer()
+    dw = decode_worker(destinations[0])
+    results = []
+    _wire(pw, dw, results)
+    finished, started = _drive(p, d, pw, dw, monkeypatch, lambda f: len(f) == 2)
+    assert {s.id for s in finished} == {da.id, db.id}
+    assert started == [pb.id, pa.id]
+    assert ("early-a", True) in results and ("early-b", True) in results
+    assert p.block_manager.state.has_free(1)
+    assert not p.deferred_free_blocks and not d.deferred_free_blocks
 
 
 # ----------------------------------- answering when P schedules the request
@@ -1034,6 +1125,36 @@ def test_at_schedule_gate_answers_without_deadlock(monkeypatch, seq_factory, poo
     assert {s.id for s in finished} == {da.id, db.id}
     assert p.block_manager.kv.num_free == pool and d.block_manager.kv.num_free == 3
     assert not p.deferred_free_blocks and not d.deferred_free_blocks
+
+
+def test_idle_ranks_answer_a_gated_request(monkeypatch, seq_factory):
+    """Copilot: AT_SCHEDULE with ATOM_DP_IDLE_WHEN_BLOCKED and
+    SPECULATIVE=0. Registration and the vote's probe send the request to wait
+    for D, so every rank votes idle and no `schedule()` runs. The idle pass
+    must answer it, or P waits on D while D waits on P's answer."""
+    import queue
+
+    from test_dp_idle_when_blocked import Loop
+
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", "1")
+    p = _p_scheduler(monkeypatch, speculative=False)
+    seq = seq_factory(list(range(10)), kv_transfer_params=p_params())
+    p.extend([seq])
+    sent_before_d = []
+
+    def d_arrives():
+        sent_before_d.append(loop.proc.output_queue.qsize())
+        _ack(p.kv_connector, seq)
+
+    loop = Loop(p, enabled=True, shutdown_at=4, script={2: d_arrives})
+    loop.proc.output_queue = queue.Queue()
+    events = loop.run(monkeypatch)
+    assert loop.votes[:2] == [False, False]  # gated: the group stays idle
+    assert sent_before_d == [1], "the gated request was never answered"
+    kind, outputs = loop.proc.output_queue.get_nowait()
+    assert kind == "STREAM" and [rid for rid, _ in outputs] == [seq.id]
+    assert loop.proc.output_queue.empty()
+    assert "schedule" in events  # D reached P: the request runs
 
 
 # ----------------------------------------------------- negotiation (P and D API)

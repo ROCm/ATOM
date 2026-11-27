@@ -5169,7 +5169,9 @@ def test_the_scheduler_applies_touch_verdicts(offload_clock):
     idx.want_touch(7)
     assert idx.take_touches() == [7]
     s = Scheduler.__new__(Scheduler)
-    s.kv_connector = SimpleNamespace(take_state_touch_verdicts=lambda: {7: False})
+    s.kv_connector = SimpleNamespace(
+        take_state_touch_verdicts=lambda: {7: False}, take_sources_to_abort=list
+    )
     s.block_manager = SimpleNamespace(state_offload=idx)
     s.finished_recving_kv_req_ids = []
     s.failed_recving_kv_req_ids = []
@@ -5196,6 +5198,9 @@ class _OffloadConnector:
 
     def get_finished(self):
         return set(), set()
+
+    def take_sources_to_abort(self):
+        return []
 
     def enqueue_state_loads(self, loads):
         return True
