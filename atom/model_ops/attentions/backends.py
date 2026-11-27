@@ -29,7 +29,9 @@ from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.pool_layout.paged_state_copy import (
     DescriptorStaging,
+    SegmentedCopyPlan,
     launch_copy_descriptor,
+    plan_segmented_copy,
 )
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
@@ -443,6 +445,79 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
             )
+
+    def clear_page_units(self, unit_ids: Sequence[int]) -> None:
+        """Zero whole PAGE units a checkpoint image held, before KV reuse.
+
+        A released unit keeps the image it held, and the pool hands it out as
+        an ordinary KV block. Attention reads a fresh block's unwritten rows
+        under a zero weight, and an image read as KV need not be finite: fp32
+        or int8 state bytes include NaN and Inf bit patterns, and `0 * NaN` is
+        NaN. One such block in a running request's table turns every later
+        token of it to noise.
+
+        Whole units rather than `image_bytes`: a block that was one image's
+        last unit still holds the tail an earlier image wrote there.
+
+        A copy out of a unit of zeros, so it is the same descriptor, kernel and
+        fenced staging the checkpoint copies use. Two staging slots in turn, so
+        a step's rows never wait on the previous step's upload.
+        """
+        if not unit_ids:
+            return
+        plan, zeros = self._page_unit_clear_plan()
+        ids = np.asarray(unit_ids, dtype=np.int64)
+        staging, per_launch = self._page_unit_clear_staging()
+        for start in range(0, len(ids), per_launch):
+            chunk = ids[start : start + per_launch]
+            total = len(chunk) * plan.num_spans
+            self._page_unit_clear_turn ^= 1
+            slot = self._page_unit_clear_turn
+            plan.write_descriptor(
+                staging.rows(slot)[:total],
+                np.full((len(chunk), 1), zeros.data_ptr(), dtype=np.int64),
+                self._page_unit_bases(chunk[:, None]),
+            )
+            launch_copy_descriptor(staging.upload(slot, total), plan)
+
+    def _page_unit_clear_plan(self) -> tuple[SegmentedCopyPlan, torch.Tensor]:
+        """One unit of zeros, cut the way one PAGE unit's regions are."""
+        cached = getattr(self, "_page_unit_clear_cache", None)
+        if cached is None:
+            sizes = [int(n) for n in self._page_unit_stream_sizes(1)]
+            unit = sum(sizes)
+            zeros = torch.zeros(
+                unit, dtype=torch.uint8, device=self._checkpoint_descriptor_device()
+            )
+            cached = (plan_segmented_copy([unit], sizes, unit), zeros)
+            self._page_unit_clear_cache = cached
+        return cached
+
+    # The slot `clear_page_units` used last; it alternates between 0 and 1.
+    _page_unit_clear_turn = 0
+
+    def _page_unit_clear_staging(self) -> tuple[DescriptorStaging, int]:
+        """Pinned rows for one launch of clears, and how many units that is.
+
+        Sized for the most fresh blocks one step allocates: a full prefill
+        budget of new blocks plus one per decoding sequence. A step that needs
+        more is split into launches, which only costs the host a wait.
+        """
+        cached = getattr(self, "_page_unit_clear_staging_cache", None)
+        if cached is None:
+            config = self.model_runner.config
+            per_launch = (
+                config.max_num_batched_tokens // config.kv_cache_block_size
+                + config.max_num_seqs
+                + 1
+            )
+            plan, _ = self._page_unit_clear_plan()
+            staging = DescriptorStaging(
+                per_launch * plan.num_spans, self._checkpoint_descriptor_device()
+            )
+            staging.reserve((0, 1))
+            cached = self._page_unit_clear_staging_cache = (staging, per_launch)
+        return cached
 
     def reserve_checkpoint_descriptors(self, descriptor_slots) -> None:
         """Allocate staging for out-of-band copy slots before serving.
@@ -1695,6 +1770,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         """
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
+        if state_ops.cleared_units:
+            self.clear_page_units(state_ops.cleared_units)
         if state_ops.relocations:
             self.relocate_state_slots(state_ops.relocations)
         if state_ops.checkpoint_stores or state_ops.checkpoint_restores:

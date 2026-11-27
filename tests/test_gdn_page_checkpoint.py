@@ -425,6 +425,53 @@ class TestMhaRegionsMatchThePublishedPages:
             ]
             assert list(zip(ptrs.tolist(), sizes.tolist(), strict=True)) == want
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+    def test_clearing_zeroes_whole_units_and_nothing_else(self):
+        """A unit going back to KV is zeroed over every region, past
+        `image_bytes` too, and no other block is touched."""
+        pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+        from atom.model_ops.attentions.backends import AttentionMetadataBuilder
+
+        pool = MhaKvPool(
+            layers=3,
+            block_size=16,
+            num_kv_heads=1,
+            head_dim=256,
+            kv_dtype=torch.bfloat16,
+        )
+        pool.allocate(6, "cuda")
+        for _, tensor in pool.region_tensors():
+            tensor.view(torch.uint8).fill_(0xFF)  # NaN, read as bf16
+        regions = layer_major_page_unit_regions([pool])
+        builder = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                config=SimpleNamespace(
+                    max_num_batched_tokens=32, kv_cache_block_size=16, max_num_seqs=1
+                )
+            ),
+            _page_unit_bases=lambda ids: layer_major_page_unit_bases(regions, ids),
+            _page_unit_stream_sizes=lambda n: layer_major_page_unit_stream_sizes(
+                regions, n
+            ),
+            _checkpoint_descriptor_device=lambda: torch.device("cuda"),
+        )
+        for name in (
+            "clear_page_units",
+            "_page_unit_clear_plan",
+            "_page_unit_clear_staging",
+        ):
+            method = getattr(AttentionMetadataBuilder, name)
+            setattr(builder, name, method.__get__(builder))
+        builder._page_unit_clear_turn = 0
+
+        # Four units a launch here, so five take both staging slots.
+        builder.clear_page_units([5, 0, 3, 1, 4])
+        torch.cuda.synchronize()
+        for _, tensor in pool.region_tensors():
+            rows = tensor.view(torch.uint8).view(tensor.shape[0], -1)
+            assert not rows[[0, 1, 3, 4, 5]].any()
+            assert (rows[2] == 0xFF).all(), "a unit nobody named was touched"
+
     def test_a_unit_past_the_pool_is_refused(self):
         pool = _pool(kv_dtype=torch.bfloat16, layers=1, block_size=16)
         try:

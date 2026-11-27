@@ -276,6 +276,10 @@ class StateMaintenanceOps:
     # (source, destination) paged blocks whose whole content is copied before
     # the batch: a private block demoted into the shared part of a split pool.
     block_copies: tuple[tuple[int, int], ...] = ()
+    # PAGE ids that held a checkpoint image and are KV from this batch on
+    # (`BlockPool.take_dirty`). Cleared before the copies above, which may
+    # store into a unit cleared here.
+    cleared_units: tuple[int, ...] = ()
 
     @property
     def empty(self) -> bool:
@@ -284,6 +288,7 @@ class StateMaintenanceOps:
             or self.checkpoint_stores
             or self.checkpoint_restores
             or self.block_copies
+            or self.cleared_units
         )
 
 
