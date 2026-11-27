@@ -20,19 +20,25 @@ if TYPE_CHECKING:
     from atom.config import Config
 
 
-def _owned(value: Any, staged: tuple[torch.Tensor, ...] = ()) -> Any:
+def _owned(
+    value: Any, staged: tuple[torch.Tensor, ...] = (), persistent: tuple[int, ...] = ()
+) -> Any:
     """A copy the graph pool cannot re-issue.
 
     Outputs that alias declared staged inputs already live outside the graph
-    pool and can be handed back directly. Clone every other tensor because the
+    pool and can be handed back directly, as can views of a flavor's
+    registered persistent output storage (``persistent``: storage pointers;
+    see ``DraftGraph.persistent_output``). Clone every other tensor because the
     pool may re-issue its storage on a later replay.
     """
     if isinstance(value, torch.Tensor):
         if any(value.data_ptr() == tensor.data_ptr() for tensor in staged):
             return value
+        if persistent and value.untyped_storage().data_ptr() in persistent:
+            return value
         return value.clone()
     if isinstance(value, tuple):
-        return tuple(_owned(v, staged) for v in value)
+        return tuple(_owned(v, staged, persistent) for v in value)
     return value
 
 
@@ -263,17 +269,40 @@ class DraftGraph:
         allocator's does. Only ``capture_epilogue`` can put a survivor in
         there; the eager path allocates normally and needs no copy.
         """
+        if self._reader_fence is not None:
+            # the previous pass's output, read on another stream (its D2H), is done before this pass rewrites it
+            torch.cuda.current_stream().wait_event(self._reader_fence)
+            self._reader_fence = None
         if running_bs not in self._graph:
             out = self._to_capture(running_bs, **staged)
         else:
             out = self._graph.replay(key=running_bs)
             if self.capture_epilogue:
-                out = _owned(out, tuple(staged.values()))
+                out = _owned(out, tuple(staged.values()), self._persistent)
         return (
             out
             if self.capture_epilogue
             else self._run_epilogue(out, running_bs, **staged)
         )
+
+    # plain class attributes, not dataclass fields: per-instance state set by the methods below
+    _persistent = ()  # storage pointers of registered persistent outputs
+    _reader_fence = None  # torch.cuda.Event | None
+
+    def persistent_output(self, tensor: torch.Tensor) -> None:
+        """Register storage (allocated outside any graph pool, kept for the
+        process) that the epilogue writes its output into: a replay hands views
+        of it back without a clone. The flavor's pass rewrites it, so every
+        reader outside the forward stream must be fenced (``reader_fence``)."""
+        ptr = tensor.untyped_storage().data_ptr()
+        if ptr not in self._persistent:
+            self._persistent = self._persistent + (ptr,)
+
+    def reader_fence(self, event: "torch.cuda.Event | None") -> None:
+        """The completion event of the last off-stream read of this pass's
+        persistent output (the runner's draft-id D2H): the next ``run`` makes
+        the current stream wait on it (device side) before rewriting it."""
+        self._reader_fence = event
 
     def _forward_and_epilogue(self, running_bs: int, **staged) -> Any:
         return self._run_epilogue(

@@ -62,6 +62,7 @@ def _spec_verify_kernel(
     counter_ptr,  # [1] int32, 0 between launches
     out_ptr,  # [batch_size, num_spec_steps + 1] int32
     verdict_ptr,  # [3, batch_size] int32
+    next_ptr,  # [batch_size] int32: out[b, verdict[0, b]], the token the drafter anchors on
     num_tokens,
     batch_size,
     num_spec_steps,
@@ -69,6 +70,8 @@ def _spec_verify_kernel(
     seed,
     greedy_eps,
     FORCED: tl.constexpr,  # synthetic acceptance: target rows take the argmax
+    NEXT_IDS: tl.constexpr,  # write next_ptr (else the caller gathers the next ids)
+    GREEDY_NO_NOISE: tl.constexpr,  # greedy rows draw no noise (else every row draws it and greedy rows drop it)
     BLOCK: tl.constexpr,
     ROWS_B: tl.constexpr,  # >= num_tokens + batch_size
     BS_B: tl.constexpr,  # >= batch_size
@@ -93,14 +96,27 @@ def _spec_verify_kernel(
     x = tl.load(
         logits_ptr + row.to(tl.int64) * logits_stride + offs, mask=mask, other=0.0
     ).to(tl.float32)
-    # Gumbel-max: argmax(x / T - log(E)), E ~ Exp(1) = -log(u), u in (0, 1).
-    # Four uniforms a Philox evaluation, one counter per (row, chunk, quad).
-    quad = (j * tl.num_programs(0) + s) * (BLOCK // 4) + tl.arange(0, BLOCK // 4)
-    r0, r1, r2, r3 = tl.randint4x(seed, quad)
-    r = tl.reshape(tl.join(tl.join(r0, r1), tl.join(r2, r3)), (BLOCK,))
-    u = ((r >> 8).to(tl.float32) + 0.5) * 5.9604644775390625e-08
-    noisy = x * (1.0 / tl.maximum(t, 1e-5)) - tl.log(-tl.log(u))
-    score = tl.where(greedy, x, noisy)
+    if GREEDY_NO_NOISE:
+        if greedy:
+            # The argmax of the logits: a greedy row draws no noise (the generator
+            # is counter-based, so the sampling rows' draws do not move).
+            score = x
+        else:
+            # Gumbel-max: argmax(x / T - log(E)), E ~ Exp(1) = -log(u), u in (0, 1).
+            # Four uniforms a Philox evaluation, one counter per (row, chunk, quad).
+            quad = (j * tl.num_programs(0) + s) * (BLOCK // 4) + tl.arange(0, BLOCK // 4)
+            r0, r1, r2, r3 = tl.randint4x(seed, quad)
+            r = tl.reshape(tl.join(tl.join(r0, r1), tl.join(r2, r3)), (BLOCK,))
+            u = ((r >> 8).to(tl.float32) + 0.5) * 5.9604644775390625e-08
+            score = x * (1.0 / tl.maximum(t, 1e-5)) - tl.log(-tl.log(u))
+    else:
+        # rF13b's: every row draws the noise, greedy rows take the logits.
+        quad = (j * tl.num_programs(0) + s) * (BLOCK // 4) + tl.arange(0, BLOCK // 4)
+        r0, r1, r2, r3 = tl.randint4x(seed, quad)
+        r = tl.reshape(tl.join(tl.join(r0, r1), tl.join(r2, r3)), (BLOCK,))
+        u = ((r >> 8).to(tl.float32) + 0.5) * 5.9604644775390625e-08
+        noisy = x * (1.0 / tl.maximum(t, 1e-5)) - tl.log(-tl.log(u))
+        score = tl.where(greedy, x, noisy)
     score = tl.where(mask, score, float("-inf"))
     best = tl.max(_score_key(score, offs), axis=0)
     tl.atomic_max(keys_ptr + j, best, sem="relaxed")
@@ -126,6 +142,7 @@ def _spec_verify_kernel(
             out_row = out_ptr + b * (num_spec_steps + 1)
             rejected = False
             last_checked = -1
+            last_id = -1
             for p in range(n):
                 rr = start + p
                 if rejected:
@@ -145,15 +162,20 @@ def _spec_verify_kernel(
                         if d_id != t_id:
                             rejected = True
                     last_checked += 1
+                    last_id = out_id
                 tl.store(out_row + p, out_id)
             # `_finish_request`
             num_accepted = last_checked
             if rejected:
                 bonus = INVALID
+                next_id = last_id
             else:
                 bonus = tl.sum(tl.where(rows == num_tokens + b, tok, 0), axis=0)
                 num_accepted += 1
+                next_id = bonus
             tl.store(out_row + n, bonus)
+            if NEXT_IDS:
+                tl.store(next_ptr + b, next_id)
             for pos in range(n + 1, num_spec_steps + 1):
                 tl.store(out_row + pos, INVALID)
             anchor = tl.load(bonus_idx_ptr + b) - n
@@ -202,10 +224,15 @@ def spec_verify(
     greedy_eps: float,
     cond_rates: torch.Tensor | None = None,  # forced acceptance, conditional
     seed_base: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    next_ids: bool = True,
+    greedy_no_noise: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """``(output_token_ids [bs, num_spec_steps + 1], verdict [3, bs])`` as
-    `rejection_sample` returns them. Call on every rank alike: the noise seed
-    advances by one a call."""
+    `rejection_sample` returns them, and each request's next token
+    ``output_token_ids[b, verdict[0, b]]`` (the last one it keeps), which
+    the drafter anchors on (None with ``next_ids`` off). Call on every rank
+    alike: the noise seed advances by one a call. ``greedy_no_noise`` off:
+    greedy rows draw the noise too and drop it (rF13b's kernel)."""
     device = logits.device
     st = _state(device)
     st["calls"] += 1
@@ -217,6 +244,7 @@ def spec_verify(
         (batch_size, num_spec_steps + 1), dtype=torch.int32, device=device
     )
     verdict = torch.empty((3, batch_size), dtype=torch.int32, device=device)
+    next_out = torch.empty(batch_size if next_ids else 1, dtype=torch.int32, device=device)
     forced = cond_rates is not None
     nrows = num_tokens + batch_size
     grid = (triton.cdiv(V, _BLOCK), nrows)
@@ -234,6 +262,7 @@ def spec_verify(
         st["counter"],
         out,
         verdict,
+        next_out,
         num_tokens,
         batch_size,
         num_spec_steps,
@@ -241,9 +270,11 @@ def spec_verify(
         seed,
         greedy_eps,
         FORCED=forced,
+        NEXT_IDS=bool(next_ids),
+        GREEDY_NO_NOISE=bool(greedy_no_noise),
         BLOCK=_BLOCK,
         ROWS_B=max(16, triton.next_power_of_2(nrows)),
         BS_B=max(16, triton.next_power_of_2(batch_size)),
         num_warps=8,
     )
-    return out, verdict
+    return out, verdict, (next_out if next_ids else None)

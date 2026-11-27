@@ -2,6 +2,7 @@
 """Runner-owned FIFO transfers with reusable pinned storage."""
 
 from collections import deque
+from collections.abc import Callable
 
 import torch
 
@@ -42,20 +43,41 @@ class D2HQueue:
     unchecked.
     """
 
-    def __init__(self, capacity: int, stream: torch.cuda.Stream):
+    def __init__(
+        self,
+        capacity: int,
+        stream: torch.cuda.Stream,
+        on_copy: Callable[[torch.cuda.Event], None] | None = None,
+    ):
         self.capacity = capacity
         self.stream = stream
+        # Called with each copy's completion event once it is enqueued.
+        self.on_copy = on_copy
         self._free: list[_D2HSlot] = []
         self._pending: deque[_D2HSlot] = deque()
+        # Sources whose copies wait for `flush` (`send(..., defer=True)`).
+        self._deferred: list[torch.Tensor] = []
 
     def send(
-        self, source: torch.Tensor, *, ready: torch.cuda.Event | None = None
+        self,
+        source: torch.Tensor,
+        *,
+        ready: torch.cuda.Event | None = None,
+        defer: bool = False,
     ) -> None:
-        """Enqueue a copy after ready, or after the caller's current stream."""
+        """Enqueue a copy after ready, or after the caller's current stream.
+
+        ``defer``: enqueue it at the next `flush`, behind the event that
+        flush is given -- one the producer's stream records later anyway --
+        instead of an event recorded on that stream now. A receive flushes
+        first, behind the current stream."""
         if source.numel() > self.capacity:
             raise ValueError(
                 f"D2H shape {tuple(source.shape)} exceeds capacity {self.capacity}"
             )
+        if defer:
+            self._deferred.append(source)
+            return
         slot = self._free.pop() if self._free else None
         if slot is None or slot.buffer.dtype != source.dtype:
             slot = _D2HSlot(self.capacity, source.dtype)
@@ -75,9 +97,27 @@ class D2HQueue:
             slot.copy_done.record(self.stream)
         slot.source = source
         self._pending.append(slot)
+        if self.on_copy is not None:
+            self.on_copy(slot.copy_done)
+
+    def has_deferred(self) -> bool:
+        return bool(self._deferred)
+
+    def flush(self, ready: "torch.cuda.Event | None" = None) -> None:
+        """Enqueue the deferred copies, in order, behind ``ready`` (default:
+        the caller's current stream)."""
+        deferred, self._deferred = self._deferred, []
+        for source in deferred:
+            self.send(source, ready=ready)
+
+    def last_copy_event(self) -> "torch.cuda.Event | None":
+        """The completion event of the newest pending copy (None when none is pending)."""
+        self.flush()
+        return self._pending[-1].copy_done if self._pending else None
 
     def receive(self):
         """Wait for the oldest transfer and return an independently owned output."""
+        self.flush()
         if not self._pending:
             return None
         slot = self._pending[0]
@@ -91,6 +131,7 @@ class D2HQueue:
 
     def drain(self) -> None:
         """Wait for every pending transfer, then drop its output and source."""
+        self.flush()
         while self._pending:
             slot = self._pending[0]
             slot.copy_done.synchronize()

@@ -540,6 +540,11 @@ def _flydsl_step_refreshed(step_owner) -> set:
     return refreshed
 
 
+# Explicit-plan calls with a plan already made: refreshed (a planner launch
+# that runs, or is recorded into a graph) or returned as they are (`refresh`).
+FLYDSL_PLAN_STATS = {"refresh": 0, "refresh_skipped": 0}
+
+
 def _flydsl_prepare_explicit_plan(
     *,
     q,
@@ -553,8 +558,13 @@ def _flydsl_prepare_explicit_plan(
     plan_step_owner=None,
     plan_cache_owner=None,
     plan_workgroup_budget=None,
+    refresh=True,
 ):
     """Return the explicit plan aiter #5809 requires.
+
+    ``refresh=False``: a plan already made is returned as it is, for a call
+    whose kernel reads none of its contents (aiter's ``plan_free`` decode reads
+    the context lengths directly; the plan only sizes the scratch).
 
     ``plan_partition_cap``: None takes ``flydsl_plan_shape``, i.e. aiter's
     defaults except at head_dim 256; a caller's cap is kept, with aiter's
@@ -611,6 +621,9 @@ def _flydsl_prepare_explicit_plan(
             plans = {}
             plan_cache_owner._flydsl_runtime_plans = plans
     plan = plans.get(plan_key)
+    if plan is not None and not refresh:
+        FLYDSL_PLAN_STATS["refresh_skipped"] += 1
+        return plan
     lengths = context_lens[:num_seqs]
     if plan_step_owner is not None:
         # Warmup and capture share the metadata; keying on capture state makes
@@ -650,6 +663,7 @@ def _flydsl_prepare_explicit_plan(
                 int(plan.capacity),
             )
     else:
+        FLYDSL_PLAN_STATS["refresh"] += 1
         plan_pa_decode(
             lengths,
             num_kv_heads,

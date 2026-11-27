@@ -115,7 +115,7 @@ def _load():
             + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
             + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
             + [ctypes.c_int] * 4
-            + [ctypes.c_void_p, ctypes.c_void_p]
+            + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
         )
         _lib = lib
     except Exception as e:  # noqa: BLE001 -- any failure keeps the two-stage path
@@ -153,10 +153,16 @@ def usable(
     )
 
 
-def markov_chain_bs1(base, ids, w1, w2) -> "torch.Tensor | None":
-    """Drafted ids into ``ids[0, 1:]`` (``ids[0, 0]`` is the anchor) and the
-    ``[K, 256]`` W1 rows of the K steps returned; None when not served."""
+def markov_chain_bs1(base, ids, w1, w2, anchor=None) -> "torch.Tensor | None":
+    """Drafted ids into ``ids[0, 1:]`` and the ``[K, 256]`` W1 rows of the K
+    steps returned; None when not served. The anchor is ``ids[0, 0]``, or
+    ``anchor`` ([1], ids' dtype), which the launch then also writes to
+    ``ids[0, 0]`` (no copy launch for the caller)."""
     if not usable(base, ids, w1, w2):
+        return None
+    if anchor is not None and (
+        anchor.dtype != ids.dtype or anchor.numel() != 1 or anchor.device != ids.device
+    ):
         return None
     dev = base.device
     st = _state.get(dev.index)
@@ -167,7 +173,10 @@ def markov_chain_bs1(base, ids, w1, w2) -> "torch.Tensor | None":
             )
         ncta = torch.cuda.get_device_properties(dev).multi_processor_count
         st = _state[dev.index] = (
-            torch.zeros(MAX_STEPS * ncta + MAX_STEPS, dtype=torch.int64, device=dev),
+            # step words, MODE 1's words, then one launch count a CTA (the tag)
+            torch.zeros(
+                MAX_STEPS * ncta + MAX_STEPS + ncta, dtype=torch.int64, device=dev
+            ),
             torch.zeros(1, dtype=torch.int32, device=dev),
             ncta,
         )
@@ -197,6 +206,7 @@ def markov_chain_bs1(base, ids, w1, w2) -> "torch.Tensor | None":
         ncta,
         torch.cuda.current_stream(dev).cuda_stream,
         None,
+        anchor.data_ptr() if anchor is not None else None,
     )
     if rc != 0:
         if rc in (

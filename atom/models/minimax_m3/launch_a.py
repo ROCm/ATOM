@@ -42,7 +42,8 @@ from atom.utils.custom_register import direct_register_custom_op
 
 logger = logging.getLogger("atom")
 
-KERNEL = "stage_o"  # launch_a_kernels.<KERNEL>: stage_o (tonight), paop / atta (lose in TP4 for now)
+KERNEL = "mf"  # launch_a_kernels.<KERNEL>: mf (MoE front, Stage O otherwise), stage_o, paop / atta (lose in TP4)
+FALLBACK = "stage_o"  # served when KERNEL's aiter files are missing
 ROWS = 8  # one request of DSpark K=7
 HIDDEN = 6144
 
@@ -125,7 +126,8 @@ _S = {
     "ctl": {},  # device index -> int32 [16]
     "route": {},  # (rows, mode) -> production takes the Gluon-order k5 path
     "logged": set(),
-    "calls": {"fused": 0, "production": 0, "pa_flushed": 0},
+    "front": {},  # id(moe) -> (output ptr, outputs) of the MoE-front launch its layer's op just ran
+    "calls": {"fused": 0, "production": 0, "pa_flushed": 0, "moe_front": 0, "moe_front_unused": 0},
 }
 _SEAMS: dict[str, Seam] = {}
 
@@ -133,16 +135,45 @@ _SEAMS: dict[str, Seam] = {}
 def kernel():
     """The kernel module behind the seam, or None when its aiter files are missing."""
     if _S["kernel"] is None:
-        try:
-            mod = importlib.import_module(f"atom.models.minimax_m3.launch_a_kernels.{KERNEL}")
-            _S["kernel"] = mod if mod.available() else False
-        except ImportError:
-            _S["kernel"] = False
+        _S["kernel"] = False
+        for name in (KERNEL, FALLBACK):
+            try:
+                mod = importlib.import_module(f"atom.models.minimax_m3.launch_a_kernels.{name}")
+            except ImportError:
+                continue
+            if mod.available():
+                _S["kernel"] = mod
+                break
     return _S["kernel"] or None
 
 
+def set_moe_front(moe, out: torch.Tensor, outputs) -> None:
+    """A kernel that ran the MoE front of ``moe``'s layer (routes, MXFP4 rows, shared output: ``outputs``) in
+    the launch that returned ``out``; the MoE takes them when its input is ``out`` (``take_moe_front``)."""
+    _S["front"][id(moe)] = (out.data_ptr(), outputs)
+
+
+def take_moe_front(moe, hidden_states: torch.Tensor):
+    """The MoE-front outputs of this ``moe`` call, or None: only when its layer's op just ran the front and the
+    call's input is that launch's output (host-side, in the MoE's dual-stream op)."""
+    ent = _S["front"].pop(id(moe), None)
+    if ent is None:
+        return None
+    if hidden_states.data_ptr() != ent[0]:
+        _S["calls"]["moe_front_unused"] += 1
+        _log_once("front_unused", "MiniMax-M3 launch A: a MoE call's input is not its front launch's output; "
+                  "production's MoE")
+        return None
+    _S["calls"]["moe_front"] += 1
+    _log_once("front", "MiniMax-M3 MoE front: one-stream MoE from the front launch (%s)", getattr(moe, "prefix", "?"))
+    return ent[1]
+
+
 def stats() -> dict:
-    return dict(_S["calls"])
+    """The seam's calls by path, with the dense layers' (``dense_mf``)."""
+    from atom.models.minimax_m3 import dense_mf
+
+    return {**_S["calls"], **dense_mf.stats()}
 
 
 def set_enabled(on: bool) -> None:
@@ -195,7 +226,8 @@ def bind(layer, prefix: str) -> str | None:
         # the top-k reads the chain's index_q: a launch that runs the chain also selects
         assert hasattr(kernel(), "index_topk"), f"{KERNEL}: qkv_chain without index_topk"
         _install_qkv_hook()
-    _log_once("bind", "MiniMax-M3 launch A seam (%s): C4 decode steps of 1 request x %d rows", KERNEL, ROWS)
+    _log_once("bind", "MiniMax-M3 launch A seam (%s): C4 decode steps of 1 request x %d rows",
+              kernel().__name__.rsplit(".", 1)[-1], ROWS)
     return name
 
 
@@ -494,12 +526,14 @@ def minimax_m3_attn_tail(
     """o_proj on the attention's MXFP8 output -> all-reduce + residual + Gemma RMSNorm
     [-> MoE in TAIL_SP_MOE_FRONT] of the seam ``seam_name``: (output, residual_out)."""
     seam = _SEAMS[seam_name]
+    _S["front"].pop(id(seam.moe), None)  # only this call's launch may hand its MoE a front
     pend = _S["pending"].pop(seam.name, None)
     call = _plan(seam, pend, x, x_scale, residual, norm_weight, eps, mode)
     if call is not None:
         out, res_out = kernel().run(call)
         _S["calls"]["fused"] += 1
-        _log_once("fused", "MiniMax-M3 launch A (%s): first fused call (layer %d, %d rows)", KERNEL,
+        _log_once("fused", "MiniMax-M3 launch A (%s): first fused call (layer %d, %d rows)",
+                  kernel().__name__.rsplit(".", 1)[-1],
                   seam.layer_num, x.reshape(-1, x.shape[-1]).shape[0])
         if mode == TAIL_SP_MOE_FRONT:
             return seam.moe.forward(out), res_out
@@ -545,4 +579,4 @@ direct_register_custom_op(
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
-__all__ = ["KERNEL", "LaunchACall", "bind", "kernel", "set_enabled", "stats"]
+__all__ = ["KERNEL", "LaunchACall", "bind", "kernel", "set_enabled", "set_moe_front", "stats", "take_moe_front"]

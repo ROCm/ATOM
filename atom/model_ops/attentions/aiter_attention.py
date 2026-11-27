@@ -1238,6 +1238,44 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             positions = var["positions"].gpu[:running_tokens]
         return attn_metadata, positions
 
+    def _dense_decode_metadata_read(self) -> bool:
+        """Whether a decode step's dense-attention metadata, `kv_indices` and
+        the FlyDSL work plan, has a reader. MiniMax-M3's sparse layers read
+        neither (their pages come from the indexer's top-k, their FlyDSL plans
+        are their own), nor does a DSpark drafter, which builds its block's
+        metadata itself. A dense layer, or any other drafter, may."""
+        from atom.model_engine import host_nl
+
+        if not host_nl.on("NO_DECODE_PLAN"):
+            return True  # rF13b's: built every step
+        read = self.__dict__.get("_dense_metadata_read")
+        if read is not None:
+            return read
+        read = True
+        drafter = getattr(self.model_runner, "drafter", None)
+        if self._has_sparse_attention:
+            from atom.models.minimax_m3.index_schedule import (
+                sparse_attention_layer_ids,
+            )
+            from atom.spec_decode.dspark_proposer import DSparkProposer
+
+            hf_config = self.model_runner.config.hf_config
+            text_config = getattr(hf_config, "text_config", hf_config)
+            layers = int(text_config.num_hidden_layers)
+            read = not (
+                sparse_attention_layer_ids(text_config) >= set(range(layers))
+                and (drafter is None or isinstance(drafter, DSparkProposer))
+            )
+            if not read:
+                logger.info(
+                    "decode metadata: no kv_indices / FlyDSL work plan built "
+                    "(all %d layers sparse, %s drafter): nothing reads them",
+                    layers,
+                    "DSpark" if drafter is not None else "no",
+                )
+        self._dense_metadata_read = read
+        return read
+
     def finish_decode(
         self,
         batch: ScheduledBatch,
@@ -1261,16 +1299,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 running_bs, self.model_runner.forward_vars["max_qlen"]
             ).items():
                 setattr(attn_metadata, name, value)
-        kv_indices_generate_triton(
-            attn_metadata.block_tables,
-            attn_metadata.kv_indices,
-            attn_metadata.kv_indptr,
-            self.block_ratio,
-            max_seqlen_k,
-        )
-        attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
-            attn_metadata.context_lens
-        )
+        if self._dense_decode_metadata_read():
+            from atom.model_engine import host_nl
+
+            host_nl.STATS["nl_off_decode_plan"] += int(not host_nl.on("NO_DECODE_PLAN"))
+            kv_indices_generate_triton(
+                attn_metadata.block_tables,
+                attn_metadata.kv_indices,
+                attn_metadata.kv_indptr,
+                self.block_ratio,
+                max_seqlen_k,
+            )
+            attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
+                attn_metadata.context_lens
+            )
         if self._has_sparse_attention:
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token

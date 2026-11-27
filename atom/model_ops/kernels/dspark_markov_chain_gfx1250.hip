@@ -122,7 +122,7 @@ __global__ __launch_bounds__(NTHREADS, 1) void markov_chain2_kernel(
     const __bf16* __restrict__ base, long base_stride, IdT* __restrict__ ids, long ids_stride,
     const __bf16* __restrict__ w1, const __bf16* __restrict__ w2, __bf16* __restrict__ embed_out, long embed_stride,
     unsigned long long* __restrict__ slots, int* __restrict__ err, float* __restrict__ dbg_vals, int V, int nsteps,
-    int lds_tiles, unsigned long long* __restrict__ tl) {
+    int lds_tiles, unsigned long long* __restrict__ tl, const IdT* __restrict__ anchor) {
   extern __shared__ __attribute__((aligned(16))) unsigned char lds[];
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int ncta = gridDim.x, cta = blockIdx.x;
@@ -144,7 +144,11 @@ __global__ __launch_bounds__(NTHREADS, 1) void markov_chain2_kernel(
   if (do_tl) tls[0] = wall_clock64();
 
   unsigned long long* win = slots + (size_t)MAX_STEPS * ncta;
-  const unsigned tag = ((unsigned)(ld_dev(&slots[(size_t)(nsteps - 1) * ncta + cta]) & 0x3fff) + 1) & 0x3fff;
+  // this CTA's launch count (after the MODE 1 words): the tag, never 0, differs from the previous call's whatever
+  // its nsteps (a tag taken from the last step's slot repeats when nsteps changes between calls)
+  unsigned long long* const cnt = slots + (size_t)MAX_STEPS * ncta + MAX_STEPS + cta;
+  const unsigned long long calls = ld_dev(cnt);
+  const unsigned tag = (unsigned)(calls % 16383ull) + 1u;
 
   // ---- prologue 1: LDS fill ----
 #if FILL_TDM
@@ -229,7 +233,9 @@ __global__ __launch_bounds__(NTHREADS, 1) void markov_chain2_kernel(
   __syncthreads();
   if (do_tl) tls[1] = wall_clock64();
 
-  int prev = (int)ids[0];
+  // the anchor from `anchor` when given (then also copied into ids[0]: the caller needs no copy launch)
+  int prev = (int)(anchor != nullptr ? anchor[0] : ids[0]);
+  if (anchor != nullptr && cta == 0 && tid == 0) ids[0] = (IdT)prev;
   for (int k = 0; k < nsteps; ++k) {
     const __bf16* e = w1 + (size_t)prev * RANK;
     bf16x16 eb[8];
@@ -391,6 +397,7 @@ __global__ __launch_bounds__(NTHREADS, 1) void markov_chain2_kernel(
     prev = winner;
     __syncthreads();
   }
+  if (tid == 0) st_dev(cnt, calls + 1);
   if (do_tl)
     for (int i = 0; i < 2 + 3 * nsteps; ++i) tl[(size_t)cta * NSTAMP + i] = tls[i];
 }
@@ -398,7 +405,7 @@ __global__ __launch_bounds__(NTHREADS, 1) void markov_chain2_kernel(
 template <int M, typename IdT, bool D>
 static int launch_t(const void* base, long base_stride, void* ids, long ids_stride, const void* w1, const void* w2,
                     void* embed_out, long embed_stride, void* slots, void* err, void* dbg, int V, int nsteps,
-                    int lds_tiles, int ncta, void* tl, hipStream_t stream) {
+                    int lds_tiles, int ncta, void* tl, const void* anchor, hipStream_t stream) {
   auto kern = markov_chain2_kernel<M, IdT, D>;
   size_t lds = (size_t)lds_tiles * TILE_LDS + 512;
   if (lds > 327680) return -4;
@@ -407,22 +414,23 @@ static int launch_t(const void* base, long base_stride, void* ids, long ids_stri
   hipLaunchKernelGGL(kern, dim3(ncta), dim3(NTHREADS), lds, stream, (const __bf16*)base, base_stride, (IdT*)ids,
                      ids_stride, (const __bf16*)w1, (const __bf16*)w2, (__bf16*)embed_out, embed_stride,
                      (unsigned long long*)slots, (int*)err, (float*)dbg, V, nsteps, lds_tiles,
-                     (unsigned long long*)tl);
+                     (unsigned long long*)tl, (const IdT*)anchor);
   return (int)hipGetLastError();
 }
 
-// Same C ABI as v1's markov_chain_launch (layout must be 0).
+// v1's ABI (layout must be 0) + `anchor` (nullable: the anchor id, then also written to ids[0]). slots:
+// MAX_STEPS * ncta + MAX_STEPS + ncta int64 words (the last ncta: per-CTA launch counts), zeroed once.
 extern "C" int markov_chain_launch(int layout, int mode, int id64, int dbg, const void* base, long base_stride,
                                    void* ids, long ids_stride, const void* w1, const void* w2, void* embed_out,
                                    long embed_stride, void* slots, void* err, void* dbg_vals, int V, int nsteps,
-                                   int lds_tiles, int ncta, void* stream, void* tl) {
+                                   int lds_tiles, int ncta, void* stream, void* tl, const void* anchor) {
   if (layout != 0 || nsteps < 1 || nsteps > MAX_STEPS || (V & 15) || ncta < 1 || ncta > NTHREADS) return -1;
   // every wave's tile list must fit the unrolled bounds
   int ntiles = V >> 4, q = ntiles / ncta + 1, nl = q < lds_tiles ? q : lds_tiles;
   if ((nl + NWAVES - 1) / NWAVES > TPW_MAX - REM_MAX || (q - nl + NWAVES - 1) / NWAVES > REM_MAX) return -3;
   hipStream_t s = (hipStream_t)stream;
 #define ARGS base, base_stride, ids, ids_stride, w1, w2, embed_out, embed_stride, slots, err, dbg_vals, V, nsteps, \
-             lds_tiles, ncta, tl, s
+             lds_tiles, ncta, tl, anchor, s
   if (mode == 0) {
     if (id64) return dbg ? launch_t<0, long long, true>(ARGS) : launch_t<0, long long, false>(ARGS);
     return dbg ? launch_t<0, int, true>(ARGS) : launch_t<0, int, false>(ARGS);
