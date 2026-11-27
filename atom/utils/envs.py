@@ -526,9 +526,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
     # MiniMax-M3 gfx1250 FP4 index, prefill: aiter's FlyDSL scorer fused with the
     # top-16 block selection (`index_topk_prefill_nvfp4`) where aiter prefers it
-    # to the scorer + selector; the same selection. Opt-in for A/B.
+    # to the scorer + selector; the same selection. On by default; 0 turns it off.
     "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL": lambda: _flag_env(
-        "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL"
+        "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL", "1"
     ),
     # MiniMax-M3: store the sparse (indexed) layers' K/V as NVFP4 (e2m1 + E4M3 per
     # 16) in their own pool; dense layers, the draft and --kv_cache_dtype are

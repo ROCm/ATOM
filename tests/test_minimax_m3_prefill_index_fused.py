@@ -96,6 +96,12 @@ def _prefill(rows=2048, fp4=True, emit=True, pages_per_block=1):
     return out, blocks
 
 
+def test_on_by_default(monkeypatch, aiter_op):
+    monkeypatch.delenv(FLAG, raising=False)
+    _prefill()
+    assert len(aiter_op.fused) == 1 and not aiter_op.select
+
+
 def test_off_keeps_the_scorer_and_the_selector(monkeypatch, aiter_op):
     monkeypatch.setenv(FLAG, "0")
     monkeypatch.setitem(sys.modules, AITER_OP, None)  # never imported
