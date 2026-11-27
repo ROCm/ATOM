@@ -7,6 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from atom.utils import mooncake_hca
+
 
 @pytest.mark.parametrize(
     "netdev_ip",
@@ -25,7 +27,7 @@ def test_matched_rail_rpc_uses_host_address_and_preserves_hca_selection(
     monkeypatch.setattr(mc, "get_ip", lambda: "192.0.2.2")
     monkeypatch.setattr(mc, "get_open_port", lambda: 17000)
     monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
-    monkeypatch.setattr(mc, "_ib_device_exists", lambda device: True)
+    monkeypatch.setattr(mooncake_hca, "ib_device_exists", lambda device: True)
     monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(mc, "ThreadPoolExecutor", Mock())
     monkeypatch.setattr(mc.zmq, "Context", Mock())

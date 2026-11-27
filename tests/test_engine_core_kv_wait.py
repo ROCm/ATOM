@@ -36,7 +36,7 @@ def engine_step(monkeypatch):
         kv_transfer_enabled=True,
         runner_mgr=SimpleNamespace(call_func=Mock(return_value="forward-result")),
         _poll_kv_transfer_progress=Mock(return_value=False),
-        _kv_progress_event=event,
+        _wake_event=event,
         input_queue=queue.Queue(),
         utility_queue=queue.Queue(),
         _postprocess=Mock(),
@@ -125,7 +125,7 @@ def test_already_queued_work_does_not_wait(engine_step, queue_name):
 def test_arrival_during_poll_is_latched_until_wait(engine_step):
     module, engine, _, _ = engine_step
     event = threading.Event()
-    engine._kv_progress_event = event
+    engine._wake_event = event
 
     def poll():
         event.set()
@@ -139,7 +139,7 @@ def test_arrival_during_poll_is_latched_until_wait(engine_step):
 def test_arrival_between_queue_check_and_wait_is_not_lost(engine_step):
     module, engine, _, _ = engine_step
     event = threading.Event()
-    engine._kv_progress_event = event
+    engine._wake_event = event
 
     class ArrivalQueue:
         def empty(self):
@@ -165,7 +165,7 @@ def test_wait_releases_thread_and_wakes_on_progress(engine_step):
             # within the production 1 ms interval.
             assert event.wait(5)
 
-    engine._kv_progress_event = ObservedEvent()
+    engine._wake_event = ObservedEvent()
 
     def run():
         module.EngineCore._wait_for_kv_progress(engine)

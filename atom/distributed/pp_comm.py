@@ -22,9 +22,9 @@ logger = logging.getLogger("atom")
 
 # Keys carried between pipeline stages. `sparse_kv_indices` is optional: present
 # only when a PP boundary splits a DSA IndexShare group (see model_runner).
-# `block_residual` is Kimi-K3's AttnRes block window [T, k, H]. `PP_AUX_KEY`
-# relays a drafter's target aux hidden states (`PPAuxRelay`, set/popped by
-# model_runner). Keys missing here are silently dropped by the send.
+# `block_residual` is Kimi-K3's written AttnRes prefix [T, closed_blocks, H].
+# `PP_AUX_KEY` relays a drafter's target aux hidden states (`PPAuxRelay`,
+# set/popped by model_runner). Keys missing here are silently dropped by the send.
 PP_AUX_KEY = "pp_aux"
 
 _PP_PROXY_KEYS = (

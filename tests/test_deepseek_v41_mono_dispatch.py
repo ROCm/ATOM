@@ -422,11 +422,17 @@ def _v41_config():
 
 class _Block(torch.nn.Module):
     # the deployed routed experts: A8W4 (gate / up interleaved, MXFP8 activations)
-    def __init__(self, table, mode, *, interleaved=True, fp8_activations=True):
+    def __init__(
+        self, table, mode, *, interleaved=True, fp8_activations=True, kept=None
+    ):
         super().__init__()
         self.attn = SimpleNamespace(spec=SimpleNamespace(layer_id=2, mode=mode))
+        # ``kept``: the routed experts' tensors the MoE keeps apart from the
+        # parameters (MegaMoE's copies); else it reads the parameters
         method = SimpleNamespace(
-            is_guinterleave=interleaved, fp8_activations=fp8_activations
+            is_guinterleave=interleaved,
+            fp8_activations=fp8_activations,
+            routed_expert_copies=lambda experts: dict(kept or {}),
         )
         self.ffn = SimpleNamespace(experts=SimpleNamespace(quant_method=method))
         self.table = table
@@ -519,3 +525,59 @@ def test_routed_experts_off_a8w4_are_refused(interleaved, fp8_activations):
     )
     with pytest.raises(MonoUnsupported, match="not A8W4"):
         weights.bind_layer(block, _v41_config(), Dims(4))
+
+
+def _mega_copies(table, w13_shape=None):
+    """MegaMoE's routed experts: its copies hold them, the parameters are
+    released to (0,) (``MegaMxfp4MoEMethod._process_weight_layout_after_loading``)."""
+    released = dict(table)
+    kept = {}
+    for name in ("w13_weight", "w2_weight"):
+        shape, dtype = table[f"ffn.experts.{name}"]
+        released[f"ffn.experts.{name}"] = ((0,), dtype)
+        kept[name] = torch.empty(shape, dtype=dtype, device="meta")
+        kept[f"{name}_scale"] = torch.empty((1,), dtype=torch.uint8, device="meta")
+    if w13_shape is not None:
+        kept["w13_weight"] = torch.empty(
+            w13_shape, dtype=kept["w13_weight"].dtype, device="meta"
+        )
+    return released, kept
+
+
+def test_routed_experts_are_read_where_the_moe_keeps_them():
+    from atom.models.deepseek_v41.config import AttentionMode
+    from atom.models.deepseek_v41.mono import weights
+
+    table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(4))
+    released, kept = _mega_copies(table)
+    bound = weights.bind_layer(
+        _Block(released, AttentionMode.FULL, kept=kept), _v41_config(), Dims(4)
+    )
+    for name, tensor in kept.items():
+        assert bound[f"ffn.experts.{name}"] is tensor
+
+
+def test_kept_routed_experts_off_the_table_are_refused():
+    from atom.models.deepseek_v41.config import AttentionMode
+    from atom.models.deepseek_v41.mono import weights
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(4))
+    shape = table["ffn.experts.w13_weight"][0]
+    released, kept = _mega_copies(table, (shape[0] // 2, *shape[1:]))
+    with pytest.raises(MonoUnsupported, match="ffn.experts.w13_weight"):
+        weights.bind_layer(
+            _Block(released, AttentionMode.FULL, kept=kept), _v41_config(), Dims(4)
+        )
+
+
+def test_only_mega_reads_routed_experts_outside_the_parameters():
+    from atom.model_ops.moe import MegaMxfp4MoEMethod, Mxfp4MoEMethod
+
+    names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+    mega = ("_mega_w1", "_mega_w1_scale", "_mega_w2", "_mega_w2_scale")
+    layer = SimpleNamespace(**{n: object() for n in names + mega})
+    # the other MXFP4 paths read the parameters, as before
+    assert Mxfp4MoEMethod.routed_expert_copies(None, layer) == {}
+    copies = MegaMxfp4MoEMethod.routed_expert_copies(None, layer)
+    assert copies == {n: getattr(layer, m) for n, m in zip(names, mega)}

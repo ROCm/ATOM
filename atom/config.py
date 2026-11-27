@@ -89,6 +89,9 @@ class KVCacheTensor:
     replay_buf_k: torch.Tensor = None
     replay_buf_u: torch.Tensor = None
     replay_buf_g: torch.Tensor = None
+    # Flush scratch is local to this layer's pool, not transferred with state.
+    replay_flush_arrivals: torch.Tensor = None
+    replay_flush_wait: str | None = None
     # True when the tensors above are a hybrid's PER-REQUEST state (GDN/KDA
     # recurrent state) rather than paged KV. Only the GDN and KDA linear-attn
     # forwards set it (`gdn_attn.py`, `kimi_mla_gdn_attn.py`, and the rtpllm/
@@ -1102,8 +1105,9 @@ class ParallelConfig:
     apart leaves the request socket with a single writer thread, so admitting a
     request needs no synchronization. Populated by launch_engine_core."""
     pp_kv_status_addr: str = ""
-    """ZMQ endpoint where the head receives KV offload status from downstream
-    PP stages. All downstream stages PUSH; the head PULLs."""
+    """ZMQ endpoint where the head receives KV offload status: downstream stages'
+    polls and, where stages push, every stage's load terminals. Senders PUSH;
+    the head PULLs."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
@@ -1495,11 +1499,6 @@ class SpeculativeConfig:
         form is converted to a length and everything downstream reads only
         ``synthetic_acceptance_rates``.
         """
-        # Local import: the schedule lives next to the kernel that consumes it,
-        # and that module pulls in triton, which has no business loading just
-        # because someone imported a config.
-        from atom.model_ops.rejection_sampler import acceptance_length_to_rates
-
         if (
             self.synthetic_acceptance_length is not None
             and self.synthetic_acceptance_rate is not None
@@ -1511,6 +1510,9 @@ class SpeculativeConfig:
         length = self.synthetic_acceptance_length
         if self.synthetic_acceptance_rate is None and length is None:
             return
+        # Below the return: the rejection sampler pulls in triton, which a config
+        # without forced acceptance has no business loading.
+        from atom.model_ops.rejection_sampler import acceptance_length_to_rates
 
         n = self.num_speculative_tokens
         if not n:
@@ -2472,6 +2474,8 @@ class Config:
 
     # Intra-GPU prefill/decode disaggregation
     enable_rapidserve: bool = False
+    # Serve the vision encoder alone, without an engine core (`encoder_only.py`)
+    encoder_only: bool = False
     # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages)
     disagg_d2p_addr: str = ""
     # ZMQ IPC address: prefill PUSH → decode PULL (PrefillDone messages)

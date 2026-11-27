@@ -539,6 +539,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if callable(offer):
                 offer(seqs)
 
+    def set_offload_lookups(self, enabled: bool) -> bool:
+        """Switch every sub's tier lookups; True if one took it and none refused."""
+        results = [
+            bool(switch(enabled)) for switch in self._sub_methods("set_offload_lookups")
+        ]
+        return bool(results) and all(results)
+
     def note_scheduled_tokens(
         self, scheduled_seqs: Any, num_scheduled_tokens: Any
     ) -> None:

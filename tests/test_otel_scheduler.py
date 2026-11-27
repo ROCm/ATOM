@@ -193,6 +193,8 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
             raise RuntimeError(name)
 
     core.label = "test"
+    core._idle_when_blocked = False
+    core._dp_group_hidden_work = False
     core.utility_queue = None
     core.utility_handler = SimpleNamespace(
         process_queue=lambda *a: None, push_metrics=lambda **k: None
@@ -299,6 +301,7 @@ def test_real_engine_dispatch_keeps_tracing_when_metrics_returns_early(
         core._defer_prefix_hash = False
         core.pp_size = pp_size
         core.pp_max_inflight = pp_size
+        core._stages_push_load_terminals = False
         completions = deque()
         core.pp_transport = SimpleNamespace(
             send_metadata=lambda batch: None,

@@ -13,9 +13,12 @@
 #                                                step. Sent for every batch that
 #                                                produces output or carries
 #                                                `pp_completion_ack`.
-#   kv_status  (every downstream stage -> head): KV offload load/save completion
+#   kv_status  (stages -> head):                 KV offload load/save completion
 #                                                status, so the head can
-#                                                aggregate across all PP stages.
+#                                                aggregate across all PP stages:
+#                                                each downstream stage's poll,
+#                                                and where stages push, every
+#                                                stage's load terminals.
 #
 # The objects moved here (ScheduledBatch, ScheduledBatchOutput, KVConnectorOutput)
 # are the same ones already pickled to broadcast to workers, so no bespoke wire
@@ -26,6 +29,7 @@
 
 import logging
 import pickle
+import threading
 from typing import Any
 
 import zmq
@@ -45,9 +49,10 @@ class PPStageTransport:
             stage binds a PULL socket to its own endpoint.
         token_addr: endpoint on which the head RECEIVES completions from the
             last stage. The head binds a PULL socket; the last stage connects PUSH.
-        kv_status_addr: endpoint on which the head RECEIVES KV offload status
-            from ALL downstream stages. The head binds a PULL socket; every
-            downstream stage connects a PUSH socket. Empty string = disabled.
+        kv_status_addr: endpoint on which the head RECEIVES KV offload status:
+            every downstream stage's, and where stages push, each stage's load
+            terminals (`PPKVStatusPusher`, stage 0's included). The head binds a
+            PULL socket; each sender connects a PUSH socket. Empty = disabled.
         ctx: optional shared zmq.Context (one is created if omitted).
     """
 
@@ -165,3 +170,44 @@ class PPStageTransport:
                 sock.close(linger=0)
         if self._owns_ctx:
             self._ctx.term()
+
+
+def stages_push_load_terminals(config) -> bool:
+    """PP on the Mooncake Store with one rank a stage: each stage's load threads
+    push their terminals to the head (`PPKVStatusPusher`)."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.model_engine.capabilities import pcp_group_size_of
+
+    if config.pipeline_parallel_size < 2:
+        return False
+    # The head counts one report a stage: one rank cannot stand for its stage.
+    if config.tensor_parallel_size * pcp_group_size_of(config) != 1:
+        return False
+    leaves = KVConnectorFactory.leaf_connectors(config) or ()
+    return any(name == "mooncake_store" for name, _ in leaves)
+
+
+class PPKVStatusPusher:
+    """A stage runner's PUSH to the head's kv_status socket: sends what
+    `PPStageTransport.send_kv_status` sends, from any thread of the runner."""
+
+    def __init__(self, pp_rank: int, kv_status_addr: str) -> None:
+        self.pp_rank = pp_rank
+        # The load threads share the socket; a zmq socket is not thread-safe.
+        self._lock = threading.Lock()
+        self._sock = zmq.Context.instance().socket(zmq.PUSH)
+        self._sock.connect(kv_status_addr)
+
+    def try_send(self, output: Any) -> bool:
+        """Queue `output` for the head without waiting; False if its pipe is full."""
+        payload = pickle.dumps((self.pp_rank, output))
+        with self._lock:
+            try:
+                self._sock.send(payload, zmq.NOBLOCK, copy=False)
+            except zmq.Again:
+                return False
+        return True
+
+    def close(self) -> None:
+        with self._lock:
+            self._sock.close(linger=1000)

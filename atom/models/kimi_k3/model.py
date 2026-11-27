@@ -67,7 +67,6 @@ from atom.models.kimi_k3.mono.plan import kda_metadata as step_kda_metadata
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
     pp_holds_embedding,
@@ -1611,6 +1610,8 @@ class KimiKDAAttention(nn.Module):
                     buf_k=cache.replay_buf_k,
                     buf_u=cache.replay_buf_u,
                     buf_g=cache.replay_buf_g,
+                    flush_arrivals=cache.replay_flush_arrivals,
+                    flush_wait=cache.replay_flush_wait,
                     write_pos=kda_metadata.write_pos,
                     slot_idx=kda_metadata.slot_idx[:nd],
                     cu_seqlens=query_start_loc[: nd + 1],
@@ -1693,6 +1694,8 @@ class KimiKDAAttention(nn.Module):
                     buf_k=cache.replay_buf_k,
                     buf_u=cache.replay_buf_u,
                     buf_g=cache.replay_buf_g,
+                    flush_arrivals=cache.replay_flush_arrivals,
+                    flush_wait=cache.replay_flush_wait,
                     write_pos=kda_metadata.write_pos,
                     slot_idx=kda_metadata.slot_idx[:nsd],
                     cu_seqlens=spec_query_start_loc[: nsd + 1],
@@ -2043,7 +2046,7 @@ class KimiDecoderLayer(nn.Module):
             getattr(self, "self_attention_res_norm", None),
             out_norm=self.input_layernorm,
             enabled=self.use_attn_residuals,
-            # Only this site banks the running prefix as a candidate.
+            # Only this site closes blocks to bank the running prefix.
             block_size=getattr(config, "attn_res_block_size", None),
             layer_idx=layer_num,
         )
@@ -2052,6 +2055,9 @@ class KimiDecoderLayer(nn.Module):
             getattr(self, "mlp_res_norm", None),
             out_norm=self.post_attention_layernorm,
             enabled=self.use_attn_residuals,
+            # Shift the read bound to include this layer's block close.
+            block_size=getattr(config, "attn_res_block_size", None),
+            layer_idx=layer_num + 1,
         )
 
     def _ffn(
@@ -2081,10 +2087,7 @@ class KimiDecoderLayer(nn.Module):
         # post_attention_layernorm are its out_norms, so hidden_states comes
         # back already normed at both.
         hidden_states, prefix_sum = self.self_attention_attn_res(
-            hidden_states, block_residual, pending_add, pending_add2
-        )
-        block_residual, prefix_sum = self.self_attention_attn_res.maybe_close_block(
-            prefix_sum, block_residual
+            hidden_states, block_residual, pending_add, pending_add2, close_block=True
         )
 
         if self.is_linear_attn:
@@ -2160,26 +2163,21 @@ class KimiDecoderLayer(nn.Module):
         score weight. ``check_aggregate_source`` must have accepted
         ``next_layer`` first.
 
-        The bank holds one snapshot per ``maybe_close_block`` at or below this
+        The bank holds one snapshot per block closed at or below this
         layer. Only those are read: a caller may hand a fixed-size bank whose
         later slots are not yet written this step.
         """
         prefix_sum, pending_add, pending_add2, block_residual = output
         if prefix_sum is None:
             return None
-        own, res = self.self_attention_attn_res, next_layer.self_attention_attn_res
-        num_blocks = own.layer_idx // own.block_size + 1
-        if block_residual is None or block_residual.shape[1] < num_blocks:
-            raise RuntimeError(
-                f"aggregate of target layer {self.layer_idx}: expected a bank "
-                f"of >= {num_blocks} blocks, got "
-                f"{None if block_residual is None else tuple(block_residual.shape)}"
-            )
+        res = next_layer.self_attention_attn_res
+        if block_residual is None:
+            raise RuntimeError("aggregate expected a bank")
         from atom.model_ops.kimi_k3 import apply_attn_res
 
         mixed, _ = apply_attn_res(
             prefix_sum,
-            block_residual[:, :num_blocks],
+            res.window(block_residual),
             res.score_weight,
             res.eps,
             pending_add,
@@ -2262,12 +2260,49 @@ class KimiLinearModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "block_residual"], config.hidden_size
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        hidden_states = torch.zeros(
+            (batch_size, self.config.hidden_size), dtype=dtype, device=device
+        )
+        block_size = getattr(self.config, "attn_res_block_size", None)
+        blocks = 0 if block_size is None else -(-self.start_layer // block_size)
+        block_residual = hidden_states.new_zeros(
+            batch_size, blocks, self.config.hidden_size
+        )
+        return IntermediateTensors(
+            {"hidden_states": hidden_states, "block_residual": block_residual}
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def block_bank(
+        self, hidden_states: torch.Tensor, received_blocks: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
+        """Allocate writable capacity, restoring a preceding PP stage's prefix."""
+        block_size = getattr(self.config, "attn_res_block_size", None)
+        if block_size is None:
+            return None
+        if self.start_layer > 0 and received_blocks is None:
+            raise ValueError("received block prefix is missing for this PP stage")
+        tokens, hidden = hidden_states.shape
+        blocks = -(-self.config.num_hidden_layers // block_size)
+        bank = hidden_states.new_empty(tokens, blocks, hidden)
+        if received_blocks is not None:
+            written = -(-self.start_layer // block_size)
+            if received_blocks.shape != (tokens, written, hidden):
+                raise ValueError("received block prefix does not match this PP stage")
+            bank[:, :written].copy_(received_blocks)
+        return bank
+
+    def block_bank_prefix(self, bank: torch.Tensor | None) -> torch.Tensor | None:
+        """Only initialized slots cross PP; keep the wire tensor contiguous."""
+        if bank is None:
+            return None
+        block_size = self.config.attn_res_block_size
+        return bank[:, : -(-self.end_layer // block_size)].contiguous()
 
     def forward(
         self,
@@ -2282,17 +2317,13 @@ class KimiLinearModel(nn.Module):
                 if inputs_embeds is not None
                 else self.embed_tokens(input_ids)
             )
-            block_residual = (
-                hidden_states.new_zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[1]
-                )
-                if getattr(self.config, "attn_res_block_size", None) is not None
-                else None
-            )
+            block_residual = self.block_bank(hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            block_residual = intermediate_tensors["block_residual"]
+            block_residual = self.block_bank(
+                hidden_states, intermediate_tensors["block_residual"]
+            )
 
         # Each layer hands its FFN output back unapplied (pending_add), and an MoE
         # layer hands its shared-expert output back separately (pending_add2); the
@@ -2313,7 +2344,10 @@ class KimiLinearModel(nn.Module):
             if pending_add2 is not None:
                 hidden_states = hidden_states + pending_add2
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "block_residual": block_residual}
+                {
+                    "hidden_states": hidden_states,
+                    "block_residual": self.block_bank_prefix(block_residual),
+                }
             )
         hidden_states, _ = self.output_attn_res(
             hidden_states, block_residual, pending_add, pending_add2
@@ -2446,6 +2480,19 @@ class KimiK3ForCausalLM(nn.Module):
         return self.language_model.get_expert_mapping()
 
 
+def _vision_config(atom_config: Config):
+    vision_config = getattr(
+        getattr(atom_config, "multimodal_config", None), "vision_config", None
+    )
+    if vision_config is None:
+        raise ValueError(
+            "Kimi-K3 needs the full HF config (with `vision_config`) to "
+            "build its vision tower. Start the server with "
+            "--trust-remote-code."
+        )
+    return vision_config
+
+
 class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
     """Kimi-K3 with the MoonViT3d vision tower attached.
 
@@ -2463,18 +2510,19 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         "mm_projector.",
     )
 
+    @classmethod
+    def encoder_only_modules(cls, atom_config: Config) -> dict[str, nn.Module]:
+        """The vision modules alone, by attribute name, for ``--encoder-only``
+        (``atom.model_engine.encoder_only``)."""
+        from atom.models.kimi_k3_vl import build_vision_modules
+
+        names = ("vision_tower", "mm_projector")
+        return dict(zip(names, build_vision_modules(_vision_config(atom_config))))
+
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__(atom_config, prefix=prefix)
 
-        vision_config = getattr(
-            getattr(atom_config, "multimodal_config", None), "vision_config", None
-        )
-        if vision_config is None:
-            raise ValueError(
-                "Kimi-K3 needs the full HF config (with `vision_config`) to "
-                "build its vision tower. Start the server with "
-                "--trust-remote-code."
-            )
+        vision_config = _vision_config(atom_config)
 
         # The tower only runs where the token embeddings are produced.
         self.has_vision_tower = get_pp_group().is_first_rank

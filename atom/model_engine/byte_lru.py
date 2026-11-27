@@ -45,12 +45,16 @@ class ByteLRU:
         self._items.move_to_end(key)
         return item[0]
 
+    def fits(self, payload_bytes: int) -> bool:
+        """Whether `put` would keep an entry of `payload_bytes` at all."""
+        return payload_bytes + ENTRY_OVERHEAD <= self.budget
+
     def put(self, key: Hashable, value, payload_bytes: int) -> None:
         """Store `value`, charged `payload_bytes` plus `ENTRY_OVERHEAD`, and
         evict down to the budget. An entry larger than the budget is not kept."""
         cost = payload_bytes + ENTRY_OVERHEAD
         self.pop(key)
-        if cost > self.budget:
+        if not self.fits(payload_bytes):
             return
         self._items[key] = (value, cost)
         self.bytes += cost

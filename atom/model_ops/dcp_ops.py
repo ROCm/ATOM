@@ -34,6 +34,7 @@ from atom.distributed.dcp_layout import (  # noqa: F401
     dcp_global_pos,
     dcp_local_index,
     dcp_owner_rank,
+    get_dcp_local_seq_lens,
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
@@ -1322,33 +1323,6 @@ def reorg_kvcache(
     return reorganized_kv_c_normed, reorganized_k_pe
 
 
-def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1):
-    """Compute per-DCP-rank local sequence lengths.
-
-    With interleaved storage, token i is stored on rank
-    (i // cp_kv_cache_interleave_size) % dcp_size.
-
-    Args:
-        seq_lens: numpy array of sequence lengths
-        dcp_size: DCP world size
-        dcp_rank: this rank's DCP rank
-        cp_kv_cache_interleave_size: interleaving granularity (default 1 = token-level)
-
-    Returns:
-        local_seq_lens: numpy array of local sequence lengths
-    """
-    full_chunks = seq_lens // (cp_kv_cache_interleave_size * dcp_size)
-    base = full_chunks * cp_kv_cache_interleave_size
-
-    remainder_total = seq_lens - base * dcp_size
-    remainder = np.clip(
-        remainder_total - dcp_rank * cp_kv_cache_interleave_size,
-        0,
-        cp_kv_cache_interleave_size,
-    )
-    return base + remainder
-
-
 def get_dcp_local_window_lens(
     positions, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
 ):
@@ -1678,15 +1652,10 @@ def dcp_decode_candidate_exchange_fused(
         values=send,
     )
 
-    # Half the payload of the (score, gid) exchange, on the custom all-gather:
-    # a pure copy, so the score bits arrive untouched.
-    n_cand = dcp_world_size * k_loc
-    gathered_sc = (
-        dcp_all_gather(get_dcp_group(), send, 0)
-        .view(dcp_world_size, num_decode_tokens, k_loc)
-        .permute(1, 0, 2)
-        .reshape(num_decode_tokens, n_cand)
-    )
+    # Keep score bits and rank order in the merge's [rows, world * k_loc] layout.
+    # The custom gather writes it directly; fallback collectives may still
+    # materialize the layout internally.
+    gathered_sc = dcp_all_gather(get_dcp_group(), send, -1)
 
     flydsl_dcp_topk_merge(
         gathered_sc,
