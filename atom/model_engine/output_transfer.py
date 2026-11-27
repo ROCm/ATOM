@@ -76,6 +76,10 @@ class D2HQueue:
         slot.source = source
         self._pending.append(slot)
 
+    def last_copy_event(self) -> "torch.cuda.Event | None":
+        """The completion event of the newest pending copy (None when none is pending)."""
+        return self._pending[-1].copy_done if self._pending else None
+
     def receive(self):
         """Wait for the oldest transfer and return an independently owned output."""
         if not self._pending:

@@ -84,6 +84,79 @@ def _masked_embedding_launcher(
     return out
 
 
+@triton.jit
+def _masked_block_embedding_kernel(
+    anchor_ptr,
+    weight_ptr,
+    out_ptr,
+    noise_id,
+    T,
+    vocab_start_idx,
+    vocab_end_idx,
+    stride_w_row,
+    stride_out_row,
+    N,
+    D,
+    BLOCK_D: tl.constexpr,
+):
+    """``_masked_embedding_kernel`` over a draft block's ids without materializing them: row r is
+    ``anchor[r // T]`` at a block's first position and ``noise_id`` elsewhere. Same loads and stores.
+    """
+    pid_row = tl.program_id(0)
+    pid_col = tl.program_id(1)
+    if pid_row >= N:
+        return
+
+    anchor = tl.load(anchor_ptr + pid_row // T)
+    token_id = tl.where(pid_row % T == 0, anchor, noise_id)
+    in_range = (token_id >= vocab_start_idx) & (token_id < vocab_end_idx)
+    local_idx = token_id - vocab_start_idx
+
+    col_start = pid_col * BLOCK_D
+    cols = col_start + tl.arange(0, BLOCK_D)
+    col_mask = cols < D
+
+    emb = tl.load(
+        weight_ptr + local_idx.to(tl.int64) * stride_w_row + cols,
+        mask=in_range & col_mask,
+        other=0.0,
+    )
+
+    tl.store(out_ptr + pid_row * stride_out_row + cols, emb, mask=col_mask)
+
+
+def masked_block_embedding(
+    anchor_ids: torch.Tensor,
+    noise_id: int,
+    T: int,
+    weight: torch.Tensor,
+    vocab_start_idx: int,
+    vocab_end_idx: int,
+) -> torch.Tensor:
+    """``masked_embedding`` of ``[anchor, noise_id x (T - 1)]`` per request, bit for bit, in one launch
+    (the block's id tensor -- a fill and a copy -- is never built)."""
+    N = anchor_ids.numel() * T
+    D = weight.shape[1]
+    BLOCK_D = 1024
+    out = torch.empty(N, D, dtype=weight.dtype, device=weight.device)
+    grid = (N, triton.cdiv(D, BLOCK_D))
+    _masked_block_embedding_kernel[grid](
+        anchor_ids,
+        weight,
+        out,
+        noise_id,
+        T,
+        vocab_start_idx,
+        vocab_end_idx,
+        weight.stride(0),
+        out.stride(0),
+        N,
+        D,
+        BLOCK_D=BLOCK_D,
+    )
+    return out
+
+
 def _masked_embedding_fake(
     x: torch.Tensor,
     weight: torch.Tensor,

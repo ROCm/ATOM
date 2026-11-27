@@ -362,6 +362,12 @@ class tokenIDProcessor:
         # The next replay of this draft output follows a whole target forward.
         # Preserve side-stream overlap; no reverse wait on the forward stream.
         self._draft_token_ids_queue.send(gpu_tensor)
+        # A drafter whose ids live in persistent storage (no clone after its
+        # graph) rewrites it on its next pass: that pass waits, device side,
+        # on this copy (the ids' only reader off the forward stream).
+        block = getattr(getattr(self, "drafter", None), "block", None)
+        if block is not None and hasattr(block, "reader_fence"):
+            block.reader_fence(self._draft_token_ids_queue.last_copy_event())
 
     def recv_draft_token_ids(self) -> np.ndarray:
         output = self._draft_token_ids_queue.receive()

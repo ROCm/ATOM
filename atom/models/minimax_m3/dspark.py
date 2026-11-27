@@ -68,7 +68,11 @@ from atom.model_ops.layernorm import (
     fused_allreduce_gemma_rms_norm,
     fused_allreduce_gemma_rms_norm_mxfp8_quant,
 )
-from atom.model_ops.embed_head import VocabParallelEmbedding, masked_embedding
+from atom.model_ops.embed_head import (
+    VocabParallelEmbedding,
+    masked_block_embedding,
+    masked_embedding,
+)
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -105,6 +109,15 @@ def _draft_fused_ar() -> bool:
     layers' fused all-reduce RMSNorm (MXFP8) path. Read at construction (the
     linears' ``reduce_results``) and in the forward alike."""
     return envs.ATOM_DSPARK_FUSED_AR and get_tensor_model_parallel_world_size() > 1
+
+
+# The draft graph's node trims (read at call time): the block's entry as one embedding launch over the anchors
+# with a persistent zero residual, and the drafted ids written by the Markov launch (anchor included) into
+# persistent storage the draft graph hands back without a clone -- 4 fewer graph nodes and no copy after the
+# replay, same values. False keeps the previous launches (A/B).
+_DRAFT_NODE_TRIMS = True
+# Trimmed paths taken (counted per call, so a recording shows each once per pass it captured).
+NODE_TRIM_STATS = {"trim_embed": 0, "trim_zero_res": 0, "trim_anchor": 0, "trim_ids": 0}
 
 
 def _draft_fuse_rows(rows: int) -> bool:
@@ -1112,10 +1125,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         Returns the post-final-norm hidden states ``[B*T, hidden]``. No
         embedding scale: the reference embeds with the target's table as is.
         """
-        bs = input_ids.shape[0]
-        draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
-        draft_ids[:, 0] = input_ids
-        hidden, residual = self._embed_block(draft_ids.view(-1))
+        hidden, residual = self._embed_block_anchors(input_ids, num_draft)
         if _draft_fused_ar() and _draft_fuse_rows(hidden.shape[0]):
             # Each layer as two launches around the paged attention where they serve (dspark_draft_mono.py).
             from atom.models.minimax_m3.model import _linear_consumes_mxfp8
@@ -1157,6 +1167,75 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             hidden, _ = self.final_norm(hidden, residual)
         return hidden
 
+    def _embed_block_anchors(self, anchor_ids: torch.Tensor, num_draft: int):
+        """``_embed_block`` of the block ids ``[anchor, noise x (num_draft - 1)]`` per request. Under
+        ATOM_DSPARK_FUSED_AR at a fused row count this is one launch (``masked_block_embedding``: the id
+        tensor's fill and copy are never run) and the zero residual is a persistent buffer (the fused
+        all-reduce + norm only reads it: its residual output is a new tensor), so the block's entry is
+        one kernel instead of four. Same values bit for bit."""
+        bs = anchor_ids.shape[0]
+        rows = bs * num_draft
+        embed = self.embed_tokens
+        if (
+            _DRAFT_NODE_TRIMS
+            and _draft_fused_ar()
+            and _draft_fuse_rows(rows)
+            and isinstance(embed, VocabParallelEmbedding)
+            and embed.tp_size > 1
+        ):
+            NODE_TRIM_STATS["trim_embed"] += 1
+            hidden = masked_block_embedding(
+                anchor_ids,
+                self.noise_token_id,
+                num_draft,
+                embed.weight,
+                embed.vocab_start_idx,
+                embed.vocab_end_idx,
+            )
+            return hidden, self._zero_residual(hidden)
+        draft_ids = anchor_ids.new_full((bs, num_draft), self.noise_token_id)
+        draft_ids[:, 0] = anchor_ids
+        return self._embed_block(draft_ids.view(-1))
+
+    _zeros: "torch.Tensor | None" = None
+    ids_out_buf: "torch.Tensor | None" = None
+
+    def _ids_out(self, anchor_ids: torch.Tensor, num_draft: int) -> torch.Tensor:
+        """``[bs, num_draft + 1]`` drafted-ids storage. Persistent (allocated on an eager call, outside any graph
+        pool, kept): the proposer registers it with its draft graph, which then hands the ids back without a clone
+        and fences the next pass on their off-stream reader (``DraftGraph.persistent_output`` / ``reader_fence``).
+        Inside a capture without it yet, a fresh tensor as before (the graph then clones it)."""
+        bs = anchor_ids.shape[0]
+        b = self.ids_out_buf
+        need = b is None or b.shape[0] < bs or b.shape[1] != num_draft + 1 or b.dtype != anchor_ids.dtype
+        if need and not torch.cuda.is_current_stream_capturing():
+            b = self.ids_out_buf = torch.zeros(
+                max(bs, self.max_num_seqs), num_draft + 1, dtype=anchor_ids.dtype, device=anchor_ids.device
+            )
+            need = False
+        if need:
+            return anchor_ids.new_empty(bs, num_draft + 1)
+        NODE_TRIM_STATS["trim_ids"] += 1
+        return b[:bs]
+
+    def _zero_residual(self, like: torch.Tensor) -> torch.Tensor:
+        """A zero ``[rows, hidden]`` residual that is never written (allocated on an eager call, outside
+        any graph pool, and kept); inside a capture without one yet, a fresh zero tensor as before."""
+        z = self._zeros
+        if (
+            z is None or z.shape[0] < like.shape[0] or z.dtype != like.dtype
+        ) and not torch.cuda.is_current_stream_capturing():
+            z = self._zeros = torch.zeros(
+                max(like.shape[0], self.max_num_seqs * 8),
+                like.shape[1],
+                dtype=like.dtype,
+                device=like.device,
+            )
+        if z is None or z.shape[0] < like.shape[0] or z.dtype != like.dtype:
+            return torch.zeros_like(like)
+        NODE_TRIM_STATS["trim_zero_res"] += 1
+        return z[: like.shape[0]]
+
     def _embed_block(self, ids: torch.Tensor):
         """The block's embedding and the residual layer 0 starts from.
 
@@ -1197,9 +1276,15 @@ class MiniMaxM3DSpark(DSparkDraftModel):
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]
-        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
-        out_ids[:, 0] = anchor_ids
+        trims = _DRAFT_NODE_TRIMS
+        if trims:
+            out_ids = self._ids_out(anchor_ids, num_draft)
+        else:
+            out_ids = anchor_ids.new_empty(bs, num_draft + 1)
+            out_ids[:, 0] = anchor_ids
         if self._sharded_markov_sample():
+            if trims:
+                out_ids[:, 0] = anchor_ids
             # Imported here, as sample_next does: the op imports Triton.
             from atom.model_ops.dspark_markov_sample import dspark_markov_argmax_tp
 
@@ -1234,9 +1319,15 @@ class MiniMaxM3DSpark(DSparkDraftModel):
                     out_ids,
                     self.markov_head.markov_w1.weight,
                     self.markov_head.markov_w2.weight,
+                    # the launch reads the anchor and writes out_ids[:, 0] itself
+                    anchor=anchor_ids if trims else None,
                 )
                 if embeds is not None:
                     markov_stack = embeds.unsqueeze(0)
+                    if trims:
+                        NODE_TRIM_STATS["trim_anchor"] += 1
+            if markov_stack is None and trims:
+                out_ids[:, 0] = anchor_ids
         if markov_stack is None:
             markov_embeds = []
             for k in range(num_draft):
