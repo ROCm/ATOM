@@ -529,6 +529,20 @@ async fn a_group_holds_what_any_of_its_ranks_holds() {
     assert_eq!(match_groups(&seq, &groups), [12, 8, 4, 16, 0]);
 }
 
+/// A group's lanes are in one partition: their ids would be read in the first lane's.
+#[cfg(debug_assertions)]
+#[tokio::test]
+#[should_panic(expected = "a group's lanes are in one partition")]
+async fn a_group_with_lanes_of_two_partitions_is_refused_in_debug_builds() {
+    let (ttl, runtime) = (Duration::from_secs(120), tokio::runtime::Handle::current());
+    let status = Arc::new(Mutex::new(SourceStatus::default()));
+    let lane = |block_size| {
+        let partition = Partition::start(block_size, ttl, &runtime);
+        partition.hold(status.clone()).unwrap().lane()
+    };
+    match_groups(&[0; 9], &[vec![lane(4), lane(8)]]);
+}
+
 fn resident_bytes() -> u64 {
     let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
     statm
