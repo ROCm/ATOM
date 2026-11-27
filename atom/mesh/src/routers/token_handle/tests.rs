@@ -321,6 +321,25 @@ mod c_token_handle {
     }
 
     #[tokio::test]
+    async fn test_prefill_charge_released_at_first_item() {
+        use crate::core::{BasicWorkerBuilder, Worker, WorkerLoadGuard};
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w:1").build());
+        let guard = WorkerLoadGuard::new(worker.clone(), None).with_prefill_tokens(9);
+        let (tx, rx) = mpsc::channel(1);
+        let mut stream = crate::routers::token_handle::test_support::single_from_receiver(rx)
+            .with_prefill_charge(guard.prefill_charge());
+        // Pending: the engine has not answered, so the prefill is still running.
+        assert!(futures::poll!(stream.next()).is_pending());
+        assert_eq!(worker.prefill_tokens(), 9);
+        tx.send(Ok(complete_chunk())).await.unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        assert_eq!(worker.prefill_tokens(), 0);
+        drop(guard);
+        assert_eq!((worker.prefill_tokens(), worker.load()), (0, 0));
+    }
+
+    #[tokio::test]
     async fn test_single_stream_propagates_engine_error() {
         let chunks = vec![
             Ok(TokenChunk::Partial {

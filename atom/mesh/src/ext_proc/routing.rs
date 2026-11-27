@@ -54,6 +54,13 @@ impl ExecutionTarget {
         // aggregate status must not charge a decode error to the prefill worker.
     }
 
+    /// Release a single worker's prefill charge at the response's first body.
+    pub fn release_prefill(&mut self) {
+        if let Self::Single { _load, .. } = self {
+            _load.release_prefill();
+        }
+    }
+
     pub fn expiration(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         match self {
             Self::Pair(lease) => lease.expiration(),
@@ -128,8 +135,12 @@ impl EndpointRouter {
                 e, model,
             ))
         })?;
-        let worker = match plan {
-            PlacementPlan::Single { worker, .. } => worker,
+        let (worker, prefill_tokens) = match plan {
+            PlacementPlan::Single {
+                worker,
+                prefill_tokens,
+                ..
+            } => (worker, prefill_tokens),
             pair @ PlacementPlan::Pair { .. } => {
                 let executor = self.executor.as_ref().ok_or_else(|| {
                     ProcessingError::new(
@@ -149,7 +160,8 @@ impl EndpointRouter {
                 });
             }
         };
-        let load = WorkerLoadGuard::new(worker.clone(), Some(&request.headers));
+        let load = WorkerLoadGuard::new(worker.clone(), Some(&request.headers))
+            .with_prefill_tokens(prefill_tokens);
         let address = match resolved.get(worker.url()) {
             Some(address) => *address,
             None => Self::address(worker.as_ref()).await?,

@@ -5,12 +5,14 @@
 //! tonic stream's `AbortOnDropStream`; PD mode → both upstreams' Drop).
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::Stream;
 
 use super::engine_error::EngineError;
 use super::token_chunk::TokenChunk;
+use crate::core::worker::PrefillCharge;
 
 /// Source of `Result<TokenChunk, EngineError>` items that can also be told
 /// it completed cleanly (so upstream `AbortOnDropStream`s suppress their
@@ -21,6 +23,7 @@ pub trait TokenSource: Stream<Item = Result<TokenChunk, EngineError>> + Send + U
 
 pub struct TokenHandle {
     inner: Inner,
+    prefill: Option<Arc<PrefillCharge>>,
 }
 
 enum Inner {
@@ -44,6 +47,7 @@ impl TokenHandle {
     {
         Self {
             inner: Inner::Single(Box::new(source)),
+            prefill: None,
         }
     }
 
@@ -54,7 +58,14 @@ impl TokenHandle {
                 prefill: Box::new(prefill),
                 decode: Box::new(decode),
             },
+            prefill: None,
         }
+    }
+
+    /// Release `charge` at the first item: the engine has finished the prefill.
+    pub fn with_prefill_charge(mut self, charge: Arc<PrefillCharge>) -> Self {
+        self.prefill = Some(charge);
+        self
     }
 
     /// Suppress upstream cancellation on clean exit. Single mode: forwards
@@ -76,10 +87,16 @@ impl Stream for TokenHandle {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match &mut this.inner {
+        let item = match &mut this.inner {
             Inner::Single(s) => Pin::new(&mut **s).poll_next(cx),
             #[cfg(test)]
             Inner::Pair { decode, .. } => Pin::new(&mut **decode).poll_next(cx),
+        };
+        if let Poll::Ready(Some(_)) = item {
+            if let Some(charge) = this.prefill.take() {
+                charge.release();
+            }
         }
+        item
     }
 }

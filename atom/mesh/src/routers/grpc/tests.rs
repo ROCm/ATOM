@@ -38,7 +38,9 @@ mod b_execute_chat {
     use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, MessageContent};
     use crate::routers::grpc::pipeline::Pipeline;
     use crate::routers::test_mocks;
-    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::test_support::{
+        single_from_receiver, synthetic_single_stream,
+    };
     use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
 
     fn shared() -> Arc<AppContext> {
@@ -248,6 +250,86 @@ mod b_execute_chat {
             "body must include finish_reason: {s}"
         );
         assert!(s.contains("\"stop\""), "body must include stop reason: {s}");
+    }
+
+    fn pipeline_charging(
+        worker: &Arc<dyn crate::core::Worker>,
+        stream: crate::routers::token_handle::token_handle::TokenHandle,
+    ) -> Arc<Pipeline> {
+        test_mocks::pipeline_with(
+            Arc::new(test_mocks::MockPdPlanner::new(vec![Ok(
+                crate::core::placement::types::PlacementPlan::Single {
+                    worker: worker.clone(),
+                    policy_name: "agentic",
+                    prefill_tokens: 11,
+                },
+            )])),
+            Arc::new(test_mocks::MockDispatcher::new(vec![Ok(stream)])),
+            metrics_labels::BACKEND_REGULAR,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_execute_chat_streaming_releases_prefill_at_first_chunk() {
+        let worker = test_mocks::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let p = pipeline_charging(&worker, single_from_receiver(rx));
+        let resp = p
+            .execute_chat(chat_req(true), None, Some("m".to_string()), shared())
+            .await;
+        assert_eq!((worker.prefill_tokens(), worker.load()), (11, 1));
+        let mut chunks = scripted_chunks().into_iter();
+        tx.send(chunks.next().unwrap()).await.unwrap();
+        for _ in 0..200 {
+            if worker.prefill_tokens() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Released by the first chunk while the response still holds its guard.
+        assert_eq!((worker.prefill_tokens(), worker.load()), (0, 1));
+        for chunk in chunks {
+            tx.send(chunk).await.unwrap();
+        }
+        drop(tx);
+        to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        assert_eq!((worker.prefill_tokens(), worker.load()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn test_execute_chat_non_streaming_releases_prefill_before_body() {
+        let worker = test_mocks::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        let p = pipeline_charging(&worker, synthetic_single_stream(scripted_chunks()));
+        let resp = p
+            .execute_chat(chat_req(false), None, Some("m".to_string()), shared())
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!((worker.prefill_tokens(), worker.load()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn test_execute_chat_engine_error_releases_prefill_on_drop() {
+        let worker = test_mocks::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        let p = test_mocks::pipeline_with(
+            Arc::new(test_mocks::MockPdPlanner::new(vec![Ok(
+                crate::core::placement::types::PlacementPlan::Single {
+                    worker: worker.clone(),
+                    policy_name: "agentic",
+                    prefill_tokens: 11,
+                },
+            )])),
+            Arc::new(test_mocks::MockDispatcher::new(vec![Err(
+                crate::routers::token_handle::engine_error::EngineError::Transport(
+                    tonic::Status::unavailable("down"),
+                ),
+            )])),
+            metrics_labels::BACKEND_REGULAR,
+        );
+        let resp = p
+            .execute_chat(chat_req(true), None, Some("m".to_string()), shared())
+            .await;
+        assert!(resp.status().is_server_error());
+        assert_eq!((worker.prefill_tokens(), worker.load()), (0, 0));
     }
 
     #[tokio::test]
