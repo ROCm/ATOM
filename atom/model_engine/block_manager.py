@@ -1551,15 +1551,14 @@ class BlockManager:
         for i in (*indexed, None):
             if run and (i is None or i != run[-1] + 1):
                 start = first + run[0]
-                self._event_log.append(
-                    _make_block_stored(
-                        [chain[first + j] for j in run],
-                        list(seq.token_ids[start * hbs : (start + len(run)) * hbs]),
-                        chain[start - 1] if start else None,
-                        hbs,
-                        token_offset=start * hbs,
-                        cache_seed=seq.cache_seed,
-                    )
+                self.record_remote_store(
+                    block_hashes=[chain[first + j] for j in run],
+                    token_ids=list(
+                        seq.token_ids[start * hbs : (start + len(run)) * hbs]
+                    ),
+                    parent_block_hash=chain[start - 1] if start else None,
+                    token_offset=start * hbs,
+                    cache_seed=seq.cache_seed,
                 )
                 run = []
             if i is not None:
@@ -4095,8 +4094,10 @@ class BlockManager:
         """Emit a BlockStored for blocks received from a remote KV transfer
         producer (Mooncake/MoriIO decode side). Called by the KVConnector
         worker once the transfer completes so external KV-cache consumers
-        (LMCache, etc.) can track them. The KV now sits in this engine's HBM,
-        so the medium is GPU like any block computed here.
+        (LMCache, etc.) can track them, and for each run of blocks a copy from
+        the pools of this rank's share group indexed (`_record_fetched`). The
+        KV now sits in this engine's HBM, so the medium is GPU like any block
+        computed here.
 
         `token_offset` is the sequence position of the first remote block;
         `cache_seed` is the seq's (see `_make_block_stored`)."""
