@@ -1456,8 +1456,6 @@ class KimiKDAAttention(nn.Module):
                 hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
             )
 
-        if self._fused_kda_max_programs is None:
-            self._init_fused_kda_decode()
         cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
         conv_state = cache.k_cache
         ssm_state = cache.v_cache
@@ -1501,12 +1499,11 @@ class KimiKDAAttention(nn.Module):
         # admission policy, not a kernel legality constraint. Use the padded
         # request bucket so replay never changes the selected path.
         num_seqs = 0
-        if (
-            self._fused_kda_max_programs > 0
-            and kda_metadata.num_prefills == 0
-            and getattr(kda_metadata, "replayssm", False)
-        ):
-            num_seqs = kda_metadata.num_decodes or kda_metadata.num_spec_decodes
+        if kda_metadata.num_prefills == 0 and getattr(kda_metadata, "replayssm", False):
+            if self._fused_kda_max_programs is None:
+                self._init_fused_kda_decode()
+            if self._fused_kda_max_programs > 0:
+                num_seqs = kda_metadata.num_decodes or kda_metadata.num_spec_decodes
         fused = (
             num_seqs > 0
             and fused_in.dtype == torch.bfloat16
