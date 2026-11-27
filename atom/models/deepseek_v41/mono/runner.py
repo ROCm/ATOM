@@ -103,8 +103,12 @@ logger = logging.getLogger("atom")
 # 0.5-4.9 us slower), so a TP size not here runs without it
 TOK_PAR_FROM = {4: 12}
 # ... where the layer kernel serves the step (``_layer_capable``): below it the
-# layer kernel's seams fold a rank's columns instead (``_shard``)
-LAYER_TOK_PAR_FROM = {4: 24}
+# layer kernel's seams fold a rank's columns instead (``_shard``). TP4 from 12:
+# the sharded 12-row K1 (``attn_pre_s12_..._sh1``) spills 68 B of scratch a
+# lane, which ``_lean_rows`` cannot leave out, so the whole width was refused
+# and its steps (two requests) took the original path; token parallel 12 rows
+# build as 24-48 do
+LAYER_TOK_PAR_FROM = {4: 12}
 # the widths below which the layer kernel serves an index-only layer
 # (``_fuses``): the layer build with the indexer uses scratch at TP4 from 24
 # rows, at TP8 at 30 (25..29, no served width, never built: kept out); a TP
