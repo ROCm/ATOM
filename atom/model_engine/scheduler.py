@@ -881,9 +881,6 @@ class Scheduler:
     # whose media its prefill kept cannot, and is finished instead.
     can_recompute_prompts = True
     pd_admission: PdAdmissionController | None = None
-    # ATOM_PREFILL_SHORT_FIRST_ROWS (`_short_first_order`); off for a scheduler
-    # assembled without `__init__`.
-    _short_first_rows = 0
 
     def __init__(
         self,
@@ -921,34 +918,6 @@ class Scheduler:
         # steps, tokens, own cost, target, steps shrunk
         self._balance_stats = [0, 0, 0.0, 0.0, 0]
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
-        # Busy-phase long-prefill cap (0 = off); see `_long_prefill_cap`.
-        self._busy_long_prefill_cap = envs.ATOM_PREFILL_LONG_CAP_BUSY
-        self._busy_long_prefill_seqs = envs.ATOM_PREFILL_LONG_CAP_BUSY_SEQS
-        if self._busy_long_prefill_cap < 0 or self._busy_long_prefill_seqs < 1:
-            raise ValueError(
-                "ATOM_PREFILL_LONG_CAP_BUSY must be non-negative and "
-                "ATOM_PREFILL_LONG_CAP_BUSY_SEQS positive; got "
-                f"{self._busy_long_prefill_cap}, {self._busy_long_prefill_seqs}"
-            )
-        # Short requests first (0 = arrival order); see `_short_first_order`.
-        self._short_first_rows = envs.ATOM_PREFILL_SHORT_FIRST_ROWS
-        self._short_first_long_rows = envs.ATOM_PREFILL_SHORT_FIRST_LONG_ROWS
-        self._short_first_max_skips = envs.ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS
-        if (
-            self._short_first_rows < 0
-            or self._short_first_max_skips < 0
-            or (
-                self._short_first_rows
-                and not 0 < self._short_first_long_rows < self.max_num_batched_tokens
-            )
-        ):
-            raise ValueError(
-                "ATOM_PREFILL_SHORT_FIRST_ROWS and ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS "
-                "must be non-negative, ATOM_PREFILL_SHORT_FIRST_LONG_ROWS positive "
-                f"and below --max-num-batched-tokens ({self.max_num_batched_tokens}); "
-                f"got {self._short_first_rows}, {self._short_first_max_skips}, "
-                f"{self._short_first_long_rows}"
-            )
         self.max_model_len = config.max_model_len
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
@@ -1514,20 +1483,6 @@ class Scheduler:
             self._resume_start_after_tier_load(seq, cached),
         )
 
-    def _long_prefill_cap(self) -> int:
-        """New tokens one prompt may add to a prefill step (0 = no cap):
-        `long_prefill_token_threshold`, or the lower busy-phase cap while the
-        DP group decodes at least `_busy_long_prefill_seqs` sequences. The
-        count is the delayer's reduced one from its last decision, the same on
-        every rank; without a delayer the flag's cap stands."""
-        cap = self.long_prefill_token_threshold
-        busy = self._busy_long_prefill_cap
-        if busy <= 0 or self.prefill_delayer is None:
-            return cap
-        if self.prefill_delayer.group_running_decode < self._busy_long_prefill_seqs:
-            return cap
-        return busy if cap <= 0 else min(cap, busy)
-
     def _new_prefill_tokens(
         self, seq: Sequence, cached_tokens: int, resume: int | None = None
     ) -> int:
@@ -1539,9 +1494,9 @@ class Scheduler:
         if (
             not self._requires_atomic_prefill(seq)
             and self.enable_chunked_prefill
-            and 0 < (cap := self._long_prefill_cap()) < seq.num_tokens - resume
+            and 0 < self.long_prefill_token_threshold < seq.num_tokens - resume
         ):
-            remaining = cap + resume - cached_tokens
+            remaining = self.long_prefill_token_threshold + resume - cached_tokens
         return remaining
 
     def _resume_prefill(self, seq: Sequence, start: int, *, hit: bool) -> None:
@@ -1688,7 +1643,6 @@ class Scheduler:
         prefix cache without recording (`can_allocate_memoized`). An estimate
         -- the real admission may park or skip some of these seqs."""
         token_cap = limits.tokens
-        long_cap = self._long_prefill_cap()
         tokens, cost = 0, 0.0
         if self._partial_prefill_count > 0:
             for seq in self.running:
@@ -1697,8 +1651,12 @@ class Scheduler:
                 remaining = seq.num_tokens - seq.num_cached_tokens
                 # A continued replay's rows below its `until` ride on top.
                 cap_from = max(seq.num_cached_tokens, seq.replay_until)
-                if 0 < long_cap < seq.num_tokens - cap_from:
-                    remaining = long_cap + cap_from - seq.num_cached_tokens
+                if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
+                    remaining = (
+                        self.long_prefill_token_threshold
+                        + cap_from
+                        - seq.num_cached_tokens
+                    )
                 k = min(remaining, token_cap - tokens)
                 if k <= 0:
                     return cost
@@ -1782,9 +1740,8 @@ class Scheduler:
         the in-flight decodes' share."""
         cap_from = resume if cap_from is None else cap_from
         remaining = seq.num_tokens - start
-        long_cap = self._long_prefill_cap()
-        if 0 < long_cap < seq.num_tokens - cap_from:
-            remaining = long_cap + cap_from - start
+        if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
+            remaining = self.long_prefill_token_threshold + cap_from - start
         chunk = self._chunked_prefill_size(
             remaining,
             self._prefill_room(batched_tokens, start, budget),
@@ -1793,190 +1750,6 @@ class Scheduler:
             kind=ChunkKind.NEXT,
         )
         return chunk if start + chunk > resume else 0
-
-    def _resume_partial_prefills(
-        self,
-        seqs,
-        scheduled_seqs: dict[int, Sequence],
-        num_scheduled_tokens: list[int],
-        num_seqs_prefill: int,
-        num_batched_tokens: int,
-        budget: int,
-    ) -> tuple[int, int]:
-        """Phase 1 of `_schedule`: the next chunk of every partial prefill in
-        `seqs` (`running`, or a part of it in this tick's order), until one
-        gets no room within `budget`
-        (`_prefill_limits().tokens`)."""
-        for seq in seqs:
-            if num_seqs_prefill >= self.max_num_seqs:
-                break
-            if not seq.is_partial_prefill:
-                continue
-            if seq.id in self._checkpoint_holds:
-                continue
-            resume = seq.num_cached_tokens
-            start = self.block_manager.replay_start(seq, resume, hit=False)
-            chunk = self._partial_prefill_chunk(
-                seq,
-                start,
-                resume,
-                num_batched_tokens,
-                cap_from=max(resume, seq.replay_until),
-                budget=budget,
-            )
-            if chunk:
-                self._resume_prefill(seq, start, hit=False)
-                chunk = self._finalize_prefill_chunk(seq, start, chunk)
-            if chunk <= 0:
-                break
-            self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
-            num_batched_tokens += chunk
-            num_seqs_prefill += 1
-            seq.type = SequenceType.PREFILL
-            scheduled_seqs[seq.id] = seq
-            num_scheduled_tokens.append(chunk)
-        return num_seqs_prefill, num_batched_tokens
-
-    def _resume_long_partials(
-        self,
-        seqs: list[Sequence],
-        scheduled_seqs: dict[int, Sequence],
-        num_scheduled_tokens: list[int],
-        num_seqs_prefill: int,
-        num_batched_tokens: int,
-        budget: int,
-    ) -> tuple[int, int]:
-        """`_resume_partial_prefills` for the long prompts in progress under
-        ATOM_PREFILL_SHORT_FIRST_ROWS, after the short requests. The tokens of
-        the budget held for them are the oldest prompt's whatever the cost
-        target: the short requests were charged first, and without this a rank
-        over the target would leave its long prompts where they are."""
-        limit = self._tick_cost_limit
-        if limit < math.inf:
-            oldest = seqs[0]
-            start = self.block_manager.replay_start(
-                oldest, oldest.num_cached_tokens, hit=False
-            )
-            # One token more: `_prefill_room` rounds the room down.
-            held = self._chunk_cost(start, self._short_first_long_rows + 1)
-            self._tick_cost_limit = max(limit, self._tick_cost + held)
-        try:
-            counts = self._resume_partial_prefills(
-                seqs[:1],
-                scheduled_seqs,
-                num_scheduled_tokens,
-                num_seqs_prefill,
-                num_batched_tokens,
-                budget,
-            )
-        finally:
-            self._tick_cost_limit = limit
-        return self._resume_partial_prefills(
-            seqs[1:], scheduled_seqs, num_scheduled_tokens, *counts, budget
-        )
-
-    def _short_first_order(
-        self,
-    ) -> tuple[list[Sequence], list[Sequence], Sequence | None]:
-        """This rank's prefill order for one tick under
-        ATOM_PREFILL_SHORT_FIRST_ROWS, a two-tier key. The front tier is not
-        reordered by length: a preemption victim, and a request passed over
-        ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS times (`_count_passed_over`), which
-        bounds how long a long prompt can be starved. The rest goes by the
-        prefill work left: the requests with at most ATOM_PREFILL_SHORT_FIRST_ROWS
-        new tokens left ("short") ahead of the longer prompts. Arrival order
-        holds inside each group.
-
-        "Left" is after prefix reuse: a waiting request is asked what the cache
-        serves it now, a partial prefill has its own progress.
-
-        The long prompts in progress resume after the short requests, on the
-        ATOM_PREFILL_SHORT_FIRST_LONG_ROWS tokens of the step held for them
-        (`_resume_long_partials`) and what the short requests left.
-
-        Reorders `waiting` in place up to the first request that cannot be
-        admitted now, which nothing overtakes, as in arrival order. Returns the
-        partial prefills to resume before Phase 2 (front tier, then short), the
-        long ones, to resume after its short requests, and the waiting request
-        those go ahead of (None: no long request waits behind the short ones).
-
-        Per rank: it orders this rank's own requests inside a step the group
-        has already agreed on (the delayer's decision, the cost target and the
-        long-prefill cap are untouched).
-        """
-        limit = self._short_first_rows
-        max_skips = self._short_first_max_skips
-
-        def in_front(seq: Sequence) -> bool:
-            return seq.is_preempted or 0 < max_skips <= seq.num_skipped_steps
-
-        front_partials: list[Sequence] = []
-        short_partials: list[Sequence] = []
-        long_partials: list[Sequence] = []
-        if self._partial_prefill_count > 0:
-            for seq in self.running:
-                if not seq.is_partial_prefill or seq.id in self._checkpoint_holds:
-                    continue
-                if seq.num_tokens - seq.num_cached_tokens <= limit:
-                    short_partials.append(seq)
-                elif in_front(seq):
-                    front_partials.append(seq)
-                else:
-                    long_partials.append(seq)
-        hbs = self.block_manager.hash_block_size
-        front_waiting: list[Sequence] = []
-        short_waiting: list[Sequence] = []
-        late_waiting: list[Sequence] = []
-        moved = False
-        for seq in itertools.islice(self.waiting, self.max_num_seqs):
-            if (
-                seq.status
-                in (SequenceStatus.ABORTED, SequenceStatus.WAITING_FOR_REMOTE_KVS)
-                or self._unschedulable_reason(seq) is not None
-            ):
-                break
-            # The exact probe's answer; the walk is memoised across ticks.
-            cached_blocks = self.block_manager.can_allocate_memoized(seq)
-            if cached_blocks < 0:
-                break
-            if in_front(seq):
-                front_waiting.append(seq)
-                moved = moved or bool(short_waiting or late_waiting)
-            elif seq.num_tokens - cached_blocks * hbs <= limit:
-                short_waiting.append(seq)
-                moved = moved or bool(late_waiting)
-            else:
-                late_waiting.append(seq)
-        seen = len(front_waiting) + len(short_waiting) + len(late_waiting)
-        if moved:
-            for _ in range(seen):
-                self.waiting.popleft()
-            self.waiting.extendleft(
-                reversed(front_waiting + short_waiting + late_waiting)
-            )
-        if late_waiting:
-            late_before = late_waiting[0]
-        elif seen < len(self.waiting):
-            late_before = self.waiting[seen]
-        else:
-            late_before = None
-        return front_partials + short_partials, long_partials, late_before
-
-    def _count_passed_over(self, scheduled_seqs: dict[int, Sequence]) -> None:
-        """Charge a skip to every request with prefill left that a step which
-        scheduled prefill gave nothing: what is still waiting, and the partial
-        prefills not in the batch.
-
-        Only on such a step. Where this rank scheduled nobody -- the delayer
-        holding, no KV room -- no request was passed over for another, and
-        counting it would age the whole queue into the front tier at once.
-        """
-        for seq in self.waiting:
-            seq.num_skipped_steps += 1
-        if self._partial_prefill_count > 0:
-            for seq in self.running:
-                if seq.is_partial_prefill and seq.id not in scheduled_seqs:
-                    seq.num_skipped_steps += 1
 
     def _preview_prefill_chunk(
         self, seq: Sequence, start: int, resume: int, chunk: int
@@ -2958,40 +2731,35 @@ class Scheduler:
         # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
-        #
-        # With ATOM_PREFILL_SHORT_FIRST_ROWS the long prompts in progress resume
-        # after Phase 2 has admitted the short requests (`_short_first_order`):
-        # `late_partials`, due when Phase 2 reaches `late_before` or ends. Until
-        # then `held` tokens of the budget count as batched, which keeps them
-        # free for those prompts.
-        late_partials: list[Sequence] = []
-        late_before = None
-        held = 0
-        short_first = (
-            delayer_allows and prefill_budget > 0
-            and self._short_first_rows > 0 and self.kv_connector is None
-        )
-        if short_first:
-            partials, late_partials, late_before = self._short_first_order()
-            if late_partials:
-                held = self._short_first_long_rows
-            num_seqs_prefill, num_batched_tokens = self._resume_partial_prefills(
-                partials,
-                scheduled_seqs,
-                num_scheduled_tokens,
-                num_seqs_prefill,
-                num_batched_tokens + held,
-                prefill_budget,
-            )
-        elif delayer_allows and prefill_budget > 0 and self._partial_prefill_count > 0:
-            num_seqs_prefill, num_batched_tokens = self._resume_partial_prefills(
-                self.running,
-                scheduled_seqs,
-                num_scheduled_tokens,
-                num_seqs_prefill,
-                num_batched_tokens,
-                prefill_budget,
-            )
+        if delayer_allows and prefill_budget > 0 and self._partial_prefill_count > 0:
+            for seq in self.running:
+                if num_seqs_prefill >= self.max_num_seqs:
+                    break
+                if not seq.is_partial_prefill:
+                    continue
+                if seq.id in self._checkpoint_holds:
+                    continue
+                resume = seq.num_cached_tokens
+                start = self.block_manager.replay_start(seq, resume, hit=False)
+                chunk = self._partial_prefill_chunk(
+                    seq,
+                    start,
+                    resume,
+                    num_batched_tokens,
+                    cap_from=max(resume, seq.replay_until),
+                    budget=prefill_budget,
+                )
+                if chunk:
+                    self._resume_prefill(seq, start, hit=False)
+                    chunk = self._finalize_prefill_chunk(seq, start, chunk)
+                if chunk <= 0:
+                    break
+                self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
+                num_batched_tokens += chunk
+                num_seqs_prefill += 1
+                seq.type = SequenceType.PREFILL
+                scheduled_seqs[seq.id] = seq
+                num_scheduled_tokens.append(chunk)
 
         # ---- Phase 2: new requests from waiting ----
         prefix_waiters: deque[Sequence] = deque()
@@ -3019,26 +2787,6 @@ class Scheduler:
                         break
                     prefix_bypass_left -= 1
             seq = self.waiting.popleft()
-
-            if late_partials and seq is late_before:
-                # Every short request ahead of `seq` has had its turn: the long
-                # prompts in progress go before the long ones still waiting.
-                num_seqs_prefill, num_batched_tokens = self._resume_long_partials(
-                    late_partials,
-                    scheduled_seqs,
-                    num_scheduled_tokens,
-                    num_seqs_prefill,
-                    num_batched_tokens - held,
-                    prefill_budget,
-                )
-                late_partials = []
-                if (
-                    num_seqs_prefill >= self.max_num_seqs
-                    or num_batched_tokens >= self.max_num_batched_tokens
-                    or self._tick_cost >= self._tick_cost_limit
-                ):
-                    self.waiting.appendleft(seq)
-                    break
 
             # Client disconnected before this seq ever ran: it holds no KV yet
             # and needs no forward pass, so finish it outright and route via
@@ -3501,17 +3249,6 @@ class Scheduler:
             self._commit_calibration_arm()
             self._inflight_prefix_wait.pop(seq.id, None)
 
-        if late_partials:
-            # Phase 2 ended on its short requests.
-            num_seqs_prefill, num_batched_tokens = self._resume_long_partials(
-                late_partials,
-                scheduled_seqs,
-                num_scheduled_tokens,
-                num_seqs_prefill,
-                num_batched_tokens - held,
-                prefill_budget,
-            )
-
         # Admission is complete; decode spends the pages protected above.
         self.block_manager.reserved_decode_blocks = 0
         if skipped_waiting_requests:
@@ -3524,8 +3261,6 @@ class Scheduler:
             # Keep deferred requests in arrival order while bounded lookahead
             # admits independent work without extending their deadlines.
             self.waiting.extendleft(reversed(prefix_waiters))
-        if short_first and num_seqs_prefill:
-            self._count_passed_over(scheduled_seqs)
 
         if self._num_parked_remote_kv > 0 and self._schedule_tick % 1000 == 0:
             logger.info(
@@ -4737,7 +4472,6 @@ class Scheduler:
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
-        seq.is_preempted = False
         self.running.append(seq)
         scheduled_seqs[seq.id] = seq
         num_scheduled_tokens.append(chunk)
@@ -5493,9 +5227,6 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
-        # What keeps it ahead of the short requests when
-        # ATOM_PREFILL_SHORT_FIRST_ROWS reorders `waiting`.
-        seq.is_preempted = True
         pos = self._behind_settled_resumes()
         self.waiting.insert(pos, seq)
         if self.pd_admission is not None:

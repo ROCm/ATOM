@@ -244,50 +244,9 @@ class _AtomMetricsCollector:
             moved_tokens.add_metric([], float(dp_router["prefix_moved_tokens"]))
             yield moved_tokens
 
-        if "affinity_new_prefix_owner_total" in dp_router:
-            # Present only with ATOM_DP_SESSION_PREFIX_OWNER_TOKENS set.
-            for name, documentation, key in (
-                (
-                    "atom:dp_affinity_new_prefix_owner",
-                    (
-                        "Number of new sticky DP sessions placed on the rank that "
-                        "holds their prompt's prefix instead of the lightest rank "
-                        "(not counted in atom:dp_affinity_new)."
-                    ),
-                    "affinity_new_prefix_owner_total",
-                ),
-                (
-                    "atom:dp_affinity_prefix_owner_gained_tokens",
-                    (
-                        "Prefix tokens those sessions' ranks held more than the "
-                        "lightest rank at placement (an estimate of the prefill "
-                        "saved, not completed cache hits)."
-                    ),
-                    "affinity_prefix_owner_gained_tokens_total",
-                ),
-            ):
-                metric = CounterMetricFamily(name, documentation)
-                metric.add_metric([], float(dp_router[key]))
-                yield metric
-            refused = CounterMetricFamily(
-                "atom:dp_affinity_prefix_owner_refused",
-                "Number of new sticky DP sessions left on the lightest rank "
-                "although another rank holds more of their prefix: threshold "
-                "(fewer tokens more than ATOM_DP_SESSION_PREFIX_OWNER_TOKENS) or "
-                "guard (that rank has too many requests in flight).",
-                labels=["reason"],
-            )
-            for reason in ("threshold", "guard"):
-                refused.add_metric(
-                    [reason],
-                    float(dp_router[f"affinity_prefix_owner_refused_{reason}_total"]),
-                )
-            yield refused
-
         index = dp_router.get("prefix_index")
         if index is not None:
-            # Prefix-index budget path (`prefix_spread`, or session affinity with
-            # ATOM_DP_SESSION_PREFIX_OWNER_TOKENS): shows whether eviction
+            # Prefix-index budget path (`prefix_spread`): shows whether eviction
             # ever ran and how much history it shed.
             events = CounterMetricFamily(
                 "atom:dp_prefix_index_events",
