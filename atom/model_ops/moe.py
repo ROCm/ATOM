@@ -2103,6 +2103,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
+    def routed_expert_copies(self, layer: torch.nn.Module) -> dict[str, torch.Tensor]:
+        """The routed experts' weights and scales the method reads from outside
+        the layer's parameters, by parameter name: none, it reads them."""
+        return {}
+
     def _triton_views_of_flydsl_weights(self, layer) -> tuple:
         """Zero-copy Triton/gluon views of the FlyDSL-shuffled MXFP4 weights.
 
@@ -2804,6 +2809,18 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             0, dtype=layer.w2_weight.dtype, device=layer.w2_weight.device
         )
         logger.info("Prepared MegaMoE weights for fused MoE layer")
+
+    def routed_expert_copies(self, layer: torch.nn.Module) -> dict[str, torch.Tensor]:
+        """Mega's own copies (``build_mega_weights``): the parameters are
+        released. On gfx950 these are the bytes the FlyDSL path's shuffle
+        writes too (aiter's ``shuffle_weight`` / ``shuffle_scale``, gate / up
+        interleaved, 16x16 tiles); on gfx1250 they are not."""
+        return {
+            "w13_weight": layer._mega_w1,
+            "w13_weight_scale": layer._mega_w1_scale,
+            "w2_weight": layer._mega_w2,
+            "w2_weight_scale": layer._mega_w2_scale,
+        }
 
     def init_prepare_finalize(self, layer: torch.nn.Module):
         # Mega includes dispatch, both GEMMs, and combine, so it must not
