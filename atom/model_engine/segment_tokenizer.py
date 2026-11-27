@@ -381,6 +381,8 @@ class SegmentTokenizer:
         with self._lock:
             if not self.enabled:  # as for segments above
                 return
+            if not self._lru.fits(entry.payload_bytes):
+                return  # it would not be kept, so `base` stays
             pids = self._buckets.get(bucket, [])
             if replaces:
                 for pid in list(pids):
@@ -394,10 +396,6 @@ class SegmentTokenizer:
             if len(pids) > _PREFIX_BUCKET:
                 self._lru.pop(("p", pids.pop(0)))
             self._lru.put(("p", pid), entry, entry.payload_bytes)
-            if ("p", pid) not in self._lru:  # larger than the whole budget
-                pids.remove(pid)
-            if not pids:
-                self._buckets.pop(bucket, None)
 
     def _evicted(self, key, value) -> None:
         """LRU eviction callback (lock held): unindex a stored prompt."""

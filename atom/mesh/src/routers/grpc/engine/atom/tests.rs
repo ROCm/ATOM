@@ -173,6 +173,7 @@ fn single(worker: Arc<dyn Worker>) -> PlacementPlan {
     PlacementPlan::Single {
         worker,
         policy_name: "random",
+        prefill_tokens: 0,
     }
 }
 
@@ -1017,6 +1018,7 @@ mod pairs {
             decode: dw,
             prefill_policy: "random",
             decode_policy: "random",
+            prefill_tokens: 0,
         };
         let handle = engine.dispatch(&plan, &mut payload(false)).await.unwrap();
         let chunks = timeout(HANG, handle.collect::<Vec<_>>()).await.unwrap();
@@ -1169,6 +1171,7 @@ mod pairs {
             decode: other,
             prefill_policy: "random",
             decode_policy: "random",
+            prefill_tokens: 0,
         };
         let pairs = AtomPairs::new(
             Arc::new(WorkerRegistry::new()),
@@ -1210,6 +1213,7 @@ mod pairs {
                 decode: dw.clone(),
                 prefill_policy: "random",
                 decode_policy: "random",
+                prefill_tokens: 0,
             };
             let engine = engine.clone();
             async move {
@@ -1443,6 +1447,7 @@ mod pairs {
             decode: test_mocks::mock_http_only_worker("http://d:8000"),
             prefill_policy: "random",
             decode_policy: "random",
+            prefill_tokens: 0,
         };
         assert!(!engine.holds_load(&sglang));
         let dual = engine.dispatch(&sglang, &mut payload(false)).await;
@@ -1453,6 +1458,7 @@ mod pairs {
             decode: decode[1].clone(),
             prefill_policy: "random",
             decode_policy: "random",
+            prefill_tokens: 0,
         };
         assert!(engine.holds_load(&plan));
         let run = tokio::spawn(async move {
