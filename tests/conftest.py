@@ -374,6 +374,14 @@ def mono_runs_on_gfx950(monkeypatch):
     monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")
 
 
+@pytest.fixture(autouse=True)
+def default_dp_lm_head_mode(monkeypatch):
+    """Admission refuses sampled requests under ATOM_DP_LM_HEAD_MODE=argmax, so
+    every test starts from the default whatever the shell sets; a test of a
+    mode sets it itself."""
+    monkeypatch.delenv("ATOM_DP_LM_HEAD_MODE", raising=False)
+
+
 @pytest.fixture
 def mxfp4_default_backends(monkeypatch):
     """Pin the MXFP4 linear backend to the default preshuffled ASM path.
