@@ -19,6 +19,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 enum DispatchKind {
     Atom,
     AtomChunked,
+    /// ATOM with `--atom-pd-concurrent`: decode is sent while prefill runs.
+    AtomConcurrent,
     Vllm,
     Sglang,
 }
@@ -156,6 +158,7 @@ fn dispatch_with_policy(
     let mut router = tests::create_test_pd_router();
     // As ATOM PD runs in CI; it maps only DP-aware workers.
     router.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
+    router.atom_pd_concurrent = matches!(kind, DispatchKind::AtomConcurrent);
     let mut prefill_binding = None;
     let mut decode_binding = None;
     if let Some((policy, binding)) = prefill_policy {
@@ -202,7 +205,7 @@ fn dispatch_with_policy(
             )
             .unwrap();
         match kind {
-            DispatchKind::Atom | DispatchKind::AtomChunked => {
+            DispatchKind::Atom | DispatchKind::AtomChunked | DispatchKind::AtomConcurrent => {
                 let decode_body = if matches!(kind, DispatchKind::AtomChunked) {
                     json!({"kv_transfer_params": {"chunked_transfer": true}})
                 } else {
@@ -975,7 +978,11 @@ async fn a_prefill_server_error_releases_only_the_prefill_binding() {
 
 #[tokio::test]
 async fn an_idx2idx_prefill_server_error_places_the_decode_session_again() {
-    for kind in [DispatchKind::Atom, DispatchKind::AtomChunked] {
+    for kind in [
+        DispatchKind::Atom,
+        DispatchKind::AtomChunked,
+        DispatchKind::AtomConcurrent,
+    ] {
         let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
         let (mut p, mut d) = servers().await;
         let dp_worker = |server: &GatedServer, rank, role| -> Arc<dyn Worker> {

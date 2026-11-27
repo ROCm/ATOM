@@ -152,6 +152,7 @@ def test_dpa_media_rejected_before_tokenization_and_sequence_creation(
 
     processor = InputOutputProcessor.__new__(InputOutputProcessor)
     processor.__dict__.update(
+        _greedy_ids_only=False,
         config=SimpleNamespace(
             hf_config=DeepseekV41TextConfig(), enable_dp_attention=True
         ),

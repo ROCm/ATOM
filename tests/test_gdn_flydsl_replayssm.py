@@ -197,6 +197,8 @@ def _replayssm_prefill(monkeypatch, *, flydsl, keep, checkpoint):
         replay_buf_k=replay["replay_buf_k"],
         replay_buf_u=replay["replay_buf_u"],
         replay_buf_g=replay["replay_buf_g"],
+        replay_flush_arrivals=torch.zeros(SLOTS, HV, dtype=torch.int32),
+        replay_flush_wait="s_waitcnt vmcnt(0)",
     )
     # Row 0 forks from slot 2 into slot 4; row 1 is a cold slot.
     writes = torch.tensor([4, 1], dtype=torch.int32)

@@ -19,6 +19,10 @@ tracing = ["opentelemetry-api>=1.40,<2", "opentelemetry-sdk>=1.40,<2", "opentele
 # canvas preparation for image conditioning, and torchaudio resamples reference
 # audio to the audio VAE's 32 kHz.
 diffusion = ["av", "pillow", "torchaudio"]
+# Qwen3.8-Flash-Next TP serving with ATOM_QWEN4_EXP_SP_SDMA only (SGLang
+# plugin, gfx942): mori CCO SDMA with the MI308X engine balancing
+# (ROCm/mori#921, #944). Not needed otherwise; the ATOM images ship it.
+qwen38-tp-sdma = ["amd-mori-nightly>=1.2.6.dev20261116"]
 
 [project.urls]
 Homepage = "https://github.com/ROCm/ATOM"

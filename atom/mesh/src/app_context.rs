@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -25,7 +25,7 @@ use crate::{
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{
         atom_bridge::AtomBridgeRuntime,
-        prepare::{chat_controls::ChatControls, fast_tokenizer::TokenizeLimits},
+        prepare::{chat_render::ChatControls, fast_tokenizer::TokenizeLimits},
         router_manager::RouterManager,
     },
     tokenizer::registry::TokenizerRegistry,
@@ -52,13 +52,8 @@ pub struct AppContext {
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub admission: Arc<crate::core::admission::AdmissionController>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
-    /// Registry ids of the tokenizers whose chats llm-tokenizer renders without
-    /// their Jinja template, found as each registers. HTTP routing does not
-    /// tokenize those chats.
-    pub chats_without_template: Arc<RwLock<HashSet<String>>>,
-    /// The reasoning controls ATOM renders a tokenizer's chats under, by
-    /// registry id, for the checkpoints that have their own; HTTP routing
-    /// takes the effort of those chats as ATOM does.
+    /// The encoder ATOM renders a tokenizer's chats with, by registry id, for
+    /// the checkpoints that have their own (`chat_render`).
     pub(crate) chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
     /// `router_config`'s tokenization byte limits.
     pub(crate) tokenize_limits: TokenizeLimits,
@@ -117,6 +112,16 @@ pub struct AppContextBuilder {
 impl AppContext {
     pub fn builder() -> AppContextBuilder {
         AppContextBuilder::new()
+    }
+
+    /// The encoder controls of the tokenizer registered as `model` (a name or
+    /// an id), if its checkpoint has them.
+    pub(crate) fn chat_controls_of(&self, model: &str) -> Option<ChatControls> {
+        let entry = self
+            .tokenizer_registry
+            .get_by_name(model)
+            .or_else(|| self.tokenizer_registry.get_by_id(model))?;
+        self.chat_controls.read().get(&entry.id).copied()
     }
 
     /// Build a context with the caller-owned preparation pool.
@@ -304,7 +309,6 @@ impl AppContextBuilder {
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
-            chats_without_template: Default::default(),
             chat_controls: Default::default(),
             tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,

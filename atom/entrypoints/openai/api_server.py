@@ -40,6 +40,8 @@ from fastapi.exception_handlers import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from jinja2 import TemplateError
+from pydantic import ValidationError
+from starlette.requests import ClientDisconnect
 from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
@@ -1667,9 +1669,11 @@ async def _race_disconnect(coro, raw_request, request_id):
     ``abort_request`` + ``io_processor.requests.pop`` (for fan-out, this aborts
     every sibling). We then raise ``_ClientDisconnected``.
 
-    ``request.receive()`` is safe here because FastAPI has already parsed the
-    request body into a pydantic model before this handler runs, so there is no
-    unread body for ``receive()`` to race against.
+    ``request.receive()`` is safe here because the request body has already
+    been read to EOF before this runs, so there is no unread body for
+    ``receive()`` to race against: on the plain routes FastAPI parsed it into a
+    pydantic model before the handler ran; on ``PD_LATE_KV_PATH``,
+    ``_read_late_kv_request`` drains it with ``_LateKvBody.rest()``.
     """
     handler_task = asyncio.ensure_future(coro)
 
@@ -1991,6 +1995,9 @@ async def _relay_to_hub(request: Request) -> Response:
 
 # ---- Error handlers ----
 
+# ATOM_PD_LATE_KV's decode leg (see pd_late_kv_chat_completions below).
+PD_LATE_KV_PATH = "/v1/pd/late_kv/chat/completions"
+
 # Generation routes whose errors use the OpenAI envelope.
 _OPENAI_ERROR_ROUTES = frozenset(
     {
@@ -1999,6 +2006,8 @@ _OPENAI_ERROR_ROUTES = frozenset(
         "/v1/responses",
         "/beta/chat/completions",
         "/beta/completions",
+        # The router relays the late-KV decode leg's errors to the client.
+        PD_LATE_KV_PATH,
     }
 )
 
@@ -2154,6 +2163,112 @@ async def beta_chat_completions(
     return await _chat_completions(request, raw_request)
 
 
+# ---------------------------------------------------------------------------
+# ATOM_PD_LATE_KV: decode leg of the router's concurrent P/D dispatch.
+# ---------------------------------------------------------------------------
+# PD_LATE_KV_PATH: atomesh (--atom-pd-concurrent) opens this request at the
+# same time as the prefill leg and streams a two-line body: line 1 is the chat
+# request, line 2 -- sent once P answers -- is `{"kv_transfer_params": {...}}`.
+# D parses and validates line 1 while P parses its own copy, so the large-body
+# ingest leaves the P->D critical path. Nothing reaches the engine before line
+# 2, so a failed prefill (the router aborts the body, or it ends early) never
+# enqueues anything on D. With the flag off the route answers 404, which the
+# router takes as "fall back to the serial relay".
+
+
+class _LateKvBody:
+    """Newline-framed reader over a streamed request body."""
+
+    def __init__(self, raw_request: Request):
+        self._chunks = raw_request.stream().__aiter__()
+        self._buf = bytearray()
+        self._eof = False
+
+    async def line(self) -> bytes | None:
+        """The next line without its newline; None once the body is exhausted."""
+        start = 0
+        while True:
+            pos = self._buf.find(b"\n", start)
+            if pos >= 0:
+                line = bytes(self._buf[:pos])
+                del self._buf[: pos + 1]
+                return line
+            if self._eof:
+                return None
+            start = len(self._buf)
+            try:
+                self._buf += await self._chunks.__anext__()
+            except StopAsyncIteration:
+                self._eof = True
+
+    async def rest(self) -> bytes:
+        while not self._eof:
+            try:
+                self._buf += await self._chunks.__anext__()
+            except StopAsyncIteration:
+                self._eof = True
+        return bytes(self._buf)
+
+
+def _parse_late_kv_line(line: bytes) -> dict[str, Any]:
+    try:
+        data = json.loads(line)
+    except ValueError as exc:
+        raise HTTPException(400, f"late-kv line is not JSON: {exc}") from exc
+    kv = data.get("kv_transfer_params") if isinstance(data, dict) else None
+    if not isinstance(kv, dict):
+        raise HTTPException(400, "late-kv line must carry a kv_transfer_params object")
+    return kv
+
+
+@app.post(PD_LATE_KV_PATH, include_in_schema=False)
+async def pd_late_kv_chat_completions(raw_request: Request):
+    """Chat completion whose KV metadata arrives after the request body."""
+    if not envs.ATOM_PD_LATE_KV:
+        raise HTTPException(404, "ATOM_PD_LATE_KV is off")
+    try:
+        request = await _read_late_kv_request(raw_request)
+    except ClientDisconnect:
+        # The router dropped the leg (prefill failed or client left) before
+        # line 2: nothing was enqueued, so there is nothing to clean up.
+        logger.debug("late-kv decode leg disconnected before kv_transfer_params")
+        return Response(status_code=499)
+    return await _chat_completions(request, raw_request)
+
+
+async def _read_late_kv_request(raw_request: Request) -> ChatCompletionRequest:
+    body = _LateKvBody(raw_request)
+    head = await body.line()
+    if head is None:
+        raise HTTPException(400, "late-kv body has no request line")
+    try:
+        payload = json.loads(head)
+    except ValueError as exc:
+        raise HTTPException(400, f"late-kv request line is not JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "late-kv request line must be a JSON object")
+    try:
+        request = ChatCompletionRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors(), body=payload) from exc
+    # Release line 1's raw bytes and parsed dict before waiting on P: for a
+    # multi-MB prompt-id body they would otherwise double the pending hold.
+    del payload, head
+    if request.kv_transfer_params is not None:
+        raise HTTPException(
+            400, "late-kv request line must not carry kv_transfer_params"
+        )
+    # Everything above overlapped with P. Now wait for P's answer.
+    line = await body.line()
+    if line is None:
+        raise HTTPException(400, "late-kv body ended before kv_transfer_params")
+    kv = _parse_late_kv_line(line)
+    if (await body.rest()).strip():
+        raise HTTPException(400, "late-kv body has data after kv_transfer_params")
+    request.kv_transfer_params = kv
+    return request
+
+
 async def _chat_completions(
     request: ChatCompletionRequest | BetaChatCompletionRequest, raw_request: Request
 ):
@@ -2266,11 +2381,29 @@ async def _chat_completions(
 
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
-        pretokenized = request.get_prompt_token_ids()
+        has_media = _has_multimodal_content(messages)
+        # A media decode leg's client-body b64 ids are not expanded; it runs on
+        # its prefill's ids from kv_transfer_params (`get_prompt_token_ids`).
+        media_decode_leg = has_media and bool(
+            (kv_transfer_params or {}).get("do_remote_prefill")
+        )
+        pretokenized = request.get_prompt_token_ids(media_decode_leg=media_decode_leg)
         # A decode leg takes its prefill's expanded ids; its media went to P.
         # Without P's cache seed its blocks would hash as text: keep the media.
-        is_multimodal = _has_multimodal_content(messages) and not (
+        is_multimodal = has_media and not (
             pretokenized is not None and leaves_media_on_prefill(kv_transfer_params)
+        )
+        # ATOM_PROMPT_IDS_B64 on a P/D prefill leg: the caller sent these ids
+        # itself, and the PD router forwards that same field to decode.
+        # Echoing them as a JSON list would have the router carry a second
+        # copy into decode's kv_transfer_params, which decode then has to
+        # parse and compare. Any other request (a single server's
+        # `return_token_ids`) still echoes, and so does a multimodal prefill:
+        # its ids have the image placeholders expanded, which decode needs.
+        echo_ids = bool(request.return_token_ids) and not (
+            request.prompt_ids_from_b64()
+            and not has_media
+            and bool((kv_transfer_params or {}).get("do_remote_decode"))
         )
         if assistant_prefix is not None and (is_multimodal or pretokenized is not None):
             # Only rendered text can be continued.
@@ -2412,7 +2545,7 @@ async def _chat_completions(
                     request_id,
                     multimodal_data=multimodal_data,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2439,7 +2572,7 @@ async def _chat_completions(
                     sampling_params,
                     request_id,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2466,7 +2599,7 @@ async def _chat_completions(
                     sampling_params,
                     request_id,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2492,7 +2625,7 @@ async def _chat_completions(
                     sampling_params,
                     request_id,
                     kv_transfer_params=kv_transfer_params,
-                    return_token_ids=bool(request.return_token_ids),
+                    return_token_ids=echo_ids,
                     **dp_routing,
                 ),
                 raw_request,
@@ -3786,6 +3919,41 @@ async def stop_profile():
     except Exception as e:
         logger.exception("Failed to stop profiling")
         raise HTTPException(status_code=500, detail=f"Failed to stop profiling: {e!s}")
+
+
+_offload_lookups_lock = asyncio.Lock()
+
+
+@_engine_route("/offload/lookups", methods=["POST"])
+async def set_offload_lookups(raw_request: Request):
+    """Turn the offload tier's lookups for new requests on or off: {"enabled": bool}."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        body = await raw_request.json()
+    except ValueError:
+        body = None
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if not isinstance(enabled, bool):
+        raise HTTPException(
+            status_code=400, detail='body must be {"enabled": true|false}'
+        )
+    try:
+        # One call at a time: overlapping broadcasts could reach the ranks in
+        # different orders. Off the event loop: each answers between its steps.
+        async with _offload_lookups_lock:
+            ranks = await asyncio.to_thread(engine.set_offload_lookups, enabled)
+    except Exception as e:
+        logger.exception("Failed to set offload lookups")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to set offload lookups: {e!s}"
+        )
+    if not all(r.get("applied") and r.get("enabled") is enabled for r in ranks):
+        # No offload tier that takes it, or one that saves (see the scheduler).
+        raise HTTPException(
+            status_code=409, detail={"enabled": enabled, "ranks": ranks}
+        )
+    return {"status": "success", "enabled": enabled, "ranks": ranks}
 
 
 # ============================================================================
