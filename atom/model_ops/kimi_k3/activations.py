@@ -42,7 +42,9 @@ if _HAS_TRITON:
         HAS_LINEAR: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        row = tl.program_id(0)
+        # 64-bit, as the kernels below: at TP1 the dense FFN's gate_up row is
+        # 2 x 33792 wide, so row * stride_xm passes 2**31 past 31,775 rows.
+        row = tl.program_id(0).to(tl.int64)
         col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = col < D
         g = tl.load(x_ptr + row * stride_xm + col, mask=mask, other=0.0).to(tl.float32)

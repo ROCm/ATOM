@@ -69,7 +69,9 @@ if _HAS_TRITON:
         # either a second pass (amax is not known until every tile is seen) or a
         # cross-tile atomic, and both cost more than the register pressure of a
         # single wide tile at the D this is used for (head_dim).
-        tok = tl.program_id(0)
+        # 64-bit: stride_xm is the fused GEMM's N (KDA's in_proj at TP1 is ~49K
+        # wide), so tok * stride_xm passes 2**31 within a long prefill batch.
+        tok = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK)
         mask = cols < D
         # stride_xm is the SOURCE row stride: for a column slice of a fused GEMM
