@@ -100,6 +100,15 @@ def _int_env(name: str, default: int, *, min_value: int | None = None) -> int:
     return default if value is None else value
 
 
+def _choice_env(name: str, default: str, choices: tuple[str, ...]) -> str:
+    """Unset or empty reads as ``default``; anything else must be one of
+    ``choices`` (case-insensitive). A typo raises rather than falling back."""
+    value = os.getenv(name, "").strip().lower() or default
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {choices}, got {value!r}")
+    return value
+
+
 def _int_env_or_default(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -1718,6 +1727,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to 1 to check, once per microbatch, that a mailbox slot carries the
     # rows the receiving stage runs (a host sync each time: debugging only).
     "ATOM_PP_MAILBOX_CHECK": lambda: os.getenv("ATOM_PP_MAILBOX_CHECK", "0") == "1",
+    # Set to 1 (with ATOM_PP_MAILBOX=1) to move a PP hop between two hosts of one
+    # scale-up fabric (UALink pod) onto a mailbox too: a torch.symm_mem ring on
+    # mori's MORI backend, written by one stage and read by the next, with no NCCL
+    # rendezvous (atom/distributed/pp_fabric.py). The PP group must be the whole
+    # world; a hop that either end cannot map stays on NCCL.
+    "ATOM_PP_MAILBOX_FABRIC": lambda: os.getenv("ATOM_PP_MAILBOX_FABRIC", "0") == "1",
+    # How a fabric hop moves the payload. push: the sender's kernel stores it into
+    # the receiver's ring. pull: the sender copies it into its own ring with the
+    # copy engine, and the receiver's copy-in reads it across the fabric.
+    "ATOM_PP_MAILBOX_FABRIC_MODE": lambda: _choice_env(
+        "ATOM_PP_MAILBOX_FABRIC_MODE", "push", ("push", "pull")
+    ),
+    # How a fabric hop waits for a counter the peer writes. kernel: a one-thread
+    # kernel polls it with system-scope loads. stream: hipStreamWaitValue64.
+    "ATOM_PP_MAILBOX_FABRIC_WAIT": lambda: _choice_env(
+        "ATOM_PP_MAILBOX_FABRIC_WAIT", "kernel", ("kernel", "stream")
+    ),
+    # Workgroups (256 threads each) of a fabric hop's push copy kernel: more move
+    # the payload faster and take more CUs from the sender's next forward.
+    "ATOM_PP_MAILBOX_FABRIC_CTAS": lambda: _int_env(
+        "ATOM_PP_MAILBOX_FABRIC_CTAS", 32, min_value=1
+    ),
     # Set to 1 to send, on an NCCL PP hop, only the AttnRes bank blocks closed
     # before the next stage's first layer (Kimi-K3); the receiver rebuilds the
     # full bank. Mailbox hops always do. Every stage must agree.
