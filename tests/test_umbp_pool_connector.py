@@ -15,6 +15,7 @@ from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.pool.umbp import pool as umbp_pool
 from atom.kv_transfer.pool.umbp.connector import UmbpPoolConnectorScheduler
 from atom.kv_transfer.pool.umbp.pool import UmbpBlockPool
+from atom.kv_transfer.pool.umbp.report import kv_pool_report
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
@@ -96,6 +97,66 @@ class TestRegistry:
     def test_other_connectors_share_no_pool(self):
         cfg = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
         assert KVConnectorFactory.pool_sharing(config_with(cfg)) is None
+
+
+class TestRouterReport:
+    """What `/kv_event_sources` tells a router of the pool a rank's blocks live
+    in: the ranks of one node that report one address and group, with `fetch`
+    on, are one share group to it (`report.kv_pool_report`)."""
+
+    @staticmethod
+    def keyed(kv_transfer_config, **facts):
+        """A config with the plain values a pool derives its group from."""
+        return MockConfig(
+            kv_transfer_config=kv_transfer_config,
+            hf_config=_MockHFConfig(["DeepseekV41ForCausalLM"]),
+            **{
+                "model": "/models/v41",
+                "kv_cache_dtype": "fp8",
+                "index_cache_dtype": "fp8",
+                "quant_config": types.SimpleNamespace(online_quant_config_raw=None),
+                **facts,
+            },
+        )
+
+    def test_reports_what_makes_a_share_group(self):
+        config = config_with(transfer(group="g", share_ratio=0.5, fetch="false"))
+        assert kv_pool_report(config) == {
+            "backend": "umbp_pool",
+            "address": ADDRESS,
+            "group": "g",
+            "share_ratio": 0.5,
+            "fetch": False,
+        }
+
+    def test_reports_the_group_the_pools_derive(self):
+        config = self.keyed(transfer())
+        report = kv_pool_report(config)
+        settings = UmbpPoolSettings.from_transfer_config(transfer())
+        assert report["group"] == umbp_pool.share_group_for(config, settings)
+        assert report["group"].startswith("atom-")
+        assert (report["share_ratio"], report["fetch"]) == (1.0, True)
+        # Another engine of the same model and KV format on the server reports
+        # the same group, whatever it names its pools; another format, another.
+        peer = self.keyed(transfer(namespace="p1"))
+        assert kv_pool_report(peer)["group"] == report["group"]
+        other = self.keyed(transfer(), kv_cache_dtype="bf16")
+        assert kv_pool_report(other)["group"] != report["group"]
+
+    def test_found_inside_multi(self):
+        cfg = {
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                transfer(group="g"),
+            ],
+        }
+        assert kv_pool_report(config_with(cfg))["group"] == "g"
+
+    def test_other_connectors_report_no_pool(self):
+        cfg = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+        assert kv_pool_report(config_with(cfg)) is None
+        assert kv_pool_report(config_with({})) is None
 
 
 class TestProvidesThePool:
