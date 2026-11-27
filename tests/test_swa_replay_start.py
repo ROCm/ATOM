@@ -149,11 +149,16 @@ def test_a_backed_off_chunk_has_to_pass_where_it_resumed():
     seq = SimpleNamespace(num_tokens=16484)
     chunk = Scheduler._partial_prefill_chunk
     # backed off one block: 128 recomputed rows plus the 100 left
-    assert chunk(scheduler, seq, 16256, 16384, 0) == 228
+    assert chunk(scheduler, seq, 16256, 16384, 0, budget=16384) == 228
     # a budget with room for the recomputed rows alone
-    assert chunk(scheduler, seq, 16256, 16384, 16384 - 128) == 0
+    assert chunk(scheduler, seq, 16256, 16384, 16384 - 128, budget=16384) == 0
     # no back-off: the cap as before
-    assert chunk(scheduler, SimpleNamespace(num_tokens=20000), 16384, 16384, 0) == 128
+    assert (
+        chunk(
+            scheduler, SimpleNamespace(num_tokens=20000), 16384, 16384, 0, budget=16384
+        )
+        == 128
+    )
 
 
 def test_a_backed_off_forward_places_checkpoints_from_where_it_resumed():

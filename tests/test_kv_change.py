@@ -627,6 +627,7 @@ def _middle_chunk(req_id):
         connector_meta_output=None,
         pp_completion_ack=True,
         total_seqs_num_decode=0,
+        total_seqs_num_prefill=1,
         is_final_chunk=[False],
         produces_output=lambda: False,
     )
@@ -658,6 +659,7 @@ def _pipeline(sched, *, stage_runs=True):
     for engine, is_head in ((head, True), (stage, False)):
         engine.is_head, engine.is_last = is_head, not is_head
         engine.pp_size = engine.pp_max_inflight = 2
+        engine._stages_push_load_terminals = False
         engine.pp_transport = wire
         engine._pp_kv_aggregator = None
         engine._has_pending_utility = False

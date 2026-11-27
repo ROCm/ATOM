@@ -1,4 +1,7 @@
-//! Whether requests tokenize for routing as on ATOM, with each tokenizer backend.
+//! Whether requests tokenize as on ATOM, with each tokenizer backend: for
+//! routing (`IngressRouting::tokens`), and as the gRPC and ATOM bridge routers
+//! prepare a chat (`prepare::prepare_chat_with`, with the body as sent, read
+//! as the gRPC routers read it: `prepare::sent_chat_body`).
 
 use std::{
     path::{Path, PathBuf},
@@ -17,7 +20,7 @@ use crate::{
         steps::{create_tokenizer_workflow_data, LoadTokenizerStep, TokenizerConfigRequest},
     },
     routers::prepare::{
-        chat_template::process_chat_messages, fast_tokenizer::FastTokenizer, thread_tokenizer,
+        fast_tokenizer::FastTokenizer, prepare_chat_with, sent_chat_body, thread_tokenizer,
     },
 };
 
@@ -171,30 +174,51 @@ async fn router(model: &Path, backend: &str) -> (PreparePoolRuntime, Arc<AppCont
     (pool, app)
 }
 
-/// The tokens HTTP routing gives `body` to match the engine's KV cache, and the
-/// median of `runs` times encoding its prompt.
+/// The tokens HTTP routing gives `body` to match the engine's KV cache, the
+/// median of `runs` times encoding its prompt, and, for a chat, the tokens the
+/// gRPC and ATOM bridge routers prepare it with.
 async fn tokenize(
-    app: &AppContext,
+    app: &Arc<AppContext>,
     route: &str,
     body: &Value,
     runs: usize,
-) -> (Result<Vec<u32>, String>, Option<Duration>) {
+) -> (
+    Result<Vec<u32>, String>,
+    Option<Duration>,
+    Option<Result<Vec<u32>, String>>,
+) {
     let mut body = body.clone();
     body["model"] = Value::from(MODEL);
-    let parsed = match ParsedInference::parse(route, &serde_json::to_vec(&body).unwrap()) {
+    let sent = serde_json::to_vec(&body).unwrap();
+    let parsed = match ParsedInference::parse(route, &sent) {
         Ok(parsed) => parsed,
-        Err(error) => return (Err(error.to_string()), None),
+        Err(error) => return (Err(error.to_string()), None, Some(Err(error.to_string()))),
     };
+    let prepared = parsed.chat().map(|chat| {
+        let body = sent_chat_body(&sent, Some(MODEL), app)
+            .map_err(|response| response.status().to_string())?;
+        prepare_chat_with(
+            Arc::new(chat.clone()),
+            None,
+            Some(MODEL.to_string()),
+            app,
+            body.as_deref(),
+            true,
+        )
+        .map(|(payload, _)| payload.token_ids)
+        .map_err(|response| response.status().to_string())
+    });
     let routing = IngressRouting::new(app);
+    let app = Arc::clone(app);
     let entry = app.tokenizer_registry.get_by_name(MODEL).unwrap();
     app.prepare_pool
         .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
             let metadata = parsed.metadata();
             let tokens = routing
-                .tokens(&parsed, &metadata, ctx, true)
+                .tokens(&parsed, &sent, None, &metadata, ctx, true)
                 .map_err(|error| error.message);
             let prompt = match parsed.chat() {
-                Some(chat) => process_chat_messages(chat, &*entry.tokenizer).map(|p| p.text),
+                Some(chat) => routing.render_chat(&entry, chat, &sent, None),
                 None => Ok(metadata.text.clone()),
             };
             let encode = prompt.ok().filter(|_| tokens.is_ok()).map(|prompt| {
@@ -215,6 +239,7 @@ async fn tokenize(
         .unwrap()
         .wait()
         .await
+        .map(|(tokens, encode)| (tokens, encode, prepared))
         .unwrap()
 }
 
@@ -255,8 +280,14 @@ async fn test_requests_tokenize_as_on_atom() {
         })
         .collect();
 
+    // fastokens reads a `tokenizer.json`; a tiktoken checkpoint (Kimi-K3's)
+    // has none.
+    let backends = match checkpoint.join("tokenizer.json").is_file() {
+        true => &BACKENDS[..],
+        false => &BACKENDS[..1],
+    };
     let mut results = Vec::new();
-    for backend in BACKENDS {
+    for &backend in backends {
         let (_pool, app) = router(&checkpoint, backend).await;
         let entry = app.tokenizer_registry.get_by_name(MODEL).unwrap();
         assert_eq!(
@@ -272,8 +303,15 @@ async fn test_requests_tokenize_as_on_atom() {
 
     eprintln!("{model}");
     eprintln!(
-        "  {:28} {:>9} {:>9}  {:24} {:24} {:>11} {:>11}",
-        "request", "bytes", "tokens", BACKENDS[0], BACKENDS[1], "encode hf", "encode fast"
+        "  {:32} {:>9} {:>9}  {:24} {:24} {:24} {:>11} {:>11}",
+        "request",
+        "bytes",
+        "tokens",
+        BACKENDS[0],
+        BACKENDS[1],
+        "prepare",
+        "encode hf",
+        "encode fast"
     );
     let micros = |time: Option<Duration>| {
         time.map_or_else(
@@ -284,17 +322,22 @@ async fn test_requests_tokenize_as_on_atom() {
     let (mut unlike_atom, mut unlike_huggingface) = (Vec::new(), Vec::new());
     let mut speedups = Vec::new();
     for (n, (name, _, body, atom)) in requests.iter().enumerate() {
-        let (huggingface, fastokens) = (&results[0][n], &results[1][n]);
+        let huggingface = &results[0][n];
+        let fastokens = results.get(1).map_or(huggingface, |results| &results[n]);
         let (hf_like_atom, hf_outcome) = atom.compare(&huggingface.0);
         let (fast_like_atom, fast_outcome) = atom.compare(&fastokens.0);
+        let (prepared_like_atom, prepared_outcome) = match &huggingface.2 {
+            Some(prepared) => atom.compare(prepared),
+            None => (true, "-".to_string()),
+        };
         eprintln!(
-            "  {name:28} {:>9} {:>9}  {hf_outcome:24} {fast_outcome:24} {:>11} {:>11}",
+            "  {name:32} {:>9} {:>9}  {hf_outcome:24} {fast_outcome:24} {prepared_outcome:24} {:>11} {:>11}",
             body.to_string().len(),
             atom.len(),
             micros(huggingface.1),
             micros(fastokens.1),
         );
-        if !(hf_like_atom && fast_like_atom) {
+        if !(hf_like_atom && fast_like_atom && prepared_like_atom) {
             unlike_atom.push(*name);
         }
         if huggingface.0 != fastokens.0 {

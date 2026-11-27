@@ -1834,7 +1834,7 @@ def expected_rules(rules_text):
 # boundary, `gemm_a8w8_blockscale_cktile_common.cuh` matched as `...common.cu`, a file the
 # PR changes read as one it does not. `=` belongs in the class because tuned-config names
 # carry it -- `gfx1201-GEMM-A8W8_BLOCKSCALE-N=1024-K=1024.json` matched as `1024.json`.
-CITATION = re.compile(r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|co|h|md|sh))"
+CITATION = re.compile(r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|co|h|md|sh|rs|toml))"
                       r"(?![\w])(?::(\d+))?")
 
 
@@ -2822,6 +2822,180 @@ def audit_core_files(text, diff_text, root=None):
 
 # ----------------------------------------------------------------- card gate
 FINDING = re.compile(r"^\s*(\U0001F534|\u26A0\uFE0F?|\U0001F4DD)\s*(.+)$")
+# A path-less FIRE is claimed by a symbol its own reason put in backticks, and by nothing
+# else. Five rounds of review found a hole each time in the shape-based version -- one
+# shared word, then lower-casing, then GEMM/BF16, then FP32/MI355X/num_tokens -- because
+# no shape separates a name from this codebase's ordinary vocabulary, and the word list
+# that tried to was never going to be complete. A backtick is the author saying "this is
+# a name"; guessing gets no credit.
+CLAIM_SYMBOL = re.compile(r"`([^`\n]{2,60})`")
+
+
+def _claim_symbols(reason):
+    """-> the backticked symbols a reason offers as its handle.
+
+    A span has to carry a word character. Punctuation on its own -- `==`, `--`, `()`,
+    `::` -- names nothing: `_mentions_symbol` puts no boundary around an end that is
+    already punctuation (it cannot, or `.cuda()` would be rejected after `x`), so a
+    reason backticking `==` was claimed by any finding with `==` anywhere in it, and the
+    UNREPORTED-FIRE that exists to force that rule onto the card never fired. Symbols
+    that mix the two -- `.cuda()`, `->data`, `::empty` -- keep their claim.
+
+    A reason that backticks only punctuation has no claim route, which is where a reason
+    that backticks nothing already was.
+    """
+    return {m.strip() for m in CLAIM_SYMBOL.findall(reason)
+            if m.strip() and re.search(r"\w", m)}
+
+
+def _mentions_symbol(text, symbol):
+    """Does text name symbol without embedding a word-character end in a word?
+
+    Punctuation is part of many useful symbols (`.cuda()`, `->data`, `::empty`). A
+    boundary on an end that is already punctuation would reject `x.cuda()` because the
+    character before `.cuda()` is `x`. Only word-character ends need word boundaries.
+    """
+    left = r"(?<!\w)" if re.match(r"\w", symbol[0]) else ""
+    right = r"(?!\w)" if re.match(r"\w", symbol[-1]) else ""
+    return re.search(left + re.escape(symbol) + right, text) is not None
+
+
+def _same_file(a, b):
+    """Do these two citations name the same file?
+
+    A verdict reason writes the path it found (`atom/models/x.py:1`); SKILL.md's own good
+    examples write the basename (`x.py:1`). Matching the verdict's exact string meant the
+    form the skill teaches could not claim the FIRE it was reporting, and the card was
+    left with a fatal UNREPORTED-FIRE. Compared on segment boundaries, so `other/x.py`
+    still does not answer for `atom/models/x.py`.
+    """
+    a, b = a.lstrip("./"), b.lstrip("./")
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+LEAD_NOISE = re.compile(r"^[\s*`_]+")
+LEAD_GROUP = re.compile(r"^[\[(]([^\])]{0,60})[\])]")
+# The id itself, with the sub-type, the `A5/B1` list and the `(silent bypass)` aside it
+# can carry. Written once: the two readers below differ only in what they accept AFTER
+# it, and a second copy is a second thing to keep in step.
+_ID_HEAD = (r"^([A-Z]+\d+[a-z]?)(?:-[\w-]+)?(?:\s*[/,]\s*[A-Z]+\d+[a-z]?)*"
+            r"(?:\s*\([^)]{0,40}\))?[\s*`_]*")
+BARE_ID = re.compile(_ID_HEAD + r"(?::|—|–|--|-(?!\w)|\s+(?=[a-z])|(?!\w))")
+# After a citation, only the colon form. `_publish.first_clause` drops the citation, so
+# both `foo.py:563-569 A5: guard missing` and `README.md:1084, B1-B2 stage before B3-B4`
+# reach the reader with an id-shaped word in front -- it draws no distinction between
+# them and is not the thing that does. The distinction is what the reader sees: `A5:` is
+# a bare label, while `B1-B2 stage before B3-B4` is a sentence that happens to start with
+# one of this codebase's own words (the KV-offload chunk groups in
+# atom/kv_transfer/offload/README.md, the MTP4 rows in
+# atom/models/glm52/mono/kernels/op.py, deepseek_v4's capture topology in
+# atom/models/deepseek_v4/mono/session.py). Reading the sentence with BARE_ID refuses a
+# lawful finding, and a refusal here is fatal -- the only way out is an untrue
+# `-- not reported:`, which is the trap the UNREPORTED-FIRE hint below exists to close.
+# This is a trade, not a clean line. first_clause drops the citation either way, so
+# `planner.rs:108 A5 charges only on req.stream` still publishes as `A5 charges only
+# …` and this gate passes it. Refusing that form would take the lawful sentences with
+# it whenever `_diff_vocabulary` does not happen to hold the word. A refusal is fatal
+# and an id-led index line is cosmetic, so the cosmetic gap is the one left open.
+CITED_ID = re.compile(_ID_HEAD + r":")
+
+
+def _diff_vocabulary(diff_text):
+    """-> the id-shaped words the code under review uses as its own.
+
+    Many of the 54 ids also appear under atom/ as ordinary words: B1..B7 are the
+    KV-offload chunk groups (atom/kv_transfer/offload/README.md), C1..C3 the MTP4 rows
+    and deepseek_v4's cuda-graph capture topology
+    (atom/models/glm52/mono/kernels/op.py, atom/models/deepseek_v4/mono/session.py),
+    T1 and D11 label obligations in atom/mesh/tests/*.rs, and there are more.
+    (C4 belongs to that topology too and is not an id at all, which is the other half
+    of the same problem.)
+
+    Deliberately no number here. Four were written into this comment during review --
+    eleven, ten, nineteen, twenty-two -- and every one of them was wrong, because the
+    answer moves with the tree and with which file extensions the counter happened to
+    grep. A constant in a comment is the thing that rots; the examples are not.
+
+    No shape separates `C1` the rule
+    from `C1` the row -- that is the lesson of the word lists this gate went through --
+    so ask the diff instead, which is the one thing that is not a guess. `_mentions_symbol`
+    answers the neighbouring question the same way: by what the text actually says, never
+    by what a word looks like.
+
+    Weighing the two errors: refusing a lawful finding is FATAL (the way out is an untrue
+    `-- not reported:`), while shipping an id-led line is cosmetic. So a word the PR uses
+    itself stops being read as an id.
+
+    `.claude/` is excluded on purpose. rules.md names every id, so a PR that touches the
+    skill -- this one does -- would otherwise put all 54 in the vocabulary and switch the
+    whole gate off, silently, in exactly the reviews most likely to exercise it.
+    """
+    vocab, path = set(), None
+    for ln in diff_text.splitlines():
+        m = re.match(r"^diff --git a/\S+ b/(\S+)", ln)
+        if m:
+            path = m.group(1)
+            continue
+        if path is None or path.startswith(".claude/") or ln[:3] in ("+++", "---"):
+            continue
+        if ln[:1] in ("+", "-", " "):
+            vocab.update(re.findall(r"\b[A-Z]+\d+[a-z]?\b", ln))
+    return vocab
+
+
+def _rule_head(text, vocab=frozenset()):
+    """-> the rule id this finding opens with, through whatever sits in front of it.
+
+    One reader for both callers -- the one that registers the claim and the one that
+    refuses to ship the id -- so they cannot disagree about what counts. `FP8:`, `TP8:`,
+    `MI300:` and `GPU0:` share the shape and none of them is a rule, and neither is a
+    word the diff itself uses (`vocab`, from `_diff_vocabulary`).
+    """
+    rest = text
+    cited = False                            # has a citation been stepped over already?
+    for _ in range(6):                       # tag, emphasis, and one wrapped in the other
+        rest = LEAD_NOISE.sub("", rest)
+        m = (CITED_ID if cited else BARE_ID).match(rest)
+        if m:
+            rid = m.group(1)
+            return rid if rid in REFUSED_IDS and rid not in vocab else None
+        citation = CITATION.match(rest)
+        if citation:
+            # Strip exactly what `_publish.first_clause` strips after the citation: the
+            # rest of a line range, and a comma or a dash as well as a colon. It drops
+            # `(?:-\d+)?` and `[,:]`, so `foo.py:563-569 A5: …` still reached the reader
+            # as `A5: …` -- the id-led line this gate exists to refuse. Range citations
+            # are common; real bot cards carry 74 of them.
+            # The separator class is every punctuation a citation is written against,
+            # not only the ones first_clause names: `foo.py:3. A5: guard missing` and
+            # `foo.py:3 - A5: broken` reached the reader id-led the same way. Closing
+            # them refuses nothing lawful, because what follows the strip still has to
+            # be the colon form -- `README.md:1084. B1-B2 stage before B3-B4` has no
+            # colon and passes. `--` precedes `-` in the alternation so the long form
+            # wins, and a line range is already eaten by `(?:-\d+)?` before any of it.
+            rest = re.sub(r"^(?:-\d+)?[\s*`_]*(?:[,:.]|—|–|--|-)?\s*", "",
+                          rest[citation.end():])
+            cited = True
+            continue
+        g = LEAD_GROUP.match(rest)
+        if not g:
+            return None
+        inner = g.group(1).strip(" *`_")
+        members = [part.strip() for part in re.split(r"[/,]", inner)]
+        rid = next((part for part in members
+                    if part in REFUSED_IDS and part not in vocab), None)
+        if rid:  # `[B1]` is the id itself, not a tag over it.
+            return rid
+        rest = rest[g.end():]
+    return None
+RULE_SET = frozenset(ALL_RULES.split())
+# Refuse every id rules.md names, not only the derivable ones. SKILL.md:111-113 notes
+# that ids such as HK3 live in UNREACHABLE_BY_DESIGN rather than ALL_RULES.
+REFUSED_IDS = RULE_SET | frozenset(UNREACHABLE_BY_DESIGN)
+# The in-card scan kept its own copy of CITATION's extension list and drifted from it:
+# no `rs|toml`, so a Rust-only finding read as citing nothing and skipped both the
+# UNANCHORED and the UNBACKED check. Derived from CITATION so they cannot diverge again.
+CITATION_BARE = CITATION.pattern.split("(?::(")[0]
 VALUE = re.compile(r"\b\d+\b|fp8|fp16|bf16|fp4|int8|int32|int64|e4m3|e5m2|gfx\d+|"
                    r"nullptr|None\b|2\^\d+", re.I)
 IDENT = re.compile(r"\b[a-z]+_[a-z_0-9]{2,}\b|\b[A-Z][A-Z0-9_]{3,}\b")
@@ -3069,12 +3243,15 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
     Three things are checkable, and only three. Whether a finding is CORRECT is not one
     of them -- that is what a human reads the card for."""
     touched = set(re.findall(r"^diff --git a/\S+ b/(\S+)", diff_text, re.M))
+    # One vocabulary for both id readers below, built once. See _diff_vocabulary:
+    # a word this PR's own code uses is not read as a rule id.
+    vocab = _diff_vocabulary(diff_text)
     # Every FIRE has to reach the card. Checking only that findings trace back to work
     # left the inverse open: a review can adjudicate nine rules FIRE, report none of
     # them, and pass. FIRE means it goes in the card; if it is not going in, the verdict
     # is not FIRE, and saying so is a one-word edit to the ledger. The escape is
     # deliberate and must be written down: `-- not reported: <reason>` on the verdict.
-    fired, fire_paths, claims = {}, {}, {}
+    fired, fire_paths, fire_tokens, claims = {}, {}, {}, {}
     for ln in (verdicts_text or "").splitlines():
         m = re.match(r"\s*([A-Z]+\d+[a-z]?)\s+FIRE\b\s*(?:--|—|:)\s*(.*)$", ln)
         if m and "not reported:" not in m.group(2).lower():
@@ -3082,6 +3259,9 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # The files this verdict cited, so a card that obeys the no-rule-codes rule
             # can still be matched to the FIRE it is reporting.
             fire_paths[m.group(1)] = [pp for pp, _ in CITATION.findall(m.group(2))]
+            # For a reason that cites no file: the symbols it backticked, which are the
+            # only handle it offers.
+            fire_tokens[m.group(1)] = _claim_symbols(m.group(2))
     backing = _fold_punct((verdicts_text or "") + "\n" + (diagnostic_text or "")
                           + "\n" + (answers_text or ""))
     problems = []
@@ -3092,17 +3272,26 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             findings.append((m.group(1), m.group(2).strip()))
     reported = set()
     for _, text in findings:
-        rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
+        rid = _rule_head(text, vocab)
         if rid:
-            reported.add(rid.group(1))
+            reported.add(rid)
         # SKILL.md's output rules say, in as many words, "Do NOT use rule codes (B1, D4,
         # A1...) in output -- they are internal labels only". Claiming a FIRE by its rule
         # id was therefore something the card was forbidden to do, and every correctly
         # written card reported every fired rule as UNREPORTED-FIRE. A finding that names
         # a file the verdict cited is the same claim without the label.
+        cited_here = [c.lstrip("./") for c in re.findall(CITATION_BARE, text)]
         for rule, paths in fire_paths.items():
-            if paths and any(pp in text for pp in paths):
+            if paths and any(_same_file(pp, cp) for pp in paths for cp in cited_here):
                 claims.setdefault(rule, []).append(text[:40])
+            elif not paths and fire_tokens.get(rule):
+                # The card has to name one of them, on identifier boundaries. As a plain
+                # substring a two-character symbol finds itself everywhere -- `tp` inside
+                # "output", `kv` inside "kv_cache", `ep` inside "step" -- and claims a
+                # FIRE the finding was never about. Matched as written, not folded: the
+                # reason chose the spelling when it chose the backticks.
+                if any(_mentions_symbol(text, sym) for sym in fire_tokens[rule]):
+                    claims.setdefault(rule, []).append(text[:40])
     # A finding may report more than one rule, and often should: aiter#3165 fired B4 and
     # E5 on the same changed file and one accurate bullet covered both. Requiring N
     # distinct bullets for N rules sharing a path -- which is what this did -- forced the
@@ -3118,7 +3307,10 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         if rule not in reported:
             problems.append(("UNREPORTED-FIRE", f"{rule}: {why}",
                              "adjudicated FIRE and absent from the card -- report it, or "
-                             "change the verdict, or append `-- not reported: <reason>`"))
+                             "change the verdict, or append `-- not reported: <reason>`. "
+                             "A reason that cites no file is matched by the symbols it "
+                             "puts in backticks, so give it one the card names -- editing "
+                             "the verdict line to add them is a fix, not a cheat"))
     for sev, text in findings:
         red = sev.startswith("\U0001F534")
         cited = [p for p in re.findall(
@@ -3126,8 +3318,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # `torch.cu` and `x.contiguous.cuda()` as `x.contiguous.cu`. Those are the
             # two most ordinary words in a HIP review, so the gate produced a citation
             # complaint about a path nobody wrote.
-            r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|co|h|md|sh)(?![\w]))",
-            text)]
+            CITATION_BARE, text)]
         def _is_touched(c):
             # NOT lstrip("./"): it strips every leading dot and slash, so
             # `.github/workflows/perf-parity.yaml` became `github/workflows/...` and a
@@ -3147,14 +3338,25 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                              f"cites only {cited[0]} and nothing this PR changes"))
         # Does anything already adjudicated mention this? Match on the rule id if the
         # finding carries one, else on a distinctive token from the text.
-        rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
+        rid = _rule_head(text, vocab)
         if rid:
+            # SKILL.md: "Do NOT use rule codes (B1, D4, A1...) in output -- they are
+            # internal labels only." Parsing one here as a claim made the gate accept
+            # what the instruction forbids, and a model that follows the gate over the
+            # prose is behaving correctly. ATOM#3481's published review opened a finding
+            # with `A5:`, which tells its reader nothing. The id still counts as the
+            # claim above -- withdrawing that would turn such cards into UNREPORTED-FIRE,
+            # which is worse -- but the card does not ship with it.
+            problems.append(("RULE-CODE-IN-CARD", text[:70],
+                             f"opens with the internal rule id `{rid}`, which "
+                             "means nothing to a reviewer -- say the thing the rule is "
+                             "about instead"))
             # `-- late finding:` is the exit for what no rule covers, so it cannot excuse a
             # finding that names a rule: claiming G1 the ledger adjudicated CLEAR is a
             # contradiction of the ledger, not a discovery arriving late.
-            if not re.search(rf"(?<![\w]){re.escape(rid.group(1))}\b\s+FIRE", backing):
+            if not re.search(rf"(?<![\w]){re.escape(rid)}\b\s+FIRE", backing):
                 problems.append(("UNBACKED-FINDING", text[:70],
-                                 f"{rid.group(1)} is reported but was not adjudicated FIRE"))
+                                 f"{rid} is reported but was not adjudicated FIRE"))
         elif LATE_MARK.search(text):
             # The honest path for a Step 7 discovery no rule covers. Before this existed
             # the only way past the gate was to edit an artifact that had already passed
@@ -3330,8 +3532,14 @@ if __name__ == "__main__":
             print(f"  {why}")
         if problems:
             unreported = sum(1 for k, _, _ in problems if k == "UNREPORTED-FIRE")
-            about_findings = len({t for k, t, _ in problems if k != "UNREPORTED-FIRE"})
+            # RULE-CODE-IN-CARD is about how a finding is written, not whether it
+            # traces -- counting it under "cannot be traced" misnames it.
+            about_findings = len({t for k, t, _ in problems
+                                  if k not in ("UNREPORTED-FIRE", "RULE-CODE-IN-CARD")})
+            codes = len({t for k, t, _ in problems if k == "RULE-CODE-IN-CARD"})
             parts = []
+            if codes:
+                parts.append(f"{codes} finding(s) ship an internal rule id")
             if about_findings:
                 parts.append(f"{about_findings} of {len(findings)} findings cannot be "
                              f"traced")
