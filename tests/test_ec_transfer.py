@@ -199,12 +199,15 @@ def test_pool_registers_on_every_configured_device(engines, monkeypatch):
 
 
 def test_engine_without_configured_device_uses_the_gpu_local_hca(engines, monkeypatch):
+    # The HCA on the GPU's PCIe switch, found from its PCI address, as the KV
+    # connector picks it: HIP's ordinal is not PCI order.
     monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE")
-    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "4,5")
-    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr(mooncake_hca, "auto_select_ib_device", lambda idx: f"rdma{idx}")
+    monkeypatch.setattr(ec, "gpu_pci_bdf", {1: "0000:05:00.0"}.__getitem__)
+    monkeypatch.setattr(
+        mooncake_hca, "rail_rdma_device", {"0000:05:00.0": "rdma0"}.__getitem__
+    )
     engine, _ = ec._open_engine(torch.device("cuda", 1), "rdma")
-    assert engine.init_args[3] == "rdma5"
+    assert engine.init_args[3] == "rdma0"
 
 
 def test_pool_on_tcp_registers_no_hca(engines, monkeypatch):
@@ -329,9 +332,12 @@ def test_reader_takes_the_kv_connectors_hca_options(engines, monkeypatch):
 
 def test_engine_registers_on_alternate_hcas(engines, monkeypatch):
     monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE")
-    monkeypatch.setattr(mooncake_hca, "auto_select_ib_device", lambda i: f"ionic_{i}")
+    monkeypatch.setattr(ec, "gpu_pci_bdf", {1: "0000:05:00.0"}.__getitem__)
+    monkeypatch.setattr(
+        mooncake_hca, "auto_select_ib_device", {"0000:05:00.0": "ionic_1"}.__getitem__
+    )
+    monkeypatch.setattr(mooncake_hca, "numbered_ib_device", lambda i: f"ionic_{i}")
     monkeypatch.setattr(mooncake_hca, "ib_device_exists", lambda _: True)
-    monkeypatch.setattr(ec, "_physical_index", lambda i: i)
     ec._open_engine(
         torch.device("cuda", 1), "rdma", enable_alternate_hca=True, hca_count=3
     )
