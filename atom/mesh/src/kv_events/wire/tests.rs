@@ -173,6 +173,20 @@ fn only_the_device_tier_of_the_full_attention_group_is_followed() {
     );
 }
 
+/// A removal and a clear of the shared tier go to `shared`, never to the device tier's
+/// events.
+#[test]
+fn the_shared_tier_is_removed_and_cleared_apart_from_the_device_tier() {
+    let batch = r#"[1.0, [{"type": "BlockRemoved", "block_hashes": [1], "medium": "GPU_SHARED"},
+        {"type": "AllBlocksCleared", "medium": "GPU_SHARED"}, {"type": "AllBlocksCleared"}]]"#;
+    let batch = decode_json(batch, 4).unwrap();
+    let removed = KvEvent::Removed {
+        hashes: vec![EngineHash(1)],
+    };
+    assert_eq!(batch.shared, vec![removed, KvEvent::Cleared]);
+    assert_eq!(render(&batch), "rank -: cleared");
+}
+
 #[test]
 fn malformed_input_fails_the_batch_or_drops_the_event() {
     assert!(decode(&[0xc1], 4).is_err());

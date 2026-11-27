@@ -425,7 +425,17 @@ pub(crate) fn match_lanes(
 /// The leading tokens of `tokens` the ranks of each share group hold between them, in the
 /// order of `groups`, each the lanes of a group's ranks in one partition: a block counts
 /// while any of them holds it. One hashing and one walk per partition.
+///
+/// A group's lanes must all be lanes in the events of one partition, that of its first:
+/// their ids are read in that partition's index, where the id of another partition's lane
+/// is some other holder's. A caller whose share group has ranks in several partitions
+/// passes one group per partition, as `KvEventMonitor::shared_tokens` does. Debug builds
+/// assert that a group has one partition.
 pub(crate) fn match_groups(tokens: &[u32], groups: &[Vec<Lane>]) -> Vec<u32> {
+    debug_assert!(
+        (groups.iter()).all(|lanes| lanes.iter().all(|(p, _)| Arc::ptr_eq(p, &lanes[0].0))),
+        "a group's lanes are in one partition"
+    );
     let mut hits = vec![0; groups.len()];
     let mut walked: Vec<&Arc<Partition>> = Vec::new();
     for (partition, _) in groups.iter().filter_map(|lanes| lanes.first()) {

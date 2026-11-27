@@ -332,8 +332,8 @@ async fn the_writer_applies_batches_and_frees_released_lanes() {
 }
 
 /// A rank's shared lane holds the blocks its shared tier names that the rank holds, until
-/// the tier or the rank lets go of them or the rank is reset; a rank without one drops the
-/// tier.
+/// the tier or the rank lets go of them, the tier is cleared or the rank is reset; a rank
+/// without one drops the tier.
 #[tokio::test]
 async fn a_shared_lane_holds_what_the_rank_shares_and_holds() {
     let ttl = Duration::from_secs(120);
@@ -383,6 +383,19 @@ async fn a_shared_lane_holds_what_the_rank_shares_and_holds() {
         .write(true, vec![stored(0, &seq, 0..3, 4)], vec![])
         .await;
     settles(match_holders, &seq, &lanes, &[Some(0)]).await;
+    assert_eq!(match_holders(&seq, &[Some(holder.lane())]), [Some(12)]);
+    // Shared again, the tier removes a block and is cleared in one batch: its lane holds
+    // none of the three blocks, the rank's own all of them.
+    holder
+        .write(false, vec![], vec![shared(hashes(0..3))])
+        .await;
+    settles(match_holders, &seq, &lanes, &[Some(12)]).await;
+    holder
+        .write(false, vec![], vec![removed(2..3), KvEvent::Cleared])
+        .await;
+    settles(match_holders, &seq, &lanes, &[Some(0)]).await;
+    until(|| status.lock().shared_blocks == Some(0)).await;
+    assert_eq!(status.lock().indexed_blocks, Some(3));
     assert_eq!(match_holders(&seq, &[Some(holder.lane())]), [Some(12)]);
     let other = Arc::new(Mutex::new(SourceStatus::default()));
     let unshared = partition.hold(other.clone()).unwrap();
@@ -514,6 +527,20 @@ async fn a_group_holds_what_any_of_its_ranks_holds() {
         vec![],
     ];
     assert_eq!(match_groups(&seq, &groups), [12, 8, 4, 16, 0]);
+}
+
+/// A group's lanes are in one partition: their ids would be read in the first lane's.
+#[cfg(debug_assertions)]
+#[tokio::test]
+#[should_panic(expected = "a group's lanes are in one partition")]
+async fn a_group_with_lanes_of_two_partitions_is_refused_in_debug_builds() {
+    let (ttl, runtime) = (Duration::from_secs(120), tokio::runtime::Handle::current());
+    let status = Arc::new(Mutex::new(SourceStatus::default()));
+    let lane = |block_size| {
+        let partition = Partition::start(block_size, ttl, &runtime);
+        partition.hold(status.clone()).unwrap().lane()
+    };
+    match_groups(&[0; 9], &[vec![lane(4), lane(8)]]);
 }
 
 fn resident_bytes() -> u64 {
