@@ -87,7 +87,7 @@ jobs:
             exit 1
           fi
 
-      - name: Free container engine disk space
+      - name: Resolve SGLANG image reference
         run: |
           set -euo pipefail
           IMG="${SGLANG_IMAGE_TAG}"
@@ -103,6 +103,10 @@ jobs:
           fi
           echo "SGLANG_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
 
+      - name: Free container engine disk space
+        run: |
+          set -euo pipefail
+          IMG="${SGLANG_IMAGE_REF}"
           echo "=== Disk before cleanup ==="
           df -h || true
           $CONTAINER_ENGINE system df || true
