@@ -2017,18 +2017,13 @@ class MLAAttention(nn.Module):
             # BF16 absorb via Triton batched GEMM (gfx1250-safe; torch.bmm's
             # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
             # X @ W^T with W (B,N,K): q_nope (N,B,P) @ W_K (N,L,P)^T -> (N,B,L),
-            # stored through YQ's transposed strides in the (B,N,L) destination.
+            # then -> (B,N,L) to match the fp8/fp4 output layout. A prestored q_out
+            # (q_nope_out) takes the result through YQ's transposed strides.
             if q_nope_out is None:
-                ql_nope = torch.empty(
-                    q_nope.shape[1],
-                    q_nope.shape[0],
-                    W_K.shape[1],
-                    device=q_nope.device,
-                    dtype=q_nope.dtype,
-                )
+                ql_nope = _aiter_triton_bf16_bmm(q_nope, W_K).transpose(0, 1)
             else:
+                _aiter_triton_bf16_bmm(q_nope, W_K, YQ=q_nope_out.transpose(0, 1))
                 ql_nope = q_nope_out
-            _aiter_triton_bf16_bmm(q_nope, W_K, YQ=ql_nope.transpose(0, 1))
         else:
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L), Convert from (N, B, L) to (B, N, L)
             # ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
