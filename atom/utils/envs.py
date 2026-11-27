@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 """Centralized environment variable definitions for ATOM.
 
@@ -51,6 +52,30 @@ def _flag_env(name: str, default: str = "0") -> bool:
     # the opposite of what the operator wrote. `VAR="off "` did the same.
     raw = os.getenv(name, default).strip().lower()
     return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def _optional_flag_env(name: str) -> bool | None:
+    """Unset or empty reads as None (the caller picks the default); a set value
+    is read as by `_flag_env`."""
+    if os.getenv(name, "").strip() == "":
+        return None
+    return _flag_env(name)
+
+
+def _preload_mode() -> str:
+    """ATOM_PRELOAD: "off", "server" (1: take the weights from a weight cache
+    daemon) or "daemon" (be one)."""
+    raw = os.getenv("ATOM_PRELOAD", "").strip().lower()
+    if raw == "daemon":
+        return "daemon"
+    if raw in ("", "0", "false", "no", "off"):  # as _flag_env reads a flag
+        return "off"
+    if raw in ("1", "true", "yes", "on"):
+        return "server"
+    raise ValueError(
+        "ATOM_PRELOAD must be on (1/true/yes/on), off (0/false/no/off) or "
+        f"daemon, not {raw!r}"
+    )
 
 
 def _profiler_detail_env(name: str) -> bool:
@@ -146,6 +171,15 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
     return value
 
 
+def _dp_sync_interval_env() -> int | None:
+    """None for a non-integer, so every DP rank can reject it together; 0 and
+    negative values mean 1."""
+    try:
+        return max(1, int(os.getenv("ATOM_DP_SYNC_INTERVAL", "1")))
+    except ValueError:
+        return None
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
@@ -173,6 +207,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # P/D decode side: serve /v1/pd/late_kv/chat/completions, the decode leg of
+    # atomesh's concurrent dispatch (--atom-pd-concurrent). The router
+    # streams the chat request first and P's kv_transfer_params as a second
+    # line, so D parses the body while P works. 0 = route answers 404 and the
+    # router falls back to its serial relay.
+    "ATOM_PD_LATE_KV": lambda: _flag_env("ATOM_PD_LATE_KV", "0"),
     # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
     # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
     "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
@@ -209,6 +249,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
+    "ATOM_STORE_SAVE_BATCH_CHUNKS": lambda: _int_env("ATOM_STORE_SAVE_BATCH_CHUNKS", 0),
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
@@ -256,6 +297,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inheriting their parent's owner.
     "ATOM_DP_SESSION_AFFINITY": lambda: (
         os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
+    ),
+    # DP engine loop: a rank votes "unfinished" only when a scheduling pass
+    # could produce a batch (`Scheduler.has_forward_work`). Finished requests
+    # awaiting their KV send (`deferred_free_blocks`), tier loads and lookups
+    # in flight then leave the group idle-polling instead of running DP dummy
+    # forwards back to back, which a new arrival had to wait out. None when
+    # unset: the engine then turns it on only on a P/D prefill instance
+    # (`kv_producer`) and leaves it off on an aggregated server and a decode
+    # instance (`engine_core.dp_idle_when_blocked`); an explicit 0/1 is used
+    # as is, on any role. Needs ATOM_ENABLE_PREFILL_DELAYER=0: the delayer is
+    # on by default with DP > 1 and turns this off (warning only when it was
+    # set explicitly). DP=1 never reads it (no DP group to vote with).
+    "ATOM_DP_IDLE_WHEN_BLOCKED": lambda: _optional_flag_env(
+        "ATOM_DP_IDLE_WHEN_BLOCKED"
     ),
     # --- DP prefill cost balancing (DP attention with more than one rank) ---
     # Under DP attention every rank prefills in the same lockstep step and the
@@ -526,8 +581,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
     # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
-    # interior states instead of cutting prefill chunks onto them. PAGE path
-    # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
+    # interior states instead of cutting prefill chunks onto them, on both the
+    # PAGE and the fork-slot path; see `StateCache.publish_midstep`. Not
+    # Qwen3.8, whose PLE windows are checkpointed only where a forward ends.
     "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
     # Set to 0 to keep Qwen3.5's GDN input projection as two layers
     # (`in_proj_qkvz` + `in_proj_ba`) when the checkpoint quantizes them with
@@ -586,14 +642,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS": lambda: int(
         os.getenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", str(1 << 26))
     ),
-    # DCP sparse (DSA) prefill: when QREP is active, produce the whole DCP
-    # group's query heads locally, as decode does, instead of AllGather Q. The
+    # gfx1250 FP4 indexer: fold the per-layer weights_proj GEMM into the query
+    # RoPE/MXFP4-quant launch for a step of at most _MAX_FUSED_PROJECT_ROWS (128)
+    # rows -- decode and short-prefill chunks alike. The kernel emits the head
+    # weights as bf16 (weights_dtype), so the fold is a single launch with no
+    # trailing cast. A larger step keeps the standalone GEMM, which is not
+    # launch-bound there. Off always runs the standalone GEMM.
+    "ATOM_DSV41_FUSE_WEIGHTS_PROJ": lambda: _flag_env(
+        "ATOM_DSV41_FUSE_WEIGHTS_PROJ", "1"
+    ),
+    # DCP sparse (DSA) prefill, "q" transport: when QREP is active, produce the
+    # whole DCP group's query heads locally, as decode does, instead of
+    # AllGather Q. A "kv" step attends only this rank's heads and ignores it. The
     # pynccl gather lands rank-major, so the dim=1 reshape after it also copies
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
-    # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
-    # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
+    # DCP sparse prefill transport. "q" gathers the group's query heads and
+    # merges partials by LSE; "kv" all-gathers the step's KV rows and attends
+    # this rank's own heads over the whole top-k, with no merge. "auto" takes
+    # "kv" while the step's context is under ~200K + k * its new tokens (k 52
+    # with >= 16 heads a rank, 40 with fewer) and its gathered KV fits the token cap, else "q";
+    # "kv" skips the first condition and warns when it cannot be taken. The cap
+    # counts gathered rows (each request padded to whole local blocks), >= 0.
+    "ATOM_DCP_SPARSE_PREFILL": lambda: os.getenv("ATOM_DCP_SPARSE_PREFILL", "auto"),
+    "ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_DCP_SPARSE_PREFILL_KV_MAX_TOKENS", str(1 << 20))
+    ),
+    # DCP sparse prefill, "q" transport: use the non-persistent fp8 gqa64 MLA
+    # kernel, which needs no work metadata; a "kv" step runs the dcp=1 kernel
+    # and its plan regardless. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
         os.getenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1") == "1"
     ),
@@ -666,9 +744,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
-    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
-    # Read and checked by atom/mono/polling.py at import, which needs no ATOM
-    # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
+    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 4; 16
+    # beside a KV transfer or offload connector, set by Config). Read and
+    # checked by atom/mono/polling.py at import, which needs no ATOM import; 1
+    # restores the pre-backoff polling (ROCm/ATOM#3369).
     "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
@@ -927,6 +1006,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # like the other directory knobs.
     "ATOM_RTL_TRACE_DIR": lambda: _optional_path_env("ATOM_RTL_TRACE_DIR"),
     # --- Model Loading ---
+    # Weight cache (docs/environment_variables.md): off, server or daemon.
+    "ATOM_PRELOAD": _preload_mode,
+    # The launch's name, set by its API server for its own processes.
+    "ATOM_PRELOAD_LAUNCH": lambda: os.getenv("ATOM_PRELOAD_LAUNCH"),
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),
@@ -1057,6 +1140,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: _nonnegative_int_env(
         "ATOM_QWEN4_EXP_SP_MIN_TOKENS", 1024
     ),
+    # Qwen3.8-Flash-Next under the SGLang plugin: run the sequence-parallel
+    # reduce-scatters / all-gathers on the copy engines (mori CCO SDMA),
+    # overlapped with the hyper-connections. gfx942 only; needs mori with CCO
+    # SDMA, FlyDSL and aiter's SdmaComm (fallback: docs/environment_variables.md).
+    "ATOM_QWEN4_EXP_SP_SDMA": lambda: _flag_env("ATOM_QWEN4_EXP_SP_SDMA", "0"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
@@ -1072,15 +1160,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # DP > 1 (single- or multi-node; not read under PP): after a sync that saw
+    # unfinished work, run the cross-DP state all_reduce only every N engine
+    # rounds (1 = every round, at most 16; 0 and negative values mean 1).
+    # Utility commands, abort and shutdown are applied only on rounds that sync,
+    # and once the group drains every rank still runs up to N-1 dummy rounds
+    # before the next sync.
+    "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
-    # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
-    # replicated path via `_can_use_dp_sharded_head`):
+    # case — TP>1, DP off, prefill, ragged/draft rows — falls back to the
+    # replicated path via `_can_use_dp_sharded_head`, except that "argmax" fails
+    # at startup without pure DP):
     #   "all2all"   -> shard vocab across the DP group + gather hidden, then a
     #                  single all-to-all delivers each rank its own rows x full
     #                  vocab (config ③, minimal comm). DEFAULT.
     #   "allgather" -> same shard/gather, but vocab all-gather + scatter rows
     #                  (config ②); kept for A/B and as a fallback.
+    #   "argmax"    -> same shard/gather, but exchange each shard's (max, id) and
+    #                  return greedy ids; the sampler is skipped. For all-greedy
+    #                  workloads only: startup fails without a single DP-sharded
+    #                  ParallelLMHead, with the model's own head output
+    #                  (verify_head) or with speculative decoding, and requests
+    #                  with temperature != 0, logprobs, structured output or a
+    #                  required channel are rejected.
     #   "default"   -> replicated full-vocab GEMM per DP rank (big GEMM, no comm);
     #                  explicit opt-out.
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
@@ -1140,7 +1243,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
     # --- Structured output ---
     # Hold tool calls to the declared schemas when the tool parser declares a
-    # grammar for them (Kimi-K3) and the structured-output extra is installed.
+    # grammar for them (Kimi-K3) and the structured-output backend is available.
     "ATOM_TOOL_CALL_GRAMMAR": lambda: (
         os.getenv("ATOM_TOOL_CALL_GRAMMAR", "0").lower() == "1"
     ),
@@ -1329,6 +1432,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FRONTEND_PREFIX_HASH": lambda: (
         os.getenv("ATOM_FRONTEND_PREFIX_HASH", "1") == "1"
     ),
+    # Read a chat request's `prompt_token_ids_b64` (base64 of
+    # `array("I", ids).tobytes()`, uint32 little-endian) instead of a JSON id
+    # list. A P/D prefill leg (`do_remote_decode`) whose ids came this way does
+    # not echo them to the PD router, which already sends the same field to
+    # decode; every other request keeps its `return_token_ids` echo. A request
+    # without the field is unchanged. Enable on P and D together (a mixed
+    # setup is not supported). Upgrade P and D before a client sends the
+    # field. A P or D that runs an ATOM without this change, or sets it to 0,
+    # makes the pair mixed. "0": the field is ignored.
+    "ATOM_PROMPT_IDS_B64": lambda: os.getenv("ATOM_PROMPT_IDS_B64", "1") == "1",
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
@@ -1379,7 +1492,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
-    # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
+    # page-locked (`engram.host_memory.pin_rows`), not copied to HBM; the
     # GPU pulls only the rows a step names and dequantizes them there. On by default: the host gather gives the same rows
     # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
@@ -1391,21 +1504,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # where Qwen Mono serves the deployment (`atom/models/qwen38/mono/ple.py`),
     # which ignores it.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
-    # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
-    # into page-locked memory of exactly its size (hipHostMalloc on base pages,
-    # so a fragmented page cache costs no compaction), one copy_ below 512 MiB, else one thread per 128 MiB (at least 8) up to
-    # 16 and the CPUs this process may use, dropping the copied checkpoint
-    # pages from the process as it goes; 0 registers the checkpoint mapping in
-    # place (one thread, under the HIP runtime lock). Either way the shard is
-    # resident once. Copying needs the HIP runtime; elsewhere it registers in
-    # place regardless. Unset, DP attention (every rank holds the whole table)
-    # registers in place -- the shared checkpoint mapping, pinned once per node
-    # rather than copied once per rank -- and copies only if that is refused.
-    # `tools/engram/bench_uva_shard.py` measures both.
-    "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
-    # Optional override of the file that serializes shared in-place
-    # registration. Empty: host_memory names one from the checkpoint path.
-    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", ""),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.
@@ -1429,6 +1527,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # OFFLOAD_LOAD_WORKERS: its SLOT load path needs a serial load executor.
     "OFFLOAD_COPY_WORKERS": lambda: _int_env("OFFLOAD_COPY_WORKERS", 1),
     "OFFLOAD_LOAD_WORKERS": lambda: _int_env("OFFLOAD_LOAD_WORKERS", 1),
+    # Opt-in (default off). Mooncake Store only: renew a load's lease keys on
+    # the bounded renewal executor instead of blocking the scheduler thread.
+    "ATOM_STORE_ASYNC_RENEW": lambda: _flag_env("ATOM_STORE_ASYNC_RENEW"),
     # Running-plus-queued save bound. None means unset: the connector then
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.

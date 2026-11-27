@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Quantized draft attention, cache state, and replay against independent oracles."""
 
 from types import SimpleNamespace
@@ -79,11 +81,6 @@ def test_runtime_setting_reaches_draft_constructor(monkeypatch, dtype):
         dspark, "build_attention_topology", lambda *a: [SimpleNamespace(layer_id=40)]
     )
     monkeypatch.setattr(dspark, "DraftBlock", lambda *a, **kw: nn.Identity())
-    # This test isolates config propagation with weightless draft stages.
-    # The real norm/weight binding is covered by test_dspark_context_norm_quant.
-    monkeypatch.setattr(
-        dspark.DeepseekV41DSpark, "_build_main_norm_quant", lambda self: None
-    )
     monkeypatch.setattr(dspark, "RotaryEmbedding", lambda *a, **kw: nn.Identity())
     assert dspark.DeepseekV41DSpark(config).draft_kv_dtype == dtype
 
@@ -205,9 +202,9 @@ def test_stages_share_one_source_build_per_draft_round(
     draft.block_size, draft.window_size = 5, 128
     draft.draft_kv_dtype = "fp8" if dtype == "fp8" else "auto"
     draft.draft_src_buffers = DraftSrcBuffers(3, 5)
-    draft.config = SimpleNamespace(hc_mult=4)
+    draft.config = SimpleNamespace(hc_mult=4, dspark_noise_token_id=0)
     draft.rope = None
-    draft._noise_embedding = lambda: draft.embed.weight[0]
+    draft._unbind_embedding()
     draft.mtp = nn.ModuleList([Stage(i) for i in (40, 41, 42)])
     raw = torch.zeros(3, 133, 512, device="cuda", dtype=torch.bfloat16)
     history = quantize_fp8(raw) if dtype == "fp8" else raw

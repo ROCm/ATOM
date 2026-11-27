@@ -23,11 +23,11 @@
     instead of token IDs to avoid tokenization overhead.
 
     Process:
-    a. For each request, find the worker with the highest prefix match
+    a. For each request, find the healthy candidate with the highest prefix match
     b. If match rate > cache_threshold:
     Route to the worker with highest match (likely has relevant data cached)
     c. If match rate ≤ cache_threshold:
-    Route to the worker with smallest tree size (most available cache capacity)
+    Route to the least-loaded candidate
     d. Background maintenance:
     Periodically evict least recently used leaf nodes to prevent memory overflow
 
@@ -40,7 +40,7 @@
     ------------------------
     1. cache_threshold: (float, 0.0 to 1.0)
     Minimum prefix match ratio to use highest-match routing.
-    Below this threshold, routes to worker with most available cache space.
+    At or below this threshold, routes to the least-loaded candidate.
 
     2. balance_abs_threshold: (integer)
     Absolute difference threshold for load imbalance detection.
@@ -55,12 +55,14 @@
     Interval between LRU eviction cycles for the approximate trees.
 
     5. max_tree_size: (integer)
-    Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
-    during the next eviction cycle.
+    Maximum characters each worker may hold in a tree. Above it, that worker's
+    LRU leaves are evicted during the next eviction cycle.
 
     With --kv-events, a request the router can tokenize goes to the worker whose
     device cache, as its KV events show, holds the largest share of its tokens,
-    if that share is above cache_threshold. The tree places all other requests:
+    if that share is above cache_threshold. With --kv-storage-weight above 0, a
+    worker's share also counts the tokens its engine will load from the Mooncake
+    Store it reads, at that weight each. The tree places all other requests:
     those at or below the threshold, those with media, those under imbalanced
     load, and those whose candidates have no indexed events.
 */
@@ -74,7 +76,9 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{
-    get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
+    get_healthy_worker_indices, normalize_model_key,
+    tree::{Candidates, Tree},
+    utils::PeriodicTask,
     CacheAwareConfig, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo, NO_HEALTHY_WORKERS,
 };
 use crate::{
@@ -119,6 +123,22 @@ pub struct CacheAwarePolicy {
     missing_tree_warned: Arc<DashSet<String>>,
     kv_events: OnceLock<Arc<dyn PrefixMatchProvider>>,
     _eviction_task: Option<PeriodicTask>,
+}
+
+/// The URLs of the healthy candidates, which a tree match may credit.
+struct HealthyUrls<'a> {
+    workers: &'a [Arc<dyn Worker>],
+    healthy_indices: &'a [usize],
+}
+
+impl Candidates for HealthyUrls<'_> {
+    fn count(&self) -> usize {
+        self.healthy_indices.len()
+    }
+
+    fn name(&self, index: usize) -> &str {
+        self.workers[self.healthy_indices[index]].url()
+    }
 }
 
 /// The least loaded of `healthy_indices`, ties broken at random so that equally loaded
@@ -318,10 +338,11 @@ impl CacheAwarePolicy {
     }
 
     /// The tree's affinity branch, with the match rate of the KV event index: the share of
-    /// the request's tokens a worker's device cache holds, the highest first, then the
-    /// lower load. None leaves the request to the tree: it has no tokens or has media, or no
-    /// candidate holds more of them than `cache_threshold`.
-    fn select_by_kv_events(
+    /// the request's tokens a worker's device cache holds, each token its engine will then
+    /// load from its store counted at `--kv-storage-weight`; the highest first, then the lower
+    /// load. None leaves the request to the tree: it has no tokens or has media, or no
+    /// candidate's match rate is above `cache_threshold`.
+    async fn select_by_kv_events(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
@@ -331,12 +352,28 @@ impl CacheAwarePolicy {
         let tokens = info
             .tokens
             .filter(|tokens| !tokens.is_empty() && !info.carries_media)?;
-        let hits = self.kv_events.get()?.match_workers(tokens, workers);
-        let (idx, cached) = healthy_indices
+        let provider = self.kv_events.get()?;
+        let hits = provider.match_workers(tokens, workers);
+        let weight = provider.store_weight();
+        let stored = if weight > 0.0 {
+            Some(provider.cached_tokens(tokens, workers, &hits).await)
+        } else {
+            None
+        };
+        let cached = |idx: usize| stored.as_ref().map_or(hits[idx], |stored| stored[idx]);
+        let score = |idx: usize| {
+            let device = hits[idx]?;
+            let loaded = cached(idx).map_or(0, |cached| cached.saturating_sub(device));
+            Some(f64::from(device) + weight * f64::from(loaded))
+        };
+        let (idx, score) = healthy_indices
             .iter()
-            .filter_map(|&idx| Some((idx, hits[idx]?)))
-            .max_by_key(|&(idx, cached)| (cached, std::cmp::Reverse(workers[idx].load())))?;
-        let match_rate = f64::from(cached) / tokens.len() as f64;
+            .filter_map(|&idx| Some((idx, score(idx)?)))
+            .max_by(|&(a, x), &(b, y)| {
+                let lower_load = || workers[b].load().cmp(&workers[a].load());
+                x.total_cmp(&y).then_with(lower_load)
+            })?;
+        let match_rate = score / tokens.len() as f64;
         // Below it, the tree, which learns every placement, may know where the prompt went.
         if match_rate <= f64::from(self.config.cache_threshold) {
             return None;
@@ -348,16 +385,20 @@ impl CacheAwarePolicy {
         }
         self.routed(info, workers[idx].as_ref());
         workers[idx].increment_processed();
+        let estimate = cached(idx).map(|cached| f64::from(cached) / tokens.len() as f64);
         let decision = RouteDecision {
             match_ratio: Some(match_rate),
-            estimated_hit_ratio: Some(match_rate),
+            estimated_hit_ratio: estimate,
             ..RouteDecision::branch("kv_affinity")
         };
         Some((Some(idx), decision))
     }
 
     /// Where the tree learns a request's text, the KV event index predicts its tokens, but
-    /// not those of a request with media, whose blocks an engine keys by the media.
+    /// not those of a request with media, whose blocks an engine keys by the media (ATOM
+    /// every block, by the media and the text up to the last, DeepSeek-V4.1 also by the
+    /// prompt's length, which the routing text's front digest does not see; vLLM and
+    /// SGLang the blocks from the media on).
     fn routed(&self, info: &SelectWorkerInfo<'_>, worker: &dyn Worker) {
         let tokens = info
             .tokens
@@ -414,8 +455,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             return (selected, RouteDecision::branch("imbalanced"));
         }
 
-        if let Some(selected) = self.select_by_kv_events(workers, info, &healthy_indices, &model_id)
-        {
+        let by_kv_events = self.select_by_kv_events(workers, info, &healthy_indices, &model_id);
+        if let Some(selected) = by_kv_events.await {
             return selected;
         }
 
@@ -427,60 +468,42 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let tree = self.trees.get(&model_id).map(|entry| entry.value().clone());
 
         if let Some(tree) = tree {
-            // Now we work with the tree without holding the HashMap lock
-            // Use prefix_match_with_counts to avoid redundant chars().count() calls
-            let result = tree.prefix_match_with_counts(text);
+            // Match among the healthy candidates only. Other tenants may be alive outside
+            // them (another DP rank under idx2idx, or an ext-proc subset), so they stay in
+            // the tree; removed workers leave it through `remove_worker_by_url`.
+            let candidates = HealthyUrls {
+                workers,
+                healthy_indices: &healthy_indices,
+            };
+            let result = tree.prefix_match_in(text, &candidates);
             let match_rate = if result.input_char_count == 0 {
                 0.0
             } else {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
-            let affinity = match_rate > self.config.cache_threshold;
-            let tenant_url: &str = &result.tenant;
+            let holder = result.candidate.map(|index| healthy_indices[index]);
+            let tenant_idx = holder.filter(|_| match_rate > self.config.cache_threshold);
+            let idx = tenant_idx
+                .or_else(|| least_loaded(workers, &healthy_indices))
+                .unwrap_or(healthy_indices[0]);
+
+            // Update the tree with this request (use worker URL directly, no allocation)
+            tree.insert(text, workers[idx].url());
+            self.routed(info, workers[idx].as_ref());
+
+            // Increment processed counter
+            workers[idx].increment_processed();
+
             let decision = RouteDecision {
                 match_ratio: Some(match_rate as f64),
-                ..RouteDecision::branch(if affinity { "affinity" } else { "relocate" })
+                estimated_hit_ratio: (holder == Some(idx)).then_some(match_rate as f64),
+                ..RouteDecision::branch(if tenant_idx.is_some() {
+                    "affinity"
+                } else {
+                    "relocate"
+                })
             };
-
-            // Select worker without String allocation
-            let selected_idx = if affinity {
-                // Cache hit path: find worker by URL (compare &str directly, no allocation)
-                workers
-                    .iter()
-                    .position(|w| w.url() == tenant_url)
-                    .filter(|&idx| workers[idx].is_healthy())
-            } else {
-                // Low cache match: use the least loaded worker.
-                least_loaded(workers, &healthy_indices)
-            };
-
-            if let Some(idx) = selected_idx {
-                // Update the tree with this request (use worker URL directly, no allocation)
-                tree.insert(text, workers[idx].url());
-                self.routed(info, workers[idx].as_ref());
-
-                // Increment processed counter
-                workers[idx].increment_processed();
-
-                let decision = RouteDecision {
-                    estimated_hit_ratio: (workers[idx].url() == tenant_url)
-                        .then_some(match_rate as f64),
-                    ..decision
-                };
-                return (Some(idx), decision);
-            }
-
-            // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-            if affinity {
-                tree.remove_tenant(tenant_url);
-                debug!("Removed stale worker {} from cache tree", tenant_url);
-            }
-
-            // Fallback to first healthy worker
-            (
-                healthy_indices.first().copied(),
-                RouteDecision::branch("stale_tenant"),
-            )
+            (Some(idx), decision)
         } else {
             // No tree for this key: cache affinity is dead and every request is
             // placed at random, which is indistinguishable from "cache_aware is
@@ -763,10 +786,11 @@ mod tests {
             select("hello, friend").await,
             (first, "relocate", (ratio(5.0, 13.0), ratio(5.0, 13.0)))
         );
+        // An unhealthy tenant's match does not count; the healthy worker is credited its own.
         workers[first].set_healthy(false);
         assert_eq!(
             select("hello world").await,
-            (1 - first, "stale_tenant", (None, None))
+            (1 - first, "relocate", (ratio(3.0, 11.0), ratio(3.0, 11.0)))
         );
         workers[first].set_healthy(true);
         for _ in 0..20 {
@@ -941,6 +965,75 @@ mod tests {
             decide(&held(), &workers, &info).await,
             (2, "imbalanced", None)
         );
+    }
+
+    /// Each worker's device hit and what its engine reports cached once it loads from a
+    /// store (None when the store does not answer), and the weight of those loads.
+    #[derive(Debug)]
+    struct Stored(Vec<(u32, Option<u32>)>, f64);
+
+    #[async_trait]
+    impl PrefixMatchProvider for Stored {
+        fn match_workers(&self, _tokens: &[u32], _: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
+            self.0.iter().map(|&(device, _)| Some(device)).collect()
+        }
+
+        async fn cached_tokens(
+            &self,
+            _: &[u32],
+            _: &[Arc<dyn Worker>],
+            device: &[Option<u32>],
+        ) -> Vec<Option<u32>> {
+            assert!(self.1 > 0.0, "a store asked at weight 0");
+            assert_eq!(device, self.match_workers(&[], &[]));
+            self.0.iter().map(|&(_, cached)| cached).collect()
+        }
+
+        fn store_weight(&self) -> f64 {
+            self.1
+        }
+    }
+
+    #[tokio::test]
+    async fn the_kv_match_rate_weighs_what_the_engine_loads_from_a_store() {
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .collect();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        // w1's device cache holds 60 of the 100 tokens; w2's none, but its store 90.
+        let stored = |weight| Stored(vec![(60, Some(60)), (0, Some(90))], weight);
+        for (stored, want) in [
+            // At weight 0 the store is not asked: the device caches alone.
+            (stored(0.0), Some((0, 0.6, Some(0.6)))),
+            // A loaded token weighing 1 is worth one on the device, and 0.5 half of it.
+            (stored(1.0), Some((1, 0.9, Some(0.9)))),
+            (stored(0.5), Some((0, 0.6, Some(0.6)))),
+            // A store that does not answer adds nothing, and leaves no estimate.
+            (
+                Stored(vec![(60, None), (0, None)], 1.0),
+                Some((0, 0.6, None)),
+            ),
+            // At most cache_threshold of the prompt, the tree places it.
+            (Stored(vec![(30, Some(30)), (0, Some(50))], 1.0), None),
+        ] {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            });
+            policy.init_workers(&workers);
+            policy.set_kv_events(Arc::new(stored));
+            let (selected, decision) = policy.select_with_decision(&workers, &info).await;
+            let got = (decision.branch == "kv_affinity").then(|| {
+                let match_rate = decision.match_ratio.unwrap();
+                (selected.unwrap(), match_rate, decision.estimated_hit_ratio)
+            });
+            assert_eq!(got, want);
+        }
     }
 
     #[tokio::test]

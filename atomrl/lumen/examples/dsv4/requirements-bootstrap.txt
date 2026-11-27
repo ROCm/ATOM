@@ -1,0 +1,32 @@
+# Runtime deps for DSV4 smoke on lumen/tests:latest (sglang import chain + tilelang).
+# Miles base image has these pre-installed; Lumen base does not.
+IPython
+cloudpickle
+openai
+pyzmq>=25.1.2
+aiohttp
+msgspec
+pydantic
+orjson
+einops
+requests
+tqdm
+partial_json_parser
+prometheus-client>=0.20.0
+psutil
+packaging
+python-multipart
+uvicorn
+uvloop
+setproctitle
+blobfile==3.0.0
+backports.strenum
+pybase64
+anthropic>=0.20.0
+scipy
+sentencepiece
+tiktoken
+interegular
+llguidance>=0.7.11,<0.8.0
+torch_memory_saver==0.0.9
+loguru

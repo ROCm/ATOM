@@ -29,7 +29,7 @@ use crate::{
             handlers as responses_handlers,
             retrieve::{cancel_response_impl, get_response_impl},
         },
-        RouterTrait,
+        prepare, RouterTrait, SentChatBody,
     },
 };
 
@@ -72,11 +72,14 @@ impl GrpcRouter {
         })
     }
 
+    /// Route a chat, its prompt rendered from its body as `sent` where the
+    /// caller has it (`prepare::sent_chat_body`).
     async fn route_chat_impl(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        sent: Option<SentChatBody>,
     ) -> Response {
         debug!(
             "Processing chat completion request for model: {}",
@@ -97,9 +100,10 @@ impl GrpcRouter {
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let sent = sent.clone();
                 async move {
                     pipeline
-                        .execute_chat(request, headers, model_id, components)
+                        .execute_chat_with(request, headers, model_id, components, sent)
                         .await
                 }
             },
@@ -209,13 +213,31 @@ impl RouterTrait for GrpcRouter {
         self.route_generate_impl(headers, body, model_id).await
     }
 
+    fn sent_chat_body(
+        &self,
+        sent: &[u8],
+        model_id: Option<&str>,
+    ) -> Result<Option<SentChatBody>, Response> {
+        prepare::sent_chat_body(sent, model_id, &self.app_context)
+    }
+
+    async fn route_chat_as_sent(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        sent: Option<SentChatBody>,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_chat_impl(headers, body, model_id, sent).await
+    }
+
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_chat_impl(headers, body, model_id).await
+        self.route_chat_impl(headers, body, model_id, None).await
     }
 
     async fn route_completion(

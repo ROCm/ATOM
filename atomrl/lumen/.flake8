@@ -1,0 +1,10 @@
+[flake8]
+max-line-length = 120
+extend-ignore = E203, W503
+per-file-ignores =
+    # __init__.py re-exports are intentional
+    */__init__.py: F401, F403
+    # Late imports after sys.path / conditional setup
+    lumen/models/megatron.py: E402
+    lumen/ops/attention/attention.py: E402
+    lumen/ops/attention/attention_with_cp_a2a.py: E402

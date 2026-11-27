@@ -94,9 +94,12 @@
 // What the Core derives when the client leaves it out:
 //   * block size, draft token count and per-request cache: always, from the
 //     Core's own config -- they are not on the wire;
-//   * `cache_seed`: hashed from `multimodal_data`;
+//   * `cache_seed`: hashed from `multimodal_data`; on a decode leg whose
+//     prefill kept the media (`kv_transfer_params` with `do_remote_prefill`
+//     and `cache_seed`, no `multimodal_data`), taken from those params;
 //   * `mrope_positions` / `mrope_position_delta`: computed from the prompt and
-//     `multimodal_data` for models that use MRoPE;
+//     `multimodal_data` for models that use MRoPE; on such a decode leg, the
+//     params' `mrope_position_delta` and no positions;
 //   * model-specific request validation runs in the Core either way; a request
 //     it refuses comes back `Rejected` with code INVALID.
 //
@@ -266,7 +269,7 @@ message TokenIds {
 // checking it against the prompt, and hashes the prompt itself otherwise.
 message PromptHashChain {
   uint32 hash_block_size = 1;
-  optional uint64 cache_seed = 2;  // absent: -1, a prompt without media
+  optional uint64 cache_seed = 2;  // absent: -1, a prompt hashed as text
   uint32 num_prompt_tokens = 3;
   uint64 fingerprint = 4;          // xxh64 of the prompt's int32 token bytes
   BufferRef hashes = 5;            // uint64, one per full hash block
@@ -293,7 +296,7 @@ message RequestSpec {
   bool needs_independent_noise = 8;
   Value kv_transfer_params = 9;   // absent: None
   Value multimodal_data = 10;     // absent: None (a text request)
-  optional uint64 cache_seed = 11;  // absent: the Core hashes the media
+  optional uint64 cache_seed = 11;  // absent: the Core derives it (REQUESTS)
   Value mrope_positions = 12;     // absent: the Core computes them if needed
   int64 mrope_position_delta = 13;
   optional int64 data_parallel_rank = 14;

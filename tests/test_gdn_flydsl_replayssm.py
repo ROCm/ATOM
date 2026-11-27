@@ -27,7 +27,10 @@ pytest.importorskip(
 )
 
 from atom.model_ops import attention_gdn as gdn
-from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+from atom.model_ops.attentions.gdn_attn import (
+    LINEAR_STATE_ROWS,
+    GDNAttentionMetadataBuilder,
+)
 from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
 from atom.model_ops.fla_ops import chunk, state_checkpoint
 from atom.model_ops.fla_ops import gdn_flydsl as fly
@@ -58,10 +61,16 @@ def test_qwen_binding_keeps_the_replayssm_checkpoint_contiguous(
     monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: gfx942)
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.replayssm = replayssm
+    builder._state_shape_for_runner = lambda: ((), tuple(raw.shape[1:]))
+    builder._state_dtypes = lambda: (raw.dtype, raw.dtype)
     attention = SimpleNamespace(allow_aiter_flydsl=True, dt_bias=raw)
-    cache = builder.build_kv_cache_tensor(
-        SimpleNamespace(base_linear_attention=None, impl=attention)
+    module = Mock(
+        spec=["base_linear_attention", "impl"],
+        base_linear_attention=None,
+        impl=attention,
     )
+    builder._pool_rows = {LINEAR_STATE_ROWS: {module: 0}}
+    cache = builder.build_kv_cache_tensor(module)
     policy = attention.gdn_flydsl_policy
     # Off gfx942, ReplaySSM keeps the Triton prefill and no FlyDSL schedule.
     prefill = gfx942 or not replayssm
@@ -188,6 +197,8 @@ def _replayssm_prefill(monkeypatch, *, flydsl, keep, checkpoint):
         replay_buf_k=replay["replay_buf_k"],
         replay_buf_u=replay["replay_buf_u"],
         replay_buf_g=replay["replay_buf_g"],
+        replay_flush_arrivals=torch.zeros(SLOTS, HV, dtype=torch.int32),
+        replay_flush_wait="s_waitcnt vmcnt(0)",
     )
     # Row 0 forks from slot 2 into slot 4; row 1 is a cold slot.
     writes = torch.tensor([4, 1], dtype=torch.int32)
@@ -317,20 +328,12 @@ def _replayssm_prefill(monkeypatch, *, flydsl, keep, checkpoint):
     published = chunk.pop_last_intermediate_states()
     if keep and not checkpoint:
         assert torch.equal(published, h_kv)
-    return pool
 
 
 @pytest.mark.parametrize("checkpoint", [False, True])
 @pytest.mark.parametrize("keep", [False, True])
-def test_replayssm_prefill_runs_flydsl_and_writes_the_same_checkpoint(
-    monkeypatch, keep, checkpoint
+@pytest.mark.parametrize("flydsl", [False, True])
+def test_replayssm_prefill_writes_the_logical_kv_final_state_into_the_pool(
+    monkeypatch, flydsl, keep, checkpoint
 ):
-    flydsl_pool = _replayssm_prefill(
-        monkeypatch, flydsl=True, keep=keep, checkpoint=checkpoint
-    )
-    triton_pool = _replayssm_prefill(
-        monkeypatch, flydsl=False, keep=keep, checkpoint=checkpoint
-    )
-    # Same logical final state in -> the same checkpoint bytes out, whichever
-    # kernel produced it and whatever layout it came back in.
-    assert torch.equal(flydsl_pool, triton_pool)
+    _replayssm_prefill(monkeypatch, flydsl=flydsl, keep=keep, checkpoint=checkpoint)

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use crate::{
@@ -10,7 +8,6 @@ use crate::{
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
-    routers::atom_standalone::AtomStandaloneRuntime,
     server::{ServerConfig, ServerTlsConfig},
 };
 
@@ -213,6 +210,8 @@ pub struct CliArgs {
     pub ext_proc: crate::ext_proc::ExtProcConfig,
     #[command(flatten)]
     pub prepare_pool: crate::config::PreparePoolConfig,
+    #[command(flatten)]
+    pub fastokens: crate::config::FastokensConfig,
     // ==================== Worker Configuration ====================
     /// Host address to bind the router server
     #[arg(long, default_value = "0.0.0.0", help_heading = "Worker Configuration")]
@@ -279,6 +278,18 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 9003, help_heading = "Routing Policy")]
     pub mooncake_admin_port: u16,
 
+    /// With --kv-storage-weight, how long a request waits for the stores its workers load
+    /// from to say what they hold of the prompt, in milliseconds. Past it a store's lookup
+    /// has no answer at all, and counts toward the store's breaker
+    #[arg(long, default_value_t = 3, help_heading = "Routing Policy")]
+    pub kv_storage_deadline_ms: u64,
+
+    /// With --kv-events, what a token a worker's engine will load from the Mooncake Store
+    /// it reads counts for in cache_aware's match rate (0 to 1), against one its device
+    /// cache holds. Above 0, a request waits for the stores that could add to it; 0 asks none
+    #[arg(long, default_value_t = 0.0, value_parser = parse_fraction, help_heading = "Routing Policy")]
+    pub kv_storage_weight: f64,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -304,9 +315,16 @@ pub struct CliArgs {
     )]
     pub decode_policy: Option<String>,
 
-    /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks
+    /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks; idx2idx
+    /// selects decode first and prefill among the workers on its rank
     #[arg(long, default_value = "none", value_parser = ["none", "idx2idx"], help_heading = "PD Disaggregation")]
     pub atom_pd_rank_mapping_policy: String,
+
+    /// ATOM-only: in relay mode, send a /v1/chat/completions request to decode while
+    /// prefill runs and pass prefill's KV metadata as a late line (decode needs
+    /// ATOM_PD_LATE_KV=1; a decode that answers 404 gets the serial relay)
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    pub atom_pd_concurrent: bool,
 
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
@@ -466,7 +484,7 @@ pub struct CliArgs {
     #[arg(long, help_heading = "Tokenizer")]
     pub chat_template: Option<String>,
 
-    /// Enable L0 (exact match) tokenizer cache
+    /// Enable L0 (exact match) tokenizer cache, for the models fastokens does not encode
     #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
     pub tokenizer_cache_enable_l0: bool,
 
@@ -474,7 +492,7 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 10000, help_heading = "Tokenizer")]
     pub tokenizer_cache_l0_max_entries: usize,
 
-    /// Enable L1 (prefix matching) tokenizer cache
+    /// Enable L1 (prefix matching) tokenizer cache, for the models fastokens does not encode
     #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
     pub tokenizer_cache_enable_l1: bool,
 
@@ -492,7 +510,14 @@ pub struct CliArgs {
     pub tool_call_parser: Option<String>,
 
     // ==================== Backend ====================
-    /// Backend runtime to use
+    /// Backend runtime of the workers; ATOM workers need `atom`
+    ///
+    /// ATOM workers need `atom` in regular mode as in PD mode: it keys an
+    /// image chat by all its media, as ATOM's prefix cache does. It also
+    /// discovers an HTTP worker's model through `/v1/models`, whose model id
+    /// (an alias under `--served-model-name`) names the worker's model;
+    /// `--tokenizer-path` and `--model-path` take precedence over it for the
+    /// worker's tokenizer.
     #[arg(long, value_enum, default_value_t = Backend::Sglang, alias = "runtime", help_heading = "Backend")]
     pub backend: Backend,
 
@@ -638,6 +663,7 @@ impl CliArgs {
             .mode(mode)
             .backend(self.backend.into())
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
+            .atom_pd_concurrent(self.atom_pd_concurrent)
             .policy(policy)
             .connection_mode(connection_mode)
             .host(&self.host)
@@ -647,6 +673,7 @@ impl CliArgs {
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .prepare_pool(self.prepare_pool.clone())
+            .fastokens(self.fastokens.clone())
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -693,20 +720,14 @@ impl CliArgs {
             .dp_aware(self.dp_aware)
             .kv_events(self.kv_events)
             .mooncake_admin_port(self.mooncake_admin_port)
+            .kv_storage_deadline_ms(self.kv_storage_deadline_ms)
+            .kv_storage_weight(self.kv_storage_weight)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
     }
 
     pub fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
-        self.to_server_config_with_runtime(router_config, None)
-    }
-
-    pub fn to_server_config_with_runtime(
-        &self,
-        router_config: RouterConfig,
-        atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
-    ) -> ServerConfig {
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
             host: self.prometheus_host.clone(),
@@ -742,7 +763,7 @@ impl CliArgs {
                     cert_path: cert_path.clone(),
                     key_path: key_path.clone(),
                 }),
-            atom_standalone_runtime,
+            atom_bridge_runtime: None,
         }
     }
 }
@@ -761,6 +782,23 @@ mod tests {
         for rate in ["-1", "2", "NaN"] {
             assert!(parse(rate).is_err(), "{rate} was accepted");
         }
+    }
+
+    #[test]
+    fn atom_pd_concurrent_flag_maps_to_router_config() {
+        let parse = |args: &[&str]| {
+            CliArgs::try_parse_from(args)
+                .unwrap()
+                .to_router_config(Vec::new())
+                .unwrap()
+        };
+        assert!(!parse(&["atomesh"]).atom_pd_concurrent);
+        assert!(!CliArgs::default().atom_pd_concurrent);
+        let config = parse(&["atomesh", "--backend", "atom", "--atom-pd-concurrent"]);
+        assert!(config.atom_pd_concurrent && config.atom_pd_concurrent_dispatch());
+        // The flag has no effect off the ATOM backend.
+        let config = parse(&["atomesh", "--backend", "sglang", "--atom-pd-concurrent"]);
+        assert!(config.atom_pd_concurrent && !config.atom_pd_concurrent_dispatch());
     }
 
     #[test]
@@ -818,6 +856,75 @@ mod tests {
             assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 10);
             assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
         }
+    }
+
+    #[test]
+    fn cli_kv_storage_options_map_to_router_config() {
+        let args = CliArgs::try_parse_from([
+            "atomesh",
+            "--kv-storage-weight",
+            "0.5",
+            "--kv-storage-deadline-ms",
+            "7",
+        ])
+        .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert_eq!(config.kv_storage_weight, 0.5);
+        assert_eq!(config.kv_storage_deadline_ms, 7);
+    }
+
+    #[test]
+    fn cli_fastokens_options_map_to_router_config() {
+        let args = CliArgs::try_parse_from([
+            "atomesh",
+            "--fastokens-models",
+            "deepseek-ai/DeepSeek-V4.1-Flash,/models/qwen",
+            "--fastokens-strict",
+            "--fastokens-max-tokenize-bytes",
+            "1000",
+            "--fastokens-segment-cache-mb",
+            "2",
+        ])
+        .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert_eq!(
+            config.fastokens,
+            crate::config::FastokensConfig {
+                models: vec![
+                    "deepseek-ai/DeepSeek-V4.1-Flash".into(),
+                    "/models/qwen".into()
+                ],
+                strict: true,
+                max_tokenize_bytes: Some(1000),
+                segment_cache_mb: Some(2),
+            }
+        );
+        assert_eq!(config.resolved_fastokens_max_tokenize_bytes(), 1000);
+        assert_eq!(config.fastokens.segment_cache_bytes(), 2 << 20);
+        assert!(config
+            .fastokens
+            .covers("deepseek-ai/DeepSeek-V4.1-Flash", "/elsewhere"));
+        assert!(config.fastokens.covers("qwen", "/models/qwen"));
+        assert!(!config.fastokens.covers("qwen", "/models/qwen2"));
+
+        // Without the options no model encodes with fastokens, its limit
+        // follows a larger prepare limit, and its segment cache has 1 GiB.
+        let args =
+            CliArgs::try_parse_from(["atomesh", "--prepare-max-tokenize-bytes", "100000000"])
+                .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert!(!config.fastokens.covers("any", "any"));
+        assert_eq!(config.fastokens.segment_cache_bytes(), 1 << 30);
+        assert_eq!(config.resolved_fastokens_max_tokenize_bytes(), 100_000_000);
+        let config = CliArgs::try_parse_from(["atomesh", "--fastokens-models", "*"])
+            .unwrap()
+            .to_router_config(Vec::new())
+            .unwrap();
+        assert!(config.fastokens.covers("any", "any"));
+        assert_eq!(
+            config.resolved_fastokens_max_tokenize_bytes(),
+            crate::config::DEFAULT_FASTOKENS_MAX_TOKENIZE_BYTES
+        );
     }
 
     #[test]
@@ -883,6 +990,7 @@ impl Default for CliArgs {
             #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
             prepare_pool: Default::default(),
+            fastokens: Default::default(),
             host: "0.0.0.0".to_string(),
             port: 30000,
             worker_urls: Vec::new(),
@@ -897,11 +1005,14 @@ impl Default for CliArgs {
             dp_aware: false,
             kv_events: false,
             mooncake_admin_port: 9003,
+            kv_storage_deadline_ms: 3,
+            kv_storage_weight: 0.0,
             pd_disaggregation: false,
             decode: Vec::new(),
             prefill_policy: None,
             decode_policy: None,
             atom_pd_rank_mapping_policy: "none".to_string(),
+            atom_pd_concurrent: false,
             worker_startup_timeout_secs: 1800,
             worker_startup_check_interval: 30,
             log_dir: None,

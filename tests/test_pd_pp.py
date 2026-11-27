@@ -204,6 +204,7 @@ def test_producer_advertises_remote_pp_size():
     seq = SimpleNamespace(
         output_tokens=[7],
         spec_token_ids=None,
+        num_prompt_tokens=130,
         block_table=[1, 2, 3],
         id=99,
         state_slot=7,
@@ -217,6 +218,102 @@ def test_producer_advertises_remote_pp_size():
     assert seq.kv_transfer_params_output["dcp_size"] == 1
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
     assert seq.kv_transfer_params_output["remote_slot_index"] == 7
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2])
+@pytest.mark.parametrize(
+    "extra_tokens, prompt_blocks",
+    [(0, [1, 2]), (1, [1, 2, 3])],
+    ids=["fills-last-block", "one-token-into-a-block"],
+)
+def test_producer_publishes_only_the_prompt_blocks(
+    dcp_size, extra_tokens, prompt_blocks
+):
+    """With deferred output a finished prefill is scheduled for one more step,
+    and a prompt that fills its last block gets a block for the first token
+    there; MTP lookahead adds blocks too. The consumer allocates the prompt's
+    blocks only."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = object.__new__(mc.MooncakeConnectorScheduler)
+    sched.pp_size = 1
+    sched.tp_size = 1
+    sched.hash_block_size = 16
+    sched.block_size = 16
+    sched.dcp_size = dcp_size
+    sched.dp_rank = 0
+    sched.engine_id = "eng"
+    sched.host_ip = "10.0.0.1"
+    sched.handshake_port = 40000
+    sched.base_handshake_port = 6301
+    sched.is_producer = True
+    sched._awaiting_send = set()
+    sched._reqs_need_save = {}
+
+    seq = SimpleNamespace(
+        kv_transfer_params={"do_remote_decode": True},
+        output_tokens=[7],
+        spec_token_ids=None,
+        num_prompt_tokens=2 * 16 * dcp_size + extra_tokens,
+        block_table=[1, 2, 3, 4],
+        id=99,
+        state_slot=-1,
+        state_slots=[],
+        kv_transfer_params_output=None,
+    )
+    mc.MooncakeConnectorScheduler.request_finished(sched, seq)
+    assert seq.kv_transfer_params_output["remote_block_ids"] == prompt_blocks
+    assert sched._reqs_need_save[seq.id][1] == prompt_blocks
+
+
+@pytest.mark.parametrize("is_producer", [True, False], ids=["producer", "consumer"])
+def test_finished_block_ids_are_lists_of_their_own(is_producer):
+    """`seq.block_table` is a live `BlockTable`, an `array`. What
+    `request_finished` publishes or queues must be a list of its own: a slice
+    of the table is an `array`, and the table itself follows later changes."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    from atom.model_engine.sequence import new_block_table
+
+    sched = object.__new__(mc.MooncakeConnectorScheduler)
+    sched.pp_size = 1
+    sched.tp_size = 1
+    sched.hash_block_size = 16
+    sched.block_size = 16
+    sched.dcp_size = 1
+    sched.dp_rank = 0
+    sched.engine_id = "eng"
+    sched.host_ip = "10.0.0.1"
+    sched.handshake_port = 40000
+    sched.base_handshake_port = 6301
+    sched.is_producer = is_producer
+    sched._awaiting_send = set()
+    sched._reqs_need_save = {}
+    sched.request_id_to_transfer_id = {}
+
+    seq = SimpleNamespace(
+        kv_transfer_params={"do_remote_decode": is_producer},
+        output_tokens=[7],
+        spec_token_ids=None,
+        num_prompt_tokens=2 * 16,
+        block_table=new_block_table([1, 2, 3]),
+        id=99,
+        state_slot=-1,
+        state_slots=[],
+        kv_transfer_params_output=None,
+    )
+    mc.MooncakeConnectorScheduler.request_finished(sched, seq)
+    finished = [seq.kv_transfer_params_output["remote_block_ids"]]
+    if is_producer:
+        finished.append(sched._reqs_need_save[seq.id][1])
+    seq.block_table[0] = 9
+    seq.block_table.append(4)
+
+    for block_ids in finished:
+        assert type(block_ids) is list
+        assert block_ids == ([1, 2] if is_producer else [1, 2, 3])
 
 
 @pytest.mark.parametrize(
@@ -412,8 +509,9 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
     monkeypatch.setenv("ATOM_HOST_IP", host_ip)
     monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
     monkeypatch.delenv("MC_FORCE_TCP", raising=False)
-    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
     monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(mc, "gpu_pci_bdf", {0: "0000:65:00.0"}.__getitem__)
+    monkeypatch.setattr(mc, "rail_rdma_device", {"0000:65:00.0": "rdma2"}.__getitem__)
     monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
     monkeypatch.setattr(
         mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=8)
@@ -535,6 +633,8 @@ def _one_row_staging_consumer(monkeypatch, send):
     monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
     monkeypatch.delenv("MC_FORCE_TCP", raising=False)
     monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(mc, "gpu_pci_bdf", {0: "0000:05:00.0"}.__getitem__)
+    monkeypatch.setattr(mc, "rail_rdma_device", {"0000:05:00.0": "rdma0"}.__getitem__)
     monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: None)
     monkeypatch.setattr(mc.torch.cuda, "set_device", lambda *a: None)
     monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
@@ -809,25 +909,28 @@ def test_mooncake_rdma_normalizes_explicit_device_list():
     )
 
 
-def test_mooncake_rdma_auto_selects_from_physical_gpu(monkeypatch):
+def test_mooncake_rdma_auto_selects_from_gpu_pci_address(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
-    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"auto{idx}")
-    assert mc._select_ib_device("rdma", "", 5) == "auto5"
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda bdf: f"auto-{bdf}")
+    assert mc._select_ib_device("rdma", "", "0000:85:00.0") == "auto-0000:85:00.0"
 
 
 def test_mooncake_rdma_registers_all_alternate_hcas_for_upper_rail_gpu(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
-    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(
+        mc, "_auto_select_ib_device", {"0000:85:00.0": "ionic_4"}.__getitem__
+    )
+    monkeypatch.setattr(mc, "_numbered_ib_device", lambda idx: f"ionic_{idx}")
     monkeypatch.setattr(mc, "_ib_device_exists", lambda _device: True)
 
     assert mc._select_ib_devices(
         "rdma",
         "",
-        4,
+        "0000:85:00.0",
         enable_alternate_hca=True,
         hca_count=8,
     ) == [
@@ -841,13 +944,16 @@ def test_mooncake_rdma_registers_all_alternate_hcas_for_lower_rail_gpu(monkeypat
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
-    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(
+        mc, "_auto_select_ib_device", {"0000:75:00.0": "ionic_3"}.__getitem__
+    )
+    monkeypatch.setattr(mc, "_numbered_ib_device", lambda idx: f"ionic_{idx}")
     monkeypatch.setattr(mc, "_ib_device_exists", lambda _device: True)
 
     assert mc._select_ib_devices(
         "rdma",
         "",
-        3,
+        "0000:75:00.0",
         enable_alternate_hca=True,
         hca_count=8,
     ) == [
@@ -863,7 +969,10 @@ def test_mooncake_rdma_skips_missing_alternate_hcas(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
-    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(
+        mc, "_auto_select_ib_device", {"0000:75:00.0": "ionic_3"}.__getitem__
+    )
+    monkeypatch.setattr(mc, "_numbered_ib_device", lambda idx: f"ionic_{idx}")
     monkeypatch.setattr(
         mc,
         "_ib_device_exists",
@@ -873,7 +982,7 @@ def test_mooncake_rdma_skips_missing_alternate_hcas(monkeypatch):
     assert mc._select_ib_devices(
         "rdma",
         "",
-        3,
+        "0000:75:00.0",
         enable_alternate_hca=True,
         hca_count=8,
     ) == ["ionic_3", "ionic_0", "ionic_7"]
@@ -883,23 +992,26 @@ def test_mooncake_rdma_rejects_nonpositive_hca_count(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
-    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(
+        mc, "_auto_select_ib_device", {"0000:85:00.0": "ionic_4"}.__getitem__
+    )
+    monkeypatch.setattr(mc, "_numbered_ib_device", lambda idx: f"ionic_{idx}")
 
     with pytest.raises(ValueError, match="ib_hca_count"):
         mc._select_ib_devices(
             "rdma",
             "",
-            4,
+            "0000:85:00.0",
             enable_alternate_hca=True,
             hca_count=0,
         )
 
 
-def test_mooncake_rdma_requires_gpu_index_without_explicit_device():
+def test_mooncake_rdma_requires_gpu_address_without_explicit_device():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
-    with pytest.raises(ValueError, match="physical GPU index"):
+    with pytest.raises(ValueError, match="GPU's PCI address"):
         mc._select_ib_device("rdma", "", None)
 
 
@@ -1574,6 +1686,7 @@ def _fake_head(batch, *, launches=1, pp_size=4, pp_max_inflight=4):
         _defer_prefix_hash=False,
         pp_size=pp_size,
         pp_max_inflight=pp_max_inflight,
+        _stages_push_load_terminals=False,
         kv_transfer_enabled=True,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1819,6 +1932,7 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
         _defer_prefix_hash=False,
         pp_size=2,
         pp_max_inflight=2,
+        _stages_push_load_terminals=False,
         kv_transfer_enabled=False,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
