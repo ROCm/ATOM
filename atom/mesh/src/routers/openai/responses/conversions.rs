@@ -1,6 +1,10 @@
 //! Conversion between /v1/responses and /v1/chat/completions request/response
 //! shapes, so the gRPC chat pipeline backs both endpoints.
 
+use std::collections::HashMap;
+
+use serde_json::Value;
+
 use crate::{
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
@@ -133,6 +137,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
     let is_streaming = req.stream.unwrap_or(false);
 
     Ok(ChatCompletionRequest {
+        chat_template_kwargs: reasoning_kwargs(req),
         messages,
         model: if req.model.is_empty() {
             UNKNOWN_MODEL_ID.to_string()
@@ -158,6 +163,17 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         response_format: map_text_to_response_format(&req.text),
         ..Default::default()
     })
+}
+
+/// The template kwargs a Responses request's `reasoning.effort` renders with,
+/// as ATOM's `/v1/responses` gives them (`RESPONSES_REASONING_RULES`): the
+/// effort as sent, as `thinking_effort`, which leaves the reasoning switch as
+/// the template's default. DeepSeek-V4.1's encoder takes it under its own
+/// effort rules (`chat_render`), as ATOM's adapter does.
+fn reasoning_kwargs(req: &ResponsesRequest) -> Option<HashMap<String, Value>> {
+    let effort = req.reasoning.as_ref()?.effort.as_ref()?;
+    let effort = serde_json::to_value(effort).ok()?;
+    Some(HashMap::from([("thinking_effort".to_string(), effort)]))
 }
 
 fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
@@ -354,6 +370,28 @@ mod tests {
 
         let chat_req = responses_to_chat(&req).unwrap();
         assert_eq!(chat_req.messages.len(), 2); // user + assistant
+    }
+
+    /// `reasoning.effort` reaches the template as ATOM's `/v1/responses` gives
+    /// it, and a request without one gives none.
+    #[test]
+    fn test_reasoning_effort_becomes_thinking_effort() {
+        let request = |reasoning: Value| {
+            let mut body = serde_json::json!({"model": "m", "input": "hi"});
+            if !reasoning.is_null() {
+                body["reasoning"] = reasoning;
+            }
+            let req: ResponsesRequest = serde_json::from_value(body).unwrap();
+            responses_to_chat(&req).unwrap().chat_template_kwargs
+        };
+        assert_eq!(
+            request(serde_json::json!({"effort": "minimal"})),
+            Some(HashMap::from([(
+                "thinking_effort".to_string(),
+                Value::from("minimal")
+            )]))
+        );
+        assert_eq!(request(Value::Null), None);
     }
 
     #[test]
