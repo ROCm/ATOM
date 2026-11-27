@@ -786,16 +786,6 @@ def install_modules(model, *, prefix: str = "") -> list[str]:
     return paths
 
 
-def install_built(model, drafter=None) -> None:
-    """The runner's step after both loads: the takeovers of ``model`` and of
-    the drafter's model (``prefix="draft"``), then the plan against the seams
-    the built models declared (`check_plan`: refuses the start)."""
-    install_modules(model)
-    if drafter is not None:
-        install_modules(drafter.model, prefix="draft")
-    check_plan()
-
-
 # -- opaque op of N tensors -----------------------------------------------------
 
 _spans_n: dict[str, tuple[Callable[..., Any], Callable[..., Any]]] = {}
@@ -935,20 +925,6 @@ def draft_model_class_for(arch: str, default: str, config: Any = None) -> str:
         return model_options().draft_model_cls or default
     options = None if _plan is not None else _recipe_model_options(config)
     return getattr(options, "draft_model_cls", None) or default
-
-
-def model_classes_key(config: Any) -> dict[str, str | None] | None:
-    """The model classes a plugin recipe builds in place of ATOM's
-    (``model_options.target_model_cls`` / ``draft_model_cls``), for the
-    weight-cache key: None without a recipe, without such a class, or under the
-    plugin kill switch, where ATOM builds its own. A daemon's weights are never
-    mapped into another model class."""
-    options = _recipe_model_options(config)
-    if options is None or (
-        options.target_model_cls is None and options.draft_model_cls is None
-    ):
-        return None
-    return {"target": options.target_model_cls, "draft": options.draft_model_cls}
 
 
 def new_model_build() -> None:
@@ -1210,17 +1186,6 @@ def configure(
     _apply_aiter(force=True)
     if plan is not None:
         logger.info("plugin_host: %s", status())
-
-
-def configure_runner(config: Any) -> None:
-    """`configure` for the runner: the plan and the arm ride the engine
-    ``Config`` (``plugin_source`` / ``plugin_arm``); a config without them (a
-    stand-in) is native."""
-    configure(
-        getattr(config, "plugin_source", None),
-        arm=getattr(config, "plugin_arm", "plugin"),
-        config=config,
-    )
 
 
 def _route_tables(plan) -> dict[Any, dict[str, tuple[_Route, ...]]]:
@@ -1704,14 +1669,6 @@ def freeze_weights(*models, prefixes: Iterable[str] = ()) -> int:
     _weight_marks.clear()
     _weight_marks.update(_weights_now())
     return len(_weight_marks)
-
-
-def prepare_built(device: Any, model, drafter=None) -> None:
-    """The runner's step before warmup and capture: the plan's providers
-    prepare their native code (`prepare_plan`), then every parameter and
-    buffer of ``model`` and the drafter's model is recorded (`freeze_weights`)."""
-    prepare_plan(device)
-    freeze_weights(model, getattr(drafter, "model", None), prefixes=("", "draft"))
 
 
 def weights_changed() -> list[str]:

@@ -453,6 +453,17 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
+        # Prefill steps of its rank that scheduled other requests' prefill and
+        # none of this one's. Only maintained under
+        # ATOM_PREFILL_SHORT_FIRST_ROWS, where reaching
+        # ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS puts the request ahead of the
+        # short ones for good: the bound on how long a long prompt is passed
+        # over.
+        self.num_skipped_steps = 0
+        # Set by `Scheduler.preempt`, cleared when the request is admitted
+        # again: under ATOM_PREFILL_SHORT_FIRST_ROWS it keeps a preemption
+        # victim ahead of the short requests instead of behind every one.
+        self.is_preempted = False
         # Set after the local prompt forward completes, or when P/D admission
         # confirms the producer's completed prompt KV. The router uses this
         # even for an abort with no sampled output.

@@ -399,6 +399,29 @@ class PrefixSpreadRouter:
         )
         return Route(rank, "explicit_total", credit, loaded)
 
+    # -- index only (session affinity with ATOM_DP_SESSION_PREFIX_OWNER_TOKENS) --
+
+    def confirmed_hits(self, seq: Any, n_ranks: int) -> dict[int, int]:
+        """Longest prefix of `seq`'s prompt each rank holds from a prefill that
+        has completed: what a request placed there now finds in that rank's
+        cache. Read-only. Unlike `_rank_hits` it offers no rank a prefix that
+        is still being prefilled: a session that moves for the hit stays on
+        that rank for good, so the hit has to be there."""
+        hits: dict[int, int] = {}
+        path = self._path(getattr(seq, "prompt_hash_chain", None))
+        # Preserve the newer index's ancestor-continuity and completed-only rules.
+        for _edge, hit, continuous in self._continuous_local_path(
+            path, range(n_ranks), include_pending=False
+        ):
+            for rank in continuous:
+                hits[rank] = hit
+        return hits
+
+    def record(self, seq: Any, rank: int) -> None:
+        """Index `seq` on `rank`, where another policy placed it: its prefix
+        becomes that rank's once its prefill completes (`prefill_complete`)."""
+        self._record(getattr(seq, "prompt_hash_chain", None), rank, seq.id, 0)
+
     def _credit(self, seq, rank, hits, owner, path, in_tier=None):
         local = hits.get(rank, 0)
         if rank == owner or not self.tier.loads:

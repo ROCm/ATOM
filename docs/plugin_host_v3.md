@@ -33,9 +33,9 @@ mapped into another model class). There is no in-process hot-plug.
 | When | Host step |
 | --- | --- |
 | before the model is built | `configure(plan, arm, config)`: entry points loaded, owners registered, AITER providers enabled; the model classes come from the plan (`model_class_for` / `draft_model_class_for`, which a process without a plan, the weight-cache daemon, reads from the config's recipe) |
-| after the target and the drafter are built | `install_built(model, drafter)`: `install_modules` (target, then the drafter under `draft.`), `check_plan()` |
+| after the target and the drafter are built | `install_modules` (target, then the drafter under `draft.`), `check_plan()` |
 | after the load, before KV sizing | `model.install` (the boot hook; native: the model's own installers), then the verify head is bound |
-| before warmup | `prepare_built(device, model, drafter)`: `prepare_plan(device)` (owners' and AITER providers' one-time setup), `freeze_weights` |
+| before warmup | `prepare_plan(device)` (owners' and AITER providers' one-time setup), `freeze_weights` |
 | after capture | `log_route_report("capture")`: routes, planned owners no call reached, weights changed |
 
 A plan is resolved identically on every rank (`plan_id`); captured decisions
