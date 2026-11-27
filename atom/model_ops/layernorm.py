@@ -26,6 +26,7 @@ from aiter.ops.fused_qk_rmsnorm_group_quant import (
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
+from aiter.ops.triton.utils.fast_launch import fast_launch
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
@@ -1192,6 +1193,11 @@ def _fused_qk_norm_single_kernel(
     )
 
 
+_fused_qk_norm_single = fast_launch(
+    _fused_qk_norm_single_kernel, by_specialization=True
+)
+
+
 def fused_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1236,7 +1242,7 @@ def fused_qk_norm(
     # When q_weight is None pass k_weight as a placeholder pointer (the
     # kernel won't load from it — Q_HAS_WEIGHT=False gates the load).
     q_weight_arg = q_weight if q_weight is not None else k_weight
-    _fused_qk_norm_single_kernel[((total_rows + XBLOCK - 1) // XBLOCK,)](
+    _fused_qk_norm_single[((total_rows + XBLOCK - 1) // XBLOCK,)](
         q,
         k,
         q_out,

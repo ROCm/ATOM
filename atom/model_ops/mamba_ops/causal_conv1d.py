@@ -8,6 +8,7 @@
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
 # from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
@@ -57,6 +58,11 @@ def _causal_conv1d_metadata_kernel(
             tl.store(token_chunk_offset_ptr + p, pad, mask=mask)
 
 
+_causal_conv1d_metadata = fast_launch(
+    _causal_conv1d_metadata_kernel, by_specialization=True
+)
+
+
 def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor, num_tokens: int):
     """Program -> (sequence, chunk) map for `_causal_conv1d_fwd_kernel`, on the GPU.
 
@@ -73,7 +79,7 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor, num_tokens: 
         (2, num_programs), dtype=torch.int32, device=query_start_loc_p.device
     )
     batch_ptr, token_chunk_offset_ptr = out[0], out[1]
-    _causal_conv1d_metadata_kernel[(num_seqs + 1,)](
+    _causal_conv1d_metadata[(num_seqs + 1,)](
         query_start_loc_p,
         batch_ptr,
         token_chunk_offset_ptr,
@@ -596,6 +602,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(v_ptrs, acc, mask=mask_token & is_v_block)
 
 
+_causal_conv1d_fwd = fast_launch(_causal_conv1d_fwd_kernel, by_specialization=True)
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -768,19 +777,16 @@ def causal_conv1d_fn(
         else:
             block_size_to_align = BLOCK_M
 
-    def grid(META):
-        # The kernel takes `batch_ptr` / `token_chunk_offset_ptr` directly;
-        # only the program count comes from the map.
-        return (
-            nums_dict[META["BLOCK_M"]]["tot"],
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
+    BLOCK_N = 256
+    # The kernel takes `batch_ptr` / `token_chunk_offset_ptr` directly; only
+    # the program count comes from the map.
+    grid = (nums_dict[BLOCK_M]["tot"], triton.cdiv(dim, BLOCK_N))
 
     if batch_ptr.device != x.device:
         batch_ptr = batch_ptr.to(x.device)
         token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
 
-    _causal_conv1d_fwd_kernel[grid](
+    _causal_conv1d_fwd[grid](
         # Pointers to matrices
         x,
         weight,
@@ -832,7 +838,7 @@ def causal_conv1d_fn(
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
-        BLOCK_N=256,
+        BLOCK_N=BLOCK_N,
         num_stages=2,
     )
     return query, key, value

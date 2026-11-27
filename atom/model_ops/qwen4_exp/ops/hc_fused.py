@@ -25,6 +25,7 @@ outputs and the scaled SiLU input/output are rounded to BF16 before use.
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
 # Batches from which the multi-row combine+norm kernel is used (prefill).
 COMBINE_NORM_ROWS_MIN_M = 256
@@ -296,6 +297,9 @@ def _hc_gated_mean_tiled_kernel(
     )
 
 
+_hc_gated_mean_tiled = fast_launch(_hc_gated_mean_tiled_kernel, by_specialization=True)
+
+
 def hc_gated_mean(
     normed: torch.Tensor,
     gate: torch.Tensor,
@@ -310,7 +314,7 @@ def hc_gated_mean(
     if m and hidden % bh == 0 and gate.stride(0) == normed.stride(0):
         if out is None:
             out = torch.empty((m, hidden), dtype=normed.dtype, device=normed.device)
-        _hc_gated_mean_tiled_kernel[(triton.cdiv(m, rb), hidden // bh)](
+        _hc_gated_mean_tiled[(triton.cdiv(m, rb), hidden // bh)](
             normed,
             gate,
             out,
@@ -367,6 +371,9 @@ def _hc_gated_mean_quant_kernel(
     tl.store(scale_ptr + rows, scale, mask=rows < M)
 
 
+_hc_gated_mean_quant = fast_launch(_hc_gated_mean_quant_kernel, by_specialization=True)
+
+
 def hc_gated_mean_quant(
     normed: torch.Tensor, gate: torch.Tensor, hc: int, quant_dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -387,7 +394,7 @@ def hc_gated_mean_quant(
     scale = torch.empty((m, 1), dtype=torch.float32, device=normed.device)
     if m:
         rb = 1
-        _hc_gated_mean_quant_kernel[(triton.cdiv(m, rb),)](
+        _hc_gated_mean_quant[(triton.cdiv(m, rb),)](
             normed,
             gate,
             out,
@@ -443,6 +450,9 @@ def _hc_combine_norm_kernel(
         (x * rstd * g).to(normed_ptr.dtype.element_ty),
         mask=mask,
     )
+
+
+_hc_combine_norm = fast_launch(_hc_combine_norm_kernel, by_specialization=True)
 
 
 @triton.jit
@@ -503,6 +513,11 @@ def _hc_combine_norm_rows_kernel(
     dt = normed_ptr.dtype.element_ty
     tl.store(normed_ptr + oh + ca, (fa * rstd[:, None] * ga).to(dt), mask=rmask)
     tl.store(normed_ptr + oh + cb, (fb * rstd[:, None] * gb).to(dt), mask=rmask)
+
+
+_hc_combine_norm_rows = fast_launch(
+    _hc_combine_norm_rows_kernel, by_specialization=True
+)
 
 
 def hc_rows(
@@ -599,7 +614,7 @@ def hc_combine_norm(
     bb = hidden - ba
     if m >= COMBINE_NORM_ROWS_MIN_M and bb > 0 and bb & (bb - 1) == 0:
         rb = 2
-        _hc_combine_norm_rows_kernel[(triton.cdiv(m, rb), hc)](
+        _hc_combine_norm_rows[(triton.cdiv(m, rb), hc)](
             h,
             block_out if combine else h,
             raw if combine else h,
@@ -621,7 +636,7 @@ def hc_combine_norm(
         )
         return h_new, normed
     if m:
-        _hc_combine_norm_kernel[(m, hc)](
+        _hc_combine_norm[(m, hc)](
             h,
             block_out if combine else h,
             raw if combine else h,
