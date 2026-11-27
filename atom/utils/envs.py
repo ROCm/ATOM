@@ -78,6 +78,17 @@ def _preload_mode() -> str:
     )
 
 
+def _strict_flag_env(name: str, default: bool) -> bool:
+    """``0`` or ``1`` (stripped; unset or empty reads as ``default``); anything
+    else raises, so a typo fails the load instead of reading as either."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    if raw not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {raw!r}")
+    return raw == "1"
+
+
 def _profiler_detail_env(name: str) -> bool:
     # Unset or empty falls back to ATOM_PROFILER_MORE, so the per-option flag
     # always wins when given and ATOM_PROFILER_MORE=1 alone still enables all.
@@ -825,6 +836,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
     ),
+    # Kimi-K3 DSpark GQA draft (`models/kimi_k3_dspark_gqa.py`): "1" (default)
+    # runs each layer's per-head q/k RMSNorm, neox rope and paged K/V write as
+    # ONE aiter launch (`fused_qk_rope_reshape_and_cache` with its q/k-norm
+    # prologue). "0" keeps the unfused launches: DualRMSNorm, the rope, an fp8
+    # clamp each for k and v, and `reshape_and_cache_flash` (five on an fp8
+    # pool, three on bf16); the context write runs the k RMSNorm in place of
+    # DualRMSNorm. Same formulas and rounding points as those launches, but
+    # the fp32 sum of squares can round otherwise: a normed value one bf16 ulp
+    # off, which the rope can carry to a few ulps of a small q or k element,
+    # and an fp8 pool byte one fp8 step off. Decided once per layer when the
+    # draft is built; a pool other than bf16 or float8_e4m3fn (gfx942's fnuz
+    # fp8) keeps the unfused launches and logs it once. Anything but 0 or 1
+    # raises.
+    "ATOM_K3_DRAFT_QKROPE": lambda: _strict_flag_env("ATOM_K3_DRAFT_QKROPE", True),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),

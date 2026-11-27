@@ -32,13 +32,21 @@ An fp8 pool takes one per-tensor scale: `reshape_and_cache_flash` and
 `unified_attention` both load a single scalar per launch. The checkpoint ships
 no KV scales, so `kv_pool_spec` declares the unit scale, every layer binds one
 shared 1.0, and the pool declares no per-token scale planes.
+
+`ATOM_K3_DRAFT_QKROPE` (default on) runs the q/k norm, rope and pool write of
+both passes as one aiter launch, `fused_qk_rope_reshape_and_cache` with its
+q/k-norm prologue (`_fused_qk_rope_write`). Only this GQA draft reads it; the
+MLA draft (`kimi_k3_dspark.py`) has its own fused context write
+(`ATOM_DSPARK_FUSED_CTX_KV`).
 """
 
+import functools
 import logging
 from typing import ClassVar
 
 import aiter
 import torch
+from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.rotary_embedding import get_rope
 from aiter.tuned_gemm import tgemm
 from torch import nn
@@ -63,13 +71,31 @@ from atom.models.dspark_draft import (
 from atom.models.qwen3 import Qwen3MLP
 from atom.spec_decode.draft_kv import DraftKvPoolSpec, draft_kv_dtype
 from atom.spec_decode.drafter import AuxCaptureSpec
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
+# The pools `ATOM_K3_DRAFT_QKROPE` is validated on: bf16 and gfx950's fp8.
+_FUSED_QK_ROPE_POOLS = (torch.bfloat16, torch.float8_e4m3fn)
+
 
 def _head_dim(config) -> int:
     return getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+
+@functools.cache
+def _fused_qk_rope_takes(kv_dtype: torch.dtype) -> bool:
+    """Whether `ATOM_K3_DRAFT_QKROPE` runs on a draft pool of `kv_dtype`.
+    Cached, so a pool it does not take is logged once, not once a layer."""
+    if kv_dtype in _FUSED_QK_ROPE_POOLS:
+        return True
+    logger.info(
+        "ATOM_K3_DRAFT_QKROPE is inert on a %s draft pool: the DSpark GQA draft "
+        "runs its q/k norm, rope and cache write unfused",
+        kv_dtype,
+    )
+    return False
 
 
 class KimiK3DSparkGQAAttention(nn.Module):
@@ -137,12 +163,20 @@ class KimiK3DSparkGQAAttention(nn.Module):
 
         self.kv = KVCacheBinding(layer_num)
         self.block_attn = None
+        self.fused_qk_rope = False
 
     def use_block_read(self, block_attn) -> None:
         """Read the block through `block_attn`, and bind only a pool it was
-        built for."""
+        built for.
+
+        That pool's dtype is the read's, so `ATOM_K3_DRAFT_QKROPE` is decided
+        here, once, for every pool this layer can bind.
+        """
         self.block_attn = block_attn
         self.kv.check_cache = block_attn.check_cache
+        self.fused_qk_rope = envs.ATOM_K3_DRAFT_QKROPE and _fused_qk_rope_takes(
+            block_attn.kv_dtype
+        )
 
     def _qkv(self, hidden_states: torch.Tensor):
         qkv = linear_out(self.qkv_proj(hidden_states))
@@ -158,23 +192,65 @@ class KimiK3DSparkGQAAttention(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
 
         q, k, v = self._qkv(hidden_states)
-        q, k = self.qk_norm(q, k)
-        # Norm, then rope: the reference's order.
-        q, k = self.rotary_emb(positions, q, k)
-
         n = q.shape[0]
-        if not self.kv.bound:
-            # Warmup runs before the pool is allocated, and still has to run
-            # the rest of the block so profiling counts its activations.
-            o = q.new_zeros((n, self.num_heads * self.head_dim))
-            return linear_out(self.o_proj(o))
-        k_cache, v_cache = self.kv.k_cache, self.kv.v_cache
-
         # The write goes FIRST: the read takes the block's own T rows out of
         # the pool with the prefix, and the next block's prefix is these rows.
-        self._write_kv(k, v, attn_metadata.slot_mapping[:n], k_cache, v_cache)
+        if self.fused_qk_rope and self.kv.bound:
+            k_cache, v_cache = self.kv.k_cache, self.kv.v_cache
+            self._fused_qk_rope_write(
+                q, k, v, positions, attn_metadata.slot_mapping, k_cache, v_cache
+            )
+        else:
+            q, k = self.qk_norm(q, k)
+            # Norm, then rope: the reference's order.
+            q, k = self.rotary_emb(positions, q, k)
+            if not self.kv.bound:
+                # Warmup runs before the pool is allocated, and still has to
+                # run the rest of the block so profiling counts its activations.
+                o = q.new_zeros((n, self.num_heads * self.head_dim))
+                return linear_out(self.o_proj(o))
+            k_cache, v_cache = self.kv.k_cache, self.kv.v_cache
+            self._write_kv(k, v, attn_metadata.slot_mapping[:n], k_cache, v_cache)
         o = self._attend_non_causal(q, attn_metadata, k_cache, v_cache)
         return linear_out(self.o_proj(o))
+
+    def _fused_qk_rope_write(
+        self, q, k, v, positions, slot_mapping, k_cache, v_cache
+    ) -> None:
+        """`ATOM_K3_DRAFT_QKROPE`: per-head RMSNorm, then rope, on q and k in
+        place, and k and v written to the pool, in one launch. The unfused
+        chain's rounding points are kept, and an fp8 write saturates as
+        `_write_kv` does. `q` is None on the context write, which has no query.
+        """
+        fp8 = k_cache.dtype.itemsize == 1
+        heads = (-1, self.num_kv_heads, self.head_dim)
+        k, v = k.view(heads), v.view(heads)
+        if q is not None:
+            q = q.view(-1, self.num_heads, self.head_dim)
+        fused_qk_rope_reshape_and_cache(
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            slot_mapping[: k.shape[0]],
+            positions,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            self.kv.k_scale,
+            self.kv.v_scale,
+            self.rotary_emb.is_neox_style,
+            flash_layout=True,
+            apply_scale=fp8,
+            q_out=q,
+            k_out=k,
+            output_zeros=False,
+            upcast_operand=True,
+            q_norm_weight=None if q is None else self.q_norm.weight,
+            k_norm_weight=self.k_norm.weight,
+            norm_eps=self.k_norm.eps,
+            saturate_fp8=fp8,
+        )
 
     def _write_kv(self, k, v, slot_mapping, k_cache, v_cache) -> None:
         """Scatter K/V into this layer's rows of the pool: the block's own rows
@@ -233,6 +309,11 @@ class KimiK3DSparkGQAAttention(nn.Module):
         """
         kv = tgemm.mm(ctx_hidden, self.qkv_proj.weight[self.q_size :], None)
         k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
+        if self.fused_qk_rope:
+            self._fused_qk_rope_write(
+                None, k, v, positions, slot_mapping, self.kv.k_cache, self.kv.v_cache
+            )
+            return
         # v is not normed, matching the reference.
         k = self.k_norm(k)
         # Absolute positions, so a cached row stays valid on every later step.

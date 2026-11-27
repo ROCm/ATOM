@@ -50,6 +50,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+    "ATOM_K3_DRAFT_QKROPE",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -133,6 +134,9 @@ class TestEnvsDefaults:
 
     def test_model_sensitive_rmsnorm_default_disabled(self):
         assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is False
+
+    def test_k3_draft_qkrope_default_enabled(self):
+        assert _get_envs().ATOM_K3_DRAFT_QKROPE is True
 
     def test_torch_profiler_dir_default(self):
         assert _get_envs().ATOM_TORCH_PROFILER_DIR is None
@@ -331,6 +335,17 @@ class TestEnvsOverrides:
         assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == 5.0
         assert len(caplog.records) == 1
         assert f"ATOM_SHUTDOWN_TIMEOUT_S={value!r}" in caplog.records[0].getMessage()
+
+    @pytest.mark.parametrize("value, expected", [("0", False), ("1", True)])
+    def test_k3_draft_qkrope_override(self, monkeypatch, value, expected):
+        monkeypatch.setenv("ATOM_K3_DRAFT_QKROPE", value)
+        assert _get_envs().ATOM_K3_DRAFT_QKROPE is expected
+
+    @pytest.mark.parametrize("value", ["true", "off", "2", "yes"])
+    def test_k3_draft_qkrope_refuses_anything_but_0_or_1(self, monkeypatch, value):
+        monkeypatch.setenv("ATOM_K3_DRAFT_QKROPE", value)
+        with pytest.raises(ValueError, match="ATOM_K3_DRAFT_QKROPE must be 0 or 1"):
+            _ = _get_envs().ATOM_K3_DRAFT_QKROPE
 
     def test_model_sensitive_rmsnorm_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "1")
