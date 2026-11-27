@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """CPU dispatch and row-slice checks around the real KDA load and forward paths."""
 
 from types import SimpleNamespace

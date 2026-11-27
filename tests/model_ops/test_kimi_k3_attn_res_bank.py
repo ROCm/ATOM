@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Kimi-K3's block-residual bank: allocated once per forward, each closing
 layer copies its prefix into a slot. Every layer's output matches the loop that
 grew the candidates by `torch.cat`, bit for bit."""

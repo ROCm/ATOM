@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Kimi's rank views, dispatch, and public AITER projection/add contract."""
 
 from types import MethodType, SimpleNamespace

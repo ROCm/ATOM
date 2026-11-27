@@ -823,7 +823,7 @@ class KimiSparseMoeBlock(nn.Module):
         router_logits: torch.Tensor,
         routed_input: torch.Tensor,
         columns_only: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Reduce contiguous latent/shared blocks together, before routed norm."""
         latent_numel = routed_input.numel()
         partials = hidden_states.new_empty(latent_numel + hidden_states.numel())
@@ -1916,6 +1916,8 @@ class KimiKDAAttention(nn.Module):
                     buf_k=cache.replay_buf_k,
                     buf_u=cache.replay_buf_u,
                     buf_g=cache.replay_buf_g,
+                    flush_arrivals=cache.replay_flush_arrivals,
+                    flush_wait=cache.replay_flush_wait,
                     write_pos=kda_metadata.write_pos,
                     slot_idx=kda_metadata.slot_idx[:nd],
                     cu_seqlens=query_start_loc[: nd + 1],
@@ -1998,6 +2000,8 @@ class KimiKDAAttention(nn.Module):
                     buf_k=cache.replay_buf_k,
                     buf_u=cache.replay_buf_u,
                     buf_g=cache.replay_buf_g,
+                    flush_arrivals=cache.replay_flush_arrivals,
+                    flush_wait=cache.replay_flush_wait,
                     write_pos=kda_metadata.write_pos,
                     slot_idx=kda_metadata.slot_idx[:nsd],
                     cu_seqlens=spec_query_start_loc[: nsd + 1],
@@ -2526,7 +2530,8 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = self.self_attn(positions, hidden_states)
 
         # Replicated steps leave routed/shared adds to the next attn_res.
-        # A row-sharded step returns the whole residual with real zero addends.
+        # A row-sharded step returns the whole residual; tensor-only boundaries
+        # materialize its absent addends as real zeros.
         prefix_sum, hidden_states, shared = self._post_attention(
             hidden_states, prefix_sum, block_residual
         )

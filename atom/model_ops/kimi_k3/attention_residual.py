@@ -256,7 +256,7 @@ if _HAS_TRITON:
         br_row, stride_br_b, i_l, o_d, ps, sw, b_m, b_acc, b_o, B, H, eps, BL
     ):
         # One tile of the online softmax over a row's candidates; candidate B is ps.
-        o_l = i_l * BL + tl.arange(0, BL)
+        o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
         m_d = o_d < H
         v = tl.load(
             br_row + o_l[:, None] * stride_br_b + o_d[None, :],
@@ -422,7 +422,8 @@ if _HAS_TRITON:
         # prefix so downstream layers reuse it. DO_ADD2 folds a SECOND addend the
         # same way, so an MoE layer can hand over its routed and shared expert
         # outputs unsummed and skip an entire [T, H] elementwise kernel.
-        t = tl.program_id(0)
+        # Fixed-capacity bank strides can put live rows past 2**31 elements.
+        t = tl.program_id(0).to(tl.int64)
         o_d = tl.arange(0, BD)
         m_d = o_d < H
         flag = 0
@@ -632,7 +633,7 @@ def _apply_attn_res_impl(
     if quant and not out_norm:
         raise ValueError("quant_dtype requires out_norm_weight")
     fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
-    # The active prefix is read by stride (i32 offsets); a wider bank needs no
+    # The active prefix is read by stride (i64 offsets); a wider bank needs no
     # slice or copy when H is unit-stride.
     br = (
         block_residual
