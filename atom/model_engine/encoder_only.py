@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """The encoder-only server (``--encoder-only``): no engine core.
 
@@ -22,35 +23,10 @@ from atom.config import Config
 from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 from atom.model_loader.loading_core import load_weights_into_model
 from atom.model_loader.weight_iterator import safetensors_weights_iterator
+from atom.models.registry import support_model_arch_dict
+from atom.utils import resolve_obj_by_qualname
 
 logger = logging.getLogger("atom")
-
-
-def _minimax_m3(config: Config):
-    from atom.models.minimax_m3.vl import (
-        MiniMaxM3SparseForConditionalGenerationVL,
-        build_vision_modules,
-    )
-
-    names = ("vision_tower", "multi_modal_projector", "patch_merge_mlp")
-    modules = build_vision_modules(config.hf_config)
-    return MiniMaxM3SparseForConditionalGenerationVL, dict(zip(names, modules))
-
-
-def _kimi_k3(config: Config):
-    from atom.models.kimi_k3 import KimiK3ForConditionalGeneration
-    from atom.models.kimi_k3_vl import build_vision_modules
-
-    names = ("vision_tower", "mm_projector")
-    modules = build_vision_modules(config.multimodal_config.vision_config)
-    return KimiK3ForConditionalGeneration, dict(zip(names, modules))
-
-
-# Checkpoint architecture -> (model class, its vision modules by attribute name).
-VISION_BUILDERS = {
-    "MiniMaxM3SparseForConditionalGeneration": _minimax_m3,
-    "KimiK3ForConditionalGeneration": _kimi_k3,
-}
 
 
 class VisionEncoder(nn.Module):
@@ -144,18 +120,17 @@ def create_encoder_only(config: Config) -> EncoderOnly:
     from atom.ec_transfer import create_writer
 
     arch = config.hf_config.architectures[0]
-    build = VISION_BUILDERS.get(arch)
-    if build is None:
-        raise ValueError(
-            f"--encoder-only serves {', '.join(VISION_BUILDERS)}, not {arch}"
-        )
+    qualname = support_model_arch_dict.get(arch)
+    model_cls = resolve_obj_by_qualname(qualname) if qualname else None
+    if not hasattr(model_cls, "encoder_only_modules"):
+        raise ValueError(f"--encoder-only does not serve {arch}")
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     default_dtype = torch.get_default_dtype()
     torch.set_default_dtype(config.torch_dtype)
     try:
         with device:
-            encoder = VisionEncoder(*build(config))
+            encoder = VisionEncoder(model_cls, model_cls.encoder_only_modules(config))
     finally:
         torch.set_default_dtype(default_dtype)
     load_vision_weights(encoder, config)
