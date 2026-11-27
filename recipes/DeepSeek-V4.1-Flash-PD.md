@@ -93,32 +93,48 @@ flag was passed).
 
 ### PRs used and how to configure them
 
-The ladder was measured on a frozen ATOM tree (see
-[Software stack](#software-stack-identical-on-p-and-d-every-point)); several
-of the PRs it carries have since been merged or revised. The table says, for
-each P/D-relevant PR, what the measured tree had, what to set today, and on
-which side. "Side" is where the setting goes: P (prefill server), D (decode
-server), router (atomesh) or ingress (the encoding ingress in front of the
-router). PR states are as of 2026-11-27.
+The ladder was measured on a frozen ATOM tree, `de7d8ec1c` (see
+[Software stack](#software-stack-identical-on-p-and-d-every-point)). Several
+of the PRs in it have been merged or revised since. For each P/D PR the
+table gives two settings: the one used when the ladder was measured, and the
+one to use on main today. "Side" says where the setting goes: P (the prefill
+server), D (the decode server), router (atomesh) or ingress (the encoding
+ingress in front of the router). PR states are as of 2026-11-27.
 
-| PR | What it does | State | Version in the measured tree | Setting (side) | Default | Points that used it | Notes |
+| PR | What it does | State | Side | As measured (tree `de7d8ec1c`) | How to configure now | Points that used it | Notes |
 |---|---|---|---|---|---|---|---|
-| [#3772](https://github.com/ROCm/ATOM/pull/3772) | Wait for a Mooncake Store load already in flight before the first forward, instead of recomputing the prefix | open | old fixed-wait version: `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS` | measured: `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20` (P). Current PR: `ATOM_OFFLOAD_LOAD_EVENT_WAIT` (P) | measured tree: 0 (off). Current PR: on (`1`); `0` turns it off | all (c1-c768) | The current PR head replaces the fixed wait with an event-driven wait (woken by the load-completion doorbell, bounded by the measured forward time) and removes `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`. Once it is merged the old variable does nothing: drop it and leave `ATOM_OFFLOAD_LOAD_EVENT_WAIT` at its default. Measured gain at 1P1D c256: TTFT mean -20.2%, throughput +0.55%. Inert without a Store tier. |
-| [#3773](https://github.com/ROCm/ATOM/pull/3773) | Early handoff: P answers the router at DP dispatch, so D allocates and pulls KV while P still computes | open | early version, default off | `ATOM_PD_EARLY_HANDOFF=1` (P) | measured tree: 0. Current PR head: 1 | all (c1-c768) | **Known issue:** after a P step that stalls for more than 60 s, early requests can leak a state slot; once a rank has leaked `--max-num-seqs` slots it admits nothing more, permanently. Set `ATOM_PD_EARLY_HANDOFF=0` at c1024 and above until the fix lands (in progress). Load visibility is correct only with a single P instance: with several P instances behind one router, the router's view of P load is wrong. Because the current PR head turns it on by default, set `0` explicitly where it should be off. |
-| [#3777](https://github.com/ROCm/ATOM/pull/3777) | `ATOM_DP_IDLE_WHEN_BLOCKED`: a DP rank whose only work is blocked (Store lookup/load, KV send) idles instead of forcing dummy forwards | merged 2026-11-27 | pre-merge version, default off | `ATOM_DP_IDLE_WHEN_BLOCKED=1` (P) | main: unset = on for a P/D prefill (`kv_producer`), off elsewhere | all (c1-c768) | On main nothing needs to be set on P. Needs `ATOM_ENABLE_PREFILL_DELAYER=0` (the delayer turns it off). |
-| [#3854](https://github.com/ROCm/ATOM/pull/3854) | Prompt token ids as base64 packed uint32, cutting the decode-side ingest cost | merged 2026-11-26 | pre-merge version, default off (merged by hand, two conflicts) | `ATOM_PROMPT_IDS_B64=1` (P and D); ingress `ATOM_FRONT_IDS_B64=1` and `ATOM_FRONT_SPLICE_BODY=1` | main: on (`1`) for P and D. The ingress variables belong to the external ingress and must be set there | all (c1-c768) | On main P and D read base64 ids by default; the ingress still has to send them. |
-| [#3873](https://github.com/ROCm/ATOM/pull/3873) | D accepts the request first and P's `kv_transfer_params` later, on `/v1/pd/late_kv/chat/completions` | merged 2026-11-26 | not in the tree | `ATOM_PD_LATE_KV=1` (D) | off (`0`): the route answers 404 | none | Pair with #3874. |
-| [#3874](https://github.com/ROCm/ATOM/pull/3874) | atomesh sends the decode leg concurrently with prefill instead of after it | merged 2026-11-26 | not in the router used | `--atom-pd-concurrent` (router, `--backend atom`) | off | none | The frozen router of the ladder relays serially. With the flag the router opens D's late-KV request while P runs; a D without `ATOM_PD_LATE_KV=1` answers 404 and the router falls back to the serial relay (logged once). Measured: D receives the request 4-11 ms earlier; end to end neutral. |
+| [#3772](https://github.com/ROCm/ATOM/pull/3772) | Store load wait: the first forward waits for a Mooncake Store load that is already in flight, instead of recomputing the prefix | open | P | Old fixed-wait version: `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20`. Its default was 0 (off), so the variable was set explicitly. | Not on main yet. On the current PR head: `ATOM_OFFLOAD_LOAD_EVENT_WAIT`, on by default (`0` turns it off), so set nothing. The PR head removes `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`, so drop that variable. | all (c1-c768) | The wait is now event-driven: the load-completion doorbell wakes it, and the measured forward time bounds it. There is no fixed timeout. It does nothing without a Store tier. Measured at 1P1D c256: TTFT mean -20.2%, throughput +0.55%. |
+| [#3773](https://github.com/ROCm/ATOM/pull/3773) | Early handoff: P answers the router at DP dispatch, so D allocates pages and pulls KV while P is still computing | open | P | `ATOM_PD_EARLY_HANDOFF=1`. Its default was 0, so the variable was set explicitly. | Not on main yet. On the current PR head it is on by default (`1`). Set `ATOM_PD_EARLY_HANDOFF=0` explicitly wherever it should be off. | all (c1-c768) | **Known issue:** if a P step stalls for more than 60 s, early requests can leak a state slot. Once a rank has leaked `--max-num-seqs` slots, it admits no more requests, permanently. Use `0` at c1024 and above until the fix lands; the fix is in progress. Load visibility is correct only with one P instance. With several P instances behind one router, the router's view of P load is wrong. |
+| [#3777](https://github.com/ROCm/ATOM/pull/3777) | Idle when blocked: a DP rank whose only work is blocked (Store lookup or load, KV send) idles instead of forcing dummy forwards | merged 2026-11-27 | P | `ATOM_DP_IDLE_WHEN_BLOCKED=1`. The pre-merge default was 0, so the variable was set explicitly. | Set nothing. On main, leaving it unset turns it on for a P/D prefill (`kv_producer`) and off elsewhere. An explicit `0` or `1` applies to any role. | all (c1-c768) | Needs `ATOM_ENABLE_PREFILL_DELAYER=0`, because the prefill delayer turns this setting off. |
+| [#3854](https://github.com/ROCm/ATOM/pull/3854) | Base64 prompt ids: the prompt token ids are sent as base64-packed uint32, which cuts D's ingest cost | merged 2026-11-26 | P, D, ingress | `ATOM_PROMPT_IDS_B64=1` on P and D (pre-merge default 0; merged into the tree by hand with two conflicts). Ingress: `ATOM_FRONT_IDS_B64=1 ATOM_FRONT_SPLICE_BODY=1`. | P and D: set nothing, since `ATOM_PROMPT_IDS_B64` is on (`1`) by default on main. Ingress: keep `ATOM_FRONT_IDS_B64=1 ATOM_FRONT_SPLICE_BODY=1`. | all (c1-c768) | The two `ATOM_FRONT_*` variables belong to the external ingress, not to ATOM. Without them the ingress sends JSON ids, which still work. |
+| [#3873](https://github.com/ROCm/ATOM/pull/3873) | Late KV params on D: D accepts the chat request first and P's `kv_transfer_params` afterwards, on `/v1/pd/late_kv/chat/completions` | merged 2026-11-26 | D | Not in the tree and not used. | `ATOM_PD_LATE_KV=1` on D. The default is `0`, under which the route answers 404. | none | Use together with #3874. |
+| [#3874](https://github.com/ROCm/ATOM/pull/3874) | Concurrent dispatch: atomesh sends the decode leg while prefill runs, instead of after it | merged 2026-11-26 | router | Not used: the ladder's frozen router relays serially. | `--atom-pd-concurrent` on the atomesh router, with `--backend atom`. Off by default. | none | Needs D with `ATOM_PD_LATE_KV=1`. A D that answers 404 gets the serial relay's request instead, and the router logs this once. Measured: D receives the request 4-11 ms earlier, with no end-to-end change. |
 
-The measured tree also carries these PRs, which need no P/D-specific setting
-beyond the commands in each point's section: MegaMoE route selection
-[#3187](https://github.com/ROCm/ATOM/pull/3187) (T1 version; merged
-2026-11-25, `--moe-backend mega`), #3738 (merged), #3842 (merged; net diff),
-#3838 (open), #3839 (open), #3840 (open), #3647 (open), #3186 (merged; EPLB
-is off in the ladder), #2903 (open), #3437 (merged), #3639 (open), #3748
-(open) and #2877 (merged). Their combination as measured is the reproduction
-branch `lirzhang/agentx-v41-recipe-de7d8ec1c`; individual PRs merged since may
-differ from the versions in that branch.
+Our other PRs that the ladder configures were merged before the measurement
+and are part of the tree's base:
+
+| PR | What it does | Side | As measured | How to configure now |
+|---|---|---|---|---|
+| [#3097](https://github.com/ROCm/ATOM/pull/3097) (merged) | Shared Mooncake Store: `share_cache` DP routing and early tier load | P | `--dp-load-balance share_cache`, Store as `ATOM_KV_OFFLOAD=mooncake_store` | Unchanged. The default DP routing is `least_requests`, so pass `share_cache` explicitly. |
+| [#3350](https://github.com/ROCm/ATOM/pull/3350) (merged) | Mono mailbox polling backoff | D (Mono, c1-c32) | `ATOM_MONO_POLL_SLEEP_UNITS=4` at c1, `16` at c2-c32 | Unchanged. When unset, the value is 4, or 16 next to a KV transfer or offload connector. c1 sets 4 explicitly. |
+
+Also in the tree, with nothing to configure: P/D support for V4.1 (#2666),
+prefix-spread routing (#2755), delayed P/D completion reporting (#3105), and
+the Store restore fixes (#3217, #3323, #3324), all merged. The Store opt-ins
+#3475 (`ATOM_STORE_SAVE_BATCH_CHUNKS`) and #3533 (`ATOM_STORE_ASYNC_RENEW`) are
+merged but were not set. The tree's top commit is a P/D endpoint-recovery
+patch that was not enabled (`ATOM_PD_ENDPOINT_RECOVERY` unset); it has no PR.
+#3781 (open) is not in the tree.
+
+Other authors' PRs in the measured tree need no P/D-specific setting beyond
+the commands in each point's section:
+- MegaMoE route selection [#3187](https://github.com/ROCm/ATOM/pull/3187): T1 version, merged 2026-11-25, enabled with `--moe-backend mega`.
+- Merged: #3738, #3842 (net diff), #3186 (EPLB is off in the ladder), #3437 and #2877.
+- Open: #3838, #3839, #3840, #3647, #2903, #3639 and #3748.
+
+The combination that was measured is the reproduction branch
+`lirzhang/agentx-v41-recipe-de7d8ec1c`. PRs merged since then may differ
+from their versions in that branch.
 
 ### High-concurrency notes (c768 and above)
 
