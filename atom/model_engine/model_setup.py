@@ -113,7 +113,7 @@ def init_model_env(
         local_rank=local_device_rank,
         data_parallel_size=dp_size,
         prefill_context_model_parallel_size=config.pcp_group_size,
-        decode_context_parallel_size=getattr(config, "decode_context_parallel_size", 1),
+        decode_context_parallel_size=config.decode_context_parallel_size,
         disable_custom_all_reduce=config.disable_custom_all_reduce,
         device_communicators=device_communicators,
     )
