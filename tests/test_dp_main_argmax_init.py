@@ -154,3 +154,5 @@ def test_preprocess_fanout_rejects_a_sampled_request_under_argmax(monkeypatch, m
     processor = _processor(le, monkeypatch, "argmax")
     with pytest.raises(ValueError, match="greedy requests only"):
         processor.preprocess_fanout([1, 2, 3], SamplingParams(temperature=0.6))
+    (seq,) = processor.preprocess_fanout([1, 2, 3], SamplingParams(temperature=0))
+    assert list(seq.token_ids) == [1, 2, 3]
