@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795626724549,
+  "lastUpdate": 1795799481361,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -5506,6 +5506,46 @@ window.BENCHMARK_DATA = {
             "value": 0.9007,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/45652077139 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611251520 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1751 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Hexiang Wang",
+            "username": "whx-sjtu",
+            "email": "56632993+whx-sjtu@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "380aeb8a094e6506ae08d31f6e0189af302420c5",
+          "message": "Allocate Kimi's block-residual bank once per forward (#3577)\n\n* fix(page-checkpoint): reserve block 0 as null page when PAGE checkpoints are enabled\n\nSeveral attention kernels route discarded lanes through block 0 (the\nblock-table zero-padding target): sparse-index gather writes 0 for\nout-of-range top-k entries, the indexer's masked prefetch lanes read\nthere, and DSpark pad rows point there. This is safe while block 0\nholds ordinary fp8 KV, but PAGE state checkpoints store fp32/bf16\nstate bytes into KV-pool blocks, and the min-heap allocator hands out\nblock 0 first. When block 0 is a checkpoint unit, those \"harmless\"\nreads see fp8 NaN codes (0x7F/0xFF from the raw state bytes), poisoning\nthe attention row. Under DSpark verify with prefix caching this caused\ngarbled tool-call output on ~62% of affected DeepSWE tasks.\n\nFix: BlockPool.reserve_null_block() removes block 0 from the free set\nbefore any allocation. Called by BlockManager when PAGE checkpoints are\nenabled. Cost: one block out of thousands.\n\n* fix(cache): reserve null storage at pool construction\n\nUse allocatable block capacity for admission, limits, occupancy, and watermarks. Reserve the padding block whenever PAGE state storage exists, including when prefix caching is disabled, and keep the physical address bound for deferred-block accounting.\n\n* test(cache): reproduce sparse MLA reads beside raw state\n\n* style: align null-block test imports\n\n* fix(cache): warm checkpoint copies without writing pages\n\n* refactor(cache): share checkpoint warmup in the base builder\n\n* fix(vllm): bind inherited native checkpoint descriptors\n\n* Allocate Kimi's block-residual bank once per forward\n\n* Fix sliced block-residual bank slot writes\n\n* Bound Kimi residual reads and pipeline payloads\n\n* Stabilize Engram registration fixture page spans\n\n* Fix wide Kimi residual bank offsets\n\n* Preserve configured DCP size during pipeline initialization\n\n* Fuse closing residual bank writes into attention residual kernel\n\n* Read required DCP width directly and clarify residual closes\n\n* Remove unreachable Kimi residual bank copy fallback\n\n---------\n\nCo-authored-by: ZhiweiYan-96 <zhiwei.yan@amd.com>",
+          "timestamp": "2026-11-27T14:42:31Z",
+          "url": "https://github.com/ROCm/ATOM/commit/380aeb8a094e6506ae08d31f6e0189af302420c5"
+        },
+        "date": 1795799480697,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9575,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/46031601049 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611271632 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.95 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8946,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/46031601049 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611271534 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1387 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b-1p1d accuracy (GSM8K)",
+            "value": 0.8961,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/46031601049 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611271534 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1327 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
