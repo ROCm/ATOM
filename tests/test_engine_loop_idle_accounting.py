@@ -75,6 +75,8 @@ class _Engine:
     """
 
     _report_backlog = False
+    _idle_when_blocked = False
+    _dp_group_hidden_work = False
 
     def __init__(self, schedule, interval_steps=INTERVAL_STEPS):
         self._schedule = list(schedule)
@@ -91,6 +93,9 @@ class _Engine:
             heartbeat_throughput=lambda now: None,
             is_finished=lambda: self._state is IDLE,
             prefill_delayer=None,
+            block_manager=SimpleNamespace(
+                complete_previous_checkpoint_batch=lambda: None
+            ),
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
             close_kv_connector=lambda: None,
@@ -129,7 +134,7 @@ class _Engine:
     def _report_held_kv_work(self):
         pass
 
-    def _sync_dp_state(self, local_unfinished, shutdown, offloaded):
+    def _sync_dp_state(self, local_unfinished, shutdown, offloaded, hidden=False):
         # Mirrors the real `local_unfinished`: STALLED has requests, so
         # the rank reports unfinished even though no forward will run.
         return (

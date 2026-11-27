@@ -54,6 +54,14 @@ def _flag_env(name: str, default: str = "0") -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
+def _optional_flag_env(name: str) -> bool | None:
+    """Unset or empty reads as None (the caller picks the default); a set value
+    is read as by `_flag_env`."""
+    if os.getenv(name, "").strip() == "":
+        return None
+    return _flag_env(name)
+
+
 def _preload_mode() -> str:
     """ATOM_PRELOAD: "off", "server" (1: take the weights from a weight cache
     daemon) or "daemon" (be one)."""
@@ -289,6 +297,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inheriting their parent's owner.
     "ATOM_DP_SESSION_AFFINITY": lambda: (
         os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
+    ),
+    # DP engine loop: a rank votes "unfinished" only when a scheduling pass
+    # could produce a batch (`Scheduler.has_forward_work`). Finished requests
+    # awaiting their KV send (`deferred_free_blocks`), tier loads and lookups
+    # in flight then leave the group idle-polling instead of running DP dummy
+    # forwards back to back, which a new arrival had to wait out. None when
+    # unset: the engine then turns it on only on a P/D prefill instance
+    # (`kv_producer`) and leaves it off on an aggregated server and a decode
+    # instance (`engine_core.dp_idle_when_blocked`); an explicit 0/1 is used
+    # as is, on any role. Needs ATOM_ENABLE_PREFILL_DELAYER=0: the delayer is
+    # on by default with DP > 1 and turns this off (warning only when it was
+    # set explicitly). DP=1 never reads it (no DP group to vote with).
+    "ATOM_DP_IDLE_WHEN_BLOCKED": lambda: _optional_flag_env(
+        "ATOM_DP_IDLE_WHEN_BLOCKED"
     ),
     # --- DP prefill cost balancing (DP attention with more than one rank) ---
     # Under DP attention every rank prefills in the same lockstep step and the
