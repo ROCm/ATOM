@@ -67,8 +67,10 @@ pub struct AtomBridgeRuntime {
     pub served_model_name: String,
     /// `--default-chat-template-kwargs`: under every chat request's own.
     pub(crate) default_chat_template_kwargs: Map<String, Value>,
-    /// The model's chat template is Python's to render (`TokenBridge.renders_chat`).
-    pub(crate) renders_chat: bool,
+    /// The bridge checks a chat's tool calls against the grammar the OpenAI
+    /// server would hold them to (`TokenBridge.checks_tool_call_grammar`),
+    /// and so takes the chat's body.
+    pub(crate) checks_tool_call_grammar: bool,
     /// Every id that ends the model's output (`TokenBridge.end_token_ids`).
     pub(crate) end_token_ids: Vec<u32>,
 }
@@ -84,7 +86,9 @@ impl AtomBridgeRuntime {
         let sink = bridge.getattr("sink")?;
         let sink: PyRef<'_, py_bridge::StepSink> = sink.extract()?;
         let registry = Arc::clone(&sink.registry);
-        let renders_chat = bridge.getattr("renders_chat")?.extract::<bool>()?;
+        let checks_tool_call_grammar = bridge
+            .getattr("checks_tool_call_grammar")?
+            .extract::<bool>()?;
         let end_token_ids = bridge.getattr("end_token_ids")?.extract::<Vec<u32>>()?;
         let default_chat_template_kwargs = match default_chat_template_kwargs {
             None | Some("") => Map::new(),
@@ -99,7 +103,7 @@ impl AtomBridgeRuntime {
             registry,
             served_model_name,
             default_chat_template_kwargs,
-            renders_chat,
+            checks_tool_call_grammar,
             end_token_ids,
         })
     }
@@ -129,13 +133,14 @@ pub(crate) struct RequestExtras {
     /// checks.
     pub dp_session_id: Option<String>,
     pub dp_parent_session_id: Option<String>,
-    /// The encoding `TokenBridge.render_chat` kept for this prompt, which
-    /// `submit` hands to preprocessing so the prompt is hashed once.
-    pub prompt_handle: Option<u64>,
-    /// A chat's body as the client sent it, where Python renders the prompt:
-    /// the typed request drops fields its template reads (a system message's
-    /// `tools`, a tool message's `name`) and normalizes others (`tool_choice`).
+    /// A chat's body as the client sent it, for a model that renders with an
+    /// encoder of its own (`chat_render`): the typed request drops fields the
+    /// encoder reads (`thinking`, a system message's `tools`, a tool message's
+    /// `name`) and normalizes others (`tool_choice`).
     pub chat_body: Option<Arc<Map<String, Value>>>,
+    /// The chat's body as JSON, for `TokenBridge.submit` to check its tool
+    /// calls against the grammar (`checks_tool_call_grammar`).
+    pub chat_json: Option<String>,
 }
 
 /// The session headers, in the OpenAI server's order of preference.
@@ -280,6 +285,19 @@ impl AtomBridgeRouter {
         Some(self.runtime.served_model_name.clone())
     }
 
+    /// The served model renders its chats with an encoder of its own, which
+    /// reads them as sent (`chat_render`).
+    fn renders_with_encoder(&self) -> bool {
+        self.app_context
+            .chat_controls_of(&self.runtime.served_model_name)
+            .is_some()
+    }
+
+    /// A chat's body as sent is read: by an encoder, or by `submit`'s tool-call check.
+    fn keeps_chat_body(&self) -> bool {
+        self.renders_with_encoder() || self.runtime.checks_tool_call_grammar
+    }
+
     async fn call_bridge(&self, method: &'static str) -> PyResult<bool> {
         let bridge = Arc::clone(&self.runtime.bridge);
         tokio::task::spawn_blocking(move || {
@@ -357,7 +375,7 @@ impl RouterTrait for AtomBridgeRouter {
         request: InferenceEnvelope,
         _app: &Arc<AppContext>,
     ) -> Response {
-        let extras = match RequestExtras::read(&request, self.runtime.renders_chat) {
+        let extras = match RequestExtras::read(&request, self.keeps_chat_body()) {
             Ok(extras) => extras,
             Err(response) => return response,
         };
@@ -453,34 +471,24 @@ impl RouterTrait for AtomBridgeRouter {
         // reads it; "required" holds the output to the tool-call channel
         // instead, where the format has one.
         let mut extras = RequestExtras::current();
-        // ATOM renders the prompt from the request as the client sent it,
-        // tool_choice included (Kimi-K3's template reads it).
-        // A chat reaching here without its body (not through `route_inference`)
-        // is rendered from the typed request.
+        // The chat as the client sent it, tool_choice included (K3's template
+        // reads it), before the rewrite below. A chat reaching here without
+        // its body (not through `route_inference`) is read from the typed one.
         let chat_body = extras.chat_body.take().or_else(|| {
-            if !self.runtime.renders_chat {
+            if !self.keeps_chat_body() {
                 return None;
             }
             let typed = serde_json::to_value(&body).ok()?;
             typed.as_object().cloned().map(Arc::new)
         });
-        let rendered = if let Some(chat_body) = chat_body {
-            match py_bridge::render_chat(
-                &self.runtime.bridge,
-                &chat_body,
-                body.chat_template_kwargs.as_ref(),
-            )
-            .await
-            {
-                Ok((rendered, handle)) => {
-                    extras.prompt_handle = handle;
-                    Some(rendered)
-                }
-                Err(response) => return response,
-            }
-        } else {
-            None
-        };
+        // Every chat goes to `submit`'s check, whose `request_tools` also reads
+        // the tools a message declares (K3's dynamic tools).
+        if self.runtime.checks_tool_call_grammar {
+            extras.chat_json = chat_body
+                .as_deref()
+                .map(|chat| Value::Object(chat.clone()).to_string());
+        }
+        let sent = chat_body.filter(|_| self.renders_with_encoder());
         extras.tool_choice_required = matches!(
             body.tool_choice,
             Some(ToolChoice::Value(ToolChoiceValue::Required))
@@ -500,7 +508,7 @@ impl RouterTrait for AtomBridgeRouter {
             headers.cloned(),
             self.model_id(),
             Arc::clone(&self.app_context),
-            rendered,
+            sent,
         );
         REQUEST_EXTRAS.scope(extras, pipeline).await
     }
@@ -566,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_python_rendered_chat_keeps_the_fields_its_typed_body_drops() {
+    async fn an_encoder_rendered_chat_keeps_the_fields_its_typed_body_drops() {
         let pool = crate::core::prepare_pool::PreparePoolRuntime::new(
             crate::config::RouterConfig::default()
                 .resolved_prepare_pool()

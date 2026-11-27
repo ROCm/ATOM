@@ -395,6 +395,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn kv_storage_deadline_ms(mut self, ms: u64) -> Self {
+        self.config.kv_storage_deadline_ms = ms;
+        self
+    }
+
+    pub fn kv_storage_weight(mut self, weight: f64) -> Self {
+        self.config.kv_storage_weight = weight;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;

@@ -340,6 +340,12 @@ class LLMEngine:
         )
         return [resp.get("result", {}) for resp in responses]
 
+    def set_offload_lookups(self, enabled: bool) -> list[dict[str, Any]]:
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "set_offload_lookups", enabled=enabled
+        )
+        return [resp.get("result", {}) for resp in responses]
+
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")
 

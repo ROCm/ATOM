@@ -3,7 +3,6 @@
 # Copyright (c) 2024-2025 ATOM Project Contributors
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from aiter import topk_select
@@ -179,17 +178,14 @@ class VocabParallelEmbedding(nn.Module):
             )
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         else:
-            y = F.embedding(x, self.weight)
+            # The masked lookup too, over the whole table: a speculative step
+            # can leave the -1 truncation sentinel in `input_ids`, and a raw
+            # F.embedding hands it to index_select, whose bounds assert takes
+            # the rank down (a Kimi-K3 DP8EP8 decode, attention TP1, DSpark).
+            # Only a draft slot can carry it, and verify rejects that draft: an
+            # anchor is the last emitted token or a committed id, never the -1.
+            y = replicated_embedding(x, self.weight)
         return y
-        # if self.tp_size > 1:
-        #     mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)
-        #     # mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-        #     x = mask * (x - self.vocab_start_idx)
-        # y = F.embedding(x, self.weight)
-        # if self.tp_size > 1:
-        #     y.masked_fill_(~mask.unsqueeze(1), 0)
-        #     y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
-        # return y
 
 
 class ReplicatedEmbedding(nn.Module):

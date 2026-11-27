@@ -880,6 +880,21 @@ def _forward_cpu_groups():
     )
 
 
+def _any_greedy(batch: ScheduledBatch, all_greedy: bool) -> bool:
+    """Whether any scheduled request samples greedily, read on the CPU.
+
+    The sampler's greedy-row correction (an argmax over the vocabulary and a
+    select) only changes greedy rows; with none in the batch it is skipped.
+    Read off the batch's requested temperatures (``prepare_sample`` clamps a
+    copy of them) with the sampler's own threshold, so a request the sampler
+    treats as greedy always counts.
+    """
+    if all_greedy:
+        return True
+    temperatures = batch.temperatures[: batch.total_seqs_num]
+    return bool((temperatures <= SAMPLER_EPS).any())
+
+
 class ModelRunner:
     # The verify head (`_bind_verify_head`), None where the logits are the
     # head output; whether this step deferred the previous verify's status
@@ -3746,6 +3761,7 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         verified, logits = lm_head_output
+        any_greedy = _any_greedy(batch, all_greedy)
         # Keep probability payloads available on every participating rank.
         need_logprobs = batch.any_logprobs
         logprob_snapshot = None
@@ -3775,6 +3791,7 @@ class ModelRunner:
                 top_ps,
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
+                any_greedy=any_greedy,
             )
             # Prefill has zero bonus/rejection counts, in the same contiguous
             # layout as verification. Slice before reshaping to avoid row gaps.
@@ -3825,6 +3842,7 @@ class ModelRunner:
                     temperatures,
                     top_ks,
                     top_ps,
+                    any_greedy=any_greedy,
                 )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
@@ -3835,6 +3853,7 @@ class ModelRunner:
                 top_ps=top_ps,
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
+                any_greedy=any_greedy,
             )
             sampled_tokens, spec_status = self.rejection_sampler.forward(
                 spec_decode_metadata,
@@ -5575,7 +5594,14 @@ class RapidServeModelRunner(ModelRunner):
             # path returns token ids only and computes no logprobs, so nothing
             # reads the unmasked row.
             apply_required_channel(self, batch, logits)
-            sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
+            sampled = self.sampler(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                any_greedy=_any_greedy(batch, all_greedy),
+            )
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.

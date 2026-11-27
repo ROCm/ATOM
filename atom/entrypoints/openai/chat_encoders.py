@@ -360,13 +360,13 @@ def template_needs_tool_call_argument_strings(
 
     Arguments are parsed into a mapping by default because most templates
     iterate them; DeepSeek-R1/V3's concatenates them as a string and raises
-    ``TypeError`` on a mapping, failing every turn after a tool call.
+    ``TypeError`` on a mapping, failing every turn after a tool call, and
+    DeepSeek-V3.2's / V4's encoders read the string too.
     """
-    # Custom encoders are model-scoped Python with their own message preparation,
-    # not Jinja; their argument handling stays theirs (DeepSeek-V4.1's takes the
-    # mapping).
+    # Custom encoders are model-scoped Python, not Jinja: their adapter says
+    # (DeepSeek-V3.2's and V4's take the string, V4.1's either form).
     if custom_encoder is not None:
-        return False
+        return custom_encoder.preserve_tool_call_arguments
 
     def renders(arguments: Any) -> bool:
         call = {"name": "get_weather", "arguments": arguments}
