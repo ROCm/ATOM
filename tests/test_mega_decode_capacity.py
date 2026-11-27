@@ -157,6 +157,7 @@ def runtime(monkeypatch):
         experts=384,
         mtpr=LARGE_CAPACITY,
         layer=None,
+        **kwargs,
     ):
         state.manager.rank = rank
         state.manager.world_size = world
@@ -173,7 +174,7 @@ def runtime(monkeypatch):
             experts=experts,
             topk=6,
             mtpr=mtpr,
-            swiglu_limit=0.0,
+            **{"swiglu_limit": 0.0, **kwargs},
         )
 
     # Target layers, then the draft model's: both are built before any forward.
@@ -678,3 +679,42 @@ def test_fused_route_query_covers_every_instance_built(
     assert not holds_fused or fused
     if num_cu == 256:
         assert holds_fused is fused
+
+
+def test_without_model_settings_the_build_is_upstreams(runtime):
+    runtime.run(_context(64))
+
+    assert runtime.instances
+    for instance in runtime.instances.values():
+        assert instance.kwargs["act"] == "silu"
+        # An aiter before combine_wire takes the build unchanged.
+        assert "combine_wire" not in instance.kwargs
+
+
+def test_cache_key_separates_activations_limits_and_wires(runtime):
+    builds = [
+        ("silu", 7.0, "auto"),
+        ("swigluoai", 7.0, "auto"),
+        ("swigluoai", 10.0, "auto"),
+        ("swigluoai", 7.0, "bf16"),
+    ]
+    for act, limit, wire in builds * 2:
+        runtime.run(
+            _context(64),
+            world=4,
+            experts=128,
+            act=act,
+            swiglu_limit=limit,
+            combine_wire=wire,
+        )
+
+    # One instance per (act, limit, wire), each built once and reused after.
+    assert len(_built(runtime)) == len(builds)
+    assert sorted(
+        (
+            m.kwargs["act"],
+            m.kwargs["swiglu_limit"],
+            m.kwargs.get("combine_wire", "auto"),
+        )
+        for m in mega._MEGA_CACHE.values()
+    ) == sorted(builds)

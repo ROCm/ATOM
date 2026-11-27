@@ -148,6 +148,12 @@ def mega_swiglu_limit(layer) -> float:
     return float(getattr(layer, "swiglu_limit", 0.0))
 
 
+def mega_combine_wire(layer) -> str:
+    """The combine wire a Mega instance for ``layer`` is built with: ``"bf16"``
+    where the model sets it on its experts, else ``"auto"`` (each route's own)."""
+    return getattr(layer, "mega_combine_wire", "auto")
+
+
 def mega_builds_fused_route(
     *,
     world_size: int,
@@ -273,15 +279,18 @@ def get_or_build_mega_moe(
     quant,
     mtpr,
     swiglu_limit,
+    act="silu",
+    combine_wire="auto",
     w1,
     w1_scale,
     w2,
     w2_scale,
 ):
-    # swiglu_limit belongs in the key: aiter bakes the clamp into the GEMM1
-    # kernel at trace time (gemm_util.py `if self._swiglu_limit <= 0`), so two
-    # layers with different limits cannot share one instance. Without it in the
-    # key they would silently reuse whichever limit was built first -- wrong
+    # act, swiglu_limit and combine_wire belong in the key: aiter bakes the
+    # activation and its clamp into the GEMM1 kernel at trace time (gemm_util.py
+    # `if self._swiglu_limit <= 0`) and the wire into the routes it builds, so
+    # two layers that differ in any cannot share one instance. Without them in
+    # the key they would silently reuse whichever was built first -- wrong
     # numerics, no error.
     key = (
         rank,
@@ -293,6 +302,8 @@ def get_or_build_mega_moe(
         quant,
         mtpr,
         swiglu_limit,
+        act,
+        combine_wire,
     )
     m = _MEGA_CACHE.get(key)
     if m is None:
@@ -322,17 +333,24 @@ def get_or_build_mega_moe(
                 w2_scale=w2_scale,
                 max_tok_per_rank=mtpr,
                 swiglu_limit=swiglu_limit,
+                act=act,
                 routed=True,
                 large_m_state_slots=_mega_layer_slots(),
+                # Passed only when set: an aiter before combine_wire has "auto" only.
+                **({} if combine_wire == "auto" else {"combine_wire": combine_wire}),
             )
         _check_layer_slots(m)
         _MEGA_CACHE[key] = m
         if rank == 0:
             logger.info(
-                "[MEGA-CAPACITY] built capacity=%d, ep=%d, experts/rank=%d",
+                "[MEGA-CAPACITY] built capacity=%d, ep=%d, experts/rank=%d, "
+                "quant=%s, act=%s, combine_wire=%s",
                 mtpr,
                 world_size,
                 experts // world_size,
+                quant,
+                act,
+                combine_wire,
             )
 
     # Bind this layer's weights on EVERY call, not only on build: the cache key
@@ -364,6 +382,8 @@ def run_mega_moe(
     topk: int,
     mtpr: int,
     swiglu_limit: float,
+    act: str = "silu",
+    combine_wire: str = "auto",
     quant: str = "a8w4",
 ) -> torch.Tensor:
     """Replace EP experts with MegaMoEV2. x: [tokens, model_dim] bf16 (this rank's
@@ -397,6 +417,8 @@ def run_mega_moe(
         "topk": topk,
         "quant": quant,
         "swiglu_limit": float(swiglu_limit),
+        "act": act,
+        "combine_wire": combine_wire,
         "w1": layer._mega_w1,
         "w1_scale": layer._mega_w1_scale,
         "w2": layer._mega_w2,
@@ -536,9 +558,10 @@ class MegaFusedExperts:
             raise NotImplementedError(
                 "mega does not support apply_router_weight_on_input=True"
             )
-        if activation is not None and activation != ActivationType.Silu:
+        acts = {ActivationType.Silu: "silu", ActivationType.Swiglu: "swigluoai"}
+        if activation is not None and activation not in acts:
             raise NotImplementedError(
-                f"mega hardcodes SwiGLU; got activation={activation}"
+                f"mega runs SiLU or SwiGLU-OAI gating; got activation={activation}"
             )
         # w1/w2 are the emptied AITER staging buffers -- mega reads layer._mega_*.
         # expert_map is intentionally unused: Mega consumes backend dispatch ids,
@@ -567,5 +590,7 @@ class MegaFusedExperts:
             # token count; request count alone is insufficient under MTP.
             mtpr=self._mtpr,
             swiglu_limit=mega_swiglu_limit(self._layer),
+            act=acts.get(activation, "silu"),
+            combine_wire=mega_combine_wire(self._layer),
             quant=self._quant,
         )

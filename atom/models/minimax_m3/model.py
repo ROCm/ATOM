@@ -344,6 +344,10 @@ class MiniMaxM3MoE(nn.Module):
             # padded intermediate avoids backend pad-skip precision issues.
             self.experts.quant_method.intermediate_pad = 0
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        # Under moe_backend=mega: combine in bf16, and run MegaMoE only on the
+        # steps where the standard MXFP4 method would quantize activations too.
+        self.experts.mega_combine_wire = "bf16"
+        self.experts.mega_quantized_steps_only = True
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
