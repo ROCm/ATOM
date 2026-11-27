@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import wraps
@@ -1432,6 +1433,15 @@ class ExpertLoadMonitor:
         self._num_physical = num_physical
         self._device = device
 
+    def reset_window(self) -> None:
+        """Drop every committed pass, so the next window holds only load
+        recorded from now on (EPLB arming: learn from traffic after the arm
+        point only). The buffers keep their addresses (CUDA graphs)."""
+        if self._expert_load_window is not None:
+            self._expert_load_window.zero_()
+        self._slot = 0
+        self._filled = 0
+
     def initialize_for_metadata(self, meta: ExpertLocationMetadata) -> None:
         """Preallocate fixed-address load tensors for all EPLB layers."""
         self.initialize(
@@ -1688,6 +1698,13 @@ class EPLBManager:
         ), "eplb_rebalance_balancedness_agg must be one of {'min','mean'}"
         # 0 = rebalance for the life of the process.
         self.max_rebalances = max(0, envs.ATOM_EPLB_MAX_REBALANCES)
+        # Optional arm point: with ATOM_EPLB_ARM_FILE set, the schedule does not
+        # advance (and the load window is dropped) until that file exists on
+        # every rank of the migration group. Lets an operator keep startup,
+        # warm-up and rail-probe traffic out of the placement and learn only
+        # from the real traffic that follows (e.g. P of a P/D deployment).
+        self.arm_file = envs.ATOM_EPLB_ARM_FILE
+        self._armed = not self.arm_file
         self._rebalancing_stopped = False
         self._gen = self._entrypoint()
         self._rebalance_count = 0
@@ -2129,7 +2146,49 @@ class EPLBManager:
         if not has_prefill:
             # Pure-decode step across the migration group: do not advance.
             return
+        if not self._armed and not self._arm_if_ready():
+            return
         next(self._gen)
+
+    @property
+    def armed(self) -> bool:
+        return self._armed
+
+    def _arm_if_ready(self) -> bool:
+        """Arm once ATOM_EPLB_ARM_FILE exists on every migration-group rank.
+
+        Called only on a group-uniform has-prefill step (never inside a decode
+        CUDA-graph capture), on every rank in lockstep, so the MIN reduction
+        matches. On arming, the load recorded so far is dropped: the first
+        window holds only post-arm traffic, and the schedule starts counting
+        (first rebalance interval//4 prefill steps later).
+        """
+        present = 1 if os.path.exists(self.arm_file) else 0
+        group = self._migration_group
+        if (
+            group is not None
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group) > 1
+        ):
+            flag = torch.tensor(
+                [present], device=self.monitor._device or "cuda", dtype=torch.int32
+            )
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MIN, group=group
+            )
+            present = int(flag.item())
+        if not present:
+            return False
+        self._armed = True
+        self.monitor.reset_window()
+        logger.info(
+            "EPLB armed by %s: load window reset; first rebalance after %d "
+            "prefill steps",
+            self.arm_file,
+            max(1, self.rebalance_interval // 4),
+        )
+        return True
 
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:
         if not self.enabled:
@@ -2186,6 +2245,13 @@ class EPLBManager:
         """
         physical_load = self.monitor.dump_global_physical_load()
         if physical_load is None:
+            return
+        # The window holds no real (non-dummy pure-prefill) load, e.g. only
+        # warm-up/dummy steps ran: a plan from zeros is meaningless, and with
+        # ATOM_EPLB_MAX_REBALANCES it would freeze that placement for good.
+        # Skip without counting. The load is all-reduced, so every rank agrees.
+        if int(physical_load.sum().item()) == 0:
+            logger.info("EPLB gate @interval: window has no load -> SKIP")
             return
         if not self._need_rebalance(physical_load):
             return

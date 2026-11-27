@@ -1278,6 +1278,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep that expert placement for the rest of the process. Rebalances the
     # balancedness gate skips do not count. 0 (default) = no limit.
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
+    # Path of an arm file. When set, the EPLB schedule waits (and drops the
+    # load recorded so far) until the file exists on every EP rank; the first
+    # rebalance then comes rebalance_interval // 4 prefill steps later. Empty
+    # (default) = armed from the start.
+    "ATOM_EPLB_ARM_FILE": lambda: os.getenv("ATOM_EPLB_ARM_FILE", ""),
     # --- Structured output ---
     # Hold tool calls to the declared schemas when the tool parser declares a
     # grammar for them (Kimi-K3) and the structured-output backend is available.
