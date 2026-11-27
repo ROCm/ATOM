@@ -146,8 +146,9 @@ def test_inline_q_proj_matches_independent_projection(qrep, group):
         _local_q_proj=lambda: project(local_weight, "local"),
     )
 
-    def bmm(a, w, *, YQ):
-        YQ.copy_(torch.bmm(a, w.transpose(1, 2)).to(torch.bfloat16))
+    def bmm(a, w, *, YQ=None):
+        out = torch.bmm(a, w.transpose(1, 2)).to(torch.bfloat16)
+        return out if YQ is None else YQ.copy_(out)
 
     nope, pe = _cpu_mla_method(
         "_q_proj_and_k_up_proj",
@@ -179,9 +180,7 @@ def test_non_supported_rank_falls_back(rank):
 
 @pytest.mark.parametrize("nope", [0, 16, 96, 160])
 def test_non_supported_nope_falls_back(nope):
-    assert not _eligible(
-        **_kup_args(w_k=torch.empty(H, L, nope, dtype=torch.bfloat16))
-    )
+    assert not _eligible(**_kup_args(w_k=torch.empty(H, L, nope, dtype=torch.bfloat16)))
 
 
 def test_lds_over_budget_falls_back():

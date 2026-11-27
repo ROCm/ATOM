@@ -132,11 +132,12 @@ def projection(monkeypatch):
         setattr(layer, name, lambda q, *args, **kwargs: q)
     seen = {}
 
-    def bmm(q, weights, *, YQ):
+    def bmm(q, weights, *, YQ=None):
         seen["YQ"] = YQ
-        YQ.copy_(
-            torch.bmm(q.float(), weights.float().transpose(1, 2)).to(torch.bfloat16)
-        )
+        out = torch.bmm(q.float(), weights.float().transpose(1, 2)).to(torch.bfloat16)
+        if YQ is None:
+            return out
+        YQ.copy_(out)
         return YQ
 
     namespace["_aiter_triton_bf16_bmm"] = bmm
@@ -167,18 +168,16 @@ def test_bf16_k_up_writes_strided_q_nope_slice_without_touching_rope(projection,
 
 
 @pytest.mark.parametrize("noncontiguous", [False, True])
-def test_default_bf16_k_up_allocates_contiguous_output(projection, noncontiguous):
+def test_default_bf16_k_up_keeps_mains_transposed_output(projection, noncontiguous):
     layer, _, seen = projection
     tokens = 5
     x = (torch.arange(tokens * 36) % 7).reshape(tokens, 36).to(torch.bfloat16)
     x = x[:, ::2] if noncontiguous else x[:, :18].contiguous()
     result, rope = layer._q_proj_and_k_up_proj(x)
-    assert result.shape == (tokens, 3, 8)
-    assert result.is_contiguous() and result.dtype == torch.bfloat16
-    assert result.stride() == (24, 8, 1)
-    assert seen["YQ"].shape == (3, tokens, 8)
-    assert seen["YQ"].stride() == (8, 24, 1)
-    assert seen["YQ"].data_ptr() == result.data_ptr()
+    # Main's expression: no YQ, the (N,B,L) result viewed as (B,N,L).
+    assert seen["YQ"] is None
+    assert result.shape == (tokens, 3, 8) and result.dtype == torch.bfloat16
+    assert result.stride() == (8, tokens * 8, 1)
     expected = torch.einsum(
         "tnp,nlp->tnl", x.reshape(tokens, 3, 6)[..., :4].float(), layer.W_K.float()
     )
