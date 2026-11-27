@@ -266,7 +266,8 @@ def _normalize_tool_call_arguments(tool_calls: Any) -> Any:
     templates (Qwen3 qwen3_coder/qwen3_xml, Hermes, etc.) iterate
     ``tool_call.arguments.items()`` and require a mapping. Mirrors how vLLM and
     SGLang deserialize arguments before applying the chat template. Skipped for
-    templates that take the string (Kimi-K3, DeepSeek-R1/V3); see
+    templates that take the string (Kimi-K3, DeepSeek-R1/V3, DeepSeek-V3.2 /
+    V4's encoders); see
     ``preserve_tool_call_arguments`` in ``api_server``.
     """
     if not isinstance(tool_calls, list):
@@ -383,6 +384,8 @@ class ChatCompletionRequest(BaseModel):
     n: int | None = 1
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
+    # Where an encoder-only server keeps this request's image embeddings.
+    ec_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
     # Pre-tokenized prompt (an image decode leg's has its prefill's image
     # placeholders expanded); messages are still required and validated.

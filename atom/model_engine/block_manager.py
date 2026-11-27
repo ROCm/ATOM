@@ -621,6 +621,19 @@ class BlockManager:
     def complete_previous_state_batch(self) -> None:
         """Complete state reads and copies issued by the previous batch."""
         self.state.release_pins()
+        self.complete_previous_checkpoint_batch()
+
+    def complete_previous_checkpoint_batch(self) -> None:
+        """Complete the PAGE checkpoint copies and restores the previous batch
+        issued: stores turn READY (and are nominated for the CPU tier), restore
+        pins and scratch slots go back.
+
+        Idempotent, and safe with no pass in between: every op it completes
+        was begun by `take_checkpoint_ops` for a batch that has since been
+        issued. An idle DP pass, which builds no batch, calls this alone.
+        Not `state.release_pins`: that is a per-pass clock (a pin for the next
+        batch survives exactly one call), so only a scheduling pass may tick it.
+        """
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.complete_previous_batch()
 
@@ -804,7 +817,7 @@ class BlockManager:
         """
         if self.dcp_world_size <= 1:
             return (seq_len + self.block_size - 1) // self.block_size
-        from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+        from atom.distributed.dcp_layout import get_dcp_local_seq_lens
 
         local_len = get_dcp_local_seq_lens(
             np.array([seq_len]),
