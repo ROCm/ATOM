@@ -29,6 +29,7 @@ struct GatedServer {
     worker: Arc<dyn Worker>,
     entered: Arc<Notify>,
     captured: mpsc::UnboundedReceiver<HeaderMap>,
+    bodies: mpsc::UnboundedReceiver<Bytes>,
     response: Option<oneshot::Sender<Response>>,
     task: JoinHandle<()>,
 }
@@ -46,14 +47,17 @@ impl GatedServer {
         let (tx, rx) = oneshot::channel::<Response>();
         let response = Arc::new(Mutex::new(Some(rx)));
         let (capture, captured) = mpsc::unbounded_channel();
+        let (capture_body, bodies) = mpsc::unbounded_channel();
         let app = Router::new().route(
             "/v1/chat/completions",
-            post(move |headers: HeaderMap| {
+            post(move |headers: HeaderMap, body: Bytes| {
                 let notify = notify.clone();
                 let response = response.clone();
                 let capture = capture.clone();
+                let capture_body = capture_body.clone();
                 async move {
                     capture.send(headers).unwrap();
+                    capture_body.send(body).unwrap();
                     let rx = response.lock().await.take().unwrap();
                     notify.notify_one();
                     rx.await
@@ -70,6 +74,7 @@ impl GatedServer {
             worker: Arc::new(worker.build()),
             entered,
             captured,
+            bodies,
             response: Some(tx),
             task,
         }
@@ -1088,4 +1093,263 @@ async fn atom_chunked_decode_admission_rejection_cancels_pending_prefill() {
         assert_eq!(p.worker.load(), 0);
         assert_eq!(d.worker.load(), 0);
     }
+}
+
+/// An early-handoff prefill answer (wire contract v1): NDJSON whose lines the
+/// test writes through the returned sender.
+fn early_prefill_response() -> (
+    Response,
+    mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/x-ndjson")
+        .header("x-atom-pd-early-handoff", "1")
+        .body(Body::from_stream(UnboundedReceiverStream::new(rx)))
+        .unwrap();
+    (response, tx)
+}
+
+/// Line 1, split over two chunks so the relay has to join them.
+fn send_early_handoff_line(tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>) {
+    let line = json!({
+        "id": "cmpl-p",
+        "prompt_token_ids": [5, 6, 7],
+        "kv_transfer_params": {
+            "do_remote_prefill": true, "do_remote_decode": false,
+            "chunked_transfer": true, "transfer_id": "xfer-early", "dp_rank": 3,
+            "remote_host": "10.0.0.1", "remote_handshake_port": 6301,
+        },
+    })
+    .to_string()
+        + "\n";
+    let (head, tail) = line.split_at(line.len() / 2);
+    tx.send(Ok(Bytes::from(head.to_string()))).unwrap();
+    tx.send(Ok(Bytes::from(tail.to_string()))).unwrap();
+}
+
+fn prefill_done_line(ok: bool) -> Bytes {
+    let reason = if ok { json!("length") } else { json!("abort") };
+    Bytes::from(
+        json!({"atom_pd_prefill_done": {"ok": ok, "finish_reason": reason}}).to_string() + "\n",
+    )
+}
+
+async fn decode_request_body(d: &mut GatedServer) -> Value {
+    let body = timeout(Duration::from_secs(5), d.bodies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn atom_early_handoff_starts_decode_and_holds_prefill_load_until_done() {
+    for streaming in [false, true] {
+        let (mut p, mut d) = servers().await;
+        let task = dispatch(DispatchKind::Atom, &p, &d, streaming);
+        p.wait_entered().await;
+        let (response, p_tx) = early_prefill_response();
+        p.respond(response);
+        send_early_handoff_line(&p_tx);
+
+        // D gets its request from line 1, before P reports the prefill's end.
+        d.wait_entered().await;
+        let decode_body = decode_request_body(&mut d).await;
+        let kv = &decode_body["kv_transfer_params"];
+        assert_eq!(kv["remote_dp_rank"], 3, "{decode_body}");
+        assert_eq!(kv["remote_dp_size"], 1, "{decode_body}");
+        assert_eq!(kv["remote_tp_size"], 1, "{decode_body}");
+        assert_eq!(kv["transfer_id"], "xfer-early", "{decode_body}");
+        assert_eq!(kv["chunked_transfer"], true, "{decode_body}");
+        assert_eq!(kv["remote_host"], "10.0.0.1", "{decode_body}");
+        assert_eq!(kv["prompt_token_ids"], json!([5, 6, 7]), "{decode_body}");
+
+        // P is still prefilling: its load stays held while D waits.
+        sleep(Duration::from_millis(150)).await;
+        assert_eq!(p.worker.load(), 1, "P load must be held until line 2");
+        assert_eq!(p.worker.prefill_tokens(), 7, "P still holds the prompt");
+        assert_eq!(d.worker.load(), 1);
+        assert!(!task.is_finished());
+
+        p_tx.send(Ok(prefill_done_line(true))).unwrap();
+        drop(p_tx);
+        wait_load(&p.worker, 0).await;
+        assert_eq!(p.worker.prefill_tokens(), 0);
+        assert_eq!(d.worker.load(), 1);
+
+        d.respond(axum::Json(json!({"choices": ["decoded"]})).into_response());
+        let response = result(task).await;
+        assert_eq!(response.status(), StatusCode::OK, "streaming={streaming}");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"choices": ["decoded"]})
+        );
+        assert_eq!((p.worker.load(), d.worker.load()), (0, 0));
+    }
+}
+
+/// D's headers can come before P's line 2 (a streaming D answers at once).
+/// The response goes out; P stays charged until its line 2, whatever it says.
+#[tokio::test]
+async fn atom_early_handoff_holds_prefill_past_decode_headers_until_line_two() {
+    for ok in [true, false] {
+        let (mut p, mut d) = servers().await;
+        let task = dispatch(DispatchKind::Atom, &p, &d, true);
+        p.wait_entered().await;
+        let (response, p_tx) = early_prefill_response();
+        p.respond(response);
+        send_early_handoff_line(&p_tx);
+        d.wait_entered().await;
+        let (response, d_tx) = stream_response(StatusCode::OK);
+        d.respond(response);
+        let response = result(task).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        sleep(Duration::from_millis(150)).await;
+        assert_eq!(p.worker.load(), 1, "ok={ok}: P load held until line 2");
+        assert_eq!(p.worker.prefill_tokens(), 7);
+        // A failure reported after D's headers is only logged; D ends on its own.
+        p_tx.send(Ok(prefill_done_line(ok))).unwrap();
+        drop(p_tx);
+        wait_load(&p.worker, 0).await;
+        assert_eq!(p.worker.prefill_tokens(), 0);
+        assert_eq!(d.worker.load(), 1);
+        d_tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+            .unwrap();
+        drop(d_tx);
+        response.into_body().collect().await.unwrap();
+        assert_eq!((p.worker.load(), d.worker.load()), (0, 0));
+    }
+}
+
+/// If the client leaves after D's headers, P's load still ends with P's line 2.
+#[tokio::test]
+async fn atom_early_handoff_client_disconnect_keeps_prefill_charged_until_line_two() {
+    let (mut p, mut d) = servers().await;
+    let task = dispatch(DispatchKind::Atom, &p, &d, true);
+    p.wait_entered().await;
+    let (response, p_tx) = early_prefill_response();
+    p.respond(response);
+    send_early_handoff_line(&p_tx);
+    d.wait_entered().await;
+    let (response, _d_tx) = stream_response(StatusCode::OK);
+    d.respond(response);
+    drop(result(task).await);
+    assert_eq!(d.worker.load(), 0);
+    assert_eq!(p.worker.load(), 1);
+    p_tx.send(Ok(prefill_done_line(true))).unwrap();
+    drop(p_tx);
+    wait_load(&p.worker, 0).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EarlyPrefillFailure {
+    NotOk,
+    EofWithoutDone,
+    StreamError,
+}
+
+#[tokio::test]
+async fn atom_early_handoff_prefill_failure_cancels_decode() {
+    for failure in [
+        EarlyPrefillFailure::NotOk,
+        EarlyPrefillFailure::EofWithoutDone,
+        EarlyPrefillFailure::StreamError,
+    ] {
+        let (mut p, mut d) = servers().await;
+        let task = dispatch(DispatchKind::Atom, &p, &d, true);
+        p.wait_entered().await;
+        let (response, p_tx) = early_prefill_response();
+        p.respond(response);
+        send_early_handoff_line(&p_tx);
+        d.wait_entered().await;
+        match failure {
+            EarlyPrefillFailure::NotOk => p_tx.send(Ok(prefill_done_line(false))).unwrap(),
+            EarlyPrefillFailure::EofWithoutDone => {}
+            EarlyPrefillFailure::StreamError => p_tx
+                .send(Err(std::io::Error::other("prefill died")))
+                .unwrap(),
+        }
+        drop(p_tx);
+        let response = result(task).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{failure:?}");
+        assert_eq!(response.headers()["x-mesh-error-code"], "prefill_error");
+        // D's request was dropped before it answered.
+        timeout(
+            Duration::from_secs(5),
+            d.response.as_mut().unwrap().closed(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{failure:?}: decode request was not cancelled"));
+        assert_eq!((p.worker.load(), d.worker.load()), (0, 0), "{failure:?}");
+        assert_eq!(p.worker.prefill_tokens(), 0);
+    }
+}
+
+#[tokio::test]
+async fn atom_early_handoff_decode_error_cancels_running_prefill() {
+    let (mut p, mut d) = servers().await;
+    let task = dispatch(DispatchKind::Atom, &p, &d, false);
+    p.wait_entered().await;
+    let (response, p_tx) = early_prefill_response();
+    p.respond(response);
+    send_early_handoff_line(&p_tx);
+    d.wait_entered().await;
+    d.respond((StatusCode::BAD_REQUEST, "cannot receive a chunked transfer").into_response());
+    let response = result(task).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // P's body is dropped: the relay stops reading it and frees P's load.
+    assert_eq!((p.worker.load(), d.worker.load()), (0, 0));
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&bytes).contains("cannot receive a chunked transfer"));
+    timeout(Duration::from_secs(5), p_tx.closed())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn atom_early_handoff_unparsable_first_line_skips_decode() {
+    let (mut p, d) = servers().await;
+    let task = dispatch(DispatchKind::Atom, &p, &d, false);
+    p.wait_entered().await;
+    let (response, p_tx) = early_prefill_response();
+    p.respond(response);
+    p_tx.send(Ok(Bytes::from_static(b"not json\n"))).unwrap();
+    let response = result(task).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.headers()["x-mesh-error-code"],
+        "prefill_parse_error"
+    );
+    assert_eq!((p.worker.load(), d.worker.load()), (0, 0));
+    assert!(timeout(Duration::from_millis(20), d.entered.notified())
+        .await
+        .is_err());
+}
+
+/// A P asked for an early handoff may still answer the legacy way (an old P,
+/// or one that declined this request): the relay behaves as today.
+#[tokio::test]
+async fn atom_legacy_prefill_answer_without_early_header_keeps_relay() {
+    let (mut p, mut d) = servers().await;
+    let task = dispatch(DispatchKind::Atom, &p, &d, false);
+    p.wait_entered().await;
+    p.respond(
+        axum::Json(json!({"prompt_token_ids": [9, 9],
+            "kv_transfer_params": {"dp_rank": 2, "remote_block_ids": [1]}}))
+        .into_response(),
+    );
+    d.wait_entered().await;
+    // Legacy: P's load is gone as soon as it answered.
+    wait_load(&p.worker, 0).await;
+    let decode_body = decode_request_body(&mut d).await;
+    let kv = &decode_body["kv_transfer_params"];
+    assert_eq!(kv["remote_dp_rank"], 2, "{decode_body}");
+    assert_eq!(kv["remote_block_ids"], json!([1]), "{decode_body}");
+    assert_eq!(kv["prompt_token_ids"], json!([9, 9]), "{decode_body}");
+    d.respond(axum::Json(json!({"choices": []})).into_response());
+    assert_eq!(result(task).await.status(), StatusCode::OK);
+    assert_eq!((p.worker.load(), d.worker.load()), (0, 0));
 }

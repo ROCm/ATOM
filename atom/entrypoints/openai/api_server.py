@@ -53,7 +53,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
 )
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
-from atom.model_engine.request import RequestOutput
+from atom.model_engine.request import PD_EARLY_SCHEDULED_KEY, RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import leaves_media_on_prefill, new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
@@ -924,6 +924,228 @@ async def _submit_engine_requests(seqs):
         raise
 
 
+# ---------------------------------------------------------------------------
+# P/D early handoff, negotiated per request.
+# ---------------------------------------------------------------------------
+# P offers it in /kv_transfer_info (`early_handoff`), D declares what it can
+# receive (`chunked_receive`), and the router asks P for it per request
+# (`kv_transfer_params.early_handoff`) only for a compatible pair. P then
+# answers at DP dispatch: an NDJSON body whose line 1 is the usual prefill
+# response with chunked-transfer metadata and whose line 2 is written when the
+# prefill ends, so the router holds P's load for the whole prefill and sees a
+# P failure after the early answer.
+EARLY_HANDOFF_HEADER = "x-atom-pd-early-handoff"
+EARLY_HANDOFF_DONE_KEY = "atom_pd_prefill_done"
+# Wire version of `early_handoff` / `chunked_receive`.
+EARLY_HANDOFF_VERSION = 1
+_early_handoff_endpoint_cache: list[dict[str, Any] | None] = []
+
+
+def _mooncake_connector(cfg, role: str) -> dict[str, Any] | None:
+    """This server's Mooncake connector config of `role`, or None."""
+    from atom.kv_transfer.disaggregation.pd_producer import iter_connector_configs
+
+    for sub, _ in iter_connector_configs(cfg.kv_transfer_config or {}):
+        if (
+            sub.get("kv_connector") == "mooncake"
+            and sub.get("kv_role", "kv_producer") == role
+        ):
+            return sub
+    return None
+
+
+def _mooncake_producer_endpoint(cfg, sub: dict[str, Any]) -> dict[str, Any]:
+    from atom.utils.network import get_ip
+
+    return producer_endpoint(
+        host=get_ip(),
+        handshake_port=sub.get("handshake_port", DEFAULT_HANDSHAKE_PORT),
+        pp_size=cfg.pipeline_parallel_size,
+        block_size=cfg.kv_cache_block_size,
+        dcp_size=cfg.decode_context_parallel_size,
+    )
+
+
+def _early_handoff_endpoint() -> dict[str, Any] | None:
+    """This P's chunked-transfer endpoint when it can answer early, else None:
+    flag off, no Mooncake producer, multi-node DP, or a core manager that does
+    not learn the DP rank at dispatch (front-end workers, DisaggCoreManager)."""
+    if _early_handoff_endpoint_cache:
+        return _early_handoff_endpoint_cache[0]
+    endpoint = None
+    cfg = engine.config
+    if (
+        envs.ATOM_PD_EARLY_HANDOFF
+        and engine.core_mgr.reports_dp_rank
+        and not cfg.parallel_config.is_multinode_dp
+    ):
+        sub = _mooncake_connector(cfg, "kv_producer")
+        if sub is not None:
+            endpoint = _mooncake_producer_endpoint(cfg, sub)
+            endpoint["tp_size"] = cfg.tensor_parallel_size
+    _early_handoff_endpoint_cache.append(endpoint)
+    return endpoint
+
+
+def chunked_receive_capability(cfg) -> dict[str, Any]:
+    """What this server declares it can receive as a chunked-transfer D.
+
+    `accepts` covers the constraints that depend on D alone; the router adds
+    the one that depends on the pair (D TP a multiple of P TP). The same
+    checks guard the receive itself (`_validate_chunked_receive`), so the
+    declaration and the refusal cannot drift apart.
+    """
+    reason = None
+    if _mooncake_connector(cfg, "kv_consumer") is None:
+        reason = "no Mooncake consumer connector"
+    elif cfg.pipeline_parallel_size != 1:
+        reason = "chunked P/D requires D PP=1"
+    elif _per_request_state_under_dcp(cfg):
+        reason = "chunked P/D does not send per-request state to a DCP decode"
+    return {
+        "version": EARLY_HANDOFF_VERSION,
+        "accepts": reason is None,
+        "tp_size": cfg.tensor_parallel_size,
+        "pp_size": cfg.pipeline_parallel_size,
+        "dcp_size": cfg.decode_context_parallel_size,
+        "reason": reason,
+    }
+
+
+def _per_request_state_under_dcp(cfg) -> bool:
+    # Not checkable at startup on P: P learns D's DCP only from a request.
+    return (
+        cfg.decode_context_parallel_size > 1
+        and cfg.hf_config.model_type
+        in InputOutputProcessor._per_req_cache_model_types()
+    )
+
+
+def _early_handoff_params(
+    kv_transfer_params: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """The chunked copy of a prefill leg whose router asked for early handoff,
+    or None to answer after the prefill as before."""
+    if (
+        not kv_transfer_params
+        or not kv_transfer_params.get("early_handoff")
+        or not kv_transfer_params.get("do_remote_decode")
+        or kv_transfer_params.get("do_remote_prefill")
+        or kv_transfer_params.get("chunked_transfer")
+        or _early_handoff_endpoint() is None
+    ):
+        return None
+    params = {k: v for k, v in kv_transfer_params.items() if k != "early_handoff"}
+    params.update(
+        chunked_transfer=True,
+        transfer_id=f"early-{uuid.uuid4().hex}",
+        # Lets the connector allocate before D's write request when P's pool
+        # provably keeps room (`_may_allocate_before_d`).
+        pd_early_handoff=True,
+    )
+    return params
+
+
+def _early_handoff_answer(transfer_id: str, dp_rank: int) -> dict[str, Any]:
+    """What the router relays to D: P's endpoint, the transfer and the DP rank
+    (`dp_rank`, renamed to `remote_dp_rank` by the relay). No first token: D
+    takes it, and the drafts, from the transfer's final handoff."""
+    return {
+        **_early_handoff_endpoint(),
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "chunked_transfer": True,
+        "transfer_id": transfer_id,
+        "dp_rank": dp_rank,
+    }
+
+
+def _prefill_succeeded(finish_reason: str | None) -> bool:
+    """Whether a finished prefill leg handed its KV off (see
+    `produced_no_handoff`, whose leave reason the engine reports)."""
+    reason = finish_reason or ""
+    return bool(reason) and not (
+        reason == "aborted"
+        or reason.startswith("unschedulable")
+        or reason.endswith("_error")
+    )
+
+
+class _EarlyPrefill:
+    """A prefill whose HTTP answer left at dispatch, until the engine ends it."""
+
+    def __init__(self, seq, token_queue: asyncio.Queue):
+        self.seq = seq
+        self.task = asyncio.create_task(self._drain(token_queue))
+
+    async def _drain(self, token_queue: asyncio.Queue) -> dict[str, Any]:
+        try:
+            while True:
+                item = await token_queue.get()
+                if item.get("finished", False):
+                    reason = item.get("finish_reason")
+                    return {"ok": _prefill_succeeded(reason), "finish_reason": reason}
+        finally:
+            engine.io_processor.requests.pop(self.seq.id, None)
+
+    def abort(self) -> None:
+        """The router gave up on this request: stop computing it."""
+        if not self.task.done():
+            with contextlib.suppress(Exception):
+                engine.core_mgr.abort_request(self.seq.id)
+            self.task.cancel()
+
+
+async def _wait_until_scheduled(seq, token_queue: asyncio.Queue) -> None:
+    """ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE: hold the early answer until P's
+    scheduler reports it scheduled the request (allocated its source, or sent
+    it to wait for D). A request that ends first was never prefilled: fail it
+    like a prefill error. Leaving (the router hung up) aborts it."""
+    finished = False
+    try:
+        while True:
+            item = await token_queue.get()
+            if item.get(PD_EARLY_SCHEDULED_KEY):
+                return
+            if item.get("finished", False):
+                finished = True
+                raise RuntimeError(
+                    "P/D early handoff: prefill ended before it was scheduled "
+                    f"({item.get('finish_reason')})"
+                )
+    except BaseException:
+        if not finished:
+            with contextlib.suppress(Exception):
+                engine.core_mgr.abort_request(seq.id)
+        engine.io_processor.requests.pop(seq.id, None)
+        raise
+
+
+def _nonstream_response(body: dict[str, Any], final_output: dict[str, Any]):
+    """The JSON answer, or for an early-handoff prefill the two-line NDJSON
+    answer (line 1 now, line 2 when the prefill ends)."""
+    early = final_output.get("_early_prefill")
+    if early is None:
+        return JSONResponse(content=body)
+
+    async def lines():
+        try:
+            yield json.dumps(body, separators=(",", ":")) + "\n"
+            done = await asyncio.shield(early.task)
+            yield json.dumps({EARLY_HANDOFF_DONE_KEY: done}) + "\n"
+        except BaseException:
+            # The router disconnected (D failed, or its client left), or the
+            # drain failed: nobody will read this prefill.
+            early.abort()
+            raise
+
+    return StreamingResponse(
+        lines(),
+        media_type="application/x-ndjson",
+        headers={EARLY_HANDOFF_HEADER: "1"},
+    )
+
+
 async def generate_async(
     prompt_or_tokens: str | list[int] | PrefixEncoding,
     sampling_params: SamplingParams,
@@ -971,6 +1193,9 @@ async def generate_async(
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
                 "ts": now,
+                PD_EARLY_SCHEDULED_KEY: bool(
+                    (kv_transfer_output_meta_info or {}).get(PD_EARLY_SCHEDULED_KEY)
+                ),
             },
         )
 
@@ -985,6 +1210,10 @@ async def generate_async(
             dp_parent_session_id=dp_parent_session_id,
         )
 
+    early_params = _early_handoff_params(kv_transfer_params)
+    if early_params is not None:
+        kv_transfer_params = early_params
+
     seq = await loop.run_in_executor(None, do_preprocess)
     try:
         _validate_sequence_context_length(seq, sampling_params)
@@ -992,6 +1221,45 @@ async def generate_async(
         engine.io_processor.requests.pop(seq.id, None)
         raise
     await _submit_engine_requests([seq])
+
+    if early_params is not None:
+        dp_rank = seq.pd_routed_dp_rank
+        if dp_rank is None:
+            # Admission happened somewhere that does not report the rank, so
+            # no D could find this source. Fail closed instead of stranding P.
+            with contextlib.suppress(Exception):
+                engine.core_mgr.abort_request(seq.id)
+            engine.io_processor.requests.pop(seq.id, None)
+            raise RuntimeError("P/D early handoff: DP rank unknown at dispatch")
+        if envs.ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE:
+            await _wait_until_scheduled(seq, token_queue)
+        response = {
+            "text": "",
+            "token_ids": new_token_ids(),
+            "logprobs": [] if sampling_params.logprobs else None,
+            "finish_reason": "length",
+            "num_tokens_input": seq.num_prompt_tokens,
+            "num_tokens_output": 0,
+            "ttft": 0.0,
+            "tpot": 0.0,
+            "latency": time.time() - started_at,
+            "num_cached_tokens": 0,
+            "kv_transfer_output_meta_info": _early_handoff_answer(
+                early_params["transfer_id"], int(dp_rank)
+            ),
+            # Read by `_nonstream_response`; no response builder copies it.
+            "_early_prefill": _EarlyPrefill(seq, token_queue),
+        }
+        if return_token_ids:
+            response["prompt_token_ids"] = list(seq.prompt_token_ids)
+        logger.debug(
+            "PD early handoff: request %s transfer %s answered at DP rank %d",
+            request_id,
+            early_params["transfer_id"],
+            dp_rank,
+        )
+        yield response
+        return
 
     _finished_ok = False
     try:
@@ -1375,13 +1643,9 @@ def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
             status_code=400,
             detail="Chunked P/D requires D PP=1 and D TP a multiple of positive P TP",
         )
-    # Not checkable at startup: chunked transfer is P's setting, and P learns
-    # D's DCP only from a request.
-    if (
-        cfg.decode_context_parallel_size > 1
-        and cfg.hf_config.model_type
-        in InputOutputProcessor._per_req_cache_model_types()
-    ):
+    # D declares the same in /kv_transfer_info (`chunked_receive_capability`),
+    # so a router that negotiates never sends what this refuses.
+    if _per_request_state_under_dcp(cfg):
         raise HTTPException(
             status_code=400,
             detail="Chunked P/D does not send per-request state to a DCP decode",
@@ -2537,6 +2801,7 @@ async def _chat_completions(
             )
 
         # Non-streaming
+        final_output: dict[str, Any] = {}
         if is_multimodal and effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
@@ -2662,7 +2927,7 @@ async def _chat_completions(
                 )
         _log_request_model("response", request_id, resp)
         # Bypass FastAPI's recursive conversion of the token ID list.
-        return JSONResponse(content=resp.model_dump(mode="json"))
+        return _nonstream_response(resp.model_dump(mode="json"), final_output)
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
@@ -2910,6 +3175,7 @@ async def _completions(
             )
 
         # Non-streaming
+        final_output: dict[str, Any] = {}
         if max_tokens == 0:
             output = await _zero_token_output(request, prompt_or_tokens)
             resp = (
@@ -2960,7 +3226,7 @@ async def _completions(
                 request_id, model_name, final_output, echo=echo
             )
         _log_request_model("response", request_id, resp)
-        return JSONResponse(content=resp.model_dump(mode="json"))
+        return _nonstream_response(resp.model_dump(mode="json"), final_output)
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
@@ -3851,23 +4117,16 @@ async def kv_transfer_info():
         "kv_role": kv_role,
         "handshake_port": handshake_port,
     }
-    from atom.kv_transfer.disaggregation.pd_producer import iter_connector_configs
-    from atom.utils.network import get_ip
-
-    for sub, _ in iter_connector_configs(kv_cfg):
-        if (
-            sub.get("kv_connector") == "mooncake"
-            and sub.get("kv_role", "kv_producer") == "kv_producer"
-            and sub.get("enable_chunked_transfer", False)
-        ):
-            info["chunked_transfer"] = producer_endpoint(
-                host=get_ip(),
-                handshake_port=sub.get("handshake_port", DEFAULT_HANDSHAKE_PORT),
-                pp_size=cfg.pipeline_parallel_size,
-                block_size=cfg.kv_cache_block_size,
-                dcp_size=cfg.decode_context_parallel_size,
-            )
-            break
+    producer = _mooncake_connector(cfg, "kv_producer")
+    if producer is not None and producer.get("enable_chunked_transfer", False):
+        # Router-chunked mode: the router dispatches P and D concurrently.
+        info["chunked_transfer"] = _mooncake_producer_endpoint(cfg, producer)
+    elif _early_handoff_endpoint() is not None:
+        # Router-chunked mode takes precedence; otherwise the router may ask
+        # this P for early handoff per request, for a D that can receive it.
+        info["early_handoff"] = {"version": EARLY_HANDOFF_VERSION}
+    if kv_role == "kv_consumer":
+        info["chunked_receive"] = chunked_receive_capability(cfg)
     return info
 
 

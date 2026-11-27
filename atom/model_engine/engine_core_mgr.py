@@ -315,6 +315,9 @@ class CoreManager:
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
     _dispatch_send_lock = Lock()
+    # `add_request` records the dispatched DP rank on each request
+    # (`Sequence.pd_routed_dp_rank`), which ATOM_PD_EARLY_HANDOFF relies on.
+    reports_dp_rank = True
 
     def _init_shared_state(
         self,
@@ -1205,10 +1208,16 @@ class CoreManager:
             # drives the pipeline downstream.
             logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
             self._send_request(0, _add_frame(seqs))
+            # The pipeline is one DP rank; D reaches every stage through
+            # `remote_pp_size` (ATOM_PD_EARLY_HANDOFF).
+            for seq in seqs:
+                seq.pd_routed_dp_rank = 0
         elif self._routable_engine_count == 1:
             # Single routable engine, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
             self._send_request(0, _add_frame(seqs))
+            for seq in seqs:
+                seq.pd_routed_dp_rank = 0
         else:
             self._dispatch_to_dp_ranks(seqs)
 
@@ -1390,6 +1399,10 @@ class CoreManager:
                         with self._lb_lock:
                             self._backlog.note_sent(dp_rank, rank_seqs, self._seq_load)
                         self._flush_credit_updates()
+                # After the frame is pickled: the rank's own copy never sees it.
+                # ATOM_PD_EARLY_HANDOFF answers the router with this rank.
+                for seq in rank_seqs:
+                    seq.pd_routed_dp_rank = dp_rank
                 batch_prefill_tokens = sum(
                     int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
                 )
@@ -2643,6 +2656,9 @@ class DisaggCoreManager(CoreManager):
     The two processes coordinate via direct ZMQ PUSH/PULL sockets whose
     addresses are established here before spawning and passed through config.
     """
+
+    # Its `add_request` fans out to both halves and records no DP rank.
+    reports_dp_rank = False
 
     def _build_prefix_router(self, config) -> None:
         """The prefill/decode pair fans out requests; neither engine is a DP target."""

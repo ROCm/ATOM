@@ -213,6 +213,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # line, so D parses the body while P works. 0 = route answers 404 and the
     # router falls back to its serial relay.
     "ATOM_PD_LATE_KV": lambda: _flag_env("ATOM_PD_LATE_KV", "0"),
+    # Mooncake P/D, prefill (`kv_producer`): offer early handoff in
+    # /kv_transfer_info (`early_handoff`). The router asks for it per request
+    # (`kv_transfer_params.early_handoff`) only when the chosen D declares it
+    # can receive chunked transfer (`chunked_receive`), so no D gets chunked
+    # metadata it cannot serve and no model needs a per-deployment opt-out.
+    # P then answers at DP dispatch with chunked-transfer metadata (line 1 of
+    # an NDJSON body) and ends the body when the prefill ends (line 2), so the
+    # router keeps P's load guard for the whole prefill. Default 0 until the
+    # GPU A/B in the docs row passes; 0 = never offer (legacy relay).
+    "ATOM_PD_EARLY_HANDOFF": lambda: _flag_env("ATOM_PD_EARLY_HANDOFF", "0"),
+    # With early handoff: let an early request allocate its source before D's
+    # write request arrives when P's pool provably keeps room for every
+    # registered chunked request (see MooncakeConnectorScheduler.
+    # _may_allocate_before_d). 0 = always wait for D (the D-first gate); kept
+    # for A/B only.
+    "ATOM_PD_EARLY_HANDOFF_SPECULATIVE": lambda: _flag_env(
+        "ATOM_PD_EARLY_HANDOFF_SPECULATIVE", "1"
+    ),
+    # With early handoff: answer the router (NDJSON line 1) when P's scheduler
+    # first schedules the request -- allocates its source, or sends it to wait
+    # for D -- instead of at DP dispatch. D then binds the request to a DP rank
+    # about one P queue wait later, close to when its KV starts to land, which
+    # balances D's ranks better; TTFT keeps the prefill/transfer overlap.
+    # 0 = answer at DP dispatch.
+    "ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE": lambda: _flag_env(
+        "ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", "0"
+    ),
     # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
     # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
     "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),

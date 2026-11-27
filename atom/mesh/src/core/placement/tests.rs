@@ -1588,7 +1588,10 @@ mod f_atom_adapter {
 
     use serde_json::json;
 
-    use super::super::backend::atom::{AtomAdapter, AtomPairCtx, AtomPrefillInfo};
+    use super::super::backend::atom::{
+        early_handoff_enabled_from, offers_early_handoff, AtomAdapter, AtomChunkedReceive,
+        AtomPairCtx, AtomPrefillInfo,
+    };
     use super::super::backend::BackendAdapter;
     use super::super::test_support::*;
     use super::super::types::AdapterError;
@@ -1610,6 +1613,7 @@ mod f_atom_adapter {
             prefill_url: "http://p:8000".into(),
             prefill_dp_size: 2,
             prefill_dp_rank: Some(1),
+            decode_url: "http://decode:8000".into(),
             decode_dp_rank: None,
             carries_media: false,
         });
@@ -1637,6 +1641,182 @@ mod f_atom_adapter {
             assert!(body["kv_transfer_params"].get("chunked_transfer").is_none());
             assert!(decode.get("kv_transfer_params").is_none());
         }
+    }
+
+    /// P offers early handoff at `prefill_tp`; D answers `receive` (None: an old,
+    /// non-ATOM or unreachable D). Returns P's kv_transfer_params and D's body.
+    fn early_handoff_case(
+        prefill_tp: usize,
+        receive: Option<AtomChunkedReceive>,
+        tweak: impl FnOnce(&mut AtomPrefillInfo),
+        enabled: bool,
+        body: serde_json::Value,
+        media_count: usize,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let prefill = make_prefill_http("http://p:8000", "m", None);
+        let decode = make_decode_http("http://decode:8000", "m");
+        let mut info = AtomPrefillInfo::default();
+        info.tp_sizes.insert(prefill.url().to_string(), prefill_tp);
+        info.early_handoff.insert(prefill.url().to_string());
+        if let Some(receive) = receive {
+            info.decode_receive
+                .insert(decode.url().to_string(), receive);
+        }
+        tweak(&mut info);
+        let adapter = AtomAdapter::new(Arc::new(info)).with_early_handoff(enabled);
+        let ctx = adapter
+            .prepare_pair_with_media(prefill.as_ref(), decode.as_ref(), media_count)
+            .unwrap();
+        let (mut p, mut d) = (body.clone(), body);
+        adapter.inject_prefill_fields(&mut p, &ctx).unwrap();
+        adapter.inject_decode_fields(&mut d, &ctx).unwrap();
+        (p["kv_transfer_params"].clone(), d)
+    }
+
+    fn accepts(tp_size: usize) -> Option<AtomChunkedReceive> {
+        Some(AtomChunkedReceive {
+            accepts: true,
+            tp_size,
+        })
+    }
+
+    #[test]
+    fn atom_early_handoff_decision_matrix() {
+        let text = || json!({"prompt": [1, 2, 3], "max_tokens": 8});
+        let rejecting = Some(AtomChunkedReceive {
+            accepts: false,
+            tp_size: 8,
+        });
+        // (name, P tp, D receive, kill switch on, body, media, expected flag)
+        let cases = [
+            ("offer+accept+tp ok", 4, accepts(8), true, text(), 0, true),
+            ("equal tp", 8, accepts(8), true, text(), 0, true),
+            (
+                "D accepts=false (Kimi-K3 DCP)",
+                4,
+                rejecting,
+                true,
+                text(),
+                0,
+                false,
+            ),
+            ("D tp not a multiple", 4, accepts(6), true, text(), 0, false),
+            ("D tp smaller", 8, accepts(4), true, text(), 0, false),
+            ("D unknown", 4, None, true, text(), 0, false),
+            ("media", 4, accepts(8), true, text(), 1, false),
+            (
+                "n=2",
+                4,
+                accepts(8),
+                true,
+                json!({"prompt": "x", "n": 2}),
+                0,
+                false,
+            ),
+            ("kill switch", 4, accepts(8), false, text(), 0, false),
+        ];
+        for (name, p_tp, receive, enabled, body, media, expected) in cases {
+            let before = body.clone();
+            let (p_kv, d) = early_handoff_case(p_tp, receive, |_| {}, enabled, body, media);
+            let flag = p_kv.get("early_handoff").cloned();
+            if expected {
+                assert_eq!(flag, Some(json!(true)), "{name}: {p_kv}");
+            } else {
+                assert_eq!(flag, None, "{name}: {p_kv}");
+            }
+            assert!(p_kv.get("chunked_transfer").is_none(), "{name}: {p_kv}");
+            // The decode body is untouched; the relay fills it from P's answer.
+            assert_eq!(d, before, "{name}");
+        }
+        // P without the offer, or with an unknown TP: no flag.
+        let (p_kv, _) = early_handoff_case(
+            4,
+            accepts(8),
+            |info| info.early_handoff.clear(),
+            true,
+            text(),
+            0,
+        );
+        assert!(p_kv.get("early_handoff").is_none(), "{p_kv}");
+        let (p_kv, _) =
+            early_handoff_case(4, accepts(8), |info| info.tp_sizes.clear(), true, text(), 0);
+        assert!(p_kv.get("early_handoff").is_none(), "{p_kv}");
+        // A P that also offers router-chunked transfer keeps today's chunked path.
+        let (p_kv, d) = early_handoff_case(
+            4,
+            accepts(8),
+            |info| {
+                info.chunked_transfer
+                    .insert("http://p:8000".into(), json!({"remote_host": "10.0.0.1"}));
+            },
+            true,
+            text(),
+            0,
+        );
+        assert!(p_kv.get("early_handoff").is_none(), "{p_kv}");
+        assert_eq!(p_kv["chunked_transfer"], true);
+        assert_eq!(d["kv_transfer_params"]["chunked_transfer"], true);
+    }
+
+    #[test]
+    fn atom_early_handoff_discovery_parsing() {
+        assert!(early_handoff_enabled_from(None));
+        assert!(early_handoff_enabled_from(Some("1")));
+        assert!(early_handoff_enabled_from(Some("")));
+        assert!(!early_handoff_enabled_from(Some("0")));
+        assert!(!early_handoff_enabled_from(Some(" 0 ")));
+
+        assert!(offers_early_handoff(
+            &json!({"kv_role": "kv_producer", "early_handoff": {"version": 1}})
+        ));
+        for no in [
+            json!({"kv_role": "kv_producer"}),
+            json!({"early_handoff": {"version": 2}}),
+            json!({"early_handoff": true}),
+        ] {
+            assert!(!offers_early_handoff(&no), "{no}");
+        }
+
+        let consumer = |receive: serde_json::Value| {
+            AtomChunkedReceive::from_kv_transfer_info(
+                &json!({"kv_role": "kv_consumer", "tp_size": 8, "chunked_receive": receive}),
+            )
+        };
+        assert_eq!(
+            consumer(json!({"version": 1, "accepts": true, "tp_size": 8,
+                "pp_size": 1, "dcp_size": 1, "reason": null})),
+            accepts(8)
+        );
+        // Kimi-K3 DCP decode: answers, but declines.
+        assert_eq!(
+            consumer(
+                json!({"version": 1, "accepts": false, "tp_size": 8, "pp_size": 1,
+                "dcp_size": 8, "reason": "DCP decode keeps per-request state"})
+            ),
+            Some(AtomChunkedReceive {
+                accepts: false,
+                tp_size: 8
+            })
+        );
+        for bad in [
+            json!(null),
+            json!({"version": 2, "accepts": true, "tp_size": 8}),
+            json!({"version": 1, "tp_size": 8}),
+            json!({"version": 1, "accepts": true}),
+            json!({"version": 1, "accepts": true, "tp_size": 0}),
+        ] {
+            assert_eq!(consumer(bad.clone()), None, "{bad}");
+        }
+        // A producer (or an old D without the key) is never a receiver.
+        assert_eq!(
+            AtomChunkedReceive::from_kv_transfer_info(&json!({"kv_role": "kv_producer",
+                "chunked_receive": {"version": 1, "accepts": true, "tp_size": 8}})),
+            None
+        );
+        assert_eq!(
+            AtomChunkedReceive::from_kv_transfer_info(&json!({"kv_role": "kv_consumer"})),
+            None
+        );
     }
 
     fn atom_info_with(prefill_url: &str, tp_size: usize) -> Arc<AtomPrefillInfo> {
@@ -1776,6 +1956,7 @@ mod f_atom_adapter {
             prefill_url: "http://p:8000".to_string(),
             prefill_dp_size: 4,
             prefill_dp_rank: Some(2),
+            decode_url: "http://decode:8000".into(),
             decode_dp_rank: Some(2),
             carries_media: false,
         });
@@ -1831,6 +2012,7 @@ mod f_atom_adapter {
             prefill_url: "http://unknown:8000".to_string(),
             prefill_dp_size: 1,
             prefill_dp_rank: None,
+            decode_url: "http://decode:8000".into(),
             decode_dp_rank: None,
             carries_media: false,
         });

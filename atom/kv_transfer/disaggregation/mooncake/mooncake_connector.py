@@ -11,6 +11,7 @@ KV cache data from producer (prefill) to consumer (decode) nodes.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import logging
 import math
 import os
@@ -498,9 +499,50 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.block_size = config.kv_cache_block_size
         self.dcp_size = config.decode_context_parallel_size
         self.hash_block_size = self.block_size * self.dcp_size
-        self.enable_chunked_transfer = kv_transfer_config.get(
-            "enable_chunked_transfer", False
+        # Early handoff (ATOM_PD_EARLY_HANDOFF) drives the same chunked
+        # machinery from P's own early answer; the router asks for it per
+        # request, only for a D that declared it can receive chunked transfer.
+        early_handoff = bool(self.is_producer and envs.ATOM_PD_EARLY_HANDOFF)
+        self.enable_chunked_transfer = (
+            kv_transfer_config.get("enable_chunked_transfer", False) or early_handoff
         )
+        # Whether an early request may allocate before D's write request
+        # (`_may_allocate_before_d`). Every use of the state below is behind it.
+        self._speculative = bool(
+            early_handoff and envs.ATOM_PD_EARLY_HANDOFF_SPECULATIVE
+        )
+        self._pool_pages = 0
+        if self._speculative:
+            # The engine sizes the pool before it builds the scheduler.
+            self._pool_pages = int(config.num_kvcache_blocks)
+            if self._pool_pages <= 0:
+                raise ValueError(
+                    "ATOM_PD_EARLY_HANDOFF_SPECULATIVE needs a sized KV pool "
+                    f"(num_kvcache_blocks={self._pool_pages})"
+                )
+        # Early sources allocated before D's report, str(request id) -> pages.
+        # Keyed like `_awaiting_send`: `send_finished` may name either form.
+        self._spec_pins: dict[str, int] = {}
+        # Early sources allocated before D's report, str(request id) -> the
+        # sequence, so a failed report (the worker retired the transfer: D was
+        # told it failed) stops the prefill instead of computing for nobody.
+        self._early_sources: dict[str, Sequence] = {}
+        # Request ids whose early source the scheduler must abort
+        # (`take_sources_to_abort`).
+        self._sources_to_abort: list[ReqId] = []
+        # ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE: P answers the router when it first
+        # schedules an early request (allocates it, or finds it must wait for
+        # D) rather than at DP dispatch. The engine drains these request ids
+        # after each schedule (`take_early_answers`).
+        self._answer_at_schedule = bool(
+            early_handoff and envs.ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE
+        )
+        self._early_answers: list[ReqId] = []
+        self._answered: set[ReqId] = set()
+        # Max-heap of the registered, not yet allocated chunked requests
+        # (`_chunked_waiting`), as (-prompt pages, id); stale entries are
+        # dropped lazily when they reach the top.
+        self._waiting_pages: list[tuple[int, Any]] = []
         self._chunked_receiving: dict[ReqId, Sequence] = {}
         self._chunked_admission_timeout_s = float(
             kv_transfer_config.get("chunked_admission_timeout_s", 300)
@@ -685,8 +727,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             self._reqs_need_save[seq.id] = previous_save
         if not already_claimed:
             self._awaiting_send.discard(str(seq.id))
+            self._unpin(seq.id)
+            self._early_sources.pop(str(seq.id), None)
         if previous_waiting is not None:
             self._chunked_waiting[seq.id] = previous_waiting
+            self._note_waiting(seq)
         if was_ready:
             self._chunked_ready.add(seq.id)
 
@@ -702,9 +747,22 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                     seq.id in self._chunked_ready,
                 ),
             )
+        d_reported = seq.id in self._chunked_ready
         self._chunked_waiting.pop(seq.id, None)
         self._chunked_ready.discard(seq.id)
         params = seq.kv_transfer_params or {}
+        if (
+            self._speculative
+            and params.get("pd_early_handoff")
+            and not d_reported
+            and str(seq.id) not in self._awaiting_send
+        ):
+            # Allocated before D's report: its pages wait on D until D reaches
+            # P or the source is released.
+            self._spec_pins[str(seq.id)] = len(seq.block_table)
+            self._early_sources[str(seq.id)] = seq
+        if self.is_producer and params.get("pd_early_handoff"):
+            self._answer_early(seq)
         if params.get("chunked_transfer") and (
             self.is_producer or params.get("do_remote_prefill")
         ):
@@ -800,6 +858,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             aborted = produced_no_handoff(seq)
             self._chunked_waiting.pop(seq.id, None)
             self._chunked_ready.discard(seq.id)
+            self._early_sources.pop(str(seq.id), None)
+            self._answered.discard(seq.id)
+            if aborted:
+                # Its cancellation is queued below. A finished source keeps
+                # its pin until D reaches P or the worker reports it safe.
+                self._unpin(seq.id)
             params["prefill_aborted"] = aborted
             if not aborted:
                 drafts = getattr(seq, "spec_token_ids", None)
@@ -900,6 +964,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
+        self._unpin(req_id)
+        self._early_sources.pop(str(req_id), None)
 
     def abort_send(self, seq: Sequence) -> None:
         # request_finished queued cancellation; only the aggregated
@@ -928,10 +994,124 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 now + self._chunked_admission_timeout_s,
             )
             self._pending_chunked_admissions[seq.id] = params["transfer_id"]
+            self._note_waiting(seq)
         _, deadline = self._chunked_waiting[seq.id]
         if self._expire_chunked_admission(seq, deadline, now):
             return False
-        return seq.id in self._chunked_ready
+        if seq.id in self._chunked_ready:
+            return True
+        if not params.get("pd_early_handoff"):
+            return False
+        if self._may_allocate_before_d(seq):
+            return True
+        # It waits for D (the gate), so D must learn of it now: answering only
+        # once it is scheduled would wait on itself.
+        self._answer_early(seq)
+        return False
+
+    # ------------------------------------------------- answering at schedule
+    #
+    # With ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE, P answers the router (NDJSON
+    # line 1) when it first schedules an early request instead of at DP
+    # dispatch, so D binds the request to a DP rank about one P queue wait
+    # later, close to when its KV starts to land. "Scheduled" is the first of:
+    # its source is allocated (`update_state_after_alloc`), or the admission
+    # rule sends it to the gate (`admission_ready`), where it waits for D's
+    # write request and so must be answered. A request that only queues behind
+    # P's own capacity holds nothing D waits on, so delaying its answer cannot
+    # form a cycle; the rule's premise (D reserves only requests already
+    # registered here) still holds, since registration happens in `add`.
+
+    def _answer_early(self, seq: Sequence) -> None:
+        if self._answer_at_schedule and seq.id not in self._answered:
+            self._answered.add(seq.id)
+            self._early_answers.append(seq.id)
+
+    def take_early_answers(self) -> list[ReqId]:
+        """Request ids to answer now; the engine sends each its frontend's
+        `pd_early_scheduled` event."""
+        answers, self._early_answers = self._early_answers, []
+        return answers
+
+    def take_sources_to_abort(self) -> list[ReqId]:
+        """Early sources whose transfer the worker retired: the scheduler
+        aborts them (`Scheduler.abort_request`), and their cancellation then
+        retires the send claim (`pd_source_safe`)."""
+        aborts, self._sources_to_abort = self._sources_to_abort, []
+        return aborts
+
+    # ---------------------------------------------- allocation before D's report
+    #
+    # An early request is registered like a gated one (the worker reports D's
+    # arrival, and a write request that arrives while P queues is not expired),
+    # but it may allocate its source before D reserved its pages, so P's
+    # prefill overlaps the router->D->P hop. Such a source waits on D. The
+    # danger is a cycle: P's pool full of sources waiting on D while D's pool
+    # holds reservations for requests P has no room for.
+    #
+    # Rule: allocate before D only if, afterwards, the pages pinned that way
+    # still leave room in P's pool for the largest other registered chunked
+    # request:  pinned + pages(seq) + max_{r registered, r != seq} pages(r)
+    # <= pool. Why that suffices: D learns of a request only from P's early
+    # answer, and P answers only after it dispatched the request to this rank,
+    # so every request D can hold pages for against this rank is already
+    # registered here (or allocated, and then it progresses). Sources D has
+    # reserved (and every non-P/D allocation) finish and free on their own, so
+    # P's pool eventually holds only pins, and the room above admits whatever
+    # D reserved. Past the rule the request waits for D (the gate), so P falls
+    # back to D's order exactly when D falls behind. Remaining gap: a larger
+    # request registered after the pins were taken, which D reserves ahead of
+    # a pinned one while every D page waits on P; the worker's lookup timeout
+    # (PREFILL_LOOKUP_TIMEOUT) then cancels the oldest pinned source and D
+    # aborts that request.
+
+    def _prompt_pages(self, seq: Sequence) -> int:
+        return -(-seq.num_prompt_tokens // (self.block_size * self.dcp_size))
+
+    def _note_waiting(self, seq: Sequence) -> None:
+        if not self._speculative:
+            return
+        heapq.heappush(self._waiting_pages, (-self._prompt_pages(seq), id(seq), seq.id))
+        # Keep the lazy heap bounded by the live set.
+        if len(self._waiting_pages) > 2 * len(self._chunked_waiting) + 64:
+            self._waiting_pages = [
+                (-self._prompt_pages(s), id(s), s.id)
+                for s, _ in self._chunked_waiting.values()
+            ]
+            heapq.heapify(self._waiting_pages)
+
+    def _largest_waiting_pages(self, exclude: Sequence) -> int:
+        """Prompt pages of the largest registered, unallocated chunked request
+        other than `exclude`."""
+        heap = self._waiting_pages
+        held = []
+        try:
+            while heap:
+                _, _, req_id = heap[0]
+                if req_id not in self._chunked_waiting:
+                    heapq.heappop(heap)
+                elif req_id == exclude.id:
+                    held.append(heapq.heappop(heap))
+                else:
+                    return -heap[0][0]
+            return 0
+        finally:
+            for entry in held:
+                heapq.heappush(heap, entry)
+
+    def _unpin(self, req_id) -> None:
+        if self._speculative:
+            self._spec_pins.pop(str(req_id), None)
+
+    def _may_allocate_before_d(self, seq: Sequence) -> bool:
+        if not self._speculative:
+            return False
+        need = (
+            sum(self._spec_pins.values())
+            + self._prompt_pages(seq)
+            + self._largest_waiting_pages(seq)
+        )
+        return need <= self._pool_pages
 
     def _expire_chunked_admission(
         self, seq: Sequence, deadline: float, now: float
@@ -957,6 +1137,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 output.finished_sending.add(completion.operation_id)
                 output.connector_completions.discard(completion)
             elif completion.channel == "pd_admission_ready":
+                # A source allocated before this report no longer waits on D
+                # (or, on failure, was already retired by the worker).
+                self._unpin(completion.operation_id)
+                source = self._early_sources.pop(str(completion.operation_id), None)
                 pending = self._chunked_waiting.get(completion.operation_id)
                 if pending is not None:
                     seq, _ = pending
@@ -965,6 +1149,18 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                     else:
                         # Retired IDs cannot authorize a new source allocation.
                         seq.status = SequenceStatus.ABORTED
+                elif source is not None and not completion.succeeded:
+                    # Allocated before D, and the worker has since retired the
+                    # transfer (e.g. it expired D's write request as an orphan
+                    # while this rank was stuck in a long step): D was told it
+                    # failed and no reader will come. Stop the prefill; its
+                    # cancellation retires the send claim.
+                    logger.warning(
+                        "P/D early source %s: transfer retired before D "
+                        "reached P; aborting its prefill",
+                        source.id,
+                    )
+                    self._sources_to_abort.append(source.id)
                 output.connector_completions.discard(completion)
         for req_id, handoff in output.received_handoffs.items():
             seq = self._chunked_receiving.pop(req_id, None)
@@ -1928,7 +2124,28 @@ class MooncakeConnector(KVConnectorBase):
                 if meta.chunked_transfer:
                     with self._completed_prefills_cv:
                         if meta.transfer_id in self._retired_chunked_transfers:
-                            continue  # Never resurrect an already released source.
+                            # Never resurrect an already released source. No
+                            # reader can acquire a retired transfer, so the
+                            # scheduler's send claim on this allocation is
+                            # moot. Report it safe when nothing has (retired
+                            # as an orphaned write request or a refused
+                            # admission), and for every new allocation (a
+                            # save without a handoff or cancellation: the
+                            # scheduler took a fresh claim), or the finished
+                            # request keeps its blocks and state slot forever.
+                            # A repeat is dropped by the quorum's tombstones.
+                            allocation = (
+                                meta.prefill_handoff is None
+                                and not meta.prefill_aborted
+                            )
+                            if allocation or not (
+                                self._retired_chunked_transfers[meta.transfer_id]
+                            ):
+                                self._retired_chunked_transfers[meta.transfer_id] = True
+                                self._admission_results.add(
+                                    ConnectorCompletion("pd_source_safe", req_id, True)
+                                )
+                            continue
                         state = self._chunked_prefills.get(meta.transfer_id)
                         if meta.prefill_aborted and (
                             (state is not None and state.req_id != req_id)
@@ -2387,7 +2604,7 @@ class MooncakeConnector(KVConnectorBase):
                         ConnectorCompletion("pd_source_safe", state.req_id, True)
                     )
                     state.cancel()  # Late holders of the object cannot acquire it.
-                    self._retire_chunked_transfer(transfer_id)
+                    self._retire_chunked_transfer(transfer_id, source_reported=True)
                     del self._chunked_prefills[transfer_id]
                     self._chunked_local_ids.pop(state.req_id, None)
                     self._kv_cache_ready_events.pop(state.req_id, None)
@@ -2866,9 +3083,16 @@ class MooncakeConnector(KVConnectorBase):
             expected_readers=num_consumers_per_producer_rank,
         )
 
-    def _retire_chunked_transfer(self, transfer_id: TransferId) -> None:
-        """Remember a terminal ID without retaining blocks; caller holds the lock."""
-        self._retired_chunked_transfers[transfer_id] = None
+    def _retire_chunked_transfer(
+        self, transfer_id: TransferId, source_reported: bool = False
+    ) -> None:
+        """Remember a terminal ID without retaining blocks; caller holds the lock.
+
+        The value records whether `pd_source_safe` was reported for it, so a
+        later save of a retired transfer can still release its claim."""
+        self._retired_chunked_transfers[transfer_id] = bool(
+            source_reported or self._retired_chunked_transfers.get(transfer_id)
+        )
         if len(self._retired_chunked_transfers) > CHUNKED_RETIRED_TRANSFER_LIMIT:
             self._retired_chunked_transfers.popitem(last=False)
 

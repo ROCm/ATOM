@@ -241,10 +241,18 @@ class TestTheEndpointUsesIt:
     """
 
     def test_every_streaming_response_is_wrapped(self):
+        import inspect
         import pathlib
         import re
 
-        src = pathlib.Path(api_server.__file__).read_text()
+        src = pathlib.Path(api_server.__file__).read_text(encoding="utf-8")
+        # Not a client stream: P's two-line answer to the P/D router, which
+        # waits for the whole prefill between its lines by design (the router
+        # holds P's load until the second). The watchdog would read that wait
+        # as silence.
+        p_to_router = inspect.getsource(api_server._nonstream_response)
+        assert p_to_router.count("StreamingResponse(") == 1
+        src = src.replace(p_to_router, "")
         total = src.count("StreamingResponse(")
         wrapped = len(re.findall(r"StreamingResponse\(\s*_client_stream\(", src))
         assert total == 4, f"the endpoint count changed ({total}); check this test"
