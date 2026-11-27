@@ -97,6 +97,17 @@ Q_LDS_WORDS = HEAD_TILE * Q_LDS_ROW
 # aligned for the vector access), then [K step][lane] their codes
 Q_LDS_CODES = HEAD_DIM // 128 * 64 * 8
 SCORE_Q_WORDS = Q_LDS_CODES + HEAD_DIM // 128 * 64
+# The layer kernel's window rows of this step as KVT's tagged pairs, where it
+# hands them over so (``layer.window_rows_tagged``, ``attn_pre._ring_row_fp8``):
+# a row's FP8 data words a pair each, its group's E8M0 code in the tag's high
+# half. A one-chunk score task's waves 4 .. 7 hold no keys: wave 4 + i polls
+# the step rows of wave i's keys into its own LDS rows (``_poll_step_rows``),
+# a row's data words, then its 4 code words (``_row_codes``' layout) from word
+# KVT_CODES
+KVT_ROW_PAIRS = HEAD_DIM // 4
+KVT_LDS = SCORE_WAVES * SCORE_LDS_WORDS
+KVT_CODES = HEAD_DIM // 4
+assert KVT_CODES + HEAD_DIM // 128 <= SCORE_LDS_ROW
 SLICE = 64  # a merge task's dims: two FP8 quant groups
 SLICES = HEAD_DIM // SLICE
 COLS = 32  # an FP8 quant group's dims
@@ -241,6 +252,51 @@ def await_step_rows(c, meta, last_slot):
         _, _, _, count, _, (n_new, _), sel_slots, _ = meta
         if last_slot >= sel_slots + count - n_new:
             c["k1_poll"]([(c["krdy"], c["lane"] % c["S"], 1)])
+
+
+def _has_step_rows(c, meta, key0):
+    """Whether key slots key0 .. + 16 of a token (``_keys``' ``meta``)
+    hold one of this launch's window rows (``_window_row``: the last
+    ``n_new`` of its ``count``)."""
+    _, _, _, count, _, (n_new, _), sel_slots, _ = meta
+    return (key0 < sel_slots + count) & (key0 + BK > sel_slots + count - n_new)
+
+
+@traced
+def _poll_step_rows(c, meta, key0):
+    """Wave 4 + i (no keys of its own) lands the step rows among wave
+    i's key slots key0 .. + 16 in its own LDS rows: lane (h, cc) of each
+    pass p polls 16 B (two quads, column chunk cc) of step row 2 p + h, a row
+    the slots do not hold out of range (``Mailbox.poll_need``); the words to
+    the row of its slot, and from the tags' codes (chunk cc: group cc // 2)
+    the row's code words, word j of groups 4 j .. 4 j + 3 (chunks 8 j, + 2,
+    + 4, + 6: lanes xor 2, then xor 4). ``_q_shared``'s first barrier hands
+    them to wave i (``_rows_from_lds``)."""
+    lane, wave, s = c["lane"], c["wave"], c["S"]
+    _, _, _, count, _, (n_new, last), sel_slots, _ = meta
+    h, cc = lane // 32, lane % 32
+    area = c["att"]["score_kv"] + wave * SCORE_LDS_WORDS
+    specs, needs, rows = [], [], []
+    for p in range_constexpr(-(-s // 2)):
+        k = 2 * p + h
+        # step row k: window slot count - 1 - (last - k) (``_window_row``)
+        r = sel_slots + count - 1 - (last - k) - key0
+        need = (k < s) & (k <= last) & (k > last - n_new) & (r >= 0) & (r < BK)
+        q0 = fx.min(k, s - 1) * (KVT_ROW_PAIRS // 2) + 2 * cc
+        specs += [(c["kvt"], Quad(q0 + e), 2) for e in range(2)]
+        needs += [need, need]
+        rows.append((need, r))
+    got = c["k1_poll_need"](specs, needs, coded=True)
+    for p in range_constexpr(len(rows)):
+        need, r = rows[p]
+        (w0, code), (w1, _) = got[2 * p], got[2 * p + 1]
+        pair = code | (xshfl(code, 2) << 8)
+        cw = pair | (xshfl(pair, 4) << 16)
+        if need:
+            at = area + r * SCORE_LDS_ROW
+            fx.ptr_store(fx.Vector.from_elements([*w0, *w1], fx.Int32), at + 4 * cc)
+            if cc % 8 == 0:
+                fx.ptr_store(cw, at + (KVT_CODES + cc // 8))
 
 
 @traced
@@ -412,15 +468,25 @@ def _row_codes(c, slot):
     return fx.Vector(fx.ptr_load(ptr, result_type=fx.Vector.make_type(4, fx.Int32)))
 
 
-def _rows_from_lds(c, kv, codes=None):
+def _rows_from_lds(c, kv, codes=None, slot=None):
     """The split's key operands back from LDS ``kv``, lane l row l % 16: a BF16
     row's bytes (ch 32 + 8 (l // 16)) 2, a K chunk ch each; an FP8 row's
     scaled-MFMA A operand (``_q_step``'s layout) -- K step st's 16 bytes from
     128 st + 16 (l // 16), then 16 from 64 past them -- with ``codes``
-    (``_row_codes``)."""
+    (``_row_codes``). ``slot``: the lane's row, one of this launch's
+    (< 0) read with its codes where wave 4 + i landed it (``_poll_step_rows``)."""
     lane = c["lane"]
     g = lane // 16
     row = kv + (lane % BK) * SCORE_LDS_ROW
+    if const_expr(slot is not None):
+        step = slot < 0
+        row = row + step.select(fx.Int32(KVT_LDS), fx.Int32(0))
+        landed = fx.Vector(
+            fx.ptr_load(row + KVT_CODES, result_type=fx.Vector.make_type(4, fx.Int32))
+        )
+        codes = fx.Vector.from_elements(
+            [step.select(landed[e], codes[e]) for e in range(4)], fx.Int32
+        )
     if const_expr(not c["kv_fp8"]):
         return [
             fx.Vector(
@@ -624,6 +690,10 @@ def stage_attn_score(c, task, per):
     # ``query_fp8``): quantized before a selection's wait, which it does not
     # depend on; without one, under the rows' DMA
     q_first = c["kv_fp8"] and "irdy" in c
+    kvt_rows = c.get("kvt_rows", False)
+    # KVT's step rows: a one-chunk task's waves 4 .. 7 free to poll them, the
+    # FP8 pool's q quantized meanwhile
+    assert not kvt_rows or (per == 1 and c["kv_fp8"] and not q_first)
     if const_expr(q_first):
         q8 = _q_shared(c, (t * d.heads + qh) * (HEAD_DIM // 2), g)
     # the token's metadata (the host's) before the selection's wait: after it
@@ -646,10 +716,16 @@ def stage_attn_score(c, task, per):
         )
         codes = fx.Vector.filled(4, 0, fx.Int32)
         if keyed:
-            await_step_rows(c, meta, key0 + BK - 1)
+            if const_expr(not kvt_rows):
+                await_step_rows(c, meta, key0 + BK - 1)
             _rows_to_lds(c, a["pool"], slot, kv)
             if const_expr(c["kv_fp8"]):
                 codes = _row_codes(c, slot)
+        if const_expr(kvt_rows):
+            # wave 4 + i: the step rows of wave i's keys, from KVT
+            key_i = chunk * CH + (wave - SCORE_WAVES) * BK
+            if (wave >= SCORE_WAVES) & _has_step_rows(c, meta, key_i):
+                _poll_step_rows(c, meta, key_i)
         if const_expr(q_first):
             qws = q8
         elif const_expr(c["kv_fp8"]):
@@ -661,7 +737,10 @@ def stage_attn_score(c, task, per):
             qws = _q_words(a, d, t, qh, g)
         if keyed:
             rocdl.s_waitcnt(vmcnt=0)
-            kws = _rows_from_lds(c, kv, codes)
+            if const_expr(kvt_rows):
+                kws = _rows_from_lds(c, kv, codes, slot)
+            else:
+                kws = _rows_from_lds(c, kv, codes)
             # the whole read-back before the first MFMA (left to the scheduler,
             # each MFMA waited on its own chunk's read)
             rocdl.s_waitcnt(lgkmcnt=0)
@@ -750,10 +829,12 @@ def stage_attn_merge(c, t, tile, hg, sl, mh):
             dtype=T.f32,
         )
     )  # fmt: skip
-    if const_expr(c["fused"]):
+    kvt_rows = c.get("kvt_rows", False)
+    if const_expr(c["fused"] and not kvt_rows):
         # the task loads its last key, always one of this launch's window rows
         # (``_new_rows`` >= 1): the poll unconditional, in flight with the
-        # metadata's loads instead of after them (``await_step_rows``)
+        # metadata's loads instead of after them (``await_step_rows``). By
+        # KVT the rows' words are polled themselves (``_merge_step_values``)
         c["k1_poll"]([(c["krdy"], c["lane"] % c["S"], 1)])
     _merge_values_land(c, _merge_values(c, t, meta, sl, sels), meta, sl)
     _merge_softmax(c, t, tile, hg, mh, meta, sink * fx.Float32(LOG2E))
@@ -792,6 +873,38 @@ def _merge_values(c, t, meta, sl, sels):
             row = _window_row(a, t, meta, slot - sel_slots)
         code = _ld_codes(c, row, col // COLS) if c["kv_fp8"] else None
         out.append((_ld_row4(c, a["pool"], row, col), code))
+    if const_expr(c.get("kvt_rows", False)):
+        out = _merge_step_values(c, meta, col, out)
+    return out
+
+
+def _merge_step_values(c, meta, col, out):
+    """``_merge_values``' window slots that hold this launch's rows
+    (``_window_row``: -1 - j, ``kvrow`` not written) from KVT's pairs: a
+    slot's 8 columns a quad, polled once every pass's loads are out (a slot
+    of the pool's out of range, ``Mailbox.poll_need``); the code from its
+    tag, at its byte of ``_ld_codes``' word (``_merge_values_land``'s
+    shift)."""
+    tid, s = c["tid"], c["S"]
+    _, _, _, count, _, (n_new, last), sel_slots, _ = meta
+    w0 = aplan.window_chunk(sel_slots)
+    specs, needs = [], []
+    for i in range_constexpr(w0, CHUNKS):
+        w = i * 64 + tid // 8 - sel_slots
+        needs.append((w >= count - n_new) & (w < count))
+        j = fx.min(fx.max(last - (count - 1 - w), 0), s - 1)
+        specs.append((c["kvt"], Quad(j * (KVT_ROW_PAIRS // 2) + col // 8), 2))
+    got = c["k1_poll_need"](specs, needs, coded=True)
+    shift = 8 * (col // COLS % 4)
+    for k in range_constexpr(len(specs)):
+        (words, code), need = got[k], needs[k]
+        loaded, lcode = out[w0 + k]
+        out[w0 + k] = (
+            fx.Vector.from_elements(
+                [need.select(words[e], loaded[e]) for e in range(2)], fx.Int32
+            ),
+            need.select(code << shift, lcode),
+        )
     return out
 
 

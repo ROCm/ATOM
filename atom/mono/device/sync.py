@@ -422,6 +422,58 @@ class Mailbox:
             e += 2 * n
         return outs
 
+    def poll_need(self, specs, need, coded=False):
+        """``poll`` of one batch whose spec k is waited on only where
+        ``need[k]`` (a lane's traced bool): an unneeded spec loads out of
+        range (``STALE_WORD`` past a bounded record: no memory access, zeros)
+        and never holds the batch. ``coded``: pairs ``put_coded`` stored,
+        stale while a tag's low half is not this launch's tag -> each spec's
+        values and its first pair's code (``poll_coded``'s)."""
+        assert 0 < len(specs) <= POLL_MAX and len(need) == len(specs)
+        cms = [_SCOPE_CM[a.space] for a, _, _ in specs]
+        bases = _batch_values(specs, "poll")
+        srs = [rsrc(b, STALE_RECORDS) for b in bases]
+        at = [
+            need[k].select(_pair_word(a, i, n), fx.Int32(STALE_WORD))
+            for k, (a, i, n) in enumerate(specs)
+        ]
+        ends = list(itertools.accumulate(2 * n for _, _, n in specs))
+        tag = self.tag
+
+        def load_all():
+            words = []
+            for k in range_constexpr(len(specs)):
+                n = specs[k][2]
+                w = fx.Vector(
+                    bo.buffer_load(
+                        srs[k], at[k], vec_width=2 * n, dtype=T.i32,
+                        cache_modifier=cms[k],
+                    )
+                )  # fmt: skip
+                words += [w[e] for e in range(2 * n)]
+            return fx.Vector.from_elements(words, fx.Int32)
+
+        def pending(v):
+            bad = None
+            for k in range_constexpr(len(specs)):
+                e0 = ends[k] - 2 * specs[k][2]
+                acc = v[e0 + 1] ^ tag
+                for q in range_constexpr(1, specs[k][2]):
+                    acc = acc | (v[e0 + 2 * q + 1] ^ tag)
+                stale = ((acc & 0xFFFF) if coded else acc) != 0
+                bad = need[k] & stale if bad is None else bad | (need[k] & stale)
+            return bad
+
+        first = specs[0][1]
+        first = first.q * 2 if isinstance(first, Quad) else first
+        v = self.spin(specs[0][0], first, load_all, pending)
+        outs = []
+        for k in range_constexpr(len(specs)):
+            e0 = ends[k] - 2 * specs[k][2]
+            words = [v[e0 + 2 * q] for q in range(specs[k][2])]
+            outs.append((words, v[e0 + 1] >> 16) if coded else words)
+        return outs
+
     def spin(self, a, index, load_all, pending, between=None):
         """Re-issue ``load_all`` until ``pending`` clears: a wait in region
         ``a`` (its word ``index``), bounded and named in a debug build's

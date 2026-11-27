@@ -18,6 +18,10 @@ tag, each written to memory no XCD caches (the scratch, and the runner's
            not from the pool, whose lines another XCD's L2 may hold from an
            earlier step
     QP     ``q`` itself as tagged pairs (wq_b -> the scores: one hop, no load after)
+    KVT    in place of KRDY and ``kvrow`` where ``window_rows_tagged``: a token's
+           window row as tagged pairs, a data word each, its group's E8M0 code
+           in the tag's high half, polled by the scores and the merge
+           themselves (no drain, no flag, no load after)
     IQDONE an index layer's (token, head) query, scale and head weight written
            (``index_query``'s quantization -> K2a's scorer: ``iq`` / ``iq_scale``
            / ``iw``, the runner's uncached buffers)
@@ -66,7 +70,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     shard_seam,
 )
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
-from atom.models.deepseek_v41.mono.kernels.dims import HIDDEN, Dims
+from atom.models.deepseek_v41.mono.kernels.dims import HIDDEN, KV_DIM, Dims
 from atom.models.deepseek_v41.mono.kernels.index_query import IQ_GROUPS, iq_in_place
 from atom.models.deepseek_v41.mono.kernels.layer_post import (
     LayerPostBuild,
@@ -107,6 +111,31 @@ TL_STAGES = k1.TL_STAGES + k2.TL_STAGES
 TL_POINTS = 1 + len(TL_STAGES)
 # K1's hand-over flags (module docstring), in its scratch past K2's regions
 FLAGS = ("sdone", "gdone", "krdy", "qp", "iqdone")
+# the window row as tagged pairs (KVT, past the flags): kv_norm puts a
+# row's data words, its group's E8M0 code in each tag's high half
+# (``Mailbox.put_coded``), and the score's idle waves and the merge poll the
+# words themselves -- no ``kvrow`` copy, no publish drain, no KRDY. TP8, an FP8
+# pool, no indexer / compressor / token parallel / DSpark block, at most
+# KVT_MAX_TOKENS rows (the score's poll a lane: two quads a pair of rows); any
+# other build keeps KRDY
+KVT_MAX_TOKENS = 8
+
+
+def window_rows_tagged(key) -> bool:
+    """Whether ``key`` (a ``LayerBuild``) hands the window rows over by KVT."""
+    pre, post = key.pre, key.post
+    return (
+        pre.tp == 8
+        and pre.kv_fp8
+        and not pre.feeds_index
+        and not pre.tok_par
+        and not key.compress_ratio
+        and pre.tokens <= KVT_MAX_TOKENS
+        and post.attn_sel
+        and not post.block_rows
+    )
+
+
 # A layer's code meets its I-cache misses in an L2 a whole layer of weights has
 # streamed through since its last launch: an index layer's (296 .. 308 KB at
 # s6, once a step) and, as measured, an ordinary layer's (~100 KB, launched
@@ -208,6 +237,9 @@ def scratch_layouts(key: LayerBuild) -> tuple[dict, dict]:
     iq_flags = IQ_GROUPS if iq_in_place(s, key.post.index_fp4) else 1
     sizes = (k1.SLICES, s, s, s * heads * k1.HEAD_DIM // 2, s * ip.HEADS * iq_flags)
     pairs = dict(zip(FLAGS, sizes, strict=True))
+    if window_rows_tagged(key):
+        # KVT: a step row's data words, a pair each
+        pairs["kvt"] = s * (KV_DIM // 4)
     if key.compress is not None:
         # CRDY a step row (the one completing a compressed entry), then the
         # compressor's own hand-offs (``compress.scratch_layout``'s regions)
@@ -417,6 +449,10 @@ def build_layer(key: LayerBuild):
         ca["k1_poll"] = mb_1.poll
         for flag in FLAGS:
             ca[flag] = c1[flag]
+        kvt_rows = window_rows_tagged(key)
+        c1["kvt_rows"] = co1["kvt_rows"] = ca["kvt_rows"] = kvt_rows
+        if const_expr(kvt_rows):
+            ca["kvt"], ca["k1_poll_need"] = c1["kvt"], mb_1.poll_need
         if const_expr(comp is not None):
             # the attention reads this launch's new entries from ``kvrow``
             # past their CRDY (``attention._selected_row`` / ``await_selection``)

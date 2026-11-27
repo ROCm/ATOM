@@ -1853,6 +1853,17 @@ def _ring_row_fp8(c, t, tt, mine, rel, row, scaled, code):
     a = c["args"]
     nb = [xshfl(v, 1) for v in scaled]
     word = fp8_pack4(scaled[0], scaled[1], nb[0], nb[1])
+    kvt_rows = c.get("kvt_rows", False)
+    if const_expr(kvt_rows):  # noqa: SIM102
+        # the row for this launch's attention as tagged pairs first
+        # (KVT, K1's tag): a data word a pair, its group's E8M0 code in the
+        # tag's high half (``put_coded``); the score and the merge poll the
+        # words themselves -- no ``kvrow`` copy, no drain, no KRDY
+        if mine:  # noqa: SIM102
+            if tt % 2 == 0:
+                c["put_coded"](
+                    c["kvt"], step_token(c, t) * (KV_DIM // 4) + tt // 2, word, code
+                )
     if mine & (rel >= 0):
         dst = rsrc(a["ring"] + fx.Int64(row) * KV_DIM)
         if tt % 2 == 0:
@@ -1863,7 +1874,7 @@ def _ring_row_fp8(c, t, tt, mine, rel, row, scaled, code):
                 rsrc(a["ring_scale"] + fx.Int64(row) * (KV_DIM // 32)),
                 tt // 16,
             )
-    if const_expr(c["fused"]):  # noqa: SIM102
+    if const_expr(c["fused"] and not kvt_rows):  # noqa: SIM102
         # the layer kernel: the row for this launch's attention too
         # (uncached: its readers on other XCDs), its flag KRDY
         if mine:
@@ -2428,10 +2439,14 @@ def run_attn_pre(
     enter_stage("k1.qkv")
     for t in range(first_task(bid, APART_QN0 if q_apart else QKV0), own_n, BLOCKS):
         stage_q_norm(co, t)
+    # read here, not in the loop's region (a method call on ``co`` there
+    # would make the rewriter carry it as the loop's state)
+    kvt_rows = co.get("kvt_rows", False)
     for t in range(first_task(bid, APART_KVN0 if q_apart else KVN0), own_n, BLOCKS):
         stage_kv_norm(co, t)
-        if const_expr(fused):
-            # ... and its attention this token's window row (``kvrow``)
+        if const_expr(fused and not kvt_rows):
+            # ... and its attention this token's window row (``kvrow``; by
+            # KVT the pairs themselves, put in the stage)
             publish(c["put"], c["krdy"], step_token(co, t), 1, tid == 0)
     if const_expr(key.tok_par):
         # wq_b reads every token's q latent where qkv pushed it
