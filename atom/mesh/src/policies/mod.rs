@@ -17,6 +17,7 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+mod tiers;
 pub mod tree;
 pub(crate) mod utils;
 pub use cache_aware::CacheAwarePolicy;
@@ -27,6 +28,7 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub(crate) use tiers::KvTiers;
 pub use tree::PrefixMatchResult;
 
 pub use crate::kv_tiers::TierWeights;
