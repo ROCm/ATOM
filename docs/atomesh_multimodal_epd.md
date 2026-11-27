@@ -431,9 +431,11 @@ The interface (`atom/ec_transfer/base.py`), apart from the KV connector:
   `rows` and `dtype` at the top, the backend's own fields under its name.
   ATOMesh and the API carry it without reading it, so a second backend
   changes neither.
-- Mooncake (`atom/ec_transfer/mooncake.py`) is the one backend. It imports
-  nothing from `kv_transfer`; it shares HCA selection with the KV
-  connector through the public `atom/utils/mooncake_hca.py`.
+- Mooncake (`atom/ec_transfer/mooncake.py`) is the one backend. Neither it
+  nor the helpers it uses import `kv_transfer`: HCA selection is the public
+  `atom/utils/mooncake_hca.py`, and the PCI topology under it
+  `atom/utils/pci_topology.py`, both shared with the KV connector and the
+  Mooncake Store offload.
 - Basis: vLLM keeps encoder output transfer in its own `ECConnector`
   (`vllm/distributed/ec_transfer/`), with Mooncake as one backend; SGLang
   picks one with `--encoder-transfer-backend`.
@@ -454,7 +456,7 @@ How the Mooncake transfer works:
   `ib_hca_count`, so KV and embeddings register on the same HCAs.
 - Unconfigured, `mooncake_hca.auto_select_ib_device` picks the ACTIVE HCA
   on the PCIe switch of the engine's GPU, found from the GPU's PCI address
-  (`gpu_pci_bdf`, `nic.rail_rdma_device`; main's #3884), whatever the HCAs
+  (`pci_topology.gpu_pci_bdf`, `rail_rdma_device`; main's #3884), whatever the HCAs
   are named. Each rank, and E on its one GPU, registers on its own GPU's
   HCA. Where the topology names no single HCA, the engine refuses to start
   and names `ib_device` and `ATOM_MOONCAKE_IB_DEVICE`.
@@ -516,8 +518,12 @@ changing the handle.
 **D12. E keeps an entry for a lease, guarded by a slot table.**
 *#3411 (pool, slots and reader), #3412 (fallback).*
 
-E's region (`MooncakeEcWriter`) is one registration: a slot table, then the
-pool of rows.
+E's region (`MooncakeEcWriter`) is one registration of the size E chose,
+in whole GiB: a slot table carved from its front, then the pool of rows.
+- There is one slot per 64 KiB of region (`default_slots`): 16384 for
+  1 GiB, a 512 KiB table. An entry holds at least one image's rows,
+  hundreds of KiB, so space runs out before slots, and past a 60 s lease a
+  1 GiB E still takes about 273 requests a second.
 - An entry's rows sit in the pool; its slot holds `(generation, address,
   length, ack)`. Rows never overlap a slot, so a later entry's rows cannot
   forge an earlier entry's generation.
