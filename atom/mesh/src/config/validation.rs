@@ -791,6 +791,7 @@ mod tests {
     fn test_validate_least_load_places_pd_decode_only() {
         let least_load = PolicyConfig::LeastLoad {
             request_token_equivalent: 512,
+            order: Default::default(),
         };
         let regular = RouterConfig::new(
             RoutingMode::Regular {

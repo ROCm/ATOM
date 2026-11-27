@@ -1,12 +1,18 @@
 //! `least_load`: place a request on the worker (`url@rank`) with the lowest
-//! outstanding decode cost.
+//! outstanding decode load.
 //!
-//! The cost is the prompt tokens reserved on that worker plus one request-equivalent
-//! per in-flight request, the same 512-token weight the engine's `least_tokens`
-//! balancer uses. Generated tokens are not counted: ATOM reports `usage` only on a
-//! stream's last frame. The reservation is taken inside the selection, before the
-//! lock is released, so a request still in prefill or waiting on decode is visible
-//! to the next choice.
+//! Two orders ([`LeastLoadOrder`]):
+//! - `tokens` (default): the prompt tokens reserved on that worker plus one
+//!   request-equivalent per in-flight request, the same 512-token weight the engine's
+//!   `least_tokens` balancer uses. With prompts far longer than the weight this evens
+//!   the workers' tokens and leaves their request counts apart.
+//! - `requests`: in-flight requests first, reserved prompt tokens among workers with
+//!   equal counts, as the engine's `least_requests` does. The DP ranks of one engine
+//!   step together, so the rank with the most rows sets every rank's decode step.
+//!
+//! Generated tokens are not counted: ATOM reports `usage` only on a stream's last
+//! frame. The reservation is taken inside the selection, before the lock is released,
+//! so a request still in prefill or waiting on decode is visible to the next choice.
 
 use std::{
     collections::HashMap,
@@ -16,7 +22,10 @@ use std::{
 use async_trait::async_trait;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo};
-use crate::core::{LoadReservation, Worker};
+use crate::{
+    config::LeastLoadOrder,
+    core::{LoadReservation, Worker},
+};
 
 /// Token weight of one in-flight request. Matches `ATOM_DP_LB_REQ_EQUIV` and
 /// [`super::AgenticCost::request_token_equivalent`].
@@ -25,6 +34,7 @@ pub const REQUEST_TOKEN_EQUIVALENT: u64 = 512;
 #[derive(Debug)]
 pub struct LeastLoadPolicy {
     request_token_equivalent: u64,
+    order: LeastLoadOrder,
     state: Mutex<State>,
 }
 
@@ -36,8 +46,13 @@ struct State {
 
 impl LeastLoadPolicy {
     pub fn new(request_token_equivalent: u64) -> Self {
+        Self::with_order(request_token_equivalent, LeastLoadOrder::Tokens)
+    }
+
+    pub fn with_order(request_token_equivalent: u64, order: LeastLoadOrder) -> Self {
         Self {
             request_token_equivalent,
+            order,
             state: Mutex::new(State {
                 next_id: 1,
                 holds: HashMap::new(),
@@ -78,17 +93,24 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
                 .iter()
                 .all(|&idx| workers[idx].decode_untokenized() == 0);
 
-        let mut best: Option<(u128, usize, usize)> = None;
+        // Compared element by element: the first decides, the next ones break its ties.
+        let mut best: Option<(u128, u128, usize)> = None;
         for idx in healthy {
             let worker = &workers[idx];
-            let load = worker.load();
-            let cost = if compare_tokens {
+            let load = worker.load() as u128;
+            let kv_tokens = if compare_tokens {
                 worker.decode_kv_tokens() as u128
-                    + u128::from(self.request_token_equivalent) * load as u128
             } else {
-                load as u128
+                0
             };
-            let rank = (cost, load, idx);
+            let rank = match self.order {
+                LeastLoadOrder::Tokens if compare_tokens => (
+                    kv_tokens + u128::from(self.request_token_equivalent) * load,
+                    load,
+                    idx,
+                ),
+                LeastLoadOrder::Tokens | LeastLoadOrder::Requests => (load, kv_tokens, idx),
+            };
             if best.is_none_or(|current| rank < current) {
                 best = Some(rank);
             }
@@ -244,6 +266,74 @@ mod tests {
         assert_eq!(workers[1].decode_untokenized(), 1);
         drop(hold);
         assert_eq!(workers[1].decode_untokenized(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_requests_order_puts_the_count_before_the_tokens() {
+        // d0 holds one long prompt, d1 three short ones. `tokens` takes d1
+        // (1_000 + 3 * 512 against 400_000 + 512), `requests` takes d0.
+        let prompt = [0u32; 4];
+        for (order, expected) in [(LeastLoadOrder::Tokens, 1), (LeastLoadOrder::Requests, 0)] {
+            let policy = LeastLoadPolicy::with_order(512, order);
+            let workers = vec![worker("http://d0"), worker("http://d1")];
+            seed(&workers[0], 400_000, 1, 0);
+            seed(&workers[1], 1_000, 3, 0);
+            let (idx, decision) = policy
+                .select_with_decision(&workers, &info_with(&prompt))
+                .await;
+            assert_eq!(idx, Some(expected), "{order}");
+            let hold = policy
+                .take_load_reservation(decision.reservation_id.unwrap())
+                .unwrap();
+            // The reservation carries the prompt under either order.
+            assert_eq!(workers[expected].decode_untokenized(), 0);
+            drop(hold);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_requests_order_breaks_a_count_tie_by_tokens() {
+        let policy = LeastLoadPolicy::with_order(512, LeastLoadOrder::Requests);
+        let workers = vec![
+            worker("http://d0"),
+            worker("http://d1"),
+            worker("http://d2"),
+        ];
+        seed(&workers[0], 300_000, 2, 0);
+        seed(&workers[1], 90_000, 2, 0);
+        seed(&workers[2], 10, 3, 0);
+        let prompt = [0u32; 4];
+        let (idx, decision) = policy
+            .select_with_decision(&workers, &info_with(&prompt))
+            .await;
+        assert_eq!(idx, Some(1));
+        drop(policy.take_load_reservation(decision.reservation_id.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn the_requests_order_keeps_counts_within_one() {
+        // Prompts from 1k to 400k tokens, the mix that left `tokens` ten requests
+        // apart: with every request still in flight the counts differ by at most one.
+        let policy = LeastLoadPolicy::with_order(512, LeastLoadOrder::Requests);
+        let workers: Vec<_> = (0..8).map(|i| worker(&format!("http://d{i}"))).collect();
+        let lengths = [1_000usize, 400_000, 20_000, 150_000, 3_000, 250_000, 80_000];
+        let mut holds = Vec::new();
+        for i in 0..100 {
+            let prompt = vec![0u32; lengths[i % lengths.len()]];
+            let (_, decision) = policy
+                .select_with_decision(&workers, &info_with(&prompt))
+                .await;
+            holds.push(
+                policy
+                    .take_load_reservation(decision.reservation_id.unwrap())
+                    .unwrap(),
+            );
+            let loads: Vec<_> = workers.iter().map(|w| w.load()).collect();
+            let spread = loads.iter().max().unwrap() - loads.iter().min().unwrap();
+            assert!(spread <= 1, "after {} requests: {loads:?}", i + 1);
+        }
+        drop(holds);
+        assert!(workers.iter().all(|w| w.load() == 0));
     }
 
     #[tokio::test]

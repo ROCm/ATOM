@@ -53,6 +53,45 @@ impl std::str::FromStr for AtomPdRankMappingPolicy {
     }
 }
 
+/// What `least_load` compares first when it places a decode request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LeastLoadOrder {
+    /// Reserved KV tokens plus one request-equivalent per in-flight request: the
+    /// engine's `least_tokens`. With prompts far longer than the request-equivalent
+    /// this evens the tokens of the workers and leaves their request counts apart.
+    #[default]
+    #[serde(rename = "tokens")]
+    Tokens,
+    /// In-flight requests first, reserved KV tokens among equal counts: the engine's
+    /// `least_requests`. The DP ranks of one engine step together, so the rank with
+    /// the most rows sets every rank's decode step.
+    #[serde(rename = "requests")]
+    Requests,
+}
+
+impl std::fmt::Display for LeastLoadOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tokens => write!(f, "tokens"),
+            Self::Requests => write!(f, "requests"),
+        }
+    }
+}
+
+impl std::str::FromStr for LeastLoadOrder {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "tokens" | "least_tokens" => Ok(Self::Tokens),
+            "requests" | "least_requests" => Ok(Self::Requests),
+            other => Err(format!(
+                "unsupported least_load order: {other} (tokens or requests)"
+            )),
+        }
+    }
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -426,14 +465,18 @@ pub enum PolicyConfig {
         max_tree_size: usize,
     },
 
-    /// Lowest outstanding decode cost at `url@rank`: reserved KV tokens plus
-    /// one request-equivalent per in-flight request.
+    /// Lowest outstanding decode load at `url@rank`. By `order`: reserved KV tokens
+    /// plus one request-equivalent per in-flight request, or in-flight requests
+    /// first and reserved KV tokens among equal counts.
     #[serde(rename = "least_load")]
     LeastLoad {
-        /// Cost of one in-flight request, in tokens. Same default as `agentic`
-        /// and the engine's `ATOM_DP_LB_REQ_EQUIV`.
+        /// Cost of one in-flight request, in tokens, under the `tokens` order. Same
+        /// default as `agentic` and the engine's `ATOM_DP_LB_REQ_EQUIV`.
         #[serde(default = "default_request_token_equivalent")]
         request_token_equivalent: u64,
+        /// What is compared first (default: tokens)
+        #[serde(default)]
+        order: LeastLoadOrder,
     },
 }
 

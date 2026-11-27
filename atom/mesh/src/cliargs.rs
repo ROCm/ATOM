@@ -3,8 +3,8 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use crate::{
     config::{
         AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigError, ConfigResult,
-        HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
-        TokenizerCacheConfig,
+        HealthCheckConfig, LeastLoadOrder, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig,
+        RoutingMode, TokenizerCacheConfig,
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
@@ -267,6 +267,13 @@ pub struct CliArgs {
     /// it equal to the engine's ATOM_DP_LB_REQ_EQUIV
     #[arg(long, default_value_t = 512, help_heading = "Routing Policy")]
     pub agentic_request_token_equivalent: u64,
+
+    /// What least_load compares first: `tokens` (reserved KV tokens plus the
+    /// request-equivalent per in-flight request, the engine's least_tokens) or
+    /// `requests` (in-flight requests, then reserved KV tokens, the engine's
+    /// least_requests: the DP ranks of one decode engine step together)
+    #[arg(long, default_value_t = LeastLoadOrder::Tokens, help_heading = "Routing Policy")]
+    pub least_load_order: LeastLoadOrder,
 
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -616,6 +623,7 @@ impl CliArgs {
             },
             "least_load" => PolicyConfig::LeastLoad {
                 request_token_equivalent: self.agentic_request_token_equivalent,
+                order: self.least_load_order,
             },
             _ => PolicyConfig::RoundRobin,
         }
@@ -1051,6 +1059,39 @@ mod tests {
         let parsed = args.parse_policy(args.prefill_policy.as_deref().unwrap());
         assert_eq!(format!("{parsed:?}"), format!("{expected:?}"));
     }
+
+    #[test]
+    fn cli_gives_least_load_its_order() {
+        let flags = "atomesh --pd-disaggregation --decode-policy least_load";
+        let args = Cli::try_parse_from(flags.split_whitespace())
+            .expect("least_load is a decode policy")
+            .router_args;
+        let parsed = args.parse_policy(args.decode_policy.as_deref().unwrap());
+        assert!(matches!(
+            parsed,
+            PolicyConfig::LeastLoad {
+                order: LeastLoadOrder::Tokens,
+                ..
+            }
+        ));
+
+        let flags = format!("{flags} --least-load-order requests");
+        let args = Cli::try_parse_from(flags.split_whitespace())
+            .expect("requests is an order")
+            .router_args;
+        let parsed = args.parse_policy(args.decode_policy.as_deref().unwrap());
+        assert!(matches!(
+            parsed,
+            PolicyConfig::LeastLoad {
+                order: LeastLoadOrder::Requests,
+                ..
+            }
+        ));
+
+        let flags =
+            "atomesh --pd-disaggregation --decode-policy least_load --least-load-order rows";
+        assert!(Cli::try_parse_from(flags.split_whitespace()).is_err());
+    }
 }
 
 impl Default for CliArgs {
@@ -1072,6 +1113,7 @@ impl Default for CliArgs {
             prefix_token_count: 256,
             prefix_hash_load_factor: 1.25,
             agentic_request_token_equivalent: 512,
+            least_load_order: LeastLoadOrder::Tokens,
             dp_aware: false,
             dp_aware_prefill_only: false,
             kv_events: false,

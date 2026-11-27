@@ -59,7 +59,11 @@ impl PolicyFactory {
             })),
             PolicyConfig::LeastLoad {
                 request_token_equivalent,
-            } => Arc::new(LeastLoadPolicy::new(*request_token_equivalent)),
+                order,
+            } => Arc::new(LeastLoadPolicy::with_order(
+                *request_token_equivalent,
+                *order,
+            )),
         }
     }
 
@@ -192,6 +196,7 @@ mod tests {
                 "least_load",
                 PolicyConfig::LeastLoad {
                     request_token_equivalent: 512,
+                    order: Default::default(),
                 },
             ),
         ];

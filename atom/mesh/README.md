@@ -290,7 +290,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
 | `agentic` | Prefill and regular pools. Lowest prefill cost: queued prefill tokens, plus the prompt tokens the worker's GPU cache does not hold (from `--kv-events`, or a text tree for requests the index cannot match), plus `--agentic-request-token-equivalent` (512) per in-flight request. See [agentic routing](docs/agentic_cost.md) |
-| `least_load` | PD decode only. Lowest outstanding cost at `url@rank`: prompt tokens reserved from selection until the decode response ends, plus `--agentic-request-token-equivalent` (512, shared with `agentic`) per in-flight request. A request with no token count counts as one request and makes the choice compare in-flight counts |
+| `least_load` | PD decode only. Lowest outstanding load at `url@rank`, by `--least-load-order`. `tokens` (default, the engine's `least_tokens`): prompt tokens reserved from selection until the decode response ends, plus `--agentic-request-token-equivalent` (512, shared with `agentic`) per in-flight request; with prompts far longer than that weight it evens the ranks' tokens and leaves their request counts apart. `requests` (the engine's `least_requests`): in-flight requests first, reserved prompt tokens among ranks with equal counts; use it for the DP ranks of one decode engine, which step together, so the rank with the most rows sets every rank's decode step. A request with no token count counts as one request and makes the choice compare in-flight counts |
 
 In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
