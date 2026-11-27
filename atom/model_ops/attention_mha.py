@@ -1744,6 +1744,61 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             return None
         return decode_md, int(sm.max_seq_len)
 
+    def _aq_exchange(self, num_tokens, max_seq_len, device):
+        """The mailbox and output buffers of the full AQ (aiter ``flydsl_aq1``
+        with ``exchange``: _cp_index_topk_decode's candidate exchange inside the
+        AQ1 launch) when it takes this call: the one-launch exchange's mailbox,
+        the NVFP4 page-128 table (one page a block); else None. Every rank takes
+        the same path: it depends on the shape only."""
+        from atom.distributed.indexer_cp import candidate_mailbox
+
+        try:
+            from atom.models.minimax_m3.mono.gfx1250.aq import aq_exchange_supported
+        except ImportError:
+            return None
+        mailbox = candidate_mailbox()
+        if (
+            mailbox is None
+            or not self.kv_nvfp4
+            or not mailbox.fits(num_tokens, self.topk)
+        ):
+            return None
+        emit = self._nvfp4_emit_kwargs()
+        if (
+            not emit["emit_sparse_block_table"]
+            or aq_exchange_supported(
+                self.num_idx_heads,
+                self.indexer_cp_world,
+                self.topk,
+                max_seq_len,
+                num_tokens,
+                mailbox.max_rows,
+                mailbox.MAX_TOPK,
+                emit["emit_pages_per_block"],
+            )
+            is not None
+        ):
+            return None
+        return dict(
+            peers=mailbox.peers,
+            send_calls=mailbox.send_calls,
+            recv_calls=mailbox.recv_calls,
+            timeouts=mailbox.timeouts,
+            max_rows=mailbox.max_rows,
+            slot_keys=mailbox.MAX_TOPK,
+            topk=self.topk,
+            init_blocks=self.init_blocks,
+            local_keep=self.local_blocks,
+            pages_per_block=emit["emit_pages_per_block"],
+            indices=torch.empty(
+                (1, num_tokens, self.topk), dtype=torch.int32, device=device
+            ),
+            sparse_bt=torch.empty(
+                (num_tokens, self.topk), dtype=torch.int32, device=device
+            ),
+            sparse_ctx=torch.empty((num_tokens,), dtype=torch.int32, device=device),
+        )
+
     def _fused_qkv_chain(self, x, x_scale, q, position, k_cache, v_cache, k_scale,
                          v_scale, slot_mapping, index_slot_mapping):  # fmt: skip
         """The QKV GEMM + norm / RoPE + NVFP4 K/V and index inserts in one aiter
@@ -1799,13 +1854,18 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             from atom.models.minimax_m3.mono.gfx1250.aq import flydsl_aq1
 
             decode_md, max_seq_len = aq1
-            blocks = -(-max_seq_len // 128)
-            local = -(-blocks // self.indexer_cp_world)
-            scores = torch.empty(
-                (self.num_idx_heads, num_tokens, local),
-                dtype=torch.float32,
-                device=x.device,
-            )
+            # full AQ: the candidate exchange in the same launch (its selection
+            # replaces the scores)
+            exchange = self._aq_exchange(num_tokens, max_seq_len, x.device)
+            scores = None
+            if exchange is None:
+                blocks = -(-max_seq_len // 128)
+                local = -(-blocks // self.indexer_cp_world)
+                scores = torch.empty(
+                    (self.num_idx_heads, num_tokens, local),
+                    dtype=torch.float32,
+                    device=x.device,
+                )
             flydsl_aq1(
                 x,
                 x_scale.view(torch.float8_e8m0fnu),
@@ -1837,12 +1897,23 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 max_query_len=num_tokens,
                 sm_scale=self.scale,
                 scores=scores,
+                exchange=exchange,
             )
             self._aq1_scores = (
                 index_q.data_ptr(),
                 decode_md.block_table.data_ptr(),
                 decode_md.seq_lens.data_ptr(),
                 scores,
+                None
+                if exchange is None
+                else (
+                    exchange["pages_per_block"],
+                    (
+                        exchange["indices"],
+                        exchange["sparse_bt"],
+                        exchange["sparse_ctx"],
+                    ),
+                ),
             )
             return q_out, index_q
         mxfp8_qkv_norm_rope_nvfp4_insert(
@@ -2561,15 +2632,17 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
         global_blocks = block_table.shape[1]
         aq1, self._aq1_scores = getattr(self, "_aq1_scores", None), None
+        scores = None
         if aq1 is not None and aq1[:3] == (
             index_q.data_ptr(),
             block_table.data_ptr(),
             seq_lens.data_ptr(),
         ):
-            # this layer's QKV chain launch (AQ1) computed the scores already
+            # this layer's QKV chain launch computed the scores already (AQ1),
+            # or ran the whole exchange (full AQ: its selection, this table)
+            if aq1[4] is not None and aq1[4][0] == pages_per_block:
+                return aq1[4][1]
             scores = aq1[3]
-        else:
-            scores = None
         # By block id: this rank's own planes under a sharded index cache,
         # which hold every block it scores (`index_shard.page_view`).
         scores = scores if scores is not None else indexer_context_scores(

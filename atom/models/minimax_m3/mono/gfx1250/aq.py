@@ -4,7 +4,10 @@
 """AQ1: the MiniMax-M3.1 TP4 decode QKV chain + CP index score in one gfx1250 launch
 (kernels/aq_gfx1250.py). Writes exactly what ``mxfp8_qkv_norm_rope_nvfp4_insert``
 followed by ATOM's ``cp_scores_fp4`` write (q, index q, the NVFP4 K / V / index-K
-rows, the fp32 scores [heads, tokens, local]), for one request of ``ql`` rows."""
+rows, the fp32 scores [heads, tokens, local]), for one request of ``ql`` rows.
+With ``exchange=`` (full AQ) the launch also runs ATOM's ``select_exchanged_candidates``
+(the CP top-16 exchange through the candidate mailbox) and writes its indices, sparse
+block table and ctx instead of the scores."""
 
 from __future__ import annotations
 
@@ -21,28 +24,41 @@ LOG2E = 1.4426950409
 # the 8-row decode chain config (rF6 / PFX): tile_m, ns, ks, kw, wm, wn, depth, astage, wcpol
 AQ1_CONFIG = (16, 4, 4, 6, 1, 2, 2, 1, 1)
 N_SCORE = 64  # score workgroups (a multiple of 16)
+N_SCORE_X = 112  # with the exchange: 368 QKV + 112 score + 32 exchange = 512 workgroups, all co-resident
 RING = 4
 MAXIT = 20_000_000
 _SCRATCH: dict = {}
 
 
-def aq1_scratch(device, niq: int, ql: int, n_score: int = N_SCORE):
+# local blocks a CP rank the exchange's score hand-off holds: 1M tokens at 4 ranks (decode graphs are captured at
+# max_model_len, so the launch must take the model's whole context)
+LOCAL_MAX = 2048
+
+
+def aq1_scratch(device, niq: int, ql: int, n_score: int = N_SCORE, xchg: bool = False):
     """Per (device, shape): launch counts [GRID], the index-q hand-off (3 copies, armed 0xff), the index-K flags,
     the timeout counter. Made outside any capture (the eager warm-up call)."""
-    from .kernels.aq import aq1_grid
+    from .kernels.aq import aq1_grid, aq_xchg_wgs
 
-    key = (device.index if device.index is not None else torch.cuda.current_device(), niq, ql, n_score)
+    key = (device.index if device.index is not None else torch.cuda.current_device(), niq, ql, n_score, bool(xchg))
     s = _SCRATCH.get(key)
     if s is None:
-        grid = aq1_grid(niq, n_score)
+        grid = aq1_grid(niq, n_score) + (aq_xchg_wgs(niq, ql) if xchg else 0)
         s = dict(
             cnt=torch.zeros(grid, dtype=torch.int32, device=device),
             q=torch.full((3 * ql * niq * D * 2,), 0xFF, dtype=torch.uint8, device=device),
             flag=torch.zeros(max(ql, 16), dtype=torch.int32, device=device),
             err=torch.zeros(4, dtype=torch.int32, device=device),
+            # exchange mode: the scores [niq, ql, LOCAL_MAX] as data-as-flag words (armed 0xffffffff, re-armed by the
+            # exchange workgroup that reads them)
+            scb=torch.full((niq * ql * LOCAL_MAX if xchg else 1,), -1, dtype=torch.int32, device=device),
         )
         _SCRATCH[key] = s
     return s
+
+
+def ql_ok(ql, ex) -> bool:
+    return ql <= ex["max_rows"] and ex["indices"].shape[-1] == ex["topk"] and ex["sparse_ctx"].numel() == ql
 
 
 def aq1_supported(m, niq, batch, max_query_len, heads_score) -> str | None:
@@ -53,12 +69,27 @@ def aq1_supported(m, niq, batch, max_query_len, heads_score) -> str | None:
     return None
 
 
+def aq_exchange_supported(niq, world, topk, max_seq_len, max_query_len, max_rows, slot_keys, pages_per_block):
+    """None when the full AQ (``exchange=``: the CP candidate exchange in the launch) takes the call: one index head a
+    rank, top-16 of 4 shards, the NVFP4 page-128 table (one page a block), at most LOCAL_MAX local blocks."""
+    if niq != world or topk != 16 or world * topk != 64 or slot_keys < topk:
+        return f"{niq} index heads, {world} ranks, top-{topk}, {slot_keys}-key slots"
+    if pages_per_block != 1:
+        return f"{pages_per_block} pages a block"
+    if max_query_len > max_rows:
+        return f"{max_query_len} rows, mailbox {max_rows}"
+    local = -(-(-(-max_seq_len // PAGE)) // world)
+    if local > LOCAL_MAX:
+        return f"{local} local blocks"
+    return None
+
+
 def flydsl_aq1(
     x, x_scale, w, w_scale, q_norm_weight, k_norm_weight, index_q_norm_weight, index_k_norm_weight,
     cos_sin_cache, positions, slot_mapping, index_slot_mapping, k_cache, v_cache, k_scale, v_scale,
     index_cache, index_scale, q_out, index_q_out, eps, *,
     num_index_heads, block_table, seq_lens, max_seq_len, rank, world, max_query_len, sm_scale, scores,
-    n_score: int = N_SCORE, maxit: int = MAXIT, scratch=None, timeline=None,
+    n_score: int | None = None, maxit: int = MAXIT, scratch=None, timeline=None, exchange=None,
 ):  # fmt: skip
     """One AQ1 launch. Arguments as ``mxfp8_qkv_norm_rope_nvfp4_insert`` + ``cp_scores_fp4`` (``scores``: fp32
     [heads, tokens, ceil(blocks / world)], slots past the live blocks left unwritten)."""
@@ -71,25 +102,40 @@ def flydsl_aq1(
     m = x.shape[0]
     niq = num_index_heads
     n = (NQ + 2 * NKV + niq + 1) * D
-    why = aq1_supported(m, niq, seq_lens.numel(), max_query_len, scores.shape[0])
+    why = aq1_supported(m, niq, seq_lens.numel(), max_query_len, niq if scores is None else scores.shape[0])
     assert why is None, f"aq1: {why}"
     assert tuple(w.shape) == (n, K_DIM) and x.shape[1] == K_DIM and x.stride(1) == 1 and x.stride(0) % 16 == 0
     assert index_q_out.is_contiguous() and tuple(index_q_out.shape) == (m, niq * D)
-    assert scores.dtype == torch.float32 and scores.is_contiguous() and scores.shape[1] == m
+    assert scores is None or (scores.dtype == torch.float32 and scores.is_contiguous() and scores.shape[1] == m)
     assert block_table.dtype == torch.int32 and seq_lens.dtype == torch.int32 and block_table.stride(1) == 1
     assert index_cache.stride()[1:] == (D // 2, 1) and index_scale.stride()[1:] == (D // 16, 1)
     assert k_cache.stride() == v_cache.stride() and k_scale.stride() == v_scale.stride()
     tile_m, ns, ks, kw, wm, wn, depth, astage, wcpol = AQ1_CONFIG
     mpad = (m + tile_m - 1) // tile_m * tile_m
     slab = _slab(x.device, ks * mpad * n)
-    sc = scratch or aq1_scratch(x.device, niq, max_query_len, n_score)
+    xchg = exchange is not None
+    n_score = n_score or (N_SCORE_X if xchg else N_SCORE)
+    sc = scratch or aq1_scratch(x.device, niq, max_query_len, n_score, xchg)
+    if xchg:
+        # exchange = dict(peers, send_calls, recv_calls, timeouts, max_rows, slot_keys, topk, init_blocks, local_keep,
+        #                 indices [1, ql, topk] int32, sparse_bt [ql, topk] int32, sparse_ctx [ql] int32)
+        ex = exchange
+        why = aq_exchange_supported(niq, world, ex["topk"], max_seq_len, max_query_len, ex["max_rows"],
+                                    ex["slot_keys"], 1)
+        assert why is None, f"aq: {why}"
+        assert ex["sparse_bt"].stride(0) == ex["topk"] and ex["indices"].is_contiguous()
+        assert ex["sparse_ctx"].is_contiguous() and ql_ok(max_query_len, ex)
     blocks = -(-max_seq_len // PAGE)
     local = -(-blocks // world)
-    assert scores.shape[2] == local
+    assert scores is None or scores.shape[2] == local
+    assert not xchg or local <= LOCAL_MAX, f"aq: {local} local blocks"
+    dummy = sc["err"]
     eps_bits = struct.unpack("<i", struct.pack("<f", float(eps)))[0]
     stream = torch.cuda.current_stream(x.device)
     spec = (tile_m, ns, ks, kw, wm, wn, depth, niq, astage, wcpol, max_query_len, int(rank), int(world), RING, n_score,
-            int(timeline is not None))
+            int(timeline is not None), int(xchg),
+            *((exchange["topk"], exchange["init_blocks"], exchange["local_keep"], exchange["max_rows"], LOCAL_MAX,
+               exchange["slot_keys"]) if xchg else (16, 0, 0, 64, LOCAL_MAX, 64)))
     _run_compiled(
         launch_aq1,
         ptr_arg(x), ptr_arg(x_scale), ptr_arg(w), ptr_arg(w_scale), ptr_arg(slab),
@@ -97,9 +143,18 @@ def flydsl_aq1(
         ptr_arg(index_q_norm_weight), ptr_arg(index_k_norm_weight), ptr_arg(cos_sin_cache), ptr_arg(positions),
         ptr_arg(slot_mapping), ptr_arg(index_slot_mapping), ptr_arg(k_cache), ptr_arg(v_cache), ptr_arg(k_scale),
         ptr_arg(v_scale), ptr_arg(index_cache), ptr_arg(index_scale),
-        ptr_arg(block_table, fx.Int32), ptr_arg(seq_lens, fx.Int32), ptr_arg(scores, fx.Float32),
+        ptr_arg(block_table, fx.Int32), ptr_arg(seq_lens, fx.Int32),
+        ptr_arg(scores if scores is not None else dummy, fx.Float32 if scores is not None else fx.Int32),
         ptr_arg(sc["q"]), ptr_arg(sc["flag"], fx.Int32), ptr_arg(sc["cnt"], fx.Int32), ptr_arg(sc["err"], fx.Int32),
         ptr_arg(timeline if timeline is not None else sc["err"], fx.Int32),
+        ptr_arg(sc["scb"], fx.Int32),
+        ptr_arg(exchange["peers"] if xchg else dummy, fx.Int32),
+        ptr_arg(exchange["send_calls"] if xchg else dummy, fx.Int32),
+        ptr_arg(exchange["recv_calls"] if xchg else dummy, fx.Int32),
+        ptr_arg(exchange["timeouts"] if xchg else dummy, fx.Int32),
+        ptr_arg(exchange["indices"] if xchg else dummy, fx.Int32),
+        ptr_arg(exchange["sparse_bt"] if xchg else dummy, fx.Int32),
+        ptr_arg(exchange["sparse_ctx"] if xchg else dummy, fx.Int32),
         m, x.stride(0), mpad, cos_sin_cache.shape[0],
         k_cache.stride(0), k_scale.stride(0), index_cache.stride(0), index_scale.stride(0), eps_bits,
         block_table.stride(0), local, blocks, float(np.float32(sm_scale * LOG2E)), int(maxit),
