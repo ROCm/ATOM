@@ -268,6 +268,12 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 512, help_heading = "Routing Policy")]
     pub agentic_request_token_equivalent: u64,
 
+    /// Tokens of prefill queued ahead that agentic lets a request accept on the worker
+    /// whose device cache holds its prefix (the longest any worker holds, and at least
+    /// half the prompt) before it places the request elsewhere; 0 lets the cost decide
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    pub agentic_stay_margin: u64,
+
     /// What least_load compares first: `tokens` (reserved KV tokens plus the
     /// request-equivalent per in-flight request, the engine's least_tokens) or
     /// `requests` (in-flight requests, then reserved KV tokens, the engine's
@@ -620,6 +626,7 @@ impl CliArgs {
                 request_token_equivalent: self.agentic_request_token_equivalent,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                stay_margin: self.agentic_stay_margin,
             },
             "least_load" => PolicyConfig::LeastLoad {
                 request_token_equivalent: self.agentic_request_token_equivalent,
@@ -1048,13 +1055,14 @@ mod tests {
     #[test]
     fn cli_accepts_agentic_with_its_request_weight() {
         let flags = "atomesh --pd-disaggregation --prefill-policy agentic \
-                     --agentic-request-token-equivalent 256";
+                     --agentic-request-token-equivalent 256 --agentic-stay-margin 4096";
         let cli = Cli::try_parse_from(flags.split_whitespace());
         let args = cli.expect("agentic is a prefill policy").router_args;
         let expected = PolicyConfig::Agentic {
             request_token_equivalent: 256,
             eviction_interval_secs: 120,
             max_tree_size: 67108864,
+            stay_margin: 4096,
         };
         let parsed = args.parse_policy(args.prefill_policy.as_deref().unwrap());
         assert_eq!(format!("{parsed:?}"), format!("{expected:?}"));
@@ -1113,6 +1121,7 @@ impl Default for CliArgs {
             prefix_token_count: 256,
             prefix_hash_load_factor: 1.25,
             agentic_request_token_equivalent: 512,
+            agentic_stay_margin: 0,
             least_load_order: LeastLoadOrder::Tokens,
             dp_aware: false,
             dp_aware_prefill_only: false,

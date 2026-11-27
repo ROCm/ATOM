@@ -463,6 +463,10 @@ pub enum PolicyConfig {
         /// Size the text tree is evicted down to (default: 67108864)
         #[serde(default = "default_agentic_max_tree_size")]
         max_tree_size: usize,
+        /// Tokens of prefill queued ahead that a request accepts on the worker whose
+        /// device cache holds its prefix before it is placed elsewhere (default: 0)
+        #[serde(default)]
+        stay_margin: u64,
     },
 
     /// Lowest outstanding decode load at `url@rank`. By `order`: reserved KV tokens
@@ -1099,6 +1103,7 @@ mod tests {
                 request_token_equivalent: 512,
                 eviction_interval_secs: 120,
                 max_tree_size: 67108864,
+                stay_margin: 0,
             }
         ));
     }

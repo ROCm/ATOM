@@ -20,6 +20,7 @@ with no extra bonus, as in the engine's `least_tokens` DP balancer.
 | `inflight_prefill_tokens` | Tokens charged to the worker whose prefill has not finished, `mesh_worker_prefill_tokens{worker}`. |
 | `inflight_requests` | `mesh_worker_requests_active{worker}`. |
 | `request_token_equivalent` | `--agentic-request-token-equivalent` (512). Keep it equal to the engine's `ATOM_DP_LB_REQ_EQUIV`. |
+| `stay_margin` | `--agentic-stay-margin` (0). Tokens of prefill queued ahead that a request accepts on the worker whose device cache holds its prefix (the longest any worker holds, and at least half the prompt) before it is placed elsewhere: the margin is taken off that worker's cost. At 0 the cost alone decides, and a request leaves the worker that holds its prefix as soon as another is cheaper by a store load or by what it computes; with long prompts and a store that is one cold request queued ahead. |
 
 The selected worker is charged its `uncached_tokens`, released when its P/D
 prefill response completes or at a streaming response's first frame.

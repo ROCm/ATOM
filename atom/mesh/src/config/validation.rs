@@ -100,6 +100,7 @@ impl ConfigValidator {
                 request_token_equivalent: _,
                 eviction_interval_secs,
                 max_tree_size,
+                stay_margin: _,
             } => {
                 if *eviction_interval_secs == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -768,6 +769,7 @@ mod tests {
             request_token_equivalent: 512,
             eviction_interval_secs: 60,
             max_tree_size: 1000,
+            stay_margin: 0,
         };
         let pd = |main: PolicyConfig, prefill, decode| {
             let mode = RoutingMode::PrefillDecode {

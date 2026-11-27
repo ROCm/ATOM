@@ -19,11 +19,12 @@ use crate::{core::Worker, kv_index::PrefixMatchProvider};
 /// Text bytes standing in for one token when a request's tokens are unknown.
 const TEXT_BYTES_PER_TOKEN: usize = 4;
 
-/// The agentic cost's weight:
+/// The agentic cost's weights:
 ///
 /// ```text
 /// cost = inflight_prefill_tokens + uncached_tokens
 ///      + request_token_equivalent * inflight_requests
+///      - stay_margin, on a worker whose device cache holds the prompt's prefix
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgenticCost {
@@ -32,12 +33,19 @@ pub struct AgenticCost {
     /// equal so the router and the engine rank a rank's load the same way.
     /// Default: 512.
     pub request_token_equivalent: u64,
+    /// Tokens of prefill queued ahead that a request accepts on the worker whose
+    /// device cache holds its prefix ([`Candidate::holds_prefix`]) before it is
+    /// placed elsewhere. A request that leaves that worker has the prefix loaded
+    /// from the store or computed again, and the queue it leaves is mostly other
+    /// requests' short suffixes. Default: 0, the cost alone decides.
+    pub stay_margin: u64,
 }
 
 impl Default for AgenticCost {
     fn default() -> Self {
         Self {
             request_token_equivalent: 512,
+            stay_margin: 0,
         }
     }
 }
@@ -58,6 +66,10 @@ pub struct Candidate {
     pub inflight_prefill_tokens: usize,
     /// Requests assigned to this worker that have not completed.
     pub inflight_requests: usize,
+    /// Its device cache holds the longest prefix of the prompt any candidate's does,
+    /// and that is at least half the prompt: the worker [`AgenticCost::stay_margin`]
+    /// keeps the request on.
+    pub holds_prefix: bool,
 }
 
 /// A candidate's cost and the prefill charge to report on placement.
@@ -74,12 +86,18 @@ impl AgenticCost {
     /// Score one candidate.
     pub fn score(&self, prompt_tokens: usize, candidate: &Candidate) -> Selection {
         let uncached_tokens = prompt_tokens.saturating_sub(candidate.cached_tokens.unwrap_or(0));
+        let cost = candidate.inflight_prefill_tokens as u128
+            + uncached_tokens as u128
+            + u128::from(self.request_token_equivalent) * candidate.inflight_requests as u128;
+        let margin = if candidate.holds_prefix {
+            u128::from(self.stay_margin)
+        } else {
+            0
+        };
         Selection {
             worker_index: candidate.worker_index,
             uncached_tokens,
-            cost: candidate.inflight_prefill_tokens as u128
-                + uncached_tokens as u128
-                + u128::from(self.request_token_equivalent) * candidate.inflight_requests as u128,
+            cost: cost.saturating_sub(margin),
         }
     }
 
@@ -300,6 +318,19 @@ impl LoadBalancingPolicy for AgenticPolicy {
             .zip(provider)
             .map(|(tokens, provider)| provider.match_workers(tokens, workers))
             .filter(|hits| healthy.iter().any(|&idx| hits[idx].is_some()));
+        // The workers whose device cache holds the longest prefix of the prompt, when
+        // that is at least half of it: the ones `stay_margin` keeps the request on.
+        let holders: Vec<bool> = match &index_hits {
+            Some(device) => {
+                let held = |idx: &usize| device[*idx];
+                let longest = healthy.iter().filter_map(held).max().unwrap_or(0);
+                let enough = longest > 0 && 2 * longest as usize >= prompt_tokens;
+                (device.iter())
+                    .map(|hit| enough && *hit == Some(longest))
+                    .collect()
+            }
+            None => vec![false; workers.len()],
+        };
         // In a share group, `pooled` is what each worker's device cache holds once its
         // engine has copied in the prefix the other ranks of its group hold; with a store,
         // `held` is what its engine then reports cached, loads included. The hits count a
@@ -413,6 +444,7 @@ impl LoadBalancingPolicy for AgenticPolicy {
                 cached_tokens: hits[idx].map(|cached| cached.min(prompt_tokens)),
                 inflight_prefill_tokens: workers[idx].prefill_tokens(),
                 inflight_requests: workers[idx].load(),
+                holds_prefix: holders[idx],
             })
             .collect();
         let Some(selection) = self.cost.select_worker(prompt_tokens, &candidates) else {
@@ -496,6 +528,7 @@ mod tests {
             cached_tokens: cached,
             inflight_prefill_tokens: queued,
             inflight_requests: requests,
+            holds_prefix: false,
         }
     }
 
@@ -533,9 +566,42 @@ mod tests {
 
         let requests_free = AgenticCost {
             request_token_equivalent: 0,
+            ..AgenticCost::default()
         };
         let selected = requests_free.select_worker(1_024, &workers).unwrap();
         assert_eq!((selected.worker_index, selected.cost), (0, 512));
+    }
+
+    #[test]
+    fn the_stay_margin_keeps_a_request_where_its_prefix_is() {
+        // a holds 900 of the 1000 tokens behind 5000 queued; b holds none and is idle.
+        let holder = Candidate {
+            holds_prefix: true,
+            ..candidate(0, Some(900), 5_000, 0)
+        };
+        let workers = [holder, candidate(1, Some(0), 0, 0)];
+        let cost = |stay_margin| AgenticCost {
+            stay_margin,
+            ..AgenticCost::default()
+        };
+        let selected = |margin| cost(margin).select_worker(1_000, &workers).unwrap();
+        // 5100 on a against 1000 on b: b, until the margin covers their difference.
+        assert_eq!(selected(0).worker_index, 1);
+        assert_eq!(selected(4_000).worker_index, 1);
+        let kept = selected(4_200);
+        assert_eq!(
+            (kept.worker_index, kept.uncached_tokens, kept.cost),
+            (0, 100, 900)
+        );
+        // The margin comes off the cost alone, and never below zero.
+        assert_eq!(selected(1 << 40).cost, 0);
+        // A worker that does not hold the prefix gets none.
+        let workers = [
+            candidate(0, Some(900), 5_000, 0),
+            candidate(1, Some(0), 0, 0),
+        ];
+        let selected = cost(1 << 40).select_worker(1_000, &workers).unwrap();
+        assert_eq!(selected.worker_index, 1);
     }
 
     #[test]
@@ -635,6 +701,7 @@ mod tests {
     fn agentic(request_token_equivalent: u64, index: Option<&Arc<Index>>) -> AgenticPolicy {
         let cost = AgenticCost {
             request_token_equivalent,
+            ..AgenticCost::default()
         };
         let config = AgenticConfig {
             cost,
@@ -968,6 +1035,44 @@ mod tests {
         workers[1].set_healthy(false);
         let none = (None, NO_HEALTHY_WORKERS, None, None);
         assert_eq!(decide(&policy, &workers, &info).await, none);
+    }
+
+    #[tokio::test]
+    async fn the_stay_margin_holds_a_request_on_the_worker_with_its_prefix() {
+        let workers = workers();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let (held, short) = (index(vec![(A, 96), (B, 0)]), index(vec![(A, 40), (B, 0)]));
+        let with_margin = |index: &Arc<Index>, stay_margin| {
+            let cost = AgenticCost {
+                stay_margin,
+                ..AgenticCost::default()
+            };
+            let policy = AgenticPolicy::new(AgenticConfig {
+                cost,
+                eviction_interval_secs: 0,
+                ..AgenticConfig::default()
+            });
+            policy.set_kv_events(index.clone());
+            policy
+        };
+        // a holds 96 of the 100 tokens behind 1000 queued: 1004 on a against 100 on b.
+        workers[0].charge_prefill_tokens(1_000);
+        let relocate = (Some(1), "relocate", Some(0.0), Some(100));
+        let hit = (Some(0), "hit", Some(0.96), Some(4));
+        let policy = with_margin(&held, 0);
+        assert_eq!(decide(&policy, &workers, &info).await, relocate);
+        let policy = with_margin(&held, 900);
+        assert_eq!(decide(&policy, &workers, &info).await, relocate);
+        let policy = with_margin(&held, 905);
+        assert_eq!(decide(&policy, &workers, &info).await, hit);
+        // A prefix under half the prompt is not worth a queue: no margin for it.
+        let policy = with_margin(&short, 1 << 30);
+        assert_eq!(decide(&policy, &workers, &info).await, relocate);
+        workers[0].release_prefill_tokens(1_000);
     }
 
     #[tokio::test]

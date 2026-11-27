@@ -50,9 +50,11 @@ impl PolicyFactory {
                 request_token_equivalent,
                 eviction_interval_secs,
                 max_tree_size,
+                stay_margin,
             } => Arc::new(AgenticPolicy::new(AgenticConfig {
                 cost: AgenticCost {
                     request_token_equivalent: *request_token_equivalent,
+                    stay_margin: *stay_margin,
                 },
                 eviction_interval_secs: *eviction_interval_secs,
                 max_tree_size: *max_tree_size,
@@ -190,6 +192,7 @@ mod tests {
                     request_token_equivalent: 512,
                     eviction_interval_secs: 60,
                     max_tree_size: 500,
+                    stay_margin: 0,
                 },
             ),
             (

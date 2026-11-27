@@ -662,6 +662,7 @@ mod tests {
             request_token_equivalent: 512,
             eviction_interval_secs: 60,
             max_tree_size: 500,
+            stay_margin: 0,
         });
         registry.set_prefill_policy(Arc::new(AgenticPolicy::default()));
         registry.set_kv_events(Arc::new(AllHit));
