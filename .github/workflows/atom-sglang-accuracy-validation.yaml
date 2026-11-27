@@ -329,7 +329,7 @@ jobs:
                   "lm_eval_gen_kwargs": "max_gen_toks=16384,temperature=0,top_p=1,until=<|im_end|>",
                   "lm_eval_limit": 200,
                   "accuracy_test_threshold": 0.9506,
-                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nSGLANG_AITER_KV_CACHE_LAYOUT=nhd\nAITER_LOG_LEVEL=WARNING\nAITER_MOE_PADDING_SIZE=64",
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nSGLANG_AITER_KV_CACHE_LAYOUT=nhd\nAITER_LOG_LEVEL=WARNING\nAITER_MOE_PADDING_SIZE=64\nATOM_QWEN4_EXP_SP_SDMA=1\nLD_PRELOAD=/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2:/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1",
                   "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
               {
@@ -345,7 +345,7 @@ jobs:
                   "lm_eval_limit": 200,
                   "accuracy_test_threshold": 0.9555,
                   "mtp_accept_threshold": "0",
-                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nSGLANG_AITER_KV_CACHE_LAYOUT=nhd\nAITER_LOG_LEVEL=WARNING\nAITER_MOE_PADDING_SIZE=64",
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nSGLANG_AITER_KV_CACHE_LAYOUT=nhd\nAITER_LOG_LEVEL=WARNING\nAITER_MOE_PADDING_SIZE=64\nATOM_QWEN4_EXP_SP_SDMA=1\nLD_PRELOAD=/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2:/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1",
                   "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
               {
