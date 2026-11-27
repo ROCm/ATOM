@@ -206,6 +206,7 @@ class EngineUtilityHandler:
         "configure_hidden_states": "_handle_configure_hidden_states",
         "start_profile": "_handle_start_profile",
         "stop_profile": "_handle_stop_profile",
+        "set_offload_lookups": "_handle_set_offload_lookups",
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
@@ -1078,6 +1079,27 @@ class EngineUtilityHandler:
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "stop_profile", "result": result})
         )
+
+    def _handle_set_offload_lookups(self, args: dict) -> dict:
+        """Turn the offload tier's lookups for new requests on or off."""
+        enabled = args.get("enabled") if isinstance(args, dict) else None
+        if not isinstance(enabled, bool):
+            # Not coerced: a missing value or "false" would switch lookups on.
+            reply = {
+                "cmd": "set_offload_lookups",
+                "error": f"enabled must be a bool, got {enabled!r}",
+            }
+            self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+            return reply
+        setter = getattr(
+            getattr(self.scheduler, "kv_connector", None), "set_offload_lookups", None
+        )
+        applied = bool(setter(enabled)) if callable(setter) else False
+        result = {"enabled": enabled, "applied": applied}
+        logger.info(f"{self.label}: offload lookups {result}")
+        reply = {"cmd": "set_offload_lookups", "result": result}
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
 
     # ------------------------------------------------------------------
     # MTP statistics

@@ -33,6 +33,9 @@ class _Tensor:
     def __getitem__(self, index):
         return _Scalar(self.values[index])
 
+    def tolist(self):
+        return list(self.values)
+
 
 class _Group:
     def __init__(self, size):
@@ -78,6 +81,8 @@ def _run(intervals, work, commands=None, shutdown_at=32, startup_error=None):
             events=[],
             pending=[],
             _report_backlog=False,
+            _idle_when_blocked=False,
+            _dp_group_hidden_work=False,
             _shutting_down=False,
             _is_rl_weights_offloaded=False,
             _weight_sync_fenced=False,
@@ -172,6 +177,9 @@ def _run(intervals, work, commands=None, shutdown_at=32, startup_error=None):
                     e.events.append(("prefill", e.tick)),
                 ),
                 notify_idle=lambda: None,
+            ),
+            block_manager=SimpleNamespace(
+                complete_previous_checkpoint_batch=lambda: None
             ),
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda e=engine: setattr(e, "cleaned", True),

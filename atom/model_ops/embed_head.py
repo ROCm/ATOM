@@ -3,7 +3,6 @@
 # Copyright (c) 2024-2025 ATOM Project Contributors
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from aiter import topk_select
@@ -179,17 +178,14 @@ class VocabParallelEmbedding(nn.Module):
             )
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         else:
-            y = F.embedding(x, self.weight)
+            # The masked lookup too, over the whole table: a speculative step
+            # can leave the -1 truncation sentinel in `input_ids`, and a raw
+            # F.embedding hands it to index_select, whose bounds assert takes
+            # the rank down (a Kimi-K3 DP8EP8 decode, attention TP1, DSpark).
+            # Only a draft slot can carry it, and verify rejects that draft: an
+            # anchor is the last emitted token or a committed id, never the -1.
+            y = replicated_embedding(x, self.weight)
         return y
-        # if self.tp_size > 1:
-        #     mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)
-        #     # mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-        #     x = mask * (x - self.vocab_start_idx)
-        # y = F.embedding(x, self.weight)
-        # if self.tp_size > 1:
-        #     y.masked_fill_(~mask.unsqueeze(1), 0)
-        #     y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
-        # return y
 
 
 class ReplicatedEmbedding(nn.Module):
@@ -236,6 +232,17 @@ def empty_token_ids(hidden: torch.Tensor) -> torch.Tensor:
     return torch.empty(hidden.shape[0], dtype=torch.int32, device=hidden.device)
 
 
+def dp_shards_vocab(tp_size: int, num_embeddings: int) -> bool:
+    """A DP-sharded `ATOM_DP_LM_HEAD_MODE` is on, the head is pure DP (TP 1),
+    and the vocab splits evenly over a DP group of more than one rank."""
+    if envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all", "argmax"):
+        return False
+    if tp_size != 1:
+        return False
+    world = get_dp_group().world_size
+    return world > 1 and num_embeddings % world == 0
+
+
 class ParallelLMHead(VocabParallelEmbedding):
     # the model's logits are this head of its final rows, so a decode verify
     # may take its argmax ids instead (``verify_head``); a head whose logits
@@ -257,6 +264,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+        # Static, read on every forward (`_can_use_dp_sharded_head`).
+        self.dp_shards_vocab = not is_plugin_mode() and dp_shards_vocab(
+            self.tp_size, self.num_embeddings
+        )
 
     def forward(self, x: torch.Tensor):
         if not is_plugin_mode():
@@ -393,7 +404,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         return group.device_communicator.all_gather(shard, -1)
 
     # ------------------------------------------------------------------
-    # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).
+    # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all, or greedy ids
+    # under ATOM_DP_LM_HEAD_MODE=argmax).
     #
     # Precondition (checked by `_can_use_dp_sharded_head`): the model TP group is size 1
     # (pure DP) and the DP group is size > 1. The lm_head weight is currently
@@ -406,22 +418,15 @@ class ParallelLMHead(VocabParallelEmbedding):
         """Whether this step may run the DP-sharded LM head (pure-DP decode only).
 
         Every DP rank must reach the SAME verdict from globally-synced state, or
-        the fixed-size collective in `_dp_sharded_logits` deadlocks. The strategy
-        (all-gather vs all2all) is read from ATOM_DP_LM_HEAD_MODE there.
+        the fixed-size collective in `_dp_sharded_logits` deadlocks. The exchange
+        (all-gather, all2all or greedy ids) is ATOM_DP_LM_HEAD_MODE's there.
 
         `is_prefill` below is per-rank, which is safe only because
         `running_tokens_are_unified` is the DP-reduced form of the same
         question: a prefilling peer drives it False on every rank, so no rank
         can answer True here while another answers False.
         """
-        dp_group = get_dp_group()
-        # Static: enabled, pure DP, vocab evenly shardable over a >1 DP group.
-        if (
-            envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all")
-            or self.tp_size != 1
-            or dp_group.world_size <= 1
-            or self.num_embeddings % dp_group.world_size != 0
-        ):
+        if not self.dp_shards_vocab:
             return False
         # Per-step: all ranks at one height. `is_draft` is its own question,
         # not shorthand for the flag below -- a drafter states uniformity per
@@ -445,7 +450,8 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         - ``"argmax"``: reduce each shard to a packed ``(max, global_id)`` and
           all-gather only ``[Σrows, 2]``, then pick the winner -> ``[local_rows]``
-          ids, still packed as fp32 (drafting; the caller narrows into its own).
+          ids, still packed as fp32 (drafting, or the decode head under
+          ``ATOM_DP_LM_HEAD_MODE=argmax``; the caller narrows into its own).
         - ``"all2all"`` / ``"allgather"``: exchange full-vocab logits ->
           ``[local_rows, vocab]`` (the decode head).
         """

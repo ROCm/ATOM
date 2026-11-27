@@ -1,0 +1,62 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are helpful.",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "role": "user",
+   "content": "Weather in Paris?"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "call_0",
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\", \"days\": 2}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_0",
+   "content": "sunny"
+  },
+  {
+   "role": "user",
+   "content": "And Rome?"
+  }
+ ],
+ "prompts": {
+  "thinking": "<｜begin▁of▁sentence｜>You are helpful.\n\n## Tools\n\nYou have access to a set of tools you can use to answer the user's question.\nYou can invoke functions by writing a \"<｜DSML｜function_calls>\" block like the following as part of your reply to the user:\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"$FUNCTION_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$FUNCTION_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜function_calls>\n\nString and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The \"string\" attribute should be set to \"true\" for string type parameters and \"false\" for other types (numbers, booleans, arrays, objects).\n\nIf the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:\n\n<｜DSML｜function_calls>\n...\n</｜DSML｜function_calls>\n\n<function_results>\n...\n</function_results>\n\n<think>...thinking about results</think>\n\nHere are the functions available in JSONSchema format:\n<functions>\n{\"name\": \"get_weather\", \"description\": \"Get the weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</functions>\n<｜User｜>Weather in Paris?<｜Assistant｜></think>\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls><｜end▁of▁sentence｜>\n\n<function_results>\n<result>sunny</result>\n</function_results>\n\n</think><｜User｜>And Rome?<｜Assistant｜><think>",
+  "chat": "<｜begin▁of▁sentence｜>You are helpful.\n\n## Tools\n\nYou have access to a set of tools you can use to answer the user's question.\nYou can invoke functions by writing a \"<｜DSML｜function_calls>\" block like the following as part of your reply to the user:\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"$FUNCTION_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$FUNCTION_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜function_calls>\n\nString and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The \"string\" attribute should be set to \"true\" for string type parameters and \"false\" for other types (numbers, booleans, arrays, objects).\n\nIf the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:\n\n<｜DSML｜function_calls>\n...\n</｜DSML｜function_calls>\n\n<function_results>\n...\n</function_results>\n\n<think>...thinking about results</think>\n\nHere are the functions available in JSONSchema format:\n<functions>\n{\"name\": \"get_weather\", \"description\": \"Get the weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</functions>\n<｜User｜>Weather in Paris?<｜Assistant｜></think>\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls><｜end▁of▁sentence｜>\n\n<function_results>\n<result>sunny</result>\n</function_results>\n\n</think><｜User｜>And Rome?<｜Assistant｜></think>"
+ }
+}
