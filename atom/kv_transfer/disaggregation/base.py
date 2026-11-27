@@ -233,11 +233,6 @@ class KVConnectorSchedulerBase(ABC):
         now (ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE); none without early handoff."""
         return []
 
-    def take_sources_to_abort(self) -> list:
-        """P/D early sources whose transfer the worker retired, for the
-        scheduler to abort; none without early handoff."""
-        return []
-
     def drop_cached_kv(self) -> bool:
         """Forget KV computed with weights that are about to change.
 

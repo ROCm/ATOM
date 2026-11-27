@@ -165,12 +165,9 @@ class _OffloadMixinStub(OffloadSchedulerMixin):
 
     def cancel_pending_load(self, seq) -> None: ...
 
-    # The P/D early-handoff hooks the scheduler and engine read off any
-    # connector (`KVConnectorSchedulerBase`); offload keeps neither.
+    # The P/D early-handoff hook the engine reads off any connector
+    # (`KVConnectorSchedulerBase`); offload keeps none.
     def take_early_answers(self) -> list:
-        return []
-
-    def take_sources_to_abort(self) -> list:
         return []
 
 
@@ -5325,7 +5322,6 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
             str(s.id) in pending_send or sched.should_defer_free(s)
         ),
         send_finished=lambda rid: pending_send.discard(str(rid)),
-        take_sources_to_abort=list,
     )
     report = engine_sched._update_from_kv_xfer_finished
     if send_first:

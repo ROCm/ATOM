@@ -6483,12 +6483,6 @@ class Scheduler:
         process_pd = getattr(self.kv_connector, "process_pd_completions", None)
         if callable(process_pd):
             kv_connector_output = process_pd(kv_connector_output)
-        # Early P/D sources whose transfer the worker retired (D was told it
-        # failed): abort them like a client disconnect, which cancels the
-        # source and so retires its send claim.
-        if self.kv_connector is not None:
-            for req_id in self.kv_connector.take_sources_to_abort():
-                self.abort_request(req_id)
         process_completions = getattr(self.kv_connector, "process_completions", None)
         if callable(process_completions):
             kv_connector_output = process_completions(kv_connector_output)

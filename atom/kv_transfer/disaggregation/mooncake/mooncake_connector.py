@@ -525,9 +525,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # sequence, so a failed report (the worker retired the transfer: D was
         # told it failed) stops the prefill instead of computing for nobody.
         self._early_sources: dict[str, Sequence] = {}
-        # Request ids whose early source the scheduler must abort
-        # (`take_sources_to_abort`).
-        self._sources_to_abort: list[ReqId] = []
         # ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE: P answers the router when it first
         # schedules an early request (allocates it, or finds it must wait for
         # D) rather than at DP dispatch. The engine drains these request ids
@@ -1034,13 +1031,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         answers, self._early_answers = self._early_answers, []
         return answers
 
-    def take_sources_to_abort(self) -> list[ReqId]:
-        """Early sources whose transfer the worker retired: the scheduler
-        aborts them (`Scheduler.abort_request`), and their cancellation then
-        retires the send claim (`pd_source_safe`)."""
-        aborts, self._sources_to_abort = self._sources_to_abort, []
-        return aborts
-
     # ---------------------------------------------- allocation before D's report
     #
     # An early request is registered like a gated one (the worker reports D's
@@ -1187,14 +1177,20 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                     # Allocated before D, and the worker has since retired the
                     # transfer (e.g. it expired D's write request as an orphan
                     # while this rank was stuck in a long step): D was told it
-                    # failed and no reader will come. Stop the prefill; its
-                    # cancellation retires the send claim.
+                    # failed and no reader will come. Stop the prefill the way
+                    # a waiting request is refused above: mark it aborted. An
+                    # allocated source is never preempted, so it is running,
+                    # and `Scheduler.abort_request` marks a running request
+                    # just so; the step's postprocess finishes it as aborted
+                    # (one still waiting on a load is reclaimed by the next
+                    # pass), and its cancellation retires the send claim
+                    # (`pd_source_safe`).
                     logger.warning(
                         "P/D early source %s: transfer retired before D "
                         "reached P; aborting its prefill",
                         source.id,
                     )
-                    self._sources_to_abort.append(source.id)
+                    source.status = SequenceStatus.ABORTED
                 output.connector_completions.discard(completion)
         for req_id, handoff in output.received_handoffs.items():
             seq = self._chunked_receiving.pop(req_id, None)

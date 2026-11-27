@@ -991,12 +991,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             rid for take in self._sub_methods("take_early_answers") for rid in take()
         ]
 
-    def take_sources_to_abort(self) -> list:
-        """P/D early sources to abort, from the sub that keeps them."""
-        return [
-            rid for take in self._sub_methods("take_sources_to_abort") for rid in take()
-        ]
-
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Let the one offload sub apply its own completions and normalize output.
 

@@ -785,23 +785,83 @@ def test_worker_reports_a_retired_transfers_source_safe():
     )
 
 
+def test_flag_off_router_chunked_retired_transfer_releases_only_its_own_claim(
+    monkeypatch, seq_factory
+):
+    """Main's router-chunked mode, ATOM_PD_EARLY_HANDOFF unset. There P
+    allocates only after D reached it, so a save can meet a retired transfer
+    only as the cancellation of a request that never got a source: D's write
+    request expired as an orphan (P stuck in a long step), P's registration is
+    then refused, and the aborted request's cancellation reaches the worker.
+    The worker now reports that save safe once; the scheduler finds no claim
+    and no deferred blocks, so nothing else changes. A repeat is not reported
+    again. (A late handoff for a transfer that already reported safe stays
+    silent: `test_late_metadata_cannot_resurrect_retired_source`.)"""
+    from conftest import MockConfig
+    from test_pd_chunked_transfer import pd_sequence, scheduler_connector
+
+    from atom.model_engine.scheduler import Scheduler
+    from atom.model_engine.sequence import SequenceStatus
+
+    monkeypatch.delenv("ATOM_PD_EARLY_HANDOFF", raising=False)
+    p = Scheduler(MockConfig())
+    p.kv_connector = conn = scheduler_connector(monkeypatch, True)
+    assert conn.enable_chunked_transfer and not conn._speculative
+    free = p.block_manager.kv.num_free
+    pw, request, _src, _dst = idle_producer()
+    with pw._completed_prefills_lock:
+        pw._pending_chunked_requests.append(
+            (request, mc.time.monotonic() - mc.PREFILL_LOOKUP_TIMEOUT - 1)
+        )
+    pw._dispatch_ready_chunked_requests()
+    pw._notify_transfer_result.assert_called_once_with(request, success=False)
+    assert dict(pw._retired_chunked_transfers) == {"xfer-a": False}
+
+    seq = pd_sequence(seq_factory)  # transfer "xfer-a", as D's write request
+    p.add(seq)
+    pw.start_load_kv(conn.build_connector_meta())
+    p._update_from_kv_xfer_finished(pw.get_finished())
+    assert seq.status == SequenceStatus.ABORTED  # a retired ID authorizes nothing
+    batch, scheduled = p.schedule()
+    assert not scheduled and not seq.block_table
+    cancel = batch.connector_meta_output
+    assert cancel.reqs_to_save[seq.id].prefill_aborted
+    pw.start_load_kv(cancel)
+    out = pw.get_finished()
+    assert out.connector_completions == {
+        mc.ConnectorCompletion("pd_source_safe", seq.id, True)
+    }
+    p._update_from_kv_xfer_finished(out)
+    assert not conn._awaiting_send and not conn._chunked_waiting
+    assert not p.deferred_free_blocks and p.block_manager.kv.num_free == free
+    assert not pw._chunked_prefills and not pw._chunked_local_ids
+    assert dict(pw._retired_chunked_transfers) == {"xfer-a": True}
+    pw.start_load_kv(cancel)  # a repeated cancellation reports nothing more
+    assert not pw.get_finished().connector_completions
+
+
 def test_failed_report_for_an_allocated_early_source_aborts_it(
     monkeypatch, seq_factory
 ):
     """`pd_admission_ready(False)` for a source allocated before D (not in
     `_chunked_waiting` any more) used to be ignored, so P prefilled for
-    nobody. Now the scheduler is asked to abort it."""
+    nobody. Now it is marked aborted, as a waiting request refused by the
+    same report is (and as `Scheduler.abort_request` marks a running one)."""
+    from atom.model_engine.sequence import SequenceStatus
+
     p = make_scheduler_connector(monkeypatch, True, early=True, num_kvcache_blocks=6)
     a = seq_factory(_prompt(3), kv_transfer_params=p_params("early-a"))
     b = seq_factory(_prompt(1, 100), kv_transfer_params=p_params("early-b"))
     for s in (a, b):
         assert p.admission_ready(s)
         _allocate(p, s, [0, 1, 2] if s is a else [3])
+        s.status = SequenceStatus.RUNNING
     assert set(p._early_sources) == {str(a.id), str(b.id)}
     _ack(p, a, succeeded=False)
     _ack(p, b)  # D reached B: not aborted, no longer tracked
-    assert p.take_sources_to_abort() == [a.id]
-    assert p.take_sources_to_abort() == []
+    assert a.status == SequenceStatus.ABORTED
+    assert b.status == SequenceStatus.RUNNING
+    _ack(p, a, succeeded=False)  # a repeated report changes nothing more
     assert not p._early_sources and not p._spec_pins
 
 
@@ -1072,20 +1132,17 @@ def test_engine_sends_each_answer_as_a_tokenless_stream_output(monkeypatch):
     assert core.output_queue.empty()
 
 
-def test_multi_connector_forwards_answers_and_aborts():
+def test_multi_connector_forwards_answers():
     from atom.kv_transfer.disaggregation.multi.multi_connector import (
         MultiConnectorScheduler,
     )
 
     multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
     multi._connectors = [
-        SimpleNamespace(
-            take_early_answers=lambda: [1, 2], take_sources_to_abort=lambda: [9]
-        ),
-        SimpleNamespace(),  # an offload tier keeps neither
+        SimpleNamespace(take_early_answers=lambda: [1, 2]),
+        SimpleNamespace(),  # an offload tier keeps none
     ]
     assert multi.take_early_answers() == [1, 2]
-    assert multi.take_sources_to_abort() == [9]
 
 
 def test_at_schedule_answers_progress_with_real_schedulers(monkeypatch, seq_factory):
