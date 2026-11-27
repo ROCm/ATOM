@@ -150,8 +150,9 @@ def test_the_op_gets_the_tuned_launch(monkeypatch, aiter_op):
 def test_other_calls_keep_the_selector(monkeypatch, aiter_op, case):
     monkeypatch.setenv(FLAG, "1")
     aiter_op.serves = case != "aiter declines"
-    if case == "bf16 index":
-        # Its Triton scorer is a stand-in too.
+    if case in ("bf16 index", "short prefill"):
+        # These go to the Triton scorer (BF16 index; FP4 under the FlyDSL row
+        # bound), a stand-in too: the inputs are CPU tensors.
         launch = types.SimpleNamespace(
             __getitem__=lambda self, grid: lambda *a, **kw: 0
         )
