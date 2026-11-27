@@ -3876,7 +3876,17 @@ class Scheduler:
             if seq.id == req_id:
                 seq.status = SequenceStatus.ABORTED
                 return True
-        return False
+        # Finished and parked while decode may still pull its advertised
+        # blocks: the connector reports the send done once no transfer of them
+        # can run, and refuses a later one. Its next metadata carries the abort
+        # to the workers, a batch's or, on an idle engine, the KV drain's.
+        seq = self._deferred_sequence(req_id)
+        if seq is None:
+            return False
+        abort = getattr(self.kv_connector, "abort_advertised_send", None)
+        if callable(abort):
+            abort(seq)
+        return True
 
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.

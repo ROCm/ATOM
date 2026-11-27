@@ -3296,6 +3296,63 @@ class TestPostprocess:
         assert not sched.deferred_free_blocks
         assert sched.is_finished()
 
+    @staticmethod
+    def _claiming_connector(advertised_aborts: list, unsent_aborts: list):
+        pending_send: set[str] = set()
+        return SimpleNamespace(
+            is_producer=True,
+            request_finished=lambda s: pending_send.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+            abort_send=lambda s: unsent_aborts.append(s.id),
+            abort_advertised_send=lambda s: advertised_aborts.append(s.id),
+        )
+
+    def test_an_abort_after_finish_hands_the_parked_send_to_the_connector(
+        self, seq_factory
+    ):
+        """A request parked for its send is still the abort's to find.
+
+        Searching only `waiting` and `running` left it parked with its claim
+        once the decode that would pull it was gone, and `is_finished()` never
+        turned True again on that prefill.
+        """
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        advertised: list = []
+        unsent: list = []
+        sched.kv_connector = self._claiming_connector(advertised, unsent)
+        sched.postprocess([seq], self._output(seq.id, [2]))
+        assert seq.id in sched.deferred_free_blocks
+
+        assert sched.abort_request(seq.id) is True
+        assert advertised == [seq.id]
+        assert unsent == [], "its addresses went out: not an unsent abort"
+        assert seq.id in sched.deferred_free_blocks, "freed before the send's report"
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={seq.id})
+        )
+        assert not seq.block_table
+        assert not sched.deferred_free_blocks
+        assert sched.is_finished()
+        assert sched.abort_request(seq.id) is False
+
+    def test_an_abort_before_finish_takes_the_unsent_path(self, seq_factory):
+        """A running request advertises nothing when it finishes aborted, so
+        its abort is `abort_send`'s, not the advertised one's."""
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        advertised: list = []
+        unsent: list = []
+        sched.kv_connector = self._claiming_connector(advertised, unsent)
+
+        assert sched.abort_request(seq.id) is True
+        sched.postprocess([seq], self._output(seq.id, [7]), mock.Mock())
+
+        assert advertised == []
+        assert unsent == [seq.id]
+
 
 # ── chunked-prefill finality ───────────────────────────────────────────────
 
