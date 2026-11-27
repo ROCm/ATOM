@@ -92,6 +92,7 @@ E8M0_LO = 0x7B7B7B7B7B7B7B7B
 E4M3_MAX = 448.0
 COPIES = 5
 POLL_SLEEP = 1
+TLW = 8  # timeline words a workgroup (tl builds): 0 entry, 1-7 role stamps (see the roles)
 
 
 def _attr(text):
@@ -142,6 +143,26 @@ def _lds_i32(base_u8, off, n):
     )
 
 
+def getpc():
+    """This instruction's PC (llvm.amdgcn.s.getpc)."""
+    return fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.getpc", [], [], []))
+
+
+def prefetch_code_to(end_pc, max_req):
+    """s_prefetch_inst over [this PC, end_pc) in 2 KiB requests, at most ``max_req``. ``end_pc`` must be a PC inside
+    this kernel (recorded by an earlier launch with ``getpc``; 0 = none), so no request reaches past the code object:
+    an unbounded pc-relative prefetch faulted on gfx1250 (SQC inst permission fault, 11-26). LLVM has no intrinsic
+    for s_prefetch_inst."""
+    pc0 = getpc()
+    # a recorded PC past this one and within 1 MiB (a kernel's code is far smaller); else nothing is prefetched
+    sane = (end_pc > pc0) & (end_pc - pc0 < fx.Int64(1 << 20))
+    for k in range_constexpr(max_req):
+        a = pc0 + fx.Int64(k * 2048)
+        # a request that would pass end_pc re-fetches this PC's own line instead (branch-free, always mapped)
+        a = (sane & (a + fx.Int64(2048) <= end_pc)).select(a, pc0)
+        _llvm.InlineAsmOp(None, [a.ir_value()], "s_prefetch_inst $0, 0x0, null, 31", "s", has_side_effects=True)
+
+
 def aq1_grid(niq: int, n_score: int) -> int:
     return 16 * chain_heads(niq) + n_score
 
@@ -169,7 +190,7 @@ def launch_aq1(
     arg_bt: fx.Pointer, arg_len: fx.Pointer, arg_out: fx.Pointer,
     arg_aqq: fx.Pointer, arg_flag: fx.Pointer, arg_cnt: fx.Pointer, arg_err: fx.Pointer, arg_tl: fx.Pointer,
     arg_scb: fx.Pointer, arg_peers: fx.Pointer, arg_send: fx.Pointer, arg_recv: fx.Pointer, arg_tmo: fx.Pointer,
-    arg_idx: fx.Pointer, arg_sbt: fx.Pointer, arg_sctx: fx.Pointer,
+    arg_idx: fx.Pointer, arg_sbt: fx.Pointer, arg_sctx: fx.Pointer, arg_pc: fx.Pointer,
     i32_m: fx.Int32, i32_lda: fx.Int32, i32_mpad: fx.Int32, i32_cs_rows: fx.Int32,
     i64_kp_page: fx.Int64, i64_ks_page: fx.Int64, i64_ip_page: fx.Int64, i64_is_page: fx.Int64,
     i32_eps: fx.Int32,
@@ -180,7 +201,8 @@ def launch_aq1(
     ql: Constexpr[int], rank_cp: Constexpr[int], world: Constexpr[int], ring: Constexpr[int],
     n_score: Constexpr[int], tl: Constexpr[int] = 0, xchg: Constexpr[int] = 0, topk: Constexpr[int] = 16,
     init_blocks: Constexpr[int] = 0, local_keep: Constexpr[int] = 0, max_rows: Constexpr[int] = 64,
-    local_max: Constexpr[int] = 1024, slot_keys: Constexpr[int] = 64,
+    local_max: Constexpr[int] = 1024, slot_keys: Constexpr[int] = 64, ipf_kib: Constexpr[int] = 0,
+    owner_fast: Constexpr[int] = 1,
 ):  # fmt: skip
     cfg = (tile_m, ns, ks, kw, wm, wn, depth, astage, wcpol, 0)
     err = chain_config_error(tile_m, ns, ks, kw, wm, wn, depth, astage)
@@ -240,7 +262,7 @@ def launch_aq1(
         f"{'aqx_qkv_score_xchg' if xchg else 'aq1_qkv_score'}_gfx1250_n{N}_t{tile_m}_ns{ns}_ks{ks}_w{kw}x{wm}x{wn}"
         f"_d{depth}_c{wcpol}"
         f"_h{heads_i}_q{ql}_r{rank_cp}w{world}_g{ring}_s{n_score}{'_tl' if tl else ''}"
-        f"{f'_x{topk}i{init_blocks}l{local_keep}m{max_rows}' if xchg else ''}"
+        f"{f'_x{topk}i{init_blocks}l{local_keep}m{max_rows}' if xchg else ''}{f'_pf{ipf_kib}' if ipf_kib else ''}{'' if owner_fast else '_ow0'}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -253,7 +275,7 @@ def launch_aq1(
         arg_bt: fx.Pointer, arg_len: fx.Pointer, arg_out: fx.Pointer,
         arg_aqq: fx.Pointer, arg_flag: fx.Pointer, arg_cnt: fx.Pointer, arg_err: fx.Pointer, arg_tl: fx.Pointer,
         arg_scb: fx.Pointer, arg_peers: fx.Pointer, arg_send: fx.Pointer, arg_recv: fx.Pointer, arg_tmo: fx.Pointer,
-        arg_idx: fx.Pointer, arg_sbt: fx.Pointer, arg_sctx: fx.Pointer,
+        arg_idx: fx.Pointer, arg_sbt: fx.Pointer, arg_sctx: fx.Pointer, arg_pc: fx.Pointer,
         i32_m: fx.Int32, i32_lda: fx.Int32, i32_mpad: fx.Int32, i32_cs_rows: fx.Int32,
         i64_kp_page: fx.Int64, i64_ks_page: fx.Int64, i64_ip_page: fx.Int64, i64_is_page: fx.Int64,
         i32_eps: fx.Int32,
@@ -285,9 +307,17 @@ def launch_aq1(
                 if tid == who:
                     now = fx.Int32(fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.readsteadycounter", [], [], []))
                                    & fx.Int64(0x7FFFFFFF))
-                    buffer_store(now, _rsrc(fx.Int64(fx.ptrtoint(arg_tl)), GRID * 16), bid * 4 + slot)
+                    buffer_store(now, _rsrc(fx.Int64(fx.ptrtoint(arg_tl)), GRID * 4 * TLW), bid * TLW + slot)
 
         stamp(0, 0)
+
+        pc_rs = _rsrc(fx.Int64(fx.ptrtoint(arg_pc)), 8)
+
+        def err_pc_end():
+            """This kernel's end PC recorded by an earlier launch (``arg_pc``, one buffer a compiled kernel)."""
+            w2 = Vec(buffer_load(pc_rs, 0, vec_width=2, dtype=T.i32))
+            return (fx.Int64(_uni(fx.Int32(w2[1]))) << fx.Int64(32)) | (fx.Int64(_uni(fx.Int32(w2[0])))
+                                                                       & fx.Int64(0xFFFFFFFF))
 
         def timeout(pend):
             if pend & (lane == 0):
@@ -881,6 +911,12 @@ def launch_aq1(
                 hh = sel // ql
                 sel_r = sel % ql
                 if sel < niq * ql:
+                    if const_expr(ipf_kib):
+                        # the role's straight-line code runs once a launch on this CU: pull it into the instruction
+                        # cache while the scores are still being computed. Bounded by the kernel's own end PC, which
+                        # an earlier launch recorded (0 before the first: no prefetch), so no request leaves the code.
+                        if wave == 0:
+                            prefetch_code_to(err_pc_end(), ipf_kib // 2)
                     zero_ = fx.Int32(0)
                     lane_lt = (fx.Int32(1) << lane) - 1  # lanes below this one
 
@@ -907,15 +943,15 @@ def launch_aq1(
                         return (fx.Int64(kh_b) << fx.Int64(32)) | (fx.Int64(kl_b) & fx.Int64(0xFFFFFFFF))
 
                     def cx(key_b, jx_b, want_max):
-                        """Compare-exchange with lane ^ jx_b: the larger key stays where want_max, else the smaller."""
-                        ph_b = fx.Int32(gpu.shuffle_xor(key_b[0], jx_b, WAVE))
-                        pl_b = fx.Int32(gpu.shuffle_xor(key_b[1], jx_b, WAVE))
-                        take_b = want_max == (k64(ph_b, pl_b) > k64(key_b[0], key_b[1]))
-                        return take_b.select(ph_b, key_b[0]), take_b.select(pl_b, key_b[1])
+                        """Compare-exchange with lane ^ jx_b: the larger key stays where want_max, else the smaller.
+                        A key is (hi, lo, payload...): the payload words move with it."""
+                        pk_b = [fx.Int32(gpu.shuffle_xor(e_b, jx_b, WAVE)) for e_b in key_b]
+                        take_b = want_max == (k64(pk_b[0], pk_b[1]) > k64(key_b[0], key_b[1]))
+                        return tuple(take_b.select(p_b, e_b) for p_b, e_b in zip(pk_b, key_b))
 
                     def kmax(ka_b, kb_b):
                         gt_b = k64(ka_b[0], ka_b[1]) > k64(kb_b[0], kb_b[1])
-                        return gt_b.select(ka_b[0], kb_b[0]), gt_b.select(ka_b[1], kb_b[1])
+                        return tuple(gt_b.select(a_b, c_b) for a_b, c_b in zip(ka_b, kb_b))
 
                     def sort16(keys_b, dirs_b):
                         """Bitonic sequences in lanes 0-15 -> sorted (descending where dirs_b[i]); stage by stage."""
@@ -937,6 +973,18 @@ def launch_aq1(
                         return sort16([kmax(ma_b, mb_b)], [desc_b])[0]
 
                     length_ = fx.Int32(fx.recast_iter(fx.Int32, arg_len)[0])
+                    send_rs = _rsrc(fx.Int64(fx.ptrtoint(arg_send)), world * max_rows * 4)
+                    peers_rs = _rsrc(fx.Int64(fx.ptrtoint(arg_peers)), world * 8)
+                    recv_rs = _rsrc(fx.Int64(fx.ptrtoint(arg_recv)), max_rows * 4)
+                    if const_expr(owner_fast):
+                        # read at the role's entry, while the scores are computed: only this workgroup advances its
+                        # send counter (head hh, row r) and, on the owner, its receive counter (row r) in a launch,
+                        # and the peer table is fixed; so the push and the poll need no dependent load later
+                        call0 = _uni(fx.Int32(buffer_load(send_rs, hh * max_rows + sel_r, vec_width=1, dtype=T.i32,
+                                                          cache_modifier=SCOPE_DEV)))
+                        rcall0 = _uni(fx.Int32(buffer_load(recv_rs, sel_r, vec_width=1, dtype=T.i32,
+                                                           cache_modifier=SCOPE_DEV)))
+                        pw0 = Vec(buffer_load(peers_rs, 2 * hh, vec_width=2, dtype=T.i32))
                     token = sel_r
                     causal_blocks = (length_ - ql + token + 128) // 128
                     local_start = causal_blocks - local_keep
@@ -981,6 +1029,7 @@ def launch_aq1(
                             pend = spend(vs)
                             pit = pit + 1
                         timeout(pend)
+                        stamp(4, 0)
                         tiles = []
                         for ts_b in range_constexpr(nslots):
                             if inrs[ts_b]:
@@ -1017,6 +1066,7 @@ def launch_aq1(
                     _lds_barrier()
                     if wave == 0:
                         # ---- the 12 lists: pairs (list 2p descending, list 2p + 1 reversed) -> 6 -> 3 -> 2 -> 1
+                        stamp(5, 0)
                         l16 = lane & 15
 
                         def lget(lw_b, li_b):
@@ -1048,15 +1098,19 @@ def launch_aq1(
                                     t_hi, t_lo = merge16(merge16(ds[0], ds[1], True), ds[2], True)
                         stamp(1, 0)
                         # ---- push the shard's top-16 to head hh's owner (rank hh): tagged, bank call % 2
-                        send_rs = _rsrc(fx.Int64(fx.ptrtoint(arg_send)), world * max_rows * 4)
-                        call = _uni(fx.Int32(buffer_load(send_rs, hh * max_rows + sel_r, vec_width=1, dtype=T.i32,
-                                                         cache_modifier=SCOPE_DEV)))
+                        if const_expr(owner_fast):
+                            call = call0
+                        else:
+                            call = _uni(fx.Int32(buffer_load(send_rs, hh * max_rows + sel_r, vec_width=1, dtype=T.i32,
+                                                             cache_modifier=SCOPE_DEV)))
                         call = (call & fx.Int32((1 << 30) - 1)) + 1
                         if lane == 0:
                             buffer_store(call, send_rs, hh * max_rows + sel_r, cache_modifier=SCOPE_DEV)
                         tag = call % 32767 + 1
-                        peers_rs = _rsrc(fx.Int64(fx.ptrtoint(arg_peers)), world * 8)
-                        pw = Vec(buffer_load(peers_rs, 2 * hh, vec_width=2, dtype=T.i32))
+                        if const_expr(owner_fast):
+                            pw = pw0
+                        else:
+                            pw = Vec(buffer_load(peers_rs, 2 * hh, vec_width=2, dtype=T.i32))
                         peer = ((fx.Int64(_uni(fx.Int32(pw[1]))) << fx.Int64(32))
                                 | fx.Int64(fx.Uint32(_uni(fx.Int32(pw[0])))))
                         box_bytes = 2 * world * max_rows * slot_keys * 8
@@ -1065,11 +1119,14 @@ def launch_aq1(
                         if lane < topk:
                             buffer_store(Vec.from_elements([t_lo, t_hi | (tag << 17)], fx.Int32), peer_rs,
                                          (slot * slot_keys + lane) * 2, cache_modifier=SCOPE_SYS)
+                        stamp(6, 0)
                         if hh == rank_cp:
                             # ---- the owner: the 4 shards' keys for this row, then the merge (_merge_winners)
-                            recv_rs = _rsrc(fx.Int64(fx.ptrtoint(arg_recv)), max_rows * 4)
-                            rcall = _uni(fx.Int32(buffer_load(recv_rs, sel_r, vec_width=1, dtype=T.i32,
-                                                              cache_modifier=SCOPE_DEV)))
+                            if const_expr(owner_fast):
+                                rcall = rcall0
+                            else:
+                                rcall = _uni(fx.Int32(buffer_load(recv_rs, sel_r, vec_width=1, dtype=T.i32,
+                                                                  cache_modifier=SCOPE_DEV)))
                             rcall = (rcall & fx.Int32((1 << 30) - 1)) + 1
                             rtag = rcall % 32767 + 1
                             bank = (rcall % 2) * world * max_rows
@@ -1106,12 +1163,18 @@ def launch_aq1(
                             if lane == 0:
                                 buffer_store(rcall, recv_rs, sel_r, cache_modifier=SCOPE_DEV)
                             stamp(2, 0)
-                            ws = rload()  # every key read after the poll saw them all
+                            # owner_fast: the poll's last read already holds every key (each 8-B word carries its own
+                            # tag and is single-copy atomic), so no second system-scope read (production re-reads
+                            # because its waves poll only one copy of each key). owner_fast 0: the re-read (A/B arm).
+                            if const_expr(not owner_fast):
+                                ws = rload()
                             causal_len = length_ - ql + token + 1
+                            btab = fx.recast_iter(fx.Int32, arg_bt)
                             valid_blocks = (causal_len + 127) // 128
                             m_start = valid_blocks - local_keep
                             m_start = (m_start < zero_).select(zero_, m_start)
                             cand = []
+                            pgs = []
                             for c in range_constexpr(2):
                                 kh_ = reals[c].select(fx.Int32(ws[c][1]) & fx.Int32(0x1FFFF), zero_)
                                 kl_ = reals[c].select(fx.Int32(ws[c][0]), zero_)
@@ -1120,7 +1183,14 @@ def launch_aq1(
                                 sc32 = ((kh_ & fx.Int32(0xFFFF)) << 16) | ((kl_ >> 16) & fx.Int32(0xFFFF))
                                 bits = sc32 ^ (sc32 < zero_).select(fx.Int32(-0x80000000), fx.Int32(-1))
                                 val = force(bits.bitcast(fx.Float32), blk_, real, m_start)
-                                cand.append(pack(val, blk_ + 1, real))
+                                # the candidate's page, read now (in flight during the merge) and carried with the key,
+                                # so the emit has no dependent table read after the merge
+                                if const_expr(owner_fast):
+                                    # the candidate's page, read now (in flight during the merge); the merge carries
+                                    # only the candidate's slot (lane + 32 c), and the winner's page is picked from
+                                    # the slot afterwards, so the merge does not wait for the read
+                                    pgs.append(real.select(fx.Int32(btab[real.select(blk_, zero_)]), zero_))
+                                cand.append((*pack(val, blk_ + 1, real), lane + fx.Int32(32 * c)))
                             # every sender's 16 keys come sorted (AQ's bitonic list, production's tl.topk) and the
                             # re-pinning is idempotent, so the registers are bitonic: lanes 0-15 non-increasing,
                             # 16-31 non-decreasing. Checked; if not, the full sort.
@@ -1134,11 +1204,13 @@ def launch_aq1(
                                 bad_b = bad_b | fx.Int32(rocdl.ballot(T.i32, ok_b == fx.Boolean(False)))
                             m_hi = zero_
                             m_lo = zero_
+                            m_pg = zero_
                             if bad_b == zero_:
-                                m_hi, m_lo = merge16(*sort16([cx(cand[0], 16, nbit_b[16]), cx(cand[1], 16, nbit_b[16])],
-                                                             [True, False]), True)
+                                m_hi, m_lo, m_pg = merge16(*sort16([cx(cand[0], 16, nbit_b[16]),
+                                                                    cx(cand[1], 16, nbit_b[16])], [True, False]), True)
                             else:
-                                m_hi, m_lo = merge16(*top16(cand, [True, False]), True)
+                                m_hi, m_lo, m_pg = merge16(*top16(cand, [True, False]), True)
+                            stamp(7, 0)
                             # ---- indices + the NVFP4 page-128 table row (_emit_sparse_block_table_row, a page a block)
                             nsel = (valid_blocks < topk).select(valid_blocks, fx.Int32(topk))
                             tidx = (m_lo & fx.Int32(0xFFFF)) - 1
@@ -1156,8 +1228,14 @@ def launch_aq1(
                             has_tail = fx.Int32(rocdl.ballot(T.i32, is_tail)) != zero_
                             earlier = fx.Int32(fx.math.ctpop(full_m & lane_lt))
                             bslot = is_full.select(earlier, n_full)
-                            btab = fx.recast_iter(fx.Int32, arg_bt)
-                            page = bvalid.select(fx.Int32(btab[bvalid.select(tidx, zero_)]), zero_)
+                            if const_expr(owner_fast):
+                                # btab[tidx]: the winner's candidate slot m_pg -> lane m_pg % 32 of register m_pg / 32
+                                sl_ = m_pg & fx.Int32(31)
+                                pg_w = (m_pg >= fx.Int32(32)).select(fx.Int32(gpu.shuffle_idx(pgs[1], sl_, WAVE)),
+                                                                     fx.Int32(gpu.shuffle_idx(pgs[0], sl_, WAVE)))
+                                page = bvalid.select(pg_w, zero_)
+                            else:
+                                page = bvalid.select(fx.Int32(btab[bvalid.select(tidx, zero_)]), zero_)
                             sbt_rs = _rsrc(fx.Int64(fx.ptrtoint(arg_sbt)), ql * topk * 4)
                             if bvalid:
                                 buffer_store(page, sbt_rs, sel_r * topk + bslot)
@@ -1171,13 +1249,17 @@ def launch_aq1(
                                 buffer_store(ctx, _rsrc(fx.Int64(fx.ptrtoint(arg_sctx)), ql * 4), sel_r)
         if tid == 0:
             buffer_store(e_, cnt_rs, bid, cache_modifier=SCOPE_DEV)
+        if const_expr(ipf_kib):
+            if (bid == 0) & (tid == 0):
+                pc_ = getpc()
+                buffer_store(Vec.from_elements([fx.Int32(pc_), fx.Int32(pc_ >> fx.Int64(32))], fx.Int32), pc_rs, 0)
         stamp(3, 0)
 
     kernel_aq1(
         arg_a, arg_as, arg_w, arg_ws, arg_slab, arg_q, arg_iq, arg_qw, arg_kw, arg_iqw, arg_ikw, arg_cs, arg_pos,
         arg_slot, arg_islot, arg_kp, arg_vp, arg_ksc, arg_vsc, arg_ip, arg_isc, arg_bt, arg_len, arg_out,
         arg_aqq, arg_flag, arg_cnt, arg_err, arg_tl,
-        arg_scb, arg_peers, arg_send, arg_recv, arg_tmo, arg_idx, arg_sbt, arg_sctx,
+        arg_scb, arg_peers, arg_send, arg_recv, arg_tmo, arg_idx, arg_sbt, arg_sctx, arg_pc,
         i32_m, i32_lda, i32_mpad, i32_cs_rows, i64_kp_page, i64_ks_page, i64_ip_page, i64_is_page, i32_eps,
         i32_bt_stride, i32_local, i32_global, f32_scale, i32_maxit,
         value_attrs={"rocdl.cluster_dims": f"{csize},1,1"},

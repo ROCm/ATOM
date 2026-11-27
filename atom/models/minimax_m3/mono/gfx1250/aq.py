@@ -24,6 +24,12 @@ LOG2E = 1.4426950409
 # the 8-row decode chain config (rF6 / PFX): tile_m, ns, ks, kw, wm, wn, depth, astage, wcpol
 AQ1_CONFIG = (16, 4, 4, 6, 1, 2, 2, 1, 1)
 N_SCORE = 64  # score workgroups (a multiple of 16)
+# KiB of the exchange role's code prefetched into the instruction cache at the role's entry (0: none). A module
+# attribute read at each (eager / capture) call, for the one-server A/B; the released value is the default.
+IPF_KIB = 0
+# 1: the owner merges the keys its poll read and carries each candidate's page through the merge (no second
+# mailbox read, no table read after the merge). 0: the previous order, kept for the one-server A/B.
+OWNER_FAST = 1
 N_SCORE_X = 112  # with the exchange: 368 QKV + 112 score + 32 exchange = 512 workgroups, all co-resident
 RING = 4
 MAXIT = 20_000_000
@@ -55,6 +61,15 @@ def aq1_scratch(device, niq: int, ql: int, n_score: int = N_SCORE, xchg: bool = 
         )
         _SCRATCH[key] = s
     return s
+
+
+def _pc_slot(device, spec):
+    """One int64 a compiled kernel (device, spec): the end PC its code prefetch is bounded by (0 until recorded)."""
+    key = ("pc", device.index if device.index is not None else torch.cuda.current_device(), spec)
+    t = _SCRATCH.get(key)
+    if t is None:
+        t = _SCRATCH[key] = torch.zeros(2, dtype=torch.int32, device=device)
+    return t
 
 
 def ql_ok(ql, ex) -> bool:
@@ -135,7 +150,8 @@ def flydsl_aq1(
     spec = (tile_m, ns, ks, kw, wm, wn, depth, niq, astage, wcpol, max_query_len, int(rank), int(world), RING, n_score,
             int(timeline is not None), int(xchg),
             *((exchange["topk"], exchange["init_blocks"], exchange["local_keep"], exchange["max_rows"], LOCAL_MAX,
-               exchange["slot_keys"]) if xchg else (16, 0, 0, 64, LOCAL_MAX, 64)))
+               exchange["slot_keys"]) if xchg else (16, 0, 0, 64, LOCAL_MAX, 64)), IPF_KIB if xchg else 0,
+            OWNER_FAST)
     _run_compiled(
         launch_aq1,
         ptr_arg(x), ptr_arg(x_scale), ptr_arg(w), ptr_arg(w_scale), ptr_arg(slab),
@@ -155,6 +171,7 @@ def flydsl_aq1(
         ptr_arg(exchange["indices"] if xchg else dummy, fx.Int32),
         ptr_arg(exchange["sparse_bt"] if xchg else dummy, fx.Int32),
         ptr_arg(exchange["sparse_ctx"] if xchg else dummy, fx.Int32),
+        ptr_arg(_pc_slot(x.device, spec), fx.Int32),
         m, x.stride(0), mpad, cos_sin_cache.shape[0],
         k_cache.stride(0), k_scale.stride(0), index_cache.stride(0), index_scale.stride(0), eps_bits,
         block_table.stride(0), local, blocks, float(np.float32(sm_scale * LOG2E)), int(maxit),
