@@ -490,6 +490,8 @@ def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
         ssm_conv_state_len=3,
     )
     context = SimpleNamespace(
+        tr_graph=None,
+        in_hipgraph=False,
         attn_metadata=SimpleNamespace(kda_metadata=metadata),
         kv_cache_data={"layer_0": SimpleNamespace(k_cache=conv_storage, v_cache=pool)},
     )
