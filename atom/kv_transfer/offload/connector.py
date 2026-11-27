@@ -294,6 +294,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def send_finished(self, req_id) -> None:
         self._impl.send_finished(req_id)
 
+    def take_sources_to_abort(self) -> list:
+        """Early-handoff sources whose transfer was retired, for the scheduler
+        to abort. An offload implementation hands no request off early, so
+        there are none unless the implementation says otherwise."""
+        callback = getattr(self._impl, "take_sources_to_abort", None)
+        return callback() if callback is not None else []
+
     def protected_block_ids(self, seq):
         callback = getattr(self._impl, "protected_block_ids", None)
         return callback(seq) if callback is not None else None
