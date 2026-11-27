@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from atom.kv_transfer.offload.mooncake_store.nic import rail_rdma_device
+from atom.utils.pci_topology import rail_rdma_device
 
 IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
