@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The cache key: the checkpoint and the drafter's, the model's HF config, the
-shard a rank holds, the quantization config, and the launch options and
-environment variables listed here as changing what loading produces. Nothing
+"""The cache key: the checkpoint and the drafter's, the model's HF config, what
+a server reads from the checkpoint by itself, the shard a rank holds, the
+quantization config, and the launch options and environment variables listed
+here as changing what loading produces. Nothing
 else is looked at: after a change to loading code, or to a setting that is
 not listed, stop the daemon by hand
 (``python -m atom.model_loader.weight_cache stop``)."""
@@ -12,13 +13,19 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import hashlib
+import json
 import os
 
 from torch import nn
 
-from atom.model_loader.weight_cache.values import _fp, _json
-from atom.model_loader.weight_iterator import _MAX_SAFETENSORS_HEADER_BYTES
+from atom.model_loader.weight_cache.values import _TAG, _fp, _json, logger
+from atom.model_loader.weight_iterator import (
+    _MAX_SAFETENSORS_HEADER_BYTES,
+    SAFE_WEIGHTS_INDEX_NAME,
+)
 from atom.model_loader.weight_utils import local_model_dir
+from atom.models.registry import server_checkpoint_reads
+from atom.utils import get_hf_text_config, resolve_obj_by_qualname
 
 # Launch options (Config fields) that change the loaded weights, or decide
 # whether loading changes an object. The cache does not find these by itself:
@@ -67,6 +74,8 @@ _ENV_VARS = (
     "ATOM_MHC_USE_BF16",
     "ATOM_MLA_ABSORB_BF16",
     "ATOM_USE_TRITON_MXFP4_BMM",
+    # Whether online quantization takes each rank's shard by itself.
+    "ATOM_ONLINE_QUANT_STREAMING",
     # Whether each rank holds the whole vocabulary embedding.
     "ATOM_REPLICATE_VOCAB_EMBED",
     # Whether loading realigns a fused norm's quantization to the layer after.
@@ -122,6 +131,36 @@ def _checkpoint_digest(model_path: str) -> str:
     return h.hexdigest() if weights else f"incomplete:{root}:{h.hexdigest()}"
 
 
+def _server_reads(config):
+    """What a server of the model reads from the checkpoint by itself, not as
+    weights a daemon holds (``models.registry.server_checkpoint_reads``): the
+    files those tensors are in, and the settings they follow. A daemon's
+    `load` does not change what a server has read, so two checkpoints that
+    differ here are not two of one model to it."""
+    archs = getattr(config.hf_config, "architectures", None) or (None,)
+    declared = server_checkpoint_reads.get(archs[0])
+    if declared is None or config.load_dummy:
+        return None
+    root = local_model_dir(config.model)
+    try:
+        tensors, follows = resolve_obj_by_qualname(declared)(
+            get_hf_text_config(config.hf_config)
+        )
+        with open(os.path.join(root, SAFE_WEIGHTS_INDEX_NAME)) as f:
+            shard = json.load(f)["weight_map"]
+        files = {
+            name: file_identity(os.path.join(root, shard[name])) for name in tensors
+        }
+    except Exception as e:  # noqa: BLE001 - e.g. a hub model before its download
+        logger.warning(
+            f"{_TAG} what a server reads from {root} by itself could not be "
+            f"found ({e!r}): a daemon that holds it takes no load"
+        )
+        # With the directory: two that cannot be read do not pass for alike.
+        return f"<unreadable {root}: {type(e).__name__}>"
+    return {"tensors": files, "config": follows}
+
+
 def _setting(config, name: str) -> str:
     for part in name.split("."):
         config = getattr(config, part)
@@ -142,6 +181,7 @@ def compute_key(config, rank: int) -> dict:
     pc = config.parallel_config
     spec = config.speculative_config
     quant = config.quant_config
+    reads = _server_reads(config)
     return {
         "checkpoint": _checkpoint_digest(local_model_dir(config.model)),
         # The daemon holds this drafter's weights too.
@@ -155,12 +195,17 @@ def compute_key(config, rank: int) -> dict:
             else None
         ),
         "hf_config": hashlib.sha256(_json(hf_dict).encode()).hexdigest(),
+        # Only for a model that declares some: the others' keys are as before.
+        **({} if reads is None else {"server_reads": reads}),
         "rank": rank,
         # The shard a rank holds depends on the whole layout (EP spans DP).
         "parallel": {
             "tp": config.tensor_parallel_size,
             "tp_world": config.tp_world_size,
             "pcp": config.pcp_group_size,
+            "sp": config.sequence_parallel_size,
+            "pp": config.pipeline_parallel_size,
+            "pp_rank": pc.pipeline_parallel_rank,
             "dp": pc.data_parallel_size,
             "dp_rank": pc.data_parallel_rank,
             "dp_attention": bool(config.enable_dp_attention),

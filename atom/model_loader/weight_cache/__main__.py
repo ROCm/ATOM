@@ -13,6 +13,7 @@ import time
 from atom.model_loader.weight_cache.preload import (
     _hold_unused,
     forget_uncacheable,
+    launch_engine,
     stop_daemon,
 )
 from atom.model_loader.weight_cache.transport import (
@@ -57,6 +58,10 @@ def _status(launches: dict) -> None:
                         line += f", idle {_age(r.get('idle_s', 0))}"
                     if r.get("poisoned"):
                         line += ", WEIGHTS MODIFIED by a client (will refuse to serve)"
+                    if r.get("stopped"):
+                        line += ", STOPPED (a load fills them)"
+                    if r.get("unfollowed"):
+                        line += ", A SERVER COULD NOT GO ON (load the checkpoint again)"
                 except Exception as e:  # noqa: BLE001
                     line += f", not answering ({e})"
             else:
@@ -113,13 +118,22 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m atom.model_loader.weight_cache",
         description="Show or stop this user's ATOM weight cache daemons on this machine.",
     )
-    parser.add_argument("command", choices=("status", "stop"))
+    # daemon <launch file>: how a launch starts one, with what it recorded.
+    parser.add_argument("command", choices=("status", "stop", "daemon"))
+    parser.add_argument("launch", nargs="?", help=argparse.SUPPRESS)
     parser.add_argument(
         "--force",
         action="store_true",
         help="stop: also stop daemons that running servers use",
     )
     args = parser.parse_args(argv)
+    if (args.command == "daemon") != (args.launch is not None):
+        parser.error(f"unrecognized arguments: {args.launch}")
+    if args.command == "daemon":
+        from atom.model_loader.weight_cache.daemon import run_daemon
+
+        run_daemon(launch_engine(args.launch))
+        return 0
     if args.command == "stop" and forget_uncacheable():
         print("forgot the loads found uncacheable")
     launches = _running_daemons()

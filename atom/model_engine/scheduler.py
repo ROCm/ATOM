@@ -3878,6 +3878,17 @@ class Scheduler:
                 return True
         return False
 
+    def abort_waiting(self, reason: str) -> int:
+        """Finish every waiting request as ``reason``; how many. After
+        `preempt_running` those are every request the scheduler has."""
+        ended = 0
+        while self.waiting:
+            seq = self.waiting.popleft()
+            seq.status = SequenceStatus.ABORTED
+            self._finish_rejected_waiting(seq, reason)
+            ended += 1
+        return ended
+
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.
 

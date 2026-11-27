@@ -12,7 +12,9 @@ from .protocol import (
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
     CompletionResponse,
+    ServerAborted,
     openai_stop_reason,
+    server_aborted_frames,
 )
 from .sse import data_frame
 from .streaming_dispatch import StreamOutputCollector
@@ -157,6 +159,9 @@ async def stream_completion_response(
                 return
 
             yield content_chunk
+    except ServerAborted as exc:
+        aborted = False  # the engine ended it: nothing left to abort there
+        yield server_aborted_frames(exc)
     finally:
         cleanup_stream(seq_id, aborted=aborted)
         cleanup_request(request_id)
@@ -347,6 +352,9 @@ async def stream_completion_response_fanout(
         if not usage_on_finish:
             finish += data_frame(usage_chunk)
         yield finish + STREAM_DONE_MESSAGE
+    except ServerAborted as exc:
+        aborted = False  # the engine ended every sibling
+        yield server_aborted_frames(exc)
     finally:
         for sid in seq_ids:
             cleanup_stream(sid, aborted=aborted)

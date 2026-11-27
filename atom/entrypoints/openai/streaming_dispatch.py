@@ -21,6 +21,8 @@ from typing import Any, NamedTuple
 
 from atom.model_engine.sequence import new_token_ids
 
+from .protocol import raise_for_server_abort
+
 logger = logging.getLogger("atom")
 
 # How long one stream may go without a chunk before it is worth a line. Long
@@ -432,6 +434,9 @@ class StreamOutputCollector:
         del self._pending[tag]
         if not self._pending:
             self._ready.clear()
+        # For every stream alike: its generator tells the client in its own
+        # API's words (`ServerAborted`).
+        raise_for_server_abort(chunk.get("finish_reason"))
         state = chunk.pop("_detokenizer", None)
         if state is not None:
             try:

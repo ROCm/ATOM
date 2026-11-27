@@ -65,6 +65,14 @@ mono_decode_installers = {
         "atom.models.minimax_m3.mono.dispatch.install_mono_decode"
     ),
 }
+# What a server of an architecture reads from its checkpoint by itself, not as
+# weights the loader gives it: (text config) -> (those tensors' names, the
+# settings they follow). A weight cache daemon's `load` cannot change them.
+server_checkpoint_reads = {
+    "DeepseekV41ForCausalLM": (
+        "atom.models.deepseek_v41.config.server_checkpoint_reads"
+    ),
+}
 # Speculative methods each architecture serves under pipeline_parallel_size > 1
 # (its drafts verified per stage, its drafter's aux taps relayed across stages).
 # Each one's drafter shares the target's embedding: the first stage builds it,

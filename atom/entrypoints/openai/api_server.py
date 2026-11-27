@@ -111,8 +111,10 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    ServerAborted,
     check_media_handoff,
     ended_by_stop,
+    raise_for_server_abort,
     validate_max_tokens,
 )
 from .reasoning import (
@@ -1025,6 +1027,7 @@ async def generate_async(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
+    raise_for_server_abort(finish_reason)
     text = "" if sampling_params.logprobs else delivered_text(all_token_ids)
     num_tokens_input = (
         seq.num_prompt_tokens
@@ -1147,6 +1150,7 @@ async def generate_async_multimodal(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
+    raise_for_server_abort(finish_reason)
     text = delivered_text(all_token_ids)
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
@@ -1291,6 +1295,8 @@ async def generate_async_fanout(
                     logger.debug("abort_request failed on teardown", exc_info=True)
             engine.io_processor.requests.pop(_seq.id, None)
 
+    for reason in per_finish_reason:
+        raise_for_server_abort(reason)
     finished_at = time.time()
     outputs: list[dict[str, Any]] = []
     for i in range(n):
@@ -2675,6 +2681,8 @@ async def _chat_completions(
     except ValueError as e:
         logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+    except ServerAborted:
+        raise  # 503 and why, as it is
     except Exception as e:
         logger.exception("Error in %s", route)
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -2973,6 +2981,8 @@ async def _completions(
     except ValueError as e:
         logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+    except ServerAborted:
+        raise  # 503 and why, as it is
     except Exception as e:
         logger.exception("Error in %s", route)
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -3253,6 +3263,21 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             yield stream_message_delta(stop_reason, output_tokens)
                             yield stream_message_stop()
                             break
+                except ServerAborted as exc:
+                    aborted = False  # the engine ended it: nothing to abort
+                    for _frame in stream_failure_frames(
+                        exc,
+                        blocks,
+                        output_tokens,
+                        opening=(
+                            None
+                            if message_started
+                            else stream_message_start(
+                                request_id, model_name, input_tokens, 0
+                            )
+                        ),
+                    ):
+                        yield _frame
                 except Exception as exc:
                     # Every block this stream opened has to be closed, and the
                     # client has to be told why. There was no `except` at all:
@@ -3363,6 +3388,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             content={
                 "type": "error",
                 "error": {"type": "invalid_request_error", "message": message},
+            },
+        )
+    except ServerAborted as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "type": "error",
+                "error": {"type": "api_error", "message": str(exc)},  # as its stream
             },
         )
     except Exception as e:
@@ -3650,6 +3683,12 @@ async def responses_create(raw_request: Request):
                             ):
                                 yield _frame
                             break
+                except ServerAborted as exc:
+                    aborted = False  # the engine ended it: nothing to abort
+                    for _frame in responses_stream_failure_frames(
+                        exc, emitter, opened=opened
+                    ):
+                        yield _frame
                 except Exception as exc:
                     logger.exception("Error streaming responses")
                     for _frame in responses_stream_failure_frames(
@@ -3715,6 +3754,8 @@ async def responses_create(raw_request: Request):
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as exc:
         return await value_error_handler(raw_request, exc)
+    except ServerAborted as exc:
+        return await openai_http_error_handler(raw_request, exc)
     except Exception as e:
         logger.exception("Error in responses_create")
         return JSONResponse(
@@ -3895,6 +3936,56 @@ async def server_info():
     }
 
 
+def _model_weight_reply(why: list[str], done: str):
+    if why:
+        reply = {"success": False, "message": "\n".join(why)}
+        return JSONResponse(reply, status_code=400)
+    return {"success": True, "message": done}
+
+
+@_engine_route("/model_weight/load", methods=["POST"])
+async def model_weight_load(raw_request: Request):
+    """Write the checkpoint at ``model_path`` (another one of this model) into
+    the weights this server has from its weight cache daemon, for every server
+    that has them. Answers once they serve it."""
+    from atom.model_loader.weight_cache.session import change_weights
+
+    model = (await raw_request.json()).get("model_path")
+    if not isinstance(model, str) or not model:
+        raise HTTPException(status_code=400, detail="model_path: the checkpoint")
+    logger.info(f"[weight-cache] load of {model} asked for")
+    started = time.monotonic()
+    why = await asyncio.to_thread(change_weights, "load", model)
+    took = f"{time.monotonic() - started:.0f}s"
+    if why:
+        logger.error(f"[weight-cache] load of {model} not done ({took}): {why}")
+    else:
+        logger.info(f"[weight-cache] load of {model} done ({took})")
+    return _model_weight_reply(why, f"The weights are now {model}'s.")
+
+
+@_engine_route("/model_weight/stop", methods=["POST"])
+async def model_weight_stop():
+    """The servers that have this server's weight cache daemon's weights run
+    nothing on them until a load."""
+    from atom.model_loader.weight_cache.session import change_weights
+
+    why = await asyncio.to_thread(change_weights, "stop")
+    return _model_weight_reply(why, "The weights are stopped until a load.")
+
+
+@_engine_route("/model_weight/status")
+async def model_weight_status():
+    """The checkpoint this server's weight cache daemon holds."""
+    from atom.model_loader.weight_cache.session import weights_status
+
+    status = await asyncio.to_thread(weights_status)
+    if status is None:
+        detail = "This server's weights are not a weight cache daemon's."
+        raise HTTPException(status_code=404, detail=detail)
+    return status
+
+
 @_engine_route("/start_profile", methods=["POST"])
 async def start_profile():
     """Start profiling the engine."""
@@ -4050,10 +4141,6 @@ def main():
 
         run_daemon(EngineArgs.from_cli_args(args))
         return
-    if envs.ATOM_PRELOAD == "server":
-        from atom.model_loader.weight_cache.preload import record_launch
-
-        record_launch()  # the runners start a daemon with it
 
     _setup_frontend(args)
 

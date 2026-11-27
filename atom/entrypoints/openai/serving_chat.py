@@ -24,8 +24,10 @@ from .protocol import (
     TOOL_CHOICE_VALUES,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ServerAborted,
     ended_by_stop,
     openai_stop_reason_with_calls,
+    server_aborted_frames,
 )
 from .reasoning import (
     NO_REASONING,
@@ -569,6 +571,9 @@ async def stream_chat_response(
             usage_on_finish=usage_on_finish,
             include_usage=include_usage,
         )
+    except ServerAborted as exc:
+        aborted = False  # the engine ended it: nothing left to abort there
+        yield server_aborted_frames(exc)
     finally:
         if any_logprobs:
             for tracker in stream_collector.trackers:
@@ -954,6 +959,9 @@ async def stream_chat_response_fanout(
             usage_on_finish=usage_on_finish,
             include_usage=include_usage,
         )
+    except ServerAborted as exc:
+        aborted = False  # the engine ended every sibling
+        yield server_aborted_frames(exc)
     finally:
         if any_logprobs:
             for tracker in shared_collector.trackers:

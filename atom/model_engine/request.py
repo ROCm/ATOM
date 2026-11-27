@@ -4,6 +4,17 @@
 from dataclasses import dataclass
 from typing import Any
 
+# A finish reason that starts so says the server ended the request itself, and
+# why after it: the client is answered an error, not a completion cut short.
+SERVER_ABORT_REASON = "server_abort: "
+
+
+def server_abort(finish_reason) -> str | None:
+    """Why the server ended the request itself; None: it did not."""
+    if isinstance(finish_reason, str) and finish_reason.startswith(SERVER_ABORT_REASON):
+        return finish_reason[len(SERVER_ABORT_REASON) :]
+    return None
+
 
 @dataclass
 class RequestOutput:

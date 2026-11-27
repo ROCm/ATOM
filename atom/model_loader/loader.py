@@ -282,8 +282,17 @@ def load_model(
     is_plugin_mode: bool = False,
     weights_mapper: WeightsMapper | None = None,
     load_fused_expert_weights_fn=None,
+    units=None,
 ):
     """Load a checkpoint into `model` and run post-load weight processing.
+
+    ``units`` has a group of modules loaded and processed at a time, so that
+    only one group's weights need memory of their own (a weight cache daemon
+    writing a checkpoint into memory in use). For each ``key`` of
+    ``units.order()``: ``units.begin(key)``, its tensors (``units.of(name)``
+    names a parameter's group) are loaded, the modules ``units.modules(key)``
+    are processed, ``units.end(key)``. The modules of no group are processed
+    last, as without ``units``.
 
     The checkpoint -> parameter logic lives in `loading_core`, which is kept
     free of AITER so it can be unit-tested without a GPU build; this wrapper
@@ -331,7 +340,51 @@ def load_model(
     # This must also run for speculative draft loads: those modules were built
     # with the same meta-backed streaming parameters as the target. `spec_decode`
     # only changes checkpoint-name selection; it must not disable materialization.
-    online_quant_streamer = OnlineQuantStreamer.maybe_create(model, load_dummy)
+    # Not with ``units``: a group at a time is loaded and quantized as it is.
+    online_quant_streamer = (
+        OnlineQuantStreamer.maybe_create(model, load_dummy) if units is None else None
+    )
+    # Modules processed with their group, and the parameters that created.
+    processed: set[int] = set()
+    created: list[str] = []
+
+    def _process(module_name: str, module: nn.Module) -> None:
+        # Avoid repeating module post-processing already run by the streamer.
+        streamed = (
+            online_quant_streamer is not None
+            and id(module) in online_quant_streamer.done_module_ids
+        )
+        if hasattr(module, "process_weights_after_loading") and not streamed:
+            module.process_weights_after_loading()
+        quant_method = getattr(module, "quant_method", None)
+
+        # when running plugin mode for sglang, don't do the post process here
+        # since sglang will call this func automatically after finishing loading
+        if isinstance(quant_method, QuantizeMethodBase) and not is_sglang():
+            quant_method.process_weights_after_loading(module)
+        if MOE_PREPARE_FINALIZE and isinstance(quant_method, FusedMoEMethodBase):
+            quant_method.init_prepare_finalize(module)
+
+        # Online quantization creates new params (e.g. weight_scale) that are
+        # not present in the source checkpoint. Record them as "loaded" so the
+        # plugin host's strict weight tracking (e.g. vLLM's default loader)
+        # does not flag them as uninitialized.
+        if getattr(module, "_online_quant_info", None) is not None:
+            for param_name, _ in module.named_parameters(recurse=False):
+                full_name = f"{module_name}.{param_name}" if module_name else param_name
+                created.append(prefix + full_name)
+
+    def _groups():
+        for key in units.order():
+            units.begin(key)
+
+            def loaded(key=key):
+                for module_name, module in units.modules(key):
+                    _process(module_name, module)
+                    processed.add(id(module))
+                units.end(key)
+
+            yield (lambda name, key=key: units.of(name) == key), loaded
 
     loaded_weights_record = load_weights_into_model(
         model=model,
@@ -347,6 +400,7 @@ def load_model(
         is_rank0=_is_rank0,
         weights_iterator=safetensors_weights_iterator,
         online_quant_streamer=online_quant_streamer,
+        groups=None if units is None else _groups(),
     )
 
     # Dummy modes other than "empty" fill the skipped-load params with finite
@@ -397,29 +451,9 @@ def load_model(
     # their parent first combines source weights, then the child's normal hook
     # online-quantizes the final fused weight.
     for module_name, module in model.named_modules():
-        # Avoid repeating module post-processing already run by the streamer.
-        if (
-            hasattr(module, "process_weights_after_loading")
-            and id(module) not in streamed_done
-        ):
-            module.process_weights_after_loading()
-        quant_method = getattr(module, "quant_method", None)
-
-        # when running plugin mode for sglang, don't do the post process here
-        # since sglang will call this func automatically after finishing loading
-        if isinstance(quant_method, QuantizeMethodBase) and not is_sglang():
-            quant_method.process_weights_after_loading(module)
-        if MOE_PREPARE_FINALIZE and isinstance(quant_method, FusedMoEMethodBase):
-            quant_method.init_prepare_finalize(module)
-
-        # Online quantization creates new params (e.g. weight_scale) that are
-        # not present in the source checkpoint. Record them as "loaded" so the
-        # plugin host's strict weight tracking (e.g. vLLM's default loader)
-        # does not flag them as uninitialized.
-        if getattr(module, "_online_quant_info", None) is not None:
-            for param_name, _ in module.named_parameters(recurse=False):
-                full_name = f"{module_name}.{param_name}" if module_name else param_name
-                loaded_weights_record.add(prefix + full_name)
+        if id(module) not in processed:
+            _process(module_name, module)
+    loaded_weights_record.update(created)
 
     # Post-processing (AITER shuffle/swizzle, per-quant-method hooks) runs inside
     # the load time the caller reports, so it is timed unconditionally: without

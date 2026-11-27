@@ -40,6 +40,7 @@ def _draft_sharing(embed, noise_token_id=2):
     draft = model.__new__(model)
     torch.nn.Module.__init__(draft)
     draft.config = SimpleNamespace(dspark_noise_token_id=noise_token_id)
+    draft.noise_row = torch.nn.Parameter(torch.zeros(8), requires_grad=False)
     draft.share_with_target(SimpleNamespace(embed=embed, head=torch.nn.Identity()))
     return draft
 
@@ -60,64 +61,66 @@ def _sharded_embedding(fill, dtype):
     return embed
 
 
-def test_noise_row_binds_once_and_rebinds_with_a_new_target(monkeypatch):
+def test_noise_row_is_loaded_from_the_checkpoints_embedding_table(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     embed = torch.nn.Embedding.from_pretrained(torch.full((4, 8), 3.0))
     forward = Mock(wraps=embed.forward)
     monkeypatch.setattr(embed, "forward", forward)
     draft = _draft_sharing(embed)
 
-    row = draft._noise_embedding()
-    torch.testing.assert_close(row, torch.full((8,), 3.0))
-    assert not row.requires_grad
-    assert draft._noise_embedding() is row
-    forward.assert_called_once()
-    assert draft._embed_peer is None
+    # The loader hands the draft the whole table, under the draft's own name
+    # for the one row it keeps; the rest of the target's tensors are dropped.
+    assert draft.remap_mtp_weight_name("embed.weight") == "noise_row"
+    assert draft.remap_mtp_weight_name("mtp.0.attn.wo_a.weight") is not None
+    assert draft.remap_mtp_weight_name("head.weight") is None
+    table = torch.arange(32.0).reshape(4, 8)
+    draft._load_noise_row(draft.noise_row, table)
+    torch.testing.assert_close(draft.noise_row.data, table[2])
 
+    # It is the draft's own: the shared table is neither looked up for it nor
+    # asked again with another target.
+    row = draft._noise_embedding()
+    assert row is draft.noise_row and not row.requires_grad
     draft.share_with_target(
         SimpleNamespace(
             embed=torch.nn.Embedding.from_pretrained(torch.full((4, 8), 5.0)),
             head=torch.nn.Identity(),
         )
     )
-    torch.testing.assert_close(draft._noise_embedding(), torch.full((8,), 5.0))
+    assert draft._noise_embedding() is row
+    forward.assert_not_called()
 
 
-def test_noise_row_is_not_bound_under_graph_capture(monkeypatch):
+def test_the_embedding_is_not_bound_under_graph_capture(monkeypatch):
     capturing = [True]
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
     draft = _draft_sharing(torch.nn.Embedding.from_pretrained(torch.ones(4, 8)))
     with pytest.raises(RuntimeError, match="not under graph capture"):
         draft._noise_embedding()
     capturing[0] = False
-    torch.testing.assert_close(draft._noise_embedding(), torch.ones(8))
+    assert draft._noise_embedding() is draft.noise_row
 
 
-def test_sharded_noise_row_reads_the_owner_shard(monkeypatch):
+def test_a_sharded_embedding_is_bound_to_its_owner_shards(monkeypatch):
     dspark = _draft_module()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     tp = SimpleNamespace(cpu_group=object(), device_group=object())
     monkeypatch.setattr(dspark, "get_tp_group", lambda: tp)
     embed = _sharded_embedding(4.0, torch.bfloat16)
-
-    def read(ids, out):
-        assert ids.tolist() == [3]
-        return out.fill_(7.0)
-
-    peer = Mock(side_effect=read)
+    peer = Mock(side_effect=AssertionError("the noise row is not read from it"))
     bind = Mock(return_value=peer)
     monkeypatch.setattr(dspark, "shared_peer_embedding", bind)
     draft = _draft_sharing(embed, noise_token_id=3)
 
-    torch.testing.assert_close(
-        draft._noise_embedding(), torch.full((8,), 7.0, dtype=torch.bfloat16)
-    )
+    assert draft._noise_embedding() is draft.noise_row
     bind.assert_called_once_with(embed, tp.cpu_group)
     assert draft._embed_peer is peer
 
 
 @pytest.mark.parametrize("refusal", ["unmapped", "fp32"])
-def test_sharded_noise_row_falls_back_to_nccl(monkeypatch, refusal):
+def test_a_sharded_embedding_without_the_mapping_keeps_the_noise_row(
+    monkeypatch, refusal
+):
     dspark = _draft_module()
     MonoUnsupported = dspark.MonoUnsupported
 
@@ -130,23 +133,10 @@ def test_sharded_noise_row_falls_back_to_nccl(monkeypatch, refusal):
         Mock(side_effect=MonoUnsupported("no IPC")),
     )
     dtype = torch.float32 if refusal == "fp32" else torch.bfloat16
-    embed = _sharded_embedding(4.0, dtype)
+    draft = _draft_sharing(_sharded_embedding(4.0, dtype), noise_token_id=3)
 
-    def lookup(ids, weight, start, end):
-        assert (start, end) == (2, 4)
-        return weight[ids - start].clone()
-
-    reduced = []
-    monkeypatch.setattr(dspark, "masked_embedding", lookup)
-    monkeypatch.setattr(
-        dspark.dist, "all_reduce", lambda t, group: reduced.append(group)
-    )
-    draft = _draft_sharing(embed, noise_token_id=3)
-
-    torch.testing.assert_close(
-        draft._noise_embedding(), torch.full((8,), 4.0, dtype=dtype)
-    )
-    assert reduced == [tp.device_group]
+    # No collective and no lookup: the row came with the draft's weights.
+    assert draft._noise_embedding() is draft.noise_row
     assert draft._embed_peer is None
     if refusal == "fp32":
         dspark.shared_peer_embedding.assert_not_called()
