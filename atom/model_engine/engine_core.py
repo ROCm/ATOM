@@ -888,8 +888,8 @@ class EngineCore:
     def _wait_for_loads(self, loading, deadline: float) -> int:
         """Block until every request of `loading` stopped loading or `deadline`;
         returns how many still load. Woken by events only: the KV doorbell (a
-        load job ended on a worker, or a lease renewal finished here) and the
-        arrival of a completion answer."""
+        load job ended on a worker, or a lease renewal here finished or reached
+        its timeout unfinished) and the arrival of a completion answer."""
         scheduler = self.scheduler
         doorbell = self.runner_mgr.kv_doorbell_event
         # When the last unread doorbell was taken: an answer requested after it
