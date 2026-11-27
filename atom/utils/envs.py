@@ -19,6 +19,7 @@ Third-party / dependency env vars (NCCL, torch, HuggingFace, AITER, FLA) are
 documented at the bottom of this file but NOT managed here.
 """
 
+import functools
 import logging
 import math
 import os
@@ -54,6 +55,14 @@ def _flag_env(name: str, default: str = "0") -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
+def _optional_flag_env(name: str) -> bool | None:
+    """Unset or empty reads as None (the caller picks the default); a set value
+    is read as by `_flag_env`."""
+    if os.getenv(name, "").strip() == "":
+        return None
+    return _flag_env(name)
+
+
 def _preload_mode() -> str:
     """ATOM_PRELOAD: "off", "server" (1: take the weights from a weight cache
     daemon) or "daemon" (be one)."""
@@ -68,6 +77,28 @@ def _preload_mode() -> str:
         "ATOM_PRELOAD must be on (1/true/yes/on), off (0/false/no/off) or "
         f"daemon, not {raw!r}"
     )
+
+
+@functools.lru_cache(maxsize=1)
+def _runs_on_gfx950() -> bool:
+    """The GPU this process runs on is MI355X (gfx950); False where it cannot
+    tell (no aiter, no GPU)."""
+    try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        return get_gfx_runtime() == "gfx950"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _graph_side_streams_default() -> str:
+    # Off where HIP's pool has more than four hardware queues (HIP's default
+    # is four) on MI355X: there the fifth queue is the first on the launch
+    # queue's command processor pipe (queue ids four apart), and a graph branch
+    # HIP binds to it runs several times slower (`graph_records_single_stream`).
+    # Measured on gfx950 only, so other generations keep their side streams.
+    raw = os.getenv("GPU_MAX_HW_QUEUES", "").strip()
+    return "0" if raw.isdigit() and int(raw) > 4 and _runs_on_gfx950() else "1"
 
 
 def _profiler_detail_env(name: str) -> bool:
@@ -179,6 +210,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TRACE_VERSION": lambda: os.getenv("ATOM_TRACE_VERSION", "unknown"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    # Mooncake HCAs this server's engines register on, comma-separated. Unset =
+    # each GPU's local HCA (rdmaN, else ionic_N).
+    "ATOM_MOONCAKE_IB_DEVICE": lambda: os.getenv("ATOM_MOONCAKE_IB_DEVICE", ""),
+    # E/P/D encoder: seconds an image embedding entry stays readable before its
+    # pool space may be reused. A full pool with every entry inside its lease
+    # refuses the encode.
+    "ATOM_EC_LEASE_S": lambda: _positive_float_env("ATOM_EC_LEASE_S", "60"),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
     # DCP decode rank owns into a GPU staging slot and send one RDMA descriptor
     # per run of adjacent destination pages instead of one per token.
@@ -199,6 +237,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # P/D decode side: serve /v1/pd/late_kv/chat/completions, the decode leg of
+    # atomesh's concurrent dispatch (--atom-pd-concurrent). The router
+    # streams the chat request first and P's kv_transfer_params as a second
+    # line, so D parses the body while P works. 0 = route answers 404 and the
+    # router falls back to its serial relay.
+    "ATOM_PD_LATE_KV": lambda: _flag_env("ATOM_PD_LATE_KV", "0"),
     # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
     # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
     "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
@@ -283,6 +327,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inheriting their parent's owner.
     "ATOM_DP_SESSION_AFFINITY": lambda: (
         os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
+    ),
+    # DP engine loop: a rank votes "unfinished" only when a scheduling pass
+    # could produce a batch (`Scheduler.has_forward_work`). Finished requests
+    # awaiting their KV send (`deferred_free_blocks`), tier loads and lookups
+    # in flight then leave the group idle-polling instead of running DP dummy
+    # forwards back to back, which a new arrival had to wait out. None when
+    # unset: the engine then turns it on only on a P/D prefill instance
+    # (`kv_producer`) and leaves it off on an aggregated server and a decode
+    # instance (`engine_core.dp_idle_when_blocked`); an explicit 0/1 is used
+    # as is, on any role. Needs ATOM_ENABLE_PREFILL_DELAYER=0: the delayer is
+    # on by default with DP > 1 and turns this off (warning only when it was
+    # set explicitly). DP=1 never reads it (no DP group to vote with).
+    "ATOM_DP_IDLE_WHEN_BLOCKED": lambda: _optional_flag_env(
+        "ATOM_DP_IDLE_WHEN_BLOCKED"
     ),
     # --- DP prefill cost balancing (DP attention with more than one rank) ---
     # Under DP attention every rank prefills in the same lockstep step and the
@@ -613,6 +671,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # index, prefix hits).
     "ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS": lambda: int(
         os.getenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", str(1 << 26))
+    ),
+    # gfx1250 FP4 indexer: fold the per-layer weights_proj GEMM into the query
+    # RoPE/MXFP4-quant launch for a step of at most _MAX_FUSED_PROJECT_ROWS (128)
+    # rows -- decode and short-prefill chunks alike. The kernel emits the head
+    # weights as bf16 (weights_dtype), so the fold is a single launch with no
+    # trailing cast. A larger step keeps the standalone GEMM, which is not
+    # launch-bound there. Off always runs the standalone GEMM.
+    "ATOM_DSV41_FUSE_WEIGHTS_PROJ": lambda: _flag_env(
+        "ATOM_DSV41_FUSE_WEIGHTS_PROJ", "1"
     ),
     # DCP sparse (DSA) prefill, "q" transport: when QREP is active, produce the
     # whole DCP group's query heads locally, as decode does, instead of
@@ -1103,6 +1170,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: _nonnegative_int_env(
         "ATOM_QWEN4_EXP_SP_MIN_TOKENS", 1024
     ),
+    # Qwen3.8-Flash-Next under the SGLang plugin: run the sequence-parallel
+    # reduce-scatters / all-gathers on the copy engines (mori CCO SDMA),
+    # overlapped with the hyper-connections. gfx942 only; needs mori with CCO
+    # SDMA, FlyDSL and aiter's SdmaComm (fallback: docs/environment_variables.md).
+    "ATOM_QWEN4_EXP_SP_SDMA": lambda: _flag_env("ATOM_QWEN4_EXP_SP_SDMA", "0"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
@@ -1127,13 +1199,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
-    # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
-    # replicated path via `_can_use_dp_sharded_head`):
+    # case — TP>1, DP off, prefill, ragged/draft rows — falls back to the
+    # replicated path via `_can_use_dp_sharded_head`, except that "argmax" fails
+    # at startup without pure DP):
     #   "all2all"   -> shard vocab across the DP group + gather hidden, then a
     #                  single all-to-all delivers each rank its own rows x full
     #                  vocab (config ③, minimal comm). DEFAULT.
     #   "allgather" -> same shard/gather, but vocab all-gather + scatter rows
     #                  (config ②); kept for A/B and as a fallback.
+    #   "argmax"    -> same shard/gather, but exchange each shard's (max, id) and
+    #                  return greedy ids; the sampler is skipped. For all-greedy
+    #                  workloads only: startup fails without a single DP-sharded
+    #                  ParallelLMHead, with the model's own head output
+    #                  (verify_head) or with speculative decoding, and requests
+    #                  with temperature != 0, logprobs, structured output or a
+    #                  required channel are rejected.
     #   "default"   -> replicated full-vocab GEMM per DP rank (big GEMM, no comm);
     #                  explicit opt-out.
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
@@ -1161,6 +1241,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_DRAFT_CUDAGRAPH", "1").lower() == "1"
     ),
     # --- MoE (DeepSeek-style shared experts) ---
+    # 0 records every CUDA graph on one stream: the side-stream forks (dual-
+    # stream MoE, DeepSeek-V4's compressors, the Engram lookup, `side_stream`
+    # regions) run inline in the graph window, its warmup forward included.
+    # Unset, it follows GPU_MAX_HW_QUEUES on gfx950 (`_graph_side_streams_default`).
+    "ATOM_GRAPH_SIDE_STREAMS": lambda: _flag_env(
+        "ATOM_GRAPH_SIDE_STREAMS", _graph_side_streams_default()
+    ),
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
@@ -1382,6 +1469,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FRONTEND_PREFIX_HASH": lambda: (
         os.getenv("ATOM_FRONTEND_PREFIX_HASH", "1") == "1"
     ),
+    # Read a chat request's `prompt_token_ids_b64` (base64 of
+    # `array("I", ids).tobytes()`, uint32 little-endian) instead of a JSON id
+    # list. A P/D prefill leg (`do_remote_decode`) whose ids came this way does
+    # not echo them to the PD router, which already sends the same field to
+    # decode; every other request keeps its `return_token_ids` echo. A request
+    # without the field is unchanged. Enable on P and D together (a mixed
+    # setup is not supported). Upgrade P and D before a client sends the
+    # field. A P or D that runs an ATOM without this change, or sets it to 0,
+    # makes the pair mixed. "0": the field is ignored.
+    "ATOM_PROMPT_IDS_B64": lambda: os.getenv("ATOM_PROMPT_IDS_B64", "1") == "1",
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",

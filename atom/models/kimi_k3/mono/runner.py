@@ -21,11 +21,11 @@ decides which is which; the two paths hand each other the same tensors. A
 full-attention layer still runs K2 for everything after its attention
 (``_pre_o_core``), unless ``bind_model`` left it on the production path.
 
-The block-residual buffer is the one place the mono loop cannot reuse
-``KimiDecoderLayer.forward``: ``AttnRes.maybe_close_block`` grows the candidates
-with ``torch.cat``, while the kernels write their block into a slot of a buffer
-sized for the whole stack. ``_fallback`` is that same forward with the ``cat``
-replaced by a slot copy, so a fallback layer's numerics are the original path's.
+The kernels write each block into a slot of a bank sized for the whole stack.
+The attention-residual close writes the same slots in its kernel, except for
+layer 0's ``AttnRes.maybe_close_block`` fallback. ``_fallback`` calls the original
+layer forward on that bank, bypassing module hooks because mono records aux taps
+itself.
 
 ATOM carries two pending adds between layers (an MoE layer defers its routed and
 its shared output separately); K2 all-reduces one MoE output, so a mono layer
@@ -49,7 +49,6 @@ from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
     Dims,
     layer_block,
-    num_blocks,
 )
 from atom.models.kimi_k3.mono.kernels import layer as k2
 from atom.models.kimi_k3.mono.kernels.attention import kda as k1
@@ -196,7 +195,6 @@ class K3MonoDecodeRunner:
         self.debug = envs.ATOM_MONO_DEBUG
         self.inner = inner_model(model)
         self.plans = bind_model(self.inner, self.dims, self.rank)
-        self.num_blocks = num_blocks(len(self.inner.layers))
         # a DSpark drafter taps hidden states; a plain-decode deployment has none
         self.aux = (
             AuxTaps((), ())
@@ -466,9 +464,7 @@ class K3MonoDecodeRunner:
         build = self.widths[width_key(rows, qlen)]
         metadata = kda_metadata(get_forward_context())
         prefix = self.inner.get_input_embeddings(input_ids)
-        # the kernels write their block into a slot, so the stack's candidates
-        # are allocated once rather than grown layer by layer
-        blocks = prefix.new_empty(rows, self.num_blocks, prefix.size(1))
+        blocks = self.inner.block_bank(prefix)
         self.mailboxes.begin_step()
         add = add2 = None
         serving = (
@@ -560,17 +556,15 @@ class K3MonoDecodeRunner:
         """The layer's attention-side AttnRes seam, on the blocks behind it."""
         layer = self.inner.layers[plan.layer_id]
         before, write_idx = layer_block(plan.layer_id)
-        normed, prefix = layer.self_attention_attn_res(
-            prefix, blocks[:, :before], add, add2
-        )
+        normed, prefix = layer.self_attention_attn_res(prefix, blocks, add, add2)
         return layer, normed, prefix, before, write_idx
 
     def _write_aux(self, layer_id: int, out: tuple, blocks) -> None:
         """This layer's aux hidden state, for a DSpark drafter tapping it.
 
         The drafter hooks ``layers[layer_id]`` (``Drafter.arm_aux_capture``),
-        and NEITHER branch above calls that module -- ``_fallback`` reruns the
-        layer's forward from its submodules -- so the hook cannot fire on a
+        and NEITHER branch above calls that module -- ``_fallback`` calls
+        ``layer.forward`` directly -- so the hook cannot fire on a
         mono step and the drafter would keep reading whatever the last
         production step left in the buffer: every DSpark deployment would
         draft from stale features.
@@ -579,8 +573,8 @@ class K3MonoDecodeRunner:
         have run, on this step's return rather than reimplementing it, so the
         two cannot drift apart. ``out`` is ``(prefix, add, add2)``; the layer's
         own return carries the block bank in a fourth slot, and mono keeps that
-        in ``blocks`` -- a fixed-size slot stack, not the forward's grown
-        ``cat``, so only the slots banked so far hold this step's data.
+        in ``blocks`` -- the same fixed-size bank the forward carries. Only
+        the slots banked so far hold this step's data.
         """
         if layer_id not in self.aux.layer_ids:
             return
@@ -588,22 +582,9 @@ class K3MonoDecodeRunner:
         self.aux.write(layer_id, tap)
 
     def _fallback(self, plan, positions, prefix, blocks, add, add2):
-        """``KimiDecoderLayer.forward`` with ``maybe_close_block``'s ``cat``
-        replaced by a slot copy."""
-        layer, normed, prefix, before, write_idx = self._seam(
-            plan, prefix, blocks, add, add2
-        )
-        if write_idx >= 0:
-            blocks[:, write_idx].copy_(prefix)
-            prefix = None
-        if layer.is_linear_attn:
-            attn_out = layer.self_attn(normed)
-        else:
-            attn_out = layer.self_attn(positions, normed)
-        after = before + (write_idx >= 0)
-        normed, prefix = layer.mlp_attn_res(prefix, blocks[:, :after], attn_out)
-        out, shared = layer._ffn(normed)
-        return prefix, out, shared
+        """Use the production forward; _write_aux owns the single aux tap."""
+        layer = self.inner.layers[plan.layer_id]
+        return layer.forward(positions, prefix, blocks, add, add2)[:3]
 
     def _k1(self, build, plan, prefix, delta, blocks, metadata, taps=None):
         """K1 -> the gated core rows (``o_proj``'s input).

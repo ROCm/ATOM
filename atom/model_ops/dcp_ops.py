@@ -7,13 +7,14 @@ Three backends combine the per-rank partial attention outputs into the global
 softmax, selected by ``DCPConfig.comm_backend``:
 
   * ``ag_rs``   -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
-  * ``a2a``     -- one all-to-all carrying output+LSE, combine locally (1 call)
+  * ``a2a``     -- packed output+LSE in one all-to-all, or head-major output
+                   and fp32 LSE in separate all-to-alls; combine locally
   * ``mailbox`` -- small decode merges in aiter's FlyDSL mailbox combine, which
     stores straight into the owners' IPC-mapped memory (no collective call);
     everything else as ``a2a``
 
-They are mathematically equivalent but not bitwise identical; see the A2A
-section below for why one collective can replace two.
+The backends implement the same LSE-weighted sum with floating-point
+differences from accumulation order.
 
 Also here: the sparse indexer's DCP support -- the decode candidate exchange
 (fused into one aiter op) and the sparse-prefill owned-slot filter, which the
@@ -33,6 +34,7 @@ from atom.distributed.dcp_layout import (  # noqa: F401
     dcp_global_pos,
     dcp_local_index,
     dcp_owner_rank,
+    get_dcp_local_seq_lens,
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
@@ -353,21 +355,19 @@ def cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=None):
 # A2A sidesteps that by not asking the network to reduce at all. The all-to-all is
 # a pure permutation: it relocates data so that every partial for a given head
 # lands on the one rank that owns that head. The weighting and the sum then happen
-# in a local kernel, where arbitrary math is allowed. One collective instead of two.
+# in a local kernel, where arbitrary math is allowed. Packed A2A sends output
+# and LSE together in one collective. Head-major A2A instead sends the already
+# contiguous output and the fp32 LSE in separate collectives.
 #
-# Both backends compute the same thing::
+# Both layouts implement the same weighted sum::
 #
 #     global_lse[b,h] = log sum_r exp(lse_r[b,h])
 #     out[b,h]        = sum_r exp(lse_r[b,h] - global_lse[b,h]) * o_r[b,h]
 #
-# They differ only in where the multiply and the sum happen, so results agree to
-# floating-point noise but are NOT bitwise identical (different summation order).
+# Floating-point accumulation order can change the result.
 #
-# Bytes are roughly the same as AG+RS: ReduceScatter and All-to-All both carry
-# scatter semantics, so each moves ~(N-1)/N of the full tensor. What A2A saves is
-# one collective's launch and synchronization -- which is worth measuring rather
-# than assuming, because the profiling in the DCP notes shows a large part of the
-# current ReduceScatter cost scales with row count rather than with bytes.
+# Packed A2A saves one collective launch and synchronization compared with AG+RS.
+# Head-major A2A uses two collectives but avoids packing the output.
 
 
 def _lse_pack_slots(dtype: torch.dtype) -> int:
@@ -517,13 +517,17 @@ def _dcp_a2a_pack_kernel(
 
 
 @triton.jit
-def _dcp_a2a_unpack_combine_kernel(
-    recv_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]  N = source rank (KV shard)
-    out_ptr,  # [B, H_LOCAL, D]
-    out_lse_ptr,  # [B, H_LOCAL] fp32, or unused
+def _dcp_a2a_combine_kernel(
+    recv_ptr,
+    recv_lse_ptr,
+    out_ptr,
+    out_lse_ptr,
     recv_stride_n,
     recv_stride_b,
     recv_stride_h,
+    recv_lse_stride_n,
+    recv_lse_stride_b,
+    recv_lse_stride_h,
     out_stride_b,
     out_stride_h,
     lse_stride_b,
@@ -534,37 +538,25 @@ def _dcp_a2a_unpack_combine_kernel(
     N_ROUNDED: tl.constexpr,
     WRITE_LSE: tl.constexpr,
 ):
-    """LSE-weighted combine along the KV-shard axis. One program per (token, head).
-
-    The reduce axis is N (the KV shards), never the head axis -- heads are only
-    ever relocated, never summed across. That is what makes the head split above
-    free to be any partition.
-    """
-    b = tl.program_id(axis=0).to(tl.int64)
-    h = tl.program_id(axis=1).to(tl.int64)
-
+    """Combine KV shards for one (token, head), with packed or separate LSE."""
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
     n = tl.arange(0, N_ROUNDED)
     valid = n < N_RANKS
-    # The padding lanes are masked at every load, which is the documented Triton
-    # contract. They are also folded onto lane 0 here so no pointer is ever
-    # FORMED outside `recv` -- belt and braces, asked for in review, and free:
-    # the select folds into the address arithmetic.
-    n_safe = tl.where(valid, n, 0)
-    base = (
-        recv_ptr
-        + n_safe.to(tl.int64) * recv_stride_n
-        + b * recv_stride_b
-        + h * recv_stride_h
+    n_safe = tl.where(valid, n, 0).to(tl.int64)
+    base = recv_ptr + n_safe * recv_stride_n + b * recv_stride_b + h * recv_stride_h
+    lse_ptr = (
+        recv_lse_ptr
+        + n_safe * recv_lse_stride_n
+        + b * recv_lse_stride_b
+        + h * recv_lse_stride_h
     )
-
     if LSE_PACK == 1:
-        lse = tl.load(base + HEAD_DIM, mask=valid, other=float("-inf"))
+        lse = tl.load(lse_ptr, mask=valid, other=float("-inf"))
         lse = lse.to(tl.float32)
     else:
-        hi = tl.load(base + HEAD_DIM, mask=valid, other=0).to(tl.uint16, bitcast=True)
-        lo = tl.load(base + HEAD_DIM + 1, mask=valid, other=0).to(
-            tl.uint16, bitcast=True
-        )
+        hi = tl.load(lse_ptr, mask=valid, other=0).to(tl.uint16, bitcast=True)
+        lo = tl.load(lse_ptr + 1, mask=valid, other=0).to(tl.uint16, bitcast=True)
         bits = (hi.to(tl.uint32) << 16) | lo.to(tl.uint32)
         lse = bits.to(tl.float32, bitcast=True)
         lse = tl.where(valid, lse, float("-inf"))
@@ -592,8 +584,7 @@ def _dcp_a2a_unpack_combine_kernel(
     factor = tl.where((factor != factor) | (~valid), 0.0, factor)  # noqa: PLR0124
 
     d = tl.arange(0, HEAD_DIM)
-    # Masked for the same reason as the fused kernel: the padding lanes of a
-    # non-power-of-two group address memory past `recv`.
+    # Padding lanes point at rank zero but must contribute no values.
     vals = tl.load(base[:, None] + d[None, :], mask=valid[:, None], other=0.0).to(
         tl.float32
     )
@@ -606,6 +597,47 @@ def _dcp_a2a_unpack_combine_kernel(
     tl.store(
         out_ptr + b * out_stride_b + h * out_stride_h + d,
         acc.to(out_ptr.dtype.element_ty),
+    )
+
+
+@triton.jit
+def _dcp_a2a_unpack_combine_kernel(
+    recv_ptr,
+    out_ptr,
+    out_lse_ptr,
+    recv_stride_n,
+    recv_stride_b,
+    recv_stride_h,
+    out_stride_b,
+    out_stride_h,
+    lse_stride_b,
+    lse_stride_h,
+    N_RANKS,
+    HEAD_DIM: tl.constexpr,
+    LSE_PACK: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
+):
+    _dcp_a2a_combine_kernel(
+        recv_ptr,
+        recv_ptr + HEAD_DIM,
+        out_ptr,
+        out_lse_ptr,
+        recv_stride_n,
+        recv_stride_b,
+        recv_stride_h,
+        recv_stride_n,
+        recv_stride_b,
+        recv_stride_h,
+        out_stride_b,
+        out_stride_h,
+        lse_stride_b,
+        lse_stride_h,
+        N_RANKS,
+        HEAD_DIM,
+        LSE_PACK,
+        N_ROUNDED,
+        WRITE_LSE,
     )
 
 
@@ -733,6 +765,60 @@ def _dcp_a2a_unpack_combine_quant_kernel(
         q.to(out_ptr.dtype.element_ty),
         mask=h_valid[:, None],
     )
+
+
+def cp_lse_a2a_head_major(
+    cp_attn_out,
+    cp_attn_lse,
+    cp_group,
+    return_lse=False,
+    owned_counts=None,
+):
+    """Exchange contiguous [H, B, D] output and FP32 LSE in two collectives."""
+    n_ranks = cp_group.world_size
+    assert n_ranks > 1, "head-major prefill requires DCP"
+    h_total, b, head_dim = cp_attn_out.shape
+    assert h_total % n_ranks == 0
+    h_local = h_total // n_ranks
+    dtype, dev = cp_attn_out.dtype, cp_attn_out.device
+    cp_attn_lse = cp_attn_lse.contiguous().to(torch.float32)
+    if owned_counts is not None:
+        cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts[:b])
+    send, send_lse = cp_attn_out.contiguous(), cp_attn_lse.t().contiguous()
+    recv, recv_lse = torch.empty_like(send), torch.empty_like(send_lse)
+    group = cp_group.device_group
+    torch.distributed.all_to_all_single(recv, send, group=group)
+    torch.distributed.all_to_all_single(recv_lse, send_lse, group=group)
+    recv = recv.view(n_ranks, h_local, b, head_dim).transpose(1, 2)
+    recv_lse = recv_lse.view(n_ranks, h_local, b).transpose(1, 2)
+    out = torch.empty((b, h_local, head_dim), dtype=dtype, device=dev)
+    out_lse = (
+        torch.empty((b, h_local), dtype=torch.float32, device=dev)
+        if return_lse
+        else None
+    )
+    _dcp_a2a_combine_kernel[(b, h_local)](
+        recv,
+        recv_lse,
+        out,
+        out_lse,
+        recv.stride(0),
+        recv.stride(1),
+        recv.stride(2),
+        recv_lse.stride(0),
+        recv_lse.stride(1),
+        recv_lse.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out_lse.stride(0) if return_lse else 0,
+        out_lse.stride(1) if return_lse else 0,
+        n_ranks,
+        HEAD_DIM=head_dim,
+        LSE_PACK=1,
+        N_ROUNDED=triton.next_power_of_2(n_ranks),
+        WRITE_LSE=return_lse,
+    )
+    return (out, out_lse) if return_lse else out
 
 
 def cp_lse_a2a(
@@ -1237,33 +1323,6 @@ def reorg_kvcache(
     return reorganized_kv_c_normed, reorganized_k_pe
 
 
-def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1):
-    """Compute per-DCP-rank local sequence lengths.
-
-    With interleaved storage, token i is stored on rank
-    (i // cp_kv_cache_interleave_size) % dcp_size.
-
-    Args:
-        seq_lens: numpy array of sequence lengths
-        dcp_size: DCP world size
-        dcp_rank: this rank's DCP rank
-        cp_kv_cache_interleave_size: interleaving granularity (default 1 = token-level)
-
-    Returns:
-        local_seq_lens: numpy array of local sequence lengths
-    """
-    full_chunks = seq_lens // (cp_kv_cache_interleave_size * dcp_size)
-    base = full_chunks * cp_kv_cache_interleave_size
-
-    remainder_total = seq_lens - base * dcp_size
-    remainder = np.clip(
-        remainder_total - dcp_rank * cp_kv_cache_interleave_size,
-        0,
-        cp_kv_cache_interleave_size,
-    )
-    return base + remainder
-
-
 def get_dcp_local_window_lens(
     positions, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
 ):
@@ -1593,15 +1652,10 @@ def dcp_decode_candidate_exchange_fused(
         values=send,
     )
 
-    # Half the payload of the (score, gid) exchange, on the custom all-gather:
-    # a pure copy, so the score bits arrive untouched.
-    n_cand = dcp_world_size * k_loc
-    gathered_sc = (
-        dcp_all_gather(get_dcp_group(), send, 0)
-        .view(dcp_world_size, num_decode_tokens, k_loc)
-        .permute(1, 0, 2)
-        .reshape(num_decode_tokens, n_cand)
-    )
+    # Keep score bits and rank order in the merge's [rows, world * k_loc] layout.
+    # The custom gather writes it directly; fallback collectives may still
+    # materialize the layout internally.
+    gathered_sc = dcp_all_gather(get_dcp_group(), send, -1)
 
     flydsl_dcp_topk_merge(
         gathered_sc,

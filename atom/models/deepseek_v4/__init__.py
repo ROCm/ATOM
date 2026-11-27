@@ -134,6 +134,7 @@ from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import (
     AttnState,
     get_forward_context,
+    graph_may_fork,
     pass_scheduled_tokens_gpu,
 )
 from atom.utils.region_graph import token_graph
@@ -2051,9 +2052,9 @@ class DeepseekV4Attention(nn.Module):
 
     def _compressors_async(self) -> bool:
         """Whether the compressors run on their side streams this forward: only
-        under a graph, where the fork and join are recorded with it."""
-        fc = get_forward_context()
-        return self._use_async_compress and fc.in_hipgraph and not tbo_active()
+        under a graph, where the fork and join are recorded with it, and not
+        where that graph stays on one stream (`graph_may_fork`)."""
+        return self._use_async_compress and graph_may_fork() and not tbo_active()
 
     def _launch_compressors(self, x: torch.Tensor) -> None:
         """Fire the compressors, on side streams when `_compressors_async`, and
@@ -3020,6 +3021,8 @@ class MoE(nn.Module):
         args: DeepseekV4Args,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_eplb: bool = True,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3086,6 +3089,7 @@ class MoE(nn.Module):
             pad_align=128,
             enable_comm_fused=True,
             mxfp4_fp8_activations=args.moe_fp8_activations,
+            enable_eplb=enable_eplb,
         )
         self.experts.swiglu_limit = args.swiglu_limit
         self._fuse_shared_into_routed = self.experts.num_fused_shared_experts > 0

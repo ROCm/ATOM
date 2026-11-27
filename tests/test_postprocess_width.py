@@ -62,6 +62,7 @@ def _batch(seqs, mask=None):
         total_seqs_num=seqs,
         is_mixed=False,
         total_tokens_num=seqs,
+        temperatures=np.ones(seqs, np.float32),
         req_ids=list(range(seqs)),
         return_logprobs=mask,
         any_logprobs=any(mask),

@@ -12,8 +12,11 @@ from atom.plugin.sglang.deepseek_v41_bridge import (
     ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE,
     DEEPSEEK_V41_ARCH,
     GRAPH_METADATA_ATTR,
+    V41_DSPARK_DRAFT_ARCH,
     align_atom_config_with_sglang,
     build_deepseek_v41_forward_metadata,
+    install_v41_chunk_decoder_gate,
+    install_v41_decoder_floor_gate,
     is_deepseek_v41_config,
     log_deepseek_v41_runtime,
     refuse_fp4ptpc_without_online_quant,
@@ -33,6 +36,7 @@ MODEL_TYPE_ADAPTER_ARCHES = {
     GLM52_DSA_MODEL_TYPE: GLM52_DSA_ARCH,
     "deepseek_v4": "DeepseekV4ForCausalLM",
     "deepseek_v4_mtp": "DeepseekV4ForCausalLM",
+    "deepseek_v41_dspark": V41_DSPARK_DRAFT_ARCH,
     "kimi_k3": "KimiK3ForConditionalGeneration",
     "minimax_m3": "MiniMaxM3SparseForCausalLM",
     "minimax_m3_vl": "MiniMaxM3SparseForConditionalGeneration",
@@ -121,11 +125,16 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     align_atom_config_with_sglang(atom_config)
     # One V4.1 PAGE per SGLang page; Config picked native's 128.
     atom_config.kv_cache_block_size = ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE
-    # Decoder SWA bounded replay: on as natively, unless
+    # Decoder SWA bounded replay: on as natively, DSpark included, unless
     # ATOM_SGLANG_V41_DECODER_REPLAY turns it off; decided before the runtime
     # model builds its replay stages. Unlike native, the prefill output here
     # depends on where SGLang cuts a prompt: a resumed chunk shorter than the
     # window computes every row (`deepseek_v41_bridge.v41_extend_replays`).
+    # Under DSpark the draft taps (layers 37-39) run on the tail, and the
+    # in-forward draft context write takes each request's last window rows,
+    # the ones its first draft block reads
+    # (`V41DSparkTargetSurface.finish_forward`, native's `_move_aux_rows` +
+    # `DeepseekV41DSpark.write_context_kv`).
     if not deepseek_v41_envs.ATOM_SGLANG_V41_DECODER_REPLAY:
         atom_config.enable_decoder_swa_bounded_replay = False
     # Encoder replay rebuilds the state below a prefix hit: on exactly when
@@ -150,6 +159,16 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     )
 
 
+def _install_deepseek_v41_adapters(model: Any) -> None:
+    # A prefill finishing no prompt skips the decoder, as native's middle
+    # chunk (`v41_chunk_finals`), and a later step computing every row of
+    # such a request starts its decoder window where its rings hold rows
+    # (`v41_decoder_floors`).
+    install_v41_chunk_decoder_gate()
+    install_v41_decoder_floor_gate()
+    log_deepseek_v41_runtime(model)
+
+
 def _build_deepseek_v41_forward_metadata(
     atom_config: Any, forward_batch: Any, positions: Any
 ) -> Any:
@@ -164,6 +183,20 @@ def _build_deepseek_v41_forward_metadata(
     if metadata is not None:
         return metadata
     return build_deepseek_v41_forward_metadata(forward_batch)
+
+
+def _build_deepseek_v41_dspark_draft_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    # The draft config must never fall into the target's builder: that would
+    # stage a target step (reset STATE slots, advance cursors) for a draft
+    # block. The draft wrapper builds its own block metadata in its forward.
+    del atom_config, positions
+    raise RuntimeError(
+        "DeepSeek-V4.1 DSpark draft forwards build their metadata in "
+        "DeepseekV4ForCausalLMDSpark.forward, not through the generic plugin "
+        f"forward context (mode={getattr(forward_batch, 'forward_mode', None)})"
+    )
 
 
 def _build_deepseek_v4_forward_metadata(
@@ -614,9 +647,17 @@ MODEL_ADAPTER_SPECS = {
     DEEPSEEK_V41_ARCH: SGLangModelAdapterSpec(
         uses_context_only_forward=True,
         prepare_config=_prepare_deepseek_v41_config,
-        install_adapters=log_deepseek_v41_runtime,
+        install_adapters=_install_deepseek_v41_adapters,
         build_forward_metadata=_build_deepseek_v41_forward_metadata,
         expand_forward_inputs=expand_v41_forward_inputs,
+    ),
+    # The V4.1 DSpark draft (`deepseek_v41_dspark_wrapper`, a custom wrapper
+    # and so not in MODEL_ARCH_SPECS); explicit so its config cannot resolve
+    # to the target's spec.
+    V41_DSPARK_DRAFT_ARCH: SGLangModelAdapterSpec(
+        uses_context_only_forward=True,
+        load_weights_prefix="",
+        build_forward_metadata=_build_deepseek_v41_dspark_draft_metadata,
     ),
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,

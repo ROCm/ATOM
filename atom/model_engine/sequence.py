@@ -432,6 +432,8 @@ class Sequence:
         # `checkpoint_end_pos` as the forward holding these reservations files
         # it: moved back onto that forward's snapshot grid. 0 when the forward
         # does not reach the anchor. Read by `StateSlotPool._anchor_of`.
+        # Without a reservation, a PAGE forward ending here uses a boundary
+        # copy from the runtime slot because shared scratch was exhausted.
         self.midstep_anchor_pos = 0
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
