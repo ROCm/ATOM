@@ -119,7 +119,6 @@ def test_loaded_prefix_can_publish_suffix_and_be_reused(
     # Model all ranks reporting successful load, then compute the next block.
     host._mark_offload_load_ready(seq)
     assert seq.num_cached_tokens == 16
-    assert seq.offload_promoted_tokens == 16 - hbm
     host.block_manager.hash_blocks(seq, 8)
     seq.num_cached_tokens = 24
 

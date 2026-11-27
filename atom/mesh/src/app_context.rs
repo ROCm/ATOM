@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -24,7 +24,8 @@ use crate::{
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{
-        atom_bridge::AtomBridgeRuntime, prepare::fast_tokenizer::TokenizeLimits,
+        atom_bridge::AtomBridgeRuntime,
+        prepare::{chat_render::ChatControls, fast_tokenizer::TokenizeLimits},
         router_manager::RouterManager,
     },
     tokenizer::registry::TokenizerRegistry,
@@ -51,10 +52,9 @@ pub struct AppContext {
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub admission: Arc<crate::core::admission::AdmissionController>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
-    /// Registry ids of the tokenizers whose chats llm-tokenizer renders without
-    /// their Jinja template, found as each registers. HTTP routing does not
-    /// tokenize those chats.
-    pub chats_without_template: Arc<RwLock<HashSet<String>>>,
+    /// The encoder ATOM renders a tokenizer's chats with, by registry id, for
+    /// the checkpoints that have their own (`chat_render`).
+    pub(crate) chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
     /// `router_config`'s tokenization byte limits.
     pub(crate) tokenize_limits: TokenizeLimits,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -112,6 +112,16 @@ pub struct AppContextBuilder {
 impl AppContext {
     pub fn builder() -> AppContextBuilder {
         AppContextBuilder::new()
+    }
+
+    /// The encoder controls of the tokenizer registered as `model` (a name or
+    /// an id), if its checkpoint has them.
+    pub(crate) fn chat_controls_of(&self, model: &str) -> Option<ChatControls> {
+        let entry = self
+            .tokenizer_registry
+            .get_by_name(model)
+            .or_else(|| self.tokenizer_registry.get_by_id(model))?;
+        self.chat_controls.read().get(&entry.id).copied()
     }
 
     /// Build a context with the caller-owned preparation pool.
@@ -282,24 +292,31 @@ impl AppContextBuilder {
         let policy_registry = self
             .policy_registry
             .ok_or(AppContextBuildError("policy_registry"))?;
+        let client = self.client.ok_or(AppContextBuildError("client"))?;
+        let kv_storage = (router_config.kv_events).then(|| {
+            let deadline = Duration::from_millis(router_config.kv_storage_deadline_ms);
+            let port = router_config.mooncake_admin_port;
+            Arc::new(StorageSources::new(port, deadline, client.clone()))
+        });
         if let Some(monitor) = &kv_event_monitor {
+            if let Some(storage) = &kv_storage {
+                monitor.read_stores(storage.clone(), router_config.kv_storage_weight);
+            }
             policy_registry.set_kv_events(monitor.clone());
         }
-        let kv_storage = (router_config.kv_events)
-            .then(|| Arc::new(StorageSources::new(router_config.mooncake_admin_port)));
         let tokenize_limits = TokenizeLimits::new(&router_config);
         Ok(AppContext {
             prepare_pool: self
                 .prepare_pool
                 .ok_or(AppContextBuildError("prepare_pool"))?,
             admission,
-            client: self.client.ok_or(AppContextBuildError("client"))?,
+            client,
             router_config,
             rate_limiter: self.rate_limiter,
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
-            chats_without_template: Default::default(),
+            chat_controls: Default::default(),
             tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,

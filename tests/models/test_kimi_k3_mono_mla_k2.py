@@ -261,10 +261,14 @@ def _stub_kda(blocks=1):
     )
 
 
-def test_k2_builds_cover_full_attention_layers_and_k1_builds_do_not(runner_module):
+@pytest.mark.parametrize("state16", [False, True])
+def test_k2_builds_cover_full_attention_layers_and_k1_builds_do_not(
+    runner_module, state16
+):
     runner = object.__new__(runner_module.K3MonoDecodeRunner)
     runner.debug = False
     runner.state_len = 3
+    runner.state16 = state16
     runner.replay_cap = 0  # no ReplaySSM record buffers
     runner.plans = [
         _plan(1, kda=_stub_kda(), moe=_stub_moe()),
@@ -273,6 +277,7 @@ def test_k2_builds_cover_full_attention_layers_and_k1_builds_do_not(runner_modul
     ]
     assert sorted(runner._k2_keys(8)) == [1, 3]
     assert sorted(runner._k1_keys(8, 8)) == [1]
+    assert all(k.state16 is state16 for k in runner._k1_keys(8, 8).values())
     # same blocks, same eps: the full-attention layer reuses the KDA layer's build
     keys = runner._k2_keys(8)
     assert keys[1] == keys[3]

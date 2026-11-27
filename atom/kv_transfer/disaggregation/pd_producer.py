@@ -15,9 +15,6 @@ from atom.kv_transfer.disaggregation.factory import (
 )
 from atom.kv_transfer.disaggregation.types import DEFAULT_SHARDED_STAGING_WORKERS
 
-# Connectors that push KV across the P/D boundary. Offload backends are not
-# producers even when ``kv_role`` is omitted (they default to ``offload``).
-_PD_TRANSFER_CONNECTORS = frozenset({"mooncake", "moriio"})
 # Only Mooncake consumes staging callbacks / pool slots (DSA index and MLA).
 _MOONCAKE_CONNECTORS = frozenset({"mooncake"})
 # KV staging: one slot of this size per send worker, the pool capped in bytes
@@ -112,7 +109,12 @@ def disaggregated_kv_role(config) -> str | None:
 
 
 def pd_producer_configured(config) -> bool:
-    return bool(_producer_connectors(config, _PD_TRANSFER_CONNECTORS))
+    """Whether any configured transport makes this a prefill-only producer."""
+    return any(
+        name in PD_TRANSFER_BACKENDS
+        and leaf.kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
+        for name, leaf in (KVConnectorFactory.leaf_connectors(config) or ())
+    )
 
 
 def mooncake_pd_producer_configured(config) -> bool:

@@ -25,6 +25,7 @@ import torch
 from atom.model_ops.fla_ops.replayssm import (
     flush_threshold_ok,
     replayssm_commit,
+    replayssm_flush_wait,
     replayssm_materialize,
 )
 from atom.utils import envs
@@ -39,7 +40,10 @@ class ReplaySSMRuntime:
 
     def __init__(self) -> None:
         self.write_pos: torch.Tensor | None = None
-        self.bufs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.bufs: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self.flush_wait: str | None = None
         self.cache_len = 0
         self.max_query_len = 0
         self.engaged = False
@@ -47,6 +51,7 @@ class ReplaySSMRuntime:
     def reset(self) -> None:
         self.write_pos = None
         self.bufs.clear()
+        self.flush_wait = None
         self.cache_len = 0
         self.max_query_len = 0
         self.engaged = False
@@ -120,7 +125,7 @@ def prepare_layer(
     head_v_dim: int,
     max_query_len: int,
     activation: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
     """Allocate this layer's ring on the first verify. Addresses stay put."""
     global _LOGGED
     install_sglang_replayssm_commit()
@@ -169,9 +174,12 @@ def prepare_layer(
             torch.zeros(slots, hv, cache_len, head_k_dim, dtype=dtype, device=device),
             torch.zeros(slots, hv, cache_len, head_v_dim, dtype=dtype, device=device),
             torch.zeros(slots, hv, cache_len, dtype=torch.float32, device=device),
+            torch.zeros(slots, hv, dtype=torch.int32, device=device),
         )
         _RUNTIME.bufs[layer_num] = bufs
-    return (*bufs, _RUNTIME.write_pos)
+        if _RUNTIME.flush_wait is None:
+            _RUNTIME.flush_wait = replayssm_flush_wait()
+    return (*bufs, _RUNTIME.write_pos, _RUNTIME.flush_wait)
 
 
 def note_full_state_write(slot_idx: torch.Tensor) -> None:
@@ -314,7 +322,7 @@ def _materialize_track_states(
     if not steps.is_contiguous():
         steps = steps.contiguous()
     pool = linear.req_to_token_pool
-    for layer_num, (buf_k, buf_u, buf_g) in _RUNTIME.bufs.items():
+    for layer_num, (buf_k, buf_u, buf_g, _) in _RUNTIME.bufs.items():
         replayssm_materialize(
             pool.mamba2_layer_cache(layer_num).temporal,
             buf_k,
