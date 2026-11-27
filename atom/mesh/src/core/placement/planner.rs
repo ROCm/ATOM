@@ -122,13 +122,7 @@ impl DefaultPlanner {
 
         Ok(PlacementPlan::Single {
             policy_name: policy.name(),
-            // The router releases the charge at the response's first frame, which a
-            // non-streaming response sends only after decoding.
-            prefill_tokens: if req.stream {
-                prefill_tokens(&chosen, req)
-            } else {
-                0
-            },
+            prefill_tokens: prefill_tokens(&chosen, req),
             worker: chosen.worker,
         })
     }

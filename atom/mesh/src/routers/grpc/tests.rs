@@ -447,6 +447,80 @@ mod c_execute_generate {
         assert!(ct.to_str().unwrap().contains("text/event-stream"));
     }
 
+    /// A non-streaming generate stays charged until its rank, followed by hand, stores the
+    /// prompt's last full block or, without that event, until the engine's first chunk.
+    #[tokio::test]
+    async fn test_execute_generate_non_streaming_prefill_released_by_kv_event_or_first_chunk() {
+        use crate::core::placement::types::PlacementPlan;
+        use crate::kv_events::{
+            monitor::tests::{followed, publish_stored},
+            KvEventMonitor,
+        };
+        use crate::routers::token_handle::test_support::single_from_receiver;
+
+        let monitor = Arc::new(KvEventMonitor::start().unwrap());
+        let mut ctx = (*shared()).clone();
+        ctx.kv_event_monitor = Some(monitor.clone());
+        let ctx = Arc::new(ctx);
+        let worker = test_mocks::mock_grpc_worker("http://w:1", WorkerType::Regular);
+        let mut publisher = followed(&monitor, worker.url()).await;
+        for (prompt, event) in [
+            ((1..=8).collect::<Vec<u32>>(), false),
+            ((11..=18).collect(), true),
+        ] {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            let p = test_mocks::pipeline_with(
+                Arc::new(test_mocks::MockPdPlanner::new(vec![Ok(
+                    PlacementPlan::Single {
+                        worker: worker.clone(),
+                        policy_name: "agentic",
+                        prefill_tokens: 8,
+                    },
+                )])),
+                Arc::new(test_mocks::MockDispatcher::new(vec![Ok(
+                    single_from_receiver(rx),
+                )])),
+                metrics_labels::BACKEND_REGULAR,
+            );
+            let req = serde_json::json!({"input_ids": prompt, "model": "m", "stream": false});
+            let req = Arc::new(serde_json::from_value(req).unwrap());
+            let routed_ctx = ctx.clone();
+            let resp = tokio::spawn(async move {
+                p.execute_generate(req, None, Some("m".to_string()), routed_ctx)
+                    .await
+            });
+            for _ in 0..200 {
+                if worker.load() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!((worker.prefill_tokens(), worker.load()), (8, 1));
+            if event {
+                publish_stored(&mut publisher, 1, &prompt).await;
+                for _ in 0..200 {
+                    if worker.prefill_tokens() == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+            // Released by the event while the engine has sent nothing.
+            assert_eq!(worker.prefill_tokens(), if event { 0 } else { 8 });
+            assert!(!resp.is_finished());
+            for chunk in scripted_chunks() {
+                tx.send(chunk).await.unwrap();
+            }
+            drop(tx);
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(5), resp)
+                .await
+                .expect("the response ends with the engine's stream")
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!((worker.prefill_tokens(), worker.load()), (0, 1));
+        }
+    }
+
     #[tokio::test]
     async fn test_execute_generate_in_pd_pipeline_routes_to_pair() {
         let p = pipeline_pd();

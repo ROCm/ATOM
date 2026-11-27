@@ -208,7 +208,7 @@ impl Pipeline {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),
         };
-        let guards = make_load_guards(&mut placement, resp_ctx.headers.as_ref());
+        let guards = make_load_guards(&mut placement, &payload, &resp_ctx, &components);
         let stream = match self.engine.dispatch(&placement, &mut payload).await {
             Ok(s) => s.with_prefill_charge(guards[0].prefill_charge()),
             Err(e) => return self.record_chat_err(&model, start, engine_err_to_response(e)),
@@ -264,7 +264,7 @@ impl Pipeline {
             Ok(p) => p,
             Err(e) => return self.record_generate_err(&model_for_metric, start, e),
         };
-        let guards = make_load_guards(&mut placement, resp_ctx.headers.as_ref());
+        let guards = make_load_guards(&mut placement, &payload, &resp_ctx, &components);
         let stream = match self.engine.dispatch(&placement, &mut payload).await {
             Ok(s) => s.with_prefill_charge(guards[0].prefill_charge()),
             Err(e) => {
@@ -311,7 +311,7 @@ impl Pipeline {
 
         let (mut payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
         let mut placement = self.plan_for(&payload, &resp_ctx).await?;
-        let guards = make_load_guards(&mut placement, resp_ctx.headers.as_ref());
+        let guards = make_load_guards(&mut placement, &payload, &resp_ctx, &components);
         let stream = self
             .engine
             .dispatch(&placement, &mut payload)
@@ -374,14 +374,28 @@ impl Pipeline {
     }
 }
 
-fn make_load_guards(plan: &mut PlacementPlan, headers: Option<&HeaderMap>) -> Vec<WorkerLoadGuard> {
+fn make_load_guards(
+    plan: &mut PlacementPlan,
+    payload: &GenerationPayload,
+    resp_ctx: &ResponseContext,
+    components: &AppContext,
+) -> Vec<WorkerLoadGuard> {
+    let headers = resp_ctx.headers.as_ref();
     match plan {
         PlacementPlan::Single {
             worker,
             prefill_tokens,
             ..
         } => {
-            vec![WorkerLoadGuard::new(worker.clone(), headers).with_prefill_tokens(*prefill_tokens)]
+            let guard =
+                WorkerLoadGuard::new(worker.clone(), headers).with_prefill_tokens(*prefill_tokens);
+            if let (false, Some(monitor)) = (
+                resp_ctx.original.is_streaming(),
+                &components.kv_event_monitor,
+            ) {
+                monitor.watch_prefill(worker.url(), &payload.token_ids, &guard.prefill_charge());
+            }
+            vec![guard]
         }
         PlacementPlan::Pair {
             prefill,

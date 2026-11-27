@@ -598,6 +598,97 @@ async fn regular_cached_tokens_are_reconciled_against_the_estimate() {
     server.abort();
 }
 
+/// A non-streaming request's prefill stays charged until its rank stores the prompt's
+/// last full block or, without that event, until the response's first byte.
+#[tokio::test]
+async fn non_streaming_prefill_is_released_by_the_kv_event_or_the_first_byte() {
+    use crate::kv_events::monitor::tests::{followed, publish_stored};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let replies = Arc::new(tokio::sync::Semaphore::new(0));
+    let engine = Router::new().fallback({
+        let replies = replies.clone();
+        move || {
+            let (arrived, replies) = (arrived.clone(), replies.clone());
+            async move {
+                arrived.send(()).unwrap();
+                replies.acquire().await.unwrap().forget();
+                ([(http::header::CONTENT_TYPE, "application/json")], "{}")
+            }
+        }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::Agentic {
+            request_token_equivalent: 512,
+            eviction_interval_secs: 120,
+            max_tree_size: 1 << 20,
+        },
+        kv_events: true,
+        disable_retries: true,
+        ..Default::default()
+    };
+    let app = Arc::new(
+        AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap(),
+    );
+    let router: Arc<dyn crate::routers::RouterTrait> = Arc::new(
+        crate::routers::http_router::Router::new(&app)
+            .await
+            .unwrap(),
+    );
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(&url).model_id("m").build());
+    app.worker_registry.register(worker.clone());
+    app.policy_registry.on_worker_added("m", None);
+    let mut publisher = followed(app.kv_event_monitor.as_ref().unwrap(), &url).await;
+    for (prompt, event) in [
+        ((1..=8).collect::<Vec<u32>>(), false),
+        ((11..=18).collect(), true),
+    ] {
+        let body = json!({"model": "m", "input_ids": prompt, "stream": false});
+        let request = InferenceEnvelope::parse(
+            "/generate".parse().unwrap(),
+            json_headers(),
+            Bytes::from(body.to_string()),
+            &app,
+        )
+        .await
+        .unwrap();
+        let (router, routed_app) = (router.clone(), app.clone());
+        let response =
+            tokio::spawn(async move { router.route_inference(request, &routed_app).await });
+        let wait = Duration::from_secs(5);
+        tokio::time::timeout(wait, arrivals.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worker.prefill_tokens(), 8);
+        if event {
+            publish_stored(&mut publisher, 1, &prompt).await;
+            for _ in 0..200 {
+                if worker.prefill_tokens() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        // Released by the event while the engine still holds the response.
+        assert_eq!(worker.prefill_tokens(), if event { 0 } else { 8 });
+        replies.add_permits(1);
+        let response = tokio::time::timeout(wait, response).await.unwrap().unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(worker.prefill_tokens(), if event { 0 } else { 8 });
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(worker.prefill_tokens(), 0);
+    }
+    server.abort();
+}
+
 #[tokio::test]
 async fn sequential_prepare_preserves_deadline_and_body() {
     let raw = Bytes::from_static(br#"{ "model": "m", "text": "test", "extension": [1, 2] }"#);

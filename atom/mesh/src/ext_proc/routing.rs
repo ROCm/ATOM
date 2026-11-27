@@ -162,6 +162,13 @@ impl EndpointRouter {
         };
         let load = WorkerLoadGuard::new(worker.clone(), Some(&request.headers))
             .with_prefill_tokens(prefill_tokens);
+        if let (false, Some(monitor), Some(tokens)) = (
+            input.stream,
+            &self.app.kv_event_monitor,
+            input.tokens.as_deref(),
+        ) {
+            monitor.watch_prefill(worker.url(), tokens, &load.prefill_charge());
+        }
         let address = match resolved.get(worker.url()) {
             Some(address) => *address,
             None => Self::address(worker.as_ref()).await?,
