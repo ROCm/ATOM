@@ -194,29 +194,38 @@ def test_capture_replay_uses_changed_inputs_without_a_pointer_table():
     _assert_same(rows, expected)
 
 
-def test_retired_generation_keeps_queued_raw_pointer_inputs_alive():
+def test_retired_generation_keeps_queued_raw_pointer_inputs_alive(record_property):
     rows = [_layer() for _ in range(3)]
     cursor = _index([8] + [0] * (SLOTS - 1))
     pool = _Pool(rows, cursor)
     src, dst, steps = _index([0]), _index([4]), _index([3])
     expected = _single_reference(rows, cursor, src, dst, steps)
-    # Compile before queuing the lifetime-sensitive use.
-    pool.materialize(src, dst, steps)
-    torch.cuda.synchronize()
-    outputs = [row[0] for row in rows]
-    for checkpoint in outputs:
-        checkpoint[4].fill_(7)
-    work = _random((1024, 1024))
+    # Build the table on the consumer before queuing the sensitive use; a
+    # device-table copy must not drain the work used to establish pending use.
     consumer = torch.cuda.Stream()
     consumer.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(consumer):
-        for _ in range(8):
-            work = work @ work
         pool.materialize(src, dst, steps)
+    consumer.synchronize()
+    generation_id = id(plugin.replay_runtime().materialize_layers)
+    outputs = [row[0] for row in rows]
+    for checkpoint in outputs:
+        checkpoint[4].fill_(7)
+    work = _random((4096, 4096))
+    blocked_output = torch.empty_like(work)
+    consumer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(consumer):
+        for _ in range(4):
+            torch.mm(work, work, out=blocked_output)
+        pool.materialize(src, dst, steps)
+    assert id(plugin.replay_runtime().materialize_layers) == generation_id
     assert plugin.replay_runtime().materialize_layers.stream == consumer.cuda_stream
     # Drop the generation and every Python reference to its record tensors
     # while work may still be queued. Same-sized allocations stress reuse.
     record_shapes = [(t.shape, t.dtype) for row in rows for t in row[1:]]
+    pending = not consumer.query()
+    record_property("consumer_pending_before_retirement", pending)
+    assert pending, "lifetime check requires an actually pending consumer"
     plugin.reset_replay_runtime_for_tests()
     rows.clear()
     pressure = [
