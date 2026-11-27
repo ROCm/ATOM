@@ -90,12 +90,36 @@ jobs:
       - name: Free container engine disk space
         run: |
           set -euo pipefail
+          IMG="${SGLANG_IMAGE_TAG}"
+          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
+            if [[ "${IMG}" != */* ]]; then
+              IMG="docker.io/library/${IMG}"
+            else
+              reg="${IMG%%/*}"
+              if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
+                IMG="docker.io/${IMG}"
+              fi
+            fi
+          fi
+          echo "SGLANG_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+
           echo "=== Disk before cleanup ==="
           df -h || true
           $CONTAINER_ENGINE system df || true
 
+          # Keep this run's SGLANG image so later cases on the same runner
+          # skip the multi-GB pull; remove every other image.
+          keep_id="$($CONTAINER_ENGINE image inspect --format '{{.Id}}' "${IMG}" 2>/dev/null || true)"
+          keep_id="${keep_id#sha256:}"
+          echo "Keeping cached SGLANG image: ${IMG} (${keep_id:-not present})"
           $CONTAINER_ENGINE container prune -f || true
-          $CONTAINER_ENGINE image prune -af || true
+          for id in $($CONTAINER_ENGINE images -q --no-trunc | sed 's/^sha256://' | sort -u); do
+            if [[ -n "${keep_id}" && "${id}" == "${keep_id}" ]]; then
+              continue
+            fi
+            $CONTAINER_ENGINE rmi "${id}" || true
+          done
+          $CONTAINER_ENGINE image prune -f || true
           $CONTAINER_ENGINE builder prune -af || true
 
           echo "=== Disk after cleanup ==="
@@ -134,18 +158,7 @@ jobs:
       - name: Pull SGLANG image
         run: |
           set -euo pipefail
-          IMG="${SGLANG_IMAGE_TAG}"
-          if [[ "${CONTAINER_ENGINE}" == "podman" ]]; then
-            if [[ "${IMG}" != */* ]]; then
-              IMG="docker.io/library/${IMG}"
-            else
-              reg="${IMG%%/*}"
-              if [[ "${reg}" != *.* && "${reg}" != localhost* && "${reg}" != *:* ]]; then
-                IMG="docker.io/${IMG}"
-              fi
-            fi
-          fi
-          echo "SGLANG_IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+          IMG="${SGLANG_IMAGE_REF}"
           echo "Pulling SGLANG image: ${IMG} (workflow tag: ${SGLANG_IMAGE_TAG})"
           $CONTAINER_ENGINE pull "${IMG}"
 
@@ -722,5 +735,6 @@ jobs:
           "$CONTAINER_ENGINE" exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
           "$CONTAINER_ENGINE" stop "$CONTAINER_NAME" || true
           "$CONTAINER_ENGINE" rm "$CONTAINER_NAME" || true
-          "$CONTAINER_ENGINE" rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
+          # The SGLANG image stays cached for the next case on this runner;
+          # the next run's "Free container engine disk space" drops stale ones.
 
