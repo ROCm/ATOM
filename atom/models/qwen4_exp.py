@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 import fnmatch
+import itertools
 import re
 from typing import Any, ClassVar
 
@@ -42,6 +43,10 @@ from atom.model_ops.qwen4_exp.ops.moe_decode import moe_decode_single_token
 from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
 from atom.model_ops.qwen4_exp.qsa_attention import (
     Qwen4ExpAttention,
+)
+from atom.model_ops.qwen4_exp.sp_sdma import (
+    PendingReduceScatter,
+    chunk_count,
 )
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
@@ -773,14 +778,21 @@ class _SequenceParallel:
     reduce-scatter, which together move the same bytes as the all-reduce they
     replace. Rows are padded to a multiple of the TP size; padded rows are
     zero streams and are dropped on gather.
+
+    With `sdma` (`sp_sdma.SdmaCollectives`), the decoder's reduce-scatters
+    and all-gathers run on the copy engines, overlapped with the
+    hyper-connections between them (`mix_gather`).
     """
 
-    def __init__(self, num_tokens: int, tp_size: int, tp_rank: int) -> None:
+    def __init__(self, num_tokens: int, tp_size: int, tp_rank: int, sdma=None) -> None:
         self.num_tokens = num_tokens
         self.chunk = -(-num_tokens // tp_size)
         self.pad = self.chunk * tp_size - num_tokens
         self.start = tp_rank * self.chunk
         self.group = get_tp_group()
+        self.sdma = sdma if sdma is not None and sdma.fits(self.chunk) else None
+        if self.sdma is not None:
+            self.sdma_chunks = chunk_count(self.chunk)
 
     def shard(self, x: torch.Tensor) -> torch.Tensor:
         """Replicated `[T, ...]` -> this rank's rows (a view unless padded).
@@ -794,14 +806,60 @@ class _SequenceParallel:
         out = self.group.all_gather(x.contiguous(), use_custom=False, dim=0)
         return out[: self.num_tokens] if self.pad else out
 
-    def scatter(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-rank partial sums over all `[T, ...]` rows -> summed local rows."""
+    def scatter(self, x: torch.Tensor) -> "torch.Tensor | PendingReduceScatter":
+        """Per-rank partial sums over all `[T, ...]` rows -> summed local rows;
+        over SDMA a `PendingReduceScatter`, consumed by `mix_gather`."""
+        if self.sdma is not None:
+            return self.sdma.reduce_scatter(x, self.chunk, self.sdma_chunks)
         return self.group.reduce_scatter_tensor(
             _pad_rows(x.contiguous(), self.pad), use_custom=False, dim=0
         )
 
+    @staticmethod
+    def resolve(pending):
+        """`pending` with a reduce-scatter still in flight summed in full."""
+        if pending is not None and isinstance(pending[0], PendingReduceScatter):
+            return pending[0].result(), pending[1]
+        return pending
+
+    def mix_gather(self, hc, streams: torch.Tensor, pending):
+        """`hc.mix_fused(streams, pending)` on this rank's rows, the mixed rows
+        all-gathered. Over SDMA, each chunk of the reduce-scatter in `pending`
+        is mixed as soon as it has landed and its rows pushed to the peers
+        while the next chunk is mixed."""
+        if self.sdma is None:
+            mixed, residuals = hc.mix_fused(streams, pending)
+            return self.gather(mixed), residuals
+        block = None if pending is None else pending[0]
+        if isinstance(block, PendingReduceScatter):
+            bounds, chunks = block.bounds, block.chunks()
+        else:
+            bounds, chunks = [0, self.chunk], [(0, self.chunk, block)]
+        # Every rank pushes the same ranges, so each knows the count up front.
+        per_chunk = -(-self.sdma_chunks // (len(bounds) - 1))
+        writer = self.sdma.all_gather(
+            self.chunk, self.num_tokens, per_chunk * (len(bounds) - 1)
+        )
+        h_out = streams if pending is None else torch.empty_like(streams)
+        raw_out = None
+        if hc.block_inject_weight is not None:
+            raw_out = streams.new_empty(streams.shape[0], hc.hc_count)
+        for r0, r1, rows in chunks:
+            cuts = [r0 + (r1 - r0) * k // per_chunk for k in range(per_chunk + 1)]
+            for a, b in itertools.pairwise(cuts):
+                hc.mix_fused_rows(
+                    streams,
+                    None if pending is None else (rows[a - r0 : b - r0], pending[1]),
+                    slice(a, b),
+                    mixed_out=writer.rows(a, b),
+                    h_out=h_out,
+                    raw_out=raw_out,
+                )
+                writer.push(a, b)
+        return writer.finish(), (h_out, raw_out)
+
     @classmethod
-    def maybe(cls, num_tokens: int) -> "_SequenceParallel | None":
+    def maybe(cls, num_tokens: int, sdma=None) -> "_SequenceParallel | None":
         """Sharding for a forward of `num_tokens`, or None to stay replicated:
         no TP, below `ATOM_QWEN4_EXP_SP_MIN_TOKENS`, or under graph capture.
         The target model adds its own fused-quant floor
@@ -817,7 +875,7 @@ class _SequenceParallel:
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size == 1:
             return None
-        return cls(num_tokens, tp_size, get_tensor_model_parallel_rank())
+        return cls(num_tokens, tp_size, get_tensor_model_parallel_rank(), sdma)
 
 
 class Qwen4ExpDecoderLayer(nn.Module):
@@ -930,7 +988,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         # `Qwen4ExpModel._sequence_parallel`) the consumer quantizes the
         # gathered rows itself, as the unsharded path does at that size.
         quant_dtype = None if sp is not None else self._attn_input_quant_dtype()
-        if quant_dtype is None:
+        if sp is not None:
+            mixed, (hidden_states, raw) = sp.mix_gather(
+                self.attn_hyper_connection, hidden_states, pending
+            )
+            quantized = None
+        elif quant_dtype is None:
             mixed, (hidden_states, raw) = self.attn_hyper_connection.mix_fused(
                 hidden_states, pending
             )
@@ -941,8 +1004,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     hidden_states, pending, quant_dtype
                 )
             )
-        if sp is not None:
-            mixed = sp.gather(mixed)
         if self.layer_type == "linear_attention":
             sub_output = self.linear_attn(mixed, quantized)
         else:
@@ -951,14 +1012,17 @@ class Qwen4ExpDecoderLayer(nn.Module):
             sub_output = sp.scatter(sub_output)
         elif self.tp_size > 1:
             sub_output = tensor_model_parallel_all_reduce(sub_output)
+        if sp is not None:
+            mixed, (hidden_states, raw) = sp.mix_gather(
+                self.mlp_hyper_connection, hidden_states, (sub_output, raw)
+            )
+            return hidden_states, (
+                sp.scatter(self.mlp(mixed, reduce_results=False)),
+                raw,
+            )
         mixed, (hidden_states, raw) = self.mlp_hyper_connection.mix_fused(
             hidden_states, (sub_output, raw)
         )
-        if sp is not None:
-            return hidden_states, (
-                sp.scatter(self.mlp(sp.gather(mixed), reduce_results=False)),
-                raw,
-            )
         # The MoE block owns its own all-reduce.
         return hidden_states, (self.mlp(mixed), raw)
 
@@ -1105,6 +1169,10 @@ class Qwen4ExpModel(nn.Module):
             ),
             default=-1,
         )
+        # SDMA reduce-scatter / all-gather for the sharded layers
+        # (`sp_sdma.SdmaCollectives`), installed by the serving framework that
+        # opts in; None keeps RCCL.
+        self.sp_sdma = None
 
     def _sequence_parallel(self, num_tokens: int) -> _SequenceParallel | None:
         """Up to `HC_QUANT_ROWS_MAX` tokens the unsharded attention HC emits
@@ -1115,7 +1183,7 @@ class Qwen4ExpModel(nn.Module):
         no layer after the last PLE layer there is nothing to shard."""
         if self.sp_start_layer >= self.end_layer or num_tokens <= HC_QUANT_ROWS_MAX:
             return None
-        return _SequenceParallel.maybe(num_tokens)
+        return _SequenceParallel.maybe(num_tokens, self.sp_sdma)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1153,6 +1221,8 @@ class Qwen4ExpModel(nn.Module):
                 pending,
                 sp if sp is not None and idx >= self.sp_start_layer else None,
             )
+        if sp is not None:
+            pending = sp.resolve(pending)
         if self.return_hc_state:
             hidden_states = self.hyper_connection_mixer.apply_pending(
                 hidden_states, pending
