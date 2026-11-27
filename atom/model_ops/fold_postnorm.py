@@ -19,7 +19,11 @@ from typing import NamedTuple
 
 import torch
 
-ENABLED = os.environ.get("ATOM_FOLD_POSTNORM", "0") == "1"
+# Off under ATOM_QWEN_MOE_A8W4: the folded path hands the experts MXFP4 rows, A8W4 experts take MXFP8.
+ENABLED = (
+    os.environ.get("ATOM_FOLD_POSTNORM", "0") == "1"
+    and os.environ.get("ATOM_QWEN_MOE_A8W4", "0") != "1"
+)
 MAX_ROWS = min(16, int(os.environ.get("ATOM_FOLD_POSTNORM_MAX_ROWS", "16")))
 
 _stats = {"folded": 0, "materialized": 0}

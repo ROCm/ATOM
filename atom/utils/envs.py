@@ -579,8 +579,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shared expert kernel also computes the MoE top-k, routing and MXFP4
     # activation quant (aiter's fused_gemm_a16w16_router_shared_expert_topk), so
     # the grouped MoE skips its moe_topk_route_quant launch. Bitwise the same.
+    # Off under ATOM_QWEN_MOE_A8W4: the fold's MXFP4 activations are not what
+    # A8W4 experts take.
     "ATOM_FOLD_TOPK_ROUTER": lambda: (
         os.getenv("ATOM_FOLD_TOPK_ROUTER", "0") == "1"
+        and os.getenv("ATOM_QWEN_MOE_A8W4", "0") != "1"
     ),
     # ATOM_ROUTER_SHARED_V2 (with ATOM_FOLD_TOPK_ROUTER): the folded router + shared
     # expert + top-k kernel is aiter's decode rewrite

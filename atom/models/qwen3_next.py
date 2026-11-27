@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 from typing import ClassVar
 
 import torch
@@ -463,6 +464,16 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 type(m).__name__,
                 getattr(m, "fp8_activations", None),
             )
+            asked = [
+                f
+                for f in ("ATOM_FOLD_TOPK_ROUTER", "ATOM_FOLD_POSTNORM")
+                if os.environ.get(f, "0") == "1"
+            ]
+            if asked:
+                logger.warning(
+                    "ATOM_QWEN_MOE_A8W4: %s set but off (the folds hand MXFP4 rows to the experts)",
+                    " / ".join(asked),
+                )
         # ATOM_QWEN_FHMOE (gfx1250, TP1): decode-size steps run the shared expert
         # inside the routed grouped MoE (see `fhmoe_forward`); the experts' quant
         # method builds its operands at load from the shared expert handed here.
