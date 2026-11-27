@@ -36,6 +36,7 @@ from atom.distributed.pcp_utils import (
 )
 from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.model_loader.weight_utils import set_weight_attrs
+from atom.model_ops import expert_counts
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import (
     eplb_append_shared_map_and_record_fused,
@@ -5671,6 +5672,8 @@ class FusedMoE(torch.nn.Module):
             hidden_states, topk_weights, topk_ids, *scale = tbo_on_comm(gather)
             x_scale = scale[0] if scale else None
         gathered = gathered or split
+        if expert_counts.DIR:
+            expert_counts.record(self, topk_ids)
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
         )

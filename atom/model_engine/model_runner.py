@@ -106,6 +106,7 @@ from atom.model_engine.token_logprobs import (
     pack_token_logprobs,
     unpack_token_logprobs,
 )
+from atom.model_ops import expert_counts
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     InsufficientPoolBudget,
@@ -3325,6 +3326,8 @@ class ModelRunner:
             dp=dp,
             dp_rank=dp_rank,
         )
+        if expert_counts.DIR:
+            expert_counts.start_forward(label, dp_rank)
 
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
         # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
