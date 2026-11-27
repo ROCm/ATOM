@@ -2038,6 +2038,35 @@ class TestInitialRampFullChunk:
             report = self._report(sched, _RampDelayer())
         assert report["prefillable"] and report["full_chunk"] is False
 
+    def test_an_unarmed_ramp_never_reaches_the_fill_check(self, seq_factory):
+        """Without a positive interval or adaptive the scheduler reports no full
+        chunk without calling the ramp's fill check at all."""
+        sched = self._sched()
+        sched.add(seq_factory(list(range(10, 30))))
+        sched.add(seq_factory(list(range(30, 50))))
+        delayer = _RampDelayer()
+        delayer.prefill_ramp = False
+        with mock.patch.object(
+            sched, "_ramp_full_chunk", side_effect=AssertionError("unarmed ramp")
+        ):
+            report = self._report(sched, delayer)
+        assert report["full_chunk"] is False
+
+    def test_an_ended_ramp_runs_no_probe(self, seq_factory):
+        """Armed, but the group's ramp has ended: no fill probe, no full chunk."""
+        sched = self._sched()
+        sched.add(seq_factory(list(range(10, 30))))
+        sched.add(seq_factory(list(range(30, 50))))
+        delayer = _RampDelayer()
+        delayer.ramp_active = False
+        with mock.patch.object(
+            sched,
+            "_local_prefill_pending_work",
+            side_effect=AssertionError("no probe once the ramp ended"),
+        ):
+            report = self._report(sched, delayer)
+        assert report["full_chunk"] is False
+
     def test_a_partial_filling_the_budget_ahead_of_a_waiting_request(self, seq_factory):
         """A long prompt's partial fills the budget before the probe reaches
         the waiting request: no fresh request is counted, so no full chunk."""
@@ -2045,7 +2074,7 @@ class TestInitialRampFullChunk:
         self._partial(sched, seq_factory, 120)
         sched.add(seq_factory(list(range(10, 14))))
         report = self._report(sched, _RampDelayer())
-        assert sched._probe_fresh == 0 and sched._probe_filled_budget
+        assert sched._probe_fresh == 0
         assert report["full_chunk"] is False
 
     @pytest.mark.parametrize("active", [True, False])

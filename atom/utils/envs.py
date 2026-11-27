@@ -1431,9 +1431,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # adaptive rule. It ends when a rank cannot (or KV runs high) and re-arms
     # once the group has no decode. A release whose forward also decodes (mixed
     # batching) arms no interval, as no mixed forward does: intended.
-    "ATOM_PREFILL_INITIAL_RAMP": lambda: (
-        os.getenv("ATOM_PREFILL_INITIAL_RAMP", "1").lower() in ("1", "true")
-    ),
+    "ATOM_PREFILL_INITIAL_RAMP": lambda: _flag_env("ATOM_PREFILL_INITIAL_RAMP", "1"),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
     # "0" re-walks every tick.

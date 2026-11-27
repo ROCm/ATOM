@@ -1388,7 +1388,6 @@ class Scheduler:
                     break
         prefillable = pending > 0
         if pending >= budget or len(self.running) >= self.max_num_seqs:
-            self._probe_filled_budget = pending >= budget
             return prefillable, min(pending, budget)
         # A chunk counts the rows its forward computes, not the reused prefix.
         slots = self.max_num_seqs - len(self.running)
@@ -1448,7 +1447,6 @@ class Scheduler:
             if offload_resume and getattr(seq, "_counted_as_inflight_load", False):
                 parked -= 1
             if pending >= budget:
-                self._probe_filled_budget = True
                 return True, budget
             if slots == 0:
                 break

@@ -8,15 +8,20 @@ sum (dp_size=1), and inject extra ranks explicitly where alignment matters.
 No GPU / real distributed group needed.
 """
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from aiter_stub import stubbed_aiter
 
 from atom.model_engine.prefill_delayer import (
     _FIXED_SLOTS,
     PrefillDelayer,
     _Gate,
 )
+
+with stubbed_aiter():
+    from atom.model_engine.engine_core import EngineCore
 
 MAX_BATCHED = 16384
 # reduce-buffer slot of the requests that arrived since the previous tick
@@ -930,3 +935,24 @@ def test_host_writes_and_collective_share_storage_across_ticks(exchange_costs):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("raw, armed", [("1", True), ("0", False)])
+def test_engine_core_passes_the_ramp_env_to_the_delayer(monkeypatch, raw, armed):
+    monkeypatch.setenv("ATOM_ENABLE_PREFILL_DELAYER", "1")
+    monkeypatch.setenv("ATOM_PREFILL_DECODE_INTERVAL", "4")
+    monkeypatch.setenv("ATOM_PREFILL_INITIAL_RAMP", raw)
+    delayers = []
+    engine = SimpleNamespace(
+        scheduler=SimpleNamespace(
+            cost_balance=False, set_prefill_delayer=delayers.append
+        )
+    )
+    config = SimpleNamespace(
+        enable_rapidserve=False,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        max_num_batched_tokens=MAX_BATCHED,
+        prefill_admit_policy="interval",
+    )
+    EngineCore._init_prefill_delayer(engine, config)
+    assert delayers[0].prefill_ramp is armed
