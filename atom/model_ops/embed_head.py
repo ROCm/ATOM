@@ -13,6 +13,7 @@ from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.distributed.ulysses_sp import sp_gather_rows, sp_is_enabled
+from atom.model_ops import lm_head_stream
 from atom.model_ops.lm_head_argmax import lm_head_argmax_pack, lm_head_draw_pack
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
@@ -340,6 +341,10 @@ class ParallelLMHead(VocabParallelEmbedding):
     def local_logits(self, x: torch.Tensor, out: torch.Tensor | None = None):
         """``x``'s logits over this rank's vocab shard [N, vocab/tp] (into
         ``out`` where given)."""
+        # Decode rows on gfx1250: one streamed launch, the same bits as tgemm.mm.
+        logits = lm_head_stream.mm(x, self.weight, self.bias, out=out)
+        if logits is not None:
+            return logits
         return tgemm.mm(x, self.weight, self.bias, out=out)
 
     def argmax_of_logits(self, logits: torch.Tensor, *, out: torch.Tensor, draw=None):
