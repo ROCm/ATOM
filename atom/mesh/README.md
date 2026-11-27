@@ -10,7 +10,7 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
 - **Regular mode**: Single-pool routing as a performance baseline
 - **Dual protocol**: HTTP and gRPC through a shared reliability layer
 - **gRPC pipeline**: Rust-side tokenization, reasoning parsing, and tool-call execution for high throughput
-- **Load balancing**: Random, round-robin, cache-aware (prefix tree), power-of-two, and prefix-hash strategies, with DP-aware scheduling where applicable
+- **Load balancing**: Random, round-robin, cache-aware (prefix tree), power-of-two, prefix-hash, and PD-decode least-load strategies, with DP-aware scheduling where applicable
 - **Reliability**: Retries with exponential backoff, per-worker circuit breakers, rate limiting, and request queuing
 - **Observability**: 40+ Prometheus metrics and structured logging
 - **Multi-backend**: SGLang worker backend
@@ -289,6 +289,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
 | `agentic` | Prefill and regular pools. Lowest prefill cost: queued prefill tokens, plus the prompt tokens the worker's GPU cache does not hold (from `--kv-events`, or a text tree for requests the index cannot match), plus `--agentic-request-token-equivalent` (512) per in-flight request. See [agentic routing](docs/agentic_cost.md) |
+| `least_load` | PD decode only. Lowest outstanding cost at `url@rank`: prompt tokens reserved from selection until the decode response ends, plus `--agentic-request-token-equivalent` (512, shared with `agentic`) per in-flight request. A request with no token count counts as one request and makes the choice compare in-flight counts |
 
 In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 

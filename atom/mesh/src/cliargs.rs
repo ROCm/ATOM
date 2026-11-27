@@ -230,7 +230,7 @@ pub struct CliArgs {
     #[arg(
         long,
         default_value = "cache_aware",
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic", "least_load"],
         help_heading = "Routing Policy"
     )]
     pub policy: String,
@@ -263,8 +263,8 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     pub prefix_hash_load_factor: f64,
 
-    /// Tokens the agentic policy charges per in-flight request; keep it equal to
-    /// the engine's ATOM_DP_LB_REQ_EQUIV
+    /// Tokens the agentic and least_load policies charge per in-flight request; keep
+    /// it equal to the engine's ATOM_DP_LB_REQ_EQUIV
     #[arg(long, default_value_t = 512, help_heading = "Routing Policy")]
     pub agentic_request_token_equivalent: u64,
 
@@ -295,7 +295,7 @@ pub struct CliArgs {
     /// Specific policy for prefill nodes in PD mode
     #[arg(
         long,
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic", "least_load"],
         help_heading = "PD Disaggregation"
     )]
     pub prefill_policy: Option<String>,
@@ -303,7 +303,7 @@ pub struct CliArgs {
     /// Specific policy for decode nodes in PD mode
     #[arg(
         long,
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic", "least_load"],
         help_heading = "PD Disaggregation"
     )]
     pub decode_policy: Option<String>,
@@ -583,6 +583,9 @@ impl CliArgs {
                 request_token_equivalent: self.agentic_request_token_equivalent,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+            },
+            "least_load" => PolicyConfig::LeastLoad {
+                request_token_equivalent: self.agentic_request_token_equivalent,
             },
             _ => PolicyConfig::RoundRobin,
         }

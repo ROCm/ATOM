@@ -11,6 +11,7 @@ use crate::policies::{LoadBalancingPolicy, RouteDecision, SelectWorkerInfo};
 pub struct PlacedWorker {
     pub worker: Arc<dyn Worker>,
     pub prefill_tokens: Option<usize>,
+    pub load_reservation: Option<crate::core::LoadReservation>,
 }
 
 pub async fn apply_policy(
@@ -35,14 +36,18 @@ pub async fn apply_policy(
     let pool = candidates[0].worker_type().as_metric_label();
     record_decision(pool, policy.name(), selected.as_ref(), decision);
     let worker = selected.ok_or(PlacementError::PolicyReturnedNone)?;
+    let load_reservation = decision
+        .reservation_id
+        .and_then(|id| policy.take_load_reservation(id));
     Ok(PlacedWorker {
         worker,
         prefill_tokens: decision.prefill_tokens,
+        load_reservation,
     })
 }
 
-/// Records one selection. Runs before the router adds the request, so the
-/// selected worker's load does not include it.
+/// Records one selection. `least_load` has already reserved the request, so
+/// that worker's load includes it. Other policies have not added it yet.
 fn record_decision(
     pool: &'static str,
     policy: &'static str,
