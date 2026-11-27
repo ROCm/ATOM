@@ -19,6 +19,13 @@ from plugin_plans import enable
 from atom import plugin_host as host
 from atom import plugin_recipe as recipes
 
+# Dynamo imports this on its first compile; once an earlier test module has built a
+# Runner (real AITER importable), that import fails, so take it at collection.
+try:
+    import torch.distributed.tensor.experimental  # noqa: F401
+except ImportError:  # pragma: no cover
+    pass
+
 
 def _v41_seams():
     """The V4.1 plugin model's seams (``atom.plugin_seams_v41``), not the host's own."""
