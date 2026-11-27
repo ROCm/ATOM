@@ -165,7 +165,7 @@ def test_fused_selector_emits_the_page_table(phase, page_table_ref):
         rows, q_rows = int(qlens.sum()), int(qlens.max())
         decode_max_q, block_k, warps = (
             0,
-            _prefill_topk_block_size_k(maxb),
+            _prefill_topk_block_size_k(_gfx(), maxb),
             PREFILL_TOPK_NUM_WARPS,
         )
         row_req, row_seq = prefill_rows(starts, prefix, rows)

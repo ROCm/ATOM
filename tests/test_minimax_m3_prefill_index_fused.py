@@ -103,8 +103,24 @@ def _prefill(rows=300, fp4=True, emit=True, pages_per_block=1, score_table=None)
     return out, blocks
 
 
-def test_unset_keeps_the_scorer_and_the_selector(monkeypatch, aiter_op):
+def test_on_by_default_with_the_tuned_launch(monkeypatch, aiter_op):
     monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.delenv(OPTS, raising=False)
+    _prefill()
+    assert not aiter_op.scorer and not aiter_op.select
+    ((_, kw),) = aiter_op.fused
+    assert kw == {
+        "fold_max": 1,
+        "pad_lds": 1,
+        "ring": 3,
+        "sel32": 1,
+        "chunk_blocks": 256,  # aiter's, from the grid
+    }
+    assert len(aiter_op.merge) == 1
+
+
+def test_off_keeps_the_scorer_and_the_selector(monkeypatch, aiter_op):
+    monkeypatch.setenv(FLAG, "0")
     _prefill()
     assert not aiter_op.fused and not aiter_op.merge
     assert len(aiter_op.scorer) == 1 and len(aiter_op.select) == 1
@@ -113,7 +129,7 @@ def test_unset_keeps_the_scorer_and_the_selector(monkeypatch, aiter_op):
 @pytest.mark.parametrize("pages_per_block", [1, m.PAGES_PER_SPARSE_BLOCK])
 def test_the_fused_op_feeds_the_merge(monkeypatch, aiter_op, pages_per_block):
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.delenv(OPTS, raising=False)
+    monkeypatch.setenv(OPTS, "")  # aiter's defaults
     made = []
     monkeypatch.setattr(
         m, "prefill_score_buffer", lambda *a: made.append(a)
@@ -255,7 +271,7 @@ gfx1250 = pytest.mark.skipif(GFX != "gfx1250", reason="needs a gfx1250 GPU")
 HEADS = 4
 
 
-def _fp4_prefill(reqs, seed):
+def _fp4_prefill(reqs, seed, heads=HEADS):
     """Real FP4 index planes for a batch of (new tokens, cached tokens). Every
     third block of a request is its neighbour's page again -- two blocks with
     the same keys score the same wherever the causal mask leaves both whole,
@@ -272,7 +288,7 @@ def _fp4_prefill(reqs, seed):
     scale = torch.zeros(pages, PAGE, D // 16, dtype=torch.uint8, device=DEV)
     index_fp4_store(index_k, torch.arange(pages * PAGE, device=DEV), payload, scale)
     total = sum(n for n, _ in reqs)
-    q = (torch.randn(total, HEADS, D, device=DEV, generator=g) * 3).bfloat16()
+    q = (torch.randn(total, heads, D, device=DEV, generator=g) * 3).bfloat16()
     q[::7] = 0
     perm = torch.randperm(pages, device=DEV, generator=g).int()
     bt = torch.zeros(len(reqs), max(nbs), dtype=torch.int32, device=DEV)
@@ -288,16 +304,31 @@ def _fp4_prefill(reqs, seed):
 
 
 def _index_topk(monkeypatch, fused, data, pins, opts, ppb, max_seq=None):
+    """The whole call, fused or by the FlyDSL scorer + Triton selector; opts:
+    the fused op's OPTS (None: ATOM's default). aiter's shape preference is
+    bypassed (these shapes are short), and the path taken is checked."""
+    from aiter.ops.flydsl import index_score_prefill as op
+
     q, payload, scale, bt, cu, seq, prefix, max_q = data
     monkeypatch.setenv(FLAG, "1" if fused else "0")
-    monkeypatch.setenv(OPTS, opts)
+    if opts is None:
+        monkeypatch.delenv(OPTS, raising=False)
+    else:
+        monkeypatch.setenv(OPTS, opts)
     monkeypatch.setenv("ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL", "1")
     monkeypatch.setenv("ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS", "1")
-    return m.minimax_m3_index_topk(
+    monkeypatch.setattr(op, "index_topk_prefill_nvfp4_preferred", lambda *a: True)
+    merged, merge = [], m._launch_prefill_merge
+    monkeypatch.setattr(
+        m, "_launch_prefill_merge", lambda *a: (merged.append(1), merge(*a))[1]
+    )
+    out = m.minimax_m3_index_topk(
         q, payload, bt, cu, seq, prefix, max_q, max_seq or int(seq.max()), TOPK,
-        pins[0], pins[1], HEADS, D**-0.5, emit_sparse_block_table=True,
+        pins[0], pins[1], q.shape[1], D**-0.5, emit_sparse_block_table=True,
         block_page_stride=ppb, index_kv_scale=scale, emit_pages_per_block=ppb,
     )  # fmt: skip
+    assert bool(merged) == fused
+    return out
 
 
 @gfx1250
@@ -310,13 +341,23 @@ def _index_topk(monkeypatch, fused, data, pins, opts, ppb, max_seq=None):
     ],
 )
 @pytest.mark.parametrize("pins", [(0, 1), (2, 3)])
-@pytest.mark.parametrize("opts", ["", "chunk_blocks=64,block_q=128,waves=2,ring=2"])
+@pytest.mark.parametrize(
+    "opts,heads",
+    [
+        (None, HEADS),  # ATOM's default launch
+        (None, 1),  # one index head a rank (TP4)
+        ("", HEADS),  # aiter's
+        ("chunk_blocks=64,block_q=128,waves=2,ring=2", HEADS),
+    ],
+)
 @pytest.mark.parametrize("ppb", [1, m.PAGES_PER_SPARSE_BLOCK])
-def test_fused_prefill_is_the_scorer_and_selector(monkeypatch, reqs, pins, opts, ppb):
+def test_fused_prefill_is_the_scorer_and_selector(
+    monkeypatch, reqs, pins, opts, heads, ppb
+):
     """Through `minimax_m3_index_topk`: the fused op + merge against aiter's
     FlyDSL scorer + the Triton selector (the same WMMA for every dot, so the
     same scores): top-k in order, page table and lengths."""
-    data = _fp4_prefill(reqs, len(reqs))
+    data = _fp4_prefill(reqs, len(reqs), heads)
     want = _index_topk(monkeypatch, False, data, pins, opts, ppb)
     # Freed blocks of these sizes poisoned: a row the fused path left alone
     # must not pass on what an earlier case left in the allocator.
@@ -336,7 +377,7 @@ def test_fused_prefill_replays_from_a_graph(monkeypatch):
     data = _fp4_prefill(reqs, 9)
     q, seq, prefix = data[0], data[5], data[6]
     bound = int(seq.max())
-    args = (data, (0, 1), "", 1, bound)
+    args = (data, (0, 1), None, 1, bound)
     _index_topk(monkeypatch, True, *args)  # compiles outside the capture
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

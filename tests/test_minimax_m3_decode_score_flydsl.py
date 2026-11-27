@@ -47,6 +47,13 @@ def _fake_aiter(monkeypatch, serves=True):
     return calls, score
 
 
+@pytest.fixture(autouse=True)
+def _scorer_under_the_triton_selector(monkeypatch):
+    """These tests are about the scorer alone: the whole FlyDSL indexer (on by
+    default, see test_minimax_m3_decode_index_topk_flydsl.py) is off."""
+    monkeypatch.setenv("ATOM_M3_DECODE_INDEX_TOPK_FLYDSL", "0")
+
+
 class TestGate:
     q = torch.zeros(16, 4, D, dtype=torch.bfloat16)
     payload = torch.zeros(3, PAGE, D // 2, dtype=torch.uint8)

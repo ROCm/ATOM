@@ -888,34 +888,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3 prefill index block scores over the FP4 index cache on gfx1250:
     # aiter's FlyDSL scorer (`aiter.ops.flydsl.index_score_prefill`) instead of
     # the Triton `_index_block_score_kernel`; the same scores bit for bit, so the
-    # same top-k. Opt-in for A/B.
+    # same top-k. On by default; 0 keeps the Triton scorer.
     "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL": lambda: _flag_env(
-        "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL"
+        "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL", "1"
     ),
     "ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS": lambda: int(
         os.getenv("ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS", "2048")
     ),
-    # With ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL: launch keywords for aiter's
-    # scorer, "key=int,..." (block_q, waves, ring, lds_scores). Empty: aiter's
-    # defaults. aiter validates them; the scores do not depend on them.
+    # Launch keywords for aiter's scorer, "key=int,..." (block_q, waves, ring,
+    # lds_scores, fold_max, pad_lds); empty: aiter's defaults. aiter validates
+    # them; the scores do not depend on them. Default: the MI455X tuning.
     "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS": lambda: os.getenv(
-        "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS", ""
+        "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS",
+        "block_q=128,waves=2,ring=2,fold_max=1,pad_lds=1",
     ),
     # MiniMax-M3 prefill indexer over the FP4 index cache on gfx1250: aiter's
     # fused FlyDSL scorer + top-16 (`index_topk_prefill_nvfp4`) instead of a
     # scorer and a selector, the scores never written; the same selection.
-    # Opt-in for A/B. _OPTS: its launch keywords, "key=int,..." (chunk_blocks,
-    # block_q, waves, ring); aiter validates them.
+    # On by default; 0 keeps the scorer and the selector. _OPTS: its launch
+    # keywords, "key=int,..." (chunk_blocks, block_q, waves, ring, fold_max,
+    # pad_lds, sel32; empty: aiter's defaults); aiter validates them. Default:
+    # the MI455X tuning.
     "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL": lambda: _flag_env(
-        "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL"
+        "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL", "1"
     ),
     "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS": lambda: os.getenv(
-        "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS", ""
+        "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS", "fold_max=1,pad_lds=1,ring=3,sel32=1"
     ),
     # MiniMax-M3 prefill index top-k: the widest tile (blocks, a power of two)
     # the Triton packed selector sorts at once. Same selection at any value.
-    "ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K": lambda: int(
-        os.getenv("ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K", "1024")
+    # Unset: 256 on gfx1250, else 1024 (`_prefill_topk_block_size_k`).
+    "ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K": lambda: (
+        int(os.environ["ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K"])
+        if os.getenv("ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K")
+        else None
     ),
     # MiniMax-M3 decode index block scores over the FP4 index cache on gfx1250:
     # aiter's FlyDSL scorer (`aiter.ops.flydsl.index_score_decode`) instead of
@@ -927,10 +933,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # plan and a wave-a-row FlyDSL selector with the sparse-table emit -- in
     # place of the Triton scorer and `_topk_index_packed_kernel`: the same
     # score bits (the Triton scorer's WMMA pair), so the same ids, order, table
-    # and lengths. Opt-in for A/B; wins over ATOM_M3_DECODE_SCORE_FLYDSL when
-    # both are set.
+    # and lengths. On by default (0: the Triton path); wins over
+    # ATOM_M3_DECODE_SCORE_FLYDSL.
     "ATOM_M3_DECODE_INDEX_TOPK_FLYDSL": lambda: _flag_env(
-        "ATOM_M3_DECODE_INDEX_TOPK_FLYDSL"
+        "ATOM_M3_DECODE_INDEX_TOPK_FLYDSL", "1"
     ),
     # Debug: save rank 0's fresh MiniMax-M3 prefill top-k selections of the
     # first ATOM_M3_DUMP_PREFILL_TOPK_CHUNKS prefill forwards whose longest

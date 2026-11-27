@@ -1777,12 +1777,24 @@ def _launch_split_decode_selector(
     )
 
 
-def _prefill_topk_block_size_k(max_block: int) -> int:
+# The prefill selector's widest tile on gfx1250. MI455X, M3.1 P (4 index heads
+# a rank), 32K-token chunks on 74K-627K contexts: 256 selects in 0.81-0.85x the
+# time of 1024 (docs/environment_variables.md).
+PREFILL_TOPK_BLOCK_SIZE_K_GFX1250 = 256
+
+
+def _prefill_topk_block_size_k(arch: str, max_block: int) -> int:
     """Widest tile the row can use, so the merge chain is as short as it gets,
-    up to ``ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K`` (default 1024, the value of
+    up to ``ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K`` (unset: 256 on gfx1250, else
     PREFILL_TOPK_MAX_BLOCK_SIZE_K): a narrower tile folds more of them but each
-    sort is cheaper, and which wins is measured per GPU and head count."""
+    sort is cheaper, and which wins is measured per GPU."""
     cap = envs.ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K
+    if cap is None:
+        cap = (
+            PREFILL_TOPK_BLOCK_SIZE_K_GFX1250
+            if arch == "gfx1250"
+            else PREFILL_TOPK_MAX_BLOCK_SIZE_K
+        )
     if cap < PREFILL_TOPK_MIN_BLOCK_SIZE_K or cap & (cap - 1):
         raise ValueError(
             "ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K must be a power of two of at least "
@@ -2247,8 +2259,8 @@ def _flydsl_prefill_score_opts(spec: str) -> tuple[tuple[str, int], ...]:
 
 
 def _flydsl_prefill_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len):
-    """aiter's FlyDSL prefill scorer when ``ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL``
-    asks for it and it serves the call (gfx1250, FP4 index cache, a prefill of
+    """aiter's FlyDSL prefill scorer unless ``ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL``
+    is off, when it serves the call (gfx1250, FP4 index cache, a prefill of
     at least ``ATOM_M3_INDEX_SCORE_FLYDSL_MIN_ROWS`` rows), else None.
 
     MI455X, one TP4 rank, 14336 new on 99968 cached: 97 us against Triton's 172
@@ -2276,13 +2288,13 @@ def _flydsl_prefill_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len)
 def _flydsl_prefill_topk(
     idx_q, index_kv_cache, index_kv_scale, max_query_len, batch, topk, max_block, emit
 ):
-    """(aiter's fused prefill scorer + top-16, its chunk) when
-    ``ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL`` asks for it and it serves the call
+    """(aiter's fused prefill scorer + top-16, its chunk) unless
+    ``ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL`` is off, when it serves the call
     (aiter decides: gfx1250, the FP4 index cache, top-16) and aiter prefers it to
     the scorer + selector for this shape, else None. The row
     bound is the FlyDSL scorer's -- the same loop -- and the merge that takes
-    its keys always emits. Imported directly: the flag needs an aiter that has
-    the op."""
+    its keys always emits. Imported directly: an FP4 index cache needs an
+    aiter that has the op (or the flag at 0)."""
     if (
         index_kv_scale is None
         or not emit
@@ -2334,10 +2346,11 @@ def _flydsl_decode_scorer(idx_q, index_kv_cache, index_kv_scale, max_query_len):
 def _flydsl_decode_index_topk(
     idx_q, index_kv_cache, index_kv_scale, max_block, max_query_len, topk
 ):
-    """(aiter's FlyDSL decode indexer, the score plane it scores into) when
-    ``ATOM_M3_DECODE_INDEX_TOPK_FLYDSL`` asks for it and aiter serves the call
+    """(aiter's FlyDSL decode indexer, the score plane it scores into) unless
+    ``ATOM_M3_DECODE_INDEX_TOPK_FLYDSL`` is off, when aiter serves the call
     (the plane is aiter's: rows padded as its selector reads them), else None.
-    Imported directly: the flag needs an aiter that has it."""
+    Imported directly: an FP4 index cache needs an aiter that has it (or the
+    flag at 0)."""
     if index_kv_scale is None or not envs.ATOM_M3_DECODE_INDEX_TOPK_FLYDSL:
         return None
     from aiter.ops.flydsl.index_score_decode import (
@@ -2595,7 +2608,7 @@ def minimax_m3_index_topk(
         num_idx_heads,
         rows_per_req=max_query_len,
         decode_max_q=0,
-        block_size_k=_prefill_topk_block_size_k(max_block),
+        block_size_k=_prefill_topk_block_size_k(arch, max_block),
         num_warps=PREFILL_TOPK_NUM_WARPS,
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,

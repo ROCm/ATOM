@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """MiniMax-M3 decode indexer through aiter's FlyDSL scorer + selector
-(``ATOM_M3_DECODE_INDEX_TOPK_FLYDSL=1``, gfx1250, FP4 index cache).
+(``ATOM_M3_DECODE_INDEX_TOPK_FLYDSL``, on by default; gfx1250, FP4 index cache).
 
 The gate is plain Python (a stand-in aiter module). The kernel half needs a
 gfx1250 GPU: the decode entry with the flag against the Triton scorer +
@@ -62,17 +62,30 @@ def _inputs(batch=3, ql=8, heads=4, blocks=8):
     return q, payload, scale, bt, seq
 
 
-def test_off_by_default(monkeypatch):
+def test_on_by_default(monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
-    assert not envs.ATOM_M3_DECODE_INDEX_TOPK_FLYDSL
-    monkeypatch.setitem(sys.modules, AITER_OP, None)  # not even imported
+    assert envs.ATOM_M3_DECODE_INDEX_TOPK_FLYDSL
+    calls = _fake_aiter(monkeypatch)
+    q, payload, scale, *_ = _inputs()
+    assert m._flydsl_decode_index_topk(q, payload, scale, 8, 8, TOPK) is not None
+    assert len(calls.asked) == 1
+
+
+def test_off_is_not_even_imported(monkeypatch):
+    monkeypatch.setenv(FLAG, "0")
+    monkeypatch.setitem(sys.modules, AITER_OP, None)
     q, payload, scale, *_ = _inputs()
     assert m._flydsl_decode_index_topk(q, payload, scale, 8, 8, TOPK) is None
 
 
-def test_the_flag_needs_an_aiter_with_the_op(monkeypatch):
-    """No probing: asked for on an aiter without the op, the import fails."""
-    monkeypatch.setenv(FLAG, "1")
+@pytest.mark.parametrize("flag", [None, "1"])
+def test_the_flag_needs_an_aiter_with_the_op(monkeypatch, flag):
+    """No probing: on (by default too) with an aiter without the op, the import
+    fails."""
+    if flag is None:
+        monkeypatch.delenv(FLAG, raising=False)
+    else:
+        monkeypatch.setenv(FLAG, flag)
     monkeypatch.setitem(sys.modules, AITER_OP, None)
     q, payload, scale, *_ = _inputs()
     with pytest.raises(ImportError):

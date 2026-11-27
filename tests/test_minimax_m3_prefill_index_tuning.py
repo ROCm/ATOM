@@ -2,7 +2,7 @@
 """MiniMax-M3 prefill indexer launch tuning by env: the keywords handed to
 aiter's FlyDSL scorer (``ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS``) and the
 Triton selector's tile cap (``ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K``). Both leave
-the scores and the selection as they are; unset, the launches are today's.
+the scores and the selection as they are; unset, they are the MI455X tuning.
 Plain Python: the kernels are stand-ins."""
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import torch
 pytest.importorskip("triton", reason="index_topk defines @triton.jit kernels")
 
 from atom.model_ops.minimax_m3 import index_topk as m
+from atom.utils import envs
 
 D, PAGE, TOPK = 128, 128, 16
 OPTS = "ATOM_M3_INDEX_SCORE_FLYDSL_PREFILL_OPTS"
@@ -70,13 +71,20 @@ def _prefill(monkeypatch):
     return kw["block_size_k"], kw["num_warps"]
 
 
-def test_unset_launches_as_before(monkeypatch, aiter_scorer):
+TUNED = {"block_q": 128, "waves": 2, "ring": 2, "fold_max": 1, "pad_lds": 1}
+
+
+def test_unset_is_the_tuned_launch(monkeypatch, aiter_scorer):
     monkeypatch.delenv(OPTS, raising=False)
     monkeypatch.delenv(TILE, raising=False)
-    assert _prefill(monkeypatch) == (
-        m.PREFILL_TOPK_MAX_BLOCK_SIZE_K,
-        m.PREFILL_TOPK_NUM_WARPS,
-    )
+    assert _prefill(monkeypatch) == (256, m.PREFILL_TOPK_NUM_WARPS)
+    ((args, kw),) = aiter_scorer
+    assert kw == TUNED and len(args) == 11
+
+
+def test_empty_opts_take_aiter_s_defaults(monkeypatch, aiter_scorer):
+    monkeypatch.setenv(OPTS, "")
+    _prefill(monkeypatch)
     ((args, kw),) = aiter_scorer
     assert kw == {} and len(args) == 11
 
@@ -89,39 +97,44 @@ def test_the_scorer_gets_the_tuned_tile(monkeypatch, aiter_scorer):
     assert kw == {"block_q": 128, "waves": 2, "ring": 2} and len(args) == 11
 
 
-def test_the_selector_gets_the_tuned_tile(monkeypatch, aiter_scorer):
+def test_the_selector_gets_the_tile_asked_for(monkeypatch, aiter_scorer):
     monkeypatch.delenv(OPTS, raising=False)
-    monkeypatch.setenv(TILE, "256")
-    assert _prefill(monkeypatch) == (256, m.PREFILL_TOPK_NUM_WARPS)
-    assert aiter_scorer[0][1] == {}
+    monkeypatch.setenv(TILE, "1024")
+    assert _prefill(monkeypatch) == (1024, m.PREFILL_TOPK_NUM_WARPS)
+    assert aiter_scorer[0][1] == TUNED
 
 
 @pytest.mark.parametrize(
-    "cap,max_block,want",
+    "arch,cap,max_block,want",
     [
-        (None, 1, 128),
-        (None, 600, 1024),
-        (None, 5000, 1024),
-        ("256", 1, 128),
-        ("256", 200, 256),
-        ("256", 5000, 256),
-        ("128", 5000, 128),
-        ("4096", 5000, 4096),
+        ("gfx950", None, 1, 128),
+        ("gfx950", None, 600, 1024),
+        ("gfx950", None, 5000, 1024),
+        ("gfx950", "", 5000, 1024),  # empty: unset
+        ("gfx1250", None, 1, 128),
+        ("gfx1250", None, 200, 256),
+        ("gfx1250", None, 5000, 256),
+        ("gfx950", "256", 1, 128),
+        ("gfx950", "256", 200, 256),
+        ("gfx950", "256", 5000, 256),
+        ("gfx1250", "128", 5000, 128),
+        ("gfx1250", "1024", 5000, 1024),
+        ("gfx950", "4096", 5000, 4096),
     ],
 )
-def test_tile_cap(monkeypatch, cap, max_block, want):
+def test_tile_cap(monkeypatch, arch, cap, max_block, want):
     if cap is None:
         monkeypatch.delenv(TILE, raising=False)
     else:
         monkeypatch.setenv(TILE, cap)
-    assert m._prefill_topk_block_size_k(max_block) == want
+    assert m._prefill_topk_block_size_k(arch, max_block) == want
 
 
 @pytest.mark.parametrize("cap", ["0", "64", "300", "-256"])
 def test_a_tile_cap_the_kernel_cannot_sort_raises(monkeypatch, cap):
     monkeypatch.setenv(TILE, cap)
     with pytest.raises(ValueError):
-        m._prefill_topk_block_size_k(5000)
+        m._prefill_topk_block_size_k("gfx1250", 5000)
 
 
 def test_score_opts_parse():
@@ -138,20 +151,35 @@ def test_score_opts_parse():
             m._flydsl_prefill_score_opts(bad)
 
 
-def test_the_tuned_tile_is_one_aiter_builds():
-    """The P setting against the real aiter scorer: keywords of its wrapper,
-    and a tile its compile entry accepts (needs FlyDSL; nothing is launched)."""
+@pytest.mark.parametrize("fused", [False, True])
+def test_the_default_launches_are_ones_aiter_builds(monkeypatch, fused):
+    """The default OPTS of the scorer and of the fused op against the real
+    aiter wrappers: keywords they take, and a launch their compile entry
+    accepts (needs FlyDSL; nothing is launched)."""
     pytest.importorskip("flydsl")
     import inspect
 
-    from aiter.ops.flydsl.index_score_prefill import index_score_prefill_nvfp4
+    from aiter.ops.flydsl import index_score_prefill as op
     from aiter.ops.flydsl.kernels.index_score_prefill_nvfp4_gfx1250 import (
         CHUNK_MAX,
         compile_index_score_prefill_nvfp4,
     )
 
-    params = inspect.signature(index_score_prefill_nvfp4).parameters
-    opts = dict(m._flydsl_prefill_score_opts("block_q=128,waves=2,ring=2"))
+    name = "ATOM_M3_INDEX_TOPK_FLYDSL_PREFILL_OPTS" if fused else OPTS
+    monkeypatch.delenv(name, raising=False)
+    wrapper = op.index_topk_prefill_nvfp4 if fused else op.index_score_prefill_nvfp4
+    opts = dict(m._flydsl_prefill_score_opts(getattr(envs, name)))
+    assert opts
+    params = inspect.signature(wrapper).parameters
     assert all(params[k].kind is inspect.Parameter.KEYWORD_ONLY for k in opts)
-    compiled = compile_index_score_prefill_nvfp4(**opts, chunk_max=CHUNK_MAX)
+    # The tile as the wrapper compiles it: its defaults, then the options.
+    launch = {k: params[k].default for k in ("block_q", "waves", "ring")}
+    launch.update(opts)
+    launch.pop("chunk_blocks", None)  # a launch argument, not a build one
+    for flag in ("fold_max", "pad_lds", "sel32"):
+        if flag in launch:
+            launch[flag] = bool(launch[flag])
+    if fused:
+        launch["select"] = (0, 1)
+    compiled = compile_index_score_prefill_nvfp4(**launch, chunk_max=CHUNK_MAX)
     assert compiled["launch"] is not None

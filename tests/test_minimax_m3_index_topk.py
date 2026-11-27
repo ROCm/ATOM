@@ -85,19 +85,22 @@ class TestPrefillTileWidth:
             (100_000, PREFILL_TOPK_MAX_BLOCK_SIZE_K),
         ],
     )
-    def test_width(self, max_block, want):
-        assert _prefill_topk_block_size_k(max_block) == want
+    def test_width(self, monkeypatch, max_block, want):
+        monkeypatch.delenv("ATOM_M3_PREFILL_TOPK_BLOCK_SIZE_K", raising=False)
+        assert _prefill_topk_block_size_k("gfx950", max_block) == want
+        # gfx1250's default cap: 256 (MI455X tuning).
+        assert _prefill_topk_block_size_k("gfx1250", max_block) == min(want, 256)
 
     def test_width_is_a_power_of_two(self):
         # The selector tiles with tl.arange and folds with tl.topk; both need it.
         for mb in range(1, 2000):
-            w = _prefill_topk_block_size_k(mb)
+            w = _prefill_topk_block_size_k("gfx950", mb)
             assert w & (w - 1) == 0
 
     def test_width_never_below_the_topk_it_must_hold(self):
         # tl.static_assert(BLOCK_SIZE_K >= BLOCK_SIZE_T) in the kernel.
         for mb in (1, 2, 15, 16, 17, 4096):
-            assert _prefill_topk_block_size_k(mb) >= TOPK
+            assert _prefill_topk_block_size_k("gfx1250", mb) >= TOPK
 
 
 class TestDecodeScoreChunks:
