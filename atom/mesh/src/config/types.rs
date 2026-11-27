@@ -101,6 +101,10 @@ pub struct RouterConfig {
     /// device; 0 asks no store.
     #[serde(default)]
     pub kv_storage_weight: f64,
+    /// What a token a worker copies in from its share group counts for in routing, against
+    /// one on its device; 0 ignores share groups.
+    #[serde(default = "default_kv_share_weight")]
+    pub kv_share_weight: f64,
     pub api_key: Option<String>,
     pub metrics: Option<MetricsConfig>,
     pub log_dir: Option<String>,
@@ -518,6 +522,10 @@ fn default_kv_storage_deadline_ms() -> u64 {
     3
 }
 
+fn default_kv_share_weight() -> f64 {
+    0.9
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -541,6 +549,7 @@ impl Default for RouterConfig {
             mooncake_admin_port: default_mooncake_admin_port(),
             kv_storage_deadline_ms: default_kv_storage_deadline_ms(),
             kv_storage_weight: 0.0,
+            kv_share_weight: default_kv_share_weight(),
             api_key: None,
             metrics: None,
             log_dir: None,
@@ -646,10 +655,11 @@ impl RouterConfig {
         matches!(self.backend, BackendType::Atom) && self.atom_pd_concurrent
     }
 
-    /// What `kv_storage_weight` counts the tier below a worker's device cache for, as each
-    /// cache-aware policy takes it in its config.
+    /// What `kv_share_weight` and `kv_storage_weight` count the tiers below a worker's
+    /// device cache for, as each cache-aware policy takes them in its config.
     pub fn kv_tier_weights(&self) -> TierWeights {
         TierWeights {
+            shared: self.kv_share_weight,
             stored: self.kv_storage_weight,
         }
     }

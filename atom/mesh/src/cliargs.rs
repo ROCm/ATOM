@@ -290,6 +290,12 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 0.0, value_parser = parse_fraction, help_heading = "Routing Policy")]
     pub kv_storage_weight: f64,
 
+    /// With --kv-events, what a token a worker's engine will copy in from the device pool of
+    /// another rank of its share group (ATOM's umbp_pool) counts for in cache_aware's match
+    /// rate (0 to 1), against one its own device cache holds; 0 ignores share groups
+    #[arg(long, default_value_t = 0.9, value_parser = parse_fraction, help_heading = "Routing Policy")]
+    pub kv_share_weight: f64,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -722,6 +728,7 @@ impl CliArgs {
             .mooncake_admin_port(self.mooncake_admin_port)
             .kv_storage_deadline_ms(self.kv_storage_deadline_ms)
             .kv_storage_weight(self.kv_storage_weight)
+            .kv_share_weight(self.kv_share_weight)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
@@ -858,20 +865,20 @@ mod tests {
         }
     }
 
-    /// The weight on the command line is the `TierWeights` in the config of each
+    /// The two weights on the command line are the `TierWeights` in the config of each
     /// cache-aware policy of the `AppContext` built from it: the default policy, one a
     /// worker's `policy` label asks for by name, and one the PD routers create. Leaving
-    /// it out of the `RouterConfig`, or of what the registry creates policies with,
-    /// fails it at the default.
+    /// either out of the `RouterConfig`, or of what the registry creates policies with,
+    /// fails it at the defaults.
     #[tokio::test]
-    async fn cli_kv_storage_weight_fills_the_tier_weights_of_every_cache_aware_policy() {
+    async fn cli_kv_weights_fill_the_tier_weights_of_every_cache_aware_policy() {
         use crate::{
             app_context::AppContext,
             core::prepare_pool::PreparePoolRuntime,
             policies::{CacheAwarePolicy, LoadBalancingPolicy, TierWeights},
         };
 
-        let flags = "atomesh --kv-events --kv-storage-weight 0.25";
+        let flags = "atomesh --kv-events --kv-share-weight 0.5 --kv-storage-weight 0.25";
         let args = CliArgs::try_parse_from(flags.split_whitespace()).unwrap();
         let config = args.to_router_config(Vec::new()).unwrap();
         let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
@@ -886,8 +893,31 @@ mod tests {
         ];
         for policy in policies {
             let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
-            let want = TierWeights { stored: 0.25 };
+            let want = TierWeights {
+                shared: 0.5,
+                stored: 0.25,
+            };
             assert_eq!(cache_aware.tier_weights(), want);
+        }
+    }
+
+    /// The weights no flag sets are `TierWeights::default()`, however the config is made.
+    #[test]
+    fn kv_tier_weights_default_alike_on_the_command_line_and_in_the_config() {
+        use crate::policies::TierWeights;
+
+        let parsed = CliArgs::try_parse_from(["atomesh"]).unwrap();
+        let mut saved = serde_json::to_value(RouterConfig::default()).unwrap();
+        for weight in ["kv_share_weight", "kv_storage_weight"] {
+            assert!(saved.as_object_mut().unwrap().remove(weight).is_some());
+        }
+        for config in [
+            parsed.to_router_config(Vec::new()).unwrap(),
+            CliArgs::default().to_router_config(Vec::new()).unwrap(),
+            RouterConfig::default(),
+            serde_json::from_value(saved).unwrap(),
+        ] {
+            assert_eq!(config.kv_tier_weights(), TierWeights::default());
         }
     }
 
@@ -1040,6 +1070,7 @@ impl Default for CliArgs {
             mooncake_admin_port: 9003,
             kv_storage_deadline_ms: 3,
             kv_storage_weight: 0.0,
+            kv_share_weight: 0.9,
             pd_disaggregation: false,
             decode: Vec::new(),
             prefill_policy: None,

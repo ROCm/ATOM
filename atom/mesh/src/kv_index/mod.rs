@@ -17,7 +17,10 @@ use std::{fmt::Debug, sync::Arc};
 
 pub(crate) use partition::{match_groups, match_lanes, Holder, Lane, Partition, Predictor};
 
-use crate::{core::Worker, kv_tiers::TieredHit};
+use crate::{
+    core::Worker,
+    kv_tiers::{TierWeights, TieredHit},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PrefixHash(u64);
@@ -32,9 +35,17 @@ pub(crate) trait PrefixMatchProvider: Send + Sync + Debug {
     /// of `workers`; `None` for a worker it knows nothing of. `device` is what the
     /// worker's device cache holds, `Some(0)` when none of them: by its KV events when
     /// they are exact, raised to the prompts routed to it when they are partial, and by
-    /// those prompts alone when it has none indexed. `stored` is not the index's to tell,
-    /// and `Some(0)`. The walk read-locks the shards of the partitions it reads.
-    fn tiered_hits(&self, tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<TieredHit>>;
+    /// those prompts alone when it has none indexed. `shared` is what its engine will then
+    /// copy in from the pools of the other ranks of its share group: 0 where none can,
+    /// and where `weights` counts the tier for nothing, as the groups are then left out
+    /// of the walk. `stored` is not the index's to tell, and `Some(0)`. The walk
+    /// read-locks the shards of the partitions it reads.
+    fn tiered_hits(
+        &self,
+        tokens: &[u32],
+        workers: &[Arc<dyn Worker>],
+        weights: &TierWeights,
+    ) -> Vec<Option<TieredHit>>;
 
     /// Predicts that `worker` will hold `tokens`, routed to it, without waiting for the
     /// index's writer.

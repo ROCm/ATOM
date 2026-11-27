@@ -58,16 +58,18 @@
     Maximum characters each worker may hold in a tree. Above it, that worker's
     LRU leaves are evicted during the next eviction cycle.
 
-    6. tier_weights: (one float, 0.0 to 1.0)
+    6. tier_weights: (two floats, 0.0 to 1.0)
     With --kv-events, what a token a worker's engine takes from a tier below its
     device cache counts for in the match rate held against cache_threshold:
-    --kv-storage-weight. At 0 a tier is not asked.
+    --kv-share-weight and --kv-storage-weight. At 0 a tier is not asked.
 
     With --kv-events, a request the router can tokenize goes to the worker whose
     device cache, as its KV events show, holds the largest share of its tokens,
-    if that share is above cache_threshold. With --kv-storage-weight above 0, a
-    worker's share also counts the tokens its engine will load from the Mooncake
-    Store it reads, at that weight each. The tree places all other requests:
+    if that share is above cache_threshold. A worker's share also counts the
+    tokens its engine will copy in from the device pools of its share group
+    (ATOM's umbp_pool), at --kv-share-weight each, and with --kv-storage-weight
+    above 0, those it will load from the Mooncake Store it reads, at that weight
+    each. The tree places all other requests:
     those at or below the threshold, those with media, those under imbalanced
     load, and those whose candidates have no indexed events.
 */
@@ -351,10 +353,12 @@ impl CacheAwarePolicy {
     }
 
     /// The tree's affinity branch, with the match rate of the KV tiers: the share of the
-    /// request's tokens a worker's device cache holds, each token its engine will then load
-    /// from its store counted at `--kv-storage-weight`, the config's `tier_weights`; the
-    /// highest first, then the lower load. None leaves the request to the tree: it has no
-    /// tokens or has media, or no candidate's match rate is above `cache_threshold`.
+    /// request's tokens a worker's device cache holds, each token its engine will then copy
+    /// in from its share group counted at `--kv-share-weight`, and each it will load from
+    /// its store at `--kv-storage-weight`, the config's `tier_weights`; the highest first,
+    /// then the lower load. `kv_shared` where the worker counts copies. None leaves the
+    /// request to the tree: it has no tokens or has media, or no candidate's match rate is
+    /// above `cache_threshold`.
     async fn select_by_kv_events(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -394,10 +398,15 @@ impl CacheAwarePolicy {
         let estimate = hit
             .cached()
             .map(|cached| f64::from(cached) / tokens.len() as f64);
+        let branch = if hit.shared > 0 {
+            "kv_shared"
+        } else {
+            "kv_affinity"
+        };
         let decision = RouteDecision {
             match_ratio: Some(match_rate),
             estimated_hit_ratio: estimate,
-            ..RouteDecision::branch("kv_affinity")
+            ..RouteDecision::branch(branch)
         };
         Some((Some(idx), decision))
     }
@@ -825,6 +834,7 @@ mod tests {
     fn device_hit(device: u32) -> TieredHit {
         TieredHit {
             device,
+            shared: 0,
             stored: Some(0),
         }
     }
@@ -843,6 +853,7 @@ mod tests {
             &self,
             _tokens: &[u32],
             workers: &[Arc<dyn Worker>],
+            _: &TierWeights,
         ) -> Vec<Option<TieredHit>> {
             let hit = |worker: &Arc<dyn Worker>| {
                 let found = self.0.iter().find(|(url, _)| *url == worker.url());
@@ -870,6 +881,7 @@ mod tests {
             &self,
             tokens: &[u32],
             workers: &[Arc<dyn Worker>],
+            _: &TierWeights,
         ) -> Vec<Option<TieredHit>> {
             let routed = self.0.lock();
             let held = |worker: &Arc<dyn Worker>| routed.iter().any(|url| url == worker.url());
@@ -1052,7 +1064,10 @@ mod tests {
             pool.held.store(held, Ordering::Relaxed);
             pool.fail.store(!answers, Ordering::Relaxed);
             let stores = stores(pool.clone(), &URLS, 10, 40).await;
-            let weights = TierWeights { stored: weight };
+            let weights = TierWeights {
+                stored: weight,
+                ..Default::default()
+            };
             let policy = weighing(weights, &workers);
             let hits = Hits(URLS.into_iter().zip(devices).collect());
             policy.set_kv_tiers(KvTiers::new(Arc::new(hits), Some(stores)));
@@ -1065,6 +1080,100 @@ mod tests {
             // The store is asked once a selection, and not at all where it counts for nothing.
             let asked = pool.asked.load(Ordering::Relaxed);
             assert_eq!(asked, usize::from(weight > 0.0), "at weight {weight}");
+        }
+    }
+
+    /// Each worker's device hit and what its device cache will hold once its engine copies
+    /// in from its share group.
+    #[derive(Debug)]
+    struct Shared(Vec<(u32, u32)>);
+
+    impl PrefixMatchProvider for Shared {
+        fn tiered_hits(
+            &self,
+            _: &[u32],
+            _: &[Arc<dyn Worker>],
+            _: &TierWeights,
+        ) -> Vec<Option<TieredHit>> {
+            let hit = |&(device, held): &(u32, u32)| TieredHit {
+                shared: held - device,
+                ..device_hit(device)
+            };
+            self.0.iter().map(hit).map(Some).collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_kv_match_rate_weighs_what_the_engine_copies_from_its_share_group() {
+        let workers = two_workers();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        // w1's device cache holds 60 of the 100 tokens; w2's 20, and its share group 80.
+        let shared = || Shared(vec![(60, 60), (20, 80)]);
+        for (shared, weight, want) in [
+            // w2's 20 + 0.9 * 60 beats w1's 60, and its engine reports the copies cached.
+            (shared(), 0.9, Some((1, "kv_shared", 0.74, Some(0.8)))),
+            (shared(), 0.5, Some((0, "kv_affinity", 0.6, Some(0.6)))),
+            // At most cache_threshold of the prompt, the tree places it.
+            (Shared(vec![(10, 10), (0, 40)]), 0.9, None),
+        ] {
+            let weights = TierWeights {
+                shared: weight,
+                ..Default::default()
+            };
+            let policy = weighing(weights, &workers);
+            policy.set_kv_tiers(index(shared));
+            let (selected, decision) = policy.select_with_decision(&workers, &info).await;
+            let got = decision.branch.starts_with("kv_").then(|| {
+                let match_rate = decision.match_ratio.unwrap();
+                let estimate = decision.estimated_hit_ratio;
+                (selected.unwrap(), decision.branch, match_rate, estimate)
+            });
+            assert_eq!(got, want);
+        }
+    }
+
+    /// A worker's tiers add up in one match rate, and its store adds to what its device
+    /// cache will hold once the copies are in: of the 90 tokens the store holds, w2's
+    /// engine, with 20 on its device and 40 to copy in, loads the 30 past those, unless
+    /// it loads no fewer than 40.
+    #[tokio::test]
+    async fn the_kv_match_rate_adds_up_the_tiers_a_worker_takes_the_prompt_from() {
+        let workers = two_workers();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let weights = TierWeights {
+            shared: 0.9,
+            stored: 0.5,
+        };
+        for (min_load_tokens, want) in [
+            // 20 + 0.9 * 40 + 0.5 * 30 beats w1's 60, and the engine reports all 90 cached.
+            (20, (1, "kv_shared", 0.71, Some(0.9))),
+            // 20 + 0.9 * 40 does not.
+            (40, (0, "kv_affinity", 0.6, Some(0.6))),
+        ] {
+            let pool = Arc::new(Pool::default());
+            pool.held.store(9, Ordering::Relaxed);
+            // w1 reads no store.
+            let stores = stores(pool, &URLS[1..], 10, min_load_tokens).await;
+            let policy = weighing(weights, &workers);
+            let shared = Shared(vec![(60, 60), (20, 60)]);
+            policy.set_kv_tiers(KvTiers::new(Arc::new(shared), Some(stores)));
+            let (selected, decision) = policy.select_with_decision(&workers, &info).await;
+            let (match_rate, estimate) = (decision.match_ratio, decision.estimated_hit_ratio);
+            let got = (
+                selected.unwrap(),
+                decision.branch,
+                match_rate.unwrap(),
+                estimate,
+            );
+            assert_eq!(got, want, "loading no fewer than {min_load_tokens}");
         }
     }
 

@@ -394,6 +394,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn kv_share_weight(mut self, weight: f64) -> Self {
+        self.config.kv_share_weight = weight;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;

@@ -107,6 +107,8 @@ Defaults are the CLI defaults.
 | | `relocate` | That ratio is at or below the threshold: the least-loaded worker, ties broken at random. Workers outside the candidates keep their matches in the tree. | ratio |
 | | `imbalanced` | The max minus min load exceeds `--balance-abs-threshold` (64) and the max exceeds `--balance-rel-threshold` (1.5) times the min: the least-loaded worker, without a tree lookup. | |
 | | `no_tree` | No tree for the model and pool: a random healthy worker. | |
+| | `kv_affinity` | With `--kv-events`: the worker whose device cache holds the largest share of the prompt, above the threshold, then the least loaded. | ratio |
+| | `kv_shared` | The same, where that worker's share counts what its engine will copy in from the device pools of its share group, at `--kv-share-weight` (0.9) per token. | ratio |
 | `prefix_hash` | `ring_hit` | The hash ring owner of the first `--prefix-token-count` (256) tokens, when its load is at most `--prefix-hash-load-factor` (1.25) times the average load including this request. | |
 | | `load_balance_walk` | The owner is over that bound: the least-loaded worker within it, or the owner if none is. | |
 | | `fallback_least_load` | No ring, or the owner is not healthy: the least-loaded worker. | |
@@ -215,10 +217,11 @@ match ratio only when it picked the worker holding the best match, which covers
 every `affinity` decision and any `relocate` that happened to pick it. With
 `--kv-events`, its `kv_affinity` decisions estimate the selection from the KV
 event index, short of the block of the prompt's last token, which the engine
-always computes. With `--kv-storage-weight`, they add what the engine will load
-from the Mooncake Store the worker reads, by ATOM's load rule. When that store
-does not answer, the match rate counts the device cache alone and the decision
-has no estimate. The
+always computes. `kv_shared` decisions add what the engine will copy in from
+the device pools of its share group, which it reports cached as well. With
+`--kv-storage-weight`, they add what the engine will load from the Mooncake
+Store the worker reads, by ATOM's load rule. When that store does not answer,
+the match rate leaves the store out and the decision has no estimate. The
 router drops the estimate when it sends the prompt to a different worker than
 the policy chose, because DP ranks keep separate KV caches; under
 `--atom-pd-rank-mapping-policy idx2idx` that takes a health or membership change
@@ -231,7 +234,8 @@ while the engine counts tokens in blocks, and the tree does not see engine
 eviction, chat templates or KV offload. `kv_affinity` counts tokens: the
 blocks the index matches, short of the last token's block, and with
 `--kv-storage-weight` what the engine will load from the store, over the
-prompt's tokens. It differs where the index is not the engine's cache at that
+prompt's tokens; `kv_shared` also counts what the engine will copy in from its
+share group. It differs where the index is not the engine's cache at that
 moment: batches not applied yet, blocks evicted since, and predictions for a
 worker without exact events. A positive error means the router overestimated; a
 negative one means the engine reused more than predicted.

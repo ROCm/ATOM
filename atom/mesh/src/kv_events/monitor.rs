@@ -5,10 +5,9 @@
 //! Admitted batches go to the writer of the rank's index partition, which has a thread of
 //! its own. What each stream carried is what `/kv_events/sources` shows. A registered
 //! worker without exact events is also predicted to hold the prompts routed to it. Of each
-//! worker the index tells the policies what its device cache holds. The stores the workers
-//! read, and what a token of theirs counts for, are the policies'. The ranks whose device
-//! pools are in one share group are followed as such: a rank's engine will copy in what
-//! the pools of the other ranks of its group hold.
+//! worker the index tells the policies what its device cache holds and what its engine
+//! will copy in from the pools of its share group. What either counts for, and the stores
+//! the workers read, are the policies'.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -45,7 +44,7 @@ use crate::{
     kv_index::{
         match_groups, match_lanes, Holder, Lane, Partition, Predictor, PrefixMatchProvider,
     },
-    kv_tiers::TieredHit,
+    kv_tiers::{TierWeights, TieredHit},
     observability::metrics::schema::names,
 };
 
@@ -309,15 +308,29 @@ impl KvEventMonitor {
 }
 
 impl PrefixMatchProvider for KvEventMonitor {
-    fn tiered_hits(&self, tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<TieredHit>> {
+    fn tiered_hits(
+        &self,
+        tokens: &[u32],
+        workers: &[Arc<dyn Worker>],
+        weights: &TierWeights,
+    ) -> Vec<Option<TieredHit>> {
         let device = self.match_workers(tokens, workers);
-        let hit = |device: &Option<u32>| {
+        // Share groups that count for nothing are left out of the walk.
+        let held = if weights.shared > 0.0 {
+            self.shared_tokens(tokens, workers, &device)
+        } else {
+            None
+        };
+        let held = held.as_deref().unwrap_or(&device);
+        let hit = |(device, held): (&Option<u32>, &Option<u32>)| {
+            let (device, held) = ((*device)?, (*held)?);
             Some(TieredHit {
-                device: (*device)?,
+                device,
+                shared: held.saturating_sub(device),
                 stored: Some(0),
             })
         };
-        device.iter().map(hit).collect()
+        device.iter().zip(held).map(hit).collect()
     }
 
     fn on_routed(&self, tokens: &[u32], worker: &dyn Worker) {
@@ -360,8 +373,6 @@ impl KvEventMonitor {
     /// `workers`, when it holds what `device` says: that, or more where its engine copies
     /// the prefix in from the pools of the other ranks of its share group. None where no
     /// worker's can, and `device` stands.
-    // No policy counts these tokens yet (ROCm/ATOM#3620 does), so only the tests ask.
-    #[allow(dead_code)]
     fn shared_tokens(
         &self,
         tokens: &[u32],
@@ -1156,8 +1167,9 @@ mod tests {
         assert_eq!(monitor.match_workers(&prompt, &workers), removed);
     }
 
-    /// A rank's engine copies in what the other followed ranks of its share group hold,
-    /// block by block; not what ranks of another group, or of none, hold.
+    /// Where a share group's tokens count, a rank's engine copies in what the other
+    /// followed ranks of its group hold, block by block; not what ranks of another group,
+    /// or of none, hold. Where they count for nothing, the groups are left out.
     #[tokio::test]
     async fn a_rank_holds_what_its_share_group_holds() {
         let monitor = KvEventMonitor::start().unwrap();
@@ -1214,13 +1226,30 @@ mod tests {
             .collect();
         let device = [Some(8), Some(0), Some(12), Some(12)];
         matched(&monitor, &prompt, &workers, &device).await;
+        // Each rank's hit where a token copied in counts `shared`.
+        let hits = |shared: f64| {
+            let weights = TierWeights {
+                shared,
+                ..Default::default()
+            };
+            monitor.tiered_hits(&prompt, &workers, &weights)
+        };
+        let hit = |device, shared| {
+            Some(TieredHit {
+                device,
+                shared,
+                stored: Some(0),
+            })
+        };
+        let own = [hit(8, 0), hit(0, 0), hit(12, 0), hit(12, 0)];
+        assert_eq!(hits(0.0), own);
         // Rank 1 copies in the 8 tokens rank 0 holds.
-        let held = monitor.shared_tokens(&prompt, &workers, &device);
-        assert_eq!(held, Some(vec![Some(8), Some(8), Some(12), Some(12)]));
+        let copied = [hit(8, 0), hit(0, 8), hit(12, 0), hit(12, 0)];
+        assert_eq!(hits(0.9), copied);
         // Without another followed rank in its group, no rank copies anything in.
         monitor.detach(&urls[1]);
         assert_eq!(monitor.shared_ranks.load(Ordering::Relaxed), 2);
-        assert_eq!(monitor.shared_tokens(&prompt, &workers, &device), None);
+        assert_eq!(hits(0.9), [hit(8, 0), None, hit(12, 0), hit(12, 0)]);
     }
 
     /// A rank that keeps some of its blocks private shares with its group only those its
@@ -1262,9 +1291,15 @@ mod tests {
             .into();
         let (prompt, device): (Vec<u32>, _) = ((1..=10).collect(), [Some(8), Some(0)]);
         assert_eq!(monitor.match_workers(&prompt, &workers), device);
-        // Its peer copies in the 4 tokens of the block it shares.
-        let held = monitor.shared_tokens(&prompt, &workers, &device);
-        assert_eq!(held, Some(vec![Some(8), Some(4)]));
+        let hits = monitor.tiered_hits(&prompt, &workers, &TierWeights::default());
+        let hit = |device, shared| {
+            Some(TieredHit {
+                device,
+                shared,
+                stored: Some(0),
+            })
+        };
+        assert_eq!(hits, [hit(8, 0), hit(0, 4)]);
     }
 
     /// A worker is predicted from its registration to its detach: in the partition of its

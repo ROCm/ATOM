@@ -1,6 +1,6 @@
 //! Where the policies read the tiers a worker's engine takes a prompt's KV from, with
-//! `--kv-events`: the KV event index, for its device cache, and the stores the workers
-//! read, which a policy asks itself for what its engine will load.
+//! `--kv-events`: the KV event index, for its device cache and its share group, and the
+//! stores the workers read, which a policy asks itself for what its engine will load.
 
 use std::sync::Arc;
 
@@ -28,15 +28,15 @@ impl KvTiers {
 
     /// What each worker's engine will take the leading tokens of `tokens` from, in the
     /// order of `workers`; None for a worker the index knows nothing of. A tier `weights`
-    /// counts for nothing is not asked, and holds no tokens: the stores are asked, once a
-    /// call, only where what they hold counts.
+    /// counts for nothing is not asked, and holds no tokens: the index leaves it out of
+    /// its walk, and the stores are asked, once a call, only where what they hold counts.
     pub(crate) async fn tiered_hits(
         &self,
         tokens: &[u32],
         workers: &[Arc<dyn Worker>],
         weights: &TierWeights,
     ) -> Vec<Option<TieredHit>> {
-        let mut hits = self.index.tiered_hits(tokens, workers);
+        let mut hits = self.index.tiered_hits(tokens, workers, weights);
         if let (true, Some(stores)) = (weights.stored > 0.0, &self.stores) {
             ask_stores(stores, tokens, workers, &mut hits).await;
         }
@@ -50,7 +50,7 @@ impl KvTiers {
 }
 
 /// Sets what each worker's engine will load of `tokens` from the store it reads, past what
-/// its device cache holds by `hits`: None where that store does not answer.
+/// its device cache will hold by `hits`: None where that store does not answer.
 async fn ask_stores(
     stores: &StorageSources,
     tokens: &[u32],
@@ -61,12 +61,12 @@ async fn ask_stores(
     let (readers, asked): (Vec<usize>, Vec<(&str, u32)>) = (workers.iter().zip(hits.iter()))
         .enumerate()
         .filter(|(_, (worker, _))| !matches!(worker.worker_type(), WorkerType::Decode))
-        .filter_map(|(i, (worker, hit))| Some((i, (worker.url(), (*hit)?.device))))
+        .filter_map(|(i, (worker, hit))| Some((i, (worker.url(), (*hit)?.on_device()))))
         .unzip();
     let cached = stores.cached_tokens(tokens, &asked).await;
-    for ((i, (_, device)), cached) in readers.into_iter().zip(asked).zip(cached) {
+    for ((i, (_, on_device)), cached) in readers.into_iter().zip(asked).zip(cached) {
         if let Some(hit) = &mut hits[i] {
-            hit.stored = cached.map(|cached| cached.saturating_sub(device));
+            hit.stored = cached.map(|cached| cached.saturating_sub(on_device));
         }
     }
 }
@@ -156,18 +156,26 @@ pub(crate) mod testing {
 mod tests {
     use std::sync::atomic::Ordering;
 
+    use parking_lot::Mutex;
+
     use super::{
         testing::{stores, Pool},
         *,
     };
     use crate::core::BasicWorkerBuilder;
 
-    /// An index that knows each worker's tiers.
+    /// An index that knows each worker's tiers, and keeps the weights it is asked at.
     #[derive(Debug)]
-    struct Index(Vec<Option<TieredHit>>);
+    struct Index(Vec<Option<TieredHit>>, Mutex<Vec<TierWeights>>);
 
     impl PrefixMatchProvider for Index {
-        fn tiered_hits(&self, _: &[u32], _: &[Arc<dyn Worker>]) -> Vec<Option<TieredHit>> {
+        fn tiered_hits(
+            &self,
+            _: &[u32],
+            _: &[Arc<dyn Worker>],
+            weights: &TierWeights,
+        ) -> Vec<Option<TieredHit>> {
+            self.1.lock().push(*weights);
             self.0.clone()
         }
     }
@@ -180,7 +188,7 @@ mod tests {
     ];
 
     /// A decode worker, one the index knows nothing of, one with nothing on its device,
-    /// and one whose device cache holds 8 tokens.
+    /// and one whose device cache will hold 8 tokens, 4 of them copied in.
     fn workers_and_hits() -> (Vec<Arc<dyn Worker>>, Vec<Option<TieredHit>>) {
         let decode = BasicWorkerBuilder::new(URLS[0]).worker_type(WorkerType::Decode);
         let workers: Vec<Arc<dyn Worker>> = vec![
@@ -189,18 +197,19 @@ mod tests {
             Arc::new(BasicWorkerBuilder::new(URLS[2]).build()),
             Arc::new(BasicWorkerBuilder::new(URLS[3]).build()),
         ];
-        let hit = |device| {
+        let hit = |device, shared| {
             Some(TieredHit {
                 device,
+                shared,
                 stored: Some(0),
             })
         };
-        (workers, vec![hit(0), None, hit(0), hit(8)])
+        (workers, vec![hit(0, 0), None, hit(0, 0), hit(4, 4)])
     }
 
     /// A decode worker takes the prompt's KV from its prefill worker, and a worker whose
     /// device cache the index knows nothing of is not asked for: of four readers of a
-    /// store, it answers for the last two, each by what its own device cache holds.
+    /// store, it answers for the last two, each by what its own device cache will hold.
     #[tokio::test]
     async fn a_store_answers_for_its_readers_the_index_knows_but_decode_workers() {
         let (workers, hits) = workers_and_hits();
@@ -209,8 +218,14 @@ mod tests {
         // the device, the 2 more are under the 4 it loads at least.
         pool.held.store(6, Ordering::Relaxed);
         let stores = stores(pool.clone(), &URLS, 2, 4).await;
-        let tiers = KvTiers::new(Arc::new(Index(hits.clone())), Some(stores));
-        let weights = TierWeights { stored: 1.0 };
+        let tiers = KvTiers::new(
+            Arc::new(Index(hits.clone(), Mutex::default())),
+            Some(stores),
+        );
+        let weights = TierWeights {
+            stored: 1.0,
+            ..Default::default()
+        };
         let prompt: Vec<u32> = (0..12).collect();
         let got = tiers.tiered_hits(&prompt, &workers, &weights).await;
         let loaded = |hit: Option<TieredHit>, stored| hit.map(|hit| TieredHit { stored, ..hit });
@@ -231,7 +246,8 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// At a weight of 0 a tier is not asked: no request goes to a store.
+    /// At a weight of 0 a tier is not asked: no request goes to a store, and the index is
+    /// told which tiers count, so that it leaves the others out of its walk.
     #[tokio::test]
     async fn a_tier_that_counts_for_nothing_is_not_asked() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -240,7 +256,7 @@ mod tests {
         let pool = Arc::new(Pool::default());
         pool.held.store(6, Ordering::Relaxed);
         let stores = stores(pool.clone(), &URLS, 2, 4).await;
-        let index = Arc::new(Index(hits.clone()));
+        let index = Arc::new(Index(hits.clone(), Mutex::default()));
         let tiers = KvTiers::new(index.clone(), Some(stores));
         let prompt: Vec<u32> = (0..12).collect();
         let lookups = || {
@@ -250,16 +266,29 @@ mod tests {
                 .contains("mesh_kv_storage_lookups_total")
         };
 
-        let unweighed = TierWeights { stored: 0.0 };
-        assert_eq!(tiers.tiered_hits(&prompt, &workers, &unweighed).await, hits);
+        let unweighed = TierWeights {
+            shared: 0.0,
+            stored: 0.0,
+        };
+        for weights in [unweighed, TierWeights::default()] {
+            assert_eq!(tiers.tiered_hits(&prompt, &workers, &weights).await, hits);
+        }
         assert_eq!(pool.asked.load(Ordering::Relaxed), 0);
         assert!(!lookups());
 
-        let weighed = TierWeights { stored: 0.5 };
+        let weighed = TierWeights {
+            shared: 0.0,
+            stored: 0.5,
+        };
         let got = tiers.tiered_hits(&prompt, &workers, &weighed).await;
         assert_eq!(got[2].and_then(|hit| hit.stored), Some(10));
         assert_eq!(pool.asked.load(Ordering::Relaxed), 1);
         assert!(lookups());
+        // The index is asked at the policy's weights, each time.
+        assert_eq!(
+            *index.1.lock(),
+            [unweighed, TierWeights::default(), weighed]
+        );
 
         // With no stores to ask, the index answers alone.
         let alone = KvTiers::new(index, None);

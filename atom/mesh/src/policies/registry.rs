@@ -50,7 +50,7 @@ impl PolicyRegistry {
     }
 
     /// The registry of a router: its default policy, and the tier weights of its
-    /// `kv_storage_weight` for every cache-aware policy it creates
+    /// `kv_share_weight` and `kv_storage_weight` for every cache-aware policy it creates
     pub fn for_router(config: &RouterConfig) -> Self {
         Self::with_tier_weights(config.policy.clone(), config.kv_tier_weights())
     }
@@ -636,6 +636,7 @@ mod tests {
             &self,
             _tokens: &[u32],
             workers: &[Arc<dyn Worker>],
+            _: &TierWeights,
         ) -> Vec<Option<TieredHit>> {
             vec![None; workers.len()]
         }
@@ -688,6 +689,7 @@ mod tests {
         };
         let config = RouterConfig {
             policy: cache_aware.clone(),
+            kv_share_weight: 0.5,
             kv_storage_weight: 0.25,
             ..Default::default()
         };
@@ -696,7 +698,10 @@ mod tests {
             cache_aware.unwrap().tier_weights()
         };
         let registry = PolicyRegistry::for_router(&config);
-        let want = TierWeights { stored: 0.25 };
+        let want = TierWeights {
+            shared: 0.5,
+            stored: 0.25,
+        };
         for policy in [
             registry.get_default_policy(),
             registry.on_worker_added("m", Some("cache_aware")),
@@ -704,7 +709,7 @@ mod tests {
         ] {
             assert_eq!(weights(policy), want);
         }
-        // Without a router's config, the default of its flag.
+        // Without a router's config, the defaults of its flags.
         let registry = PolicyRegistry::new(cache_aware);
         let default = registry.get_default_policy();
         assert_eq!(weights(default), TierWeights::default());
