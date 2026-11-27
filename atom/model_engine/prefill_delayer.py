@@ -196,14 +196,21 @@ _ADAPT_FIXED = 4
 #        prefill step
 #   FIRE on the n-th decision since the last FIRE (n-1 held ticks) once
 #   regret >= A*B and n >= _MIN_TICKS, or once n >= the TTFT cap
-#   _MAX_HOLD_MS / mean decode step (600 ms ~ 24 at ~25 ms/tick), clamped to
-#   [_MIN_TICKS, _TICKS_CAP].
-# Tuned on DSV4.1 DEP4 8k/1k; not meant to be tuned per deployment.
+#   _MAX_HOLD_MS / mean decode step (2 s ~ 80 at ~25 ms/tick), clamped to
+#   [_COLD_MAX_TICKS, _TICKS_CAP].
+# _MIN_TICKS and _MAX_HOLD_MS: each prefill pass stalls the decode batch of
+# every rank. With DP lockstep and many requests decoding per rank, admitting
+# prefill every few ticks makes those stalls frequent and the decode cadence
+# uneven. Holding at least _MIN_TICKS decisions spaces the passes out and lets
+# each gather a fuller batch, trading some TTFT for steadier decode; the TTFT
+# cap is long enough not to fire before that at usual decode step times.
+# Tuned on DSV4.1 DEP4 8k/1k and DEP8 agentic serving; not meant to be tuned
+# per deployment.
 _T0_FRAC = 0.75
 _A_MIN_FRAC = 0.3
 _A_MAX_FRAC = 1.5
-_MAX_HOLD_MS = 600.0
-_MIN_TICKS = 4
+_MAX_HOLD_MS = 2000.0
+_MIN_TICKS = 40
 _TICKS_CAP = 200
 # cap before the decode mean is known (cold start)
 _COLD_MAX_TICKS = 24
@@ -254,6 +261,7 @@ class PrefillDecision(NamedTuple):
 
 class PrefillDelayer:
     __slots__ = (
+        "_adapt_after_prefill",
         "_adapt_at",
         "_adapt_dec_fit",
         "_adapt_last_tokens",
@@ -449,6 +457,7 @@ class PrefillDelayer:
         self._adapt_pf_fit = _EwFit(_PF_HALF_LIFE)
         self._adapt_last_tokens = 0
         self._adapt_prev_dec_per_rank = 0.0
+        self._adapt_after_prefill = False
         self._adapt_regret = 0.0
         self._adapt_thr_last = (0.0, 0.0, 0.0)
         self._stat_adapt_cycles = 0
@@ -968,7 +977,10 @@ class PrefillDelayer:
             return max(_MIN_TICKS, _COLD_MAX_TICKS)
         mean_dec_us = t0 / _T0_FRAC
         n = round(_MAX_HOLD_MS * 1000.0 / mean_dec_us)
-        return min(max(n, _MIN_TICKS), _TICKS_CAP)
+        # Never below the cold-start cap: a cap that shrinks with T0 admits
+        # prefill more often, which slows decode and raises T0 again, a loop
+        # that can settle in a slow state and stay there.
+        return min(max(n, _COLD_MAX_TICKS), _TICKS_CAP)
 
     def _adapt_observe(
         self, reduced: list[int], step_s: float, prefill_ran: bool, g_running_dec: int
@@ -984,8 +996,19 @@ class PrefillDelayer:
                 )
                 if toks > 0:
                     self._adapt_pf_fit.add(float(toks), step_s * 1e6)
-            elif self._adapt_prev_dec_per_rank > 0:
-                self._adapt_dec_fit.add(self._adapt_prev_dec_per_rank, step_s * 1e6)
+            elif self._adapt_prev_dec_per_rank > 0 and not self._adapt_after_prefill:
+                # T0 is the cost of a decode step. Only a decode step that
+                # follows a decode step counts: the first one after a prefill
+                # also pays for the prefill's aftermath. A sample over twice the
+                # current mean (warm-up, compile, a stall) is clipped, so the
+                # mean cannot run away: a high T0 shortens the TTFT cap, which
+                # admits prefill more often, which slows decode further.
+                y = step_s * 1e6
+                dec = self._adapt_dec_fit
+                if dec.n >= _DEC_MIN_N:
+                    y = min(y, 2.0 * dec.mean_y())
+                dec.add(self._adapt_prev_dec_per_rank, y)
+        self._adapt_after_prefill = bool(prefill_ran)
         self._adapt_prev_dec_per_rank = g_running_dec / max(self.dp_size, 1)
 
     def _adapt_decide(
