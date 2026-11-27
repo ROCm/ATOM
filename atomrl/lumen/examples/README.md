@@ -130,15 +130,6 @@ and calling that script directly. `DRY_RUN=1` prints the `torchrun` line.
 
 ---
 
-## CI mapping
-
-Lumen changes run package verification and CPU-safe tests on Python 3.10 and
-3.12. The numbered GPU examples are release-validation workloads and are not
-run by pull-request CI. Run them explicitly on an 8-GPU host with the commands
-in the table above when preparing or validating a GPU release image.
-
----
-
 ## 20 steps, 8× MI350X
 
 The benchmark table below was measured with the historical runbook image and
