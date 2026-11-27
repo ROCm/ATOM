@@ -178,6 +178,7 @@ class PPEngineCoreProc(EngineCore):
 
             rejected = self.scheduler.take_rejected()
             if rejected:
+                self._release_request_resources(rejected)
                 self.output_queue.put_nowait(rejected)
 
             if result is None:
@@ -270,6 +271,9 @@ class PPEngineCoreProc(EngineCore):
             except queue.Empty:
                 pass
             if finished_seqs:
+                # The head stage holds the vision leases, and the last stage
+                # has run every forward of these seqs by now.
+                self._release_request_resources(finished_seqs)
                 self.output_queue.put_nowait(finished_seqs)
 
     def _queue_or_flush_prefill_hashes(self, batch, seqs):

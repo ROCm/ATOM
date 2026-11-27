@@ -1631,12 +1631,15 @@ class PrefillEngineCore(EngineCore):
             self._p2d_sock.send(pickle.dumps((DisaggMsgType.PREFILL_DONE, done)))
 
         # Remove completed sequences — prefill produces no output tokens.
-        for seq in list(seqs.values()):
+        finished = list(seqs.values())
+        for seq in finished:
             seq.status = SequenceStatus.FINISHED
             try:
                 self.scheduler.running.remove(seq)
             except ValueError:
                 pass
+        # This instance never sees them again, so drop their vision leases.
+        self._release_request_resources(finished)
         return True
 
     @staticmethod

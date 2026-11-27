@@ -222,8 +222,12 @@ class TestMultimodalInputs:
         config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=[architecture]),
             multimodal_config=SimpleNamespace(
+                model_type="qwen3_5",
+                image_token_id=42,
                 media_placeholder_token_id=42,
-                vision_config=SimpleNamespace(merge_kernel_size=2),
+                vision_config=SimpleNamespace(
+                    spatial_merge_size=2, merge_kernel_size=2
+                ),
             ),
         )
         processor = Processor()
@@ -255,6 +259,8 @@ class TestMultimodalInputs:
         assert online_data.keys() == offline_data.keys()
         for key in online_data:
             np.testing.assert_array_equal(online_data[key], offline_data[key])
+        if architecture == "Qwen3_5ForConditionalGeneration":
+            assert online_data["embedding_spans"] == ((1, 1),)
 
 
 class TestCoerceN:
