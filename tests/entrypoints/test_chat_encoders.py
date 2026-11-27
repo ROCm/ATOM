@@ -22,6 +22,7 @@ from atom.entrypoints.openai.chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
     template_needs_tool_call_argument_strings,
+    template_takes_mid_system,
 )
 from atom.entrypoints.openai.protocol import ChatMessage
 from atom.entrypoints.openai.tool_parser.registry import resolve_tool_call_parser
@@ -387,8 +388,9 @@ class TestAModelWithNoChatTemplateStillBoots:
             (lambda t: resolve_reasoning_toggle(t, None), None),
             (lambda t: resolve_tool_call_parser(None, t, None), None),
             (lambda t: template_needs_tool_call_argument_strings(t, None), False),
+            (lambda t: template_takes_mid_system(t, None), False),
         ],
-        ids=["reasoning", "tool-parser", "tool-call-arguments"],
+        ids=["reasoning", "tool-parser", "tool-call-arguments", "mid-system"],
     )
     def test_no_startup_probe_raises(self, probe, expected):
         assert probe(self.NoTemplate()) is expected

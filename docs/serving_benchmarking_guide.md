@@ -1080,7 +1080,7 @@ script using `EngineArgs.add_cli_args`):
 | `--tensor-parallel-size`, `-tp` | `1` | Tensor parallel size |
 | `--data-parallel-size`, `-dp` | `1` | Data parallel size |
 | `--enforce-eager` | `False` | Disable CUDA graph capture; use eager execution |
-| `--enable_prefix_caching` | `False` | Enable prefix caching |
+| `--enable_prefix_caching` | `True` | Enable prefix caching; `--no-enable_prefix_caching` disables it |
 | `--enable-log-stats` / `--no-enable-log-stats` | `True` | Emit the periodic engine-status line (throughput, running/waiting reqs, KV usage, prefix-cache hit rate) |
 | `--throughput-log-interval` | `10.0` | Seconds between engine-status lines |
 | `--port` | `8006` | Internal engine communication port |

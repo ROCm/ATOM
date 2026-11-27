@@ -31,6 +31,7 @@ class _Delayer:
         self.is_local = is_local
         self.reported = []
         self.pending = []
+        self.budgets = []
         self.rank_prefill_costs = []
 
     def protects_decode(self, running_decode_batch: int) -> bool:
@@ -41,6 +42,7 @@ class _Delayer:
     ):
         self.reported.append(prefill_cost)
         self.pending.append(pending_tokens)
+        self.budgets.append(kwargs.get("prefill_budget"))
         self.rank_prefill_costs = [prefill_cost, *self.others]
         return PrefillDecision(allow=True, prefillable_ranks=1 + len(self.others))
 
@@ -55,6 +57,7 @@ def _sched(
     max_tokens=64,
     dp_size=8,
     prefix_caching=False,
+    mixed=False,
 ):
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", str(weight))
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_SLACK", str(slack))
@@ -67,6 +70,7 @@ def _sched(
             max_model_len=256,
             max_num_batched_tokens=max_tokens,
             enable_prefix_caching=prefix_caching,
+            enable_mixed_prefill_decode=mixed,
             enable_dp_attention=dp_attention,
             parallel_config=SimpleNamespace(data_parallel_size=dp_size),
         )
@@ -110,6 +114,49 @@ def test_off_with_a_single_dp_rank(monkeypatch, seq_factory):
     assert delayer.reported == [0.0]
 
 
+@pytest.mark.parametrize("mixed", [False, True])
+def test_estimate_prices_the_chunk_the_prefill_budget_allows(
+    monkeypatch, seq_factory, mixed
+):
+    """Under mixed batching the running decodes keep their rows
+    (`_prefill_limits().tokens`), so the estimate prices the chunk that is left, not
+    one the batch budget would allow and admission then could not take."""
+    sched = _sched(monkeypatch, mixed=mixed)
+    for i in range(6):
+        decode = seq_factory([i + 1] * 4)
+        assert sched.block_manager.allocate(decode, 0)
+        decode.num_cached_tokens = 4
+        decode.append_token(7)
+        sched.running.append(decode)
+    sched.add(seq_factory(list(range(100, 164))))
+    chunk = 64 - 6 if mixed else 64  # one row per decode (no drafts)
+    limits = sched._prefill_limits() if mixed else sched._unreserved_prefill_limits
+    assert limits.tokens == chunk
+    assert sched._estimate_prefill_chunk_cost(limits=limits) == sched._chunk_cost(
+        0, chunk
+    )
+
+
+def test_delayer_is_told_what_a_mixed_step_can_admit(monkeypatch, seq_factory):
+    """The delayer's fill target and the pending it is compared with are both
+    the decode-first prefill budget, not the batch budget a mixed step can no
+    longer spend on prefill."""
+    sched = _sched(monkeypatch, mixed=True)
+    decodes = [seq_factory([10 * i, 1, 2, 3]) for i in range(6)]
+    for seq in decodes:
+        sched.add(seq)
+    sched.schedule()  # their prompts
+    for seq in decodes:
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        seq.append_token(9)
+    delayer = _Delayer(others=[1.0] * 7)
+    sched.set_prefill_delayer(delayer)
+    sched.add(seq_factory(list(range(100, 200))))
+    sched.schedule()
+    assert delayer.budgets[-1] == 64 - 6  # one row per decode, no drafts
+    assert delayer.pending[-1] == 64 - 6
+
+
 def test_per_tick_probes_keep_the_head_walk(monkeypatch, seq_factory):
     """The estimate and the delayer's head check probe the waiting head on
     every tick with prefill work. Its prompt-block hashes and its prefix walk
@@ -132,11 +179,11 @@ def test_per_tick_probes_keep_the_head_walk(monkeypatch, seq_factory):
     walk = bm._walk_prefix
     monkeypatch.setattr(bm, "_walk_prefix", lambda s: walks.append(s) or walk(s))
     # 8 cached blocks of 4 tokens: the chunk is the 32 new tokens after them.
-    cost = sched._estimate_prefill_chunk_cost()
+    cost = sched._estimate_prefill_chunk_cost(limits=sched._prefill_limits())
     assert cost == sched._chunk_cost(32, 32)
     assert hashed and len(walks) == 1
     first_probe = len(hashed)
-    assert sched._estimate_prefill_chunk_cost() == cost
+    assert sched._estimate_prefill_chunk_cost(limits=sched._prefill_limits()) == cost
     assert sched._can_admit_head_prefill() and sched._can_admit_head_prefill()
     assert len(hashed) == first_probe and len(walks) == 1
 
@@ -150,7 +197,9 @@ def test_balanced_admission_takes_exactly_the_cached_prefix(monkeypatch, seq_fac
     resident = _cached_prefix(sched, seq_factory, prefix)
     seq = seq_factory(prefix + list(range(500, 564)))
     sched.add(seq)
-    sched._estimate_prefill_chunk_cost()  # leave kept hashes behind
+    sched._estimate_prefill_chunk_cost(
+        limits=sched._prefill_limits()
+    )  # leave kept hashes behind
     # Own 64-token chunk after 32 cached costs 4096, seven ranks at 512:
     # target = 1.1 * 960 = 1056, i.e. 24 tokens.
     batch, _ = sched.schedule()
@@ -164,7 +213,7 @@ def test_room_is_the_largest_chunk_within_the_cost_left(monkeypatch, start):
     sched = _sched(monkeypatch, weight=4096, min_tokens=0, max_tokens=1 << 20)
     sched._tick_cost_limit = 5e8
     sched._tick_cost = 1e8
-    room = sched._prefill_room(0, start)
+    room = sched._prefill_room(0, start, sched.max_num_batched_tokens)
     left = sched._tick_cost_limit - sched._tick_cost
     assert sched._chunk_cost(start, room) <= left
     assert sched._chunk_cost(start, room + 1) > left
@@ -283,9 +332,19 @@ def test_costs_ride_the_delayer_reduce_on_a_stateless_gloo_group():
         max_num_batched_tokens=64,
         exchange_prefill_costs=True,
     )
-    delayer.should_allow_prefill(prefillable=True, pending_tokens=8, prefill_cost=3.5e9)
+    delayer.should_allow_prefill(
+        prefillable=True,
+        pending_tokens=8,
+        prefill_cost=3.5e9,
+        prefill_budget=64,
+    )
     assert delayer.rank_prefill_costs == [3.5e9]
     # Without the exchange the buffer keeps its 8 decision slots only.
     plain = PrefillDelayer(dp_size=1, cpu_group=group, max_num_batched_tokens=64)
-    plain.should_allow_prefill(prefillable=True, pending_tokens=8, prefill_cost=3.5e9)
+    plain.should_allow_prefill(
+        prefillable=True,
+        pending_tokens=8,
+        prefill_cost=3.5e9,
+        prefill_budget=64,
+    )
     assert plain.rank_prefill_costs == []
